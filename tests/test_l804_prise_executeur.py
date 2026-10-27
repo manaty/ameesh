@@ -163,6 +163,8 @@ class _FauxRunner:
     once = False
     mediated = False
     dry_run = False
+    #: pas de filtre d'admission dans les cas nominaux
+    agents_filter = None
     #: seuils de `balance_low` (`--balance-*`), vides : les défauts partagés
     take_balance: dict = {}
 
@@ -189,6 +191,24 @@ class TakePassTest(_Lots):
         self.assertIsNone(work.get(self.db, deux["id"])["assignee"])
         # l'agent a un lot et du courrier : la passe suivante ne reprend rien
         self.assertEqual(runner.Runner.take_pass(faux), [])
+
+    def test_worker_retire_de_l_admission_ne_prend_pas(self):
+        # #3972 : un worker retiré de la liste d'admission reste vivant
+        # jusqu'à la fin de son tour ; il ne prend pas de lot entre-temps.
+        self.agent("a1", team="nexlink", since_s=2 * HEURE)
+        self.agent("a2", team="nexlink", since_s=3 * HEURE)  # plus ancien au repos
+        un = self.lot("un")
+        faux = _FauxRunner(self.db, self.cfg, self.settings(),
+                           {"a1": _Worker(), "a2": _Worker()})
+        faux.agents_filter = ["a1"]
+        out = runner.Runner.take_pass(faux)
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out], [("a1", un["id"])])
+        self.assertEqual(work.get(self.db, un["id"])["assignee"], "a1")
+        # liste vide : personne ne prend, même avec des workers vivants
+        deux = self.lot("deux")
+        faux.agents_filter = []
+        self.assertEqual(runner.Runner.take_pass(faux), [])
+        self.assertIsNone(work.get(self.db, deux["id"])["assignee"])
 
     def test_passe_coupee(self):
         self.agent("a1", team="nexlink", since_s=2 * HEURE)

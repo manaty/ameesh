@@ -1087,7 +1087,7 @@ def _record_receipt(db, path: str, lot: int, actor: str) -> tuple[str | None, st
     if db is None:
         return None, "no database"
     try:
-        review_provenance.prepare_commit_creation(path, actor=actor)
+        review_provenance.prepare_commit_creation(path, actor=actor, db=db)
         ident = review_provenance.proof_for_current_turn(db, actor=actor, cwd=path)
         if ident is None:
             return None, "outside a managed turn, or no live session"
@@ -1156,7 +1156,7 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
         # #2942 : `_run` coupe les crochets (`core.hooksPath=/dev/null`) ; la
         # paire attestation/fait de création de #1465 est donc posée ici, avec
         # les mêmes gardes de tour que les hooks, autour du commit mécanique.
-        review_provenance.prepare_commit_intent(path, actor=actor)
+        review_provenance.prepare_commit_intent(path, actor=actor, db=db)
         try:
             _check(_run(path, "-c", "rerere.enabled=false", "commit", "--quiet",
                         "--no-verify", "-F", "-", stdin=_message(meta, note).encode()),

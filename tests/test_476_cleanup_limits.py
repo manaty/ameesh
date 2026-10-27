@@ -44,6 +44,34 @@ class CleanupLimitsTest(unittest.TestCase):
         self.assertIn(mock.call(signal.SIGCONT), target.send.call_args_list)
         self.assertTrue(entry.unverified)
 
+    def test_default_window_is_the_rest_of_the_section_and_late_stop_signals(self):
+        # #3991: a stop confirmed after .5 s used to skip TERM and KILL.
+        notes = []
+        tracker, target = self.tracker(), self.target()
+        tracker.log = notes.append
+        target.freeze.return_value = True
+        entry = self.entry(target)
+        clock = [0, .1, .2, .3] + [.9] * 10
+        with mock.patch.object(background.time, "perf_counter", side_effect=clock):
+            tracker._signal_handles(entry, signal.SIGTERM)
+        self.assertAlmostEqual(target.freeze.call_args.kwargs["timeout"], 1.7)
+        self.assertIn(mock.call(signal.SIGTERM), target.send.call_args_list)
+        self.assertIn(mock.call(signal.SIGCONT), target.send.call_args_list)
+        self.assertFalse(entry.unverified)
+        self.assertTrue(any("stop confirmed late" in n and "under lock" in n
+                            for n in notes), notes)
+
+    def test_unconfirmed_stop_logs_the_time_held_under_lock(self):
+        notes = []
+        tracker, target = self.tracker(), self.target()
+        tracker.log = notes.append
+        target.freeze.return_value = False
+        with mock.patch.object(background.time, "perf_counter",
+                               side_effect=[0, .1, .2, .3] + [.4] * 10):
+            tracker._signal_handles(self.entry(target), signal.SIGTERM)
+        self.assertNotIn(mock.call(signal.SIGTERM), target.send.call_args_list)
+        self.assertTrue(any("stop not confirmed within 1.70 s" in n for n in notes), notes)
+
     def test_cont_ignores_expired_budget_and_shared_lock(self):
         tracker, target = self.tracker(), self.target()
         entry = self.entry(target)

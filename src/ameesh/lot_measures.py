@@ -822,14 +822,18 @@ def measure(db, ids=None, *, repos=(), ci=gh_ci_runs, limit: int = PASS_LIMIT,
 
 
 def host_repos(db, host: str | None, agents=None) -> list[str]:
-    """The working directories (registry `cwd`) of the agents of `host`."""
+    """The working directories (registry `cwd`) of the agents of `host`.
+
+    `agents=None` keeps every agent of the host; a given filter (including an
+    empty one) selects exactly its agents, so a runner admitting nobody has
+    no repository — never "all agents" (#3972)."""
     from . import registry
 
     out = []
     for agent in registry.overview(db):
         if host and agent.get("host") != host:
             continue
-        if agents and agent.get("name") not in agents:
+        if agents is not None and agent.get("name") not in agents:
             continue
         repo = os.path.expanduser(agent.get("cwd") or "")
         if repo and os.path.isdir(repo) and repo not in out:
@@ -840,8 +844,16 @@ def host_repos(db, host: str | None, agents=None) -> list[str]:
 def measure_pending(db, *, host: str | None = None, agents=None, ci=gh_ci_runs,
                     errors: list | None = None) -> list[dict]:
     """The runner pass: measures the lots delivered recently and not
-    measured yet, within `PASS_BUDGET_S`."""
-    return measure(db, None, repos=host_repos(db, host, agents), ci=ci,
+    measured yet, within `PASS_BUDGET_S`.
+
+    With no repository of the host — no admitted agent, no readable working
+    directory — nothing is measured: the diff cannot be read, and a measure
+    written without one would claim a repository this host does not have
+    (#3972)."""
+    repos = host_repos(db, host, agents)
+    if not repos:
+        return []
+    return measure(db, None, repos=repos, ci=ci,
                    since_s=PENDING_WINDOW_S, budget_s=PASS_BUDGET_S, errors=errors)
 
 

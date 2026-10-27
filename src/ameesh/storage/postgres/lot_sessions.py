@@ -146,6 +146,10 @@ class LotSessions(interface.LotSessions):
                                   WHERE e.work_item_id = w.id
                                     AND coalesce(btrim(e.note), '') <> ''
                                     AND NOT starts_with(lower(btrim(e.note)), %s)
+                                    AND (starts_with(e.actor, 'human:')
+                                         OR EXISTS (SELECT 1 FROM agent_registry r
+                                                     WHERE r.name = e.actor
+                                                        OR 'agent:' || r.name = e.actor))
                                   ORDER BY e.created_at DESC, e.id DESC LIMIT 1), false)
              ORDER BY w.priority ASC NULLS LAST, w.created_at ASC, w.id ASC
             """,

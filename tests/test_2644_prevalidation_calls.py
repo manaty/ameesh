@@ -367,6 +367,7 @@ class ContractFallbackTest(unittest.TestCase):
                         "test_cluster  # rôles du cluster\n"
                         "test_migrations  # migrations\n")
         self.repo.write("tests/test_cluster.py", "x = 1\n")
+        self.repo.write("tests/test_l107_executor_contract.py", "x = 1\n")
         self.repo.write("tests/test_l161f_plan.py", "x = 1\n")
         self.head = self.repo.commit("contracts")
 
@@ -482,6 +483,70 @@ class ContractFallbackTest(unittest.TestCase):
         self.assertEqual(got["state"], "green")
         self.assertEqual(got["report"]["fallback"]["cause"], "selection-full")
         self.assertEqual(got["report"]["selection"], "contract")
+
+    def test_fallback_adds_transverse_contracts_and_changed_tests(self):
+        # #3954 : un lot qui change l'interface de stockage rend le contrat de
+        # l'exécuteur (#3885, tête 68c30d91) et son test changé (P0, #3916,
+        # tête 7ae1e095) reste joué par le repli « contrats ».
+        script = FULL_PLAN_SCRIPT.replace(
+            "'classes': {}",
+            "'classes': {'test_3845_paquet_horaire': ['P0', 'test changé'],"
+            " 'test_a': ['P3', '']}")
+        self.repo.write("scripts/test-plan.py", script)
+        self.repo.write("src/ameesh/storage/interface.py",
+                        "class Storage:\n    def ops(self):\n        return 1\n")
+        self.repo.write("tests/test_3845_paquet_horaire.py", "x = 1\n")
+        self.head = self.repo.commit("transverse")
+        prepared = calls.prepare(self.repo.root, self.head, self.repo.base)
+        self.addCleanup(prepared.close)
+        fallback = calls.contract_fallback(prepared, self.parameters(),
+                                           head=self.head, base=self.repo.base)
+        self.assertIsNotNone(fallback)
+        plan = prepared.plan
+        self.assertEqual(plan["selection"]["mode"], "contract")
+        self.assertIn("contrats et tests du lot", plan["selection"]["why"])
+        self.assertEqual(fallback["transverse"], ["test_l107_executor_contract"])
+        self.assertEqual(fallback["changed_tests"], ["test_3845_paquet_horaire"])
+        self.assertFalse(fallback["transverse_all"])
+        self.assertEqual(fallback["diff"], "read")
+        modules = plan["parts"]["psycopg"][0]["modules"]
+        self.assertIn("test_l107_executor_contract", modules)
+        self.assertIn("test_3845_paquet_horaire", modules)
+        self.assertIn("test_cluster", modules)
+        # la preuve se relit comme un repli déclaré, pas comme un vert de
+        # sélection : les modules supplémentaires sont dans les classes du plan.
+        chosen = pv.selection(plan, head=self.head, base=self.repo.base)
+        self.assertTrue(chosen.ok, chosen.why)
+        self.assertEqual(chosen.fallback["transverse"],
+                         ["test_l107_executor_contract"])
+
+    def test_unreadable_diff_plays_all_transverse_contracts(self):
+        # #3954/B de cx3 : un diff illisible ne conclut pas « aucun contrat
+        # transverse dû » ; le repli joue alors tous les contrats déclarés.
+        prepared = calls.prepare(self.repo.root, self.head, self.repo.base)
+        self.addCleanup(prepared.close)
+        with mock.patch.object(calls, "_changed_paths", return_value=None):
+            fallback = calls.contract_fallback(prepared, self.parameters(),
+                                               head=self.head, base=self.repo.base)
+        self.assertIsNotNone(fallback)
+        self.assertTrue(fallback["transverse_all"])
+        self.assertEqual(fallback["diff"], "unreadable")
+        self.assertEqual(fallback["transverse"],
+                         sorted(calls.transverse_contracts.CONTRACTS))
+        modules = prepared.plan["parts"]["psycopg"][0]["modules"]
+        self.assertIn("test_l107_executor_contract", modules)
+        self.assertIn("test_cluster", modules)
+
+    def test_missing_declared_module_refuses_the_fallback(self):
+        # #3954/B de cx3 : une déclaration qui nomme un module disparu ne se
+        # suppose pas ; le repli est refusé (le refus d'origine reste).
+        prepared = calls.prepare(self.repo.root, self.head, self.repo.base)
+        self.addCleanup(prepared.close)
+        with mock.patch.dict(calls.transverse_contracts.CONTRACTS,
+                             {"test_absent_3954": ("src/ameesh/x.py",)}):
+            fallback = calls.contract_fallback(prepared, self.parameters(),
+                                               head=self.head, base=self.repo.base)
+        self.assertIsNone(fallback)
 
 
 class CommitProbeTest(unittest.TestCase):

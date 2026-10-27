@@ -267,6 +267,12 @@ class Tracker:
     STRAYS_EVERY_S = 60.0
     UNKNOWN_ZOMBIES_WARN = 32
     CLEANUP_SECTION_S = 2.0
+    #: confirmation de l'arrêt (SIGSTOP) avant le signal ; None : tout le
+    #: reste de la section (#3991 : sous charge, 0,5 s sautait TERM et KILL)
+    FREEZE_CONFIRM_S: float | None = None
+    #: arrêt confirmé au-delà de ce délai : journalisé avec la durée de
+    #: verrouillage (CLEANUP_SIGNAL_LOCK tenu pendant l'attente)
+    FREEZE_SLOW_S = .5
     #: fin de tour : délai laissé aux processus qui se ferment avec le
     #: harnais (serveurs MCP) avant de parler de travail de fond
     SETTLE_S = 2.0
@@ -275,6 +281,9 @@ class Tracker:
     #: une entrée close et dite à l'agent part ; close et jamais dite (agent
     #: sans tour suivant), elle part après ce délai
     KEEP_S = 24 * 3600.0
+    #: #3949 : codes de sortie déjà moissonnés par la passe des orphelins avant
+    #: l'inscription de l'entrée qui les attend ; bornés, le plus ancien part
+    OBSERVED_CODES_MAX = 256
 
     def __init__(self, runner, log=print) -> None:
         self.runner = runner
@@ -289,6 +298,10 @@ class Tracker:
         self.thread: threading.Thread | None = None
         self.observed_children: dict[int, float] = {}
         self.observed_handles: dict[int, ProcessHandle] = {}
+        #: #3949 : statut déjà lu pour une observation, en attente du `Job` qui
+        #: la réclamera (la passe des orphelins peut passer entre `survivors`
+        #: et `start`) ; clé = (pid, start), valeur = code de sortie
+        self.observed_codes: dict[tuple[int, float], int] = {}
         self.observed_lock = threading.Lock()
         self.unknown_zombies = 0
         self._zombies_warned = False
@@ -713,11 +726,19 @@ class Tracker:
                     if not remaining:
                         continue
                     stop_attempted = True
-                    if not handle.freeze(timeout=min(.5, remaining)):
+                    window = remaining if self.FREEZE_CONFIRM_S is None \
+                        else min(self.FREEZE_CONFIRM_S, remaining)
+                    if not handle.freeze(timeout=window):
                         entry.unverified |= bool(handle.live())
-                        note = "stop not confirmed; no termination signal"
+                        note = ("stop not confirmed within %.2f s under lock; "
+                                "no termination signal" % window)
                         continue
-                    if not self._cleanup_remaining(entry, deadline):
+                    # The wait is measured on the section's own clock reads.
+                    after = self._cleanup_remaining(entry, deadline)
+                    if remaining - after > self.FREEZE_SLOW_S:
+                        note = ("stop confirmed late, %.2f s under lock"
+                                % (remaining - after))
+                    if not after:
                         continue
                     location = handle.location()
                     if not self._cleanup_remaining(entry, deadline):
@@ -912,10 +933,10 @@ class Tracker:
         if job.start is None:
             return None
         with self.observed_lock:
-            if job.pid in self.observed_handles:
-                retained = True
-            else:
-                retained = False
+            # #3949 : un statut retenu survit au retrait de l'observation par
+            # une passe des orphelins ultérieure (pid absent du relevé)
+            retained = (job.pid in self.observed_handles
+                        or (job.pid, job.start) in self.observed_codes)
         if retained:
             return self._reap_observed(job.pid, job.start)
         return self._reap_identity(job.pid, job.start)
@@ -936,6 +957,18 @@ class Tracker:
 
     def _reap_observed(self, pid: int, start) -> int | None:
         with self.observed_lock:
+            # #3949 : la passe des orphelins peut avoir consommé ce statut
+            # (`_remember_observed_code`) avant que l'entrée ne soit inscrite
+            # (`survivors` → `start`). Le code est alors rendu au `Job` qui
+            # réclame cette identité.
+            cached = self.observed_codes.pop((pid, start), None)
+            if cached is not None:
+                if self.observed_children.get(pid) == start:
+                    handle = self.observed_handles.pop(pid, None)
+                    self.observed_children.pop(pid, None)
+                    if handle is not None:
+                        handle.close()
+                return cached
             if start is None or self.observed_children.get(pid) != start:
                 return None
             handle = self.observed_handles.get(pid)
@@ -949,6 +982,13 @@ class Tracker:
                 handle.close()
             return code
 
+    def _remember_observed_code(self, pid: int, start, code: int) -> None:
+        """#3949 : retient un statut moissonné avant l'inscription de l'entrée."""
+        with self.observed_lock:
+            self.observed_codes[(pid, start)] = code
+            while len(self.observed_codes) > self.OBSERVED_CODES_MAX:
+                self.observed_codes.pop(next(iter(self.observed_codes)))
+
     def _reap_strays(self, table: list[dict], suivis: list[Entry]) -> None:
         """Moissonne les descendants observés, et les orphelins **adoptés**.
 
@@ -959,7 +999,11 @@ class Tracker:
         le laisser ferait une fuite de zombies (#1749). Un descendant observé
         garde son pidfd (`_reap_observed`) ; les autres ne sont moissonnés
         qu'après vérification d'identité (`_reap_identity`, anti-recyclage de
-        PID) et seulement si aucun `Popen` vivant ne les attend."""
+        PID) et seulement si aucun `Popen` vivant ne les attend.
+
+        #3949 : un statut consommé ici pour une observation encore en attente
+        d'inscription (`capture_before_wait` → `survivors` → `start`) est
+        retenu par `_reap_observed` jusqu'à ce que le `Job` le réclame."""
         moi = os.getpid()
         with self.observed_lock:
             known = dict(self.observed_children)
@@ -994,8 +1038,13 @@ class Tracker:
                         unknown.append(p["pid"])
                         continue
                     if known.get(p["pid"]) == start:
-                        if self._reap_observed(p["pid"], start) is None:
+                        # #3949 : ce statut n'est peut-être pas encore à un
+                        # `Job` (entrée pas inscrite) ; on le retient pour lui.
+                        code = self._reap_observed(p["pid"], start)
+                        if code is None:
                             unknown.append(p["pid"])
+                        else:
+                            self._remember_observed_code(p["pid"], start, code)
                         continue
                     if p["pid"] not in owned:
                         # orphelin adopté : personne ne détient son statut

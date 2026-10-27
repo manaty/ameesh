@@ -15,6 +15,7 @@ from unittest import mock
 
 from . import support  # noqa: F401 -- isolate live agent settings
 from ameesh import background, platform
+from ameesh.platform import signals
 from ameesh.platform.signals import ProcessHandle
 
 
@@ -551,24 +552,61 @@ class BackgroundSignalTest(unittest.TestCase):
     @unittest.skipUnless(platform.is_linux() and hasattr(os, "pidfd_open")
                          and hasattr(signal, "pidfd_send_signal"), "Linux pidfds")
     def test_real_term_then_kill_reaches_reparented_ignoring_child(self):
+        self._real_term_then_kill_reparented(stop_delay=0)
+
+    @unittest.skipUnless(platform.is_linux() and hasattr(os, "pidfd_open")
+                         and hasattr(signal, "pidfd_send_signal"), "Linux pidfds")
+    def test_real_escalation_tolerates_late_stop_confirmation(self):
+        # #3971: on a saturated host the stopped state shows up late; a fixed
+        # .5 s confirmation window then skipped both TERM and KILL silently.
+        self._real_term_then_kill_reparented(stop_delay=.8)
+
+    def _real_term_then_kill_reparented(self, *, stop_delay):
+        """Real TERM, detachment, then KILL; every wait is event-driven.
+
+        Fixed windows only bound a failure: the escalation waits for the
+        child's detachment and stop confirmations wait for the stopped state,
+        so host load changes the duration, never the outcome (#3971)."""
+        import select
         with tempfile.TemporaryDirectory(prefix="ameesh-476-") as tmp:
             ready = os.path.join(tmp, "ready")
             detached = os.path.join(tmp, "detached")
             child_code = ("import os,signal,time; from pathlib import Path; "
                           "signal.signal(signal.SIGTERM,lambda *_: "
                           "(os.setsid(),Path(%r).touch())); " % detached +
-                          "Path(%r).touch(); time.sleep(60)" % ready)
+                          "Path(%r).touch(); time.sleep(120)" % ready)
             parent_code = ("import subprocess,sys,time; from pathlib import Path; "
                            "p=subprocess.Popen([sys.executable,'-c',sys.argv[1]]); "
                            "\nwhile not Path(sys.argv[2]).exists(): time.sleep(.01)\n"
-                           "print(p.pid,flush=True); time.sleep(60)")
+                           "print(p.pid,flush=True); time.sleep(120)")
             parent = subprocess.Popen([sys.executable, "-c", parent_code, child_code, ready],
                                       start_new_session=True, stdout=subprocess.PIPE,
                                       text=True)
             fd = None
+            hidden = {}
+            stat_fields, freeze = signals._stat_fields, ProcessHandle.freeze
+            signal_handles = self.tracker._signal_handles
+
+            def late_freeze(handle, timeout=.5):
+                # The stop is delivered at once but observed only later.
+                hidden[handle.pid] = time.monotonic() + stop_delay
+                return freeze(handle, timeout)
+
+            def late_stat(pid):
+                fields = stat_fields(pid)
+                if fields[0] == "T" and time.monotonic() < hidden.get(pid, 0):
+                    return ["S"] + fields[1:]
+                return fields
+
+            def escalate_after_detach(entry, signum):
+                signal_handles(entry, signum)
+                if signum == signal.SIGTERM:
+                    end = time.monotonic() + 20
+                    while not os.path.exists(detached) and time.monotonic() < end:
+                        time.sleep(.01)
+
             try:
-                import select
-                self.assertTrue(select.select([parent.stdout], [], [], 5)[0],
+                self.assertTrue(select.select([parent.stdout], [], [], 60)[0],
                                 "synthetic parent did not start")
                 child = int(parent.stdout.readline())
                 fd = os.pidfd_open(child)
@@ -580,14 +618,21 @@ class BackgroundSignalTest(unittest.TestCase):
                     entry = self.tracker.start(agent="test", turn_id="real-expiry",
                                                pgid=parent.pid, members=members,
                                                containers=[], grace_s=1, now=0, handles=held.handles)
-                self.tracker.TERM_GRACE_S = .5
-                with mock.patch.object(os, "killpg") as killpg:
+                self.tracker.TERM_GRACE_S = 0
+                # Default FREEZE_CONFIRM_S: the confirmation window is the
+                # section budget, never a fixed .5 s (#3991).
+                self.tracker.CLEANUP_SECTION_S = 60
+                with mock.patch.object(os, "killpg") as killpg, \
+                        mock.patch.object(ProcessHandle, "freeze", late_freeze), \
+                        mock.patch.object(signals, "_stat_fields", late_stat), \
+                        mock.patch.object(self.tracker, "_signal_handles",
+                                          escalate_after_detach):
                     survives = self.tracker._kill(entry)
                 killpg.assert_not_called()
-                self.assertEqual(parent.wait(timeout=5), -signal.SIGTERM)
-                self.assertTrue(select.select([fd], [], [], 5)[0],
-                                "reparented child survived escalation")
+                self.assertEqual(parent.wait(timeout=30), -signal.SIGTERM, self.notes)
                 self.assertTrue(os.path.exists(detached), "child did not leave the old group")
+                self.assertTrue(select.select([fd], [], [], 60)[0],
+                                "reparented child survived escalation: %s" % self.notes)
                 self.assertEqual(entry.handles, {})
                 self.assertFalse(survives)
             finally:
@@ -599,9 +644,8 @@ class BackgroundSignalTest(unittest.TestCase):
                     os.close(fd)
                 if parent.poll() is None:
                     parent.kill()
-                parent.wait(timeout=5)
+                parent.wait(timeout=60)
                 parent.stdout.close()
-
 
 if __name__ == "__main__":
     unittest.main()

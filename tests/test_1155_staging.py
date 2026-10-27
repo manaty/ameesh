@@ -85,6 +85,13 @@ state=${FAKE_STATE:?}
 printf 'stub %s %s\n' "$0" "$*" >> "$state/calls.log"
 printf 'venv-python %s\n' "$*" >> "$state/calls.log"
 if [ "${1:-}" = "-" ]; then exit 0; fi   # notification
+code=$(sed -n 's/^code-sonde=//p' "$state/scenario" 2>/dev/null | head -1)
+if [ -n "$code" ]; then
+  # #3976 : la sonde n'a pas pu tourner (127 : outil absent ; 3 : base
+  # injoignable, rapport non concluant)
+  [ "$code" = 3 ] && printf '{"verdict": "non-concluant", "erreur": "base injoignable"}\n'
+  exit "$code"
+fi
 hote=""; precedent=""
 for arg in "$@"; do
   [ "$precedent" = --hote ] && hote=$arg
@@ -130,6 +137,23 @@ case "$*" in
       echo "migration injectee KO" >&2
       exit 1
     fi
+    exit 0 ;;
+  *"/venv/bin/python3 -"*)
+    # #3976 : outil python lance sur HOTE_OUTILS (sonde, notification) ;
+    # la source arrive sur l'entree standard.
+    source=$(cat)
+    printf 'ssh-python %s\n' "$*" >> "$FAKE_STATE/calls.log"
+    case "$source" in *"mail.send(conn, work.SYSTEM_SENDER, dest"*) exit 0 ;; esac
+    if grep -qx "ssh-python=127" "$FAKE_STATE/scenario" 2>/dev/null; then
+      echo "bash: /home/ameesh/.local/share/ameesh/venv/bin/python3: No such file or directory" >&2
+      exit 127
+    fi
+    hote=$(printf '%s\n' "$*" | sed -n "s/.*'--hote' '\([^']*\)'.*/\1/p")
+    if grep -qx "ko=sante:$hote" "$FAKE_STATE/scenario" 2>/dev/null; then
+      printf '{"hote": "%s", "verdict": "ko", "sonde": null, "pourquoi": "echec injecte"}\n' "$hote"
+      exit 1
+    fi
+    printf '{"hote": "%s", "verdict": "ok"}\n' "$hote"
     exit 0 ;;
   *ameesh-sauvegarde.service*)
     # relecture dev1 #3848 : dump serveur quand le poste est absent
@@ -899,6 +923,82 @@ class StagingTest(unittest.TestCase):
         p = self.run_vm('--hotes', 'pc-smichea ameesh-agents-1 ameesh-agents-2 ameesh-agents-3 manaty-mesh-1')
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn('--absent pc-smichea=', self.actif_args())
+
+    def run_bureau(self, *args, sans_venv=True):
+        """#3976 : sequence lancee depuis bureau-goal, sans venv ameesh."""
+        if sans_venv:
+            shutil.rmtree(self.home / '.local/share/ameesh/venv')
+        env = dict(self.env, HOTE_LOCAL='bureau-goal')
+        return self.run_staging(*args, env=env)
+
+    def ssh_python(self):
+        return [l for l in self.calls() if l.startswith('ssh-python ')]
+
+    def test_bureau_sonde_le_courrier_sur_une_vm_d_agents(self):
+        """#3976 : hors du poste et des VM d'agents, la sonde tourne sur
+        HOTE_OUTILS (agents-2 par defaut), sous ameesh, avec l'instantane du
+        commit ; aucun python local."""
+        p = self.run_bureau()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(len(self.ssh_python()), 4, self.calls())
+        for ligne in self.ssh_python():
+            self.assertIn('root@10.77.0.4', ligne)
+            self.assertIn('runuser -u ameesh -- env HOME=/home/ameesh', ligne)
+            self.assertIn("PYTHONPATH='/home/ameesh/work/snap-%s/src'" % self.sha[:8], ligne)
+        for hote in ('ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3', 'manaty-mesh-1'):
+            self.assertTrue(any("'--hote' '%s'" % hote in l for l in self.ssh_python()), hote)
+        self.assertFalse([l for l in self.calls() if l.startswith('venv-python ')])
+        self.assertEqual([t['verdict'] for t in self.traces() if t['etape'] == 'sante'],
+                         ['ok', 'ok', 'ok', 'ok'])
+        self.assertFalse([t for t in self.traces() if t['etape'] == 'retour'])
+
+    def test_bureau_hote_outils_explicite_et_valide(self):
+        env = dict(self.env, HOTE_LOCAL='bureau-goal', HOTE_OUTILS='manaty-mesh-1')
+        p = self.run_staging('--a-blanc', env=env)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn('HOTE_OUTILS', p.stderr)
+        env['HOTE_OUTILS'] = 'ameesh-agents-1'
+        p = self.run_staging('--a-blanc', env=env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_bureau_sonde_ko_remet_l_hote_en_arriere_et_notifie_par_la_vm(self):
+        """Une sonde qui a tourne et constate un defaut reste « malsain »."""
+        (self.state / 'scenario').write_text('ko=sante:ameesh-agents-1\n')
+        p = self.run_bureau()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn(('ameesh-agents-1', 'retour'), self.actions())
+        # la notification part aussi par la VM (source sur l'entree standard)
+        self.assertEqual(len(self.ssh_python()), 2, self.calls())
+
+    def test_bureau_outil_de_sonde_absent_ne_remet_rien_en_arriere(self):
+        """#3976, temoin : python de sonde absent sur la VM (127) = non
+        concluant : aucun retour, sequence arretee en 3 et dite."""
+        (self.state / 'scenario').write_text('ssh-python=127\n')
+        p = self.run_bureau()
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertNotIn(('ameesh-agents-1', 'retour'), self.actions())
+        self.assertNotIn(('ameesh-agents-2', 'installer'), self.actions())
+        self.assertIn('non concluante', p.stderr)
+        trace = [t for t in self.traces() if t['etape'] == 'sante']
+        self.assertEqual([(t['hote'], t['verdict']) for t in trace],
+                         [('ameesh-agents-1', 'non-concluant')])
+        self.assertIn('code 127', trace[0]['detail'])
+        self.assertFalse([t for t in self.traces() if t['etape'] == 'retour'])
+        self.assertNotIn('actif.py', ' '.join(self.calls()))
+
+    def test_sonde_non_concluante_en_local_ne_remet_rien_en_arriere(self):
+        """Poste : outil absent (127) ou base injoignable (rapport non
+        concluant, 3) n'est jamais un hote malsain."""
+        for code in ('127', '3'):
+            with self.subTest(code=code):
+                (self.state / 'calls.log').write_text('')
+                (self.state / 'scenario').write_text('code-sonde=%s\n' % code)
+                p = self.run_staging()
+                self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+                self.assertFalse([a for a in self.actions() if a[1] == 'retour'])
+                self.assertIn('non concluante', p.stderr)
+                self.assertTrue(any(l.startswith('venv-python - ') for l in self.calls()),
+                                'notification attendue')
 
     def test_outside_main_is_refused_without_override(self):
         self.repo.joinpath('marque').write_text('y\n')
@@ -1802,20 +1902,34 @@ class SanteCourrierTest(unittest.TestCase):
         self.assertIsNone(rapport['sonde']['remise_s'])
         self.assertEqual(rapport['sonde']['statut_cible'], 'idle')
 
-    def test_main_erreur_de_sonde_sort_en_rapport_ko(self):
-        """#2190 : une erreur (base injoignable) sort en rapport JSON KO, pas
-        en trace vide : la notification peut la porter."""
+    def test_main_base_injoignable_sort_en_rapport_non_concluant(self):
+        """#2190 : une erreur de base sort en rapport JSON, pas en trace vide ;
+        #3976 : rien n'a ete constate sur l'hote sonde, le verdict est non
+        concluant (code 3), jamais un KO qui le remettrait en arriere."""
         sortie = io.StringIO()
         with mock.patch.object(self.mod.config, 'load', return_value={}), \
              mock.patch.object(self.mod.db_mod, 'connect',
                                side_effect=RuntimeError('base injoignable')), \
              redirect_stdout(sortie):
             code = self.mod.main(['--hote', 'ameesh-agents-1', '--json'])
+        self.assertEqual(code, 3, sortie.getvalue())
+        rapport = json.loads(sortie.getvalue())
+        self.assertEqual(rapport['verdict'], 'non-concluant')
+        self.assertEqual(rapport['hote'], 'ameesh-agents-1')
+        self.assertIn('base injoignable', rapport['erreur'])
+
+    def test_main_base_du_serveur_injoignable_reste_ko(self):
+        """--serveur : la base est celle de l'hote sonde, redemarre : KO."""
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.db_mod, 'connect',
+                               side_effect=RuntimeError('base injoignable')), \
+             redirect_stdout(sortie):
+            code = self.mod.main(['--hote', 'manaty-mesh-1', '--serveur', '--json'])
         self.assertEqual(code, 1, sortie.getvalue())
         rapport = json.loads(sortie.getvalue())
         self.assertEqual(rapport['verdict'], 'ko')
-        self.assertEqual(rapport['hote'], 'ameesh-agents-1')
-        self.assertIn('base injoignable', rapport['erreur'])
+        self.assertEqual(rapport['erreur'], 'RuntimeError: base injoignable')
 
     def test_main_cible_inconnue_sort_en_rapport_ko(self):
         """#2190 : une cible nommee absente n'est pas une trace vide."""

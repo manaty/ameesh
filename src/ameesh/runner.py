@@ -4219,18 +4219,30 @@ class AgentWorker(threading.Thread):
             # migration) : la pause se lit `blocked` + raison dans `status_text`.
             # L242b (5) : la pause d'un agent critique est marquée — alerte
             # urgente `critical_budget_pause`
-            marque = budget_mod.CRITICAL_MARK if account_turn.is_critical(self) else ""
+            # #3969 : un compte invalide est une configuration de l'hôte, pas
+            # un budget — bloqué sous `CONFIG_BLOCK_PREFIX` (alerte
+            # `account_config_invalid`), sans échéance de pause
+            config = raison.startswith(accounts_mod.NO_VALID_PREFIX)
+            marque = budget_mod.CRITICAL_MARK if account_turn.is_critical(self) \
+                and not config else ""
             registry.set_status(self.db, self.name, "blocked",
-                                status_text="%s%s%s" % (budget_mod.PAUSE_PREFIX, marque,
-                                                        raison))
+                                status_text="%s%s%s" % (
+                                    accounts_mod.CONFIG_BLOCK_PREFIX if config
+                                    else budget_mod.PAUSE_PREFIX, marque, raison))
             # #2934 : une note par nature de pause (compte, fenêtre, échéance),
             # pas à chaque variation du pourcentage, qui reste dans `status_text`.
             nature = accounts_mod.pause_nature(raison)
             if nature != self._budget_nature:
                 self._budget_nature = nature
-                self._fil_note("Budget pause: %s. No turn until the gauge goes back "
-                               "down." % raison,
-                               meta={"action": "budget", "raison": raison})
+                if config:
+                    self._fil_note("Account configuration error: %s. No turn until "
+                                   "the host configuration is fixed (ameesh doctor)."
+                                   % raison,
+                                   meta={"action": "account_config", "raison": raison})
+                else:
+                    self._fil_note("Budget pause: %s. No turn until the gauge goes "
+                                   "back down." % raison,
+                                   meta={"action": "budget", "raison": raison})
             self._budget_reason = raison
         return False
 
@@ -4241,13 +4253,14 @@ class AgentWorker(threading.Thread):
         jusqu'à son prochain tour, même la jauge redescendue."""
         agent = self.agent or {}
         texte = agent.get("status_text") or ""
-        if agent.get("status") != "blocked" or not texte.startswith("budget : "):
+        if agent.get("status") != "blocked" or not texte.startswith(
+                ("budget : ", accounts_mod.CONFIG_BLOCK_PREFIX)):
             return
         issue = registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
                                             self.epoch, texte, "")
         if issue == "done":
             self.agent = dict(agent, status="idle", status_text="")
-            log_async("[%s] budget pause lifted (%s)" % (self.name, texte))
+            log_async("[%s] pause lifted (%s)" % (self.name, texte))
 
     def turn_harness(self) -> str:
         """L242b (3) : le harnais de ce tour (`account_turn._harness`) — le
@@ -9663,14 +9676,21 @@ class Runner:
         ici, sur l'hôte où ces agents tournent, avec les mêmes garde-fous
         (repos réel, budget, hôtes en pause, `balance_low`, plafonds horaires
         comptés en base). Seuls les agents servis par cet exécuteur — leurs
-        workers vivants — sont preneurs ; la liste du mesh reste entière pour
-        les gardes et l'avertissement des orchestrateurs. Un hôte sous pression
-        est écarté comme par `ameesh notify` (alerte `host_pressure` locale).
+        workers vivants et encore admis — sont preneurs ; la liste du mesh
+        reste entière pour les gardes et l'avertissement des orchestrateurs.
+        Un hôte sous pression est écarté comme par `ameesh notify` (alerte
+        `host_pressure` locale).
+
+        #3972 : un worker retiré de l'admission reste vivant jusqu'à la fin
+        de son tour ; il ne prend plus de lot entre-temps.
         """
         if self.once or self.mediated or not self.take:
             return []
         with self.lock:
             names = {name for name, worker in self.workers.items() if worker.is_alive()}
+            flt = getattr(self, "agents_filter", None)
+        if flt is not None:
+            names &= set(flt)
         if not names:
             return []
         alerts = []
@@ -10660,9 +10680,17 @@ class Runner:
                     # de l'ancien pour les siennes. Rien n'est fermé non plus.
                     loaded = []
             synced: list = []
+            actually_synced = False
             for canon in loaded:
                 try:
-                    report = canon_sync.sync(db, canon, self.host)
+                    interval = getattr(self, "canon_sync_interval", 0.0)
+                    report = (canon_sync.periodic_sync(db, canon, self.host, interval)
+                              if interval > 0 else canon_sync.sync(db, canon, self.host))
+                    if report is None:
+                        # Another executor is syncing, or this snapshot differs
+                        # from its completed one: do not open the host gate.
+                        continue
+                    actually_synced |= not getattr(report, "shared", False)
                     synced.append(canon)
                     status = getattr(report, "status", None)
                     if status and status != canon_sync.CANON_OK:
@@ -10705,7 +10733,7 @@ class Runner:
             self._canon_complete = bool(entries) and len(synced) == len(entries)
             # #2561: only a pass that actually synced a canon may replay the
             # pending designations (a mocked/test `canon_sync_once` must not).
-            self._designation_retry_ready = bool(synced)
+            self._designation_retry_ready = actually_synced
             refresh = getattr(self, "refresh_host_limits", None)
             if refresh is not None and synced:
                 refresh(*synced, complete=self._canon_complete)
@@ -11258,11 +11286,11 @@ class Runner:
         try:
             from .scoped_db import ScopedDb
             db = ScopedDb(self.cfg)
-            # #3925 : `{""}` pour une liste d'admission vide (un ensemble
-            # vide se lirait « tous les agents »)
+            # #3972 : un filtre d'admission vide ne sélectionne aucun agent
+            # (un ensemble vide n'est jamais « tous les agents »)
             report = plan_git.sync_branches(
-                db, host=self.host, agents=set(self.agents_filter or ("",))
-                if self.agents_filter is not None else None,
+                db, host=self.host,
+                agents=set(self.agents_filter) if self.agents_filter is not None else None,
                 dry_run=self.dry_run, actor="runner %s" % self.runner_id)
             for entry in report["results"]:
                 if entry["result"] in ("merged", "would-merge"):
@@ -11405,7 +11433,7 @@ class Runner:
             errors: list = []
             for row in lot_measures.measure_pending(
                     db, host=self.host,
-                    agents=(set(self.agents_filter or ("",))
+                    agents=(set(self.agents_filter)
                             if self.agents_filter is not None else None),
                     errors=errors):
                 log_async("work item #%s measured: %s" % (

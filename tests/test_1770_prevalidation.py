@@ -234,6 +234,39 @@ class ProofTest(unittest.TestCase):
         self.assertIn("contrats seuls", " ".join(rapport["detail"]))
         self.assertEqual(rapport["modules"], ["test_a", "test_cluster"])
 
+    def test_un_repli_avec_contrats_transverses_dit_les_tests_du_lot(self):
+        # #3954 : le repli joue aussi les contrats transverses et les tests
+        # changés du lot ; la preuve ne les cache pas sous « contrats seuls ».
+        modules = ["test_a", "test_cluster", "test_l107_executor_contract",
+                   "test_3845_paquet_horaire"]
+        plan = plan_contrat()
+        plan["fallback"] = dict(plan["fallback"],
+                                modules=modules,
+                                transverse=["test_l107_executor_contract"],
+                                changed_tests=["test_3845_paquet_horaire"])
+        plan["classes"] = {name: ["P1", "contrat"] for name in modules}
+        plan["parts"] = {"psycopg": [{"part": 1, "of": 1, "modules": modules,
+                                      "estimate_s": 10}], "psql": []}
+        plan["selection"] = dict(plan["selection"], modules=len(modules),
+                                 impacted=len(modules), selected=len(modules))
+        sel = pv.selection(plan, head=A)
+        lignes = [pv.PART_MARK + "psycopg:1"]
+        for module in modules:
+            lignes.append(json.dumps({
+                "v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                "part": "psycopg:1", "module": module, "test": "test_x",
+                "statut": "succes"}))
+        lignes.append(json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "fin",
+                                  "part": "psycopg:1", "statut": "succes",
+                                  "duree_s": 1.2}))
+        rapport = sel.proof(lot=7, host="vm",
+                            run={"outcome": "green", "exit": 0, "seconds": 1.0},
+                            flow=pv.parse_flow("\n".join(lignes)))
+        self.assertTrue(rapport["ok"], rapport)
+        self.assertIn("contrats et tests du lot", " ".join(rapport["detail"]))
+        self.assertEqual(rapport["fallback"]["transverse"],
+                         ["test_l107_executor_contract"])
+
     def test_une_seule_part_ne_vaut_pas_vert(self):
         """Repro cx1 : une part verte sur deux, un module sur trois -> refus."""
         rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},

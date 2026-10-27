@@ -226,13 +226,17 @@ class Selection:
         detail: list[str] = []
         if self.fallback:
             #: #3800 : la preuve dit toujours que la sélection n'était pas
-            #: prouvée et que seuls les contrats ont tourné — un vert de
-            #: contrat ne se lit pas comme un vert de sélection.
+            #: prouvée — un vert de contrat ne se lit pas comme un vert de
+            #: sélection. #3954 : quand le repli porte aussi les contrats
+            #: transverses et les tests changés du lot, il le dit.
             origin = [str(c) for c in (self.fallback.get("causes") or ())
                       if str(c)]
             cause = ", ".join(origin) or str(self.fallback.get("cause") or "incertaine")
-            detail.append("sélection incertaine (%s) : contrats seuls (%d module(s))"
-                          % (cause, len(self.modules)))
+            joues = ("contrats et tests du lot"
+                     if self.fallback.get("transverse")
+                     or self.fallback.get("changed_tests") else "contrats seuls")
+            detail.append("sélection incertaine (%s) : %s (%d module(s))"
+                          % (cause, joues, len(self.modules)))
         outcome = run.get("outcome") or ""
         if causes:
             outcome = "refused"

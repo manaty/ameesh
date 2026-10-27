@@ -137,14 +137,24 @@ class Canon(interface.Canon):
             "ORDER BY checked_at DESC LIMIT 1", (host, root))
         return rows[0]["canon"] if rows else None
 
-    def record_auth_state(self, host, status, diagnostic, canon="") -> dict | None:
+    def record_auth_state(self, host, status, diagnostic, canon="", *,
+                          quiet_prefix="") -> dict | None:
+        # The previous state and the transient-error promotion belong to the
+        # same row lock. A second write after returning would reopen the race.
         rows = self.db.query(
-            "SELECT auth_status, auth_diagnostic FROM canon_state "
-            "WHERE host = %s AND canon = %s", (host, canon or ""))
-        self.db.query(
-            "UPDATE canon_state SET auth_status = %s, auth_diagnostic = %s, "
-            "auth_checked_at = now() WHERE host = %s AND canon = %s RETURNING host",
-            (status, diagnostic, host, canon or ""))
+            """WITH previous AS MATERIALIZED (
+                SELECT host, canon, auth_status, auth_diagnostic
+                  FROM canon_state WHERE host = %s AND canon = %s FOR UPDATE
+            )
+                UPDATE canon_state s SET auth_status = %s,
+                    auth_diagnostic = CASE WHEN %s <> ''
+                        AND previous.auth_status IS DISTINCT FROM 'error'
+                        THEN left(%s || %s, 4000) ELSE %s END,
+                    auth_checked_at = now()
+                  FROM previous
+                 WHERE s.host = previous.host AND s.canon = previous.canon
+                RETURNING previous.auth_status, previous.auth_diagnostic""",
+            (host, canon or "", status, quiet_prefix, quiet_prefix, diagnostic, diagnostic))
         return rows[0] if rows else None
 
     def close_others(self, host, keep, diagnostic) -> list[str]:
@@ -156,6 +166,31 @@ class Canon(interface.Canon):
             RETURNING canon
             """, (diagnostic, host, json.dumps(list(keep))))
         return sorted(r["canon"] for r in rows)
+
+    def claim_sync(self, host, canon, token, interval_s) -> bool:
+        rows = self.db.query(
+            """INSERT INTO canon_state AS s
+                (host, canon, status, sync_claimed_at, sync_token)
+                VALUES (%s, %s, 'unreadable', clock_timestamp(), %s)
+                ON CONFLICT (host, canon) DO UPDATE SET
+                    sync_claimed_at = clock_timestamp(), sync_token = excluded.sync_token
+                WHERE s.sync_claimed_at IS NULL OR
+                    s.sync_claimed_at <= clock_timestamp() - make_interval(secs => %s)
+                RETURNING host""", (host, canon, token, float(interval_s)))
+        return bool(rows)
+
+    def complete_sync(self, host, canon, token, signature) -> None:
+        self.db.execute(
+            "UPDATE canon_state SET sync_completed_token = %s, sync_signature = %s "
+            "WHERE host = %s AND canon = %s AND sync_token = %s",
+            (token, signature, host, canon, token))
+
+    def shared_sync(self, host, canon) -> dict | None:
+        rows = self.db.query(
+            "SELECT status, diagnostic, sync_signature FROM canon_state "
+            "WHERE host = %s AND canon = %s AND sync_token = sync_completed_token",
+            (host, canon))
+        return rows[0] if rows else None
 
     def lock_default_state(self, host) -> dict | None:
         rows = self.db.query(

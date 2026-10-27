@@ -51,6 +51,7 @@ from dataclasses import dataclass, replace
 
 from . import canon as canon_mod
 from . import land, lot_class, mechanics, plan_git, prevalidation, registry, work
+from . import transverse_contracts
 from .deadline import Deadline
 
 #: le calculateur du plan L161f, lu dans l'arbre du candidat (convention ameesh)
@@ -123,6 +124,9 @@ class Prepared:
     path: str
     rel: str
     plan: dict
+    #: #3954 : la base de fusion (base → tête) que le plan a jugée ; le repli
+    #: contractuel relit le même intervalle pour les contrats transverses.
+    base: str = ""
 
     def close(self, timeout: float = TRAIN_CLEANUP_TIMEOUT) -> None:
         """Retire le worktree ; ``timeout`` est le temps qui reste au passage."""
@@ -524,7 +528,7 @@ def prepare(repo: str, head: str, base: str, *, map_path: str = "",
             raise prevalidation.PrevalidationError(
                 "selection-unsafe", "plan L161f: objet JSON attendu")
         return Prepared(repo=repo, root=root, tree=tree, path=plan_path,
-                        rel=rel, plan=plan)
+                        rel=rel, plan=plan, base=comparison)
     except BaseException:
         try:
             _run_git(repo, "worktree", "remove", "--force", tree,
@@ -550,6 +554,71 @@ FALLBACK_MODULES = ("test_cluster", "test_l161f_plan")
 FALLBACK_CAUSES = ("selection-full", "selection-unsafe", "card-missing", "card-stale")
 
 
+def _changed_paths(prepared: Prepared, base: str, head: str, *,
+                   deadline: Deadline | None = None) -> list[tuple[str, str]] | None:
+    """Les fichiers de l'intervalle base de fusion → tête, pour #3954.
+
+    Le repli contractuel doit voir les mêmes changements que le plan : la
+    base de fusion, pas le tip de la cible. Une lecture impossible rend
+    ``None`` : le repli ne peut pas conclure qu'aucun contrat transverse
+    n'est dû (B/P2 cx3 de #3954), il joue alors tous les contrats transverses
+    déclarés, ou refuse plutôt que d'écrire un vert incomplet.
+    """
+    comparison = str(getattr(prepared, "base", "") or "").strip() \
+        or str(base or "").strip()
+    if not comparison:
+        comparison = _merge_base(prepared.repo, base or "origin/main", head)
+    if not comparison:
+        return None
+    if deadline is not None and deadline.expired():
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé avant la lecture des changements")
+    bounded = prevalidation._bounded_runner(subprocess.run, deadline)
+    try:
+        proc = bounded(["git", "-C", prepared.repo, *prevalidation.NO_REPLACE,
+                        "diff", "--name-status", "--no-renames",
+                        comparison, head], capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1):
+        return None
+    out: list[tuple[str, str]] = []
+    for line in (getattr(proc, "stdout", "") or "").splitlines():
+        status, _, path = line.partition("\t")
+        if path:
+            out.append((status[:1], path))
+    return out
+
+
+def _tree_modules(prepared: Prepared, head: str, *,
+                  deadline: Deadline | None = None) -> set[str] | None:
+    """Les modules de ``tests/`` présents à la tête, ou ``None`` si illisible.
+
+    La déclaration des contrats transverses est vérifiée sur l'arbre du
+    candidat, comme les contrats déclarés : un module disparu rend le repli
+    incertain (B/P2 cx3 de #3954), jamais silencieusement sauté.
+    """
+    if deadline is not None and deadline.expired():
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé avant la lecture des tests")
+    bounded = prevalidation._bounded_runner(subprocess.run, deadline)
+    try:
+        proc = bounded(["git", "-C", prepared.repo, *prevalidation.NO_REPLACE,
+                        "ls-tree", "--name-only", "-z", head, "tests/"],
+                       capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1):
+        return None
+    out: set[str] = set()
+    for name in (getattr(proc, "stdout", "") or "").split("\0"):
+        if name.startswith("tests/test") and name.endswith(".py"):
+            out.add(os.path.basename(name)[:-3])
+    return out
+
+
 def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
                       deadline: Deadline | None = None) -> dict | None:
     """#3800 : sur sélection incertaine, la prévalidation joue les contrats.
@@ -560,9 +629,12 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
     la CI du paquet. Ce repli remplace le refus par un **plan contractuel**
     explicite : les modules de ``params.contracts`` (``tests/parts/toujours.txt``
     par convention), plus ``test_cluster`` et ``test_l161f_plan``, en une part
-    psycopg. Le plan écrit dans l'arbre porte ``fallback`` : le rapport dit la
-    cause d'origine et les modules joués, il ne se lit pas comme un vert de
-    sélection.
+    psycopg. #3954 y ajoute les **contrats transverses** que les fichiers du
+    lot rendent dus (``transverse_contracts``) et les tests du lot lui-même
+    (P0 du plan) : un test d'identité changé et un contrat de l'exécuteur ne
+    dépendent pas de la mesure par blocs pour être dus. Le plan écrit dans
+    l'arbre porte ``fallback`` : le rapport dit la cause d'origine et les
+    modules joués, il ne se lit pas comme un vert de sélection.
 
     Rend le bloc ``fallback`` quand le repli a été écrit, ``None`` sinon (le
     refus d'origine reste alors la réponse). Un contrat déclaré illisible ne
@@ -599,19 +671,64 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
         raise prevalidation.PrevalidationError(
             "run-incomplete",
             "budget de prévalidation épuisé pendant la lecture des contrats")
+    #: #3954 : la déclaration des contrats transverses est relue dans l'arbre
+    #: du candidat ; un module déclaré disparu rend le repli incertain (B/P2
+    #: cx3), jamais silencieusement sauté.
+    tree_modules = _tree_modules(prepared, head, deadline=deadline)
+    if tree_modules is None:
+        return None
+    if transverse_contracts.problem(tree_modules):
+        return None
+    #: #3954 : les contrats transverses dus par les fichiers du lot, et les
+    #: tests que le lot change lui-même (P0 du plan) — ils sont dus par le
+    #: diff, pas par la carte, et un repli « contrats seuls » les sautait.
+    #: Le plan du candidat peut déjà les nommer (`transverse`) : ils comptent
+    #: même si le diff relu ci-dessous est illisible.
+    known = plan.get("transverse") if isinstance(plan.get("transverse"), dict) else {}
+    changes = _changed_paths(prepared, base, head, deadline=deadline)
+    if changes is None:
+        #: diff illisible : on ne peut pas conclure qu'aucun contrat
+        #: transverse n'est dû. Les jouer tous est le seul repli conservateur
+        #: (le contraire sauterait test_l107 sur un lot d'interface).
+        transverse = {str(name): "diff illisible : contrat transverse joué"
+                      for name in transverse_contracts.CONTRACTS}
+        diff_read = False
+    else:
+        transverse = dict(transverse_contracts.hits(changes))
+        diff_read = True
+    for name, why in known.items():
+        transverse.setdefault(str(name), str(why) or "plan L161f")
+    #: Le plan peut déjà classer un contrat transverse en P0/P1 sans porter le
+    #: champ `transverse` (sélecteur antérieur) : sa classe est une preuve
+    #: suffisante, et le repli ne doit pas la perdre.
+    for name, entry in (plan.get("classes") or {}).items():
+        if str(name) not in transverse_contracts.CONTRACTS:
+            continue
+        if isinstance(entry, (list, tuple)) and entry \
+                and str(entry[0]) in ("P0", "P1"):
+            transverse.setdefault(str(name), "classe %s du plan" % entry[0])
+    changed_tests = [str(name) for name, entry in (plan.get("classes") or {}).items()
+                     if isinstance(entry, (list, tuple)) and entry
+                     and str(entry[0]) == "P0"]
     modules: list[str] = []
-    for name in (*required, *FALLBACK_MODULES):
+    for name in (*required, *FALLBACK_MODULES, *sorted(transverse),
+                 *sorted(changed_tests)):
         if name not in modules:
             modules.append(name)
     if not modules:
         return None
     classes = tuple(getattr(block, "classes", ()) or ())
     rank = classes[0] if classes else "P1"
+    extra = bool(transverse or changed_tests)
     fallback = {
         "cause": chosen.causes[0],
         "causes": list(chosen.causes),
         "why": chosen.why,
         "contracts": list(required),
+        "transverse": sorted(transverse),
+        "changed_tests": sorted(changed_tests),
+        "transverse_all": not diff_read,
+        "diff": "read" if diff_read else "unreadable",
         "modules": list(modules),
     }
     plan = json.loads(json.dumps(plan))
@@ -619,7 +736,9 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
     plan["fallback"] = fallback
     plan["selection"] = {
         "mode": "contract",
-        "why": "sélection incertaine (%s): contrats seuls" % chosen.causes[0],
+        "why": (("sélection incertaine (%s): contrats et tests du lot" if extra
+                 else "sélection incertaine (%s): contrats seuls")
+                % chosen.causes[0]),
         "modules": len(modules), "impacted": len(modules),
         "contract": len(required), "selected": len(modules), "skipped": 0,
         "impacted_estimate_s": 0.0, "total_estimate_s": 0.0,

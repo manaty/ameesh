@@ -2351,6 +2351,18 @@ class LotBranchTest(unittest.TestCase):
                 self.assertTrue(p["selection"]["why"], why)
                 self.assertEqual(self._ran(p), sorted(self.mods), why)
 
+    def test_a_transverse_declaration_without_its_module_runs_the_full_suite(self):
+        # #3954/B de cx3 : un module de contrat transverse déclaré mais absent
+        # de tests/ sauterait le contrat en silence ; le plan le refuse.
+        with mock.patch.dict(plan.transverse_contracts.CONTRACTS,
+                             {"test_absent_3954": ("src/ameesh/x.py",)}, clear=True):
+            p = self._plan()
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertFalse(p["sure"])
+        self.assertIn("test_absent_3954", " ".join(p["unsure"]))
+        self.assertIn("contrat transverse", p["phase2_why"])
+        self.assertEqual(self._ran(p), sorted(self.mods))
+
     def test_full_suite_on_main_release_and_integration(self):
         # une poussée sur main/release/integration garde la suite complète.
         p = self._plan(event="push")

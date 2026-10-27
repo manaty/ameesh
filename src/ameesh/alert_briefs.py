@@ -51,6 +51,8 @@ BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias"
                  # retiré ou une configuration que l'exécuteur ne lit pas ; les
                  # orchestrateurs peuvent vérifier, l'auditeur suit
                  "budget_pause_long",
+                 # #3969 : un compte invalide sur l'hôte — l'équipe le répare
+                 "account_config_invalid",
                  # #3036 : le courrier en souffrance part aux orchestrateurs
                  # VIVANTS ; le brief est ainsi suivi et re-tenté comme les
                  # autres, au lieu d'une remise unique à un hôte perdu.
@@ -719,6 +721,14 @@ def _critical_budget_pause(alert: dict) -> str:
             % (alert.get("detail") or "?"))
 
 
+def _account_config_invalid(alert: dict) -> str:
+    """#3969 : aux orchestrateurs de l'équipe et aux auditeurs."""
+    return ("No valid harness account on the host: %s. Expected action: apply the fix "
+            "given for each account (chmod 700 of a profile directory, a login), check "
+            "with ameesh doctor on that host; the agent resumes on its own at the next "
+            "check, no `ameesh resume` needed." % (alert.get("detail") or "?"))
+
+
 def _budget_pause_long(alert: dict) -> str:
     """#1466 : une pause budget qui dure n'est plus ordinaire. Aux
     orchestrateurs de l'équipe et aux auditeurs."""
@@ -1048,6 +1058,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "critical_budget_pause":
             text = _critical_budget_pause(alert)
             teams = _projects(by_name, alert.get("agent"))
+        elif kind == "account_config_invalid":
+            text = _account_config_invalid(alert)
+            teams = _projects(by_name, alert.get("agent"))
         elif kind == "budget_pause_long":
             text = _budget_pause_long(alert)
             teams = _projects(by_name, alert.get("agent"))
@@ -1096,7 +1109,8 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     if kind not in ("stale_lot", "plan_underused"):
         for name in auditor_names or ():
             out.setdefault(name, audit_text)
-    if kind in ("critical_budget_pause", "budget_pause_long", "rate_limited_chronic"):
+    if kind in ("critical_budget_pause", "budget_pause_long", "rate_limited_chronic",
+                "account_config_invalid"):
         out.pop(alert.get("agent"), None)       # en pause : il ne le lirait pas
     # #3036 : un destinataire sans bail vivant (ou sur un hôte aux claims
     # fermés) ne lira pas ; il n'est pas compté prévenu. Le brief dit qui
