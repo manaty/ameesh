@@ -168,6 +168,17 @@ class DeliveredFreezeTest(unittest.TestCase):
         self.head = binary
         self.assertFalse(self.outside(binary))
 
+    def test_reverted_removal_outside_landing_keeps_author(self):
+        self.repo.write("gate.py", "require_identity();\nbypass();\n")
+        self.target = self.repo.commit("target gate")
+        self.repo.write("gate.py", "require_identity();\n")
+        removal = self.repo.commit("historical removal")
+        self.repo.git("checkout", "-qb", "reverted-removal", self.target)
+        self.repo.write("unrelated.py", "unrelated();\n")
+        self.head = self.repo.commit("rewrite without the removal")
+        self.assertNotIn("gate.py", self.landing())
+        self.assertFalse(self.outside(removal))
+
 
 if __name__ == "__main__":
     unittest.main()

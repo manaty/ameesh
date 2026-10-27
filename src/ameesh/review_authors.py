@@ -678,12 +678,14 @@ def _outside_delivered(repo: str, target: str, commit: str, landing,
 
     Existing occurrences on target never excuse new occurrences in a landing.
     A repeated generic line conservatively retains its historical author.
+    Historical removals retain authors even when reverted (#3220); this
+    exception must not bypass the existing conservative removal proof.
     """
     if landing is None:
         return False
     try:
         patch = _text_delta(repo, commit + "^", commit)
-        if patch is None or not any(patch):
+        if patch is None or not any(patch) or patch[1]:
             return False
         if any(patch[0] & delta[0] or patch[1] & delta[1]
                for delta in landing.values()):
