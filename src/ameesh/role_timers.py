@@ -352,7 +352,10 @@ def paquet_reach(path: str | None = None, *, git=None) -> tuple[str, str]:
     ``paquet-horaire.env``), advanced on ``origin/<target>`` before each tick.
     Without that file, that clone, or the script on the target (#3845 not
     landed, clone behind), the tick would fail every ten minutes: the pass is
-    blocked instead. Empty strings when it can run.
+    blocked instead. Empty strings when it can run. The path must be absolute:
+    systemd reads ``EnvironmentFile`` literally (no ``~``, no working
+    directory). ``origin/<target>`` is what the tick runs, so it is read first;
+    the work tree only answers when git cannot.
     """
     target_path = Path(os.path.expanduser(path or PAQUET_ENV))
     if not target_path.is_file():
@@ -368,11 +371,12 @@ def paquet_reach(path: str | None = None, *, git=None) -> tuple[str, str]:
                 % (path or PAQUET_ENV))
     if any(ch.isspace() for ch in repo):
         return ("AMEESH_PAQUET_REPO contains whitespace", repr(repo))
-    root = Path(os.path.expanduser(repo))
+    if not repo.startswith("/"):
+        return ("AMEESH_PAQUET_REPO is not an absolute path",
+                "%r: systemd reads paquet-horaire.env literally" % repo)
+    root = Path(repo)
     if not (root / ".git").exists():
         return ("AMEESH_PAQUET_REPO is not a git clone", repo)
-    if (root / PAQUET_SCRIPT).is_file():
-        return "", repo
     target = (env.get("AMEESH_PAQUET_TARGET") or "main").strip() or "main"
     run = git or (lambda *args: subprocess.run(
         ["git", "-C", str(root), *args], capture_output=True, text=True, timeout=30))
@@ -381,6 +385,8 @@ def paquet_reach(path: str | None = None, *, git=None) -> tuple[str, str]:
     except (OSError, subprocess.SubprocessError):
         found = None
     if found is not None and found.returncode == 0:
+        return "", repo
+    if found is None and (root / PAQUET_SCRIPT).is_file():
         return "", repo
     return ("%s absent from the clone" % PAQUET_SCRIPT,
             "%s on origin/%s: #3845 not landed, or the clone is behind "
@@ -497,7 +503,8 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
     and ``notify_error`` come from :func:`notify_reach`: without a remote push
     to every required human, the ``alerts`` pass is blocked (#3383).
     ``paquet`` is the ``(blocked, detail)`` of :func:`paquet_reach`; ``None``
-    leaves the hourly packet tick out of the plan (#3854).
+    leaves the hourly packet tick out of the plan (#3854), as does any role
+    but ``mesh-design``, whose lease carries the tick.
     """
     declared = candidates(row)
     candidate = is_candidate(row, host)
@@ -566,7 +573,7 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
         reported.append(TimerSpec(
             "alerts", "alerts", ALERTS_INTERVAL_S, description,
             detail="reaches %s" % ", ".join(notify_humans)))
-    if paquet is not None:
+    if paquet is not None and role == DEFAULT_ROLE:
         blocked, detail = paquet
         # #3854: a missing clone is a host setting, not a negative result (§3)
         reported.append(TimerSpec(
@@ -640,7 +647,7 @@ def render_paquet_service(*, role: str, bin_path: str = DEFAULT_BIN) -> str:
         "Type=oneshot",
         "Environment=PATH=%h/.local/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin",
         "Environment=AMEESH_PAQUET_TARGET=main",
-        "Environment=AMEESH_PAQUET_PILOT=%s" % role,
+        "Environment=AMEESH_PAQUET_PILOT=%s" % DEFAULT_ROLE,
         "EnvironmentFile=%h/.config/ameesh/env",
         "EnvironmentFile=-%h/.config/ameesh/release.env",
         "EnvironmentFile=%s" % PAQUET_ENV.replace("~", "%h", 1),
@@ -1034,7 +1041,7 @@ def main(argv: list[str] | None = None) -> int:
                       row=row, settings=settings, watch_intervals=intervals,
                       watch_error=watch_error, expected_projects=expected,
                       notify_humans=humans, notify_error=notify_error,
-                      paquet=paquet_reach())
+                      paquet=paquet_reach() if args.role == DEFAULT_ROLE else None)
         if sync is not None:
             report["github_sync"] = sync
         directory = systemd_dir(args.systemd_dir)

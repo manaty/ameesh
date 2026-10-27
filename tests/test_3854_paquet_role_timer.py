@@ -23,9 +23,9 @@ def row(candidates=("agents-a", "agents-b")):
             "candidats": list(candidates)}
 
 
-def plan(host="agents-a", paquet=("", "/srv/clone")):
+def plan(host="agents-a", paquet=("", "/srv/clone"), role="mesh-design"):
     return role_timers.plan(
-        host=host, role="mesh-design", row=row(),
+        host=host, role=role, row=row(),
         settings=SimpleNamespace(projects={"ameesh": "manaty/ameesh"}, interval=900),
         watch_intervals=[900], notify_humans=["human:owner"], paquet=paquet)
 
@@ -59,12 +59,30 @@ class ReachTest(unittest.TestCase):
         blocked, _ = role_timers.paquet_reach(str(self.env))
         self.assertEqual(blocked, "AMEESH_PAQUET_REPO is not a git clone")
 
-    def test_a_clone_with_the_script_can_tick(self):
+    def test_a_relative_or_tilde_path_is_refused(self):
+        # systemd reads the EnvironmentFile literally (revue mty-amh-impl-04)
+        for value in ("~/clone", "clone"):
+            with self.subTest(value=value):
+                self.declare("AMEESH_PAQUET_REPO=%s\n" % value)
+                blocked, _ = role_timers.paquet_reach(str(self.env))
+                self.assertEqual(blocked, "AMEESH_PAQUET_REPO is not an absolute path")
+
+    def test_the_work_tree_answers_only_when_git_cannot(self):
         (self.clone / ".git").mkdir(parents=True)
         (self.clone / "scripts").mkdir()
         (self.clone / role_timers.PAQUET_SCRIPT).write_text("", encoding="utf-8")
         self.declare('AMEESH_PAQUET_REPO="%s"\n' % self.clone)
-        self.assertEqual(role_timers.paquet_reach(str(self.env)), ("", str(self.clone)))
+
+        def no_git(*args):
+            raise FileNotFoundError("git")
+
+        self.assertEqual(role_timers.paquet_reach(str(self.env), git=no_git),
+                         ("", str(self.clone)))
+        # origin/<target> is what the tick runs: a script left in the work
+        # tree does not stand for it (revue mty-amh-impl-04)
+        blocked, _ = role_timers.paquet_reach(
+            str(self.env), git=lambda *args: subprocess.CompletedProcess(args, 128))
+        self.assertIn("absent from the clone", blocked)
 
     def test_a_clone_behind_the_target_is_read_on_origin(self):
         (self.clone / ".git").mkdir(parents=True)
@@ -104,6 +122,10 @@ class PlanTest(unittest.TestCase):
         item = plan(paquet=("AMEESH_PAQUET_REPO missing", "declare it"))["timers"][-1]
         self.assertEqual(item["blocked"], "AMEESH_PAQUET_REPO missing")
         self.assertTrue(item["advisory"])
+
+    def test_another_role_does_not_carry_the_tick(self):
+        names = [item["name"] for item in plan(role="auditeur")["timers"]]
+        self.assertNotIn(role_timers.PAQUET_PASS, names)
 
     def test_a_non_candidate_gets_nothing(self):
         self.assertEqual(plan(host="agents-c")["timers"], [])
