@@ -81,7 +81,8 @@ import json, os, sys
 sha = sys.argv[1]
 path = os.path.expanduser("~/.local/state/ameesh/mise-a-jour/actif-%s.json" % sha[:12])
 json.dump({"sha": sha, "hotes": {name: {"actif": sha} for name in
-          ("ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1", "pc-smichea")}},
+          ("ameesh-agents-1", "ameesh-agents-2", "ameesh-agents-3", "manaty-mesh-1",
+           "pc-smichea")}},
           open(path, "w"))
 EOF
 echo "staged $last"

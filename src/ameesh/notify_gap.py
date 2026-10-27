@@ -234,6 +234,29 @@ def beat(cfg, db, ncfg, now: float | None = None) -> int:
     return storage.of(db).notify_liveness.beat(host, covered, now=now)
 
 
+def brief_body(text: str, previous_ts, since, now: float) -> str:
+    """Le texte du brief, relance seulement pour le MÊME épisode (#3913).
+
+    `previous_ts` est l'envoi précédent de `(destinataire, humain)` ; `since`
+    est le début de l'épisode (dernier battement pour `notifier_stale`, la
+    plus ancienne demande pour `uncovered`). Une réclamation antérieure au
+    début de l'épisode appartient à un trou déjà résorbé : le texte part sans
+    « Reminder, alert still active for … », qui ferait croire à une panne
+    continue et non à un nouvel incident. Dans le même épisode, l'âge annoncé
+    est celui de l'épisode (`since`), pas celui du dernier brief : « active
+    depuis 15 h 53 » ne décrit plus l'espacement des relances.
+    """
+    if previous_ts is None:
+        return text
+    if since is None:
+        from . import alert_briefs
+        return alert_briefs.reminder(text, previous_ts, now)
+    if float(previous_ts) < float(since):
+        return text
+    from . import alert_briefs
+    return alert_briefs.reminder(text, since, now)
+
+
 def brief_once(cfg, db, now: float | None = None) -> dict:
     """Brief hors du poste : les orchestrateurs et l'auditeur, sans doublon.
 
@@ -286,9 +309,8 @@ def brief_once(cfg, db, now: float | None = None) -> dict:
                 if not claim["claimed"]:
                     report["skipped"] += 1
                     continue
-                body = text
-                if claim.get("previous_ts") is not None:
-                    body = alert_briefs.reminder(text, claim["previous_ts"], now)
+                body = brief_body(text, claim.get("previous_ts"),
+                                  gap.get("since"), now)
                 payload = {"alert": GAP_TYPE, "human": gap["human"],
                            "decisions": list(gap["decisions"]),
                            "reason": gap["reason"]}

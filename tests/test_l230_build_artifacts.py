@@ -131,10 +131,10 @@ class RulesTest(unittest.TestCase):
             self.assertIsNone(ba.parse_rules(bad)[0], bad)
         parsed, problems, unknown = menage.parse_policy(
             {"artifacts": ["node_modules", ".venv"], "artifact_idle": "36h",
-             "unreadable_ok": ["btop"]})
+             "artifact_ended_idle": "2h", "unreadable_ok": ["btop"]})
         self.assertEqual((parsed, problems, unknown), (
             {"artifacts": ("node_modules", ".venv"), "artifact_idle": 36 * 3600.0,
-             "unreadable_ok": ("btop",)}, [], []))
+             "artifact_ended_idle": 2 * 3600.0, "unreadable_ok": ("btop",)}, [], []))
         self.assertEqual(len(menage.parse_policy({"artifacts": "x", "artifact_idle": "?",
                                                   "unreadable_ok": "btop"})[1]), 3)
         self.assertEqual(menage.Policy().unreadable_ok, ())
@@ -150,10 +150,15 @@ class RulesTest(unittest.TestCase):
         def canon(ident, declared):
             fiche = SimpleNamespace(policy=SimpleNamespace(housekeeping=declared))
             return SimpleNamespace(id=ident, host=lambda _h: fiche)
-        policy = menage.effective([canon("a", {"artifact_idle": DAY}),
-                                   canon("b", {"artifact_idle": 2 * DAY, "artifacts": ()})], "pc")
-        self.assertEqual((policy.artifact_idle, policy.artifacts), (2 * DAY, ()))
+        policy = menage.effective([canon("a", {"artifact_idle": DAY,
+                                               "artifact_ended_idle": 3600.0}),
+                                   canon("b", {"artifact_idle": 2 * DAY,
+                                               "artifact_ended_idle": 2 * 3600.0,
+                                               "artifacts": ()})], "pc")
+        self.assertEqual((policy.artifact_idle, policy.artifact_ended_idle,
+                          policy.artifacts), (2 * DAY, 2 * 3600.0, ()))
         self.assertEqual(menage.Policy().artifact_idle, DAY)
+        self.assertEqual(menage.Policy().artifact_ended_idle, ba.DEFAULT_ENDED_IDLE_S)
 
 
 class UserPathsTest(_Base):
@@ -415,6 +420,59 @@ class RunTest(_Base):
                                     now=time.time() + LATER)["entries"], [])
         self.assertEqual(self.go(wt, rules=())["entries"], [])
         self.assertTrue(os.path.isdir(os.path.join(wt, "node_modules")))
+
+    def test_3956_cwd_of_an_agent_is_no_longer_blanket_protected(self):
+        """#3956 : le dossier de travail d'un agent n'est plus exempté par son
+        seul statut (ses node_modules restaient à vie et ont rempli le
+        disque) ; un worktree qui CONTIENT un dossier protégé reste
+        intouchable."""
+        wt = self.worktree()
+        out = self.go(wt, protected=[wt])
+        self.assertEqual({os.path.relpath(e["path"], wt) for e in out["entries"]},
+                         {"node_modules", "web/node_modules", "desktop/host/target"})
+        wt2 = self.worktree("sous")
+        self.assertEqual(self.go(wt2, protected=[os.path.join(wt2, "src")])["entries"], [])
+        self.assertTrue(os.path.isdir(os.path.join(wt2, "node_modules")))
+
+    def test_3956_artifacts_of_finished_lots_go_earlier(self):
+        """#3956 : tous les lots cités finis = plus rien ne s'y reconstruit ;
+        inactif depuis 2 h, ses sorties partent dès `artifact_ended_idle`,
+        sans attendre l'inactivité de 24 h d'un worktree sans lot fini."""
+        wt = self.worktree()
+        out = self.go(wt, now=time.time() + 2 * 3600, ended_idle_s=3600,
+                      ended_of=lambda _wt: True)
+        self.assertEqual(len(out["entries"]), 3)
+        self.assertIn("lots finished", out["entries"][0]["detail"])
+        other = self.worktree("sans-lot")
+        out = self.go(other, now=time.time() + 2 * 3600, ended_idle_s=3600,
+                      ended_of=lambda _wt: False)
+        self.assertEqual(out["entries"], [])
+        self.assertIn("active within", " ".join(out["skipped"]))
+
+    def test_3956_finished_lot_worktrees_are_scanned_first(self):
+        """#3956 : une passe coupée par son budget ne doit pas repasser
+        toujours les mêmes worktrees ; ceux d'un lot fini passent d'abord, le
+        reste (trié par chemin) attend la passe suivante."""
+        finished = self.worktree("fini")
+        other = self.worktree("autre")
+        seen = []
+
+        def survey(path, *_args, **_kw):
+            seen.append(path)
+            return {"latest": 0.0, "artifacts": [], "complete": True, "why": "",
+                    "real": os.path.realpath(path), "identity": None}
+
+        ticks = iter([0.0, 0.0, 10.0 ** 6])
+        with mock.patch.object(ba, "survey", side_effect=survey):
+            out = ba.run([{"path": other}, {"path": finished}], ba.rules_of(None),
+                         idle_s=DAY, ended_idle_s=3600.0,
+                         ended_of=lambda wt: wt["path"] == finished,
+                         protected=(), dry_run=True, now=time.time(),
+                         budget_s=1.0, clock=lambda: next(ticks),
+                         journal_path=self.journal_path)
+        self.assertEqual(seen, [finished])
+        self.assertEqual((out["entries"], out["plan"]), ([], []))
+        self.assertIn("time budget", " ".join(out["skipped"]))
 
     def test_process_arriving_before_the_rename_stops_it(self):
         wt = self.worktree()

@@ -687,7 +687,7 @@ class Operations(interface.Operations):
             age = "observed_at >= (SELECT cutoff FROM bounds)"
         scope = ""
         if harness is not None:
-            scope = ("harness = %s AND (account IS NULL) = false"
+            scope = ("harness = %s AND (account IS NULL) IS FALSE"
                      " AND coalesce(account, '') = %s AND ")
             params.extend((harness, account))
         order = key + ", produced_at DESC NULLS LAST, observed_at DESC, id DESC"

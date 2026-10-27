@@ -80,13 +80,13 @@ VERSION_FILE = "pyproject.toml"
 NOTES_DIR = "docs/versions"
 #: staging attestation of the installed source
 ATTESTATION_DIR = "mise-a-jour"
-#: staging hosts (canon §14): the three VMs are always proved; the poste may be
-#: reported absent only when the sequence runs from a VM (#3848)
-STAGING_HOSTS = ("ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1", "pc-smichea")
-STAGING_AGENTS = STAGING_HOSTS[:2]
-STAGING_SERVEUR = STAGING_HOSTS[2]
-STAGING_POSTE = STAGING_HOSTS[3]
-STAGING_VMS = STAGING_HOSTS[:3]
+#: staging hosts (canon §14): the agent VMs are always proved; the server and
+#: the poste may be reported absent (#3848, #3965: same lists as actif.py)
+STAGING_AGENTS = ("ameesh-agents-1", "ameesh-agents-2", "ameesh-agents-3")
+STAGING_SERVEUR = "manaty-mesh-1"
+STAGING_POSTE = "pc-smichea"
+STAGING_VMS = (*STAGING_AGENTS, STAGING_SERVEUR)
+STAGING_HOSTS = (*STAGING_VMS, STAGING_POSTE)
 _VERSION_LINE = re.compile(r'^version\s*=\s*"([^"\s]+)"\s*$', re.MULTILINE)
 _SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 _TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
@@ -1890,7 +1890,7 @@ def attestation_path(sha: str) -> str:
 def read_attestation(sha: str) -> dict | None:
     """The durable attestation of `sha`, if present and complete.
 
-    Complete = the three VM hosts proved; the poste either proved itself or is
+    Complete = the agent VMs and the server proved (the server may be reported); the poste either proved itself or is
     explicitly reported absent (`reportes`, #3848). A reported poste does not
     make the VMs inactive; `maybe_staging` reruns the sequence only on the
     poste, so it catches up when it is back.
@@ -1962,7 +1962,7 @@ def staging_summary(events: list[dict], sha: str) -> list[dict]:
         if host:
             by_host.setdefault(host, []).append(row)
     out = []
-    for host in ("ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1", "pc-smichea"):
+    for host in STAGING_HOSTS:
         rows = by_host.get(host, [])
         if not rows:
             continue

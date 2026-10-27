@@ -290,7 +290,7 @@ poussée ne couvre (#2957). Les profils humains sont aussi exclus de
 
 Le signal est porté par
 [`deploy/mise-a-jour/staging.sh`](../deploy/mise-a-jour/staging.sh) : une
-séquence **complète et saine** — les trois VM, plus le poste s’il est en ligne,
+séquence **complète et saine** — les quatre VM, plus le poste s’il est en ligne,
 `installer`, `redemarrer`, `controler` et sonde de courrier réellement remise —
 écrit une attestation durable sous
 `~/.local/state/ameesh/mise-a-jour/actif-<commit>.json` et réveille les
@@ -310,9 +310,9 @@ en dessous ». Un poste absent ne retient ni staging ni lots ; un poste présent
 mais omis de `--hotes` reste une séquence partielle, sans attestation. Un
 **serveur sans accès root** (`manaty-mesh-1`, aucun exécutant, sauvegarde
 seulement) peut être reporté de la même façon avec
-`--absent manaty-mesh-1=raison` : les deux VM d’agents restent requises et
+`--absent manaty-mesh-1=raison` : les trois VM d’agents restent requises et
 attestées, le serveur est nommé dans `reportes` ; sans cette option, la
-séquence exige les trois VM. Les migrations sont alors appliquées
+séquence exige les quatre VM. Les migrations sont alors appliquées
 depuis une VM d’agents (`HOTE_MIGRATIONS`, par défaut `ameesh-agents-2`) :
 instantané `git archive` de `src`, `ameesh migrate --dry-run --additive-only`
 puis `--additive-only`, comme le chemin bureau-goal ; un échec arrête avant
@@ -331,7 +331,7 @@ rattraper ; ailleurs, il ne la rejoue pas. L’hôte local est `HOTE_LOCAL`, sin
 ambiguïté sur une VM dont la configuration recopierait celle du poste.
 
 Sans `HOTES_STAGING` (bureau-goal n’a qu’un fichier par VM d’agents), la
-topologie est composée des `bascule-a1.env` et `bascule-a2.env` du dossier de
+topologie est composée des `bascule-a1.env`, `bascule-a2.env` et `bascule-agents-3.env` du dossier de
 `BASCULE_ENV` (`AGENTS_SSH`, `HOTE_AGENTS`) et de `SERVEUR_SSH` (ou `VM`)
 pour `manaty-mesh-1` ; `pc-smichea` reste absent et reporté. Un
 `SERVEUR_SSH` absent est refusé explicitement, sans adresse supposée.
@@ -472,7 +472,7 @@ plancher de `scripts/version-level.py`, appliqué par le pilote pour #2448) ou
 go owner. Le **coupeur** reste sur le poste ; quand il est éteint, le staging
 des VM peut être lancé à la main depuis une VM (bureau-goal) avec le même
 `BASCULE_ENV` — `HOTE_LOCAL` y nomme la VM, jamais `pc-smichea` —, ce qui
-atteste les trois VM et reporte le poste à son retour (`#3848`).
+atteste les quatre VM et reporte le poste à son retour (`#3848`).
 
 **Activation** (une fois, par l'opérateur) :
 
@@ -555,7 +555,23 @@ poussée atomique, puis le rend. `staging.sh` refuse deux séquences simultanée
 (code 75, `staging.lock`).
 
 **Preuve** : le journal `~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl`,
-l'attestation `actif-<sha>.json` (trois VM et sonde de courrier remise, plus le
+l'attestation `actif-<sha>.json` (quatre VM et sonde de courrier remise, plus le
 poste quand il est en ligne ou le champ `reportes` sinon) et le rapport JSON du
 tick. Aucune prod : le staging n'est pas une release de prod (canon §14), un go
 owner reste requis pour la prod.
+
+La recette PgBouncer autorise aussi `ameesh-agents-3` sous l’utilisateur
+`ameesh`. Elle prévoit pour cet hôte 32 connexions ordinaires et 8 de réserve
+(`max_db_connections = 40`), et conserve un plafond de 80 pour chacun des
+trois hôtes de runners antérieurs. Si ces quatre hôtes passent exclusivement
+par ces pools, leur budget cumulé est de 280 sous le plafond serveur de 300.
+
+Au relevé en lecture seule du bureau du 27/10/2026 vers 11:00Z (courrier
+#150697), seul `pc-smichea` dispose de PgBouncer, plafonné à 80 ; les trois
+VM d’agents se connectent directement à Postgres. Les connexions observées
+pour ameesh étaient respectivement de 60 sur agents-1, 50 sur agents-2,
+14 sur le poste et 0 sur agents-3 ; ce relevé ponctuel ne borne pas leur
+croissance. Le budget théorique de la recette ne plafonne donc pas la flotte
+déployée. Cette modification n’installe aucun pool et ne redimensionne aucune
+installation ; une installation ultérieure exige de vérifier aussi les
+connexions directes et les autres clients du serveur.

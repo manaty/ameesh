@@ -123,6 +123,30 @@ class NotifyLiveness(interface.NotifyLiveness):
                 (json.dumps(body, ensure_ascii=False, sort_keys=True), scope))
             return True
 
+    def renew_state(self, scope, owner, epoch, ttl_seconds):
+        # #3913 : l'epoch ne bouge pas (le détenteur garde son droit
+        # d'écriture) ; seul `expires_at` avance, avec l'horloge de la base et
+        # seulement si le bail est encore vivant.
+        rows = self.db.query(
+            "update notify_state"
+            "   set expires_at = clock_timestamp() + make_interval(secs => %s),"
+            "       updated_at = clock_timestamp()"
+            " where scope = %s and owner = %s and epoch = %s"
+            "   and expires_at > clock_timestamp()"
+            " returning scope",
+            (float(ttl_seconds), scope, owner, int(epoch)))
+        return bool(rows)
+
+    def state_lease(self, scope):
+        rows = self.db.query(
+            "select owner, epoch,"
+            "       extract(epoch from expires_at)::float8 as expires_ts,"
+            "       extract(epoch from clock_timestamp())::float8 as now_ts"
+            "  from notify_state where scope = %s", (scope,))
+        if not rows or not rows[0].get("owner"):
+            return None
+        return dict(rows[0])
+
     def release_state(self, scope, owner, epoch):
         rows = self.db.query(
             "update notify_state set owner = null, expires_at = null,"

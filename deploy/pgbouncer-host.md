@@ -1,9 +1,9 @@
 # Per-host session pooling (#653)
 
-This recipe is for **bureau**, after review, on `agents-1` and `agents-2`,
+This recipe is for **bureau**, after review, on `agents-1`, `agents-2` and `agents-3`,
 under the Unix user running Ameesh. The script checks the system hostname and
 real/effective UID before creating directories or dispatching any action.
-Only `ameesh-agents-1` / `ameesh` and `ameesh-agents-2` / `ameesh` are accepted;
+Only `ameesh-agents-1`, `ameesh-agents-2` and `ameesh-agents-3` under `ameesh` are accepted;
 root and a mismatched HOME are refused (HOME and the account home are compared
 as canonical paths, and the canonical home is used). This accepts an account
 home that is itself a symlink, including one targeting a different directory;

@@ -233,7 +233,7 @@ class StagingTest(unittest.TestCase):
             path.chmod(0o755)
         self.config = self.root / 'bascule.env'
         self.config.write_text(
-            'HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 '
+            'HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 ameesh-agents-3=root@10.77.0.5 '
             'manaty-mesh-1=root@10.77.0.2 pc-smichea=poste"\n'
             'VM=10.77.0.2\nPERSONAS_VM=\n')
         self.repo = self.root / 'repo'
@@ -265,7 +265,7 @@ class StagingTest(unittest.TestCase):
                         # #3848 : le banc tourne sur une VM ; sans cette
                         # declaration, le poste serait (a juste titre) reporte
                         # absent et les sequences completes ne testeraient plus
-                        # les quatre hotes.
+                        # les cinq hotes.
                         HOTE_LOCAL='pc-smichea',
                         # jamais la configuration, l'etat ni le DSN reels : les
                         # replis de config.load() (AGENT_MESH_CONFIG, alias
@@ -380,7 +380,7 @@ class StagingTest(unittest.TestCase):
     def test_dry_run_touches_nothing(self):
         p = self.run_staging('--a-blanc')
         self.assertEqual(p.returncode, 0, p.stderr)
-        for host in ('ameesh-agents-1', 'ameesh-agents-2', 'manaty-mesh-1', 'pc-smichea'):
+        for host in ('ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3', 'manaty-mesh-1', 'pc-smichea'):
             self.assertIn(host, p.stdout)
         self.assertEqual(self.calls(), [])
         self.assertIn('par hote installer, redemarrer, controler, sante', p.stdout)
@@ -392,6 +392,7 @@ class StagingTest(unittest.TestCase):
         self.assertEqual(self.actions(), [
             ('ameesh-agents-1', 'verifier'),
             ('ameesh-agents-2', 'verifier'),
+            ('ameesh-agents-3', 'verifier'),
             ('manaty-mesh-1', 'verifier'),
             ('pc-smichea', 'verifier'),
             ('pc-smichea', 'sauvegarder'),
@@ -402,6 +403,9 @@ class StagingTest(unittest.TestCase):
             ('ameesh-agents-2', 'installer'),
             ('ameesh-agents-2', 'redemarrer'),
             ('ameesh-agents-2', 'controler'),
+            ('ameesh-agents-3', 'installer'),
+            ('ameesh-agents-3', 'redemarrer'),
+            ('ameesh-agents-3', 'controler'),
             ('manaty-mesh-1', 'installer'),
             ('manaty-mesh-1', 'redemarrer'),
             ('manaty-mesh-1', 'controler'),
@@ -411,7 +415,7 @@ class StagingTest(unittest.TestCase):
             ('pc-smichea', 'controler'),
         ])
         self.assertIn('venv-ameesh doctor --harness', self.calls())
-        for host in ('ameesh-agents-1', 'ameesh-agents-2', 'manaty-mesh-1', 'pc-smichea'):
+        for host in ('ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3', 'manaty-mesh-1', 'pc-smichea'):
             self.assertIn('courrier %s : ok' % host, p.stdout)
         traces = self.traces()
         self.assertEqual(traces[-1]['etape'], 'sequence')
@@ -594,7 +598,7 @@ class StagingTest(unittest.TestCase):
         self.assertIn('--additif-seulement %s' % self.sha, migrations[0])
 
     def test_subset_with_poste_is_refused(self):
-        """canon §14 : le poste ne se met a jour qu'apres les trois VM saines ;
+        """canon §14 : le poste ne se met a jour qu'apres les quatre VM saines ;
         un sous-ensemble qui l'inclut n'en apporte aucune preuve (avis R1 B4).
         Le refus porte sur la selection normalisee : les doublons ne comptent
         pas, et tabulation/nouvelle ligne ne contournent plus le controle."""
@@ -610,7 +614,7 @@ class StagingTest(unittest.TestCase):
             with self.subTest(nom):
                 p = self.run_staging('--hotes', sous_ensemble)
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
-                self.assertIn('sequence complete des quatre hotes', p.stderr)
+                self.assertIn('sequence complete des cinq hotes', p.stderr)
                 self.assertEqual(self.calls(), [])
 
     def test_subset_deduplicates_host_names(self):
@@ -625,19 +629,19 @@ class StagingTest(unittest.TestCase):
     def test_topology_is_required_and_consistent(self):
         cases = {
             'sans topologie': 'VM=10.77.0.2\nPERSONAS_VM=\n',
-            'hote inconnu': ('HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 '
+            'hote inconnu': ('HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 ameesh-agents-3=root@10.77.0.5 '
                              'manaty-mesh-1=root@10.77.0.2 poste-x=root@10.77.0.9"\nVM=10.77.0.2\n'),
-            'vm differente': ('HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 '
+            'vm differente': ('HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 ameesh-agents-3=root@10.77.0.5 '
                               'manaty-mesh-1=root@10.77.0.2 pc-smichea=poste"\nVM=10.77.0.9\n'),
             # #3848 : la sequence tourne ici sur le poste (HOTE_LOCAL) ; une
             # topologie qui l'omet ne peut pas le declarer absent.
             'topologie locale sans poste': (
-                'HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 '
+                'HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 ameesh-agents-3=root@10.77.0.5 '
                 'manaty-mesh-1=root@10.77.0.2"\nVM=10.77.0.2\n'),
-            'poste distant': ('HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 '
+            'poste distant': ('HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 ameesh-agents-3=root@10.77.0.5 '
                               'manaty-mesh-1=root@10.77.0.2 pc-smichea=root@10.77.0.5"\nVM=10.77.0.2\n'),
             'sans manaty-mesh-1': (
-                'HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 '
+                'HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 ameesh-agents-3=root@10.77.0.5 '
                 'pc-smichea=poste"\nVM=10.77.0.2\n'),
             'sans ameesh-agents-2': (
                 'HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 '
@@ -650,6 +654,36 @@ class StagingTest(unittest.TestCase):
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                 self.assertEqual(self.calls(), [])
 
+    def test_third_agent_missing_or_postponed_is_refused_before_mutation(self):
+        complete = self.config.read_text()
+        self.config.write_text(complete.replace('ameesh-agents-3=root@10.77.0.5 ', ''))
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn('ameesh-agents-3', p.stderr)
+        self.assertEqual(self.calls(), [])
+        self.config.write_text(complete)
+        p = self.run_staging('--absent', 'ameesh-agents-3=indisponible')
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn('non reportable', p.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_third_agent_alone_can_run_migrations_but_cannot_attest(self):
+        p = self.run_vm('--hotes', 'ameesh-agents-3')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual([a for a in self.actions() if a[1] == 'installer'],
+                         [('ameesh-agents-3', 'installer')])
+        self.assertTrue(any(t['hote'] == 'ameesh-agents-3' and t['etape'] == 'migrations'
+                            for t in self.traces()))
+        self.assertNotIn('actif.py', ' '.join(self.calls()))
+
+    def test_third_agent_failure_rolls_back_before_workstation(self):
+        (self.state / 'scenario').write_text('ko=sante:ameesh-agents-3\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn(('ameesh-agents-3', 'retour'), self.actions())
+        self.assertNotIn(('pc-smichea', 'installer'), self.actions())
+        self.assertNotIn('actif.py', ' '.join(self.calls()))
+
     def run_vm(self, *args, **kw):
         """Sequence lancee depuis une VM : le poste est absent par nature."""
         env = dict(kw.pop('env', self.env), HOTE_LOCAL='ameesh-agents-1')
@@ -661,8 +695,8 @@ class StagingTest(unittest.TestCase):
         self.assertEqual(len(lignes), 1, self.calls())
         return lignes[0]
 
-    def test_vm_sequence_reports_poste_absent_and_attests_three_vms(self):
-        """#3848 : depuis une VM, le poste est saute avec trace, les trois VM
+    def test_vm_sequence_reports_poste_absent_and_attests_four_vms(self):
+        """#3848 : depuis une VM, le poste est saute avec trace, les quatre VM
         sont deployees et le signal actif est demande avec --absent."""
         p = self.run_vm('--lots', '917', '--rapporteurs', 'docs01')
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
@@ -671,6 +705,7 @@ class StagingTest(unittest.TestCase):
         self.assertEqual([a for a in actions if a[1] == 'installer'],
                          [('ameesh-agents-1', 'installer'),
                           ('ameesh-agents-2', 'installer'),
+                          ('ameesh-agents-3', 'installer'),
                           ('manaty-mesh-1', 'installer')])
         # sauvegarde du poste non jouee, remplacee par le dump du serveur
         # avant les migrations (relecture dev1 #3848) ; migrations depuis agents-2
@@ -703,7 +738,7 @@ class StagingTest(unittest.TestCase):
         self.assertEqual(trace['sha'], self.sha)
         self.assertIn('mise a jour a son retour', trace['detail'])
         ligne = self.actif_args()
-        for hote in ('ameesh-agents-1', 'ameesh-agents-2', 'manaty-mesh-1'):
+        for hote in ('ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3', 'manaty-mesh-1'):
             self.assertIn('--hote %s=' % hote, ligne)
         self.assertNotIn('--hote pc-smichea=', ligne)
         self.assertIn('--absent pc-smichea=', ligne)
@@ -713,14 +748,15 @@ class StagingTest(unittest.TestCase):
 
     def test_vm_sequence_without_server_access_reports_it(self):
         """#3848 : sans acces root au serveur, il est reporte comme le poste ;
-        les deux VM d'agents restent requises et attestees."""
+        les trois VM d'agents restent requises et attestees."""
         p = self.run_vm('--absent', 'manaty-mesh-1=sans-acces')
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         actions = self.actions()
         self.assertFalse([a for a in actions if a[0] == 'manaty-mesh-1'], actions)
         self.assertEqual([a for a in actions if a[1] == 'installer'],
                          [('ameesh-agents-1', 'installer'),
-                          ('ameesh-agents-2', 'installer')])
+                          ('ameesh-agents-2', 'installer'),
+                          ('ameesh-agents-3', 'installer')])
         migrations = [i for i, ligne in enumerate(self.calls())
                       if ligne.startswith('stub ') and 'bash -s -- %s' % self.sha in ligne]
         self.assertEqual(len(migrations), 1, self.calls())
@@ -780,20 +816,22 @@ class StagingTest(unittest.TestCase):
         (dossier / 'bascule-a2.env').write_text(
             'AGENTS_SSH=root@10.77.0.4\nHOTE_AGENTS=ameesh-agents-2\n'
             'PERSONAS_VM=\nDRAIN_ATTENTE=0\nAMEESH_OPERATEUR=bureau\n')
+        (dossier / 'bascule-agents-3.env').write_text(
+            'AGENTS_SSH=root@10.77.0.5\nHOTE_AGENTS=ameesh-agents-3\nPERSONAS_VM=\n')
         env = dict(self.env, BASCULE_ENV=str(dossier / 'bascule-a1.env'),
                    HOTE_LOCAL='ameesh-agents-1', SERVEUR_SSH='root@10.77.0.2')
         env.pop('VM', None)
         p = self.run_staging('--a-blanc', env=env)
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         self.assertIn('topologie staging composee', p.stderr)
-        for hote in ('ameesh-agents-1', 'ameesh-agents-2', 'manaty-mesh-1'):
+        for hote in ('ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3', 'manaty-mesh-1'):
             self.assertIn(hote, p.stdout)
         self.assertIn('pc-smichea', p.stdout)
         self.assertIn('absent', p.stdout)
 
     def test_composed_topology_without_server_target_is_refused(self):
         dossier = self.root / 'bascule-composee'; dossier.mkdir()
-        for nom, cible in (('a1', 'root@10.77.0.3'), ('a2', 'root@10.77.0.4')):
+        for nom, cible in (('a1', 'root@10.77.0.3'), ('a2', 'root@10.77.0.4'), ('agents-3', 'root@10.77.0.5')):
             (dossier / ('bascule-%s.env' % nom)).write_text(
                 'AGENTS_SSH=%s\nHOTE_AGENTS=ameesh-agents-%s\nPERSONAS_VM=\n'
                 % (cible, nom[-1]))
@@ -826,7 +864,7 @@ class StagingTest(unittest.TestCase):
 
     def test_vm_sequence_accepts_topology_without_poste(self):
         self.config.write_text(
-            'HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 '
+            'HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 ameesh-agents-3=root@10.77.0.5 '
             'manaty-mesh-1=root@10.77.0.2"\nVM=10.77.0.2\nPERSONAS_VM=\n')
         p = self.run_vm()
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
@@ -853,12 +891,12 @@ class StagingTest(unittest.TestCase):
         p = self.run_vm('--hotes', 'pc-smichea ameesh-agents-1', '--sans-sonde')
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn('pc-smichea ignore (poste absent', p.stderr)
-        self.assertNotIn('sequence complete des quatre hotes', p.stderr)
+        self.assertNotIn('sequence complete des cinq hotes', p.stderr)
         self.assertEqual([a for a in self.actions() if a[1] == 'installer'],
                          [('ameesh-agents-1', 'installer')])
         self.assertIn('sequence partielle', p.stderr)
         self.assertNotIn('actif.py', ' '.join(self.calls()))
-        p = self.run_vm('--hotes', 'pc-smichea ameesh-agents-1 ameesh-agents-2 manaty-mesh-1')
+        p = self.run_vm('--hotes', 'pc-smichea ameesh-agents-1 ameesh-agents-2 ameesh-agents-3 manaty-mesh-1')
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn('--absent pc-smichea=', self.actif_args())
 

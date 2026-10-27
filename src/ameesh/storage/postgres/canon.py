@@ -45,7 +45,10 @@ class Canon(interface.Canon):
         # #3955 : `expected` rend l'avance du commit audité conditionnelle.
         # `None` : sans condition (comportement historique, écritures non-`ok`) ;
         # une chaîne ('' comprise) : la valeur enregistrée doit encore être
-        # celle-là, sinon `last_good_commit`/`last_good_at` restent inchangés.
+        # celle-là, sinon le commit ET sa provenance restent ceux du gagnant.
+        # #3964 : la provenance (statut, racine, source, diagnostic, horodatage)
+        # suit le même CAS — une écriture fondée sur une lecture périmée ne
+        # laisse pas une provenance périmée derrière un commit plus récent.
         # Le CAS, dans la même instruction que l'upsert, ferme la course entre
         # deux synchronisations (l'une lit l'ancien commit avant le fetch et
         # écrit après que l'autre a enregistré le nouveau).
@@ -57,9 +60,18 @@ class Canon(interface.Canon):
             VALUES (%s, %s, %s, %s, %s, %s, %s, CASE WHEN %s THEN now() END, %s, now())
             ON CONFLICT (host, canon) DO UPDATE SET
                 canon_id         = coalesce(excluded.canon_id, s.canon_id),
-                status           = excluded.status,
-                root             = excluded.root,
-                source           = excluded.source,
+                status           = CASE WHEN excluded.status <> 'ok'
+                                              OR %s::boolean
+                                              OR coalesce(s.last_good_commit, '') = %s
+                                        THEN excluded.status ELSE s.status END,
+                root             = CASE WHEN excluded.status <> 'ok'
+                                              OR %s::boolean
+                                              OR coalesce(s.last_good_commit, '') = %s
+                                        THEN excluded.root ELSE s.root END,
+                source           = CASE WHEN excluded.status <> 'ok'
+                                              OR %s::boolean
+                                              OR coalesce(s.last_good_commit, '') = %s
+                                        THEN excluded.source ELSE s.source END,
                 last_good_commit = CASE WHEN excluded.status = 'ok'
                                          AND (%s::boolean
                                               OR coalesce(s.last_good_commit, '') = %s)
@@ -70,12 +82,24 @@ class Canon(interface.Canon):
                                               OR coalesce(s.last_good_commit, '') = %s)
                                         THEN excluded.last_good_at
                                         ELSE s.last_good_at END,
-                diagnostic       = excluded.diagnostic,
-                checked_at       = excluded.checked_at
+                diagnostic       = CASE WHEN excluded.status <> 'ok'
+                                              OR %s::boolean
+                                              OR coalesce(s.last_good_commit, '') = %s
+                                        THEN excluded.diagnostic ELSE s.diagnostic END,
+                checked_at       = CASE WHEN excluded.status <> 'ok'
+                                              OR %s::boolean
+                                              OR coalesce(s.last_good_commit, '') = %s
+                                        THEN excluded.checked_at ELSE s.checked_at END
             RETURNING last_good_commit
             """,
             (host, canon or "", canon_id, status, root, source, commit, good, diagnostic,
-             expected is None, expected or "", expected is None, expected or ""),
+             expected is None, expected or "",      # status
+             expected is None, expected or "",      # root
+             expected is None, expected or "",      # source
+             expected is None, expected or "",      # last_good_commit
+             expected is None, expected or "",      # last_good_at
+             expected is None, expected or "",      # diagnostic
+             expected is None, expected or ""),     # checked_at
         )
         return rows[0]["last_good_commit"] if rows else None
 
