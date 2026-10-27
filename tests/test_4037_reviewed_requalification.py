@@ -169,11 +169,18 @@ class ReviewedMoveTest(unittest.TestCase):
         self.assertFalse(self.historical_authors.call_args.kwargs['carry_receipts'])
 
     def test_uncited_newer_block_is_not_hidden(self):
-        self.marks.append(dict(self.marks[0], id=3, verdict='blocked', at_ts=3))
-        self.receipts[3] = dict(self.receipts[1], milestone=self.marks[-1])
-        with self.assertRaisesRegex(TrainError, 'blocking opinion'):
-            self.execute()
-        self.assert_unchanged()
+        for actor in ('pilot', 'human:smichea'):
+            with self.subTest(actor=actor):
+                block = dict(self.marks[0], id=3, actor=actor, verdict='blocked', at_ts=3)
+                self.marks.append(block)
+                if actor == 'pilot':
+                    self.receipts[3] = dict(self.receipts[1], milestone=block)
+                else:
+                    self.receipts.pop(3, None)
+                with self.assertRaisesRegex(TrainError, 'blocking opinion'):
+                    self.execute()
+                self.assert_unchanged()
+                self.marks.pop()
 
     def test_superseded_pilot_opinion_cannot_be_cited_as_current(self):
         self.marks.append(dict(self.marks[0], id=3, at_ts=3))
@@ -197,13 +204,6 @@ class ReviewedMoveTest(unittest.TestCase):
     def test_unproven_block_does_not_revoke_a_proven_opinion(self):
         self.marks.append(dict(self.marks[0], id=3, verdict='blocked', at_ts=3))
         self.assertEqual(self.execute()['state'], 'requalified')
-
-    def test_human_block_without_turn_receipt_still_refuses(self):
-        self.marks.append(dict(self.marks[0], id=3, actor='human:smichea',
-                               verdict='blocked', at_ts=3))
-        with self.assertRaisesRegex(TrainError, 'blocking opinion'):
-            self.execute()
-        self.assert_unchanged()
 
     def test_dry_run_validates_without_writing(self):
         self.assertTrue(self.execute(dry_run=True)['dry_run'])

@@ -60,20 +60,21 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
     # Read complete histories, including newer blocks that were not cited.
     marks = [mark for lot in lots for mark in work.milestones(db, lot, limit=None)
              if mark.get("kind") == "verdict" and mark.get("sha") == gate]
+    # Ask the common gate for opposition on the complete history. Its result
+    # is not an authorization here: pilot assent and diff qualification are
+    # checked below. This avoids maintaining a second definition of a block.
+    opposition = merge_queue.review_gate(
+        db, marks, gate, repo=spec.canon, klass={"class": "sensitive"},
+        families=families, authors=[], authors_complete=True)
+    if opposition["blocked"]:
+        raise TrainError("reviewed requalification has a current blocking opinion")
     latest = {}
     for mark in sorted(marks, key=lambda m: (m["at_ts"], m["id"])):
-        if str(mark.get("actor") or "").startswith(work.HUMAN_PREFIX):
-            # As in the merge gate (#2928): a human verdict has no managed
-            # turn; an owner's block on the gate commit still refuses.
-            latest[mark["actor"]] = mark
-            continue
         receipt = selected.get(mark["id"]) or review_provenance.receipt_for_milestone(
             db, mark["id"])
         if (receipt and receipt["commit"] == gate and receipt["actor"] == mark["actor"]
                 and (receipt.get("milestone") or {}).get("verdict") == mark["verdict"]):
             latest[mark["actor"]] = mark
-    if any(mark.get("verdict") == "blocked" for mark in latest.values()):
-        raise TrainError("reviewed requalification has a current blocking opinion")
     current = [mark for mark in latest.values() if mark["id"] in selected]
     if not any(_role(cfg, db, mark["actor"]) for mark in current):
         raise TrainError("reviewed requalification requires a current pilot opinion")
