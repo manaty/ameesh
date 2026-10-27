@@ -22,11 +22,16 @@ l'ordre, sans agent :
    un agent ;
 4. les contrôles locaux : `scripts/freeze-checks.py`, puis
    `tests/parts/toujours.txt`, `tests.test_l161f_plan`, `tests.test_cluster`
-   et les modules de test apportés par chaque unité. Une unité dont un module
-   **rougit** est retirée et le paquet est recomposé **une seule fois**. Un
-   run **non concluant** (délai, base absente, psql/psycopg indisponible, rc
-   inattendu) est consigné au manifeste, à la PR et au courrier, sans retirer
-   d'unité ni arrêter le paquet : le canon §3 le veut, la ci-full tranche ;
+   et les modules de test apportés par chaque unité. Un test ciblé **rouge**
+   est attribué par la même lecture que #3801 (`packet_red`) : l'unité
+   désignée par une preuve forte est retirée, son auteur est prévenu, et le
+   paquet est recomposé **une seule fois** sans elle (#3931). Un rouge non
+   attribuable garde le geste antérieur : une unité dont le module propre a
+   rougi est retirée, un contrat rouge arrête (l'attribution demande un
+   agent). Un run **non concluant** (délai, base absente, psql/psycopg
+   indisponible, rc inattendu) est consigné au manifeste, à la PR et au
+   courrier, sans retirer d'unité ni arrêter le paquet : le canon §3 le veut,
+   la ci-full tranche ;
 5. le manifeste `reviews/integration-paquet-<nom>.md` : base et SHA de la
    cible, table `## Composition` produite par `paquet-compose.py --units`
    (gabarit #3629), admissions, écartés et leur motif, contrôles locaux ;
@@ -69,7 +74,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 #: branche de paquet et manifeste, pour un `--name` (ex. `h-20261027-01`)
@@ -117,6 +122,16 @@ ERROR_HEADER_RE = re.compile(r"^ERROR: .*$", re.MULTILINE)
 EXCEPTION_LINE_RE = re.compile(
     r"^([\w.]+(?:Error|Exception)):\s*(.*)$", re.MULTILINE)
 BLOCK_END_RE = re.compile(r"^=+$", re.MULTILINE)
+#: le seuil de preuve forte de #3801, le même que `paquet_horaire.classify`
+STRONG_EVIDENCE = 4
+#: l'outil qui rend l'attribution `packet_red` d'un rouge de composition
+ATTRIBUTION_SCRIPT = "scripts/paquet-attribution.py"
+#: un en-tête d'échec unittest (`FAIL: test (tests.test_x.T.t)`) ; une ligne
+#: `FAIL:` produite par le test lui-même n'a pas ce nom pointé et est ignorée
+FAIL_LINE_RE = re.compile(
+    r"^(FAIL|ERROR):\s+.+?\(((?:tests\.|unittest\.loader\.)[^()]*)\)",
+    re.MULTILINE)
+TEST_MODULE_RE = re.compile(r"(?:^|\.)tests\.(test_[A-Za-z0-9_]+)")
 
 
 class PaquetAutoError(RuntimeError):
@@ -164,6 +179,16 @@ class Composition:
     units: list[Unit]
     discarded: list[Discarded]
     head: str
+
+
+@dataclass
+class Removal:
+    """Une unité retirée sur un test ciblé rouge, avec sa preuve."""
+
+    lot: int
+    tests: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+    attributed: bool = False
 
 
 @dataclass
@@ -890,19 +915,145 @@ def run_freeze_checks(worktree: Path, *, timeout: int) -> tuple[int, str, float]
     return proc.returncode, _output(proc), time.monotonic() - start
 
 
+def unittest_failures(output: str) -> list[dict]:
+    """Les échecs d'une sortie unittest, au format des échecs de CI (#3801).
+
+    `FAIL: test_x (tests.test_module.Class.test_x)` et
+    `ERROR: setUpClass (tests.test_module.Class)` donnent le même nom pointé
+    que la CI ; un sous-test (`... (i=1)`) ne change pas le nom. Une
+    `ERROR:` d'environnement (psql/psycopg absent) n'est pas un rouge du lot :
+    elle est ignorée, comme `TestRun.real_failure` la classe.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    for match in FAIL_LINE_RE.finditer(output or ""):
+        kind, test = match.group(1), match.group(2).strip()
+        if not test or test in seen:
+            continue
+        if kind == "ERROR":
+            rest = (output or "")[match.end():]
+            end = BLOCK_END_RE.search(rest)
+            block = rest[:end.start()] if end else rest
+            if TestRun._error_is_environment(block):
+                continue
+        seen.add(test)
+        module = ""
+        found = TEST_MODULE_RE.search(test)
+        if found:
+            module = found.group(1)
+        out.append({"test": test, "module": module})
+    return out
+
+
+def attribute_composition(worktree: Path, composition: Composition,
+                          failures: list[dict]) -> dict:
+    """La lecture #3801 du rouge, par l'outil de l'arbre composé (#3931).
+
+    Le helper lit la carte d'impact localement et applique
+    `packet_red.attribute_tests` : même lecture que le rouge de ci-full. Un
+    helper absent ou illisible ne conclut pas (`status` le dit) ; l'appelant
+    garde alors l'échec actuel, sans retrait inventé.
+    """
+    script = worktree / ATTRIBUTION_SCRIPT
+    if not script.is_file():
+        return {"status": "no-helper", "tests": [],
+                "why": "%s absent de l'arbre composé" % ATTRIBUTION_SCRIPT}
+    payload = {
+        "schema": "ameesh-paquet-attribution-request/1",
+        "units": [{"lot": unit.lot, "unit_sha": unit.commit}
+                  for unit in composition.units],
+        "failures": failures,
+    }
+    try:
+        proc = run_command(
+            [project_python(worktree), str(script), "--repo", str(worktree)],
+            cwd=worktree, input_text=json.dumps(payload),
+            timeout=GIT_TIMEOUT, env=python_env(worktree))
+    except PaquetAutoError as exc:
+        return {"status": "error", "tests": [], "why": str(exc)}
+    text = _decode(proc.stdout).strip()
+    try:
+        report = json.loads(text) if text else {}
+    except ValueError:
+        report = {}
+    if proc.returncode != 0 or not isinstance(report, dict):
+        return {"status": "error", "tests": [],
+                "why": _tail(_output(proc), 5) or "sortie illisible"}
+    return report
+
+
+def designated_removals(attribution: dict, failures: list[dict], *,
+                        known_lots=None) -> tuple[list[Removal], str]:
+    """Les unités désignées sans ambiguïté pour **tous** les échecs.
+
+    Même règle que `paquet_horaire.classify` (#3801) : chaque échec est
+    `probable`, sa meilleure preuve atteint `STRONG_EVIDENCE`, et une seule
+    unité est à égalité à ce poids. Un seul échec non attribuable annule le
+    retrait : on ne retire pas une unité sur une lecture partielle.
+    `known_lots` refuse une unité qui ne fait pas partie de la composition.
+    """
+    if attribution.get("status") != "ok":
+        return [], (str(attribution.get("why") or "")
+                    or "attribution %s" % (attribution.get("status") or "absente"))
+    entries = attribution.get("tests") or []
+    if len(entries) != len(failures):
+        return [], ("attribution incomplète (%d échec(s), %d entrée(s))"
+                    % (len(failures), len(entries)))
+    expected = {str(failure.get("test") or "") for failure in failures}
+    seen: set[str] = set()
+    by_lot: dict[int, Removal] = {}
+    for entry in entries:
+        name = str(entry.get("test") or "?")
+        if name not in expected:
+            return [], "entrée %s hors des échecs" % name
+        if name in seen:
+            return [], "entrée %s en double" % name
+        seen.add(name)
+        if entry.get("status") != "probable":
+            return [], "test %s non attribuable" % name
+        units = entry.get("units") or []
+        top = max((int(unit.get("best") or 0) for unit in units), default=0)
+        best = [unit for unit in units if int(unit.get("best") or 0) == top]
+        if top < STRONG_EVIDENCE:
+            return [], "test %s : preuve faible (poids %d)" % (name, top)
+        if len(best) != 1:
+            return [], "test %s : %d unités à égalité" % (name, len(best))
+        unit = best[0]
+        lot = int(unit["lot"])
+        if known_lots is not None and lot not in known_lots:
+            return [], "unité #%d hors de la composition" % lot
+        removal = by_lot.setdefault(lot, Removal(lot=lot, attributed=True))
+        if name not in removal.tests:
+            removal.tests.append(name)
+        for item in unit.get("evidence") or []:
+            label = " ".join((str(item.get("kind") or ""),
+                              str(item.get("file") or ""))).strip()
+            if label and label not in removal.evidence:
+                removal.evidence.append(label)
+    return list(by_lot.values()), ""
+
+
 def check_local_tests(worktree: Path, composition: Composition, *,
-                      timeout: int, log=print) -> tuple[list[TestRun], list[int]]:
+                      timeout: int, log=print,
+                      attribute=None) -> tuple[list[TestRun], list[int],
+                                               list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
-    Rend `(exécutions, unités fautives)` ; une unité fautive est celle dont un
-    module a **rougi** (test négatif). Un résultat non concluant (délai, base
-    absente, psql/psycopg indisponible, rc inattendu) est **consigné** dans
-    `runs` et ne retire aucune unité : le canon §3 veut qu'il ne retienne ni
-    paquet ni release ; la ci-full tranche. Un contrat rouge, lui, arrête
-    (l'attribution d'un rouge de contrat demande un agent).
+    Rend `(exécutions, unités fautives, retraits)`. Une unité est fautive
+    quand un test ciblé la désigne :
+    * par attribution #3801 (`packet_red`) quand **chaque** échec est attribué
+      sans ambiguïté à une seule unité avec une preuve forte (#3931) ;
+    * sinon par le geste antérieur : le module propre de l'unité a rougi, et un
+      contrat rouge non attribuable arrête.
+
+    Un résultat non concluant (délai, base absente, psql/psycopg indisponible,
+    rc inattendu) est **consigné** dans `runs` et ne retire aucune unité : le
+    canon §3 veut qu'il ne retienne ni paquet ni release ; la ci-full tranche.
+    `attribute` est injectable pour les témoins (`attribute_composition`).
     """
     runs: list[TestRun] = []
-    faulty: list[int] = []
+    red: list[tuple[TestRun, list[dict]]] = []
+    own: dict[int, list[dict]] = {}
     for unit in composition.units:
         modules = unit_test_modules(worktree, unit)
         if not modules:
@@ -915,28 +1066,72 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                 "continue" % (unit.lot, run.motive()))
             continue
         if not run.green:
-            faulty.append(unit.lot)
+            found = unittest_failures(run.output)
+            own[unit.lot] = found
+            red.append((run, found))
             log("tests unité #%d : ROUGE (%d modules)\n%s"
                 % (unit.lot, len(modules), _tail(run.output)))
         else:
             log("tests unité #%d : vert (%d modules, %d tests)"
                 % (unit.lot, len(modules), run.tests))
-    if faulty:
-        return runs, faulty
     modules = contract_modules(worktree)
-    run = run_tests(worktree, "contrats", modules, timeout=timeout)
-    runs.append(run)
-    if run.inconclusive:
+    contract = run_tests(worktree, "contrats", modules, timeout=timeout)
+    runs.append(contract)
+    contract_red = False
+    if contract.inconclusive:
         log("tests contrats : NON CONCLUANT (%s) — consigné, le paquet "
-            "continue" % run.motive())
-        return runs, []
-    if not run.green:
+            "continue" % contract.motive())
+    elif not contract.green:
+        contract_red = True
+        red.append((contract, unittest_failures(contract.output)))
+        log("tests contrats : ROUGE (%d modules)\n%s"
+            % (len(modules), _tail(contract.output)))
+    else:
+        log("tests contrats : vert (%d modules, %d tests)"
+            % (len(modules), contract.tests))
+    if not red:
+        return runs, [], []
+    failures: list[dict] = []
+    seen_failures: set[str] = set()
+    for _run, found in red:
+        for failure in found:
+            name = str(failure.get("test") or "")
+            if name and name in seen_failures:
+                continue
+            if name:
+                seen_failures.add(name)
+            failures.append(failure)
+    why = ""
+    removals: list[Removal] = []
+    if failures and all(found for _run, found in red):
+        reader = attribute or attribute_composition
+        report = reader(worktree, composition, failures)
+        removals, why = designated_removals(
+            report, failures,
+            known_lots={unit.lot for unit in composition.units})
+    else:
+        why = "un rouge sans nom de test attribuable"
+    if removals:
+        log("tests ciblés : retrait de %s (%s)"
+            % (", ".join("#%d" % removal.lot for removal in removals),
+               why or "attribution #3801"))
+        return runs, [removal.lot for removal in removals], removals
+    if contract_red and not own:
         raise PaquetAutoError(
             "tests de contrat rouges sur la tête composée (aucune unité retirée "
-            "automatiquement : l'attribution demande un agent) :\n%s"
-            % _tail(run.output))
-    log("tests contrats : vert (%d modules, %d tests)" % (len(modules), run.tests))
-    return runs, []
+            "automatiquement : %s) :\n%s"
+            % (why or "attribution incertaine", _tail(contract.output)))
+    removals = [Removal(lot=lot, tests=[failure["test"] for failure in found])
+                for lot, found in own.items()]
+    if contract_red:
+        log("tests contrats : rouge non attribuable (%s) — retrait des unités "
+            "aux tests propres rouges, puis recomposition"
+            % (why or "attribution incertaine"))
+    if removals:
+        log("tests ciblés : retrait de %s (module propre rouge, sans "
+            "attribution sûre)"
+            % ", ".join("#%d" % removal.lot for removal in removals))
+    return runs, [removal.lot for removal in removals], removals
 
 
 # ---------------------------------------------------------------------------
@@ -1230,8 +1425,9 @@ def freeze_carrier(worktree: Path, carrier: int, head: str, note: str) -> str:
     return _output(proc)
 
 
-def send_mail(pilot: str, carrier: int, body: str, sender: str | None = None) -> str:
-    cmd = ["agent-mail", "send", pilot, "-", "--lot", str(carrier)]
+def send_mail(recipient: str, lot: int, body: str,
+              sender: str | None = None) -> str:
+    cmd = ["agent-mail", "send", recipient, "-", "--lot", str(lot)]
     if sender:
         # #3845 : sous `ameesh role run`, AGENT_MAIL_NAME est retiré ; sans
         # --from, agent-mail refuse (« unbound sender »).
@@ -1239,8 +1435,57 @@ def send_mail(pilot: str, carrier: int, body: str, sender: str | None = None) ->
     proc = run_command(cmd, input_text=body, timeout=120)
     if proc.returncode != 0:
         raise PaquetAutoError(
-            "courrier au pilote %s : %s" % (pilot, _tail(_output(proc))))
+            "courrier à %s : %s" % (recipient, _tail(_output(proc))))
     return _output(proc)
+
+
+def lot_author(lot: int, repo: Path) -> str:
+    """L'assigné du lot, ou "" si la base ne le dit pas (jamais bloquant)."""
+    try:
+        proc = run_command(["ameesh", "work", "show", str(lot), "--json"],
+                           cwd=repo, timeout=GIT_TIMEOUT)
+    except PaquetAutoError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    try:
+        item = json.loads(_decode(proc.stdout))
+    except ValueError:
+        return ""
+    return str(item.get("assignee") or "").strip()
+
+
+def notify_removals(repo: Path, name: str, removals: list[Removal], *,
+                    sender: str | None, log=print) -> list[str]:
+    """Prévient l'auteur de chaque unité retirée (§11 bis, #3931).
+
+    Un courrier qui ne part pas n'annule pas la recomposition : il est
+    consigné, et le courrier du pilote porte les lots retirés. Rend les
+    échecs, pour la trace du tic.
+    """
+    failed: list[str] = []
+    for removal in removals:
+        author = lot_author(removal.lot, repo)
+        if not author:
+            log("auteur de #%d inconnu : courrier non envoyé" % removal.lot)
+            continue
+        tests = ", ".join(removal.tests[:3]) or "tests ciblés"
+        evidence = " ; ".join(removal.evidence[:3]) or "attribution #3801"
+        body = (
+            "#%d retiré du paquet %s : les tests ciblés de la composition ont "
+            "rougi sur la tête composée, et la lecture #3801 désigne ton unité "
+            "(%s). Tests : %s. Le paquet est recomposé sans ton lot ; corrige "
+            "puis regèle, il reviendra à une coupure suivante."
+            % (removal.lot, name, evidence, tests))
+        try:
+            send_mail(author, removal.lot, body, sender)
+        except PaquetAutoError as exc:
+            failed.append("#%d : %s" % (removal.lot, exc))
+            log("courrier à %s (#%d) non envoyé : %s"
+                % (author, removal.lot, exc))
+        else:
+            log("courrier à %s (#%d) envoyé" % (author, removal.lot))
+    return failed
 
 
 def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
@@ -1588,7 +1833,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                     "freeze-checks rouge sur la tête composée :\n%s"
                     % _tail(freeze_output))
             print("freeze-checks : vert (%.1f s)" % freeze_seconds, flush=True)
-            runs, faulty = check_local_tests(
+            runs, faulty, removals = check_local_tests(
                 worktree, composition, timeout=args.tests_timeout)
             if not faulty:
                 break
@@ -1599,15 +1844,25 @@ def compose_packet(args: argparse.Namespace) -> int:
                     % ", ".join("#%d" % lot for lot in faulty))
             recomp += 1
             removed = set(faulty)
+            if not removals:
+                removals = [Removal(lot) for lot in faulty]
             reasons = []
-            for lot in faulty:
+            for removal in removals:
                 modules = next(
                     (run.modules for run in runs
-                     if run.label == "unité #%d" % lot), [])
-                reasons.append(Discarded(
-                    lot,
-                    "tests locaux rouges (%s), retiré de la recomposition"
-                    % (", ".join(modules) or "modules illisibles")))
+                     if run.label == "unité #%d" % removal.lot), [])
+                if removal.attributed:
+                    reason = ("tests ciblés rouges (%s), attribués à son "
+                              "unité (#3801), retirés de la recomposition"
+                              % (", ".join(removal.tests[:3])
+                                 or "tests illisibles"))
+                    detail = " ; ".join(removal.evidence[:3])
+                else:
+                    reason = ("tests locaux rouges (%s), retiré de la "
+                              "recomposition"
+                              % (", ".join(modules) or "modules illisibles"))
+                    detail = ""
+                reasons.append(Discarded(removal.lot, reason, detail))
             print("recomposition : retrait de %s"
                   % ", ".join("#%d" % lot for lot in faulty), flush=True)
             candidates = [candidate for candidate in candidates
@@ -1617,6 +1872,15 @@ def compose_packet(args: argparse.Namespace) -> int:
                 compose_script=compose_script,
                 record_package=not args.no_packet_record)
             composition.discarded.extend(reasons)
+            # `--local` est une composition de contrôle : aucun courrier.
+            failed: list[str] = []
+            if not getattr(args, "local", False):
+                failed = notify_removals(
+                    worktree, args.name, removals,
+                    sender=getattr(args, "sender", None))
+            if failed:
+                print("courriers d'auteur non envoyés : %s"
+                      % " ; ".join(failed), file=sys.stderr, flush=True)
             if not composition.units:
                 print("aucune unité après recomposition : %s"
                       % ", ".join("#%d" % item.lot
