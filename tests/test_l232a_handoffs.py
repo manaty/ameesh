@@ -243,9 +243,7 @@ class HandoffTest(PgTestCase):
             index = len(calls)
             calls.append(intent["id"])
             try:
-                # #3877 : le permis doit rester pris jusqu'à `release` ; une
-                # borne de 5 s le rendait trop tôt sur un runner chargé.
-                release.wait(60)
+                release.wait(5)
                 return True
             finally:
                 finished[index].set()
