@@ -3795,7 +3795,9 @@ def _packet_prevalidation(cfg, db, item, decision, args) -> int:
     result = prevalidation_calls.gate_packet(
         cfg, db, item, decision,
         repo=getattr(args, "prevalidation_repo", "") or "",
-        map_path=getattr(args, "prevalidation_map", "") or "")
+        map_path=getattr(args, "prevalidation_map", "") or "",
+        deadline=prevalidation_calls.caller_deadline(
+            getattr(args, "prevalidation_budget", None)))
     if result.get("state") == "red":
         #: décision pilote 19/10 : seul un rouge bloque la demande de CI.
         why = result.get("why") or "run-red"
