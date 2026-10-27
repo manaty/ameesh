@@ -1303,6 +1303,9 @@ exit 0
 SSH = r'''#!/usr/bin/env bash
 printf 'stub %s %s\n' "$0" "$*" >> "${FAKE_STATE:?}/calls.log"
 printf 'ssh %s\n' "$*" >> "${FAKE_STATE:?}/calls.log"
+case "$*" in
+  *"bash -s -- "*) cat >/dev/null || true; exit 0 ;;   # migrations depuis une VM (#3848)
+esac
 exit 255
 '''
 

@@ -26,6 +26,11 @@
 # `hostname -s` ; le poser dans BASCULE_ENV sur une VM dont la configuration
 # porterait « pc-smichea » evite une fausse detection (#3848).
 #
+# Sans HOTES_STAGING (cas de bureau-goal, qui n'a qu'un fichier par VM), la
+# topologie est composee des bascule-a1.env et bascule-a2.env du dossier de
+# BASCULE_ENV (AGENTS_SSH + HOTE_AGENTS) et de SERVEUR_SSH (ou VM) pour
+# manaty-mesh-1 ; pc-smichea reste absent (poste reporte).
+#
 # HOTES_STAGING (BASCULE_ENV) : la topologie, une entree « nom=cible » par
 # hote, dans cet ordre :
 #   ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4
@@ -75,15 +80,15 @@
 # persona menee) n'atteste rien, et une remise croisee n'y est pas acceptee.
 #
 # Etapes : verifier chaque hote (lecture seule) ; sauvegarder puis migrer REF
-# (additif seulement, base partagee) — ces deux etapes sont celles du poste et
-# sont sautees quand il est absent, trace a l'appui : la base doit alors deja
-# porter les migrations de REF (chemin VM, bureau-goal), et les installateurs
-# VM refusent sinon avant toute mutation ; puis, hote par hote dans l'ordre
-# ci-dessus : installer, [poste] role, redemarrer, controler, sante (unites,
-# baux et doctor par `controler`, puis courrier reellement remis par une
-# sonde). Un echec = retour automatique de l'HOTE (previous-sha), controle du
-# retour, arret de la sequence et courrier urgent au pilote. Rien n'est
-# repris apres un echec ; relancer la commande est sur : un hote deja au
+# (additif seulement, base partagee) — la sauvegarde est celle du poste et est
+# sautee quand il est absent ; les migrations sont alors appliquees depuis une
+# VM d'agents (snapshot git archive de src, dry-run additif d'abord, puis
+# --additive-only), comme le chemin bureau-goal (#3848) ; puis, hote par hote
+# dans l'ordre ci-dessus : installer, [poste] role, redemarrer, controler,
+# sante (unites, baux et doctor par `controler`, puis courrier reellement remis
+# par une sonde). Un echec = retour automatique de l'HOTE (previous-sha),
+# controle du retour, arret de la sequence et courrier urgent au pilote. Rien
+# n'est repris apres un echec ; relancer la commande est sur : un hote deja au
 # commit vise ne le reinstallle pas (le previous-sha reste le bon).
 # Un seul operateur a la fois : un second passage sort en 75 (verrou
 # ~/.local/state/ameesh/mise-a-jour/staging.lock) sans rien modifier.
@@ -236,10 +241,39 @@ declare -A CHOISI=()   #: selection normalisee de --hotes (un nom = une entree)
 POSTE_ABSENT=0
 POSTE_RAISON=""
 HOTES=()
+TOPOLOGIE_COMPOSEE=0
 if [ -z "${HOTES_STAGING:-}" ]; then
-  echo "HOTES_STAGING absent de $BASCULE_ENV : declarer les trois VM (pc-smichea=poste en option)" >&2
-  echo "  HOTES_STAGING=\"ameesh-agents-1=root@… ameesh-agents-2=root@… manaty-mesh-1=root@… pc-smichea=poste\"" >&2
-  exit 2
+  # #3848 : le bureau VM n'a qu'un fichier par VM d'agents (bascule-a1/a2.env).
+  # Composer la topologie depuis ces deux fichiers ; manaty-mesh-1 vient de
+  # SERVEUR_SSH (ou VM), pc-smichea reste absent (poste reporte).
+  DIR_BASCULE=$(dirname "$BASCULE_ENV")
+  compose=()
+  for f in "$DIR_BASCULE/bascule-a1.env" "$DIR_BASCULE/bascule-a2.env"; do
+    [ -r "$f" ] || continue
+    entree=$(
+      # shellcheck disable=SC1090
+      . "$f" >/dev/null 2>&1 || exit 1
+      [ -n "${HOTE_AGENTS:-}" ] && [ -n "${AGENTS_SSH:-}" ] || exit 1
+      printf '%s=%s' "$HOTE_AGENTS" "$AGENTS_SSH"
+    ) || entree=""
+    [ -n "$entree" ] && compose+=("$entree")
+  done
+  if [ ${#compose[@]} -ge 2 ]; then
+    SERVEUR_SSH=${SERVEUR_SSH:-${VM:+root@$VM}}
+    if [ -z "$SERVEUR_SSH" ]; then
+      echo "HOTES_STAGING absent de $BASCULE_ENV ; topologie composee depuis $DIR_BASCULE/bascule-a{1,2}.env," >&2
+      echo "mais manaty-mesh-1 manque : poser SERVEUR_SSH=root@10.77.0.2 (ou VM=10.77.0.2) dans l'environnement ou BASCULE_ENV" >&2
+      exit 2
+    fi
+    HOTES_STAGING="${compose[*]} manaty-mesh-1=$SERVEUR_SSH"
+    TOPOLOGIE_COMPOSEE=1
+    echo "topologie staging composee depuis $DIR_BASCULE/bascule-a{1,2}.env : $HOTES_STAGING" >&2
+  else
+    echo "HOTES_STAGING absent de $BASCULE_ENV : declarer les trois VM (pc-smichea=poste en option)" >&2
+    echo "  ou poser $DIR_BASCULE/bascule-a1.env et bascule-a2.env (AGENTS_SSH, HOTE_AGENTS) et SERVEUR_SSH" >&2
+    echo "  HOTES_STAGING=\"ameesh-agents-1=root@… ameesh-agents-2=root@… manaty-mesh-1=root@… pc-smichea=poste\"" >&2
+    exit 2
+  fi
 fi
 for entree in $HOTES_STAGING; do
   nom=${entree%%=*}
@@ -336,8 +370,11 @@ else
 fi
 
 # VM sert aussi a poste.sh (migrations, sauvegarde) : la topologie et VM
-# doivent dire la meme chose.
+# doivent dire la meme chose. La topologie composee pose VM depuis SERVEUR_SSH.
 ADRESSE_MESH=${CIBLE[manaty-mesh-1]#*@}
+if [ "$TOPOLOGIE_COMPOSEE" = 1 ] && [ -z "${VM:-}" ]; then
+  VM=$ADRESSE_MESH
+fi
 if [ "${VM:-}" != "$ADRESSE_MESH" ]; then
   echo "VM (« ${VM:-absent} ») doit etre l'adresse de manaty-mesh-1 (« $ADRESSE_MESH ») dans $BASCULE_ENV" >&2
   exit 2
@@ -458,6 +495,34 @@ precedent_retour() {  # commit que « retour » reinstalle reellement
     serveur) ssh_lire "${CIBLE[$nom]}" "cat /opt/ameesh/precedent" 2>/dev/null ;;
   esac || true
 }
+# Migrations depuis une VM d'agents quand le poste est absent (#3848) : le
+# chemin du bureau (snapshot git archive de src, venv courant, PYTHONPATH sur
+# l'instantane), dry-run additif d'abord, puis application additive seule.
+# La base est commune : un seul hote suffit. Aucun secret ne traverse la
+# commande ; le SHA est un commit deja resolu par git.
+DEPOT_VM=${DEPOT_VM:-/home/ameesh/work/ameesh-release}
+SNAP_VM=${SNAP_VM:-/home/ameesh/work}
+migrer_depuis_vm() {  # nom sha
+  local nom=$1 sha=$2 cible=${CIBLE[$1]} a b c
+  printf -v a '%q' "$sha"
+  printf -v b '%q' "$DEPOT_VM"
+  printf -v c '%q' "$SNAP_VM"
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$cible" \
+    "runuser -u ameesh -- env HOME=/home/ameesh bash -s -- $a $b $c" <<'REMOTE'
+set -euo pipefail
+R=$1
+depot=$2
+snap=$3
+d="$snap/snap-${R:0:8}"
+rm -rf -- "$d"
+mkdir -p -- "$d"
+git -C "$depot" fetch -q origin
+git -C "$depot" archive "$R" src | tar -x -C "$d"
+cd "$d"
+PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migrate --dry-run --additive-only
+PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migrate --additive-only
+REMOTE
+}
 sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
   local nom=$1 sans=${2:-} cible_sonde var sortie args_hote=()
   SANTE_DETAIL=""
@@ -551,7 +616,7 @@ if [ "$POSTE_ABSENT" = 1 ]; then
 fi
 if [ "$A_BLANC" = 1 ]; then
   if [ "$POSTE_ABSENT" = 1 ]; then
-    echo "  etapes : verifier les trois VM ; sauvegarde et migrations du poste sautees (poste absent : les appliquer par le chemin VM avant l'installation) ; puis par hote installer, redemarrer, controler, sante"
+    echo "  etapes : verifier les trois VM ; sauvegarde du poste sautee ; migrations appliquees depuis une VM d'agents (additif, dry-run d'abord) ; puis par hote installer, redemarrer, controler, sante"
   else
     echo "  etapes : verifier partout, sauvegarder+migrer ${SHA_TRAVE} (additif), puis par hote installer, redemarrer, controler, sante"
   fi
@@ -585,7 +650,7 @@ done
 if [ "$SAUVER" = 1 ]; then
   if [ "$POSTE_ABSENT" = 1 ]; then
     etape "sauvegarde du poste sautee (poste absent)"
-    echo "  sauvegarde et migrations du poste non faites : la base doit deja porter $SHA_TRAVE (chemin VM, bureau-goal) ; les installateurs VM refusent sinon, avant toute mutation"
+    echo "  sauvegarde du poste non faite (poste absent) ; les migrations suivent depuis une VM d'agents (instantané git archive, additif, dry-run d'abord)"
   else
     etape "sauvegarde de la base du mesh (poste.sh sauvegarder)"
     "$POSTE_SH" sauvegarder || { echo "sauvegarde en echec : rien n'a ete modifie" >&2; exit 1; }
@@ -594,8 +659,29 @@ if [ "$SAUVER" = 1 ]; then
 fi
 
 if [ "$POSTE_ABSENT" = 1 ]; then
-  etape "migrations de $SHA_TRAVE : poste absent, laissees au chemin VM"
-  echo "  migrations additives attendues deja appliquees (snapshot VM, ameesh migrate --additive-only) ; installation refusee par vm.sh sinon"
+  # Chemin VM (#3848) : la base commune est migree depuis une VM d'agents, avec
+  # le meme instantane et la meme garde additive que le bureau.
+  HOTE_MIGRATIONS=${HOTE_MIGRATIONS:-}
+  if [ -z "$HOTE_MIGRATIONS" ]; then
+    for nom in ameesh-agents-2 ameesh-agents-1; do
+      case " ${HOTES[*]} " in *" $nom "*) HOTE_MIGRATIONS=$nom; break ;; esac
+    done
+  fi
+  if [ -z "$HOTE_MIGRATIONS" ] || [ "$(mode_de "$HOTE_MIGRATIONS")" != agents ]; then
+    echo "HOTE_MIGRATIONS (« ${HOTE_MIGRATIONS:-absent} ») doit etre une VM d'agents de la sequence" >&2
+    exit 2
+  fi
+  case " ${HOTES[*]} " in
+    *" $HOTE_MIGRATIONS "*) ;;
+    *) echo "HOTE_MIGRATIONS (« $HOTE_MIGRATIONS ») n'est pas dans la sequence (${HOTES[*]})" >&2; exit 2 ;;
+  esac
+  etape "migrations de $SHA_TRAVE depuis $HOTE_MIGRATIONS (poste absent, additives seulement)"
+  if ! migrer_depuis_vm "$HOTE_MIGRATIONS" "$SHA"; then
+    trace "$HOTE_MIGRATIONS" migrations ko "migrations en echec depuis la VM"
+    echo "migrations en echec : aucune installation" >&2
+    exit 1
+  fi
+  trace "$HOTE_MIGRATIONS" migrations ok "migrations de $SHA_TRAVE appliquees depuis un snapshot VM (additif, dry-run d'abord)"
 else
   etape "migrations de $SHA_TRAVE (additives seulement, base partagee)"
   # #2357 : une sonde d'auto-prise en echec ne doit pas arreter la sequence. La

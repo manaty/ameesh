@@ -302,20 +302,26 @@ La séquence est lançable **depuis une VM** (bureau-goal ou une VM d’agents),
 pas seulement depuis le poste. Le poste ne se met à jour qu’en local
 (`poste.sh`, unités systemd du poste) : exécutée ailleurs, `staging.sh` le
 déclare absent (`absent`/`reporte` dans le journal), saute ses étapes
-`verifier`, sauvegarde, migrations, `role`, `installer`, `redemarrer`,
-`controler` et `sante`, et n’attend pas son retour. Les trois VM sont
-déployées normalement ; l’attestation porte leurs preuves et le champ
-`reportes` nomme le poste, la raison et sa mise à jour « à son retour, jamais
-en dessous ». Un poste absent ne retient ni staging ni lots ; un poste présent
-mais omis de `--hotes` reste une séquence partielle, sans attestation. La
-sauvegarde et les migrations locales du poste ne sont alors pas faites : la
-base doit déjà porter les migrations de la cible par le chemin VM
-(`ameesh migrate --additive-only` depuis un instantané sur une VM), et
-`vm.sh agents installer` refuse avant toute mutation sinon. L’hôte local est
-`HOTE_LOCAL`, sinon `AMEESH_HOST`, sinon le champ `host` de la configuration
-ameesh, sinon `hostname -s` ; `HOTE_LOCAL=pc-smichea` dans `BASCULE_ENV`
-lève toute ambiguïté sur une VM dont la configuration recopierait celle du
-poste.
+`verifier`, sauvegarde, `role`, `installer`, `redemarrer`, `controler` et
+`sante`, et n’attend pas son retour. Les trois VM sont déployées normalement ;
+l’attestation porte leurs preuves et le champ `reportes` nomme le poste, la
+raison et sa mise à jour « à son retour, jamais en dessous ». Un poste absent
+ne retient ni staging ni lots ; un poste présent mais omis de `--hotes` reste
+une séquence partielle, sans attestation. Les migrations sont alors appliquées
+depuis une VM d’agents (`HOTE_MIGRATIONS`, par défaut `ameesh-agents-2`) :
+instantané `git archive` de `src`, `ameesh migrate --dry-run --additive-only`
+puis `--additive-only`, comme le chemin bureau-goal ; un échec arrête avant
+toute installation. Seule la sauvegarde locale du poste n’est pas faite (la
+sauvegarde serveur quotidienne reste). L’hôte local est `HOTE_LOCAL`, sinon
+`AMEESH_HOST`, sinon le champ `host` de la configuration ameesh, sinon
+`hostname -s` ; `HOTE_LOCAL=pc-smichea` dans `BASCULE_ENV` lève toute
+ambiguïté sur une VM dont la configuration recopierait celle du poste.
+
+Sans `HOTES_STAGING` (bureau-goal n’a qu’un fichier par VM d’agents), la
+topologie est composée des `bascule-a1.env` et `bascule-a2.env` du dossier de
+`BASCULE_ENV` (`AGENTS_SSH`, `HOTE_AGENTS`) et de `SERVEUR_SSH` (ou `VM`)
+pour `manaty-mesh-1` ; `pc-smichea` reste absent et reporté. Un
+`SERVEUR_SSH` absent est refusé explicitement, sans adresse supposée.
 
 Sur le poste, `redemarrer` et `retour` passent par des unités transitoires
 `poste-maj-staging-<pid>-<action>` (`systemd-run --user --collect --wait --pipe`,

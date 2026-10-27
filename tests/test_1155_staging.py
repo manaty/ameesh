@@ -121,6 +121,17 @@ exit 0
 SSH = r'''#!/usr/bin/env bash
 printf 'stub %s %s\n' "$0" "$*" >> "${FAKE_STATE:?}/calls.log"
 printf 'ssh %s\n' "$*" >> "${FAKE_STATE:?}/calls.log"
+case "$*" in
+  *"bash -s -- "*)
+    cat >/dev/null || true
+    if grep -qx "ko=migration" "$FAKE_STATE/scenario" 2>/dev/null; then
+      grep -vx "ko=migration" "$FAKE_STATE/scenario" > "$FAKE_STATE/scenario.tmp" || true
+      mv "$FAKE_STATE/scenario.tmp" "$FAKE_STATE/scenario"
+      echo "migration injectee KO" >&2
+      exit 1
+    fi
+    exit 0 ;;
+esac
 exit 255
 '''
 
@@ -651,9 +662,19 @@ class StagingTest(unittest.TestCase):
                          [('ameesh-agents-1', 'installer'),
                           ('ameesh-agents-2', 'installer'),
                           ('manaty-mesh-1', 'installer')])
-        # sauvegarde et migrations du poste non jouees, migrer n'est pas appele
+        # sauvegarde du poste non jouee ; migrations depuis agents-2 (#3848)
         self.assertNotIn(('pc-smichea', 'sauvegarder'), actions)
         self.assertNotIn(('pc-smichea', 'migrer'), actions)
+        migrations = [i for i, ligne in enumerate(self.calls())
+                      if ligne.startswith('stub ') and 'bash -s -- %s' % self.sha in ligne]
+        self.assertEqual(len(migrations), 1, self.calls())
+        self.assertIn('root@10.77.0.4', self.calls()[migrations[0]])
+        premier_install = next(i for i, ligne in enumerate(self.calls())
+                               if 'action=installer' in ligne)
+        self.assertLess(migrations[0], premier_install)
+        trace_migration = next(t for t in self.traces() if t['etape'] == 'migrations')
+        self.assertEqual(trace_migration['hote'], 'ameesh-agents-2')
+        self.assertEqual(trace_migration['verdict'], 'ok')
         self.assertIn('poste absent', p.stdout)
         self.assertIn('mise a jour a son retour', p.stdout)
         trace = next(t for t in self.traces()
@@ -669,6 +690,51 @@ class StagingTest(unittest.TestCase):
         self.assertIn('--mode manaty-mesh-1=serveur', ligne)
         self.assertIn('--lot 917', ligne)
         self.assertIn('--rapporteur docs01', ligne)
+
+    def test_vm_migration_failure_installs_nothing(self):
+        """Une migration en echec arrete avant toute installation (#3848)."""
+        (self.state / 'scenario').write_text('ko=migration\n')
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn('migrations en echec', p.stderr)
+        self.assertNotIn(('ameesh-agents-1', 'installer'), self.actions())
+        self.assertNotIn('actif.py', ' '.join(self.calls()))
+        trace = next(t for t in self.traces() if t['etape'] == 'migrations')
+        self.assertEqual(trace['verdict'], 'ko')
+
+    def test_topology_composed_from_per_host_envs(self):
+        """#3848 : bureau-goal n'a qu'un fichier par VM ; SERVEUR_SSH complete."""
+        dossier = self.root / 'bascule-composee'; dossier.mkdir()
+        (dossier / 'bascule-a1.env').write_text(
+            'AGENTS_SSH=root@10.77.0.3\nHOTE_AGENTS=ameesh-agents-1\n'
+            'PERSONAS_VM=\nDRAIN_ATTENTE=0\nAMEESH_OPERATEUR=bureau\n')
+        (dossier / 'bascule-a2.env').write_text(
+            'AGENTS_SSH=root@10.77.0.4\nHOTE_AGENTS=ameesh-agents-2\n'
+            'PERSONAS_VM=\nDRAIN_ATTENTE=0\nAMEESH_OPERATEUR=bureau\n')
+        env = dict(self.env, BASCULE_ENV=str(dossier / 'bascule-a1.env'),
+                   HOTE_LOCAL='ameesh-agents-1', SERVEUR_SSH='root@10.77.0.2')
+        env.pop('VM', None)
+        p = self.run_staging('--a-blanc', env=env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertIn('topologie staging composee', p.stderr)
+        for hote in ('ameesh-agents-1', 'ameesh-agents-2', 'manaty-mesh-1'):
+            self.assertIn(hote, p.stdout)
+        self.assertIn('pc-smichea', p.stdout)
+        self.assertIn('absent', p.stdout)
+
+    def test_composed_topology_without_server_target_is_refused(self):
+        dossier = self.root / 'bascule-composee'; dossier.mkdir()
+        for nom, cible in (('a1', 'root@10.77.0.3'), ('a2', 'root@10.77.0.4')):
+            (dossier / ('bascule-%s.env' % nom)).write_text(
+                'AGENTS_SSH=%s\nHOTE_AGENTS=ameesh-agents-%s\nPERSONAS_VM=\n'
+                % (cible, nom[-1]))
+        env = dict(self.env, BASCULE_ENV=str(dossier / 'bascule-a1.env'),
+                   HOTE_LOCAL='ameesh-agents-1')
+        env.pop('SERVEUR_SSH', None); env.pop('VM', None)
+        p = self.run_staging('--a-blanc', env=env)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn('SERVEUR_SSH', p.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_vm_sequence_detects_local_host_without_HOTE_LOCAL(self):
         """Repli hostname : le banc tourne sur ameesh-agents-1, pas sur le poste."""
