@@ -1655,6 +1655,10 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
     if args.work_command == "move" and getattr(args, "correct", None) is not None:
         args.actor = work.corrector(cfg, db, args.actor)
         return
+    if args.work_command == "move" and getattr(args, "package_exclusion", False):
+        # #4043 : le retrait d'un paquet est le geste du pilote (paquet-horaire)
+        args.actor = work.corrector(cfg, db, args.actor, what="package exclusion")
+        return
     if args.work_command in ("add", "assign") and (getattr(args, "force", None) or "").strip():
         # #540 : l'auteur d'un forçage est l'identité de la session
         args.actor = work.forcer(cfg, db, args.actor)
@@ -2430,7 +2434,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     return 2
                 note = device_gates.session_note(args.device, note)
             item = work.move(db, args.id, args.state, note=note, actor=args.actor,
-                             correct=args.correct, reviewer=args.reviewer)
+                             correct=args.correct, reviewer=args.reviewer,
+                             package_exclusion=args.package_exclusion)
             print("lot #%d → %s (loops %s)%s%s" % (
                 item["id"], item["state"], item["loops"],
                 " — reviewer %s" % item["reviewer"] if item.get("reviewer") else "",
@@ -3874,6 +3879,11 @@ def build_parser() -> argparse.ArgumentParser:
                               "when moving to qa: waiting(), the progress view and the stale_lot "
                               "alert name them before any verdict; a reviewer of the author's "
                               "declared harness warns (indicative, #800)")
+    pw_move.add_argument("--package-exclusion", action="store_true",
+                         help="#4043: qa → build of a lot excluded from a package for a "
+                              "negative test (paquet-horaire): no author loop is consumed "
+                              "(loops unchanged, never refused at the limit); reserved for "
+                              "humans and for orchestrators or design agents")
     pw_move.add_argument("--device", action="append", default=None, metavar="DEVICE",
                          help="#3070: with blocked, the device (canon Host fiche) whose "
                               "session the lot waits for (repeatable); --note then names the "

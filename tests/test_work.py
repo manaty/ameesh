@@ -89,6 +89,33 @@ class WorkTest(PgTestCase):
         hold_for_owner(self.db, item["id"])
         self.assertEqual(work.get(self.db, item["id"])["state"], "waiting_human")
 
+    def test_exclusion_de_paquet_ne_consomme_pas_de_boucle(self):
+        # #4043 : le retrait d'un paquet (qa → build) laisse loops inchangé,
+        # même à la limite ; il n'est ouvert qu'en qa → build.
+        item = self._add()
+        work.move(self.db, item["id"], "build")
+        work.move(self.db, item["id"], "qa")
+        item = work.move(self.db, item["id"], "build", package_exclusion=True)
+        self.assertEqual(int(item["loops"]), 0)
+        work.move(self.db, item["id"], "qa")
+        work.move(self.db, item["id"], "build")
+        work.move(self.db, item["id"], "qa")
+        work.move(self.db, item["id"], "build")
+        work.move(self.db, item["id"], "qa")
+        item = work.move(self.db, item["id"], "build", package_exclusion=True,
+                         note="paquet-horaire: exclu h-1 porteur=#9 run=1 tests=t")
+        self.assertEqual((item["state"], int(item["loops"])),
+                         ("build", work.MAX_QA_LOOPS))
+        self.assertEqual(work.events(self.db, item["id"])[0]["note"],
+                         "paquet-horaire: exclu h-1 porteur=#9 run=1 tests=t")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.move(self.db, item["id"], "qa", package_exclusion=True)
+        self.assertIn("returns to build", str(ctx.exception))
+        work.move(self.db, item["id"], "blocked")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.move(self.db, item["id"], "build", package_exclusion=True)
+        self.assertIn("not in qa", str(ctx.exception))
+
     def test_journal_des_transitions(self):
         item = self._add()
         work.move(self.db, item["id"], "build", note="je prends", actor="deepseek7")
