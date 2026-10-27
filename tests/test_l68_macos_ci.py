@@ -112,8 +112,10 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
     def setUpClass(cls):
         with open(MACOS, encoding="utf-8") as fh:
             cls.text = fh.read()
-        debut = cls.text.index("\n  suite:\n")
+        # #4063 : le job `plan` puis la matrice `suite`, lus ensemble.
+        debut = cls.text.index("\n  plan:\n")
         cls.job = cls.text[debut:]
+        cls.suite = cls.text[cls.text.index("\n  suite:\n"):]
 
     def test_it_runs_nightly_on_main(self):
         self.assertRegex(self.text, r"(?m)^  schedule:\n")
@@ -157,10 +159,25 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
         self.assertIn("--mode full", self.job)
         self.assertIn("test-parts.py run --plan", self.job)
         self.assertIn("--driver psycopg", self.job)
-        # N1 de la revue #393 : toutes les parts tournent avant l'échec.
-        self.assertIn("rc=0", self.job)
-        self.assertIn("|| rc=1", self.job)
-        self.assertIn('exit "$rc"', self.job)
+        # N1 de la revue #393 : toutes les parts tournent avant l'échec ;
+        # #4063 : une part par job, aucune n'annule les autres.
+        self.assertIn("fail-fast: false", self.suite)
+        self.assertIn("part: ${{ fromJSON(needs.plan.outputs.psycopg) }}", self.suite)
+        self.assertIn("--part ${{ matrix.part }} --driver psycopg", self.suite)
+
+    def test_each_part_reads_the_plan_of_the_plan_job(self):
+        # #1256 B4 : le plan téléchargé est vérifié par l'empreinte que le job
+        # plan publie en sortie ; une part au plan différent n'exécute rien.
+        self.assertIn("needs: plan", self.suite)
+        self.assertIn("uses: actions/upload-artifact@v4", self.job)
+        self.assertIn("uses: actions/download-artifact@v4", self.suite)
+        self.assertIn("needs.plan.outputs.plan_sha256", self.suite)
+        self.assertIn("shasum -a 256 -c -", self.suite)
+
+    def test_the_parts_run_side_by_side_not_in_series(self):
+        # #4063 : huit parts en série dans un job dépassaient 240 min (runs
+        # 40295524043, 40477342997) ; plus de boucle sur les parts.
+        self.assertNotIn('while [ "$part" -le "$parts" ]', self.text)
 
     def test_postgresql_is_installed_and_started_in_a_step(self):
         self.assertNotIn("services:", self.job)
@@ -185,10 +202,10 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
         self.assertIn('echo "$(brew --prefix flock)/bin"', self.job)
 
     def test_the_runner_is_the_standard_x64_image(self):
-        self.assertIn("runs-on: macos-26-intel", self.job)
-        # La suite complète reste bornée (jusqu'à 3 h 50 mesuré), hors du
-        # chemin du paquet : le plafond de 240 min ne bloque aucune fusion.
-        self.assertIn("timeout-minutes: 240", self.job)
+        self.assertIn("runs-on: macos-26-intel", self.suite)
+        # #4063 : une part de 20 à 47 min mesurées, plus l'installation.
+        self.assertIn("timeout-minutes: 90", self.suite)
+        self.assertNotIn("timeout-minutes: 240", self.text)
 
 
 class CiMacosCoexistenceTest(unittest.TestCase):
