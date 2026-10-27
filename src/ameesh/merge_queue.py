@@ -806,7 +806,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
            "rejected": [],
            "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "authors": [],
-           "corrections": [], "on_freeze": 0, "unproven": [], "vehicle": None,
+           "class_why": "", "corrections": [], "on_freeze": 0, "unproven": [],
+           "vehicle": None,
            "attribution_read": False, "provenance_exclusions": [],
            "provenance_manifest": "",
            "exclude_author_family": exclude_author_family,
@@ -846,12 +847,20 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             cls = str(klass.get("class") or cls)
             if klass.get("doubt"):
                 cls = lot_class.SENSITIVE
+            # #4041 : la classe rendue est celle du delta propre, pas celle du
+            # diff gelé entier ; la trace le dit.
+            out["class_why"] = "§12 vehicle: class of its proper delta (%s)" % (
+                klass.get("why") or ", ".join(vehicle.get("own_paths") or ()) or "?")
     vehicle_required = 0
     if vehicle is not None and vehicle.get("ok") is not False:
         vehicle_required = int(vehicle.get("required") or 0)
         if vehicle.get("ok") is True and vehicle_required == 0 and cls != lot_class.RELEASE:
             klass = {"class": lot_class.LIGHT, "files": []}
             cls = lot_class.LIGHT
+            # #4041 : sans cette trace, `queue add` affichait « class light »
+            # suivi de la raison sensible du diff gelé entier.
+            out["class_why"] = "§12 vehicle: %s" % (
+                vehicle.get("why") or "constituents reviewed on their frozen heads")
     # #2803 : le seul contenu que la porte du véhicule relit est son delta
     # propre (`commits`) ; les membres ont leurs avis sur leur propre tête.
     own_commits = [str(sha).strip() for sha in (vehicle or {}).get("commits") or ()
@@ -2653,9 +2662,26 @@ def _readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
             "pr": (status or {}).get("number"),
             "class": gate.get("class") or klass.get("class"),
-            "class_why": klass.get("why") or "", "parts": proof,
+            "class_why": _class_why(gate, klass), "parts": proof,
             "waived": bool(gate.get("waived")),
             "waived_by": gate.get("waived_by") or ""}
+
+
+def _class_why(gate: dict, klass: dict) -> str:
+    """La raison de la classe rendue par la porte (#4041).
+
+    Sur un véhicule de paquet (§12, #2803), la porte remplace la classe du
+    diff gelé entier par celle de son delta propre (léger si aucun). La raison
+    du diff entier ne justifie plus la classe affichée : elle est citée comme
+    telle, à la suite de la règle du véhicule.
+    """
+    why = str(klass.get("why") or "")
+    vehicle_why = str(gate.get("class_why") or "")
+    if not vehicle_why:
+        return why
+    frozen = str(klass.get("class") or "?")
+    return "%s; frozen diff: %s%s" % (vehicle_why, frozen,
+                                       " — %s" % why if why else "")
 
 
 def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str | None,
