@@ -60,8 +60,11 @@ l'humain. Chaque famille a sa règle :
   poubelle journalisée (L230).
 * **Build output of idle worktrees** (L230, [`build_artifacts`]):
   `node_modules`, Rust `target/`, deleted once the worktree is idle for 24 h
-  with no process of the user inside; never in a main checkout, nor while
-  its agent is in turn or a lot it names is open (#3195).
+  (6 h when every lot it names is finished, #3956) with no process of the
+  user inside; never in a main checkout, nor while its agent is in turn or a
+  lot it names is open (#3195). An agent's working directory is no longer
+  exempt by its status (#3956): the same guards decide, and the finished-lot
+  worktrees are scanned first so a pass cut by its budget frees them first.
 
 * **Clones ad hoc d'un lot** (#2743, [`housekeeping_clones`]) : enfant direct
   d'une racine de travail dont le `.git` est un dossier ; rattaché à un lot
@@ -405,7 +408,8 @@ KEPT_MERGED_GRACE_S = 24 * 3600.0
 POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_alert",
                "redirect", "xdg_cache", "worktrees", "orphan_min_size",
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
-               "artifact_idle", "unreadable_ok", "docker_orphan_volumes_alert",
+               "artifact_idle", "artifact_ended_idle", "unreadable_ok",
+               "docker_orphan_volumes_alert",
                "docker_build_cache_alert", "docker_volumes", "docker_volume_idle",
                "events_quota", "former_mesh_keys", "dirty_worktree_after",
                "dirty_archive_retention")
@@ -451,6 +455,11 @@ class Policy:
     artifacts: tuple | None = None
     #: L230: inactivity (seconds) of a worktree before its artifacts go
     artifact_idle: float = build_artifacts.DEFAULT_IDLE_S
+    #: #3956: inactivity (seconds) of a worktree whose cited lots are ALL
+    #: finished — shorter, since nothing rebuilds there; same guards (no open
+    #: lot, no turn, no process inside) and the never-touch rule of a worktree
+    #: that contains an agent's working directory still apply
+    artifact_ended_idle: float = build_artifacts.DEFAULT_ENDED_IDLE_S
     #: L230/L162: names of the user's processes whose unreadability (not
     #: dumpable: capabilities, setuid) does not block a deletion — the build
     #: artifacts of an idle worktree AND the holder check of an abandoned /tmp
@@ -532,8 +541,8 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`tmpfs_alert`: fraction expected (0 < x <= 1, or \"60%\")")
         else:
             parsed["tmpfs_alert"] = part
-    for key in ("orphan_idle", "deps_idle", "artifact_idle", "docker_volume_idle",
-                "dirty_worktree_after", "dirty_archive_retention"):
+    for key in ("orphan_idle", "deps_idle", "artifact_idle", "artifact_ended_idle",
+                "docker_volume_idle", "dirty_worktree_after", "dirty_archive_retention"):
         if raw.get(key) is None:
             continue
         seconds = parse_idle(raw[key])
@@ -595,7 +604,8 @@ def effective(canons, host: str) -> Policy:
     (le plus bas), comme les limites physiques de L43. L162 : la suppression
     des entrées de /tmp abandonnées est coupée dès qu'UNE fiche la coupe, et
     l'inactivité exigée est la plus longue. L230: `artifact_idle` too, the
-    longest. #3728 : `dirty_worktree_after` et `dirty_archive_retention`
+    longest, et `artifact_ended_idle` (#3956) de même. #3728 :
+    `dirty_worktree_after` et `dirty_archive_retention`
     aussi, les plus longs (garder plus longtemps est le choix prudent)."""
     values: dict = {}
     origin: dict = {}
@@ -632,7 +642,8 @@ def effective(canons, host: str) -> Policy:
                     and value < values[key]:
                 values[key], origin[key] = value, label
             elif (key in ("orphan_idle", "deps_idle", "artifact_idle",
-                          "docker_volume_idle", "dirty_worktree_after",
+                          "artifact_ended_idle", "docker_volume_idle",
+                          "dirty_worktree_after",
                           "dirty_archive_retention") and value > values[key]) or \
                     (key in ("orphan_cleanup", "deps", "docker_volumes") and value is False
                      and values[key] is not False):
@@ -4103,7 +4114,11 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
     turn (`running`), or while a lot recorded for it (tracked worktree, R2
     cx1) or named by its branch or its directory is open (an unknown id names
     no lot; an unreadable state or record keeps it). A worktree of the clone
-    an agent works in is that agent's."""
+    an agent works in is that agent's. #3956 : quand TOUS les lots cités sont
+    finis, l'inactivité exigée est `artifact_ended_idle` (plus courte) — plus
+    rien ne s'y reconstruit ; le dossier de travail d'un agent n'est plus
+    exempté par son seul statut, seules les mêmes gardes (lot ouvert, tour,
+    processus dedans, doute) le retiennent."""
     from . import housekeeping_clones
 
     rules = build_artifacts.rules_of(policy.artifacts)
@@ -4124,10 +4139,8 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
         return next((name for name, cwd in agents if _under(real, _real(cwd))), None) \
             or clone_of.get(main_of.get(real, ""))
 
-    def keep(wt: dict) -> str:
-        agent = owner_of(wt["path"])
-        if agent and agent in running:
-            return "turn in progress for %s" % agent
+    def cited(wt: dict):
+        """Les lots nommés par un worktree (None si un lot enregistré est illisible)."""
         branch = wt.get("branch") or ""
         lots = []
         if _real(wt["path"]) in recorded:
@@ -4136,15 +4149,40 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
             try:
                 lots.append(int(str(recorded[_real(wt["path"])]).lstrip("#")))
             except ValueError:
-                return "recorded lot %r unreadable" % (recorded[_real(wt["path"])],)
+                return None
         lots += cited_lots(branch, agent=branch_agent(branch, names)) \
             + housekeeping_clones.named_lots(os.path.basename(os.path.normpath(wt["path"])),
                                              names)
-        for ident in dict.fromkeys(lots):
-            if ident not in states:
-                states[ident] = _lot_state(db, ident)
-            if states[ident] is not None and states[ident] not in LOT_ENDED:
-                return "lot #%d %s" % (ident, states[ident])
+        return list(dict.fromkeys(lots))
+
+    def lot_state(ident: int) -> str | None:
+        if ident not in states:
+            states[ident] = _lot_state(db, ident)
+        return states[ident]
+
+    def ended_of(wt: dict) -> bool:
+        """#3956 : au moins un lot cité, et TOUS finis — plus rien ne s'y
+        reconstruit, ses sorties régénérables peuvent partir plus tôt."""
+        lots = cited(wt)
+        if not lots:
+            return False
+        for ident in lots:
+            state = lot_state(ident)
+            if state is None or state not in LOT_ENDED:
+                return False
+        return True
+
+    def keep(wt: dict) -> str:
+        agent = owner_of(wt["path"])
+        if agent and agent in running:
+            return "turn in progress for %s" % agent
+        lots = cited(wt)
+        if lots is None:
+            return "recorded lot %r unreadable" % (recorded[_real(wt["path"])],)
+        for ident in lots:
+            state = lot_state(ident)
+            if state is not None and state not in LOT_ENDED:
+                return "lot #%d %s" % (ident, state)
         return ""
 
     def listed(seed: str) -> list[dict]:
@@ -4164,7 +4202,9 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
     return build_artifacts.gently(
         lambda: build_artifacts.run(
             candidates(), rules,
-            idle_s=policy.artifact_idle, protected=list(cwd_of.values()), skip_roots=skip,
+            idle_s=policy.artifact_idle,
+            ended_idle_s=policy.artifact_ended_idle, ended_of=ended_of,
+            protected=list(cwd_of.values()), skip_roots=skip,
             owner_of=owner_of, keep=keep, dry_run=dry_run, now=now,
             allow=policy.unreadable_ok, lock_path=lock_path, journal_path=journal_path,
             budget_s=seconds))
