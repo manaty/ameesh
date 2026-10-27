@@ -105,10 +105,17 @@ class ContentBeforeHeadTest(unittest.TestCase):
             [self.fixture.parent_commit])
 
     def test_unreadable_target_content_keeps_the_unknown(self):
-        with mock.patch.object(review_authors, "_path_line_counts",
+        with mock.patch.object(review_authors, "_path_lines",
                                return_value=None):
             self.assertEqual(self.remaining(),
                              [self.fixture.parent_commit])
+
+    def test_unreadable_hunks_keep_the_unknown(self):
+        with mock.patch.object(review_authors, "_commit_hunks",
+                               return_value=None):
+            self.assertFalse(review_authors._content_before_head(
+                self.repo, self.fixture.target_if_integrated,
+                self.fixture.parent_commit))
 
     def test_survives_rewrite_reads_the_target_content_too(self):
         self.assertFalse(review_authors._survives_rewrite(
@@ -171,6 +178,134 @@ class ContentBeforeHeadTest(unittest.TestCase):
             self.repo, [earlier], target, head=head), [])
         self.assertFalse(review_authors._survives_rewrite(
             self.repo, head, earlier, {}, target, target))
+
+    def test_reordered_calls_with_delivered_marker_keep_the_unknown(self):
+        """#3902 B/P2 : un réordre + un ajout déjà livré n'est pas « déjà là ».
+
+        Les comptes de lignes dépouillées voyaient le marqueur présent et
+        ignoraient l'ordre : le commit perdait son auteur alors que son
+        réordre restait à livrer.
+        """
+        repo = _Repo(os.path.join(self.tmp, "reorder"))
+        repo.write("feature.py",
+                   "def operation():\n"
+                   "    validate_access()\n"
+                   "    perform_action()\n")
+        base = repo.commit("base")
+        repo.write("feature.py",
+                   "def operation():\n"
+                   "    perform_action()\n"
+                   "    validate_access()\n"
+                   "    # parent_marker_is_present\n")
+        earlier = repo.commit("parent reorders and marks", agent="parent")
+        repo.git("checkout", "-q", "-b", "target", base)
+        repo.write("feature.py",
+                   "def operation():\n"
+                   "    validate_access()\n"
+                   "    perform_action()\n"
+                   "    # parent_marker_is_present\n")
+        target = repo.commit("target integrates the marker only", agent="other")
+        repo.git("checkout", "-q", "-b", "head", target)
+        repo.write("feature.py",
+                   "def operation():\n"
+                   "    perform_action()\n"
+                   "    validate_access()\n"
+                   "    # parent_marker_is_present\n")
+        head = repo.commit("head delivers the reorder", agent="impl")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, target, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=head), [earlier])
+        self.assertTrue(review_authors._survives_rewrite(
+            repo.root, head, earlier, {}, target, target))
+
+    def test_reindented_contribution_with_delivered_marker_keeps_the_unknown(self):
+        """#3902 B/P2 : une ligne dépouillée ignore aussi l'indentation."""
+        repo = _Repo(os.path.join(self.tmp, "reindent"))
+        repo.write("feature.py",
+                   "def operation():\n"
+                   "    perform_action()\n")
+        base = repo.commit("base")
+        repo.write("feature.py",
+                   "def operation():\n"
+                   "    with lock:\n"
+                   "            perform_action()\n"
+                   "    # parent_marker_is_present\n")
+        earlier = repo.commit("parent indents and marks", agent="parent")
+        repo.git("checkout", "-q", "-b", "target", base)
+        repo.write("feature.py",
+                   "def operation():\n"
+                   "    with lock:\n"
+                   "        perform_action()\n"
+                   "    # parent_marker_is_present\n")
+        target = repo.commit("target integrates the marker only", agent="other")
+        repo.git("checkout", "-q", "-b", "head", target)
+        repo.write("feature.py",
+                   "def operation():\n"
+                   "    with lock:\n"
+                   "            perform_action()\n"
+                   "    # parent_marker_is_present\n")
+        head = repo.commit("head delivers the indent", agent="impl")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, target, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=head), [earlier])
+
+    def test_deletion_is_proven_only_when_applied(self):
+        """La suppression d'une ligne n'est prouvée que dans son contexte."""
+        repo = _Repo(os.path.join(self.tmp, "deletion"))
+        repo.write("feature.py",
+                   "keep_line()\n"
+                   "remove_me()\n"
+                   "end_line()\n")
+        base = repo.commit("base")
+        repo.write("feature.py",
+                   "keep_line()\n"
+                   "end_line()\n")
+        earlier = repo.commit("parent removes a line", agent="parent")
+        # cible où le retrait n'est pas appliqué (seul un marqueur arrive)
+        repo.git("checkout", "-q", "-b", "kept", base)
+        repo.write("feature.py",
+                   "keep_line()\n"
+                   "remove_me()\n"
+                   "end_line()\n"
+                   "# target_marker\n")
+        kept = repo.commit("target keeps the line", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, kept, earlier))
+        # cible où le retrait est appliqué
+        repo.git("checkout", "-q", "-b", "removed", base)
+        repo.git("cherry-pick", earlier)
+        repo.write("anchor.txt", "target advanced\n")
+        removed = repo.commit("target applies the deletion", agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, removed, earlier))
+
+    def test_delivered_reorder_is_proven(self):
+        """La preuve stricte accepte un réordre réellement livré."""
+        repo = _Repo(os.path.join(self.tmp, "reorder-delivered"))
+        repo.write("feature.py",
+                   "def operation():\n"
+                   "    validate_access()\n"
+                   "    perform_action()\n")
+        base = repo.commit("base")
+        repo.write("feature.py",
+                   "def operation():\n"
+                   "    perform_action()\n"
+                   "    validate_access()\n"
+                   "    # parent_marker_is_present\n")
+        earlier = repo.commit("parent reorders", agent="parent")
+        repo.git("checkout", "-q", "-b", "target", base)
+        repo.git("cherry-pick", earlier)
+        repo.write("anchor.txt", "target advanced\n")
+        target = repo.commit("target integrates the reorder", agent="other")
+        repo.git("checkout", "-q", "-b", "head", target)
+        repo.write("other.py", "unrelated();\n")
+        head = repo.commit("head evolves elsewhere", agent="impl")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, target, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=head), [])
 
 
 class RewrittenParentDesignationTest(PgTestCase):

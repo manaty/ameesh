@@ -1185,6 +1185,94 @@ def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
     return None
 
 
+def _diff_path(raw: str) -> Optional[str]:
+    """Le chemin d'un en-tête `---`/`+++`, ou None pour `/dev/null`."""
+    value = str(raw or "").strip()
+    if value == "/dev/null":
+        return None
+    if value[:2] in ("a/", "b/"):
+        return value[2:]
+    return value or None
+
+
+def _commit_hunks(repo: str, sha: str):
+    """`{chemin: [hunk]}` du patch complet, ordre et indentation compris.
+
+    Chaque hunk porte `new` (contexte + lignes ajoutées, image postérieure),
+    `old` (contexte + lignes retirées) et `changed` (lignes ajoutées/retirées
+    seules). Un diff binaire ou une lecture impossible rend None : l'appelant
+    garde le doute. Le contexte est celui de `--unified=1` : une évolution
+    voisine de la cible empêche la preuve au lieu de la contourner. Les
+    renommages sont lus comme suppression + création (`--no-renames`).
+    """
+    text = _raw_out(repo, "show", "--format=", "--unified=1", "--no-renames",
+                    sha)
+    if text is None:
+        return None
+    hunks: dict = {}
+    path = ""
+    old_path = ""
+    current = None
+    in_hunk = False
+    for line in text.split("\n"):
+        if line.startswith("diff --git "):
+            path, old_path, current, in_hunk = "", "", None, False
+            continue
+        if line.startswith(("Binary files ", "GIT binary patch")):
+            return None
+        if not in_hunk and line.startswith("--- "):
+            old_path = _diff_path(line[4:]) or ""
+            continue
+        if not in_hunk and line.startswith("+++ "):
+            path = _diff_path(line[4:]) or old_path
+            continue
+        if line.startswith("@@"):
+            if not path:
+                return None
+            current = {"new": [], "old": [], "changed": []}
+            hunks.setdefault(path, []).append(current)
+            in_hunk = True
+            continue
+        if current is None:
+            continue
+        if line.startswith("+"):
+            current["new"].append(line[1:])
+            current["changed"].append(line[1:])
+        elif line.startswith("-"):
+            current["old"].append(line[1:])
+            current["changed"].append(line[1:])
+        elif line.startswith(" "):
+            current["new"].append(line[1:])
+            current["old"].append(line[1:])
+    return hunks
+
+
+def _path_lines(repo: str, rev: str, path: str, cache: dict):
+    """Les lignes exactes de `path` dans `rev`, ou None si absentes/illisibles."""
+    key = ("path-lines", str(rev), str(path))
+    if key not in cache:
+        text = _raw_out(repo, "show", "%s:%s" % (rev, path))
+        if text is None:
+            cache[key] = None
+        else:
+            lines = text.split("\n")
+            if lines and lines[-1] == "":
+                lines.pop()
+            cache[key] = lines
+    return cache[key]
+
+
+def _find_block(lines: Sequence[str], block: Sequence[str], start: int) -> int:
+    """Index du bloc exact `block` dans `lines` à partir de `start`, sinon -1."""
+    if not block:
+        return start
+    limit = len(lines) - len(block)
+    for index in range(max(0, start), limit + 1):
+        if list(lines[index:index + len(block)]) == list(block):
+            return index
+    return -1
+
+
 def _content_before_head(repo: str, before: str, sha: str,
                          cache: Optional[dict] = None) -> bool:
     """Preuve positive que le patch de `sha` est déjà dans `before` (#3902).
@@ -1198,60 +1286,47 @@ def _content_before_head(repo: str, before: str, sha: str,
     La preuve est volontairement stricte et **positive** :
 
     * diff lisible et non binaire, avec au moins une ligne significative ;
-    * à chaque chemin, les occurrences ajoutées par le commit sont présentes
-      dans `before` au même chemin (compte au moins égal au post-image) ;
-    * les occurrences retirées y sont absentes (compte au plus égal au
-      post-image) ;
-    * un chemin créé ou supprimé se prouve par sa présence ou son absence.
+    * par chemin, chaque hunk est prouvé **entier** : son image postérieure
+      (contexte `--unified=1` + lignes ajoutées), ordre et indentation
+      compris, apparaît telle quelle dans `before` ; les hunks se suivent dans
+      l'ordre du commit ;
+    * une suppression totale de chemin se prouve par l'absence du chemin ;
+    * un réordre ou une réindentation change l'image : il n'est pas prouvé
+      par le seul compte de lignes.
 
-    Toute lecture impossible, tout déplacement de chemin, tout retrait
-    réapparu dans la cible est un doute : le commit reste (le doute ne retire
-    jamais un auteur). Un commit sans ligne significative (binaire, vide)
-    n'est jamais prouvé : il reste aussi.
+    Toute lecture impossible, tout hunk non prouvé, tout déplacement de
+    chemin est un doute : le commit reste (le doute ne retire jamais un
+    auteur). Un commit sans ligne significative (binaire, vide, blanc) n'est
+    jamais prouvé : il reste aussi.
     """
     cache = {} if cache is None else cache
     try:
-        parsed = _commit_lines(repo, sha)
+        hunks = _commit_hunks(repo, sha)
     except Exception:  # noqa: BLE001 - lecture impossible : doute
         return False
-    if parsed is None:
-        return False
-    adds, removes, binary = parsed
-    if binary:
-        return False
-    paths = sorted(set(adds) | set(removes))
-    if not paths:
+    if not hunks:
         return False
     meaningful = False
-    for path in paths:
-        parent = _path_line_counts(repo, str(sha) + "^", path, cache)
-        if parent is None:
-            if _path_absent(repo, str(sha) + "^", path, cache) is not True:
-                return False
-            parent = {}
-        after = _path_line_counts(repo, sha, path, cache)
-        if after is None:
-            if _path_absent(repo, sha, path, cache) is not True:
-                return False
-            after = {}
-        here = _path_line_counts(repo, before, path, cache)
+    for path, path_hunks in sorted(hunks.items()):
+        here = _path_lines(repo, before, path, cache)
         if here is None:
             if _path_absent(repo, before, path, cache) is not True:
                 return False
-            here = {}
-        for row in set(parent) | set(after):
-            if not _meaningful_line(row):
+            here = []
+        position = 0
+        for hunk in path_hunks:
+            changed = [row for row in hunk["changed"] if row.strip()]
+            if any(_meaningful_line(row) for row in changed):
+                meaningful = True
+            block = hunk["new"]
+            if not block:
+                if _path_absent(repo, before, path, cache) is not True:
+                    return False
                 continue
-            was, now = parent.get(row, 0), after.get(row, 0)
-            there = here.get(row, 0)
-            if now > was:
-                meaningful = True
-                if there < now:
-                    return False        # l'ajout n'est pas (encore) dans la cible
-            if now < was:
-                meaningful = True
-                if there > now:
-                    return False        # le retrait n'est pas appliqué
+            index = _find_block(here, block, position)
+            if index < 0:
+                return False
+            position = index + len(block)
     return meaningful
 
 
