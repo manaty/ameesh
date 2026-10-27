@@ -66,8 +66,11 @@ NON_LIVE_STATUS = frozenset(("stopped", "dead"))
 #: legacy `paused` state. An operator pause is a **column**, read by
 #: `is_available` (#3415), not a status: the row keeps `idle`.
 UNAVAILABLE_STATUS = NON_LIVE_STATUS | frozenset(("paused",))
-#: the `status_text` prefixes of an operations or budget pause
-PAUSE_PREFIXES = ("paused", "budget : ")
+#: the `status_text` prefixes of an operations or budget pause, and (#3973)
+#: of an account configuration block (`accounts.CONFIG_BLOCK_PREFIX`, #3969):
+#: an agent with no valid account on its host takes no turn until the host is
+#: fixed, so a request deposited there would hold the seat
+PAUSE_PREFIXES = ("paused", "budget : ", "accounts : ")
 #: a commit SHA (full or abbreviated): a branch name is not a freeze
 _SHA = re.compile(r"[0-9a-f]{7,64}")
 
@@ -242,7 +245,8 @@ def is_available(row: Mapping, *, closed_hosts: Iterable[str] = ()) -> bool:
     reaped lease writes `dead`), an `external` session (never run by the
     executor, L46), an operations or budget pause (`status_text` "paused…" or
     "budget : …", except the short-window pause of the account, #3876), an
-    operator pause (`operator_paused`, a column: the row keeps
+    account configuration block (#3973: "accounts : …", no valid account on
+    the host, #3969), an operator pause (`operator_paused`, a column: the row keeps
     `status` `idle` and its text "last turn: …", so the status and the prefixes
     never see it), and — #3328 — an agent whose host is `draining`/`lost`
     (claims closed): the request deposited there is not read until the host

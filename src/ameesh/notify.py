@@ -205,6 +205,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable",
                  # L242b : un agent critique est en pause budget
                  "critical_budget_pause",
+                 # #3969 : un compte déclaré invalide tient un agent sans tour
+                 "account_config_invalid",
                  # #1268 : un agent critique enchaîne les échecs de tour réels
                  "critical_turn_failures",
                  # L242c : canon illisible, rôles critiques tenus
@@ -346,6 +348,7 @@ TYPE_LABELS = {
     "owner_key_registered": "owner key registered",
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",
+    "account_config_invalid": "no valid harness account on the host",
     # #1268 : deux échecs de tour réels d'affilée sur un agent critique
     "critical_turn_failures": "critical agent failing turns",
     # #2729 : plus aucun tour n'aboutit — la préemption prioritaire se répète ;
@@ -369,6 +372,8 @@ URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_ex
                 # #3536 : « jamais de dépassement » — l'owner le sait tout de suite
                 "account_overage",
                 "credential_failing", "critical_budget_pause", "critical_turn_failures",
+                # #3969 : aucun tour tant que l'hôte n'est pas réparé
+                "account_config_invalid",
                 "owner_key_registered",
                 "land_uncertain", "db_connections_high", "pgbouncer_pool_waiting",
                 "host_network_overlap")

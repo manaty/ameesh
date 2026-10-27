@@ -4219,18 +4219,30 @@ class AgentWorker(threading.Thread):
             # migration) : la pause se lit `blocked` + raison dans `status_text`.
             # L242b (5) : la pause d'un agent critique est marquée — alerte
             # urgente `critical_budget_pause`
-            marque = budget_mod.CRITICAL_MARK if account_turn.is_critical(self) else ""
+            # #3969 : un compte invalide est une configuration de l'hôte, pas
+            # un budget — bloqué sous `CONFIG_BLOCK_PREFIX` (alerte
+            # `account_config_invalid`), sans échéance de pause
+            config = raison.startswith(accounts_mod.NO_VALID_PREFIX)
+            marque = budget_mod.CRITICAL_MARK if account_turn.is_critical(self) \
+                and not config else ""
             registry.set_status(self.db, self.name, "blocked",
-                                status_text="%s%s%s" % (budget_mod.PAUSE_PREFIX, marque,
-                                                        raison))
+                                status_text="%s%s%s" % (
+                                    accounts_mod.CONFIG_BLOCK_PREFIX if config
+                                    else budget_mod.PAUSE_PREFIX, marque, raison))
             # #2934 : une note par nature de pause (compte, fenêtre, échéance),
             # pas à chaque variation du pourcentage, qui reste dans `status_text`.
             nature = accounts_mod.pause_nature(raison)
             if nature != self._budget_nature:
                 self._budget_nature = nature
-                self._fil_note("Budget pause: %s. No turn until the gauge goes back "
-                               "down." % raison,
-                               meta={"action": "budget", "raison": raison})
+                if config:
+                    self._fil_note("Account configuration error: %s. No turn until "
+                                   "the host configuration is fixed (ameesh doctor)."
+                                   % raison,
+                                   meta={"action": "account_config", "raison": raison})
+                else:
+                    self._fil_note("Budget pause: %s. No turn until the gauge goes "
+                                   "back down." % raison,
+                                   meta={"action": "budget", "raison": raison})
             self._budget_reason = raison
         return False
 
@@ -4241,13 +4253,14 @@ class AgentWorker(threading.Thread):
         jusqu'à son prochain tour, même la jauge redescendue."""
         agent = self.agent or {}
         texte = agent.get("status_text") or ""
-        if agent.get("status") != "blocked" or not texte.startswith("budget : "):
+        if agent.get("status") != "blocked" or not texte.startswith(
+                ("budget : ", accounts_mod.CONFIG_BLOCK_PREFIX)):
             return
         issue = registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
                                             self.epoch, texte, "")
         if issue == "done":
             self.agent = dict(agent, status="idle", status_text="")
-            log_async("[%s] budget pause lifted (%s)" % (self.name, texte))
+            log_async("[%s] pause lifted (%s)" % (self.name, texte))
 
     def turn_harness(self) -> str:
         """L242b (3) : le harnais de ce tour (`account_turn._harness`) — le
