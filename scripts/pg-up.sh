@@ -214,14 +214,37 @@ else
   # d'un tour (posée par le shim docker depuis AMEESH_CONTAINER_LABELS) en
   # ferait la ressource d'un tour et d'un lot, gardée jusqu'à la fin du lot
   # (L73) puis récoltée à tort. `env -u` : le shim ne voit plus l'étiquette.
-  env -u AMEESH_CONTAINER_LABELS docker run -d --name "$NAME" \
+  #
+  # #3833 : sans `--init`, le postmaster est PID 1 du conteneur et recueille
+  # tout orphelin. Le healthcheck est un `sh -c` : sous un verrou de catalogue
+  # (VACUUM FULL, DROP DATABASE) `pg_isready` ne répond pas en 3 s, Docker tue
+  # le shell et laisse `pg_isready` orphelin, qui sort 2 (PQPING_NO_RESPONSE).
+  # Le postmaster prend cette sortie 2 pour un backend mort (« server process
+  # (PID n) exited with exit code 2 ») et redémarre le banc. `--init` installe
+  # docker-init en PID 1, qui recueille l'orphelin ; `exec` retire le shell du
+  # healthcheck (plus d'enfant à laisser). Un conteneur créé avant ce garde
+  # n'en bénéficie qu'après recréation (voir l'avertissement ci-dessous).
+  env -u AMEESH_CONTAINER_LABELS docker run -d --init --name "$NAME" \
     -e POSTGRES_USER="$USER" -e POSTGRES_PASSWORD="$PASSWORD" -e POSTGRES_DB="$DB" \
     -p "127.0.0.1:$PORT:5432" \
     -v "$VOLUME":/var/lib/postgresql/data \
-    --health-cmd "pg_isready -U $USER -d $DB" \
+    --health-cmd "exec pg_isready -U $USER -d $DB" \
     --health-interval 2s --health-timeout 3s --health-retries 30 \
     "$IMAGE" "${AUTOVACUUM_OPTS[@]}" >/dev/null
   STARTED=1
+fi
+
+# #3833 : le correctif de création ne vaut que pour un conteneur neuf. Un banc
+# existant créé sans `--init` reste exposé au redémarrage par un orphelin du
+# healthcheck ; on le dit à chaque passage, avec le geste de recréation (le
+# volume et son contenu ne sont pas touchés par `docker rm`).
+banc_init=$(docker inspect -f '{{if .HostConfig.Init}}true{{else}}false{{end}}' \
+  "$NAME" 2>/dev/null || true)
+if [ "$banc_init" != "true" ]; then
+  echo "banc : $NAME créé sans --init — un orphelin du healthcheck qui sort 2" \
+       "est reçu par le postmaster comme un backend mort et redémarre le banc" \
+       "(#3833) ; à recréer au calme : docker stop $NAME && docker rm $NAME," \
+       "puis scripts/pg-up.sh" >&2
 fi
 
 for _ in $(seq 1 60); do
