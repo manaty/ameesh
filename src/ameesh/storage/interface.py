@@ -273,7 +273,9 @@ class Agents(Domain):
     def operator_pause(self, name: str, *, paused: bool, reason: str,
                        actor: str, principal: str,
                        expect_reason: str | None = None,
-                       not_after: float | None = None) -> dict | None:
+                       not_after: float | None = None,
+                       until: float | None = None,
+                       indefinite: bool = False) -> dict | None:
         """Native human hold: row lock, state and audit in one atomic statement.
 
         No status/prompt/lease changes; repeated state has no new event.
@@ -289,7 +291,18 @@ class Agents(Domain):
         base la compare à son horloge sous le verrou de ligne et refuse la
         pose au-delà (`changed=false`, `refusal='not_after'`). Une pose
         distante retardée ne peut donc pas committer après le nettoyage.
+
+        `until` (#3961) : échéance (epoch) de la pause posée, levée ensuite
+        par `operator_pause_expire` ; une échéance déjà passée est refusée
+        (`refusal='until_past'`). `indefinite` : pose sans échéance, choix
+        explicite (sans lui, une pose exige `until`).
         """
+
+    @abc.abstractmethod
+    def operator_pause_expire(self, name: str | None = None) -> list[dict]:
+        """#3961 : lève les pauses opérateur échues (toutes, ou celle de
+        `name`), une fois chacune, avec un événement d'audit au nom de
+        l'humain qui les avait posées ; rend les pauses levées."""
 
     @abc.abstractmethod
     def retire(self, name: str, *, actor: str, reason: str) -> dict | None:

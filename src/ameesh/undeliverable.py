@@ -421,8 +421,10 @@ def wake_note(cfg, db, name: str, row: dict) -> list[str]:
     if row.get("operator_paused"):
         # #2200 : la pause humaine a sa propre sortie ; « prochain canon sync »
         # serait faux et ferait attendre un réveil qui n'arrivera pas seul.
+        # #3961 : `why` porte l'échéance ; la pause se lève seule à l'échéance
         return ["%s is under operator pause (%s): the message is stored, and no turn "
-                "opens until a human lifts the pause (ameesh resume %s --operator "
+                "opens until the pause ends at its deadline or a human lifts it "
+                "(ameesh resume %s --operator "
                 "--reason <reason>); if the request cannot wait, address another agent"
                 % (name, why, name)]
     return ["%s is not wakeable right now (%s): the message is stored, but no turn "

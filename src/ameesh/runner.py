@@ -9530,6 +9530,45 @@ class Runner:
             host_gate_mod.SlotPool.release(self._gate_slots.pop(name, None))
 
     # -- réclamation -------------------------------------------------------
+    def expire_operator_pauses_once(self) -> list[dict]:
+        """#3961 (issue #3014) : les pauses opérateur échues, à chaque passe.
+
+        Comme les délégations : tout exécuteur natif vivant lève toutes les
+        échéances (la pause d'un agent sans bail n'a pas de worker pour la
+        relire) ; deux exécuteurs ne lèvent jamais deux fois (verrou de ligne,
+        SKIP LOCKED). La levée a son événement d'audit (`operator_pause_events`)
+        et une note dans le fil du projet de l'agent ; le déclencheur de 0441
+        réveille l'exécuteur qui le tient. Une erreur de base est journalisée
+        une fois, jamais fatale à la passe."""
+        from . import agent_pause
+
+        if getattr(self, "mediated", False) or self.dry_run:
+            return []
+        try:
+            done = agent_pause.expire(self.db)
+        except db_mod.DbError as exc:
+            message = "expired operator pauses not processed (%s)" % exc
+            if message != getattr(self, "_operator_pause_error", None):
+                log_async(message)
+            self._operator_pause_error = message
+            return []
+        self._operator_pause_error = None
+        for row in done:
+            text = ("Operator pause lifted at its deadline (%s, set by %s): %s"
+                    % (agent_pause.until_label(row["until_ts"]), row.get("by_human") or "?",
+                       row.get("reason") or "?"))
+            log_async("[%s] %s" % (row["agent"], text))
+            try:
+                agent = registry.get(self.db, row["agent"]) or {}
+                fil.record(self.cfg, self.db, sender=row["agent"], recipients=[], text=text,
+                           ts=time.time(),
+                           project=fil.project_for(self.cfg, agent.get("chantier") or ""),
+                           meta={"action": "operator_pause_expired", "audit": "runner",
+                                 "event_id": row.get("event_id")})
+            except Exception as exc:  # une trace ne casse jamais la passe
+                log_async("[%s] thread unavailable: %s" % (row["agent"], exc))
+        return done
+
     def expire_delegations_once(self) -> list[dict]:
         """L40 (0030, point 5) : les délégations échues, à chaque passe.
 
@@ -9828,6 +9867,7 @@ class Runner:
         self.report_liveness()
         self.role_evaluation_once()  # L165 (EP2) : score des candidats de l'hôte
         self.expire_delegations_once()
+        self.expire_operator_pauses_once()  # #3961 : avant toute garde de passe
         self.lift_device_gates_once()
         for row in registry.reap(self.db, self.host):
             log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))

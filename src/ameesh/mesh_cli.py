@@ -67,6 +67,7 @@ import sys
 import time
 
 from . import accounts as accounts_mod
+from . import agent_pause
 from . import account_window
 from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
@@ -1219,6 +1220,11 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
             print("paused   : operator pause since %s by %s — %s" % (
                 _fmt_moment(pause.get("since_ts")), who,
                 pause.get("reason") or "(no reason given)"))
+            if pause.get("until_ts"):
+                print("           deadline %s: the runner lifts it then (#3961)"
+                      % agent_pause.until_label(pause["until_ts"]))
+            else:
+                print("           no deadline (--indefinite)")
             if pause.get("after_turn"):
                 print("           this turn finishes, then no new turn starts")
             else:

@@ -64,6 +64,7 @@ AGENT_COLUMNS = """
     session_harness, session_cwd, session_origin,
     operator_paused, operator_pause_reason, operator_pause_by, operator_pause_for,
     extract(epoch from operator_pause_at)::float8 as operator_pause_ts,
+    extract(epoch from operator_pause_until)::float8 as operator_pause_until_ts,
     -- #3460 (0484) : retrait d'un agent (`ameesh agent retire`)
     retired_by, retired_reason,
     extract(epoch from retired_at)::float8 as retired_ts
@@ -310,7 +311,8 @@ def name_lock_key(name: str) -> str:
 class Agents(interface.Agents):
 
     def operator_pause(self, name, *, paused, reason, actor, principal,
-                       expect_reason=None, not_after=None) -> dict | None:
+                       expect_reason=None, not_after=None, until=None,
+                       indefinite=False) -> dict | None:
         # #2152 : reprise conditionnelle (une seule instruction SQL, verrou de
         # ligne) ; `expect_reason` n'a de sens que pour LEVER une pause.
         if expect_reason is not None:
@@ -319,6 +321,16 @@ class Agents(interface.Agents):
             rows = self.db.query(
                 "SELECT * FROM ameesh_operator_resume_if(%s, %s, %s, %s, %s)",
                 (name, reason, actor, principal, expect_reason))
+            return rows[0] if rows else None
+        if paused and (until is not None or indefinite):
+            # #3961 : pose avec échéance (ou sans fin, choix explicite) ; la
+            # barrière `not_after` (#2184/R3) passe par la même instruction.
+            if until is not None and indefinite:
+                raise ValueError("until and indefinite are exclusive")
+            rows = self.db.query(
+                "SELECT * FROM ameesh_operator_pause_until("
+                "%s, %s, %s, %s, to_timestamp(%s), to_timestamp(%s))",
+                (name, reason, actor, principal, until, not_after))
             return rows[0] if rows else None
         if not_after is not None:
             if not paused:
@@ -334,6 +346,9 @@ class Agents(interface.Agents):
             "SELECT * FROM ameesh_operator_pause(%s, %s, %s, %s, %s)",
             (name, paused, reason, actor, principal))
         return rows[0] if rows else None
+
+    def operator_pause_expire(self, name=None) -> list[dict]:
+        return self.db.query("SELECT * FROM ameesh_operator_pause_expire(%s)", (name,))
 
     def retire(self, name, *, actor, reason) -> dict | None:
         with self.db.transaction() as tx:
@@ -550,7 +565,7 @@ class Agents(interface.Agents):
                    (SELECT r.runner_seen_owner FROM agent_registry r
                      WHERE r.name = o.name) AS runner_seen_owner,
                    p.operator_paused, p.operator_pause_reason, p.operator_pause_by,
-                   p.operator_pause_for, p.operator_pause_ts,
+                   p.operator_pause_for, p.operator_pause_ts, p.operator_pause_until_ts,
                    __GOVERNED__ AS canon_governed,
                    (SELECT s.status FROM canon_state s WHERE s.host = o.host
                        AND s.canon = coalesce(o.canon, '')) AS canon_status,
@@ -575,7 +590,9 @@ class Agents(interface.Agents):
             LEFT JOIN LATERAL (
                 SELECT operator_paused, operator_pause_reason, operator_pause_by,
                        operator_pause_for,
-                       extract(epoch from operator_pause_at)::float8 AS operator_pause_ts
+                       extract(epoch from operator_pause_at)::float8 AS operator_pause_ts,
+                       extract(epoch from operator_pause_until)::float8
+                           AS operator_pause_until_ts
                   FROM agent_registry WHERE name = o.name
             ) p ON true
             ORDER BY last_seen_ts DESC NULLS LAST
@@ -776,6 +793,8 @@ class Agents(interface.Agents):
                    extract(epoch from r.retired_at)::float8 AS retired_ts,
                    -- #2200 : la pause opérateur fait partie de la disponibilité
                    r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
+                   extract(epoch from r.operator_pause_until)::float8
+                       AS operator_pause_until_ts,
                    (NOT r.ephemeral OR r.ephemeral_expires_at > now()) AS alive,
                    __GOVERNED__ AS canon_governed,
                    __CLAIM_OK__ AS canon_claim_ok,
