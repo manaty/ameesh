@@ -1283,6 +1283,14 @@ def _find_block(lines: Sequence[str], block: Sequence[str], start: int) -> int:
     return -1
 
 
+def _count_block(lines: Sequence[str], block: Sequence[str]) -> int:
+    """Nombre d'occurrences exactes de `block` dans `lines`."""
+    if not block or len(block) > len(lines):
+        return 0
+    return sum(1 for index in range(len(lines) - len(block) + 1)
+               if list(lines[index:index + len(block)]) == list(block))
+
+
 def _content_before_head(repo: str, before: str, sha: str,
                          cache: Optional[dict] = None) -> bool:
     """Preuve positive que le patch de `sha` est déjà dans `before` (#3902).
@@ -1303,6 +1311,10 @@ def _content_before_head(repo: str, before: str, sha: str,
     * au même endroit, l'image antérieure du hunk (contexte + lignes
       retirées) ne doit pas être encore là : une suppression restée en place
       n'est pas une livraison, même quand le contexte seul y ressemble ;
+    * une image antérieure qui apparaît plus souvent dans `before` que dans
+      la post-image du commit (où elle peut légitimement subsister ailleurs)
+      est un doute : le bloc postérieur trouvé peut n'être qu'une occurrence
+      identique dans une autre fonction (#3902 B/P2, témoin cx2) ;
     * une suppression totale de chemin se prouve par l'absence du chemin ;
     * un réordre ou une réindentation change l'image : il n'est pas prouvé
       par le seul compte de lignes.
@@ -1326,6 +1338,11 @@ def _content_before_head(repo: str, before: str, sha: str,
             if _path_absent(repo, before, path, cache) is not True:
                 return False
             here = []
+        after = _path_lines(repo, sha, path, cache)
+        if after is None:
+            if _path_absent(repo, sha, path, cache) is not True:
+                return False
+            after = []
         position = 0
         for hunk in path_hunks:
             changed = [row for row in hunk["changed"] if row.strip()]
@@ -1347,6 +1364,14 @@ def _content_before_head(repo: str, before: str, sha: str,
             old = hunk["old"]
             end = len(old) - hunk["trail"] if hunk["trail"] else len(old)
             old_core = old[hunk["lead"]:end]
+            # Une occurrence de l'image antérieure au-delà de ce que la
+            # post-image du commit en garde ailleurs (une autre fonction au
+            # contexte identique, par exemple) est un doute : le bloc
+            # postérieur trouvé peut n'être qu'une occurrence décalée.
+            watch = old_core if old_core else old
+            if (watch
+                    and _count_block(here, watch) > _count_block(after, watch)):
+                return False
             if old_core:
                 if len(block) == hunk["lead"] + hunk["trail"]:
                     # suppression pure : le bloc postérieur n'est que du

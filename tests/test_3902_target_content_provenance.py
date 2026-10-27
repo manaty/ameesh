@@ -330,6 +330,79 @@ class ContentBeforeHeadTest(unittest.TestCase):
         self.assertTrue(review_authors._content_before_head(
             repo.root, delivered, earlier))
 
+    def test_duplicate_context_elsewhere_does_not_prove_a_removal(self):
+        """#3902 B/P2 (cx2) : le bloc postérieur d'une suppression peut
+        exister tel quel dans une autre fonction ; la preuve ne vaut que si
+        l'image antérieure n'y est pas plus présente que dans la post-image."""
+        repo = _Repo(os.path.join(self.tmp, "duplicate-context"))
+        repo.write("feature.py",
+                   "def protected():\n"
+                   "    keep_line()\n"
+                   "    remove_me()\n"
+                   "    end_line()\n"
+                   "\n"
+                   "def other():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n")
+        base = repo.commit("base")
+        repo.write("feature.py",
+                   "def protected():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n"
+                   "\n"
+                   "def other():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n")
+        earlier = repo.commit("parent removes the protected line",
+                              agent="parent")
+        # cible : base inchangée, marqueur en fin de fichier
+        repo.git("checkout", "-q", "-b", "duplicate-target", base)
+        repo.write("feature.py",
+                   "def protected():\n"
+                   "    keep_line()\n"
+                   "    remove_me()\n"
+                   "    end_line()\n"
+                   "\n"
+                   "def other():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n"
+                   "# target_marker\n")
+        target = repo.commit("target keeps the removal undone", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, target, earlier))
+        # tête : la cible + la suppression, donc la contribution reste à livrer
+        repo.git("checkout", "-q", "-b", "duplicate-head", target)
+        repo.write("feature.py",
+                   "def protected():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n"
+                   "\n"
+                   "def other():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n"
+                   "# target_marker\n")
+        head = repo.commit("head delivers the removal", agent="impl")
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=head), [earlier])
+        self.assertTrue(review_authors._survives_rewrite(
+            repo.root, head, earlier, {}, target, target))
+        # cible où la suppression est réellement appliquée : preuve positive
+        repo.git("checkout", "-q", "-b", "duplicate-delivered", base)
+        repo.write("feature.py",
+                   "def protected():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n"
+                   "\n"
+                   "def other():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n"
+                   "# target_marker\n")
+        delivered = repo.commit("target applies the removal", agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], delivered, head=head), [])
+
     def test_delivered_reorder_is_proven(self):
         """La preuve stricte accepte un réordre réellement livré."""
         repo = _Repo(os.path.join(self.tmp, "reorder-delivered"))
