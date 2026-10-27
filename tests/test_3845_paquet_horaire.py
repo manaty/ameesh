@@ -223,6 +223,39 @@ class FollowTest(Base):
         # la recomposition est republiée : ci-full sur la nouvelle tête
         self.assertTrue(self.shell.ran("ci", "run", "4000", "--full"))
 
+    def test_lot_retire_repasse_en_build_avec_sa_trace(self):
+        # #4028 : le lot retiré porte sa trace (paquet, porteur, run, tests) et
+        # repasse en build : correctif dû par l'assigné jusqu'au regel.
+        self.open_carrier()
+        self.shell.items[3801] = {"id": 3801, "assignee": "mty-amh-impl-02"}
+        self.shell.ci[4000] = {"runs": [red_run()]}
+        ph.tick(self.ctx)
+        move = self.shell.ran("work", "move", "3801", "build")
+        self.assertEqual(len(move), 1)
+        trace = move[0][move[0].index("--note") + 1]
+        self.assertTrue(trace.startswith(ph.MARK_EXCLUDED + "h-20261027-04 porteur=#4000 "
+                                         "run=77 tests=tests.test_x.T.test_a"))
+        self.assertEqual(move[0][move[0].index("--actor") + 1], "mesh-design")
+        self.assertEqual(self.shell.ran("work", "move", "3807"), [])
+
+    def test_transition_refusee_laisse_la_trace_en_note(self):
+        self.open_carrier()
+        self.shell.items[3801] = {"id": 3801, "assignee": "mty-amh-impl-02"}
+        self.shell.ci[4000] = {"runs": [red_run()]}
+        run = self.shell.run
+
+        def refuse(cmd, **kw):
+            if cmd[:3] == ["ameesh", "work", "move"]:
+                self.shell.calls.append(list(cmd))
+                return ph.Result(1, "qa → build loop exhausted (3)")
+            return run(cmd, **kw)
+        self.shell.run = refuse
+        ph.tick(self.ctx)
+        self.assertTrue(any(n.startswith(ph.MARK_EXCLUDED + "h-20261027-04 porteur=#4000")
+                            for n in ph.marks(self.shell.items[3801])))
+        # la recomposition n'est pas retenue par le refus
+        self.assertTrue([c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)])
+
     def test_rouge_apres_recomposition_ne_retire_plus(self):
         item = self.open_carrier()
         item["events"].append({"note": ph.MARK_ATTEMPT + "recomposition n=1 base=%s "
