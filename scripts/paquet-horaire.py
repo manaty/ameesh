@@ -813,6 +813,21 @@ def tick(ctx: Context) -> str:
     return compose(ctx, recent_lots(ctx))
 
 
+def pose_git_identity(pilot: str) -> dict:
+    """#3916 : la minuterie compose sous l'identité de son rôle pilote.
+
+    `ameesh role run` ne pose aucune identité git et le clone de la minuterie
+    n'a pas de `user.*` (à juste titre) : `git merge` échouait « Committer
+    identity unknown ». Comme le runner (#834), l'identité passe par
+    l'**environnement** (auteur et committer), hérité par paquet-auto et ses
+    `git`, jamais par `git config`.
+    """
+    from ameesh import identity
+    env = identity.git_identity(pilot)
+    os.environ.update(env)
+    return env
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Paquet horaire déclenché par minuterie, sans agent (#3845).")
@@ -835,6 +850,7 @@ def main(argv: list[str] | None = None) -> int:
         print("paquet-horaire : --repo %s n'est pas un clone" % repo, file=sys.stderr)
         return 2
     actor = args.actor or os.environ.get("AMEESH_ROLE") or args.pilot
+    pose_git_identity(args.pilot)
     try:
         from ameesh import config as config_mod, mechanics
         zone = ZoneInfo(mechanics.configured(config_mod.load()).timezone)
