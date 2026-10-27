@@ -18,6 +18,8 @@
 # admise par le pas ci-dessous. La porte de fusion de `main` exige `tests`
 # seul (protection de branche relue le 18/10/2026) : `ui` n'est pas un check
 # requis et son retrait ne laisse aucune validation requise sans porteur.
+# #4036 : la fraîcheur des types clients est aussi contrôlée dans le job
+# plan de tests.yml, porté par l'agrégat requis `tests`, sans build UI.
 name: ui
 
 on:
