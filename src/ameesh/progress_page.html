@@ -365,6 +365,8 @@ p.summary { font-size: .86rem; margin: 6px 0; }
     var t = pad(d.getHours()) + ":" + pad(d.getMinutes());
     return d.toDateString() === now.toDateString() ? t : pad(d.getDate()) + "/" + pad(d.getMonth() + 1) + " " + t;
   }
+  //: §16 (#3889) : délais avant un nouvel essai après une panne (ms)
+  var RETRY_MS = [2000, 5000, 15000, 30000, 60000];
   function dur(s) {
     if (s === null || s === undefined) return "?";
     s = Math.max(0, Math.floor(s));
@@ -447,35 +449,57 @@ p.summary { font-size: .86rem; margin: 6px 0; }
     send.type = "submit";
     var state = el("span", "conv-head");
     form.appendChild(input); form.appendChild(send); form.appendChild(state);
+    // §16 (#3889) : une panne n'est pas un échec. Le message garde sa clé
+    // (Idempotency-Key) tant qu'il n'est pas confirmé : renvoyé tel quel, il
+    // n'est jamais déposé deux fois. Seule une saisie refusée (4xx) guide.
+    var pending = null;
     form.addEventListener("submit", function (ev) {
       ev.preventDefault();
       var text = input.value.trim();
       if (!text || send.disabled) return;
-      send.disabled = true; state.textContent = "sending…"; state.className = "conv-head";
-      var body = {agent: name, text: text};
-      var key = "web-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10);
+      if (!pending || pending.text !== text) {
+        pending = {text: text, key: "web-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10)};
+      }
+      deliver(pending, 0);
+    });
+    function deliver(msg, attempt) {
+      send.disabled = true; state.className = "conv-head";
+      state.textContent = attempt ? "sending… (the server is busy, retrying by itself)" : "sending…";
       fetch(CHAT, {method: "POST", credentials: "omit", cache: "no-store",
                    headers: {"Accept": "application/json",
                              "Content-Type": "application/json",
                              "Authorization": "Bearer " + TOKEN,
-                             "Idempotency-Key": key},
-                   body: JSON.stringify(body)})
+                             "Idempotency-Key": msg.key},
+                   body: JSON.stringify({agent: name, text: msg.text})})
         .then(function (r) {
-          return r.json().then(function (d) { return {status: r.status, data: d}; },
-                                 function () { return {status: r.status, data: {}}; });
-        })
+          return r.text().then(function (t) {
+            var d = {};
+            try { d = JSON.parse(t); } catch (e) { d = {message: t.trim()}; }
+            return {status: r.status, data: d || {}};
+          });
+        }, function () { return {status: 0, data: {}}; })
         .then(function (res) {
-          if (res.status !== 200) {
-            throw new Error((res.data && res.data.message) || ("HTTP " + res.status));
+          if (res.status === 200) {
+            pending = null; input.value = ""; state.textContent = "sent";
+            send.disabled = false;
+            return loadConversation(name, list);
           }
-          input.value = ""; state.textContent = "sent";
-          return loadConversation(name, list);
-        })
-        .then(null, function (e) {
-          state.textContent = "not sent: " + e.message; state.className = "conv-head warn";
-        })
-        .then(function () { send.disabled = false; });
-    });
+          if (res.status === 0 || res.status === 503 || res.status === 429) {
+            setTimeout(function () { deliver(msg, attempt + 1); }, RETRY_MS[Math.min(attempt, RETRY_MS.length - 1)]);
+            return;
+          }
+          send.disabled = false;
+          if (res.status >= 500 || (res.data && res.data.error === "idempotency_in_progress")) {
+            // issue inconnue : peut-être déposé — on relit avant tout renvoi
+            state.textContent = "being checked: look at the conversation below before sending again";
+            state.className = "conv-head warn";
+            return loadConversation(name, list);
+          }
+          pending = null;
+          state.textContent = "not sent: " + ((res.data && res.data.message) || ("HTTP " + res.status));
+          state.className = "conv-head warn";
+        });
+    }
     wrap.appendChild(form);
     loadConversation(name, list);
     return wrap;
@@ -499,9 +523,10 @@ p.summary { font-size: .86rem; margin: 6px 0; }
         entries.forEach(function (e) { list.appendChild(convEntry(e)); });
         list.scrollTop = list.scrollHeight;
       })
-      .then(null, function (e) {
-        clear(list);
-        list.appendChild(el("p", "empty warn", "conversation unavailable: " + e.message));
+      .then(null, function () {
+        // §16 (#3889) : on garde ce qui est affiché, et on relit plus tard
+        if (!list.firstChild) list.appendChild(el("p", "empty", "conversation loading…"));
+        setTimeout(function () { if (list.isConnected) loadConversation(name, list); }, RETRY_MS[2]);
       });
   }
 
@@ -599,24 +624,37 @@ p.summary { font-size: .86rem; margin: 6px 0; }
           {credentials: "omit", cache: "no-store",
            headers: {"Accept": "application/json", "Authorization": "Bearer " + TOKEN}})
       .then(function (r) {
-        if (r.status === 401) throw new Error("token refused: open the URL printed at start (a restart draws a new one)");
-        if (!r.ok) return r.text().then(function (t) { throw new Error("HTTP " + r.status + ": " + t.trim()); });
+        if (r.status === 401) { var t = new Error("token refused: open the URL printed at start (a restart draws a new one)"); t.guide = true; throw t; }
+        if (r.status === 400) return r.text().then(function (t) { var g = new Error(t.trim()); g.guide = true; throw g; });
+        if (!r.ok) throw new Error("HTTP " + r.status);
         return r.json();
       })
       .then(function (d) {
         if (!current()) return;
         if (!d || d.schema !== "ameesh-progress/1") throw new Error("unknown schema");
-        D = d; status.textContent = ""; renderAll();
+        D = d; renderAll(); showAge(!!d.stale);
       })
       .then(null, function (e) {
         if (!current()) return;
-        status.textContent = D ? "refresh failed: " + e.message + " (previous data kept)" : e.message;
-        status.className = "warn";
+        if (e && e.guide) { status.textContent = e.message; status.className = "warn"; return; }
+        // §16 (#3889) : une panne n'est jamais une erreur affichée ; les
+        // dernières données restent, avec leur âge, et la page relit seule
+        showAge(true);
       })
       .then(function () {
         busy = false; btn.disabled = false;
         if (queued || !current()) refresh();
       });
+  }
+  var retryTimer = null;
+  function showAge(on) {
+    clearTimeout(retryTimer);
+    if (!on) { status.textContent = ""; status.className = ""; return; }
+    status.className = "";
+    status.textContent = D
+      ? "data from " + dur(Date.now() / 1000 - D.generated_ts) + " ago; updating as soon as the server answers"
+      : "loading the data…";
+    retryTimer = setTimeout(refresh, RETRY_MS[2]);
   }
 
   function renderHeader() {
