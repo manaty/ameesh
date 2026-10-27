@@ -183,6 +183,10 @@ CANON_INVALID = "invalid"
 CANON_UNREADABLE = "unreadable"
 SYNC_INCOMPLETE = "canon-sync-incomplete"
 _DIAGNOSTIC_MAX = 4000
+#: #3955 : tentatives d'écriture conditionnelle du commit audité quand une
+#: synchronisation concurrente a avancé la ligne entre la lecture et l'écriture.
+#: Au-delà, on ne réessaie plus : l'état garde le commit le plus récent.
+_COMMIT_CAS_ATTEMPTS = 5
 
 
 class SpawnError(ValueError):
@@ -472,12 +476,71 @@ def audited_commit(db: Db, cfg, canon: Canon, source) -> str:
     return str(getattr(source, "commit", "") or "").strip().lower()
 
 
+def _commit_relation(canon: Canon | None, old: str, new: str) -> str:
+    """Rapport d'ancienneté entre le commit enregistré `old` et `new`.
+
+    ``forward`` (aucun enregistré, même commit, ou `new` descend de `old`),
+    ``ancestor`` (`new` est un ancêtre : retour arrière), ``unknown`` (le
+    commit enregistré n'est pas dans ce dépôt — clone en retard) ou
+    ``unrelated`` (histoires distinctes / canon réécrit). Seul ``forward``
+    autorise l'avance sans retour arrière déclaré : dans le doute on ne
+    touche pas au commit audité. #3955 — la synchro qui a lu la référence
+    avant un fetch et écrit après ne fait plus reculer la porte."""
+    if not old or old == new:
+        return "forward"
+    source = canon.sources[0] if canon is not None and canon.sources else None
+    repo = str(getattr(source, "repo", "") or "")
+    if not repo or str(getattr(source, "mode", "")) != "git":
+        return "unrelated"
+    if canon_mod.git_contains(repo, old, new):
+        return "forward"
+    if canon_mod.git_contains(repo, new, old):
+        return "ancestor"
+    try:
+        if canon_mod.git_commit(repo, old) is None:
+            return "unknown"
+    except canon_mod.GitError:
+        return "unknown"        # git illisible : le doute ne fait jamais avancer
+    return "unrelated"
+
+
+def _journal_rewind(db: Db, host: str, canon: Canon | None, key: str,
+                    old: str, new: str) -> None:
+    """#3955 : journalise un retour arrière DÉCLARÉ du commit audité (thread)."""
+    relation = _commit_relation(canon, old, new)
+    which = " (canon %s)" % key if key else ""
+    text = ("canon sync on %s%s: DECLARED REWIND of the audited commit — "
+            "last_good_commit %s -> %s (%s). The train and the merge gate now "
+            "read the older commit; explicit `ameesh canon sync --allow-rewind`."
+            % (host, which, old[:12], new[:12], relation))
+    cfg = getattr(db, "cfg", None)
+    if cfg is None:
+        fil.warn(text)
+        return
+    try:
+        fil.record(cfg, db, sender=FIL_SENDER, recipients=["all"], text=text,
+                   project=fil.project_for(cfg),
+                   meta={"event": "canon-rewind", "host": host, "canon": key,
+                         "from": old, "to": new, "relation": relation})
+    except Exception as exc:  # noqa: BLE001 - fil.record ne lève pas ; prudence
+        fil.warn("%s (thread entry not written: %s)"
+                 % (text, " ".join(str(exc).split())[:200]))
+
+
 def record_state(db: Db, host: str, status: str, diagnostic: str,
-                 canon: Canon | None = None, *, key: str | None = None) -> None:
+                 canon: Canon | None = None, *, key: str | None = None,
+                 allow_rewind: bool = False) -> None:
     """Écrit l'état du canon de `host` ; le dernier commit valide ne suit que `ok`.
 
     L42 (0031) : `key` ('' = canon par défaut, sinon l'identifiant du canon) ;
-    sans `key`, celle du canon (`state_key`), ou '' sans canon."""
+    sans `key`, celle du canon (`state_key`), ou '' sans canon.
+
+    #3955 : le commit audité ne recule JAMAIS vers un ancêtre (ni vers une
+    histoire que ce dépôt ne peut pas situer) sans retour arrière DÉCLARÉ
+    (`allow_rewind`, `canon sync --allow-rewind`) ; ce retour-là est journalisé.
+    L'écriture est conditionnelle (`expected`, CAS) puis rejouée : une synchro
+    concurrente qui enregistre un commit plus récent entre notre lecture et
+    notre écriture n'est jamais écrasée par une plus ancienne."""
     commit = None
     if status == CANON_OK and canon is not None and canon.sources:
         commit = canon.sources[0].commit or None
@@ -488,11 +551,37 @@ def record_state(db: Db, host: str, status: str, diagnostic: str,
         canon_id = canon.id
     elif key:
         canon_id = key
-    storage.of(db).canon.record_state(
-        host, status, root=canon.root if canon is not None else "",
-        source=canon.source_label() if canon is not None and canon.sources else "",
-        commit=commit, good=status == CANON_OK, diagnostic=diagnostic,
-        canon=key, canon_id=canon_id)
+    store = storage.of(db).canon
+
+    def write(expected: str | None) -> str | None:
+        return store.record_state(
+            host, status, root=canon.root if canon is not None else "",
+            source=canon.source_label() if canon is not None and canon.sources else "",
+            commit=commit, good=status == CANON_OK, diagnostic=diagnostic,
+            canon=key, canon_id=canon_id, expected=expected)
+
+    if status != CANON_OK or not commit:
+        write(None)
+        return
+    if allow_rewind:
+        previous = store.state(host, key) or {}
+        old = str(previous.get("last_good_commit") or "")
+        written = write(None)
+        if written == commit and old and old != commit:
+            _journal_rewind(db, host, canon, key, old, commit)
+        return
+    for _ in range(_COMMIT_CAS_ATTEMPTS):
+        previous = store.state(host, key) or {}
+        old = str(previous.get("last_good_commit") or "")
+        if _commit_relation(canon, old, commit) != "forward":
+            # Un sync en retard (référence lue avant le fetch) garde l'état
+            # enregistré : ni le commit, ni le statut, ni la source ne reculent.
+            return
+        if write(old) == commit:
+            return
+        # CAS perdu : une synchro concurrente a avancé la ligne ; on relit et
+        # on décide sur le commit qu'elle a enregistré.
+    # Épuisement (course très disputée) : ne jamais écrire l'ancien commit.
 
 
 def state(db: Db, host: str, canon: "Canon | str | None" = None) -> dict | None:
@@ -1447,13 +1536,18 @@ def _same(row: dict, values: dict) -> bool:
 
 def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None, *,
          trusted_ref: str | None = None, bootstrap_ref: str = "",
-         forge=None) -> SyncReport:
+         forge=None, allow_rewind: bool = False) -> SyncReport:
     """Aligne le registre de `host` sur le canon et enregistre l'état du canon.
 
     Canon illisible : seul l'état `unreadable` est écrit, puis CanonUnreadable.
     Ordre fail closed : un état non `ok` est écrit AVANT toute autre écriture
     (la réclamation est fermée d'abord) ; un état `ok` APRÈS (elle ne rouvre
     qu'une fois le registre aligné).
+
+    `allow_rewind` (#3955, `canon sync --allow-rewind`) : déclare un retour
+    arrière du commit audité. Sans lui, `record_state` refuse d'enregistrer un
+    commit qui ne descend pas du dernier commit audité ; avec lui, le retour
+    est accepté et journalisé (thread).
 
     `trusted_ref` (configuration de l'hôte) et `bootstrap_ref` (premier
     amorçage explicite) ne servent qu'au registre des authentificateurs :
@@ -1500,7 +1594,8 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
 
     if not canon.readable:
         status, diagnostic = assess(canon, host)
-        record_state(db, host, status, diagnostic, canon, key=key)
+        record_state(db, host, status, diagnostic, canon, key=key,
+                     allow_rewind=allow_rewind)
         raise CanonUnreadable(host, diagnostic, list(canon.load_findings))
     if findings is None:
         findings = canon_mod.validate(canon)
@@ -1509,7 +1604,8 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     findings.extend(conflicts(db, canon))
     status, diagnostic = assess(canon, host, findings)
     if status != CANON_OK:
-        record_state(db, host, status, diagnostic, canon, key=key)
+        record_state(db, host, status, diagnostic, canon, key=key,
+                     allow_rewind=allow_rewind)
     block = canon_mod.blocking(findings)
     #: L780 : le canon est invalide POUR CET HÔTE (erreur sans sujet, ou liée à
     #: sa fiche Host). La réclamation est déjà fermée par `canon_state` : une
@@ -1741,7 +1837,8 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                     path=agent.fiche.path, member=agent.fiche.member,
                     host=host, untrusted=canon.untrusted))
                 status, diagnostic = assess(canon, host, findings)
-                record_state(db, host, status, diagnostic, canon, key=key)
+                record_state(db, host, status, diagnostic, canon, key=key,
+                             allow_rewind=allow_rewind)
                 actions.append(SyncAction(name, "différé", message, [SYNC_INCOMPLETE]))
                 continue
             action = SyncAction(name, "créé" if row is None else "mis à jour")
@@ -1862,7 +1959,8 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             # l'ancien commit, encore dans canon_state) ; #793 : seulement si
             # ce commit est enregistré `ok`, et par une seule synchronisation.
             processes = sync_processes(db, canon, host, sorted(process_agents))
-        record_state(db, host, status, diagnostic, canon, key=key)
+        record_state(db, host, status, diagnostic, canon, key=key,
+                     allow_rewind=allow_rewind)
     # registre des authentificateurs (§8.2) : copie de travail des fiches
     # Member, quel que soit l'état du canon pour cet hôte (ses propres règles).
     # L44 (0031) : CHAQUE canon synchronise les siens, dans son registre et son
