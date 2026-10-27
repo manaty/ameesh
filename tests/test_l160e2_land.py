@@ -15,11 +15,13 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from ameesh import db as db_mod
 from ameesh import land, mail, merge_queue, radar, resolutions, review_lot, storage, work
 
 from .support import PgTestCase
@@ -194,6 +196,83 @@ class LocalLandTest(_Land):
         self.assertEqual(self.fake.queue_rows[4]["state"], "landing")
 
 
+class PassLeaseTest(_Land):
+    """#3932 : le bail de la passe radar est pris à la borne courte et rendu
+    sur les chemins qui quittent la file, alors qu'une PR en attente de CI ou
+    un merge en doute le gardent (TTL long) entre deux passes, pour qu'aucun
+    train ni tir direct ne fusionne sous une CI validée sur une ancienne base."""
+
+    def test_an_exception_before_the_first_queue_write_releases_the_lease(self):
+        """Le cas du vol : la prise réussit, puis plus rien avant l'écriture
+        `landing`. Le `finally` rend le bail, la ligne reste `queued`."""
+        self.queued(4)
+        with mock.patch.object(resolutions.Replayer, "ensure",
+                               side_effect=land.GitError("clone unavailable")):
+            out = self.land(4)
+        self.assertEqual(out["result"], "error", out)
+        self.assertIn("clone unavailable", out["error"])
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
+        self.assertIsNone(self.locks.held["p:main"][0],
+                          "the lease is released on the error path")
+
+    def test_a_database_error_after_the_take_releases_the_lease(self):
+        """Une coupure de base entre la prise et l'usage n'est pas avalée :
+        l'erreur remonte, et le bail est tout de même rendu."""
+        self.queued(4)
+        with mock.patch.object(self.fake, "queue_update",
+                               side_effect=db_mod.DbError("connection lost")):
+            with self.assertRaises(db_mod.DbError):
+                self.land(4)
+        self.assertIsNone(self.locks.held["p:main"][0],
+                          "the lease is released on a database error")
+
+    def test_a_gate_waits_for_the_pass_heartbeat_to_renew_the_lease(self):
+        """Le battement renouvelle le même epoch pendant une porte longue ;
+        sans lui, la porte dépasserait la borne courte et le push serait
+        refusé (`held()`)."""
+        self.queued(4)
+        renewed = threading.Event()
+        real_lock = self.fake.land_lock
+
+        def tracked_lock(key, owner, ttl_s, *, epoch=None):
+            got = real_lock(key, owner, ttl_s, epoch=epoch)
+            if epoch is not None and got is not None:
+                renewed.set()
+            return got
+
+        self.fake.land_lock = tracked_lock
+
+        def gate(project, path, **kw):
+            self.assertTrue(renewed.wait(2.0),
+                            "the pass heartbeat did not renew the lease during the gate")
+            return {"ok": True, "gate": None, "output": ""}
+
+        with mock.patch.object(land, "LAND_PASS_TTL_S", 0.3), \
+                mock.patch.object(land, "gates", side_effect=gate):
+            out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertIsNone(self.locks.held["p:main"][0],
+                          "the lease is released at the end of the pass")
+
+    def test_the_pass_takes_the_lease_at_the_short_bound(self):
+        """Une passe morte ne bloque la file que jusqu'au TTL court de la
+        passe, pas jusqu'aux 30 min du train : la prise emploie bien
+        `LAND_PASS_TTL_S`."""
+        self.assertLess(land.LAND_PASS_TTL_S, land.LOCK_TTL_S)
+        self.queued(4)
+        taken = []
+        real_lock = self.fake.land_lock
+
+        def tracked_lock(key, owner, ttl_s, *, epoch=None):
+            if epoch is None:
+                taken.append(ttl_s)
+            return real_lock(key, owner, ttl_s, epoch=epoch)
+
+        self.fake.land_lock = tracked_lock
+        self.assertEqual(self.land(4)["result"], "landed")
+        self.assertEqual(taken, [land.LAND_PASS_TTL_S])
+
+
 class ReviewAfterMergeTest(LocalLandTest):
     """L539 : la fusion confirmée d'un lot léger ouvre le lot de relecture §2."""
 
@@ -297,6 +376,29 @@ class PrLandTest(_Land):
         self.assertIn("--merge", merge_call)
         self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
 
+    def test_pr_waiting_for_ci_keeps_the_target_reserved_between_passes(self):
+        """#3932 : tant que la PR attend sa CI, le bail de la cible reste tenu
+        entre deux passes, au TTL long : un tir concurrent est `busy` et ne
+        peut pas fusionner sous une CI qui a validé une ancienne cible."""
+        from ameesh import fire
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        locks: dict = {}
+        out = self.land(4, gh=gh, locks=locks)
+        self.assertEqual(out["result"], "landing", out)
+        self.assertTrue(locks, "the lease is kept between two passes")
+        owner, epoch, expires = self.locks.held["p:main"]
+        self.assertEqual((owner, epoch), ("runner-1", locks["p:main"]))
+        self.assertGreaterEqual(expires - time.time(), land.LOCK_TTL_S * 0.9,
+                                "the kept lease covers the interval between passes, "
+                                "not the short pass bound")
+        handle, blocked = fire._target_lock(None, self.project, "main")
+        self.assertIsNone(handle)
+        self.assertTrue(blocked, "a concurrent fire finds the target busy")
+        gh.head, gh.ci = out["sha"], "green"
+        self.assertEqual(self.land(4, gh=gh, locks=locks)["result"], "landed")
+
     def test_red_ci_or_moved_branch_ejects(self):
         for why in ("red", "moved"):
             with self.subTest(why):
@@ -333,7 +435,7 @@ class PrLandTest(_Land):
         self.assertIn("authentication required", failed["error"])
         row = self.fake.queue_rows[4]
         self.assertEqual((row["state"], row["landing_sha"]), ("landing", out["sha"]))
-        self.assertTrue(locks, "the lease is kept")
+        self.assertTrue(locks, "the lease is kept while the lot waits on its PR")
         self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
         gh.fail, gh.head, gh.ci = False, out["sha"], "green"
         self.assertEqual(self.land(4, gh=gh, locks=locks)["result"], "landed")
@@ -481,7 +583,7 @@ class Review194Test(_Land):
         self.assertEqual(out["result"], "retry", out)
         row = self.fake.queue_rows[4]
         self.assertEqual((row["state"], row["landing_sha"]), ("landing", sha))
-        self.assertTrue(locks, "the lease is kept")
+        self.assertTrue(locks, "the lease is kept while the lot waits on its PR")
         gh.merge_result = (0, "", "")
         self.assertEqual(self.land(4, gh=gh, locks=locks)["result"], "landed")
 
@@ -660,8 +762,11 @@ class EpochFenceTest(_Land):
             self.acquire_runner2(lease_ref=False)
             self.fake.queue_rows[4]["state"] = "landed"           # runner-2 merged it
             _git(self.repo, "push", "-q", "origin", "lot/3-c:main")
-        # renewal 1: taking the lease again; 2: right before the merge
-        self.pause_after_renewal(runner2_lands, nth=2)
+        # #3932: the lease of the first pass was released, so the follower
+        # legitimately takes a new epoch. The hook steals it on the first
+        # renewal of the pass, before `target_moved`: that check then sees
+        # runner-2's push and the stale epoch cannot eject over the landed row.
+        self.pause_after_renewal(runner2_lands, nth=1)
         stale = self.land(4, gh=gh, locks=locks)
         self.assertEqual(stale["result"], "busy", stale)
         self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
@@ -976,7 +1081,11 @@ class Review194r8Test(_Land):
         row = self.fake.queue_rows[4]
         self.assertEqual(row["state"], "landing")
         self.assertTrue(row["reason"].startswith(land.UNCERTAIN))
-        self.assertTrue(locks, "the lease is kept")
+        self.assertTrue(locks, "the lease is kept while the lot waits on its PR")
+        from ameesh import fire
+        handle, blocked = fire._target_lock(None, self.project, "main")
+        self.assertIsNone(handle)
+        self.assertTrue(blocked, "a concurrent fire finds the target busy during the doubt")
         # next pass: the PR is no longer open, found merged at the landing commit
         fake, state = self.merging(gh, merges=True, readable=True)
         state["merged"] = True
@@ -994,7 +1103,7 @@ class Review194r8Test(_Land):
         self.assertTrue(self.fake.queue_rows[4]["reason"].startswith(land.UNCERTAIN))
         self.assertIn("state OPEN", done["reason"])
         self.assertIn("complete later", self.sent[-1][1])
-        self.assertTrue(locks)
+        self.assertTrue(locks, "the lease is kept while the lot waits on its PR")
         state["merged"] = True
         again = self.land(4, gh=lambda args, timeout=60: fake(args, timeout)
                           if args[:2] != ["pr", "merge"] else self.fail("merged twice"), locks=locks)
@@ -1188,6 +1297,27 @@ class LeaseDbTest(PgTestCase):
         self.assertIsNone(ops.land_lock("p:main", "r2", 60, epoch=3))
         self.assertFalse(ops.land_unlock("p:main", "r2", 3))
         self.assertEqual(ops.land_lock("p:other", "r2", 60), 1)
+
+    def test_a_pass_lease_that_is_not_renewed_is_taken_at_the_short_bound(self):
+        """#3932 : une passe morte après la prise ne bloque la file que jusqu'à
+        la borne courte du passage (le TTL long du train n'est pas employé) ;
+        le nouveau détenteur prend un epoch neuf et l'ancien ne peut plus
+        écrire la ligne."""
+        self.assertLessEqual(land.LAND_PASS_TTL_S, 300,
+                             "the queue pass TTL must stay well below the train's 30 min")
+        ops = storage.of(self.db).work
+        lot = work.add(self.db, title="dead pass")["id"]
+        ops.queue_add(lot, target="main", frozen_sha="a" * 40, note="queued", actor="t")
+        dead = ops.land_lock("dead-pass:main", "radar-dead", 0.2)
+        self.assertEqual(dead, 1)
+        time.sleep(0.5)
+        live = ops.land_lock("dead-pass:main", "radar-live", 0.2)
+        self.assertEqual(live, 2)
+        self.assertFalse(ops.land_unlock("dead-pass:main", "radar-dead", dead))
+        self.assertIsNone(ops.queue_update(lot, state="landing",
+                                           lease=("dead-pass:main", "radar-dead", dead)))
+        self.assertIsNotNone(ops.queue_update(lot, state="landing",
+                                              lease=("dead-pass:main", "radar-live", live)))
 
     def test_land_holder_names_the_live_lease_and_hides_an_expired_one(self):
         """#3598 : le détenteur du bail et son échéance, pour le refus de
