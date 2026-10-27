@@ -161,6 +161,9 @@ class NoClaimAfterStaleTest(unittest.TestCase):
         # #3070 : `sweep` lève les portes d'appareil restées fermées ; cette
         # doublure n'a ni porte ni horloge, la passe est neutralisée.
         fake.lift_device_gates_once = lambda: None
+        # #3961 : `sweep` lève les pauses opérateur échues ; la doublure n'a
+        # ni registre ni horloge, la passe est neutralisée.
+        fake.expire_operator_pauses_once = lambda: None
         # L85 (#373) : `sweep` prune le journal d'événements après la moisson
         # des baux — la doublure doit fournir le point d'entrée, borné ici.
         fake.prune_events_once = lambda *args, **kwargs: None
