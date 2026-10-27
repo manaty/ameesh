@@ -360,6 +360,65 @@ class ProofTest(unittest.TestCase):
         self.assertFalse(rapport["ok"])
         self.assertIn("run-red", rapport["causes"])
 
+    def _flux_en_echec(self, *echecs, statut_2: str = "succes") -> dict:
+        """#4039 : le flux complet, plus des tests en échec
+        `(nom, extrait[, part])`."""
+        lignes = [flux_complet(statut_2)]
+        for echec in echecs:
+            nom, extrait = echec[0], echec[1]
+            part = echec[2] if len(echec) > 2 else "psycopg:2"
+            event = {"v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                     "part": part, "module": "test_b", "test": nom,
+                     "statut": "erreur"}
+            if extrait:
+                event["extrait"] = extrait
+            lignes.append(json.dumps(event))
+        return pv.parse_flow("\n".join(lignes))
+
+    def test_echecs_de_setupclass_seuls_ne_sont_pas_rouges(self):
+        """#4039 : base absente du guest — chaque module à base tombe en
+        setUpClass ; le run n'est pas concluant (§3), jamais un run-red."""
+        echecs = (
+            ("setUpClass (tests.test_b.C)", "AssertionError: Postgres injoignable"),
+            ("setUpModule (tests.test_cluster)", ""),
+            ("tests.test_a.D.test_x", "AssertionError: Postgres injoignable (dsn)"))
+        # rouge de l'offload (exit 1), ou part rouge sous un exit 0
+        for run, statut in (({"outcome": "run-red", "exit": 1}, "succes"),
+                            ({"outcome": "green", "exit": 0}, "echec")):
+            with self.subTest(run=run["outcome"]):
+                flow = self._flux_en_echec(*echecs, statut_2=statut)
+                rapport = self.sel.proof(lot=7, host="vm", run=run, flow=flow)
+                self.assertFalse(rapport["ok"])
+                self.assertEqual(rapport["outcome"], "run-incomplete", rapport)
+                self.assertNotIn("run-red", rapport["causes"])
+                self.assertIn("environnement", " ".join(rapport["detail"]))
+
+    def test_un_echec_de_corps_de_test_reste_rouge(self):
+        flow = self._flux_en_echec(
+            ("setUpClass (tests.test_b.C)", "AssertionError: Postgres injoignable"),
+            ("tests.test_b.C.test_y", "AssertionError: 1 != 2"))
+        rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "run-red", "exit": 1},
+                                 flow=flow)
+        self.assertEqual(rapport["outcome"], "run-red")
+        self.assertIn("run-red", rapport["causes"])
+
+    def test_meme_nom_environnement_puis_assertion_reste_rouge(self):
+        """#4039 (B/P1 cx3) : un même test en base injoignable sous une part
+        et en assertion sous une autre est un rouge, dans les deux ordres."""
+        nom = "tests.test_b.C.test_y"
+        env = (nom, "AssertionError: Postgres injoignable", "psql:1")
+        corps = (nom, "AssertionError: 1 != 2", "psycopg:2")
+        for ordre in ((env, corps), (corps, env)):
+            with self.subTest(premier=ordre[0][2]):
+                flow = self._flux_en_echec(*ordre)
+                self.assertEqual(flow["failed"], (nom,))
+                self.assertEqual(flow["environment"], ())
+                rapport = self.sel.proof(lot=7, host="vm",
+                                         run={"outcome": "run-red", "exit": 1},
+                                         flow=flow)
+                self.assertEqual(rapport["outcome"], "run-red")
+                self.assertIn("run-red", rapport["causes"])
+
     def test_preemption_par_la_porte_nest_pas_no_vm(self):
         """#2298 : un run coupé par la porte (exit 75) dit gate-preempted."""
         rapport = self.sel.proof(lot=7, host="vm",

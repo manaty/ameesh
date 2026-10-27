@@ -142,6 +142,11 @@ SECONDS_MARK = "ameesh-prevalidation-seconds="
 PART_MARK = "ameesh-prevalidation-part="
 _SECONDS_RE = re.compile(r"^%s(\d+)\s*$" % re.escape(SECONDS_MARK), re.M)
 _PART_RE = re.compile(r"^%s([A-Za-z0-9_.:-]+)\s*$" % re.escape(PART_MARK), re.M)
+#: #4039 : un échec d'environnement, pas de code — une fixture de classe ou
+#: de module (`setUpClass (tests.x.C)`, `setUpModule (tests.x)`…) ou la base
+#: injoignable de `tests/support.py`. Seul un échec de corps de test est rouge.
+_FIXTURE_RE = re.compile(r"^(setUp|tearDown)(Class|Module) \(")
+_ENVIRONMENT_RE = re.compile(r"Postgres injoignable")
 #: notes du client offload quand la porte de l'hôte refuse ou arrête un run
 #: (drain) : avant le départ du job (`refused on …`) comme pendant son cours
 #: (`stopped on …`). Un refus de porte n'est pas une VM absente (#2298).
@@ -241,8 +246,21 @@ class Selection:
             detail.append("sélection incertaine (%s) : %s (%d module(s))"
                           % (cause, joues, len(self.modules)))
         outcome = run.get("outcome") or ""
+        failed_all = [str(t) for t in (flow.get("failed") or ())]
+        environment = set(str(t) for t in (flow.get("environment") or ()))
+        #: #4039 : un rouge dont chaque échec est d'environnement (fixture de
+        #: classe ou de module, base injoignable) n'est pas concluant (§3)
+        environment_only = bool(failed_all) and all(t in environment for t in failed_all)
         if causes:
             outcome = "refused"
+        elif environment_only and (outcome == "run-red"
+                                   or (outcome == "green" and red)):
+            outcome = "run-incomplete"
+            causes.append("run-incomplete")
+            detail.append("échecs d'environnement seuls (%d) : %s%s"
+                          % (len(failed_all), ", ".join(failed_all[:4]),
+                             " (+%d)" % (len(failed_all) - 4)
+                             if len(failed_all) > 4 else ""))
         elif outcome == "green":
             if red:
                 outcome = "run-red"
@@ -683,6 +701,8 @@ def parse_flow(text: str) -> dict:
     visible : c'est un run incomplet, jamais un vert."""
     modules: set = set()
     failed: list[str] = []
+    environment_hits: set = set()
+    body_hits: set = set()
     parts: list[str] = []
     fins: list[str] = []
     fins_par_part: dict = {}
@@ -716,6 +736,13 @@ def parse_flow(text: str) -> dict:
                 nom = str(event["test"])
                 if nom not in failed:
                     failed.append(nom)
+                # chaque occurrence compte : un même nom en environnement dans
+                # une part et en assertion dans une autre reste un rouge
+                if _FIXTURE_RE.match(nom) \
+                        or _ENVIRONMENT_RE.search(str(event.get("extrait") or "")):
+                    environment_hits.add(nom)
+                else:
+                    body_hits.add(nom)
         elif kind == "fin":
             statut = str(event.get("statut") or "")
             fins.append(statut)
@@ -723,7 +750,11 @@ def parse_flow(text: str) -> dict:
                 fins_par_part[part] = statut
                 if part not in parts:
                     parts.append(part)
+    #: les noms dont **toutes** les occurrences en échec sont d'environnement
+    environment = tuple(nom for nom in failed
+                        if nom in environment_hits and nom not in body_hits)
     return {"modules": tuple(sorted(modules)), "failed": tuple(failed), "tests": tests,
+            "environment": environment,
             "parts": tuple(parts), "fins": tuple(fins), "fins_par_part": fins_par_part}
 
 
