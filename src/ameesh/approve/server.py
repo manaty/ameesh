@@ -124,6 +124,8 @@ _ROUTE_TEMPLATES = {"api": "/requests|/receipts/<id>", "login-api": "/login-*",
 _SINCE_RE = re.compile(r"^since=([0-9]{1,18})$")
 #: délai suggéré au client avant de renvoyer après une panne (secondes)
 RETRY_AFTER = 15
+#: 503 voulus (une attente, pas une panne) : jamais versés au journal
+WAITING_CODES = frozenset({"enroll_pending"})
 #: un corps refusé mais pas plus gros que ceci est lu et jeté avant la
 #: fermeture (sinon le noyau répond RST et le client perd la réponse)
 DRAIN_LIMIT = 1024 * 1024
@@ -413,7 +415,7 @@ class ApproveHandler(BaseHTTPRequestHandler):
         except ApproveError as exc:
             self._discard_body()
             extra = (("Retry-After", "60"),) if exc.status == 429 else ()
-            if exc.status >= 500:
+            if exc.status >= 500 and exc.code not in WAITING_CODES:
                 self._fault(kind, exc, value)
             self._error(kind or "api", exc, extra)
         except (ConnectionError, socket.timeout):

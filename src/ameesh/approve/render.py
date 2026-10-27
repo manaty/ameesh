@@ -177,7 +177,10 @@ def _moment(epoch: float) -> str:
 
 
 def _page(title: str, body: str, *, base: str, refresh: int = 0) -> str:
-    head = "<meta http-equiv=\"refresh\" content=\"%d\">\n" % refresh if refresh else ""
+    # sans script seulement : avec lui, la page renvoie d'abord ce qui est
+    # gardé sur l'appareil, puis se recharge (approve.js)
+    head = ("<noscript><meta http-equiv=\"refresh\" content=\"%d\"></noscript>\n" % refresh
+            if refresh else "")
     return (
         "<!DOCTYPE html>\n"
         "<!-- SPDX-License-Identifier: AGPL-3.0-only -->\n"
@@ -199,9 +202,11 @@ def message_page(title: str, message: str, *, base: str = "../") -> str:
 def unavailable_page(retry_after: int, *, base: str = "../") -> str:
     """§16 (#3889) : une panne du service n'est pas une erreur pour l'humain —
     la page dit qu'elle se recharge seule, et que rien n'est perdu."""
-    body = ("<main class=\"message\">\n<h1>Just a moment</h1>\n"
+    body = ("<main class=\"message\" id=\"ameesh-wait\" data-retry=\"%d\">\n"
+            "<h1>Just a moment</h1>\n"
             "<p>This page is being prepared. It will reload by itself in a few "
-            "seconds; you have nothing to do and nothing is lost.</p>\n</main>")
+            "seconds; you have nothing to do and nothing is lost.</p>\n"
+            "<p id=\"status\" role=\"status\"></p>\n</main>" % int(retry_after))
     return _page("Just a moment", body, base=base, refresh=retry_after)
 
 

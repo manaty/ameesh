@@ -371,7 +371,8 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   // outbox:begin — §16 (#3889) : la boîte d'envoi de la conversation.
   // Chaque message est gardé sur l'appareil (localStorage) avec son
   // Idempotency-Key AVANT l'envoi, renvoyé tel quel après une panne (réseau,
-  // 503, 429), effacé à l'accusé (200) ou au refus d'une saisie (4xx). Issue
+  // 503, 429), effacé à l'accusé (200) seulement ; un refus (4xx) le garde,
+  // marqué, sans renvoi automatique, de retour dans la saisie. Issue
   // inconnue (500, clé en cours) : gardé, sans renvoi automatique, à vérifier
   // dans la conversation ; le même texte renvoyé reprend la même clé. Une page
   // rechargée reprend les envois en attente : jamais perdu, jamais déposé deux fois.
@@ -418,8 +419,14 @@ p.summary { font-size: .86rem; margin: 6px 0; }
         if (res.status >= 500 || res.data.error === "idempotency_in_progress") {
           m.checking = true; write(agent, m); view(agent).checking(); return;
         }
-        drop(agent);
-        view(agent).refused(res.data.message || ("HTTP " + res.status));
+        // un refus (jeton, saisie) guide sans rien perdre : le message reste
+        // gardé, marqué, et revient dans la saisie quand sa fiche s'ouvre ;
+        // seul l'accusé l'efface
+        m.refused = res.status === 401
+          ? "token refused: open the URL printed at start (a restart draws a new one)"
+          : (res.data.message || ("HTTP " + res.status));
+        write(agent, m);
+        view(agent).refused(m.refused);
       });
     }
     function send(agent, text) {
@@ -429,7 +436,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
         m = {text: text, at: Date.now(),
              key: "web-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10)};
       }
-      m.checking = false;
+      m.checking = false; m.refused = "";
       write(agent, m);           // gardé AVANT l'envoi
       attempt(agent, m, 0);
     }
@@ -445,11 +452,17 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       agents.forEach(function (agent) {
         var m = read(agent);
         if (!m || !(Date.now() - m.at < MAX_AGE_MS)) { drop(agent); return; }
-        if (!m.checking && !flying[agent]) attempt(agent, m, 0);
+        if (!m.checking && !m.refused && !flying[agent]) attempt(agent, m, 0);
       });
     }
     return {send: send, resume: resume, pending: read,
-            watch: function (agent, ui) { views[agent] = ui; if (flying[agent]) ui.sending(1); else if (read(agent) && read(agent).checking) ui.checking(); }};
+            watch: function (agent, ui) {
+              views[agent] = ui;
+              var m = read(agent);
+              if (flying[agent]) ui.sending(1);
+              else if (m && m.checking) ui.checking();
+              else if (m && m.refused) ui.refused(m.refused);
+            }};
   })();
   // outbox:end
   function dur(s) {

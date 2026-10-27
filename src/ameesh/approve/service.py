@@ -444,16 +444,26 @@ class ApproveService:
 
     def submit(self, token: str, body) -> dict:
         decision = self._assertion(body, receipts.DECISIONS)
-        # §16 (#3889) : le MÊME corps signé, renvoyé par la page après une
-        # panne (réponse perdue), rend le reçu déjà gardé, sans second effet.
-        # Le reçu existant a été vérifié à son écriture ; un autre corps sur
-        # un lien consommé reste refusé (410 plus bas).
-        record = self.store.request_by_token(token)
-        kept = record and self.store.receipt_bytes(record["request_id"])
-        if kept and _same_receipt(kept, _receipt_of(dict(record["request"], decision=decision),
-                                                    body)):
-            return {"request_id": record["request_id"], "decision": decision, "replayed": True}
+        # §16 (#3889) : le MÊME corps signé, renvoyé après une panne (réponse
+        # perdue) ou en même temps qu'un autre envoi, rend le reçu déjà gardé,
+        # sans second effet. La décision se prend sur le refus « déjà utilisé »
+        # lui-même, où qu'il survienne : il n'y a pas de course entre une
+        # première lecture et l'écriture. Le reçu gardé a été vérifié à son
+        # écriture ; un autre corps sur un lien consommé reste refusé.
+        try:
+            return self._submit(token, body, decision)
+        except ApproveError as exc:
+            if (exc.status, exc.code) != (410, "used"):
+                raise
+            record = self.store.request_by_token(token)
+            kept = record and self.store.receipt_bytes(record["request_id"])
+            if kept and _same_receipt(
+                    kept, _receipt_of(dict(record["request"], decision=decision), body)):
+                return {"request_id": record["request_id"], "decision": decision,
+                        "replayed": True}
+            raise
 
+    def _submit(self, token: str, body, decision: str) -> dict:
         record = self._live_record(token)
         action = self._check_unchanged(record)
         request = dict(record["request"], decision=decision)
@@ -472,12 +482,6 @@ class ApproveService:
             log.info("request %s: assertion refused [%s]", record["request_id"], verdict.code)
             raise ApproveError(403, verdict.code, verdict.reason)
         if not self.store.save_receipt_once(record["request_id"], receipt):
-            # §16 (#3889) : deux envois concurrents du MÊME corps (deux onglets,
-            # un renvoi après délai) : le perdant rend le reçu du gagnant
-            kept = self.store.receipt_bytes(record["request_id"])
-            if kept and _same_receipt(kept, receipt):
-                return {"request_id": record["request_id"], "decision": decision,
-                        "replayed": True}
             raise ApproveError(410, "used", "this link has already been used")
         log.info("request %s: receipt %s%s signed by %s", record["request_id"], decision,
                  " (duplicate assumed)" if record.get("assume_duplicate") is True
@@ -683,7 +687,12 @@ class ApproveService:
         """`POST /login/<jeton>` : `view` ouvre la vue privée (assertion
         requise AVANT tout affichage) ; `done` / `cancel` signent le reçu."""
         decision = self._assertion(body, ("view",) + LOGIN_FINAL_DECISIONS)
-        if decision in LOGIN_FINAL_DECISIONS:   # §16 (#3889) : rejeu du même reçu
+        try:
+            return self._login_submit_live(token, body, decision)
+        except ApproveError as exc:
+            # §16 (#3889) : même règle que `submit`, sur le refus lui-même
+            if (exc.status, exc.code) != (410, "used") or decision not in LOGIN_FINAL_DECISIONS:
+                raise
             record = self.store.login_by_token(token)
             kept = record and self.store.login_receipt_bytes(record["login_id"])
             if kept and _same_receipt(
@@ -691,6 +700,9 @@ class ApproveService:
                 self.store.drop_login_private(record["login_id"])
                 return {"login_id": record["login_id"], "decision": decision,
                         "replayed": True}
+            raise
+
+    def _login_submit_live(self, token: str, body, decision: str) -> dict:
         record = self._live_login(token)
         with self.store.login_transition(record["login_id"]):
             # Une clôture peut avoir gagné depuis la première lecture.
@@ -722,11 +734,6 @@ class ApproveService:
                 "challenge_cancel": _b64u(receipts.challenge(dict(request, decision="cancel"))),
             }
         if not self.store.save_login_receipt_once(record["login_id"], receipt):
-            kept = self.store.login_receipt_bytes(record["login_id"])   # §16 : concurrent
-            if kept and _same_receipt(kept, receipt):
-                self.store.drop_login_private(record["login_id"])
-                return {"login_id": record["login_id"], "decision": decision,
-                        "replayed": True}
             raise ApproveError(410, "used", "this challenge is already settled")
         self.store.drop_login_private(record["login_id"])
         log.info("login %s: receipt %s signed by %s", record["login_id"], decision,
@@ -860,11 +867,15 @@ class ApproveService:
                     return dict(claim["result"], replayed=True)
             elif self.clock() >= record["exp"]:
                 raise ApproveError(410, "expired", "this link has expired")
+            # l'instant de la proposition est gardé avec la consommation du
+            # lien : une reprise réécrit la MÊME proposition (même nom)
+            moment = claim["at"] if claim is not None and claim["at"] is not None \
+                else int(self.clock())
             return self._enroll_once(record, decoded, body_digest, claimed=claim is not None,
-                                     origin=origin)
+                                     origin=origin, moment=moment)
 
     def _enroll_once(self, record: dict, decoded: dict, body_digest: str, *, claimed: bool,
-                     origin: str) -> dict:
+                     origin: str, moment: int) -> dict:
         try:
             entry = enroll.parse_registration(
                 attestation_object=decoded["attestationObject"],
@@ -875,16 +886,16 @@ class ApproveService:
         except enroll.EnrollError as exc:
             log.info("enrollment of %s refused [%s]", record["approver"], exc.code)
             raise ApproveError(403, exc.code, str(exc)) from exc
-        if not claimed and not self.store.claim_enroll(record, body_digest):
+        if not claimed and not self.store.claim_enroll(record, body_digest, at=moment):
             raise ApproveError(410, "used", "this link has already been used")
         name = enroll.write_proposal(self.cfg.proposals_path, approver=record["approver"],
                                      entry=entry, rp_id=self.cfg.rp_id, origin=origin,
-                                     now=self.clock())
+                                     now=moment)
         log.info("authenticator proposal for %s: %s", record["approver"], name)
         result = {"proposal": name, "credential_id": entry["credential_id"],
                   "key_fingerprint": entry["key_fingerprint"],
                   "backup_eligible": entry["backup_eligible"], "level": entry["level"]}
-        self.store.settle_enroll(record, body_digest, result)
+        self.store.settle_enroll(record, body_digest, result, at=moment)
         return result
 
 

@@ -32,12 +32,19 @@ const status = { textContent: "", className: "" };
 const listeners = {};
 const button = (id) => ({ id, disabled: false,
   addEventListener(_e, fn) { listeners[id] = fn; } });
-const buttons = { approve: button("approve"), deny: button("deny") };
-const root = { dataset: { kind: "", rpId: "example.org", credentials: "",
-                          challengeApprove: "AA", challengeDeny: "AA" } };
+const buttons = { approve: button("approve"), deny: button("deny"), enroll: button("enroll") };
+const roots = {
+  "ameesh-approval": { dataset: { kind: "", rpId: "example.org", credentials: "",
+                                  challengeApprove: "AA", challengeDeny: "AA" } },
+  "ameesh-enroll": { dataset: { rpId: "example.org", rpName: "x", userId: "AA",
+                                userName: "human:dave", challenge: "AA", exclude: "" } },
+  "ameesh-wait": { dataset: { retry: "15" } },
+};
+const rootId = "ameesh-" + (scenario.root || "approval");
+let reloads = 0;
 const document = {
   getElementById(id) {
-    if (id === "ameesh-approval") return root;
+    if (id === rootId) return roots[id];
     if (id === "status") return status;
     return buttons[id] || null;
   },
@@ -56,8 +63,10 @@ function fetch(_url, init) {
 }
 const statuses = [];
 const context = {
-  window: { location: { pathname: PATH }, localStorage, PublicKeyCredential: function () {} },
-  navigator: { credentials: { get: () => Promise.resolve(scenario.credential) } },
+  window: { location: { pathname: PATH, reload: () => { reloads += 1; } }, localStorage,
+            PublicKeyCredential: function () {} },
+  navigator: { credentials: { get: () => Promise.resolve(scenario.credential),
+                              create: () => Promise.resolve(scenario.credential) } },
   document, fetch, atob, btoa, Uint8Array, JSON, Math, Date, Promise, String, Error,
   setTimeout: (fn) => { statuses.push(status.textContent); setImmediate(fn); return 0; },
   clearTimeout() {}, AbortController,
@@ -69,7 +78,7 @@ if (scenario.click) listeners[scenario.click]();
 setTimeout(function wait(n) {
   if (answers.length && n < 50) return setImmediate(wait, (n || 0) + 1);
   setImmediate(() => setImmediate(() => {
-    process.stdout.write(JSON.stringify({ sent, keptAtSend, status, statuses,
+    process.stdout.write(JSON.stringify({ sent, keptAtSend, status, statuses, reloads,
       kept: storage.get("ameesh-approve:pending:" + PATH) || null,
       storage: Array.from(storage.keys()) }));
   }));
@@ -128,6 +137,48 @@ class ApproveJsDeliveryTest(unittest.TestCase):
         self.assertEqual(result["keptAtSend"], [True, True])
         self.assertEqual(result["status"]["className"], "done")
         self.assertIsNone(result["kept"])
+
+    def kept_as(self, kind, body):
+        import time
+        return {KEY: json.dumps({"at": time.time() * 1000, "kind": kind, "body": body})}
+
+    def test_enrolement_garde_la_passkey_avant_l_envoi(self):
+        """B1 (cx2) : la passkey créée est gardée AVANT l'envoi ; une panne la
+        laisse sur l'appareil, l'accusé l'efface."""
+        credential = {"rawId": [1, 2], "response": {"clientDataJSON": [4],
+                                                    "attestationObject": [5]}}
+        result = self.run_page({"root": "enroll", "click": "enroll", "credential": credential,
+                                "answers": [{"status": 500, "body": {"retry": True}},
+                                            {"status": 200, "body": {"key_fingerprint": "ab"}}]})
+        self.assertEqual(result["keptAtSend"], [True, True])
+        self.assertEqual(result["sent"][0], result["sent"][1])
+        self.assertEqual((result["status"]["className"], result["kept"]), ("done", None))
+        self.assertIn("Passkey created", result["status"]["textContent"])
+
+    def test_enrolement_rouvert_renvoie_la_passkey_gardee(self):
+        body = {"credential_id": "Y3JlZA", "clientDataJSON": "Y2xpZW50",
+                "attestationObject": "YXR0"}
+        result = self.run_page({"root": "enroll", "storage": self.kept_as("enroll", body),
+                                "answers": [{"status": 200, "body": {"key_fingerprint": "ab"}}]})
+        self.assertEqual([json.loads(b) for b in result["sent"]], [body])
+        self.assertEqual(result["status"]["className"], "done")
+
+    def test_page_d_attente_renvoie_le_corps_garde(self):
+        """B1 (cx2) : la page « Just a moment » (enrôlement en attente) ne
+        recharge pas en boucle : elle renvoie le corps gardé."""
+        body = {"credential_id": "Y3JlZA", "clientDataJSON": "Y2xpZW50",
+                "attestationObject": "YXR0"}
+        result = self.run_page({"root": "wait", "storage": self.kept_as("enroll", body),
+                                "answers": [{"status": 503, "body": {"retry": True}},
+                                            {"status": 200, "body": {"key_fingerprint": "ab"}}]})
+        self.assertEqual([json.loads(b) for b in result["sent"]], [body, body])
+        self.assertEqual((result["status"]["className"], result["kept"], result["reloads"]),
+                         ("done", None, 0))
+        self.assertIn("Passkey created", result["status"]["textContent"])
+
+    def test_page_d_attente_sans_corps_se_recharge(self):
+        result = self.run_page({"root": "wait", "answers": []})
+        self.assertEqual((result["sent"], result["reloads"]), ([], 1))
 
     def test_corps_garde_trop_ancien_oublie(self):
         result = self.run_page({"storage": self.kept(at=0), "answers": []})

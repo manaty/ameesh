@@ -90,6 +90,14 @@ class FaultJournalTest(unittest.TestCase):
         self.assertEqual(sorted(e["revision"] for e in self.journal.entries()),
                          ["1.2.3", "1.2.4"])
 
+    def test_route_et_code_bornes_au_lecteur_3885(self):
+        class Long(Exception):
+            code = "c" * 40
+        self.journal.record("GET /" + "x" * 400, Long())
+        [entry] = self.journal.entries()
+        self.assertLessEqual(len(entry["route"]), server_faults.MAX_ROUTE)
+        self.assertLessEqual(len(entry["code"]), server_faults.MAX_CODE)
+
     def test_page_par_curseur(self):
         self.journal.record("GET /", KeyError("k"))
         page = self.journal.page()
@@ -215,6 +223,39 @@ class ApproveReplayTest(ApproveBase):
                 thread.join(30)
         self.assertEqual(sorted(status for status, _r in results), [200, 200], results)
         self.assertEqual(sum(1 for _s, r in results if r.get("replayed")), 1)
+        self.assertEqual(self.fetch_receipt(data["request_id"])[0], 200)
+
+    def test_course_avant_la_lecture_live_deux_accuses(self):
+        """B3 (cx2) : le second envoi lit le lien APRÈS l'écriture du premier
+        (refus « used » de la lecture live) : il rend le reçu gardé."""
+        _action, data, path = self.create()
+        _status, _headers, text = self.page(path)
+        body = self.sign(self.alice, self.page_data(text))
+        first_done = threading.Event()
+        real = self.service._live_record
+        calls = []
+
+        def ordered(token):
+            calls.append(1)
+            if len(calls) == 2:          # le second attend que le premier ait écrit
+                first_done.wait(10)
+            return real(token)
+        results = {}
+        with mock.patch.object(self.service, "_live_record", ordered):
+            def one(name):
+                results[name] = self.submit(path, body)
+                if name == "a":
+                    first_done.set()
+            a = threading.Thread(target=one, args=("a",))
+            a.start()
+            while not calls:
+                threading.Event().wait(0.01)
+            b = threading.Thread(target=one, args=("b",))
+            b.start()
+            a.join(30)
+            b.join(30)
+        self.assertEqual((results["a"][0], results["b"][0]), (200, 200), results)
+        self.assertTrue(results["b"][1]["replayed"])
         self.assertEqual(self.fetch_receipt(data["request_id"])[0], 200)
 
     def test_panne_du_registre_puis_rejeu_du_meme_corps(self):
@@ -356,14 +397,54 @@ class EnrollReplayTest(ApproveBase):
             status, result = self.submit(path, body)
         self.assertEqual((status, result.get("retry")), (500, True), result)
         self.assertEqual(self.proposals(), [])
-        # la page qui l'a envoyé attend ; la page rouverte se recharge seule
+        # la page qui l'a envoyé attend ; la page rouverte renvoie le corps
+        # gardé — une attente voulue, pas une panne : non journalisée (B5 dev3)
         self.assertEqual(self.page(path)[0], 503)
+        self.assertEqual([e["route"] for e in self.service.faults.entries()],
+                         ["ameesh-approve POST /enroll/<token>"])
         status, result = self.submit(path, body)
         self.assertEqual(status, 200, result)
         self.assertEqual(self.proposals(), [result["proposal"]])
         # un AUTRE corps sur le lien consommé reste un refus
         status, other = self.submit(path, self.body_for_other(path, body))
         self.assertEqual((status, other["error"]), (410, "used"))
+
+    def test_proposition_ecrite_puis_reponse_non_gardee_aucun_doublon(self):
+        """B2 (cx2) : la proposition est écrite, garder la réponse échoue ;
+        une reprise plus tard (horloge avancée) rend la MÊME proposition."""
+        path = self.enroll_link()
+        body = self.body(path)
+        real = self.service.store.settle_enroll
+        with mock.patch.object(self.service.store, "settle_enroll",
+                               side_effect=[OSError("disk full"), None]) as settle:
+            status, result = self.submit(path, body)
+            self.assertEqual((status, result.get("retry")), (500, True), result)
+            [written] = self.proposals()
+            # une écriture interrompue a laissé un fichier tronqué
+            proposal = os.path.join(self.acfg.proposals_path, written)
+            with open(proposal, "r+b") as fh:
+                fh.truncate(20)
+            self.clock.offset += 7
+            settle.side_effect = real
+            status, result = self.submit(path, body)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(self.proposals(), [written])
+        self.assertEqual(result["proposal"], written)
+        with open(proposal, encoding="utf-8") as fh:
+            self.assertIn("authenticators:", fh.read())
+        status, again = self.submit(path, body)
+        self.assertEqual((status, again["proposal"], again["replayed"]), (200, written, True))
+
+    def test_page_d_attente_porte_la_reprise(self):
+        path = self.enroll_link()
+        body = self.body(path)
+        with mock.patch("ameesh.approve.enroll.write_proposal",
+                        side_effect=OSError("disk full")):
+            self.assertEqual(self.submit(path, body)[0], 500)
+        status, _headers, text = self.page(path)
+        self.assertEqual(status, 503)
+        self.assertIn('id="ameesh-wait"', text)       # approve.js renvoie le corps gardé
+        self.assertIn('<script src="../static/approve.js"', text)
 
     def body_for_other(self, path, body):
         return dict(body, credential_id=body["credential_id"][:-2] + "AA")
@@ -380,6 +461,71 @@ class EnrollReplayTest(ApproveBase):
             thread.join(30)
         self.assertEqual(sorted(status for status, _r in results), [200, 200], results)
         self.assertEqual(len(self.proposals()), 1)
+
+
+class LoginReplayTest(unittest.TestCase):
+    """B3 (cx2) : done/cancel d'un défi, rejoués ou concurrents — sans base."""
+
+    def setUp(self):
+        from types import SimpleNamespace
+        from urllib.parse import urlsplit
+        from ameesh.approve.config import ApproveConfig
+        from ameesh.approve.service import ApproveService
+        from .test_approve import AGENT, ALICE
+        directory = tempfile.TemporaryDirectory(prefix="l3889-login-")
+        self.addCleanup(directory.cleanup)
+        self.service = ApproveService(ApproveConfig(
+            state_dir=directory.name, public_url="https://approve.example.test"),
+            None, None, service_token="fake", clock=lambda: 1000)
+        self.service._credentials = lambda _approver: ["fake-credential"]
+        first = self.service.create_login_request(dict(
+            host="h", provider="gh", account="a", approver=ALICE, requested_by=AGENT,
+            url="https://github.com/login/device", code="CANARY-CODE-1234"))
+        self.login_id = first["login_id"]
+        self.token = urlsplit(first["link"]).path.rsplit("/", 1)[1]
+        self.service.store.mark_login_viewed(self.login_id)
+        from ameesh.approve import service as service_mod
+        self.service._login_receipt = lambda record, body, decision: (
+            service_mod._receipt_of(dict(record["request"], decision=decision), body),
+            SimpleNamespace(ok=True, approver=ALICE))
+        self.body = {"decision": "done", "credential_id": "Y3JlZA",
+                     "authenticatorData": "YXV0aA", "clientDataJSON": "Y2xpZW50",
+                     "signature": "c2ln"}
+
+    def test_meme_corps_rejoue_autre_corps_refuse(self):
+        from ameesh.approve.service import ApproveError
+        self.assertNotIn("replayed", self.service.login_submit(self.token, self.body))
+        again = self.service.login_submit(self.token, self.body)
+        self.assertTrue(again["replayed"])
+        with self.assertRaises(ApproveError) as caught:
+            self.service.login_submit(self.token, dict(self.body, signature="b3RoZXI"))
+        self.assertEqual((caught.exception.status, caught.exception.code), (410, "used"))
+
+    def test_course_avant_le_verrou_deux_accuses(self):
+        """Deux envois passent la première lecture, puis se suivent sous le
+        verrou : le second voit le reçu (410 « used ») et rend le gardé."""
+        store = self.service.store
+        real = store.login_transition
+        barrier = threading.Barrier(2)
+
+        def together(login_id):
+            barrier.wait(10)
+            return real(login_id)
+        results, errors = [], []
+
+        def one():
+            try:
+                results.append(self.service.login_submit(self.token, self.body))
+            except Exception as exc:  # noqa: BLE001 — le témoin le montre
+                errors.append(exc)
+        with mock.patch.object(store, "login_transition", together):
+            threads = [threading.Thread(target=one) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(30)
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(bool(r.get("replayed")) for r in results), [False, True])
 
 
 if __name__ == "__main__":
