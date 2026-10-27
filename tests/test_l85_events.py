@@ -193,6 +193,19 @@ class EventLogPgTest(PgTestCase):
     def last(self):
         return storage.of(self.db).events.bounds()["last"]
 
+    def position_after_existing(self):
+        """Position after every row already present (#3868).
+
+        `bounds()["head"]` is the last *deliverable* row: on the shared bench,
+        a foreign transaction holds the cluster-wide xmin below rows this
+        schema already committed, so the head lags. When that transaction
+        ends, those rows surface after the position and the test reads a
+        stranger's tail (`alert:pc` before `alert:b`). The schema is ours
+        alone; `top` is the last existing row, so only the events created
+        after it are read.
+        """
+        return storage.of(self.db).events.bounds()["top"]
+
     def delivered(self, store, position, expected, limit=100, timeout=10.0):
         """`readable()` until `expected` (objects, in order) is delivered.
 
@@ -468,7 +481,7 @@ class EventLogPgTest(PgTestCase):
         """Codex P3 r5: after a logical restore, rows of the old cluster sit
         above the counter; `delayed` named an open transaction."""
         store = storage.of(self.db).events
-        position = store.bounds()["head"]
+        position = self.position_after_existing()
         self.addCleanup(self._empty)
         self.db.execute(
             "INSERT INTO ameesh_events (type, object, tx) VALUES ('alert.raised', 'alert:r',"
@@ -488,7 +501,7 @@ class EventLogPgTest(PgTestCase):
         """Codex P1 r1: A takes id 11 and stays open, B takes 12 and commits;
         the reader must neither give 12 and skip 11, nor lose 11."""
         store = storage.of(self.db).events
-        position = store.bounds()["head"]
+        position = self.position_after_existing()
         other = db_mod.connect(self.cfg)
         self.addCleanup(other.close)
         with other.transaction() as tx_a:
@@ -520,7 +533,7 @@ class EventLogPgTest(PgTestCase):
         between two reads on two snapshots: `[]` then `waiting` False, and B
         undelivered with no notification to come. One statement, one snapshot."""
         store = storage.of(self.db).events
-        position = store.bounds()["head"]
+        position = self.position_after_existing()
         other = db_mod.connect(self.cfg)
         self.addCleanup(other.close)
         with other.transaction() as tx_a:

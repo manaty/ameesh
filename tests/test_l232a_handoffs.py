@@ -235,6 +235,11 @@ class HandoffTest(PgTestCase):
                 operations[index] = self.advance(operations[index])
             self.assertEqual(operations[index]["state"], "activated")
 
+        # #3868 : la fenêtre de 5 s expirait sous la charge de la CI (deux
+        # processus, part de ~800 s) : l'effet « enable » rendait la main
+        # avant le contrôle de capacité, et les permis revenaient trop tôt.
+        # Les attentes ci-dessous ne mesurent que la libération explicite ;
+        # elles restent larges pour ne pas dépendre de la charge.
         release = threading.Event()
         finished = [threading.Event(), threading.Event()]
         calls = []
@@ -243,7 +248,7 @@ class HandoffTest(PgTestCase):
             index = len(calls)
             calls.append(intent["id"])
             try:
-                release.wait(5)
+                release.wait(60)
                 return True
             finally:
                 finished[index].set()
@@ -269,18 +274,18 @@ class HandoffTest(PgTestCase):
 
                 release.set()
                 for done in finished:
-                    self.assertTrue(done.wait(2))
+                    self.assertTrue(done.wait(15))
                 # Permits return only after callbacks actually exit, never
                 # when the controller deadline expires.
-                self.assertTrue(pool.acquire(timeout=2))
-                self.assertTrue(pool.acquire(timeout=2))
+                self.assertTrue(pool.acquire(timeout=15))
+                self.assertTrue(pool.acquire(timeout=15))
                 pool.release()
                 pool.release()
                 self.assertEqual(self.advance(deferred)["state"], "prepared")
         finally:
             release.set()
             for done in finished:
-                done.wait(5)
+                done.wait(15)
 
     def test_retry_between_capacity_read_and_controller_reserves_enable_slot(self):
         op = self.request()
