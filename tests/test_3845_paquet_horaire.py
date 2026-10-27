@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import unittest
+from unittest import mock
 from datetime import datetime
 from pathlib import Path
 
@@ -164,6 +167,18 @@ class ComposeTest(Base):
         self.assertEqual(ci[ci.index("--sha") + 1], HEAD)
         self.assertIn(ph.MARK_CI + HEAD, ph.marks(self.shell.items[4000]))
         self.assertEqual(self.shell.mails[-1][0], "mesh-design")
+
+    def test_courriers_nomment_l_expediteur(self):
+        # revue mty-amh-impl-04 : `role run` retire AGENT_MAIL_NAME ; sans
+        # --from, agent-mail refuse (« unbound sender »).
+        self.shell.items[4000] = carrier()
+        ph.tick(self.ctx)
+        mails = [c for c in self.shell.calls if c[0] == "agent-mail"]
+        self.assertTrue(mails)
+        for cmd in mails:
+            self.assertEqual(cmd[cmd.index("--from") + 1], "mesh-design")
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
+        self.assertEqual(auto[auto.index("--from") + 1], "mesh-design")
 
     def test_resolution_laisse_le_verdict_au_pilote(self):
         self.manifest = RESOLVED
@@ -448,6 +463,32 @@ class ExcludeOptionTest(unittest.TestCase):
             ph.auto.compose_packet = original
         self.assertEqual(rc, 0)
         self.assertEqual(parsed, [[3801, 3755]])
+
+    def test_paquet_auto_courrier_avec_expediteur(self):
+        seen = []
+        original = ph.auto.run_command
+        ph.auto.run_command = lambda cmd, **kw: seen.append(cmd) or subprocess.CompletedProcess(cmd, 0, b"", b"")
+        try:
+            ph.auto.send_mail("mesh-design", 9, "corps", "mesh-design")
+            ph.auto.send_mail("mesh-design", 9, "corps")
+        finally:
+            ph.auto.run_command = original
+        self.assertEqual(seen[0][-2:], ["--from", "mesh-design"])
+        self.assertNotIn("--from", seen[1])
+
+    def test_paquet_auto_expediteur_par_defaut_le_role(self):
+        parsed = []
+        original = ph.auto.compose_packet
+        ph.auto.compose_packet = lambda args: parsed.append(args.sender) or 0
+        env = {k: v for k, v in os.environ.items() if k != "AGENT_MAIL_NAME"}
+        env["AMEESH_ROLE"] = "mesh-design"
+        try:
+            with mock.patch.dict(os.environ, env, clear=True):
+                ph.auto.main(["--name", "h-x", "--carrier", "9"])
+            ph.auto.main(["--name", "h-x", "--carrier", "9", "--from", "x"])
+        finally:
+            ph.auto.compose_packet = original
+        self.assertEqual(parsed, ["mesh-design", "x"])
 
 
 if __name__ == "__main__":

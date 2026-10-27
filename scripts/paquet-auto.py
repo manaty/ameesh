@@ -1230,8 +1230,12 @@ def freeze_carrier(worktree: Path, carrier: int, head: str, note: str) -> str:
     return _output(proc)
 
 
-def send_mail(pilot: str, carrier: int, body: str) -> str:
+def send_mail(pilot: str, carrier: int, body: str, sender: str | None = None) -> str:
     cmd = ["agent-mail", "send", pilot, "-", "--lot", str(carrier)]
+    if sender:
+        # #3845 : sous `ameesh role run`, AGENT_MAIL_NAME est retiré ; sans
+        # --from, agent-mail refuse (« unbound sender »).
+        cmd += ["--from", sender]
     proc = run_command(cmd, input_text=body, timeout=120)
     if proc.returncode != 0:
         raise PaquetAutoError(
@@ -1680,7 +1684,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                          inclusion_rc=inclusion_rc, pr_number=pr_number,
                          pr_url=pr_url)
         try:
-            send_mail(args.pilot, args.carrier, mail)
+            send_mail(args.pilot, args.carrier, mail, getattr(args, "sender", None))
         except PaquetAutoError as error:
             print("courrier non envoyé : %s\n\n%s" % (error, mail),
                   file=sys.stderr)
@@ -1708,6 +1712,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="lot porteur du paquet")
     parser.add_argument("--pilot", default="mesh-design",
                         help="destinataire du courrier (défaut : mesh-design)")
+    parser.add_argument("--from", dest="sender",
+                        default=os.environ.get("AMEESH_ROLE") or None,
+                        help="expéditeur du courrier (défaut : AMEESH_ROLE, sinon "
+                             "l'identité liée)")
     parser.add_argument("--local", action="store_true",
                         help="s'arrêter après le manifeste et packet record")
     parser.add_argument("--force", action="store_true",

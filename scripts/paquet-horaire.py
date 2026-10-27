@@ -218,8 +218,10 @@ class Context:
         if self.dry_run:
             self.say("[essai] courrier à %s (#%d) : %s" % (to, lot, body.splitlines()[0]))
             return
-        result = self.shell.run(["agent-mail", "send", to, "-", "--lot", str(lot)],
-                                input_text=body, timeout=120)
+        # #3845 : `ameesh role run` retire AGENT_MAIL_NAME ; l'expéditeur est
+        # l'acteur (le rôle), nommé explicitement.
+        result = self.shell.run(["agent-mail", "send", to, "-", "--lot", str(lot),
+                                 "--from", self.actor], input_text=body, timeout=120)
         if result.returncode != 0:
             # Un courrier perdu ne défait pas le geste : il est dit au journal.
             self.say("courrier à %s non envoyé : %s" % (to, auto._tail(result.text, 5)))
@@ -375,7 +377,7 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
                 exclude: list[int] = (), force: bool = False) -> Result:
     cmd = [ctx.python, str(SCRIPT_DIR / "paquet-auto.py"), "--repo", str(ctx.repo),
            "--target", ctx.target, "--name", name, "--carrier", str(carrier),
-           "--pilot", ctx.pilot]
+           "--pilot", ctx.pilot, "--from", ctx.actor]
     if force:
         cmd.append("--force")
     for lot in exclude:
