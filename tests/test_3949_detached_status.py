@@ -100,6 +100,10 @@ os._exit(0)
             table = [p for p in platform.process_table() if p["pid"] == pid]
             self.assertTrue(table and table[0]["zombie"])
             tracker._reap_strays(table, [])
+            # Une passe suivante, avant le `Job`, ne voit plus le pid et ôte
+            # l'observation : le statut retenu doit rester réclamable.
+            tracker._reap_strays(
+                [p for p in platform.process_table() if p["pid"] == pid], [])
             with mock.patch.object(background.storage, "of"):
                 entry = tracker.start(agent="test", turn_id="detache",
                                       pgid=parent.pid, members=survivors[0],

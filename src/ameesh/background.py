@@ -919,10 +919,10 @@ class Tracker:
         if job.start is None:
             return None
         with self.observed_lock:
-            if job.pid in self.observed_handles:
-                retained = True
-            else:
-                retained = False
+            # #3949 : un statut retenu survit au retrait de l'observation par
+            # une passe des orphelins ultérieure (pid absent du relevé)
+            retained = (job.pid in self.observed_handles
+                        or (job.pid, job.start) in self.observed_codes)
         if retained:
             return self._reap_observed(job.pid, job.start)
         return self._reap_identity(job.pid, job.start)
