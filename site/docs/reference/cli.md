@@ -711,7 +711,7 @@ ameesh agent name  --role R [--project P …] [--canon DIR] [--ref REV] [--fetch
 ameesh agent spawn [name] --by CREATOR --ttl TTL [--role R] [--project P …] [--cwd DIR] [--prompt TEXT] [--json]
 ameesh review-class [FILE …] [--diff REF] [--canon DIR] [--ref REV] [--fetch] [--json]
 ameesh process check FILE [--ref REF] [--version N] [--json]
-ameesh identity verify [TOKEN|-] [--issuer URL --client-id ID] [--domain D] [--binding subject|email]
+ameesh identity verify [FILE|-] [--issuer URL --client-id ID] [--domain D …] [--binding subject|email]
 ```
 
 | Option | Meaning |
@@ -732,8 +732,8 @@ checked revision (default `file:<path>` and `0`), `--json` prints the encoded
 native document and labels. Exit 0 when the block compiles (or the card has no
 workflow), 1 on a named refusal, 2 when the file cannot be read.
 
-`ameesh identity verify` checks an OIDC identity token (the argument, `-` on
-standard input, or the configured token file) and binds its `{issuer,
+`ameesh identity verify` checks an OIDC identity token (read from the FILE
+given, or from standard input when it is omitted or `-`) and binds its `{issuer,
 subject}` — or its `email` on an explicit `--binding email` — to a member of
 the canon (L86). It prints the bound `human` as JSON; exit 3 when no member
 matches, 1 on a named refusal (bad token, unknown issuer, unreadable
