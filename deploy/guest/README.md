@@ -11,7 +11,7 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
 | `install.sh` | prepares the VM; run by its owner, as root (`--dry-run` shows everything first) |
 | `install-pilot.sh` | pilot (a1, L159g): guest runners, slice, guard and gate on the host; run by its owner, as root (`--dry-run`, `--check`, `--uninstall`) |
 | `PILOT-ameesh-agents-1.md` | the owner's exact commands and rollback for the first lending host |
-| `PILOT-ameesh-agents-3.md` | the bureau's commands and rollback for the second host (#4011, no new spend): guest on the root filesystem, transport from agents-1 and agents-2 |
+| `PILOT-ameesh-agents-3.md` | the bureau's commands and rollback for the second host (#4011, no new spend): guest on the root filesystem, transport from agents-1, agents-2 and the host's own `ameesh` user (loopback) |
 | `PILOT-ci-vm.md` | the CI VM lent in mode b1 only (L159h, decision #47757): offer, `install-pilot.sh --offload-only`, then `install.sh --gate file` |
 | `ameesh-guard.service`, `ameesh-gate.tmpfiles.conf` | the capacity guard (L159e) and its gate directories, installed by `install-pilot.sh` |
 | `../../src/ameesh/platform/offload_shell.py` | the VM side, installed as `/usr/local/lib/ameesh-guest/ameesh-offload-shell`; standard library only |
