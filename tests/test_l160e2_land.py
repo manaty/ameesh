@@ -197,9 +197,10 @@ class LocalLandTest(_Land):
 
 
 class PassLeaseTest(_Land):
-    """#3932 : le bail de la passe radar est rendu sur tout chemin de sortie et
-    renouvelé pendant la passe, pour qu'une passe morte ne bloque la file que
-    jusqu'à la borne courte, jamais jusqu'au TTL de 30 min du train."""
+    """#3932 : le bail de la passe radar est pris à la borne courte et rendu
+    sur les chemins qui quittent la file, alors qu'une PR en attente de CI ou
+    un merge en doute le gardent (TTL long) entre deux passes, pour qu'aucun
+    train ni tir direct ne fusionne sous une CI validée sur une ancienne base."""
 
     def test_an_exception_before_the_first_queue_write_releases_the_lease(self):
         """Le cas du vol : la prise réussit, puis plus rien avant l'écriture
@@ -252,6 +253,24 @@ class PassLeaseTest(_Land):
         self.assertEqual(out["result"], "landed", out)
         self.assertIsNone(self.locks.held["p:main"][0],
                           "the lease is released at the end of the pass")
+
+    def test_the_pass_takes_the_lease_at_the_short_bound(self):
+        """Une passe morte ne bloque la file que jusqu'au TTL court de la
+        passe, pas jusqu'aux 30 min du train : la prise emploie bien
+        `LAND_PASS_TTL_S`."""
+        self.assertLess(land.LAND_PASS_TTL_S, land.LOCK_TTL_S)
+        self.queued(4)
+        taken = []
+        real_lock = self.fake.land_lock
+
+        def tracked_lock(key, owner, ttl_s, *, epoch=None):
+            if epoch is None:
+                taken.append(ttl_s)
+            return real_lock(key, owner, ttl_s, epoch=epoch)
+
+        self.fake.land_lock = tracked_lock
+        self.assertEqual(self.land(4)["result"], "landed")
+        self.assertEqual(taken, [land.LAND_PASS_TTL_S])
 
 
 class ReviewAfterMergeTest(LocalLandTest):
@@ -357,6 +376,29 @@ class PrLandTest(_Land):
         self.assertIn("--merge", merge_call)
         self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
 
+    def test_pr_waiting_for_ci_keeps_the_target_reserved_between_passes(self):
+        """#3932 : tant que la PR attend sa CI, le bail de la cible reste tenu
+        entre deux passes, au TTL long : un tir concurrent est `busy` et ne
+        peut pas fusionner sous une CI qui a validé une ancienne cible."""
+        from ameesh import fire
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        locks: dict = {}
+        out = self.land(4, gh=gh, locks=locks)
+        self.assertEqual(out["result"], "landing", out)
+        self.assertTrue(locks, "the lease is kept between two passes")
+        owner, epoch, expires = self.locks.held["p:main"]
+        self.assertEqual((owner, epoch), ("runner-1", locks["p:main"]))
+        self.assertGreaterEqual(expires - time.time(), land.LOCK_TTL_S * 0.9,
+                                "the kept lease covers the interval between passes, "
+                                "not the short pass bound")
+        handle, blocked = fire._target_lock(None, self.project, "main")
+        self.assertIsNone(handle)
+        self.assertTrue(blocked, "a concurrent fire finds the target busy")
+        gh.head, gh.ci = out["sha"], "green"
+        self.assertEqual(self.land(4, gh=gh, locks=locks)["result"], "landed")
+
     def test_red_ci_or_moved_branch_ejects(self):
         for why in ("red", "moved"):
             with self.subTest(why):
@@ -393,7 +435,7 @@ class PrLandTest(_Land):
         self.assertIn("authentication required", failed["error"])
         row = self.fake.queue_rows[4]
         self.assertEqual((row["state"], row["landing_sha"]), ("landing", out["sha"]))
-        self.assertFalse(locks, "the lease is released at the end of the pass")
+        self.assertTrue(locks, "the lease is kept while the lot waits on its PR")
         self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
         gh.fail, gh.head, gh.ci = False, out["sha"], "green"
         self.assertEqual(self.land(4, gh=gh, locks=locks)["result"], "landed")
@@ -541,7 +583,7 @@ class Review194Test(_Land):
         self.assertEqual(out["result"], "retry", out)
         row = self.fake.queue_rows[4]
         self.assertEqual((row["state"], row["landing_sha"]), ("landing", sha))
-        self.assertFalse(locks, "the lease is released at the end of the pass")
+        self.assertTrue(locks, "the lease is kept while the lot waits on its PR")
         gh.merge_result = (0, "", "")
         self.assertEqual(self.land(4, gh=gh, locks=locks)["result"], "landed")
 
@@ -1039,7 +1081,11 @@ class Review194r8Test(_Land):
         row = self.fake.queue_rows[4]
         self.assertEqual(row["state"], "landing")
         self.assertTrue(row["reason"].startswith(land.UNCERTAIN))
-        self.assertFalse(locks, "the lease is released at the end of the pass")
+        self.assertTrue(locks, "the lease is kept while the lot waits on its PR")
+        from ameesh import fire
+        handle, blocked = fire._target_lock(None, self.project, "main")
+        self.assertIsNone(handle)
+        self.assertTrue(blocked, "a concurrent fire finds the target busy during the doubt")
         # next pass: the PR is no longer open, found merged at the landing commit
         fake, state = self.merging(gh, merges=True, readable=True)
         state["merged"] = True
@@ -1057,7 +1103,7 @@ class Review194r8Test(_Land):
         self.assertTrue(self.fake.queue_rows[4]["reason"].startswith(land.UNCERTAIN))
         self.assertIn("state OPEN", done["reason"])
         self.assertIn("complete later", self.sent[-1][1])
-        self.assertFalse(locks, "the lease is released at the end of the pass")
+        self.assertTrue(locks, "the lease is kept while the lot waits on its PR")
         state["merged"] = True
         again = self.land(4, gh=lambda args, timeout=60: fake(args, timeout)
                           if args[:2] != ["pr", "merge"] else self.fail("merged twice"), locks=locks)

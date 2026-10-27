@@ -611,6 +611,7 @@ class _PassLeaseRenewal:
         self.interval = max(0.05, float(ttl / 3.0 if interval is None else interval))
         self.lost = False
         self._stop = threading.Event()
+        self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
     def start(self):
@@ -621,13 +622,16 @@ class _PassLeaseRenewal:
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
-            try:
-                renewed = bool(self._renew())
-            except Exception:  # noqa: BLE001 - database hiccup: retry the next beat
-                continue
-            if not renewed:
-                self.lost = True
-                return
+            with self._lock:
+                if self._stop.is_set():
+                    return
+                try:
+                    renewed = bool(self._renew(self.ttl))
+                except Exception:  # noqa: BLE001 - database hiccup: retry the next beat
+                    continue
+                if not renewed:
+                    self.lost = True
+                    return
 
     def stop(self) -> None:
         self._stop.set()
@@ -638,12 +642,33 @@ class _PassLeaseRenewal:
             # lease is a no-op (the epoch/owner check refuses it).
             thread.join(timeout=5.0)
 
+    def keep(self, ttl: float):
+        """#3932: stop the pass heartbeat, then renew the SAME lease for the
+        inter-pass `ttl`; returns the epoch, or None when the lease is gone.
+
+        The lock orders this final renewal after any beat already in flight,
+        so no late short renewal can shorten it; once stopped, `_run` does not
+        renew again. A database call blocked past the timeout leaves the
+        caller with None: the short pass TTL still frees the target, and no
+        other holder can act while the database is unreadable.
+        """
+        self._stop.set()
+        if not self._lock.acquire(timeout=5.0):
+            return None
+        try:
+            if self.lost:
+                return None
+            return self._renew(ttl)
+        finally:
+            self._lock.release()
+
 
 class _Landing:
     """One landing under the lease `(key, owner, epoch)` (#194 r5): every
     queue write is a compare-and-swap on the lease, in the same statement — a
     stale holder's writes fail, and it reports `busy`; the lease is released
-    once, at the end of every pass (`land_head`), whatever the exit path."""
+    at the end of the pass, except where the lot waits on its PR or on a
+    merge in doubt: those paths keep it for the next pass (`land_head`)."""
 
     def __init__(self, db, project, row, key, owner, epoch, locks, projects=(),
                  cfg=None, clone=None, replayer=None, parts=None, fence=None,
@@ -654,6 +679,11 @@ class _Landing:
         self.key, self.owner, self.epoch, self.locks = key, owner, epoch, locks
         self.ttl = float(ttl)
         self.renewal = renewal
+        #: #3932: the paths that leave the lot `landing` on its PR — waiting
+        #: for its CI, a refused merge, a merge in doubt — keep the target
+        #: reserved between passes. Every other path releases it at the end
+        #: of the pass; `land_head` applies the flag in its `finally`.
+        self.keep = False
         self.projects = projects
         self.cfg, self.clone = cfg, clone
         #: L165 (EP4) : garde du bail élu, appliquée juste avant chaque effet
@@ -917,7 +947,7 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         return {"lot": lot, "result": "busy"}
     locks[key] = epoch
     renewal = _PassLeaseRenewal(
-        lambda: ops.land_lock(key, owner, LAND_PASS_TTL_S, epoch=epoch) is not None,
+        lambda ttl: ops.land_lock(key, owner, ttl, epoch=epoch) is not None,
         ttl=LAND_PASS_TTL_S)
     landing = None
     try:
@@ -952,25 +982,41 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         error = {"lot": lot, "result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}
         if landing is not None:
             if row["state"] == "landing" and project.land == "pr":
-                # its branch holds the merge commit: it stays `landing` and the
-                # PR is read again at the next pass (an error never merges)
+                # its branch holds the merge commit: it stays `landing`, the
+                # target stays reserved, and the PR is read again at the next
+                # pass (an error never merges)
+                landing.keep = True
                 landing.write(reason="reading PR failed (%s): retried" % str(exc)[:200])
             else:
                 landing.write(state="queued",
                               reason="landing failed (%s): retried" % str(exc)[:200])
         return error
     finally:
-        # #3932: the lease is released on EVERY exit path — result, early
-        # return before `landing` exists, exception. A release that fails is
-        # not fatal: without its heartbeat, the short TTL frees the target at
-        # a new epoch (the old holder is fenced by its epoch).
+        # #3932: the lease only covers the pass, except where the lot waits on
+        # its PR (CI pending, refused merge) or on a merge in doubt: there it
+        # stays held, renewed for the long inter-pass TTL, so neither the train
+        # nor a direct fire can merge into the target under a PR whose CI
+        # qualified an older base. Every other exit — result, early return,
+        # exception — releases it. A release that fails is not fatal: without
+        # its heartbeat, the short TTL frees the target at a new epoch (the old
+        # holder is fenced by its epoch).
         renewal.stop()
-        try:
-            ops.land_unlock(key, owner, epoch)
-        except Exception as exc:  # noqa: BLE001 - the TTL still frees the lease
-            print("ameesh: merge lease %s not released (%s: %s); it expires in %.0fs"
-                  % (key, type(exc).__name__, exc, LAND_PASS_TTL_S), file=sys.stderr)
-        locks.pop(key, None)
+        if landing is not None and landing.keep:
+            try:
+                kept = renewal.keep(LOCK_TTL_S)
+            except Exception as exc:  # noqa: BLE001 - the short TTL still frees it
+                kept = None
+                print("ameesh: merge lease %s not kept for the next pass (%s: %s)"
+                      % (key, type(exc).__name__, exc), file=sys.stderr)
+            if kept is None:
+                locks.pop(key, None)
+        else:
+            try:
+                ops.land_unlock(key, owner, epoch)
+            except Exception as exc:  # noqa: BLE001 - the TTL still frees the lease
+                print("ameesh: merge lease %s not released (%s: %s); it expires in %.0fs"
+                      % (key, type(exc).__name__, exc, LAND_PASS_TTL_S), file=sys.stderr)
+            locks.pop(key, None)
 
 
 def _land(landing: _Landing, replayer, slug, gh) -> dict:
@@ -1173,6 +1219,9 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
                                                    merged["sha"][:12], status["number"]),
                          actor=work.SYSTEM_SENDER):
         return landing.busy("lease on %s lost after pushing" % landing.key)
+    # #3932: the merge commit is on the branch, the PR now waits for its CI:
+    # keep the target reserved between passes.
+    landing.keep = True
     return {"lot": lot, "result": "landing", "sha": merged["sha"],
             "replayed": merged["files"] if merged["state"] == "replayed" else []}
 
@@ -1311,6 +1360,10 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
                              % (status["head"] or "?")[:12],
                              "Freeze again, then ameesh work queue add %d." % lot)
     if status["ci"] == "pending":
+        # #3932: the PR waits for its CI on the merge commit: the target stays
+        # reserved between passes, so no train or fire merges under a CI that
+        # qualified an older base; the next pass renews the lease.
+        landing.keep = True
         return {"lot": lot, "result": "landing", "pr": status["number"]}
     if status["ci"] == "red":
         return landing.eject("the CI of PR #%s is red on the merge %s"
@@ -1365,9 +1418,11 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
             # #194 r3: the branch holds the merge commit; the lot stays
             # `landing` with it (and the lease: a lasting refusal raises
             # `merge_blocked`); a merge completed later is found by `pr_merged`
+            landing.keep = True
             landing.write(reason="PR merge refused (%s): retried" % error[:200])
             return {"lot": lot, "result": "retry", "error": error}
         if now is None:
+            landing.keep = True
             landing.write(reason="PR merge refused (%s), PR unreadable (%s): retried"
                           % (error[:200], unread))
             return {"lot": lot, "result": "retry", "error": error}
@@ -1430,6 +1485,9 @@ def _merged_in_doubt(landing: _Landing, pr, after, unread, *, pending=False) -> 
          "lot": lot, "reason": reason})
     how = landing.record(reason, "merge queue of %s: %s" % (row["target"], reason),
                          state="landing" if pending else "landed")
+    # #3932: a merge whose completion is still unknown keeps the target
+    # reserved between passes; the next pass reads the PR again.
+    landing.keep = pending
     return {"lot": lot, "result": "uncertain" if after is None else "landed",
             "wrong_base": after, "pr": pr, "reason": reason, "recorded": how}
 
