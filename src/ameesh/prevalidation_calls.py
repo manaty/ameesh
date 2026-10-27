@@ -555,21 +555,21 @@ FALLBACK_CAUSES = ("selection-full", "selection-unsafe", "card-missing", "card-s
 
 
 def _changed_paths(prepared: Prepared, base: str, head: str, *,
-                   deadline: Deadline | None = None) -> list[tuple[str, str]]:
+                   deadline: Deadline | None = None) -> list[tuple[str, str]] | None:
     """Les fichiers de l'intervalle base de fusion → tête, pour #3954.
 
     Le repli contractuel doit voir les mêmes changements que le plan : la
-    base de fusion, pas le tip de la cible. Une lecture impossible n'invente
-    pas de contrat transverse (les contrats déclarés et les tests P0 du plan
-    restent joués) ; elle ne lève pas non plus, pour ne pas masquer le refus
-    d'origine déjà nommé.
+    base de fusion, pas le tip de la cible. Une lecture impossible rend
+    ``None`` : le repli ne peut pas conclure qu'aucun contrat transverse
+    n'est dû (B/P2 cx3 de #3954), il joue alors tous les contrats transverses
+    déclarés, ou refuse plutôt que d'écrire un vert incomplet.
     """
     comparison = str(getattr(prepared, "base", "") or "").strip() \
         or str(base or "").strip()
     if not comparison:
         comparison = _merge_base(prepared.repo, base or "origin/main", head)
     if not comparison:
-        return []
+        return None
     if deadline is not None and deadline.expired():
         raise prevalidation.PrevalidationError(
             "run-incomplete",
@@ -580,14 +580,42 @@ def _changed_paths(prepared: Prepared, base: str, head: str, *,
                         "diff", "--name-status", "--no-renames",
                         comparison, head], capture_output=True, text=True)
     except (OSError, subprocess.SubprocessError):
-        return []
+        return None
     if getattr(proc, "returncode", 1):
-        return []
+        return None
     out: list[tuple[str, str]] = []
     for line in (getattr(proc, "stdout", "") or "").splitlines():
         status, _, path = line.partition("\t")
         if path:
             out.append((status[:1], path))
+    return out
+
+
+def _tree_modules(prepared: Prepared, head: str, *,
+                  deadline: Deadline | None = None) -> set[str] | None:
+    """Les modules de ``tests/`` présents à la tête, ou ``None`` si illisible.
+
+    La déclaration des contrats transverses est vérifiée sur l'arbre du
+    candidat, comme les contrats déclarés : un module disparu rend le repli
+    incertain (B/P2 cx3 de #3954), jamais silencieusement sauté.
+    """
+    if deadline is not None and deadline.expired():
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé avant la lecture des tests")
+    bounded = prevalidation._bounded_runner(subprocess.run, deadline)
+    try:
+        proc = bounded(["git", "-C", prepared.repo, *prevalidation.NO_REPLACE,
+                        "ls-tree", "--name-only", "-z", head, "tests/"],
+                       capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1):
+        return None
+    out: set[str] = set()
+    for name in (getattr(proc, "stdout", "") or "").split("\0"):
+        if name.startswith("tests/test") and name.endswith(".py"):
+            out.add(os.path.basename(name)[:-3])
     return out
 
 
@@ -643,11 +671,42 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
         raise prevalidation.PrevalidationError(
             "run-incomplete",
             "budget de prévalidation épuisé pendant la lecture des contrats")
+    #: #3954 : la déclaration des contrats transverses est relue dans l'arbre
+    #: du candidat ; un module déclaré disparu rend le repli incertain (B/P2
+    #: cx3), jamais silencieusement sauté.
+    tree_modules = _tree_modules(prepared, head, deadline=deadline)
+    if tree_modules is None:
+        return None
+    if transverse_contracts.problem(tree_modules):
+        return None
     #: #3954 : les contrats transverses dus par les fichiers du lot, et les
     #: tests que le lot change lui-même (P0 du plan) — ils sont dus par le
     #: diff, pas par la carte, et un repli « contrats seuls » les sautait.
-    transverse = transverse_contracts.hits(
-        _changed_paths(prepared, base, head, deadline=deadline))
+    #: Le plan du candidat peut déjà les nommer (`transverse`) : ils comptent
+    #: même si le diff relu ci-dessous est illisible.
+    known = plan.get("transverse") if isinstance(plan.get("transverse"), dict) else {}
+    changes = _changed_paths(prepared, base, head, deadline=deadline)
+    if changes is None:
+        #: diff illisible : on ne peut pas conclure qu'aucun contrat
+        #: transverse n'est dû. Les jouer tous est le seul repli conservateur
+        #: (le contraire sauterait test_l107 sur un lot d'interface).
+        transverse = {str(name): "diff illisible : contrat transverse joué"
+                      for name in transverse_contracts.CONTRACTS}
+        diff_read = False
+    else:
+        transverse = dict(transverse_contracts.hits(changes))
+        diff_read = True
+    for name, why in known.items():
+        transverse.setdefault(str(name), str(why) or "plan L161f")
+    #: Le plan peut déjà classer un contrat transverse en P0/P1 sans porter le
+    #: champ `transverse` (sélecteur antérieur) : sa classe est une preuve
+    #: suffisante, et le repli ne doit pas la perdre.
+    for name, entry in (plan.get("classes") or {}).items():
+        if str(name) not in transverse_contracts.CONTRACTS:
+            continue
+        if isinstance(entry, (list, tuple)) and entry \
+                and str(entry[0]) in ("P0", "P1"):
+            transverse.setdefault(str(name), "classe %s du plan" % entry[0])
     changed_tests = [str(name) for name, entry in (plan.get("classes") or {}).items()
                      if isinstance(entry, (list, tuple)) and entry
                      and str(entry[0]) == "P0"]
@@ -668,6 +727,8 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
         "contracts": list(required),
         "transverse": sorted(transverse),
         "changed_tests": sorted(changed_tests),
+        "transverse_all": not diff_read,
+        "diff": "read" if diff_read else "unreadable",
         "modules": list(modules),
     }
     plan = json.loads(json.dumps(plan))

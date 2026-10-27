@@ -367,6 +367,7 @@ class ContractFallbackTest(unittest.TestCase):
                         "test_cluster  # rôles du cluster\n"
                         "test_migrations  # migrations\n")
         self.repo.write("tests/test_cluster.py", "x = 1\n")
+        self.repo.write("tests/test_l107_executor_contract.py", "x = 1\n")
         self.repo.write("tests/test_l161f_plan.py", "x = 1\n")
         self.head = self.repo.commit("contracts")
 
@@ -506,6 +507,8 @@ class ContractFallbackTest(unittest.TestCase):
         self.assertIn("contrats et tests du lot", plan["selection"]["why"])
         self.assertEqual(fallback["transverse"], ["test_l107_executor_contract"])
         self.assertEqual(fallback["changed_tests"], ["test_3845_paquet_horaire"])
+        self.assertFalse(fallback["transverse_all"])
+        self.assertEqual(fallback["diff"], "read")
         modules = plan["parts"]["psycopg"][0]["modules"]
         self.assertIn("test_l107_executor_contract", modules)
         self.assertIn("test_3845_paquet_horaire", modules)
@@ -516,6 +519,34 @@ class ContractFallbackTest(unittest.TestCase):
         self.assertTrue(chosen.ok, chosen.why)
         self.assertEqual(chosen.fallback["transverse"],
                          ["test_l107_executor_contract"])
+
+    def test_unreadable_diff_plays_all_transverse_contracts(self):
+        # #3954/B de cx3 : un diff illisible ne conclut pas « aucun contrat
+        # transverse dû » ; le repli joue alors tous les contrats déclarés.
+        prepared = calls.prepare(self.repo.root, self.head, self.repo.base)
+        self.addCleanup(prepared.close)
+        with mock.patch.object(calls, "_changed_paths", return_value=None):
+            fallback = calls.contract_fallback(prepared, self.parameters(),
+                                               head=self.head, base=self.repo.base)
+        self.assertIsNotNone(fallback)
+        self.assertTrue(fallback["transverse_all"])
+        self.assertEqual(fallback["diff"], "unreadable")
+        self.assertEqual(fallback["transverse"],
+                         sorted(calls.transverse_contracts.CONTRACTS))
+        modules = prepared.plan["parts"]["psycopg"][0]["modules"]
+        self.assertIn("test_l107_executor_contract", modules)
+        self.assertIn("test_cluster", modules)
+
+    def test_missing_declared_module_refuses_the_fallback(self):
+        # #3954/B de cx3 : une déclaration qui nomme un module disparu ne se
+        # suppose pas ; le repli est refusé (le refus d'origine reste).
+        prepared = calls.prepare(self.repo.root, self.head, self.repo.base)
+        self.addCleanup(prepared.close)
+        with mock.patch.dict(calls.transverse_contracts.CONTRACTS,
+                             {"test_absent_3954": ("src/ameesh/x.py",)}):
+            fallback = calls.contract_fallback(prepared, self.parameters(),
+                                               head=self.head, base=self.repo.base)
+        self.assertIsNone(fallback)
 
 
 class CommitProbeTest(unittest.TestCase):

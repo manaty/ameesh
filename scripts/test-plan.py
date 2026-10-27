@@ -1939,6 +1939,18 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
                        else "full CI request: whole suite")
     plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo,
                          docs_only=bool(plan["docs_only"] and not release)))
+    #: #3954 : une déclaration de contrat transverse qui nomme un module
+    #: disparu sauterait le contrat en silence (B/P2 cx3). La validation
+    #: porte sur les modules réellement présents dans `tests/` à l'arbre du
+    #: sélecteur, pas sur la liste que l'appelant a pu réduire : la sélection
+    #: se déclare alors incertaine (suite complète en CI, contrats seuls en
+    #: prévalidation), et `contract_fallback` refuse son repli.
+    declared_tests = {p.stem for p in (REPO / "tests").glob("test*.py")}
+    contract_problem = transverse_contracts.problem(declared_tests)
+    if contract_problem:
+        plan["unsure"] = list(plan.get("unsure") or ()) + [contract_problem]
+        plan["sure"] = plan["lot_safe"] = plan["phase2_safe"] = False
+        plan["phase2_why"] = contract_problem
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
     #: #749 : modules « always » declenches par le diff (contrat de base, baux
     #: et orphelins), a rejoindre au pilote psql sur une PR.
