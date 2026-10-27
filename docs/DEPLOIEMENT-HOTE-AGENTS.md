@@ -316,8 +316,16 @@ séquence exige les trois VM. Les migrations sont alors appliquées
 depuis une VM d’agents (`HOTE_MIGRATIONS`, par défaut `ameesh-agents-2`) :
 instantané `git archive` de `src`, `ameesh migrate --dry-run --additive-only`
 puis `--additive-only`, comme le chemin bureau-goal ; un échec arrête avant
-toute installation. Seule la sauvegarde locale du poste n’est pas faite (la
-sauvegarde serveur quotidienne reste). L’hôte local est `HOTE_LOCAL`, sinon
+toute installation. La sauvegarde locale du poste est remplacée par un dump
+du serveur seul : `ameesh-sauvegarde.service` lancé sur `manaty-mesh-1`, un
+nouveau dump exigé (chemin, taille, SHA-256 dans la trace), gardé sur la VM
+sans rapatriement ; un échec arrête avant les migrations ; serveur reporté
+(`--absent manaty-mesh-1=…`), le dump est sauté, sans autre événement à son
+nom que `absent`/`reporte` (une autre étape contredirait l’absence). Nommé dans
+`--hotes` alors qu’il est absent, le poste est ignoré : la sélection est celle
+des VM nommées. Le tick de release ne relance une séquence déjà attestée avec
+le poste reporté que s’il tourne sur le poste (même détection d’hôte), pour le
+rattraper ; ailleurs, il ne la rejoue pas. L’hôte local est `HOTE_LOCAL`, sinon
 `AMEESH_HOST`, sinon le champ `host` de la configuration ameesh, sinon
 `hostname -s` ; `HOTE_LOCAL=pc-smichea` dans `BASCULE_ENV` lève toute
 ambiguïté sur une VM dont la configuration recopierait celle du poste.

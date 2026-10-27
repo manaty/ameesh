@@ -319,21 +319,24 @@ class PrepareTest(unittest.TestCase):
 
     def test_both_commit_probes_read_the_shared_deadline(self):
         # #2665/B1 cx2 : les sondes head/base repartaient de GIT_TIMEOUT (60 s).
+        # #3877 : le plan (vrai sous-processus) a le reste de l'échéance ;
+        # 0,5 s ne suffisait pas sur un runner chargé. Le reste (20 s) reste
+        # sous GIT_TIMEOUT : la sonde lit toujours l'échéance partagée.
         now = [100.0]
-        deadline = calls.Deadline(1.0, clock=lambda: now[0])
+        deadline = calls.Deadline(40.0, clock=lambda: now[0])
         seen = []
 
         def probe(repo, rev, *, timeout=None):
             seen.append((rev, timeout))
-            now[0] += 0.25
+            now[0] += 10.0
             return self.repo.head if len(seen) == 1 else self.repo.base
 
         with mock.patch.object(plan_git, "_commit", side_effect=probe):
             prepared = calls.prepare(self.repo.root, self.repo.head, self.repo.base,
                                      deadline=deadline)
         self.addCleanup(prepared.close)
-        self.assertEqual(seen[0], (self.repo.head, 1.0))
-        self.assertAlmostEqual(seen[1][1], 0.75)
+        self.assertEqual(seen[0], (self.repo.head, 40.0))
+        self.assertAlmostEqual(seen[1][1], 30.0)
 
     def test_an_overrunning_commit_probe_is_run_incomplete(self):
         # La preuve de cx2 : une sonde lente ne doit pas rendre selection-unsafe.

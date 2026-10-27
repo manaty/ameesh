@@ -131,6 +131,16 @@ case "$*" in
       exit 1
     fi
     exit 0 ;;
+  *ameesh-sauvegarde.service*)
+    # relecture dev1 #3848 : dump serveur quand le poste est absent
+    cat >/dev/null || true
+    printf 'sauvegarde-serveur %s\n' "$*" >> "$FAKE_STATE/calls.log"
+    if grep -qx "ko=sauvegarde" "$FAKE_STATE/scenario" 2>/dev/null; then
+      echo "sauvegarde injectee KO" >&2
+      exit 1
+    fi
+    printf '/home/ameesh/sauvegardes/ameesh-2026-10-27.dump\n4096\n%064d\n' 0
+    exit 0 ;;
 esac
 exit 255
 '''
@@ -662,8 +672,17 @@ class StagingTest(unittest.TestCase):
                          [('ameesh-agents-1', 'installer'),
                           ('ameesh-agents-2', 'installer'),
                           ('manaty-mesh-1', 'installer')])
-        # sauvegarde du poste non jouee ; migrations depuis agents-2 (#3848)
+        # sauvegarde du poste non jouee, remplacee par le dump du serveur
+        # avant les migrations (relecture dev1 #3848) ; migrations depuis agents-2
         self.assertNotIn(('pc-smichea', 'sauvegarder'), actions)
+        sauvegardes = [i for i, ligne in enumerate(self.calls())
+                       if ligne.startswith('sauvegarde-serveur ')]
+        self.assertEqual(len(sauvegardes), 1, self.calls())
+        self.assertIn('root@10.77.0.2', self.calls()[sauvegardes[0]])
+        trace_sauvegarde = next(t for t in self.traces() if t['etape'] == 'sauvegarde')
+        self.assertEqual(trace_sauvegarde['hote'], 'manaty-mesh-1')
+        self.assertEqual(trace_sauvegarde['verdict'], 'ok')
+        self.assertIn('ameesh-2026-10-27.dump', trace_sauvegarde['detail'])
         self.assertNotIn(('pc-smichea', 'migrer'), actions)
         migrations = [i for i, ligne in enumerate(self.calls())
                       if ligne.startswith('stub ') and 'bash -s -- %s' % self.sha in ligne]
@@ -671,6 +690,7 @@ class StagingTest(unittest.TestCase):
         self.assertIn('root@10.77.0.4', self.calls()[migrations[0]])
         premier_install = next(i for i, ligne in enumerate(self.calls())
                                if 'action=installer' in ligne)
+        self.assertLess(sauvegardes[0], migrations[0])
         self.assertLess(migrations[0], premier_install)
         trace_migration = next(t for t in self.traces() if t['etape'] == 'migrations')
         self.assertEqual(trace_migration['hote'], 'ameesh-agents-2')
@@ -710,12 +730,35 @@ class StagingTest(unittest.TestCase):
         self.assertEqual(trace['sha'], self.sha)
         self.assertIn('sans-acces', trace['detail'])
         self.assertIn('manaty-mesh-1 : absent', p.stdout)
+        # aucun dump tente sur un serveur sans acces ; le serveur reporte ne
+        # porte que son evenement absent (actif.py, preuve_absence ; #3853)
+        self.assertFalse([l for l in self.calls() if l.startswith('sauvegarde-serveur ')])
+        self.assertIn('sauvegarde sautee', p.stdout)
+        self.assertEqual([t['etape'] for t in self.traces()
+                          if t['hote'] == 'manaty-mesh-1'], ['absent'])
         ligne = self.actif_args()
         self.assertIn('--absent manaty-mesh-1=sans-acces', ligne)
         self.assertIn('--absent pc-smichea=', ligne)
         self.assertNotIn('--hote manaty-mesh-1=', ligne)
         self.assertIn('--hote ameesh-agents-1=', ligne)
         self.assertIn('--hote ameesh-agents-2=', ligne)
+
+    def test_vm_backup_failure_migrates_nothing(self):
+        """Dump serveur en echec : ni migration ni installation."""
+        (self.state / 'scenario').write_text('ko=sauvegarde\n')
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn('sauvegarde serveur en echec', p.stderr)
+        self.assertFalse([l for l in self.calls()
+                          if l.startswith('stub ') and 'bash -s -- ' in l], self.calls())
+        self.assertNotIn(('ameesh-agents-1', 'installer'), self.actions())
+        trace = next(t for t in self.traces() if t['etape'] == 'sauvegarde')
+        self.assertEqual((trace['hote'], trace['verdict']), ('manaty-mesh-1', 'ko'))
+
+    def test_vm_sans_sauvegarde_skips_the_server_dump(self):
+        p = self.run_vm('--sans-sauvegarde')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertFalse([l for l in self.calls() if l.startswith('sauvegarde-serveur ')])
 
     def test_vm_migration_failure_installs_nothing(self):
         """Une migration en echec arrete avant toute installation (#3848)."""
@@ -804,11 +847,20 @@ class StagingTest(unittest.TestCase):
         self.assertIn('sequence partielle', p.stderr)
         self.assertNotIn('actif.py', ' '.join(self.calls()))
 
-    def test_vm_hotes_with_poste_still_requires_the_three_vms(self):
-        p = self.run_vm('--hotes', 'pc-smichea ameesh-agents-1')
-        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
-        self.assertIn('sequence complete des quatre hotes', p.stderr)
-        self.assertEqual(self.calls(), [])
+    def test_vm_hotes_naming_absent_poste_ignores_it(self):
+        """Poste absent : nomme dans --hotes, il est ignore ; le reste est une
+        selection de VM ordinaire (relecture dev1 #3848, plus de sortie 2)."""
+        p = self.run_vm('--hotes', 'pc-smichea ameesh-agents-1', '--sans-sonde')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('pc-smichea ignore (poste absent', p.stderr)
+        self.assertNotIn('sequence complete des quatre hotes', p.stderr)
+        self.assertEqual([a for a in self.actions() if a[1] == 'installer'],
+                         [('ameesh-agents-1', 'installer')])
+        self.assertIn('sequence partielle', p.stderr)
+        self.assertNotIn('actif.py', ' '.join(self.calls()))
+        p = self.run_vm('--hotes', 'pc-smichea ameesh-agents-1 ameesh-agents-2 manaty-mesh-1')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('--absent pc-smichea=', self.actif_args())
 
     def test_outside_main_is_refused_without_override(self):
         self.repo.joinpath('marque').write_text('y\n')
