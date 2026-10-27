@@ -473,6 +473,11 @@ class RunnerTest(PgTestCase):
             proc.terminate()
             proc.wait(timeout=30)
             lecteur.join(timeout=10)
+            # #3881 : le fil lecteur atteint l'EOF mais ne ferme pas le fichier
+            # du tube ; sans cette fermeture, `unclosed file` sort en
+            # ResourceWarning à la finalisation.
+            if proc.stdout is not None:
+                proc.stdout.close()
         # Arrêt propre, jamais une mort par signal : un fil démon encore dans un
         # `print` à la finalisation faisait abandonner CPython (SIGABRT, core).
         self.assertGreaterEqual(proc.returncode, 0, "code %r\n%s" % (proc.returncode, "".join(lignes)))
