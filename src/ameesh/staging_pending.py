@@ -75,10 +75,13 @@ def _deployment_refs(note) -> tuple[set[int], set[int]]:
 
 
 def active_hosts() -> dict[str, dict]:
-    """Latest attested commit per host; keep partial-host evidence too.
+    """Latest attested state per host; a reported poste is kept as absent.
 
     A newer attestation supersedes an older one (including a deliberate
-    rollback). An unknown commit is never resolved by substituting a tag.
+    rollback or a reported absence, #3848). An unknown commit is never resolved
+    by substituting a tag. A reported host has `sha: None` and `absent: True`:
+    callers that compare content (`regressions`, `waiting`) skip it, so an
+    absent poste holds neither staging nor lots.
     """
     from . import release_cutoff as rc
     folder = Path(rc.attestation_path("0" * 40)).parent
@@ -92,13 +95,25 @@ def active_hosts() -> dict[str, dict]:
             sha = str(data.get("sha") or "").lower()
             if not _SHA.fullmatch(sha) or not isinstance(data.get("hotes"), dict):
                 continue
+            reportes = data.get("reportes") or {}
+            if not isinstance(reportes, dict):
+                continue
+            for host, detail in reportes.items():
+                raison = (str(detail.get("raison") or "").strip()
+                          if isinstance(detail, dict) else "")
+                if not raison:
+                    continue
+                if host not in out or at >= out[host]["at"]:
+                    out[host] = {"sha": None, "absent": True, "raison": raison,
+                                 "at": at, "attestation": str(path)}
             for host, detail in data["hotes"].items():
                 current = str(detail.get("actif") or "").lower()
                 if not _SHA.fullmatch(current) or not (
                         sha.startswith(current) or current.startswith(sha)):
                     continue
-                if host not in out or at > out[host]["at"]:
-                    out[host] = {"sha": sha, "at": at, "attestation": str(path)}
+                if host not in out or at >= out[host]["at"]:
+                    out[host] = {"sha": sha, "absent": False, "at": at,
+                                 "attestation": str(path)}
         except (OSError, ValueError, TypeError, AttributeError):
             continue
     return out
@@ -117,6 +132,9 @@ def regressions(project, candidate: str, active=None, *, unknown=None) -> dict[s
     if project.name != "ameesh":
         return out
     for host, evidence in (active_hosts() if active is None else active).items():
+        # un poste reporte ne porte aucun contenu a preserver (#3848)
+        if evidence.get("absent"):
+            continue
         try:
             sha = rc.commit_of(project.repo, evidence["sha"])
         except rc.TransientReleaseError:
@@ -175,6 +193,10 @@ def waiting(db, project, *, active=None) -> dict:
             for number in numbers:
                 refs[ident].update(migrations.get(number, ()))
     active = active_hosts() if active is None else active
+    # #3848 : un poste reporte absent ne retient ni staging ni lots. Seuls les
+    # hotes reellement actifs sont compares.
+    actifs_reels = {host: evidence for host, evidence in active.items()
+                    if not evidence.get("absent")}
     needed, unknown = [], []
     milestones: dict[int, dict | None] = {}
     commits: dict[str, str | None] = {}
@@ -207,7 +229,7 @@ def waiting(db, project, *, active=None) -> dict:
                                 "reason": "merged commit absent from the release clone"})
                 continue
             missing_hosts = []
-            for host, evidence in active.items():
+            for host, evidence in actifs_reels.items():
                 current = commit(evidence["sha"])
                 if current is None:
                     unknown.append({"lot": ident, "blocker": blocker, "sha": sha,
@@ -219,7 +241,7 @@ def waiting(db, project, *, active=None) -> dict:
                     raise rc.TransientReleaseError("unreadable staging ancestry")
                 if check.returncode:
                     missing_hosts.append(host)
-            if not active:
+            if not actifs_reels:
                 unknown.append({"lot": ident, "blocker": blocker, "sha": sha,
                                 "reason": "no active host attestation"})
             elif missing_hosts:

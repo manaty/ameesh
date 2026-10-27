@@ -31,6 +31,7 @@ import time
 from typing import Sequence
 
 from . import accounts, account_turn, auth_failure, fil, identity, mail, platform, registry, stagnation, storage
+from . import canon as canon_mod
 from . import config as config_mod
 from . import cost as cost_mod
 from . import db as db_mod
@@ -50,8 +51,9 @@ DEFAULT_ADOPT = ("Resuming under the runner: read your mail, pick up the state o
 DEFAULT_RESUME = ("Resuming (ameesh resume): read your mail, pick up the state of your "
                   "work, end each turn with a clear status.")
 
-#: bornes du brief de reprise déterministe (octets UTF-8)
-BRIEF_MAX_BYTES = 19000
+#: bornes du brief de reprise déterministe (octets UTF-8) ; #3867 : le plafond
+#: est partagé avec `canon check`, qui mesure le bloc de règles avec lui
+BRIEF_MAX_BYTES = canon_mod.BRIEF_MAX_BYTES
 FIL_ENTRIES = 30
 FIL_MAX_BYTES = 8000
 FIL_ENTRY_CHARS = 400
@@ -64,16 +66,16 @@ LOTS_MAX = 40
 #: pour autant : le texte plus court que cette part reste entier.
 #: #3126 : réserve fixe de 4 000 octets ; relever le plafond du brief donne
 #: toute la place supplémentaire aux règles, sans agrandir cette réserve.
-BRIEF_TEXT_MIN_BYTES = 4000
+BRIEF_TEXT_MIN_BYTES = canon_mod.BRIEF_TEXT_MIN_BYTES
 
 #: #538 : les règles de travail des fiches Process du canon ouvrent le brief
 #: (nouvelle session, rotation, reprise), avant le rôle et la consigne.
-PROCESS_RULES_HEADER = "## Working rules (canon Process cards)"
+PROCESS_RULES_HEADER = canon_mod.PROCESS_RULES_HEADER
 
 #: #538 : pied du bloc de règles. Il marque la FIN du bloc : un brief préparé à
 #: l'avance (rotation, reprise) se laisse ainsi RELIRE au lancement, et une
 #: fiche retirée entre-temps ne reste pas dans le brief (verdict codex #510 r2, P2).
-PROCESS_RULES_FOOTER = "<!-- end of the canon Process rules -->"
+PROCESS_RULES_FOOTER = canon_mod.PROCESS_RULES_FOOTER
 
 #: #538 : constats de lecture qui privent le canon de ses fiches. `readable`
 #: reste vrai quand la lecture des fiches échoue (`canon-git-error`) : le brief

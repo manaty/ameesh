@@ -1,28 +1,52 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# Mise a jour « staging » du mesh ameesh : les quatre hotes, VM d'abord, poste
-# en dernier, sante bornee par hote, retour automatique, traces JSONL et
-# attestation « staging actif » vers le rapporteur (#1323).
+# Mise a jour « staging » du mesh ameesh : les trois VM d'abord, le poste en
+# dernier s'il est en ligne, sante bornee par hote, retour automatique, traces
+# JSONL et attestation « staging actif » vers le rapporteur (#1323).
 # Procedure : docs/DEPLOIEMENT-HOTE-AGENTS.md, « Sequence staging ».
 #
 #   deploy/mise-a-jour/staging.sh [--a-blanc] [--hotes "nom …"]
 #                                [--lots "n …"] [--rapporteurs "agent …"]
-#                                [--sans-sauvegarde] [--sans-sonde] [REF]
+#                                [--sans-sauvegarde] [--sans-sonde]
+#                                [--sans-poste] [--absent nom=raison] [REF]
 #
 # REF : commit, branche ou etiquette du depot (defaut : HEAD). Il doit etre un
 # ancetre de origin/main, sauf HORS_MAIN=1 (BRANCHE_MAIN pour viser une autre
 # branche).
 #
+# La sequence est lancable depuis le poste ou depuis une VM (bureau-goal,
+# VM d'agents). Le poste ne se met a jour qu'en local (poste.sh, unites
+# systemd du poste) : executee ailleurs, la sequence le declare ABSENT, saute
+# ses etapes (verifier, sauvegarde, migrations, role, installer, redemarrer,
+# controler, sante) avec la trace « poste absent, mise a jour a son retour »,
+# et n'attend pas son retour. Sur le poste, la sequence complete reste celle
+# des quatre hotes (VM d'abord). L'hote local est HOTE_LOCAL s'il est pose,
+# sinon AMEESH_HOST, sinon le champ « host » de la configuration ameesh, sinon
+# `hostname -s` ; le poser dans BASCULE_ENV sur une VM dont la configuration
+# porterait « pc-smichea » evite une fausse detection (#3848). Un serveur du
+# mesh sans acces root (manaty-mesh-1, aucun executant, sauvegarde seulement)
+# peut etre declare absent de la meme facon avec
+# `--absent manaty-mesh-1=raison` : les deux VM d'agents restent requises et
+# atteste ; l'attestation le nomme dans `reportes`, sans bloquer la sequence
+# (bureau #147558). Les deux VM d'agents ne sont jamais reportables.
+#
+# Sans HOTES_STAGING (cas de bureau-goal, qui n'a qu'un fichier par VM), la
+# topologie est composee des bascule-a1.env et bascule-a2.env du dossier de
+# BASCULE_ENV (AGENTS_SSH + HOTE_AGENTS) et de SERVEUR_SSH (ou VM) pour
+# manaty-mesh-1 ; pc-smichea reste absent (poste reporte).
+#
 # HOTES_STAGING (BASCULE_ENV) : la topologie, une entree « nom=cible » par
 # hote, dans cet ordre :
 #   ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4
-#   manaty-mesh-1=root@10.77.0.2 pc-smichea=poste
-# « poste » (ou « local ») designe le poste, toujours en dernier. Le mode de
-# chaque hote est deduit de son nom : manaty-mesh-1 est le serveur du mesh
-# (Postgres, `vm.sh`), pc-smichea le poste (`poste.sh`), les autres sont des
-# VM d'agents (`vm.sh agents`). VM (BASCULE_ENV) doit etre l'adresse de
-# manaty-mesh-1 ; PERSONAS_VM peut etre vide (hote sans executant).
+#   manaty-mesh-1=root@10.77.0.1 pc-smichea=poste
+# Les trois VM sont requises. pc-smichea=poste est optionnel : omis, il est
+# declare absent et la sequence des trois VM peut attester. « poste » (ou
+# « local ») designe le poste, en dernier. Le mode de chaque hote est deduit de
+# son nom : manaty-mesh-1 est le serveur du mesh (Postgres, `vm.sh`),
+# pc-smichea le poste (`poste.sh`), les autres sont des VM d'agents
+# (`vm.sh agents`). VM (BASCULE_ENV) doit etre l'adresse de manaty-mesh-1 ;
+# PERSONAS_VM peut etre vide (hote sans executant).
 #
 # Options lues dans BASCULE_ENV : SONDE_<HOTE> (cible de la sonde de courrier,
 # par defaut la premiere persona menee de l'hote), ATTENTE_COURRIER (300 s),
@@ -34,7 +58,16 @@
 # noms sont normalises : un seul exemplaire par hote, quel que soit le
 # separateur (espace, tabulation, nouvelle ligne). Le poste ne peut pas y
 # figurer sans les trois VM : le canon §14 exige des VM saines avant toute
-# modification du poste, et un sous-ensemble n'en apporte aucune preuve.
+# modification du poste, et un sous-ensemble n'en apporte aucune preuve. Nomme
+# alors que le poste est absent, il est ignore (deja reporte).
+#
+# --sans-poste (ou SANS_POSTE=1 dans BASCULE_ENV) declare le poste absent meme
+# si la sequence tourne sur lui : ses etapes sont sautees et tracees, comme
+# lorsqu'elle part d'une VM.
+#
+# --absent nom=raison (repete) declare un hote sans acces reportable :
+# manaty-mesh-1 ou pc-smichea. Les deux VM d'agents ne le sont jamais ; chaque
+# absence est tracee au commit vise et reprise dans l'attestation.
 #
 # --lots / --rapporteurs (ou LOTS_VERIF / RAPPORTEURS_VERIF) : les lots livres
 # par ce deploiement et les agents a reveiller quand il est reellement actif.
@@ -42,9 +75,11 @@
 # (deploy/mise-a-jour/actif.py, #1323) est ecrite sous
 # ~/.local/state/ameesh/mise-a-jour/actif-<commit>.json et chaque rapporteur
 # recoit un courrier unique par commit (hotes, commit relu actif, preuves
-# installer/redemarrer/controler/sante). Un echec ou un retour n'emet aucun
-# signal de reussite ; un sous-ensemble n'atteste rien ; aucun lot n'est clos
-# automatiquement.
+# installer/redemarrer/controler/sante). « Complete » = les trois VM prouvees,
+# plus le poste s'il est en ligne ; poste absent, l'attestation porte les trois
+# VM et le champ `reportes` qui nomme le poste et sa mise a jour a son retour.
+# Un echec ou un retour n'emet aucun signal de reussite ; un sous-ensemble de
+# VM n'atteste rien ; aucun lot n'est clos automatiquement.
 #
 # La preuve d'activation d'un hote en mode serveur (sans executant, comme
 # manaty-mesh-1) est specifique : son `controler` vert et une sonde croisee
@@ -54,12 +89,15 @@
 # persona menee) n'atteste rien, et une remise croisee n'y est pas acceptee.
 #
 # Etapes : verifier chaque hote (lecture seule) ; sauvegarder puis migrer REF
-# (additif seulement, base partagee) ; puis, hote par hote dans l'ordre
-# ci-dessus : installer, [poste] role, redemarrer, controler, sante (unites,
-# baux et doctor par `controler`, puis courrier reellement remis par une
-# sonde). Un echec = retour automatique de l'HOTE (previous-sha), controle du
-# retour, arret de la sequence et courrier urgent au pilote. Rien n'est
-# repris apres un echec ; relancer la commande est sur : un hote deja au
+# (additif seulement, base partagee) — la sauvegarde est celle du poste et est
+# sautee quand il est absent ; les migrations sont alors appliquees depuis une
+# VM d'agents (snapshot git archive de src, dry-run additif d'abord, puis
+# --additive-only), comme le chemin bureau-goal (#3848) ; puis, hote par hote
+# dans l'ordre ci-dessus : installer, [poste] role, redemarrer, controler,
+# sante (unites, baux et doctor par `controler`, puis courrier reellement remis
+# par une sonde). Un echec = retour automatique de l'HOTE (previous-sha),
+# controle du retour, arret de la sequence et courrier urgent au pilote. Rien
+# n'est repris apres un echec ; relancer la commande est sur : un hote deja au
 # commit vise ne le reinstallle pas (le previous-sha reste le bon).
 # Un seul operateur a la fois : un second passage sort en 75 (verrou
 # ~/.local/state/ameesh/mise-a-jour/staging.lock) sans rien modifier.
@@ -103,6 +141,54 @@ LOTS_VERIF=${LOTS_VERIF:-}
 RAPPORTEURS_VERIF=${RAPPORTEURS_VERIF:-}
 #: ordre canonique du staging : VM d'abord, poste en dernier
 ORDRE=(ameesh-agents-1 ameesh-agents-2 manaty-mesh-1 pc-smichea)
+#: les trois VM, seules requises : un staging sans elles n'atteste rien
+HOTES_VMS=(ameesh-agents-1 ameesh-agents-2 manaty-mesh-1)
+#: les deux VM d'agents, jamais reportables ; le serveur du mesh peut l'etre
+#: quand le bureau n'a aucun acces root (il n'a pas d'executant, sauvegarde)
+HOTES_AGENTS=(ameesh-agents-1 ameesh-agents-2)
+HOTE_SERVEUR=manaty-mesh-1
+#: sans le poste, cette sequence pourra attester les trois VM (poste reporte)
+SANS_POSTE=${SANS_POSTE:-0}
+SERVEUR_ABSENT=0
+SERVEUR_RAISON=""
+POSTE_RAISON_DECLAREE=""
+declare -A ABSENT_DECLARE=()
+CONFIG_HOTE=${AMEESH_CONFIG:-${AGENT_MESH_CONFIG:-$HOME/.config/ameesh/config.json}}
+#: hote qui execute la sequence : le poste (pc-smichea) ne se met a jour qu'en
+#: local ; ailleurs, il est absent et sa mise a jour est reportee a son retour.
+hote_courant() {
+  local hote=""
+  if [ -n "${HOTE_LOCAL:-}" ]; then
+    printf '%s\n' "$HOTE_LOCAL"
+    return 0
+  fi
+  # les services du poste posent AMEESH_HOST ; la configuration le repete.
+  if [ -n "${AMEESH_HOST:-}" ]; then
+    printf '%s\n' "${AMEESH_HOST,,}"
+    return 0
+  fi
+  if [ -n "${AGENT_MESH_HOST:-}" ]; then
+    printf '%s\n' "${AGENT_MESH_HOST,,}"
+    return 0
+  fi
+  if [ -r "$CONFIG_HOTE" ]; then
+    hote=$(python3 -c 'import json, sys
+try:
+    donnees = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit(1)
+hote = donnees.get("host") if isinstance(donnees, dict) else None
+if not isinstance(hote, str) or not hote.strip():
+    raise SystemExit(1)
+print(hote.strip().lower())' "$CONFIG_HOTE" 2>/dev/null) || hote=""
+  fi
+  if [ -z "$hote" ]; then
+    hote=$(hostname -s 2>/dev/null || hostname)
+  fi
+  printf '%s\n' "${hote,,}"
+}
+HOTE_LOCAL=$(hote_courant)
+HOTE_LOCAL=${HOTE_LOCAL,,}
 
 A_BLANC=0
 SAUVER=1
@@ -111,13 +197,19 @@ HOTES_FILTRE=""
 REF=HEAD
 POSITIONNELS=0
 
-usage() { sed -n '7,20p' "$0"; }
+usage() { sed -n '9,12p' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --a-blanc) A_BLANC=1 ;;
     --sans-sauvegarde) SAUVER=0 ;;
     --sans-sonde) SONDE=0 ;;
+    --sans-poste) SANS_POSTE=1 ;;
+    --absent)
+      _absent=${2:?--absent attend NOM=RAISON}
+      shift
+      ABSENT_DECLARE[${_absent%%=*}]=${_absent#*=}
+      ;;
     --hotes) HOTES_FILTRE=${2:?--hotes attend une liste de noms}; shift ;;
     --lots) LOTS_VERIF=${2:?--lots attend une liste de lots}; shift ;;
     --rapporteurs) RAPPORTEURS_VERIF=${2:?--rapporteurs attend une liste d agents}; shift ;;
@@ -128,6 +220,15 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ "$POSITIONNELS" -le 1 ] || { echo "un seul REF attendu" >&2; exit 2; }
+for _nom in "${!ABSENT_DECLARE[@]}"; do
+  _raison=${ABSENT_DECLARE[$_nom]}
+  [ -n "$_raison" ] || { echo "--absent : raison vide pour « $_nom »" >&2; exit 2; }
+  case "$_nom" in
+    manaty-mesh-1) SERVEUR_ABSENT=1; SERVEUR_RAISON=$_raison ;;
+    pc-smichea) SANS_POSTE=1; POSTE_RAISON_DECLAREE=$_raison ;;
+    *) echo "--absent : hôte non reportable « $_nom » (seuls manaty-mesh-1 et pc-smichea)" >&2; exit 2 ;;
+  esac
+done
 
 # Liste normalisee (virgule, espace, tabulation, nouvelle ligne) : un seul
 # exemplaire par element, ordre d'apparition conserve. Le globbing est
@@ -168,11 +269,42 @@ var_sonde_de() { printf 'SONDE_%s\n' "$(printf '%s' "$1" | tr 'a-z.-' 'A-Z__')";
 declare -A CIBLE=()
 declare -A FICHIER_HOTE=()
 declare -A CHOISI=()   #: selection normalisee de --hotes (un nom = une entree)
+POSTE_ABSENT=0
+POSTE_RAISON=""
 HOTES=()
+TOPOLOGIE_COMPOSEE=0
 if [ -z "${HOTES_STAGING:-}" ]; then
-  echo "HOTES_STAGING absent de $BASCULE_ENV : declarer les quatre hotes" >&2
-  echo "  HOTES_STAGING=\"ameesh-agents-1=root@… ameesh-agents-2=root@… manaty-mesh-1=root@… pc-smichea=poste\"" >&2
-  exit 2
+  # #3848 : le bureau VM n'a qu'un fichier par VM d'agents (bascule-a1/a2.env).
+  # Composer la topologie depuis ces deux fichiers ; manaty-mesh-1 vient de
+  # SERVEUR_SSH (ou VM), pc-smichea reste absent (poste reporte).
+  DIR_BASCULE=$(dirname "$BASCULE_ENV")
+  compose=()
+  for f in "$DIR_BASCULE/bascule-a1.env" "$DIR_BASCULE/bascule-a2.env"; do
+    [ -r "$f" ] || continue
+    entree=$(
+      # shellcheck disable=SC1090
+      . "$f" >/dev/null 2>&1 || exit 1
+      [ -n "${HOTE_AGENTS:-}" ] && [ -n "${AGENTS_SSH:-}" ] || exit 1
+      printf '%s=%s' "$HOTE_AGENTS" "$AGENTS_SSH"
+    ) || entree=""
+    [ -n "$entree" ] && compose+=("$entree")
+  done
+  if [ ${#compose[@]} -ge 2 ]; then
+    SERVEUR_SSH=${SERVEUR_SSH:-${VM:+root@$VM}}
+    if [ -z "$SERVEUR_SSH" ]; then
+      echo "HOTES_STAGING absent de $BASCULE_ENV ; topologie composee depuis $DIR_BASCULE/bascule-a{1,2}.env," >&2
+      echo "mais manaty-mesh-1 manque : poser SERVEUR_SSH=root@10.77.0.1 (ou VM=10.77.0.1) dans l'environnement ou BASCULE_ENV" >&2
+      exit 2
+    fi
+    HOTES_STAGING="${compose[*]} manaty-mesh-1=$SERVEUR_SSH"
+    TOPOLOGIE_COMPOSEE=1
+    echo "topologie staging composee depuis $DIR_BASCULE/bascule-a{1,2}.env : $HOTES_STAGING" >&2
+  else
+    echo "HOTES_STAGING absent de $BASCULE_ENV : declarer les trois VM (pc-smichea=poste en option)" >&2
+    echo "  ou poser $DIR_BASCULE/bascule-a1.env et bascule-a2.env (AGENTS_SSH, HOTE_AGENTS) et SERVEUR_SSH" >&2
+    echo "  HOTES_STAGING=\"ameesh-agents-1=root@… ameesh-agents-2=root@… manaty-mesh-1=root@… pc-smichea=poste\"" >&2
+    exit 2
+  fi
 fi
 for entree in $HOTES_STAGING; do
   nom=${entree%%=*}
@@ -192,11 +324,45 @@ for entree in $HOTES_STAGING; do
   fi
   CIBLE[$nom]=$cible
 done
-for nom in "${ORDRE[@]}"; do [ -n "${CIBLE[$nom]:-}" ] && HOTES+=("$nom"); done
-[ ${#HOTES[@]} -eq ${#ORDRE[@]} ] \
-  || { echo "HOTES_STAGING : les quatre hotes sont requis (${ORDRE[*]})" >&2; exit 2; }
-[ "${HOTES[-1]}" = pc-smichea ] || { echo "HOTES_STAGING : pc-smichea doit etre present" >&2; exit 2; }
+# Les trois VM sont requises : sans elles, aucune sequence n'apporte de preuve.
+for nom in "${HOTES_VMS[@]}"; do
+  [ -n "${CIBLE[$nom]:-}" ] \
+    || { echo "HOTES_STAGING : les trois VM sont requises (${HOTES_VMS[*]})" >&2; exit 2; }
+done
 
+# --- poste : present ou absent --------------------------------------------
+# Le poste ne se met a jour qu'en local : poste.sh et ses unites systemd ne
+# s'executent que sur lui. Depuis une VM, il est declare absent, ses etapes
+# sont sautees et sa mise a jour reportee a son retour (canon §14) ; il ne
+# retient ni le staging ni les lots. Sur le poste, la sequence complete reste
+# celle des quatre hotes, VM d'abord.
+if [ -n "${CIBLE[pc-smichea]:-}" ]; then
+  if [ "$HOTE_LOCAL" = pc-smichea ] && [ "$SANS_POSTE" != 1 ]; then
+    :
+  else
+    POSTE_ABSENT=1
+    if [ -n "$POSTE_RAISON_DECLAREE" ]; then
+      POSTE_RAISON=$POSTE_RAISON_DECLAREE
+    elif [ "$HOTE_LOCAL" = pc-smichea ]; then
+      POSTE_RAISON="poste declare absent par l'operateur : mise a jour a son retour, jamais en dessous"
+    else
+      POSTE_RAISON="poste absent (sequence lancee depuis $HOTE_LOCAL) : mise a jour a son retour, jamais en dessous"
+    fi
+  fi
+else
+  if [ "$HOTE_LOCAL" = pc-smichea ] && [ "$SANS_POSTE" != 1 ]; then
+    echo "HOTES_STAGING sans pc-smichea alors que la sequence tourne sur le poste ($HOTE_LOCAL) : ajouter pc-smichea=poste, ou lancer depuis une VM (--sans-poste pour le declarer absent)" >&2
+    exit 2
+  fi
+  POSTE_ABSENT=1
+  if [ -n "$POSTE_RAISON_DECLAREE" ]; then
+    POSTE_RAISON=$POSTE_RAISON_DECLAREE
+  else
+    POSTE_RAISON="poste absent de la topologie (sequence lancee depuis $HOTE_LOCAL) : mise a jour a son retour, jamais en dessous"
+  fi
+fi
+
+# --- selection ------------------------------------------------------------
 if [ -n "$HOTES_FILTRE" ]; then
   # Selection normalisee : un nom connu compte une seule fois, quel que soit
   # le separateur (espace, tabulation, nouvelle ligne) ; le globbing est
@@ -209,26 +375,52 @@ if [ -n "$HOTES_FILTRE" ]; then
     CHOISI[$choisi]=1
   done
   set +f
-  HOTES=()
-  for nom in "${ORDRE[@]}"; do
-    [ -n "${CHOISI[$nom]:-}" ] && HOTES+=("$nom")
+else
+  for nom in "${HOTES_VMS[@]}"; do CHOISI[$nom]=1; done
+  [ "$POSTE_ABSENT" = 1 ] || CHOISI[pc-smichea]=1
+fi
+# canon §14 : le poste ne se met a jour qu'apres des VM saines. Le controle
+# porte sur la selection normalisee, jamais sur la chaine brute : le case
+# sur espaces litteraux etait contourne par tabulation, nouvelle ligne et
+# doublons (avis R1 B4).
+if [ -n "${CHOISI[pc-smichea]:-}" ]; then
+  for nom in "${HOTES_AGENTS[@]}"; do
+    [ -n "${CHOISI[$nom]:-}" ] \
+      || { echo "--hotes : pc-smichea ne se met a jour que dans la sequence complete des quatre hotes (canon §14 : VM saines d'abord)" >&2; exit 2; }
   done
-  # canon §14 : le poste ne se met a jour qu'apres des VM saines. Le controle
-  # porte sur la selection normalisee, jamais sur la chaine brute : le case
-  # sur espaces litteraux etait contourne par tabulation, nouvelle ligne et
-  # doublons (avis R1 B4).
-  if [ -n "${CHOISI[pc-smichea]:-}" ]; then
-    for nom in "${ORDRE[@]}"; do
-      [ -n "${CHOISI[$nom]:-}" ] \
-        || { echo "--hotes : pc-smichea ne se met a jour que dans la sequence complete des quatre hotes (canon §14 : VM saines d'abord)" >&2; exit 2; }
-    done
+  if [ "$SERVEUR_ABSENT" != 1 ]; then
+    [ -n "${CHOISI[manaty-mesh-1]:-}" ] \
+      || { echo "--hotes : pc-smichea ne se met a jour que dans la sequence complete des quatre hotes (canon §14 : VM saines d'abord)" >&2; exit 2; }
   fi
 fi
+HOTES=()
+for nom in "${ORDRE[@]}"; do
+  [ -n "${CHOISI[$nom]:-}" ] || continue
+  if [ "$nom" = pc-smichea ] && [ "$POSTE_ABSENT" = 1 ]; then continue; fi
+  if [ "$nom" = manaty-mesh-1 ] && [ "$SERVEUR_ABSENT" = 1 ]; then continue; fi
+  HOTES+=("$nom")
+done
 [ ${#HOTES[@]} -gt 0 ] || { echo "--hotes : liste vide" >&2; exit 2; }
+# Complete = les trois VM, plus le poste s'il est en ligne. Un poste absent ne
+# rend pas la sequence partielle : son absence est prouvee par la trace et
+# l'attestation le nomme dans `reportes`.
+SEQUENCE_COMPLETE=1
+for nom in "${HOTES_AGENTS[@]}"; do
+  case " ${HOTES[*]} " in *" $nom "*) ;; *) SEQUENCE_COMPLETE=0 ;; esac
+done
+if [ "$SERVEUR_ABSENT" = 0 ]; then
+  case " ${HOTES[*]} " in *" $HOTE_SERVEUR "*) ;; *) SEQUENCE_COMPLETE=0 ;; esac
+fi
+if [ "$POSTE_ABSENT" = 0 ]; then
+  case " ${HOTES[*]} " in *" pc-smichea "*) ;; *) SEQUENCE_COMPLETE=0 ;; esac
+fi
 
 # VM sert aussi a poste.sh (migrations, sauvegarde) : la topologie et VM
-# doivent dire la meme chose.
+# doivent dire la meme chose. La topologie composee pose VM depuis SERVEUR_SSH.
 ADRESSE_MESH=${CIBLE[manaty-mesh-1]#*@}
+if [ "$TOPOLOGIE_COMPOSEE" = 1 ] && [ -z "${VM:-}" ]; then
+  VM=$ADRESSE_MESH
+fi
 if [ "${VM:-}" != "$ADRESSE_MESH" ]; then
   echo "VM (« ${VM:-absent} ») doit etre l'adresse de manaty-mesh-1 (« $ADRESSE_MESH ») dans $BASCULE_ENV" >&2
   exit 2
@@ -349,6 +541,34 @@ precedent_retour() {  # commit que « retour » reinstalle reellement
     serveur) ssh_lire "${CIBLE[$nom]}" "cat /opt/ameesh/precedent" 2>/dev/null ;;
   esac || true
 }
+# Migrations depuis une VM d'agents quand le poste est absent (#3848) : le
+# chemin du bureau (snapshot git archive de src, venv courant, PYTHONPATH sur
+# l'instantane), dry-run additif d'abord, puis application additive seule.
+# La base est commune : un seul hote suffit. Aucun secret ne traverse la
+# commande ; le SHA est un commit deja resolu par git.
+DEPOT_VM=${DEPOT_VM:-/home/ameesh/work/ameesh-release}
+SNAP_VM=${SNAP_VM:-/home/ameesh/work}
+migrer_depuis_vm() {  # nom sha
+  local nom=$1 sha=$2 cible=${CIBLE[$1]} a b c
+  printf -v a '%q' "$sha"
+  printf -v b '%q' "$DEPOT_VM"
+  printf -v c '%q' "$SNAP_VM"
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$cible" \
+    "runuser -u ameesh -- env HOME=/home/ameesh bash -s -- $a $b $c" <<'REMOTE'
+set -euo pipefail
+R=$1
+depot=$2
+snap=$3
+d="$snap/snap-${R:0:8}"
+rm -rf -- "$d"
+mkdir -p -- "$d"
+git -C "$depot" fetch -q origin
+git -C "$depot" archive "$R" src | tar -x -C "$d"
+cd "$d"
+PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migrate --dry-run --additive-only
+PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migrate --additive-only
+REMOTE
+}
 sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
   local nom=$1 sans=${2:-} cible_sonde var sortie args_hote=()
   SANTE_DETAIL=""
@@ -437,9 +657,36 @@ etape "plan staging : ${HOTES[*]} ; cible $SHA_TRAVE"
 for nom in "${HOTES[@]}"; do
   printf '  %-16s %-8s %s\n' "$nom" "$(mode_de "$nom")" "${CIBLE[$nom]}"
 done
+if [ "$POSTE_ABSENT" = 1 ]; then
+  printf '  %-16s %-8s %s\n' pc-smichea absent "reporte — $POSTE_RAISON"
+fi
+if [ "$SERVEUR_ABSENT" = 1 ]; then
+  printf '  %-16s %-8s %s\n' manaty-mesh-1 absent "reporte — $SERVEUR_RAISON"
+fi
 if [ "$A_BLANC" = 1 ]; then
-  echo "  etapes : verifier partout, sauvegarder+migrer ${SHA_TRAVE} (additif), puis par hote installer, redemarrer, controler, sante ; sequence complete et saine : attestation « staging actif » et courrier aux rapporteurs"
+  if [ "$POSTE_ABSENT" = 1 ]; then
+    echo "  etapes : verifier les VM de la sequence ; sauvegarde du poste sautee ; migrations appliquees depuis une VM d'agents (additif, dry-run d'abord) ; puis par hote installer, redemarrer, controler, sante"
+  else
+    echo "  etapes : verifier partout, sauvegarder+migrer ${SHA_TRAVE} (additif), puis par hote installer, redemarrer, controler, sante"
+  fi
+  if [ "$SEQUENCE_COMPLETE" = 1 ]; then
+    echo "  sequence complete et saine : attestation « staging actif » et courrier aux rapporteurs"
+  else
+    echo "  sequence partielle : aucune attestation staging"
+  fi
   exit 0
+fi
+
+# La preuve d'absence du poste precede toute mutation : actif.py exige cet
+# evenement pour attester les trois VM sans lui. Il porte le commit vise,
+# comme tous les autres, et n'est jamais un `retour`.
+if [ "$POSTE_ABSENT" = 1 ]; then
+  trace pc-smichea absent reporte "$POSTE_RAISON"
+  echo "  pc-smichea : absent (reporte) — $POSTE_RAISON"
+fi
+if [ "$SERVEUR_ABSENT" = 1 ]; then
+  trace "$HOTE_SERVEUR" absent reporte "$SERVEUR_RAISON"
+  echo "  $HOTE_SERVEUR : absent (reporte) — $SERVEUR_RAISON"
 fi
 
 # --- preflight (lecture seule), sauvegarde, puis migrations ---------------
@@ -454,18 +701,49 @@ for nom in "${HOTES[@]}"; do
 done
 
 if [ "$SAUVER" = 1 ]; then
-  etape "sauvegarde de la base du mesh (poste.sh sauvegarder)"
-  "$POSTE_SH" sauvegarder || { echo "sauvegarde en echec : rien n'a ete modifie" >&2; exit 1; }
-  trace poste sauvegarde ok "sauvegarde avant migrations"
+  if [ "$POSTE_ABSENT" = 1 ]; then
+    etape "sauvegarde du poste sautee (poste absent)"
+    echo "  sauvegarde du poste non faite (poste absent) ; les migrations suivent depuis une VM d'agents (instantané git archive, additif, dry-run d'abord)"
+  else
+    etape "sauvegarde de la base du mesh (poste.sh sauvegarder)"
+    "$POSTE_SH" sauvegarder || { echo "sauvegarde en echec : rien n'a ete modifie" >&2; exit 1; }
+    trace poste sauvegarde ok "sauvegarde avant migrations"
+  fi
 fi
 
-etape "migrations de $SHA_TRAVE (additives seulement, base partagee)"
-# #2357 : une sonde d'auto-prise en echec ne doit pas arreter la sequence. La
-# suite par hote installe et redemarre les VM d'abord, le poste en dernier
-# (canon §14) ; sans ce drapeau, poste.sh redemarrerait le poste tout de suite
-# et interromprait l'operateur avant les VM, sur une base deja migree.
-MIGRER_SANS_REDEMARRAGE=1 "$POSTE_SH" migrer --additif-seulement "$SHA" || { echo "migrations en echec : aucune installation" >&2; exit 1; }
-trace poste migrations ok "migrations de $SHA_TRAVE passees avant toute installation"
+if [ "$POSTE_ABSENT" = 1 ]; then
+  # Chemin VM (#3848) : la base commune est migree depuis une VM d'agents, avec
+  # le meme instantane et la meme garde additive que le bureau.
+  HOTE_MIGRATIONS=${HOTE_MIGRATIONS:-}
+  if [ -z "$HOTE_MIGRATIONS" ]; then
+    for nom in ameesh-agents-2 ameesh-agents-1; do
+      case " ${HOTES[*]} " in *" $nom "*) HOTE_MIGRATIONS=$nom; break ;; esac
+    done
+  fi
+  if [ -z "$HOTE_MIGRATIONS" ] || [ "$(mode_de "$HOTE_MIGRATIONS")" != agents ]; then
+    echo "HOTE_MIGRATIONS (« ${HOTE_MIGRATIONS:-absent} ») doit etre une VM d'agents de la sequence" >&2
+    exit 2
+  fi
+  case " ${HOTES[*]} " in
+    *" $HOTE_MIGRATIONS "*) ;;
+    *) echo "HOTE_MIGRATIONS (« $HOTE_MIGRATIONS ») n'est pas dans la sequence (${HOTES[*]})" >&2; exit 2 ;;
+  esac
+  etape "migrations de $SHA_TRAVE depuis $HOTE_MIGRATIONS (poste absent, additives seulement)"
+  if ! migrer_depuis_vm "$HOTE_MIGRATIONS" "$SHA"; then
+    trace "$HOTE_MIGRATIONS" migrations ko "migrations en echec depuis la VM"
+    echo "migrations en echec : aucune installation" >&2
+    exit 1
+  fi
+  trace "$HOTE_MIGRATIONS" migrations ok "migrations de $SHA_TRAVE appliquees depuis un snapshot VM (additif, dry-run d'abord)"
+else
+  etape "migrations de $SHA_TRAVE (additives seulement, base partagee)"
+  # #2357 : une sonde d'auto-prise en echec ne doit pas arreter la sequence. La
+  # suite par hote installe et redemarre les VM d'abord, le poste en dernier
+  # (canon §14) ; sans ce drapeau, poste.sh redemarrerait le poste tout de suite
+  # et interromprait l'operateur avant les VM, sur une base deja migree.
+  MIGRER_SANS_REDEMARRAGE=1 "$POSTE_SH" migrer --additif-seulement "$SHA" || { echo "migrations en echec : aucune installation" >&2; exit 1; }
+  trace poste migrations ok "migrations de $SHA_TRAVE passees avant toute installation"
+fi
 
 # --- sequence par hote ----------------------------------------------------
 for nom in "${HOTES[@]}"; do
@@ -508,12 +786,14 @@ echo "traces : $JOURNAL"
 trace sequence sequence ok
 
 # --- signal « staging actif » (#1323) ------------------------------------
-# Durable et borne : l'attestation n'est ecrite que si les quatre hotes sont
-# tous prouves (installer, redemarrer, controler, sante reelle) et si le commit
-# relu apres la sequence est la cible ; chaque rapporteur n'est reveille qu'une
-# fois par commit. Un echec d'emission ne remet pas en cause le deploiement :
+# Durable et borne : l'attestation n'est ecrite que si les trois VM (et le
+# poste s'il est en ligne) sont tous prouves (installer, redemarrer, controler,
+# sante reelle) et si le commit relu apres la sequence est la cible ; chaque
+# rapporteur n'est reveille qu'une fois par commit. Un poste absent est admis :
+# l'attestation porte les trois VM et `reportes` nomme le poste et sa mise a
+# jour a son retour. Un echec d'emission ne remet pas en cause le deploiement :
 # l'attestation reste, le relais operateur prend le courrier.
-if [ ${#HOTES[@]} -ne 4 ]; then
+if [ "$SEQUENCE_COMPLETE" != 1 ]; then
   echo "signal actif : sequence partielle (${HOTES[*]}), aucune attestation staging" >&2
 else
   etape "signal actif staging ($SHA_TRAVE)"
@@ -523,6 +803,12 @@ else
     actif_sha=$(sha_installe "$nom" || true)
     ARGS_ACTIF+=(--hote "$nom=${actif_sha,,}" --mode "$nom=$(mode_de "$nom")")
   done
+  if [ "$POSTE_ABSENT" = 1 ]; then
+    ARGS_ACTIF+=(--absent "pc-smichea=$POSTE_RAISON")
+  fi
+  if [ "$SERVEUR_ABSENT" = 1 ]; then
+    ARGS_ACTIF+=(--absent "$HOTE_SERVEUR=$SERVEUR_RAISON")
+  fi
   for lot in ${VERIF_LOTS[@]+"${VERIF_LOTS[@]}"}; do
     ARGS_ACTIF+=(--lot "$lot")
   done
