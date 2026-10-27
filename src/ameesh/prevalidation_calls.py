@@ -698,7 +698,14 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
     rapport est persisté après le run, hors de toute transaction ; l'échec de
     cette écriture est signalé, jamais transformé en refus (le run réel reste
     la preuve).
+
+    `profile` nomme le profil d'offload du guest ; sans lui, le profil du
+    **projet** s'applique (convention L159b : `ameesh` porte le venv et la
+    base jetable). Un automatisme qui ne le nommait pas jouait le profil
+    `default`, sans base : les contrats tombaient en `setUpClass` et la
+    prévalidation rendait un faux rouge (#4008).
     """
+    profile = (profile or project or "").strip()
     params = parameters(cfg, project)
     if not repo:
         raise prevalidation.PrevalidationError(
@@ -982,7 +989,7 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
                 raise prevalidation.PrevalidationError(
                     "run-incomplete", "budget de prévalidation épuisé avant l'hôte")
             report = _run_hosts(prepared, params, lot=0, head=head, base=base,
-                                branch="", profile="", say=say,
+                                branch="", profile=project, say=say,
                                 executable="ameesh", validate=None,
                                 deadline=deadline)
             if fallback:
