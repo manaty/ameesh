@@ -215,6 +215,8 @@ class TestRun:
     timed_out: bool = False
     #: #4025 : les modules voisins ajoutés (`module`, `reason`, `files`)
     added: list = field(default_factory=list)
+    #: Rouge écarté après rejeu des seuls voisins sur la base (#4048).
+    ignored_red: bool = False
 
     @property
     def green(self) -> bool:
@@ -1291,6 +1293,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         if kept or not found:
             red.append((run, kept))
         else:
+            run.ignored_red = True
             log("tests unité #%d : rouge des seuls voisins, aussi rouges sur la "
                 "base ou non rejoués — sans effet" % unit.lot)
     modules = contract_modules(worktree)
@@ -1464,11 +1467,13 @@ def _tests_summary(tests: list[TestRun]) -> str:
     modules = sorted({module for run in tests for module in run.modules})
     total = sum(run.tests for run in tests)
     skipped = sum(run.skipped for run in tests)
-    red = sum(1 for run in tests if not run.green and not run.inconclusive)
+    red = sum(1 for run in tests if not run.green and not run.inconclusive
+              and not run.ignored_red)
+    ignored = sum(1 for run in tests if run.ignored_red)
     inconclusive = sum(1 for run in tests if run.inconclusive)
     return ("%d séries, %d modules, %d tests exécutés, %d échec(s), "
-            "%d non concluant(s), %d sauté(s) : %s"
-            % (len(tests), len(modules), total, red, inconclusive, skipped,
+            "%d run(s) rouge(s) sans effet, %d non concluant(s), %d sauté(s) : %s"
+            % (len(tests), len(modules), total, red, ignored, inconclusive, skipped,
                ", ".join("`%s`" % module for module in modules) or "aucun"))
 
 
