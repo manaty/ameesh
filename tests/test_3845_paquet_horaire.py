@@ -1,0 +1,495 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#3845 : paquet horaire déclenché par minuterie (scripts/paquet-horaire.py).
+
+Le tic est piloté par une fausse coquille : aucune base, aucune forge. Les
+témoins : rien n'est créé sans lot prêt ni pendant une réservation ; une
+composition propre pose « verdict non requis » et demande la ci-full ; une
+résolution laisse ce geste au pilote ; un rouge attribué à une seule unité la
+retire et recompose une fois, en écrivant à son auteur ; un rouge non concluant
+ne retire rien ; le porteur est créé avec son estimation (garde L157 de la
+vraie CLI) ; une tentative morte (arrêt, échec) est reprise sur le même
+porteur, bornée, puis signalée une fois.
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import unittest
+from unittest import mock
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "paquet_horaire", ROOT / "scripts" / "paquet-horaire.py")
+ph = importlib.util.module_from_spec(SPEC)
+sys.modules["paquet_horaire"] = ph
+SPEC.loader.exec_module(ph)
+
+HEAD = "a" * 40
+HEAD2 = "b" * 40
+ZONE = ph.ZoneInfo("Europe/Paris")
+NOW = datetime(2026, 10, 27, 10, 25, tzinfo=ZONE).timestamp()
+
+MANIFEST = """# Paquet
+
+## Composition (2 unités)
+
+| unité | lot(s) | source | commit | note |
+|---|---|---|---|---|
+| 1 | #3801 | `035249f490d2` | `035249f49` | composition |
+| 2 | #3807 | `6f5d44e941c4` | `6f5d44e94` | composition |
+"""
+RESOLVED = MANIFEST.replace("| 1 | #3801 | `035249f490d2` | `035249f49` | composition |",
+                            "| 1 | #3779, #3755 | `404177ae7c83` | `51762f6fa8b1` | résolution |")
+
+
+class FakeShell:
+    def __init__(self):
+        self.calls: list[list[str]] = []
+        self.mails: list[tuple[str, str]] = []
+        self.lists: dict[str, list] = {}
+        self.items: dict[int, dict] = {}
+        self.ci: dict[int, dict] = {}
+        self.auto_out = "manifeste reviews/x.md : tête %s\n" % HEAD
+        self.auto_rc = 0
+        self.added: list[list[str]] = []
+        self.clock = NOW
+
+    def run(self, cmd, *, cwd=None, input_text=None, timeout=0):
+        self.calls.append(list(cmd))
+        if cmd[0] == "agent-mail":
+            self.mails.append((cmd[2], input_text))
+            return ph.Result(0)
+        if cmd[0] == "git":
+            if "ls-remote" in cmd:
+                return ph.Result(0, "%s\trefs/heads/integration/paquet-h-20261027-03\n" % HEAD)
+            return ph.Result(0)
+        if cmd[0] == "ameesh":
+            args = cmd[1:]
+            if args[:2] == ["work", "list"]:
+                state = args[args.index("--state") + 1] if "--state" in args else ""
+                return ph.Result(0, json.dumps(self.lists.get(state, [])))
+            if args[:2] == ["work", "add"]:
+                self.added.append(args)
+                return ph.Result(0, "lot #4000 created in intake: x\n")
+            if args[:2] == ["work", "show"]:
+                return ph.Result(0, json.dumps(self.items[int(args[2])]))
+            if args[:2] == ["ci", "status"]:
+                return ph.Result(0, json.dumps(self.ci.get(int(args[2]), {"runs": []})))
+            if args[:2] == ["work", "note"]:
+                item = self.items.get(int(args[2]))
+                if item is not None:
+                    self.clock += 1
+                    item.setdefault("events", []).append(
+                        {"note": args[3], "created_ts": self.clock})
+            return ph.Result(0, "ok\n")
+        if str(cmd[1]).endswith("paquet-auto.py"):
+            return ph.Result(self.auto_rc, self.auto_out)
+        raise AssertionError("commande inattendue : %r" % cmd)
+
+    def ran(self, *prefix) -> list[list[str]]:
+        return [c for c in self.calls if c[:len(prefix)] == list(prefix)
+                or (len(c) > 1 and c[1:1 + len(prefix)] == list(prefix))]
+
+
+def carrier(lot=4000, *, sha=HEAD, notes=(), title="Paquet horaire h-20261027-04 — x",
+            source="paquet-horaire (#3845), minuterie", created=NOW - 600):
+    return {"id": lot, "app": "ameesh", "title": title, "source": source,
+            "state": "qa", "branch": "integration/paquet-h-20261027-04",
+            "branch_target": "main", "created_ts": created, "assignee": "mesh-design",
+            "freeze": {"declared": {"sha": sha}} if sha else {},
+            "events": [{"note": n} for n in notes]}
+
+
+def red_run(*, attribution=True, best=(3801,), status="failure", part="psycopg 1/8"):
+    test = "tests.test_x.T.test_a"
+    run = {"run_id": "77", "head_sha": HEAD, "status": status, "url": "u",
+           "failures": [{"test": test, "part": part, "inherited": False}]}
+    if attribution:
+        run["attribution"] = {"status": "ok", "tests": [{
+            "test": test, "status": "probable",
+            "units": [{"lot": lot, "best": 4} for lot in best]
+            + [{"lot": 3807, "best": 1}]}]}
+    return run
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.shell = FakeShell()
+        self.ctx = ph.Context(repo=ROOT, target="main", project="ameesh",
+                              pilot="mesh-design", actor="mesh-design",
+                              shell=self.shell, python="python3", now=NOW,
+                              zone=ZONE)
+        self._saved = (ph.ready_lots, ph.manifest_at, ph.replay_locally)
+        self.ready = [3801, 3807]
+        self.manifest = MANIFEST
+        self.replay = ""
+        ph.ready_lots = lambda ctx: list(self.ready)
+        ph.manifest_at = lambda ctx, item, sha: self.manifest
+        ph.replay_locally = lambda ctx, sha, tests: self.replay
+
+    def tearDown(self):
+        ph.ready_lots, ph.manifest_at, ph.replay_locally = self._saved
+
+
+class ComposeTest(Base):
+    def test_rien_sans_lot_pret(self):
+        self.ready = []
+        self.assertIn("aucun lot prêt", ph.tick(self.ctx))
+        self.assertEqual(self.shell.ran("work", "add"), [])
+
+    def test_heure_deja_servie(self):
+        self.shell.lists[""] = [dict(carrier(), state="merged", created_ts=NOW - 60)]
+        self.assertIn("déjà créé", ph.tick(self.ctx))
+        self.assertEqual(self.shell.ran("work", "add"), [])
+
+    def test_reservation_par_un_autre_porteur(self):
+        manual = carrier(lot=3999, title="h-33 manuel", source="mesh-design")
+        self.shell.lists["qa"] = [manual]
+        self.assertIn("réservée par #3999", ph.tick(self.ctx))
+        self.assertEqual(self.shell.ran("work", "add"), [])
+        self.assertFalse([c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)])
+
+    def test_composition_propre_verdict_non_requis_et_ci_full(self):
+        self.shell.items[4000] = carrier()
+        self.assertIn("ci-full demandée", ph.tick(self.ctx))
+        add = self.shell.ran("work", "add")[0]
+        self.assertIn("integration/paquet-h-20261027-04", add)
+        self.assertEqual(add[add.index("--title") + 1][:31], "Paquet horaire h-20261027-04 — ")
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
+        self.assertNotIn("--force", auto)
+        self.assertTrue(self.shell.ran("work", "reviewer", "4000", "--no-verdict"))
+        ci = self.shell.ran("ci", "run", "4000", "--full")[0]
+        self.assertEqual(ci[ci.index("--sha") + 1], HEAD)
+        self.assertIn(ph.MARK_CI + HEAD, ph.marks(self.shell.items[4000]))
+        self.assertEqual(self.shell.mails[-1][0], "mesh-design")
+
+    def test_courriers_nomment_l_expediteur(self):
+        # revue mty-amh-impl-04 : `role run` retire AGENT_MAIL_NAME ; sans
+        # --from, agent-mail refuse (« unbound sender »).
+        self.shell.items[4000] = carrier()
+        ph.tick(self.ctx)
+        mails = [c for c in self.shell.calls if c[0] == "agent-mail"]
+        self.assertTrue(mails)
+        for cmd in mails:
+            self.assertEqual(cmd[cmd.index("--from") + 1], "mesh-design")
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
+        self.assertEqual(auto[auto.index("--from") + 1], "mesh-design")
+
+    def test_resolution_laisse_le_verdict_au_pilote(self):
+        self.manifest = RESOLVED
+        self.shell.items[4000] = carrier()
+        ph.tick(self.ctx)
+        self.assertEqual(self.shell.ran("work", "reviewer"), [])
+        self.assertTrue(self.shell.ran("ci", "run", "4000", "--full"))
+        self.assertIn("#1979", self.shell.mails[-1][1])
+
+    def test_composition_vide_clot_le_porteur(self):
+        self.shell.auto_out = "aucune unité composée : #3801 (conflit)\n"
+        self.shell.items[4000] = carrier()
+        self.assertIn("rien composé", ph.tick(self.ctx))
+        self.assertTrue(self.shell.ran("work", "close", "4000", "--abandoned"))
+        self.assertEqual(self.shell.ran("ci", "run"), [])
+
+
+class FollowTest(Base):
+    def open_carrier(self, **kw):
+        item = carrier(notes=(ph.MARK_CI + HEAD,), **kw)
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        return item
+
+    def test_ci_en_cours_rien(self):
+        self.open_carrier()
+        self.shell.ci[4000] = {"runs": [dict(red_run(), status="running")]}
+        self.assertIn("en cours", ph.tick(self.ctx))
+
+    def test_rouge_deterministe_retire_et_recompose_une_fois(self):
+        self.open_carrier()
+        self.shell.items[3801] = {"id": 3801, "assignee": "mty-amh-impl-02"}
+        self.shell.ci[4000] = {"runs": [red_run()]}
+        ph.tick(self.ctx)
+        auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
+        self.assertIn("--force", auto)
+        self.assertEqual(auto[auto.index("--exclude") + 1], "3801")
+        self.assertIn("mty-amh-impl-02", [to for to, _ in self.shell.mails])
+        notes = ph.marks(self.shell.items[4000])
+        self.assertTrue(any(n.startswith(ph.MARK_ATTEMPT + "recomposition n=1 base=%s"
+                                         % HEAD) for n in notes))
+        # la recomposition est republiée : ci-full sur la nouvelle tête
+        self.assertTrue(self.shell.ran("ci", "run", "4000", "--full"))
+
+    def test_rouge_apres_recomposition_ne_retire_plus(self):
+        item = self.open_carrier()
+        item["events"].append({"note": ph.MARK_ATTEMPT + "recomposition n=1 base=%s "
+                               "par=autre:1 run=70 sans=3755" % HEAD2})
+        self.shell.ci[4000] = {"runs": [red_run()]}
+        self.assertIn("épuisé", ph.tick(self.ctx))
+        self.assertFalse([c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)])
+        self.assertTrue(any(n.startswith(ph.MARK_RED + "77") for n in ph.marks(item)))
+        # consigné une fois : le tic suivant ne réécrit pas au pilote
+        mails = len(self.shell.mails)
+        ph.tick(self.ctx)
+        self.assertEqual(len(self.shell.mails), mails)
+
+    def test_rouge_ambigu_non_concluant(self):
+        self.open_carrier()
+        self.shell.ci[4000] = {"runs": [red_run(best=(3801, 3807))]}
+        self.assertIn("rouge consigné", ph.tick(self.ctx))
+        self.assertFalse([c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)])
+
+    def test_vert_en_local_non_concluant(self):
+        self.open_carrier()
+        self.replay = "vert en local (1 test(s)) : rouge non reproduit"
+        self.shell.ci[4000] = {"runs": [red_run()]}
+        self.assertIn("vert en local", ph.tick(self.ctx))
+        self.assertFalse([c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)])
+
+
+class EstimateGuardTest(Base):
+    """B1 : la commande de création passe la vraie garde de `ameesh work add`."""
+
+    def test_creation_passe_la_garde_l157_pour_un_agent(self):
+        from ameesh import estimates, mesh_cli
+        self.shell.items[4000] = carrier()
+        ph.tick(self.ctx)
+        args = mesh_cli.build_parser().parse_args(self.shell.added[0])
+        self.assertEqual(args.actor, "mesh-design")
+        saved = estimates.is_agent
+        estimates.is_agent = lambda db, actor: True  # mesh-design est au registre
+        try:
+            minutes = estimates.parse(args.estimate) if args.estimate else None
+            self.assertFalse(estimates.check(None, args.actor, minutes))
+            with self.assertRaises(estimates.EstimateError):  # le témoin mord
+                estimates.check(None, args.actor, None)
+        finally:
+            estimates.is_agent = saved
+        self.assertEqual(minutes, 90)
+
+
+class ResumeTest(Base):
+    """B2 : arrêt ou échec entre deux gestes, reprise sur le même porteur."""
+
+    def unfrozen(self, *notes, created=NOW - 3600):
+        item = carrier(sha="", created=created)
+        item["events"] = [{"note": n, "created_ts": NOW - 3000 + i}
+                          for i, n in enumerate(notes)]
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        return item
+
+    def autos(self):
+        return [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)]
+
+    def test_porteur_sans_tentative_repris(self):
+        self.unfrozen()
+        def frozen(cmd, _orig=self.shell.run, **kw):
+            out = _orig(cmd, **kw)
+            if "paquet-auto.py" in " ".join(cmd):
+                self.shell.items[4000]["freeze"] = {"declared": {"sha": HEAD}}
+            return out
+        self.shell.run = frozen
+        self.assertIn("ci-full demandée", ph.tick(self.ctx))
+        # aucune marque : paquet-auto n'a jamais tourné, tentative 1 sans --force
+        self.assertNotIn("--force", self.autos()[0])
+        self.assertIn(ph.MARK_ATTEMPT + "composition n=1 base=-",
+                      " ".join(ph.marks(self.shell.items[4000])))
+        self.assertEqual(self.shell.ran("work", "add"), [])
+
+    def test_porteur_tout_juste_cree_attend(self):
+        self.unfrozen(created=NOW - 30)
+        self.assertIn("en cours", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+
+    def test_tentative_vivante_sur_cet_hote_attend(self):
+        self.ctx.alive = lambda pid: True
+        self.unfrozen(ph.MARK_ATTEMPT + "composition n=1 base=- par=%s:99" % self.ctx.host)
+        self.assertIn("en cours", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+
+    def test_tentative_morte_sur_cet_hote_reprise(self):
+        self.ctx.alive = lambda pid: False
+        item = self.unfrozen(
+            ph.MARK_ATTEMPT + "composition n=1 base=- par=%s:99" % self.ctx.host)
+        self.shell.auto_rc = 1
+        with self.assertRaises(ph.HoraireError):
+            ph.tick(self.ctx)
+        self.assertIn("--force", self.autos()[0])
+        notes = ph.marks(item)
+        self.assertIn(ph.MARK_FAILED + "composition n=2 base=- rc=1", notes)
+        # l'échec consigné est repris au tic suivant, sans attendre de délai
+        self.shell.auto_rc = 0
+        ph.tick(self.ctx)
+        tried = [n for n in ph.marks(item) if n.startswith(ph.MARK_ATTEMPT)]
+        self.assertIn("composition n=3", tried[-1])
+
+    def test_autre_hote_attend_le_delai(self):
+        item = self.unfrozen(ph.MARK_ATTEMPT + "composition n=1 base=- par=autre:9")
+        self.assertIn("en cours", ph.tick(self.ctx))
+        item["events"][0]["created_ts"] = NOW - ph.ATTEMPT_STALE - 1
+        self.shell.auto_out = "aucune unité composée\n"
+        self.assertIn("rien composé", ph.tick(self.ctx))
+        self.assertEqual(len(self.autos()), 1)
+
+    def test_reprise_epuisee_signalee_une_fois(self):
+        notes = []
+        for n in range(1, ph.MAX_ATTEMPTS + 1):
+            notes += [ph.MARK_ATTEMPT + "composition n=%d base=- par=autre:9" % n,
+                      ph.MARK_FAILED + "composition n=%d base=- rc=1" % n]
+        self.unfrozen(*notes)
+        self.assertIn("épuisée", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+        self.assertEqual(len(self.shell.mails), 1)
+        self.assertIn("épuisée, déjà signalée", ph.tick(self.ctx))
+        self.assertEqual(len(self.shell.mails), 1)
+
+    def test_recomposition_interrompue_reprise_sans_reecrire_aux_auteurs(self):
+        item = carrier(notes=(ph.MARK_CI + HEAD,))
+        item["events"] = [{"note": ph.MARK_CI + HEAD, "created_ts": NOW - 900},
+                          {"note": ph.MARK_ATTEMPT + "recomposition n=1 base=%s par=autre:9 "
+                           "run=77 sans=3801" % HEAD, "created_ts": NOW - 800},
+                          {"note": ph.MARK_FAILED + "recomposition n=1 base=%s rc=1" % HEAD,
+                           "created_ts": NOW - 700}]
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        self.shell.ci[4000] = {"runs": [red_run()]}
+        ph.tick(self.ctx)
+        auto = self.autos()[0]
+        self.assertIn("--force", auto)
+        self.assertEqual(auto[auto.index("--exclude") + 1], "3801")
+        self.assertIn(ph.MARK_ATTEMPT + "recomposition n=2 base=%s" % HEAD,
+                      " ".join(ph.marks(item)))
+        self.assertNotIn("mty-amh-impl-02", [to for to, _ in self.shell.mails])
+        self.assertFalse(any(n.startswith(ph.MARK_RED) for n in ph.marks(item)))
+
+
+class ClassifyTest(unittest.TestCase):
+    def test_cas(self):
+        self.assertTrue(ph.classify(red_run()).deterministic)
+        self.assertEqual(ph.classify(red_run()).lots, [3801])
+        self.assertFalse(ph.classify(red_run(status="cancelled")).deterministic)
+        self.assertFalse(ph.classify(red_run(part="job")).deterministic)
+        self.assertFalse(ph.classify(red_run(attribution=False)).deterministic)
+        inherited = red_run()
+        inherited["failures"][0]["inherited"] = True
+        self.assertFalse(ph.classify(inherited).deterministic)
+
+    def test_unites_du_manifeste(self):
+        units = ph.composition_units(RESOLVED)
+        self.assertEqual([u.resolution for u in units], [True, False])
+        self.assertEqual(units[0].lots, [3779, 3755])
+
+    def test_heure_locale(self):
+        start = ph.hour_start(NOW, ZONE)
+        self.assertEqual(datetime.fromtimestamp(start, ZONE).minute, 0)
+        self.assertLessEqual(NOW - start, 3600)
+
+
+class BestWeightTest(unittest.TestCase):
+    """`best` est un poids (#3801), pas un booléen."""
+
+    def run_with(self, *weights):
+        run = red_run()
+        run["attribution"]["tests"][0]["units"] = [
+            {"lot": 3801 + i, "best": w} for i, w in enumerate(weights)]
+        return ph.classify(run)
+
+    def test_poids_distincts_un_seul_meilleur(self):
+        verdict = self.run_with(4, 2, 1)
+        self.assertTrue(verdict.deterministic)
+        self.assertEqual(verdict.lots, [3801])
+
+    def test_egalite_et_preuve_faible(self):
+        self.assertFalse(self.run_with(4, 4).deterministic)
+        self.assertIn("faible", self.run_with(2, 1).why)
+
+
+class FreshTest(unittest.TestCase):
+    """Revue cx2 : un clone qui n'est pas à la tête exacte de la cible n'écrit rien."""
+
+    def ctx(self, local, remote, *, fetch_rc=0, dirty=""):
+        calls = []
+
+        class Git:
+            def run(self, cmd, **kw):
+                calls.append(cmd)
+                if "fetch" in cmd:
+                    return ph.Result(fetch_rc, "", "réseau" if fetch_rc else "")
+                if "rev-parse" in cmd:
+                    return ph.Result(0, (local if cmd[-1] == "HEAD^{commit}" else remote) + "\n")
+                if "status" in cmd:
+                    return ph.Result(0, dirty)
+                raise AssertionError(cmd)
+        return ph.Context(repo=ROOT, target="main", project="ameesh", pilot="p",
+                          actor="p", shell=Git(), zone=ZONE), calls
+
+    def test_tete_exacte(self):
+        ctx, _ = self.ctx(HEAD, HEAD)
+        ph.check_fresh(ctx)
+
+    def test_refus(self):
+        for kw in ({"local": HEAD, "remote": HEAD2}, {"local": HEAD, "remote": HEAD, "fetch_rc": 1},
+                   {"local": HEAD, "remote": HEAD, "dirty": " M scripts/paquet-horaire.py"}):
+            ctx, _ = self.ctx(**kw)
+            with self.assertRaises(ph.HoraireError):
+                ph.check_fresh(ctx)
+
+    def test_main_refuse_sans_aucun_geste(self):
+        saved = (ph.check_fresh, ph.tick)
+        ticked = []
+        def stale(ctx):
+            raise ph.HoraireError("code périmé")
+        ph.check_fresh, ph.tick = stale, lambda ctx: ticked.append(ctx) or "x"
+        try:
+            self.assertEqual(ph.main(["tick", "--repo", str(ROOT)]), 1)
+        finally:
+            ph.check_fresh, ph.tick = saved
+        self.assertEqual(ticked, [])
+
+
+class ExcludeOptionTest(unittest.TestCase):
+    def test_paquet_auto_accepte_exclude(self):
+        parsed = []
+        original = ph.auto.compose_packet
+        ph.auto.compose_packet = lambda args: parsed.append(args.exclude) or 0
+        try:
+            rc = ph.auto.main(["--name", "h-x", "--carrier", "9",
+                               "--exclude", "3801", "--exclude", "3755"])
+        finally:
+            ph.auto.compose_packet = original
+        self.assertEqual(rc, 0)
+        self.assertEqual(parsed, [[3801, 3755]])
+
+    def test_paquet_auto_courrier_avec_expediteur(self):
+        seen = []
+        original = ph.auto.run_command
+        ph.auto.run_command = lambda cmd, **kw: seen.append(cmd) or subprocess.CompletedProcess(cmd, 0, b"", b"")
+        try:
+            ph.auto.send_mail("mesh-design", 9, "corps", "mesh-design")
+            ph.auto.send_mail("mesh-design", 9, "corps")
+        finally:
+            ph.auto.run_command = original
+        self.assertEqual(seen[0][-2:], ["--from", "mesh-design"])
+        self.assertNotIn("--from", seen[1])
+
+    def test_paquet_auto_expediteur_par_defaut_le_role(self):
+        parsed = []
+        original = ph.auto.compose_packet
+        ph.auto.compose_packet = lambda args: parsed.append(args.sender) or 0
+        env = {k: v for k, v in os.environ.items() if k != "AGENT_MAIL_NAME"}
+        env["AMEESH_ROLE"] = "mesh-design"
+        try:
+            with mock.patch.dict(os.environ, env, clear=True):
+                ph.auto.main(["--name", "h-x", "--carrier", "9"])
+            ph.auto.main(["--name", "h-x", "--carrier", "9", "--from", "x"])
+        finally:
+            ph.auto.compose_packet = original
+        self.assertEqual(parsed, ["mesh-design", "x"])
+
+
+if __name__ == "__main__":
+    unittest.main()
