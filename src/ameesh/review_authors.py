@@ -73,6 +73,8 @@ absence.
 """
 from __future__ import annotations
 
+import re
+
 from typing import Mapping, Optional, Sequence
 
 from . import plan_git, registry, review_lot, review_provenance, storage
@@ -649,6 +651,44 @@ def _no_reintroduced_patch(repo: str, sha: str, landing) -> bool:
     if patch is None or not any(patch):
         return False
     return not (patch[0] & landing[0] or patch[1] & landing[1])
+
+
+def _outside_delivered(repo: str, target: str, commit: str, landing,
+                       cache: dict) -> bool:
+    """#3837: no historical contribution to the actual delivered delta.
+
+    Added lines already present verbatim on target are not brought by this
+    prior freeze. Removed lines always remain evidence. No whitespace or
+    significance normalization; unreadable/binary changes retain authors.
+    """
+    if landing is None:
+        return False
+    try:
+        patch = _text_delta(repo, commit + "^", commit)
+        if patch is None or not any(patch) or patch[1] & landing[1]:
+            return False
+        overlap = patch[0] & landing[0]
+        if not overlap:
+            return True
+        for line in sorted(overlap):
+            key = ("delivered-target-line", target, line)
+            if key not in cache:
+                # One anchored pattern per early-exit query: combined EREs
+                # grow very costly on the real Nexlink tree. Exact bytes,
+                # including blank lines and regex metacharacters, count.
+                pattern = "^" + re.sub(r"([][.^$*+?{}()|\\])",
+                                       lambda match: "\\" + match.group(), line) + "$"
+                proc = plan_git._git(
+                    repo, "grep", "--no-color", "-q", "-I", "-E",
+                    "-e", pattern, target, "--")
+                if proc.returncode not in (0, 1):
+                    return False
+                cache[key] = proc.returncode == 0
+            if not cache[key]:
+                return False
+        return True
+    except Exception:  # noqa: BLE001 - uncertainty retains every author
+        return False
 
 
 def _not_in_target(repo: str, commits, target: str, *, head: str = "") -> list:
@@ -2294,6 +2334,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     file_cache: dict = {}
     patch_cache: dict = {}
     received_patches = None
+    delivered, delivered_read = None, False
 
     def obsolete_missing(commit: str, *, stored: bool) -> bool:
         nonlocal received_patches
@@ -2481,6 +2522,39 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                     % (sha[:12], lot))
             unknown.append(sha[:12])
             continue
+        # #3837: only rewritten freezes get this extra scope proof. A squash
+        # whose content is still delivered keeps every contributing author.
+        if target_sha and _is_ancestor(repo, sha, head_sha) is False:
+            if not delivered_read:
+                delivered_read = True
+                try:
+                    tree = _merged_tree(repo, target_sha, head_sha)
+                    delivered = _text_delta(repo, target_sha, tree) if tree else None
+                except Exception:  # noqa: BLE001 - uncertainty retains authors
+                    delivered = None
+            outside = [commit for commit in earlier
+                       if _is_ancestor(repo, commit, head_sha) is False
+                       and _outside_delivered(repo, target_sha, commit, delivered,
+                                              file_cache)]
+            if outside:
+                # Journal before granting an exception. Read-only/unavailable
+                # storage cannot silently remove provenance from the gate.
+                from . import work
+                message = ("#3837 : gel #%s (%s), contenu déjà dans la cible ; "
+                           "aucune contribution de ces commits au delta livré "
+                           "vers %s sur %s : %s"
+                           % (row_id, sha, target_sha, head_sha,
+                              ", ".join(outside)))
+                try:
+                    work.note(db, lot, message, once=True)
+                except Exception:  # noqa: BLE001 - no trace, no exception
+                    outside = []
+                if exclusions_out is not None:
+                    exclusions_out.extend({"commit": commit, "head": target_sha,
+                                           "reason": "contenu déjà dans la cible",
+                                           "carried_from": sha, "freeze_id": row_id}
+                                          for commit in outside)
+                earlier = [commit for commit in earlier if commit not in outside]
         processed.append(sha)
         if not earlier or all(plan_git.full_commit_id(value) in current_set
                               for value in earlier):

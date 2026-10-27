@@ -36,3 +36,24 @@ The gate, reviewer designation and packet candidate selection use the same
 `review_authors.reading` filter. The current frozen head is passed for both the
 current range and carried freezes. Calls without a frozen head, including
 admitted-member scopes, retain the original isolated replay proof.
+
+## Rewritten prior freezes (#3837)
+
+A non-ancestral freeze is never dropped solely because history was rewritten.
+For a historical patch from a rewritten freeze, the carried reader additionally
+measures its contribution to the
+actual clean merge into the exact target. Its removed lines must not overlap
+landing removals. Any of its added lines in the landing must already exist as
+an exact full line somewhere on the target. Blank lines and whitespace count;
+there is no meaningful-line threshold. Each match is an anchored literal
+query, cached for this reading. A novel addition, a delivered removal, a
+conflict, binary/mode change or unreadable object keeps provenance.
+
+The #3762/#3781 filters run first and retain their existing semantics.
+An ancestral freeze remains under the existing reader, and a squash retaining
+new content retains its authors. No unknown provenance is automatically
+waived. The new filter runs before prior provenance is read, equally for the
+gate, designation and packet candidates. Every removed commit is traced with
+its source freeze, current head and exact target in the lot journal (once per
+proof); a failed journal write does not grant the exception. The exclusions
+also enter the existing provenance manifest output.
