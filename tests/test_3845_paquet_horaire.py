@@ -370,6 +370,53 @@ class ResumeTest(Base):
         self.assertIn("rien composé", ph.tick(self.ctx))
         self.assertEqual(len(self.autos()), 1)
 
+    def test_autre_hote_epoque_ancienne_reprise_au_tic_suivant(self):
+        # #4087 : h-46, tentative d'agents-2 (époque 277), bail passé à 279
+        self.ctx.epoch = 279
+        self.unfrozen(ph.MARK_ATTEMPT + "composition n=1 base=- par=autre:9 epoque=277")
+        self.shell.auto_out = "aucune unité composée\n"
+        self.assertIn("rien composé", ph.tick(self.ctx))
+        auto = self.autos()[0]
+        self.assertIn("--force", auto)
+        tried = [n for n in ph.marks(self.shell.items[4000])
+                 if n.startswith(ph.MARK_ATTEMPT)]
+        self.assertTrue(tried[-1].startswith(ph.MARK_ATTEMPT + "composition n=2 "))
+        self.assertTrue(tried[-1].endswith(" epoque=279"))
+
+    def test_autre_hote_meme_epoque_reste_en_cours(self):
+        self.ctx.epoch = 279
+        item = self.unfrozen(
+            ph.MARK_ATTEMPT + "composition n=1 base=- par=autre:9 epoque=279")
+        item["events"][0]["created_ts"] = NOW - ph.ATTEMPT_STALE - 1
+        self.assertIn("en cours", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+
+    def test_autre_hote_sans_epoque_du_tic_attend_le_delai(self):
+        self.unfrozen(ph.MARK_ATTEMPT + "composition n=1 base=- par=autre:9 epoque=277")
+        self.assertIn("en cours", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+
+    def test_meme_hote_pid_vivant_malgre_l_epoque(self):
+        self.ctx.epoch = 279
+        self.ctx.alive = lambda pid: True
+        self.unfrozen(ph.MARK_ATTEMPT + "composition n=1 base=- par=%s:99 epoque=277"
+                      % self.ctx.host)
+        self.assertIn("en cours", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+
+    def test_marque_recomposition_avec_epoque_relue(self):
+        found = ph.attempts({"events": [{"note": ph.MARK_ATTEMPT + "recomposition n=1 "
+                                         "base=%s par=autre:9 run=77 sans=3801,3807 "
+                                         "epoque=12" % HEAD}]})
+        self.assertEqual((found[0].run_id, found[0].exclude, found[0].epoch),
+                         ("77", [3801, 3807], 12))
+
+    def test_epoque_du_bail_lue_a_l_environnement(self):
+        with mock.patch.dict(os.environ, {"AMEESH_LEASE_EPOCH": "279"}):
+            self.assertEqual(ph.lease_epoch(), 279)
+        with mock.patch.dict(os.environ, {"AMEESH_LEASE_EPOCH": "x"}):
+            self.assertEqual(ph.lease_epoch(), 0)
+
     def test_reprise_epuisee_signalee_une_fois(self):
         notes = []
         for n in range(1, ph.MAX_ATTEMPTS + 1):
