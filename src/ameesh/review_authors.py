@@ -205,8 +205,14 @@ def _milestone_receipt(provider, db, milestone_id: int, *, strict: bool) -> Opti
 
 def reference_author(db, item: Mapping, milestone: Optional[Mapping], families,
                      *, provider=None, strict: bool = False,
-                     families_out: Optional[dict] = None) -> dict:
+                     families_out: Optional[dict] = None,
+                     receipt: Optional[Mapping] = None) -> dict:
     """L'auteur de référence `{name, family}` : l'assigné au gel.
+
+    `receipt` (#3948) est la preuve déjà capturée du jalon en cours, quand la
+    lecture est faite **avant** l'écriture du `frozen` : le reçu n'existe pas
+    encore en base, mais `proof_for_current_turn` le connaît. Il tient lieu de
+    `_milestone_receipt` sans relire la base ni retarder le gel.
 
     La famille vient de la trace du gel (`_author_at_freeze`), sinon du reçu du
     jalon quand son acteur est bien l'auteur, sinon de la session ouverte du
@@ -254,7 +260,13 @@ def reference_author(db, item: Mapping, milestone: Optional[Mapping], families,
         milestone_id = int((milestone or {}).get("id") or 0)
     except (TypeError, ValueError):
         milestone_id = 0
-    if milestone is not None and milestone_id > 0:
+    if receipt is not None:
+        # #3948 : la lecture précède l'INSERT du jalon, son reçu n'est pas
+        # encore en base. La preuve du tour en tient lieu, sans relecture.
+        proof = dict(receipt)
+        if proof and str(proof.get("actor") or "").strip() == name:
+            prove(proof.get("harness"))
+    elif milestone is not None and milestone_id > 0:
         try:
             proof = _milestone_receipt(provider, db, milestone_id,
                                        strict=strict)
@@ -3281,8 +3293,14 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             recover=None, admitted_heads=(),
             exclusions_out: Optional[list] = None,
             commits_out: Optional[dict] = None,
-            fetch: bool = True) -> tuple[list, list, list]:
+            fetch: bool = True,
+            milestone_proof: Optional[Mapping] = None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
+
+    `milestone_proof` (#3948) est la preuve du jalon lue hors transaction,
+    avant son INSERT : elle tient lieu de reçu du gel courant pour
+    [`reference_author`]. Un rejeu ou la porte laissent le défaut (`None`) et
+    lisent le reçu en base.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
     désignation et le train la partagent. `reference_families` porte les
@@ -3403,7 +3421,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     if reference is None:
         reference = reference_author(db, item, milestone, families,
                                      provider=provider, strict=strict,
-                                     families_out=proven_reference)
+                                     families_out=proven_reference,
+                                     receipt=milestone_proof)
     author_name = str((reference or {}).get("name") or "").strip()
     author_family = str((reference or {}).get("family") or "")
     reviewers = designated_reviewers(db, item, milestone, author_name)

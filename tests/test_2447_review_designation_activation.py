@@ -2585,6 +2585,76 @@ class FreezeTransactionNetworkTest(_ActivationFixture, PgTestCase):
         self.assertNotIn(("forge", True), calls)
 
 
+class FreezeReadingOutsideTransactionTest(_ActivationFixture, PgTestCase):
+    """#3948 — la lecture des gels antérieurs ne tient pas la transaction.
+
+    Incident #3889 : `prepare` lit les auteurs de tous les gels antérieurs
+    (`_carried_from_previous`) ; sur une branche rebasée aux nombreux gels,
+    cette lecture Git prend plus de 120 s. Faite dans la transaction du jalon,
+    elle laissait la session `idle in transaction` au-delà de la garde de
+    180 s (#3836), qui tuait la connexion : « connection lost during a
+    transaction ». La lecture est désormais faite avant le BEGIN ; le hook ne
+    reçoit que le résultat.
+    """
+
+    def setUp(self):
+        # The default hook reads the canon from `db.cfg`; restore the fixture's
+        # canon-less cfg after the test so a later `work.add` in this class's
+        # `setUp` does not inherit the human-owner requirement (#3948).
+        previous = self.db.cfg
+        super().setUp()
+        self.db.cfg = self.cfg
+        self.addCleanup(setattr, self.db, "cfg", previous)
+
+    def _prior_freeze(self) -> int:
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, at)"
+            " VALUES (%s, 'frozen', %s, 'author', now() - interval '1 hour')",
+            (self.lot, self.base))
+        return int(self.db.query(
+            "SELECT id FROM work_item_milestones"
+            " WHERE work_item_id = %s AND sha = %s ORDER BY id DESC",
+            (self.lot, self.base))[0]["id"])
+
+    def test_the_reading_is_prepared_before_the_transaction(self):
+        self._prior_freeze()
+        calls: list = []
+        original = review_authors._carried_from_previous
+
+        def carried(*args, **kwargs):
+            calls.append(("carried", freeze_gate._in_transaction(self.db)))
+            return original(*args, **kwargs)
+
+        original_prepare = act.prepare
+
+        def prepare(*args, **kwargs):
+            calls.append(("prepare", freeze_gate._in_transaction(self.db)))
+            return original_prepare(*args, **kwargs)
+
+        with mock.patch.object(review_authors, "_carried_from_previous",
+                               side_effect=carried), \
+                mock.patch.object(act, "prepare", side_effect=prepare):
+            row = work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
+                                 actor="author")
+        self.assertEqual(row["kind"], "frozen")
+        self.assertIn(("carried", False), calls,
+                      "la lecture des gels antérieurs n'a pas été faite hors transaction")
+        self.assertIn(("prepare", False), calls)
+        self.assertFalse(any(in_transaction for _name, in_transaction in calls),
+                         "une lecture de désignation a tourné dans la transaction du gel")
+        self.assertEqual(set(designated(work.get(self.db, self.lot))), {"r1", "r2"})
+
+    def test_a_prepare_failure_is_journaled_and_keeps_the_freeze(self):
+        with mock.patch.object(act, "prepare", side_effect=RuntimeError("boom")):
+            row = work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
+                                 actor="author")
+        self.assertEqual(row["kind"], "frozen")
+        notes = self.notes("review-designation-unavailable:")
+        self.assertTrue(any("internal designation error: RuntimeError: boom" in note
+                            for note in notes), notes)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+
+
 class FreezeLockWaitTest(_ActivationFixture, PgTestCase):
     """#3836 — un gel n'attend pas un verrou en tenant ceux du mesh.
 

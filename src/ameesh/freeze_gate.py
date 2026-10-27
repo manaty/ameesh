@@ -837,7 +837,23 @@ def milestone(
         marker = _freeze_absent_marker(db, item, sha, repo, refreshed)
         if marker:
             note = (note + "\n" if note else "") + marker
+    # #1465 : un gel ou un verdict déclaré dans un tour managé emporte la
+    # preuve exacte de son origine (acteur, session, tour, harnais, sha
+    # complet). Hors tour (orchestrateur, humain), le jalon s'écrit sans
+    # preuve : l'origine reste inconnue, jamais devinée par proximité.
+    # #2928 : la preuve se résout dans le dépôt qui porte la tête (le canon
+    # pour un lot `canon/**`), pas seulement dans le répertoire courant.
+    from . import review_provenance
+    try:
+        proof = review_provenance.proof_for_current_turn(
+            db, actor=actor, sha=sha, cwd=_proof_repo(db, item, sha, repo),
+            required=kind == "verdict" and bool(os.environ.get("AMEESH_TURN_ID", "").strip()))
+    except review_provenance.ProvenanceError as exc:
+        raise WorkError("verdict refused (provenance-missing): %s" % exc) from exc
+    if proof and not actor:
+        actor = proof["actor"]
     drain: list | None = None
+    prepared = None
     if kind == "frozen" and on_frozen is None:
         from . import review_designation_activation as activation
         cfg = getattr(db, "cfg", None)
@@ -856,25 +872,18 @@ def milestone(
             # la session `idle in transaction` sept minutes, verrous tenus.
             if not carried:
                 activation.prefetch_freeze_objects(db, item, target, sha)
-            on_frozen = activation.hook(cfg, outcome, carried=carried, target=target)
+                # #3948 : la lecture des auteurs (dont `_carried_from_previous`
+                # sur tous les gels antérieurs) prend >120 s sur un lot comme
+                # #3889 ; la faire dans la transaction du jalon la laissait
+                # `idle in transaction` au-delà de la garde de 180 s, qui
+                # tuait la connexion. Toute la lecture passe ici.
+                prepared = activation.prepare_for_freeze(
+                    cfg, db, item, sha, target=target, actor=actor, proof=proof)
+            on_frozen = activation.hook(cfg, outcome, carried=carried,
+                                        target=target, prepared=prepared)
             if after_commit is None:
                 after_commit = []
                 drain = after_commit
-    # #1465 : un gel ou un verdict déclaré dans un tour managé emporte la
-    # preuve exacte de son origine (acteur, session, tour, harnais, sha
-    # complet). Hors tour (orchestrateur, humain), le jalon s'écrit sans
-    # preuve : l'origine reste inconnue, jamais devinée par proximité.
-    # #2928 : la preuve se résout dans le dépôt qui porte la tête (le canon
-    # pour un lot `canon/**`), pas seulement dans le répertoire courant.
-    from . import review_provenance
-    try:
-        proof = review_provenance.proof_for_current_turn(
-            db, actor=actor, sha=sha, cwd=_proof_repo(db, item, sha, repo),
-            required=kind == "verdict" and bool(os.environ.get("AMEESH_TURN_ID", "").strip()))
-    except review_provenance.ProvenanceError as exc:
-        raise WorkError("verdict refused (provenance-missing): %s" % exc) from exc
-    if proof and not actor:
-        actor = proof["actor"]
     row = storage.of(db).work.add_milestone(
         item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip(),
         on_frozen=on_frozen, after_commit=after_commit, proof=proof)
