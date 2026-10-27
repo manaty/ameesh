@@ -528,6 +528,24 @@ class EventLogPgTest(PgTestCase):
         events.record(self.db, "alert.raised", "alert:d")
         self.delivered(store, after, ["alert:d"])
 
+    def test_a_foreign_transaction_does_not_move_the_witness_position(self):
+        """#3868: h-33 CI — another process of the part (`--parallel`, #3754)
+        holds a transaction older than a row of this schema: `head`
+        (deliverable) lags behind `top` (existing), and a witness starting at
+        the head would read that row again once the foreign transaction ends."""
+        store = storage.of(self.db).events
+        other = db_mod.connect(self.cfg)
+        self.addCleanup(other.close)
+        with other.transaction() as tx:
+            tx.query("select pg_current_xact_id()")     # the foreign xmin
+            events.record(self.db, "alert.raised", "alert:held")
+            bounds = store.bounds()
+            self.assertNotEqual(bounds["head"], bounds["top"])
+            self.assertEqual(self.position_after_existing(), bounds["top"])
+            # nothing after the position: no event waits for the foreign xmin
+            self.assertEqual(store.readable(self.position_after_existing(), 100)[:2],
+                             ([], None))
+
     def test_readable_and_waiting_share_one_snapshot(self):
         """Codex P2 r2: A holds B back, then ends WITHOUT writing an event
         between two reads on two snapshots: `[]` then `waiting` False, and B
@@ -675,6 +693,24 @@ class StreamPgTest(ServerMixin, PgTestCase):
             buf += resp.fp.read1(65536)
         self.fail("%d message(s) expected, got %r" % (count, found))
 
+    def wait_deliverable(self, timeout=60.0):
+        """Wait (bounded) until every row of this schema is deliverable.
+
+        #3868: another process of the part (`--parallel`, #3754) can hold a
+        transaction older than this schema's rows: `head` then lags behind
+        `top`, and a stream opened now starts before them and replays them
+        legitimately once the foreign transaction ends. Wait for its end, or
+        skip: what it holds is not this test's subject (#3832).
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            bounds = storage.of(self.db).events.bounds()
+            if bounds["head"] == bounds["top"]:
+                return bounds
+            if time.monotonic() >= deadline:
+                self.skipTest("a foreign transaction holds this schema's rows (xmin)")
+            time.sleep(0.1)
+
     def assert_reset_at_head(self, frame, at_least, cluster):
         """#928: a reset frame names THIS journal and a position at or after
         `at_least`. The exact head at the instant of the reset cannot be
@@ -763,13 +799,12 @@ class StreamPgTest(ServerMixin, PgTestCase):
     def test_without_last_event_id_only_new_events(self):
         before = events.record(self.db, "alert.raised", "alert:before")
         self.serve()
-        # #928: a foreign transaction of the shared bench (xmin) can hold the
-        # record back for a moment; opening the stream before it is readable
-        # would replay it, legitimately, as a new event (never skip).
-        deadline = time.monotonic() + 5
-        while (storage.of(self.db).events.bounds()["head"][1] != before
-               and time.monotonic() < deadline):
-            time.sleep(0.02)
+        # #928/#3868: a foreign transaction of the shared bench (xmin) can
+        # hold the record back for a moment; opening the stream before it is
+        # readable would replay it, legitimately, as a new event (never
+        # skip). Wait for its end, bounded, before opening.
+        bounds = self.wait_deliverable()
+        self.assertEqual(bounds["head"][1], before)
         resp = self.open_stream()
         events.record(self.db, "alert.raised", "alert:after")
         got = self.read_messages(resp, 1, kind="alert.raised")
@@ -877,7 +912,12 @@ class StreamPgTest(ServerMixin, PgTestCase):
         position a reset instead of a silent skip."""
         self.serve()
         events.record(self.db, "alert.raised", "alert:old")
-        bounds = storage.of(self.db).events.bounds()
+        # #3868: a foreign transaction of the part (xmin) holds this schema's
+        # rows back, so `head` lags behind `top`: the stream would reset
+        # below `alert:old` and replay it after the reset. Wait, bounded, for
+        # the head to reach our own top, then the stream starts after it.
+        bounds = self.wait_deliverable()
+        self.assertEqual(bounds["head"], bounds["top"])
         self.assertRegex(bounds["cluster"], "^[0-9a-f]{1,16}t[0-9a-f]{8}j[0-9a-f]{16}$")
         sysid, rest = bounds["cluster"].split("t")
         timeline, journal = rest.split("j")
@@ -889,7 +929,7 @@ class StreamPgTest(ServerMixin, PgTestCase):
                       "%st%08xj%s" % (sysid, int(timeline, 16) + 1, journal),
                       "%st%sj%016x" % (sysid, timeline, int(journal, 16) + 1)):
             resp = self.open_stream({"Last-Event-ID": events.format_position(
-                (head[0] - 1, head[1] - 1), other)})          # within the bounds
+                (head[0] - 1, max(0, head[1] - 1)), other)})   # within the bounds
             got = self.read_messages(resp, 1, kind="reset")
             self.assertEqual(json.loads(got[0]["data"])["reason"],
                              "another cluster or timeline", other)
