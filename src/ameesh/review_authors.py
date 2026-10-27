@@ -1006,15 +1006,16 @@ def _text_delta(repo: str, before: str, after: str, *, path: str = ""):
     return adds, removes
 
 
-def _no_reintroduced_patch(repo: str, sha: str, landing) -> bool:
-    """Historical integration + no contribution in the actual landing.
+def _no_reintroduced_contribution(repo: str, sha: str, landing) -> bool:
+    """Le contenu propre du commit est-il réintroduit par la tête (#3902) ?
 
-    Historical patch-id alone is never current-content proof. A clean merge
-    of the WHOLE head must add none of the candidate's added lines and remove
-    none of its removed lines. This also covers prior freezes no longer
-    ancestral to head. A revert/rewrite reintroduced by head intersects the
-    landing and keeps its author. No head, clean merge or readable text
-    deltas: keep the author. No inference from `_effective_revert(None)`.
+    Une ligne vide, ou une ligne que le parent du commit portait déjà,
+    n'est pas la contribution du commit ; l'inclure retenait indéfiniment des
+    copies de l'ancienne pile H7/H8 pourtant livrées dans la cible (#3519).
+    Seules les lignes **propres** (ajouts absents du parent) non vides et les
+    retraits non vides comptent. Un recoupement fait uniquement de lignes
+    héritées ou vides ne réintroduit rien : le commit est déjà livré. Une
+    lecture impossible garde le doute.
     """
     if landing is None:
         return False
@@ -1024,7 +1025,60 @@ def _no_reintroduced_patch(repo: str, sha: str, landing) -> bool:
         return False
     if patch is None or not any(patch):
         return False
-    return not (patch[0] & landing[0] or patch[1] & landing[1])
+    added = {row for row in patch[0] if row.strip()}
+    removed = {row for row in patch[1] if row.strip()}
+    landing_add = {row for row in landing[0] if row.strip()}
+    landing_remove = {row for row in landing[1] if row.strip()}
+    # Un retrait propre réapparu dans la tête est une réintroduction.
+    if removed & landing_remove:
+        return False
+    overlap = added & landing_add
+    if not overlap:
+        return True
+    # Seul le recoupement avec le landing demandait la preuve d'héritage :
+    # une ligne propre hors du landing ne peut pas être réintroduite par lui.
+    # Le `git grep` d'arbre entier se limite donc à ces quelques lignes.
+    try:
+        inherited = _lines_in_tree(repo, sha + "^", sorted(overlap))
+    except Exception:  # noqa: BLE001 - doute : garder le commit
+        return False
+    return all(row.strip() in inherited for row in overlap)
+
+
+def _patch_in_target(repo: str, target: str, sha: str, cache: dict) -> bool:
+    """Le patch de `sha` existe-t-il déjà dans l'histoire de la cible (#3902) ?
+
+    Même preuve bornée que `_not_in_target` (#3762), pour un seul commit :
+    patch-id verbatim présent parmi les `MAX_TARGET_COMMITS` derniers commits
+    de la cible. Une lecture impossible, un diff vide ou un patch absent
+    rendent `False` : le doute garde le commit.
+    """
+    key = ("patch-in-target", str(target), str(sha))
+    if key in cache:
+        return bool(cache[key])
+    found = False
+    try:
+        patches = plan_git._patch_ids(repo, "--no-walk", sha)
+        if patches:
+            base = plan_git._out(repo, "merge-base", str(target), sha)
+            if base:
+                # Une seule lecture de la cible par base : les copies d'un
+                # même gel partagent leur point de divergence, et le parcours
+                # borné est le poste coûteux de cette preuve.
+                index_key = ("target-patch-ids", str(target), str(base))
+                if index_key not in cache:
+                    try:
+                        cache[index_key] = plan_git._patch_ids(
+                            repo, "--max-count=%d" % plan_git.MAX_TARGET_COMMITS,
+                            "%s..%s" % (base, str(target)))
+                    except Exception:  # noqa: BLE001 - pas de preuve
+                        cache[index_key] = None
+                on_target = cache[index_key]
+                found = bool(on_target) and patches.keys() <= on_target.keys()
+    except Exception:  # noqa: BLE001 - pas de preuve : garder le commit
+        found = False
+    cache[key] = found
+    return found
 
 
 def _delivered_paths(repo: str, target: str, tree: str):
@@ -1131,7 +1185,78 @@ def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
     return None
 
 
-def _not_in_target(repo: str, commits, target: str, *, head: str = "") -> list:
+def _content_before_head(repo: str, before: str, sha: str,
+                         cache: Optional[dict] = None) -> bool:
+    """Preuve positive que le patch de `sha` est déjà dans `before` (#3902).
+
+    Un gel antérieur peut porter les commits d'un lot parent que la cible a
+    depuis intégrés **sous d'autres SHA** (squash, empilement, réécriture) :
+    ces commits ne comptent ni comme auteurs ni comme inconnus du lot courant.
+    `before` est la cible courante, lue avant la fusion de la tête : aucune
+    ligne apportée par la tête elle-même ne peut acheter cette preuve.
+
+    La preuve est volontairement stricte et **positive** :
+
+    * diff lisible et non binaire, avec au moins une ligne significative ;
+    * à chaque chemin, les occurrences ajoutées par le commit sont présentes
+      dans `before` au même chemin (compte au moins égal au post-image) ;
+    * les occurrences retirées y sont absentes (compte au plus égal au
+      post-image) ;
+    * un chemin créé ou supprimé se prouve par sa présence ou son absence.
+
+    Toute lecture impossible, tout déplacement de chemin, tout retrait
+    réapparu dans la cible est un doute : le commit reste (le doute ne retire
+    jamais un auteur). Un commit sans ligne significative (binaire, vide)
+    n'est jamais prouvé : il reste aussi.
+    """
+    cache = {} if cache is None else cache
+    try:
+        parsed = _commit_lines(repo, sha)
+    except Exception:  # noqa: BLE001 - lecture impossible : doute
+        return False
+    if parsed is None:
+        return False
+    adds, removes, binary = parsed
+    if binary:
+        return False
+    paths = sorted(set(adds) | set(removes))
+    if not paths:
+        return False
+    meaningful = False
+    for path in paths:
+        parent = _path_line_counts(repo, str(sha) + "^", path, cache)
+        if parent is None:
+            if _path_absent(repo, str(sha) + "^", path, cache) is not True:
+                return False
+            parent = {}
+        after = _path_line_counts(repo, sha, path, cache)
+        if after is None:
+            if _path_absent(repo, sha, path, cache) is not True:
+                return False
+            after = {}
+        here = _path_line_counts(repo, before, path, cache)
+        if here is None:
+            if _path_absent(repo, before, path, cache) is not True:
+                return False
+            here = {}
+        for row in set(parent) | set(after):
+            if not _meaningful_line(row):
+                continue
+            was, now = parent.get(row, 0), after.get(row, 0)
+            there = here.get(row, 0)
+            if now > was:
+                meaningful = True
+                if there < now:
+                    return False        # l'ajout n'est pas (encore) dans la cible
+            if now < was:
+                meaningful = True
+                if there > now:
+                    return False        # le retrait n'est pas appliqué
+    return meaningful
+
+
+def _not_in_target(repo: str, commits, target: str, *, head: str = "",
+                   cache: Optional[dict] = None) -> list:
     """Les commits qui ne sont dans `target` ni par ascendance ni par patch.
 
     #3116 : un commit déjà dans la cible a été relu sous son propre lot ; il
@@ -1156,8 +1281,11 @@ def _not_in_target(repo: str, commits, target: str, *, head: str = "") -> list:
     ne peut que conserver des auteurs, jamais en retirer sans preuve. Un
     patch historique n'est écarté que si son rejeu laisse la cible inchangée,
     ou si la fusion propre de `head` prouve qu'aucune de ses lignes ajoutées
-    ou retirées n'est réintroduite (#3781). Sans tête, seule la première
-    preuve s'applique. Le doute conserve l'auteur après revert/réécriture."""
+    ou retirées n'est réintroduite (#3781). #3902 : une preuve de contenu sur
+    la cible courante couvre aussi les patchs intégrés sous un autre SHA ;
+    sans tête, elle ne s'applique pas. Le doute conserve l'auteur après
+    revert/réécriture."""
+    cache = {} if cache is None else cache
     wanted = [str(commit).strip() for commit in commits or ()
               if str(commit).strip()]
     if not wanted or not target:
@@ -1196,8 +1324,13 @@ def _not_in_target(repo: str, commits, target: str, *, head: str = "") -> list:
             return kept
     except Exception:  # noqa: BLE001 - pas de preuve : garder les auteurs
         return kept
-    landing, landing_read = None, False
     equivalent = set()
+    # #3902 : la preuve de contenu se lit sur la cible **courante**. Un commit
+    # d'un gel antérieur dont le patch y est déjà (squash, empilement,
+    # réécriture) ne compte ni comme auteur ni comme inconnu : son contenu est
+    # livré, la tête n'en est pas l'auteur. Le doute (lecture impossible,
+    # contenu absent) garde le commit.
+    before = str(target) if head else ""
     for sha in set(kept):
         try:
             # Une entrée par commit : deux copies du même patch doivent être
@@ -1205,23 +1338,24 @@ def _not_in_target(repo: str, commits, target: str, *, head: str = "") -> list:
             patches = plan_git._patch_ids(repo, "--no-walk", sha)
         except Exception:  # noqa: BLE001 - ce candidat reste dans le doute
             continue
-        if not patches or not patches.keys() <= on_target.keys():
+        if before and _content_before_head(repo, before, sha, cache):
+            equivalent.add(sha)
+            continue
+        subset = bool(patches) and patches.keys() <= on_target.keys()
+        if not subset:
+            # Patch intégré sous un autre SHA, mais son contenu n'est plus
+            # dans la cible : rien ne prouve qu'il y est livré.
             continue
         if _applied_in(repo, str(target), sha):
             equivalent.add(sha)
             continue
-        # #3781: compute the actual landing once, only for historical
-        # equivalents whose isolated replay failed. A failed read is not empty.
-        if head and not landing_read:
-            landing_read = True
-            try:
-                tree = _merged_tree(repo, str(target), head)
-                if tree:
-                    landing = _text_delta(repo, str(target), tree)
-            except Exception:  # noqa: BLE001 - uncertainty retains authors
-                pass
-        if _no_reintroduced_patch(repo, sha, landing):
-            equivalent.add(sha)
+        # #3781 : le patch est historique et son rejeu échoue (cible évoluée
+        # ou revert). La contribution propre réintroduite par la tête garde
+        # l'auteur ; une ligne vide ou héritée ne le retient pas (#3902).
+        if not _no_reintroduced_contribution(
+                repo, sha, _landing_delta(repo, str(target), head, cache)):
+            continue
+        equivalent.add(sha)
     return [sha for sha in kept if sha not in equivalent]
 
 
@@ -1233,11 +1367,31 @@ def _survives_rewrite(repo: str, head: str, sha: str, cache: dict,
     tiers. Hors cible, un commit qui n'est plus ancêtre de la tête **et** dont
     le contenu ne survit pas (preuve de contenu #2924/#2977) a été réellement
     réécrit : il ne bloque pas la lecture. Un commit encore ancêtre de la tête
-    reste lu comme avant ; une lecture impossible est un doute, qui garde."""
+    reste lu comme avant ; une lecture impossible est un doute, qui garde.
+
+    #3902 : hors cible par SHA, un commit d'un gel antérieur dont le contenu
+    # est présent dans la cible avant la tête ne compte pas : il est livré,
+    # et la tête n'en est pas l'auteur (une copie réintroduite en plus ne
+    # change pas ce fait). Si le contenu n'y est plus mais que le patch-id
+    # appartient à l'histoire de la cible (squash, empilement), le rejeu
+    # prouve qu'il est encore appliqué ; sinon le garde-fou de réintroduction
+    # ne retient que sa contribution **propre**, car une ligne vide ou héritée
+    # retenait indéfiniment les copies H7/H8. Sans preuve, le doute garde.
+    """
     if not head:
         return True
     if target and _is_ancestor(repo, sha, target) is True:
         return False
+    if target:
+        if _content_before_head(repo, str(target), sha, cache):
+            return False
+        if _patch_in_target(repo, str(target), sha, cache):
+            if _applied_in(repo, str(target), sha):
+                return False
+            if _no_reintroduced_contribution(
+                    repo, sha,
+                    _landing_delta(repo, str(target), head, cache)):
+                return False
     if _is_ancestor(repo, sha, head) is True:
         return True
     # #3116 B1 : la preuve de réécriture cherche le contenu DÉPLACÉ (un
@@ -1263,6 +1417,27 @@ def _merged_tree(repo: str, left: str, right: str) -> Optional[str]:
         return None
     lines = proc.stdout.decode("utf-8", "replace").splitlines()
     return lines[0].strip() if lines else None
+
+
+def _landing_delta(repo: str, target: str, head: str, cache: dict):
+    """Le delta livré par `head` sur `target`, mis en cache, ou None (doute).
+
+    La fusion peut être lue plusieurs fois pour une même lecture (un candidat
+    par gel antérieur) : l'arbre fusionné et le diff sont identiques, et la
+    cible est épinglée pour toute la lecture. Une lecture impossible rend None,
+    que les appelants traitent comme un doute (jamais comme un landing vide).
+    """
+    key = ("landing", str(target), str(head))
+    if key not in cache:
+        value = None
+        try:
+            tree = _merged_tree(repo, str(target), head)
+            if tree:
+                value = _text_delta(repo, str(target), tree)
+        except Exception:  # noqa: BLE001 - doute : garder les auteurs
+            value = None
+        cache[key] = value
+    return cache[key]
 
 
 def _commits_between(repo: str, start: str, head: str) -> Optional[list]:
@@ -2464,7 +2639,7 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
     review_families: dict[str, dict[str, set]] = {}
     unknown: list[str] = []
     cache = {} if cache is None else cache
-    commits = _not_in_target(repo, commits, target, head=head)
+    commits = _not_in_target(repo, commits, target, head=head, cache=cache)
 
     def record_unknown(value: str) -> None:
         """Un inconnu ne bloque que s'il compte encore pour la tête (#3116),
@@ -3208,7 +3383,8 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             continue
         earlier = _commits_between(repo, start, sha)
         if earlier is not None:
-            earlier = _not_in_target(repo, earlier, target_sha, head=head_sha)
+            earlier = _not_in_target(repo, earlier, target_sha, head=head_sha,
+                                     cache=file_cache)
             # #3544 : l'exclusion du report se trace comme celle de la plage
             # courante, avec le gel antérieur d'où vient la plage.
             from . import provenance_scope
