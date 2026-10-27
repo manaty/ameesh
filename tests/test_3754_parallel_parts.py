@@ -233,6 +233,7 @@ class ParallelRunTest(unittest.TestCase):
             plan = self._plan(racine)
             flux = racine / "flux.jsonl"
             env = dict(os.environ, AMEESH_REQUIRE_DB="0", AMEESH_BALANCE_INTERVAL="0")
+            env.pop("AMEESH_CI_JOBS_PER_HOST", None)  # #3945 : pas de plafond d'hôte ici
             proc = subprocess.run(
                 [sys.executable, str(SCRIPTS / "test-parts.py"), "run",
                  "--plan", str(plan), "--part", "1", "--driver", "psql",
