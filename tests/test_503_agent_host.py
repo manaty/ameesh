@@ -206,7 +206,7 @@ elif sys.argv[1] == 'show':
     # #2184/R3 : un créateur tardif indépendant (systemd-run retardé) rejoue
     # la pose APRÈS la relecture. La base doit la refuser au-delà de
     # --not-after ; sinon la pause resterait orpheline.
-    if scenario == 'pause-expiree-tardive' and (state / 'resume-seen').exists() \
+    if scenario == 'pause-expiree-tardive' and (state / ('resume-seen-' + name)).exists() \
             and (state / ('motif-tardif-' + name)).exists() \
             and not (state / 'createur-tardif-fait').exists():
         (state / 'createur-tardif-fait').touch()
@@ -227,6 +227,7 @@ elif sys.argv[1] in ('pause', 'resume'):
     if '--reason' not in args: sys.exit(2)
     if sys.argv[1] == 'resume':
         (state / 'resume-seen').touch()
+        (state / ('resume-seen-' + name)).touch()
     if sys.argv[1] == 'pause':
         # #2184/R3 : la base refuse une pose au-delà de --not-after. Le banc
         # compare à l'horloge injectée (HORLOGE_FICHIER) quand elle est posée.
@@ -1200,7 +1201,8 @@ class AgentHostTest(unittest.TestCase):
 
     def test_resume_failure_is_named_and_the_hold_stays_visible(self):
         self.env['DRAIN_ATTENTE'] = '1'
-        p = self.run_vm(scenario='chaines-resume-error')
+        # Isolate this agent: a failed lift now prevents pausing the next one (#4000).
+        p = self.run_vm(scenario='chaines-resume-error', agents=[self.agents[0]])
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('drain NON levé', p.stderr)
         self.assertIn('ameesh resume dev9 --operator', p.stderr)

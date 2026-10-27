@@ -20,8 +20,8 @@
 #   redemarrer   ameesh-runner@<persona>, une par une : arrêt prouvé
 #                (SIGTERM, drainage borné) puis démarrage ; si
 #                DRAIN_ATTENTE > 0, une pause opérateur courte (drain #2152)
-#                est posée au début du balayage pour les agents en tour ou au
-#                repos (idle/queued), puis levée après le démarrage — aucun
+#                est posée pour le seul agent courant, en tour ou au repos
+#                (idle/queued), puis levée après son démarrage — aucun
 #                tour interrompu ; geste d'opérateur : à lancer hors session
 #                liée à un agent (le CLI local refuse bad_actor), sinon le
 #                drain est refusé et le redémarrage de cet agent s'arrête sans
@@ -57,8 +57,8 @@
 # par le serveur ; liste vide admise, un hôte sans exécutant). Aucun secret
 # n'est lu ni affiché. DRAIN_ATTENTE (0 = jamais, défaut) ne mesure plus une
 # attente : c'est un interrupteur. > 0 pose la pause opérateur #2152
-# au début du balayage pour tous les agents en tour ou au repos (idle/queued),
-# puis la lève après le démarrage ; 0 l'arrêt prouvé #1152 sans pause.
+# juste avant l'arrêt du seul agent courant (K = 0), puis la lève après son
+# démarrage ; 0 l'arrêt prouvé #1152 sans pause.
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -98,7 +98,7 @@ VENV_AGENTS=/home/ameesh/.local/share/ameesh/venv
 PRECEDENT=/opt/ameesh/precedent
 TRAVAIL="$HOME/.local/state/ameesh/mise-a-jour"
 # #2152 : quand un agent est en tour, une pause opérateur courte (drain) peut
-# être posée au début du balayage de l'hôte (#3114), pour qu'aucun nouveau
+# être posée avant l'arrêt du seul agent courant (#4000), pour qu'aucun nouveau
 # tour ne soit admis pendant l'arrêt ; le SIGTERM draine le tour en cours —
 # aucun tour interrompu — et la pause est levée après le démarrage. 0 (défaut)
 # = jamais : l'arrêt prouvé #1152 suffit ; > 0 = pause immédiate (la valeur ne
@@ -941,7 +941,37 @@ lever_drains() {  # sortie du script : aucun drain ne survit à la commande
   done
   return "$code"
 }
-trap 'lever_drains || true' EXIT
+signaler_drains_non_leves() {
+  local e
+  DRAINS_NON_LEVES=()
+  for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
+    DRAINS_NON_LEVES+=("${e%%$'\t'*}")
+  done
+  etape "ERREUR: drain(s) NON levé(s) : ${DRAINS_NON_LEVES[*]} — reprise conditionnelle requise"
+}
+sortie_drains() {
+  local code=$?
+  # Un arrêt/démarrage ou un lien SSH peut échouer avant le bilan normal.
+  if ! lever_drains; then
+    signaler_drains_non_leves
+    code=1
+  fi
+  exit "$code"
+}
+trap 'sortie_drains' EXIT
+exiger_drain_precedent_leve() {
+  [ "${#DRAINS[@]}" -gt 0 ] || return 0
+  # Réconcilier les échecs passagers avant de toucher l'agent suivant.
+  # Deux passes, comme à la sortie ; après leur verdict, aucune quatrième
+  # tentative ne peut rendre le bilan « NON levé » périmé (#2498).
+  if ! lever_drains; then
+    trap - EXIT
+    echo "drain précédent non réconcilié — balayage arrêté avant $1" >&2
+    signaler_drains_non_leves
+    return 1
+  fi
+  DRAINS_NON_LEVES=()
+}
 drains_non_leves_relus() {  # #2498 : passe du trap avant le verdict
   # Le message « NON levé(s) » précédait la seconde passe du trap et pouvait
   # être périmé. La passe est faite ici ; ne restent signalés que les drains
@@ -960,40 +990,32 @@ drains_non_leves_relus() {  # #2498 : passe du trap avant le verdict
   DRAINS_NON_LEVES=(${reste[@]+"${reste[@]}"})
 }
 
-# #3114 : fermer l'admission de tous les tours avant le premier arrêt lent.
-# #3120/N2 : inclure les personas au repos (idle/queued). Sinon l'une d'elles
-# peut commencer un tour pendant l'arrêt lent d'une autre et son drain de
-# rattrapage, posé juste avant son propre arrêt, ajoute ce tour à l'attente.
-# Ne pas mettre cette passe dans une substitution : DRAINS et les refus doivent
-# rester dans le shell qui porte le trap EXIT. Relire ensuite chaque placement
-# dans la boucle d'arrêt ; une persona peut avoir été déplacée ou arrêtée.
-preparer_drains() {  # personas dans l'ordre du balayage
+# #4000 : K = 0. Cette préparation ne vise que la persona courante, jamais
+# les suivantes. Les intentions de pause restent dans le shell du trap EXIT.
+preparer_drain() {  # une seule persona, juste avant son arrêt
   [ "$DRAIN_ATTENTE" -gt 0 ] || return 0
-  local p etat st deja_pause detail
-  etape "pré-drain de l'hôte ($# personas), avant tout arrêt"
-  for p in "$@"; do
-    etat=$(etat_agent "$p") \
-      || { echo "$p : registre illisible pendant le pré-drain — aucun arrêt" >&2; return 1; }
-    IFS='|' read -r st deja_pause detail <<<"$etat"
-    case "$st" in
-      running|idle|queued)
-        if [ "$deja_pause" != 1 ]; then
-          # --not-after borne la POSE, pas la durée de la pause. Son échéance
-          # est recalculée dans poser_drain pour chaque appel, même en fin de
-          # passe. Une pause étrangère n'est ni doublée ni levée.
-          if ! poser_drain "$p"; then
-            # Une persona au repos n'a pas besoin du drain : un échec ne la
-            # condamne pas (#2184/N2, #3120/B1). La boucle d'arrêt pose le
-            # drain de rattrapage si elle est entrée en tour depuis.
-            if [ "$st" = running ]; then
-              drain_marque_indisponible "$p"
-            else
-              echo "$p : au repos, drain non posé — arrêt prouvé sans drain s'il le reste" >&2
-            fi
+  local p=$1 etat st deja_pause detail
+  etat=$(etat_agent "$p") \
+    || { echo "$p : registre illisible avant le drain — aucun arrêt" >&2; return 1; }
+  IFS='|' read -r st deja_pause detail <<<"$etat"
+  case "$st" in
+    running|idle|queued)
+      if [ "$deja_pause" != 1 ]; then
+        # --not-after borne la POSE, pas la durée de la pause. Son échéance
+        # est recalculée dans poser_drain pour chaque appel, même en fin de
+        # passe. Une pause étrangère n'est ni doublée ni levée.
+        if ! poser_drain "$p"; then
+          # Une persona au repos n'a pas besoin du drain : un échec ne la
+          # condamne pas (#2184/N2, #3120/B1). La boucle d'arrêt pose le
+          # drain de rattrapage si elle est entrée en tour depuis.
+          if [ "$st" = running ]; then
+            drain_marque_indisponible "$p"
+          else
+            echo "$p : au repos, drain non posé — arrêt prouvé sans drain s'il le reste" >&2
           fi
-        fi ;;
-    esac
-  done
+        fi
+      fi ;;
+  esac
 }
 
 redemarrer_agents() {
@@ -1022,8 +1044,11 @@ redemarrer_agents() {
     fi
   fi
   etape "exécuteurs de $HOTE_AGENTS (${#restantes[@]}), arrêt prouvé avant chaque démarrage"
-  preparer_drains "${restantes[@]}" || return 1
   for p in "${restantes[@]}"; do
+      # Ne jamais poser le drain suivant tant que le précédent reste suivi.
+      # Le trap réconcilie et rapporte toute pause restante, même sur échec.
+      exiger_drain_precedent_leve "$p" || return 1
+      preparer_drain "$p" || return 1
       drain_est_indisponible "$p" && continue
       # Le placement peut changer : relire avant de toucher une unité que cet
       # hôte ne doit plus mener.
@@ -1049,8 +1074,8 @@ redemarrer_agents() {
         fi
         continue
       fi
-      # Une persona idle au pré-drain peut avoir commencé un tour depuis :
-      # garder le drain juste avant l'arrêt pour ce cas seulement.
+      # Une pause peut avoir été levée pendant la relecture : rattraper le
+      # tour courant sans toucher aux autres agents.
       if [ "$st" = running ] && [ "$deja_pause" != 1 ] && [ "$DRAIN_ATTENTE" -gt 0 ]; then
         # #2184/N2 : un refus de pose ne stoppe que cet agent ; les autres
         # agents du balayage continuent, et la sortie du script le signale.
@@ -1788,8 +1813,11 @@ redemarrer() {
   # shellcheck disable=SC2206
   restantes=($PERSONAS_VM)
   etape "exécuteurs du serveur (${#restantes[@]}), arrêt prouvé avant chaque démarrage"
-  preparer_drains "${restantes[@]}" || return 1
   for p in "${restantes[@]}"; do
+      # Ne jamais poser le drain suivant tant que le précédent reste suivi.
+      # Le trap réconcilie et rapporte toute pause restante, même sur échec.
+      exiger_drain_precedent_leve "$p" || return 1
+      preparer_drain "$p" || return 1
       drain_est_indisponible "$p" && continue
       etat=$(etat_agent "$p") \
         || { echo "$p: registry unreadable — nothing restarted" >&2; exit 1; }
@@ -1814,7 +1842,7 @@ redemarrer() {
         fi
         continue
       fi
-      # Rattraper un tour commencé après le pré-drain de l'hôte.
+      # Rattraper un tour commencé après la préparation de cet agent.
       if [ "$st" = running ] && [ "$deja_pause" != 1 ] && [ "$DRAIN_ATTENTE" -gt 0 ]; then
         # #2184/N2 : un refus de pose ne stoppe que cet agent ; les autres
         # agents du balayage continuent, et la sortie du script le signale.

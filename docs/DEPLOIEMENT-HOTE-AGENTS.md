@@ -51,15 +51,16 @@ antérieur avant `stop`. Un échec de cette remise à zéro ou du drainage, un
 le démarrage. Un nouvel échec pendant l’arrêt n’est jamais effacé.
 
 Quand `DRAIN_ATTENTE` est supérieur à 0 (0 par défaut : désactivé), c’est un
-interrupteur, pas un délai : au début du balayage de l’hôte, tous les agents
-en tour ou au repos (`idle`, `queued`) reçoivent une pause opérateur courte et
-nommée (drain, #2152). Les fins de tour se chevauchent : l’attente dépend du
-plus long tour restant, puis des arrêts et contrôles séquentiels, au lieu de
-leur somme (#3114). Une persona au repos mise en pause avant son premier tour
-n’ajoute pas ce tour à l’attente du balayage (#3120/N2). Aucun nouveau tour ne
-commence sous pause ; celle-ci reste en place jusqu’au démarrage de la persona.
-Chaque arrêt journalise sa durée d’attente. Un tour commencé après la première
-passe reçoit aussi son drain juste avant l’arrêt.
+interrupteur, pas un délai : seul l’agent courant, en tour ou au repos
+(`idle`, `queued`), reçoit une pause opérateur courte et nommée (drain, #2152)
+juste avant son arrêt prouvé. La pause est levée après son démarrage contrôlé.
+Aucun agent suivant n’est mis en pause par anticipation (K = 0, #4000) : au
+plus un drain du script existe à la fois, y compris pour les rôles élus.
+Le SIGTERM laisse finir le tour courant, borné par `TimeoutStopSec` ; chaque
+arrêt journalise sa durée. Si une pause reste suivie, le balayage s’arrête
+avant de toucher l’agent suivant. La sortie réessaie la levée conditionnelle,
+même après un échec d’arrêt, de démarrage ou de SSH, et rapporte les
+`DRAINS_NON_LEVES` si le lien reste indisponible.
 `--not-after` est recalculé à chaque pose : il borne l’admission de la pause,
 sans faire expirer une pause déjà posée. La valeur ne mesure plus une attente d’un
 créneau « idle » ; aucune fenêtre « idle » n’est attendue. Le mesh journalise
