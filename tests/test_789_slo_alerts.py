@@ -885,6 +885,31 @@ class PaquetTest(_Base):
             self.assertNotIn("reassign it now", text)
             self.assertNotIn("ameesh work assign", text)
 
+    def test_retire_d_un_paquet_attend_le_correctif_puis_le_regel(self):
+        # #4028, cas #3986 dans h-42 : retiré du paquet pour un test négatif,
+        # le lot repasse en build (paquet-horaire). Il attend le correctif de
+        # son assigné ; le niveau 3 ne demande plus de l'inclure au paquet.
+        self.qa_at(self.GO)
+        self._return_to_build(self.GO + 30 * 60, qa_at=self.GO)
+        self.now = self.GO + 30 * 60 + 6 * HEURE
+        alerts = [a for a in self.slo() if a["level"] == 3]
+        self.assertEqual([a["step"] for a in alerts], ["blocked_freeze"])
+        self.assertEqual(alerts[0]["waiting"]["what"], "fix")
+        self.assertEqual(alerts[0]["waiting"]["who"], self.lot["assignee"])
+        for text in self.briefs(alerts[0]).values():
+            self.assertNotIn("include it in the next package", text)
+        # Regel après l'exclusion : le GO est caduc, le lot revient en qa et
+        # n'attend plus le correctif.
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, actor, sha)"
+            " VALUES (%s, 'frozen', to_timestamp(%s), 'dev', %s)",
+            (self.lot["id"], self.now, "e" * 40))
+        work.move(self.db, self.lot["id"], "qa")
+        rows = storage.of(self.db).operations.open_lots_activity(None)
+        info = stagnation.describe(self.db, rows, now=self.now,
+                                   open_items=rows)[self.lot["id"]]
+        self.assertNotEqual(info["waiting"]["what"], "fix")
+
     def test_ci_du_paquet_verte_seulement_si_tous_les_workflows_le_sont(self):
         # #3487 (avis cx3) : un workflow vert n'efface pas un autre en cours ou
         # rouge sur la même tête ; l'état nommé est le plus actionnable.
