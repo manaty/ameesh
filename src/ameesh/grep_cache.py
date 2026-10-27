@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#3974 — cache partagé de l'hôte des balayages `git grep -F -f -`.
+
+La lecture d'auctorialité d'une plage gelée (`review_authors`) balaie l'arbre
+d'un commit (`_tree_lines`, `_source_paths`) avec la liste des lignes copiées.
+Sur un dépôt Nexlink, un balayage prend des dizaines de secondes de CPU ; les
+boucles des exécuteurs, `notify --only alerts` et `queue add` relisaient la
+même plage gelée, inchangée, à chaque passage, dans des processus distincts :
+le cache en mémoire de #3753 ne survivait pas au processus.
+
+Le résultat d'un balayage ne dépend que du **contenu** de l'arbre lu, des
+options (fixées par l'appelant, jamais lues de la configuration : `--no-color`,
+`-h`…) et des motifs. La clé est donc l'objet arbre (SHA, immuable), le mode
+et l'empreinte des motifs, sur le modèle du cache de lectures GitHub (#848) :
+un fichier par clé sous l'état de l'hôte, partagé par tous les exécuteurs du
+même utilisateur. Seuls les résultats réussis (`grep` à 0 ou 1) se gardent :
+un échec reste un doute et se relit au passage suivant. Les attributs
+(`-I`, fichier binaire) restent ceux du dépôt lecteur, comme dans #3753.
+
+Deux processus qui calculent la même clé ne balaient pas deux fois : le second
+attend le verrou de la clé (borné) puis relit le résultat du premier.
+
+`AMEESH_GREP_CACHE=off` coupe le cache (la suite de tests le coupe par défaut) ;
+`AMEESH_GREP_CACHE_DIR` choisit le dossier, sinon `<AMEESH_STATE>/git-grep`.
+"""
+from __future__ import annotations
+
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import tempfile
+import time
+from typing import Callable, Optional, Sequence
+
+from . import canon
+
+#: sous-dossier de l'état de l'hôte qui porte le cache
+CACHE_DIR = "git-grep"
+#: entrées gardées au plus (les plus anciennement lues retirées)
+MAX_ENTRIES = 20000
+#: magasins entre deux élagages
+PRUNE_EVERY = 256
+#: attente au plus du verrou d'une clé qu'un autre processus calcule (s)
+LOCK_WAIT_S = canon.GIT_TIMEOUT
+#: pas de l'attente du verrou (s)
+LOCK_STEP_S = 0.1
+#: version du format : un changement de format change toutes les clés
+FORMAT = 1
+
+_stores = 0
+
+
+def enabled() -> bool:
+    return str(os.environ.get("AMEESH_GREP_CACHE") or "").strip().lower() not in (
+        "off", "0", "no", "false")
+
+
+def root() -> str:
+    explicit = str(os.environ.get("AMEESH_GREP_CACHE_DIR") or "").strip()
+    if explicit:
+        return os.path.expanduser(explicit)
+    state = (os.environ.get("AMEESH_STATE") or os.environ.get("AGENT_MESH_STATE")
+             or "~/.local/state/ameesh")
+    return os.path.join(os.path.expanduser(state), CACHE_DIR)
+
+
+def tree_of(repo: str, rev: str) -> Optional[str]:
+    """L'objet arbre de `rev`, lu dans les objets locaux, ou None."""
+    try:
+        proc = canon._git(repo, "rev-parse", "--verify", "--quiet",
+                          "%s^{tree}" % rev, env_extra=canon.NO_LAZY_FETCH,
+                          timeout=10.0)
+    except Exception:  # noqa: BLE001 - arbre illisible : pas de cache
+        return None
+    if proc.returncode != 0:
+        return None
+    tree = proc.stdout.decode("ascii", "replace").strip()
+    return tree if len(tree) in (40, 64) and all(
+        ch in "0123456789abcdef" for ch in tree) else None
+
+
+def key(tree: str, mode: str, patterns: Sequence[str]) -> str:
+    digest = hashlib.sha256()
+    digest.update(("%d\0%s\0%s\0" % (FORMAT, mode, tree)).encode("utf-8"))
+    for line in patterns:
+        digest.update(str(line).encode("utf-8", "surrogatepass") + b"\0")
+    return digest.hexdigest()
+
+
+def _path(name: str) -> str:
+    return os.path.join(root(), name[:2], name + ".json")
+
+
+def _read(name: str):
+    """(True, valeur) si l'entrée est lisible, sinon (False, None)."""
+    path = _path(name)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return False, None
+    if not isinstance(data, dict) or data.get("format") != FORMAT \
+            or not isinstance(data.get("value"), list):
+        return False, None
+    try:
+        os.utime(path)                 # élagage : la plus anciennement lue part
+    except OSError:
+        pass
+    return True, data["value"]
+
+
+def _write(name: str, value: list) -> None:
+    global _stores
+    path = _path(name)
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"format": FORMAT, "value": value}, handle,
+                          ensure_ascii=False)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        return                         # cache best-effort : la lecture vaut
+    _stores += 1
+    if _stores % PRUNE_EVERY == 0:
+        prune()
+
+
+def prune(limit: int = MAX_ENTRIES) -> int:
+    """Retire les entrées les plus anciennement lues au-delà de `limit`."""
+    entries = []
+    base = root()
+    try:
+        shards = os.listdir(base)
+    except OSError:
+        return 0
+    for shard in shards:
+        folder = os.path.join(base, shard)
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            full = os.path.join(folder, name)
+            try:
+                entries.append((os.stat(full).st_mtime, full))
+            except OSError:
+                continue
+    removed = 0
+    if len(entries) > limit:
+        entries.sort()
+        for _mtime, full in entries[:len(entries) - limit]:
+            try:
+                os.unlink(full)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+class _KeyLock:
+    """Verrou consultatif d'une clé, pris au mieux dans `LOCK_WAIT_S`."""
+
+    def __init__(self, name: str, wait: float):
+        self.path = _path(name)[:-len(".json")] + ".lock"
+        self.wait = wait
+        self.fd = None
+
+    def __enter__(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            self.fd = None
+            return self
+        until = time.monotonic() + max(0.0, self.wait)
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES) \
+                        or time.monotonic() >= until:
+                    os.close(self.fd)
+                    self.fd = None     # sans verrou : on calcule soi-même
+                    return self
+            time.sleep(LOCK_STEP_S)
+
+    def __exit__(self, *_exc):
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+        return False
+
+
+def cached(repo: str, rev: str, mode: str, patterns: Sequence[str],
+           compute: Callable[[], Optional[list]], *,
+           wait: Optional[float] = None) -> Optional[list]:
+    """Le résultat de `compute()` pour (arbre de `rev`, `mode`, `patterns`).
+
+    `compute` rend une liste JSON (le résultat) ou None (lecture impossible,
+    jamais gardée). Sans cache, sans arbre lisible ou sans dossier inscriptible,
+    `compute` est simplement appelé."""
+    if not enabled() or not repo or not rev:
+        return compute()
+    tree = tree_of(repo, rev)
+    if tree is None:
+        return compute()
+    name = key(tree, mode, patterns)
+    found, value = _read(name)
+    if found:
+        return value
+    with _KeyLock(name, LOCK_WAIT_S if wait is None else wait):
+        found, value = _read(name)     # un autre processus a pu le poser
+        if found:
+            return value
+        value = compute()
+        if value is not None:
+            _write(name, list(value))
+    return value

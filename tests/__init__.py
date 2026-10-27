@@ -13,3 +13,8 @@ _tmpdir = os.path.realpath(tempfile.gettempdir())
 if _tmpdir != tempfile.gettempdir():
     os.environ["TMPDIR"] = _tmpdir
     tempfile.tempdir = _tmpdir
+
+# #3974 : le cache de l'hôte des balayages `git grep` (`grep_cache`) vit sous
+# l'état de l'utilisateur ; les tests le coupent, sauf ceux qui le visent avec
+# un dossier jetable.
+os.environ.setdefault("AMEESH_GREP_CACHE", "off")

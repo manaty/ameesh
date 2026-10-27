@@ -78,11 +78,86 @@ reçu exact contradictoire est une erreur, pas une absence.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import re
 
 from typing import Mapping, Optional, Sequence
 
-from . import plan_git, registry, review_lot, review_provenance, storage
+from . import (canon, grep_cache, plan_git, registry, review_lot,
+               review_provenance, storage)
+from .deadline import Deadline
+
+#: #3974 : échéance du balayage d'auctorialité, posée par l'appelant borné
+#: (`sweep_deadline`) ; sans elle, rien ne change (les veilles historiques).
+_SWEEP: contextvars.ContextVar = contextvars.ContextVar(
+    "review_authors_sweep", default=None)
+
+
+class SweepDeadline(RuntimeError):
+    """#3974 : l'échéance du balayage d'auctorialité est épuisée.
+
+    Jamais lue comme un doute qui conclut : l'appelant borné refuse en
+    nommant le lot et l'étape. Les balayages déjà faits restent dans le cache
+    de l'hôte (`grep_cache`), le passage suivant repart plus loin."""
+
+
+class _Sweep:
+    def __init__(self, budget: float, label: str):
+        self.deadline = Deadline(budget)
+        self.budget = float(budget)
+        self.label = str(label or "")
+        self.tripped = ""              # première étape refusée à l'échéance
+
+    def check(self, step: str) -> None:
+        if self.deadline.expired():
+            self.trip(step)
+
+    def trip(self, step: str) -> None:
+        if not self.tripped:
+            self.tripped = step
+        raise SweepDeadline(
+            "%sthe authorship sweep exceeded %d s at step %s"
+            % (self.label + ": " if self.label else "", int(self.budget), step))
+
+
+@contextlib.contextmanager
+def sweep_deadline(budget: float, label: str = ""):
+    """Borne les balayages `git grep` de la lecture d'auctorialité (#3974).
+
+    Chaque balayage ne prend que le temps qui reste ; une échéance épuisée
+    lève `SweepDeadline`. `tripped` dit si une étape a été refusée, même si
+    une couche intermédiaire a transformé l'exception en doute."""
+    sweep = _Sweep(budget, label)
+    token = _SWEEP.set(sweep)
+    try:
+        yield sweep
+    finally:
+        _SWEEP.reset(token)
+
+
+def _sweep_grep(repo: str, rev: str, args: Sequence[str], patterns: Sequence[str],
+                step: str):
+    """`git grep <args> -f - <rev>` borné par l'échéance courante, s'il y en a.
+
+    Rend le processus (ou lève `SweepDeadline`) ; une autre erreur remonte
+    à l'appelant, qui la lit comme un doute."""
+    sweep = _SWEEP.get()
+    stdin = ("\n".join(patterns) + "\n").encode("utf-8")
+    if sweep is None:
+        return plan_git._git(repo, "grep", *args, "-f", "-", str(rev), stdin=stdin)
+    sweep.check(step)
+    try:
+        return plan_git._git(repo, "grep", *args, "-f", "-", str(rev),
+                             stdin=stdin, deadline=sweep.deadline)
+    except canon.GitDeadline:
+        sweep.trip(step)
+
+
+def _cache_wait() -> Optional[float]:
+    sweep = _SWEEP.get()
+    return None if sweep is None else sweep.deadline.remaining()
+
 
 #: canon §2 : une correction de premier tour va jusqu'à ~50 lignes changées
 REVIEWER_FIX_LINES = 50
@@ -1554,25 +1629,33 @@ def _source_paths(repo: str, rev: str, lines: Sequence[str], cache: dict):
         if not wanted or not repo or not rev:
             cache[key] = set()
         else:
-            try:
-                proc = plan_git._git(
-                    repo, "grep", "--no-color", "-l", "-I", "-F", "-f", "-",
-                    str(rev),
-                    stdin=("\n".join(wanted) + "\n").encode("utf-8"))
-            except Exception:  # noqa: BLE001 - lecture impossible : doute
-                proc = None
-            if proc is None or proc.returncode not in (0, 1):
-                cache[key] = None
-            elif proc.returncode == 1:
-                cache[key] = set()
-            else:
+            def scan():
+                # #3974 : seule la liste brute de `grep -l` est gardée par
+                # l'hôte (clé : arbre, motifs) ; le filtre de ligne entière
+                # ci-dessous relit les fichiers (cache #3753).
+                try:
+                    proc = _sweep_grep(repo, rev,
+                                       ("--no-color", "-l", "-I", "-F"), wanted,
+                                       "git grep -l -I -F -f - %s" % rev)
+                except SweepDeadline:
+                    raise
+                except Exception:  # noqa: BLE001 - lecture impossible : doute
+                    return None
+                if proc is None or proc.returncode not in (0, 1):
+                    return None
+                if proc.returncode == 1:
+                    return []
                 prefix = str(rev) + ":"
+                return [line[len(prefix):] if line.startswith(prefix) else line
+                        for line in proc.stdout.decode(
+                            "utf-8", "replace").splitlines() if line]
+            listed = grep_cache.cached(repo, str(rev), "sources-l-I", wanted,
+                                       scan, wait=_cache_wait())
+            if listed is None:
+                cache[key] = None
+            else:
                 sources = set()
-                for line in proc.stdout.decode(
-                        "utf-8", "replace").splitlines():
-                    if not line:
-                        continue
-                    path = line[len(prefix):] if line.startswith(prefix) else line
+                for path in listed:
                     # `grep -l` cherche des sous-chaînes : seule une ligne
                     # entière (à l'indentation près) fait de `path` une source.
                     text = _head_file_lines(repo, rev, path, cache)
@@ -1798,20 +1881,31 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
         return set()
     if not repo or not rev:
         return None
-    try:
-        proc = plan_git._git(repo, "grep", "--no-color", "--no-line-number",
-                             "--no-column", "-h", "-a" if binary else "-I",
-                             "-F", "-f", "-", rev,
-                             stdin=("\n".join(sorted(wanted)) + "\n").encode("utf-8"))
-    except Exception:  # noqa: BLE001 - lecture impossible : doute
-        return None
-    if proc.returncode == 1:
-        return set()
-    if proc.returncode != 0:
-        return None
-    found = {line.strip() for line in
-             proc.stdout.decode("utf-8", "replace").splitlines()}
-    return wanted & found
+    patterns = sorted(wanted)
+    flag = "-a" if binary else "-I"
+
+    def scan():
+        try:
+            proc = _sweep_grep(repo, rev, ("--no-color", "--no-line-number",
+                                           "--no-column", "-h", flag, "-F"),
+                               patterns, "git grep -h %s -F -f - %s" % (flag, rev))
+        except SweepDeadline:
+            raise
+        except Exception:  # noqa: BLE001 - lecture impossible : doute
+            return None
+        if proc.returncode == 1:
+            return []
+        if proc.returncode != 0:
+            return None
+        found = {line.strip() for line in
+                 proc.stdout.decode("utf-8", "replace").splitlines()}
+        return sorted(wanted & found)
+
+    # #3974 : le résultat ne dépend que de l'arbre de `rev` et des motifs ; il
+    # est gardé par l'hôte, une plage gelée déjà jugée ne relance aucun grep.
+    found = grep_cache.cached(repo, str(rev), "lines" + flag, patterns, scan,
+                              wait=_cache_wait())
+    return None if found is None else set(found)
 
 
 def _lines_in_tree(repo: str, rev: str, lines: Sequence[str]) -> set:
