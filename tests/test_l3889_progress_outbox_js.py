@@ -86,7 +86,8 @@ done(0);
 
 PREFIX = "ameesh-progress:outbox:"
 #: l'accusé du serveur : l'enveloppe de l'action et le message déposé
-ACK = {"schema": "ameesh-action/1", "action": "chat", "result": {"message_id": 7}}
+ACK = {"schema": "ameesh-action/1", "action": "chat",
+       "result": {"agent": "a1", "message_id": 7}}
 
 
 def entry(text="bonjour", key="web-kept-0001", **extra):
@@ -198,6 +199,20 @@ class ProgressOutboxTest(unittest.TestCase):
             {"status": 200, "body": ACK}]})
         posts = self.posted(result)
         self.assertEqual(len(posts), 4)
+        self.assertEqual(len({p["key"] for p in posts}), 1)
+        self.assertEqual(result["events"].count("sent:bonjour"), 1)
+        self.assertEqual(result["events"][-1], "sent:bonjour")
+        self.assertEqual(result["outbox"], [])
+
+    def test_200_d_une_autre_action_ou_d_un_autre_agent_n_acquitte_pas(self):
+        """B (docs-01, gel #21693) : l'accusé est celui de CE message — action
+        « chat », son agent ; sinon même clé, jusqu'à l'accusé valide."""
+        result = self.run_outbox({"steps": ["bonjour"], "posts": [
+            {"status": 200, "body": dict(ACK, action="message")},
+            {"status": 200, "body": dict(ACK, result={"agent": "a2", "message_id": 8})},
+            {"status": 200, "body": ACK}]})
+        posts = self.posted(result)
+        self.assertEqual(len(posts), 3)
         self.assertEqual(len({p["key"] for p in posts}), 1)
         self.assertEqual(result["events"].count("sent:bonjour"), 1)
         self.assertEqual(result["events"][-1], "sent:bonjour")

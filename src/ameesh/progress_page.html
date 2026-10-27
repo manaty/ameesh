@@ -427,13 +427,15 @@ p.summary { font-size: .86rem; margin: 6px 0; }
         // issue indéterminée, la même clé repart (le serveur rejoue son accusé)
         .then(null, function () { return {status: 0, data: {}}; });
     }
-    // l'accusé du serveur : l'enveloppe de l'action, avec le message déposé
-    function acked(d) {
-      return !!d && d.schema === "ameesh-action/1" && !!d.result
-        && typeof d.result.message_id === "number";
+    // l'accusé du serveur pour CE message : l'enveloppe de l'action « chat »,
+    // pour son agent, avec le message déposé (jamais la réponse d'une autre
+    // action ni d'un autre agent, rendue par un cache ou un mandataire)
+    function acked(d, m) {
+      return !!d && d.schema === "ameesh-action/1" && d.action === "chat" && !!d.result
+        && d.result.agent === m.agent && typeof d.result.message_id === "number";
     }
     function settle(m, res, n) {
-      if (res.status === 200 && acked(res.data)) {
+      if (res.status === 200 && acked(res.data, m)) {
         flying[m.key] = false; drop(m); view(m.agent).sent(m); return;
       }
       if (res.status === 0 || res.status === 503 || res.status === 429) {
