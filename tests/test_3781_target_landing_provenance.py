@@ -125,10 +125,13 @@ class RealLandingWitnessTest(unittest.TestCase):
                for sha in [target, head, *copies]):
             self.skipTest("historical H8 objects unavailable")
         self.assertEqual(authors._not_in_target(repo, copies, target), copies)
-        # Generic lines overlap H8's own additions for the first two copies.
-        # Keep them conservatively; do not use meaningful-line heuristics.
+        # #3902 : les trois copies sont déjà dans la cible par contenu, et la
+        # tête ne réintroduit aucune de leurs lignes **propres** (les lignes
+        # génériques qui se recoupent sont héritées de leur parent). Le doute
+        # de #3781 reste pour une contribution propre réintroduite (classes
+        # ci-dessus), pas pour du contexte hérité.
         self.assertEqual(authors._not_in_target(repo, copies, target, head=head),
-                         copies[:2])
+                         [])
 
 
 if __name__ == "__main__":
