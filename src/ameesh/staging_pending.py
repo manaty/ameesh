@@ -74,7 +74,47 @@ def _deployment_refs(note) -> tuple[set[int], set[int]]:
     return lots, migrations
 
 
-def active_hosts() -> dict[str, dict]:
+def _merge_attestation(out: dict, data, at: float, source: str) -> None:
+    """Merge one attestation into the latest-state-per-host view."""
+    if not isinstance(data, dict):
+        return
+    sha = str(data.get("sha") or "").lower()
+    if not _SHA.fullmatch(sha) or not isinstance(data.get("hotes"), dict):
+        return
+    reportes = data.get("reportes") or {}
+    if not isinstance(reportes, dict):
+        return
+    for host, detail in reportes.items():
+        raison = (str(detail.get("raison") or "").strip()
+                  if isinstance(detail, dict) else "")
+        if not raison:
+            continue
+        if host not in out or at >= out[host]["at"]:
+            out[host] = {"sha": None, "absent": True, "raison": raison,
+                         "at": at, "attestation": source}
+    for host, detail in data["hotes"].items():
+        current = str(detail.get("actif") or "").lower()
+        if not _SHA.fullmatch(current) or not (
+                sha.startswith(current) or current.startswith(sha)):
+            continue
+        if host not in out or at >= out[host]["at"]:
+            out[host] = {"sha": sha, "absent": False, "at": at,
+                         "attestation": source}
+
+
+def _stamp(data, fallback: float) -> float:
+    """The attestation's ISO date as epoch, or `fallback` when unreadable."""
+    stamp = data.get("date") if isinstance(data, dict) else None
+    if isinstance(stamp, str):
+        try:
+            return datetime.datetime.fromisoformat(
+                stamp.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    return fallback
+
+
+def active_hosts(db=None) -> dict[str, dict]:
     """Latest attested state per host; a reported poste is kept as absent.
 
     A newer attestation supersedes an older one (including a deliberate
@@ -82,6 +122,10 @@ def active_hosts() -> dict[str, dict]:
     by substituting a tag. A reported host has `sha: None` and `absent: True`:
     callers that compare content (`regressions`, `waiting`) skip it, so an
     absent poste holds neither staging nor lots.
+
+    #3981: the local files are read first, then the shared `ameesh_events`
+    attestations (when `db` is given) — a staging launched from a VM writes the
+    shared proof on HOTE_OUTILS, not on this host. The most recent date wins.
     """
     from . import release_cutoff as rc
     folder = Path(rc.attestation_path("0" * 40)).parent
@@ -89,37 +133,21 @@ def active_hosts() -> dict[str, dict]:
     for path in sorted(folder.glob("actif-*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            stamp = data.get("date")
-            at = (datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
-                  if isinstance(stamp, str) else path.stat().st_mtime)
-            sha = str(data.get("sha") or "").lower()
-            if not _SHA.fullmatch(sha) or not isinstance(data.get("hotes"), dict):
-                continue
-            reportes = data.get("reportes") or {}
-            if not isinstance(reportes, dict):
-                continue
-            for host, detail in reportes.items():
-                raison = (str(detail.get("raison") or "").strip()
-                          if isinstance(detail, dict) else "")
-                if not raison:
-                    continue
-                if host not in out or at >= out[host]["at"]:
-                    out[host] = {"sha": None, "absent": True, "raison": raison,
-                                 "at": at, "attestation": str(path)}
-            for host, detail in data["hotes"].items():
-                current = str(detail.get("actif") or "").lower()
-                if not _SHA.fullmatch(current) or not (
-                        sha.startswith(current) or current.startswith(sha)):
-                    continue
-                if host not in out or at >= out[host]["at"]:
-                    out[host] = {"sha": sha, "absent": False, "at": at,
-                                 "attestation": str(path)}
+            _merge_attestation(out, data, _stamp(data, path.stat().st_mtime),
+                               str(path))
         except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    for data in rc.stored_attestations(db):
+        try:
+            _merge_attestation(out, data, _stamp(data, 0.0),
+                               "ameesh_events:%s" % (data.get("sha") or "?"))
+        except (TypeError, AttributeError):
             continue
     return out
 
 
-def regressions(project, candidate: str, active=None, *, unknown=None) -> dict[str, str]:
+def regressions(project, candidate: str, active=None, *, unknown=None,
+                db=None) -> dict[str, str]:
     """Hosts whose attested content would be lost by deploying candidate.
 
     An unresolvable attestation refuses the action rather than permitting a
@@ -131,7 +159,7 @@ def regressions(project, candidate: str, active=None, *, unknown=None) -> dict[s
     out = {}
     if project.name != "ameesh":
         return out
-    for host, evidence in (active_hosts() if active is None else active).items():
+    for host, evidence in (active_hosts(db) if active is None else active).items():
         # un poste reporte ne porte aucun contenu a preserver (#3848)
         if evidence.get("absent"):
             continue
@@ -192,7 +220,7 @@ def waiting(db, project, *, active=None) -> dict:
             refs.setdefault(ident, set()).update(lots)
             for number in numbers:
                 refs[ident].update(migrations.get(number, ()))
-    active = active_hosts() if active is None else active
+    active = active_hosts(db) if active is None else active
     # #3848 : un poste reporte absent ne retient ni staging ni lots. Seuls les
     # hotes reellement actifs sont compares.
     actifs_reels = {host: evidence for host, evidence in active.items()
@@ -281,8 +309,9 @@ def inspect(cfg, db, project, *, now: float) -> dict:
     report["candidate"] = candidate
     report.update(_window(rules, now))
     unresolved = []
-    report["regressions"] = (regressions(project, candidate, report["active"],
-                                         unknown=unresolved) if candidate else {})
+    report["regressions"] = (
+        regressions(project, candidate, report["active"],
+                    unknown=unresolved, db=db) if candidate else {})
     if unresolved:
         report["unknown"].extend(unresolved)
     # A last-green commit before the merged fix would deploy nothing useful.
@@ -324,7 +353,7 @@ def apply(cfg, db, project, *, now: float, actor=None) -> dict:
         included = sorted({r["blocker"] for r in report["waiting"]
                            if r["lot"] in report["candidate_unblocks"]})
         report["staging"] = rc._staging_step(project, report["candidate"],
-                                             included, cfg.state_dir)
+                                             included, cfg.state_dir, db=db)
         report["result"] = "staged" if report["staging"].get("exit") == 0 else "failed"
         return report
     finally:

@@ -251,6 +251,39 @@ class EventLogPgTest(PgTestCase):
         self.assertEqual([r["data"]["state"] for r in rows], ["intake", "build"])
         self.assertEqual({r["project"] for r in rows}, {"demo"})
 
+    def test_recent_type_filters_the_window_and_the_object(self):
+        """#3981 : la preuve partagee du staging se relit par type et objet,
+        la plus recente d'abord, sans index dedie (borne `created_at`)."""
+        store = storage.of(self.db).events
+        first = store.record("staging.attested", "staging:first", "ameesh",
+                             {"sha": "a" * 40})
+        second = store.record("staging.attested", "staging:second", "ameesh",
+                              {"sha": "b" * 40})
+        store.record("lot.updated", "lot:1", "ameesh", {})
+        rows = [row for row in store.recent_type("staging.attested", 1, 10,
+                                                 object="staging:second")
+                if row["id"] >= first]
+        self.assertEqual([row["object"] for row in rows], ["staging:second"])
+        self.assertEqual(rows[0]["data"]["sha"], "b" * 40)
+        self.assertGreater(second, first)
+        self.assertEqual(store.recent_type("staging.attested", 0, 10), [])
+
+    def test_staging_attestation_round_trips_to_release_cutoff(self):
+        """#3981 : la preuve compacte deposee par actif.py est exactement ce
+        que release_cutoff relit sur le poste, sans ssh."""
+        from ameesh import release_cutoff
+        sha = "c" * 40
+        data = {"schema": "ameesh-staging-actif/1", "sha": sha,
+                "sha_court": sha[:9], "date": "2026-10-27T14:00:00Z",
+                "hotes": {hote: {"actif": sha, "etapes": {"sante": "ok"}}
+                          for hote in release_cutoff.STAGING_VMS},
+                "reportes": {release_cutoff.STAGING_POSTE: {"raison": "poste absent"}},
+                "lots": [3981], "rapporteurs": ["mesh-design"]}
+        storage.of(self.db).events.record(
+            "staging.attested", "staging:%s" % sha, "ameesh", data)
+        self.assertEqual(release_cutoff.stored_attestations(self.db, sha), [data])
+        self.assertIn(data, release_cutoff.stored_attestations(self.db))
+
     def test_turns_lease_and_unchanged_updates(self):
         registry.upsert(self.db, "a1", chantier="demo", harness="codex", host="h1")
         start = self.last()

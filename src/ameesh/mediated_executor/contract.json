@@ -4704,6 +4704,7 @@
     "count_before",
     "prune",
     "readable",
+    "recent_type",
     "record"
    ],
    "grants": [

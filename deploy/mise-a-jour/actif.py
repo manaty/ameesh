@@ -48,6 +48,18 @@ signal (code de sortie 5, distinct d'un echec). Une preuve manquante n'ecrit
 ni attestation ni courrier de reussite. Aucun lot n'est clos automatiquement
 et aucun sondage n'est arme : le rapporteur reprend sa verification apres
 deploiement lui-meme.
+
+#3981 : la meme preuve est aussi deposee dans le journal du mesh
+(`ameesh_events`, type `staging.attested`) sous une forme compacte (hotes
+actifs, reportes, commit, date, sans le detail de sante ni les marques
+d'emission). C'est la seule forme qu'un autre hote — en particulier le poste
+qui fait la coupure — peut relire sans ssh : le fichier local reste la preuve
+complete et l'etat d'emission, l'evenement la rend partagee. Le depot de
+l'evenement echoue sans annuler le deploiement : l'attestation locale est
+ecrite, le code de sortie 4 le dit, et une relance reconcilie le courrier deja
+depose (cle d'emission). Depuis une VM sans venv ni base (bureau-goal), cet
+outil n'est pas lance localement : staging.sh l'execute sur `HOTE_OUTILS`
+(#3976) avec le journal recopie.
 """
 from __future__ import annotations
 
@@ -61,9 +73,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ameesh import config, db as db_mod, mail, work
+from ameesh import config, db as db_mod, mail, storage, work
 
 SCHEMA = "ameesh-staging-actif/1"
+#: #3981 : type de l'evenement partage dans `ameesh_events` ; le journal est
+#: append-only et lisible de tout hote qui a la base, sans ssh ni fichier.
+EVENEMENT_TYPE = "staging.attested"
+EVENEMENT_PROJET = "ameesh"
 #: instants du journal, tel que produits par `date -u +%Y-%m-%dT%H:%M:%SZ`
 ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
 #: instant ISO UTC, tel que produit par `date -u +%Y-%m-%dT%H:%M:%SZ`
@@ -461,6 +477,53 @@ def ecrire_attestation(chemin: Path, attestation: dict) -> None:
         raise
 
 
+def attestation_partagee(attestation: dict) -> dict:
+    """La preuve compacte deposee dans le journal du mesh (#3981).
+
+    Le fichier local reste la preuve complete et l'etat d'emission ; l'evenement
+    partage ne porte que ce que `release_cutoff` et `staging_pending` relisent
+    d'un autre hote : commit, date, hotes actifs, reportes, lots. Le detail de
+    sante (rapport de sonde, journal) et les marques d'emission restent locaux.
+    """
+    hotes = {}
+    for hote, preuve in (attestation.get("hotes") or {}).items():
+        if not isinstance(preuve, dict):
+            continue
+        compacte = {"actif": preuve.get("actif")}
+        if isinstance(preuve.get("etapes"), dict):
+            compacte["etapes"] = preuve["etapes"]
+        hotes[hote] = compacte
+    return {
+        "schema": attestation.get("schema"),
+        "cle": attestation.get("cle"),
+        "date": attestation.get("date"),
+        "sha": attestation.get("sha"),
+        "sha_court": attestation.get("sha_court"),
+        "hotes": hotes,
+        "reportes": attestation.get("reportes") or {},
+        "lots": attestation.get("lots") or [],
+        "rapporteurs": attestation.get("rapporteurs") or [],
+    }
+
+
+def enregistrer_attestation(attestation: dict) -> int:
+    """Depose la preuve partagee (deja compacte) dans `ameesh_events` ; son id.
+
+    L'evenement est append-only et se relit de tout hote qui a la base : sans
+    lui, une attestation ecrite sur `HOTE_OUTILS` (staging lance depuis une VM)
+    resterait invisible du poste qui fait la coupure. Un echec de depot ne
+    remet pas en cause le deploiement : l'attestation locale est deja ecrite,
+    l'appelant rend le code 4 et une relance reconcilie le courrier.
+    """
+    conn = db_mod.connect(config.load())
+    try:
+        return storage.of(conn).events.record(
+            EVENEMENT_TYPE, "staging:%s" % attestation["sha"],
+            EVENEMENT_PROJET, attestation)
+    finally:
+        conn.close()
+
+
 def envoyer(dest: str, corps: str, charge: dict) -> int:
     """Un courrier urgent (reveil immediat, sans fenetre de regroupement) et
     signale comme evenement de staging. Une seule voie d'envoi, comme le
@@ -672,6 +735,15 @@ def main(argv: list[str] | None = None) -> int:
         ecrire_attestation(chemin, attestation)
     except OSError as exc:
         print("attestation non ecrite (%s) : %s" % (chemin, exc), file=sys.stderr)
+        return CODE_ECHEC
+    try:
+        enregistrer_attestation(attestation_partagee(attestation))
+    except Exception as exc:  # noqa: BLE001 — la preuve locale reste ecrite
+        # le fichier local est la preuve de ce lancement ; sans l'evenement
+        # partage, un autre hote ne peut pas la lire (#3981). Relancer le meme
+        # commit reessaie le depot sans renvoyer un courrier deja depose.
+        print("attestation non partagee (journal du mesh) : %s" % exc,
+              file=sys.stderr)
         return CODE_ECHEC
     if args.json:
         print(json.dumps(attestation, ensure_ascii=False))

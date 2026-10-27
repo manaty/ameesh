@@ -138,6 +138,16 @@ case "$*" in
     fi
     echo "0123456789abcdef0123456789abcdef01234567"
     exit 0 ;;
+  *"cat > "*)
+    # #3981 : journal copie sur HOTE_OUTILS avant actif.py ; la source arrive
+    # sur l'entree standard de ssh.
+    cat >/dev/null || true
+    printf 'ssh-copie-journal %s\n' "$*" >> "$FAKE_STATE/calls.log"
+    if grep -qx "ko=copie-journal" "$FAKE_STATE/scenario" 2>/dev/null; then
+      echo "copie du journal refusee" >&2
+      exit 1
+    fi
+    exit 0 ;;
   *"bash -s -- "*)
     cat >/dev/null || true
     if grep -qx "ko=migration" "$FAKE_STATE/scenario" 2>/dev/null; then
@@ -152,7 +162,13 @@ case "$*" in
     # la source arrive sur l'entree standard.
     source=$(cat)
     printf 'ssh-python %s\n' "$*" >> "$FAKE_STATE/calls.log"
-    case "$source" in *"mail.send(conn, work.SYSTEM_SENDER, dest"*) exit 0 ;; esac
+    case "$source" in
+      *"def attestation_partagee"*)
+        # #3981 : actif.py tourne la-bas, avec le journal recopie
+        printf 'ssh-actif %s\n' "$*" >> "$FAKE_STATE/calls.log"
+        exit 0 ;;
+      *"mail.send(conn, work.SYSTEM_SENDER, dest"*) exit 0 ;;
+    esac
     if grep -qx "ssh-python=127" "$FAKE_STATE/scenario" 2>/dev/null; then
       echo "bash: /home/ameesh/.local/share/ameesh/venv/bin/python3: No such file or directory" >&2
       exit 127
@@ -981,7 +997,43 @@ class StagingTest(unittest.TestCase):
         return self.run_staging(*args, env=env)
 
     def ssh_python(self):
-        return [l for l in self.calls() if l.startswith('ssh-python ')]
+        # #3981 : actif.py tourne aussi par ssh, mais c'est un autre outil ;
+        # les temoins de sonde comptent les seules sondes de courrier.
+        return [l for l in self.calls()
+                if l.startswith('ssh-python ') and '--journal' not in l]
+
+    def ssh_actif(self):
+        return [l for l in self.calls() if l.startswith('ssh-actif ')]
+
+    def test_bureau_actif_tourne_sur_hote_outils_avec_le_journal(self):
+        """#3981 : sans venv local, actif.py tourne sur HOTE_OUTILS avec le
+        journal recopie et le venv de la VM ; aucune attestation locale."""
+        p = self.run_bureau()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(len(self.ssh_actif()), 1, self.calls())
+        ligne = self.ssh_actif()[0]
+        self.assertIn('root@10.77.0.4', ligne)
+        self.assertIn('runuser -u ameesh -- env HOME=/home/ameesh', ligne)
+        self.assertIn("'--journal'", ligne)
+        self.assertIn('/home/ameesh/.local/state/ameesh/mise-a-jour/staging-', ligne)
+        copies = [l for l in self.calls() if l.startswith('ssh-copie-journal ')]
+        self.assertEqual(len(copies), 1, self.calls())
+        self.assertIn('chown ameesh:ameesh', copies[0])
+        self.assertFalse([l for l in self.calls() if l.startswith('venv-python ')])
+        self.assertFalse(list(
+            (self.home / '.local/state/ameesh/mise-a-jour').glob('actif-*.json')))
+
+    def test_bureau_journal_non_copie_aucun_actif_et_le_dit(self):
+        """#3981 : sans journal sur HOTE_OUTILS, actif.py n'est pas lance ;
+        le deploiement reste fait (signal best-effort) et l'echec est dit."""
+        (self.state / 'scenario').write_text('ko=copie-journal\n')
+        p = self.run_bureau()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('journal non copie', p.stderr)
+        self.assertIn(self.sha[:9], p.stdout)
+        self.assertFalse(self.ssh_actif())
+        self.assertFalse(list(
+            (self.home / '.local/state/ameesh/mise-a-jour').glob('actif-*.json')))
 
     def test_bureau_sonde_le_courrier_sur_une_vm_d_agents(self):
         """#3976 : hors du poste et des VM d'agents, la sonde tourne sur
