@@ -11,9 +11,10 @@ la fenêtre.
 """
 from __future__ import annotations
 
+import threading
 import unittest
 
-from ameesh import election, host_lifecycle, role_standings_pg as pg
+from ameesh import db as db_mod, election, host_lifecycle, role_standings_pg as pg
 
 from .support import PgTestCase
 
@@ -143,8 +144,86 @@ class HostPresenceTest(PgTestCase):
             "                  AND r.sampled_at < p.bucket_start + interval '120 seconds')")
         self.assertEqual(rows[0]["n"], 0)
         self.db.execute("DELETE FROM host_resources WHERE host = 'vm'")
+        # emptied buckets stay at 0 (no deletion in the migration), ignored
         self.assertEqual(self.db.query(
-            "SELECT count(*)::int AS n FROM host_presence WHERE host = 'vm'")[0]["n"], 0)
+            "SELECT count(*)::int AS n FROM host_presence WHERE host = 'vm'"
+            " AND readings > 0")[0]["n"], 0)
+        got = self.assert_matches("vm")
+        self.assertEqual(got["samples"], 0)
+
+    def test_since_on_a_bucket_boundary_excludes_its_reading(self):
+        # review #3921 (cx2): `since` aligned on 120 s must not let the bucket
+        # it starts count the reading dated exactly `since`
+        since = 14_166_666 * pg.PRESENCE_BUCKET_S
+        self.series("vm", since, 1, 1.0)
+        self.series("vm", since + 300.0, 3, 50.0)
+        got = pg.coverage(self.db, "vm", since, now=since + 3600.0, cover_s=180.0)
+        self.assertEqual(got["samples"], len(self.times("vm", since)))
+        self.assertEqual(got["samples"], 3)
+        self.assertAlmostEqual(got["first_ts"], since + 300.0, delta=1e-6)
+
+    # -- concurrent writers of one bucket ---------------------------------
+    def assert_bucket_consistent(self) -> None:
+        rows = self.db.query(
+            "SELECT count(*)::int AS n FROM host_presence p WHERE host = 'vm'"
+            " AND readings <> (SELECT count(*) FROM host_resources r WHERE r.host = p.host"
+            "                  AND r.sampled_at >= p.bucket_start"
+            "                  AND r.sampled_at < p.bucket_start + interval '120 seconds')")
+        self.assertEqual(rows[0]["n"], 0)
+
+    def race(self, first_sql: str, second_sql: str) -> None:
+        """`first_sql` runs in an open transaction; `second_sql`, on another
+        connection, must wait for its commit (same bucket), then see it."""
+        started, errors = threading.Event(), []
+
+        def second():
+            other = db_mod.connect(self.cfg)
+            try:
+                started.set()
+                other.execute(second_sql)
+            except Exception as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+            finally:
+                other.close()
+
+        thread = threading.Thread(target=second, daemon=True)
+        try:
+            with self.db.transaction() as tx:
+                tx.execute(first_sql)
+                thread.start()
+                self.assertTrue(started.wait(5))
+                thread.join(1.0)
+                self.assertTrue(thread.is_alive(), "the second writer did not wait")
+        finally:
+            if thread.ident is not None:
+                thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def bucket_rows(self) -> list[float]:
+        base = 14_166_666 * pg.PRESENCE_BUCKET_S
+        self.series("vm", base + 1.0, 10, 10.0)
+        return [base + 1.0 + 10.0 * i for i in range(10)]
+
+    def test_two_deletes_of_one_bucket(self):
+        ts = self.bucket_rows()
+        self.race("DELETE FROM host_resources WHERE host = 'vm'"
+                  " AND sampled_at = to_timestamp(%r)" % ts[0],
+                  "DELETE FROM host_resources WHERE host = 'vm'"
+                  " AND sampled_at = to_timestamp(%r)" % ts[5])
+        self.assert_bucket_consistent()
+        self.assertEqual(self.db.query(
+            "SELECT readings FROM host_presence WHERE host = 'vm' AND readings > 0")[0]["readings"], 8)
+
+    def test_insert_during_a_recompute(self):
+        ts = self.bucket_rows()
+        self.race("DELETE FROM host_resources WHERE host = 'vm'"
+                  " AND sampled_at = to_timestamp(%r)" % ts[0],
+                  "INSERT INTO host_resources (host, sampled_at)"
+                  " VALUES ('vm', to_timestamp(%r))" % (ts[-1] + 5.0))
+        self.assert_bucket_consistent()
+        self.assertEqual(self.db.query(
+            "SELECT readings FROM host_presence WHERE host = 'vm' AND readings > 0")[0]["readings"], 10)
 
     # -- bounded ------------------------------------------------------------
     def test_availability_reads_a_bounded_number_of_readings(self):
@@ -161,6 +240,18 @@ class HostPresenceTest(PgTestCase):
         self.assertEqual(av["samples"], 60480)
         self.assertGreater(av["availability"], 99.9)
 
+
+    def test_recompute_during_an_insert(self):
+        # the recompute must not overwrite an insert still uncommitted when
+        # it read the history
+        ts = self.bucket_rows()
+        self.race("INSERT INTO host_resources (host, sampled_at)"
+                  " VALUES ('vm', to_timestamp(%r))" % (ts[-1] + 5.0),
+                  "DELETE FROM host_resources WHERE host = 'vm'"
+                  " AND sampled_at = to_timestamp(%r)" % ts[0])
+        self.assert_bucket_consistent()
+        self.assertEqual(self.db.query(
+            "SELECT readings FROM host_presence WHERE host = 'vm' AND readings > 0")[0]["readings"], 10)
 
 if __name__ == "__main__":
     unittest.main()

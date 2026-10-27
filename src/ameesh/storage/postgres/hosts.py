@@ -267,6 +267,11 @@ class Hosts(interface.HostResources):
         self.db.execute(
             "DELETE FROM host_resource_slots"
             " WHERE slot_start < now() - interval '7 days'", ())
+        # #3921 : les tranches de présence suivent (vidées à 0 par le
+        # déclencheur de la suppression ci-dessus, effacées ici)
+        self.db.execute(
+            "DELETE FROM host_presence"
+            " WHERE bucket_start < now() - interval '7 days'", ())
         return _reading(sample)
 
     def latest(self, host) -> dict | None:

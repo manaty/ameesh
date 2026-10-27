@@ -165,6 +165,10 @@ FERMEES = {
     # état de mesure interne, fermé aux deux rôles, aucun GRANT modifié.
     "host_resource_slots": {"host", "slot_start", "readings", "cpu_sum", "cpu_n",
                             "free_mem_min", "first_cpu_at", "last_cpu_at"},
+    # #3921 (0496) : présence des relevés d'hôte par tranche de 120 s, tenue
+    # par déclencheurs et lue par l'élection (`role_standings_pg.coverage`) ;
+    # état de mesure interne, fermé aux deux rôles, aucun GRANT modifié.
+    "host_presence": {"host", "bucket_start", "readings", "first_at", "last_at"},
     # #2845 (0470) : curseur, reçus et progression de la veille des tickets
     # GitHub. État interne de l'agent de veille, pas un état de supervision ;
     # fermé aux deux rôles superviseur, aucun GRANT modifié.
