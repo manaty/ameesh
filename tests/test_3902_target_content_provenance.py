@@ -403,6 +403,83 @@ class ContentBeforeHeadTest(unittest.TestCase):
         self.assertEqual(review_authors._not_in_target(
             repo.root, [earlier], delivered, head=head), [])
 
+    def test_removal_applied_in_the_other_function_does_not_prove_the_hunk(self):
+        """#3902 B/P2 cx2 (gel #21778) : un retrait appliqué dans l'autre
+        fonction laisse le compte global égal ; seul l'ancrage sur
+        l'occurrence d'origine garde le doute."""
+        repo = _Repo(os.path.join(self.tmp, "permuted-removal"))
+        repo.write("feature.py",
+                   "def protected():\n"
+                   "    keep_line()\n"
+                   "    remove_me()\n"
+                   "    end_line()\n"
+                   "\n"
+                   "def other():\n"
+                   "    keep_line()\n"
+                   "    remove_me()\n"
+                   "    end_line()\n")
+        base = repo.commit("base")
+        repo.write("feature.py",
+                   "def protected():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n"
+                   "\n"
+                   "def other():\n"
+                   "    keep_line()\n"
+                   "    remove_me()\n"
+                   "    end_line()\n")
+        earlier = repo.commit("parent removes the protected line",
+                              agent="parent")
+        # cible : le retrait est appliqué dans other(), pas dans protected()
+        repo.git("checkout", "-q", "-b", "permuted-target", base)
+        repo.write("feature.py",
+                   "def protected():\n"
+                   "    keep_line()\n"
+                   "    remove_me()\n"
+                   "    end_line()\n"
+                   "\n"
+                   "def other():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n"
+                   "# target_marker\n")
+        target = repo.commit("target removes elsewhere", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, target, earlier))
+        repo.git("checkout", "-q", "-b", "permuted-head", target)
+        repo.write("feature.py",
+                   "def protected():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n"
+                   "\n"
+                   "def other():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n"
+                   "# target_marker\n")
+        head = repo.commit("head delivers the protected removal", agent="impl")
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=head), [earlier])
+        self.assertTrue(review_authors._survives_rewrite(
+            repo.root, head, earlier, {}, target, target))
+        # positif : le retrait est appliqué dans protected(), other() garde
+        # le sien ; le compte global reste égal, l'ancrage doit prouver.
+        repo.git("checkout", "-q", "-b", "permuted-delivered", base)
+        repo.write("feature.py",
+                   "def protected():\n"
+                   "    keep_line()\n"
+                   "    end_line()\n"
+                   "\n"
+                   "def other():\n"
+                   "    keep_line()\n"
+                   "    remove_me()\n"
+                   "    end_line()\n"
+                   "# target_marker\n")
+        delivered = repo.commit("target applies the right removal",
+                                agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], delivered, head=head), [])
+
     def test_delivered_reorder_is_proven(self):
         """La preuve stricte accepte un réordre réellement livré."""
         repo = _Repo(os.path.join(self.tmp, "reorder-delivered"))

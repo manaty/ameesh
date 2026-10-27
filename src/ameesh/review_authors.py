@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import difflib
 import re
 
 from typing import Mapping, Optional, Sequence
@@ -1230,8 +1231,10 @@ def _commit_hunks(repo: str, sha: str):
         if line.startswith("@@"):
             if not path:
                 return None
+            header = re.match(r"@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", line)
             current = {"new": [], "old": [], "changed": [], "lead": 0,
-                       "trail": 0, "changed_seen": False}
+                       "trail": 0, "changed_seen": False,
+                       "old_start": int(header.group(1)) if header else 0}
             hunks.setdefault(path, []).append(current)
             in_hunk = True
             continue
@@ -1283,12 +1286,80 @@ def _find_block(lines: Sequence[str], block: Sequence[str], start: int) -> int:
     return -1
 
 
-def _count_block(lines: Sequence[str], block: Sequence[str]) -> int:
-    """Nombre d'occurrences exactes de `block` dans `lines`."""
-    if not block or len(block) > len(lines):
-        return 0
-    return sum(1 for index in range(len(lines) - len(block) + 1)
-               if list(lines[index:index + len(block)]) == list(block))
+def _position_map(parent: Sequence[str], target: Sequence[str]) -> dict:
+    """`{index parent: index cible}` des lignes alignées par SequenceMatcher.
+
+    Sert à rattacher le hunk à son occurrence d'origine malgré les
+    insertions/suppressions de la cible avant lui. Une ligne non alignée est
+    absente de la table : l'appelant garde alors le doute."""
+    mapping: dict = {}
+    matcher = difflib.SequenceMatcher(None, list(parent), list(target),
+                                      autojunk=False)
+    for block in matcher.get_matching_blocks():
+        for offset in range(block.size):
+            mapping[block.a + offset] = block.b + offset
+    return mapping
+
+
+def _anchor_position(hunk: Mapping, mapping: Mapping):
+    """`(index antérieur mappé, index postérieur attendu)` du hunk, ou None.
+
+    `mapping` vient de `_position_map(sha^:path, before:path)`. Le bloc est
+    rattaché à son occurrence d'origine par son contexte de tête (ou de queue
+    s'il commence par un retrait), jamais par une recherche libre : un bloc
+    identique dans une autre fonction ne peut donc pas acheter la preuve.
+    None quand le hunk n'a pas de contexte alignable (création, ligne isolée
+    sans contexte) : l'appelant retombe alors sur la recherche historique."""
+    old_start = int(hunk.get("old_start") or 0)
+    old = hunk["old"]
+    new = hunk["new"]
+    lead, trail = hunk["lead"], hunk["trail"]
+    if old_start < 1 or not old:
+        return None
+    p0 = old_start - 1
+    if lead:
+        mapped = mapping.get(p0)
+        if mapped is None:
+            return None
+        return mapped, mapped
+    if trail:
+        # le contexte de queue commence après les lignes retirées ; on le
+        # mappe, puis on recule du nombre de lignes retirées (ancienne image)
+        # ou ajoutées (nouvelle image).
+        anchor = p0 + len(old) - trail
+        mapped_trail = mapping.get(anchor)
+        if mapped_trail is None:
+            return None
+        mapped_old = mapped_trail - (len(old) - trail)
+        expected = mapped_trail - (len(new) - trail)
+        if expected < 0:
+            return None
+        return mapped_old, expected
+    return None
+
+
+def _anchor_holds(parent: Sequence[str], target: Sequence[str], hunk: Mapping,
+                  mapped_old: int, expected: int, window: int = 3) -> bool:
+    """Le contexte immédiat autour du hunk confirme-t-il le point d'ancrage ?
+
+    Vérifie jusqu'à `window` lignes avant l'ancien bloc et après le nouveau
+    bloc. Une zone voisine modifiée dans la cible fait échouer l'ancrage :
+    c'est un doute, jamais une preuve par un bloc identique ailleurs. Un
+    `mapped_old` négatif est légitime quand le hunk commence avant la
+    première ligne de la cible (suppression en tête de fichier)."""
+    old_start = int(hunk["old_start"]) - 1
+    old_len, new_len = len(hunk["old"]), len(hunk["new"])
+    before = list(parent[max(0, old_start - window):old_start])
+    if mapped_old >= 0:
+        if list(target[max(0, mapped_old - window):mapped_old]) != before:
+            return False
+    elif before:
+        # le début du hunk est avant la première ligne de la cible : aucun
+        # contexte antérieur ne peut exister.
+        return False
+    after = list(parent[old_start + old_len:old_start + old_len + window])
+    start = expected + new_len
+    return list(target[start:start + len(after)]) == after
 
 
 def _content_before_head(repo: str, before: str, sha: str,
@@ -1306,15 +1377,16 @@ def _content_before_head(repo: str, before: str, sha: str,
     * diff lisible et non binaire, avec au moins une ligne significative ;
     * par chemin, chaque hunk est prouvé **entier** : son image postérieure
       (contexte `--unified=1` + lignes ajoutées), ordre et indentation
-      compris, apparaît telle quelle dans `before` ; les hunks se suivent dans
-      l'ordre du commit ;
+      compris, apparaît telle quelle **à l'occurrence d'origine** du hunk
+      (celle de `sha^:path`, mappée dans `before` par alignement) ; les hunks
+      se suivent dans l'ordre du commit ;
+    * un point d'ancrage ambigu (contexte répété, ligne non alignée) ou un
+      contexte voisin modifié dans la cible est un doute : un bloc identique
+      dans une autre fonction ne peut pas acheter la preuve (#3902 B/P2,
+      témoins cx2) ;
     * au même endroit, l'image antérieure du hunk (contexte + lignes
       retirées) ne doit pas être encore là : une suppression restée en place
       n'est pas une livraison, même quand le contexte seul y ressemble ;
-    * une image antérieure qui apparaît plus souvent dans `before` que dans
-      la post-image du commit (où elle peut légitimement subsister ailleurs)
-      est un doute : le bloc postérieur trouvé peut n'être qu'une occurrence
-      identique dans une autre fonction (#3902 B/P2, témoin cx2) ;
     * une suppression totale de chemin se prouve par l'absence du chemin ;
     * un réordre ou une réindentation change l'image : il n'est pas prouvé
       par le seul compte de lignes.
@@ -1338,11 +1410,12 @@ def _content_before_head(repo: str, before: str, sha: str,
             if _path_absent(repo, before, path, cache) is not True:
                 return False
             here = []
-        after = _path_lines(repo, sha, path, cache)
-        if after is None:
-            if _path_absent(repo, sha, path, cache) is not True:
+        parent = _path_lines(repo, str(sha) + "^", path, cache)
+        if parent is None:
+            if _path_absent(repo, str(sha) + "^", path, cache) is not True:
                 return False
-            after = []
+            parent = []
+        mapping = _position_map(parent, here)
         position = 0
         for hunk in path_hunks:
             changed = [row for row in hunk["changed"] if row.strip()]
@@ -1353,25 +1426,35 @@ def _content_before_head(repo: str, before: str, sha: str,
                 if _path_absent(repo, before, path, cache) is not True:
                     return False
                 continue
-            index = _find_block(here, block, position)
-            if index < 0:
-                return False
+            old = hunk["old"]
+            end = len(old) - hunk["trail"] if hunk["trail"] else len(old)
+            old_core = old[hunk["lead"]:end]
+            if hunk["lead"] or hunk["trail"]:
+                # Ancrage sur l'occurrence d'origine : le bloc postérieur doit
+                # se trouver exactement au point mappé, et le contexte voisin
+                # doit le confirmer (un ancrage ambigu est un doute).
+                anchor = _anchor_position(hunk, mapping)
+                if anchor is None:
+                    return False
+                mapped_old, index = anchor
+                if index < position:
+                    return False
+                if not _anchor_holds(parent, here, hunk, mapped_old, index):
+                    return False
+                if list(here[index:index + len(block)]) != block:
+                    return False
+            else:
+                # ni contexte de tête ni de queue : création de fichier ou
+                # ligne isolée ; la recherche historique reste la seule
+                # preuve possible, et le doute la borne.
+                index = _find_block(here, block, position)
+                if index < 0:
+                    return False
             # L'image antérieure du hunk ne doit pas être encore à sa place :
             # une suppression non appliquée n'est pas une livraison, même si
             # son contexte seul se retrouve tel quel (suppression en bout de
             # fichier, par exemple). Les lignes de contexte de tête sont
             # communes aux deux images ; on compare donc le cœur du hunk.
-            old = hunk["old"]
-            end = len(old) - hunk["trail"] if hunk["trail"] else len(old)
-            old_core = old[hunk["lead"]:end]
-            # Une occurrence de l'image antérieure au-delà de ce que la
-            # post-image du commit en garde ailleurs (une autre fonction au
-            # contexte identique, par exemple) est un doute : le bloc
-            # postérieur trouvé peut n'être qu'une occurrence décalée.
-            watch = old_core if old_core else old
-            if (watch
-                    and _count_block(here, watch) > _count_block(after, watch)):
-                return False
             if old_core:
                 if len(block) == hunk["lead"] + hunk["trail"]:
                     # suppression pure : le bloc postérieur n'est que du
