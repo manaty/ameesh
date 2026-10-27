@@ -55,6 +55,29 @@ class CloneReapTest(PgTestCase):
             artifacts=(), lock_path=self.lock, journal_path=self.journal,
             skip_roots=(self.cfg.state_dir,))
 
+    def test_the_dependency_inventory_gets_the_remaining_pass_time(self):
+        """#3802 B1/cx2 : l'inventaire profond qui tient host-pass (walk de
+        /home/ameesh/work) reçoit le temps qui reste au passage, pas le
+        budget initial déjà consommé par l'inventaire des candidats."""
+        self.clone("c1")
+        clock = [100.0]
+
+        def monotonic():
+            value = clock[0]
+            clock[0] += 0.3
+            return value
+
+        with mock.patch.object(clones, "_dependency_inventory",
+                               return_value=([], True, "")) as dep, \
+                mock.patch.object(clones.time, "monotonic", side_effect=monotonic):
+            entries, plan, skipped = clones.reap(
+                self.db, "pc", self.cfg, roots=(self.root,), agents=self.agents,
+                protected={self.main}, dry_run=True, now=self.now,
+                artifacts=(), lock_path=self.lock, journal_path=self.journal,
+                skip_roots=(self.cfg.state_dir,), budget_s=0.5)
+        dep.assert_called_once()
+        self.assertAlmostEqual(dep.call_args.kwargs["budget_s"], 0.2, places=3)
+
     def plan_for(self, path, report=None):
         entries, plan, skipped = report or self.reap()
         self.assertEqual(skipped, [])

@@ -207,14 +207,35 @@ dans le canon :
 
 ```sh
 ameesh accounts list [--json]          # comptes, dernier choix, état, jauges, pertes, bascules
-ameesh accounts use claude secondaire  # forçage manuel (levé seul au seuil si un autre compte est libre)
-ameesh accounts auto [claude]          # retour au choix automatique (0034)
+ameesh accounts use claude secondaire --for 1h
+                                       # forçage manuel, avec échéance (levé seul au seuil si un autre compte est libre)
+ameesh accounts use claude secondaire --force "sonde de jauge" --for 15m
+                                       # passe outre la garde (overage/rythme), raison journalisée
+ameesh accounts auto [claude]          # retour au choix automatique (0034), avant l'échéance
 ameesh accounts healthy claude secondaire  # compte reconnecté : déclaré sain (L226b)
 ameesh cost report                     # dépense par agent, compte actif, jauges par compte
 ameesh cost gauges                     # historique des jauges, par compte
 ameesh cost balance --record           # soldes, par compte de clé d'API
 ameesh budget                          # plafonds du mesh en vigueur, source, pauses (L70)
 ```
+
+**Un forçage a une garde et une échéance (#3755).** `ameesh accounts use`
+évalue le compte avant de le forcer : s'il est **en overage** ou **au-delà de
+son rythme** (`accounts.evaluate`), la commande refuse, avec la raison et le
+rappel de `--force`. Une retenue d'overage valide publiée par un autre runner
+de l'hôte est relue **sous le verrou de placement**, dans la transaction de la
+bascule : sans `--force` elle refuse sans rien écrire, avec `--force` elle est
+levée dans la même transaction. `--force "raison"` passe outre — la raison est
+journalisée
+dans `account_switches` (visible dans les dernières bascules d'`ameesh accounts
+list`) — mais ne change
+rien à la garde du tour : un compte en overage ou au-delà de ses plafonds n'est
+jamais lancé, même forcé. `--for DUREE` (défaut **1 h** : `90m`, `6h`, `2j`)
+pose l'échéance du forçage ; au terme, le choix suivant le lit comme
+automatique, le lève (journalisé `auto`, raison « forcing expired ») et reprend
+la règle 0034. `--for 0` est refusé : pas de forçage sans échéance. `ameesh
+accounts list` affiche l'échéance ; `ameesh accounts auto` rend la main avant
+elle.
 
 `ameesh accounts list` montre, pour chaque compte, la capacité **perdue à la
 prochaine remise à zéro** de chaque fenêtre en cours si rien ne change, et le
@@ -405,6 +426,15 @@ agents while another healthy account is under its own: the force is lifted
 no other account free, the force holds and the agents pause. The lift is
 fenced on the forced account that was read (#295): a human who forces another
 account in between keeps their force, applied as is for that turn.
+Since #3755 the command itself refuses to force an account already in overage
+or above its pace (`--force "reason"` overrides, journaled), and every force
+carries an expiry (`--for`, 1 h by default): at the deadline the next choice
+reads it as automatic and lifts it (journaled `auto`). A valid overage hold
+published by another runner of the host is re-read under the placement lock,
+in the switch transaction: without `--force` it refuses and writes nothing;
+with `--force` it is lifted in that same transaction. The expiry is fenced on
+the forced account that was read, like a threshold lift: a concurrent force of
+another account is kept.
 With the budget guard off (`budget_usd_per_hour` 0) the pace no longer
 pauses, but these rules still hold: an account in overage or past `cap` /
 `overage_cap` is never chosen, and with no other account the agent is
@@ -1053,3 +1083,43 @@ are not seen, because ameesh never reads a credential. A `key_env` variable
 that is absent from the executor's environment has no value to fingerprint
 (the launch would fail for the same reason). The separation itself stays the
 owner's: lot #65 (accounts per organisation).
+
+## Fenêtre courte du fournisseur (#3779)
+
+Le forfait Codex n'expose qu'un bucket hebdomadaire (`codex`, 10080 min). Le
+fournisseur applique en plus un **bucket de rafale/concurrence non documenté,
+au niveau du compte** : plusieurs sessions reçoivent 429 sur la première
+requête d'un tour alors que la jauge hebdomadaire est loin de son plafond
+(openai/codex#41702, holon-run/holon#3369). Les runners le suivent maintenant
+ensemble :
+
+* `account_rate_events` journalise chaque 429 par `(harnais, compte)` ; le
+  cooldown partagé vaut 4 min après le premier refus, doublé à chaque refus
+  supplémentaire dans les 15 min, plafonné à 15 min. Il retarde le **début**
+  des tours, jamais un tour en cours ;
+* `account_turn_starts` porte les débuts de tour du compte ; l'écart minimal
+  par défaut est de **30 s**, le plafond de tours actifs de **2** (Codex). Le
+  plafond compte les places d'`account_turn_slots`, qui portent le harnais et
+  le compte **effectifs** du tour : un agent Claude/DeepSeek qui emprunte Codex
+  (repli L242b) compte dans le plafond Codex. La place n'est retenue que si le
+  bail est **vivant** (`lease_expires_at` futur) : un hôte tombé ne bloque pas
+  le compte pour toujours. L'admission est atomique sous un verrou par compte :
+  `begin_turn`, la place et le journal du départ sont dans la même transaction
+  que la relecture du cooldown, de l'écart et du plafond, donc deux runners
+  d'hôtes différents ne peuvent pas se glisser ensemble sous le plafond, même
+  avec un écart nul ;
+* `ameesh accounts list` affiche la jauge `codex-short-window` (texte et
+  `--json`) : tours actifs, écart de début, 429 récents et cooldown.
+
+Les deux seuils se règlent par profil de compte, comme les autres seuils de
+compte, sans redémarrage :
+
+```json
+{"accounts": {"codex": [
+  {"name": "primaire", "max_concurrent": 2, "min_start_gap_s": 30}
+]}}
+```
+
+`max_concurrent: 0` ou `min_start_gap_s: 0` désactivent la garde
+correspondante ; l'absence des clés prend les défauts du harnais. Un exécuteur
+médié sans le domaine `account_windows` ignore la garde (contrat fermé).

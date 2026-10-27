@@ -29,10 +29,12 @@ Le plan L161f n'est jamais deviné. Il est calculé par le
 ``scripts/test-plan.py`` du **commit candidat** (arbre détaché), avec la carte
 mesurée fournie par l'appelant quand elle existe, sinon la dernière carte
 publiée (artefact ``carte`` de GitHub, même lecture que la restauration
-``tests.yml``). Sans carte fraîche, le plan retombe sur la suite complète et
-``prevalidation.validate`` refuse ``selection-full`` / ``selection-unsafe`` :
-aucun repli local, aucun test supposé ; l'appelant dit alors la prévalidation
-indisponible. Le rapport passe par ``prevalidation.record`` (0450), après le
+``tests.yml``). Sans carte fraîche, le plan retombe sur la suite complète :
+``prevalidation.validate`` refuse ``selection-full`` / ``selection-unsafe``,
+et ``contract_fallback`` (#3800) joue alors les contrats déclarés au canon
+(``tests/parts/toujours.txt``) plus ``test_cluster`` et ``test_l161f_plan``,
+en le disant dans le rapport. Aucun repli local, aucun test supposé. Le
+rapport passe par ``prevalidation.record`` (0450), après le
 run distant et hors de toute transaction ; une table absente n'annule jamais
 un run réel.
 """
@@ -371,6 +373,22 @@ def _free_name(repo: str, head: str, *, deadline: Deadline | None = None) -> str
         "selection-unsafe", "aucun nom libre pour le plan dans l'arbre du candidat")
 
 
+def _merge_base(repo: str, base: str, head: str, *, timeout: int = 120) -> str:
+    """Le merge-base de la base de comparaison et de la tête, ou ``""`` (#3800).
+
+    Le plan L161f exige la base de fusion d'un lot, pas le tip de la cible :
+    comparer le tip à la tête fait passer les changements de la cible depuis
+    le point de branche pour des changements du lot (en sens inverse), et une
+    carte en retard rend alors toute branche « non sûre » (fondation, données,
+    scripts hors socle).
+    """
+    proc = _run_git(repo, "merge-base", base, head, timeout=timeout)
+    if proc.returncode:
+        return ""
+    out = (proc.stdout or "").strip().split()
+    return out[0] if out else ""
+
+
 def prepare(repo: str, head: str, base: str, *, map_path: str = "",
             timeout: int = PLAN_TIMEOUT, deadline: Deadline | None = None) -> Prepared:
     """Construit un arbre détaché de ``head`` et y calcule le plan L161f.
@@ -417,6 +435,27 @@ def prepare(repo: str, head: str, base: str, *, map_path: str = "",
         raise prevalidation.PrevalidationError(
             "selection-unsafe", "base de comparaison inconnue de %s: %r"
             % (repo, (base or "—")[:12]))
+    #: #3800 : le plan juge le diff propre du lot, donc `--base` est la base de
+    #: fusion avec la tête, jamais le tip de la cible. Le tip sert encore à
+    #: nommer la cible dans le rapport ; il ne juge plus le diff.
+    if deadline is not None and deadline.expired():
+        raise prevalidation.PrevalidationError(
+            "run-incomplete", "budget de prévalidation épuisé avant le merge-base")
+    try:
+        comparison = _merge_base(repo, base, full,
+                                 timeout=limit(canon_mod.GIT_TIMEOUT))
+    except (OSError, subprocess.SubprocessError) as exc:
+        if deadline is not None and deadline.expired():
+            raise prevalidation.PrevalidationError(
+                "run-incomplete",
+                "budget de prévalidation épuisé pendant le merge-base") from None
+        raise prevalidation.PrevalidationError(
+            "selection-unsafe", "merge-base illisible: %s: %s"
+            % (type(exc).__name__, str(exc)[:200])) from None
+    if not comparison:
+        raise prevalidation.PrevalidationError(
+            "selection-unsafe", "base de fusion inconnue de %s entre %s et %s"
+            % (repo, base[:12], full[:12]))
     root = tempfile.mkdtemp(prefix="ameesh-prevalidation-")
     tree = os.path.join(root, "tree")
     try:
@@ -453,7 +492,7 @@ def prepare(repo: str, head: str, base: str, *, map_path: str = "",
         plan_path = os.path.join(tree, rel)
         argv = [sys.executable, os.path.join(tree, "scripts", "test-plan.py"), "plan",
                 "--out", rel, "--event", "workflow_dispatch", "--ref", "",
-                "--base", base, "--mode", "lot"]
+                "--base", comparison, "--mode", "lot"]
         if map_path:
             argv += ["--map", os.path.abspath(map_path)]
         try:
@@ -494,6 +533,118 @@ def prepare(repo: str, head: str, base: str, *, map_path: str = "",
             pass
         shutil.rmtree(root, ignore_errors=True)
         raise
+
+
+# --------------------------------------------------------------------------
+# #3800 : le repli contractuel quand la sélection n'est pas prouvée
+# --------------------------------------------------------------------------
+
+#: contrats lus quand le canon n'en déclare aucun (convention ameesh)
+FALLBACK_CONTRACTS = ("tests/parts/toujours.txt",)
+#: modules ajoutés au repli même s'ils ne sont pas dans le fichier de contrat :
+#: le lecteur des contrats de la porte de fusion et le rôle superviseur.
+FALLBACK_MODULES = ("test_cluster", "test_l161f_plan")
+#: refus de sélection qui déclenchent le repli (une tête déplacée, un plan
+#: illisible ou une panne d'hôte n'en sont pas : ils ne se prouvent pas par des
+#: contrats)
+FALLBACK_CAUSES = ("selection-full", "selection-unsafe", "card-missing", "card-stale")
+
+
+def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
+                      deadline: Deadline | None = None) -> dict | None:
+    """#3800 : sur sélection incertaine, la prévalidation joue les contrats.
+
+    Le plan d'un lot peut retomber sur la suite complète (carte en retard,
+    fichier de la cible hors socle, sélection non sûre). Refuser alors sans
+    rien exécuter laissait passer des rouges de contrat déterministes jusqu'à
+    la CI du paquet. Ce repli remplace le refus par un **plan contractuel**
+    explicite : les modules de ``params.contracts`` (``tests/parts/toujours.txt``
+    par convention), plus ``test_cluster`` et ``test_l161f_plan``, en une part
+    psycopg. Le plan écrit dans l'arbre porte ``fallback`` : le rapport dit la
+    cause d'origine et les modules joués, il ne se lit pas comme un vert de
+    sélection.
+
+    Rend le bloc ``fallback`` quand le repli a été écrit, ``None`` sinon (le
+    refus d'origine reste alors la réponse). Un contrat déclaré illisible ne
+    se suppose pas : pas de repli, le refus est nommé par l'appelant.
+    """
+    plan = getattr(prepared, "plan", None)
+    path = str(getattr(prepared, "path", "") or "")
+    tree = str(getattr(prepared, "tree", "") or "")
+    if not isinstance(plan, dict) or not path or not tree:
+        return None
+    chosen = prevalidation.selection(plan, head=head, base=base)
+    #: une tête déplacée n'est pas une sélection incertaine : le plan ne parle
+    #: pas de la tête candidate, aucun contrat ne la prouve.
+    if chosen.ok or "head-moved" in chosen.causes \
+            or not (set(chosen.causes) & set(FALLBACK_CAUSES)):
+        return None
+    block = getattr(params, "params", params)
+    declared = tuple(getattr(block, "contracts", ()) or ())
+    #: #3800/N cx2 B1 : `gate_train` lit les contrats sous le bail de la cible.
+    #: La lecture git doit être bornée par la même échéance que le reste du
+    #: passage (`validate` borne déjà `contract_modules` ainsi) ; un
+    #: `git cat-file` suspendu ne doit pas dépasser le budget global.
+    if deadline is not None and deadline.expired():
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé avant la lecture des contrats")
+    bounded = prevalidation._bounded_runner(subprocess.run, deadline)
+    required, problem = prevalidation.contract_modules(
+        declared or FALLBACK_CONTRACTS, repo=prepared.tree, head=head,
+        runner=bounded)
+    if problem:
+        return None
+    if deadline is not None and deadline.expired():
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé pendant la lecture des contrats")
+    modules: list[str] = []
+    for name in (*required, *FALLBACK_MODULES):
+        if name not in modules:
+            modules.append(name)
+    if not modules:
+        return None
+    classes = tuple(getattr(block, "classes", ()) or ())
+    rank = classes[0] if classes else "P1"
+    fallback = {
+        "cause": chosen.causes[0],
+        "causes": list(chosen.causes),
+        "why": chosen.why,
+        "contracts": list(required),
+        "modules": list(modules),
+    }
+    plan = json.loads(json.dumps(plan))
+    plan["head"] = head
+    plan["fallback"] = fallback
+    plan["selection"] = {
+        "mode": "contract",
+        "why": "sélection incertaine (%s): contrats seuls" % chosen.causes[0],
+        "modules": len(modules), "impacted": len(modules),
+        "contract": len(required), "selected": len(modules), "skipped": 0,
+        "impacted_estimate_s": 0.0, "total_estimate_s": 0.0,
+    }
+    #: `meets_canon` exige que les contrats déclarés soient dans la sélection
+    #: et que les classes retenues soient exactement les modules joués.
+    plan["contract"] = list(required)
+    plan["classes"] = {name: [rank, "contrat (#3800)"] for name in modules}
+    plan["parts"] = {
+        "psycopg": [{"part": 1, "of": 1, "label": "psycopg contrats",
+                     "modules": list(modules), "estimate_s": 0.0}],
+        "psql": [],
+    }
+    if deadline is not None and deadline.expired():
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé avant l'écriture du plan de contrats")
+    try:
+        with open(prepared.path, "w", encoding="utf-8") as fh:
+            json.dump(plan, fh, indent=1, ensure_ascii=False)
+            fh.write("\n")
+    except OSError:
+        return None
+    prepared.plan = plan
+    return fallback
 
 
 # --------------------------------------------------------------------------
@@ -567,9 +718,13 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
     prepared = None
     try:
         prepared = prepare(repo, head, base, map_path=carte)
+        fallback = contract_fallback(prepared, params, head=head, base=base)
         report = _run_hosts(prepared, params, lot=lot, head=head, base=base,
                             branch=branch, profile=profile, say=say,
                             executable=executable, validate=validate)
+        if fallback:
+            report.setdefault("fallback", fallback)
+            report.setdefault("selection", "contract")
     finally:
         if prepared is not None:
             prepared.close()
@@ -821,6 +976,8 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
         try:
             prepared = prepare(repo, head, base, map_path=carte,
                                timeout=TRAIN_PLAN_TIMEOUT, deadline=deadline)
+            fallback = contract_fallback(prepared, params, head=head, base=base,
+                                         deadline=deadline)
             if deadline.expired():
                 raise prevalidation.PrevalidationError(
                     "run-incomplete", "budget de prévalidation épuisé avant l'hôte")
@@ -828,6 +985,9 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
                                 branch="", profile="", say=say,
                                 executable="ameesh", validate=None,
                                 deadline=deadline)
+            if fallback:
+                report.setdefault("fallback", fallback)
+                report.setdefault("selection", "contract")
         finally:
             if prepared is not None:
                 prepared.close(timeout=deadline.timeout(TRAIN_CLEANUP_TIMEOUT))

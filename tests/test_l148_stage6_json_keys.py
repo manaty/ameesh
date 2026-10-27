@@ -89,6 +89,13 @@ class CardKeysTest(unittest.TestCase):
     def test_plan_weights_read_the_english_key(self):
         # un module de test réel : `weight` compte ses `def test` pour le repli
         card = _card({"test_l161e_map": {"durations": {"psycopg": 3.0}, "echecs": []}})
+        # #3754 : une table `durees.json` régénérée (clé `_generated`) passe
+        # devant une carte plus ancienne ; ce témoin porte sur la lecture de la
+        # clé anglaise de la carte, donc la carte doit être au moins aussi
+        # récente que la table du dépôt.
+        genere = json.loads(plan.parts.TABLE.read_text(encoding="utf-8")).get("_generated")
+        if genere:
+            card["genere"] = genere
         self.assertEqual(plan.weights(["test_l161e_map"], "psycopg", card),
                          {"test_l161e_map": 3.0})
 

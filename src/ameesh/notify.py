@@ -277,8 +277,10 @@ TYPE_LABELS = {
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
     "worktree_kept": "worktree kept at end of lot",
-    # #3396 : le doute sur les processus retient les retraits, l'hôte se remplit
-    "housekeeping_blocked": "housekeeping blocked by unreadable processes",
+    # #3396 : le doute sur les processus retient les retraits ; #3802 : un
+    # verrou d'hôte trop vieux empêche tout passage — dans les deux cas
+    # l'hôte se remplit, le détail de l'alerte dit lequel.
+    "housekeeping_blocked": "housekeeping blocked",
     # #2618 : le libellé dit l'apparition, pas l'imputation : le ménage ne
     # supprime jamais une entrée qu'il n'a pas attribuée (#222, #234).
     "tmp_orphan": "/tmp entry that appeared during a turn",

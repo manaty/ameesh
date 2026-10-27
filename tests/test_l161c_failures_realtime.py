@@ -3282,6 +3282,60 @@ class WatcherTest(PgTestCase):
         self.assertFalse(mail.is_urgent(verdict))
         self.assertEqual(mail.unread_urgent(self.db, "dev-a"), [])
 
+    def test_paquet_rouge_nomme_l_unite_probable(self):
+        """#3801 : le courrier et `ci status` nomment l'unité du paquet.
+
+        Le manifeste est lu à la tête du run (ici une composition d'une unité),
+        la carte relie le module de test au fichier que l'unité modifie, et le
+        retrait automatique n'existe pas : on nomme seulement.
+        """
+        from ameesh import packet_red
+        from .test_3801_packet_red import GitRepo, card as red_card
+        repo = GitRepo()
+        self.addCleanup(repo.close)
+        source, merge = repo.unit(101, {"src/ameesh/x.py": "x = 1\n"})
+        repo.manifest([(101, source, merge)])
+        repo.write("tests/test_a.py", "from .support import PgTestCase\n")
+        sha = repo.commit("test")
+        registry.upsert(self.db, "dev-packet", harness="claude", host=self.cfg.host)
+        lot = work.add(self.db, title="Paquet h-test", assignee="dev-packet",
+                       branch="integration/paquet-h-test")
+        self.api.live = [run_view(810, sha, "integration/paquet-h-test")]
+        self.api.branches["integration/paquet-h-test"] = sha
+        data = red_card(blocs={"src/ameesh/x.py": {"f": {"modules": ["test_a"]}}})
+        provenance = {"status": "lue", "commit": "c" * 40, "age_s": 3600}
+        checkout = mock.patch.object(packet_red, "checkout_for",
+                                     return_value=repo.path)
+        carte = mock.patch.object(packet_red, "carte_for",
+                                  return_value=(data, provenance))
+        checkout.start()
+        self.addCleanup(checkout.stop)
+        carte.start()
+        self.addCleanup(carte.stop)
+        self.watcher.tick(self.db)
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1",
+                                                   execution=810)])]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["urgent"]) for o in out],
+                         [("failures", True)])
+        self.assertIn("unités probables : #101",
+                      self.mails("dev-packet")[-1]["body"])
+        # le verdict rouge porte la même unité
+        self.api.live = []
+        self.api.done[810] = {"status": "completed", "conclusion": "failure"}
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["status"]) for o in out],
+                         [("verdict", "failure")])
+        self.assertIn("unités probables : #101",
+                      self.mails("dev-packet")[-1]["body"])
+        self.assertIn("aucun retrait automatique",
+                      self.mails("dev-packet")[-1]["body"])
+        # `ameesh ci status` porte la même attribution
+        report = ci.status_of(self.db, lot["id"], cfg=self.cfg)
+        self.assertEqual(report["runs"][0]["attribution"]["manifest"]["units"], 1)
+        texte = "\n".join(ci.render_status(report))
+        self.assertIn("unités probables : #101", texte)
+
 
 if __name__ == "__main__":
     unittest.main()

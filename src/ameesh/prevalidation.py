@@ -11,7 +11,9 @@ nommée, tout ce que la CI élargirait — carte absente ou périmée, sélectio
 non sûre, repli sur la suite complète. La suite complète n'est jamais
 exécutée par la prévalidation, et aucun repli local n'est permis :
 l'exécution passe par `ameesh offload run --fallback none` sur un hôte
-d'agents, jamais sur le poste de l'owner.
+d'agents, jamais sur le poste de l'owner. Sur une sélection incertaine, le
+plan de repli contractuel (#3800) déclare `mode: contract` : il ne se fait
+pas passer pour une sélection impactée et son rapport dit les contrats joués.
 
 La preuve est lue dans la sortie de la VM : le flux `ameesh-test-event/1`
 (événements `fin` par part, modules réellement exécutés = événements `test`)
@@ -76,7 +78,7 @@ CAUSES = (
     "card-stale",         # carte trop vieille ou sans ancêtre commun avec la tête
     "selection-unsafe",   # le plan n'est pas sûr (fondation, bloc inconnu, retrait…)
     "plan-path-conflict",   # un parent du plan est un fichier au SHA (conflit D/F, #1820)
-    "selection-full",     # le plan retombe sur la suite complète : refus, jamais de repli
+    "selection-full",     # le plan retombe sur la suite complète : refus (repli contrat #3800)
     "head-moved",         # le plan ne porte pas la tête candidate exacte
     "no-vm",              # VM absente, injoignable, job refusé (offload 75)
     "gate-preempted",     # le run a été arrêté par la porte de l'hôte (drain), pas une VM
@@ -183,6 +185,9 @@ class Selection:
     causes: tuple[str, ...] = ()
     why: str = ""
     plan_path: str = ""
+    #: #3800 : repli contractuel quand la sélection n'a pas pu être prouvée ;
+    #: porte la cause d'origine et les modules de contrat réellement joués.
+    fallback: dict | None = None
 
     @property
     def ok(self) -> bool:
@@ -219,6 +224,15 @@ class Selection:
                       if fins_par_part.get(p) not in ("succes", "echec")]
         missing_modules = [m for m in self.modules if m not in set(executed)]
         detail: list[str] = []
+        if self.fallback:
+            #: #3800 : la preuve dit toujours que la sélection n'était pas
+            #: prouvée et que seuls les contrats ont tourné — un vert de
+            #: contrat ne se lit pas comme un vert de sélection.
+            origin = [str(c) for c in (self.fallback.get("causes") or ())
+                      if str(c)]
+            cause = ", ".join(origin) or str(self.fallback.get("cause") or "incertaine")
+            detail.append("sélection incertaine (%s) : contrats seuls (%d module(s))"
+                          % (cause, len(self.modules)))
         outcome = run.get("outcome") or ""
         if causes:
             outcome = "refused"
@@ -265,6 +279,9 @@ class Selection:
             "failed": list(flow.get("failed") or ()),
             "causes": unique, "ok": not unique, "detail": detail,
         }
+        if self.fallback:
+            report["selection"] = "contract"
+            report["fallback"] = dict(self.fallback)
         if tree is not None:
             report["tree"] = tree
         return report
@@ -333,39 +350,47 @@ def selection(plan: dict, *, head: str, base: str = "", plan_path: str = "") -> 
     if not _same_commit(got, head):
         causes.append("head-moved")
         why.append("plan %s != tête %s" % (got[:12] or "—", head[:12] or "—"))
+    fallback = plan.get("fallback") if isinstance(plan.get("fallback"), dict) else None
     card = plan.get("map") if isinstance(plan.get("map"), dict) else None
     card_commit = str((card or {}).get("commit") or "")
-    if not card or not card.get("used"):
-        problem = str((card or {}).get("problem") or "carte absente")
-        causes.append("card-missing" if _missing(problem) else "card-stale")
-        why.append(problem)
-    elif card.get("stale"):
-        #: #3450 : une carte périmée juge encore le diff propre d'un lot en CI,
-        #: mais la prévalidation au gel exige une carte fraîche (elle prouve la
-        #: tête avant le gel) ; le refus reste nommé, pas une indisponibilité
-        #: silencieuse.
-        causes.append("card-stale")
-        why.append("carte de mesure périmée (%s h)" % card.get("age_h", "?"))
     sel = plan.get("selection") if isinstance(plan.get("selection"), dict) else {}
     modules = planned_modules(plan)
     mode = str(sel.get("mode") or "")
-    if mode == "full":
-        causes.append("selection-full")
-        why.append(str(sel.get("why") or "repli sur la suite complète"))
-    elif mode != "impacted":
+    if fallback is None:
+        if not card or not card.get("used"):
+            problem = str((card or {}).get("problem") or "carte absente")
+            causes.append("card-missing" if _missing(problem) else "card-stale")
+            why.append(problem)
+        elif card.get("stale"):
+            #: #3450 : une carte périmée juge encore le diff propre d'un lot en CI,
+            #: mais la prévalidation au gel exige une carte fraîche (elle prouve la
+            #: tête avant le gel) ; le refus reste nommé, pas une indisponibilité
+            #: silencieuse.
+            causes.append("card-stale")
+            why.append("carte de mesure périmée (%s h)" % card.get("age_h", "?"))
+        if mode == "full":
+            causes.append("selection-full")
+            why.append(str(sel.get("why") or "repli sur la suite complète"))
+        elif mode != "impacted":
+            causes.append("selection-unsafe")
+            why.append("mode de sélection %r" % (mode or "absent",))
+        if not plan.get("sure"):
+            causes.append("selection-unsafe")
+            unsure = list(plan.get("unsure") or ())
+            why.append("sélection non sûre: %s" % (unsure[0] if unsure else "raison absente"))
+        if not plan.get("phase2_safe"):
+            causes.append("selection-unsafe")
+            why.append("phase 2 non sûre: %s" % (plan.get("phase2_why") or "raison absente"))
+    elif mode != "contract":
+        #: #3800 : un plan de repli contractuel se déclare ; il ne se fait pas
+        #: passer pour une sélection impactée complète.
         causes.append("selection-unsafe")
-        why.append("mode de sélection %r" % (mode or "absent",))
-    if not plan.get("sure"):
-        causes.append("selection-unsafe")
-        unsure = list(plan.get("unsure") or ())
-        why.append("sélection non sûre: %s" % (unsure[0] if unsure else "raison absente"))
-    if not plan.get("phase2_safe"):
-        causes.append("selection-unsafe")
-        why.append("phase 2 non sûre: %s" % (plan.get("phase2_why") or "raison absente"))
+        why.append("mode de repli %r" % (mode or "absent",))
     if not modules:
         causes.append("selection-unsafe")
         why.append("aucun module sélectionné")
-    contract = tuple(str(m) for m in (plan.get("contract") or ()))
+    candidates = plan.get("contract")
+    contract = tuple(str(m) for m in (candidates or ()))
     if contract and not set(contract) <= set(modules):
         causes.append("selection-unsafe")
         why.append("contrats absents de la sélection: %s"
@@ -395,7 +420,8 @@ def selection(plan: dict, *, head: str, base: str = "", plan_path: str = "") -> 
             unique.append(cause)
     return Selection(head=head, base=base, card_commit=card_commit,
                      modules=modules, parts=tuple(parts),
-                     causes=tuple(unique), why=" ; ".join(why), plan_path=plan_path)
+                     causes=tuple(unique), why=" ; ".join(why), plan_path=plan_path,
+                     fallback=fallback)
 
 
 def host_allowed(host: str, *, local: str | None = None, deny: Sequence[str] = (),
