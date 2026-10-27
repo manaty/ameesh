@@ -44,6 +44,16 @@ passagers pour l'incident #1270. Borne de cette reprise : `DELAYS` est atteint
 dès le 4e palier (600 s) et ne croît plus, et l'alerte #1268 n'est levée
 qu'après `PERSIST_S` (15 min) d'un épisode entier — le témoin
 `test_borne_de_reprise_atteignable_et_stable` fixe le plafond.
+
+#3733 : un succès efface l'épisode, donc un agent bridé de façon chronique
+(codex1 le 26/10 : trois épisodes de 4 min en 45 min, chacun sous
+`PERSIST_S`) ne levait jamais rien. L'exécuteur garde aussi les épisodes de
+débit passager **clos** de l'heure glissante (`WINDOW_S`) et écrit leur cumul,
+épisode en cours compris, dans un marqueur suffixe de `status_text`
+(``[rate_limited 540s in 1h x3 since …Z at …Z]``) qu'un succès ne retire pas.
+`since` est le début de la série (premier épisode depuis une fenêtre vide) :
+la clé d'alerte ne glisse pas avec la fenêtre. L'alerte `rate_limited_chronic`
+se lève à `CHRONIC_S` de cumul ; un quota n'y entre pas (L48 l'arrête déjà).
 """
 from __future__ import annotations
 
@@ -143,10 +153,19 @@ QUOTA = "quota"
 DELAYS = (60.0, 120.0, 300.0, 600.0)
 #: durée d'un épisode de débit avant que l'alerte #1268 puisse se lever
 PERSIST_S = 900.0
+#: #3733 : fenêtre glissante du cumul de débit passager
+WINDOW_S = 3600.0
+#: #3733 : cumul sur la fenêtre qui lève `rate_limited_chronic`
+CHRONIC_S = PERSIST_S
+#: #3733 : épisodes clos gardés au plus (la fenêtre reste bornée)
+WINDOW_MAX = 32
 
 _STATE_RE = re.compile(
     r"\[(rate_limited|quota) x(\d+) since (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z),"
     r" retry in (\d+)s(?:, retry at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z))?\]")
+_WINDOW_RE = re.compile(
+    r"\[rate_limited (\d+)s in 1h x(\d+)"
+    r" since (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\]")
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -266,3 +285,88 @@ def alert_suppressed(etat: dict | None, streak: int, now: float | None = None) -
         return False
     maintenant = time.time() if now is None else float(now)
     return maintenant - etat["since"] < PERSIST_S
+
+
+def window_prune(closed, now: float) -> list:
+    """#3733 : les épisodes clos `(début, fin)` encore dans l'heure glissante,
+    les `WINDOW_MAX` plus récents."""
+    debut = float(now) - WINDOW_S
+    return [(float(s), float(e)) for s, e in closed or () if float(e) > debut][-WINDOW_MAX:]
+
+
+def window_total(closed, now: float, ongoing_since: float = 0.0) -> float:
+    """#3733 : secondes de débit passager dans l'heure glissante — épisodes
+    clos coupés au bord de la fenêtre, plus l'épisode en cours depuis
+    `ongoing_since` (0 : aucun)."""
+    maintenant = float(now)
+    debut = maintenant - WINDOW_S
+    total = sum(max(0.0, min(float(e), maintenant) - max(float(s), debut))
+                for s, e in closed or ())
+    if ongoing_since:
+        total += max(0.0, maintenant - max(float(ongoing_since), debut))
+    return total
+
+
+def window_text(base: str, total: float, episodes: int, since: float, at: float) -> str:
+    """#3733 : `status_text` suffixé du cumul de l'heure ; `base` tel quel
+    sans cumul. `since` est le début de la série, `at` l'heure de la mesure."""
+    if total < 1 or episodes < 1 or not since:
+        return base
+    return "%s [rate_limited %ds in 1h x%d since %s at %s]" % (
+        base, int(total), int(episodes), _stamp(since), _stamp(at))
+
+
+def window_state(status_text: str | None) -> dict | None:
+    """#3733 : le cumul marqué dans `status_text`, None sans marqueur."""
+    m = _WINDOW_RE.search(str(status_text or ""))
+    if not m:
+        return None
+    try:
+        since, at = _parse_stamp(m.group(3)), _parse_stamp(m.group(4))
+    except ValueError:
+        return None
+    return {"total": float(m.group(1)), "episodes": int(m.group(2)),
+            "since": since, "at": at}
+
+
+def _ongoing(debit: dict | None) -> float:
+    """Début de l'épisode de débit passager en cours (marqueur #1270), 0 sinon."""
+    if debit and debit.get("kind") == RATE_LIMITED:
+        return float(debit.get("since") or 0.0)
+    return 0.0
+
+
+def window_seen(fenetre: dict | None, debit: dict | None,
+                now: float | None = None) -> float:
+    """#3733 : le cumul vu à `now` par l'alerte. Une mesure sortie de la
+    fenêtre ne compte plus ; un épisode en cours ajoute le temps écoulé
+    depuis la mesure (l'exécuteur attend sa reprise sans réécrire la ligne)."""
+    if not fenetre:
+        return 0.0
+    maintenant = time.time() if now is None else float(now)
+    ecart = maintenant - fenetre["at"]
+    if ecart >= WINDOW_S:
+        return 0.0
+    total = fenetre["total"]
+    if _ongoing(debit):
+        total += max(0.0, ecart)
+    return min(total, WINDOW_S)
+
+
+def window_restore(fenetre: dict | None, debit: dict | None,
+                   now: float | None = None) -> tuple[list, float]:
+    """#3733 : (épisodes clos, début de série) relus de la ligne au
+    redémarrage. Le cumul mesuré, moins la part de l'épisode en cours (que
+    l'exécuteur recompte depuis son début), devient un épisode clos qui
+    finit à l'heure de la mesure."""
+    if not fenetre:
+        return [], 0.0
+    maintenant = time.time() if now is None else float(now)
+    if maintenant - fenetre["at"] >= WINDOW_S:
+        return [], 0.0
+    clos = fenetre["total"]
+    en_cours = _ongoing(debit)
+    if en_cours:
+        clos -= max(0.0, fenetre["at"] - max(en_cours, fenetre["at"] - WINDOW_S))
+    episodes = [(fenetre["at"] - clos, fenetre["at"])] if clos >= 1 else []
+    return episodes, fenetre["since"]

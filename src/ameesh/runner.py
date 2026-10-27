@@ -55,6 +55,7 @@ from . import account_budget, account_turn, adapters, auth_failure, canon as can
 from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import rate_limit as rate_limit_mod
+from . import account_window
 from . import persona_memory as memory_mod
 from . import train_events
 from . import venv_guard
@@ -618,6 +619,12 @@ class AgentWorker(threading.Thread):
                 # marqueur d'avant `retry at` : repli sur la date de la ligne
                 self.rate_limit_retry_at = (float(agent.get("status_since_ts") or 0.0)
                                             + etat_debit["wait"])
+        #: #3733 : épisodes de débit passager clos de l'heure glissante, et
+        #: début de leur série ; le cumul est écrit dans `status_text` (un
+        #: succès ne l'efface pas) et lu par `rate_limited_chronic`. Relus de
+        #: la ligne : le cumul mesuré revient comme un épisode clos.
+        self.rate_limit_window, self.rate_limit_window_since = rate_limit_mod.window_restore(
+            rate_limit_mod.window_state(agent.get("status_text")), etat_debit)
         self.last_activity = time.monotonic()
         #: #408 : dernière lecture des lots actionnables (règle 1)
         self._lot_wake_checked = float("-inf")
@@ -6949,7 +6956,33 @@ class AgentWorker(threading.Thread):
         if self.preemption_streak:
             texte = exploitation_mod.preemption_status_text(
                 texte, self.preemption_streak, since=self.preemption_since)
-        return texte
+        return self._fenetre_debit(texte)
+
+    def _clos_episode_debit(self, fin: float) -> None:
+        """#3733 : l'épisode de débit passager en cours, fini à `fin` (début
+        du tour qui l'a terminé), entre dans la fenêtre glissante. Un quota
+        n'y entre pas : L48 l'arrête déjà."""
+        if self.rate_limit == rate_limit_mod.RATE_LIMITED and self.rate_limit_since:
+            self.rate_limit_window.append(
+                (self.rate_limit_since, max(self.rate_limit_since, float(fin))))
+
+    def _fenetre_debit(self, texte: str) -> str:
+        """#3733 : `texte` suffixé du cumul de débit passager de l'heure
+        glissante (épisode en cours compris) ; tel quel sans cumul, et la
+        série se referme quand la fenêtre est vide."""
+        now = time.time()
+        en_cours = (self.rate_limit_since
+                    if self.rate_limit == rate_limit_mod.RATE_LIMITED else 0.0)
+        self.rate_limit_window = rate_limit_mod.window_prune(self.rate_limit_window, now)
+        debuts = [s for s, _e in self.rate_limit_window] + ([en_cours] if en_cours else [])
+        if not debuts:
+            self.rate_limit_window_since = 0.0
+            return texte
+        if not self.rate_limit_window_since:
+            self.rate_limit_window_since = min(debuts)
+        return rate_limit_mod.window_text(
+            texte, rate_limit_mod.window_total(self.rate_limit_window, now, en_cours),
+            len(debuts), self.rate_limit_window_since, now)
 
     def _run_turn(self, spec: dict) -> bool:
         """Un tour, sous battement de bail **dès la préparation** (#2544).
@@ -7094,14 +7127,44 @@ class AgentWorker(threading.Thread):
             log("[%s] %s turn (dry-run, session %s): %s"
                 % (self.name, shown, session or "new", " ".join(argv)))
             return True
-        if not registry.begin_turn(self.db, self.name, self.runner.runner_id, self.epoch,
-                                   self._marqueurs_durables(
-                                       "%s turn (%s)" % (shown, harness))):
-            # L87b: pause may have won the row lock after pick/run_turn.
-            # Return a prompt already taken, without rewriting concurrent status.
+        # #3779 : admission ATOMIQUE juste avant d'ouvrir le tour. La première
+        # lecture (dans `account_turn.choose`) n'est qu'un pré-contrôle : deux
+        # agents peuvent s'y présenter ensemble. Ici le cooldown, l'écart depuis
+        # le dernier début et le plafond de tours actifs sont relus sous le
+        # verrou du compte, et `begin_turn` (donc la place `running`) est posé
+        # dans la MÊME transaction que le journal des débuts : la place est
+        # visible des autres runners dès le commit, même avec un écart nul.
+        # Un tour refusé ici n'a pas commencé : consigne remise, pas un échec.
+        marqueurs = self._marqueurs_durables("%s turn (%s)" % (shown, harness))
+        admission = account_window.claim_start(
+            self.db, harness, getattr(compte, "name", None), self.cfg.host,
+            self.name, profile=compte,
+            begin=lambda tx: registry.begin_turn(
+                tx, self.name, self.runner.runner_id, self.epoch, marqueurs))
+        if not admission.ok:
+            if admission.begin_failed:
+                # L87b: pause may have won the row lock after pick/run_turn.
+                # Return a prompt already taken, without rewriting concurrent status.
+                registry.restore_prompt(self.db, self.name, self.runner.runner_id,
+                                        self.epoch)
+                log("[%s] lease lost, agent stopped or operator paused before the turn"
+                    % self.name)
+                return False
+            log("[%s] turn postponed: %s" % (self.name, admission.reason))
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-            log("[%s] lease lost, agent stopped or operator paused before the turn" % self.name)
+            registry.set_status(self.db, self.name, "blocked",
+                                status_text=admission.reason)
             return False
+        if not admission.begun:
+            if not registry.begin_turn(self.db, self.name, self.runner.runner_id,
+                                       self.epoch, marqueurs):
+                # L87b: pause may have won the row lock after pick/run_turn.
+                # Return a prompt already taken, without rewriting concurrent status.
+                registry.restore_prompt(self.db, self.name, self.runner.runner_id,
+                                        self.epoch)
+                log("[%s] lease lost, agent stopped or operator paused before the turn"
+                    % self.name)
+                return False
         lot = spec.get("lot")
         if lot and not spec.get("lot_finished") \
                 and str(lot) != str(self.agent.get("session_work_item") or ""):
@@ -7898,9 +7961,9 @@ class AgentWorker(threading.Thread):
             # repart en attente, `pick()` servira le message en tête au tour
             # suivant, sur la même session. Le fil garde la trace.
             from . import exploitation as exploitation_mod
-            texte_fin = exploitation_mod.preemption_status_text(
+            texte_fin = self._fenetre_debit(exploitation_mod.preemption_status_text(
                 "turn interrupted: priority message", self.preemption_streak,
-                since=self.preemption_since)
+                since=self.preemption_since))
             if self.preemption_streak == exploitation_mod.PREEMPTIONS_ALERT:
                 # #2729 : une alerte, pas seulement une ligne de journal — sans
                 # elle, 185 tours préemptés d'affilée sont passés inaperçus.
@@ -7992,15 +8055,16 @@ class AgentWorker(threading.Thread):
             # reste seule juge du budget. Un échec d'une autre cause
             # efface l'épisode (hors refus de session fille, qui n'est pas une
             # panne fournisseur et n'efface ni n'étend l'épisode).
+            stderr_debit = auth_failure.stderr_tail(stderr_path, start=stderr_debut)
             genre = rate_limit_mod.classify(
-                error, self.last_final,
-                auth_failure.stderr_tail(stderr_path, start=stderr_debut))
+                error, self.last_final, stderr_debit)
             if genre:
                 if genre == rate_limit_mod.RATE_LIMITED:
                     self.fast_failure = False
                 if genre == self.rate_limit:
                     self.rate_limit_streak += 1
                 else:
+                    self._clos_episode_debit(started)
                     self.rate_limit = genre
                     self.rate_limit_streak = 1
                     self.rate_limit_since = time.time()
@@ -8008,7 +8072,24 @@ class AgentWorker(threading.Thread):
                 # redémarrage et ne se recalcule pas à chaque réveil (#1270 B1)
                 self.rate_limit_retry_at = (time.time() + rate_limit_mod.delay(
                     self.rate_limit_streak))
+                # #3779 : un 429 du fournisseur est aussi un refus du BUCKET
+                # COURT du compte, partagé par toutes ses sessions. On le
+                # journalise en base pour que les autres agents du compte
+                # s'arrêtent avec le fautif, au lieu de relancer chacun leur
+                # tour et d'entretenir la rafale.
+                detail_429 = "\n".join(
+                    texte for texte in (str(error or ""), stderr_debit or "") if texte)
+                if (genre == rate_limit_mod.RATE_LIMITED
+                        and account_window.enabled(harness)
+                        and ("429" in detail_429
+                             or "Too Many Requests" in detail_429)):
+                    nom_compte = getattr(compte, "name", None)
+                    if nom_compte:
+                        account_window.record_rate_limit(
+                            self.db, harness, nom_compte, self.cfg.host,
+                            self.name, detail_429)
             elif not session_fille_ecartee:
+                self._clos_episode_debit(started)
                 self.rate_limit = None
                 self.rate_limit_streak = 0
                 self.rate_limit_since = 0.0
@@ -8026,6 +8107,7 @@ class AgentWorker(threading.Thread):
         if ok:
             self.failure_streak = 0
             self.failure_since = 0.0
+            self._clos_episode_debit(started)
             self.rate_limit, self.rate_limit_streak, self.rate_limit_since = None, 0, 0.0
             self.rate_limit_retry_at = 0.0
         elif not session_fille_ecartee:
@@ -8051,6 +8133,8 @@ class AgentWorker(threading.Thread):
             texte_fin = exploitation_mod.turn_failure_status_text(
                 texte_fin, self.failure_streak,
                 critical=account_turn.is_critical(self), since=self.failure_since)
+        # #3733 : le cumul de débit de l'heure survit au succès
+        texte_fin = self._fenetre_debit(texte_fin)
         self._avec_reprise(
             "end of turn", registry.end_turn,
             self.db, self.name, self.runner.runner_id, self.epoch,

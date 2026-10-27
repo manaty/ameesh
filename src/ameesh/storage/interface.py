@@ -259,7 +259,11 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
-        """Agent by primary or alias; alias resolutions are durably audited."""
+        """Agent by primary or alias; alias resolutions are durably audited.
+
+        #3729 : la ligne porte aussi `last_mail_ts` et `last_mail_host`, le
+        dernier message déposé et l'hôte qui l'a déposé — le signe de vie que
+        `ameesh show` affiche comme `ameesh list` depuis #3337."""
 
     @abc.abstractmethod
     def resolve_name(self, name: str, *, operation: str = "lookup") -> str:
@@ -1124,6 +1128,63 @@ class Accounts(Domain):
     @abc.abstractmethod
     def switches(self, host: str, harness: str | None, limit: int) -> list[dict]:
         """Les dernières bascules de l'hôte (toutes ou d'un harnais), récentes d'abord."""
+
+
+# --------------------------------------------------------------------------
+# fenêtre courte du fournisseur, par compte logique (#3779)
+# --------------------------------------------------------------------------
+
+class AccountWindows(Domain):
+    """Refus 429 du fournisseur, partagés par les exécuteurs d'un même compte.
+
+    Les lignes de `account_rate_events` ne portent que des noms de comptes,
+    des noms d'agents, l'hôte et le texte d'erreur du fournisseur (borné) :
+    jamais de secret, d'invite ni de jeton. La clé est le compte **logique**
+    (`harness`, `account`), le même nom sur tous les hôtes du réservoir (Codex :
+    `primaire`) — le bucket de rafale est celui du fournisseur, pas celui d'un
+    hôte.
+    """
+
+    @abc.abstractmethod
+    def record(self, harness: str, account: str, host: str, agent: str,
+               kind: str, detail: str | None) -> None:
+        """Ajoute un refus fournisseur (`kind` = `rate_limited`)."""
+
+    @abc.abstractmethod
+    def recent(self, harness: str, account: str, since_s: float) -> dict:
+        """Les refus des `since_s` dernières secondes : `count`, `last_at_ts`
+        (epoch), `last_agent`, `last_host`, `last_detail`. Zéros et None sans
+        refus ; l'instant est celui de la base (`now()`), commun aux hôtes."""
+
+    @abc.abstractmethod
+    def active(self, harness: str, account: str) -> list[dict]:
+        """Les tours actifs du compte, **bail vivant seulement** (`lease_owner`
+        posé et `lease_expires_at` futur) : un hôte tombé ne bloque pas le
+        plafond de son compte pour toujours. La place porte le harnais et le
+        compte **effectifs** du tour (`account_turn_slots`, écrit avec
+        `begin_turn`) : un agent d'un autre harnais qui emprunte ce compte
+        compte dans son plafond. Rend `name`, `host`, `status_since_ts`
+        (epoch). Un agent sans place (tour commencé avant le déploiement) n'est
+        pas compté : la garde s'ouvre un tour, jamais ne bloque à tort."""
+
+    @abc.abstractmethod
+    def start(self, harness: str, account: str, host: str, agent: str,
+              *, slot_only: bool = False) -> None:
+        """Journalise le début d'un tour du compte (écart entre deux débuts) et
+        pose/actualise sa place active avec le harnais et le compte effectifs
+        (`harness`, `account`) — appelé dans la transaction d'admission, avec
+        `begin_turn`.
+
+        `slot_only` : ne journalise pas le début (harnais non suivi, qui n'a
+        pas d'écart à tenir) et ne fait que remplacer la place de l'agent.
+        Un agent qui revient d'un emprunt Codex sous son harnais propre efface
+        ainsi son ancienne place Codex (#3779, avis cx2)."""
+
+    @abc.abstractmethod
+    def last_start(self, harness: str, account: str) -> dict:
+        """Le dernier début de tour du compte : `last_at_ts` (epoch, None sans
+        début) et `last_agent`, `last_host`. Instant de la base, commun aux
+        hôtes."""
 
 
 # --------------------------------------------------------------------------
@@ -4810,6 +4871,7 @@ class Storage(abc.ABC):
     pending_spend: PendingSpend
     turn_costs: TurnCosts
     accounts: Accounts
+    account_windows: AccountWindows
     credentials: Credentials
     budgets: Budgets
     api_requests: ApiRequests
