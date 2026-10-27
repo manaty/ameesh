@@ -2446,6 +2446,13 @@ class WorkItems(Domain):
         correction `merged → build` postérieure a annulé (#2317)."""
 
     @abc.abstractmethod
+    def verdicts_for_commit(self, commit: str) -> list[dict]:
+        """All verdicts naming this exact commit, across lots, including hex
+        abbreviations. Provenance and current opposition remain caller checks.
+        No history limit: a block must not disappear behind newer rows.
+        """
+
+    @abc.abstractmethod
     def earlier_freezes(self, app: str, lot: int, before_ts: float) -> list[dict]:
         """Up to 256 earlier freezes of other lots in this project.
 

@@ -4944,6 +4944,7 @@
     "migration_holder",
     "migration_landed_holder",
     "milestones",
+    "verdicts_for_commit",
     "open_by_ref",
     "open_for",
     "open_for_sweep",
