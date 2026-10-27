@@ -448,8 +448,9 @@ class FaultJournalTest(ServerMixin, unittest.TestCase):
         status, body = self.get_json("/api/v1/lots/123")
         self.assertEqual((status, body["error"]), (503, "unavailable"))
         [entry] = self.faults().values()
-        self.assertEqual((entry["route"], entry["exception"]),
-                         ("GET /api/v1/lots/{id}", "Unavailable"))
+        self.assertEqual((entry["route"], entry["code"]),
+                         ("ameesh-serve GET /api/v1/lots/{id}",
+                          "EXCEPTION:Unavailable"))
         self.assertEqual(entry["occurrences"], 1)
         raw = json.dumps(self.faults())
         self.assertNotIn("10.1.2.3", raw)
@@ -461,8 +462,8 @@ class FaultJournalTest(ServerMixin, unittest.TestCase):
         status, body = self.get_json("/api/v1/projects")
         self.assertEqual((status, body["error"]), (500, "internal"))
         [entry] = self.faults().values()
-        self.assertEqual((entry["route"], entry["exception"]),
-                         ("GET /api/v1/projects", "RuntimeError"))
+        self.assertEqual((entry["route"], entry["code"]),
+                         ("ameesh-serve GET /api/v1/projects", "EXCEPTION:RuntimeError"))
         self.assertNotIn("10.1.2.3", json.dumps(self.faults()))
 
 
