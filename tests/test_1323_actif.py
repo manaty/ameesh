@@ -1419,6 +1419,7 @@ SSH = r'''#!/usr/bin/env bash
 printf 'stub %s %s\n' "$0" "$*" >> "${FAKE_STATE:?}/calls.log"
 printf 'ssh %s\n' "$*" >> "${FAKE_STATE:?}/calls.log"
 case "$*" in
+  *"rev-parse --verify HEAD"*) echo "0123456789abcdef0123456789abcdef01234567"; exit 0 ;;  # clone migrations (#4050)
   *"bash -s -- "*) cat >/dev/null || true; exit 0 ;;   # migrations depuis une VM (#3848)
   *ameesh-sauvegarde.service*)   # dump serveur, poste absent (relecture dev1 #3848)
     cat >/dev/null || true

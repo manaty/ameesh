@@ -100,8 +100,10 @@
 # (additif seulement, base partagee) — la sauvegarde est celle du poste ; quand
 # il est absent, c'est le dump du serveur seul (ameesh-sauvegarde.service sur
 # manaty-mesh-1, gardé sur la VM, sans rapatriement), et les migrations sont
-# alors appliquees depuis une VM d'agents (snapshot git archive de src, dry-run additif d'abord, puis
-# --additive-only), comme le chemin bureau-goal (#3848) ; puis, hote par hote
+# alors appliquees depuis une VM d'agents (clone de travail DEPOT_VM verifie au
+# preflight, snapshot git archive de src, dry-run additif d'abord, puis
+# --additive-only), comme le chemin bureau-goal (#3848 ; clone absent, #4050 :
+# refus nomme avant toute sauvegarde, sans retour automatique) ; puis, hote par hote
 # dans l'ordre ci-dessus : installer, [poste] role, redemarrer, controler,
 # sante (unites, baux et doctor par `controler`, puis courrier reellement remis
 # par une sonde). Un echec = retour automatique de l'HOTE (previous-sha),
@@ -601,6 +603,27 @@ precedent_retour() {  # commit que « retour » reinstalle reellement
 # commande ; le SHA est un commit deja resolu par git.
 DEPOT_VM=${DEPOT_VM:-/home/ameesh/work/ameesh-release}
 SNAP_VM=${SNAP_VM:-/home/ameesh/work}
+# #4050 : le clone de travail des migrations doit exister sur l'hote qui les
+# applique quand le poste est absent. Un hote neuf n'en a pas : le preflight le
+# constate avant sauvegarde, migration et tout arret de runner, nomme le geste
+# exact et s'arrete sans retour automatique (rien n'a ete modifie).
+verifier_clone_migrations() {  # nom
+  local nom=$1 cible=${CIBLE[$1]} depot sortie
+  printf -v depot '%q' "$DEPOT_VM"
+  if sortie=$(ssh_lire "$cible" \
+      "runuser -u ameesh -- git -C $depot rev-parse --verify HEAD && runuser -u ameesh -- git -C $depot remote get-url origin" 2>&1); then
+    return 0
+  fi
+  {
+    echo "clone des migrations absent ou illisible sur $nom ($DEPOT_VM)"
+    echo "  geste exact (clone complet, jamais --depth/--shallow, canon §7) :"
+    printf "    ssh %s 'runuser -u ameesh -- git clone https://github.com/manaty/ameesh.git %s'\n" \
+      "$cible" "$DEPOT_VM"
+    if [ -n "$sortie" ]; then printf '  lecture : %s\n' "$sortie"; fi
+    echo "  rien n'a ete modifie ; aucun retour automatique"
+  } >&2
+  return 1
+}
 migrer_depuis_vm() {  # nom sha
   local nom=$1 sha=$2 cible=${CIBLE[$1]} a b c
   printf -v a '%q' "$sha"
@@ -837,6 +860,16 @@ fi
 # --- preflight (lecture seule), sauvegarde, puis migrations ---------------
 etape "preflight : verifier chaque hote (lecture seule)"
 for nom in "${HOTES[@]}"; do
+  # #4050 : sur le chemin sans poste, les migrations partent de
+  # HOTE_MIGRATIONS avec le clone DEPOT_VM. Un hote neuf n'en a pas : le
+  # constater ici, avant sauvegarde, migration et tout arret de runner. Un
+  # refus nomme, sans retour automatique : rien n'a ete modifie.
+  if [ "$POSTE_ABSENT" = 1 ] && [ "$nom" = "$HOTE_MIGRATIONS" ] \
+     && ! verifier_clone_migrations "$nom"; then
+    trace "$nom" verifier ko "clone des migrations absent ou illisible ($DEPOT_VM)"
+    echo "preflight en echec sur $nom : rien n'a ete modifie" >&2
+    exit 1
+  fi
   if ! exec_hote "$nom" verifier; then
     trace "$nom" verifier ko "echec du preflight"
     echo "preflight en echec sur $nom : rien n'a ete modifie" >&2
