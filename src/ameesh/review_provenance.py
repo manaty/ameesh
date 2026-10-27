@@ -26,6 +26,19 @@ transaction que `work_item_milestones`. Le `turn` est l'identifiant du tour
 managé (`AMEESH_TURN_ID`), la `session` celle du registre vivant de l'acteur,
 et le `harness` celui du tour (`AMEESH_HARNESS`), recontrôlé contre le registre.
 
+Une session de gouvernance **hors tour** (le bureau, canon §10) n'a ni bail ni
+`AMEESH_TURN_ID` ; elle est liée à son agent par `ameesh mail bind` (L41,
+décision 0030). Sa liaison est une preuve aussi forte qu'un tour tant qu'elle
+porte un PID — le processus est alors vérifié comme descendant du harnais lié
+(L46/L63) — et que l'agent est `externe` au registre, sans bail vivant, sous le
+même harnais que la liaison. Le reçu porte alors `turn = "session:<id>"` : un
+tour synthétique qui dit l'origine sans la confondre avec un tour managé. La
+paire de hooks Git installée, les commandes `ameesh provenance
+intent|created|record` et le commit mécanique de `resolutions.finish_resolution`
+suivent ce chemin : un commit de résolution créé dans une session liée a un
+reçu exact, et le gel en lit la famille. Sans liaison vérifiable, rien n'est
+écrit : le commit reste « origine inconnue », jamais deviné.
+
 Un commit n'est enregistrable que s'il a été **créé dans ce tour** : le hook
 `pre-commit` écrit avant le commit une attestation (identité du tour, HEAD et
 arbre de départ, aléa), puis le hook `post-commit` écrit le **fait de création**
@@ -50,6 +63,10 @@ from . import storage
 FULL_SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 #: une abréviation Git citée par un jalon (au moins 7 caractères)
 ABBREV = re.compile(r"[0-9a-f]{7,64}")
+
+#: préfixe du `turn` d'un reçu écrit par une session liée hors tour : le reçu
+#: dit ainsi qu'il ne vient pas d'un tour managé (`AMEESH_TURN_ID`).
+SESSION_TURN_PREFIX = "session:"
 
 
 class ProvenanceError(Exception):
@@ -141,29 +158,123 @@ def receipt_for_milestone(db, milestone_id) -> dict | None:
     })
 
 
-def _identity(environ=None, *, actor: str = "") -> dict:
+def _binding_hint(db, cfg, actor: str) -> str:
+    """La voie à suivre quand une liaison existe mais ne prouve pas le processus.
+
+    `by_ancestry` ignore une liaison sans PID : sans elle, le refus générique
+    ne dirait pas qu'un `--pid` manque. On nomme les liaisons actives de cet
+    hôte (celles de l'acteur quand il est connu), jamais leur session."""
+    try:
+        rows = storage.of(db).session_bindings.listing(
+            host=cfg.host, agent=actor or None)
+    except Exception:  # noqa: BLE001 - indice seulement, jamais une erreur
+        return ""
+    without = [row for row in rows or () if not row.get("pid")]
+    if not without:
+        return ""
+    names = ", ".join(sorted({str(row.get("agent") or "?") for row in without})[:3])
+    return ("; %d active binding(s) on this host carry no pid (%s): "
+            "rebind with --pid" % (len(without), names))
+
+
+def _bound_session(db, *, actor: str = "", cfg=None) -> dict:
+    """L'identité d'une session liée (`ameesh mail bind`), ou un refus nommé.
+
+    La liaison est lue par l'ascendance du processus : elle doit porter un PID
+    (contrôle L46/L63 de `session_bindings.by_ancestry`) et être active sur cet
+    hôte. L'agent doit être `externe` au registre, sans bail vivant, et le
+    harnais de la liaison doit être celui que le registre lui connaît : deux
+    sources qui divergent ne prouvent rien. Le `turn` rendu est synthétique
+    (`session:<id>`) — un reçu de session ne se fait jamais passer pour un tour
+    managé."""
+    from . import config as config_mod
+    from . import identity as identity_mod
+    from . import registry
+    cfg = cfg or getattr(db, "cfg", None) or config_mod.load()
+    try:
+        binding = identity_mod.resolve_binding(cfg, db)
+    except Exception as exc:  # noqa: BLE001 - liaison illisible : origine inconnue
+        raise ProvenanceError(
+            "no managed turn (AMEESH_TURN_ID): outside a turn, and the session "
+            "binding cannot be read (%s)" % " ".join(str(exc).split())[:160]) from exc
+    if binding.source != "session":
+        raise ProvenanceError(
+            "no managed turn (AMEESH_TURN_ID): outside a turn, and %s%s"
+            % (binding.reason or "no session binding (ameesh mail bind)",
+               _binding_hint(db, cfg, actor)))
+    if not binding.ok:
+        raise ProvenanceError(
+            "no managed turn (AMEESH_TURN_ID): outside a turn, and the session "
+            "binding of %s does not hold (%s)"
+            % (binding.name or "?", binding.reason or "not bound"))
+    row = binding.session or {}
+    name = str(binding.name or "").strip()
+    session = str(row.get("session_id") or "").strip()
+    harness = str(row.get("harness") or "").strip().lower()
+    if not name or not session or not harness:
+        raise ProvenanceError(
+            "session binding is incomplete (agent, session and harness are required)")
+    if actor and str(actor).strip() != name:
+        raise ProvenanceError(
+            "actor %r is not the agent of this bound session (%r)"
+            % (actor, name))
+    if not row.get("pid"):
+        raise ProvenanceError(
+            "session %s %s of %s carries no pid: the bound process is not "
+            "proven (re-bind with --pid)" % (harness, session, name))
+    reg = registry.get(db, name) or {}
+    if not reg:
+        raise ProvenanceError(
+            "session binding names %s, absent from the registry" % name)
+    if str(reg.get("mode") or "execute").strip() != "externe":
+        # Liste d'admission, comme le registre (`mode` absent = `execute`).
+        raise ProvenanceError(
+            "%s is an execute agent (runner-driven): a session binding cannot "
+            "prove a family outside a managed turn" % name)
+    declared = str(reg.get("harness") or "").strip().lower()
+    if declared and declared != harness:
+        raise ProvenanceError(
+            "agent %s is registered under %r but its session binding declares "
+            "%r: rebind the session or correct the registry"
+            % (name, declared, harness))
+    return {"actor": name, "turn": SESSION_TURN_PREFIX + session,
+            "harness": harness, "session": session}
+
+
+def _identity(environ=None, *, actor: str = "", db=None, cfg=None) -> dict:
     """L'identité brute d'écriture d'un fait, sans contrôle de famille.
 
-    Refuse hors tour (`AMEESH_TURN_ID` absent) ou sans identité : une preuve
-    sans tour ou sans acteur n'est pas une preuve. Le harnais du tour est
-    celui du runner (`AMEESH_HARNESS`), jamais un nom choisi par le dépôt.
+    Sous tour managé (`AMEESH_TURN_ID` posé), l'identité est celle du runner :
+    `AGENT_MAIL_NAME` et `AMEESH_HARNESS`, jamais un nom choisi par le dépôt.
+    Hors tour, et seulement si une base est fournie, une session liée peut
+    attester la sienne (`_bound_session`) ; sans liaison, on refuse.
 
-    Les hooks `pre-commit`/`post-commit` n'ont pas de base : ils attestent
-    cette identité sans lire le canon (#2664) ; c'est l'écriture de la preuve
-    (`capture`, avec les familles du canon) qui refuse un harnais inconnu.
+    Les hooks `pre-commit`/`post-commit` lisent la base seulement hors tour
+    (ils restent muets et non bloquants si elle manque) ; c'est l'écriture de
+    la preuve (`capture`, avec les familles du canon) qui refuse un harnais
+    inconnu (#2664).
 
     `actor` n'est qu'une **attente** : quand il est fourni, il doit être celui
-    du tour (`AGENT_MAIL_NAME`, posé par le runner) — un tour ne signe pas la
-    preuve d'un autre agent (écart relevé par la relecture cx3, 15/10 04:27)."""
+    du tour (`AGENT_MAIL_NAME`, posé par le runner) ou de la session liée — un
+    tour ne signe pas la preuve d'un autre agent (écart relevé par la relecture
+    cx3, 15/10 04:27)."""
     env = os.environ if environ is None else environ
     turn_actor = str(env.get("AGENT_MAIL_NAME") or "").strip()
     who = str(actor or turn_actor).strip()
     turn = str(env.get("AMEESH_TURN_ID") or "").strip()
     harness = str(env.get("AMEESH_HARNESS") or "").strip().lower()
+    if not turn:
+        if turn_actor or env.get("AMEESH_RUNNER_ID") or env.get("AGENT_MESH_RUNNER_ID"):
+            # Un nom d'agent sans tour n'est pas une preuve : la voie « session
+            # liée » ne remplace pas un tour managé annoncé par l'environnement.
+            raise ProvenanceError(
+                "no managed turn (AMEESH_TURN_ID): outside a turn, an agent "
+                "identity is announced but nothing proves it")
+        if db is not None:
+            return _bound_session(db, actor=actor, cfg=cfg)
+        raise ProvenanceError("no managed turn (AMEESH_TURN_ID): outside a turn")
     if not who:
         raise ProvenanceError("no agent identity (AGENT_MAIL_NAME)")
-    if not turn:
-        raise ProvenanceError("no managed turn (AMEESH_TURN_ID): outside a turn")
     if turn_actor and who != turn_actor:
         raise ProvenanceError(
             "actor %r is not the agent of this turn (%r)" % (who, turn_actor))
@@ -183,14 +294,16 @@ def compiled_families(db) -> tuple:
         raise ProvenanceError("model families unreadable: %s" % exc) from exc
 
 
-def capture(environ=None, *, actor: str = "", families) -> dict:
+def capture(environ=None, *, actor: str = "", families, db=None, cfg=None) -> dict:
     """L'identité d'écriture d'un fait, contrôlée contre les familles du canon.
 
-    Refuse hors tour (`AMEESH_TURN_ID` absent) ou sur un harnais que le canon
-    ne déclare pas : une preuve sans tour ou sans famille n'est pas une preuve.
-    `families` vient de `compiled_families` (#2664) ; une liste vide refuse
-    (aucune famille n'est supposée)."""
-    ident = _identity(environ, actor=actor)
+    Refuse hors tour (`AMEESH_TURN_ID` absent) sans session liée vérifiable, ou
+    sur un harnais que le canon ne déclare pas : une preuve sans identité ou
+    sans famille n'est pas une preuve. `families` vient de `compiled_families`
+    (#2664) ; une liste vide refuse (aucune famille n'est supposée). `db` est
+    requis pour la voie « session liée » ; sans lui, le comportement d'avant
+    (tour only) est conservé."""
+    ident = _identity(environ, actor=actor, db=db, cfg=cfg)
     if not families:
         raise ProvenanceError("no model families: the canon cannot be read")
     if ident["harness"] not in families:
@@ -292,19 +405,21 @@ def clear_commit_intent(cwd: str | None = None) -> None:
 
 
 def prepare_commit_intent(cwd: str | None = None, *, environ=None,
-                          actor: str = "") -> dict | None:
+                          actor: str = "", db=None, cfg=None) -> dict | None:
     """Écrit l'attestation du commit qui vient (hook `pre-commit`).
 
-    Elle lie le tour courant au HEAD et à l'arbre d'où le commit va partir.
-    Elle ne bloque jamais un commit : hors tour managé, sans identité ou sans
-    arbre calculable, elle n'est pas écrite (et toute attestation précédente
-    est retirée) — le commit naîtra sans preuve, son origine restera inconnue.
-    Aucune base n'est requise : c'est le hook `post-commit` qui écrit la preuve.
+    Elle lie l'identité courante au HEAD et à l'arbre d'où le commit va partir.
+    Elle ne bloque jamais un commit : hors tour managé sans session liée
+    vérifiable, sans identité ou sans arbre calculable, elle n'est pas écrite
+    (et toute attestation précédente est retirée) — le commit naîtra sans
+    preuve, son origine restera inconnue. Une base n'est lue que hors tour
+    managé, pour retrouver la liaison de session ; c'est le hook `post-commit`
+    qui écrit la preuve.
     """
     env = os.environ if environ is None else environ
     path = intent_path(cwd)
     try:
-        ident = _identity(env, actor=actor)
+        ident = _identity(env, actor=actor, db=db, cfg=cfg)
     except ProvenanceError:
         ident = None
     tree = _git(cwd, "write-tree") if ident is not None else None
@@ -317,6 +432,7 @@ def prepare_commit_intent(cwd: str | None = None, *, environ=None,
         "actor": ident["actor"],
         "turn": ident["turn"],
         "harness": ident["harness"],
+        "session": ident.get("session") or "",
         "head": _git(cwd, "rev-parse", "--verify", "--quiet", "HEAD^{commit}") or "",
         "tree": tree,
         # L'état de reflog AVANT le commit : le fait de création devra constater
@@ -445,7 +561,7 @@ def _head_reflog(cwd: str | None = None) -> tuple[str, str] | None:
 
 
 def prepare_commit_creation(cwd: str | None = None, *, environ=None,
-                            actor: str = "") -> dict | None:
+                            actor: str = "", db=None, cfg=None) -> dict | None:
     """Écrit le fait de création de l'objet qui vient de naître (hook `post-commit`).
 
     Il lie le tour courant à l'objet créé : `sha`, arbre et parents de HEAD,
@@ -459,13 +575,15 @@ def prepare_commit_creation(cwd: str | None = None, *, environ=None,
     portait : un HEAD inchangé, qui portait déjà son `commit:` d'un tour
     antérieur, n'est pas une création. Sans ces deux conditions, rien n'est
     écrit. Ne bloque jamais un commit ; aucune base n'est requise (c'est
-    `record_commit` qui écrit la preuve)."""
+    `record_commit` qui écrit la preuve). Hors tour, une base peut être
+    fournie pour retrouver la liaison de session ; sans elle, rien n'est
+    constaté."""
     env = os.environ if environ is None else environ
     path = created_path(cwd)
     if path is None:
         return None
     try:
-        ident = _identity(env, actor=actor)
+        ident = _identity(env, actor=actor, db=db, cfg=cfg)
     except ProvenanceError:
         return None
     intent = read_commit_intent(cwd)
@@ -488,6 +606,7 @@ def prepare_commit_creation(cwd: str | None = None, *, environ=None,
         "actor": ident["actor"],
         "turn": ident["turn"],
         "harness": ident["harness"],
+        "session": ident.get("session") or "",
         "sha": head,
         "tree": tree,
         "parents": parents,
@@ -509,21 +628,27 @@ def proof_for_current_turn(db, *, actor: str = "", sha: str = "",
                            cwd: str | None = None, required: bool = False) -> dict | None:
     """L'identité exacte du tour courant, ou None si le fait n'y est pas déclaré.
 
-    None couvre quatre cas, tous « origine inconnue » : pas de tour managé
-    (`AMEESH_TURN_ID` absent), pas de session vivante au registre pour l'acteur,
-    un `sha` déclaré qui n'est pas une abréviation hexadécimale (`HEAD`, nom de
-    branche), ou un `sha` hexadécimal que le dépôt ne résout pas. Un jalon hors
-    tour — ou dont le `sha` n'est pas un commit lisible — s'écrit donc sans
-    preuve, jamais avec une preuve que `receipt_for_milestone` devrait ensuite
-    refuser à jamais (N1 de la relecture Claude de #1465).
+    None couvre ces cas, tous « origine inconnue » : ni tour managé
+    (`AMEESH_TURN_ID` absent) ni session liée vérifiable, pas de session vivante
+    au registre pour l'acteur d'un tour, un `sha` déclaré qui n'est pas une
+    abréviation hexadécimale (`HEAD`, nom de branche), ou un `sha` hexadécimal
+    que le dépôt ne résout pas. Un jalon hors tour — ou dont le `sha` n'est pas
+    un commit lisible — s'écrit donc sans preuve, jamais avec une preuve que
+    `receipt_for_milestone` devrait ensuite refuser à jamais (N1 de la
+    relecture Claude de #1465). Une session liée écrit un reçu à `turn`
+    synthétique (`session:<id>`), jamais un faux tour managé.
 
     `required` (#3104) refuse ces cas par une `ProvenanceError` qui en nomme
     la cause : un verdict de tour managé ne doit jamais réussir sans reçu.
     Les gels et les déclarations hors tour gardent le comportement facultatif.
     """
     try:
-        ident = capture(actor=actor, families=compiled_families(db))
-        ident["session"] = live_session(db, ident["actor"], harness=ident["harness"])
+        ident = capture(actor=actor, families=compiled_families(db), db=db)
+        if "session" not in ident:
+            # Tour managé : la session est celle du registre vivant. Une session
+            # liée porte déjà la sienne, vérifiée par sa liaison.
+            ident["session"] = live_session(db, ident["actor"],
+                                            harness=ident["harness"])
     except ProvenanceError:
         if required:
             raise
@@ -651,10 +776,12 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
 
 
 #: les hooks posés par `ameesh provenance install` — ils ne bloquent JAMAIS un
-#: commit : hors tour managé, sans base ou sans ameesh, ils sortent 0.
-#: `pre-commit` atteste le commit qui vient (identité du tour, HEAD et arbre de
-#: départ) ; `post-commit` constate le fait de création de l'objet né, puis
-#: écrit la preuve en consommant les deux.
+#: commit : sans identité prouvable (tour managé ou session liée), sans base ou
+#: sans ameesh, ils sortent 0. `pre-commit` atteste le commit qui vient
+#: (identité, HEAD et arbre de départ) ; `post-commit` constate le fait de
+#: création de l'objet né, puis écrit la preuve en consommant les deux. Ils
+#: n'exigent pas `AMEESH_TURN_ID` : la commande cherche la liaison de session
+#: quand le tour manque (#3985).
 #:
 #: Chaque hook porte une ligne de signature EXACTE : `_install_one` ne reconnaît
 #: un hook comme le nôtre que sur cette ligne entière (ou sur un contenu
@@ -664,8 +791,7 @@ PRE_COMMIT_MARK = "# ameesh #1465 — attestation de creation du commit, avant q
 POST_COMMIT_MARK = "# ameesh #1465 — fait de creation de l'objet ne, puis preuve d'origine."
 PRE_COMMIT_HOOK = """#!/bin/sh
 # ameesh #1465 — attestation de creation du commit, avant qu'il naisse.
-# Ne bloque jamais un commit : hors tour manage ou sans ameesh, sort 0.
-[ "${AMEESH_TURN_ID:-}" ] || exit 0
+# Ne bloque jamais un commit : sans preuve possible ou sans ameesh, sort 0.
 command -v ameesh >/dev/null 2>&1 || exit 0
 ameesh provenance intent >/dev/null 2>&1 || exit 0
 exit 0
@@ -673,8 +799,7 @@ exit 0
 
 HOOK = """#!/bin/sh
 # ameesh #1465 — fait de creation de l'objet ne, puis preuve d'origine.
-# Ne bloque jamais un commit : hors tour manage ou sans base, sort 0.
-[ "${AMEESH_TURN_ID:-}" ] || exit 0
+# Ne bloque jamais un commit : sans preuve possible ou sans base, sort 0.
 command -v ameesh >/dev/null 2>&1 || exit 0
 ameesh provenance created >/dev/null 2>&1
 ameesh provenance record --commit HEAD --quiet >/dev/null 2>&1 || exit 0
@@ -761,6 +886,20 @@ def _connect():
     return db
 
 
+def _hook_db():
+    """La base des hooks hors tour, ou None (hook muet, jamais bloquant).
+
+    Un tour managé n'en a pas besoin : l'identité vient de l'environnement.
+    Hors tour (session liée), la liaison ne se lit qu'en base ; une base
+    absente ou illisible rend None et le hook n'atteste rien, comme avant."""
+    if os.environ.get("AMEESH_TURN_ID"):
+        return None
+    try:
+        return _connect()
+    except Exception:  # noqa: BLE001 - hook non bloquant
+        return None
+
+
 def build_parser():
     import argparse
     parser = argparse.ArgumentParser(
@@ -806,23 +945,34 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
         return 0 if out["installed"] else 1
     if args.command == "intent":
-        # aucune base requise : le hook `pre-commit` atteste, `post-commit` écrit
-        attestation = prepare_commit_intent()
+        # Aucune base sous tour managé ; hors tour, la liaison de session se
+        # lit en base. Le hook ne bloque jamais un commit.
+        db = _hook_db()
+        try:
+            attestation = prepare_commit_intent(db=db)
+        finally:
+            if db is not None:
+                db.close()
         if args.json:
             print(json.dumps(attestation, sort_keys=True))
         return 0
     if args.command == "created":
-        # aucune base requise : le hook `post-commit` constate l'objet né
-        creation = prepare_commit_creation()
+        db = _hook_db()
+        try:
+            creation = prepare_commit_creation(db=db)
+        finally:
+            if db is not None:
+                db.close()
         if args.json:
             print(json.dumps(creation, sort_keys=True))
         return 0
     db = _connect()
     try:
         if args.command == "record":
-            identity = capture(families=compiled_families(db))
-            identity["session"] = live_session(db, identity["actor"],
-                                               harness=identity["harness"])
+            identity = capture(families=compiled_families(db), db=db)
+            if "session" not in identity:
+                identity["session"] = live_session(db, identity["actor"],
+                                                   harness=identity["harness"])
             row = record_commit(db, args.commit, identity=identity,
                                 work_item_id=args.lot)
             if args.json:
