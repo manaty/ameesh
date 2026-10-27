@@ -1352,7 +1352,7 @@ class WorkItems(interface.WorkItems):
         return [int(r["id"]) for r in rows]
 
     def handoff(self, item_id, assignee, *, current, state, paused_prefix, note_prefix,
-                window_s, max_per_window, note, actor) -> dict | None:
+                window_s, max_per_window, note, actor, still_paused=None) -> dict | None:
         """L233b : toutes les conditions relues sous le verrou, dans la
         transaction qui écrit (codex r1, #409) : deux `notify` sur deux hôtes
         ne dépassent ni le plafond ni ne donnent deux lots au même preneur ;
@@ -1372,9 +1372,12 @@ class WorkItems(interface.WorkItems):
                     "SELECT 1 FROM work_items WHERE assignee = %%s"
                     "   AND state NOT IN %s LIMIT 1" % _CLOSED, (assignee,)):
                 return None
-            if not tx.query("SELECT 1 FROM agent_registry WHERE name = %s"
-                            "   AND status = 'blocked' AND starts_with(status_text, %s)"
-                            " FOR SHARE", (current, paused_prefix)):
+            paused = tx.query("SELECT status_text FROM agent_registry WHERE name = %s"
+                              "   AND status = 'blocked' AND starts_with(status_text, %s)"
+                              " FOR SHARE", (current, paused_prefix))
+            if not paused:
+                return None
+            if still_paused is not None and not still_paused(paused[0]["status_text"]):
                 return None
             return WorkItems(tx)._reassign(item_id, assignee, current, state, note, actor)
 

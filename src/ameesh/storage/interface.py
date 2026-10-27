@@ -2343,7 +2343,8 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str | None, *, current: str, state: str,
                 paused_prefix: str, note_prefix: str, window_s: float,
-                max_per_window: int, note: str, actor: str) -> dict | None:
+                max_per_window: int, note: str, actor: str,
+                still_paused=None) -> dict | None:
         """L233b : `current`, en pause budget, cède le lot à `assignee`, en UNE
         transaction sous verrou consultatif (une reprise à la fois pour tout
         le mesh), journalisée comme `assign` ; None si l'une des conditions
@@ -2355,7 +2356,11 @@ class WorkItems(Domain):
         `window_s` dernières secondes.
 
         `assignee` None rend le lot à la file d'équipe (assigné NULL, L165) :
-        aucun contrôle du preneur n'a lieu, les autres tiennent."""
+        aucun contrôle du preneur n'a lieu, les autres tiennent.
+
+        #4066 : `still_paused(status_text)`, s'il est donné, juge aussi la
+        pause relue sous le verrou (une pause devenue la seule fenêtre courte
+        du compte ne cède plus rien)."""
 
     @abc.abstractmethod
     def delegate(self, item_id: int, delegate: str, *, current: str | None,
