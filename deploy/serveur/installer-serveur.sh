@@ -118,9 +118,9 @@ ALTER ROLE ameesh PASSWORD '$PW';
 -- passent pas par ameesh (psql, script de déploiement, nouveau rôle).
 ALTER ROLE ameesh SET jit = off;
 -- #3836 : une session laissée `idle in transaction` tenait les verrous du
--- mesh (sept minutes lors du gel #3700). La garde serveur la coupe à 2 min ;
--- le code du gel ne va plus au réseau dans sa transaction, et cette valeur
--- couvre le travail local légitime qui y reste.
+-- mesh (sept minutes lors du gel #3700). La garde serveur la coupe à 3 min
+-- (180 s) ; le code du gel ne va plus au réseau dans sa transaction, et cette
+-- valeur couvre le travail local légitime qui y reste.
 ALTER ROLE ameesh SET idle_in_transaction_session_timeout = '180s';
 SQL
 runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'ameesh'" | grep -q 1 \

@@ -69,6 +69,12 @@ class DeployGuardTest(unittest.TestCase):
         self.assertIn("ALTER DATABASE ameesh SET idle_in_transaction_session_timeout"
                       " = '180s'", text)
 
+    def test_the_installer_comment_matches_the_three_minute_guard(self):
+        # N1 revue #3836 : le commentaire disait « 2 min » pour 180 s.
+        text = self._read("deploy", "serveur", "installer-serveur.sh")
+        self.assertIn("garde serveur la coupe à 3 min", text)
+        self.assertNotIn("coupe à 2 min", text)
+
 
 if __name__ == "__main__":
     unittest.main()
