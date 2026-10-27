@@ -31,6 +31,13 @@
 # atteste ; l'attestation le nomme dans `reportes`, sans bloquer la sequence
 # (bureau #147558). Les trois VM d'agents ne sont jamais reportables.
 #
+# Les outils python de la sequence (sonde de courrier, notification) tournent
+# avec le venv du lanceur sur le poste et les VM d'agents ; ailleurs
+# (bureau-goal, sans venv ameesh ni route vers la base), sur HOTE_OUTILS, une
+# VM d'agents de la sequence (HOTE_MIGRATIONS par defaut), par ssh (#3976).
+# Une sonde qui n'a pas pu tourner (outil absent, ssh, base injoignable) est
+# non concluante (canon §3) : aucun retour de l'hote, sequence arretee en 3.
+#
 # Sans HOTES_STAGING (cas de bureau-goal, qui n'a qu'un fichier par VM), la
 # topologie est composee des bascule-a1.env, bascule-a2.env et bascule-agents-3.env du dossier de
 # BASCULE_ENV (AGENTS_SSH + HOTE_AGENTS) et de SERVEUR_SSH (ou VM) pour
@@ -423,6 +430,44 @@ if [ "$POSTE_ABSENT" = 0 ]; then
   case " ${HOTES[*]} " in *" pc-smichea "*) ;; *) SEQUENCE_COMPLETE=0 ;; esac
 fi
 
+# Hote des migrations quand le poste est absent (#3848), choisi et valide avant
+# toute mutation : une VM d'agents de la sequence.
+HOTE_MIGRATIONS=${HOTE_MIGRATIONS:-}
+if [ "$POSTE_ABSENT" = 1 ]; then
+  if [ -z "$HOTE_MIGRATIONS" ]; then
+    for nom in ameesh-agents-2 ameesh-agents-1 ameesh-agents-3; do
+      case " ${HOTES[*]} " in *" $nom "*) HOTE_MIGRATIONS=$nom; break ;; esac
+    done
+  fi
+  if [ -z "$HOTE_MIGRATIONS" ] || [ "$(mode_de "$HOTE_MIGRATIONS")" != agents ]; then
+    echo "HOTE_MIGRATIONS (« ${HOTE_MIGRATIONS:-absent} ») doit etre une VM d'agents de la sequence" >&2
+    exit 2
+  fi
+  case " ${HOTES[*]} " in
+    *" $HOTE_MIGRATIONS "*) ;;
+    *) echo "HOTE_MIGRATIONS (« $HOTE_MIGRATIONS ») n'est pas dans la sequence (${HOTES[*]})" >&2; exit 2 ;;
+  esac
+fi
+
+# #3976 : les outils python de la sequence (sonde de courrier, notification)
+# ont besoin du venv ameesh et d'une route vers la base. Le poste et les VM
+# d'agents les ont ; ailleurs (bureau-goal), ils tournent sur HOTE_OUTILS, une
+# VM d'agents de la sequence (HOTE_MIGRATIONS par defaut), sous l'utilisateur
+# ameesh, avec l'instantane src du commit vise (migrer_depuis_vm).
+OUTILS_DISTANTS=0
+if [ "$(mode_de "$HOTE_LOCAL")" != poste ] && [ "$(mode_de "$HOTE_LOCAL")" != agents ]; then
+  OUTILS_DISTANTS=1
+  HOTE_OUTILS=${HOTE_OUTILS:-$HOTE_MIGRATIONS}
+  if [ -z "$HOTE_OUTILS" ] || [ "$(mode_de "$HOTE_OUTILS")" != agents ]; then
+    echo "HOTE_OUTILS (« ${HOTE_OUTILS:-absent} ») doit etre une VM d'agents de la sequence" >&2
+    exit 2
+  fi
+  case " ${HOTES[*]} " in
+    *" $HOTE_OUTILS "*) ;;
+    *) echo "HOTE_OUTILS (« $HOTE_OUTILS ») n'est pas dans la sequence (${HOTES[*]})" >&2; exit 2 ;;
+  esac
+fi
+
 # VM sert aussi a poste.sh (migrations, sauvegarde) : la topologie et VM
 # doivent dire la meme chose. La topologie composee pose VM depuis SERVEUR_SSH.
 ADRESSE_MESH=${CIBLE[manaty-mesh-1]#*@}
@@ -607,9 +652,56 @@ sauvegarde_serveur_vm() {
     sha256sum -- "$f" | cut -d" " -f1
   '
 }
+# #3976 : un outil python de la sequence (script, ou « - » pour une source sur
+# l'entree standard). En local avec le venv du lanceur ; sinon sur HOTE_OUTILS
+# (voir plus haut) : la source part sur l'entree standard de ssh, chaque
+# argument est cite pour le shell distant, PYTHONPATH vise l'instantane src du
+# commit (absent, python l'ignore et prend le paquet installe). Un outil qui ne
+# peut pas tourner (venv absent, ssh en echec : 127, 255…) n'est jamais lu comme
+# un verdict sur un hote : voir verdict_sonde.
+citer() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+py_sequence() {  # script|- [args…]
+  local script=$1 a commande
+  shift
+  if [ "$OUTILS_DISTANTS" != 1 ]; then
+    "$VENV/bin/python" "$script" "$@"
+    return
+  fi
+  commande="runuser -u ameesh -- env HOME=/home/ameesh"
+  commande+=" PYTHONPATH=$(citer "$SNAP_VM/snap-${SHA:0:8}/src")"
+  commande+=" /home/ameesh/.local/share/ameesh/venv/bin/python3 -"
+  for a in "$@"; do commande+=" $(citer "$a")"; done
+  if [ "$script" = - ]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 \
+      "${CIBLE[$HOTE_OUTILS]}" "$commande"
+  else
+    ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 \
+      "${CIBLE[$HOTE_OUTILS]}" "$commande" < "$script"
+  fi
+}
+# Verdict d'une sonde de courrier (#3976, canon §3) : « ok » (code 0), « ko »
+# (code 1 ET rapport JSON de sante-courrier.py au verdict ko : la sonde a
+# tourne et constate un defaut de l'hote), sinon « non-concluant » : outil
+# absent (126, 127), ssh en echec (255), base injoignable (verdict
+# non-concluant, code 3), sortie sans rapport. Seul « ko » rend l'hote malsain.
+verdict_sonde() {  # code sortie
+  [ "$1" = 0 ] && { echo ok; return; }
+  if [ "$1" = 1 ] && printf '%s\n' "$2" | python3 -c 'import json, sys
+lignes = [l for l in sys.stdin.read().splitlines() if l.strip()]
+try:
+    rapport = json.loads(lignes[-1])
+except (IndexError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(rapport, dict) and rapport.get("verdict") == "ko" else 1)'; then
+    echo ko
+  else
+    echo non-concluant
+  fi
+}
 sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
-  local nom=$1 sans=${2:-} cible_sonde var sortie args_hote=()
+  local nom=$1 sans=${2:-} cible_sonde var sortie rc args_hote=() args_sonde=()
   SANTE_DETAIL=""
+  SANTE_RC=""
   var=$(var_sonde_de "$nom")
   cible_sonde=${!var:-}
   if [ "$(mode_de "$nom")" = poste ]; then
@@ -624,25 +716,27 @@ sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
   fi
   if [ "$SONDE" = 1 ] && [ "$sans" != jamais ]; then
     etape "courrier de $nom (sonde de remise reelle)"
-    sortie=$("$VENV/bin/python" "$SONDE_PY" --hote "$nom" --sonde "${cible_sonde:-auto}" \
-      --attente "$ATTENTE_COURRIER" --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json \
-      ${args_hote[@]+"${args_hote[@]}"}) \
-      || { printf '%s\n' "$sortie"; SANTE_DETAIL=$sortie; return 1; }
-    printf '%s\n' "$sortie"
-    SANTE_DETAIL=$sortie
+    args_sonde=(--sonde "${cible_sonde:-auto}" --attente "$ATTENTE_COURRIER")
   else
     etape "courrier de $nom (lecture seule, sonde desactivee)"
-    sortie=$("$VENV/bin/python" "$SONDE_PY" --hote "$nom" --sonde jamais \
-      --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json \
-      ${args_hote[@]+"${args_hote[@]}"}) \
-      || { printf '%s\n' "$sortie"; SANTE_DETAIL=$sortie; return 1; }
-    printf '%s\n' "$sortie"
-    SANTE_DETAIL=$sortie
+    args_sonde=(--sonde jamais)
   fi
+  rc=0
+  sortie=$(py_sequence "$SONDE_PY" --hote "$nom" "${args_sonde[@]}" \
+    --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json \
+    ${args_hote[@]+"${args_hote[@]}"}) || rc=$?
+  printf '%s\n' "$sortie"
+  SANTE_DETAIL=$sortie
+  # 3 : la sonde n'a pas pu tourner (non concluant), jamais un hote malsain
+  case "$(verdict_sonde "$rc" "$sortie")" in
+    ok) return 0 ;;
+    ko) return 1 ;;
+    *) SANTE_RC=$rc; return 3 ;;
+  esac
 }
 notifier() {  # sujet corps
   local sujet=$1 corps=$2
-  "$VENV/bin/python" - "$NOTIF_STAGING" "$sujet" "$corps" <<'PY' \
+  py_sequence - "$NOTIF_STAGING" "$sujet" "$corps" <<'PY' \
     || echo "notification non remise (courrier indisponible)" >&2
 import sys
 from ameesh import config, db, mail, work
@@ -688,6 +782,19 @@ echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
     "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail). Retour automatique effectue et controle (unites, baux, doctor). Sequence arretee avant les hotes suivants : rien d'autre n'a ete modifie.$complement Trace : $JOURNAL"
   echo "sequence arretee sur $nom (retour effectue et controle)" >&2
   exit 1
+}
+
+# #3976 : la sonde n'a pas pu tourner (outil absent, ssh, base injoignable) :
+# non concluant (canon §3), jamais « malsain ». Aucun retour de l'hote, qui a
+# passe installer, redemarrer et controler ; la sequence s'arrete et le dit.
+sonde_non_concluante() {  # nom
+  local nom=$1 detail
+  detail="sonde de courrier non concluante (code ${SANTE_RC:-?}) : l'outil n'a pas pu tourner, aucun retour"
+  trace "$nom" sante non-concluant "$detail" "$SANTE_DETAIL"
+  echo "!! $nom : $detail ; $nom reste sur $SHA_TRAVE, sequence arretee avant les hotes suivants" >&2
+  notifier "staging : sonde de $nom non concluante, sequence arretee sans retour" \
+    "Le staging $SHA_TRAVE a installe, redemarre et controle $nom, mais sa sonde de courrier n'a pas pu tourner ($detail). Non concluant (canon §3) : $nom n'est PAS remis en arriere ; sequence arretee avant les hotes suivants, aucune attestation. Corriger l'outil puis relancer (un hote deja au commit n'est pas reinstalle). Sortie de la sonde : ${SANTE_DETAIL:-vide}. Trace : $JOURNAL"
+  exit 3
 }
 
 # --- plan -----------------------------------------------------------------
@@ -777,21 +884,8 @@ fi
 
 if [ "$POSTE_ABSENT" = 1 ]; then
   # Chemin VM (#3848) : la base commune est migree depuis une VM d'agents, avec
-  # le meme instantane et la meme garde additive que le bureau.
-  HOTE_MIGRATIONS=${HOTE_MIGRATIONS:-}
-  if [ -z "$HOTE_MIGRATIONS" ]; then
-    for nom in ameesh-agents-2 ameesh-agents-1 ameesh-agents-3; do
-      case " ${HOTES[*]} " in *" $nom "*) HOTE_MIGRATIONS=$nom; break ;; esac
-    done
-  fi
-  if [ -z "$HOTE_MIGRATIONS" ] || [ "$(mode_de "$HOTE_MIGRATIONS")" != agents ]; then
-    echo "HOTE_MIGRATIONS (« ${HOTE_MIGRATIONS:-absent} ») doit etre une VM d'agents de la sequence" >&2
-    exit 2
-  fi
-  case " ${HOTES[*]} " in
-    *" $HOTE_MIGRATIONS "*) ;;
-    *) echo "HOTE_MIGRATIONS (« $HOTE_MIGRATIONS ») n'est pas dans la sequence (${HOTES[*]})" >&2; exit 2 ;;
-  esac
+  # le meme instantane et la meme garde additive que le bureau (HOTE_MIGRATIONS
+  # est choisi et valide avant le plan, avec HOTE_OUTILS).
   etape "migrations de $SHA_TRAVE depuis $HOTE_MIGRATIONS (poste absent, additives seulement)"
   if ! migrer_depuis_vm "$HOTE_MIGRATIONS" "$SHA"; then
     trace "$HOTE_MIGRATIONS" migrations ko "migrations en echec depuis la VM"
@@ -839,7 +933,13 @@ for nom in "${HOTES[@]}"; do
   exec_hote "$nom" controler || echec_hote "$nom" controler "controles en echec"
   trace "$nom" controler ok
   etape "$nom : sante"
-  sante_hote "$nom" || echec_hote "$nom" sante "sante en echec"
+  rc=0
+  sante_hote "$nom" || rc=$?
+  case $rc in
+    0) ;;
+    3) sonde_non_concluante "$nom" ;;
+    *) echec_hote "$nom" sante "sante en echec" ;;
+  esac
   # `detail` reste le rapport JSON (lu par actif.py) ; le meme contenu part en
   # objet `rapport` pour la lecture structuree de la trace (#2190).
   trace "$nom" sante ok "$SANTE_DETAIL" "$SANTE_DETAIL"
