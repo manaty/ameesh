@@ -335,6 +335,31 @@ class PaquetAutoBanc(unittest.TestCase):
         with self.assertRaises(paquet_auto.InputError):
             paquet_auto.ensure_source(self.repo, candidate)
 
+    def test_source_remise_fetchee_par_sa_ref(self) -> None:
+        # #3916 : la remise n'est que sous refs/ameesh/resolutions/ d'origin ;
+        # fetcher la branche ne l'apporte pas, sa ref si.
+        origin = pathlib.Path(self.tmp.name) / "origin"
+        self.git("clone", "-q", "--bare", str(self.repo), str(origin))
+        remise = self.lot(7, "remise.txt", "remise\n")
+        ref = "refs/ameesh/resolutions/7/main-%s" % remise[:9]
+        self.git("push", "-q", str(origin), "%s:%s" % (remise, ref))
+        self.git("branch", "-D", "lot/7")
+        clone = pathlib.Path(self.tmp.name) / "clone"
+        self.git("clone", "-q", "--no-local", str(origin), str(clone))
+        self.assertIsNone(paquet_auto.rev(clone, remise))
+        candidate = paquet_auto.Candidate(
+            7, remise, branch="lot/7", remise_ref=ref)
+        paquet_auto.ensure_source(clone, candidate)
+        self.assertEqual(candidate.source, remise)
+
+    def test_remise_d_un_autre_lot_refusee_avant_fetch(self) -> None:
+        for ref in ("refs/ameesh/resolutions/8/main-abc",
+                    "refs/heads/main", "--upload-pack=evil",
+                    "refs/ameesh/resolutions/7/"):
+            candidate = paquet_auto.Candidate(7, "deadbeef" * 5, remise_ref=ref)
+            with self.assertRaises(paquet_auto.InputError, msg=ref):
+                paquet_auto.ensure_source(self.repo, candidate)
+
     def test_conflit_ecarte_sans_rien_commiter(self) -> None:
         first, conflict, third = self.fixture()
         worktree = self.worktree("banc")
@@ -397,6 +422,26 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertEqual([item.lot for item in errors], [7])
         self.assertIn("jamais composé", errors[0].reason)
         self.assertIn("porte illisible", errors[0].detail)
+
+    def test_remise_portee_par_le_candidat(self) -> None:
+        ref = "refs/ameesh/resolutions/7/main-fb029a526"
+        payload = {
+            "schema": "ameesh-packet-candidates/1",
+            "base_source": "option",
+            "ready": [7, 8],
+            "candidates": [
+                {"work_item": 7, "source": self.base,
+                 "remise": {"ref": ref, "sha": self.base}},
+                {"work_item": 8, "source": self.base, "remise": None},
+            ],
+            "errors": [],
+        }
+        head = self._fake_candidates(payload, 0)
+        worktree = self.worktree("candidats-remise", head)
+        ready = pathlib.Path(self.tmp.name) / "prets.txt"
+        candidates, _got = paquet_auto.compute_candidates(
+            worktree, "main", self.base, ready)
+        self.assertEqual([c.remise_ref for c in candidates], [ref, ""])
 
     def test_erreur_globale_interrompt_la_composition(self) -> None:
         payload = {
