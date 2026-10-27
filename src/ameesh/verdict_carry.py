@@ -28,7 +28,9 @@ répété, ni second avis sur delta ») ; ce module le fait sans jugement (§7).
 Tout autre écart laisse la porte exiger ses verdicts : un commit de l'auteur,
 une fusion « maligne », le contenu d'une branche qui n'est pas dans la cible,
 une résolution de conflit (la tête relue ne fusionne plus proprement : la
-résolution est un jugement, que seule la dispense du pilote couvre, #1979), et
+résolution est un jugement, que seule la dispense du pilote couvre, #1979) —
+sauf (#4053, canon §2 « conflit mécanique : aucun avis ») celle que git
+calcule en prenant le côté de la cible (`-X ours`), sans ligne nouvelle —, et
 par prudence un réalignement dont les lignes de contexte ont bougé près des
 morceaux du lot. Une cible illisible, un commit absent ou une fusion d'essai
 ratée ne prouvent rien : pas de report. Un **clone superficiel** ne prouve rien
@@ -202,19 +204,25 @@ def pending(marks, frozen) -> dict:
 
 
 def merged_tree(repo: str, target: str, head: str, *, base: str | None = None,
-                attributes: str | None = None) -> str | None:
+                attributes: str | None = None, favor: str | None = None) -> str | None:
     """L'arbre de la fusion d'essai **propre** de `head` dans `target`, ou None
     (conflit, commit inconnu, git en échec). `base` impose la base de fusion
     (un cherry-pick : `base` = parent du commit repris). Les objets écrits vont
     dans un dossier jetable (le dépôt en alternates) : rien n'entre dans `.git`
     (L230). Les attributs de fusion se lisent dans l'arbre de `attributes`, la
-    cible par défaut (#1517)."""
+    cible par défaut (#1517). `favor` (#4053, `ours` = `target`, `theirs` =
+    `head`) résout les morceaux en conflit de contenu de ce côté (`-X`) ; un
+    conflit d'une autre nature (suppression, renommage) reste un échec."""
     from . import radar
     objects = plan_git._out(repo, "rev-parse", "--path-format=absolute",
                             "--git-path", "objects")
     if not objects:
         return None
     extra = ["--merge-base", base] if base else []
+    if favor:
+        if favor not in ("ours", "theirs"):
+            raise ValueError("favor: ours or theirs")
+        extra += ["-X", favor]
     scratch = tempfile.mkdtemp(prefix="ameesh-carry-")
     try:
         proc = radar._scratch_git(repo, objects, scratch,
@@ -231,8 +239,46 @@ def merged_tree(repo: str, target: str, head: str, *, base: str | None = None,
     return lines[0].strip() if lines else None
 
 
+def conflict_hunks(repo: str, target: str, head: str) -> int | None:
+    """#4053 : le nombre de morceaux en conflit de la fusion d'essai de `head`
+    dans `target` (marques `<<<<<<<` de l'arbre écrit par git), ou None si
+    rien n'est lisible. Sert à la raison tracée, jamais à la preuve."""
+    from . import radar
+    objects = plan_git._out(repo, "rev-parse", "--path-format=absolute",
+                            "--git-path", "objects")
+    if not objects:
+        return None
+    scratch = tempfile.mkdtemp(prefix="ameesh-carry-")
+    try:
+        proc = radar._scratch_git(repo, objects, scratch,
+                                  "-c", "attr.tree=%s" % target,
+                                  "merge-tree", "--write-tree", "-z", "--name-only",
+                                  "--no-messages", target, head)
+        if proc.returncode != 1:
+            return None
+        lines = radar._lines(proc)
+        if len(lines) < 2:
+            return None
+        hunks = 0
+        for path in dict.fromkeys(lines[1:]):
+            blob = radar._scratch_git(repo, objects, scratch, "cat-file", "blob",
+                                      "%s:%s" % (lines[0].strip(), path))
+            if blob.returncode != 0:
+                return None
+            hunks += sum(1 for line in blob.stdout.splitlines()
+                         if line.startswith(b"<<<<<<< "))
+        return hunks
+    except radar.GitError:
+        return None
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 #: commits nouveaux examinés au plus pour une preuve d'historique (borne de coût)
 MAX_NEW_COMMITS = 200
+#: commits relus essayés au plus pour un commit rejoué dont le conflit a été
+#: résolu côté cible (#4053) : son patch-id ne nomme plus le commit repris
+MAX_REPLAY_CANDIDATES = 20
 
 
 def _lines_of(repo: str, *args: str) -> list[str] | None:
@@ -314,7 +360,8 @@ def _same_delta_with_landed(repo: str, reviewed: str, frozen: str,
     return True, "%d reviewed commit(s) already landed in the target ignored" % len(dropped)
 
 
-def mechanical_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
+def mechanical_history(repo: str, reviewed: str, frozen: str, tip: str, *,
+                       target_side: bool = False) -> tuple:
     """R1 cx1/qa-01 : chaque commit atteignable depuis `frozen` mais ni depuis
     `reviewed` ni depuis la cible `tip` est **mécanique** — rien de ce que la
     nouvelle tête apporte à l'historique n'est un contenu neuf :
@@ -324,6 +371,13 @@ def mechanical_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple
     * un commit à un parent qui reprend proprement (cherry-pick, rebase) un
       commit de l'historique relu de même patch-id : son arbre est la fusion
       d'essai du commit repris sur son parent, avec pour base le parent repris.
+
+    `target_side` (#4053) admet en plus la résolution **côté cible** calculée
+    par git (`-X`), sans aucune ligne de l'auteur : une fusion dont l'arbre est
+    celle de ses parents, conflits résolus du côté du parent ancêtre de `tip` ;
+    un commit rejoué dont l'arbre est la reprise d'un commit relu, conflits
+    résolus du côté de son parent (son patch-id a changé avec le conflit : les
+    commits relus sont essayés, au plus `MAX_REPLAY_CANDIDATES`).
 
     Une copie à la main d'un fichier de la cible, un ajout suivi d'un retrait
     (un secret resterait dans l'historique), une fusion « maligne » ou le
@@ -339,6 +393,7 @@ def mechanical_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple
     if len(new) > MAX_NEW_COMMITS:
         return False, "too many new commits to prove (%d)" % len(new)
     sources = None
+    resolved = 0
     for commit in new:
         parents = _lines_of(repo, "rev-list", "--parents", "-n", "1", commit)
         tree = plan_git._out(repo, "rev-parse", commit + "^{tree}")
@@ -346,9 +401,14 @@ def mechanical_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple
             return False, "commit %s cannot be read" % commit[:12]
         parents = parents[1:]
         if len(parents) == 2:
-            if merged_tree(repo, parents[0], parents[1], attributes=parents[0]) != tree:
+            if merged_tree(repo, parents[0], parents[1], attributes=parents[0]) == tree:
+                continue
+            favor = _target_parent(repo, parents, tip) if target_side else None
+            if not favor or merged_tree(repo, parents[0], parents[1], attributes=parents[0],
+                                        favor=favor) != tree:
                 return False, ("merge %s is not the clean, unmodified merge of its parents "
                                "(conflict resolved or content added)" % commit[:12])
+            resolved += 1
             continue
         if len(parents) != 1:
             return False, "commit %s has %d parents" % (commit[:12], len(parents))
@@ -362,22 +422,65 @@ def mechanical_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple
         except Exception:  # noqa: BLE001 - idem
             pid = None
         source = sources.get(pid) if pid else None
-        origin = _lines_of(repo, "rev-list", "--parents", "-n", "1", source) if source else None
-        if not origin or len(origin) != 2:
-            return False, ("commit %s is not a replay of a reviewed commit: new content "
-                           "in the history" % commit[:12])
-        if merged_tree(repo, parents[0], source, base=origin[1],
-                       attributes=parents[0]) != tree:
+        if source:
+            if _replays(repo, parents[0], source, tree):
+                continue
+            if target_side and _replays(repo, parents[0], source, tree, favor="ours"):
+                resolved += 1
+                continue
             return False, ("commit %s is not the clean replay of reviewed commit %s"
                            % (commit[:12], source[:12]))
+        if target_side and any(
+                _replays(repo, parents[0], candidate, tree, favor="ours")
+                for candidate in list(sources.values())[:MAX_REPLAY_CANDIDATES]):
+            resolved += 1
+            continue
+        return False, ("commit %s is not a replay of a reviewed commit: new content "
+                       "in the history" % commit[:12])
+    if resolved:
+        return True, ("%d mechanical commit(s), %d resolved on the target side"
+                      % (len(new), resolved))
     return True, "%d mechanical commit(s)" % len(new)
+
+
+def _replays(repo: str, parent: str, source: str, tree: str, *,
+             favor: str | None = None) -> bool:
+    """L'arbre `tree` est-il la reprise du commit relu `source` sur `parent`
+    (base : le parent de `source`) ? Un commit de fusion ne se rejoue pas."""
+    origin = _lines_of(repo, "rev-list", "--parents", "-n", "1", source)
+    if not origin or len(origin) != 2:
+        return False
+    return merged_tree(repo, parent, source, base=origin[1], attributes=parent,
+                       favor=favor) == tree
+
+
+def _target_parent(repo: str, parents: list, tip: str) -> str | None:
+    """#4053 : le côté cible d'une fusion à deux parents, au sens de `-X` —
+    `ours` si seul le premier parent est ancêtre de `tip`, `theirs` si seul le
+    second l'est ; None sinon (aucun côté cible prouvé)."""
+    inside = [plan_git._git(repo, "merge-base", "--is-ancestor", p, tip).returncode == 0
+              for p in parents]
+    if inside == [True, False]:
+        return "ours"
+    if inside == [False, True]:
+        return "theirs"
+    return None
 
 
 def realigned(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
     """`frozen` est-elle un réalignement mécanique de `reviewed` sur la cible
     de pointe `tip` ? Trois preuves : même atterrissage, historique mécanique,
     même delta de lot. Rend `(oui, raison)` ; la raison dit pourquoi non. Un
-    clone superficiel est refusé d'emblée (N2 #2486)."""
+    clone superficiel est refusé d'emblée (N2 #2486).
+
+    #4053 — conflit résolu **côté cible** (canon §2 : « conflit mécanique :
+    aucun avis ») : quand la tête relue ne fusionne plus proprement, la
+    résolution reste mécanique si la fusion d'essai de `reviewed` dans `tip`,
+    morceaux en conflit pris du côté de la cible (`-X ours`), donne l'arbre de
+    la fusion propre de `frozen` : aucune ligne nouvelle. L'historique doit
+    alors être mécanique au même sens (`target_side`) ; il tient lieu de preuve
+    du delta, que le conflit résolu change par construction. Toute autre
+    résolution (une ligne ajoutée, le côté du lot) reste un jugement."""
     if not _complete_history(repo):
         return False, "complete Git history required; shallow clone refused"
     if _same(reviewed, frozen):
@@ -387,8 +490,18 @@ def realigned(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
         return False, "the frozen head does not merge cleanly into the target"
     ours = merged_tree(repo, tip, reviewed)
     if ours is None:
-        return False, ("the reviewed head no longer merges cleanly into the target: "
-                       "the new head resolves a conflict (a judgment, not a realignment)")
+        if merged_tree(repo, tip, reviewed, favor="ours") != theirs:
+            return False, ("the reviewed head no longer merges cleanly into the target: "
+                           "the new head resolves a conflict (a judgment, not a "
+                           "realignment)")
+        history, why = mechanical_history(repo, reviewed, frozen, tip, target_side=True)
+        if not history:
+            return False, ("conflict resolved like the target, but the history is not "
+                           "mechanical: %s" % why)
+        hunks = conflict_hunks(repo, tip, reviewed)
+        return True, ("conflict resolved on the target side: %s hunk(s) already carried "
+                      "by the target, no new line (%s)"
+                      % ("?" if hunks is None else hunks, why))
     if ours != theirs:
         return False, ("landing the frozen head would not land the reviewed content: "
                        "the merge results differ")

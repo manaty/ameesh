@@ -3,7 +3,8 @@
 
 Témoins : le critère (fusions d'essai propres et même arbre sur la pointe de la
 cible) — fusion de la cible, rebasage, cible avancée depuis, commit de l'auteur,
-fusion « maligne », résolution de conflit ; les candidats au report (dernier
+fusion « maligne », résolution de conflit (côté cible : reportée,
+#4053 ; ligne ajoutée ou côté du lot : refusée) ; les candidats au report (dernier
 verdict de chaque relecteur, hors tête gelée) ; puis sur Postgres le report de
 bout en bout : jalons au nom des relecteurs, porte franchie, blocage reporté,
 idempotence, issue négative journalisée une fois, verdict déjà rendu sur la
@@ -178,6 +179,96 @@ class CriterionTest(unittest.TestCase):
         ok, why = verdict_carry.realigned(self.repo.root, reviewed, frozen, tip)
         self.assertFalse(ok)
         self.assertIn("resolves a conflict", why)
+
+    def _conflict(self):
+        """#4053 : R ajoute lot2.txt, puis modifie la ligne 2 de shared.txt et
+        lot.txt (le commit garde un contenu une fois le conflit résolu côté
+        cible) ; la cible modifie la même ligne. Rend (R, T)."""
+        _git(self.repo.root, "switch", "-q", "lot/9-x")
+        _commit(self.repo.root, "lot2.txt", "lot2\n", "lot 2")
+        with open(os.path.join(self.repo.root, "lot.txt"), "w", encoding="utf-8") as fh:
+            fh.write("lot, edited\n")
+        _git(self.repo.root, "add", "lot.txt")
+        reviewed = _commit(self.repo.root, "shared.txt", "one\nLOT\nthree\n", "lot edit")
+        _git(self.repo.root, "switch", "-q", "main")
+        tip = _commit(self.repo.root, "shared.txt", "one\nMAIN\nthree\n", "main edit")
+        return reviewed, tip
+
+    def _rebase(self, tip, resolution):
+        """Rebase à la main de R sur T ; le conflit de shared.txt prend `resolution`."""
+        _git(self.repo.root, "switch", "-q", "-c", "rebased-4053", tip)
+        _git(self.repo.root, "cherry-pick", "%s..lot/9-x~1" % self.repo.b0)
+        subprocess.run(["git", "-C", self.repo.root, "cherry-pick", "lot/9-x"],
+                       env=ENV, capture_output=True)
+        with open(os.path.join(self.repo.root, "shared.txt"), "w", encoding="utf-8") as fh:
+            fh.write(resolution)
+        _git(self.repo.root, "add", "shared.txt")
+        _git(self.repo.root, "-c", "core.editor=true", "cherry-pick", "--continue")
+        return _git(self.repo.root, "rev-parse", "HEAD")
+
+    def test_a_rebase_resolved_on_the_target_side_is_a_realignment(self):
+        # #4053, témoin 1 (#3993, 78f18bd4 → 5b64add1) : rebase dont le seul
+        # morceau en conflit prend le côté de la cible ; aucune ligne nouvelle.
+        reviewed, tip = self._conflict()
+        frozen = self._rebase(tip, "one\nMAIN\nthree\n")
+        self.assertIsNone(verdict_carry.merged_tree(self.repo.root, tip, reviewed))
+        self.assertEqual(verdict_carry.conflict_hunks(self.repo.root, tip, reviewed), 1)
+        self.assertEqual(
+            verdict_carry.realigned(self.repo.root, reviewed, frozen, tip),
+            (True, "conflict resolved on the target side: 1 hunk(s) already carried by "
+                   "the target, no new line (3 mechanical commit(s), 1 resolved on the "
+                   "target side)"))
+        # la cible avance sans toucher au lot : le report tient
+        _git(self.repo.root, "switch", "-q", "main")
+        t2 = _commit(self.repo.root, "later.txt", "later\n", "t2")
+        self.assertTrue(verdict_carry.realigned(self.repo.root, reviewed, frozen, t2)[0])
+
+    def test_a_merge_resolved_on_the_target_side_is_a_realignment(self):
+        reviewed, tip = self._conflict()
+        _git(self.repo.root, "switch", "-q", "lot/9-x")
+        subprocess.run(["git", "-C", self.repo.root, "merge", "-q", "--no-edit", "main"],
+                       env=ENV, capture_output=True)
+        with open(os.path.join(self.repo.root, "shared.txt"), "w", encoding="utf-8") as fh:
+            fh.write("one\nMAIN\nthree\n")
+        _git(self.repo.root, "add", "shared.txt")
+        _git(self.repo.root, "commit", "-q", "--no-edit")
+        frozen = _git(self.repo.root, "rev-parse", "HEAD")
+        ok, why = verdict_carry.realigned(self.repo.root, reviewed, frozen, tip)
+        self.assertTrue(ok, why)
+        self.assertIn("conflict resolved on the target side: 1 hunk(s)", why)
+        # hors de ce mode, la fusion résolue n'est pas mécanique
+        self.assertIn("not the clean, unmodified merge", verdict_carry.mechanical_history(
+            self.repo.root, reviewed, frozen, tip)[1])
+
+    def test_a_resolution_adding_a_line_is_a_judgment(self):
+        # #4053, témoin 2 : le côté de la cible, plus une ligne de l'auteur.
+        reviewed, tip = self._conflict()
+        frozen = self._rebase(tip, "one\nMAIN\nadded\nthree\n")
+        ok, why = verdict_carry.realigned(self.repo.root, reviewed, frozen, tip)
+        self.assertFalse(ok)
+        self.assertIn("resolves a conflict", why)
+
+    def test_a_rebase_resolved_on_the_lot_side_is_a_judgment(self):
+        # #4053, témoin 3 : le côté du lot (theirs) écrase la cible.
+        reviewed, tip = self._conflict()
+        frozen = self._rebase(tip, "one\nLOT\nthree\n")
+        ok, why = verdict_carry.realigned(self.repo.root, reviewed, frozen, tip)
+        self.assertFalse(ok)
+        self.assertIn("resolves a conflict", why)
+
+    def test_a_target_side_landing_with_author_commits_is_a_judgment(self):
+        # Même atterrissage côté cible, mais un secret ajouté puis retiré par
+        # l'auteur reste dans l'historique : refusé.
+        reviewed, tip = self._conflict()
+        self._rebase(tip, "one\nMAIN\nthree\n")
+        _commit(self.repo.root, "secret.txt", "s3cr3t\n", "oups")
+        _git(self.repo.root, "rm", "-q", "secret.txt")
+        _git(self.repo.root, "commit", "-q", "-m", "retiré")
+        frozen = _git(self.repo.root, "rev-parse", "HEAD")
+        ok, why = verdict_carry.realigned(self.repo.root, reviewed, frozen, tip)
+        self.assertFalse(ok)
+        self.assertIn("the history is not mechanical", why)
+        self.assertIn("not a replay of a reviewed commit", why)
 
     def test_content_masked_by_the_target_is_not_a_realignment(self):
         # R1 cx1, P1-2 : l'auteur ajoute à l'identique un fichier de la cible,
