@@ -666,6 +666,12 @@ class ControlChannel(LocalChannel):
         self._server.stop_fn = stop_fn
         self._server.allowed = self.allowed
 
+    def set_allowed(self, allowed: Iterable[str]) -> None:
+        """#3925 : la liste d'admission relue de l'exécuteur ; ici une liste
+        vide n'admet aucun agent (pas « tous », comme au constructeur)."""
+        self.allowed = frozenset(str(a) for a in allowed)
+        self._server.allowed = self.allowed
+
 
 # --------------------------------------------------------------------------
 # client et fusion

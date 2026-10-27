@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-runner — one runner per machine: leases, turns, wake-up on NOTIFY.
 
-  agent-runner [--host H] [--runner-id ID] [--agents a,b] [--once [--wait S]]
+  agent-runner [--host H] [--runner-id ID] [--agents a,b] [--agents-file F]
+               [--once [--wait S]]
                [--dry-run] [--max-turns N] [--migrate]
                [--take-idle S] [--take-max-per-hour N]
                [--take-lot-idle S] [--take-lot-max-per-hour N]
@@ -13,6 +14,10 @@
         best-ranked lot that fits them (L119/L165, #804) — the same guarded
         `backlog.auto_take` that `ameesh notify` calls, so distribution no
         longer depends on a central notifier.
+        --agents-file F: host-side admission list owned by the operator,
+        re-read on every pass (#3925): an agent written into it is claimed
+        without a restart, one taken out releases its lease after its turn;
+        canon, placement, max_agents and account checks still apply.
   agent-runner register <name> <claude|codex|deepseek> [--cwd DIR] [--prompt TEXT]
                [--session ID] [--chantier C] [--model M] [--budget USD]
         registers an agent (the v1 equivalent of "nexlink-agent start").
@@ -1581,6 +1586,32 @@ class AgentWorker(threading.Thread):
         agent = registry.get(self.db, self.name) or {}
         host = agent.get("host") or ""
         return host if host and host != self.runner.host else ""
+
+    def admission_withdrawn(self) -> str:
+        """#3925 : pourquoi cet agent n'est plus admis sur cet exécuteur ('' s'il
+        l'est) : retiré de la liste d'admission de l'exécuteur, ou, gouverné
+        par le canon, sa fiche ou son placement retirés (`placement_ok` faux
+        après `canon sync`). Un canon momentanément invalide n'est pas un
+        retrait (admission seule, comme `registry.wakeable`) ; un rôle élu a
+        sa propre relève (EP2) ; une lecture impossible ne retire rien."""
+        flt = getattr(self.runner, "agents_filter", None)
+        if flt is not None and self.name not in flt:
+            return "no longer in the runner's admission list"
+        if getattr(self.runner, "mediated", False):
+            return ""  # médié : le serveur juge l'admission à chaque bail
+        try:
+            row = storage.of(self.db).agents.wake_check(self.name)
+        except NotImplementedError:
+            return ""
+        if not row:
+            return ""
+        if row.get("retired_ts"):
+            return "retired from the registry"
+        if (row.get("canon_governed") and not row.get("placement_admitted")
+                and row.get("releve") != "election"):
+            return "Agent card or Placement withdrawn from the canon (%s)" % (
+                row.get("placement_diagnostic") or "placement not admitted")
+        return ""
 
     def peek(self) -> bool:
         agent = registry.get(self.db, self.name)
@@ -8525,6 +8556,14 @@ class AgentWorker(threading.Thread):
                         log("[%s] placed on host %s, not %s: lease released after the "
                             "current turn" % (self.name, ailleurs, self.runner.host))
                         break
+                    retrait = self.admission_withdrawn()
+                    if retrait:
+                        # #3925 : plus admis (liste d'admission, fiche ou
+                        # placement retirés) : entre deux tours, le bail est
+                        # rendu et l'agent n'est plus réclamé
+                        log("[%s] %s: lease released after the current turn"
+                            % (self.name, retrait))
+                        break
                     self.apply_restart_if_requested()
                     self.maybe_rotate()
                     # L165 (EP2) : bascule planifiée — le détenteur rend le bail
@@ -8658,6 +8697,15 @@ RELOADABLE_FIELDS = frozenset({
 })
 
 
+def _admits_nobody(runner) -> bool:
+    """#3925 : une liste d'admission vide (fichier vide, ou tout refusé)
+    n'admet aucun agent, alors que `claimable` lit `[]` comme « tous ».
+    Fonction et `getattr` : les doublures des tests passent à `Runner.sweep`
+    un exécuteur sans cet attribut (sans filtre : tout est admis)."""
+    flt = getattr(runner, "agents_filter", None)
+    return flt is not None and not flt
+
+
 class Runner:
     def __init__(
         self,
@@ -8665,6 +8713,7 @@ class Runner:
         db: db_mod.Db,
         *,
         agents: list[str] | None = None,
+        agents_file: str | None = None,
         once: bool = False,
         wait: float = 0.0,
         dry_run: bool = False,
@@ -8698,6 +8747,19 @@ class Runner:
         self.agents_filter = (list(dict.fromkeys(
             resolve(n, db=self.db, operation="runner.filter") for n in agents))
             if agents is not None else None)
+        #: #3925 : source d'admission côté hôte (`--agents-file`), relue à
+        #: chaque passe. Le filtre devient alors `--agents` ∪ fichier, et la
+        #: liste est modifiée EN PLACE (le canal de contrôle et les workers
+        #: lisent le même objet). Une liste vide n'admet personne.
+        self.agents_file = agents_file or None
+        self._agents_static = list(self.agents_filter or ())
+        self._admission_stamp: object = ()
+        self._admission_file_names: list[str] = []
+        self._admission_error: str | None = None
+        self._control_channel = None
+        if self.agents_file:
+            self.agents_filter = list(self._agents_static)
+            self.refresh_admission()
         self.once = once
         self.wait = wait
         self.dry_run = dry_run
@@ -9161,6 +9223,8 @@ class Runner:
     def _note_gate_wait(self, reason: str) -> None:
         if getattr(self, "mediated", False):
             return
+        if _admits_nobody(self):
+            return
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             self._note_unleased(agent, reason)
 
@@ -9192,7 +9256,7 @@ class Runner:
         from . import election, role_handover_pg as handover_pg
         from . import role_standings_pg as pg
         try:
-            published = election.publish_self(
+            published = 0 if _admits_nobody(self) else election.publish_self(
                 self.cfg, self.db, self.host, names=self.agents_filter)
             self._role_error = None
         except Exception as exc:  # un score de rôle ne fait jamais tomber l'exécuteur
@@ -9794,7 +9858,10 @@ class Runner:
             except Exception as exc:
                 log_async("auto-take pass failed (%s): %s; runner continues"
                           % (type(exc).__name__, db_mod.brief(exc)))
-        candidates = registry.claimable(self.db, self.host, self.agents_filter)
+        # #3925 : une liste d'admission vide n'admet personne (`claimable`
+        # lit une liste vide comme « tous »)
+        candidates = ([] if _admits_nobody(self)
+                      else registry.claimable(self.db, self.host, self.agents_filter))
         for agent in candidates:
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -10005,6 +10072,90 @@ class Runner:
             except OSError:
                 out.append((path, None, None))
         return tuple(out)
+
+    @property
+    def admits_nobody(self) -> bool:
+        return _admits_nobody(self)
+
+    def _admission_failed(self, path: str, why: str) -> None:
+        """Panne passagère de la source d'admission : dernière liste gardée,
+        empreinte non retenue (nouvel essai à la passe suivante), journal une
+        fois par cause."""
+        self._admission_stamp = ()
+        if getattr(self, "_admission_error", None) != why:
+            self._admission_error = why
+            log_async("admission file %s %s: last list kept (%d agent(s)), retried "
+                      "on the next pass" % (path, why, len(self.agents_filter or ())))
+
+    def refresh_admission(self) -> bool:
+        """Relit la source d'admission côté hôte si elle a changé (#3925).
+
+        Un agent ajouté au fichier est réclamable à la passe suivante, sans
+        redémarrage ; un agent retiré n'est plus réclamé, et son worker rend
+        le bail à la fin de son tour (`AgentWorker.admission_withdrawn`). Une
+        entrée invalide est écartée avec sa raison ; un fichier absent ou
+        illisible garde la dernière liste lue (vide au démarrage). Une lecture
+        refusée ou une résolution impossible (base injoignable) est une panne
+        passagère, pas une entrée invalide : la dernière liste reste en
+        vigueur et l'empreinte n'est pas retenue, la passe suivante réessaie
+        sans édition du fichier (R1 cx2 sur #3925). Le fichier
+        ne fait que restreindre : canon, placement, `max_agents`, porte et
+        comptes s'appliquent toujours à la réclamation. Vrai si la liste a
+        changé."""
+        path = getattr(self, "agents_file", None)
+        if not path:
+            return False
+        from . import admission
+        stamp = admission.stamp(path)
+        if stamp == self._admission_stamp:
+            return False
+        if stamp is None:
+            self._admission_stamp = stamp  # sa création changera l'empreinte
+            log_async("admission file %s missing: %d agent(s) of the last read kept"
+                      % (path, len(self._admission_file_names)))
+            return False
+        try:
+            parsed = admission.read(path)
+        except (OSError, UnicodeDecodeError) as exc:
+            self._admission_failed(path, "unreadable (%s)" % type(exc).__name__)
+            return False
+        from .agent_names import resolve
+        names: list[str] = []
+        for name in parsed.names:
+            try:
+                names.append(resolve(name, db=self.db, operation="runner.admission"))
+            except Exception as exc:  # une entrée ne fait jamais tomber l'exécuteur
+                self._admission_failed(path, "%r not resolved (%s)"
+                                       % (name, type(exc).__name__))
+                return False
+        self._admission_stamp = stamp
+        self._admission_error = None
+        for number, entry, reason in parsed.problems:
+            log_async("admission file %s%s: %r skipped, %s"
+                      % (path, ":%d" % number if number else "", entry, reason))
+        self._admission_file_names = names
+        new = list(dict.fromkeys(self._agents_static + names))
+        old = list(self.agents_filter or ())
+        if new == old:
+            return False
+        added = [n for n in new if n not in old]
+        removed = [n for n in old if n not in new]
+        self.agents_filter[:] = new  # en place : canal de contrôle, workers
+        control = getattr(self, "_control_channel", None)
+        if control is not None:
+            control.set_allowed(self.agents_filter)
+        log_async("admission file %s: %d agent(s)%s%s"
+                  % (path, len(new),
+                     "; admitted " + ", ".join(added) if added else "",
+                     "; withdrawn after their current turn " + ", ".join(removed)
+                     if removed else ""))
+        lock = getattr(self, "lock", None)
+        if removed and lock is not None:
+            with lock:
+                leaving = [self.workers[n] for n in removed if n in self.workers]
+            for worker in leaving:
+                worker.wake.set()  # un worker au repos rend son bail sans attendre
+        return True
 
     def reload_config(self, *, force: bool = False) -> bool:
         """Relit la configuration si un fichier lu a changé (#1466).
@@ -10350,6 +10501,9 @@ class Runner:
                     lambda agent: device_state.stop_agent(self.cfg, self.db, agent, strict=True),
                     allowed=self.agents_filter,
                     log=lambda msg: log_async("device control: %s" % msg))
+                if getattr(self, "agents_file", None):
+                    control.set_allowed(self.agents_filter)
+                self._control_channel = control  # #3925 : suit la liste relue
                 channels.append(control)
             for channel in channels:
                 channel.start()
@@ -11104,9 +11258,12 @@ class Runner:
         try:
             from .scoped_db import ScopedDb
             db = ScopedDb(self.cfg)
+            # #3925 : `{""}` pour une liste d'admission vide (un ensemble
+            # vide se lirait « tous les agents »)
             report = plan_git.sync_branches(
-                db, host=self.host, agents=set(self.agents_filter) if self.agents_filter
-                else None, dry_run=self.dry_run, actor="runner %s" % self.runner_id)
+                db, host=self.host, agents=set(self.agents_filter or ("",))
+                if self.agents_filter is not None else None,
+                dry_run=self.dry_run, actor="runner %s" % self.runner_id)
             for entry in report["results"]:
                 if entry["result"] in ("merged", "would-merge"):
                     log_async("work item #%s delivered: %s%s" % (
@@ -11248,7 +11405,8 @@ class Runner:
             errors: list = []
             for row in lot_measures.measure_pending(
                     db, host=self.host,
-                    agents=set(self.agents_filter) if self.agents_filter else None,
+                    agents=(set(self.agents_filter or ("",))
+                            if self.agents_filter is not None else None),
                     errors=errors):
                 log_async("work item #%s measured: %s" % (
                     row["work_item_id"], lot_measures.describe_phases(row)))
@@ -11934,7 +12092,7 @@ class Runner:
                 if (r.get("host") or "") == self.host
                 and (r.get("mode") or "execute") == "execute"
                 and r.get("status") != "stopped"
-                and (not self.agents_filter or r["name"] in self.agents_filter)]
+                and (self.agents_filter is None or r["name"] in self.agents_filter)]
 
     def harness_versions_once(self, now: float | None = None) -> list[dict] | None:
         """L120: read and record the version of the harnesses this runner
@@ -12444,6 +12602,11 @@ class Runner:
                 except Exception as exc:  # la relecture ne fait jamais tomber l'exécuteur
                     log_async("config reload failed (%s)" % type(exc).__name__)
                 try:
+                    if getattr(self, "agents_file", None):
+                        self.refresh_admission()
+                except Exception as exc:  # #3925 : jamais fatal non plus
+                    log_async("admission file reload failed (%s)" % type(exc).__name__)
+                try:
                     self.sweep()
                 except db_mod.DbError as exc:
                     if getattr(exc, "code", None) == "executor_revoked":
@@ -12497,6 +12660,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default=None, help="host whose agents this runner claims")
     parser.add_argument("--runner-id", default=None, help="lease identifier (default host:pid)")
     parser.add_argument("--agents", default=None, help="comma-separated list of agents")
+    parser.add_argument("--agents-file", default=None, metavar="FILE",
+                        help="#3925: host-side admission list (one agent per line, "
+                             "re-read while running; added agents are claimed without a "
+                             "restart, withdrawn ones released after their turn)")
     parser.add_argument("--once", action="store_true",
                         help="a single pass (exit 0 if a turn ran, 3 otherwise)")
     parser.add_argument("--wait", type=float, default=0.0,
@@ -13574,7 +13741,8 @@ def main(argv: list[str] | None = None) -> int:
                 log_async("train service disabled: %s" % exc)
         try:
             runner = Runner(
-                cfg, db, agents=agents, once=parsed.once, wait=parsed.wait,
+                cfg, db, agents=agents, agents_file=parsed.agents_file,
+                once=parsed.once, wait=parsed.wait,
                 dry_run=parsed.dry_run, max_turns=parsed.max_turns,
                 take=_take_settings(parsed), take_interval=parsed.take_interval,
                 take_balance=_take_balance(parsed),
