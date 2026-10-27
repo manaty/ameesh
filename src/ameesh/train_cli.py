@@ -11,7 +11,9 @@ the canon loader nor a functioning CI/Git adapter.
 its diff does not touch ``processus/mecanique.yaml`` or ``federation.yaml``,
 it writes the gate's audited commit to every configuration file that declares
 ``train.projects.<p>.canon_commit`` and traces the move on the lot named by
-``--lot``. A rules diff refuses.
+``--lot``. A rules diff requires ``--reviewed --review milestone:<id>`` with
+exact canon opinions, including a pilot's. A bound bureau may execute this
+reviewed move on the train host while the pilot records opinions elsewhere.
 
 A persisted plan that was never fired has no receipt to withdraw: ``abandon``
 is its terminal gesture. It refuses an active/uncertain fire (withdraw or
@@ -128,6 +130,10 @@ def main(argv=None):
                            help="lot receiving the journal trace of the move")
     requalify.add_argument("--dry-run", action="store_true",
                            help="print the move; write nothing")
+    requalify.add_argument("--reviewed", action="store_true",
+                           help="qualify a reviewed canon diff, including rule files")
+    requalify.add_argument("--review", action="append", default=[],
+                           help="exact ok verdict reference: milestone:<id> (repeatable)")
     for action in ("give", "withdraw", "abandon"):
         command = commands.add_parser(action)
         command.add_argument("--manifest", required=True,
@@ -143,10 +149,18 @@ def main(argv=None):
         if args.action == "requalify":
             db = db_mod.open_db(cfg)
             try:
-                actor = _pilot(cfg, db, "train requalify")
+                extra = {}
+                if args.reviewed:
+                    from . import train_requalify_review
+                    actor = train_requalify_review.actor(cfg, db)
+                    extra = dict(reviewed=True, reviews=args.review)
+                else:
+                    if args.review:
+                        raise TrainError("--review requires --reviewed")
+                    actor = _pilot(cfg, db, "train requalify")
                 result = train_requalify.execute(
                     cfg, db, args.project, lot=args.lot, actor=actor,
-                    dry_run=args.dry_run)
+                    dry_run=args.dry_run, **extra)
             finally:
                 db.close()
             print(json.dumps(result, ensure_ascii=False, indent=2))

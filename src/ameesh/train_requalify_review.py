@@ -1,0 +1,109 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#4037: exact recorded opinions for a host-local reviewed canon move.
+
+References are milestone:<id>, never assertions parsed from prose. Reviewers
+can record a canon opinion from another host with work milestone --repo.
+The old policy remains a floor: the proposed canon cannot waive its own review.
+"""
+from __future__ import annotations
+
+import re
+
+from . import (assignments, mechanics, merge_queue, resolutions, review_lot,
+               review_provenance, storage, train_assembly, work)
+from .train import TrainError
+
+
+def _role(cfg, db, name, *, desk=False):
+    try:
+        return assignments.is_orchestrator(
+            cfg, db, name, roles=(*work.CORRECTOR_ROLES, "bureau") if desk
+            else work.CORRECTOR_ROLES, history=False, strict=True)
+    except Exception as exc:
+        raise TrainError("reviewed requalification authority unreadable: %s" % exc) from exc
+
+
+def actor(cfg, db):
+    """Bound pilot or desk role; no caller-supplied identity or role widening."""
+    from . import identity
+    binding = identity.resolve_binding(cfg, db)
+    if not binding.ok or not binding.name:
+        raise TrainError("reviewed requalification requires a valid bound identity")
+    if not _role(cfg, db, binding.name, desk=True):
+        raise TrainError("reviewed requalification requires a pilot or bureau role")
+    return binding.name
+
+
+def qualify(cfg, db, spec, pin, gate, changed, references):
+    """Read exact provenance and current verdicts before any configuration write."""
+    if not references:
+        raise TrainError("reviewed requalification requires --review milestone:<id>")
+    rules = [mechanics.load(spec.canon, commit, spec.name) for commit in (pin, gate)]
+    families = tuple(dict.fromkeys(family for rule in rules for family in rule.families))
+    selected, lots = {}, set()
+    for reference in dict.fromkeys(references):
+        match = re.fullmatch(r"milestone:([1-9][0-9]*)", reference)
+        if not match:
+            raise TrainError("unsupported review reference %r: milestone:<id> required"
+                             % reference)
+        number = int(match[1])
+        receipt = review_provenance.receipt_for_milestone(db, number)
+        origin = storage.of(db).provenance.get(reference)
+        if not receipt or not origin or not origin.get("work_item_id"):
+            raise TrainError("%s: exact review provenance missing" % reference)
+        mark = receipt.get("milestone") or {}
+        if receipt["commit"] != gate or mark.get("verdict") != "ok":
+            raise TrainError("%s: an ok opinion on the exact gate commit is required"
+                             % reference)
+        selected[number] = receipt
+        lots.add(int(origin["work_item_id"]))
+    # Read complete histories, including newer blocks that were not cited.
+    marks = [mark for lot in lots for mark in work.milestones(db, lot, limit=None)
+             if mark.get("kind") == "verdict" and mark.get("sha") == gate]
+    latest = {}
+    for mark in sorted(marks, key=lambda m: (m["at_ts"], m["id"])):
+        latest[mark["actor"]] = mark
+    if any(mark.get("verdict") == "blocked" for mark in latest.values()):
+        raise TrainError("reviewed requalification has a current blocking opinion")
+    current = [mark for mark in latest.values() if mark["id"] in selected]
+    if not any(_role(cfg, db, mark["actor"]) for mark in current):
+        raise TrainError("reviewed requalification requires a current pilot opinion")
+    guard = set(changed).intersection(train_assembly.REQUALIFY_GUARD)
+    if guard:
+        authors = []
+        commits = resolutions._run(spec.canon, "rev-list", "--parents", pin + ".." + gate)
+        if commits.returncode:
+            raise TrainError("cannot read canon authors")
+        for line in commits.stdout.splitlines():
+            commit, *parents = line.split()
+            if len(parents) > 1:
+                # A hosting merge whose tree is exactly a parent adds no
+                # content. A conflict resolution does, and needs provenance.
+                trees = resolutions._run(spec.canon, "rev-parse", commit + "^{tree}",
+                                         *(parent + "^{tree}" for parent in parents))
+                if trees.returncode:
+                    raise TrainError("cannot read canon merge trees")
+                tree, *parent_trees = trees.stdout.split()
+                if tree in parent_trees:
+                    continue
+            receipt = review_provenance.receipt_for_commit(db, commit)
+            family = review_lot.family_of((receipt or {}).get("harness"), families)
+            if not receipt or not family:
+                raise TrainError("canon author provenance missing for %s" % commit)
+            authors.append({"name": receipt["actor"], "family": family})
+        if not authors:
+            raise TrainError("canon author provenance missing")
+        need = max(rule.reviews_for(changed).reviews for rule in rules)
+        family_by_actor = {r["actor"]: review_lot.family_of(r["harness"], families)
+                           for r in selected.values()}
+        verdict = merge_queue.review_gate(
+            db, current, gate, repo=spec.canon, klass={"class": "sensitive"},
+            families=families, required=need, authors=authors, authors_complete=True,
+            family_of=lambda name: family_by_actor.get(name, ""),
+            exclude_author_family=any(rule.exclude_author_family for rule in rules),
+            distinct_families=any(rule.distinct_families for rule in rules))
+        if not verdict["ok"]:
+            raise TrainError("canon diff reviews refused: %s" % verdict["why"])
+    return [{"reference": "milestone:%s" % mark["id"], "actor": mark["actor"],
+             "commit": gate, "record": selected[mark["id"]]["record"]}
+            for mark in current]
