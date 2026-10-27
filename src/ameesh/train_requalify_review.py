@@ -62,7 +62,11 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
              if mark.get("kind") == "verdict" and mark.get("sha") == gate]
     latest = {}
     for mark in sorted(marks, key=lambda m: (m["at_ts"], m["id"])):
-        latest[mark["actor"]] = mark
+        receipt = selected.get(mark["id"]) or review_provenance.receipt_for_milestone(
+            db, mark["id"])
+        if (receipt and receipt["commit"] == gate and receipt["actor"] == mark["actor"]
+                and (receipt.get("milestone") or {}).get("verdict") == mark["verdict"]):
+            latest[mark["actor"]] = mark
     if any(mark.get("verdict") == "blocked" for mark in latest.values()):
         raise TrainError("reviewed requalification has a current blocking opinion")
     current = [mark for mark in latest.values() if mark["id"] in selected]

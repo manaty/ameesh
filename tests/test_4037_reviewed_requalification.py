@@ -170,15 +170,21 @@ class ReviewedMoveTest(unittest.TestCase):
 
     def test_uncited_newer_block_is_not_hidden(self):
         self.marks.append(dict(self.marks[0], id=3, verdict='blocked', at_ts=3))
+        self.receipts[3] = dict(self.receipts[1], milestone=self.marks[-1])
         with self.assertRaisesRegex(TrainError, 'blocking opinion'):
             self.execute()
         self.assert_unchanged()
 
     def test_superseded_pilot_opinion_cannot_be_cited_as_current(self):
         self.marks.append(dict(self.marks[0], id=3, at_ts=3))
+        self.receipts[3] = dict(self.receipts[1], milestone=self.marks[-1])
         with self.assertRaisesRegex(TrainError, 'pilot opinion'):
             self.execute()
         self.assert_unchanged()
+
+    def test_unproven_block_does_not_revoke_a_proven_opinion(self):
+        self.marks.append(dict(self.marks[0], id=3, verdict='blocked', at_ts=3))
+        self.assertEqual(self.execute()['state'], 'requalified')
 
     def test_dry_run_validates_without_writing(self):
         self.assertTrue(self.execute(dry_run=True)['dry_run'])
