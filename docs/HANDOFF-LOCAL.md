@@ -12,7 +12,8 @@ jamais `HostEffects` en processus local. L'adresse n'est pas configurable :
 `/run/ameesh-handoff/local.sock`. Son parent est root non modifiable par les
 agents, le socket root:ameesh 0660. Le client contrôle les propriétaires et
 le pair root par `SO_PEERCRED`. Le service contrôle l'UID du pair par le même
-mécanisme ; PID, UID ou compte déclarés dans le JSON n'ont aucune autorité.
+mécanisme ; PID, UID ou compte déclarés dans la requête JSON n'ont aucune
+autorité.
 Le groupe du socket autorise seulement la connexion, l'UID exact reste exigé.
 
 Le service systemd `Accept=yes` traite une connexion puis quitte. Le JSON
@@ -26,8 +27,9 @@ exactement ces clés (valeurs à établir par l'opérateur) :
 {"uid": 1001, "host": "ameesh-agents-1", "agents": ["agent-canari-a-designer"]}
 ```
 
-L'exemple n'est pas une admission. `uid` doit être celui du compte `ameesh`
-réel, `host` celui de `execution.json`, `agents` la liste approuvée. Le fichier
+L'exemple n'est pas une admission. `uid` est l'UID réel du compte qui exécute
+les runners (`ameesh` aujourd'hui, ou un UID dédié si le plan d'enrôlement le
+retient) ; `host` celui de `execution.json`, `agents` la liste approuvée. Le fichier
 est root:root 0600 et tous ses parents root sans écriture groupe/autres.
 Chaque connexion recharge cette politique et la recoupe avec `execution.json` :
 hôte identique et agents inclus dans les comptes enrôlés ; agent et hôte sont vérifiés avant
@@ -41,10 +43,14 @@ ou un succès : un effet peut avoir commencé et exige alors réconciliation.
 Délai global serveur 55 s, client 60 s ; durée systemd 65 s et arrêt 5 s,
 `KillMode=control-group`. Les enfants sont aussi bornés par H7. Au plus huit
 connexions actives par socket ; chaque requête d'un agent partage le verrou
-H7. Le journal systemd ne reçoit que la catégorie fixe d'indisponibilité,
-avec le PID et l’UID du pair obtenus du noyau (−1 avant identification),
-jamais le corps reçu, les chemins d'un refus ou les secrets. Les reçus et
-intents privés restent dans le journal H7 enrôlé.
+H7. Le journal systemd ne reçoit qu'une catégorie fixe (`refused`, `uncertain`
+ou `unavailable`) avec le PID et l’UID du pair obtenus du noyau (−1 avant
+identification), jamais le corps reçu, les chemins d'un refus ou les secrets.
+Une erreur de contrat ou un refus survenu après l'appel de l'effet (reçu
+invalide ou trop long) est classé `uncertain`, jamais `refused` : le reçu
+manquant peut suivre un effet, et le client réconcilie ; un refus sans effet
+reste `refused`. Les reçus et intents privés
+restent dans le journal H7 enrôlé.
 
 ## Installation par l'opérateur après relecture et enrôlement signé
 
