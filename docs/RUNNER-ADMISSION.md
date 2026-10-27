@@ -48,6 +48,10 @@ file only narrows admission. These checks still apply at claim time:
   resolved.
 - If the file disappears or cannot be read, the last list read stays in
   force.
+- A transient failure is not an invalid entry. That covers a read refused
+  (permissions) and a name the runner cannot resolve because the database is
+  unreachable. The whole last list stays in force, and the next pass tries
+  again without the file being edited. Each cause is logged once.
 - If the file is missing at startup, the runner admits nobody.
 
 **An empty list admits nobody.** This holds for claims, role standings,

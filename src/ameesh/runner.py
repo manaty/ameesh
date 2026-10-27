@@ -8737,6 +8737,7 @@ class Runner:
         self._agents_static = list(self.agents_filter or ())
         self._admission_stamp: object = ()
         self._admission_file_names: list[str] = []
+        self._admission_error: str | None = None
         self._control_channel = None
         if self.agents_file:
             self.agents_filter = list(self._agents_static)
@@ -10055,6 +10056,16 @@ class Runner:
         flt = getattr(self, "agents_filter", None)
         return flt is not None and not flt
 
+    def _admission_failed(self, path: str, why: str) -> None:
+        """Panne passagère de la source d'admission : dernière liste gardée,
+        empreinte non retenue (nouvel essai à la passe suivante), journal une
+        fois par cause."""
+        self._admission_stamp = ()
+        if getattr(self, "_admission_error", None) != why:
+            self._admission_error = why
+            log_async("admission file %s %s: last list kept (%d agent(s)), retried "
+                      "on the next pass" % (path, why, len(self.agents_filter or ())))
+
     def refresh_admission(self) -> bool:
         """Relit la source d'admission côté hôte si elle a changé (#3925).
 
@@ -10062,7 +10073,11 @@ class Runner:
         redémarrage ; un agent retiré n'est plus réclamé, et son worker rend
         le bail à la fin de son tour (`AgentWorker.admission_withdrawn`). Une
         entrée invalide est écartée avec sa raison ; un fichier absent ou
-        illisible garde la dernière liste lue (vide au démarrage). Le fichier
+        illisible garde la dernière liste lue (vide au démarrage). Une lecture
+        refusée ou une résolution impossible (base injoignable) est une panne
+        passagère, pas une entrée invalide : la dernière liste reste en
+        vigueur et l'empreinte n'est pas retenue, la passe suivante réessaie
+        sans édition du fichier (R1 cx2 sur #3925). Le fichier
         ne fait que restreindre : canon, placement, `max_agents`, porte et
         comptes s'appliquent toujours à la réclamation. Vrai si la liste a
         changé."""
@@ -10073,16 +10088,15 @@ class Runner:
         stamp = admission.stamp(path)
         if stamp == self._admission_stamp:
             return False
-        self._admission_stamp = stamp
         if stamp is None:
+            self._admission_stamp = stamp  # sa création changera l'empreinte
             log_async("admission file %s missing: %d agent(s) of the last read kept"
                       % (path, len(self._admission_file_names)))
             return False
         try:
             parsed = admission.read(path)
         except (OSError, UnicodeDecodeError) as exc:
-            log_async("admission file %s unreadable (%s): last list kept"
-                      % (path, type(exc).__name__))
+            self._admission_failed(path, "unreadable (%s)" % type(exc).__name__)
             return False
         from .agent_names import resolve
         names: list[str] = []
@@ -10090,7 +10104,11 @@ class Runner:
             try:
                 names.append(resolve(name, db=self.db, operation="runner.admission"))
             except Exception as exc:  # une entrée ne fait jamais tomber l'exécuteur
-                parsed.problems.append((0, name, "unresolved (%s)" % type(exc).__name__))
+                self._admission_failed(path, "%r not resolved (%s)"
+                                       % (name, type(exc).__name__))
+                return False
+        self._admission_stamp = stamp
+        self._admission_error = None
         for number, entry, reason in parsed.problems:
             log_async("admission file %s%s: %r skipped, %s"
                       % (path, ":%d" % number if number else "", entry, reason))

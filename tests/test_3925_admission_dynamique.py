@@ -102,6 +102,42 @@ class RefreshTest(PgTestCase):
         self.assertEqual(runner.agents_filter, ["alpha", "beta"])
         self.assertTrue(any("'not valid' skipped" in line for line in self.logs))
 
+    def test_resolution_outage_keeps_the_list_and_retries_without_edit(self):
+        # R1 cx2 : une résolution impossible (base) n'écarte personne ; la
+        # passe suivante réessaie sans que le fichier change
+        self.write("alpha\n")
+        runner = self.runner()
+        self.write("alpha\nbeta\n")
+        from ameesh import agent_names
+        with mock.patch.object(agent_names, "resolve",
+                               side_effect=runner_mod.db_mod.Unavailable("base")):
+            self.assertFalse(runner.refresh_admission())
+            self.assertFalse(runner.refresh_admission())
+        self.assertEqual(runner.agents_filter, ["alpha"])  # admission gardée
+        self.assertEqual(sum("not resolved" in line for line in self.logs), 1)
+        self.assertTrue(runner.refresh_admission())      # base revenue, même fichier
+        self.assertEqual(runner.agents_filter, ["alpha", "beta"])
+
+    def test_resolution_outage_at_startup_is_retried(self):
+        self.write("alpha\n")
+        from ameesh import agent_names
+        with mock.patch.object(agent_names, "resolve",
+                               side_effect=runner_mod.db_mod.Unavailable("base")):
+            runner = self.runner()
+        self.assertEqual(runner.agents_filter, [])
+        self.assertTrue(runner.refresh_admission())
+        self.assertEqual(runner.agents_filter, ["alpha"])
+
+    def test_transient_read_refusal_is_retried_without_edit(self):
+        self.write("alpha\n")
+        runner = self.runner()
+        self.write("alpha\nbeta\n")
+        with mock.patch("ameesh.admission.read", side_effect=PermissionError("refusé")):
+            self.assertFalse(runner.refresh_admission())
+        self.assertEqual(runner.agents_filter, ["alpha"])
+        self.assertTrue(runner.refresh_admission())      # droits réparés, même empreinte
+        self.assertEqual(runner.agents_filter, ["alpha", "beta"])
+
     def test_withdrawn_agent_worker_is_woken(self):
         self.write("alpha\n")
         runner = self.runner()
