@@ -62,6 +62,7 @@ def needs(nom: str) -> list[str]:
 
 def holds(nom: str, *, event_name: str, head_ref: str = "",
           repo_full_name: str = "manaty/ameesh",
+          head_repo_full_name: str | None = None,
           need_results: dict[str, str] | None = None) -> bool:
     """Évalue la condition du job comme GitHub, sans base ni code tiers.
 
@@ -71,13 +72,14 @@ def holds(nom: str, *, event_name: str, head_ref: str = "",
     implicite `success()`.
     """
     need_results = dict(need_results or {})
+    head_repo_full_name = head_repo_full_name or repo_full_name
     expr = condition(nom).strip()
     if expr.startswith("${{") and expr.endswith("}}"):
         expr = expr[3:-2].strip()
     expr = NEED_RESULT.sub(
         lambda m: repr(need_results.get(m.group(1), "success")), expr)
     expr = expr.replace("github.event.pull_request.head.repo.full_name",
-                        "repo_full_name")
+                        "head_repo_full_name")
     expr = expr.replace("github.repository", "repo_full_name")
     expr = expr.replace("github.event.pull_request.head.ref", "head_ref")
     expr = expr.replace("github.head_ref", "head_ref")
@@ -88,6 +90,7 @@ def holds(nom: str, *, event_name: str, head_ref: str = "",
         "event_name": event_name,
         "head_ref": head_ref,
         "repo_full_name": repo_full_name,
+        "head_repo_full_name": head_repo_full_name,
         "always": lambda: True,
         "cancelled": lambda: False,
         "success": lambda: all(r == "success" for r in need_results.values()),
@@ -98,7 +101,8 @@ def holds(nom: str, *, event_name: str, head_ref: str = "",
 
 
 def results(*, event_name: str, head_ref: str = "",
-            repo_full_name: str = "manaty/ameesh") -> dict[str, str]:
+            repo_full_name: str = "manaty/ameesh",
+            head_repo_full_name: str | None = None) -> dict[str, str]:
     """Le résultat de chaque job : `success` s'il tourne, `skipped` sinon.
 
     Les jobs sont parcourus dans l'ordre du fichier : une dépendance est
@@ -108,7 +112,9 @@ def results(*, event_name: str, head_ref: str = "",
     for nom in jobs():
         dependances = {dep: resultats.get(dep, "success") for dep in needs(nom)}
         if holds(nom, event_name=event_name, head_ref=head_ref,
-                 repo_full_name=repo_full_name, need_results=dependances):
+                 repo_full_name=repo_full_name,
+                 head_repo_full_name=head_repo_full_name,
+                 need_results=dependances):
             resultats[nom] = "success"
         else:
             resultats[nom] = "skipped"
@@ -159,14 +165,19 @@ class CarteHorsPaquetTest(unittest.TestCase):
 
     def test_un_fork_garde_ses_gardes_de_fork(self):
         # la garde #3838 ne remplace pas celle des fourches : une PR de paquet
-        # reste sautée, une PR de fork hors paquet garde sa mesure hébergée.
+        # reste sautée ; une PR de fork hors paquet garde ses jobs de mesure
+        # (hors du runner auto-hébergé) et `menage-mesures`, qui exclut les
+        # forks, reste sauté.
         paquet = results(event_name="pull_request",
                          head_ref="integration/paquet-h-20261027-0003",
-                         repo_full_name="autre/fork")
+                         head_repo_full_name="autre/fork")
         self.assertEqual(paquet, {nom: "skipped" for nom in self.jobs})
         fork = results(event_name="pull_request", head_ref="lot/1-x",
-                       repo_full_name="autre/fork")
-        self.assertEqual(fork, {nom: "success" for nom in self.jobs})
+                       head_repo_full_name="autre/fork")
+        self.assertEqual(fork["menage-mesures"], "skipped")
+        for nom in ("plan-mesure", "mesure", "carte"):
+            with self.subTest(job=nom):
+                self.assertEqual(fork[nom], "success")
 
 
 if __name__ == "__main__":  # pragma: no cover
