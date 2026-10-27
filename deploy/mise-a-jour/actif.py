@@ -14,7 +14,7 @@ le signal que si l'ACTIVATION est prouvee, hote par hote :
   `absent`/`reporte` portant le commit vise et une raison, et par AUCUNE preuve
   d'activation. Seuls le poste pc-smichea (mise a jour a son retour) et le
   serveur manaty-mesh-1 (aucun executant, sans acces root : bureau #147558)
-  sont reportables ; les deux VM d'agents ne le sont jamais. L'attestation
+  sont reportables ; les trois VM d'agents ne le sont jamais. L'attestation
   porte alors les hotes prouves et le champ `reportes` qui nomme chaque hote
   et sa mise a jour a son retour ; un staging complet le remplace plus tard
   pour le meme commit. Un hote VM d'agents absent, une absence non tracee ou
@@ -68,18 +68,13 @@ SCHEMA = "ameesh-staging-actif/1"
 ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
 #: instant ISO UTC, tel que produit par `date -u +%Y-%m-%dT%H:%M:%SZ`
 DEPUIS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-#: hotes du staging complet (canon §14) : les trois VM sont toujours requises ;
-#: pc-smichea est reportable quand la sequence part d'une VM ou qu'il est
-#: declare absent (`--absent`), jamais une VM.
-HOTES_CANON = ("ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1", "pc-smichea")
-#: les trois VM : sans leur preuve, aucune attestation
-HOTES_VMS = HOTES_CANON[:3]
-#: seuls les hotes sans executant et sans acces root peuvent etre reportes :
-#: le poste (mise a jour a son retour) et le serveur du mesh (aucun runner,
-#: sauvegarde seulement ; acces root a decider par l'owner, bureau #147558)
-HOTES_REPORTABLES = ("manaty-mesh-1", "pc-smichea")
-#: les deux VM d'agents ne sont jamais reportables
-HOTES_AGENTS = HOTES_CANON[:2]
+#: VM d'agents requises, jamais reportables (canon §14).
+HOTES_AGENTS = ("ameesh-agents-1", "ameesh-agents-2", "ameesh-agents-3")
+HOTE_SERVEUR = "manaty-mesh-1"
+HOTES_VMS = (*HOTES_AGENTS, HOTE_SERVEUR)
+HOTES_CANON = (*HOTES_VMS, "pc-smichea")
+#: Seuls le serveur sans executant et le poste peuvent etre reportes.
+HOTES_REPORTABLES = (HOTE_SERVEUR, "pc-smichea")
 #: etape de trace qui prouve l'absence declaree d'un hote
 ETAPE_ABSENCE = "absent"
 VERDICT_ABSENCE = "reporte"
@@ -260,7 +255,7 @@ def preuves(evenements: list[dict], sha: str, actifs: dict[str, str],
     La comparaison du commit actif est un prefixe dans les deux sens : le
     poste publie un nom court (`src-<7>`), les VM un SHA complet. `modes`
     (nom -> mode, defaut `agents`) decide quelle remise prouve chaque hote.
-    `absents` (nom -> raison) declare les hotes reportes : seules les trois VM
+    `absents` (nom -> raison) declare les hotes reportes : les trois VM d'agents
     restent requises, et chaque absence doit etre prouvee par la trace.
     """
     modes = modes or {}
@@ -284,7 +279,7 @@ def preuves(evenements: list[dict], sha: str, actifs: dict[str, str],
     agents_manquants = [h for h in HOTES_AGENTS if h not in requis]
     if agents_manquants or sorted(actifs) != sorted(requis):
         raise PreuveManquante(
-            "sequence partielle (%s) : les deux VM d'agents sont requises"
+            "sequence partielle (%s) : les trois VM d'agents sont requises"
             % ", ".join(sorted(actifs)))
     retours = [e for e in evenements if e.get("etape") == "retour"]
     if retours:

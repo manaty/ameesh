@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# Mise a jour « staging » du mesh ameesh : les trois VM d'abord, le poste en
+# Mise a jour « staging » du mesh ameesh : les quatre VM d'abord, le poste en
 # dernier s'il est en ligne, sante bornee par hote, retour automatique, traces
 # JSONL et attestation « staging actif » vers le rapporteur (#1323).
 # Procedure : docs/DEPLOIEMENT-HOTE-AGENTS.md, « Sequence staging ».
@@ -21,27 +21,27 @@
 # ses etapes (verifier, sauvegarde, migrations, role, installer, redemarrer,
 # controler, sante) avec la trace « poste absent, mise a jour a son retour »,
 # et n'attend pas son retour. Sur le poste, la sequence complete reste celle
-# des quatre hotes (VM d'abord). L'hote local est HOTE_LOCAL s'il est pose,
+# des cinq hotes (VM d'abord). L'hote local est HOTE_LOCAL s'il est pose,
 # sinon AMEESH_HOST, sinon le champ « host » de la configuration ameesh, sinon
 # `hostname -s` ; le poser dans BASCULE_ENV sur une VM dont la configuration
 # porterait « pc-smichea » evite une fausse detection (#3848). Un serveur du
 # mesh sans acces root (manaty-mesh-1, aucun executant, sauvegarde seulement)
 # peut etre declare absent de la meme facon avec
-# `--absent manaty-mesh-1=raison` : les deux VM d'agents restent requises et
+# `--absent manaty-mesh-1=raison` : les trois VM d'agents restent requises et
 # atteste ; l'attestation le nomme dans `reportes`, sans bloquer la sequence
-# (bureau #147558). Les deux VM d'agents ne sont jamais reportables.
+# (bureau #147558). Les trois VM d'agents ne sont jamais reportables.
 #
 # Sans HOTES_STAGING (cas de bureau-goal, qui n'a qu'un fichier par VM), la
-# topologie est composee des bascule-a1.env et bascule-a2.env du dossier de
+# topologie est composee des bascule-a1.env, bascule-a2.env et bascule-agents-3.env du dossier de
 # BASCULE_ENV (AGENTS_SSH + HOTE_AGENTS) et de SERVEUR_SSH (ou VM) pour
 # manaty-mesh-1 ; pc-smichea reste absent (poste reporte).
 #
 # HOTES_STAGING (BASCULE_ENV) : la topologie, une entree « nom=cible » par
 # hote, dans cet ordre :
-#   ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4
+#   ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 ameesh-agents-3=root@10.77.0.5
 #   manaty-mesh-1=root@10.77.0.1 pc-smichea=poste
-# Les trois VM sont requises. pc-smichea=poste est optionnel : omis, il est
-# declare absent et la sequence des trois VM peut attester. « poste » (ou
+# Les quatre VM sont requises. pc-smichea=poste est optionnel : omis, il est
+# declare absent et la sequence des quatre VM peut attester. « poste » (ou
 # « local ») designe le poste, en dernier. Le mode de chaque hote est deduit de
 # son nom : manaty-mesh-1 est le serveur du mesh (Postgres, `vm.sh`),
 # pc-smichea le poste (`poste.sh`), les autres sont des VM d'agents
@@ -57,7 +57,7 @@
 # --hotes limite la sequence a un sous-ensemble, dans l'ordre canonique. Les
 # noms sont normalises : un seul exemplaire par hote, quel que soit le
 # separateur (espace, tabulation, nouvelle ligne). Le poste ne peut pas y
-# figurer sans les trois VM : le canon §14 exige des VM saines avant toute
+# figurer sans les quatre VM : le canon §14 exige des VM saines avant toute
 # modification du poste, et un sous-ensemble n'en apporte aucune preuve. Nomme
 # alors que le poste est absent, il est ignore (deja reporte) : la selection
 # est celle des VM nommees, sans lui.
@@ -67,7 +67,7 @@
 # lorsqu'elle part d'une VM.
 #
 # --absent nom=raison (repete) declare un hote sans acces reportable :
-# manaty-mesh-1 ou pc-smichea. Les deux VM d'agents ne le sont jamais ; chaque
+# manaty-mesh-1 ou pc-smichea. Les trois VM d'agents ne le sont jamais ; chaque
 # absence est tracee au commit vise et reprise dans l'attestation.
 #
 # --lots / --rapporteurs (ou LOTS_VERIF / RAPPORTEURS_VERIF) : les lots livres
@@ -76,8 +76,8 @@
 # (deploy/mise-a-jour/actif.py, #1323) est ecrite sous
 # ~/.local/state/ameesh/mise-a-jour/actif-<commit>.json et chaque rapporteur
 # recoit un courrier unique par commit (hotes, commit relu actif, preuves
-# installer/redemarrer/controler/sante). « Complete » = les trois VM prouvees,
-# plus le poste s'il est en ligne ; poste absent, l'attestation porte les trois
+# installer/redemarrer/controler/sante). « Complete » = les quatre VM prouvees,
+# plus le poste s'il est en ligne ; poste absent, l'attestation porte les quatre
 # VM et le champ `reportes` qui nomme le poste et sa mise a jour a son retour.
 # Un echec ou un retour n'emet aucun signal de reussite ; un sous-ensemble de
 # VM n'atteste rien ; aucun lot n'est clos automatiquement.
@@ -142,14 +142,12 @@ NOTIF_STAGING=${NOTIF_STAGING:-mesh-design}
 LOTS_VERIF=${LOTS_VERIF:-}
 RAPPORTEURS_VERIF=${RAPPORTEURS_VERIF:-}
 #: ordre canonique du staging : VM d'abord, poste en dernier
-ORDRE=(ameesh-agents-1 ameesh-agents-2 manaty-mesh-1 pc-smichea)
-#: les trois VM, seules requises : un staging sans elles n'atteste rien
-HOTES_VMS=(ameesh-agents-1 ameesh-agents-2 manaty-mesh-1)
-#: les deux VM d'agents, jamais reportables ; le serveur du mesh peut l'etre
-#: quand le bureau n'a aucun acces root (il n'a pas d'executant, sauvegarde)
-HOTES_AGENTS=(ameesh-agents-1 ameesh-agents-2)
+HOTES_AGENTS=(ameesh-agents-1 ameesh-agents-2 ameesh-agents-3)
 HOTE_SERVEUR=manaty-mesh-1
-#: sans le poste, cette sequence pourra attester les trois VM (poste reporte)
+ORDRE=("${HOTES_AGENTS[@]}" "$HOTE_SERVEUR" pc-smichea)
+#: VM de la sequence complete ; seul le serveur sans acces root est reportable
+HOTES_VMS=("${HOTES_AGENTS[@]}" "$HOTE_SERVEUR")
+#: sans le poste, cette sequence pourra attester les quatre VM (poste reporte)
 SANS_POSTE=${SANS_POSTE:-0}
 SERVEUR_ABSENT=0
 SERVEUR_RAISON=""
@@ -279,12 +277,12 @@ POSTE_RAISON=""
 HOTES=()
 TOPOLOGIE_COMPOSEE=0
 if [ -z "${HOTES_STAGING:-}" ]; then
-  # #3848 : le bureau VM n'a qu'un fichier par VM d'agents (bascule-a1/a2.env).
-  # Composer la topologie depuis ces deux fichiers ; manaty-mesh-1 vient de
+  # #3848 : le bureau VM n'a qu'un fichier par VM d'agents (bascule-a1/a2.env et bascule-agents-3.env).
+  # Composer la topologie depuis ces trois fichiers ; manaty-mesh-1 vient de
   # SERVEUR_SSH (ou VM), pc-smichea reste absent (poste reporte).
   DIR_BASCULE=$(dirname "$BASCULE_ENV")
   compose=()
-  for f in "$DIR_BASCULE/bascule-a1.env" "$DIR_BASCULE/bascule-a2.env"; do
+  for f in "$DIR_BASCULE/bascule-a1.env" "$DIR_BASCULE/bascule-a2.env" "$DIR_BASCULE/bascule-agents-3.env"; do
     [ -r "$f" ] || continue
     entree=$(
       # shellcheck disable=SC1090
@@ -294,20 +292,20 @@ if [ -z "${HOTES_STAGING:-}" ]; then
     ) || entree=""
     [ -n "$entree" ] && compose+=("$entree")
   done
-  if [ ${#compose[@]} -ge 2 ]; then
+  if [ ${#compose[@]} -ge ${#HOTES_AGENTS[@]} ]; then
     SERVEUR_SSH=${SERVEUR_SSH:-${VM:+root@$VM}}
     if [ -z "$SERVEUR_SSH" ]; then
-      echo "HOTES_STAGING absent de $BASCULE_ENV ; topologie composee depuis $DIR_BASCULE/bascule-a{1,2}.env," >&2
+      echo "HOTES_STAGING absent de $BASCULE_ENV ; topologie composee depuis $DIR_BASCULE/bascule-a{1,2}.env et bascule-agents-3.env," >&2
       echo "mais manaty-mesh-1 manque : poser SERVEUR_SSH=root@10.77.0.1 (ou VM=10.77.0.1) dans l'environnement ou BASCULE_ENV" >&2
       exit 2
     fi
     HOTES_STAGING="${compose[*]} manaty-mesh-1=$SERVEUR_SSH"
     TOPOLOGIE_COMPOSEE=1
-    echo "topologie staging composee depuis $DIR_BASCULE/bascule-a{1,2}.env : $HOTES_STAGING" >&2
+    echo "topologie staging composee depuis $DIR_BASCULE/bascule-a{1,2}.env et bascule-agents-3.env : $HOTES_STAGING" >&2
   else
-    echo "HOTES_STAGING absent de $BASCULE_ENV : declarer les trois VM (pc-smichea=poste en option)" >&2
-    echo "  ou poser $DIR_BASCULE/bascule-a1.env et bascule-a2.env (AGENTS_SSH, HOTE_AGENTS) et SERVEUR_SSH" >&2
-    echo "  HOTES_STAGING=\"ameesh-agents-1=root@… ameesh-agents-2=root@… manaty-mesh-1=root@… pc-smichea=poste\"" >&2
+    echo "HOTES_STAGING absent de $BASCULE_ENV : declarer les quatre VM (pc-smichea=poste en option)" >&2
+    echo "  ou poser $DIR_BASCULE/bascule-a1.env, bascule-a2.env et bascule-agents-3.env (AGENTS_SSH, HOTE_AGENTS) et SERVEUR_SSH" >&2
+    echo "  HOTES_STAGING=\"ameesh-agents-1=root@… ameesh-agents-2=root@… ameesh-agents-3=root@… manaty-mesh-1=root@… pc-smichea=poste\"" >&2
     exit 2
   fi
 fi
@@ -329,10 +327,10 @@ for entree in $HOTES_STAGING; do
   fi
   CIBLE[$nom]=$cible
 done
-# Les trois VM sont requises : sans elles, aucune sequence n'apporte de preuve.
+# Les quatre VM sont requises : sans elles, aucune sequence n'apporte de preuve.
 for nom in "${HOTES_VMS[@]}"; do
   [ -n "${CIBLE[$nom]:-}" ] \
-    || { echo "HOTES_STAGING : les trois VM sont requises (${HOTES_VMS[*]})" >&2; exit 2; }
+    || { echo "HOTES_STAGING : les quatre VM sont requises (${HOTES_VMS[*]})" >&2; exit 2; }
 done
 
 # --- poste : present ou absent --------------------------------------------
@@ -340,7 +338,7 @@ done
 # s'executent que sur lui. Depuis une VM, il est declare absent, ses etapes
 # sont sautees et sa mise a jour reportee a son retour (canon §14) ; il ne
 # retient ni le staging ni les lots. Sur le poste, la sequence complete reste
-# celle des quatre hotes, VM d'abord.
+# celle des cinq hotes, VM d'abord.
 if [ -n "${CIBLE[pc-smichea]:-}" ]; then
   if [ "$HOTE_LOCAL" = pc-smichea ] && [ "$SANS_POSTE" != 1 ]; then
     :
@@ -372,7 +370,7 @@ if [ -n "$HOTES_FILTRE" ]; then
   # Selection normalisee : un nom connu compte une seule fois, quel que soit
   # le separateur (espace, tabulation, nouvelle ligne) ; le globbing est
   # desactive pour que chaque mot soit compare tel quel. « pc-smichea » repete
-  # quatre fois ne peut donc plus tenir lieu des trois VM (avis R1 B4).
+  # quatre fois ne peut donc plus tenir lieu des quatre VM (avis R1 B4).
   set -f
   for choisi in $HOTES_FILTRE; do
     [ -n "${CIBLE[$choisi]:-}" ] \
@@ -397,11 +395,11 @@ fi
 if [ -n "${CHOISI[pc-smichea]:-}" ]; then
   for nom in "${HOTES_AGENTS[@]}"; do
     [ -n "${CHOISI[$nom]:-}" ] \
-      || { echo "--hotes : pc-smichea ne se met a jour que dans la sequence complete des quatre hotes (canon §14 : VM saines d'abord)" >&2; exit 2; }
+      || { echo "--hotes : pc-smichea ne se met a jour que dans la sequence complete des cinq hotes (canon §14 : VM saines d'abord)" >&2; exit 2; }
   done
   if [ "$SERVEUR_ABSENT" != 1 ]; then
     [ -n "${CHOISI[manaty-mesh-1]:-}" ] \
-      || { echo "--hotes : pc-smichea ne se met a jour que dans la sequence complete des quatre hotes (canon §14 : VM saines d'abord)" >&2; exit 2; }
+      || { echo "--hotes : pc-smichea ne se met a jour que dans la sequence complete des cinq hotes (canon §14 : VM saines d'abord)" >&2; exit 2; }
   fi
 fi
 HOTES=()
@@ -411,7 +409,7 @@ for nom in "${ORDRE[@]}"; do
   HOTES+=("$nom")
 done
 [ ${#HOTES[@]} -gt 0 ] || { echo "--hotes : liste vide" >&2; exit 2; }
-# Complete = les trois VM, plus le poste s'il est en ligne. Un poste absent ne
+# Complete = les quatre VM, plus le poste s'il est en ligne. Un poste absent ne
 # rend pas la sequence partielle : son absence est prouvee par la trace et
 # l'attestation le nomme dans `reportes`.
 SEQUENCE_COMPLETE=1
@@ -718,7 +716,7 @@ if [ "$A_BLANC" = 1 ]; then
 fi
 
 # La preuve d'absence du poste precede toute mutation : actif.py exige cet
-# evenement pour attester les trois VM sans lui. Il porte le commit vise,
+# evenement pour attester les quatre VM sans lui. Il porte le commit vise,
 # comme tous les autres, et n'est jamais un `retour`.
 if [ "$POSTE_ABSENT" = 1 ]; then
   trace pc-smichea absent reporte "$POSTE_RAISON"
@@ -782,7 +780,7 @@ if [ "$POSTE_ABSENT" = 1 ]; then
   # le meme instantane et la meme garde additive que le bureau.
   HOTE_MIGRATIONS=${HOTE_MIGRATIONS:-}
   if [ -z "$HOTE_MIGRATIONS" ]; then
-    for nom in ameesh-agents-2 ameesh-agents-1; do
+    for nom in ameesh-agents-2 ameesh-agents-1 ameesh-agents-3; do
       case " ${HOTES[*]} " in *" $nom "*) HOTE_MIGRATIONS=$nom; break ;; esac
     done
   fi
@@ -852,11 +850,11 @@ echo "traces : $JOURNAL"
 trace sequence sequence ok
 
 # --- signal « staging actif » (#1323) ------------------------------------
-# Durable et borne : l'attestation n'est ecrite que si les trois VM (et le
+# Durable et borne : l'attestation n'est ecrite que si les quatre VM (et le
 # poste s'il est en ligne) sont tous prouves (installer, redemarrer, controler,
 # sante reelle) et si le commit relu apres la sequence est la cible ; chaque
 # rapporteur n'est reveille qu'une fois par commit. Un poste absent est admis :
-# l'attestation porte les trois VM et `reportes` nomme le poste et sa mise a
+# l'attestation porte les quatre VM et `reportes` nomme le poste et sa mise a
 # jour a son retour. Un echec d'emission ne remet pas en cause le deploiement :
 # l'attestation reste, le relais operateur prend le courrier.
 if [ "$SEQUENCE_COMPLETE" != 1 ]; then

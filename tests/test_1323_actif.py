@@ -34,7 +34,9 @@ SHA = '0123456789abcdef0123456789abcdef01234567'
 AUTRE_SHA = 'fedcba9876543210fedcba9876543210fedcba98'
 DEPUIS = '2026-10-14T16:00:00Z'
 TS = '2026-10-14T16:05:00Z'
-HOTES = ('ameesh-agents-1', 'ameesh-agents-2', 'manaty-mesh-1', 'pc-smichea')
+HOTES = ('ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3', 'manaty-mesh-1', 'pc-smichea')
+HOTES_AGENTS = ('ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3')
+HOTES_VMS = (*HOTES_AGENTS, 'manaty-mesh-1')
 DESTINATAIRE = 'quidu'
 MESSAGE = 7
 
@@ -81,7 +83,7 @@ def evenement(hote, etape, verdict='ok', detail=None, ts=TS, sha=SHA):
 
 
 def journal_complet():
-    """Journal d'une sequence complete : les quatre hotes actives."""
+    """Journal d'une sequence complete : les cinq hotes actives."""
     out = []
     for hote in HOTES:
         out.append(evenement(hote, 'installer', detail='installe %s' % SHA[:9]))
@@ -116,7 +118,7 @@ def journal_serveur(hote_destinataire='ameesh-agents-1', personas=0,
 
 def journal_poste_absent(raison='poste absent, mise a jour a son retour',
                          avec_poste=False):
-    """Sequence de trois VM, poste reporte (trace `absent`/`reporte`, #3848)."""
+    """Sequence de quatre VM, poste reporte (trace `absent`/`reporte`, #3848)."""
     out = []
     for hote in HOTES:
         if hote == 'pc-smichea':
@@ -140,9 +142,9 @@ def journal_poste_absent(raison='poste absent, mise a jour a son retour',
 
 def journal_deux_vm_absents(raison_serveur='serveur sans acces root',
                             raison_poste='poste absent, mise a jour a son retour'):
-    """Deux VM d'agents prouvees ; serveur et poste reportes (#147558/#3848)."""
+    """Trois VM d'agents prouvees ; serveur et poste reportes (#147558/#3848)."""
     out = []
-    for hote in HOTES[:2]:
+    for hote in HOTES_AGENTS:
         out.append(evenement(hote, 'installer', detail='installe %s' % SHA[:9]))
         out.append(evenement(hote, 'redemarrer'))
         out.append(evenement(hote, 'controler'))
@@ -211,18 +213,18 @@ class ActifTest(unittest.TestCase):
         return out
 
     def hotes_sans_poste(self, actifs=None):
-        """Les trois VM seules ; manaty-mesh-1 en mode serveur (sonde croisee)."""
-        valeurs = actifs or {h: SHA for h in HOTES[:3]}
+        """Les quatre VM seules ; manaty-mesh-1 en mode serveur (sonde croisee)."""
+        valeurs = actifs or {h: SHA for h in HOTES_VMS}
         out = []
-        for hote in HOTES[:3]:
+        for hote in HOTES_VMS:
             out += ['--hote', '%s=%s' % (hote, valeurs[hote])]
             out += ['--mode', '%s=%s' % (
                 hote, 'serveur' if hote == 'manaty-mesh-1' else 'agents')]
         return out
 
-    def hotes_deux_agents(self):
+    def hotes_agents(self):
         out = []
-        for hote in HOTES[:2]:
+        for hote in HOTES_AGENTS:
             out += ['--hote', '%s=%s' % (hote, SHA), '--mode', '%s=agents' % hote]
         return out
 
@@ -442,7 +444,7 @@ class ActifTest(unittest.TestCase):
         self.assertIn('partielle', erreur)
         self.assertEqual(self.envois, [])
 
-    def test_poste_absent_atteste_les_trois_vm_et_le_mentionne(self):
+    def test_poste_absent_atteste_les_quatre_vm_et_le_mentionne(self):
         """#3848 : une sequence de VM avec poste absent atteste, le courrier
         nomme le report et sa mise a jour au retour."""
         raison = 'poste absent (sequence lancee depuis ameesh-agents-1) : ' \
@@ -457,24 +459,24 @@ class ActifTest(unittest.TestCase):
         self.assertEqual(len(fichiers), 1, fichiers)
         attestation = json.loads(fichiers[0].read_text())
         self.assertEqual(sorted(attestation['hotes']),
-                         ['ameesh-agents-1', 'ameesh-agents-2', 'manaty-mesh-1'])
+                         ['ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3', 'manaty-mesh-1'])
         self.assertNotIn('pc-smichea', attestation['hotes'])
         self.assertEqual(attestation['reportes']['pc-smichea']['raison'], raison)
         self.assertIn('a son retour', attestation['reportes']['pc-smichea']['mise_a_jour'])
-        self.assertEqual(attestation['cle'], '%s-3hotes-1reporte' % SHA[:12])
+        self.assertEqual(attestation['cle'], '%s-4hotes-1reporte' % SHA[:12])
         self.assertEqual(len(self.envois), 1)
         corps = self.envois[0]['corps']
-        self.assertIn('3 hotes', corps)
+        self.assertIn('4 hotes', corps)
         self.assertIn('pc-smichea : REPORTE', corps)
         self.assertIn(raison, corps)
         self.assertIn('mise a jour a son retour', corps)
         self.assertEqual(self.envois[0]['charge']['reportes'], ['pc-smichea'])
 
-    def test_serveur_absent_atteste_les_deux_vm_et_le_mentionne(self):
+    def test_serveur_absent_atteste_les_trois_vm_et_le_mentionne(self):
         """#147558 : sans acces root, le serveur est reporte comme le poste ;
-        les deux VM d'agents restent la preuve minimale."""
+        les trois VM d'agents restent la preuve minimale."""
         self.ecrire(journal_deux_vm_absents(raison_serveur='sans-acces'))
-        code, _, erreur = self.lancer(*self.hotes_deux_agents(),
+        code, _, erreur = self.lancer(*self.hotes_agents(),
                                       '--absent', 'manaty-mesh-1=sans-acces',
                                       '--absent', 'pc-smichea=poste absent',
                                       '--rapporteur', 'docs01')
@@ -483,11 +485,11 @@ class ActifTest(unittest.TestCase):
         self.assertEqual(len(fichiers), 1, fichiers)
         attestation = json.loads(fichiers[0].read_text())
         self.assertEqual(sorted(attestation['hotes']),
-                         ['ameesh-agents-1', 'ameesh-agents-2'])
+                         ['ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3'])
         self.assertEqual(sorted(attestation['reportes']),
                          ['manaty-mesh-1', 'pc-smichea'])
         self.assertIn('sans-acces', attestation['reportes']['manaty-mesh-1']['raison'])
-        self.assertEqual(attestation['cle'], '%s-2hotes-2reporte' % SHA[:12])
+        self.assertEqual(attestation['cle'], '%s-3hotes-2reporte' % SHA[:12])
         corps = self.envois[0]['corps']
         self.assertIn('manaty-mesh-1 : REPORTE', corps)
         self.assertIn('sans-acces', corps)
@@ -495,7 +497,7 @@ class ActifTest(unittest.TestCase):
     def test_serveur_absent_sans_trace_refuse(self):
         self.ecrire([e for e in journal_deux_vm_absents()
                      if not (e['hote'] == 'manaty-mesh-1')])
-        code, _, erreur = self.lancer(*self.hotes_deux_agents(),
+        code, _, erreur = self.lancer(*self.hotes_agents(),
                                       '--absent', 'manaty-mesh-1=sans-acces',
                                       '--absent', 'pc-smichea=poste absent')
         self.assertEqual(code, 3, erreur)
@@ -529,6 +531,28 @@ class ActifTest(unittest.TestCase):
         code, _, erreur = self.lancer(*self.hotes_sans_poste(),
                                       '--absent', 'ameesh-agents-1=absente',
                                       '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('peuvent etre reportes', erreur)
+        self.assertEqual(self.envois, [])
+
+    def test_third_agent_is_required_in_inventory_and_evidence(self):
+        for omitted_inventory in (True, False):
+            with self.subTest(omitted_inventory=omitted_inventory):
+                self.ecrire([e for e in journal_complet()
+                             if e.get('hote') != 'ameesh-agents-3'])
+                args = self.hotes()
+                if omitted_inventory:
+                    position = args.index('ameesh-agents-3=%s' % SHA)
+                    del args[position - 1:position + 1]
+                code, _, erreur = self.lancer(*args, '--rapporteur', 'docs01')
+                self.assertEqual(code, 3, erreur)
+                self.assertEqual(self.attestations(), [])
+                self.assertEqual(self.envois, [])
+
+    def test_third_agent_cannot_be_postponed(self):
+        self.ecrire(journal_complet())
+        code, _, erreur = self.lancer(*self.hotes(),
+            '--absent', 'ameesh-agents-3=indisponible', '--rapporteur', 'docs01')
         self.assertEqual(code, 3, erreur)
         self.assertIn('peuvent etre reportes', erreur)
         self.assertEqual(self.envois, [])
@@ -1066,7 +1090,7 @@ class StagingSignalTest(unittest.TestCase):
             path.chmod(0o755)
         self.config = self.root / 'bascule.env'
         self.config.write_text(
-            'HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 '
+            'HOTES_STAGING="ameesh-agents-1=root@10.77.0.3 ameesh-agents-2=root@10.77.0.4 ameesh-agents-3=root@10.77.0.5 '
             'manaty-mesh-1=root@10.77.0.2 pc-smichea=poste"\n'
             'VM=10.77.0.2\nPERSONAS_VM=\n')
         run = ['git', '-C', str(self.repo)]
@@ -1094,7 +1118,7 @@ class StagingSignalTest(unittest.TestCase):
                         PATH=str(self.bin) + os.pathsep + base.get('PATH', ''),
                         TMPDIR=str(bacs['tmp']),
                         # #3848 : le banc tourne sur une VM ; les sequences
-                        # completes doivent rester celles des quatre hotes.
+                        # completes doivent rester celles des cinq hotes.
                         HOTE_LOCAL='pc-smichea',
                         AMEESH_CONFIG=str(self.root / 'config-absente.json'),
                         AMEESH_STATE=str(bacs['etat']),
@@ -1255,7 +1279,7 @@ class StagingSignalTest(unittest.TestCase):
                 self.assertNotIn('pc-smichea', preuve)
 
     def test_poste_absent_appelle_le_signal_avec_absent(self):
-        """#3848 : depuis une VM, le signal porte --absent et les trois VM."""
+        """#3848 : depuis une VM, le signal porte --absent et les quatre VM."""
         env = dict(self.env, HOTE_LOCAL='ameesh-agents-1')
         p = self.run_staging('--lots', '917', '--rapporteurs', 'docs01', env=env)
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
@@ -1264,7 +1288,7 @@ class StagingSignalTest(unittest.TestCase):
         ligne = appels[0]
         self.assertIn('--absent pc-smichea=', ligne)
         self.assertNotIn('--hote pc-smichea=', ligne)
-        for hote in HOTES[:3]:
+        for hote in HOTES_VMS:
             self.assertIn('--hote %s=' % hote, ligne)
         trace = next(t for t in self.journal()
                      if t['hote'] == 'pc-smichea' and t['etape'] == 'absent')
@@ -1432,6 +1456,18 @@ while index < len(args):
         break
 raise SystemExit(subprocess.run(args[index:], cwd=cwd, env=env).returncode)
 '''
+
+
+class HotesPartagesTest(unittest.TestCase):
+    """#3965 : la coupure relit l'attestation avec les memes hotes qu'actif.py."""
+
+    def test_release_cutoff_et_actif_listent_les_memes_hotes(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+        from ameesh import release_cutoff
+        actif = charger_actif()
+        self.assertEqual(release_cutoff.STAGING_AGENTS, actif.HOTES_AGENTS)
+        self.assertEqual(release_cutoff.STAGING_VMS, actif.HOTES_VMS)
+        self.assertEqual(release_cutoff.STAGING_HOSTS, actif.HOTES_CANON)
 
 
 if __name__ == '__main__':

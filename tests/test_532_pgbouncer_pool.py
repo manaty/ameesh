@@ -51,7 +51,7 @@ class RecipePoolSizing(unittest.TestCase):
         ini = self.recipe.pool_ini('ameesh', '10.77.0.1', '5432',
                                    socket_dir=Path('/private/socket'),
                                    auth_file=Path('/private/userlist.txt'),
-                                   admin_user='ameesh', tls='require')
+                                   admin_user='ameesh', tls='require', host='ameesh-agents-1')
         self.assertIn('pool_mode = session', ini)
         self.assertIn('unix_socket_dir = /private/socket', ini)
         self.assertIn('auth_file = /private/userlist.txt', ini)
@@ -65,6 +65,23 @@ class RecipePoolSizing(unittest.TestCase):
         self.assertGreaterEqual(self.recipe.MAX_DB_CONNECTIONS,
                                 self.recipe.DEFAULT_POOL_SIZE
                                 + self.recipe.RESERVE_POOL_SIZE)
+
+    def test_four_host_budget_preserves_existing_pools_and_bounds_new_host(self):
+        limits = self.recipe.POOL_LIMITS
+        self.assertEqual(set(limits), {'pc-smichea', 'ameesh-agents-1',
+                                      'ameesh-agents-2', 'ameesh-agents-3'})
+        self.assertLess(sum(cap for _, _, cap in limits.values()), 300)
+        for host, (default, reserve, cap) in limits.items():
+            with self.subTest(host=host):
+                self.assertLessEqual(default + reserve, cap)
+                with mock.patch.object(self.recipe.socket, 'gethostname', return_value=host):
+                    ini = self.recipe.pool_ini('ameesh', '10.77.0.1', '5432',
+                        socket_dir=Path('/private/socket'),
+                        auth_file=Path('/private/userlist.txt'), admin_user='ameesh', tls='require')
+                self.assertIn('max_db_connections = %s' % cap, ini)
+                self.assertIn('default_pool_size = %s' % default, ini)
+                self.assertIn('reserve_pool_size = %s' % reserve, ini)
+        self.assertEqual(limits['ameesh-agents-3'], (32, 8, 40))
 
 
 def every_startup_setting():
