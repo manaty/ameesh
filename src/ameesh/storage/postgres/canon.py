@@ -40,8 +40,16 @@ def _owner(owner) -> tuple[str, tuple]:
 class Canon(interface.Canon):
 
     def record_state(self, host, status, *, root, source, commit, good,
-                     diagnostic, canon="", canon_id=None) -> None:
-        self.db.query(
+                     diagnostic, canon="", canon_id=None,
+                     expected=None) -> str | None:
+        # #3955 : `expected` rend l'avance du commit audité conditionnelle.
+        # `None` : sans condition (comportement historique, écritures non-`ok`) ;
+        # une chaîne ('' comprise) : la valeur enregistrée doit encore être
+        # celle-là, sinon `last_good_commit`/`last_good_at` restent inchangés.
+        # Le CAS, dans la même instruction que l'upsert, ferme la course entre
+        # deux synchronisations (l'une lit l'ancien commit avant le fetch et
+        # écrit après que l'autre a enregistré le nouveau).
+        rows = self.db.query(
             """
             INSERT INTO canon_state AS s
                 (host, canon, canon_id, status, root, source, last_good_commit, last_good_at,
@@ -53,17 +61,23 @@ class Canon(interface.Canon):
                 root             = excluded.root,
                 source           = excluded.source,
                 last_good_commit = CASE WHEN excluded.status = 'ok'
+                                         AND (%s::boolean
+                                              OR coalesce(s.last_good_commit, '') = %s)
                                         THEN excluded.last_good_commit
                                         ELSE s.last_good_commit END,
                 last_good_at     = CASE WHEN excluded.status = 'ok'
+                                         AND (%s::boolean
+                                              OR coalesce(s.last_good_commit, '') = %s)
                                         THEN excluded.last_good_at
                                         ELSE s.last_good_at END,
                 diagnostic       = excluded.diagnostic,
                 checked_at       = excluded.checked_at
-            RETURNING host
+            RETURNING last_good_commit
             """,
-            (host, canon or "", canon_id, status, root, source, commit, good, diagnostic),
+            (host, canon or "", canon_id, status, root, source, commit, good, diagnostic,
+             expected is None, expected or "", expected is None, expected or ""),
         )
+        return rows[0]["last_good_commit"] if rows else None
 
     _STATE_COLUMNS = """
         host, canon, canon_id, status, root, source, last_good_commit, process_commit, diagnostic,
