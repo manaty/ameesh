@@ -129,6 +129,10 @@ BLOCK_END_RE = re.compile(r"^=+$", re.MULTILINE)
 STRONG_EVIDENCE = 4
 #: l'outil qui rend l'attribution `packet_red` d'un rouge de composition
 ATTRIBUTION_SCRIPT = "scripts/paquet-attribution.py"
+#: #4025 : budget, en secondes (durées psycopg de la carte), des modules que
+#: la carte d'impact ajoute à une unité ; les modules `support`, déterministes,
+#: ne sont pas plafonnés
+IMPACT_BUDGET_S = 180
 #: un en-tête d'échec unittest (`FAIL: test (tests.test_x.T.t)`) ; une ligne
 #: `FAIL:` produite par le test lui-même n'a pas ce nom pointé et est ignorée
 FAIL_LINE_RE = re.compile(
@@ -185,6 +189,8 @@ class Composition:
     units: list[Unit]
     discarded: list[Discarded]
     head: str
+    #: #4025 : la provenance de la sélection des modules voisins (carte)
+    selection: str = ""
 
 
 @dataclass
@@ -207,6 +213,8 @@ class TestRun:
     output: str
     seconds: float
     timed_out: bool = False
+    #: #4025 : les modules voisins ajoutés (`module`, `reason`, `files`)
+    added: list = field(default_factory=list)
 
     @property
     def green(self) -> bool:
@@ -926,6 +934,105 @@ def unit_test_modules(worktree: Path, unit: Unit) -> list[str]:
     return _dedupe_modules(worktree, modules)
 
 
+def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
+                     *, budget: int = IMPACT_BUDGET_S) -> tuple[dict, str]:
+    """#4025 : les modules voisins de chaque unité, et la note de la carte.
+
+    `paquet-attribution.py --select` de l'arbre composé rend, par unité, les
+    modules qui importent un module de test qu'elle modifie (`support`) et
+    ceux que la carte d'impact relie aux blocs `src/` qu'elle change
+    (`carte`, dans `budget` secondes). Un outil absent ou illisible n'ajoute
+    rien et le dit : les tests propres et les contrats restent joués, la
+    ci-full tranche.
+    """
+    script = worktree / ATTRIBUTION_SCRIPT
+    if not composition.units:
+        return {}, ""
+    if not script.is_file():
+        return {}, "modules voisins non sélectionnés : %s absent" % ATTRIBUTION_SCRIPT
+    payload = {
+        "schema": "ameesh-paquet-selection-request/1",
+        "base": base_sha, "budget": budget,
+        "units": [{"lot": unit.lot, "unit_sha": unit.commit}
+                  for unit in composition.units],
+    }
+    try:
+        proc = run_command(
+            [project_python(worktree), str(script), "--select",
+             "--repo", str(worktree)],
+            cwd=worktree, input_text=json.dumps(payload),
+            timeout=GIT_TIMEOUT, env=python_env(worktree))
+        report = json.loads(_decode(proc.stdout).strip() or "{}")
+    except (PaquetAutoError, ValueError) as exc:
+        return {}, "modules voisins non sélectionnés : %s" % _one_line(str(exc))[:200]
+    if proc.returncode != 0 or not isinstance(report, dict) \
+            or report.get("status") != "ok":
+        why = (report.get("why") if isinstance(report, dict) else "") \
+            or _tail(_output(proc), 3) or "sortie illisible"
+        return {}, "modules voisins non sélectionnés : %s" % _one_line(why)[:200]
+    out: dict[int, list[dict]] = {}
+    dropped = 0
+    spent = 0.0
+    for entry in report.get("units") or []:
+        lot = int(entry.get("lot") or 0)
+        rows = []
+        for row in entry.get("added") or []:
+            module = str(row.get("module") or "")
+            if not re.fullmatch(r"tests\.test_[A-Za-z0-9_]+", module) \
+                    or not (worktree / (module.replace(".", "/") + ".py")).is_file():
+                continue
+            rows.append({"module": module, "reason": str(row.get("reason") or ""),
+                         "files": [str(path) for path in row.get("files") or []]})
+        out.setdefault(lot, []).extend(rows)
+        dropped += int(entry.get("dropped") or 0)
+        spent += float(entry.get("seconds") or 0)
+    card = report.get("card") or {}
+    if card.get("commit"):
+        note = "carte d'impact `%s` (%s, %s)" % (
+            str(card["commit"])[:12], card.get("status") or "lue",
+            {"à jour": "à la base", "antérieure": "antérieure à la base",
+             }.get(card.get("base"), "%s par rapport à la base"
+                   % (card.get("base") or "inconnue")))
+    else:
+        note = "carte d'impact absente (%s) : seuls les modules `support` " \
+            "sont ajoutés" % (card.get("why") or card.get("status") or "?")
+    note += " ; budget de carte %d s par unité, %.0f s pris" % (budget, spent)
+    if dropped:
+        note += ", %d module(s) au-delà du budget non joué(s)" % dropped
+    return out, note
+
+
+def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
+                  timeout: int) -> set[str] | None:
+    """#4025 : les tests de `modules` rouges sur la base, ou None (non concluant).
+
+    Un module voisin rouge ne désigne l'unité que s'il est vert sur la base :
+    un rouge aussi présent sur la base vient de l'environnement de l'hôte ou
+    lui préexiste. Les modules sont rejoués dans un worktree détaché de la base.
+    """
+    if not base_sha or not modules:
+        return None
+    parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    path = Path(tempfile.mkdtemp(prefix="paquet-auto-base-", dir=str(parent)))
+    path.rmdir()
+    proc = git(worktree, "worktree", "add", "--detach", str(path), base_sha,
+               check=False)
+    if proc.returncode != 0:
+        shutil.rmtree(path, ignore_errors=True)
+        return None
+    try:
+        present = [module for module in modules
+                   if (path / (module.replace(".", "/") + ".py")).is_file()]
+        if not present:
+            return set()
+        run = run_tests(path, "base", present, timeout=timeout)
+        if run.inconclusive:
+            return None
+        return {failure["test"] for failure in unittest_failures(run.output)}
+    finally:
+        remove_worktree(worktree, path)
+
+
 def _dedupe_modules(worktree: Path, modules) -> list[str]:
     out: list[str] = []
     for module in modules:
@@ -1088,8 +1195,9 @@ def designated_removals(attribution: dict, failures: list[dict], *,
 
 def check_local_tests(worktree: Path, composition: Composition, *,
                       timeout: int, log=print,
-                      attribute=None) -> tuple[list[TestRun], list[int],
-                                               list[Removal]]:
+                      attribute=None, base_sha: str = "",
+                      select=None, on_base=None) -> tuple[list[TestRun], list[int],
+                                                          list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
     Rend `(exécutions, unités fautives, retraits)`. Une unité est fautive
@@ -1103,16 +1211,44 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     rc inattendu) est **consigné** dans `runs` et ne retire aucune unité : le
     canon §3 veut qu'il ne retienne ni paquet ni release ; la ci-full tranche.
     `attribute` est injectable pour les témoins (`attribute_composition`).
+
+    #4025 : la série d'une unité joue aussi ses modules voisins
+    (`neighbor_modules`, injectable par `select`). Dans le geste antérieur,
+    un rouge d'un module `carte` ne désigne l'unité que si aucune autre ne
+    l'a sélectionné ; un rouge partagé reste à l'attribution et à la ci-full.
+    Un rouge de module voisin aussi rouge sur la base (`base_failures`,
+    injectable par `on_base`) ne compte pas : environnement ou préexistant.
     """
     runs: list[TestRun] = []
     red: list[tuple[TestRun, list[dict]]] = []
     own: dict[int, list[dict]] = {}
+    neighbors, composition.selection = (select or neighbor_modules)(
+        worktree, composition, base_sha)
+    shared: dict[str, int] = {}
+    for rows in neighbors.values():
+        for module in {row["module"] for row in rows}:
+            shared[module] = shared.get(module, 0) + 1
+    if composition.selection:
+        log("tests voisins : %s" % composition.selection)
+    pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str]]] = []
     for unit in composition.units:
-        modules = unit_test_modules(worktree, unit)
+        proper = unit_test_modules(worktree, unit)
+        added = []
+        for row in neighbors.get(unit.lot, []):
+            if row["module"] not in proper \
+                    and all(row["module"] != done["module"] for done in added):
+                added.append(row)
+        modules = proper + [row["module"] for row in added]
         if not modules:
             log("tests unité #%d : aucun module propre" % unit.lot)
             continue
+        if added:
+            log("tests unité #%d : %d module(s) voisin(s) : %s"
+                % (unit.lot, len(added),
+                   ", ".join("%s (%s)" % (row["module"], row["reason"])
+                             for row in added)))
         run = run_tests(worktree, "unité #%d" % unit.lot, modules, timeout=timeout)
+        run.added = added
         runs.append(run)
         if run.inconclusive:
             log("tests unité #%d : NON CONCLUANT (%s) — consigné, le paquet "
@@ -1120,13 +1256,43 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             continue
         if not run.green:
             found = unittest_failures(run.output)
-            own[unit.lot] = found
-            red.append((run, found))
+            mine = {module.split(".", 1)[1] for module in proper}
+            neighbor = {row["module"].split(".", 1)[1] for row in added}
+            mine |= {row["module"].split(".", 1)[1] for row in added
+                     if row["reason"] != "carte" or shared.get(row["module"]) == 1}
+            pending.append((unit, run, found, mine, neighbor))
             log("tests unité #%d : ROUGE (%d modules)\n%s"
                 % (unit.lot, len(modules), _tail(run.output)))
         else:
             log("tests unité #%d : vert (%d modules, %d tests)"
                 % (unit.lot, len(modules), run.tests))
+    neighbor_red = sorted({"tests." + failure["module"]
+                           for _unit, _run, found, _mine, neighbor in pending
+                           for failure in found
+                           if failure.get("module") in neighbor})
+    at_base: set[str] | None = set()
+    if neighbor_red:
+        at_base = (on_base or base_failures)(worktree, base_sha, neighbor_red,
+                                             timeout=timeout)
+        log("tests voisins rouges rejoués sur la base %s : %s"
+            % (base_sha[:12] or "?", "non concluant" if at_base is None
+               else "%d rouge(s) aussi sur la base" % len(at_base)))
+    for unit, run, found, mine, neighbor in pending:
+        kept = []
+        for failure in found:
+            if failure.get("module") in neighbor \
+                    and (at_base is None or failure["test"] in at_base):
+                continue
+            kept.append(failure)
+        owned = [failure for failure in kept
+                 if not failure.get("module") or failure["module"] in mine]
+        if owned or not found:
+            own[unit.lot] = owned
+        if kept or not found:
+            red.append((run, kept))
+        else:
+            log("tests unité #%d : rouge des seuls voisins, aussi rouges sur la "
+                "base ou non rejoués — sans effet" % unit.lot)
     modules = contract_modules(worktree)
     contract = run_tests(worktree, "contrats", modules, timeout=timeout)
     runs.append(contract)
@@ -1277,6 +1443,7 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
         "- `scripts/freeze-checks.py` : vert en %.1f s." % freeze_seconds,
         "- Tests locaux : %s." % _tests_summary(tests),
     ]
+    lines += _neighbor_lines(composition, tests)
     inconclusive = _inconclusive_lines(tests)
     if inconclusive:
         lines += [
@@ -1303,6 +1470,27 @@ def _tests_summary(tests: list[TestRun]) -> str:
             "%d non concluant(s), %d sauté(s) : %s"
             % (len(tests), len(modules), total, red, inconclusive, skipped,
                ", ".join("`%s`" % module for module in modules) or "aucun"))
+
+
+def _neighbor_lines(composition: Composition, tests: list[TestRun]) -> list[str]:
+    """#4025 : les modules voisins joués par unité, avec leur raison."""
+    rows = []
+    for run in tests:
+        for row in run.added:
+            rows.append("| %s | `%s` | %s | %s |" % (
+                run.label.replace("#", ""), row["module"], row["reason"],
+                _cell(", ".join("`%s`" % path for path in row["files"][:3])
+                      + (" …" if len(row["files"]) > 3 else ""))))
+    if not rows and not composition.selection:
+        return []
+    lines = ["", "Modules voisins joués (support importé, carte d'impact) : %s."
+             % (composition.selection or "sélection sans note"), ""]
+    if rows:
+        lines += ["| unité | module | raison | fichiers de l'unité |",
+                  "|---|---|---|---|"] + rows
+    else:
+        lines.append("Aucun module voisin ajouté.")
+    return lines
 
 
 def _inconclusive_lines(tests: list[TestRun]) -> list[str]:
@@ -1893,7 +2081,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                     % _tail(freeze_output))
             print("freeze-checks : vert (%.1f s)" % freeze_seconds, flush=True)
             runs, faulty, removals = check_local_tests(
-                worktree, composition, timeout=args.tests_timeout)
+                worktree, composition, timeout=args.tests_timeout,
+                base_sha=base_sha)
             if not faulty:
                 break
             if recomp >= MAX_RECOMPOSITIONS:
