@@ -196,7 +196,14 @@ class RunChildTest(unittest.TestCase):
     @unittest.skipUnless(platform.is_linux(),
                          "L131c : waitid(WNOWAIT) et zombie du chef de groupe (Linux)")
     def test_a_worker_ignoring_sigterm_keeps_the_slot_until_sigkill(self):
-        proc, (suite, worker) = self._wrapper(self.SUITE % "1", grace=1.5, pids=2)
+        # #3935: the state below is observed BEFORE the grace ends, so the
+        # grace must outlast the observation on a loaded runner. In the CI
+        # (psycopg 6/8, run 40467354076) more than the old 1.5 s passed
+        # between SIGTERM and this check, and the final SIGKILL had already
+        # taken the worker. A long grace for the state assertions, then the
+        # wrapper's escalation waited for, bounded — not raced.
+        grace = 10.0
+        proc, (suite, worker) = self._wrapper(self.SUITE % "1", grace=grace, pids=2)
         proc.send_signal(signal.SIGTERM)
         self.assertTrue(self._gone(suite))
         # codex r3: the command stays unreaped while its group drains — its
@@ -209,7 +216,7 @@ class RunChildTest(unittest.TestCase):
         self.assertFalse(self._gone(worker, timeout=0.3))
         self.assertIsNone(proc.poll())
         self.assertIsNone(heavy.acquire(self.one, max_wait_s=0))
-        self.assertEqual(proc.wait(timeout=10), 128 + signal.SIGTERM)
+        self.assertEqual(proc.wait(timeout=grace + 30), 128 + signal.SIGTERM)
         self.assertTrue(self._gone(worker))
         got = heavy.acquire(self.one, max_wait_s=0)
         self.assertIsNotNone(got)
