@@ -36,7 +36,14 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    non concluant (§3 : run annulé ou hors délai, échec de job sans test,
    échec non attribuable ou ambigu, test vert en local) ne retire rien : il
    est consigné au journal du porteur et le pilote est prévenu, une fois.
-5. Un courrier au pilote à chaque étape (tête, unités, écartés, CI).
+5. **Reprise.** Chaque lancement de `paquet-auto.py` laisse d'abord une
+   marque « tentative » (étape, tête de départ, hôte:pid) ; son achèvement se
+   lit à la tête gelée qui a bougé, son échec à une marque « échec ». Une
+   tentative morte (échec, processus disparu sur cet hôte, ou délai de
+   composition dépassé ailleurs) est relancée sur le même porteur avec
+   `--force`, au plus 3 fois, puis le pilote est prévenu une fois. Un porteur
+   créé sans tentative (arrêt entre `work add` et la marque) est repris de même.
+6. Un courrier au pilote à chaque étape (tête, unités, écartés, CI).
 
 Ce script ne fusionne jamais : la fusion reste celle de `packet_automerge`
 sur la tête gelée, CI requise verte. Les marques d'idempotence sont des notes
@@ -53,6 +60,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -68,15 +76,31 @@ CARRIER_BRANCH_PREFIX = "integration/paquet"
 OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
 MARK = "paquet-horaire: "
 MARK_CI = MARK + "ci demandée "
-MARK_RECOMPOSED = MARK + "recomposition "
 MARK_RED = MARK + "rouge consigné "
 MARK_WAIT = MARK + "verdict au pilote "
+MARK_ATTEMPT = MARK + "tentative "
+MARK_FAILED = MARK + "échec "
+MARK_STUCK = MARK + "reprise épuisée "
+COMPOSITION = "composition"
+RECOMPOSITION = "recomposition"
+ATTEMPT_RE = re.compile(
+    r"^paquet-horaire: tentative (composition|recomposition) n=(\d+) base=(\S+) "
+    r"par=(\S+):(\d+)(?: run=(\S+) sans=([\d,]+))?")
+FAILED_RE = re.compile(r"^paquet-horaire: échec (composition|recomposition) n=(\d+) base=(\S+)")
 MAX_RECOMPOSITIONS = 1
+#: lancements de paquet-auto pour une même étape (même tête de départ)
+MAX_ATTEMPTS = 3
+#: un porteur sans tentative plus jeune que ce délai : création en cours
+CREATION_GRACE = 300
+#: forfait du porteur (L157) : les porteurs manuels h-29…h-32 étaient à 90 min
+CARRIER_ESTIMATE = "90m"
 CREATED_RE = re.compile(r"^lot #(\d+) created", re.MULTILINE)
 SCRIPT_DIR = Path(__file__).resolve().parent
 LIST_LIMIT = 300
 COMMAND_TIMEOUT = 600
 COMPOSE_TIMEOUT = 3 * 3600
+#: au-delà, une tentative lancée sur un autre hôte est réputée morte
+ATTEMPT_STALE = COMPOSE_TIMEOUT + 900
 REPLAY_TIMEOUT = 900
 
 
@@ -149,7 +173,17 @@ class Context:
     #: fuseau des coupures, lu au canon compilé (`mechanics.timezone`, #2449)
     zone: ZoneInfo = ZoneInfo("UTC")
     now: float = field(default_factory=time.time)
+    host: str = field(default_factory=socket.gethostname)
+    pid: int = field(default_factory=os.getpid)
     log: list[str] = field(default_factory=list)
+
+    def alive(self, pid: int) -> bool:
+        """Un tic de ce script tourne-t-il encore sous ce pid, sur cet hôte ?"""
+        try:
+            cmdline = Path("/proc/%d/cmdline" % pid).read_bytes()
+        except OSError:
+            return False
+        return b"paquet-horaire" in cmdline
 
     def say(self, text: str) -> None:
         self.log.append(text)
@@ -476,6 +510,8 @@ def compose(ctx: Context, rows: list[dict]) -> str:
         "work", "add", "--title", title, "--type", "evolution",
         "--app", ctx.project, "--assignee", ctx.pilot, "--priority", "1",
         "--branch", branch, "--target", ctx.target,
+        "--estimate", CARRIER_ESTIMATE,
+        "--estimate-source", "forfait du porteur horaire (#3845)",
         "--source", "paquet-horaire (#3845), minuterie",
         "--body", "Paquet horaire composé sans agent par scripts/paquet-horaire.py "
                   "(#3845) : %d lot(s) prêt(s) à la lecture (%s)."
@@ -487,17 +523,130 @@ def compose(ctx: Context, rows: list[dict]) -> str:
                            % auto._tail(created.text, 5))
     carrier = int(found.group(1))
     ctx.say("porteur #%d : %s" % (carrier, title))
-    result = paquet_auto(ctx, name, carrier)
-    return after_compose(ctx, carrier, name, result, step="composition")
+    return attempt(ctx, carrier, name, Attempt(COMPOSITION, 1, ""))
 
 
-def after_compose(ctx: Context, carrier: int, name: str, result: Result, *,
-                  step: str) -> str:
-    if result.returncode != 0:
-        ctx.note(carrier, MARK + "%s en échec (rc %d)" % (step, result.returncode))
+# ---------------------------------------------------------------------------
+# Tentatives et reprise
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Attempt:
+    step: str
+    n: int
+    base: str  # tête gelée au départ ("" : aucune)
+    host: str = ""
+    pid: int = 0
+    run_id: str = ""
+    exclude: list[int] = field(default_factory=list)
+    ts: float = 0.0
+    failed: bool = False
+
+    @property
+    def key(self) -> str:
+        return "%s base=%s" % (self.step, self.base or "-")
+
+
+def _events(item: dict) -> list[dict]:
+    """Les événements du plus ancien au plus récent (`work show` : récents d'abord)."""
+    events = list(item.get("events") or [])
+    return sorted(events, key=lambda ev: (float(ev.get("created_ts") or 0),
+                                          int(ev.get("id") or 0)))
+
+
+def attempts(item: dict) -> list[Attempt]:
+    """Les tentatives du journal, dans l'ordre, chacune marquée si un échec a suivi."""
+    found: list[Attempt] = []
+    for ev in _events(item):
+        note = str(ev.get("note") or "")
+        match = ATTEMPT_RE.match(note)
+        if match:
+            step, n, base, host, pid, run_id, without = match.groups()
+            found.append(Attempt(
+                step, int(n), "" if base == "-" else base, host, int(pid), run_id or "",
+                [int(lot) for lot in (without or "").split(",") if lot],
+                float(ev.get("created_ts") or 0)))
+            continue
+        match = FAILED_RE.match(note)
+        if match:
+            step, n, base = match.groups()
+            base = "" if base == "-" else base
+            for previous in reversed(found):
+                if (previous.step, previous.n, previous.base) == (step, int(n), base):
+                    previous.failed = True
+                    break
+    return found
+
+
+def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
+    """Lancer paquet-auto pour une étape, la marque d'intention d'abord."""
+    mark = "%s%s n=%d base=%s par=%s:%d" % (MARK_ATTEMPT, this.step, this.n,
+                                            this.base or "-", ctx.host, ctx.pid)
+    if this.step == RECOMPOSITION:
+        mark += " run=%s sans=%s" % (this.run_id, ",".join(str(lot) for lot in this.exclude))
+    ctx.note(carrier, mark)
+    # une reprise (n > 1) réécrit une branche peut-être déjà poussée
+    result = paquet_auto(ctx, name, carrier, exclude=this.exclude,
+                         force=this.step == RECOMPOSITION or this.n > 1)
+    return after_compose(ctx, carrier, name, result, this)
+
+
+def pending(ctx: Context, item: dict, sha: str) -> Attempt | None:
+    """La dernière tentative, si elle n'a pas abouti (la tête gelée n'a pas bougé)."""
+    found = attempts(item)
+    if found and found[-1].base == sha:
+        return found[-1]
+    if not sha and not found:
+        # porteur créé, arrêt avant la première marque : une tentative 0 morte
+        created = float(item.get("created_ts") or 0)
+        if ctx.now - created < CREATION_GRACE:
+            return Attempt(COMPOSITION, 0, "", ctx.host, ctx.pid, ts=created)
+        return Attempt(COMPOSITION, 0, "", failed=True, ts=created)
+    return None
+
+
+def running(ctx: Context, this: Attempt) -> bool:
+    if this.failed:
+        return False
+    if this.host == ctx.host:
+        return this.pid == ctx.pid or ctx.alive(this.pid)
+    return ctx.now - this.ts < ATTEMPT_STALE
+
+
+def resume(ctx: Context, item: dict, this: Attempt) -> str:
+    """Une tentative sans aboutissement : attendre, relancer, ou prévenir une fois."""
+    carrier = int(item["id"])
+    branch = str(item.get("branch") or "")
+    name = branch[len(auto.PACKAGE_PREFIX):]
+    if running(ctx, this):
+        return "#%d : %s en cours (%s:%d)" % (carrier, this.step, this.host, this.pid)
+    if this.n >= MAX_ATTEMPTS:
+        if MARK_STUCK + this.key in marks(item):
+            return "#%d : reprise de la %s épuisée, déjà signalée" % (carrier, this.step)
         ctx.mail(ctx.pilot, carrier,
-                 "#%d %s : paquet-auto.py a échoué (rc %d) ; un agent lit.\n\n%s"
-                 % (carrier, name, result.returncode, auto._tail(result.text, 30)))
+                 "#%d %s : %s lancée %d fois sans aboutir (tête %s) ; plus de reprise "
+                 "automatique, un agent lit le journal du porteur."
+                 % (carrier, name, this.step, this.n, (this.base or "aucune")[:12]))
+        ctx.note(carrier, MARK_STUCK + this.key)
+        return "#%d : reprise de la %s épuisée" % (carrier, this.step)
+    ctx.say("#%d : reprise de la %s (tentative %d morte)" % (carrier, this.step, this.n))
+    return attempt(ctx, carrier, name, Attempt(this.step, this.n + 1, this.base,
+                                               run_id=this.run_id,
+                                               exclude=list(this.exclude)))
+
+
+def after_compose(ctx: Context, carrier: int, name: str, result: Result,
+                  this: Attempt) -> str:
+    step = this.step
+    if result.returncode != 0:
+        ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (
+            MARK_FAILED, step, this.n, this.base or "-", result.returncode))
+        ctx.mail(ctx.pilot, carrier,
+                 "#%d %s : paquet-auto.py a échoué (rc %d, %s, tentative %d/%d) ; "
+                 "le tic suivant reprend.\n\n%s"
+                 % (carrier, name, result.returncode, step, this.n, MAX_ATTEMPTS,
+                    auto._tail(result.text, 30)))
         raise HoraireError("paquet-auto rc %d pour %s" % (result.returncode, name))
     if re.search(r"^(aucun lot prêt|aucune unité)", result.stdout, re.MULTILINE):
         reason = "rien composé (%s)" % step
@@ -548,8 +697,11 @@ def follow(ctx: Context, item: dict) -> str:
     """Un porteur horaire ouvert : publier, attendre, ou traiter un rouge."""
     carrier = int(item["id"])
     sha = frozen_sha(item)
+    left = pending(ctx, item, sha)
+    if left is not None:
+        return resume(ctx, item, left)
     if not sha:
-        return "#%d sans gel : composition en cours ou en échec, rien à faire" % carrier
+        return "#%d sans gel ni tentative : rien à faire" % carrier
     noted = marks(item)
     if MARK_CI + sha not in noted:
         return publish(ctx, item)
@@ -566,16 +718,17 @@ def follow(ctx: Context, item: dict) -> str:
         why = replay_locally(ctx, sha, verdict.tests)
         if why:
             verdict = Verdict(False, verdict.lots, verdict.tests, why)
-    recomposed = sum(1 for note in noted if note.startswith(MARK_RECOMPOSED))
+    recomposed = len({a.run_id for a in attempts(item) if a.step == RECOMPOSITION})
     if verdict.deterministic and recomposed < MAX_RECOMPOSITIONS:
         return recompose(ctx, item, run, verdict)
     reason = verdict.why if not verdict.deterministic else \
         "retrait automatique épuisé (%d recomposition)" % recomposed
-    ctx.note(carrier, MARK_RED + "%s : %s" % (run_id, reason))
+    # courrier puis marque : un arrêt entre les deux redit, il ne tait pas
     ctx.mail(ctx.pilot, carrier,
              "#%d %s : ci-full rouge (run %s, %s) ; rien retiré : %s. "
              "Un agent lit (ameesh ci status %d)."
              % (carrier, item.get("branch"), run_id, sha[:12], reason, carrier))
+    ctx.note(carrier, MARK_RED + "%s : %s" % (run_id, reason))
     return "#%d : rouge consigné (%s)" % (carrier, reason)
 
 
@@ -585,8 +738,6 @@ def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
     name = branch[len(auto.PACKAGE_PREFIX):]
     run_id = str(run.get("run_id") or "?")
     removed = ", ".join("#%d" % lot for lot in verdict.lots)
-    ctx.note(carrier, MARK_RED + "%s : déterministe, retrait de %s" % (run_id, removed))
-    ctx.note(carrier, MARK_RECOMPOSED + "1 sans %s (run %s)" % (removed, run_id))
     for lot in verdict.lots:
         try:
             author = str(show(ctx, lot).get("assignee") or "")
@@ -604,8 +755,8 @@ def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
     ctx.mail(ctx.pilot, carrier,
              "#%d %s : ci-full rouge (run %s), retrait de %s (%s) ; recomposition."
              % (carrier, name, run_id, removed, ", ".join(verdict.tests)))
-    result = paquet_auto(ctx, name, carrier, exclude=verdict.lots, force=True)
-    return after_compose(ctx, carrier, name, result, step="recomposition")
+    return attempt(ctx, carrier, name, Attempt(RECOMPOSITION, 1, frozen_sha(item),
+                                               run_id=run_id, exclude=list(verdict.lots)))
 
 
 def tick(ctx: Context) -> str:

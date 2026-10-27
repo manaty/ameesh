@@ -6,7 +6,9 @@ témoins : rien n'est créé sans lot prêt ni pendant une réservation ; une
 composition propre pose « verdict non requis » et demande la ci-full ; une
 résolution laisse ce geste au pilote ; un rouge attribué à une seule unité la
 retire et recompose une fois, en écrivant à son auteur ; un rouge non concluant
-ne retire rien.
+ne retire rien ; le porteur est créé avec son estimation (garde L157 de la
+vraie CLI) ; une tentative morte (arrêt, échec) est reprise sur le même
+porteur, bornée, puis signalée une fois.
 """
 from __future__ import annotations
 
@@ -51,6 +53,8 @@ class FakeShell:
         self.ci: dict[int, dict] = {}
         self.auto_out = "manifeste reviews/x.md : tête %s\n" % HEAD
         self.auto_rc = 0
+        self.added: list[list[str]] = []
+        self.clock = NOW
 
     def run(self, cmd, *, cwd=None, input_text=None, timeout=0):
         self.calls.append(list(cmd))
@@ -67,6 +71,7 @@ class FakeShell:
                 state = args[args.index("--state") + 1] if "--state" in args else ""
                 return ph.Result(0, json.dumps(self.lists.get(state, [])))
             if args[:2] == ["work", "add"]:
+                self.added.append(args)
                 return ph.Result(0, "lot #4000 created in intake: x\n")
             if args[:2] == ["work", "show"]:
                 return ph.Result(0, json.dumps(self.items[int(args[2])]))
@@ -75,7 +80,9 @@ class FakeShell:
             if args[:2] == ["work", "note"]:
                 item = self.items.get(int(args[2]))
                 if item is not None:
-                    item.setdefault("events", []).append({"note": args[3]})
+                    self.clock += 1
+                    item.setdefault("events", []).append(
+                        {"note": args[3], "created_ts": self.clock})
             return ph.Result(0, "ok\n")
         if str(cmd[1]).endswith("paquet-auto.py"):
             return ph.Result(self.auto_rc, self.auto_out)
@@ -196,13 +203,15 @@ class FollowTest(Base):
         self.assertEqual(auto[auto.index("--exclude") + 1], "3801")
         self.assertIn("mty-amh-impl-02", [to for to, _ in self.shell.mails])
         notes = ph.marks(self.shell.items[4000])
-        self.assertTrue(any(n.startswith(ph.MARK_RECOMPOSED) for n in notes))
+        self.assertTrue(any(n.startswith(ph.MARK_ATTEMPT + "recomposition n=1 base=%s"
+                                         % HEAD) for n in notes))
         # la recomposition est republiée : ci-full sur la nouvelle tête
         self.assertTrue(self.shell.ran("ci", "run", "4000", "--full"))
 
     def test_rouge_apres_recomposition_ne_retire_plus(self):
         item = self.open_carrier()
-        item["events"].append({"note": ph.MARK_RECOMPOSED + "1 sans #3755 (run 70)"})
+        item["events"].append({"note": ph.MARK_ATTEMPT + "recomposition n=1 base=%s "
+                               "par=autre:1 run=70 sans=3755" % HEAD2})
         self.shell.ci[4000] = {"runs": [red_run()]}
         self.assertIn("épuisé", ph.tick(self.ctx))
         self.assertFalse([c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)])
@@ -224,6 +233,123 @@ class FollowTest(Base):
         self.shell.ci[4000] = {"runs": [red_run()]}
         self.assertIn("vert en local", ph.tick(self.ctx))
         self.assertFalse([c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)])
+
+
+class EstimateGuardTest(Base):
+    """B1 : la commande de création passe la vraie garde de `ameesh work add`."""
+
+    def test_creation_passe_la_garde_l157_pour_un_agent(self):
+        from ameesh import estimates, mesh_cli
+        self.shell.items[4000] = carrier()
+        ph.tick(self.ctx)
+        args = mesh_cli.build_parser().parse_args(self.shell.added[0])
+        self.assertEqual(args.actor, "mesh-design")
+        saved = estimates.is_agent
+        estimates.is_agent = lambda db, actor: True  # mesh-design est au registre
+        try:
+            minutes = estimates.parse(args.estimate) if args.estimate else None
+            self.assertFalse(estimates.check(None, args.actor, minutes))
+            with self.assertRaises(estimates.EstimateError):  # le témoin mord
+                estimates.check(None, args.actor, None)
+        finally:
+            estimates.is_agent = saved
+        self.assertEqual(minutes, 90)
+
+
+class ResumeTest(Base):
+    """B2 : arrêt ou échec entre deux gestes, reprise sur le même porteur."""
+
+    def unfrozen(self, *notes, created=NOW - 3600):
+        item = carrier(sha="", created=created)
+        item["events"] = [{"note": n, "created_ts": NOW - 3000 + i}
+                          for i, n in enumerate(notes)]
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        return item
+
+    def autos(self):
+        return [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)]
+
+    def test_porteur_sans_tentative_repris(self):
+        self.unfrozen()
+        def frozen(cmd, _orig=self.shell.run, **kw):
+            out = _orig(cmd, **kw)
+            if "paquet-auto.py" in " ".join(cmd):
+                self.shell.items[4000]["freeze"] = {"declared": {"sha": HEAD}}
+            return out
+        self.shell.run = frozen
+        self.assertIn("ci-full demandée", ph.tick(self.ctx))
+        # aucune marque : paquet-auto n'a jamais tourné, tentative 1 sans --force
+        self.assertNotIn("--force", self.autos()[0])
+        self.assertIn(ph.MARK_ATTEMPT + "composition n=1 base=-",
+                      " ".join(ph.marks(self.shell.items[4000])))
+        self.assertEqual(self.shell.ran("work", "add"), [])
+
+    def test_porteur_tout_juste_cree_attend(self):
+        self.unfrozen(created=NOW - 30)
+        self.assertIn("en cours", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+
+    def test_tentative_vivante_sur_cet_hote_attend(self):
+        self.ctx.alive = lambda pid: True
+        self.unfrozen(ph.MARK_ATTEMPT + "composition n=1 base=- par=%s:99" % self.ctx.host)
+        self.assertIn("en cours", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+
+    def test_tentative_morte_sur_cet_hote_reprise(self):
+        self.ctx.alive = lambda pid: False
+        item = self.unfrozen(
+            ph.MARK_ATTEMPT + "composition n=1 base=- par=%s:99" % self.ctx.host)
+        self.shell.auto_rc = 1
+        with self.assertRaises(ph.HoraireError):
+            ph.tick(self.ctx)
+        self.assertIn("--force", self.autos()[0])
+        notes = ph.marks(item)
+        self.assertIn(ph.MARK_FAILED + "composition n=2 base=- rc=1", notes)
+        # l'échec consigné est repris au tic suivant, sans attendre de délai
+        self.shell.auto_rc = 0
+        ph.tick(self.ctx)
+        tried = [n for n in ph.marks(item) if n.startswith(ph.MARK_ATTEMPT)]
+        self.assertIn("composition n=3", tried[-1])
+
+    def test_autre_hote_attend_le_delai(self):
+        item = self.unfrozen(ph.MARK_ATTEMPT + "composition n=1 base=- par=autre:9")
+        self.assertIn("en cours", ph.tick(self.ctx))
+        item["events"][0]["created_ts"] = NOW - ph.ATTEMPT_STALE - 1
+        self.shell.auto_out = "aucune unité composée\n"
+        self.assertIn("rien composé", ph.tick(self.ctx))
+        self.assertEqual(len(self.autos()), 1)
+
+    def test_reprise_epuisee_signalee_une_fois(self):
+        notes = []
+        for n in range(1, ph.MAX_ATTEMPTS + 1):
+            notes += [ph.MARK_ATTEMPT + "composition n=%d base=- par=autre:9" % n,
+                      ph.MARK_FAILED + "composition n=%d base=- rc=1" % n]
+        self.unfrozen(*notes)
+        self.assertIn("épuisée", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+        self.assertEqual(len(self.shell.mails), 1)
+        self.assertIn("épuisée, déjà signalée", ph.tick(self.ctx))
+        self.assertEqual(len(self.shell.mails), 1)
+
+    def test_recomposition_interrompue_reprise_sans_reecrire_aux_auteurs(self):
+        item = carrier(notes=(ph.MARK_CI + HEAD,))
+        item["events"] = [{"note": ph.MARK_CI + HEAD, "created_ts": NOW - 900},
+                          {"note": ph.MARK_ATTEMPT + "recomposition n=1 base=%s par=autre:9 "
+                           "run=77 sans=3801" % HEAD, "created_ts": NOW - 800},
+                          {"note": ph.MARK_FAILED + "recomposition n=1 base=%s rc=1" % HEAD,
+                           "created_ts": NOW - 700}]
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        self.shell.ci[4000] = {"runs": [red_run()]}
+        ph.tick(self.ctx)
+        auto = self.autos()[0]
+        self.assertIn("--force", auto)
+        self.assertEqual(auto[auto.index("--exclude") + 1], "3801")
+        self.assertIn(ph.MARK_ATTEMPT + "recomposition n=2 base=%s" % HEAD,
+                      " ".join(ph.marks(item)))
+        self.assertNotIn("mty-amh-impl-02", [to for to, _ in self.shell.mails])
+        self.assertFalse(any(n.startswith(ph.MARK_RED) for n in ph.marks(item)))
 
 
 class ClassifyTest(unittest.TestCase):
