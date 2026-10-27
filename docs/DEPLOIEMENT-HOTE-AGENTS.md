@@ -561,8 +561,17 @@ tick. Aucune prod : le staging n'est pas une release de prod (canon §14), un go
 owner reste requis pour la prod.
 
 La recette PgBouncer autorise aussi `ameesh-agents-3` sous l’utilisateur
-`ameesh`. Son pool est limité à 32 connexions ordinaires et 8 de réserve
-(`max_db_connections = 40`) ; les trois pools existants restent à 80 chacun,
-soit un budget de 280 sous le plafond serveur de 300. Cette recette ne
-redimensionne pas les installations existantes : le bureau vérifie leurs
-plafonds effectifs avant d’installer ou de modifier un pool.
+`ameesh`. Elle prévoit pour cet hôte 32 connexions ordinaires et 8 de réserve
+(`max_db_connections = 40`), et conserve un plafond de 80 pour chacun des
+trois hôtes de runners antérieurs. Si ces quatre hôtes passent exclusivement
+par ces pools, leur budget cumulé est de 280 sous le plafond serveur de 300.
+
+Au relevé en lecture seule du bureau du 27/10/2026 vers 11:00Z (courrier
+#150697), seul `pc-smichea` dispose de PgBouncer, plafonné à 80 ; les trois
+VM d’agents se connectent directement à Postgres. Les connexions observées
+pour ameesh étaient respectivement de 60 sur agents-1, 50 sur agents-2,
+14 sur le poste et 0 sur agents-3 ; ce relevé ponctuel ne borne pas leur
+croissance. Le budget théorique de la recette ne plafonne donc pas la flotte
+déployée. Cette modification n’installe aucun pool et ne redimensionne aucune
+installation ; une installation ultérieure exige de vérifier aussi les
+connexions directes et les autres clients du serveur.

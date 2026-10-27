@@ -37,9 +37,12 @@ APPROVED_OPERATORS = {
 #: then `no more connections allowed`): these are the values applied by hand on
 #: pc-smichea and kept here so a redeployment does not lower them again.
 #: `default_pool_size + reserve_pool_size` must not exceed
-#: `max_db_connections`. #3965 preserves the existing three 80-slot pools
+#: `max_db_connections`. #3965 keeps the 80-slot recipe for the three original runner hosts
 #: and gives agents-3 32+8 slots: 80+80+80+40 = 280 < 300, with 20 slots
-#: left for direct administration/monitoring. Existing pools are not resized.
+#: left for other clients IF all four hosts use these pools exclusively.
+#: Bureau #150697 (2026-10-27): only pc-smichea currently has a pool; the
+#: three agent VMs connect directly. These recipe limits do not cap direct
+#: clients, and no existing installation is resized here.
 MAX_CLIENT_CONN = 250
 DEFAULT_POOL_SIZE = 64
 RESERVE_POOL_SIZE = 16
