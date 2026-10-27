@@ -35,6 +35,15 @@ invalide le rapport.
 Le rapport porte lot, SHA complet, base, commit de carte, identité de l'arbre
 envoyé, modules exécutés, hôte, résultat et durée ; il n'est pas un verdict et
 ne remplace aucune relecture (#1617, #1756).
+
+Le lot #4071 — le guest n'est pas le poste. Le profil d'offload `ameesh` ne
+peut pas exécuter les tests qui exigent les unités systemd, le HOME/UID ou les
+canaux Unix courts du poste, ni ceux dont l'environnement diverge (recette
+libpq, snapshot sans histoire). `GUEST_EXCLUSIONS` les déclare module par
+module, avec une raison ; `validate` les retire du **plan envoyé au guest**
+(jamais de la suite complète), et le rapport les nomme (`excluded`) en séparant
+leurs échecs éventuels (`excluded_failed`) d'un rouge réel. Aucun motif de nom
+n'y intervient.
 """
 from __future__ import annotations
 
@@ -88,6 +97,40 @@ CAUSES = (
     "block-missing",      # le canon ne porte pas le bloc `prevalidation` (#1770)
     "tooling-missing",    # le dépôt candidat n'a pas le plan ni le lanceur (#2794)
 )
+
+#: #4071 — tests qu'un guest d'offload ne peut pas exécuter, par profil
+#: (`ameesh` pour la suite du projet), avec leur raison nommée.
+#:
+#: Liste **déclarative** : un module exact par entrée, jamais un motif de nom.
+#: Le guest n'est pas le poste : ni son HOME/UID (unités systemd, chemins
+#: `/run/user/…`), ni ses canaux Unix courts, ni l'histoire du dépôt (un
+#: snapshot n'a pas de parent), ni la recette libpq du poste. Ces modules
+#: restent dans la **suite complète** (CI, `main`, paquets) ; seule la
+#: sélection envoyée au guest les retire (`filter_guest_plan`), et le rapport
+#: les nomme (`excluded`, `excluded_failed`) pour qu'un échec de test exclu ne
+#: se lise jamais comme un rouge réel (§3). Les huit entrées sont celles
+#: observées au run réel #4044 du 27/10 (hôte agents-3, 2 486 tests, 91
+#: échecs) ; une entrée nouvelle se justifie par un run réel, pas par un nom.
+GUEST_EXCLUSIONS: dict[str, dict[str, str]] = {
+    "ameesh": {
+        "test_503_agent_host":
+            "hôte : unités systemd, HOME/UID et chemins du poste",
+        "test_3114_host_wide_drain":
+            "hôte : drain d'hôte (doubles de test_503)",
+        "test_l93_device_state":
+            "hôte : canaux Unix courts sous XDG_RUNTIME_DIR du poste",
+        "test_l112_host_gate":
+            "hôte : porte d'hôte par socket Unix",
+        "test_approve":
+            "guest (#4044) : dossier d'état privé et journal du poste (2 échecs)",
+        "test_653_db_connections":
+            "guest (#4044) : recette socket DSN libpq du poste (1 échec)",
+        "test_l161f_plan":
+            "guest (#4044) : plan L161f dans le snapshot (1 échec)",
+        "test_1323_actif":
+            "guest (#4044) : point d'entrée deploy/mise-a-jour (1 échec)",
+    },
+}
 
 
 class PrevalidationError(Exception):
@@ -177,6 +220,24 @@ def _fin_label(part: str, fins_par_part: dict) -> str:
     return "%s (%s)" % (part, fins_par_part.get(part) or "sans fin")
 
 
+def test_module(name: str) -> str:
+    """Le module de test d'un nom unittest, ou "" si le nom n'en porte pas.
+
+    `tests.test_503_agent_host.AgentHostTest.test_x` et
+    `setUpClass (tests.test_503_agent_host.AgentHostTest)` désignent tous deux
+    le module `test_503_agent_host` ; c'est ce grain que la liste #4071
+    déclare. Aucun rapprochement par sous-chaîne : le nom doit commencer par
+    `tests.` et son deuxième champ est le module."""
+    text = str(name or "").strip()
+    for prefix in ("setUpClass (", "tearDownClass (",
+                   "setUpModule (", "tearDownModule ("):
+        if text.startswith(prefix) and text.endswith(")"):
+            text = text[len(prefix):-1]
+            break
+    fields = text.split(".")
+    return fields[1] if len(fields) >= 2 and fields[0] == "tests" else ""
+
+
 @dataclass(frozen=True)
 class Selection:
     """La sélection à exécuter, ou les causes de son refus (`ok` faux).
@@ -196,6 +257,9 @@ class Selection:
     #: #3800 : repli contractuel quand la sélection n'a pas pu être prouvée ;
     #: porte la cause d'origine et les modules de contrat réellement joués.
     fallback: dict | None = None
+    #: #4071 : modules retirés du plan parce que le guest ne peut pas les
+    #: exécuter, avec leur raison nommée. Ils restent dans la suite complète.
+    excluded: tuple[dict, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -215,8 +279,9 @@ class Selection:
         La preuve est **exhaustive** : chaque part attendue doit avoir sa fin
         verte — seul `succes` est vert ; `echec` est rouge, tout autre statut
         (interrompu, inconnu, vide) est incomplet —, chaque module attendu doit
-        avoir été exécuté, et les modules du rapport sont ceux réellement vus —
-        jamais ceux du plan (une preuve ne s'invente pas)."""
+        avoir été exécuté (hors modules déclarés exclus du guest, #4071), et les
+        modules du rapport sont ceux réellement vus — jamais ceux du plan (une
+        preuve ne s'invente pas)."""
         flow = flow or {}
         causes = list(self.causes)
         if head_after and not _same_commit(head_after, self.head):
@@ -224,13 +289,39 @@ class Selection:
         executed = tuple(sorted(str(m) for m in (flow.get("modules") or ())))
         fins_par_part = flow.get("fins_par_part") or {}
         planned_parts = tuple(sorted(part_label(p) for p in self.parts))
+        #: #4071 : le module exclu du guest est déclaré par la liste, pas par
+        #: un motif de nom. Un échec dont le module est exclu est non concluant
+        #: (§3) : il ne peint pas la part en rouge, et le rapport le range à
+        #: part (`excluded_failed`).
+        excluded = tuple(dict(item) for item in self.excluded
+                         if isinstance(item, dict))
+        excluded_names = {str(item.get("module")) for item in excluded}
+        all_failed = [str(t) for t in (flow.get("failed") or ())]
+        excluded_failed = [name for name in all_failed
+                           if test_module(name) in excluded_names]
+        failed = [name for name in all_failed
+                  if test_module(name) not in excluded_names]
         # une part rouge et une part sans fin verte ne disent pas la même chose :
         # la première a tourné et échoué, la seconde n'a pas rendu son verdict.
         # Un statut inconnu n'est jamais vert (#1770, P1 cx1).
-        red = [p for p in planned_parts if fins_par_part.get(p) == "echec"]
+        red: list[str] = []
+        for part in planned_parts:
+            if fins_par_part.get(part) != "echec":
+                continue
+            named = [str(t) for t in
+                     ((flow.get("failed_by_part") or {}).get(part) or ())]
+            if named and all(test_module(t) in excluded_names for t in named):
+                continue
+            red.append(part)
+        if red and all_failed and not failed \
+                and all(test_module(t) in excluded_names for t in all_failed):
+            # flux ancien, sans `failed_by_part` : tous les échecs observés
+            # sont exclus ; aucune preuve réelle ne reste.
+            red = []
         unfinished = [p for p in planned_parts
                       if fins_par_part.get(p) not in ("succes", "echec")]
-        missing_modules = [m for m in self.modules if m not in set(executed)]
+        missing_modules = [m for m in self.modules
+                           if m not in set(executed) and m not in excluded_names]
         detail: list[str] = []
         if self.fallback:
             #: #3800 : la preuve dit toujours que la sélection n'était pas
@@ -245,12 +336,26 @@ class Selection:
                      or self.fallback.get("changed_tests") else "contrats seuls")
             detail.append("sélection incertaine (%s) : %s (%d module(s))"
                           % (cause, joues, len(self.modules)))
+        if excluded:
+            detail.append(
+                "%d module(s) exclu(s) du guest : %s%s"
+                % (len(excluded),
+                   ", ".join("%s (%s)" % (item["module"], item["reason"])
+                             for item in excluded[:4]),
+                   " (+%d)" % (len(excluded) - 4) if len(excluded) > 4 else ""))
+        if excluded_failed:
+            detail.append(
+                "tests en échec dans un module exclu du guest (non concluant) : "
+                "%s%s" % (", ".join(excluded_failed[:6]),
+                          " (+%d)" % (len(excluded_failed) - 6)
+                          if len(excluded_failed) > 6 else ""))
         outcome = run.get("outcome") or ""
-        failed_all = [str(t) for t in (flow.get("failed") or ())]
-        environment = set(str(t) for t in (flow.get("environment") or ()))
-        #: #4039 : un rouge dont chaque échec est d'environnement (fixture de
-        #: classe ou de module, base injoignable) n'est pas concluant (§3)
-        environment_only = bool(failed_all) and all(t in environment for t in failed_all)
+        #: #4039 : seuls les échecs réels (non exclus du guest) comptent pour
+        #: la qualification d'environnement ; un échec d'un module exclu ne
+        #: doit ni empêcher un run purement environnemental d'être non
+        #: concluant, ni verdir une part rouge anonyme.
+        environment = set(str(t) for t in (flow.get("environment") or ())) & set(failed)
+        environment_only = bool(failed) and all(t in environment for t in failed)
         if causes:
             outcome = "refused"
         elif environment_only and (outcome == "run-red"
@@ -258,19 +363,26 @@ class Selection:
             outcome = "run-incomplete"
             causes.append("run-incomplete")
             detail.append("échecs d'environnement seuls (%d) : %s%s"
-                          % (len(failed_all), ", ".join(failed_all[:4]),
-                             " (+%d)" % (len(failed_all) - 4)
-                             if len(failed_all) > 4 else ""))
-        elif outcome == "green":
-            if red:
+                          % (len(failed), ", ".join(failed[:4]),
+                             " (+%d)" % (len(failed) - 4)
+                             if len(failed) > 4 else ""))
+        elif outcome in ("green", "run-red"):
+            if red or failed:
                 outcome = "run-red"
                 causes.append("run-red")
-                detail.append("parts rouges: %s" % ", ".join(red[:4]))
-                failed = [str(t) for t in (flow.get("failed") or ())]
+                if red:
+                    detail.append("parts rouges: %s" % ", ".join(red[:4]))
                 if failed:
                     detail.append("tests en échec: %s%s"
                                   % (", ".join(failed[:6]),
-                                     " (+%d)" % (len(failed) - 6) if len(failed) > 6 else ""))
+                                     " (+%d)" % (len(failed) - 6)
+                                     if len(failed) > 6 else ""))
+            elif outcome == "run-red" and not all_failed:
+                # un code de sortie rouge sans test nommé n'est pas un échec
+                # exclu : rien ne prouve que la part est verte.
+                outcome = "run-red"
+                causes.append("run-red")
+                detail.append("run rouge sans test en échec nommé")
             elif unfinished:
                 outcome = "run-incomplete"
                 causes.append("run-incomplete")
@@ -282,6 +394,10 @@ class Selection:
                 causes.append("run-incomplete")
                 detail.append("modules planifiés non exécutés: %s"
                               % ", ".join(sorted(missing_modules)[:4]))
+            else:
+                # un run `run-red` dont tous les échecs sont ceux de modules
+                # exclus du guest n'a plus de rouge réel : il est vert.
+                outcome = "green"
         else:
             causes.append(outcome)
         unique: list[str] = []
@@ -301,7 +417,9 @@ class Selection:
             "tests": flow.get("tests"),
             "host": host, "outcome": outcome,
             "exit": run.get("exit"), "seconds": run.get("seconds"),
-            "failed": list(flow.get("failed") or ()),
+            "failed": failed,
+            "excluded": list(excluded),
+            "excluded_failed": excluded_failed,
             "causes": unique, "ok": not unique, "detail": detail,
         }
         if self.fallback:
@@ -361,8 +479,116 @@ def planned_modules(plan: dict) -> tuple[str, ...]:
     return tuple(modules)
 
 
-def selection(plan: dict, *, head: str, base: str = "", plan_path: str = "") -> Selection:
+def guest_excluded(profile: str) -> tuple[dict, ...]:
+    """#4071 : les modules que ce profil de guest ne peut pas exécuter.
+
+    Rend `(module, raison)` dans l'ordre alphabétique. Un profil inconnu n'a
+    aucune exclusion : la liste est propre à un profil d'offload, pas une
+    règle générale qui retirerait des tests du guest de tous les projets."""
+    listed = GUEST_EXCLUSIONS.get(str(profile or "").strip(), {})
+    return tuple({"module": name, "reason": reason}
+                 for name, reason in sorted(listed.items()))
+
+
+def filter_guest_plan(plan: dict, excluded: Sequence[dict]
+                      ) -> tuple[dict, tuple[dict, ...]]:
+    """#4071 : retire du plan les modules exclus du guest, et dit lesquels.
+
+    Le plan envoyé au guest est celui qui est filtré : ses parts, ses classes,
+    sa liste de contrats et le bloc `fallback` sont recalculés, et les comptes
+    de `selection` suivent (le plan L161f ne porte que des comptes). Rend
+    `(plan, appliqués)` ; `appliqués` ne contient que les modules réellement
+    présents (un module déclaré mais absent n'a rien retiré). Le plan d'entrée
+    n'est pas modifié."""
+    if not isinstance(plan, dict) or not excluded:
+        return plan, ()
+    names = {str(item.get("module")) for item in excluded
+             if isinstance(item, dict) and item.get("module")}
+    if not names:
+        return plan, ()
+
+    def kept(values) -> list[str]:
+        return [str(value) for value in (values or ())
+                if str(value) not in names]
+
+    removed: set[str] = set()
+    raw_parts = plan.get("parts")
+    parts: dict[str, list[dict]] = {}
+    if isinstance(raw_parts, dict):
+        for driver, listed in raw_parts.items():
+            kept_parts: list[dict] = []
+            for part in listed or ():
+                if not isinstance(part, dict) \
+                        or not isinstance(part.get("modules"), (list, tuple)):
+                    # plan malformé : ne pas le réparer en silence, `selection`
+                    # le refusera ; on ne retire que ce qu'on sait lire.
+                    kept_parts.append(part)
+                    continue
+                before = [str(name) for name in part["modules"]]
+                modules = [name for name in before if name not in names]
+                removed |= {name for name in before if name in names}
+                if not modules:
+                    continue
+                folio = dict(part)
+                folio["modules"] = modules
+                kept_parts.append(folio)
+            if kept_parts:
+                parts[str(driver)] = kept_parts
+
+    raw_contract = plan.get("contract")
+    if isinstance(raw_contract, (list, tuple)):
+        removed |= {str(name) for name in raw_contract if str(name) in names}
+    fallback = plan.get("fallback") if isinstance(plan.get("fallback"), dict) else None
+    if fallback and isinstance(fallback.get("modules"), (list, tuple)):
+        removed |= {str(name) for name in fallback["modules"]
+                    if str(name) in names}
+    if not removed:
+        return plan, ()
+    applied = tuple(dict(item) for item in excluded
+                    if isinstance(item, dict) and str(item.get("module")) in removed)
+
+    new = dict(plan)
+    if isinstance(raw_parts, dict):
+        new["parts"] = parts
+    raw_classes = plan.get("classes")
+    if isinstance(raw_classes, dict):
+        new["classes"] = {str(name): value
+                          for name, value in raw_classes.items()
+                          if str(name) not in names}
+    if isinstance(raw_contract, (list, tuple)):
+        new["contract"] = kept(raw_contract)
+    if fallback:
+        folio = dict(fallback)
+        for key in ("modules", "contracts", "transverse", "changed_tests"):
+            if isinstance(fallback.get(key), (list, tuple)):
+                folio[key] = kept(fallback.get(key))
+        folio["excluded"] = [dict(item) for item in applied]
+        new["fallback"] = folio
+    raw_selection = plan.get("selection")
+    if isinstance(raw_selection, dict):
+        selection_block = dict(raw_selection)
+        modules = planned_modules(new)
+        classes = new.get("classes") if isinstance(new.get("classes"), dict) else {}
+        selection_block.update(
+            selected=len(modules), modules=len(modules),
+            impacted=sum(1 for name in modules
+                         if isinstance(classes.get(name), (list, tuple))
+                         and classes[name]
+                         and str(classes[name][0]) in ("P0", "P1")),
+            contract=len(new.get("contract") or ()))
+        new["selection"] = selection_block
+    new["guest_excluded"] = [dict(item) for item in applied]
+    return new, applied
+
+
+def selection(plan: dict, *, head: str, base: str = "", plan_path: str = "",
+              excluded: Sequence[dict] = ()) -> Selection:
     """La sélection d'un plan pour la tête `head`, ou les causes du refus.
+
+    `excluded` (#4071) porte les modules que le guest ne peut pas exécuter :
+    ils ne sont pas exigés dans la preuve et leurs échecs éventuels sont dits
+    non concluants. Le plan lui-même est filtré par `validate` avant l'envoi ;
+    ce paramètre sert à la preuve et aux appelants qui jugent un plan brut.
 
     Un plan insuffisant est un **résultat**, pas une exception : le gel sera
     refusé avec la cause nommée."""
@@ -446,7 +672,9 @@ def selection(plan: dict, *, head: str, base: str = "", plan_path: str = "") -> 
     return Selection(head=head, base=base, card_commit=card_commit,
                      modules=modules, parts=tuple(parts),
                      causes=tuple(unique), why=" ; ".join(why), plan_path=plan_path,
-                     fallback=fallback)
+                     fallback=fallback,
+                     excluded=tuple(dict(item) for item in excluded
+                                    if isinstance(item, dict)))
 
 
 def host_allowed(host: str, *, local: str | None = None, deny: Sequence[str] = (),
@@ -703,6 +931,7 @@ def parse_flow(text: str) -> dict:
     failed: list[str] = []
     environment_hits: set = set()
     body_hits: set = set()
+    failed_by_part: dict[str, list[str]] = {}
     parts: list[str] = []
     fins: list[str] = []
     fins_par_part: dict = {}
@@ -743,6 +972,8 @@ def parse_flow(text: str) -> dict:
                     environment_hits.add(nom)
                 else:
                     body_hits.add(nom)
+                if part:
+                    failed_by_part.setdefault(part, []).append(nom)
         elif kind == "fin":
             statut = str(event.get("statut") or "")
             fins.append(statut)
@@ -755,7 +986,9 @@ def parse_flow(text: str) -> dict:
                         if nom in environment_hits and nom not in body_hits)
     return {"modules": tuple(sorted(modules)), "failed": tuple(failed), "tests": tests,
             "environment": environment,
-            "parts": tuple(parts), "fins": tuple(fins), "fins_par_part": fins_par_part}
+            "parts": tuple(parts), "fins": tuple(fins), "fins_par_part": fins_par_part,
+            "failed_by_part": {part: tuple(names)
+                               for part, names in failed_by_part.items()}}
 
 
 def parse_seconds(text: str) -> float | None:
@@ -869,7 +1102,8 @@ def contract_modules(paths, repo: str = "", *, head: str = "",
 
 
 def meets_canon(plan: dict, params, repo: str = "", *, head: str = "",
-                runner=subprocess.run) -> tuple[bool, str]:
+                runner=subprocess.run,
+                excluded: Sequence[dict] = ()) -> tuple[bool, str]:
     """La sélection du plan tient-elle exactement dans le canon ?
 
     Le canon déclare les classes retenues et les fichiers de contrat ; le plan
@@ -881,19 +1115,24 @@ def meets_canon(plan: dict, params, repo: str = "", *, head: str = "",
     - le plan ne peut pas compter comme contrat un module absent de ces
       fichiers (un contrat inventé n'est pas une garantie du canon).
 
-    Sans classes lisibles, rien ne se prouve : refus."""
+    `excluded` (#4071) retire de cette exigence les modules que le guest ne
+    peut pas exécuter : ils restent dans la suite complète, pas dans la
+    sélection envoyée. Sans classes lisibles, rien ne se prouve : refus."""
     classes = plan.get("classes") if isinstance(plan, dict) else None
     if not isinstance(classes, dict) or not classes:
         return False, "plan sans classes : la sélection ne se prouve pas"
     declared = tuple(getattr(params, "classes", ()) or ())
     if not declared:
         return False, "canon sans classes déclarées"
+    skipped = {str(item.get("module")) for item in excluded
+               if isinstance(item, dict) and item.get("module")}
     required, problem = contract_modules(getattr(params, "contracts", ()) or (), repo,
                                         head=head, runner=runner)
     if problem:
         return False, problem
-    contract = {str(m) for m in (plan.get("contract") or ())}
-    chosen = set(planned_modules(plan))
+    required = tuple(name for name in required if name not in skipped)
+    contract = {str(m) for m in (plan.get("contract") or ())} - skipped
+    chosen = set(planned_modules(plan)) - skipped
     if required:
         absent = sorted(set(required) - chosen)
         if absent:
@@ -906,6 +1145,7 @@ def meets_canon(plan: dict, params, repo: str = "", *, head: str = "",
                 if isinstance(entry, (list, tuple)) and entry
                 and str(entry[0]) in declared}
     expected |= contract
+    expected -= skipped
     missing = sorted(expected - chosen)
     extra = sorted(chosen - expected)
     if missing:
@@ -970,6 +1210,10 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
     ou une sélection élargie ; aucun repli local, aucune écriture de jalon. Le
     rapport rendu n'est pas un verdict (#1617, #1756).
 
+    `profile` (#4071) nomme le profil d'offload du guest. Ses exclusions
+    déclarées (`GUEST_EXCLUSIONS`) retirent du plan **envoyé** les modules que
+    le guest ne peut pas exécuter ; la suite complète n'est jamais filtrée.
+
     Avec `deadline` (#2665/N cx2), le geste ne commence aucune étape après
     l'échéance et `run_offload` borne l'attente locale du client (slot,
     transport, push) ; une échéance épuisée est `run-incomplete`, jamais un
@@ -996,8 +1240,20 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
     root = os.path.abspath(cwd or repo or os.getcwd())
     text = plan_text(plan_path)
     plan = parse_plan(text, plan_path)
-    within, why = meets_canon(plan, params, root, head=head, runner=git_runner)
-    chosen = selection(plan, head=head, base=base, plan_path=plan_path)
+    #: #4071 : le guest ne joue pas les modules que son profil déclare
+    #: inexécutables ; le plan filtré est celui qui part (le même texte est
+    #: parsé et embarqué), et le rapport nomme les retirés. La suite complète
+    #: n'est jamais filtrée : elle garde ces modules.
+    excluded = guest_excluded(profile)
+    applied: tuple[dict, ...] = ()
+    if excluded:
+        plan, applied = filter_guest_plan(plan, excluded)
+        if applied:
+            text = json.dumps(plan, indent=1, ensure_ascii=False) + "\n"
+    within, why = meets_canon(plan, params, root, head=head, runner=git_runner,
+                              excluded=excluded)
+    chosen = selection(plan, head=head, base=base, plan_path=plan_path,
+                       excluded=applied)
     if not chosen.ok:
         raise PrevalidationError(chosen.causes[0], chosen.why)
     if not within:
