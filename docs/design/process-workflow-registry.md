@@ -99,7 +99,8 @@ sources = pr.read_sources(context)                # real collections, in the tx
   reopened, `terminal-reopened`) or a transfer (the stage is kept, it must
   exist in the new artifact and project the current core outside a hold). It
   requires the reserved `revision_transfer` verifier: nothing is possible by
-  default.
+  default. Slice C installs it (#4007, contract `revision-transfer/1`, see
+  [Revision transfer](#revision-transfer-4007-a-of-2846)).
 * `Receipt`: `accepted`, `replayed`, `event_id`/`version`, `state`,
   `workflow_ref`, `workflow_stage`, `workflow_version`, `intent_sha256`.
 * `read_sources(context) -> Mapping`: the source read for C (which is pure and
@@ -201,7 +202,7 @@ here).
 | 1a | `planning` **and** `start_work`: current spec approved | none: `_check_planning` reads only `title`; the locked row also carries `app`, `workstream`, `type`, `state`, `reviewer`, `workflow_*` | `evidence-missing` (no title); `type-unsupported` (type outside `INSTALLED_TYPES`) | "current spec": artifact/digest, approving actor, validity window — **consumer policy, not published** |
 | 1b | `planning`/`start_work`: budget | three native envelopes, none read by C: lot `work_items.budget_usd numeric(12,4)` (migration 0004, **not projected** by `_lock_lot`); account `account_budgets` (migration 0443, daily per billing account); agent `budget_usd` (canon declarative field, `canon_sync.DECLARATIVE`) | none: no native budget check | which envelope (lot vs agent vs account), threshold, period — **missing**. Shape matters: a lot field added to `_lock_lot` is a plain projection and **escapes** `source-unavailable` (an absent field reads as empty, not as a missing source); an account/agent envelope would be one more declared collection in `SOURCE_KEYS`, fail-closed when absent |
 | 1c | reviewed governance authority | no generic native object; only candidates: native decision request L233 (open requests only), module proof `work_module_milestones` (`schemas`/`rules`, `actor_role`, `separation_of_duties`), `reviewer` designation | nothing generic | source role/actor and review rule — **missing**; any acceptance would be invented |
-| 2 | `revision_transfer`: admission/transfer explicitly reviewed, bounded to lot/project/revision/actor, refused on absent or stale proof | reserved name `TRANSFER_VERIFIER = "revision_transfer"` (`process_registry`), called by `transfer_revision`; **not installed** by `install_verifiers` (14 guards + `hold`), **not published** by the code matrix (`RESERVED_VERIFIERS`) | `verifier-uninstalled` (B refuses before C); nothing else is possible today. `capability_report().refusal("revision_transfer")` answers `guard-unsupported` (the name is in neither the guard registry nor `RESERVED_VERIFIERS`), not `verifier-uninstalled` | proof binding: lot (`work_item_id`) and project (`app`/`workstream`) are native in the locked row (`_lock_lot`), the revision (`workflow_ref@version` vs milestone sha vs digest) and the reviewing actor are not bound to a proof; the proof's source, its staleness rule and the independence rule — **missing** |
+| 2 | `revision_transfer`: admission/transfer explicitly reviewed, bounded to lot/project/revision/actor, refused on absent or stale proof | reserved name `TRANSFER_VERIFIER = "revision_transfer"` (`process_registry` and `process_verifiers`), called by `transfer_revision`; **installed** by `install_verifiers` (#4007) and published in `RESERVED_VERIFIERS`; source: the conditional `approvals` collection (#4006) | contract `revision-transfer/1` (#4007): see [Revision transfer](#revision-transfer-4007-a-of-2846) | approver identity is a GitHub login compared to agent names (see the named limit there) |
 | 3 | `docs`, `investigation`, `governance-tracking`, `promotion`, `human_operation` admitted by an **active project module**, without bypassing the SQL guard | `INSTALLED_TYPES` carries the five (+ `bug`, `evolution`); completion is per type; SQL guard `ameesh_module_requirements` (migration 0363): `bug`/`evolution`/`improvement` stay admitted, any other type needs `project_modules.types` for the lot's project; modules are written only by canon sync | SQL `AMEESH_MODULE_RULE: work item type % has no active module in project %` (every write of the lot — insert, state change or any other update — and module-milestone insert; trigger of 0363, `ameesh_module_requirements` redefined by 0427); C `type-unsupported` | the active module is canon-declared: `extensions.ameesh.projects.<project>.modules` names **installed** descriptors only (`modules.installed()`), whose types must be disjoint within a project; the installed registry also discovers external descriptors installed in the environment through the `ameesh.modules` entry point group (#2847); a private descriptor (for example ThePackengers', name chosen by its owner, not in this repository) declares the five, so a project admits them by selecting that module in its canon, while a project without it is still refused by the SQL guard; the exact external descriptor revision and project/canon admission revisions remain to be supplied by its owner; `improvement` is admitted by the legacy SQL but absent from `INSTALLED_TYPES`, so C refuses its `advance` `type-unsupported` (`hold`/`release` do not check the type and pass) |
 | 4 | `observations` staging/preprod: reliable source absent, refusal kept | `observations` is declared in `SOURCE_COLLECTIONS` but absent from `SOURCE_KEYS`/`read_sources`: the snapshot never carries it | `source-unavailable` before the guard's own check, after the earlier refusals (see the order below), for `merged_and_staging_deployed`, `staging_pass`/`staging_failure`, `preprod_*`, `repair_started` | shape, attestation and freshness of the reliable source — **not designed, named missing**; nothing invented (no table edit, no client boolean) |
 
@@ -233,7 +234,8 @@ C checks neither type nor guard sources (except `decisions` for
 `waiting_human`).
 
 * `verifier-uninstalled` (B) — B knows the guard name, no server callable is
-  installed for it; `revision_transfer` refuses this way today, before C runs;
+  installed for it (`revision_transfer` too, on a host that did not call
+  `install_verifiers`);
 * `source-unavailable` (C) — a collection the guard declares is absent from
   the snapshot; fail-closed, after the earlier refusals above;
 * `type-unsupported` (C) — the lot type is outside `INSTALLED_TYPES`; the SQL gate
@@ -247,7 +249,7 @@ C checks neither type nor guard sources (except `decisions` for
 | name | installed by `install_verifiers` | in the code matrix | note |
 |---|---|---|---|
 | `hold` | yes | yes | `hold`/`release`; `waiting_human` additionally needs `decisions` |
-| `revision_transfer` | **no** | **no** (`RESERVED_VERIFIERS` = `("hold",)`; `capability_report().refusal` → `guard-unsupported`) | reserved and called by B; published here at **documentation** level only |
+| `revision_transfer` | yes (#4007) | yes (`RESERVED_VERIFIERS` = `("hold", "revision_transfer")`; requires the `approvals` source, so `capability_report().refusal` → `source-unavailable` without a fresh projection) | `transfer_revision`; contract `revision-transfer/1`; `installation_receipt()` |
 
 ### First deliverable admitted now (Q1/Q2/Q3)
 
@@ -261,7 +263,8 @@ C checks neither type nor guard sources (except `decisions` for
   them fail-closed, and exposes installation evidence with `ameesh module
   --list`; the production private descriptor revision and project admissions
   remain with its owner. No consumer policy is invented.
-* **Q2** — document `revision_transfer` as absent (today
+* **Q2** — (superseded by #4007, which publishes the contract below)
+  document `revision_transfer` as absent (then
   `verifier-uninstalled`). Publishing the name stays documentation for now; no
   `install_verifier("revision_transfer", …)` is added without a published
   contract (lot/project binding, identity of the reviewed revision and actor,
@@ -443,7 +446,7 @@ file or trusting a client: `process_approvals.projection_from_source(...)` /
 `approval_for_source(...)` rebuild the projection from the snapshot mapping
 and refuse with the same bridge codes. This lot publishes **no new Process
 refusal code**: #4007 (`revision_transfer`) owns the public contract and maps
-these bridge codes to it.
+these bridge codes to it (see [Revision transfer](#revision-transfer-4007-a-of-2846)).
 
 Bridge codes (stable, module-level; `ApprovalError.code`):
 
@@ -479,8 +482,96 @@ Witnesses name the level they observe: **C** = the verifier callable
 | `planning` | empty title → C `evidence-missing`, B `verifier-refused`; otherwise accepted, with spec/budget/governance **not** checked (the witness must show it) |
 | `start_work` | no assignee → C `evidence-missing`, B `verifier-refused` |
 | type | `docs` lot, no module → SQL `AMEESH_MODULE_RULE` at insert; `release` lot with the `it` module active → SQL admitted; `improvement` lot → SQL admitted, then `advance` C `type-unsupported` / B `verifier-refused`, while `hold`/`release` pass |
-| `revision_transfer` | no verifier → B `verifier-uninstalled`, `capability_report().refusal` → `guard-unsupported`; once a contract is published, with its codes: absent proof, proof for **another lot**, proof for **another project**, other revision, same actor (not independent), stale proof → each a distinct refusal code published with the contract (none exists today) |
+| `revision_transfer` | #4007: see the refusal contract in [Revision transfer](#revision-transfer-4007-a-of-2846) (existing codes only, the bridge code in `facts["detail"]`) |
 | `observations` | any staging/preprod advance → C `source-unavailable`, B `verifier-refused`, no effect (rollback); a well-formed command refuses identically |
+
+## Revision transfer (#4007, A of #2846)
+
+`process_verifiers` installs the reserved `revision_transfer` verifier
+(`install_verifiers`, after the 14 guards and `hold`). B calls it from
+`transfer_revision`, for a first adoption as for a later transfer, inside the
+transaction and after the lot lock, the authority check and B's own refusals
+(`terminal-reopened`, `stage-mismatch`, `revision-regression`,
+`hold-core-unproven`…). C stays pure: the proof comes from `read_sources`, the
+`approvals` collection of #4006, never from a file, a network read or the
+client.
+
+### Contract `revision-transfer/1`
+
+* **Target revision**: the command's `workflow_ref` is an exact pin
+  `owner/repo@<40-hex sha>:<path>`; a branch, a tag, a short sha or any other
+  form binds to no exact approval and is refused.
+* **Proof source**: the `approvals` projection (IMA #704, `source=github`,
+  authority `ima`). The approval source and the contract version are module
+  constants (`TRANSFER_APPROVAL_SOURCE`, `TRANSFER_CONTRACT`): no caller, test
+  included, chooses another source or clock (`verify`, `server_verifier` and
+  `install_verifiers` take neither `source` nor `now`).
+* **Approval**: `process_approvals.require_approval` must return the single
+  **current** approval of that exact artifact (repo, sha, path), not expired;
+  the projection must still be fresh when C reads it.
+* **References** (`evidence`, exactly these keys, any other is refused):
+  `approval` (the approval `id` or its `comment_id`; it must be the current
+  one), `lot` (the locked lot id), `project` (the locked lot's `app`).
+* **Independence**: the approver (GitHub login) is in the projection's
+  approvers and is neither the command actor nor the lot assignee
+  (case-insensitive).
+* **Terminal lot**: refused even if B would let a pinned terminal lot through.
+
+Accepted: the verification facts carry `proof` — contract, approval source,
+authority, lot, project, target `workflow_ref`/`workflow_version`, the
+approval (`id`, `comment_id`, `author`, `created_at`, `url`, `body_sha256`,
+`artifact`) and the projection (`digest`, `source_digest`, `generated_at`,
+`expires_at`, `repo`, `issue`). B writes them into the receipt
+(`work_item_events.evidence.verification.facts.proof`).
+
+### Refusal contract (existing codes only)
+
+No new Process refusal code is published (a new code goes through the pilot
+first). The bridge code, when there is one, stays readable in
+`facts["detail"]` and in the message (through B: `verifier-refused`, with the
+message).
+
+| case | C code | `detail` |
+|---|---|---|
+| projection absent, unconfigured, stale (dropped by `read_sources`) | `source-unavailable` | — |
+| projection expired or unreadable when C reads it | `source-unavailable` | `projection-stale`, `projection-future`, `projection-invalid` |
+| no approval for the artifact | `evidence-missing` | `approval-missing` |
+| approval of another revision (head changed, other target revision) | `revision-mismatch` | `approval-stale` |
+| approval superseded by a later one for the same path | `revision-mismatch` | `approval-superseded` |
+| approval revoked | `evidence-invalid` | `approval-revoked` |
+| approval expired, ambiguous, invalid, non-github source | `evidence-invalid` | `approval-expired`, `approval-ambiguous`, `approval-invalid`, `approval-source`, `approval-api-not-authority` |
+| cited approval is not the current one; approver outside the projection's approvers | `evidence-invalid` | — |
+| `workflow_ref` not an exact pin | `evidence-invalid` | — |
+| unknown reference key / missing reference | `evidence-invalid` / `evidence-missing` | — |
+| other lot / other project (or lot without project) | `item-mismatch` | — |
+| approver is the actor or the assignee | `reviewer-not-independent` | — |
+| terminal lot | `terminal-reopening` | — |
+
+### Installation receipt
+
+`installation_receipt(registry)` (schema `process-verifier-install/1`) says
+what is **really** installed: `installed` is true only when the callable under
+`revision_transfer` is C's own; it carries the contract, the approval source,
+the authority, the required references and source, the ameesh version and the
+SHA-256 of the two deciding sources (`process_verifiers`,
+`process_approvals`). A foreign callable under the name reads
+`installed: false`.
+
+### Named limit
+
+The independence rule compares a GitHub login (the approver) with agent names
+(actor, assignee). If an agent ever posted on IMA #704 under the approver's
+GitHub account, C could not tell; the bridge's author rule (`User`, configured
+approvers) and IMA remain the authority on who approved.
+
+### Proofs
+
+`tests/test_4007_revision_transfer.py`: on C's callable, acceptance with its
+proof and every refusal above; on the real B (`transfer_revision`, public
+API, verifiers installed by `install_verifiers`, projection read by
+`read_sources`), the first adoption of a test lot is accepted with its
+receipt, and a revoked approval or a missing projection leaves no event and
+no pinned revision.
 
 ## Proofs
 
