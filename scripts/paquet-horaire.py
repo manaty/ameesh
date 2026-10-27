@@ -102,6 +102,9 @@ COMPOSE_TIMEOUT = 3 * 3600
 #: au-delà, une tentative lancée sur un autre hôte est réputée morte
 ATTEMPT_STALE = COMPOSE_TIMEOUT + 900
 REPLAY_TIMEOUT = 900
+#: poids #3801 d'une preuve forte (fichier du test, liste, migration) :
+#: `packet_red.attribute_tests` rend `best` = poids de la meilleure preuve
+STRONG_EVIDENCE = 4
 
 
 class HoraireError(RuntimeError):
@@ -456,7 +459,11 @@ def classify(run: dict) -> Verdict:
         entry = by_test.get(name)
         if not entry or entry.get("status") != "probable":
             return Verdict(False, [], [], "%s non attribuable" % name)
-        best = [unit for unit in entry.get("units") or [] if unit.get("best")]
+        units = entry.get("units") or []
+        top = max((int(unit.get("best") or 0) for unit in units), default=0)
+        best = [unit for unit in units if int(unit.get("best") or 0) == top]
+        if top < STRONG_EVIDENCE:
+            return Verdict(False, [], [], "%s : preuve faible (poids %d)" % (name, top))
         if len(best) != 1:
             return Verdict(False, [], [], "%s : %d unités à égalité" % (name, len(best)))
         lot = int(best[0]["lot"])
@@ -759,6 +766,32 @@ def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
                                                run_id=run_id, exclude=list(verdict.lots)))
 
 
+def check_fresh(ctx: Context) -> None:
+    """Le code exécuté est-il celui de la tête exacte de la cible ? Sinon, rien.
+
+    Le `git pull` de la minuterie peut échouer (réseau, divergence, autre
+    branche) : ce tic chargerait alors un ancien orchestrateur et écrirait
+    quand même. Il faut donc ce script dans le clone, la tête locale égale à
+    `origin/<cible>` tout juste lue, et aucun fichier suivi modifié.
+    """
+    if SCRIPT_DIR != (ctx.repo / "scripts").resolve():
+        raise HoraireError("script lancé hors du clone %s (%s)" % (ctx.repo, SCRIPT_DIR))
+    fetched = ctx.git("fetch", "--no-tags", "origin", ctx.target, timeout=300)
+    if fetched.returncode != 0:
+        raise HoraireError("fetch %s : %s" % (ctx.target, auto._tail(fetched.text, 5)))
+    local = ctx.git("rev-parse", "HEAD^{commit}")
+    remote = ctx.git("rev-parse", "origin/%s^{commit}" % ctx.target)
+    if local.returncode or remote.returncode or not remote.stdout.strip():
+        raise HoraireError("têtes illisibles (HEAD, origin/%s)" % ctx.target)
+    if local.stdout.strip() != remote.stdout.strip():
+        raise HoraireError("clone à %s, %s à %s : code périmé, aucun geste"
+                           % (local.stdout.strip()[:12], ctx.target,
+                              remote.stdout.strip()[:12]))
+    dirty = ctx.git("status", "--porcelain", "--untracked-files=no")
+    if dirty.returncode or dirty.stdout.strip():
+        raise HoraireError("clone modifié : aucun geste\n%s" % auto._tail(dirty.text, 5))
+
+
 def tick(ctx: Context) -> str:
     rows = open_lots(ctx)
     carriers = [row for row in rows if is_carrier(row, ctx.project, ctx.target)]
@@ -806,6 +839,7 @@ def main(argv: list[str] | None = None) -> int:
                   python=args.python or auto.project_python(repo),
                   dry_run=args.dry_run, zone=zone)
     try:
+        check_fresh(ctx)
         print(tick(ctx), flush=True)
         return 0
     except InputError as error:

@@ -109,8 +109,8 @@ def red_run(*, attribution=True, best=(3801,), status="failure", part="psycopg 1
     if attribution:
         run["attribution"] = {"status": "ok", "tests": [{
             "test": test, "status": "probable",
-            "units": [{"lot": lot, "best": True} for lot in best]
-            + [{"lot": 3807, "best": False}]}]}
+            "units": [{"lot": lot, "best": 4} for lot in best]
+            + [{"lot": 3807, "best": 1}]}]}
     return run
 
 
@@ -372,6 +372,68 @@ class ClassifyTest(unittest.TestCase):
         start = ph.hour_start(NOW, ZONE)
         self.assertEqual(datetime.fromtimestamp(start, ZONE).minute, 0)
         self.assertLessEqual(NOW - start, 3600)
+
+
+class BestWeightTest(unittest.TestCase):
+    """`best` est un poids (#3801), pas un booléen."""
+
+    def run_with(self, *weights):
+        run = red_run()
+        run["attribution"]["tests"][0]["units"] = [
+            {"lot": 3801 + i, "best": w} for i, w in enumerate(weights)]
+        return ph.classify(run)
+
+    def test_poids_distincts_un_seul_meilleur(self):
+        verdict = self.run_with(4, 2, 1)
+        self.assertTrue(verdict.deterministic)
+        self.assertEqual(verdict.lots, [3801])
+
+    def test_egalite_et_preuve_faible(self):
+        self.assertFalse(self.run_with(4, 4).deterministic)
+        self.assertIn("faible", self.run_with(2, 1).why)
+
+
+class FreshTest(unittest.TestCase):
+    """Revue cx2 : un clone qui n'est pas à la tête exacte de la cible n'écrit rien."""
+
+    def ctx(self, local, remote, *, fetch_rc=0, dirty=""):
+        calls = []
+
+        class Git:
+            def run(self, cmd, **kw):
+                calls.append(cmd)
+                if "fetch" in cmd:
+                    return ph.Result(fetch_rc, "", "réseau" if fetch_rc else "")
+                if "rev-parse" in cmd:
+                    return ph.Result(0, (local if cmd[-1] == "HEAD^{commit}" else remote) + "\n")
+                if "status" in cmd:
+                    return ph.Result(0, dirty)
+                raise AssertionError(cmd)
+        return ph.Context(repo=ROOT, target="main", project="ameesh", pilot="p",
+                          actor="p", shell=Git(), zone=ZONE), calls
+
+    def test_tete_exacte(self):
+        ctx, _ = self.ctx(HEAD, HEAD)
+        ph.check_fresh(ctx)
+
+    def test_refus(self):
+        for kw in ({"local": HEAD, "remote": HEAD2}, {"local": HEAD, "remote": HEAD, "fetch_rc": 1},
+                   {"local": HEAD, "remote": HEAD, "dirty": " M scripts/paquet-horaire.py"}):
+            ctx, _ = self.ctx(**kw)
+            with self.assertRaises(ph.HoraireError):
+                ph.check_fresh(ctx)
+
+    def test_main_refuse_sans_aucun_geste(self):
+        saved = (ph.check_fresh, ph.tick)
+        ticked = []
+        def stale(ctx):
+            raise ph.HoraireError("code périmé")
+        ph.check_fresh, ph.tick = stale, lambda ctx: ticked.append(ctx) or "x"
+        try:
+            self.assertEqual(ph.main(["tick", "--repo", str(ROOT)]), 1)
+        finally:
+            ph.check_fresh, ph.tick = saved
+        self.assertEqual(ticked, [])
 
 
 class ExcludeOptionTest(unittest.TestCase):

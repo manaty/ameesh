@@ -34,7 +34,9 @@ Environment=AMEESH_PAQUET_PILOT=mesh-design
 EnvironmentFile=%h/.config/ameesh/env
 EnvironmentFile=-%h/.config/ameesh/release.env
 EnvironmentFile=%h/.config/ameesh/paquet-horaire.env
-ExecStartPre=-/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull --ff-only --quiet origin ${AMEESH_PAQUET_TARGET}
+# Fatal (#3845, revue cx2) : un clone qui n'avance pas n'a pas de tic ; le
+# script revérifie aussi que sa tête est celle de origin/<cible>.
+ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull --ff-only --quiet origin ${AMEESH_PAQUET_TARGET}
 ExecStart=%h/.local/share/ameesh/venv/bin/ameesh role run mesh-design -- \
     %h/.local/share/ameesh/venv/bin/python ${AMEESH_PAQUET_REPO}/scripts/paquet-horaire.py tick \
     --repo ${AMEESH_PAQUET_REPO} --target ${AMEESH_PAQUET_TARGET} --pilot ${AMEESH_PAQUET_PILOT}
