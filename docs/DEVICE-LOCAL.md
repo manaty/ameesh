@@ -118,7 +118,9 @@ is mediated or `--once`.
   The reply is `{"schema": "ameesh-device-control/1", "ok": true, "agent":
   "...", "returned": [382]}` or `{"ok": false, "error": "..."}`. A runner
   only accepts an agent it serves (`--agents`); an omitted or empty filter
-  serves all agents on this host, with the same host check on every stop. The
+  serves all agents on this host, with the same host check on every stop.
+  With `--agents-file` the filter follows the re-read admission list, and an
+  empty list serves no agent (`docs/RUNNER-ADMISSION.md`). The
   stop is the exact gesture of `agent-runner stop` — status `stopped`, reason `manuel`, open lots
   returned to the team queue, current turn ending at its safe point (0030).
   It never touches an approval, a gated action, a token or the Compute lease.
