@@ -120,7 +120,7 @@ class DeliveredFreezeTest(unittest.TestCase):
         self.head = self.repo.commit("generic contribution in a new file")
         self.assertFalse(self.outside())
 
-    def test_literal_line_in_same_path_is_excluded_and_counted(self):
+    def test_literal_line_repeated_in_same_path_keeps_author(self):
         self.repo.write("literal [x]", "a.b[0]();\n \n")
         original = self.repo.commit("historical literal")
         self.repo.git("checkout", "-qb", "same-path-target", self.target)
@@ -129,17 +129,29 @@ class DeliveredFreezeTest(unittest.TestCase):
         self.repo.write("literal [x]", "a.b[0]();\na.b[0]();\n \n \n")
         self.head = self.repo.commit("repeat target literal")
         cache = {}
-        self.assertTrue(a._outside_delivered(self.repo.root, self.target,
-                                             original, self.landing(), cache))
-        self.assertEqual(cache[("delivered-proof", self.target, original)],
-                         {"literal [x]": 2})
+        self.assertFalse(a._outside_delivered(self.repo.root, self.target,
+                                              original, self.landing(), cache))
 
-    def test_same_path_existing_line_is_excluded(self):
+    def test_same_path_existing_line_repeated_keeps_author(self):
         self.repo.write("own.py", "own_contribution();\n}\n\n")
         self.target = self.repo.commit("existing target lines")
         self.repo.write("own.py", "own_contribution();\n}\n}\n\n")
         self.head = self.repo.commit("repeat existing line")
-        self.assertTrue(self.outside())
+        self.assertFalse(self.outside())
+
+    def test_rewritten_bypass_with_existing_line_keeps_author(self):
+        self.repo.write("check.py", "def check(user):\n    if not user.admin:\n"
+                        "        return False\n    return True\n")
+        self.target = self.repo.commit("target check")
+        bypass = "def check(user):\n    return True\n    if not user.admin:\n" \
+                 "        return False\n    return True\n"
+        self.repo.write("check.py", bypass)
+        original = self.repo.commit("historical bypass")
+        self.repo.git("checkout", "-qb", "rewritten-bypass", self.target)
+        self.repo.write("check.py", bypass)
+        self.head = self.repo.commit("rewritten bypass")
+        self.assertFalse(a._is_ancestor(self.repo.root, original, self.head))
+        self.assertFalse(self.outside(original))
 
     def test_deletion_still_delivered_keeps_author(self):
         self.repo.git("checkout", "-qb", "deletion", self.base)

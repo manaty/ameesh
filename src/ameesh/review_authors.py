@@ -674,10 +674,10 @@ def _delivered_paths(repo: str, target: str, tree: str):
 
 def _outside_delivered(repo: str, target: str, commit: str, landing,
                        cache: dict) -> bool:
-    """#3837: every overlapping addition already exists in its target path.
+    """No candidate line is brought by this landing, including copies/moves.
 
-    Candidate overlap is global to retain copies and moves. Target presence
-    is path-specific: a generic line elsewhere never erases an author.
+    Existing occurrences on target never excuse new occurrences in a landing.
+    A repeated generic line conservatively retains its historical author.
     """
     if landing is None:
         return False
@@ -685,31 +685,75 @@ def _outside_delivered(repo: str, target: str, commit: str, landing,
         patch = _text_delta(repo, commit + "^", commit)
         if patch is None or not any(patch):
             return False
-        proof = {}
-        for path, delta in landing.items():
-            if patch[1] & delta[1]:
-                return False
-            overlap = patch[0] & delta[0]
-            if not overlap:
-                continue
-            for line in sorted(overlap):
-                key = ("delivered-target-line", target, path, line)
-                if key not in cache:
-                    pattern = "^" + re.sub(r"([][.^$*+?{}()|\\])",
-                                           lambda match: "\\" + match.group(), line) + "$"
-                    proc = plan_git._git(
-                        repo, "grep", "--no-color", "-q", "-I", "-E",
-                        "-e", pattern, target, "--", path)
-                    if proc.returncode not in (0, 1):
-                        return False
-                    cache[key] = proc.returncode == 0
-                if not cache[key]:
-                    return False
-            proof[path] = len(overlap)
-        cache[("delivered-proof", target, commit)] = proof
+        if any(patch[0] & delta[0] or patch[1] & delta[1]
+               for delta in landing.values()):
+            return False
+        cache[("delivered-proof", target, commit)] = {}
         return True
     except Exception:  # noqa: BLE001 - uncertainty retains every author
         return False
+
+
+def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
+                                  commit: str, repo: str, families, *,
+                                  provider=None, cache: dict, target: str = ""):
+    """Resolve an unknown in its earlier originating lot, never remove it.
+
+    Only exact membership and recorded provenance count. Re-read the exact
+    commit using the other lot's historical reference; no recursive carry.
+    Bounded/missing/unreadable candidates leave the unknown unchanged.
+    """
+    lot = int(item.get("id") or 0)
+    app = str(item.get("app") or "")
+    at_ts = freeze.get("at_ts")
+    if not app or not lot or at_ts is None:
+        return None
+    try:
+        port = storage.of(db).work
+        key = ("other-freezes", app, lot, float(at_ts))
+        if key not in cache:
+            cache[key] = port.earlier_freezes(app, lot, float(at_ts))
+        for source in cache[key] or ():
+            source_lot = int(source.get("work_item_id") or 0)
+            source_sha = plan_git.full_commit_id(source.get("sha"))
+            stamp = source.get("at_ts")
+            if (not source_lot or source_lot == lot or not source_sha
+                    or stamp is None or float(stamp) > float(at_ts)):
+                continue
+            if _is_ancestor(repo, commit, source_sha) is not True:
+                continue
+            source_item = port.get(source_lot)
+            if (not source_item or source_item.get("app") != app
+                    or packet_composer(source_item)):
+                continue
+            # The source range is above its common baseline with the exact
+            # target. A baseline ancestor is never attributed by this proof.
+            start = plan_git._out(repo, "merge-base", target, source_sha) if target else None
+            if not start or _is_ancestor(repo, commit, start) is not False:
+                continue
+            # Freeze receipt pins the source head.
+            receipt = _milestone_receipt(provider, db, int(source["id"]), strict=True)
+            if not receipt or receipt.get("commit") != source_sha:
+                continue
+            known, written, corrections, unknown = _prior_reading(
+                db, source_item, source, [commit], repo, families,
+                provider=provider, strict=True)
+            if unknown or not known or any(not values or "" in values
+                                           for values in known.values()):
+                continue
+            if any(commit not in written.get(actor, ()) for actor in known):
+                continue
+            from . import work
+            work.note(db, lot,
+                      "#3837 : commit %s attribué par le gel #%s du lot #%s ; "
+                      "auteurs ajoutés : %s" % (
+                          commit, source["id"], source_lot,
+                          ", ".join("%s (%s)" % (actor, ", ".join(sorted(values)))
+                                    for actor, values in sorted(known.items()))), once=True)
+            return known, written, corrections
+    except Exception:  # noqa: BLE001 - no recorded proof, no attribution
+        return None
+    return None
 
 
 def _not_in_target(repo: str, commits, target: str, *, head: str = "") -> list:
@@ -2604,6 +2648,29 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                     % (sha[:12], lot, exc)) from exc
             unknown.append(sha[:12])
             continue
+        for value in list(unreadable):
+            matches = [candidate for candidate in earlier if candidate.startswith(value)]
+            if len(matches) != 1:
+                continue
+            commit = matches[0]
+            # Never replace a contradictory exact receipt with another source.
+            try:
+                if _commit_receipt(provider, db, commit, strict=True) is not None:
+                    continue
+            except Exception:  # noqa: BLE001 - unreadable receipt stays unknown
+                continue
+            attributed = _attributed_from_other_freeze(
+                db, item, row, commit, repo, families,
+                provider=provider, cache=file_cache, target=target_sha)
+            if attributed is None:
+                continue
+            source_authors, source_written, source_corrections = attributed
+            for actor, values in source_authors.items():
+                by_name.setdefault(actor, set()).update(values)
+                written.setdefault(actor, []).extend(source_written.get(actor, ()))
+            for actor, entries in source_corrections.items():
+                review_commits.setdefault(actor, []).extend(entries)
+            unreadable.remove(value)
         unknown.extend(unreadable)
         for actor, proven in by_name.items():
             # #3335 (auditeur B1) : un relecteur promu auteur d'un gel antérieur
