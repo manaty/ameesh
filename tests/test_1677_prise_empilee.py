@@ -591,6 +591,7 @@ class InactiviteTest(_Prise):
         self.agent("claude1", team="nexlink", since_s=0)
         lot = self.lot("en qa", assignee="claude1")
         self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (lot["id"],))
+        work.milestone(self.db, lot["id"], "frozen", sha=SHA, actor="test")
         self.assertEqual(int(self.ligne("claude1")["actionable_lots"]), 0)
         now = time.time()
         self.assertEqual(self.repos(now), ["claude1"])

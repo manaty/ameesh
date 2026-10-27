@@ -63,6 +63,20 @@ def current_verdict(alias: str) -> str:
         % (alias, alias))
 
 
+def freeze_due(alias: str) -> str:
+    """#3986: author owes a declared freeze unless review is already satisfied.
+
+    A QA transition alone is not a declared freeze. Without a freeze the
+    class resolver cannot certify a light lot, so this keeps its cautious
+    default. The pilot's explicit review waiver still takes precedence.
+    """
+    return ("(NOT EXISTS (SELECT 1 FROM work_item_milestones m"
+            " WHERE m.work_item_id = {a}.id AND m.kind = 'frozen')"
+            " AND coalesce(to_jsonb({a})->>'reviewer', '') <> '-none'"
+            " AND coalesce({verdict}, '') <> 'ok')").format(
+                a=alias, verdict=current_verdict(alias))
+
+
 def not_blocking(alias: str) -> str:
     """#2252 : prédicat SQL « ce lot ne bloque plus » — il est FUSIONNÉ
     (`merged`/`promoted`/`closed`). Un lot en `qa`, même à verdict courant

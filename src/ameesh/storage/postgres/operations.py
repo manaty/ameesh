@@ -21,7 +21,7 @@ from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
 from .work import REQUEUED_PARAMS, has_reviewer, requeued_sql
-from .work_dependencies import current_verdict as _current_verdict
+from .work_dependencies import current_verdict as _current_verdict, freeze_due
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = "('merged', 'promoted', 'closed')"   # closed : abandonné ou remplacé (L29)
@@ -239,7 +239,8 @@ class Operations(interface.Operations):
                   SELECT count(*)""" + review_due + """ AS n FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                      AND (w.state NOT IN """ + _WAITING_ON_OTHERS + """
-                          OR (w.state = 'qa' AND """ + _current_verdict("w") + """ = 'blocked'))
+                          OR (w.state = 'qa' AND (""" + freeze_due("w") + """
+                              OR """ + _current_verdict("w") + """ = 'blocked')))
                      AND (w.planned_start IS NULL OR w.planned_start <= j.today)) ac ON true
               LEFT JOIN LATERAL (
                   SELECT c.harness, c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at

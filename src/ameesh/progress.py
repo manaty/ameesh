@@ -338,6 +338,7 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     verdict_required = designated != work_mod.REVIEWER_NONE
     return {
         "requested": requested,
+        "freeze_declared": any(r.get("kind") == "frozen" for r in rows),
         "frozen": freezes[0]["at_ts"] if freezes else None,
         "last_frozen": last_frozen["at_ts"] if last_frozen else None,
         "verdict": last["at_ts"] if last else None,
@@ -1020,7 +1021,7 @@ def _lots_view(db, st, cfg, *, since_ts, project, now, max_lots, threshold):
     from . import lot_class
     classes: dict = {}
     for lot, item in zip(lots, items):
-        if (lot.get("waiting_for") or {}).get("what") != "verdict":
+        if (lot.get("waiting_for") or {}).get("what") not in ("verdict", "freeze"):
             continue
         cls = stagnation.review_class_of(db, item, cfg=cfg, memo=classes,
                                          milestones=declared.get(int(item["id"]), []))
