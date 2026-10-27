@@ -69,7 +69,7 @@ class SelectFixerTest(TestCase):
         self.assertEqual([row["name"] for row in out["reviewers"]], ["dev1"])
         self.assertEqual(out["missing"], 1)
         self.assertIn("1 independent review missing", out["why"])
-        self.assertIn("forbidden codex, deepseek", out["why"])
+        self.assertIn("forbidden author families: codex, deepseek", out["why"])
 
 
 class GateCorrectorTest(PgTestCase):

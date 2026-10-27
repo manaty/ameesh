@@ -687,9 +687,19 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
         seats = [row for row in seats
                  if row["name"] not in kept_names
                  and row["family"] not in kept_families]
+    # #3968 : `forbidden` ne porte que les familles **d'auteurs** (et de
+    # correcteurs). Les familles déjà couvertes par un siège (manuel ou
+    # automatique du même gel) sont une autre preuve : les confondre dans le
+    # même mot faisait lire « codex interdit comme auteur » alors que codex
+    # était le siège manuel de codex1, sur une tête sans commit codex.
+    seat_rows = [dict(row) for row in seats + kept]
+    seat_families = {row["family"] for row in seat_rows}
     out = {"state": NONE, "required": required, "reviewers": [], "missing": 0,
            "manual": seats, "why": "no review required",
-           "forbidden": sorted(forbidden), "families": [],
+           "forbidden": sorted(forbidden),
+           "author_families": sorted(forbidden),
+           "seat_families": sorted(seat_families),
+           "seats": seat_rows, "families": [],
            "fixers": sorted(fixer_names)}
     if required == 0:
         return out
@@ -711,8 +721,6 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
                     "why": "author family unknown: %s" % ", ".join(unknown)})
         return out
     seat_names = {row["name"] for row in seats} | {row["name"] for row in kept}
-    seat_families = ({row["family"] for row in seats}
-                     | {row["family"] for row in kept})
     eligible = [c for c in candidates or ()
                 if c.eligible(forbidden_names=names | seat_names | fixer_names,
                               forbidden_families=forbidden | seat_families,
@@ -744,13 +752,25 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     out["reviewers"] = reviewers
     out["families"] = sorted(set(best) | {row["family"] for row in kept})
     if len(chosen) < remaining:
-        missing_why = ("%d independent %s missing: %d eligible famil%s (%s), "
-                       "forbidden %s" % (
-                           remaining - len(chosen),
-                           "review" if remaining - len(chosen) == 1 else "reviews",
-                           len(ordered), "y" if len(ordered) == 1 else "ies",
-                           ", ".join(sorted(best)) or "none",
-                           ", ".join(sorted(forbidden | seat_families)) or "none"))
+        # #3968 : le refus nomme sa cause en deux ensembles distincts. Les
+        # familles d'auteurs interdisent un avis ; les familles des sièges déjà
+        # pourvus ne sont pas des familles d'auteurs (elles couvrent un avis
+        # requis). Les fondre dans un seul « forbidden » faisait conclure à un
+        # défaut d'attribution sur une tête sans commit de la famille en cause.
+        missing_why = ("%d independent %s missing: %d eligible famil%s (%s); "
+                       "forbidden author families: %s"
+                       % (remaining - len(chosen),
+                          "review" if remaining - len(chosen) == 1 else "reviews",
+                          len(ordered), "y" if len(ordered) == 1 else "ies",
+                          ", ".join(sorted(best)) or "none",
+                          ", ".join(sorted(forbidden)) or "none"))
+        if seat_rows:
+            missing_why += ("; already covered by seat(s): %s"
+                            % ", ".join("%s (%s)" % (row["name"], row["family"])
+                                        for row in sorted(
+                                            seat_rows,
+                                            key=lambda item: (item["name"],
+                                                              item["family"]))))
         if kept:
             missing_why += (" (already designated: %s)"
                             % ", ".join(row["name"] for row in kept))

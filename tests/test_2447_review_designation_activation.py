@@ -965,7 +965,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
             self.db, "author", float(self.repo.git("log", "-1", "--format=%ct", head)),
             ("claude", "codex", "deepseek")), "codex")
         self.assertEqual(out["state"], rd.WAITING, out)
-        self.assertIn("forbidden codex, deepseek", out["why"])
+        self.assertIn("forbidden author families: codex, deepseek", out["why"])
         self.assertNotIn("unknown", out["why"])
         self.assertEqual(out["reviewers"], [{"name": "r1", "family": "claude"}])
         self.assertEqual(out["missing"], 1)
