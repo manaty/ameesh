@@ -7818,15 +7818,20 @@ class AgentWorker(threading.Thread):
             with self.lock:
                 self.proc = None
                 self.pgid = None
-            if rp is None:
-                with self.runner.launch_lock:
-                    self.runner.harness_pids.discard(pgid)
-            if fond is not None:
-                self.runner.background.start(
-                    agent=self.name, turn_id=turn_id, pgid=pgid, members=fond[0],
-                    containers=fond[1], grace_s=self.turn_grace_seconds(),
-                    handles=background_handles, cgroup=cgroup_path)
-            elif rp is None:
+            # #3944 : le groupe ne quitte `harness_pids` qu'une fois inscrit en
+            # grâce — entre les deux, la passe des orphelins (`_reap_strays`)
+            # consommerait le statut du travail de fond.
+            try:
+                if fond is not None:
+                    self.runner.background.start(
+                        agent=self.name, turn_id=turn_id, pgid=pgid, members=fond[0],
+                        containers=fond[1], grace_s=self.turn_grace_seconds(),
+                        handles=background_handles, cgroup=cgroup_path)
+            finally:
+                if rp is None:
+                    with self.runner.launch_lock:
+                        self.runner.harness_pids.discard(pgid)
+            if fond is None and rp is None:
                 if background_handles:
                     from .background import Entry
                     # A failed handoff must not discard detached live targets.
