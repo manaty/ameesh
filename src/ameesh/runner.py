@@ -8688,6 +8688,15 @@ RELOADABLE_FIELDS = frozenset({
 })
 
 
+def _admits_nobody(runner) -> bool:
+    """#3925 : une liste d'admission vide (fichier vide, ou tout refusé)
+    n'admet aucun agent, alors que `claimable` lit `[]` comme « tous ».
+    Fonction et `getattr` : les doublures des tests passent à `Runner.sweep`
+    un exécuteur sans cet attribut (sans filtre : tout est admis)."""
+    flt = getattr(runner, "agents_filter", None)
+    return flt is not None and not flt
+
+
 class Runner:
     def __init__(
         self,
@@ -9205,7 +9214,7 @@ class Runner:
     def _note_gate_wait(self, reason: str) -> None:
         if getattr(self, "mediated", False):
             return
-        if self.admits_nobody:
+        if _admits_nobody(self):
             return
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             self._note_unleased(agent, reason)
@@ -9238,7 +9247,7 @@ class Runner:
         from . import election, role_handover_pg as handover_pg
         from . import role_standings_pg as pg
         try:
-            published = 0 if self.admits_nobody else election.publish_self(
+            published = 0 if _admits_nobody(self) else election.publish_self(
                 self.cfg, self.db, self.host, names=self.agents_filter)
             self._role_error = None
         except Exception as exc:  # un score de rôle ne fait jamais tomber l'exécuteur
@@ -9836,7 +9845,7 @@ class Runner:
                           % (type(exc).__name__, db_mod.brief(exc)))
         # #3925 : une liste d'admission vide n'admet personne (`claimable`
         # lit une liste vide comme « tous »)
-        candidates = ([] if self.admits_nobody
+        candidates = ([] if _admits_nobody(self)
                       else registry.claimable(self.db, self.host, self.agents_filter))
         for agent in candidates:
             with self.lock:
@@ -10051,10 +10060,7 @@ class Runner:
 
     @property
     def admits_nobody(self) -> bool:
-        """#3925 : une liste d'admission vide (fichier vide, ou tout refusé)
-        n'admet aucun agent, alors que `claimable` lit `[]` comme « tous »."""
-        flt = getattr(self, "agents_filter", None)
-        return flt is not None and not flt
+        return _admits_nobody(self)
 
     def _admission_failed(self, path: str, why: str) -> None:
         """Panne passagère de la source d'admission : dernière liste gardée,
@@ -10081,7 +10087,7 @@ class Runner:
         ne fait que restreindre : canon, placement, `max_agents`, porte et
         comptes s'appliquent toujours à la réclamation. Vrai si la liste a
         changé."""
-        path = self.agents_file
+        path = getattr(self, "agents_file", None)
         if not path:
             return False
         from . import admission
@@ -10480,9 +10486,9 @@ class Runner:
                     lambda agent: device_state.stop_agent(self.cfg, self.db, agent, strict=True),
                     allowed=self.agents_filter,
                     log=lambda msg: log_async("device control: %s" % msg))
-                if self.agents_file:
+                if getattr(self, "agents_file", None):
                     control.set_allowed(self.agents_filter)
-                self._control_channel = control
+                self._control_channel = control  # #3925 : suit la liste relue
                 channels.append(control)
             for channel in channels:
                 channel.start()
@@ -12581,7 +12587,8 @@ class Runner:
                 except Exception as exc:  # la relecture ne fait jamais tomber l'exécuteur
                     log_async("config reload failed (%s)" % type(exc).__name__)
                 try:
-                    self.refresh_admission()
+                    if getattr(self, "agents_file", None):
+                        self.refresh_admission()
                 except Exception as exc:  # #3925 : jamais fatal non plus
                     log_async("admission file reload failed (%s)" % type(exc).__name__)
                 try:
