@@ -125,15 +125,16 @@
       (result.data.message || "");
   }
 
-  // Le corps signé d'une approbation, gardé sur l'appareil jusqu'à la réponse
-  // définitive : une page rechargée ou rouverte le renvoie d'elle-même.
+  // Le corps signé (approbation, passkey d'un enrôlement), gardé sur
+  // l'appareil AVANT l'envoi et jusqu'à la réponse définitive : une page
+  // rechargée, rouverte ou en attente (« Just a moment ») le renvoie d'elle-même.
   var KEPT_PREFIX = "ameesh-approve:pending:";
   var KEPT_MAX_AGE_MS = 7 * 86400 * 1000;
 
-  function keep(body) {
+  function keep(kind, body) {
     try {
       window.localStorage.setItem(KEPT_PREFIX + window.location.pathname,
-        JSON.stringify({ at: Date.now(), body: body }));
+        JSON.stringify({ at: Date.now(), kind: kind, body: body }));
     } catch (e) { /* stockage refusé : l'envoi continue en mémoire */ }
   }
 
@@ -143,6 +144,7 @@
     } catch (e) { /* rien */ }
   }
 
+  // { kind, body } gardé pour cette page, ou null ; élague les trop anciens
   function kept() {
     try {
       var store = window.localStorage;
@@ -156,10 +158,50 @@
         }
       }
       var mine = JSON.parse(store.getItem(KEPT_PREFIX + window.location.pathname) || "null");
-      return mine && mine.body ? mine.body : null;
+      return mine && mine.body ? { kind: mine.kind || "approve", body: mine.body } : null;
     } catch (e) {
       return null;
     }
+  }
+
+  // garde, envoie, renvoie après une panne, oublie à la réponse définitive
+  function sendKept(kind, body, doneText) {
+    setBusy(true);
+    keep(kind, body);
+    deliver(body, function () {
+      say(pendingText(), "pending");
+    }).then(function (result) {
+      forget();
+      if (result.ok) {
+        say(doneText(result), "done");
+      } else {
+        setBusy(false);
+        say(refused(result), "error");
+      }
+    });
+  }
+
+  function enrolled(result) {
+    return "Passkey created. Key fingerprint: " +
+      String(result.data.key_fingerprint || "").slice(0, 16) +
+      ". It will be active after the canon PR is reviewed and merged.";
+  }
+
+  // la page d'attente (service momentanément indisponible) : un corps gardé
+  // part d'ici ; sans lui, elle se recharge seule
+  function waiting(root) {
+    var entry = kept();
+    if (entry) {
+      say("Sending what you signed…");
+      sendKept(entry.kind, entry.body, entry.kind === "enroll" ? enrolled : function () {
+        return "Your signed answer is recorded. You can close this page.";
+      });
+      return;
+    }
+    var delay = parseInt(root.dataset.retry || "15", 10) || 15;
+    setTimeout(function () {
+      window.location.reload();
+    }, delay * 1000);
   }
 
   function supported() {
@@ -183,18 +225,8 @@
     }
 
     function send(body) {
-      setBusy(true);
-      keep(body);
-      deliver(body, function () {
-        say(pendingText(), "pending");
-      }).then(function (result) {
-        forget();
-        if (result.ok) {
-          say(signed(body.decision), "done");
-        } else {
-          setBusy(false);
-          say(refused(result), "error");
-        }
+      sendKept("approve", body, function () {
+        return signed(body.decision);
       });
     }
 
@@ -230,10 +262,10 @@
       });
     }
 
-    var waiting = kept();
-    if (waiting) {
+    var entry = kept();
+    if (entry && entry.kind === "approve") {
       say("Sending your signed answer…");
-      send(waiting);
+      send(entry.body);
     }
 
     document.getElementById("approve").addEventListener("click", function () {
@@ -342,6 +374,11 @@
   // -- enrôlement ----------------------------------------------------------
   function enrollment(root) {
     var data = root.dataset;
+    var entry = kept();
+    if (entry && entry.kind === "enroll") {   // la passkey déjà créée repart
+      say("Sending the new passkey…");
+      sendKept("enroll", entry.body, enrolled);
+    }
     document.getElementById("enroll").addEventListener("click", function () {
       if (!supported()) {
         return;
@@ -370,17 +407,7 @@
           body.transports = response.getTransports();
         }
         say("Sending the new passkey…");
-        deliver(body, function () {
-          say(pendingText(), "pending");
-        }).then(function (result) {
-          if (result.ok) {
-            say("Passkey created. Key fingerprint: " + String(result.data.key_fingerprint || "").slice(0, 16) +
-              ". It will be active after the canon PR is reviewed and merged.", "done");
-          } else {
-            setBusy(false);
-            say(refused(result), "error");
-          }
-        });
+        sendKept("enroll", body, enrolled);
       }, function () {
         setBusy(false);
         say("Creation cancelled or refused by the device.", "error");
@@ -400,6 +427,10 @@
     root = document.getElementById("ameesh-enroll");
     if (root) {
       enrollment(root);
+    }
+    root = document.getElementById("ameesh-wait");
+    if (root) {
+      waiting(root);
     }
   });
 })();

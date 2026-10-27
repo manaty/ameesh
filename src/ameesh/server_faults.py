@@ -52,6 +52,9 @@ PAGE_SCHEMA = "nexlink-fingerprints/1"
 #: champs d'une entrée : exactement le contrat de #3885
 FIELDS = ("fingerprint", "route", "code", "revision", "first_seen", "last_seen",
           "occurrences", "users")
+#: bornes du lecteur de #3885
+MAX_ROUTE = 300
+MAX_CODE = 120
 #: condensats de sujets gardés par entrée (borne mémoire et disque)
 MAX_SUBJECTS = 500
 #: sujet d'une panne vue par un humain dont l'identité n'est pas connue ici
@@ -115,8 +118,9 @@ class Journal:
     def record(self, route: str, exc: BaseException, *, subject: str | None = None) -> str:
         """Compte une panne de `route` (gabarit) ; rend son empreinte (vide si
         le journal a échoué). `subject` : l'humain touché (opaque, condensé)."""
-        route = "%s %s" % (self.client, route)
-        code = code_of(exc)
+        # bornes du lecteur de #3885 (route 300, code 120 caractères)
+        route = ("%s %s" % (self.client, route))[:MAX_ROUTE]
+        code = code_of(exc)[:MAX_CODE]
         key = fingerprint(route, code)
         try:
             with self._lock, self._locked():

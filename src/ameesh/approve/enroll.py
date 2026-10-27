@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import secrets
 import re
 import time
 
@@ -206,11 +207,33 @@ def write_proposal(directory: str, *, approver: str, entry: dict, rp_id: str, or
         lines.append("%s%s: %s" % ("  - " if first else "    ", key, _q(value)))
         first = False
     lines += ["```", ""]
+    # §16 (#3889) : écriture atomique et idempotente. Le nom et le contenu ne
+    # dépendent que de l'entrée et de `now` (l'instant gardé à la consommation
+    # du lien) : une reprise réécrit la MÊME proposition, jamais une seconde.
     path = os.path.join(directory, name)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+    data = "\n".join(lines).encode("utf-8")
+    tmp = os.path.join(directory, ".tmp-%s" % secrets.token_hex(8))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                  0o600)
     try:
-        os.write(fd, "\n".join(lines).encode("utf-8"))
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            try:
+                with open(path, "rb") as fh:
+                    same = fh.read() == data
+            except OSError:
+                same = False
+            if not same:   # reste d'une écriture interrompue : la nôtre la remplace
+                os.replace(tmp, path)
     finally:
-        os.close(fd)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
     return name

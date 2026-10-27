@@ -433,21 +433,25 @@ class Store:
         except (UnicodeDecodeError, ValueError):
             data = None
         if not isinstance(data, dict):
-            return {"body": None, "result": None}
-        return {"body": data.get("body"), "result": data.get("result")}
+            return {"body": None, "result": None, "at": None}
+        at = data.get("at")
+        return {"body": data.get("body"), "result": data.get("result"),
+                "at": at if isinstance(at, int) and not isinstance(at, bool) else None}
 
-    def claim_enroll(self, record: dict, body_digest: str = "") -> bool:
-        """Consomme le jeton d'enrôlement, une seule fois, pour CE corps."""
+    def claim_enroll(self, record: dict, body_digest: str = "", *, at: int | None = None) -> bool:
+        """Consomme le jeton d'enrôlement, une seule fois, pour CE corps ; `at`
+        est l'instant de la proposition, gardé AVANT de l'écrire (§16, #3889)."""
         digest = record["token_hash"]
         if not _HASH_RE.fullmatch(digest):
             return False
-        mark = {"at": int(time.time()), "body": body_digest or None, "result": None}
+        mark = {"at": int(time.time()) if at is None else int(at),
+                "body": body_digest or None, "result": None}
         return self._write(self._path("enroll-used", digest), self._dump(mark),
                            exclusive=True)
 
-    def settle_enroll(self, record: dict, body_digest: str, result: dict) -> None:
+    def settle_enroll(self, record: dict, body_digest: str, result: dict, *, at: int) -> None:
         """Garde la réponse de l'enrôlement : un renvoi du même corps la rend."""
-        mark = {"at": int(time.time()), "body": body_digest, "result": result}
+        mark = {"at": int(at), "body": body_digest, "result": result}
         self._write(self._path("enroll-used", record["token_hash"]), self._dump(mark),
                     exclusive=False)
 
