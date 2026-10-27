@@ -84,6 +84,11 @@ class _Base(PgTestCase):
         """Le lot passe en qa avec un verdict `ok` posé il y a `verdict_s`."""
         work.move(self.db, self.lot["id"], "build")
         work.move(self.db, self.lot["id"], "qa")
+        # #3986 : le scénario de fusion part d'un gel déclaré avant le GO.
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, actor)"
+            " VALUES (%s, 'frozen', now() - make_interval(secs => %s), 'dev1')",
+            (self.lot["id"], float(verdict_s) + 1))
         self.db.execute(
             "INSERT INTO work_item_milestones (work_item_id, kind, at, actor, verdict)"
             " VALUES (%s, 'verdict', now() - make_interval(secs => %s), 'rel', 'ok')",
@@ -105,6 +110,12 @@ class _Base(PgTestCase):
             "UPDATE work_item_events SET created_at = to_timestamp(%s)"
             " WHERE work_item_id = %s AND state = 'build'",
             (created + 1800.0, lot["id"]))
+        # #3986 : un GO destiné à la fusion suppose un gel déclaré avant
+        # le verdict ; sans lui, le geste dû reste le gel par l'assigné.
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, actor)"
+            " VALUES (%s, 'frozen', to_timestamp(%s), 'dev1')",
+            (lot["id"], float(verdict_ts) - 1))
         self.db.execute(
             "INSERT INTO work_item_milestones (work_item_id, kind, at, actor, verdict)"
             " VALUES (%s, 'verdict', to_timestamp(%s), 'rel', 'ok')",
