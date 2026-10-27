@@ -22,13 +22,14 @@ class DeliveredFreezeTest(unittest.TestCase):
         self.old = self.repo.commit("old migration")
         self.repo.git("checkout", "-qb", "target", self.base)
         self.repo.write("553.sql", "shared_implementation();\nnew_number_553();\n}\n\n")
+        self.repo.write("own.py", "}\n")
         self.target = self.repo.commit("reviewed renamed migration")
-        self.repo.write("own.py", "own_contribution();\n}\n\n")
+        self.repo.write("own.py", "own_contribution();\n")
         self.head = self.repo.commit("own lot")
 
     def landing(self):
         tree = a._merged_tree(self.repo.root, self.target, self.head)
-        return a._text_delta(self.repo.root, self.target, tree) if tree else None
+        return a._delivered_paths(self.repo.root, self.target, tree) if tree else None
 
     def outside(self, commit=None):
         return a._outside_delivered(self.repo.root, self.target,
@@ -58,6 +59,7 @@ class DeliveredFreezeTest(unittest.TestCase):
         read.assert_not_called()
         self.assertIn("contenu déjà dans la cible", note.call_args.args[2])
         self.assertTrue(note.call_args.kwargs["once"])
+        self.assertIn("0 lignes communes", note.call_args.args[2])
         self.assertEqual(trace[0]["freeze_id"], 1)
         self.assertEqual(trace[0]["commit"], self.old)
 
@@ -91,7 +93,7 @@ class DeliveredFreezeTest(unittest.TestCase):
     def test_failed_target_read_keeps_provenance(self):
         with mock.patch.object(a.plan_git, "_git", side_effect=OSError):
             self.assertFalse(a._outside_delivered(
-                self.repo.root, self.target, self.old, ({"}"}, set()), {}))
+                self.repo.root, self.target, self.old, {"own.py": ({"}"}, set())}, {}))
 
     def test_exact_whitespace_and_regex_characters(self):
         self.repo.write("literal", "a.b[0]();\n \n")
@@ -103,7 +105,7 @@ class DeliveredFreezeTest(unittest.TestCase):
         self.head = self.repo.commit("deliver literal contribution")
         self.assertFalse(self.outside(original))
 
-    def test_literal_regex_characters_already_on_target_are_excluded(self):
+    def test_same_lines_in_new_file_keep_author(self):
         self.repo.write("literal", "a.b[0]();\n \n")
         original = self.repo.commit("old literal contribution")
         self.repo.git("checkout", "-qb", "literal-target", self.target)
@@ -111,7 +113,33 @@ class DeliveredFreezeTest(unittest.TestCase):
         self.target = self.repo.commit("reviewed literal content")
         self.repo.write("copy", "a.b[0]();\n \n")
         self.head = self.repo.commit("copy content already on target")
-        self.assertTrue(self.outside(original))
+        self.assertFalse(self.outside(original))
+
+    def test_generic_line_in_new_file_keeps_author(self):
+        self.repo.write("brand-new.py", "}\n")
+        self.head = self.repo.commit("generic contribution in a new file")
+        self.assertFalse(self.outside())
+
+    def test_literal_line_in_same_path_is_excluded_and_counted(self):
+        self.repo.write("literal [x]", "a.b[0]();\n \n")
+        original = self.repo.commit("historical literal")
+        self.repo.git("checkout", "-qb", "same-path-target", self.target)
+        self.repo.write("literal [x]", "a.b[0]();\n \n")
+        self.target = self.repo.commit("target literal")
+        self.repo.write("literal [x]", "a.b[0]();\na.b[0]();\n \n \n")
+        self.head = self.repo.commit("repeat target literal")
+        cache = {}
+        self.assertTrue(a._outside_delivered(self.repo.root, self.target,
+                                             original, self.landing(), cache))
+        self.assertEqual(cache[("delivered-proof", self.target, original)],
+                         {"literal [x]": 2})
+
+    def test_same_path_existing_line_is_excluded(self):
+        self.repo.write("own.py", "own_contribution();\n}\n\n")
+        self.target = self.repo.commit("existing target lines")
+        self.repo.write("own.py", "own_contribution();\n}\n}\n\n")
+        self.head = self.repo.commit("repeat existing line")
+        self.assertTrue(self.outside())
 
     def test_deletion_still_delivered_keeps_author(self):
         self.repo.git("checkout", "-qb", "deletion", self.base)

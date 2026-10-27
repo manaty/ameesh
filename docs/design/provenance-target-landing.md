@@ -44,9 +44,10 @@ For a historical patch from a rewritten freeze, the carried reader additionally
 measures its contribution to the
 actual clean merge into the exact target. Its removed lines must not overlap
 landing removals. Any of its added lines in the landing must already exist as
-an exact full line somewhere on the target. Blank lines and whitespace count;
+an exact full line in the same destination path on the target. Blank lines and whitespace count;
 there is no meaningful-line threshold. Each match is an anchored literal
-query, cached for this reading. A novel addition, a delivered removal, a
+query scoped to that exact path, cached for this reading. A missing target
+file retains the author even when the line occurs elsewhere on target. A novel addition, a delivered removal, a
 conflict, binary/mode change or unreadable object keeps provenance.
 
 The #3762/#3781 filters run first and retain their existing semantics.
@@ -55,5 +56,6 @@ new content retains its authors. No unknown provenance is automatically
 waived. The new filter runs before prior provenance is read, equally for the
 gate, designation and packet candidates. Every removed commit is traced with
 its source freeze, current head and exact target in the lot journal (once per
-proof); a failed journal write does not grant the exception. The exclusions
+proof), with the number of common lines and the target path for each
+commit; a failed journal write does not grant the exception. The exclusions
 also enter the existing provenance manifest output.

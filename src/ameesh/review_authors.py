@@ -597,7 +597,7 @@ def _applied_in(repo: str, target: str, sha: str) -> bool:
         return False
 
 
-def _text_delta(repo: str, before: str, after: str):
+def _text_delta(repo: str, before: str, after: str, *, path: str = ""):
     """Exact added/removed lines, or None for unreadable/non-text changes.
 
     Compare globally, including trivial lines and whitespace: a rename or a
@@ -606,7 +606,8 @@ def _text_delta(repo: str, before: str, after: str):
     """
     proc = plan_git._git(repo, "diff", "--no-color", "--no-ext-diff", "--no-textconv",
                          "--ignore-submodules=none",
-                         "--no-renames", "--unified=0", before, after, "--")
+                         "--no-renames", "--unified=0", before, after, "--",
+                         *([path] if path else []))
     if proc.returncode:
         return None
     text = proc.stdout.decode("utf-8", "strict")
@@ -653,39 +654,59 @@ def _no_reintroduced_patch(repo: str, sha: str, landing) -> bool:
     return not (patch[0] & landing[0] or patch[1] & landing[1])
 
 
+def _delivered_paths(repo: str, target: str, tree: str):
+    """Exact landing lines by destination path; unreadable changes fail closed."""
+    proc = plan_git._git(repo, "diff", "--no-renames", "--name-only", "-z",
+                         target, tree, "--")
+    if proc.returncode:
+        return None
+    result = {}
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        path = raw.decode("utf-8", "strict")
+        delta = _text_delta(repo, target, tree, path=path)
+        if delta is None:
+            return None
+        result[path] = delta
+    return result
+
+
 def _outside_delivered(repo: str, target: str, commit: str, landing,
                        cache: dict) -> bool:
-    """#3837: no historical contribution to the actual delivered delta.
+    """#3837: every overlapping addition already exists in its target path.
 
-    Added lines already present verbatim on target are not brought by this
-    prior freeze. Removed lines always remain evidence. No whitespace or
-    significance normalization; unreadable/binary changes retain authors.
+    Candidate overlap is global to retain copies and moves. Target presence
+    is path-specific: a generic line elsewhere never erases an author.
     """
     if landing is None:
         return False
     try:
         patch = _text_delta(repo, commit + "^", commit)
-        if patch is None or not any(patch) or patch[1] & landing[1]:
+        if patch is None or not any(patch):
             return False
-        overlap = patch[0] & landing[0]
-        if not overlap:
-            return True
-        for line in sorted(overlap):
-            key = ("delivered-target-line", target, line)
-            if key not in cache:
-                # One anchored pattern per early-exit query: combined EREs
-                # grow very costly on the real Nexlink tree. Exact bytes,
-                # including blank lines and regex metacharacters, count.
-                pattern = "^" + re.sub(r"([][.^$*+?{}()|\\])",
-                                       lambda match: "\\" + match.group(), line) + "$"
-                proc = plan_git._git(
-                    repo, "grep", "--no-color", "-q", "-I", "-E",
-                    "-e", pattern, target, "--")
-                if proc.returncode not in (0, 1):
-                    return False
-                cache[key] = proc.returncode == 0
-            if not cache[key]:
+        proof = {}
+        for path, delta in landing.items():
+            if patch[1] & delta[1]:
                 return False
+            overlap = patch[0] & delta[0]
+            if not overlap:
+                continue
+            for line in sorted(overlap):
+                key = ("delivered-target-line", target, path, line)
+                if key not in cache:
+                    pattern = "^" + re.sub(r"([][.^$*+?{}()|\\])",
+                                           lambda match: "\\" + match.group(), line) + "$"
+                    proc = plan_git._git(
+                        repo, "grep", "--no-color", "-q", "-I", "-E",
+                        "-e", pattern, target, "--", path)
+                    if proc.returncode not in (0, 1):
+                        return False
+                    cache[key] = proc.returncode == 0
+                if not cache[key]:
+                    return False
+            proof[path] = len(overlap)
+        cache[("delivered-proof", target, commit)] = proof
         return True
     except Exception:  # noqa: BLE001 - uncertainty retains every author
         return False
@@ -2529,7 +2550,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                 delivered_read = True
                 try:
                     tree = _merged_tree(repo, target_sha, head_sha)
-                    delivered = _text_delta(repo, target_sha, tree) if tree else None
+                    delivered = _delivered_paths(repo, target_sha, tree) if tree else None
                 except Exception:  # noqa: BLE001 - uncertainty retains authors
                     delivered = None
             outside = [commit for commit in earlier
@@ -2540,11 +2561,18 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                 # Journal before granting an exception. Read-only/unavailable
                 # storage cannot silently remove provenance from the gate.
                 from . import work
+                details = "; ".join(
+                    "%s : %s" % (commit, ", ".join(
+                        "%d lignes déjà présentes dans %s de la cible" % (count, path)
+                        for path, count in file_cache.get(
+                            ("delivered-proof", target_sha, commit), {}).items())
+                        or "0 lignes communes au delta livré")
+                    for commit in outside)
                 message = ("#3837 : gel #%s (%s), contenu déjà dans la cible ; "
                            "aucune contribution de ces commits au delta livré "
                            "vers %s sur %s : %s"
                            % (row_id, sha, target_sha, head_sha,
-                              ", ".join(outside)))
+                              details))
                 try:
                     work.note(db, lot, message, once=True)
                 except Exception:  # noqa: BLE001 - no trace, no exception
