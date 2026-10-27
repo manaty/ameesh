@@ -1311,7 +1311,9 @@ class LeaseDbTest(PgTestCase):
         dead = ops.land_lock("dead-pass:main", "radar-dead", 0.2)
         self.assertEqual(dead, 1)
         time.sleep(0.5)
-        live = ops.land_lock("dead-pass:main", "radar-live", 0.2)
+        # le vivant prend un bail long : une borne de 0,2 s expirait avant
+        # l'écriture sur un exécuteur chargé (#4021, run 40541653061)
+        live = ops.land_lock("dead-pass:main", "radar-live", 60)
         self.assertEqual(live, 2)
         self.assertFalse(ops.land_unlock("dead-pass:main", "radar-dead", dead))
         self.assertIsNone(ops.queue_update(lot, state="landing",
