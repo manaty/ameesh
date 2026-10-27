@@ -270,6 +270,8 @@ class StockageTest(_Base):
         qa = lot("en qa")
         work.move(self.db, qa, "build")
         work.move(self.db, qa, "qa")
+        # #3986 : la relecture attend seulement après déclaration du gel.
+        work.milestone(self.db, qa, "frozen", sha="a" * 40, actor="test")
         tenu = lot("tenu")
         work.note(self.db, tenu, "hold: attend la fin de #1", actor="a6")
         repris = lot("tenu puis repris")
@@ -1183,7 +1185,9 @@ class ReveilTest(_Base):
         qa = work.add(self.db, title="en relecture", assignee="r1", force=_FORCE)["id"]
         work.move(self.db, qa, "build")
         work.move(self.db, qa, "qa")
-        self.assertIsNone(self.pick(worker), "un lot en qa ne réveille pas")
+        # #3986 : la relecture attend seulement après déclaration du gel.
+        work.milestone(self.db, qa, "frozen", sha="a" * 40, actor="test")
+        self.assertIsNone(self.pick(worker), "un lot en qa gelé ne réveille pas")
         b = work.add(self.db, title="à faire", assignee="r1", force=_FORCE)["id"]
         spec = self.pick(worker)
         self.assertEqual((spec["kind"], spec["lot"]), ("idle", str(b)))
