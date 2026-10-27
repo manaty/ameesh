@@ -84,6 +84,28 @@ def paused(row: dict) -> bool:
             and (row.get("status_text") or "").startswith(budget_mod.PAUSE_PREFIX))
 
 
+def gauge_paused(row: dict) -> bool:
+    """#4066 : la pause budget qui retire les lots — pas la seule fenêtre
+    courte du compte (#3779 : écart de départ, cooldown, plafond de tours).
+
+    Le runner écrit la fenêtre courte sous le même préfixe « budget : » ; elle
+    dure au plus `account_window.COOLDOWN_MAX_S` et, sur un compte partagé,
+    se renouvelle au départ de chaque voisin : la lire comme une pause de jauge
+    rendait les lots d'un agent tenu quelques secondes. Même reconnaissance que
+    la désignation (#3876) et que `work.check_assignee` (#4056). `paused` reste
+    la tenue (`account_turn.turn_hold`) : l'agent n'a pas de tour pendant ce
+    temps, mais garde ses lots."""
+    from . import review_designation
+    return paused(row) and not review_designation.is_short_window_pause(
+        row.get("status_text") or "")
+
+
+def gauge_text(status_text: str) -> bool:
+    """`gauge_paused` sur le seul `status_text` (déjà `blocked`, préfixe relu
+    en SQL), pour la relecture sous verrou de `WorkItems.handoff`."""
+    return gauge_paused({"status": "blocked", "status_text": status_text})
+
+
 def assign_prefixes() -> tuple:
     """Débuts des notes d'une attribution du lot (toutes : attribution,
     création, délégation, prises automatiques, reprise sur pause budget), plus
@@ -323,7 +345,7 @@ def budget_handoff(cfg, db, *, now: float | None = None,
         return []
     listing = st.operations.listing() if listing is None else listing
     sources = [row for row in listing
-               if row.get("harness") == SOURCE_HARNESS and paused(row)]
+               if row.get("harness") == SOURCE_HARNESS and gauge_paused(row)]
     if not sources:
         return []
     if canons is None:
@@ -414,6 +436,7 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                 # aucun preneur n'est exigé
                 row = st.work.handoff(int(item["id"]), None, current=source["name"],
                                       state="intake", paused_prefix=budget_mod.PAUSE_PREFIX,
+                                      still_paused=gauge_text,
                                       note_prefix=NOTE_PREFIX, window_s=backlog.TAKE_WINDOW_S,
                                       max_per_window=max_per_hour,
                                       note=return_note(item, source["name"], reason),
@@ -482,6 +505,7 @@ def budget_handoff(cfg, db, *, now: float | None = None,
             # pause, le preneur encore sans lot, le plafond horaire
             row = st.work.handoff(int(item["id"]), check["assignee"], current=source["name"],
                                   state="build", paused_prefix=budget_mod.PAUSE_PREFIX,
+                                  still_paused=gauge_text,
                                   note_prefix=NOTE_PREFIX, window_s=backlog.TAKE_WINDOW_S,
                                   max_per_window=max_per_hour,
                                   note=handoff_note(item, source["name"], check["assignee"],
