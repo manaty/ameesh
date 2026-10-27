@@ -4451,7 +4451,10 @@ class LotSessions(Domain):
         `today`, ni en attente d'une décision (demande non lue, jalon de
         décision ouvert), d'un lot bloquant ouvert ou d'une note `hold:`
         (la dernière note du lot). Une note `wake:` (#2466 : pose ou
-        déclenchement d'un réveil programmé) ne lève pas la retenue. Chaque
+        déclenchement d'un réveil programmé) ne lève pas la retenue, ni une
+        note de l'outillage (#3992 : composition de paquet, runner, git…) :
+        seules comptent les notes d'un agent du registre ou d'un humain
+        (`human:…`). Chaque
         ligne : `id`, `title`, `state`, `priority`, `activity_ts` (dernier
         signe de vie du lot : lot, journal, pointe de branche, courrier sur
         le lot), `wakes`, `last_wake_ts`, `wake_activity_ts`."""
