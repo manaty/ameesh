@@ -2864,10 +2864,20 @@ class Canon(Domain):
     @abc.abstractmethod
     def record_state(self, host: str, status: str, *, root: str, source: str,
                      commit: str | None, good: bool, diagnostic: str,
-                     canon: str = "", canon_id: str | None = None) -> None:
+                     canon: str = "", canon_id: str | None = None,
+                     expected: str | None = None) -> str | None:
         """Écrit l'état du canon de l'hôte ; le dernier commit valide ne suit que
         `good`. L42 (0031) : clé (host, canon), '' = canon par défaut ;
-        `canon_id` : identifiant réel du canon (gardé s'il n'est pas fourni)."""
+        `canon_id` : identifiant réel du canon (gardé s'il n'est pas fourni).
+
+        #3955 : `expected` (None : sans condition) rend l'avance du dernier
+        commit valide CONDITIONNELLE — la valeur enregistrée doit encore valoir
+        `expected` ('' : aucune) pour que `last_good_commit` / `last_good_at`
+        suivent `commit` ; une synchronisation concurrente qui a avancé la
+        ligne entre la lecture et l'écriture est donc détectée. Rend la valeur
+        EFFECTIVE de `last_good_commit` après l'écriture (None : aucune) :
+        l'appelant qui attend `commit` sait que son écriture a été retenue,
+        sinon il relit et rejoue (cas d'usage `canon_sync.record_state`)."""
 
     @abc.abstractmethod
     def state(self, host: str, canon: str = "") -> dict | None:
