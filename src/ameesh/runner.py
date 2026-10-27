@@ -312,10 +312,14 @@ def local_balance_alerts(db, thresholds, now: float) -> list:
     seuils qu'`ameesh alerts` et `ameesh notify` — un agent au token ne prend
     jamais sous cette alerte. `notify` ne publie pas d'état d'alerte : on
     relit le solde au moment de la passe, une seule implémentation
-    (`sous_utilisation.balance_low`)."""
+    (`sous_utilisation.balance_low`).
+
+    #3923 : la garde locale ne lit plus le registre complet. `balance_low`
+    n'en tire que le `responsible` de l'alerte routée ; ici elle n'est qu'un
+    verrou de prise, sans destinataire (`notify` passe, lui, son listing).
+    Cette lecture coûtait 1,2 s par passe et par exécuteur."""
     from . import sous_utilisation
-    listing = storage.of(db).operations.listing()
-    return sous_utilisation.balance_low(db, listing, now, **(thresholds or {}))
+    return sous_utilisation.balance_low(db, (), now, **(thresholds or {}))
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -7814,15 +7818,20 @@ class AgentWorker(threading.Thread):
             with self.lock:
                 self.proc = None
                 self.pgid = None
-            if rp is None:
-                with self.runner.launch_lock:
-                    self.runner.harness_pids.discard(pgid)
-            if fond is not None:
-                self.runner.background.start(
-                    agent=self.name, turn_id=turn_id, pgid=pgid, members=fond[0],
-                    containers=fond[1], grace_s=self.turn_grace_seconds(),
-                    handles=background_handles, cgroup=cgroup_path)
-            elif rp is None:
+            # #3944 : le groupe ne quitte `harness_pids` qu'une fois inscrit en
+            # grâce — entre les deux, la passe des orphelins (`_reap_strays`)
+            # consommerait le statut du travail de fond.
+            try:
+                if fond is not None:
+                    self.runner.background.start(
+                        agent=self.name, turn_id=turn_id, pgid=pgid, members=fond[0],
+                        containers=fond[1], grace_s=self.turn_grace_seconds(),
+                        handles=background_handles, cgroup=cgroup_path)
+            finally:
+                if rp is None:
+                    with self.runner.launch_lock:
+                        self.runner.harness_pids.discard(pgid)
+            if fond is None and rp is None:
                 if background_handles:
                     from .background import Entry
                     # A failed handoff must not discard detached live targets.

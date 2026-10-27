@@ -167,7 +167,14 @@ class MenageTest(unittest.TestCase):
                 pass
             time.sleep(0.01)
 
-        rapport = bascule._menager(str(self.base / "venv"), appliquer=True)
+        # Racine dédiée à ce seul PID : le test ne dépend pas des autres
+        # processus du runner, dont un cmdline illisible rendrait le relevé
+        # non concluant (#3934).
+        racine = self.base / "proc-reel"
+        racine.mkdir()
+        (racine / str(enfant.pid)).symlink_to("/proc/%d" % enfant.pid)
+        rapport = bascule._menager(str(self.base / "venv"), appliquer=True,
+                                   racine=str(racine))
 
         self.assertIsNone(rapport["probleme"])
         self.assertTrue(usage.is_dir(), "le venv du processus vivant a été retiré")
@@ -359,6 +366,15 @@ class CablageActiverTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="menage-3792-activer-")
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
+        # #3934 : `activer` déclenche le ménage, qui lit les processus
+        # vivants. Le /proc du runner n'est pas une donnée de ces tests : un
+        # seul cmdline illisible rendait le relevé non concluant et le test
+        # instable (run 40467354076). Le relevé réel est testé dans
+        # MenageTest avec une racine injectée.
+        scan = mock.patch.object(bascule, "_chemins_des_processus",
+                                 return_value=set())
+        scan.start()
+        self.addCleanup(scan.stop)
 
     def activer(self, version: str, precedent: str | None = None) -> int:
         arguments = ["activer", "--venv", str(self.base / "venv"), "--version", version]

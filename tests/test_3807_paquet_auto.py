@@ -123,7 +123,7 @@ class PaquetAutoBanc(unittest.TestCase):
                                   return_value=["tests.test_contract"]), \
                 mock.patch.object(paquet_auto, "run_tests",
                                   side_effect=[unit_run, contract_run]):
-            runs, faulty = paquet_auto.check_local_tests(
+            runs, faulty, _removals = paquet_auto.check_local_tests(
                 pathlib.Path(self.tmp.name), composition, timeout=1,
                 log=lambda _line: None)
         self.assertEqual(faulty, [])
@@ -149,11 +149,16 @@ class PaquetAutoBanc(unittest.TestCase):
         red = paquet_auto.TestRun(
             "unité #1", ["tests.test_unit"], 1,
             "FAIL: test_x (tests.test_unit.TestX)\nAssertionError", 0.1)
+        green = paquet_auto.TestRun(
+            "contrats", ["tests.test_contract"], 0,
+            "Ran 1 test in 0.1s\n\nOK", 0.1)
         with mock.patch.object(paquet_auto, "unit_test_modules",
                                return_value=["tests.test_unit"]), \
+                mock.patch.object(paquet_auto, "contract_modules",
+                                  return_value=["tests.test_contract"]), \
                 mock.patch.object(paquet_auto, "run_tests",
-                                  side_effect=[red]):
-            runs, faulty = paquet_auto.check_local_tests(
+                                  side_effect=[red, green]):
+            runs, faulty, _removals = paquet_auto.check_local_tests(
                 pathlib.Path(self.tmp.name), composition, timeout=1,
                 log=lambda _line: None)
         self.assertEqual(faulty, [1])
@@ -189,11 +194,16 @@ class PaquetAutoBanc(unittest.TestCase):
         composition = paquet_auto.Composition(
             units=[paquet_auto.Unit(1, "0" * 40, "1" * 40)],
             discarded=[], head="2" * 40)
+        green = paquet_auto.TestRun(
+            "contrats", ["tests.test_contract"], 0,
+            "Ran 1 test in 0.1s\n\nOK", 0.1)
         with mock.patch.object(paquet_auto, "unit_test_modules",
                                return_value=["tests.test_unit"]), \
+                mock.patch.object(paquet_auto, "contract_modules",
+                                  return_value=["tests.test_contract"]), \
                 mock.patch.object(paquet_auto, "run_tests",
-                                  side_effect=[mixed]):
-            runs, faulty = paquet_auto.check_local_tests(
+                                  side_effect=[mixed, green]):
+            runs, faulty, _removals = paquet_auto.check_local_tests(
                 pathlib.Path(self.tmp.name), composition, timeout=1,
                 log=lambda _line: None)
         self.assertEqual(faulty, [1])
@@ -291,7 +301,7 @@ class PaquetAutoBanc(unittest.TestCase):
                 mock.patch.object(paquet_auto, "run_freeze_checks",
                                   return_value=(0, "ok", 0.1)), \
                 mock.patch.object(paquet_auto, "check_local_tests",
-                                  return_value=([inconclusive], [])), \
+                                  return_value=([inconclusive], [], [])), \
                 mock.patch.object(paquet_auto, "composition_table",
                                   return_value="## Composition (1 unité, 1 lot)\n"), \
                 mock.patch.object(paquet_auto, "write_manifest",

@@ -68,6 +68,24 @@ def release_reason(row: dict, *targets) -> str:
     return ""
 
 
+def release_vehicle(row: dict) -> str:
+    """Pourquoi ce lot porte une release (chaîne vide sinon) — #3936.
+
+    `release_reason`, plus la **tête** `release/**` : une PR `release/11y →
+    main` est un lot release (canon §8 « PR release/* ») même quand sa cible
+    est `main`. Sa fusion est le geste du pilote sur la tête verte (canon §2),
+    sans nouveau gel : l'horloge SLO ne doit pas en attendre un. La classe de
+    la porte (`release_reason`, `of_lot`) n'est pas changée ici.
+    """
+    reason = release_reason(row)
+    if reason:
+        return reason
+    head = _normalized_target(row.get("branch"))
+    if head.startswith(RELEASE + "/"):
+        return "head %s" % head
+    return ""
+
+
 def _ref(canon) -> str:
     sources = getattr(canon, "sources", None) or []
     return str(getattr(sources[0], "commit", "") or "") if sources else ""
