@@ -1795,6 +1795,18 @@ class WorkItems(interface.WorkItems):
             (int(item_id), None if limit is None else int(limit)),
         )
 
+    def verdicts_for_commit(self, commit) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT id, work_item_id, kind, sha, actor, verdict, note,
+                   extract(epoch from at)::float8 AS at_ts, at
+              FROM work_item_milestones
+             WHERE kind = 'verdict'
+               AND sha ~ '^[0-9a-fA-F]{12,40}$'
+               AND starts_with(lower(%s), lower(sha))
+             ORDER BY at DESC, id DESC
+            """, (commit,))
+
     def earlier_freezes(self, app, lot, before_ts) -> list[dict]:
         return self.db.query(
             """
