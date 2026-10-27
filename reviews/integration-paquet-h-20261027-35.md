@@ -70,10 +70,10 @@ tête courante.
 
 | lot | motif |
 |---|---|
-| #3519 | hold pilote actif (mesh-design, depuis 02:00Z) : désignation en attente de la provenance (9 commits inconnus) avant le staging de #3837. |
-| #3526 | non prêt : verdicts manquants sur son gel `5e1bfc4a8067` (sensible) — le calcul le rend `verdicts-missing`. |
-| #3885 | non prêt au calcul de 05:33Z : `verdicts-missing` sur sa tête publiée ; il prend le paquet suivant. |
-| #3889 | non prêt au calcul de 05:33Z : gel postérieur à la composition, avis dus ; paquet suivant. |
+| #3519 | hold pilote actif (mesh-design, depuis 02:00Z) : désignation en attente de la provenance (9 commits inconnus) avant le staging de #3837 ; le gel effectif est en outre refusé après verdict (`freeze-after-verdict`). |
+| #3526 | non prêt : aucun verdict sur son gel `5e1bfc4a8067` (sensible) — le calcul le rend `verdicts-missing`. |
+| #3885 | non prêt : conflit avec la cible sur `docs/EXPLOITATION.md` et `src/ameesh/role_timers.py` (sensible : empreintes et migration additive 0492) ; remise à préparer, paquet suivant. |
+| #3889 | non prêt : verdict bloqué sur son gel (le calcul refuse le gel effectif, `blocked-verdict`) ; correction due, paquet suivant. |
 
 La liste calculée du 27/10 05:33Z sur `fb029a526557` (worktree détaché à
 cette référence) rend **6 lots prêts** — #3877, #3506, #3876, #3843, #3853
