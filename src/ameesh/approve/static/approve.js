@@ -75,10 +75,13 @@
       referrerPolicy: "no-referrer",
       signal: controller ? controller.signal : undefined
     }).then(function (response) {
+      // corps illisible (HTML d'un mandataire, coupé après les en-têtes) :
+      // `data` null, jamais une réponse du service
       return response.json().catch(function () {
-        return {};
+        return null;
       }).then(function (data) {
-        return { ok: response.ok, status: response.status, data: data };
+        return { ok: response.ok, status: response.status,
+                 data: data && typeof data === "object" ? data : null };
       });
     }).finally(function () {
       if (timer) {
@@ -91,9 +94,37 @@
     return result.status >= 500 || result.status === 429;
   }
 
-  // Rend la réponse définitive (2xx ou refus 4xx) ; `waiting(n)` est appelé
-  // avant chaque nouvel essai. Ne rejette jamais.
-  function deliver(body, waiting) {
+  // §16 (#3889) : l'accusé vérifiable d'un envoi de ce type — jamais un 2xx
+  // quelconque (cx2, gel #21680)
+  var ACKS = {
+    approve: function (body, d) {
+      return typeof d.request_id === "string" && d.decision === body.decision;
+    },
+    login: function (body, d) {
+      return typeof d.login_id === "string" && (body.decision === "view"
+        ? typeof d.url === "string" : d.decision === body.decision);
+    },
+    enroll: function (body, d) {
+      return typeof d.proposal === "string" && typeof d.key_fingerprint === "string";
+    }
+  };
+
+  // une réponse du service : son accusé, ou son refus nommé (`error`)
+  function verified(kind, body, result) {
+    if (!result.data) {
+      return false;
+    }
+    if (result.ok) {
+      return !!ACKS[kind] && ACKS[kind](body, result.data);
+    }
+    return typeof result.data.error === "string";
+  }
+
+  // Rend la réponse définitive et vérifiée (l'accusé du type `kind`, ou un
+  // refus 4xx du service) ; une panne, ou une réponse illisible ou sans
+  // accusé, repart avec le MÊME corps ; `waiting(n)` est appelé avant chaque
+  // nouvel essai. Ne rejette jamais.
+  function deliver(kind, body, waiting) {
     var attempt = 0;
     return new Promise(function (resolve) {
       function again() {
@@ -104,7 +135,7 @@
       }
       function once() {
         post(body).then(function (result) {
-          if (transient(result)) {
+          if (transient(result) || !verified(kind, body, result)) {
             again();
           } else {
             resolve(result);
@@ -168,7 +199,7 @@
   function sendKept(kind, body, doneText) {
     setBusy(true);
     keep(kind, body);
-    deliver(body, function () {
+    deliver(kind, body, function () {
       say(pendingText(), "pending");
     }).then(function (result) {
       forget();
@@ -329,7 +360,7 @@
           if (final) {
             keep("login", body);
           }
-          deliver(body, function () {
+          deliver("login", body, function () {
             say(pendingText(), "pending");
           }).then(function (result) {
             if (final) {

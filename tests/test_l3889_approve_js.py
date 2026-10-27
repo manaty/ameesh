@@ -64,7 +64,8 @@ function fetch(_url, init) {
   const a = answers.shift();
   if (a === undefined || a === "network") return Promise.reject(new TypeError("Failed to fetch"));
   return Promise.resolve({ ok: a.status < 300, status: a.status,
-                           json: () => Promise.resolve(a.body || {}) });
+    json: () => typeof a.body === "string" ? Promise.reject(new SyntaxError("not JSON"))
+      : Promise.resolve(a.body || {}) });
 }
 const statuses = [];
 const context = {
@@ -119,13 +120,56 @@ class ApproveJsDeliveryTest(unittest.TestCase):
     def test_corps_garde_renvoye_tel_quel_jusqu_a_l_accuse(self):
         result = self.run_page({"storage": self.kept(), "answers": [
             "network", {"status": 503, "body": {"error": "registry", "retry": True}},
-            {"status": 429, "body": {}}, {"status": 200, "body": {"decision": "approve"}}]})
+            {"status": 429, "body": {}}, {"status": 200, "body": {"request_id": "r1", "decision": "approve"}}]})
         self.assertEqual([json.loads(b) for b in result["sent"]], [BODY] * 4)
         self.assertEqual((result["status"]["className"], result["kept"]), ("done", None))
         self.assertIn("recorded", result["status"]["textContent"])
         self.assertTrue(any("Sending" in s for s in result["statuses"]))
         for shown in result["statuses"] + [result["status"]["textContent"]]:
             self.assertNotIn("rror", shown)
+
+    def test_2xx_sans_accuse_valide_garde_et_renvoie_le_meme_corps(self):
+        """B (cx2, gel #21680) : un 200 HTML (mandataire), vide, ou dont
+        l'accusé n'est pas celui de cette approbation, ne vaut pas accusé :
+        le corps reste gardé et repart tel quel, jusqu'à l'accusé valide."""
+        result = self.run_page({"storage": self.kept(), "answers": [
+            {"status": 200, "body": "<html>proxy</html>"}, {"status": 200, "body": {}},
+            {"status": 200, "body": {"request_id": "r1", "decision": "deny"}},
+            {"status": 404, "body": "<html>not found</html>"},
+            {"status": 200, "body": {"request_id": "r1", "decision": "approve"}}]})
+        self.assertEqual([json.loads(b) for b in result["sent"]], [BODY] * 5)
+        self.assertEqual(result["keptAtSend"], [True] * 5)
+        self.assertEqual((result["status"]["className"], result["kept"]), ("done", None))
+        self.assertEqual(sum("recorded" in s for s in result["statuses"]), 0)
+
+    def test_200_illisible_puis_rechargement_reprend_le_corps(self):
+        result = self.run_page({"storage": self.kept(), "answers": [
+            {"status": 200, "body": "<html>proxy</html>"}]})
+        self.assertNotEqual(result["status"]["className"], "done")
+        self.assertIsNotNone(result["kept"])
+        again = self.run_page({"storage": {KEY: result["kept"]}, "answers": [
+            {"status": 200, "body": {"request_id": "r1", "decision": "approve"}}]})
+        self.assertEqual([json.loads(b) for b in again["sent"]], [BODY])
+        self.assertEqual((again["status"]["className"], again["kept"]), ("done", None))
+
+    def test_enrolement_et_login_2xx_sans_accuse_gardes(self):
+        enroll = {"credential_id": "Y3JlZA", "clientDataJSON": "Y2xpZW50",
+                  "attestationObject": "YXR0"}
+        result = self.run_page({"root": "enroll", "storage": self.kept_as("enroll", enroll),
+                                "answers": [{"status": 200, "body": {"key_fingerprint": "ab"}}]})
+        self.assertNotEqual(result["status"]["className"], "done")
+        self.assertIsNotNone(result["kept"])
+        login = dict(BODY, decision="done")
+        result = self.run_page({"root": "login", "storage": self.kept_as("login", login),
+                                "answers": [{"status": 200, "body": "<html>proxy</html>"},
+                                            {"status": 200, "body": {"login_id": "l1",
+                                                                     "decision": "cancel"}}]})
+        # l'accusé d'une autre décision n'est pas le sien : le même corps repart
+        self.assertGreaterEqual(len(result["sent"]), 2)
+        self.assertEqual(set(result["sent"]), {result["sent"][0]})
+        self.assertEqual(json.loads(result["sent"][0]), login)
+        self.assertNotEqual(result["status"]["className"], "done")
+        self.assertEqual(json.loads(result["kept"])["body"], login)
 
     def test_refus_voulu_explique_et_jamais_renvoye(self):
         result = self.run_page({"storage": self.kept(), "answers": [
@@ -140,7 +184,7 @@ class ApproveJsDeliveryTest(unittest.TestCase):
                                                     "clientDataJSON": [4], "signature": [5]}}
         result = self.run_page({"click": "approve", "credential": credential, "answers": [
             {"status": 500, "body": {"error": "internal", "retry": True}},
-            {"status": 200, "body": {"decision": "approve"}}]})
+            {"status": 200, "body": {"request_id": "r1", "decision": "approve"}}]})
         self.assertEqual(len(result["sent"]), 2)
         self.assertEqual(result["sent"][0], result["sent"][1])
         self.assertEqual(result["keptAtSend"], [True, True])
@@ -158,7 +202,7 @@ class ApproveJsDeliveryTest(unittest.TestCase):
                                                     "attestationObject": [5]}}
         result = self.run_page({"root": "enroll", "click": "enroll", "credential": credential,
                                 "answers": [{"status": 500, "body": {"retry": True}},
-                                            {"status": 200, "body": {"key_fingerprint": "ab"}}]})
+                                            {"status": 200, "body": {"proposal": "p.json", "key_fingerprint": "ab"}}]})
         self.assertEqual(result["keptAtSend"], [True, True])
         self.assertEqual(result["sent"][0], result["sent"][1])
         self.assertEqual((result["status"]["className"], result["kept"]), ("done", None))
@@ -168,7 +212,7 @@ class ApproveJsDeliveryTest(unittest.TestCase):
         body = {"credential_id": "Y3JlZA", "clientDataJSON": "Y2xpZW50",
                 "attestationObject": "YXR0"}
         result = self.run_page({"root": "enroll", "storage": self.kept_as("enroll", body),
-                                "answers": [{"status": 200, "body": {"key_fingerprint": "ab"}}]})
+                                "answers": [{"status": 200, "body": {"proposal": "p.json", "key_fingerprint": "ab"}}]})
         self.assertEqual([json.loads(b) for b in result["sent"]], [body])
         self.assertEqual(result["status"]["className"], "done")
 
@@ -179,7 +223,7 @@ class ApproveJsDeliveryTest(unittest.TestCase):
                 "attestationObject": "YXR0"}
         result = self.run_page({"root": "wait", "storage": self.kept_as("enroll", body),
                                 "answers": [{"status": 503, "body": {"retry": True}},
-                                            {"status": 200, "body": {"key_fingerprint": "ab"}}]})
+                                            {"status": 200, "body": {"proposal": "p.json", "key_fingerprint": "ab"}}]})
         self.assertEqual([json.loads(b) for b in result["sent"]], [body, body])
         self.assertEqual((result["status"]["className"], result["kept"], result["reloads"]),
                          ("done", None, 0))
@@ -205,7 +249,7 @@ class ApproveJsDeliveryTest(unittest.TestCase):
     def test_login_rouvert_renvoie_le_corps_garde(self):
         body = dict(BODY, decision="cancel")
         result = self.run_page({"root": "login", "storage": self.kept_as("login", body),
-                                "answers": [{"status": 200, "body": {"decision": "cancel"}}]})
+                                "answers": [{"status": 200, "body": {"login_id": "l1", "decision": "cancel"}}]})
         self.assertEqual([json.loads(b) for b in result["sent"]], [body])
         self.assertEqual((result["status"]["className"], result["kept"]), ("done", None))
         self.assertIn("Cancellation signed", result["status"]["textContent"])
@@ -214,7 +258,7 @@ class ApproveJsDeliveryTest(unittest.TestCase):
         body = dict(BODY, decision="done")
         result = self.run_page({"root": "wait", "storage": self.kept_as("login", body),
                                 "answers": [{"status": 503, "body": {}},
-                                            {"status": 200, "body": {"decision": "done"}}]})
+                                            {"status": 200, "body": {"login_id": "l1", "decision": "done"}}]})
         self.assertEqual([json.loads(b) for b in result["sent"]], [body, body])
         self.assertIn("Done signed", result["status"]["textContent"])
         self.assertEqual(result["reloads"], 0)
