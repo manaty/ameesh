@@ -28,6 +28,7 @@ import unittest
 from unittest import mock
 
 from ameesh import notify, notify_gap, role_timers, storage
+from ameesh.storage.postgres import notify_liveness as liveness_mod
 
 from .support import PgTestCase
 
@@ -78,6 +79,19 @@ class LeaseBoundsTest(unittest.TestCase):
         self.assertFalse(lease.expired())
         time.sleep(0.1)
         self.assertTrue(lease.expired())
+
+    def test_the_initial_deadline_starts_before_the_acquisition(self):
+        # #3913 (relecture cx1) : l'ancre est celle d'AVANT l'appel
+        # d'acquisition ; une prise retardée de plus que la TTL ne donne pas
+        # un droit local neuf au retour.
+        past = notify._StateRenewal(
+            object(), "agents-a:1:tok", 1, ttl=0.1, interval=10,
+            acquired_at=time.monotonic() - 0.2)
+        self.assertTrue(past.expired())
+        fresh = notify._StateRenewal(
+            object(), "agents-a:1:tok", 1, ttl=10, interval=10,
+            acquired_at=time.monotonic())
+        self.assertFalse(fresh.expired())
 
 
 class BriefBodyTest(unittest.TestCase):
@@ -293,6 +307,58 @@ class LeaseRecoveryTest(PgTestCase):
         self.assertEqual(gate.call_count, 2)
         self.assertEqual(notifier.sender.sent, [])
         notify.leave_shared_state(self.db, notifier, lease, cfg=self.cfg_a)
+
+    def test_a_delayed_acquisition_cannot_open_a_late_delivery(self):
+        # #3913 (relecture cx1) : la TTL serveur commence DANS acquire_state ;
+        # un retour retardé de plus que la TTL ne doit pas laisser une échéance
+        # locale neuve au retour, sans aucun renouvellement.
+        original = liveness_mod.NotifyLiveness.acquire_state
+
+        def delayed(domain, scope, owner, ttl):
+            time.sleep(0.3)
+            return original(domain, scope, owner, ttl)
+
+        notifier = self.notifier(self.cfg_a)
+        with mock.patch.object(liveness_mod.NotifyLiveness, "acquire_state",
+                               new=delayed):
+            lease, deliver = notify.enter_shared_state(
+                self.db, notifier, self.cfg_a, lease_s=0.2, renew_s=10)
+        self.assertTrue(deliver)
+        self.assertIsNotNone(lease)
+        self.assertTrue(lease.expired())
+        notifier.run_pass(self.db, current=[decision()])
+        self.assertEqual(notifier.sender.sent, [])
+        self.assertFalse(notify.leave_shared_state(
+            self.db, notifier, lease, cfg=self.cfg_a))
+
+    def test_a_delayed_reacquisition_after_reclaim_is_anchored_too(self):
+        # Même borne pour la DEUXIÈME tentative (reprise d'un bail local mort).
+        dead = _dead_pid()
+        seeded = storage.of(self.db).notify_liveness.acquire_state(
+            "alerts", "agents-a:%d:dead" % dead, 600)
+        self.assertIsNotNone(seeded)
+        original = liveness_mod.NotifyLiveness.acquire_state
+        calls = {"n": 0}
+
+        def delayed(domain, scope, owner, ttl):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                time.sleep(0.3)
+            return original(domain, scope, owner, ttl)
+
+        notifier = self.notifier(self.cfg_a)
+        with mock.patch.object(liveness_mod.NotifyLiveness, "acquire_state",
+                               new=delayed):
+            lease, deliver = notify.enter_shared_state(
+                self.db, notifier, self.cfg_a, lease_s=0.2, renew_s=10)
+        self.assertEqual(calls["n"], 2)
+        self.assertTrue(deliver)
+        self.assertIsNotNone(lease)
+        self.assertTrue(lease.expired())
+        notifier.run_pass(self.db, current=[decision()])
+        self.assertEqual(notifier.sender.sent, [])
+        self.assertFalse(notify.leave_shared_state(
+            self.db, notifier, lease, cfg=self.cfg_a))
 
 
 class ReleaseOnFreshConnectionTest(PgTestCase):

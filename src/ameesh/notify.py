@@ -1751,11 +1751,16 @@ class _StateRenewal:
     prise et prolongée seulement par un renouvellement réussi, dit au passage
     qu'il ne doit plus rien pousser même quand la base ne répond plus
     (`expired`, lu par `Notifier._delivery_open`) : un fil bloqué ou une base
-    injoignable ne laisse pas livrer au-delà de la TTL.
+    injoignable ne laisse pas livrer au-delà de la TTL. La borne initiale est
+    ancrée **avant** l'appel d'acquisition (`acquired_at`), pas après son
+    retour : un aller-retour lent ou une pause du processus entre la prise
+    serveur et la construction ne peut pas prolonger le droit local au-delà de
+    la TTL du serveur (relecture cx1).
     """
 
     def __init__(self, cfg: Config, owner: str, epoch: int, *,
-                 ttl: float, interval: float, log=None):
+                 ttl: float, interval: float, log=None,
+                 acquired_at: float | None = None):
         self.cfg, self.owner, self.epoch = cfg, owner, int(epoch)
         self.ttl, self.interval = float(ttl), max(0.01, float(interval))
         self.log = log or (lambda text: None)
@@ -1763,8 +1768,11 @@ class _StateRenewal:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._warned = False
-        #: échéance LOCALE : avance à chaque renouvellement réussi seulement
-        self._deadline = time.monotonic() + self.ttl
+        #: échéance LOCALE : ancrée avant l'acquisition, avancée ensuite par
+        #: chaque renouvellement réussi seulement. Un appelant sans ancre
+        #: (tests unitaires) part de l'instant courant.
+        anchor = time.monotonic() if acquired_at is None else float(acquired_at)
+        self._deadline = anchor + self.ttl
 
     def expired(self) -> bool:
         """Le bail ne couvre plus cette passe (perdu, ou échéance locale) ?"""
@@ -1969,6 +1977,10 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
             notifier.local_resolved_keys.clear()
         return None, True
     owner = state_owner(cfg)
+    # #3913 (relecture cx1) : l'ancre précède l'appel, pas son retour. La TTL
+    # serveur commence DANS `acquire_state` ; un retour retardé ou une pause du
+    # processus ne doit pas repousser l'échéance locale au-delà.
+    started = time.monotonic()
     try:
         epoch = storage.of(db).notify_liveness.acquire_state(
             STATE_SCOPE, owner, ttl)
@@ -1985,6 +1997,8 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
         # #3913 : une passe tuée laisse `hôte:PID:jeton` ; le MÊME hôte sait
         # que ce PID n'existe plus et reprend le bail sans attendre la TTL.
         if reclaim_dead_local_state(db, cfg, log=log) is not None:
+            # nouvelle tentative d'acquisition = nouvelle ancre, avant l'appel
+            started = time.monotonic()
             epoch = storage.of(db).notify_liveness.acquire_state(
                 STATE_SCOPE, owner, ttl)
     if epoch is None:
@@ -1992,7 +2006,8 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
             "standing by, nothing is delivered")
         return None, False
     lease = StateLease(owner, epoch, _StateRenewal(
-        cfg, owner, epoch, ttl=ttl, interval=interval, log=log))
+        cfg, owner, epoch, ttl=ttl, interval=interval, log=log,
+        acquired_at=started))
     # #3913 B1 : la passe consulte ce bail avant chaque envoi ; le retirer au
     # rendu ou sur toute sortie en erreur est aussi important que le poser.
     notifier.lease = lease
