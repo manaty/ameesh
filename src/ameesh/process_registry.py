@@ -1373,7 +1373,10 @@ def receipt_of(db: Db, work_item_id: int, command_id: str) -> dict | None:
 
 #: Collections actually collected for slice C (no `observations`:
 #: the source is not installed, a verifier that requires it must refuse).
-SOURCE_KEYS = ("milestones", "receipts", "decisions", "deliveries")
+#: `approvals` is conditional: it is present only when the host has a fresh,
+#: valid local projection of the IMA #704 records (#4006).
+SOURCE_KEYS = ("milestones", "receipts", "decisions", "deliveries",
+               "approvals")
 
 
 def read_sources(context: VerificationContext) -> dict[str, Any]:
@@ -1396,7 +1399,14 @@ def read_sources(context: VerificationContext) -> dict[str, Any]:
       work_item_id}` (L233);
     * `deliveries`: native `delivered` milestones, `{id, sha, accepted}` — `id`
       is projected as a string (#1994): it is the client reference that C
-      compares.
+      compares;
+    * `approvals` (#4006): the local IMA/GitHub projection,
+      `{"projection": {generated_at, expires_at, digest, source_digest, repo,
+      issue}, "records": [{id, comment_id, author, artifact, state,
+      superseded_by, revoked_by, ...}]}`. The key is **absent** when the
+      projection is not configured, missing, stale, unreadable or invalid:
+      a verifier that requires approvals then refuses `source-unavailable`,
+      never a default agreement. No network read happens here.
     """
     if not isinstance(context, VerificationContext):
         raise RegistryRefusal("verifier-invalid", "VerificationContext expected")
@@ -1459,5 +1469,16 @@ def read_sources(context: VerificationContext) -> dict[str, Any]:
             "SELECT id, sha FROM work_item_milestones"
             " WHERE work_item_id = %s AND kind = 'delivered' ORDER BY id",
             (item_id,))]
-    return {"milestones": milestones, "receipts": receipts,
-            "decisions": decisions, "deliveries": deliveries}
+    sources: dict[str, Any] = {"milestones": milestones, "receipts": receipts,
+                               "decisions": decisions, "deliveries": deliveries}
+    # #4006 : la projection locale est la seule source d'approbation. Toute
+    # absence ou peremption la retire du mapping (fail-closed) ; aucune
+    # lecture reseau n'a lieu ici.
+    from . import process_approvals as approvals_mod
+    try:
+        projection = approvals_mod.local_projection()
+    except approvals_mod.ApprovalError:
+        projection = None
+    if projection is not None:
+        sources["approvals"] = projection.as_source()
+    return sources

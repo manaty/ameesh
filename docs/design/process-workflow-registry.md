@@ -105,11 +105,14 @@ sources = pr.read_sources(context)                # real collections, in the tx
 * `read_sources(context) -> Mapping`: the source read for C (which is pure and
   SQL-free), **inside the transaction and under lock**. The mapping declares
   only what is really collected (`SOURCE_KEYS`: `milestones`, `receipts`,
-  `decisions`, `deliveries`); `observations` is not installed and is **not**
-  declared: a verifier that requires it refuses `source-unavailable`
-  (fail-closed). `receipts` carries `{accepted, guard, event_id, command_id,
-  workflow_stage, workflow_version, sha256, evidence, facts}` — `guard` is the
-  Process guard or the reserved verifier name (`hold`, `revision_transfer`).
+  `decisions`, `deliveries`, plus the conditional `approvals` of #4006);
+  `observations` is not installed and is **not** declared: a verifier that
+  requires it refuses `source-unavailable` (fail-closed). `approvals` is
+  declared only when the host has a fresh, valid IMA #704 projection; absent,
+  a verifier that requires it refuses the same way. `receipts` carries
+  `{accepted, guard, event_id, command_id, workflow_stage, workflow_version,
+  sha256, evidence, facts}` — `guard` is the Process guard or the reserved
+  verifier name (`hold`, `revision_transfer`).
 
 ## Transaction invariants
 
@@ -286,11 +289,158 @@ type); the matrix publishes "not admitted" for the missing facts below.
 `process_registry.install_verifier(name, callable)` and `read_sources(context)`
 remain **the** generic seam: the source read happens inside the transaction,
 under the lot lock and after the authority check; the collections are declared
-(`SOURCE_KEYS`: `milestones`, `receipts`, `decisions`, `deliveries`); the
-verifier returns a `Verification`; no caller-supplied verifier and no client
-boolean. A field that needs more asks for **one more declared collection**,
-read in the same transaction; absent ⇒ `source-unavailable`, never a private
-SQL read by C.
+(`SOURCE_KEYS`: `milestones`, `receipts`, `decisions`, `deliveries`, and the
+conditional `approvals` of #4006); the verifier returns a `Verification`; no
+caller-supplied verifier and no client boolean. A field that needs more asks
+for **one more declared collection**, read in the same transaction; absent ⇒
+`source-unavailable`, never a private SQL read by C.
+
+## Approval bridge IMA/GitHub (#4006, C of #2846)
+
+Owner decision **#143364** (option a, signed 27/10 06:58Z, approval #132): no
+new token. The bureau reuses an existing GitHub token that already reads the
+IMA repository's issues, keeps it in the bureau vault on `bureau-goal` (0600)
+and records its name and real scopes on lot **#4005**, never its value. There
+is **one reader**, on `bureau-goal`; agent hosts read a local read-only
+projection and never call GitHub themselves.
+
+### Source and authority
+
+The source is the IMA-owned record: issue
+`thepackengers/issue-manager-agent#704`, its comments and state. IMA remains
+the decision authority; this bridge only *reads* the records and normalises
+them. `source=api` is never an authority (it is refused by
+`require_approval(..., source="api")`), and a projection whose `authority` is
+not `ima` is invalid. No IMA database, API or private content is copied into
+this repository.
+
+An owner approval is a comment that:
+
+* is authored by a configured approver (for #704: `smichea`), of GitHub type
+  `User` — a bot comment is never an approval;
+* starts with an explicit marker (`Owner approval` / `Owner approval
+  recorded`), or carries the machine-readable envelope
+  `<!-- ameesh-approval:v1 {...} -->` (schema `ameesh-approval/1`);
+* names at least one exact artifact: a `blob/<revision>/<path>` URL, an
+  `owner/repo@<revision>:<path>` pin, or a strict prose reference
+  (`Reviewed artifact: <sha>, knowledge/...`). A branch or tag name is
+  refused (`mutable-revision`); a short revision is resolved from a full SHA
+  in the same body, otherwise through the GitHub commits API, and the
+  resolved SHA must match. The real reader re-checks even a 40-hex revision
+  against the commits API, so a branch named like a SHA cannot pass.
+
+A comment edited after creation (`updated_at != created_at`) is refused
+(`approval-edited`): the projection never accepts a decision whose text can
+have changed after the fact.
+
+### Supersession and revocation
+
+* **Supersession** is per `(repository, path)`: the last approval of that
+  path replaces every earlier one, even when it approves another revision.
+  A superseded approval is never resurrected if the newer one is later
+  revoked — the path then has no current approval (fail-closed).
+* **Revocation** is an explicit later comment by an approver whose first line
+  is `Owner approval revoked|withdrawn|superseded` (or a structured envelope
+  with `decision: revoked`). It targets `#issuecomment-<id>` references, or,
+  when it names none, the artifacts it pins (same repository + path). It
+  applies only to approvals created strictly before it; an approval posted
+  after a scope revocation is a new decision. A revocation of an unknown or
+  later comment is witnessed (`revocation-time`), never ignored silently.
+* A `revocation` record is published for audit; approvals carry
+  `state: current|superseded|revoked`, `superseded_by`, `revoked_by`.
+
+### Projection (`ameesh-approvals/1`)
+
+`bureau-goal` writes the projection atomically (0644, parent not
+group/other-writable, `.lock` serialisation, temp file + `os.replace` +
+fsync). It contains no secret: repo/issue/state, `source_digest` (SHA-256 of
+the issue state and every comment id/body hash), `generated_at`,
+`expires_at`, approvers, normalised approvals, revocations, refusal
+witnesses (comment id + stable code, never the body), reader identity and a
+`digest` (JCS + SHA-256 of the rest). A host rejects a projection that is
+missing, unreadable, a symlink, group/other-writable, too large, of another
+schema/authority, digest-tampered, in the future, older than its TTL or its
+consumer's `max_age_s`. `owner_uid` can pin the expected owner of the file
+and its directory (0 for a root-synchronised copy).
+
+### Configuration
+
+```json
+{
+  "approvals": {
+    "projection": "/var/lib/ameesh/approvals/ima-704.json",
+    "max_age_s": 300,
+    "owner_uid": 0,
+    "source": {
+      "repo": "thepackengers/issue-manager-agent",
+      "issue": 704,
+      "approvers": ["smichea"],
+      "artifact_repos": ["thepackengers/home"],
+      "token_file": "/etc/ameesh/secrets/ima-github.token",
+      "api_base": "https://api.github.com",
+      "ttl_s": 300,
+      "timeout_s": 10,
+      "total_timeout_s": 30,
+      "reader": "bureau-goal"
+    }
+  }
+}
+```
+
+`token_file` names a 0600 file; a token *value* in the configuration is
+refused. `api_base` must be https outside the loopback. The bureau runs:
+
+```
+ameesh process-approvals refresh     # reads #704, writes the projection
+ameesh process-approvals refresh --dry-run
+ameesh process-approvals check       # freshness, counts, digests
+ameesh process-approvals show --repo R --revision <full-sha> --path P
+```
+
+A host only uses `check` / `show`; it performs no network access.
+
+### Seam and refusal codes
+
+`process_registry.SOURCE_KEYS` gains the **conditional** `approvals`
+collection. `read_sources` adds it only when `local_projection()` succeeds;
+otherwise the key is absent, so a verifier that requires approvals refuses
+`source-unavailable` (fail-closed), exactly like `observations`. The
+`source=` argument of `require_approval` is the **approval source** (only
+`github` is accepted); it is not the command's authority source
+(`runner`/`explicit`/`session`), which B checks separately. The value is
+`{"projection": {generated_at, expires_at, digest, source_digest, repo,
+issue}, "records": [...]}`. `process_verifiers.SOURCE_COLLECTIONS` and
+`Snapshot.approvals` carry it; `approval_records(snapshot)` returns the
+normalised records. A C verifier applies the exact rules without reading a
+file or trusting a client: `process_approvals.projection_from_source(...)` /
+`approval_for_source(...)` rebuild the projection from the snapshot mapping
+and refuse with the same bridge codes. This lot publishes **no new Process
+refusal code**: #4007 (`revision_transfer`) owns the public contract and maps
+these bridge codes to it.
+
+Bridge codes (stable, module-level; `ApprovalError.code`):
+
+| family | codes |
+|---|---|
+| reader | `reader-config`, `reader-token`, `reader-timeout`, `reader-unavailable`, `reader-http`, `reader-invalid`, `reader-bounds` |
+| projection | `projection-missing`, `projection-unreadable`, `projection-permissions`, `projection-owner`, `projection-bounds`, `projection-invalid`, `projection-digest`, `projection-stale`, `projection-future`, `projection-source` |
+| approval | `approval-missing`, `approval-stale`, `approval-revoked`, `approval-superseded`, `approval-ambiguous`, `approval-expired`, `approval-api-not-authority`, `approval-source` |
+| normalisation witnesses | `author-bot`, `author-not-approver`, `approval-edited`, `approval-no-artifact`, `approval-envelope-invalid`, `mutable-revision`, `revision-unresolved`, `path-invalid`, `out-of-scope`, `revocation-unscoped`, `revocation-time` |
+
+### Qualification
+
+`tests/test_process_approvals.py` (41 pure/fixture cases, no database and no
+network in the core, one loopback HTTP case) covers every refusal witness
+requested by the lot: absent, revoked, stale-head, expired approval, stale
+projection and unavailable reader. `tests/test_process_approvals_704.py`
+runs only from `bureau-goal` with the real #704 fixture
+(`AMEESH_APPROVALS_704_FIXTURE`); it is skipped by default and becomes the
+real qualification once the #4005 token is recorded. The fixture file stays
+in the bureau vault, never in Git. A read-only pre-check from an existing
+host token on 27/10 normalised the two owner approvals cited by the Process
+contract (P1 `d918149…:knowledge/architecture/ima-ameesh-work-contract.md`,
+Process `6c771e2…:knowledge/architecture/ima-ameesh-process-contract.md`);
+it is not the official bureau qualification and does not replace #4005.
 
 ### Discriminating cases proposed for review (no code)
 

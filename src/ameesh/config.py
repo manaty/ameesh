@@ -469,6 +469,12 @@ class Config:
     #: configuration de l'HÔTE désigné (`projects` : projet → dépôt et dossier
     #: des migrations), validée par `ameesh.radar`.
     radar: dict = field(default_factory=dict)
+    #: #4006 : pont d'approbation IMA/GitHub. Clé `approvals` du fichier de
+    #: configuration : `projection` (chemin local en lecture seule),
+    #: `max_age_s`, `owner_uid` éventuel, et côté bureau `source` (dépôt,
+    #: issue, approbateurs, `token_file` 0600, TTL). Jamais de valeur de
+    #: jeton ici : seulement le chemin du fichier qui le porte.
+    approvals: dict = field(default_factory=dict)
     #: #2448 : release aux coupures du canon compilé (clé `release` du fichier
     #: de l'hôte opérateur : `host` et `projects` — dépôt, cible, staging,
     #: rapport). Validée par `ameesh.release_cutoff` ; absente = aucune.

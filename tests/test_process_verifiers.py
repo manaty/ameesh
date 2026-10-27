@@ -31,7 +31,7 @@ COMMAND_ID = "11111111-1111-4111-8111-111111111111"
 AUTHOR = "agent:dev1"
 REVIEWER = "agent:reviewer"
 ALL_SOURCES = ("milestones", "receipts", "observations", "decisions",
-               "deliveries")
+               "deliveries", "approvals")
 
 OBSERVATIONS = (
     {"id": "obs-staging-deployed", "env": "staging", "sha": REV,
