@@ -5047,7 +5047,9 @@
     "read_state",
     "release_brief",
     "release_state",
-    "save_state"
+    "renew_state",
+    "save_state",
+    "state_lease"
    ],
    "fingerprints": [
     "advance",

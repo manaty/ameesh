@@ -4902,6 +4902,26 @@ class NotifyLiveness(Domain):
         un détenteur périmé ne remplace jamais l'état du nouveau)."""
 
     @abc.abstractmethod
+    def renew_state(self, scope: str, owner: str, epoch: int,
+                    ttl_seconds: float) -> bool:
+        """Renouvelle le bail vivant `(owner, epoch)` sans changer son epoch.
+
+        #3913 : une passe d'alertes dure plus que la TTL courte du bail ; le
+        renouvellement la maintient sans rouvrir la course à l'écriture.
+        False si le bail n'est plus celui-là ou s'il est déjà expiré (un bail
+        expiré ne ressuscite jamais).
+        """
+
+    @abc.abstractmethod
+    def state_lease(self, scope: str) -> dict | None:
+        """Le bail courant de l'état : `owner`, `epoch`, `expires_ts` et
+        `now_ts` (heure de la base). None si la ligne ou l'owner manque.
+
+        Sert à reprendre le bail d'un processus mort du MÊME hôte (#3913),
+        jamais à décider d'un autre hôte : son PID n'est pas visible ici.
+        """
+
+    @abc.abstractmethod
     def release_state(self, scope: str, owner: str, epoch: int) -> bool:
         """Rend le bail d'exécution de l'état, à son epoch."""
 
