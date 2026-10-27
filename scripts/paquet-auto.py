@@ -1002,6 +1002,37 @@ def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
     return out, note
 
 
+def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
+                  timeout: int) -> set[str] | None:
+    """#4025 : les tests de `modules` rouges sur la base, ou None (non concluant).
+
+    Un module voisin rouge ne désigne l'unité que s'il est vert sur la base :
+    un rouge aussi présent sur la base vient de l'environnement de l'hôte ou
+    lui préexiste. Les modules sont rejoués dans un worktree détaché de la base.
+    """
+    if not base_sha or not modules:
+        return None
+    parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    path = Path(tempfile.mkdtemp(prefix="paquet-auto-base-", dir=str(parent)))
+    path.rmdir()
+    proc = git(worktree, "worktree", "add", "--detach", str(path), base_sha,
+               check=False)
+    if proc.returncode != 0:
+        shutil.rmtree(path, ignore_errors=True)
+        return None
+    try:
+        present = [module for module in modules
+                   if (path / (module.replace(".", "/") + ".py")).is_file()]
+        if not present:
+            return set()
+        run = run_tests(path, "base", present, timeout=timeout)
+        if run.inconclusive:
+            return None
+        return {failure["test"] for failure in unittest_failures(run.output)}
+    finally:
+        remove_worktree(worktree, path)
+
+
 def _dedupe_modules(worktree: Path, modules) -> list[str]:
     out: list[str] = []
     for module in modules:
@@ -1165,8 +1196,8 @@ def designated_removals(attribution: dict, failures: list[dict], *,
 def check_local_tests(worktree: Path, composition: Composition, *,
                       timeout: int, log=print,
                       attribute=None, base_sha: str = "",
-                      select=None) -> tuple[list[TestRun], list[int],
-                                            list[Removal]]:
+                      select=None, on_base=None) -> tuple[list[TestRun], list[int],
+                                                          list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
     Rend `(exécutions, unités fautives, retraits)`. Une unité est fautive
@@ -1185,6 +1216,8 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     (`neighbor_modules`, injectable par `select`). Dans le geste antérieur,
     un rouge d'un module `carte` ne désigne l'unité que si aucune autre ne
     l'a sélectionné ; un rouge partagé reste à l'attribution et à la ci-full.
+    Un rouge de module voisin aussi rouge sur la base (`base_failures`,
+    injectable par `on_base`) ne compte pas : environnement ou préexistant.
     """
     runs: list[TestRun] = []
     red: list[tuple[TestRun, list[dict]]] = []
@@ -1197,6 +1230,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             shared[module] = shared.get(module, 0) + 1
     if composition.selection:
         log("tests voisins : %s" % composition.selection)
+    pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str]]] = []
     for unit in composition.units:
         proper = unit_test_modules(worktree, unit)
         added = []
@@ -1223,18 +1257,42 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         if not run.green:
             found = unittest_failures(run.output)
             mine = {module.split(".", 1)[1] for module in proper}
+            neighbor = {row["module"].split(".", 1)[1] for row in added}
             mine |= {row["module"].split(".", 1)[1] for row in added
                      if row["reason"] != "carte" or shared.get(row["module"]) == 1}
-            owned = [failure for failure in found
-                     if not failure.get("module") or failure["module"] in mine]
-            if owned or not found:
-                own[unit.lot] = owned
-            red.append((run, found))
+            pending.append((unit, run, found, mine, neighbor))
             log("tests unité #%d : ROUGE (%d modules)\n%s"
                 % (unit.lot, len(modules), _tail(run.output)))
         else:
             log("tests unité #%d : vert (%d modules, %d tests)"
                 % (unit.lot, len(modules), run.tests))
+    neighbor_red = sorted({"tests." + failure["module"]
+                           for _unit, _run, found, _mine, neighbor in pending
+                           for failure in found
+                           if failure.get("module") in neighbor})
+    at_base: set[str] | None = set()
+    if neighbor_red:
+        at_base = (on_base or base_failures)(worktree, base_sha, neighbor_red,
+                                             timeout=timeout)
+        log("tests voisins rouges rejoués sur la base %s : %s"
+            % (base_sha[:12] or "?", "non concluant" if at_base is None
+               else "%d rouge(s) aussi sur la base" % len(at_base)))
+    for unit, run, found, mine, neighbor in pending:
+        kept = []
+        for failure in found:
+            if failure.get("module") in neighbor \
+                    and (at_base is None or failure["test"] in at_base):
+                continue
+            kept.append(failure)
+        owned = [failure for failure in kept
+                 if not failure.get("module") or failure["module"] in mine]
+        if owned or not found:
+            own[unit.lot] = owned
+        if kept or not found:
+            red.append((run, kept))
+        else:
+            log("tests unité #%d : rouge des seuls voisins, aussi rouges sur la "
+                "base ou non rejoués — sans effet" % unit.lot)
     modules = contract_modules(worktree)
     contract = run_tests(worktree, "contrats", modules, timeout=timeout)
     runs.append(contract)

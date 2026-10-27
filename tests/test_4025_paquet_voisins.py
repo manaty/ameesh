@@ -184,8 +184,13 @@ class LocalNeighborsTest(unittest.TestCase):
                    paquet_auto.Unit(2, "b", "2" * 40)],
             discarded=[], head="3" * 40)
 
-    def run_check(self, neighbors, results):
+    def run_check(self, neighbors, results, at_base=frozenset()):
         calls = []
+        replayed = []
+
+        def fake_base(_worktree, _base, modules, *, timeout):
+            replayed.append(list(modules))
+            return None if at_base is None else set(at_base)
 
         def fake_run(_worktree, label, modules, *, timeout):
             calls.append((label, list(modules)))
@@ -202,7 +207,9 @@ class LocalNeighborsTest(unittest.TestCase):
                 self.worktree, self.composition, timeout=1,
                 log=lambda _line: None,
                 attribute=lambda *_a: {"status": "ok", "tests": []},
-                select=lambda *_a: (neighbors, "carte d'impact `abc` (lue)"))
+                select=lambda *_a: (neighbors, "carte d'impact `abc` (lue)"),
+                base_sha="4" * 40, on_base=fake_base)
+        self.replayed = replayed
         return calls, out
 
     def test_voisin_support_rouge_retire_son_unite(self) -> None:
@@ -252,6 +259,32 @@ class LocalNeighborsTest(unittest.TestCase):
             "contrats": lambda m: _green("contrats", m),
         })
         self.assertEqual(faulty, [2])
+
+    def test_voisin_rouge_aussi_sur_la_base_ne_designe_personne(self) -> None:
+        # h-42 : test_1651_ci_parts rouge par l'hôte (bwrap), vert en CI
+        support = {"module": "tests.test_1651_ci_parts", "reason": "support",
+                   "files": ["tests/test_1467_train.py"]}
+        name = "tests.test_1651_ci_parts.T.test_x"
+        for at_base in ({name}, None):
+            with self.subTest(at_base=at_base):
+                _calls, (_runs, faulty, _removals) = self.run_check(
+                    {1: [support]}, {
+                        "unité #1": lambda m: _red("unité #1", m,
+                                                   "tests.test_1651_ci_parts"),
+                        "unité #2": lambda m: _green("unité #2", m),
+                        "contrats": lambda m: _green("contrats", m),
+                    }, at_base=at_base)
+                self.assertEqual(self.replayed, [["tests.test_1651_ci_parts"]])
+                self.assertEqual(faulty, [])
+
+    def test_module_propre_rouge_n_est_pas_rejoue(self) -> None:
+        _calls, (_runs, faulty, _removals) = self.run_check({}, {
+            "unité #1": lambda m: _red("unité #1", m, "tests.test_propre_1"),
+            "unité #2": lambda m: _green("unité #2", m),
+            "contrats": lambda m: _green("contrats", m),
+        })
+        self.assertEqual(self.replayed, [])
+        self.assertEqual(faulty, [1])
 
     def test_outil_absent_n_ajoute_rien(self) -> None:
         found, note = paquet_auto.neighbor_modules(
