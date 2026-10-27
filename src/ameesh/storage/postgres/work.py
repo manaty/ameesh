@@ -1815,7 +1815,15 @@ class WorkItems(interface.WorkItems):
 
         `proof` (facultatif, #1465) : quand il porte un sha complet, sa ligne de
         provenance est écrite dans la MÊME transaction — le fait et sa preuve
-        naissent ensemble, ou pas du tout. Indépendant du callback de gel."""
+        naissent ensemble, ou pas du tout. Indépendant du callback de gel.
+
+        #3836 : la transaction d'un jalon `frozen` borne ses attentes de verrou
+        (`SET LOCAL lock_timeout`, `FREEZE_LOCK_TIMEOUT_MS`). Cette borne ne
+        vaut que pour les prises **postérieures** au `SET LOCAL` : les verrous
+        déjà pris par l'appelant dans sa transaction, et les attentes qu'il y a
+        faites, restent hors de la borne. Un appel imbriqué est couvert pour
+        ses propres prises, et un `lock_timeout` plus court déjà posé par
+        l'appelant est gardé."""
         if on_frozen is not None and kind != "frozen":
             raise ValueError("on_frozen only makes sense for the `frozen` milestone")
         threads = [] if after_commit is None else after_commit
@@ -1831,6 +1839,10 @@ class WorkItems(interface.WorkItems):
                 # les deux pilotes ; une attente expirée lève, le `with` annule
                 # le jalon et relâche les verrous, l'appelant relance. Un
                 # `lock_timeout` déjà plus court posé par l'appelant est gardé.
+                # Limite : la borne couvre les prises qui suivent ce SET LOCAL,
+                # y compris dans un appel imbriqué ; les verrous déjà tenus par
+                # la transaction de l'appelant ne sont pas bornés (pas de borne
+                # rétroactive) — l'appelant pose la sienne avant ses prises.
                 current = float(tx.query(
                     "SELECT extract(epoch FROM current_setting('lock_timeout')"
                     "::interval) AS seconds")[0]["seconds"] or 0)

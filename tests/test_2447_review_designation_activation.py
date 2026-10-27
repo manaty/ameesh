@@ -2591,6 +2591,11 @@ class FreezeLockWaitTest(_ActivationFixture, PgTestCase):
     La récidive #3820 a attendu 174 s le lookup de provenance de son gel en
     tenant le verrou du dépôt de migration et celui du projet ; la transaction
     est restée ouverte. La transaction du jalon borne ses attentes à 15 s.
+
+    N3 revue #3836 : `SET LOCAL` ne borne que les prises qui le suivent ; un
+    gel appelé dans une transaction déjà ouverte est couvert pour ses propres
+    prises (avec la borne de l'appelant si elle est plus courte), pas pour les
+    verrous que l'appelant tenait déjà.
     """
 
     def test_a_locked_lot_fails_the_freeze_and_releases_its_locks(self):
@@ -2612,3 +2617,36 @@ class FreezeLockWaitTest(_ActivationFixture, PgTestCase):
             " WHERE pid = %s AND locktype = 'advisory'", (pid,))[0]["n"]
         self.assertEqual(leftover, 0,
                          "le jalon annulé a laissé ses verrous consultatifs")
+
+    def _nested_freeze_lock_timeouts(self, *, caller_bound=None):
+        """Gèle dans une transaction déjà ouverte et rend la borne de verrou
+        que le jalon voit avant ses propres prises (#3843, N3 de #3836)."""
+        seen = []
+        real = pg_work._lock_migration_writer
+
+        def spy(tx, item_id, proposed=None):
+            seen.append(float(tx.query(
+                "SELECT extract(epoch FROM current_setting('lock_timeout')"
+                "::interval) AS seconds")[0]["seconds"] or 0))
+            return real(tx, item_id, proposed=proposed)
+
+        with self.db.transaction() as outer:
+            if caller_bound is not None:
+                outer.execute("SET LOCAL lock_timeout = '%s'" % caller_bound)
+            with mock.patch.object(pg_work, "_lock_migration_writer",
+                                   side_effect=spy):
+                # `outer` est la transaction déjà ouverte : sous psql c'est le
+                # seul objet qui la porte (le pilote en ouvrirait une neuve).
+                work.milestone(outer, self.lot, "frozen",
+                               sha=self.frozen, actor="author")
+        return seen
+
+    def test_a_nested_freeze_bounds_its_own_lock_waits(self):
+        seen = self._nested_freeze_lock_timeouts()
+        self.assertTrue(seen, "le jalon n'a pris aucun verrou")
+        self.assertTrue(all(value == 15.0 for value in seen), seen)
+
+    def test_a_nested_freeze_keeps_the_callers_shorter_bound(self):
+        seen = self._nested_freeze_lock_timeouts(caller_bound="200ms")
+        self.assertTrue(seen, "le jalon n'a pris aucun verrou")
+        self.assertTrue(all(abs(value - 0.2) < 1e-9 for value in seen), seen)
