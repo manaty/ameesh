@@ -721,6 +721,29 @@ class MeasurePgTest(PgTestCase):
         self.assertEqual([r["work_item_id"] for r in rows], [lot["id"]])
         self.assertEqual(rows[0]["total_minutes"], 1440.0)
 
+    def test_runner_pass_without_repository_measures_nothing(self):
+        # #3972 : sans dépôt (aucun agent admis, dossier de travail illisible),
+        # la passe ne mesure pas — le diff resterait inconnu et la mesure
+        # prétendrait un dépôt que l'hôte n'a pas.
+        with tempfile.TemporaryDirectory() as root:
+            repo, sha = make_repo(root)
+            lot = self._delivered("recent", branch="lot/recent", sha=sha)
+            # aucun agent de l'hôte : aucun dossier de travail
+            self.assertEqual(lot_measures.measure_pending(
+                self.db, host=self.cfg.host, ci=None), [])
+            self.assertIsNone(storage.of(self.db).work.measure(lot))
+            # un agent existe, mais le filtre d'admission ne sélectionne personne
+            registry.upsert(self.db, "solo", host=self.cfg.host, cwd=repo)
+            for agents in (set(), {""}):
+                self.assertEqual(lot_measures.measure_pending(
+                    self.db, host=self.cfg.host, agents=agents, ci=None), [])
+                self.assertIsNone(storage.of(self.db).work.measure(lot))
+            # le même agent sélectionné : le lot est mesuré avec son diff
+            rows = lot_measures.measure_pending(
+                self.db, host=self.cfg.host, agents={"solo"}, ci=None)
+            self.assertEqual([r["work_item_id"] for r in rows], [lot])
+            self.assertEqual(rows[0]["diff_files"], 2)
+
     def test_lot_without_start_is_not_measured(self):
         lot = work.add(self.db, title="no start")
         work.close_merged(self.db, lot["id"], sha="abcdef1")

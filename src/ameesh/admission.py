@@ -14,7 +14,9 @@ the host's `max_agents`, gate and account checks still apply at claim time.
 Format: one name per line (or comma-separated), `#` starts a comment, blank
 lines are ignored. An invalid entry is skipped with its reason; it never
 stops the runner nor its other agents. A file that disappears or cannot be
-read keeps the last list that was read.
+read keeps the last list that was read, and a name whose resolution fails
+(database unreachable, ambiguous alias) is a transient failure that keeps
+that whole list and is retried on the next pass.
 """
 from __future__ import annotations
 

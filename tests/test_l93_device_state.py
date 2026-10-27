@@ -359,7 +359,7 @@ class SocketTest(unittest.TestCase):
             finally:
                 channel.stop()
 
-    def test_snapshot_empty_filter_still_includes_every_local_agent(self):
+    def test_snapshot_empty_filter_includes_nobody(self):
         store = mock.MagicMock()
         store.operations.listing.return_value = [row("agent-a"), row("agent-b"),
                                                 row("elsewhere", host="other")]
@@ -369,10 +369,13 @@ class SocketTest(unittest.TestCase):
         db.query.return_value = []
         with mock.patch.object(D.storage, "of", return_value=store), \
                 mock.patch.object(D, "_organisations", return_value={None: "test"}):
-            for names in (None, [], iter(()), ["agent-a"]):
-                expected = ["agent-a"] if names == ["agent-a"] else ["agent-a", "agent-b"]
+            for names, expected in ((None, ["agent-a", "agent-b"]),
+                                    ([], []),
+                                    (iter(()), []),
+                                    (["agent-a"], ["agent-a"])):
                 body = D.snapshot(cfg(), db, names=names)
-                self.assertEqual([a["name"] for a in body["meshes"][0]["agents"]], expected)
+                served = [a["name"] for mesh in body["meshes"] for a in mesh["agents"]]
+                self.assertEqual(served, expected)
 
     def test_query_of_a_missing_channel_fails_cleanly(self):
         with self.assertRaises(D.DeviceError):

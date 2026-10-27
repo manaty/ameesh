@@ -327,13 +327,17 @@ def snapshot(cfg, db, *,
              control_socket: str = "",
              gate: Optional[Mapping[str, Any]] = None,
              now: Optional[float] = None) -> dict:
-    """Lit la base et rend ``ameesh-device/1`` pour cet exécuteur."""
-    wanted = {str(n) for n in names} if names is not None else set()
+    """Lit la base et rend ``ameesh-device/1`` pour cet exécuteur.
+
+    ``names`` absent (``None``) sert tous les agents de l'hôte ; un filtre
+    donné, même vide, ne sert que ses noms (une liste d'admission vide
+    n'affiche personne, jamais « tous », #3972)."""
+    wanted = {str(n) for n in names} if names is not None else None
     host = getattr(cfg, "host", "") or ""
     store = storage.of(db)
     rows = [row for row in store.operations.listing()
             if (row.get("host") or "") == host
-            and (not wanted or row.get("name") in wanted)]
+            and (wanted is None or row.get("name") in wanted)]
     lot_ids = sorted({_bigint(row.get("session_work_item")) for row in rows
                       if _bigint(row.get("session_work_item")) is not None}
                      | {_int(row.get("assigned_lot_id")) for row in rows
