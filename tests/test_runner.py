@@ -626,6 +626,11 @@ class RunnerTest(PgTestCase):
                 proc.terminate()
                 proc.wait(timeout=10)
             lecteur.join(10)
+            # #3881 : le fil lecteur atteint l'EOF mais ne ferme pas le fichier
+            # du tube ; sans cette fermeture, `unclosed file` sort en
+            # ResourceWarning à la finalisation.
+            if proc.stdout is not None:
+                proc.stdout.close()
         sortie = "".join(lignes)
         self.assertLess(time.monotonic() - debut, 25.0)
         self.assertEqual(proc.returncode, 0, sortie)
