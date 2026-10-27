@@ -75,6 +75,17 @@ class ListingIndexDbTest(PgTestCase):
         self.db.execute(
             "INSERT INTO work_items (title, type, state, assignee)"
             " VALUES ('lot 3923', 'evolution', 'build', 't3923')")
+        # #3946 : avec un seul lot, l'index d'état (tous les `qa`) et l'index
+        # partiel de relecture (relecteur, état) coûtent exactement pareil : le
+        # départage dépend de l'ordre des index, que le rejeu du gabarit
+        # (`pg_dump`, le chemin de la CI) ne donne pas comme `migrate()` (le
+        # chemin local). Assez de lots `qa` d'un autre relecteur pour que le
+        # partiel soit nettement moins cher : le plan ne dépend plus d'un
+        # départage.
+        self.db.execute(
+            "INSERT INTO work_items (title, type, state, reviewer)"
+            " SELECT 'lot qa ' || g, 'evolution', 'qa', 'autre-relecteur'"
+            "   FROM generate_series(1, 500) g")
         self.db.execute("ANALYZE agent_mailbox")
         self.db.execute("ANALYZE work_items")
         cap = {}
