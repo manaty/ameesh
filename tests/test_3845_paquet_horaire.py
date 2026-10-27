@@ -462,8 +462,14 @@ class GitIdentityTest(unittest.TestCase):
         ph.tick = lambda ctx: seen.append(
             (os.environ.get("GIT_AUTHOR_NAME"),
              os.environ.get("GIT_COMMITTER_EMAIL"))) or "x"
+        # La CI n'a pas de canon compilé (config vide) : le fuseau est simulé,
+        # comme check_fresh et tick, pour ne tester que l'identité posée.
+        from ameesh import config as config_mod, mechanics
+        zone = mock.Mock(timezone="Europe/Paris")
         try:
-            with mock.patch.dict(os.environ, {}, clear=False):
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                    mock.patch.object(config_mod, "load", lambda *a, **k: {}), \
+                    mock.patch.object(mechanics, "configured", lambda *a, **k: zone):
                 for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
                             "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
                     os.environ.pop(key, None)
