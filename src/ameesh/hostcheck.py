@@ -793,6 +793,48 @@ def jit_lines(db) -> list[str]:
             % (role, database, found, _sql_name(role), _sql_name(database))]
 
 
+#: #3836 : au-delà, la garde n'en est plus une — l'incident a tenu 7 min.
+IDLE_XACT_MAX_S = 180.0
+
+
+def idle_transaction_lines(db) -> list[str]:
+    """#3836 : lignes de `ameesh doctor` sur la garde `idle in transaction`.
+
+    Le gel #3700 est resté `idle in transaction` sept minutes : il tenait le
+    verrou du dépôt de migration et le verrou consultatif du projet, et les
+    écritures du mesh attendaient. La garde serveur
+    (`idle_in_transaction_session_timeout`) coupe une session fautive sans
+    dépendre du client. Ce contrôle lit la valeur effective de la session et
+    sa source ; 0 (le défaut PostgreSQL) est signalé avec les deux gestes de
+    déploiement, et une valeur au-dessus de `IDLE_XACT_MAX_S` aussi. Un
+    avertissement ne change pas le verdict du doctor : la garde s'applique au
+    déploiement, pas à chaud (#3836, avis d'une autre famille requis)."""
+    rows = db.query(
+        "SELECT current_user AS role, current_database() AS database,"
+        "       setting, source FROM pg_settings"
+        " WHERE name = 'idle_in_transaction_session_timeout'")
+    if not rows:
+        return ["idle xact  : not checked (pg_settings has no "
+                "idle_in_transaction_session_timeout on this server)"]
+    try:
+        ms = int(float(str(rows[0].get("setting") or 0)))
+    except (TypeError, ValueError):
+        ms = 0
+    source = str(rows[0].get("source") or "?").strip()
+    seconds = ms / 1000.0
+    if 0 < seconds <= IDLE_XACT_MAX_S:
+        return ["idle xact  : %gs (source %s)" % (seconds, source)]
+    role = str(rows[0].get("role") or "")
+    database = str(rows[0].get("database") or "")
+    why = ("a client left idle in transaction holds its locks indefinitely"
+           if ms <= 0 else
+           "a client left idle in transaction can hold its locks for %gs" % seconds)
+    return ["warning    : idle_in_transaction_session_timeout is %gs (source %s): "
+            "%s (#3836); ALTER ROLE %s SET idle_in_transaction_session_timeout = "
+            "'180s'; ALTER DATABASE %s SET idle_in_transaction_session_timeout = '180s'"
+            % (seconds, source, why, _sql_name(role), _sql_name(database))]
+
+
 def _sql_name(name: str) -> str:
     """Identifiant SQL entre guillemets (conseil de commande, jamais exécuté)."""
     return '"%s"' % str(name).replace('"', '""')

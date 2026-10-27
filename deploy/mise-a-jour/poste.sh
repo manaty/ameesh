@@ -484,11 +484,31 @@ reapply_jit_off() {
   echo "JIT de Postgres coupé par défaut (rôle ameesh, base du mesh)"
 }
 
+reapply_idle_in_transaction_guard() {
+  # #3836 : un client resté `idle in transaction` sept minutes (gel #3700,
+  # 27/10) tenait le verrou du dépôt de migration et le verrou consultatif du
+  # projet ; toutes les écritures du mesh ont attendu. La garde serveur coupe
+  # la session après 3 min : bien au-delà du travail local que fait un gel
+  # depuis que la lecture de provenance ne va plus au réseau dans sa
+  # transaction, et bien en deçà de l'incident. Elle couvre aussi les clients
+  # antérieurs au correctif (psql, script, runner non redémarré).
+  local valeur=180s
+  local existe
+  existe=$(ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c \"SELECT 1 FROM pg_roles WHERE rolname = 'ameesh'\"")
+  if [ "$existe" = 1 ]; then
+    ssh_vm "runuser -u postgres -- psql -X -q -d ameesh -v ON_ERROR_STOP=1 -c \"ALTER ROLE ameesh SET idle_in_transaction_session_timeout = '$valeur'\""
+  fi
+  ssh_vm "runuser -u postgres -- psql -X -q -d ameesh -v ON_ERROR_STOP=1 -c \"ALTER DATABASE ameesh SET idle_in_transaction_session_timeout = '$valeur'\""
+  echo "garde idle-in-transaction posée par défaut ($valeur, rôle ameesh et base du mesh)"
+}
+
 role() {
   local existe dsn
   reapply_executor_role
   etape "réglage JIT de la base du mesh (#3503)"
   reapply_jit_off
+  etape "garde idle-in-transaction de la base du mesh (#3836)"
+  reapply_idle_in_transaction_guard
   etape "rôle $ROLE, base du mesh (sur le serveur, en superutilisateur)"
   existe=$(ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c \"SELECT 1 FROM pg_roles WHERE rolname = '$ROLE'\"")
   if [ "$existe" = 1 ]; then

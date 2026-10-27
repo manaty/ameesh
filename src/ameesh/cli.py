@@ -2286,6 +2286,14 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             jit_ko = jit_ko or line.startswith(hostcheck.JIT_SESSION_ON_PREFIX)
     except db_mod.DbError as exc:
         print("jit        : not checked (%s)" % exc)
+    # #3836 : la garde serveur contre un client resté `idle in transaction`
+    # (le gel #3700 a bloqué les écritures du mesh sept minutes). Signalée,
+    # sans changer le verdict : elle s'applique au déploiement, pas à chaud.
+    try:
+        for line in hostcheck.idle_transaction_lines(db):
+            print(line)
+    except db_mod.DbError as exc:
+        print("idle xact  : not checked (%s)" % exc)
     # #2580 : un compte déclaré aussi par un autre mesh de l'hôte — signalé,
     # sans changer le verdict par défaut (refuser arrêterait les deux meshes).
     try:

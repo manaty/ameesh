@@ -78,10 +78,11 @@ class _ForgeFixture(_RewriteFixture):
         _run(root, "fetch", "-q", "origin", "main")
         return root
 
-    def read(self, repo: str, *, strict: bool = True):
+    def read(self, repo: str, *, strict: bool = True, fetch: bool = True):
         return review_authors.reading(
             self.db, self.lot_item(), self.milestone, [self.head_b], repo,
-            FAMILIES, base=self.base, head=self.head_b, strict=strict)
+            FAMILIES, base=self.base, head=self.head_b, strict=strict,
+            fetch=fetch)
 
 
 class PriorFreezeForgeRecoveryTest(_ForgeFixture):
@@ -144,3 +145,34 @@ class PriorFreezeForgeRecoveryTest(_ForgeFixture):
         self.assertFalse(_has(orphan, self.head_a))
         with self.assertRaises(review_provenance.ProvenanceError):
             self.read(orphan)
+
+    def test_fetch_false_never_reaches_the_forge(self):
+        # #3836 : la lecture du gel tourne dans la transaction qui tient les
+        # verrous du lot et du dépôt de migration. Même quand la forge sert
+        # l'objet, elle ne doit pas être appelée : un `git fetch` de 180 s y
+        # laissait la session `idle in transaction` (incident du 27/10).
+        scratch = self.clone(self.forge("forge-no-fetch.git", serves=True),
+                             "scratch-no-fetch")
+        self.assertFalse(_has(scratch, self.head_a))
+        authors, unknown, _correctors = self.read(scratch, strict=False,
+                                                  fetch=False)
+        self.assertEqual(unknown, [self.head_a[:12]])
+        self.assertFalse(_has(scratch, self.head_a),
+                         "une lecture de transaction ne doit pas fetcher")
+        self.assertNotIn("cx3", {row["name"] for row in authors})
+
+    def test_prefetch_before_the_transaction_recovers_the_same_reading(self):
+        # #3836 : le rapatriement se fait hors transaction, avant le gel ; la
+        # lecture `fetch=False` retrouve alors les mêmes auteurs qu'avant.
+        scratch = self.clone(self.forge("forge-prefetch.git", serves=True),
+                             "scratch-prefetch")
+        self.assertFalse(_has(scratch, self.head_a))
+        fetched = review_authors.prefetch_prior_freezes(
+            self.db, self.lot_item(), scratch)
+        self.assertEqual(fetched, [self.head_a])
+        self.assertTrue(_has(scratch, self.head_a))
+        authors, unknown, _correctors = self.read(scratch, strict=False,
+                                                  fetch=False)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})

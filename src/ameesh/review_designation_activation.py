@@ -1604,7 +1604,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     authors, unknown, correctors = review_authors.reading(
         db, item, freeze, commits, repo, families=policy.families, trace=True,
         base=start, head=frozen_sha, target=read_target,
-        commits_out=author_commits)
+        commits_out=author_commits, fetch=fetch)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, correctors=correctors,
@@ -1613,6 +1613,27 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   manual_seats=_manual_seats(manual, listing, authors, families,
                                              correctors=correctors),
                   advances=_advances(db), author_commits=author_commits)
+
+
+def prefetch_freeze_objects(db, item: Mapping, target, head: str) -> list[str]:
+    """Rapatrie hors transaction les objets des gels antérieurs (#3836).
+
+    `prepare(fetch=False)` refuse tout accès réseau dans la transaction du gel.
+    Cette passe, appelée **avant** l'ouverture de cette transaction, demande à
+    la forge du dépôt de lecture les objets absents des gels antérieurs : la
+    désignation retrouve alors les mêmes auteurs qu'avant, sans jamais tenir
+    les verrous du gel pendant un `git fetch` (180 s par objet au plus).
+
+    `target` est le `Target` épinglé par `prepare_target` (ou `Unavailable`) ;
+    une cible illisible ne rapatrie rien, la désignation attendra. Jamais
+    d'exception : une forge injoignable est une absence, pas un échec du gel.
+    """
+    if target is None or isinstance(target, Unavailable):
+        return []
+    try:
+        return review_authors.prefetch_prior_freezes(db, item, target.repo, head)
+    except Exception:  # noqa: BLE001 - rapatriement au mieux : le gel continue
+        return []
 
 
 #: #3572 : le texte de la note et l'erreur du bloc, passés par réglages locaux
@@ -2551,6 +2572,18 @@ def _manual_unavailable(cfg, tx, item: Mapping, freeze: Mapping,
     return out
 
 
+def _excluded_names(inputs: Inputs) -> set[str]:
+    """Les noms que la porte écarte sur la tête lue (#2812/#2888/#3836).
+
+    La lecture de la désignation les a déjà calculés (`authors` +
+    `correctors`) ; la notification des blocages levés les réutilise au lieu
+    de refaire une lecture git dans la transaction du gel.
+    """
+    return {str(row.get("name") or "").strip().lower()
+            for row in list(inputs.authors or ()) + list(inputs.correctors or ())
+            if str(row.get("name") or "").strip()}
+
+
 def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                               threads: list, carried: Optional[Mapping] = None,
                               reading: Optional[dict] = None, target=None,
@@ -2635,10 +2668,7 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
     if reading is not None:
         # #2812 : la même lecture que la désignation, réutilisée par la
         # notification des blocages levés (aucune lecture git redoublée).
-        reading["excluded"] = {
-            str(row.get("name") or "").strip().lower()
-            for row in list(inputs.authors or ()) + list(inputs.correctors or ())
-            if str(row.get("name") or "").strip()}
+        reading["excluded"] = _excluded_names(inputs)
     if _manual_covers(inputs):
         return _manual_outcome(tx, item, freeze, inputs.manual)
     checkpoint = len(threads)
@@ -2685,7 +2715,8 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
 SUPERSEDED_PREFIX = "review-block-superseded:"
 
 
-def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping) -> set[str]:
+def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping, *,
+                        fetch: bool = True) -> set[str]:
     """Les noms que la porte écarte sur cette tête gelée (#2812).
 
     Même lecture que la porte et la désignation (`review_authors.reading`) :
@@ -2694,6 +2725,9 @@ def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping) -> set[str]:
     agent qui ne peut pas rendre un avis indépendant. Une lecture impossible
     rend l'ensemble vide : la notification garde son comportement historique et
     ne perd jamais un gel.
+
+    #3836 : `fetch=False` quand la lecture tourne dans la transaction du gel —
+    la notification ne doit pas y rapatrier un objet par le réseau.
     """
     sha = str((freeze or {}).get("sha") or "").strip().lower()
     if cfg is None or db is None or not sha:
@@ -2709,7 +2743,7 @@ def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping) -> set[str]:
         _start, _paths, commits = _range(repo, base, sha)
         authors, _unknown, correctors = review_authors.reading(
             db, item, dict(freeze or {}), commits, repo, families=(),
-            base=base, head=sha, target=_target_tip(repo, base))
+            base=base, head=sha, target=_target_tip(repo, base), fetch=fetch)
     except Exception:  # noqa: BLE001 - plage illisible : comportement historique
         return set()
     return {str(row.get("name") or "").strip().lower()
@@ -2719,7 +2753,8 @@ def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping) -> set[str]:
 
 def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mapping,
                               threads: list, *, cfg=None,
-                              excluded: set[str] | None = None) -> None:
+                              excluded: set[str] | None = None,
+                              fetch: bool = True) -> None:
     """Notifie le relecteur dont le blocage portait sur une tête antérieure.
 
     #2681 : la porte ne lit que les verdicts de la tête gelée ; un blocage
@@ -2733,7 +2768,11 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
     auteur de la plage gelée, y compris un relecteur dont la correction est un
     commit de la tête (#2888). `excluded` est la lecture déjà faite par la
     désignation ; à défaut (`None`), elle est refaite ici, et son échec laisse
-    le courrier historique."""
+    le courrier historique.
+
+    `fetch=False` (#3836) interdit le rapatriement par la forge : la
+    notification tourne dans la transaction du gel et ne doit jamais y attendre
+    le réseau."""
     lot = int((item or {}).get("id") or 0)
     freeze_id = int((freeze or {}).get("id") or 0)
     sha = str((freeze or {}).get("sha") or "").strip().lower()
@@ -2772,7 +2811,7 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
     if not candidates:
         return
     if excluded is None:
-        excluded = _excluded_on_freeze(cfg, db, item, freeze)
+        excluded = _excluded_on_freeze(cfg, db, item, freeze, fetch=fetch)
     for key, row, mark_sha in candidates:
         if key in excluded:
             # #2812/#2888 : auteur de la tête ou correcteur de relecteur, son
@@ -2826,7 +2865,8 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     try:
         item = work.get(tx, int(lot)) or {"id": int(lot)}
         _notify_superseded_blocks(tx, item, milestone or {}, result, threads,
-                                  cfg=cfg, excluded=reading.get("excluded"))
+                                  cfg=cfg, excluded=reading.get("excluded"),
+                                  fetch=False)
     except Exception:  # noqa: BLE001 - une notification ne perd pas un gel
         pass
     return result
@@ -3102,7 +3142,9 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                      if out.get("state") in (rd.DESIGNATED, rd.WAITING) else [])
             _sync_reviewers(tx, item, freeze, names)
             try:
-                _notify_superseded_blocks(tx, item, freeze, out, threads)
+                _notify_superseded_blocks(tx, item, freeze, out, threads,
+                                          excluded=_excluded_names(inputs),
+                                          fetch=False)
             except Exception:  # noqa: BLE001 - une notification ne perd rien
                 pass
         _drain(db, threads)
