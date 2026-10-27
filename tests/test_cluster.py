@@ -103,6 +103,9 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #3963 (0498) : coordination interne de canon sync, sans nouveau GRANT.
+    "canon_state": {"sync_claimed_at", "sync_token", "sync_completed_token",
+                    "sync_signature"},
     # #1467 (0442): plans and replayable admission/fire receipts stay closed
     # to both supervisor roles. No new grants accompany this classification.
     "integration_trains": {"target_key", "revision", "document", "updated_at"},
