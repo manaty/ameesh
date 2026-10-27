@@ -415,7 +415,7 @@ class LocalTestCompositionTest(unittest.TestCase):
             discarded=[], head="e" * 40)
 
     def check(self, *, unit_runs=(), contract_run=None, attribute=None,
-              unit_modules=None):
+              unit_modules=None, contract_module_list=("tests.test_cluster",)):
         # Les unités sans module propre ne produisent aucun run : le témoin
         # contracts-only reste lisible.
         modules = unit_modules or {}
@@ -427,7 +427,7 @@ class LocalTestCompositionTest(unittest.TestCase):
         with mock.patch.object(paquet_auto, "unit_test_modules",
                                side_effect=unit_modules_for), \
                 mock.patch.object(paquet_auto, "contract_modules",
-                                  return_value=["tests.test_cluster"]), \
+                                  return_value=list(contract_module_list)), \
                 mock.patch.object(paquet_auto, "run_tests",
                                   side_effect=side):
             return paquet_auto.check_local_tests(
@@ -467,6 +467,69 @@ class LocalTestCompositionTest(unittest.TestCase):
         with self.assertRaises(paquet_auto.PaquetAutoError) as caught:
             self.check(contract_run=red_contract, attribute=attribute)
         self.assertIn("contrat rouges", str(caught.exception))
+
+    def mixed_run(self) -> "paquet_auto.TestRun":
+        return red(
+            "======================================================================\n"
+            "FAIL: test_a (tests.test_a.T.test_a)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "AssertionError: rouge réel de A\n"
+            "\n"
+            "======================================================================\n"
+            "ERROR: test_b (tests.test_b.T.test_b)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "psycopg.OperationalError: connection refused\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 2 tests in 0.1s\n"
+            "FAILED (failures=1, errors=1)\n")
+
+    def test_une_error_infra_dans_un_run_mixte_ne_retire_que_le_fail(self) -> None:
+        # #3931, B/P2 de la relecture cx2 : B n'a qu'une ERROR d'environnement,
+        # son test est sain ; l'attribution ne doit voir que le FAIL de A.
+        seen: list[dict] = []
+
+        def attribute(_worktree, _composition, failures):
+            seen.extend(failures)
+            return attribution(entry(failures[0]["test"], (1, 6)))
+
+        _runs, faulty, removals = self.check(
+            contract_run=self.mixed_run(), attribute=attribute,
+            contract_module_list=("tests.test_a", "tests.test_b"))
+        self.assertEqual([failure["test"] for failure in seen],
+                         ["tests.test_a.T.test_a"])
+        self.assertEqual(faulty, [1])
+        self.assertEqual([removal.lot for removal in removals], [1])
+        remaining = [unit.lot for unit in self.composition.units
+                     if unit.lot not in set(faulty)]
+        self.assertEqual(remaining, [2])
+
+    def test_error_infra_seule_est_non_concluante(self) -> None:
+        env_only = paquet_auto.TestRun(
+            "contrats", ["tests.test_b"], 1,
+            "======================================================================\n"
+            "ERROR: test_b (tests.test_b.T.test_b)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "psycopg.OperationalError: connection refused\n"
+            "\n"
+            "FAILED (errors=1)\n", 0.1)
+        self.assertTrue(env_only.inconclusive)
+        _runs, faulty, removals = self.check(
+            contract_run=env_only, contract_module_list=("tests.test_b",))
+        self.assertEqual((faulty, removals), ([], []))
+
+    def test_run_mixte_fail_non_attribuable_ne_retire_pas(self) -> None:
+        def attribute(_worktree, _composition, failures):
+            return {"status": "ok", "tests": [
+                {"test": failures[0]["test"], "status": "unattributable",
+                 "units": []}]}
+
+        with self.assertRaises(paquet_auto.PaquetAutoError):
+            self.check(contract_run=self.mixed_run(), attribute=attribute,
+                       contract_module_list=("tests.test_a", "tests.test_b"))
 
     def test_unite_propre_rouge_sans_attribution_est_retiree(self) -> None:
         unit_red = red(
