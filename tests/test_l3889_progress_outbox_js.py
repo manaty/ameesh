@@ -3,9 +3,10 @@
 
 Chaque message a sa propre entrée sur l'appareil, écrite avec son
 Idempotency-Key AVANT l'envoi ; aucun nouvel envoi n'efface un message non
-acquitté. Une panne est renvoyée telle quelle ; une issue inconnue (500, 409)
-se réconcilie seule (la conversation relue, sinon la MÊME clé renvoyée),
-jusqu'à l'accusé ; une page rouverte reprend tout ; un refus de saisie est
+acquitté. Une panne (réseau, corps illisible) est renvoyée telle quelle ; une
+issue inconnue (500, 409) renvoie la MÊME clé jusqu'à l'accusé du serveur pour
+cette clé — jamais sur un texte vu dans la conversation (cx3, dev3) ; une page
+rouverte reprend tout ; un refus de saisie est
 gardé et rendu à la saisie. Le bloc `outbox:begin … outbox:end` de la page
 tourne sous Node (sauté sans `node`)."""
 from __future__ import annotations
@@ -46,7 +47,8 @@ function fetch(url, init) {
     const a = posts.shift();
     if (a === undefined || a === "network") return Promise.reject(new TypeError("Failed to fetch"));
     return Promise.resolve({status: a.status,
-      text: () => Promise.resolve(typeof a.body === "string" ? a.body : JSON.stringify(a.body || {}))});
+      text: () => a.bodyFails ? Promise.reject(new TypeError("network error while reading"))
+        : Promise.resolve(typeof a.body === "string" ? a.body : JSON.stringify(a.body || {}))});
   }
   sent.push({method: "GET"});
   const r = reads.shift();
@@ -112,7 +114,11 @@ class ProgressOutboxTest(unittest.TestCase):
                 fh.write(text)
         out = subprocess.run(["node", paths["harness.js"], paths["outbox.js"],
                               json.dumps(scenario)],
-                             capture_output=True, text=True, timeout=60, check=True)
+                             capture_output=True, text=True, timeout=60, cwd=directory)
+        # cwd : le dossier du test — un `node` de mise ne lit pas la
+        # configuration du dépôt, dont la confiance vit dans le vrai
+        # XDG_STATE_HOME que tests.support déplace
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
         return json.loads(out.stdout)
 
     @staticmethod
@@ -137,32 +143,63 @@ class ProgressOutboxTest(unittest.TestCase):
                          [("web-kept-0001", "bonjour")])
         self.assertEqual(result["outbox"], [])
 
-    def test_issue_inconnue_se_reconcilie_seule_sans_double_effet(self):
-        """B2 (cx3) : 500 puis 409 « en cours » : la page relit la conversation
-        et renvoie la MÊME clé, jusqu'à voir le message déposé."""
+    def test_issue_inconnue_meme_cle_jusqu_a_l_accuse_du_serveur(self):
+        """B2 (cx3) : 500 puis 409 « en cours » : la MÊME clé repart jusqu'à
+        l'accusé du serveur pour elle ; la conversation n'est jamais lue."""
         result = self.run_outbox({"steps": ["bonjour"], "posts": [
             {"status": 500, "body": "internal error: the message may have been delivered"},
             {"status": 409, "body": {"error": "idempotency_in_progress"}},
-            {"status": 409, "body": {"error": "idempotency_in_progress"}}],
-            "reads": [[], [human("autre chose")], [human("bonjour")]]})
+            {"status": 409, "body": {"error": "idempotency_in_progress"}},
+            {"status": 200, "body": {"ok": True}}]})
         posts = self.posted(result)
         self.assertEqual(len({p["key"] for p in posts}), 1)
-        self.assertEqual(len(posts), 3)        # 500, puis 409 tant que l'issue reste inconnue
+        self.assertEqual(len(posts), 4)
+        self.assertEqual([s for s in result["sent"] if s["method"] == "GET"], [])
         self.assertEqual(result["events"][-1], "sent:bonjour")
         self.assertEqual(result["outbox"], [])
 
-    def test_reconciliation_ignore_un_meme_texte_plus_ancien(self):
-        old = time.time() - 3600
+    def test_meme_texte_recent_dans_la_conversation_n_acquitte_pas(self):
+        """B1 (cx3), B (dev3) : deux gestes identiques récents, d'auteurs
+        différents, dans la conversation : sans accusé du serveur pour SA
+        clé, le message reste gardé (« checking ») et seule sa clé repart."""
+        now = time.time()
+        other = dict(human("bonjour", ts=now), author="human:autre")
+        reads = [[human("bonjour", ts=now - 1), other, human("bonjour", ts=now + 1)]] * 3
         result = self.run_outbox({"storage": entry(state="checking"), "steps": ["resume"],
-                                  "reads": [[human("bonjour", ts=old)]],
-                                  "posts": [{"status": 200, "body": {}}]})
-        self.assertEqual([p["key"] for p in self.posted(result)], ["web-kept-0001"])
+                                  "reads": reads, "posts": [
+            {"status": 409, "body": {"error": "idempotency_in_progress"}},
+            {"status": 409, "body": {"error": "idempotency_in_progress"}}]})
+        self.assertEqual([p["key"] for p in self.posted(result)][:2],
+                         ["web-kept-0001", "web-kept-0001"])
+        self.assertNotIn("sent:bonjour", result["events"])
+        [kept] = result["outbox"]
+        self.assertEqual((kept["key"], kept["state"]), ("web-kept-0001", "checking"))
+
+    def test_corps_illisible_apres_les_en_tetes_meme_cle(self):
+        """B2 (cx3) : `r.text()` rejeté (même après un 200) : issue
+        indéterminée, la même clé repart ; le rejeu du serveur acquitte."""
+        result = self.run_outbox({"steps": ["bonjour"], "posts": [
+            {"status": 200, "bodyFails": True}, {"status": 503, "bodyFails": True},
+            {"status": 200, "body": {"replayed": True}}]})
+        posts = self.posted(result)
+        self.assertEqual(len(posts), 3)
+        self.assertEqual(len({p["key"] for p in posts}), 1)
+        self.assertEqual(result["events"][-1], "sent:bonjour")
         self.assertEqual(result["outbox"], [])
+
+    def test_issue_inconnue_puis_jeton_refuse_passe_en_auth(self):
+        """N (dev3) : une réconciliation sous un jeton périmé ne boucle pas."""
+        result = self.run_outbox({"storage": entry(state="checking"), "steps": ["resume"],
+                                  "posts": [{"status": 401, "body": ""}]})
+        self.assertEqual(len(self.posted(result)), 1)
+        [kept] = result["outbox"]
+        self.assertEqual(kept["state"], "auth")
+        self.assertEqual(result["input"], "bonjour")
 
     def test_page_rouverte_serveur_pret_reprend_une_issue_inconnue(self):
         """B2 (cx3) : une entrée « checking » reprend seule à la réouverture."""
         result = self.run_outbox({"storage": entry(state="checking"), "steps": ["resume"],
-                                  "reads": [[]], "posts": [{"status": 200, "body": {}}]})
+                                  "posts": [{"status": 200, "body": {}}]})
         self.assertEqual([p["key"] for p in self.posted(result)], ["web-kept-0001"])
         self.assertEqual(result["events"][-1], "sent:bonjour")
         self.assertEqual(result["outbox"], [])
@@ -185,8 +222,7 @@ class ProgressOutboxTest(unittest.TestCase):
 
     def test_second_message_pendant_une_issue_inconnue_garde_les_deux(self):
         result = self.run_outbox({"steps": ["premier", "second"], "posts": [
-            {"status": 500, "body": "may have been delivered"}, {"status": 200, "body": {}}],
-            "reads": ["network"]})
+            {"status": 500, "body": "may have been delivered"}, {"status": 200, "body": {}}]})
         self.assertEqual([(m["text"], m["state"]) for m in result["outbox"]],
                          [("premier", "checking")])
         self.assertIn("sent:second", result["events"])

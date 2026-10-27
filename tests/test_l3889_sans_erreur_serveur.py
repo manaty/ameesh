@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -23,13 +24,14 @@ import threading
 import unittest
 from unittest import mock
 
-from ameesh import receipts, server_faults
+from ameesh import chat, conversation, receipts, registry, serve, server_faults, storage
 from ameesh.approve import enroll as enroll_mod
 from ameesh.approve import server as approve_server
 from ameesh.approve.sources import ActionSourceError
 from ameesh.db import DbError
 
 from . import test_approve as base
+from .support import PgTestCase
 from .test_approve import ORIGIN, ApproveBase, attestation
 from .webauthn_soft import SoftWebAuthn
 
@@ -526,6 +528,104 @@ class LoginReplayTest(unittest.TestCase):
                 thread.join(30)
         self.assertEqual(errors, [])
         self.assertEqual(sorted(bool(r.get("replayed")) for r in results), [False, True])
+
+
+
+class ChatReconcileTest(PgTestCase):
+    """B1 (cx3), B (dev3) : l'issue inconnue d'un message de la conversation
+    se lève par SA clé, côté serveur : le courrier porte l'Idempotency-Key ;
+    une réservation restée sans réponse est réconciliée — courrier trouvé :
+    sa réponse est rejouée (reflet complété, aucun second courrier) ; aucun :
+    la clé est reprise et l'action tourne une fois sous elle."""
+
+    KEY = "web-3889-reconcile-01"
+
+    def setUp(self):
+        super().setUp()
+        self.db.execute("TRUNCATE api_idempotency, agent_mailbox, conversation_log,"
+                        " conversation_heads CASCADE")
+        registry.upsert(self.db, "a1", chantier="demo", harness="codex", host="h1")
+        self.ctx = serve.Context(cfg=dataclasses.replace(self.cfg, read_only=True),
+                                 human="human:owner")
+        self.action, self.params = serve.match_action("/api/v1/agents/a1/chat")
+        self.body = {"text": "bonjour"}
+        self.digest = serve.fingerprint("/api/v1/agents/a1/chat", self.body)
+
+    def act(self, key=KEY, body=None):
+        return serve.act(self.ctx, self.db, self.action, self.params, body or self.body,
+                         key, self.digest)
+
+    def age(self, seconds):
+        self.db.execute("update api_idempotency set created_at = now() - %s * interval '1 second'",
+                        (seconds,))
+
+    def mails(self):
+        return self.db.query("select sender, payload::text as payload from agent_mailbox"
+                             " order by id")
+
+    def texts(self):
+        return [e["text"] for e in conversation.history(self.db, "a1")["entries"]
+                if e["kind"] == "human_message"]
+
+    def test_le_courrier_porte_la_cle(self):
+        status, data, replayed = self.act()
+        self.assertEqual((status, replayed), (200, False))
+        [mail_row] = self.mails()
+        self.assertEqual(json.loads(mail_row["payload"])["idempotency_key"], self.KEY)
+
+    def test_courrier_parti_reflet_perdu_rejoue_sans_second_courrier(self):
+        real = conversation.Log.append
+        with mock.patch.object(conversation.Log, "append",
+                               side_effect=RuntimeError("connection lost")):
+            with self.assertRaises(RuntimeError):
+                self.act()
+        self.assertEqual(len(self.mails()), 1)          # délivré, issue inconnue
+        status, data, _r = self.act()
+        self.assertEqual((status, data["error"]), (409, "idempotency_in_progress"))
+        self.age(serve.RECONCILE_AFTER_S + 1)
+        self.assertIs(conversation.Log.append, real)
+        status, data, replayed = self.act()
+        self.assertEqual((status, replayed), (200, True))
+        self.assertEqual(data["result"]["message_id"],
+                         self.db.query("select id from agent_mailbox")[0]["id"])
+        self.assertEqual(len(self.mails()), 1)
+        self.assertEqual(self.texts(), ["bonjour"])     # le reflet complété
+        again, data2, replayed2 = self.act()
+        self.assertEqual((again, data2, replayed2), (200, data, True))
+        self.assertEqual(len(self.mails()), 1)
+
+    def test_aucun_courrier_l_action_tourne_une_fois_sous_la_meme_cle(self):
+        requests = storage.of(self.db).api_requests
+        requests.reserve("human:owner", self.KEY, self.digest, retention_s=86400)
+        self.age(serve.RECONCILE_AFTER_S + 1)
+        status, data, replayed = self.act()
+        self.assertEqual((status, replayed), (200, False))
+        [mail_row] = self.mails()
+        self.assertEqual(json.loads(mail_row["payload"])["idempotency_key"], self.KEY)
+        self.assertEqual(self.act()[2], True)
+        self.assertEqual(len(self.mails()), 1)
+
+    def test_trop_recent_reste_409_rien_envoye(self):
+        storage.of(self.db).api_requests.reserve("human:owner", self.KEY, self.digest,
+                                                 retention_s=86400)
+        status, data, _r = self.act()
+        self.assertEqual((status, data["error"]), (409, "idempotency_in_progress"))
+        self.assertEqual(self.mails(), [])
+
+    def test_meme_texte_sous_une_autre_cle_ou_d_un_autre_n_acquitte_pas(self):
+        # deux gestes identiques : chacun sa clé, chacun son courrier
+        self.assertEqual(self.act(key="web-3889-reconcile-00")[0], 200)
+        chat.post_human_message(self.cfg, self.db, human="human:other", sender="other",
+                                agent="a1", text="bonjour", idempotency_key=self.KEY)
+        storage.of(self.db).api_requests.reserve("human:owner", self.KEY, self.digest,
+                                                 retention_s=86400)
+        self.age(serve.RECONCILE_AFTER_S + 1)
+        status, data, replayed = self.act()
+        self.assertEqual((status, replayed), (200, False))
+        self.assertEqual(len(self.mails()), 3)
+        self.assertEqual([json.loads(r["payload"]).get("idempotency_key")
+                          for r in self.mails() if r["sender"] == "human:owner"],
+                         ["web-3889-reconcile-00", self.KEY])
 
 
 if __name__ == "__main__":

@@ -220,7 +220,8 @@ CLIENT_HELP_TEXT = (
 # --------------------------------------------------------------------------
 
 def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
-                       text: str, lot=None, event_id: str | None = None) -> dict:
+                       text: str, lot=None, event_id: str | None = None,
+                       idempotency_key: str = "") -> dict:
     """Le message d'un humain dans la conversation partagée d'un agent (L83).
 
     Le serveur écrit : l'appelant a authentifié `human` (`human:<id>`, le
@@ -238,16 +239,46 @@ def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
 
     `event_id` est stable (`mail:<id>` par défaut) : un rejeu après la
     délivrance ne crée pas de seconde entrée.
+
+    §16 (#3889) : `idempotency_key`, la clé de la requête de l'API, part
+    dans le courrier (`payload.idempotency_key`). C'est l'accusé vérifiable
+    d'une issue restée inconnue : `delivered_human_message` le retrouve et
+    rend la même réponse, sans second envoi.
     """
-    from . import conversation, fil, mail, registry
+    from . import mail, registry
     if not NAME_RE.match(agent or ""):
         raise ValueError("invalid agent name: %r" % (agent,))
     row = registry.get(db, agent)
     work_item_id = None if lot is None else str(lot)
     from . import resident_queue
     sender = resident_queue.human_ref(sender) or sender
+    payload = {"human": True}
+    if idempotency_key:
+        payload["idempotency_key"] = idempotency_key
     message_id = mail.send(db, sender, agent, text, host=cfg.host, kind="notify",
-                           payload={"human": True}, work_item_id=work_item_id)
+                           payload=payload, work_item_id=work_item_id)
+    return _reflect_human_message(cfg, db, row=row, human=human, agent=agent, text=text,
+                                  lot=lot, message_id=message_id, event_id=event_id)
+
+
+def delivered_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
+                            text: str, lot=None, idempotency_key: str) -> dict | None:
+    """§16 (#3889) : le message déjà délivré sous `idempotency_key` (son
+    reflet dans la conversation complété, idempotent), ou None s'il n'est
+    jamais parti. Jamais un second courrier."""
+    from . import registry, resident_queue, storage
+    sender = resident_queue.human_ref(sender) or sender
+    message_id = storage.of(db).mailbox.by_idempotency_key(sender, agent, idempotency_key)
+    if message_id is None:
+        return None
+    return _reflect_human_message(cfg, db, row=registry.get(db, agent), human=human,
+                                  agent=agent, text=text, lot=lot, message_id=message_id)
+
+
+def _reflect_human_message(cfg: Config, db, *, row, human: str, agent: str, text: str,
+                           lot, message_id: int, event_id: str | None = None) -> dict:
+    from . import conversation, fil
+    work_item_id = None if lot is None else str(lot)
     log = conversation.Log(db, cfg, agent=agent,
                            project=fil.project_for(cfg, fil.lot_project(db, work_item_id),
                                                    fil.agent_project(row)),

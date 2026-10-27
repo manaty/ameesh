@@ -900,6 +900,11 @@ class ApiRequests(Domain):
         """Drops a reservation that was never completed (transient failure:
         the client may retry with the same key); False if there was none."""
 
+    @abc.abstractmethod
+    def age(self, human: str, key: str) -> float | None:
+        """Seconds since (human, key) was reserved; None without a row (§16,
+        #3889: an outcome left unknown is reconciled once old enough)."""
+
 
 # --------------------------------------------------------------------------
 # watches managed by ameesh (L121, migration 0362)
@@ -1263,6 +1268,11 @@ class RecipientRetired(MailboxRefused):
 
 class Mailbox(Domain):
     """Messages durables ; le dépôt réveille le destinataire (NOTIFY en Postgres)."""
+
+    @abc.abstractmethod
+    def by_idempotency_key(self, sender: str, recipient: str, key: str) -> int | None:
+        """L'id du message de `sender` à `recipient` déposé sous cette
+        Idempotency-Key (`payload.idempotency_key`, §16 #3889), ou None."""
 
     @abc.abstractmethod
     def lock_recipient(self, recipient: str) -> dict | None:
