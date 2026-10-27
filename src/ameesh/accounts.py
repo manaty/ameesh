@@ -1752,6 +1752,8 @@ def remedy(profile: Profile, problem: str) -> str:
         return "chmod 700 %s" % profile.path
     if problem.startswith("key file too permissive"):
         return "chmod 600 %s" % profile.key_file
+    if problem.startswith("missing key file"):
+        return "write the key to %s (chmod 600)" % profile.key_file
     if problem.startswith("missing directory"):
         return "install -d -m 700 %s, then log in" % profile.path
     if problem.startswith("credentials missing"):
@@ -1797,9 +1799,10 @@ def doctor_lines(cfg, environ=None) -> tuple[bool, list[str]]:
     27/10, à la mise en service d'agents-3, des profils laissés en 755 ont
     tenu des agents en « pause budget » sous un doctor vert.
 
-    Lu par l'utilisateur qui lance doctor : un dossier à un autre
-    utilisateur (doctor lancé hors du compte de l'exécuteur) n'est pas jugé,
-    ni une variable de clé, que porte l'environnement de l'exécuteur."""
+    Lu par l'utilisateur qui lance doctor : un dossier ou un fichier de clé
+    à un autre utilisateur (doctor lancé hors du compte de l'exécuteur) n'est
+    pas jugé, ni une variable de clé, que porte l'environnement de
+    l'exécuteur ; un fichier de clé absent ou trop ouvert l'est."""
     environ = os.environ if environ is None else environ
     try:
         declared = parse(getattr(cfg, "accounts", None) or {})
@@ -1810,16 +1813,18 @@ def doctor_lines(cfg, environ=None) -> tuple[bool, list[str]]:
     for harness, items in declared.items():
         for profile in items:
             label = "%s/%s" % (harness, profile.name)
-            if profile.kind == "api_key_env":
+            if profile.kind == "api_key_env" and not profile.key_file:
                 continue
-            if profile.kind == "config_dir" and not profile.default and uid is not None:
+            owned = profile.key_file or (
+                profile.path if profile.kind == "config_dir" and not profile.default else "")
+            if owned and uid is not None:
                 try:
-                    owner = os.stat(profile.path).st_uid
+                    owner = os.lstat(owned).st_uid
                 except OSError:
                     owner = uid
                 if owner != uid:
                     lines.append("%s not checked (%s belongs to uid %d: run doctor as "
-                                 "the runner's user)" % (label, profile.path, owner))
+                                 "the runner's user)" % (label, owned, owner))
                     continue
             problems = invalid(profile, _check(profile, environ))
             if problems:

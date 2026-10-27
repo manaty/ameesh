@@ -52,6 +52,24 @@ class DoctorTest(unittest.TestCase):
         self.assertFalse(ko)
         self.assertEqual(lignes, [])
 
+    def test_fichier_de_cle_absent_ou_trop_ouvert_fait_echouer_doctor(self):
+        # B ameesh-dev3 (gel #22015) : `check` le juge invalide, doctor aussi.
+        cle = os.path.join(self.tmp, "deepseek.key")
+        comptes = {"deepseek": [{"name": "k", "type": "api_key_env", "key_file": cle}]}
+        ko, lignes = accounts.doctor_lines(self._cfg(comptes))
+        self.assertTrue(ko)
+        self.assertIn("deepseek/k", lignes[0])
+        self.assertIn("missing key file", lignes[0])
+        self.assertIn("write the key to %s" % cle, lignes[0])
+        with open(cle, "w") as fh:
+            fh.write("sk-test\n")
+        os.chmod(cle, 0o644)
+        ko, lignes = accounts.doctor_lines(self._cfg(comptes))
+        self.assertTrue(ko)
+        self.assertIn("chmod 600 %s" % cle, lignes[0])
+        os.chmod(cle, 0o600)
+        self.assertEqual(accounts.doctor_lines(self._cfg(comptes)), (False, []))
+
     def test_profil_absent_et_configuration_invalide(self):
         absent = os.path.join(self.tmp, "absent")
         ko, lignes = accounts.doctor_lines(self._cfg({"claude": [
