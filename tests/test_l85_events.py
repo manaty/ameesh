@@ -424,7 +424,7 @@ class EventLogPgTest(PgTestCase):
             first = int(tx.query("select pg_backend_pid() as p")[0]["p"])
             worker = threading.Thread(target=second, daemon=True)
             worker.start()
-            deadline = time.monotonic() + 10.0
+            deadline = time.monotonic() + 30.0
             while not probe.query("select 1 from pg_stat_activity"
                                   " where %s = any(pg_blocking_pids(pid))", (first,)):
                 self.assertLess(time.monotonic(), deadline, "the second pruner never waited")
@@ -621,13 +621,13 @@ class StreamPgTest(ServerMixin, PgTestCase):
         ctx = serve.Context(cfg=self.ro, human="human:owner")
         self.start(ctx, self.read, hub=self.hub, **kwargs)
         if self.hub is not None and listen:
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + 30
             while not self.hub.listening and time.monotonic() < deadline:
                 time.sleep(0.05)
             self.assertTrue(self.hub.listening)
 
     def open_stream(self, headers=None, auth=True):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
         conn.putrequest("GET", serve.EVENTS_PATH, skip_host=True)
         conn.putheader("Host", "127.0.0.1:%d" % self.port)
         if auth:
@@ -639,8 +639,13 @@ class StreamPgTest(ServerMixin, PgTestCase):
         self.addCleanup(conn.close)
         return resp
 
-    def read_messages(self, resp, count, timeout=8.0, kind=None):
-        """`count` messages (of `kind` only, if given): dicts of their fields."""
+    def read_messages(self, resp, count, timeout=30.0, kind=None):
+        """`count` messages (of `kind` only, if given): dicts of their fields.
+
+        #3832 : le témoin est l'arrivée du message, pas 8 s de mur ; sous
+        --parallel, le serveur et le client peuvent attendre plusieurs
+        secondes avant d'être ordonnancés (h-32 : aucun message en 8 s).
+        """
         found, buf = [], b""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:

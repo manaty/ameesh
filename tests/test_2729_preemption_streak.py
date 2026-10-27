@@ -274,10 +274,27 @@ class BoutEnBoutTest(PgTestCase):
         self.addCleanup(worker.watchdog_stop.set)
         return worker
 
+    def _lignes_tour(self) -> int:
+        try:
+            with open(self.turns_log, encoding="utf-8") as fh:
+                return sum(1 for _ in fh)
+        except OSError:
+            return 0
+
+    def _attend_le_tour(self, avant: int, timeout: float = 60.0) -> bool:
+        """Le faux harnais journalise son argv dès son démarrage : sa ligne
+        est l'état « tour commencé », pas un délai de 0,4 s (rouge h-32)."""
+        fin = time.monotonic() + timeout
+        while time.monotonic() < fin:
+            if self._lignes_tour() > avant:
+                return True
+            time.sleep(0.02)
+        return self._lignes_tour() > avant
+
     def test_la_serie_leve_l_alerte_puis_un_tour_la_resout(self):
         worker = self._worker()
         env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
-               "AMEESH_TEST_SLEEP": "5"}
+               "AMEESH_TEST_SLEEP": "30"}
         try:
             with mock.patch.dict(os.environ, env, clear=False):
                 for rang in range(1, exploitation.PREEMPTIONS_ALERT + 1):
@@ -287,10 +304,15 @@ class BoutEnBoutTest(PgTestCase):
                     thread = threading.Thread(
                         target=lambda: resultat.append(worker.run_turn(spec)),
                         daemon=True)
+                    avant = self._lignes_tour()
                     thread.start()
-                    time.sleep(0.4)
+                    # #3832 : attendre l'état « le faux harnais a démarré »,
+                    # pas 0,4 s de mur ; le harnais dort 30 s, donc une
+                    # préemption manquée se voit (tour non interrompu).
+                    self.assertTrue(self._attend_le_tour(avant),
+                                    "le tour n'a pas démarré dans la borne")
                     worker.request_preempt()
-                    thread.join(timeout=10)
+                    thread.join(timeout=60)
                     self.assertFalse(thread.is_alive())
                     self.assertEqual(resultat, [False])
                     self.assertEqual(worker.preemption_streak, rang)
