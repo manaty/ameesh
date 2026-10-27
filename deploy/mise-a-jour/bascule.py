@@ -652,11 +652,12 @@ def _chemins_proc(racine):
         try:
             with open(os.path.join(dossier, "cmdline"), "rb") as handle:
                 brut = handle.read()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             # terminé entre l'énumération et la lecture (ou pendant un exec) :
-            # il n'y a plus de ligne de commande à défendre. Ne pas tester
-            # `isdir` ici : le PID peut être réutilisé entre les deux appels,
-            # et la course rendrait le ménage aléatoirement muet.
+            # il n'y a plus de ligne de commande à défendre. `ESRCH` est la
+            # même course vue par le noyau (cf. platform/process.py). Ne pas
+            # tester `isdir` ici : le PID peut être réutilisé entre les deux
+            # appels, et la course rendrait le ménage aléatoirement muet.
             continue
         except OSError:
             # un processus vivant illisible ne peut pas être innocenté
