@@ -1195,6 +1195,38 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertNotIn("usermod --home", res.stdout)
 
+    def test_live_pilot_home_change_has_named_refusal(self):
+        # Exercise the real account setup with harmless shell doubles.
+        # usermod's refusal must stop installation before any job-home setup,
+        # with an actionable diagnostic rather than its raw exit code (9).
+        with open(self.SCRIPT, encoding="utf-8") as fh:
+            script = fh.read()
+        account_setup = script[script.index('say "user $GUEST '):
+                               script.index('check_no_power_groups "$GUEST"')]
+        harness = textwrap.dedent("""\
+            set -e
+            GUEST=ameesh-guest
+            ROOT=/srv/ameesh-guest
+            say() { :; }
+            die() { echo "install.sh: $*" >&2; exit 1; }
+            id() { echo 997; }
+            getent() { echo "ameesh-guest:x:997:997::$ROOT/home:/bin/sh"; }
+            run() { "$@"; }
+            usermod() {
+              if [ "$1" = --home ]; then
+                echo "usermod: user ameesh-guest is currently used by process 123" >&2
+                return 9
+              fi
+            }
+            """)
+        res = subprocess.run(["bash", "-c", harness + account_setup +
+                              '\necho job-home-setup-reached\n'],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("guest-home-change refused for ameesh-guest", res.stderr)
+        self.assertIn("stop them before rerunning install.sh", res.stderr)
+        self.assertNotIn("job-home-setup-reached", res.stdout)
+
     def test_the_legacy_dry_run_keeps_the_guest_alone(self):
         # --no-job-user: no job user, no group, no launcher, no rule the
         # guest cannot satisfy; the volume stays the guest's own (L159b)
