@@ -129,7 +129,11 @@ _PLAIN_ARTIFACT_RE = re.compile(
     r"((?:knowledge|docs|src|ameesh|scripts|tests)/[^\s,;)]+)", re.I)
 _FULL_SHA_RE = re.compile(r"\b([0-9a-fA-F]{40})\b")
 _COMMENT_REF_RE = re.compile(r"#issuecomment-([0-9]{1,20})")
-_APPROVAL_RE = re.compile(r"^\s*(?:#+\s*)?owner\s+approval(?:\s+recorded)?\b", re.I)
+#: Le marqueur s'arrete au mot « approval » (ou « approval recorded ») : une
+#: demande (« Owner approval requested/needed/pending ») n'est pas un accord.
+_APPROVAL_RE = re.compile(
+    r"^\s*(?:#+\s*)?owner\s+approval(?:\s+recorded)?\s*(?:$|[\u2014\u2013:(.\-])",
+    re.I)
 _REVOKE_RE = re.compile(
     r"^\s*(?:#+\s*)?(?:owner\s+)?approval\s+(revoked|withdrawn|superseded)\b", re.I)
 _ENVELOPE_RE = re.compile(r"<!--\s*ameesh-approval:v1\s*(\{.*?\})\s*-->", re.S)
@@ -246,6 +250,25 @@ class Source:
     api_base: str = DEFAULT_API_BASE
     max_comments: int = MAX_COMMENTS
     reader: str = ""
+
+    @property
+    def repos(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((self.repo,) + self.artifact_repos))
+
+
+@dataclass(frozen=True)
+class ApprovalIdentity:
+    """Identite attendue de la source, ancree dans la configuration locale.
+
+    Le fichier de projection est auto-declare : il ne prouve pas sa provenance.
+    Un hote refuse donc une projection dont le depot, l'issue, les approbateurs
+    ou le perimetre d'artefacts ne correspondent pas a cette identite locale.
+    """
+
+    repo: str
+    issue: int
+    approvers: tuple[str, ...]
+    artifact_repos: tuple[str, ...] = ()
 
     @property
     def repos(self) -> tuple[str, ...]:
@@ -507,6 +530,73 @@ def source_from_config(section: Any) -> Source:
                   api_base=api_base, max_comments=max_comments, reader=reader)
 
 
+def identity_from_config(section: Any) -> ApprovalIdentity:
+    """Identite de source attendue, lue dans ``approvals.source``.
+
+    Les hotes n'ont pas besoin de ``token_file`` (jamais lu par la lecture
+    locale) ; ils declarent ``repo``, ``issue``, ``approvers`` et, si besoin,
+    ``artifact_repos``. Sans ce bloc, la projection est refusee : un fichier
+    valide ne prouve pas sa provenance.
+    """
+    if not isinstance(section, Mapping):
+        raise ProjectionError("projection-source", "approvals: JSON object expected")
+    raw = section.get("source")
+    if raw is None:
+        raw = section
+    if not isinstance(raw, Mapping):
+        raise ProjectionError("projection-source",
+                              "approvals.source identity is required")
+    try:
+        repo = _check_repo(raw.get("repo"), "source repo")
+        issue = _as_int(raw.get("issue"), "source issue", minimum=1,
+                        maximum=10**9)
+        approvers_raw = raw.get("approvers")
+        if not isinstance(approvers_raw, (list, tuple)) or not approvers_raw:
+            raise ValueError("approvers: non-empty list expected")
+        approvers = tuple(dict.fromkeys(
+            _require_text(login, "approver", maximum=39).lower()
+            for login in approvers_raw))
+        for login in approvers:
+            if not _LOGIN_RE.fullmatch(login):
+                raise ValueError("approvers: invalid GitHub login")
+        artifact_raw = raw.get("artifact_repos") or ()
+        if not isinstance(artifact_raw, (list, tuple)):
+            raise ValueError("artifact_repos: list expected")
+        artifact_repos = tuple(dict.fromkeys(
+            _check_repo(item, "artifact_repos") for item in artifact_raw))
+    except (TypeError, ValueError) as exc:
+        raise ProjectionError("projection-source", str(exc)) from exc
+    return ApprovalIdentity(repo=repo, issue=issue, approvers=approvers,
+                            artifact_repos=artifact_repos)
+
+
+def _check_identity(projection: Projection, identity: ApprovalIdentity) -> None:
+    source = projection.source
+    if str(source.get("repo") or "") != identity.repo:
+        raise ProjectionError("projection-source",
+                              "projection repository does not match the identity")
+    try:
+        issue = int(source.get("issue") or 0)
+    except (TypeError, ValueError):
+        issue = 0
+    if issue != identity.issue:
+        raise ProjectionError("projection-source",
+                              "projection issue does not match the identity")
+    if tuple(projection.approvers) != identity.approvers:
+        raise ProjectionError("projection-source",
+                              "projection approvers do not match the identity")
+    allowed = set(identity.repos)
+    for approval in projection.approvals:
+        if approval.artifact.repo not in allowed:
+            raise ProjectionError("projection-source",
+                                  "approval artifact is outside the identity")
+    for revocation in projection.revocations:
+        for artifact in revocation.scope:
+            if artifact.repo not in allowed:
+                raise ProjectionError("projection-source",
+                                      "revocation scope is outside the identity")
+
+
 def projection_path(config: Any = None) -> str:
     """Chemin absolu de la projection locale, ou ``projection-missing``."""
     section = _section(config)
@@ -662,10 +752,21 @@ def _commit_resolver(transport: Any, deadline: float) -> Callable[[str, str], st
             return cache[key]
         if time.monotonic() > deadline:
             raise ReaderError("reader-timeout", "GitHub read budget exhausted")
-        commit = _get_json(
-            transport,
-            "/repos/%s/commits/%s" % (repo, urllib.parse.quote(ref, safe="")),
-            what="commit")
+        try:
+            commit = _get_json(
+                transport,
+                "/repos/%s/commits/%s" % (repo, urllib.parse.quote(ref, safe="")),
+                what="commit")
+        except ReaderError as exc:
+            # Un commit inconnu ne bloque que cet enregistrement : la
+            # projection ne doit pas devenir indisponible pour un seul ref.
+            status = (exc.detail or {}).get("status") \
+                if isinstance(exc.detail, Mapping) else None
+            if status in (404, 422):
+                raise ApprovalRefusal(
+                    "revision-unresolved",
+                    "the forge does not know this revision") from exc
+            raise
         if not isinstance(commit, Mapping):
             raise ReaderError("reader-invalid", "commit: JSON object expected")
         sha = str(commit.get("sha") or "").lower()
@@ -732,13 +833,22 @@ def _artifact(repo: str, revision: str, path: str, source: Source,
             raise ApprovalRefusal("revision-unresolved",
                                   "several full revisions match the short one")
         elif resolve is not None:
+            requested = text
             text = resolve(repo, text).lower()
+            # Une branche hex nommee comme un SHA ne doit pas fournir un
+            # commit arbitraire : le SHA complet doit commencer par la
+            # reference demandee.
+            if not text.startswith(requested):
+                raise ApprovalRefusal(
+                    "revision-unresolved",
+                    "the resolved commit does not match the requested revision")
         if not _FULL_REVISION_RE.fullmatch(text):
             raise ApprovalRefusal("revision-unresolved",
                                   "the exact revision could not be resolved")
-    elif resolve is not None:
-        # Meme un SHA complet est relu a la forge : une branche nommee comme
-        # un SHA ne doit pas se faire passer pour une revision exacte.
+    if resolve is not None:
+        # Meme un SHA complet (ou trouve dans le corps) est relu a la forge :
+        # une branche nommee comme un SHA, ou un SHA etranger au contrat, ne
+        # doit pas se faire passer pour la revision exacte.
         observed = resolve(repo, text).lower()
         if observed != text:
             raise ApprovalRefusal("revision-unresolved",
@@ -839,6 +949,45 @@ def _structured_artifacts(
     return found, refusals
 
 
+def _revocation_scope(body: str, envelope: Mapping | None,
+                      source: Source) -> list[Artifact]:
+    """Portee d'une revocation : depot + chemin, quelle que soit la revision.
+
+    Une revocation par portee ne depend pas d'un SHA exact : une URL de
+    branche ou un SHA court non resolu doit revoquer la portee, jamais etre
+    ignore (fail-closed). Le champ `revision` du scope est un marqueur
+    (0*40), `_apply_revocations` ne compare que depot et chemin.
+    """
+    items: list[tuple[Any, Any]] = []
+    if envelope is not None:
+        raw = envelope.get("artifacts", envelope.get("scope"))
+        if isinstance(raw, list):
+            items = [(item.get("repo"), item.get("path"))
+                     for item in raw if isinstance(item, Mapping)]
+    else:
+        items += [(match.group(1), match.group(3))
+                  for match in _BLOB_URL_RE.finditer(body)]
+        items += [(match.group(1), match.group(3))
+                  for match in _PIN_RE.finditer(body)]
+        items += [(source.repo, match.group(2))
+                  for match in _PLAIN_ARTIFACT_RE.finditer(body)]
+    found: list[Artifact] = []
+    seen: set[tuple[str, str]] = set()
+    for repo, path in items:
+        try:
+            repo = _check_repo(repo, "revocation repo")
+            path = _check_path(urllib.parse.unquote(str(path)).rstrip(".,;:`"))
+        except (TypeError, ValueError):
+            continue
+        if repo not in source.repos or (repo, path) in seen:
+            continue
+        seen.add((repo, path))
+        found.append(Artifact(repo=repo, revision="0" * 40, path=path))
+        if len(found) >= MAX_ARTIFACTS_PER_COMMENT:
+            break
+    return found
+
+
 def _revocation_targets(body: str) -> tuple[int, ...]:
     return tuple(dict.fromkeys(int(match.group(1))
                                for match in _COMMENT_REF_RE.finditer(body)))
@@ -882,8 +1031,6 @@ def _normalize_comment(comment: Mapping, source: Source,
         updated = _comment_time(comment, "updated_at")
     except ApprovalRefusal as exc:
         return [], [], [{"comment": comment_id, "code": exc.code}]
-    if updated != created:
-        return [], [], [{"comment": comment_id, "code": "approval-edited"}]
     body_sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
     url = str(comment.get("html_url") or "").strip()
     if not url:
@@ -891,6 +1038,28 @@ def _normalize_comment(comment: Mapping, source: Source,
             source.repo, source.issue, comment_id)
     statement = first
     refusals: list[dict] = []
+    if updated != created and not revocation:
+        # Une approbation modifiee n'est pas une decision. Mais si elle
+        # remplace un accord anterieur, l'ignorer reactiverait cet accord :
+        # on borne la portee qu'elle nomme et on refuse l'approbation.
+        try:
+            artifacts, _extra = (
+                _structured_artifacts(envelope, source, resolve)
+                if envelope is not None
+                else _legacy_artifacts(body, source, resolve))
+        except ApprovalRefusal:
+            artifacts = []
+        if not artifacts:
+            raise ProjectionError(
+                "projection-invalid",
+                "an edited approval cannot be scoped safely")
+        fence = Revocation(
+            id="edited:%d" % comment_id, comment_id=comment_id,
+            author=login.lower(), created_at=created, updated_at=updated,
+            url=url, statement=statement, body_sha256=body_sha,
+            targets=(), scope=tuple(artifacts))
+        refusals.append({"code": "approval-edited"})
+        return [], [fence], _bounded_refusals(comment_id, refusals)
 
     if revocation:
         targets = _revocation_targets(body)
@@ -906,18 +1075,12 @@ def _normalize_comment(comment: Mapping, source: Source,
             except (TypeError, ValueError):
                 return [], [], [{"comment": comment_id,
                                  "code": "approval-envelope-invalid"}]
-        scope: list[Artifact] = []
-        if not targets:
-            try:
-                scope, extra = (_structured_artifacts(envelope, source, resolve)
-                                if envelope is not None
-                                else _legacy_artifacts(body, source, resolve))
-                refusals.extend(extra)
-            except ApprovalRefusal as exc:
-                refusals.append({"code": exc.code})
-            if not scope:
-                refusals.append({"code": "revocation-unscoped"})
-                return [], [], _bounded_refusals(comment_id, refusals)
+        # Cibles et portee s'additionnent : un lien de contexte vers un autre
+        # commentaire n'efface pas la portee nommee.
+        scope = _revocation_scope(body, envelope, source)
+        if not targets and not scope:
+            refusals.append({"code": "revocation-unscoped"})
+            return [], [], _bounded_refusals(comment_id, refusals)
         record = Revocation(
             id="revocation:%d" % comment_id, comment_id=comment_id,
             author=login.lower(), created_at=created, updated_at=updated,
@@ -1261,8 +1424,8 @@ def _parse_revocation(value: Any) -> Revocation:
         raise ValueError("revocation: a target or a scope is required")
     created = _parse_ts(value.get("created_at"), "revocation created_at")
     updated = _parse_ts(value.get("updated_at"), "revocation updated_at")
-    if updated != created:
-        raise ValueError("revocation was edited after creation")
+    if updated < created:
+        raise ValueError("revocation updated before its creation")
     body_sha256 = _require_text(value.get("body_sha256"), "body_sha256",
                                 maximum=64)
     if not _DIGEST_RE.fullmatch(body_sha256):
@@ -1389,16 +1552,24 @@ def _parse_projection(payload: Any, *, now: dt.datetime,
 def load_projection(config: Any = None, *, path: str | None = None,
                     now: dt.datetime | None = None,
                     max_age_s: int | None = None,
-                    owner_uid: int | None = None) -> Projection:
+                    owner_uid: int | None = None,
+                    identity: ApprovalIdentity | None = None) -> Projection:
     """Lit et valide la projection locale ; toute absence est un refus.
 
     ``config`` peut etre un objet ``Config``, un mapping de configuration, ou
-    ``None`` (configuration de l'hote). Le fichier doit etre un fichier
-    regulier, non modifiable par le groupe ou les autres ; ``owner_uid``,
-    s'il est fourni, fixe son proprietaire attendu.
+    ``None`` (configuration de l'hote). L'identite de source (depot, issue,
+    approbateurs, perimetre d'artefacts) vient de la configuration locale et
+    est **obligatoire** : un fichier de projection valide ne prouve pas sa
+    provenance. Un appel direct par chemin doit fournir ``identity``.
+
+    Le fichier doit etre un fichier regulier, non modifiable par le groupe ou
+    les autres ; ``owner_uid``, s'il est fourni, fixe son proprietaire attendu.
     """
-    # Un chemin explicite (ecrivain, test) ne depend pas de la config hote.
+    # Un chemin explicite ne depend pas de la config hote pour ses reglages,
+    # mais l'identite de source reste obligatoire.
     section = _section(config) if (config is not None or path is None) else {}
+    if identity is None and (config is not None or path is None):
+        identity = identity_from_config(section)
     if path is None:
         path = projection_path(config)
     path = os.path.abspath(os.path.expanduser(path))
@@ -1429,6 +1600,10 @@ def load_projection(config: Any = None, *, path: str | None = None,
     projection = _parse_projection(body, now=current, max_age_s=max_age_s,
                                    clock_skew_s=CLOCK_SKEW_S,
                                    max_ttl_s=MAX_TTL_S)
+    if identity is None:
+        raise ProjectionError("projection-source",
+                              "expected source identity is required")
+    _check_identity(projection, identity)
     return replace(projection, digest=digest, path=path)
 
 
@@ -1649,7 +1824,7 @@ __all__ = [
     "ENVELOPE_SCHEMA", "GitHubTransport", "Projection", "ProjectionError",
     "ReaderError", "Revocation", "SCHEMA", "SOURCE_API", "SOURCE_GITHUB",
     "Source", "build_projection", "load_projection", "local_projection",
-    "approval_for_source", "projection_from_source", "projection_path",
-    "read_source", "refresh", "require_approval", "source_from_config",
-    "write_projection",
+    "ApprovalIdentity", "approval_for_source", "identity_from_config",
+    "projection_from_source", "projection_path", "read_source", "refresh",
+    "require_approval", "source_from_config", "write_projection",
 ]

@@ -326,8 +326,15 @@ An owner approval is a comment that:
   (`Reviewed artifact: <sha>, knowledge/...`). A branch or tag name is
   refused (`mutable-revision`); a short revision is resolved from a full SHA
   in the same body, otherwise through the GitHub commits API, and the
-  resolved SHA must match. The real reader re-checks even a 40-hex revision
-  against the commits API, so a branch named like a SHA cannot pass.
+  resolved SHA must match the requested prefix. When the real reader runs,
+  even a 40-hex revision cited in the body is re-read against the commits
+  API, so a branch named like a SHA or an unrelated full SHA cannot pass.
+  A revocation by scope ignores the revision: a branch URL or an unresolved
+  short SHA still revokes its repository + path (it never becomes a silent
+  no-op). An edited revocation still revokes; an edited replacement approval
+  fences the scope it names so the previous approval cannot become current
+  again, and an edited approval whose scope cannot be established refuses the
+  whole projection.
 
 A comment edited after creation (`updated_at != created_at`) is refused
 (`approval-edited`): the projection never accepts a decision whose text can
@@ -363,6 +370,17 @@ schema/authority, digest-tampered, in the future, older than its TTL or its
 consumer's `max_age_s`. `owner_uid` can pin the expected owner of the file
 and its directory (0 for a root-synchronised copy).
 
+**The file does not prove its provenance.** The local configuration therefore
+carries the expected identity in `approvals.source`: `repo`, `issue`,
+`approvers` and, when the approvals cover another artifact repository,
+`artifact_repos`. `load_projection` compares the projection's `source.repo`,
+`source.issue`, `approvers` and every approval/revocation artifact with that
+identity; a mismatch, or an absent identity, is `projection-source` and the
+approvals source is omitted from `read_sources` (fail-closed). The bureau and
+each host must declare the same identity; only the bureau also needs
+`token_file`. A valid 0644 projection produced from another repository, issue
+or approver therefore cannot be substituted for the expected one.
+
 ### Configuration
 
 ```json
@@ -397,14 +415,20 @@ ameesh process-approvals check       # freshness, counts, digests
 ameesh process-approvals show --repo R --revision <full-sha> --path P
 ```
 
-A host only uses `check` / `show`; it performs no network access.
+A host only uses `check` / `show`; it performs no network access. Its
+`approvals` section must keep the **identity** fields (`source.repo`,
+`source.issue`, `source.approvers`, optional `source.artifact_repos`) and the
+projection path; it may keep `source.token_file` (never read by `check` /
+`show`) or omit it. Omitting the identity is a refusal (`projection-source`),
+not a default.
 
 ### Seam and refusal codes
 
 `process_registry.SOURCE_KEYS` gains the **conditional** `approvals`
-collection. `read_sources` adds it only when `local_projection()` succeeds;
-otherwise the key is absent, so a verifier that requires approvals refuses
-`source-unavailable` (fail-closed), exactly like `observations`. The
+collection. `read_sources` adds it only when `local_projection()` succeeds
+(fresh file **and** local identity match); otherwise the key is absent, so a
+verifier that requires approvals refuses `source-unavailable` (fail-closed),
+exactly like `observations`. The
 `source=` argument of `require_approval` is the **approval source** (only
 `github` is accepted); it is not the command's authority source
 (`runner`/`explicit`/`session`), which B checks separately. The value is
@@ -429,7 +453,7 @@ Bridge codes (stable, module-level; `ApprovalError.code`):
 
 ### Qualification
 
-`tests/test_process_approvals.py` (41 pure/fixture cases, no database and no
+`tests/test_process_approvals.py` (55 pure/fixture cases, no database and no
 network in the core, one loopback HTTP case) covers every refusal witness
 requested by the lot: absent, revoked, stale-head, expired approval, stale
 projection and unavailable reader. `tests/test_process_approvals_704.py`

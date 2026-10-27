@@ -81,6 +81,8 @@ class ApprovalCase(unittest.TestCase):
             handle.write(TOKEN + "\n")
         os.chmod(self.token_file, 0o600)
         self.projection_path = os.path.join(self.tmp, "projection.json")
+        self.identity = pa.ApprovalIdentity(
+            repo=REPO, issue=ISSUE, approvers=(APPROVER,))
 
     @staticmethod
     def _cleanup(path: str) -> None:
@@ -93,6 +95,12 @@ class ApprovalCase(unittest.TestCase):
                     os.rmdir(os.path.join(root, name))
         with contextlib.suppress(OSError):
             os.rmdir(path)
+
+    def load(self, path: str | None = None, *, now: dt.datetime = NOW,
+             **kwargs):
+        identity = kwargs.pop("identity", self.identity)
+        return pa.load_projection(path=path or self.projection_path,
+                                  now=now, identity=identity, **kwargs)
 
     def source(self, **overrides) -> pa.Source:
         values = {
@@ -138,8 +146,9 @@ class ApprovalCase(unittest.TestCase):
         self.assertEqual(projection.approvals[0].artifact.revision, FULL_B)
 
     def test_short_revision_needs_an_exact_resolution(self):
+        short = FULL_A[:7]
         body = ("Owner approval \u2014 16 October 2026\n\n"
-                "https://github.com/%s/blob/abc1234/%s\n" % (REPO, PATH_A))
+                "https://github.com/%s/blob/%s/%s\n" % (REPO, short, PATH_A))
         calls = []
 
         def resolve(repo: str, ref: str) -> str:
@@ -147,8 +156,31 @@ class ApprovalCase(unittest.TestCase):
             return FULL_A
 
         projection = self.build([_comment(1003, body)], resolve=resolve)
-        self.assertEqual(calls, [(REPO, "abc1234")])
+        self.assertEqual(calls[0], (REPO, short))
+        # Le SHA complet rendu est relu a la forge avant d'etre accepte.
+        self.assertEqual(calls[1], (REPO, FULL_A))
         self.assertEqual(projection.approvals[0].artifact.revision, FULL_A)
+
+    def test_a_resolved_sha_must_start_with_the_requested_ref(self):
+        body = ("Owner approval \u2014 16 October 2026\n\n"
+                "https://github.com/%s/blob/abc1234/%s\n" % (REPO, PATH_A))
+        projection = self.build(
+            [_comment(1004, body)],
+            resolve=lambda repo, ref: FULL_A)
+        self.assertEqual(projection.approvals, ())
+        self.assertIn("revision-unresolved",
+                      {item["code"] for item in projection.refusals})
+
+    def test_a_pin_resolved_by_a_branch_cannot_forge_a_commit(self):
+        source = self.source(artifact_repos=("target/repo",))
+        body = ("Owner approval \u2014 16 October 2026\n\n"
+                "target/repo@abc1234:docs/a.md\n")
+        projection = self.build(
+            [_comment(1005, body)],
+            source=source, resolve=lambda repo, ref: "d" * 40)
+        self.assertEqual(projection.approvals, ())
+        self.assertIn("revision-unresolved",
+                      {item["code"] for item in projection.refusals})
 
     def test_unresolved_short_revision_is_refused(self):
         body = ("Owner approval \u2014 16 October 2026\n\n"
@@ -218,6 +250,89 @@ class ApprovalCase(unittest.TestCase):
         self.assertEqual(projection.approvals, ())
         self.assertIn("approval-edited",
                       {item["code"] for item in projection.refusals})
+
+    def test_an_edited_revocation_still_revokes(self):
+        approval = _comment(1030, _body(FULL_A, PATH_A))
+        revocation = _comment(
+            1031, "Owner approval revoked \u2014 #issuecomment-1030",
+            created="2026-10-18T00:00:00Z", updated="2026-10-18T00:05:00Z")
+        projection = self.build([approval, revocation])
+        self.assertEqual(projection.approvals[0].state, "revoked")
+        self.write(projection)
+        loaded = self.load()
+        self.assertEqual(loaded.approvals[0].state, "revoked")
+
+    def test_an_edited_replacement_approval_fences_the_old_one(self):
+        first = _comment(1032, _body(FULL_A, PATH_A))
+        replacement = _comment(
+            1033, _body(FULL_B, PATH_A), created="2026-10-17T00:00:00Z",
+            updated="2026-10-17T00:05:00Z")
+        projection = self.build([first, replacement])
+        self.assertEqual(projection.current(), ())
+        self.assertEqual(projection.approvals[0].state, "revoked")
+        self.assertEqual(projection.approvals[0].revoked_by, "edited:1033")
+        self.assertIn({"comment": 1033, "code": "approval-edited"},
+                      [dict(item) for item in projection.refusals])
+        self.write(projection)
+        loaded = self.load()
+        self.assertEqual(loaded.current(), ())
+        with self.assertRaises(pa.ApprovalRefusal) as caught:
+            pa.require_approval(loaded, repo=REPO, revision=FULL_A,
+                                path=PATH_A, now=NOW)
+        self.assertEqual(caught.exception.code, "approval-revoked")
+
+    def test_an_unscoped_edited_approval_refuses_the_projection(self):
+        edited = _comment(
+            1034, "Owner approval recorded \u2014 no artifact reference",
+            created="2026-10-17T00:00:00Z",
+            updated="2026-10-17T00:05:00Z")
+        with self.assertRaises(pa.ProjectionError) as caught:
+            self.build([edited])
+        self.assertEqual(caught.exception.code, "projection-invalid")
+
+    def test_a_revocation_naming_a_branch_still_revokes_the_scope(self):
+        approval = _comment(1035, _body(FULL_A, PATH_A))
+        revocation = _comment(
+            1036, "Approval revoked\n\n"
+                  "https://github.com/%s/blob/main/%s\n" % (REPO, PATH_A),
+            created="2026-10-18T00:00:00Z")
+        projection = self.build([approval, revocation])
+        self.assertEqual(projection.approvals[0].state, "revoked")
+
+    def test_revocation_targets_and_scope_add_up(self):
+        first = _comment(1037, _body(FULL_A, PATH_A))
+        second = _comment(1038, _body(FULL_B, PATH_B))
+        revocation = _comment(
+            1039, "Owner approval revoked \u2014 context #issuecomment-1037\n\n"
+                  "https://github.com/%s/blob/%s/%s\n"
+                  % (REPO, FULL_B, PATH_B),
+            created="2026-10-18T00:00:00Z")
+        projection = self.build([first, second, revocation])
+        self.assertEqual([a.state for a in projection.approvals],
+                         ["revoked", "revoked"])
+
+    def test_an_approval_request_is_not_an_approval(self):
+        for marker in ("Owner approval requested for this contract",
+                       "Owner approval needed", "Owner approval pending"):
+            projection = self.build([_comment(
+                1040, _body(FULL_A, PATH_A, marker=marker))])
+            self.assertEqual(projection.approvals, (), marker)
+
+    def test_an_unknown_commit_refuses_only_its_record(self):
+        class Transport:
+            def get(self, path):
+                if path.endswith("/" + "0" * 40):
+                    return 422, {}, b"{}"
+                return 200, {}, json.dumps({"sha": FULL_A}).encode()
+
+        resolve = pa._commit_resolver(Transport(), float("inf"))
+        projection = self.build([
+            _comment(1041, _body(FULL_A, PATH_A, ref=FULL_A)),
+            _comment(1042, _body("0" * 40, PATH_B, ref="0" * 40))],
+            resolve=resolve)
+        self.assertEqual([a.comment_id for a in projection.approvals], [1041])
+        self.assertIn({"comment": 1042, "code": "revision-unresolved"},
+                      [dict(item) for item in projection.refusals])
 
     def test_supersession_is_per_artifact_path(self):
         first = _comment(1013, _body(FULL_A, PATH_A))
@@ -308,12 +423,70 @@ class ApprovalCase(unittest.TestCase):
         self.assertIn("approval-envelope-invalid",
                       {item["code"] for item in projection.refusals})
 
+    # -- identite locale de la source (cx2-01) -----------------------------
+
+    def test_local_identity_refuses_another_source(self):
+        foreign = self.source(repo="other/repo", issue=123,
+                              approvers=("attacker",),
+                              artifact_repos=("target/repo",))
+        body = _body(FULL_A, PATH_A, repo="target/repo")
+        projection = pa.build_projection(
+            foreign, _issue(), [_comment(1100, body, login="attacker")],
+            now=NOW)
+        self.write(projection)
+        with self.assertRaises(pa.ProjectionError) as caught:
+            self.load(now=NOW)
+        self.assertEqual(caught.exception.code, "projection-source")
+        config = {"approvals": {
+            "projection": self.projection_path,
+            "source": {"repo": REPO, "issue": ISSUE,
+                       "approvers": [APPROVER]}}}
+        with self.assertRaises(pa.ProjectionError) as caught:
+            pa.load_projection(config, now=NOW)
+        self.assertEqual(caught.exception.code, "projection-source")
+
+    def test_local_identity_refuses_other_approvers(self):
+        foreign = self.source(approvers=("attacker",))
+        projection = pa.build_projection(
+            foreign, _issue(),
+            [_comment(1101, _body(FULL_A, PATH_A), login="attacker")],
+            now=NOW)
+        self.write(projection)
+        with self.assertRaises(pa.ProjectionError) as caught:
+            self.load(now=NOW)
+        self.assertEqual(caught.exception.code, "projection-source")
+
+    def test_local_identity_refuses_an_extra_artifact_repo(self):
+        widened = self.source(artifact_repos=("target/repo",))
+        body = _body(FULL_A, PATH_A, repo="target/repo")
+        projection = pa.build_projection(
+            widened, _issue(), [_comment(1102, body)], now=NOW)
+        self.write(projection)
+        with self.assertRaises(pa.ProjectionError) as caught:
+            self.load(now=NOW)
+        self.assertEqual(caught.exception.code, "projection-source")
+        identity = pa.ApprovalIdentity(
+            repo=REPO, issue=ISSUE, approvers=(APPROVER,),
+            artifact_repos=("target/repo",))
+        loaded = self.load(now=NOW, identity=identity)
+        self.assertEqual(loaded.approvals[0].artifact.repo, "target/repo")
+
+    def test_local_identity_is_required(self):
+        projection = self.build([_comment(1103, _body(FULL_A, PATH_A))])
+        self.write(projection)
+        with self.assertRaises(pa.ProjectionError) as caught:
+            pa.load_projection(path=self.projection_path, now=NOW)
+        self.assertEqual(caught.exception.code, "projection-source")
+        with self.assertRaises(pa.ProjectionError) as caught:
+            pa.identity_from_config({"projection": self.projection_path})
+        self.assertEqual(caught.exception.code, "projection-source")
+
     # -- projection locale -------------------------------------------------
 
     def test_projection_roundtrip_and_digest(self):
         projection = self.build([_comment(1024, _body(FULL_A, PATH_A))])
         self.write(projection)
-        loaded = pa.load_projection(path=self.projection_path, now=NOW)
+        loaded = self.load(now=NOW)
         self.assertEqual(loaded.digest, projection.digest)
         self.assertEqual(loaded.path, os.path.abspath(self.projection_path))
         self.assertEqual(loaded.source["source_digest"],
@@ -327,43 +500,38 @@ class ApprovalCase(unittest.TestCase):
         self.write(newer)
         self.assertEqual(pa.write_projection(older, self.projection_path),
                          "not-newer")
-        loaded = pa.load_projection(path=self.projection_path, now=NOW)
+        loaded = self.load(now=NOW)
         self.assertEqual(loaded.generated_at, NOW)
 
     def test_projection_is_fail_closed_when_stale(self):
         projection = self.build([_comment(1025, _body(FULL_A, PATH_A))])
         self.write(projection)
         with self.assertRaises(pa.ProjectionError) as caught:
-            pa.load_projection(path=self.projection_path,
-                               now=NOW + dt.timedelta(seconds=301))
+            self.load(now=NOW + dt.timedelta(seconds=301))
         self.assertEqual(caught.exception.code, "projection-stale")
 
     def test_consumer_max_age_can_be_stricter_than_the_ttl(self):
         projection = self.build([_comment(1024, _body(FULL_A, PATH_A))])
         self.write(projection)
         with self.assertRaises(pa.ProjectionError) as caught:
-            pa.load_projection(path=self.projection_path,
-                               now=NOW + dt.timedelta(seconds=120),
-                               max_age_s=60)
+            self.load(now=NOW + dt.timedelta(seconds=120), max_age_s=60)
         self.assertEqual(caught.exception.code, "projection-stale")
 
     def test_owner_uid_is_enforced_when_configured(self):
         projection = self.build([_comment(1024, _body(FULL_A, PATH_A))])
         self.write(projection)
         with self.assertRaises(pa.ProjectionError) as caught:
-            pa.load_projection(path=self.projection_path, now=NOW,
-                               owner_uid=os.geteuid() + 1)
+            self.load(now=NOW, owner_uid=os.geteuid() + 1)
         self.assertEqual(caught.exception.code, "projection-owner")
-        self.assertEqual(pa.load_projection(
-            path=self.projection_path, now=NOW,
-            owner_uid=os.geteuid()).digest, projection.digest)
+        self.assertEqual(self.load(
+            now=NOW, owner_uid=os.geteuid()).digest, projection.digest)
 
     def test_projection_is_fail_closed_when_in_the_future(self):
         projection = self.build([_comment(1026, _body(FULL_A, PATH_A))],
                                 now=NOW + dt.timedelta(seconds=120))
         self.write(projection)
         with self.assertRaises(pa.ProjectionError) as caught:
-            pa.load_projection(path=self.projection_path, now=NOW)
+            self.load(now=NOW)
         self.assertEqual(caught.exception.code, "projection-future")
 
     def test_projection_digest_catches_tampering(self):
@@ -375,7 +543,7 @@ class ApprovalCase(unittest.TestCase):
         with open(self.projection_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
         with self.assertRaises(pa.ProjectionError) as caught:
-            pa.load_projection(path=self.projection_path, now=NOW)
+            self.load(now=NOW)
         self.assertEqual(caught.exception.code, "projection-digest")
 
     def test_invalid_schema_is_refused_even_with_a_valid_digest(self):
@@ -389,7 +557,7 @@ class ApprovalCase(unittest.TestCase):
             json.dump(payload, handle)
         os.chmod(self.projection_path, 0o644)
         with self.assertRaises(pa.ProjectionError) as caught:
-            pa.load_projection(path=self.projection_path, now=NOW)
+            self.load(now=NOW)
         self.assertEqual(caught.exception.code, "projection-invalid")
 
     def test_projection_permissions_are_checked(self):
@@ -397,7 +565,7 @@ class ApprovalCase(unittest.TestCase):
         self.write(projection)
         os.chmod(self.projection_path, 0o666)
         with self.assertRaises(pa.ProjectionError) as caught:
-            pa.load_projection(path=self.projection_path, now=NOW)
+            self.load(now=NOW)
         self.assertEqual(caught.exception.code, "projection-permissions")
 
     def test_projection_symlink_is_refused(self):
@@ -406,7 +574,7 @@ class ApprovalCase(unittest.TestCase):
         link = os.path.join(self.tmp, "link.json")
         os.symlink(self.projection_path, link)
         with self.assertRaises(pa.ProjectionError) as caught:
-            pa.load_projection(path=link, now=NOW)
+            self.load(path=link, now=NOW)
         self.assertEqual(caught.exception.code, "projection-unreadable")
 
     def test_projection_oversize_is_refused(self):
@@ -415,7 +583,7 @@ class ApprovalCase(unittest.TestCase):
             handle.write(b"{" + b" " * (pa.MAX_PROJECTION_BYTES + 1))
         os.chmod(path, 0o644)
         with self.assertRaises(pa.ProjectionError) as caught:
-            pa.load_projection(path=path, now=NOW)
+            self.load(path=path, now=NOW)
         self.assertEqual(caught.exception.code, "projection-bounds")
 
     def test_projection_missing_and_stale_head(self):
@@ -426,7 +594,7 @@ class ApprovalCase(unittest.TestCase):
         self.assertEqual(caught.exception.code, "approval-missing")
         projection = self.build([_comment(1031, _body(FULL_A, PATH_A))])
         self.write(projection)
-        loaded = pa.load_projection(path=self.projection_path, now=NOW)
+        loaded = self.load(now=NOW)
         with self.assertRaises(pa.ApprovalRefusal) as caught:
             pa.require_approval(loaded, repo=REPO, revision=FULL_B,
                                 path=PATH_A, now=NOW)
@@ -553,8 +721,10 @@ class ApprovalCase(unittest.TestCase):
     def test_read_sources_includes_a_fresh_projection(self):
         projection = self.build([_comment(1034, _body(FULL_A, PATH_A))])
         self.write(projection)
-        config = {"approvals": {"projection": self.projection_path,
-                                "max_age_s": 300}}
+        config = {"approvals": {
+            "projection": self.projection_path, "max_age_s": 300,
+            "source": {"repo": REPO, "issue": ISSUE,
+                       "approvers": [APPROVER]}}}
         context = self._context()
         original = pa.load_projection
 
@@ -572,19 +742,41 @@ class ApprovalCase(unittest.TestCase):
         self.assertEqual(sources["approvals"]["projection"]["digest"],
                          projection.digest)
 
+    def test_read_sources_omits_a_foreign_projection(self):
+        foreign = self.source(repo="other/repo", issue=123,
+                              approvers=("attacker",),
+                              artifact_repos=("target/repo",))
+        body = _body(FULL_A, PATH_A, repo="target/repo")
+        projection = pa.build_projection(
+            foreign, _issue(), [_comment(1104, body, login="attacker")],
+            now=NOW)
+        self.write(projection)
+        config = {"approvals": {
+            "projection": self.projection_path,
+            "source": {"repo": REPO, "issue": ISSUE,
+                       "approvers": [APPROVER]}}}
+        with mock.patch.object(pa.config_mod, "load", return_value=config):
+            sources = pr.read_sources(self._context())
+        self.assertNotIn("approvals", sources)
+
     def test_read_sources_omits_a_missing_or_stale_projection(self):
         context = self._context()
         with mock.patch.object(
                 pa.config_mod, "load",
-                return_value={"approvals": {"projection": self.projection_path}}):
+                return_value={"approvals": {
+                    "projection": self.projection_path,
+                    "source": {"repo": REPO, "issue": ISSUE,
+                               "approvers": [APPROVER]}}}):
             self.assertNotIn("approvals", pr.read_sources(context))
         projection = self.build([_comment(1035, _body(FULL_A, PATH_A))],
                                 now=NOW - dt.timedelta(seconds=600))
         self.write(projection)
         with mock.patch.object(
                 pa.config_mod, "load",
-                return_value={"approvals": {"projection": self.projection_path,
-                                            "max_age_s": 300}}):
+                return_value={"approvals": {
+                    "projection": self.projection_path, "max_age_s": 300,
+                    "source": {"repo": REPO, "issue": ISSUE,
+                               "approvers": [APPROVER]}}}):
             self.assertNotIn("approvals", pr.read_sources(context))
 
     def _context(self):
