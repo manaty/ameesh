@@ -14,7 +14,41 @@ from ameesh import adapters, conversation as C, db as db_mod, fil, progress
 from tests.support import PgTestCase
 
 
+def wait_agent_notification(listener, agent, timeout):
+    """Ignore other schemas' chat traffic, preserving listener failures."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        notification = listener.wait(max(0.0, deadline - time.monotonic()))
+        if notification is None:
+            continue
+        if "event" in notification:
+            return notification
+        try:
+            payload = json.loads(notification.get("payload") or "")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("agent") == agent:
+            return notification
+    return None
+
+
 class UnitTest(unittest.TestCase):
+    def test_chat_wait_ignores_foreign_agent_and_preserves_listener_failure(self):
+        foreign = {"channel": C.CHANNEL,
+                   "payload": json.dumps({"agent": "plafond", "seq": 9})}
+        own = {"channel": C.CHANNEL,
+               "payload": json.dumps({"agent": "unique-worker", "seq": 1})}
+        listener = mock.Mock()
+        listener.wait.side_effect = [foreign, own]
+        self.assertEqual(wait_agent_notification(listener, "unique-worker", 0.1), own)
+        listener.wait.side_effect = [foreign, {"event": "disconnect"}]
+        self.assertEqual(wait_agent_notification(listener, "unique-worker", 0.1),
+                         {"event": "disconnect"})
+        with mock.patch.object(listener, "wait", side_effect=[foreign, None]) as wait:
+            with mock.patch.object(time, "monotonic", side_effect=[0, 0, 0, 0, 0, 1]):
+                self.assertIsNone(wait_agent_notification(listener, "unique-worker", 0.1))
+            self.assertEqual(wait.call_count, 2)
+
     def test_tools_never_include_arguments_output_or_reasoning(self):
         secret = "DO NOT STORE THIS"
         raw = {"type": "assistant", "message": {"content": [
@@ -227,20 +261,24 @@ class StoreTest(PgTestCase):
         # pg_listening_channels) ; la sonde de ce test réémettait le même
         # payload et son vidage de 0,1 s laissait une notification en vol que
         # la lecture suivante prenait pour celle du journal sous charge CI.
+        agent = "worker-" + self.schema
+        own_log = C.Log(self.db, self.cfg, agent=agent, project="acme")
+        # Committed foreign traffic must not break the next silence check.
+        C.Log(self.db, self.cfg, agent="plafond", project="elsewhere").append("text", "noise")
         with self.db.transaction() as tx:
-            log = C.Log(tx, self.cfg, agent="worker", project="acme")
+            log = C.Log(tx, self.cfg, agent=agent, project="acme")
             row = log.append("text", "sensitive " * 2000, event_id="1")
-            self.assertIsNone(listener.wait(0.1))
-        notification = listener.wait(5)
+            self.assertIsNone(wait_agent_notification(listener, agent, 0.1))
+        notification = wait_agent_notification(listener, agent, 5)
         self.assertIsNotNone(notification)
-        self.assertEqual(json.loads(notification["payload"]), {"agent": "worker", "seq": row["seq"]})
-        self.log.append("text", "ignored", event_id="1")
-        self.assertIsNone(listener.wait(0.2))
+        self.assertEqual(json.loads(notification["payload"]), {"agent": agent, "seq": row["seq"]})
+        own_log.append("text", "ignored", event_id="1")
+        self.assertIsNone(wait_agent_notification(listener, agent, 0.2))
         with self.assertRaises(RuntimeError):
             with self.db.transaction() as tx:
-                C.Log(tx, self.cfg, agent="worker", project="acme").append("text", "rolled back")
+                C.Log(tx, self.cfg, agent=agent, project="acme").append("text", "rolled back")
                 raise RuntimeError("rollback")
-        self.assertIsNone(listener.wait(0.2))
+        self.assertIsNone(wait_agent_notification(listener, agent, 0.2))
 
     def test_cursor_serializes_writers_through_commit(self):
         result, errors = [], []
