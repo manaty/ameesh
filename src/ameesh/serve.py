@@ -751,6 +751,16 @@ def act(ctx: Context, db, action, params: dict, body: dict, key: str,
                              "or its outcome is unknown: check before acting again, then "
                              "release the key with `ameesh serve --release-key KEY`"), False
         return row["status"], row["response"], True
+    # §16 (#3889): a new reservation, but the key's trace may outlive its
+    # purge (the page keeps a message and its key 7 days): replayed, not redone
+    if action.outcome is not None:
+        try:
+            settled = _settle(ctx, db, action, params, body, key)
+        except Exception as exc:  # the effect stays exclusive per key
+            log.warning("trace of %s: %s", action.name, type(exc).__name__)
+            settled = None
+        if settled is not None:
+            return settled
     return _run(ctx, db, action, params, body, key)
 
 
@@ -772,19 +782,37 @@ def _reconcile(ctx: Context, db, action, params: dict, body: dict,
     if not requests.retake(ctx.human, key, RECONCILE_AFTER_S):
         return None
     try:
-        result = action.outcome(ctx, db, params, body)
+        settled = _settle(ctx, db, action, params, body, key)
     except Exception as exc:
         log.warning("reconcile %s: %s", action.name, type(exc).__name__)
         return None
-    if result is not None:
-        data = _envelope(ctx, action, result)
-        if not requests.complete(ctx.human, key, 200, data):
-            return None
-        return 200, data, True
+    if settled is not None:
+        return settled
     # no trace yet: the action runs under the same key. A first request still
     # alive may write its trace meanwhile: the effect is exclusive per key
     # (`Action.outcome`), so the later of the two returns the earlier's.
     return _run(ctx, db, action, params, body, key)
+
+
+def _settle(ctx: Context, db, action, params: dict, body: dict,
+            key: str) -> tuple[int, dict, bool] | None:
+    """The key's answer read from the action's trace, stored: the result
+    already produced (200, replayed), or a refusal (another request under the
+    same key); None without a trace. Raises if the trace cannot be read."""
+    requests = storage.of(db).api_requests
+    try:
+        result = action.outcome(ctx, db, params, body)
+    except serve_actions.ActionError as exc:
+        if exc.status >= 500:
+            raise
+        data = _err(exc.code, str(exc))
+        requests.complete(ctx.human, key, exc.status, data)
+        return exc.status, data, False
+    if result is None:
+        return None
+    data = _envelope(ctx, action, result)
+    requests.complete(ctx.human, key, 200, data)
+    return 200, data, True
 
 
 def _run(ctx: Context, db, action, params: dict, body: dict,

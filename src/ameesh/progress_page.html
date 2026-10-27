@@ -373,8 +373,9 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   // avec son Idempotency-Key AVANT l'envoi ; aucun nouvel envoi n'efface un
   // message non acquitté. Panne (réseau, corps de réponse illisible, 503,
   // 429) : renvoi tel quel, même clé. Issue inconnue (500, 502, clé en cours
-  // 409) : la MÊME clé est renvoyée avec un délai croissant, sans jamais la
-  // libérer ; seul l'accusé du serveur POUR CETTE CLÉ (200, rejeu compris)
+  // 409, 200 sans enveloppe d'action lisible) : la MÊME clé est renvoyée avec
+  // un délai croissant, sans jamais la libérer ; seul l'accusé du serveur POUR
+  // CETTE CLÉ (200 portant l'enveloppe et son message_id, rejeu compris)
   // acquitte — le serveur la réconcilie lui-même (serve.act : le courrier
   // déposé sous la clé, sinon l'action rejouée sous elle). Un même texte vu
   // dans la conversation n'acquitte jamais. Jeton refusé (401) : gardé, repris
@@ -426,8 +427,15 @@ p.summary { font-size: .86rem; margin: 6px 0; }
         // issue indéterminée, la même clé repart (le serveur rejoue son accusé)
         .then(null, function () { return {status: 0, data: {}}; });
     }
+    // l'accusé du serveur : l'enveloppe de l'action, avec le message déposé
+    function acked(d) {
+      return !!d && d.schema === "ameesh-action/1" && !!d.result
+        && typeof d.result.message_id === "number";
+    }
     function settle(m, res, n) {
-      if (res.status === 200) { flying[m.key] = false; drop(m); view(m.agent).sent(m); return; }
+      if (res.status === 200 && acked(res.data)) {
+        flying[m.key] = false; drop(m); view(m.agent).sent(m); return;
+      }
       if (res.status === 0 || res.status === 503 || res.status === 429) {
         // une issue déjà inconnue le reste : seul un accusé la lève
         if (m.state !== "checking") m.state = "sending";
@@ -435,7 +443,8 @@ p.summary { font-size: .86rem; margin: 6px 0; }
         setTimeout(function () { attempt(m, n + 1); }, delay(n));
         return;
       }
-      if (res.status >= 500 || res.data.error === "idempotency_in_progress") {
+      // 200 illisible (un mandataire, une page HTML) : pas un accusé, issue inconnue
+      if (res.status >= 500 || res.status === 200 || res.data.error === "idempotency_in_progress") {
         m.state = "checking"; write(m); view(m.agent).checking(m);
         setTimeout(function () { reconcile(m, n + 1); }, delay(Math.max(n, 2)));
         return;

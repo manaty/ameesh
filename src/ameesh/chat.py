@@ -270,23 +270,42 @@ def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
         if not (idempotency_key and db_mod.is_unique_violation(exc, IDEMPOTENT_MAIL_INDEX)):
             raise
         from . import storage
-        message_id = storage.of(db).mailbox.by_idempotency_key(sender, agent, idempotency_key)
+        mailbox = storage.of(db).mailbox
+        message_id = mailbox.by_idempotency_key(sender, agent, idempotency_key)
         if message_id is None:
             raise
+        # la même requête seulement : jamais un reflet d'un autre texte
+        _same_message(mailbox.get(message_id), text, lot)
     return _reflect_human_message(cfg, db, row=row, human=human, agent=agent, text=text,
                                   lot=lot, message_id=message_id, event_id=event_id)
+
+
+class KeyReused(ValueError):
+    """L'Idempotency-Key d'un message déjà déposé, pour un autre texte ou lot."""
+
+
+def _same_message(row: dict | None, text: str, lot) -> None:
+    """Le courrier déposé sous une clé est-il ce message (texte et lot) ?"""
+    row = row or {}
+    if (row.get("body") != text
+            or (row.get("work_item_id") or "") != ("" if lot is None else str(lot))):
+        raise KeyReused("this Idempotency-Key was used for another message")
 
 
 def delivered_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
                             text: str, lot=None, idempotency_key: str) -> dict | None:
     """§16 (#3889) : le message déjà délivré sous `idempotency_key` (son
     reflet dans la conversation complété, idempotent), ou None s'il n'est
-    jamais parti. Jamais un second courrier."""
+    jamais parti. Jamais un second courrier. Lève `KeyReused` si le courrier
+    de cette clé porte un autre texte ou un autre lot : ce n'est pas la même
+    requête (la réservation de la clé a pu être purgée depuis)."""
     from . import registry, resident_queue, storage
     sender = resident_queue.human_ref(sender) or sender
-    message_id = storage.of(db).mailbox.by_idempotency_key(sender, agent, idempotency_key)
+    mailbox = storage.of(db).mailbox
+    message_id = mailbox.by_idempotency_key(sender, agent, idempotency_key)
     if message_id is None:
         return None
+    _same_message(mailbox.get(message_id), text, lot)
     return _reflect_human_message(cfg, db, row=registry.get(db, agent), human=human,
                                   agent=agent, text=text, lot=lot, message_id=message_id)
 

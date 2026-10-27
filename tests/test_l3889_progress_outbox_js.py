@@ -85,6 +85,8 @@ done(0);
 """
 
 PREFIX = "ameesh-progress:outbox:"
+#: l'accusé du serveur : l'enveloppe de l'action et le message déposé
+ACK = {"schema": "ameesh-action/1", "action": "chat", "result": {"message_id": 7}}
 
 
 def entry(text="bonjour", key="web-kept-0001", **extra):
@@ -128,7 +130,7 @@ class ProgressOutboxTest(unittest.TestCase):
     def test_panne_puis_accuse_meme_cle_garde_avant_l_envoi(self):
         result = self.run_outbox({"steps": ["bonjour"], "posts": [
             {"status": 503, "body": "the conversation is busy"}, "network",
-            {"status": 429, "body": {}}, {"status": 200, "body": {"ok": True}}]})
+            {"status": 429, "body": {}}, {"status": 200, "body": ACK}]})
         posts = self.posted(result)
         self.assertEqual(len(posts), 4)
         self.assertEqual(len({item["key"] for item in posts}), 1)
@@ -138,7 +140,7 @@ class ProgressOutboxTest(unittest.TestCase):
 
     def test_page_rechargee_reprend_l_envoi_avec_la_meme_cle(self):
         result = self.run_outbox({"storage": entry(), "steps": ["resume"],
-                                  "posts": [{"status": 200, "body": {}}]})
+                                  "posts": [{"status": 200, "body": ACK}]})
         self.assertEqual([(p["key"], p["text"]) for p in self.posted(result)],
                          [("web-kept-0001", "bonjour")])
         self.assertEqual(result["outbox"], [])
@@ -150,7 +152,7 @@ class ProgressOutboxTest(unittest.TestCase):
             {"status": 500, "body": "internal error: the message may have been delivered"},
             {"status": 409, "body": {"error": "idempotency_in_progress"}},
             {"status": 409, "body": {"error": "idempotency_in_progress"}},
-            {"status": 200, "body": {"ok": True}}]})
+            {"status": 200, "body": ACK}]})
         posts = self.posted(result)
         self.assertEqual(len({p["key"] for p in posts}), 1)
         self.assertEqual(len(posts), 4)
@@ -180,12 +182,33 @@ class ProgressOutboxTest(unittest.TestCase):
         indéterminée, la même clé repart ; le rejeu du serveur acquitte."""
         result = self.run_outbox({"steps": ["bonjour"], "posts": [
             {"status": 200, "bodyFails": True}, {"status": 503, "bodyFails": True},
-            {"status": 200, "body": {"replayed": True}}]})
+            {"status": 200, "body": ACK}]})
         posts = self.posted(result)
         self.assertEqual(len(posts), 3)
         self.assertEqual(len({p["key"] for p in posts}), 1)
         self.assertEqual(result["events"][-1], "sent:bonjour")
         self.assertEqual(result["outbox"], [])
+
+    def test_200_sans_accuse_lisible_garde_et_renvoie_la_meme_cle(self):
+        """B (cx1, gel #21581) : un 200 au corps HTML (mandataire) ou sans
+        enveloppe n'acquitte pas : même clé, jusqu'à l'accusé valide."""
+        result = self.run_outbox({"steps": ["bonjour"], "posts": [
+            {"status": 200, "body": "<html>proxy</html>"}, {"status": 200, "body": {}},
+            {"status": 200, "body": {"schema": "ameesh-action/1", "result": {}}},
+            {"status": 200, "body": ACK}]})
+        posts = self.posted(result)
+        self.assertEqual(len(posts), 4)
+        self.assertEqual(len({p["key"] for p in posts}), 1)
+        self.assertEqual(result["events"].count("sent:bonjour"), 1)
+        self.assertEqual(result["events"][-1], "sent:bonjour")
+        self.assertEqual(result["outbox"], [])
+
+    def test_200_html_sans_suite_reste_garde(self):
+        result = self.run_outbox({"steps": ["bonjour"], "posts": [
+            {"status": 200, "body": "<html>proxy</html>"}]})
+        self.assertNotIn("sent:bonjour", result["events"])
+        [kept] = result["outbox"]
+        self.assertEqual(kept["state"], "checking")
 
     def test_issue_inconnue_puis_jeton_refuse_passe_en_auth(self):
         """N (dev3) : une réconciliation sous un jeton périmé ne boucle pas."""
@@ -199,7 +222,7 @@ class ProgressOutboxTest(unittest.TestCase):
     def test_page_rouverte_serveur_pret_reprend_une_issue_inconnue(self):
         """B2 (cx3) : une entrée « checking » reprend seule à la réouverture."""
         result = self.run_outbox({"storage": entry(state="checking"), "steps": ["resume"],
-                                  "posts": [{"status": 200, "body": {}}]})
+                                  "posts": [{"status": 200, "body": ACK}]})
         self.assertEqual([p["key"] for p in self.posted(result)], ["web-kept-0001"])
         self.assertEqual(result["events"][-1], "sent:bonjour")
         self.assertEqual(result["outbox"], [])
@@ -207,8 +230,8 @@ class ProgressOutboxTest(unittest.TestCase):
     def test_second_message_avant_l_accuse_n_efface_pas_le_premier(self):
         """B2 (cx3) : chaque message garde sa clé ; les deux finissent acquittés."""
         result = self.run_outbox({"steps": ["premier", "second"], "posts": [
-            {"status": 503, "body": "busy"}, {"status": 200, "body": {}},
-            {"status": 200, "body": {}}]})
+            {"status": 503, "body": "busy"}, {"status": 200, "body": ACK},
+            {"status": 200, "body": ACK}]})
         posts = self.posted(result)
         keys = {}
         for item in posts:
@@ -222,7 +245,7 @@ class ProgressOutboxTest(unittest.TestCase):
 
     def test_second_message_pendant_une_issue_inconnue_garde_les_deux(self):
         result = self.run_outbox({"steps": ["premier", "second"], "posts": [
-            {"status": 500, "body": "may have been delivered"}, {"status": 200, "body": {}}]})
+            {"status": 500, "body": "may have been delivered"}, {"status": 200, "body": ACK}]})
         self.assertEqual([(m["text"], m["state"]) for m in result["outbox"]],
                          [("premier", "checking")])
         self.assertIn("sent:second", result["events"])
@@ -249,13 +272,13 @@ class ProgressOutboxTest(unittest.TestCase):
         [kept] = result["outbox"]
         self.assertEqual(kept["state"], "auth")
         again = self.run_outbox({"storage": {PREFIX + "a1\n" + kept["key"]: json.dumps(kept)},
-                                 "steps": ["resume"], "posts": [{"status": 200, "body": {}}]})
+                                 "steps": ["resume"], "posts": [{"status": 200, "body": ACK}]})
         self.assertEqual([p["key"] for p in self.posted(again)], ["web-kept-0001"])
         self.assertEqual(again["outbox"], [])
 
     def test_meme_texte_renvoye_reprend_la_meme_cle(self):
         result = self.run_outbox({"storage": entry(state="refused", refused="x"),
-                                  "steps": ["bonjour"], "posts": [{"status": 200, "body": {}}]})
+                                  "steps": ["bonjour"], "posts": [{"status": 200, "body": ACK}]})
         self.assertEqual([p["key"] for p in self.posted(result)], ["web-kept-0001"])
 
     def test_message_trop_ancien_oublie(self):

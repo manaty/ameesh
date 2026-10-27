@@ -654,6 +654,47 @@ class ChatReconcileTest(PgTestCase):
         self.assertEqual(data["result"]["message_id"], first["out"]["message_id"])
         self.assertEqual(self.texts(), ["bonjour"])
 
+    def test_rejeu_apres_la_purge_de_la_reservation_un_seul_courrier(self):
+        """B1 (qa-01, gel #21556) : la page garde clé et corps 7 jours, la
+        réservation est purgée après 24 h : le même envoi est rejoué depuis
+        le courrier de sa clé, jamais refait."""
+        status, first, _r = self.act()
+        self.assertEqual(status, 200)
+        self.db.execute("delete from api_idempotency")       # la purge de 24 h
+        status, data, replayed = self.act()
+        self.assertEqual((status, replayed), (200, True))
+        self.assertEqual(data["result"]["message_id"], first["result"]["message_id"])
+        self.assertEqual(len(self.mails()), 1)
+        self.assertEqual(self.texts(), ["bonjour"])
+        self.assertEqual(self.act()[:1], (200,))                # rejeu stocké
+        self.assertEqual(len(self.mails()), 1)
+
+    def test_meme_cle_autre_texte_apres_la_purge_refusee(self):
+        self.assertEqual(self.act()[0], 200)
+        self.db.execute("delete from api_idempotency")
+        other = {"text": "autre chose"}
+        status, data, _r = serve.act(self.ctx, self.db, self.action, self.params, other,
+                                     self.KEY, serve.fingerprint("/api/v1/agents/a1/chat",
+                                                                 other))
+        self.assertEqual((status, data["error"]), (422, "idempotency_mismatch"))
+        self.assertEqual(len(self.mails()), 1)
+
+    def test_collision_sous_la_cle_avec_un_autre_texte_refusee_sans_reflet(self):
+        """B (cx1, gel #21581) : le dépôt sous une clé déjà prise (0497) rend
+        le courrier existant seulement s'il porte ce texte et ce lot ; sinon
+        422, aucun reflet du nouveau texte."""
+        self.assertEqual(self.act()[0], 200)
+        ctx = dataclasses.replace(self.ctx, idempotency_key=self.KEY)
+        with self.assertRaises(serve_actions.ActionError) as caught:
+            serve_actions._chat(ctx, self.db, self.params, {"text": "autre chose"})
+        self.assertEqual((caught.exception.status, caught.exception.code),
+                         (422, "idempotency_mismatch"))
+        self.assertEqual(len(self.mails()), 1)
+        self.assertEqual(self.texts(), ["bonjour"])
+        same = serve_actions._chat(ctx, self.db, self.params, {"text": "bonjour"})
+        self.assertEqual(same["message_id"], self.db.query("select id from agent_mailbox")[0]["id"])
+        self.assertEqual(self.texts(), ["bonjour"])
+
     def test_un_autre_index_unique_n_est_pas_pris_pour_un_rejeu(self):
         error = DbError("duplicate", sqlstate="23505", constraint="autre_idx")
         with mock.patch.object(mail, "send", side_effect=error):
