@@ -129,11 +129,24 @@ _PLAIN_ARTIFACT_RE = re.compile(
     r"((?:knowledge|docs|src|ameesh|scripts|tests)/[^\s,;)]+)", re.I)
 _FULL_SHA_RE = re.compile(r"\b([0-9a-fA-F]{40})\b")
 _COMMENT_REF_RE = re.compile(r"#issuecomment-([0-9]{1,20})")
-#: Le marqueur s'arrete au mot « approval » (ou « approval recorded ») : une
-#: demande (« Owner approval requested/needed/pending ») n'est pas un accord.
-_APPROVAL_RE = re.compile(
-    r"^\s*(?:#+\s*)?owner\s+approval(?:\s+recorded)?\s*(?:$|[\u2014\u2013:(.\-])",
-    re.I)
+#: Separateurs acceptes apres « Owner approval » (ou « recorded »).
+_APPROVAL_SEPARATORS = "\u2014\u2013:(-.)"
+
+
+def _owner_approval(first: str) -> bool:
+    """Un accord explicite ouvre-t-il le commentaire ?
+
+    « Owner approval requested/needed/pending » est une demande, jamais un
+    accord : apres le marqueur, seul « recorded » ou un separateur (tiret,
+    deux-points, parenthese, point) est admis, pas un verbe.
+    """
+    text = first.strip().lstrip("#").strip()
+    if not text.lower().startswith("owner approval"):
+        return False
+    rest = text[len("owner approval"):].lstrip()
+    if rest.lower().startswith("recorded"):
+        rest = rest[len("recorded"):].lstrip()
+    return not rest or rest[0] in _APPROVAL_SEPARATORS
 _REVOKE_RE = re.compile(
     r"^\s*(?:#+\s*)?(?:owner\s+)?approval\s+(revoked|withdrawn|superseded)\b", re.I)
 _ENVELOPE_RE = re.compile(r"<!--\s*ameesh-approval:v1\s*(\{.*?\})\s*-->", re.S)
@@ -743,6 +756,27 @@ def read_source(source: Source, *, transport: Any = None,
     return dict(issue), comments
 
 
+def _unknown_commit(exc: ReaderError) -> bool:
+    """La forge ne connait pas cette reference (404/422), ce n'est pas une panne."""
+    detail = exc.detail
+    return isinstance(detail, Mapping) and detail.get("status") in (404, 422)
+
+
+def _commit_payload(transport: Any, repo: str, ref: str) -> Any:
+    """Lit un commit ; une reference inconnue ne bloque que son enregistrement."""
+    try:
+        return _get_json(
+            transport,
+            "/repos/%s/commits/%s" % (repo, urllib.parse.quote(ref, safe="")),
+            what="commit")
+    except ReaderError as exc:
+        if _unknown_commit(exc):
+            raise ApprovalRefusal(
+                "revision-unresolved",
+                "the forge does not know this revision") from exc
+        raise
+
+
 def _commit_resolver(transport: Any, deadline: float) -> Callable[[str, str], str]:
     cache: dict[tuple[str, str], str] = {}
 
@@ -752,21 +786,7 @@ def _commit_resolver(transport: Any, deadline: float) -> Callable[[str, str], st
             return cache[key]
         if time.monotonic() > deadline:
             raise ReaderError("reader-timeout", "GitHub read budget exhausted")
-        try:
-            commit = _get_json(
-                transport,
-                "/repos/%s/commits/%s" % (repo, urllib.parse.quote(ref, safe="")),
-                what="commit")
-        except ReaderError as exc:
-            # Un commit inconnu ne bloque que cet enregistrement : la
-            # projection ne doit pas devenir indisponible pour un seul ref.
-            status = (exc.detail or {}).get("status") \
-                if isinstance(exc.detail, Mapping) else None
-            if status in (404, 422):
-                raise ApprovalRefusal(
-                    "revision-unresolved",
-                    "the forge does not know this revision") from exc
-            raise
+        commit = _commit_payload(transport, repo, ref)
         if not isinstance(commit, Mapping):
             raise ReaderError("reader-invalid", "commit: JSON object expected")
         sha = str(commit.get("sha") or "").lower()
@@ -949,59 +969,70 @@ def _structured_artifacts(
     return found, refusals
 
 
+def _scope_references(body: str, envelope: Mapping | None, source: Source):
+    """Rend (depot, chemin, bien_forme) pour chaque reference reconnue."""
+    if envelope is not None:
+        raw = envelope.get("artifacts", envelope.get("scope"))
+        if not isinstance(raw, list):
+            yield None, None, False
+            return
+        for item in raw:
+            if isinstance(item, Mapping):
+                yield item.get("repo"), item.get("path"), True
+            else:
+                yield None, None, False
+        return
+    for match in _BLOB_URL_RE.finditer(body):
+        yield match.group(1), match.group(3), True
+    for match in _PIN_RE.finditer(body):
+        yield match.group(1), match.group(3), True
+    for match in _PLAIN_ARTIFACT_RE.finditer(body):
+        yield source.repo, match.group(2), True
+
+
+def _scope_key(repo: Any, path: Any) -> tuple[str, str] | None:
+    """Normalise une reference en (depot, chemin), ou None si non bornable."""
+    try:
+        repo = _check_repo(repo, "scope repo")
+        path = _check_path(urllib.parse.unquote(str(path)).rstrip(".,;:`"))
+    except (TypeError, ValueError):
+        return None
+    return repo, path
+
+
 def _scope_artifacts(body: str, envelope: Mapping | None, source: Source,
                      *, strict: bool = False) -> tuple[list[Artifact], list[dict]]:
     """References d'une decision, bornees par depot + chemin.
 
     La revision est ignoree : une URL de branche ou un SHA court non resolu
-    nomme quand meme une portee (fail-closed). Le champ `revision` du scope
-    est un marqueur (0*40) ; `_apply_revocations` ne compare que depot et
-    chemin. En mode ``strict`` (approbation editee), une reference reconnue
-    mais non bornable (depot hors perimetre, chemin invalide, entree
-    structuree illisible) est remontee : l'appelant doit refuser la
-    projection, pas se contenter des references valides.
+    nomme quand meme une portee. En mode ``strict`` (approbation editee), une
+    reference reconnue mais non bornable est remontee : l'appelant refuse la
+    projection au lieu de se contenter des references valides.
     """
-    items: list[tuple[Any, Any]] = []
+    found: dict[tuple[str, str], Artifact] = {}
     unbounded: list[dict] = []
-    if envelope is not None:
-        raw = envelope.get("artifacts", envelope.get("scope"))
-        if not isinstance(raw, list):
+    overflow = False
+    for repo, path, well_formed in _scope_references(body, envelope, source):
+        if not well_formed:
             unbounded.append({"code": "approval-envelope-invalid"})
-            raw = []
-        for item in raw:
-            if isinstance(item, Mapping):
-                items.append((item.get("repo"), item.get("path")))
-            else:
-                unbounded.append({"code": "approval-envelope-invalid"})
-    else:
-        items += [(match.group(1), match.group(3))
-                  for match in _BLOB_URL_RE.finditer(body)]
-        items += [(match.group(1), match.group(3))
-                  for match in _PIN_RE.finditer(body)]
-        items += [(source.repo, match.group(2))
-                  for match in _PLAIN_ARTIFACT_RE.finditer(body)]
-    found: list[Artifact] = []
-    seen: set[tuple[str, str]] = set()
-    for repo, path in items:
-        try:
-            repo = _check_repo(repo, "scope repo")
-            path = _check_path(urllib.parse.unquote(str(path)).rstrip(".,;:`"))
-        except (TypeError, ValueError):
+            continue
+        key = _scope_key(repo, path)
+        if key is None:
             unbounded.append({"code": "path-invalid"})
             continue
-        if repo not in source.repos:
+        if key[0] not in source.repos:
             unbounded.append({"code": "out-of-scope"})
             continue
-        if (repo, path) in seen:
-            continue
-        seen.add((repo, path))
-        found.append(Artifact(repo=repo, revision="0" * 40, path=path))
-        if len(found) > MAX_ARTIFACTS_PER_COMMENT:
-            unbounded.append({"code": "approval-invalid"})
-            break
+        if key not in found:
+            if len(found) >= MAX_ARTIFACTS_PER_COMMENT:
+                overflow = True
+                break
+            found[key] = Artifact(repo=key[0], revision="0" * 40, path=key[1])
+    if overflow:
+        unbounded.append({"code": "approval-invalid"})
     if not strict:
-        return found, []
-    return found, unbounded
+        return list(found.values()), []
+    return list(found.values()), unbounded
 
 
 def _revocation_scope(body: str, envelope: Mapping | None,
@@ -1035,7 +1066,7 @@ def _normalize_comment(comment: Mapping, source: Source,
         return [], [], [{"comment": _comment_id_or_zero(comment),
                          "code": "approval-envelope-invalid"}]
     if not approval and not revocation:
-        approval = bool(_APPROVAL_RE.match(first))
+        approval = _owner_approval(first)
         revocation = bool(_REVOKE_RE.match(first))
     if not approval and not revocation:
         return [], [], []
