@@ -44,3 +44,24 @@ class QaFreezeTest(PgTestCase):
         self.assertEqual(storage.of(self.db).lot_sessions.actionable("author"), [])
         listing = storage.of(self.db).operations.listing()
         self.assertEqual(next(r for r in listing if r["name"] == "author")["actionable_lots"], 0)
+
+    def test_ok_without_freeze_still_requires_author_then_freeze_allows_merge(self):
+        # Historical verdict fixture: no frozen milestone accompanies it.
+        storage.of(self.db).work.add_milestone(
+            self.item["id"], "verdict", verdict="ok",
+            sha="a" * 40, actor="reviewer", note="historical ok without freeze")
+        rows = work.list_items(self.db)
+        plan.annotate(self.db, rows, cfg=self.cfg)
+        self.assertEqual(rows[0]["waiting_for"]["label"], "freeze by author")
+        self.assertEqual(stagnation.legacy(rows[0]["waiting_for"]), "correction")
+        listing = storage.of(self.db).operations.listing()
+        self.assertEqual(next(r for r in listing if r["name"] == "author")["actionable_lots"], 1)
+        self.assertEqual([r["id"] for r in storage.of(self.db).lot_sessions.actionable("author")],
+                         [self.item["id"]])
+        work.milestone(self.db, self.item["id"], "frozen", sha="a" * 40, actor="author")
+        rows = work.list_items(self.db)
+        plan.annotate(self.db, rows, cfg=self.cfg)
+        self.assertEqual(rows[0]["waiting_for"]["what"], "merge")
+        self.assertEqual(storage.of(self.db).lot_sessions.actionable("author"), [])
+        listing = storage.of(self.db).operations.listing()
+        self.assertEqual(next(r for r in listing if r["name"] == "author")["actionable_lots"], 0)

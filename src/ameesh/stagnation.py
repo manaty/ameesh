@@ -55,7 +55,7 @@ WAITING_FOR = ("verdict", "correction", "fusion", "decision_humaine")
 #: ce qu'un lot peut attendre, forme détaillée (`waiting.what`)
 WHATS = ("start", "build", "freeze", "verdict", "fix", "merge-approval", "merge", "merge-outcome",
          "decision", "unblock", "packet")
-_LEGACY = {"verdict": "verdict", "fix": "correction", "merge": "fusion",
+_LEGACY = {"freeze": "correction", "verdict": "verdict", "fix": "correction", "merge": "fusion",
            "decision": "decision_humaine", "merge-approval": "decision_humaine",
            "merge-outcome": "decision_humaine", "packet": "fusion"}
 #: états d'un lot qui n'attend plus rien
@@ -234,7 +234,9 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
     # canon §11 bis/#87), ou lot léger dont la relecture suit la fusion
     # (#1822, §2) ; dans tous les cas la suite est la fusion, et aucun rappel
     # ne part à un relecteur.
-    if (jalons.get("verdict_kind") == "ok" and jalons.get("verdict_current")) \
+    freeze_declared = jalons.get("freeze_declared", jalons.get("frozen") is not None)
+    if (freeze_declared and jalons.get("verdict_kind") == "ok"
+            and jalons.get("verdict_current")) \
             or jalons.get("verdict_required", True) is False:
         return _merge_wait(actions, responsible, assignee, canon=canon)
     from . import lot_class  # import tardif : lot_class lit work et canon
@@ -242,8 +244,7 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
         # §2 : la relecture d'un lot léger suit la fusion ; aucun verdict
         # n'est dû avant, même si un relecteur est désigné (#1822).
         return _merge_wait(actions, responsible, assignee, canon=canon)
-    if state == lifecycle.TO_VALIDATE and not jalons.get(
-            "freeze_declared", jalons.get("frozen") is not None):
+    if state == lifecycle.TO_VALIDATE and not freeze_declared:
         return _waiting("freeze", assignee)
     if jalons.get("pending_reviewers"):
         return _waiting("verdict", jalons["pending_reviewers"])
