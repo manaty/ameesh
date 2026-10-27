@@ -137,6 +137,50 @@ class StaleSnapshotTest(unittest.TestCase):
         self.assertEqual([type(e) for e in self.faults], [RuntimeError])
 
 
+class FaultReporterTest(unittest.TestCase):
+    """§16 (#3889) : les pannes de la page deviennent des lots `ameesh` par la
+    primitive de #3885, en arrière-plan, sans jamais lever."""
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        from ameesh import server_faults
+        directory = tempfile.mkdtemp(prefix="ameesh-progress-faults-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        self.journal = server_faults.Journal(directory + "/faults.json", "ameesh-progress",
+                                             revision="1")
+        self.opened, self.down = [], [True]
+
+        def write(fn):
+            if self.down[0]:
+                raise db_mod.Unavailable("connection refused")
+            return fn("db")
+
+        def open_lot(db, **fields):
+            self.opened.append(fields)
+            return {"lot": 7, "created": True}
+        self.reporter = progress_serve.FaultReporter(self.journal, write, report=open_lot)
+
+    def test_base_en_panne_puis_rapport_a_la_reprise(self):
+        from ameesh import server_faults
+        self.reporter.record("GET " + progress_serve.API, db_mod.Unavailable("x"),
+                             subject=server_faults.HUMAN)
+        with mock.patch("sys.stderr"):
+            self.reporter.kick(wait=True)
+        self.assertEqual(self.opened, [])
+        self.assertTrue(self.journal.pending)
+        self.down[0] = False
+        self.reporter.kick(wait=True)
+        [fields] = self.opened
+        self.assertEqual((fields["app"], fields["users"], fields["route"]),
+                         ("ameesh", 1, "ameesh-progress GET " + progress_serve.API))
+        self.assertFalse(self.journal.pending)
+        # au plus un rapport par intervalle hors panne
+        self.reporter.record("GET " + progress_serve.API, db_mod.Unavailable("x"))
+        self.reporter.kick(wait=True, every=3600)
+        self.assertEqual(len(self.opened), 1)
+
+
 class ServeTest(ServerCase):
     def test_lie_a_127_0_0_1_seulement(self):
         self.assertEqual(self.server.server_address[0], "127.0.0.1")

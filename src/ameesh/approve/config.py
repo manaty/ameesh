@@ -176,6 +176,10 @@ class ApproveConfig:
     #: quand elle est ouverte ; fichier privé 0600, hors de portée des agents,
     #: distinct du jeton de service.
     login_token_file: str = _expand(DEFAULT_LOGIN_TOKEN_FILE)
+    #: §16 (#3889) : jeton de LECTURE du journal des pannes (`GET
+    #: /fingerprints`, lu par la passe `fingerprints` de #3885) ; vide (défaut)
+    #: = route fermée. Fichier 0600, distinct des deux autres jetons.
+    fingerprints_token_file: str = ""
     #: utiliser le dernier élément de X-Forwarded-For comme IP du client (à
     #: n'activer que derrière un mandataire qui pose cet en-tête)
     trust_forwarded: bool = False
@@ -334,6 +338,11 @@ class ApproveConfig:
             raise ApproveConfigError(
                 "login_token_file must be DISTINCT from token_file: the team service token, "
                 "readable by every agent of the team, cannot open a connection challenge")
+        others = {_expand(path) for path in (self.token_file, self.login_token_file) if path}
+        if self.fingerprints_token_file and _expand(self.fingerprints_token_file) in others:
+            raise ApproveConfigError(
+                "fingerprints_token_file must be DISTINCT from token_file and "
+                "login_token_file: it only reads the server-fault journal")
         return replace(self, origins=origins, reserved_zones=_names(self.reserved_zones),
                        reserved_hosts=_names(self.reserved_hosts))
 
@@ -376,6 +385,7 @@ _ENV = {
     "AMEESH_APPROVE_PORT": "port",
     "AMEESH_APPROVE_TOKEN_FILE": "token_file",
     "AMEESH_APPROVE_LOGIN_TOKEN_FILE": "login_token_file",
+    "AMEESH_APPROVE_FINGERPRINTS_TOKEN_FILE": "fingerprints_token_file",
     "AMEESH_APPROVE_STATE": "state_dir",
     "AMEESH_APPROVE_PROPOSALS": "proposals_dir",
     "AMEESH_APPROVE_LEVEL": "level",
@@ -385,7 +395,7 @@ _ENV = {
     "AMEESH_APPROVE_TLS_CERT": "tls_cert",
     "AMEESH_APPROVE_TLS_KEY": "tls_key",
 }
-_PATHS = ("token_file", "login_token_file", "state_dir", "proposals_dir", "tls_cert", "tls_key")
+_PATHS = ("token_file", "login_token_file", "fingerprints_token_file", "state_dir", "proposals_dir", "tls_cert", "tls_key")
 
 
 def _coerce(name: str, value):
@@ -473,6 +483,12 @@ def read_login_token(path: str) -> str:
     return httpkit.read_token_file(path, what="login token",
                                    hint="ameesh-approve gen-token --login",
                                    error=ApproveConfigError)
+
+
+def read_fingerprints_token(path: str) -> str:
+    """Lit le jeton de lecture du journal des pannes (§16, #3889) ; mêmes contrôles."""
+    return httpkit.read_token_file(path, what="fingerprints token",
+                                   hint="ameesh-approve gen-token", error=ApproveConfigError)
 
 
 def write_service_token(path: str) -> str:

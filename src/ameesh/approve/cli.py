@@ -73,6 +73,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         # L232d (avis B1) : l'API des défis n'est ouverte qu'au porteur du
         # jeton dédié, lu ici une fois (mêmes contrôles de fichier privé).
         login_token = config_mod.read_login_token(cfg.login_token_file)
+    # §16 (#3889) : GET /fingerprints n'est ouvert qu'au porteur de son jeton
+    fingerprints_token = (config_mod.read_fingerprints_token(cfg.fingerprints_token_file)
+                          if cfg.fingerprints_token_file else None)
     tls = None
     if cfg.tls:
         from .tls import TlsReloader
@@ -91,7 +94,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             print("warning: %s; POST /requests will answer 503 while it is missing" % exc,
                   file=sys.stderr)
         service = ApproveService(cfg, db, source, service_token=token,
-                                 login_token=login_token, db_lock=lock)
+                                 login_token=login_token, db_lock=lock,
+                                 fingerprints_token=fingerprints_token)
         server = make_server(service, tls=tls)
         if tls is not None and hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, lambda _sig, _frame: tls.request_reload())
@@ -106,6 +110,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print("login API (connection challenges): %s"
               % ("open (dedicated login token)" if login_token is not None else "closed"),
               file=sys.stderr)
+        print("server-fault journal (GET /fingerprints): %s"
+              % ("open (dedicated read token)" if fingerprints_token is not None
+                 else "closed"), file=sys.stderr)
         try:
             server.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
