@@ -179,7 +179,7 @@ below.
 | B5 | B4+70 min | third wake, gap over 1 h: **the one-hour-cache question**, same split; then schedule the controlled unit restart |
 | B5b | B5+5 min | lease after the restart: epoch increment, old PID dead, new PID, same session, `resident=on` |
 | B5c | B5b+5 min | controlled silent resident: schedule `SIGSTOP` of the resident PID 60 s after the turn |
-| B5d | B5c+90 s | pre-turn probe: the silent process must not serve the turn; journal `liveness probe failed` / `silent`, process stopped, turn one-per-event (60 s backoff) |
+| B5d | B5c+90 s | pre-turn probe: the silent process must not serve the turn; journal `liveness probe failed` / `silent`, process stopped; the turn is one-per-event while the 60 s backoff holds, a restart otherwise |
 | B6 | T0+24 h | 24 h cost, cache, memory, dormant runs; then `resident=off` |
 | B7 | B6+5 min | return: `resident=off`, no resident process, one-per-event turn; sampler and runner stopped |
 
