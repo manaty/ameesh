@@ -2779,6 +2779,45 @@ class FreezeReadingOutsideTransactionTest(_ActivationFixture, PgTestCase):
                         notes)
         self.assertEqual(designated(work.get(self.db, self.lot)), [])
 
+    def test_a_carried_freeze_defers_the_superseded_notification(self):
+        # #3948 B cx3 : les chemins `carried` et `waiver` sortent avant de
+        # renseigner la lecture d'exclusion. La notification des anciens
+        # blocages doit être différée après le COMMIT : jamais
+        # `_excluded_on_freeze` (lecture de tous les gels antérieurs) sous le
+        # verrou du gel.
+        self.db.execute(
+            "INSERT INTO work_item_milestones"
+            " (work_item_id, kind, sha, actor, at)"
+            " VALUES (%s, 'frozen', %s, 'author', now() - interval '1 hour')",
+            (self.lot, self.base))
+        self.db.execute(
+            "INSERT INTO work_item_milestones"
+            " (work_item_id, kind, sha, actor, verdict, at)"
+            " VALUES (%s, 'verdict', %s, 'r1', 'blocked',"
+            "         now() - interval '1 hour')",
+            (self.lot, self.base))
+        calls = []
+
+        def excluded(cfg, db, item, freeze, **kwargs):
+            calls.append(freeze_gate._in_transaction(self.db))
+            return set()
+
+        shape = {"state": "carried", "reviewers": [], "freeze": {}}
+        with mock.patch.object(act, "carried_plan",
+                               return_value={"result": "would-carry"}), \
+                mock.patch.object(act, "_carried_in_transaction",
+                                  return_value=shape), \
+                mock.patch.object(act, "_excluded_on_freeze",
+                                  side_effect=excluded):
+            row = work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
+                                 actor="author")
+        self.assertEqual(row["kind"], "frozen")
+        self.assertEqual(calls, [False],
+                         "la notification a relu les auteurs sous le verrou")
+        recipients = [row["recipient"] for row in self.db.query(
+            "SELECT recipient FROM agent_mailbox ORDER BY id")]
+        self.assertIn("r1", recipients)
+
 
 class FreezeProvisionalProofTest(_ActivationFixture, PgTestCase):
     """#3948 B2 — le reçu du jalon provisoire n'est jamais lu.

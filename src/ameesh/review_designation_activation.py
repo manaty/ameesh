@@ -3026,34 +3026,21 @@ def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping, *,
             if str(row.get("name") or "").strip()}
 
 
-def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mapping,
-                              threads: list, *, cfg=None,
-                              excluded: set[str] | None = None,
-                              fetch: bool = True) -> None:
-    """Notifie le relecteur dont le blocage portait sur une tête antérieure.
+def _superseded_candidates(db, item: Mapping, freeze: Mapping,
+                           outcome: Mapping) -> tuple:
+    """`(lot, gel, sha, candidats)` de la notification #2681, sans lecture Git.
 
-    #2681 : la porte ne lit que les verdicts de la tête gelée ; un blocage
-    posé sur une tête antérieure ne bloque plus, et un `ok` indépendant sur la
-    nouvelle tête suffit. Le relecteur qui a bloqué doit le savoir : un
-    `notify` par (lot, gel, relecteur), jamais un doublon, et pas de courrier
-    quand sa désignation du gel le prévient déjà. Une lecture impossible ne
-    perd jamais un gel : la notification est au mieux.
-
-    #2812 : on n'invite pas un agent que la porte écarte sur cette tête — un
-    auteur de la plage gelée, y compris un relecteur dont la correction est un
-    commit de la tête (#2888). `excluded` est la lecture déjà faite par la
-    désignation ; à défaut (`None`), elle est refaite ici, et son échec laisse
-    le courrier historique.
-
-    `fetch=False` (#3836) interdit le rapatriement par la forge : la
-    notification tourne dans la transaction du gel et ne doit jamais y attendre
-    le réseau."""
+    Un candidat est le dernier verdict d'un acteur qui a bloqué une **autre**
+    tête et que la désignation du gel ne prévient pas déjà. La lecture est
+    purement base de données : l'appelant décide quand la preuve d'exclusion
+    (Git) est nécessaire, et ne la lance jamais sous le verrou du gel (#3948
+    B cx3)."""
     lot = int((item or {}).get("id") or 0)
     freeze_id = int((freeze or {}).get("id") or 0)
     sha = str((freeze or {}).get("sha") or "").strip().lower()
     state = str((outcome or {}).get("state") or "")
     if not lot or not freeze_id or not sha or state in ("unavailable", "stale"):
-        return
+        return lot, freeze_id, sha, []
     rows = storage.of(db).work.milestones(lot, None)
     latest: dict = {}
     for row in rows or ():
@@ -3083,6 +3070,34 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
             # du gel envoie déjà son propre courrier au relecteur
             continue
         candidates.append((key, row, mark_sha))
+    return lot, freeze_id, sha, candidates
+
+
+def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mapping,
+                              threads: Optional[list], *, cfg=None,
+                              excluded: set[str] | None = None,
+                              fetch: bool = True) -> None:
+    """Notifie le relecteur dont le blocage portait sur une tête antérieure.
+
+    #2681 : la porte ne lit que les verdicts de la tête gelée ; un blocage
+    posé sur une tête antérieure ne bloque plus, et un `ok` indépendant sur la
+    nouvelle tête suffit. Le relecteur qui a bloqué doit le savoir : un
+    `notify` par (lot, gel, relecteur), jamais un doublon, et pas de courrier
+    quand sa désignation du gel le prévient déjà. Une lecture impossible ne
+    perd jamais un gel : la notification est au mieux.
+
+    #2812 : on n'invite pas un agent que la porte écarte sur cette tête — un
+    auteur de la plage gelée, y compris un relecteur dont la correction est un
+    commit de la tête (#2888). `excluded` est la lecture déjà faite par la
+    désignation ; à défaut (`None`), elle est refaite ici, et son échec laisse
+    le courrier historique.
+
+    `fetch=False` (#3836) interdit le rapatriement par la forge : la
+    notification tourne dans la transaction du gel et ne doit jamais y attendre
+    le réseau. `threads=None` écrit le courrier dans la transaction courante
+    (chemin différé après commit, #3948) ; une liste le diffère à son tour."""
+    lot, freeze_id, sha, candidates = _superseded_candidates(
+        db, item, freeze, outcome)
     if not candidates:
         return
     if excluded is None:
@@ -3120,6 +3135,33 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
                   after_commit=threads)
 
 
+def _deferred_superseded(cfg, lot: int, freeze: Mapping, result: Mapping):
+    """La notification #2681 rejouée **après** le COMMIT du gel (#3948 B cx3).
+
+    Les chemins `carried` et `waiver` de `_designate_in_transaction` sortent
+    avant de renseigner la lecture d'exclusion. La notification ne doit pas
+    refaire `_excluded_on_freeze` sous le verrou du gel : un lot réaligné à
+    nombreux gels y relancerait `_carried_from_previous` plus de deux minutes,
+    le défaut que ce lot corrige. La preuve d'exclusion est donc lue après
+    commit (autocommit, aucun verrou tenu), puis la note et le courrier
+    s'écrivent ensemble dans une transaction courte.
+    """
+    def notify(db_cfg, db):
+        try:
+            item = work.get(db, int(lot)) or {"id": int(lot)}
+            candidates = _superseded_candidates(db, item, freeze, result)[3]
+            if not candidates:
+                return
+            excluded = _excluded_on_freeze(cfg, db, item, freeze, fetch=False)
+            with db.transaction() as tx:
+                _notify_superseded_blocks(tx, item, freeze, result, None,
+                                          cfg=cfg, excluded=excluded,
+                                          fetch=False)
+        except Exception:  # noqa: BLE001 - notification au mieux, gel gardé
+            pass
+    return notify
+
+
 def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                              threads: list, carried: Optional[Mapping] = None,
                              target=None, freezing: bool = False,
@@ -3134,12 +3176,24 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     make unreviewable raises before any designation write and rolls the
     milestone back; a replay of an existing freeze leaves it False.
     `prepared` (#3948) is the pre-transaction reading, handed to the body
-    unchanged so no Git reading runs under the freeze's lock."""
+    unchanged so no Git reading runs under the freeze's lock. Quand le corps
+    sort par un chemin sans lecture préparée (`carried`, `waiver`), la
+    notification #2681 est différée après le COMMIT : `_excluded_on_freeze`
+    relit les gels antérieurs et ne doit jamais tourner sous le verrou du gel
+    (#3948 B cx3)."""
     reading: dict = {}
     result = _designate_in_transaction(cfg, tx, lot, milestone=milestone,
                                        threads=threads, carried=carried,
                                        reading=reading, target=target,
                                        freezing=freezing, prepared=prepared)
+    if (reading.get("excluded") is None
+            and str(result.get("state") or "") not in ("unavailable", "stale")):
+        # #3948 B cx3 : pas de lecture préparée sur ces chemins ; la
+        # notification est au mieux et se rejoue hors transaction.
+        threads.append(_deferred_superseded(cfg, int(lot),
+                                            dict(milestone or {}),
+                                            dict(result)))
+        return result
     try:
         item = work.get(tx, int(lot)) or {"id": int(lot)}
         _notify_superseded_blocks(tx, item, milestone or {}, result, threads,
