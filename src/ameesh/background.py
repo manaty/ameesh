@@ -267,6 +267,8 @@ class Tracker:
     STRAYS_EVERY_S = 60.0
     UNKNOWN_ZOMBIES_WARN = 32
     CLEANUP_SECTION_S = 2.0
+    #: confirmation de l'arrêt (SIGSTOP) avant le signal, dans la section
+    FREEZE_CONFIRM_S = .5
     #: fin de tour : délai laissé aux processus qui se ferment avec le
     #: harnais (serveurs MCP) avant de parler de travail de fond
     SETTLE_S = 2.0
@@ -713,7 +715,7 @@ class Tracker:
                     if not remaining:
                         continue
                     stop_attempted = True
-                    if not handle.freeze(timeout=min(.5, remaining)):
+                    if not handle.freeze(timeout=min(self.FREEZE_CONFIRM_S, remaining)):
                         entry.unverified |= bool(handle.live())
                         note = "stop not confirmed; no termination signal"
                         continue
