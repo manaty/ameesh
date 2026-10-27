@@ -304,6 +304,16 @@ class ReponseTest(_Base):
         self.assertEqual(self.lot_state(), "waiting_human")
         self.assertEqual(self.db.query("SELECT id FROM agent_mailbox WHERE kind = 'reply'"), [])
 
+    def test_une_panne_entre_retrait_et_lot_annule_le_retrait(self):
+        """#3892 : le retrait et la libération du lot sont une seule transaction."""
+        view = self.ask()
+        with mock.patch.object(decisions, "_release_lot",
+                               side_effect=RuntimeError("panne simulée")):
+            with self.assertRaises(RuntimeError):
+                decisions.withdraw(self.cfg, self.db, view["id"], requester="orch")
+        self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")
+        self.assertEqual(self.lot_state(), "waiting_human")
+
     def test_courrier_rejoue_par_cle_d_idempotence(self):
         """#3892 : le même corps sous la même clé n'est déposé qu'une fois."""
         from ameesh import mail
