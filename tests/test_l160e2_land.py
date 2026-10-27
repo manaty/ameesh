@@ -314,19 +314,22 @@ class CarriedLeaseTest(_Land):
         self.assertIsNone(self.locks.held["p:main"][0], "and releases the lease")
 
     def test_a_dead_executor_frees_the_target_at_the_short_bound(self):
-        with mock.patch.object(land, "LAND_PASS_TTL_S", 0.3):
+        # #4084: a 0.3 s pass TTL let a late beat lose the lease mid-pass
+        with mock.patch.object(land, "LAND_PASS_TTL_S", 1.0):
             self.pending({})
             # the executor dies: its daemon heartbeat dies with it
             land._CARRIED.pop(("p:main", "runner-1")).stop()
-            time.sleep(0.5)
+            time.sleep(1.3)
             self.assertIsNotNone(self.locks.land_lock("p:main", "runner-2", 60),
                                  "another executor takes the target at the short bound")
 
     def test_a_carried_heartbeat_stops_at_the_train_ttl(self):
-        with mock.patch.object(land, "LAND_PASS_TTL_S", 0.3), \
-                mock.patch.object(land, "LOCK_TTL_S", 0.4):
+        # #4084: the pass itself must outlive a late beat on a loaded bench;
+        # freed at most LOCK_TTL_S + LAND_PASS_TTL_S after the pass
+        with mock.patch.object(land, "LAND_PASS_TTL_S", 1.0), \
+                mock.patch.object(land, "LOCK_TTL_S", 1.5):
             self.pending({})
-            time.sleep(1.2)
+            time.sleep(3.0)
             self.assertIsNotNone(self.locks.land_lock("p:main", "runner-2", 60),
                                  "a stuck executor never holds it beyond LOCK_TTL_S")
 
