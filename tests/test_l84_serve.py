@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 
 from ameesh import db as db_mod
-from ameesh import fil, httpkit, mesh_cli, registry, serve, storage, work
+from ameesh import fil, httpkit, mesh_cli, registry, serve, server_faults, storage, work
 from ameesh import resources as res
 from ameesh import version as package_version
 
@@ -465,6 +465,34 @@ class FaultJournalTest(ServerMixin, unittest.TestCase):
         self.assertEqual((entry["route"], entry["code"]),
                          ("ameesh-serve GET /api/v1/projects", "EXCEPTION:RuntimeError"))
         self.assertNotIn("10.1.2.3", json.dumps(self.faults()))
+
+
+class FaultReporterTest(unittest.TestCase):
+    """#3892 : le journal nourrit la primitive de #3885, une fois, sans double lot."""
+
+    def test_the_reporter_feeds_the_primitive_once(self):
+        tmp = tempfile.mkdtemp(prefix="l84-reporter-")
+        journal = server_faults.Journal(os.path.join(tmp, "faults-serve.json"),
+                                        "ameesh-serve")
+        reported = []
+
+        def report(db, **kwargs):
+            reported.append(kwargs)
+            return {"id": 7, "created": True}
+
+        reporter = serve.FaultReporter(journal, lambda fn: fn(None), report=report)
+        reporter.record("GET /api/v1/lots/{id}",
+                        db_mod.Unavailable("database at 10.1.2.3 refused"))
+        reporter.kick(wait=True)
+        self.assertEqual(len(reported), 1)
+        entry = reported[0]
+        self.assertEqual((entry["app"], entry["route"], entry["code"]),
+                         ("ameesh", "ameesh-serve GET /api/v1/lots/{id}",
+                          "EXCEPTION:Unavailable"))
+        self.assertEqual((entry["count"], entry["users"]), (1, 0))
+        # entrée rapportée : un second rapport ne rouvre pas de lot
+        reporter.kick(wait=True)
+        self.assertEqual(len(reported), 1)
 
 
 if __name__ == "__main__":
