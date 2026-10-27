@@ -509,6 +509,9 @@ class TerminalClient:
         self._queue: queue.Queue = queue.Queue(maxsize=64)
         self._eof = threading.Event()
         self._thread: threading.Thread | None = None
+        #: #3892 : lignes tapées pas encore déposées (base coupée), dans l'ordre
+        self.outbox: list[dict] = []
+        self._outbox_warned: set[str] = set()
 
     # -- identité ----------------------------------------------------------
 
@@ -622,6 +625,11 @@ class TerminalClient:
         if not text:
             return True
         if text in CLIENT_QUIT:
+            if self.outbox:
+                # #3892 : ne jamais quitter en silence sur une ligne gardée.
+                self.view.line("  … %d message(s) not sent yet: kept and retried "
+                               "(Ctrl-C to leave anyway)" % len(self.outbox))
+                return True
             return False
         if text in CLIENT_HELP:
             self.view.line(CLIENT_HELP_TEXT)
@@ -636,8 +644,13 @@ class TerminalClient:
         return self.send(text)
 
     def send(self, text: str, *, urgent: bool = False) -> bool:
-        """Dépose un message pour l'agent ; rend False seulement sur `!quit`."""
-        from . import fil, mail
+        """Dépose un message pour l'agent ; rend False seulement sur `!quit`.
+
+        #3892 (§16) : une panne de base au dépôt ne quitte plus le client et
+        ne perd pas la ligne. Elle est gardée, avec une clé d'idempotence
+        stable, et renvoyée tant que la base ne répond pas ; un renvoi après
+        une réponse perdue est rejoué, jamais déposé deux fois.
+        """
         if self.read_only:
             self.view.line("  ! read-only: %s" % self.read_only)
             return True
@@ -645,27 +658,63 @@ class TerminalClient:
         if not text:
             return True
         payload: dict = {"human": True} if self.human else {}
-        if payload:
-            from . import identity, resident_queue
-            binding = identity.resolve_binding(self.cfg, getattr(self, "db", None))
-            if binding.source == "none":
-                user, host = resident_queue.local_account(self.cfg)
-                payload["human_account"] = "%s@%s" % (user or "?", host or "?")
         if urgent and self._may_interrupt():
             payload["urgent"] = True
         elif urgent:
             self.view.line("  ! %s may not interrupt a turn (AMEESH_INTERRUPT_SENDERS): "
                            "delivered as a normal message" % self.sender)
-        try:
-            message_id = mail.send(self.db, self.sender, self.agent, text, host=self.cfg.host,
-                                   kind="event" if payload.get("urgent") else "notify",
-                                   payload=payload or None)
-        except fil.UnreadableBody as exc:
-            self.view.line("  ! message not dropped: %s" % exc)
-            return True
-        self.view.line("  → sent to %s (mail #%d%s)" % (
-            self.agent, message_id, ", urgent" if payload.get("urgent") else ""))
+        self.outbox.append({
+            "text": text, "urgent": bool(payload.get("urgent")),
+            "payload": payload,
+            # stable pour ce texte : un rejeu après une réponse perdue retombe
+            # sur le message déjà déposé au lieu d'en déposer un second.
+            "key": "chat:%s:%s" % (self.agent, os.urandom(8).hex()),
+        })
+        self.flush_outbox()
         return True
+
+    def _send_payload(self, item: dict) -> dict:
+        """Le corps du message, complété une seule fois (compte humain local)."""
+        payload = dict(item["payload"])
+        if payload and "human_account" not in payload:
+            from . import identity, resident_queue
+            binding = identity.resolve_binding(self.cfg, getattr(self, "db", None))
+            if binding.source == "none":
+                user, host = resident_queue.local_account(self.cfg)
+                payload["human_account"] = "%s@%s" % (user or "?", host or "?")
+                item["payload"] = payload
+        return payload
+
+    def flush_outbox(self) -> None:
+        """Renvoie les lignes gardées, dans l'ordre ; ne lève jamais."""
+        from . import db as db_mod, fil, mail, storage
+        while self.outbox:
+            item = self.outbox[0]
+            try:
+                payload = self._send_payload(item)
+                message_id = mail.send(
+                    self.db, self.sender, self.agent, item["text"], host=self.cfg.host,
+                    kind="event" if item.get("urgent") else "notify",
+                    payload=payload or None, idempotency_key=item["key"])
+            except fil.UnreadableBody as exc:
+                self.outbox.pop(0)
+                self.view.line("  ! message not dropped: %s" % exc)
+                continue
+            except storage.MailboxRefused as exc:
+                self.outbox.pop(0)
+                self.view.line("  ! not sent: %s" % exc)
+                continue
+            except (db_mod.DbError, OSError) as exc:
+                if item["key"] not in self._outbox_warned:
+                    self._outbox_warned.add(item["key"])
+                    self.view.line(
+                        "  … sending: the line is kept and will be resent when the "
+                        "database answers (%s)" % db_mod.explain(exc, 120))
+                return
+            self.outbox.pop(0)
+            self._outbox_warned.discard(item["key"])
+            self.view.line("  → sent to %s (mail #%d%s)" % (
+                self.agent, message_id, ", urgent" if item.get("urgent") else ""))
 
     def interrupt(self, text: str) -> bool:
         """`!stop` : le même chemin que `ameesh interrupt`, refusé sans habilitation."""
@@ -719,6 +768,9 @@ class TerminalClient:
         try:
             return self.loop(cursor)
         except KeyboardInterrupt:
+            if self.outbox:
+                self.view.line("  ! %d message(s) not sent: the database did not answer; "
+                               "they are lost with this session" % len(self.outbox))
             self.view.line("")
             return 0
 
@@ -732,8 +784,13 @@ class TerminalClient:
             for line in self._drain():
                 if not self.handle(line):
                     return 0
+            # #3892 : une ligne gardée est retentée à chaque tour, sans quitter
+            # le client ; l'entrée terminée, on reste tant qu'elle n'est pas
+            # déposée (Ctrl-C laisse sortir explicitement).
+            self.flush_outbox()
             if self._eof.is_set() and self._queue.empty():
-                return 0
+                if not self.outbox:
+                    return 0
             wakeup = None
             if listener is None:
                 self.sleep(self.poll)

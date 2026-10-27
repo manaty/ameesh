@@ -1293,6 +1293,17 @@ class Mailbox(Domain):
         """Dépose un message ; rend id, created_ts et les projets du fil
         (`sender_project`, `recipient_project`) des deux agents."""
 
+    def sent_with_key(self, sender: str, key: str) -> dict | None:
+        """#3892 : le message déjà déposé par `sender` sous cette clé
+        d'idempotence (`payload.idempotency_key`), ou None.
+
+        Lecture seule, pour rejouer un envoi dont la réponse s'est perdue
+        (panne de base au milieu du chat terminal) : le même corps n'est pas
+        déposé deux fois. Pas une opération du contrat médié (le client
+        terminal lit sa propre base) : un pilote qui ne l'implémente pas lève
+        NotImplementedError et l'appelant retombe sur un envoi ordinaire."""
+        raise NotImplementedError
+
     @abc.abstractmethod
     def unread(self, recipient: str, limit: int) -> list[dict]:
         """Messages non remis, du plus ancien au plus récent, avec leur lot
@@ -3624,6 +3635,18 @@ class Decisions(Domain):
         (`answered` | `delivered`), `record` fusionné dans `payload.decision`
         (état, réponse ou retrait). Rend la ligne close, ou None (déjà close,
         inconnue) — rien n'est écrit."""
+
+    def reply_for(self, decision_id: int, *, sender: str | None = None) -> dict | None:
+        """#3892 : le courrier de réponse déjà déposé pour `decision_id`
+        (`kind = 'reply'`, `payload.decision_answer.decision`), ou None.
+
+        Il rend le même rejeu possible après une panne entre la réponse
+        gardée et son courrier : le courrier manquant est renvoyé, le courrier
+        déjà déposé n'est jamais doublé. `sender` borne la lecture au
+        répondeur. Pas une opération du contrat médié : un pilote qui ne
+        l'implémente pas lève NotImplementedError et l'appelant envoie le
+        courrier sous une clé d'idempotence."""
+        raise NotImplementedError
 
     @abc.abstractmethod
     def source_mail(self, message_id: int) -> dict | None:

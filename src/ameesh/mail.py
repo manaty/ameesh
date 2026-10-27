@@ -37,6 +37,9 @@ PROJECT_SQL = _pg.PROJECT_SQL
 #: colonnes rendues pour un message (pilote Postgres ; alias de compatibilité)
 MAIL_COLUMNS = _pg.MAIL_COLUMNS
 
+#: #3892 : forme d'une clé d'idempotence d'envoi (stable, du client)
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+
 
 def send(
     db: Db,
@@ -58,6 +61,7 @@ def send(
     thread: bool = True,
     thread_meta: dict | None = None,
     after_commit: list | None = None,
+    idempotency_key: str | None = None,
 ) -> int:
     """Dépose un message pour UN destinataire, l'écrit dans son fil. Renvoie son id.
 
@@ -75,10 +79,31 @@ def send(
     destinataire — son équipe (`team`) s'il est gouverné par le canon, sinon
     son chantier —, sinon AMEESH_PROJECT, sinon `default` ; lot :
     `work_item_id`.
+
+    #3892 : `idempotency_key` (une chaîne stable du client, rangée dans
+    `payload.idempotency_key`) rejoue un envoi dont la réponse s'est perdue.
+    Un message déjà déposé par le même expéditeur sous cette clé est rendu
+    tel quel, jamais déposé une seconde fois (base locale ; un exécuteur
+    médié n'a pas cette lecture et envoie comme avant).
     """
     from .agent_names import resolve as resolve_agent_name
     sender = resolve_agent_name(sender, db=db, operation="mail.send")
     recipient = resolve_agent_name(recipient, db=db, operation="mail.send")
+    if idempotency_key is not None:
+        idempotency_key = str(idempotency_key).strip()
+        if not _IDEMPOTENCY_KEY_RE.match(idempotency_key):
+            raise ValueError("invalid idempotency key: %r" % idempotency_key)
+        if not storage.is_remote(db):
+            try:
+                existing = storage.of(db).mailbox.sent_with_key(sender, idempotency_key)
+            except NotImplementedError:
+                existing = None
+            if existing is not None:
+                return int(existing["id"])
+        payload = dict(payload or {})
+        if payload.get("idempotency_key") not in (None, idempotency_key):
+            raise ValueError("payload.idempotency_key does not match the key")
+        payload["idempotency_key"] = idempotency_key
     fil.ensure_readable(body, allow_structured)
     row = storage.of(db).mailbox.send(
         sender, recipient, body, host=host, kind=kind, payload=payload,

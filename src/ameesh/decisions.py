@@ -875,10 +875,14 @@ def _closed_reason(view: dict) -> str:
         fil.excerpt(answer.get("text") or "", 120))
 
 
-def _release_lot(db, view: dict, *, actor: str, note: str) -> dict:
+def _release_lot(db, view: dict, *, actor: str, note: str, replay: bool = False) -> dict:
     """Après la réponse (ou le retrait) : le lot revient à son état d'avant la
     demande s'il attend encore et qu'aucune autre demande ne le tient ; sinon
-    une note. Rend `{lot, state, moved, others}`."""
+    une note. Rend `{lot, state, moved, others}`.
+
+    `replay` (#3892) : une réponse identique est rejouée ; un lot déjà sorti
+    de `waiting_human`, ou retenu par une autre demande, ne reçoit pas une
+    seconde note."""
     lot = view.get("lot")
     if lot is None or not str(lot).isdigit():
         return {"lot": lot, "state": None, "moved": False, "others": 0}
@@ -887,6 +891,8 @@ def _release_lot(db, view: dict, *, actor: str, note: str) -> dict:
         return {"lot": lot, "state": None, "moved": False, "others": 0}
     others = [r for r in storage.of(db).decisions.pending_for_lot(str(lot))
               if int(r["id"]) != int(view["id"])]
+    if replay and (item["state"] != "waiting_human" or others):
+        return {"lot": int(lot), "state": item["state"], "moved": False, "others": len(others)}
     target = view.get("previous_state")
     if item["state"] == "waiting_human" and not others and target \
             and target in work.TRANSITIONS["waiting_human"]:
@@ -929,22 +935,118 @@ def answer_text(view: dict) -> str:
     return "\n".join(lines)
 
 
+class _DecisionRace(Exception):
+    """La clôture conditionnelle a perdu la course : rien n'est écrit, on relit."""
+
+
+def _same_answer(view: dict, text: str, option: str | None, human: str) -> bool:
+    """La réponse close est-elle exactement celle que l'humain re-saisit ?"""
+    answer = view.get("answer") or {}
+    return (view.get("state") == "answered"
+            and answer.get("by") == human
+            and (answer.get("text") or "").strip() == text
+            and (answer.get("option") or None) == (option or None))
+
+
+def _reply_for(db, view: dict, human: str) -> dict | None:
+    """Le courrier déjà déposé pour cette réponse, ou None (lecture locale)."""
+    try:
+        return storage.of(db).decisions.reply_for(int(view["id"]), sender=human)
+    except NotImplementedError:
+        return None
+
+
+def _answer_mail(cfg: Config, db, view: dict, *, human: str,
+                 after: list | None = None) -> tuple[int | None, str | None]:
+    """Dépose le courrier de la réponse gardée, ou rend celui déjà déposé.
+
+    Rejouable : le courrier se recompose depuis `payload.decision.answer`. Un
+    courrier manquant (panne entre la réponse et lui) est renvoyé, un courrier
+    déjà déposé n'est jamais doublé. Une panne de base lève : la transaction
+    de la réponse est annulée et la re-saisie la refait."""
+    from . import identity, mail, resident_queue
+    existing = _reply_for(db, view, human)
+    if existing is not None:
+        return int(existing["id"]), None
+    binding = identity.resolve_binding(cfg, db)
+    human_account = ""
+    if binding.source == "none":
+        user, host = resident_queue.local_account(cfg)
+        human_account = "%s@%s" % (user or "?", host or "?")
+    answer = view.get("answer") or {}
+    payload = {"human": True, "urgent": True,
+               **({"human_account": human_account} if human_account else {}),
+               "decision_answer": {"decision": view["id"], "lot": view.get("lot"),
+                                   "by": human, "channel": answer.get("channel"),
+                                   "option": answer.get("option"),
+                                   "text": answer.get("text")}}
+    try:
+        message_id = mail.send(
+            db, human, view["requester"], answer_text(view), host=cfg.host, kind=REPLY_KIND,
+            work_item_id=str(view["lot"]) if view.get("lot") is not None else None,
+            # L125 : le courrier d'un humain réveille tout de suite (jamais
+            # retenu par la fenêtre de regroupement, jamais passif). #795 : la
+            # réponse de l'owner est prioritaire (0018 §2) — elle préempte le
+            # tour du demandeur, qui repart avec elle en tête.
+            payload=payload,
+            thread_meta={"decision": view["id"], "channel": answer.get("channel")},
+            idempotency_key="decision:%d:reply" % int(view["id"]),
+            after_commit=after)
+    except (fil.UnreadableBody, storage.MailboxRefused) as exc:
+        return None, ("answer recorded, but the mail to %s was not delivered (%s): "
+                      "let them know" % (view["requester"], exc))
+    except Exception as exc:  # noqa: BLE001 - la réponse est gardée : le dire
+        if isinstance(exc, db_mod.DbError):
+            raise
+        return None, ("answer recorded, but the mail to %s was not delivered (%s): "
+                      "let them know" % (view["requester"], exc))
+    return int(message_id), None
+
+
+def _replay_answer(cfg: Config, db, view: dict, *, text: str, option: str | None,
+                   human: str, now: float) -> dict:
+    """Rejoue une réponse identique : libère le lot s'il attend encore et
+    renvoie le courrier s'il manque, sans second effet."""
+    note = ("decision #%d: identical answer replayed by %s (already recorded)"
+            % (view["id"], human))
+    if storage.is_remote(db):
+        lot = _release_lot(db, view, actor=human, note=note, replay=True)
+        message_id, warning = _answer_mail(cfg, db, view, human=human)
+        return {"decision": view, "lot": lot, "message_id": message_id,
+                "warning": warning, "replayed": True}
+    after: list = []
+    with db.transaction() as tx:
+        latest = get(tx, view["id"], now) or view
+        if not _same_answer(latest, text, option, human):
+            raise DecisionError(_closed_reason(latest))
+        view = latest
+        lot = _release_lot(tx, view, actor=human, note=note, replay=True)
+        message_id, warning = _answer_mail(cfg, tx, view, human=human, after=after)
+    for record in after:
+        record(cfg, db)
+    return {"decision": view, "lot": lot, "message_id": message_id,
+            "warning": warning, "replayed": True}
+
+
 def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel: str,
            key_path: str | None = None, approver: str | None = None, signed: bool = False,
            now: float | None = None) -> dict:
     """Enregistre la réponse de `human` (déjà identifié : `answering_human`).
 
-    Rend `{decision, lot, message_id, warning}`. DecisionError : demande
-    inconnue ou close, humain non visé, texte illisible, signature exigée
-    absente ou refusée."""
+    #3892 : la réponse et la libération du lot sont UNE transaction ; le
+    courrier se recompose depuis la réponse gardée (`_answer_mail`). Une
+    re-saisie identique est un rejeu sans double effet : ni seconde clôture,
+    ni seconde note, ni second courrier.
+
+    Rend `{decision, lot, message_id, warning}` (+ `replayed`). DecisionError :
+    demande inconnue ou close, humain non visé, texte illisible, signature
+    exigée absente ou refusée."""
     now = time.time() if now is None else float(now)
     if channel not in CHANNELS:
         raise DecisionError("unknown channel: %r" % channel)
     view = get(db, decision_id, now)
     if view is None:
         raise DecisionError("decision #%s not found (ameesh decisions)" % decision_id)
-    if view["state"] != "pending":
-        raise DecisionError(_closed_reason(view))
     if view["owner"] and view["owner"] != human:
         raise DecisionError("decision #%d is addressed to %s: %s does not answer it"
                             % (view["id"], view["owner"], human))
@@ -958,57 +1060,82 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
     if reason:
         raise DecisionError("unreadable answer — %s" % reason)
     option = match_option(view, text)
-    proof = None
-    if key_path or signed:
+    if view["state"] != "pending":
+        if _same_answer(view, text, option, human):
+            return _replay_answer(cfg, db, view, text=text, option=option,
+                                  human=human, now=now)
+        raise DecisionError(_closed_reason(view))
+    signed_requested = bool(key_path or signed)
+    if signed_requested:
         if channel == "chat":
             raise DecisionError("a signed answer is given in your terminal, not in the "
                                 "chat:\n" + signature_hint(view, text, option, human))
-        proof = _sign(db, view, text, option, human, key_path=key_path, approver=approver)
-        channel = "signed"
     elif view["needs_signature"]:
         raise DecisionError(signature_hint(view, text, option, human))
-    record = {"state": "answered", "answer": {
-        "by": human, "channel": channel, "text": text, "option": option,
-        "option_label": _option_label(view, option), "ts": round(now, 3), "host": cfg.host,
-        "proof": proof}}
-    closed = storage.of(db).decisions.close(int(view["id"]), status="answered", record=record)
-    if closed is None:
+    if signed_requested:
+        channel = "signed"
+
+    def record_for(proof) -> dict:
+        return {"state": "answered", "answer": {
+            "by": human, "channel": channel, "text": text, "option": option,
+            "option_label": _option_label(view, option), "ts": round(now, 3),
+            "host": cfg.host, "proof": proof}}
+
+    def said(view: dict) -> str:
+        if option:
+            return "option %s \"%s\"" % (option, _option_label(view, option) or "")
+        return "\"%s\"" % fil.excerpt(text, 160)
+
+    if storage.is_remote(db):
+        # Pas de transaction sur un exécuteur médié : la clôture est déjà UNE
+        # écriture conditionnelle ; le courrier garde sa clé d'idempotence et
+        # la re-saisie identique est un rejeu.
+        proof = _sign(db, view, text, option, human, key_path=key_path,
+                      approver=approver) if signed_requested else None
+        closed = storage.of(db).decisions.close(int(view["id"]), status="answered",
+                                                record=record_for(proof))
+        if closed is None:
+            latest = get(db, decision_id, now)
+            if latest is not None and _same_answer(latest, text, option, human):
+                return _replay_answer(cfg, db, latest, text=text, option=option,
+                                      human=human, now=now)
+            raise DecisionError(_closed_reason(latest) if latest else
+                                "decision #%s not found" % decision_id)
+        view = view_of(closed, now)
+        lot = _release_lot(db, view, actor=human, note="decision #%d answered by %s (%s): %s"
+                           % (view["id"], human, CHANNEL_LABELS[channel], said(view)))
+        message_id, warning = _answer_mail(cfg, db, view, human=human)
+        return {"decision": view, "lot": lot, "message_id": message_id,
+                "warning": warning, "replayed": False}
+
+    after: list = []
+    try:
+        with db.transaction() as tx:
+            proof = _sign(tx, view, text, option, human, key_path=key_path,
+                          approver=approver) if signed_requested else None
+            closed = storage.of(tx).decisions.close(int(view["id"]), status="answered",
+                                                    record=record_for(proof))
+            if closed is None:
+                # Une autre réponse a gagné : la transaction est annulée (y
+                # compris une approbation consommée), puis on relit.
+                raise _DecisionRace()
+            view = view_of(closed, now)
+            lot = _release_lot(
+                tx, view, actor=human,
+                note="decision #%d answered by %s (%s): %s"
+                     % (view["id"], human, CHANNEL_LABELS[channel], said(view)))
+            message_id, warning = _answer_mail(cfg, tx, view, human=human, after=after)
+    except _DecisionRace:
         latest = get(db, decision_id, now)
+        if latest is not None and _same_answer(latest, text, option, human):
+            return _replay_answer(cfg, db, latest, text=text, option=option,
+                                  human=human, now=now)
         raise DecisionError(_closed_reason(latest) if latest else
                             "decision #%s not found" % decision_id)
-    view = view_of(closed, now)
-    if option:
-        said = "option %s \"%s\"" % (option, _option_label(view, option) or "")
-    else:
-        said = "\"%s\"" % fil.excerpt(text, 160)
-    lot = _release_lot(db, view, actor=human, note="decision #%d answered by %s (%s): %s" % (
-        view["id"], human, CHANNEL_LABELS[channel], said))
-    out = {"decision": view, "lot": lot, "message_id": None, "warning": None}
-    from . import mail, resident_queue
-    from . import identity
-    binding = identity.resolve_binding(cfg, db)
-    human_account = ""
-    if binding.source == "none":
-        user, host = resident_queue.local_account(cfg)
-        human_account = "%s@%s" % (user or "?", host or "?")
-    try:
-        out["message_id"] = mail.send(
-            db, human, view["requester"], answer_text(view), host=cfg.host, kind=REPLY_KIND,
-            work_item_id=str(view["lot"]) if view.get("lot") is not None else None,
-            # L125 : le courrier d'un humain réveille tout de suite (jamais
-            # retenu par la fenêtre de regroupement, jamais passif). #795 : la
-            # réponse de l'owner est prioritaire (0018 §2) — elle préempte le
-            # tour du demandeur, qui repart avec elle en tête.
-            payload={"human": True, "urgent": True,
-                     **({"human_account": human_account} if human_account else {}),
-                     "decision_answer": {"decision": view["id"], "lot": view.get("lot"),
-                                         "by": human, "channel": channel, "option": option,
-                                         "text": text}},
-            thread_meta={"decision": view["id"], "channel": channel})
-    except Exception as exc:  # noqa: BLE001 - la réponse est enregistrée : le dire
-        out["warning"] = ("answer recorded, but the mail to %s was not delivered (%s): "
-                          "let them know" % (view["requester"], exc))
-    return out
+    for record in after:
+        record(cfg, db)
+    return {"decision": view, "lot": lot, "message_id": message_id,
+            "warning": warning, "replayed": False}
 
 
 def withdraw(cfg: Config, db, decision_id: int, *, requester: str, why: str | None = None,
@@ -1026,14 +1153,31 @@ def withdraw(cfg: Config, db, decision_id: int, *, requester: str, why: str | No
     why = " ".join(str(why or "").split()) or None
     record = {"state": "withdrawn", "withdrawn": {"by": requester, "why": why,
                                                   "ts": round(now, 3)}}
-    closed = storage.of(db).decisions.close(int(view["id"]), status="delivered", record=record)
-    if closed is None:
-        latest = get(db, decision_id, now)
-        raise DecisionError(_closed_reason(latest) if latest else
-                            "decision #%s not found" % decision_id)
-    view = view_of(closed, now)
-    text = "decision #%d withdrawn by %s%s" % (view["id"], requester, ": %s" % why if why else "")
-    lot = _release_lot(db, view, actor=requester, note=text)
+
+    def close_and_release(conn) -> tuple[dict, dict, dict]:
+        closed = storage.of(conn).decisions.close(int(view["id"]), status="delivered",
+                                                  record=record)
+        if closed is None:
+            raise _DecisionRace()
+        closed_view = view_of(closed, now)
+        text = "decision #%d withdrawn by %s%s" % (
+            closed_view["id"], requester, ": %s" % why if why else "")
+        lot = _release_lot(conn, closed_view, actor=requester, note=text)
+        return closed_view, lot, closed
+
+    if storage.is_remote(db):
+        view, lot, closed = close_and_release(db)
+    else:
+        # #3892 : le retrait et la libération du lot sont UNE transaction,
+        # comme la réponse ; une panne entre les deux ne laisse plus le lot
+        # en waiting_human sans sa demande.
+        try:
+            with db.transaction() as tx:
+                view, lot, closed = close_and_release(tx)
+        except _DecisionRace:
+            latest = get(db, decision_id, now)
+            raise DecisionError(_closed_reason(latest) if latest else
+                                "decision #%s not found" % decision_id)
     fil.record(cfg, db, sender=requester, recipients=[view["owner"] or OWNER_ANY],
                text="Decision #%d withdrawn by %s%s — question: \"%s\"" % (
                    view["id"], requester, " (%s)" % why if why else "",
@@ -1298,8 +1442,10 @@ def cmd_answer(cfg: Config, argv: list[str]) -> int:
         _dump(result)
         return 0
     view, answer_ = result["decision"], result["decision"]["answer"]
-    print("decision #%d: answer from %s (%s) recorded: %s\"%s\"" % (
-        view["id"], answer_["by"], CHANNEL_LABELS[answer_["channel"]],
+    replayed = bool(result.get("replayed"))
+    print("decision #%d: %s from %s (%s): %s\"%s\"" % (
+        view["id"], "identical answer replayed (already recorded)" if replayed
+        else "answer recorded", answer_["by"], CHANNEL_LABELS[answer_["channel"]],
         "option %s — " % answer_["option"] if answer_.get("option") else "", answer_["text"]))
     lot = result["lot"]
     if lot.get("moved"):
@@ -1309,8 +1455,12 @@ def cmd_answer(cfg: Config, argv: list[str]) -> int:
                                            " (%d other decision(s) pending)"
                                            % lot["others"] if lot.get("others") else ""))
     if result.get("message_id"):
-        print("answer delivered to %s (message #%d): it wakes them up"
-              % (view["requester"], result["message_id"]))
+        if replayed:
+            print("answer mail already present (message #%d): nothing sent twice"
+                  % result["message_id"])
+        else:
+            print("answer delivered to %s (message #%d): it wakes them up"
+                  % (view["requester"], result["message_id"]))
     if result.get("warning"):
         print("warning: %s" % result["warning"], file=sys.stderr)
     return 0

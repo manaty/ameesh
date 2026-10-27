@@ -259,6 +259,64 @@ class ReponseTest(_Base):
             self.answer(view["id"], "b")
         self.assertIn("already answered by human:alice", str(ctx.exception))
 
+    def test_reponse_identique_est_un_rejeu_sans_double_effet(self):
+        """#3892 : re-saisir la même réponse ne rejoue ni clôture, ni note, ni courrier."""
+        view = self.ask()
+        first = self.answer(view["id"], "a")
+        self.assertFalse(first["replayed"])
+        notes = [e["note"] for e in work.events(self.db, self.lot["id"])]
+        replies = self.db.query("SELECT id FROM agent_mailbox WHERE kind = 'reply'")
+        second = self.answer(view["id"], "a")
+        self.assertTrue(second["replayed"])
+        self.assertEqual(second["decision"]["answer"]["text"], "a")
+        self.assertEqual(second["lot"]["state"], "build")
+        self.assertEqual(second["message_id"], first["message_id"])
+        self.assertEqual([e["note"] for e in work.events(self.db, self.lot["id"])], notes)
+        self.assertEqual(
+            self.db.query("SELECT id FROM agent_mailbox WHERE kind = 'reply'"), replies)
+        # une réponse DIFFÉRENTE reste refusée, pas rejouée
+        with self.assertRaises(decisions.DecisionError) as ctx:
+            self.answer(view["id"], "b")
+        self.assertIn("already answered by human:alice", str(ctx.exception))
+
+    def test_une_panne_entre_reponse_et_courrier_est_rejouee(self):
+        """#3892 : la réponse gardée permet de renvoyer le courrier manquant."""
+        view = self.ask()
+        first = self.answer(view["id"], "a")
+        self.db.execute("DELETE FROM agent_mailbox WHERE kind = 'reply'")
+        replay = self.answer(view["id"], "a")
+        self.assertTrue(replay["replayed"])
+        self.assertIsNotNone(replay["message_id"])
+        rows = self.db.query("SELECT id FROM agent_mailbox WHERE kind = 'reply'")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(self.lot_state(), "build")
+        self.assertEqual(replay["lot"]["moved"], False)
+
+    def test_une_panne_entre_reponse_et_lot_annule_la_reponse(self):
+        """#3892 : clôture et libération du lot sont UNE transaction : une
+        panne de la seconde ne laisse pas la réponse seule."""
+        view = self.ask()
+        with mock.patch.object(decisions, "_release_lot",
+                               side_effect=RuntimeError("panne simulée")):
+            with self.assertRaises(RuntimeError):
+                self.answer(view["id"], "a")
+        self.assertEqual(decisions.get(self.db, view["id"])["state"], "pending")
+        self.assertEqual(self.lot_state(), "waiting_human")
+        self.assertEqual(self.db.query("SELECT id FROM agent_mailbox WHERE kind = 'reply'"), [])
+
+    def test_courrier_rejoue_par_cle_d_idempotence(self):
+        """#3892 : le même corps sous la même clé n'est déposé qu'une fois."""
+        from ameesh import mail
+        first = mail.send(self.db, "orch", "dev1", "même corps",
+                          idempotency_key="test:mail:1")
+        second = mail.send(self.db, "orch", "dev1", "même corps",
+                           idempotency_key="test:mail:1")
+        self.assertEqual(first, second)
+        rows = self.db.query("SELECT id, payload FROM agent_mailbox WHERE recipient = 'dev1'"
+                             " AND kind = 'notify'")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["payload"]["idempotency_key"], "test:mail:1")
+
     def test_demande_et_reponse_restent_reveillantes(self):
         """L125 : ni la demande (vers human:<id>) ni la réponse au demandeur
         ne sont du courrier passif ; la réponse, d'un humain, réveille sans
@@ -425,6 +483,12 @@ class SignatureTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         out = self.answer(view["id"], texte, signed=True)
         self.assertEqual(out["decision"]["answer"]["channel"], "signed")
+        # #3892 : la même réponse signée rejouée ne consomme pas une nouvelle
+        # approbation (l'unique approbation est déjà consommée) et ne double rien
+        again = self.answer(view["id"], texte, signed=True)
+        self.assertTrue(again["replayed"])
+        self.assertEqual(again["decision"]["answer"]["proof"]["approval_id"],
+                         out["decision"]["answer"]["proof"]["approval_id"])
         # une approbation vaut pour SA réponse : une autre demande ne la réutilise pas
         autre = self.ask(needs_signature=True, question="Autre ?")
         with self.assertRaises(decisions.DecisionError):

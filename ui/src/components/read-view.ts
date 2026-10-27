@@ -61,6 +61,9 @@ export abstract class ReadView extends LitElement {
   #timer: ReturnType<typeof setTimeout> | null = null;
   #again = false;
   #lastLoad = 0;
+  /** When the displayed data was read (epoch seconds); 0 before the first read.
+   * A failed refresh keeps the data: the age says how old it is (#3892). */
+  #loadedAt = 0;
   /** Minimum between two automatic refreshes; a manual refresh is immediate. */
   protected minRefreshMs = 1000;
   #configChanged = () => { this.#signature = []; this.#sync(); };
@@ -90,6 +93,7 @@ export abstract class ReadView extends LitElement {
     this.#abort?.abort(); this.#abort = null;
     this.#unsubscribe?.(); this.#unsubscribe = null;
     this.data = null; this.error = ""; this.loading = false; this.#again = false;
+    this.#loadedAt = 0;
     this.live = "waiting";
     if (!client || (this.required && !this[this.required])) return;
     this.#unsubscribe = subscribe(client, {
@@ -99,6 +103,7 @@ export abstract class ReadView extends LitElement {
         this.#abort?.abort(); this.#abort = null; this.loading = false;
         if (this.#timer !== null) clearTimeout(this.#timer); this.#timer = null;
         this.#again = false; this.data = null; this.error = status === 401 ? "unauthorized" : "forbidden";
+        this.#loadedAt = 0;
         if (status === 401) this.dispatchEvent(new CustomEvent(UNAUTHORIZED, { bubbles: true, composed: true }));
       },
     });
@@ -125,7 +130,10 @@ export abstract class ReadView extends LitElement {
     this.loading = true; this.error = "";
     try {
       const data = await this.load(client, abort.signal);
-      if (!abort.signal.aborted) this.data = object(data);
+      if (!abort.signal.aborted) {
+        this.data = object(data);
+        this.#loadedAt = Date.now() / 1000;
+      }
     } catch (error) {
       if (abort.signal.aborted) return;
       this.error = error instanceof ApiError ? error.code : "network";
@@ -144,6 +152,15 @@ export abstract class ReadView extends LitElement {
     const ts = number(value);
     return ts === null || !Number.isFinite(new Date(ts * 1000).getTime()) ? "—" : formatDate(languageOf(this), ts);
   }
+  /** How long ago the displayed data was read, short and language-neutral. */
+  #age(): string {
+    if (!this.#loadedAt) return "—";
+    const seconds = Math.max(0, Math.round(Date.now() / 1000 - this.#loadedAt));
+    if (seconds < 60) return `${seconds} s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)} min`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)} h`;
+    return `${Math.floor(seconds / 86400)} d`;
+  }
   protected money(value: unknown): string {
     const n = number(value);
     return n === null ? "—" : new Intl.NumberFormat(languageOf(this), { style: "currency", currency: "USD", maximumFractionDigits: 4 }).format(n);
@@ -158,12 +175,14 @@ export abstract class ReadView extends LitElement {
   protected empty(): unknown { return html`<p class="muted">${this.t("view.empty")}</p>`; }
   override render() {
     const code = ["unauthorized", "unavailable", "network", "not_found", "forbidden"].includes(this.error) ? this.error : "other";
+    const stale = Boolean(this.error && this.data);
     return html`<section aria-label=${this.t(this.headingKey)} aria-busy=${this.loading}>
       <header><h2>${this.t(this.headingKey)}</h2>
         ${this.data ? html`<span class="muted" role="status">${this.t("stream." + this.live)}</span>` : nothing}
         <button type="button" @click=${() => this.refresh()} ?disabled=${this.loading}>${this.t("view.refresh")}</button></header>
       ${this.loading && !this.data ? html`<p role="status">${this.t("app.loading")}</p>` : nothing}
-      ${this.error ? html`<p role="alert" class="critical">${this.t("error." + code, { code: this.error })}</p>` : nothing}
+      ${this.error && !this.data ? html`<p role="alert" class="critical">${this.t("error." + code, { code: this.error })}</p>` : nothing}
+      ${stale ? html`<p role="status" class="muted">${this.t("view.stale", { time: this.date(this.#loadedAt), age: this.#age() })}</p>` : nothing}
       ${this.required && !this[this.required] ? html`<p>${this.t("view.choose." + this.required)}</p>` : nothing}
       ${this.data ? this.content(this.data) : nothing}
     </section>`;
