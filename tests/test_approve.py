@@ -366,7 +366,7 @@ class ApproveFlowTest(ApproveBase):
         self.assertEqual(status, 410)
         status, _headers, text = self.page(path)
         self.assertEqual(status, 410)
-        self.assertIn("already been used", text)
+        self.assertIn("already recorded", text)
         status, receipt = self.fetch_receipt(data["request_id"])
         self.assertEqual(receipt["request"]["decision"], "approve")
 

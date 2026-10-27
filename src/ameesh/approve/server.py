@@ -74,6 +74,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler
 
+from .. import server_faults
 from ..httpkit import BoundedHTTPServer, RateLimiter  # noqa: F401 — RateLimiter: re-exported
 from . import render
 from .service import ApproveError, ApproveService, load_json_body
@@ -114,6 +115,12 @@ _ROUTES = (
     ("enroll", "GET POST", re.compile(r"^/enroll/%s$" % _TOKEN_PATH)),
     ("static", "GET", re.compile(r"^/static/([a-z]+\.(?:js|css))$")),
 )
+#: gabarit de route d'une empreinte de panne (jamais le chemin : il porte le jeton)
+_ROUTE_TEMPLATES = {"api": "/requests|/receipts/<id>", "login-api": "/login-*",
+                    "health": "/health", "approve": "/a/<token>", "login": "/login/<token>",
+                    "enroll": "/enroll/<token>", "static": "/static/<file>"}
+#: délai suggéré au client avant de renvoyer après une panne (secondes)
+RETRY_AFTER = 15
 #: un corps refusé mais pas plus gros que ceci est lu et jeté avant la
 #: fermeture (sinon le noyau répond RST et le client perd la réponse)
 DRAIN_LIMIT = 1024 * 1024
@@ -138,6 +145,9 @@ class ApproveHTTPServer(BoundedHTTPServer):
         self.tls = tls
         cfg = service.cfg
         self.ip_limiter = RateLimiter(cfg.rate_ip_per_minute)
+        #: §16 (#3889) : pannes serveur par empreinte, jamais montrées en clair
+        self.faults = server_faults.Journal(os.path.join(cfg.state_dir, "faults.json"),
+                                            "ameesh-approve")
         self.token_limiter = RateLimiter(cfg.rate_token_per_minute)
         super().__init__(address, ApproveHandler, max_connections=cfg.max_connections)
         port = self.server_address[1]
@@ -229,13 +239,33 @@ class ApproveHandler(BaseHTTPRequestHandler):
         self._send(status, page.encode("utf-8"), "text/html; charset=utf-8")
 
     def _error(self, kind: str, exc: ApproveError, extra: tuple = ()) -> None:
+        if exc.status >= 500:
+            # §16 (#3889) : une panne n'est pas un refus. La page de lien se
+            # recharge seule ; la réponse JSON dit au client de renvoyer le
+            # MÊME corps (`retry`), jamais de re-signer.
+            extra = extra + (("Retry-After", str(RETRY_AFTER)),)
+            if kind in ("approve", "enroll", "login") and self.command == "GET":
+                return self._html(exc.status, render.unavailable_page(RETRY_AFTER))
+            return self._json(exc.status, {"error": exc.code, "message": exc.message,
+                                           "retry": True}, extra)
         if kind in ("approve", "enroll", "login") and self.command == "GET":
             titles = {404: "Unknown link", 410: "Unusable link", 409: "Obsolete request",
-                      429: "Too many requests", 503: "Service unavailable"}
+                      429: "Too many requests"}
+            if exc.code == "used":   # la réponse a été gardée : ce n'est pas un échec
+                return self._html(exc.status, render.message_page(
+                    "Already answered", "An answer to this link is already recorded. "
+                    "You can close this page."))
             self._html(exc.status, render.message_page(
                 titles.get(exc.status, "Error"), exc.message))
         else:
             self._json(exc.status, {"error": exc.code, "message": exc.message}, extra)
+
+    def _fault(self, kind: str | None, exc: BaseException, token: str | None) -> None:
+        """Verse la panne au journal par empreinte : gabarit de route, classe
+        d'exception, version ; le sujet est le lien (condensé), jamais la donnée."""
+        route = "%s %s" % (self.command, _ROUTE_TEMPLATES.get(kind or "", kind or "?"))
+        self.server.faults.record(route, exc, subject=token if kind in (
+            "approve", "enroll", "login") else None)
 
     # -- méthodes ----------------------------------------------------------
     def do_GET(self) -> None:
@@ -359,14 +389,17 @@ class ApproveHandler(BaseHTTPRequestHandler):
         except ApproveError as exc:
             self._discard_body()
             extra = (("Retry-After", "60"),) if exc.status == 429 else ()
+            if exc.status >= 500:
+                self._fault(kind, exc, value)
             self._error(kind or "api", exc, extra)
         except (ConnectionError, socket.timeout):
             self.close_connection = True       # client parti : rien à répondre
         except Exception as exc:  # pas de trace (ni de donnée) vers le client
             log.error("internal error %s on %s %s", type(exc).__name__, self.command,
                       redact(path)[:120])
+            self._fault(kind, exc, value)
             self.close_connection = True
-            self._json(500, {"error": "internal", "message": "internal error"})
+            self._error(kind or "api", ApproveError(500, "internal", "internal error"))
 
     def _static(self, name: str) -> None:
         entry = self.server.static.get(name)

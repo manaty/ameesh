@@ -106,6 +106,23 @@ def _b64u(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
+def _receipt_of(request: dict, body: dict) -> dict:
+    """Le reçu WebAuthn d'une demande signée (`body` déjà validé)."""
+    return {
+        "v": receipts.RECEIPT_VERSION,
+        "request": request,
+        "facade": "webauthn",
+        "credential_id": body["credential_id"],
+        "proof": {name: body[name]
+                  for name in ("authenticatorData", "clientDataJSON", "signature")},
+    }
+
+
+def _same_receipt(kept: bytes, receipt: dict) -> bool:
+    """Le reçu gardé est-il, octet pour octet (JCS), celui-ci ?"""
+    return hmac.compare_digest(kept, jcs.canonicalize(receipt))
+
+
 class ApproveService:
     def __init__(self, cfg: ApproveConfig, db, source: ActionSource, *, service_token: str,
                  login_token: str | None = None, store: Store | None = None, clock=time.time,
@@ -393,20 +410,22 @@ class ApproveService:
 
     def submit(self, token: str, body) -> dict:
         decision = self._assertion(body, receipts.DECISIONS)
+        # §16 (#3889) : le MÊME corps signé, renvoyé par la page après une
+        # panne (réponse perdue), rend le reçu déjà gardé, sans second effet.
+        # Le reçu existant a été vérifié à son écriture ; un autre corps sur
+        # un lien consommé reste refusé (410 plus bas).
+        record = self.store.request_by_token(token)
+        kept = record and self.store.receipt_bytes(record["request_id"])
+        if kept and _same_receipt(kept, _receipt_of(dict(record["request"], decision=decision),
+                                                    body)):
+            return {"request_id": record["request_id"], "decision": decision, "replayed": True}
 
         record = self._live_record(token)
         action = self._check_unchanged(record)
         request = dict(record["request"], decision=decision)
         # L44 (0031) : vérifié contre les authentificateurs du canon de l'action
         policy = dataclasses.replace(self.policy, canon=action.get("canon") or "")
-        receipt = {
-            "v": receipts.RECEIPT_VERSION,
-            "request": request,
-            "facade": "webauthn",
-            "credential_id": body["credential_id"],
-            "proof": {name: body[name]
-                      for name in ("authenticatorData", "clientDataJSON", "signature")},
-        }
+        receipt = _receipt_of(request, body)
         with self.db_lock:
             try:
                 verdict = receipts.verify_receipt(
@@ -607,14 +626,7 @@ class ApproveService:
         """Construit et VÉRIFIE le reçu d'un défi (sans consommer le nonce :
         c'est ameesh qui le consommera en acceptant le reçu)."""
         request = dict(record["request"], decision=decision)
-        receipt = {
-            "v": receipts.RECEIPT_VERSION,
-            "request": request,
-            "facade": "webauthn",
-            "credential_id": body["credential_id"],
-            "proof": {name: body[name]
-                      for name in ("authenticatorData", "clientDataJSON", "signature")},
-        }
+        receipt = _receipt_of(request, body)
         expected = {"login_id": request["login_id"], "host": request["host"],
                     "provider": request["provider"], "account": request["account"],
                     "exp": request["exp"]}
@@ -631,6 +643,14 @@ class ApproveService:
         """`POST /login/<jeton>` : `view` ouvre la vue privée (assertion
         requise AVANT tout affichage) ; `done` / `cancel` signent le reçu."""
         decision = self._assertion(body, ("view",) + LOGIN_FINAL_DECISIONS)
+        if decision in LOGIN_FINAL_DECISIONS:   # §16 (#3889) : rejeu du même reçu
+            record = self.store.login_by_token(token)
+            kept = record and self.store.login_receipt_bytes(record["login_id"])
+            if kept and _same_receipt(
+                    kept, _receipt_of(dict(record["request"], decision=decision), body)):
+                self.store.drop_login_private(record["login_id"])
+                return {"login_id": record["login_id"], "decision": decision,
+                        "replayed": True}
         record = self._live_login(token)
         with self.store.login_transition(record["login_id"]):
             # Une clôture peut avoir gagné depuis la première lecture.
