@@ -26,7 +26,8 @@ SPEC.loader.exec_module(ph)
 
 HEAD = "a" * 40
 HEAD2 = "b" * 40
-NOW = datetime(2026, 10, 27, 10, 25, tzinfo=ph.TZ).timestamp()
+ZONE = ph.ZoneInfo("Europe/Paris")
+NOW = datetime(2026, 10, 27, 10, 25, tzinfo=ZONE).timestamp()
 
 MANIFEST = """# Paquet
 
@@ -111,7 +112,8 @@ class Base(unittest.TestCase):
         self.shell = FakeShell()
         self.ctx = ph.Context(repo=ROOT, target="main", project="ameesh",
                               pilot="mesh-design", actor="mesh-design",
-                              shell=self.shell, python="python3", now=NOW)
+                              shell=self.shell, python="python3", now=NOW,
+                              zone=ZONE)
         self._saved = (ph.ready_lots, ph.manifest_at, ph.replay_locally)
         self.ready = [3801, 3807]
         self.manifest = MANIFEST
@@ -241,8 +243,8 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(units[0].lots, [3779, 3755])
 
     def test_heure_locale(self):
-        start = ph.hour_start(NOW)
-        self.assertEqual(datetime.fromtimestamp(start, ph.TZ).minute, 0)
+        start = ph.hour_start(NOW, ZONE)
+        self.assertEqual(datetime.fromtimestamp(start, ZONE).minute, 0)
         self.assertLessEqual(NOW - start, 3600)
 
 

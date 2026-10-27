@@ -6,7 +6,7 @@
 # sur l'hôte qui détient le bail (L165/EP5), les autres sortent en 0.
 #
 # Le tic lit tout dans la base et la forge (aucun état local) : il compose au
-# plus un porteur par heure (Europe/Paris), ne fait rien tant qu'un porteur
+# plus un porteur par heure (fuseau du canon), ne fait rien tant qu'un porteur
 # réserve la cible (§12), et ne fusionne jamais (fusion automatique de
 # packet_automerge, tic de release, sur la CI verte).
 #

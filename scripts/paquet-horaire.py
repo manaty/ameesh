@@ -19,7 +19,7 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    `integration/paquet-*` ou titre « Paquet horaire h-… ») la réserve : le tic
    suit ce porteur s'il est à lui (étapes 3-4), sinon ne fait rien.
 2. **Composition, une fois par heure.** Cible libre et aucun porteur horaire
-   créé dans l'heure (Europe/Paris) : la liste calculée est lue
+   créé dans l'heure locale (fuseau du canon compilé) : la liste calculée est lue
    (`paquet-candidats.py` depuis un worktree à la tête exacte de la cible) ;
    sans lot prêt, rien n'est créé. Sinon le lot porteur « Paquet horaire
    h-AAAAMMJJ-NN » est créé et `paquet-auto.py` compose, pousse et gèle.
@@ -62,7 +62,6 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-TZ = ZoneInfo("Europe/Paris")
 TITLE_PREFIX = "Paquet horaire "
 HOURLY_RE = re.compile(r"^Paquet horaire (h-(\d{8})-(\d+))\b")
 CARRIER_BRANCH_PREFIX = "integration/paquet"
@@ -147,6 +146,8 @@ class Context:
     shell: Shell
     python: str = sys.executable
     dry_run: bool = False
+    #: fuseau des coupures, lu au canon compilé (`mechanics.timezone`, #2449)
+    zone: ZoneInfo = ZoneInfo("UTC")
     now: float = field(default_factory=time.time)
     log: list[str] = field(default_factory=list)
 
@@ -230,21 +231,22 @@ def is_hourly(row: dict) -> bool:
     return bool(HOURLY_RE.match(str(row.get("title") or "")))
 
 
-def hour_start(now: float) -> float:
-    local = datetime.fromtimestamp(now, TZ)
+def hour_start(now: float, zone: ZoneInfo) -> float:
+    local = datetime.fromtimestamp(now, zone)
     return local.replace(minute=0, second=0, microsecond=0).timestamp()
 
 
-def slot_served(rows: list[dict], now: float, project: str, target: str) -> bool:
-    """Un porteur horaire a-t-il été créé dans l'heure courante ?"""
-    start = hour_start(now)
+def slot_served(rows: list[dict], now: float, zone: ZoneInfo, project: str,
+                target: str) -> bool:
+    """Un porteur horaire a-t-il été créé dans l'heure locale courante ?"""
+    start = hour_start(now, zone)
     return any(is_hourly(row) and is_carrier(row, project, target)
                and float(row.get("created_ts") or 0) >= start for row in rows)
 
 
 def next_name(ctx: Context) -> str:
     """h-AAAAMMJJ-NN, NN = suivant le plus grand du jour (branches d'origin)."""
-    day = datetime.fromtimestamp(ctx.now, TZ).strftime("%Y%m%d")
+    day = datetime.fromtimestamp(ctx.now, ctx.zone).strftime("%Y%m%d")
     pattern = "refs/heads/%sh-%s-*" % (auto.PACKAGE_PREFIX, day)
     result = ctx.git("ls-remote", "origin", pattern, timeout=120)
     if result.returncode != 0:
@@ -458,7 +460,7 @@ def replay_locally(ctx: Context, sha: str, tests: list[str]) -> str:
 
 
 def compose(ctx: Context, rows: list[dict]) -> str:
-    if slot_served(rows, ctx.now, ctx.project, ctx.target):
+    if slot_served(rows, ctx.now, ctx.zone, ctx.project, ctx.target):
         return "porteur horaire déjà créé dans l'heure : rien à faire"
     ready = ready_lots(ctx)
     if not ready:
@@ -641,10 +643,17 @@ def main(argv: list[str] | None = None) -> int:
         print("paquet-horaire : --repo %s n'est pas un clone" % repo, file=sys.stderr)
         return 2
     actor = args.actor or os.environ.get("AMEESH_ROLE") or args.pilot
+    try:
+        from ameesh import config as config_mod, mechanics
+        zone = ZoneInfo(mechanics.configured(config_mod.load()).timezone)
+    except Exception as error:  # noqa: BLE001 - sans canon, aucune heure sûre
+        print("paquet-horaire : fuseau du canon compilé illisible (%s)" % error,
+              file=sys.stderr)
+        return 1
     ctx = Context(repo=repo, target=args.target, project=args.project,
                   pilot=args.pilot, actor=actor, shell=Shell(),
                   python=args.python or auto.project_python(repo),
-                  dry_run=args.dry_run)
+                  dry_run=args.dry_run, zone=zone)
     try:
         print(tick(ctx), flush=True)
         return 0
