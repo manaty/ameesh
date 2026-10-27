@@ -7,8 +7,8 @@ audited gate only through this guard (#3483). When the canon has moved and its d
 files that carry the train's rules — ``processus/mecanique.yaml`` and
 ``federation.yaml`` — the move is mechanical: the command below writes the
 gate's audited commit where the pin is declared, and traces the gesture on the
-lot the pilot names. Any other diff refuses: a rules change needs a human
-review, not a requalification.
+lot the pilot names. A rules diff requires the explicit reviewed path (#4037):
+exact recorded opinions, including a pilot's, are checked before the move.
 
 It writes **every** configuration file that explicitly carries the pin (the
 host ``config.json`` and the profiles that override it), so the recursive
@@ -18,6 +18,7 @@ in a file that inherits it. Each write is atomic.
 from __future__ import annotations
 
 import dataclasses
+from contextlib import contextmanager
 import fcntl
 from datetime import datetime, timezone
 import json
@@ -122,7 +123,7 @@ def _validate(spec, path, raw, project, gate):
         raise RequalifyError(str(exc)) from exc
 
 
-def _plan(cfg, db, project, *, gate_reader=None):
+def _plan(cfg, db, project, *, gate_reader=None, reviewed=False, reviews=()):
     try:
         spec = train_assembly.project_of(cfg, project)
     except train_assembly.ConfigurationError as exc:
@@ -154,8 +155,15 @@ def _plan(cfg, db, project, *, gate_reader=None):
             "canon (%s); align them before requalifying"
             % (project, ", ".join(sorted(canons))))
     if pin == gate:
-        return {"state": "aligned", "project": project, "pin": pin, "gate": gate,
-                "changed": [], "files": [path for path, _raw in files]}, []
+        result = {"state": "aligned", "project": project, "pin": pin, "gate": gate,
+                  "changed": [], "files": [path for path, _raw in files]}
+        if reviewed:
+            from . import train_requalify_review
+            result["reviews"] = train_requalify_review.qualify(
+                cfg, db, dataclasses.replace(spec, canon=next(iter(canons))),
+                pin, gate, [], reviews)
+            result["mode"] = "reviewed"
+        return result, []
     for path, raw in files:
         _validate(spec, path, raw, project, gate)
     canon = canons.pop()
@@ -169,18 +177,25 @@ def _plan(cfg, db, project, *, gate_reader=None):
                              "reviewed requalification required")
     changed = train_assembly.canon_diff(canon, pin, gate)
     guard = [name for name in changed if name in train_assembly.REQUALIFY_GUARD]
-    if guard:
+    if guard and not reviewed:
         raise RequalifyError(
             "refused: the canon diff %s..%s touches %s — a rules change is not "
             "a mechanical requalification; reviewed requalification required"
             % (pin[:12], gate[:12], ", ".join(guard)))
-    return {"state": "requalified", "project": project, "pin": pin, "gate": gate,
-            "changed": changed, "files": [path for path, _raw in files]}, files
+    result = {"state": "requalified", "project": project, "pin": pin, "gate": gate,
+              "changed": changed, "files": [path for path, _raw in files]}
+    if reviewed:
+        from . import train_requalify_review
+        result["reviews"] = train_requalify_review.qualify(
+            cfg, db, dataclasses.replace(spec, canon=canon), pin, gate, changed, reviews)
+        result["mode"] = "reviewed"
+    return result, files
 
 
-def plan(cfg, db, project, *, gate_reader=None):
+def plan(cfg, db, project, *, gate_reader=None, reviewed=False, reviews=()):
     """Compute the requalification; no write, no trace."""
-    result, _files = _plan(cfg, db, project, gate_reader=gate_reader)
+    result, _files = _plan(cfg, db, project, gate_reader=gate_reader,
+                           reviewed=reviewed, reviews=reviews)
     return result
 
 
@@ -213,21 +228,25 @@ def _write(path, raw):
     _replace(path, (json.dumps(raw, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
-def apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None):
+def apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None,
+          reviewed=False, reviews=()):
     """Serialize manual and automatic writers of this host's train pins."""
     directory = os.path.dirname(os.path.abspath(cfg.config_base or cfg.config_path))
     with open(os.path.join(directory, ".train-canon.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        extra = {"reviewed": True, "reviews": reviews} if reviewed else {}
         return _apply(cfg, db, project, lot=lot, actor=actor,
-                      gate_reader=gate_reader, record=record)
+                      gate_reader=gate_reader, record=record, **extra)
 
 
-def _apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None):
+def _apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None,
+           reviewed=False, reviews=()):
     """Requalify the pin, write every declaring file, trace on the lot."""
-    result, files = _plan(cfg, db, project, gate_reader=gate_reader)
+    result, files = _plan(cfg, db, project, gate_reader=gate_reader,
+                          reviewed=reviewed, reviews=reviews)
     if result["state"] == "aligned":
         return result
-    if record is None and work.get(db, int(lot)) is None:
+    if lot is not None and work.get(db, int(lot)) is None:
         raise RequalifyError("lot #%s not found: no trace target" % lot)
     originals = [(path, _bytes(path)) for path, _raw in files]
     written = []
@@ -252,8 +271,13 @@ def _apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None):
     text = ("canon pin requalified: %s %s -> %s; diff: %s; config: %s"
             % (project, result["pin"][:12], result["gate"][:12],
                ", ".join(result["changed"]) or "none", ", ".join(written)))
+    if reviewed:
+        text += "; reviews: " + json.dumps(result["reviews"], ensure_ascii=False)
     try:
-        if record is None:
+        if reviewed:
+            with journal(cfg, result, actor=actor, lot=int(lot)):
+                work.note(db, int(lot), text, actor=actor)
+        elif record is None:
             work.note(db, int(lot), text, actor=actor)
         else:
             record(result)
@@ -272,13 +296,49 @@ def _apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None):
     return result
 
 
-def execute(cfg, db, project, *, lot, actor, dry_run=False, gate_reader=None):
+def execute(cfg, db, project, *, lot, actor, dry_run=False, gate_reader=None,
+            reviewed=False, reviews=()):
     """The command body: plan or apply, with one named result."""
+    if reviews and not reviewed:
+        raise RequalifyError("--review requires --reviewed")
+    extra = {"reviewed": True, "reviews": reviews} if reviewed else {}
     if dry_run:
-        result = plan(cfg, db, project, gate_reader=gate_reader)
+        result = plan(cfg, db, project, gate_reader=gate_reader, **extra)
         result["dry_run"] = True
         return result
-    return apply(cfg, db, project, lot=lot, actor=actor, gate_reader=gate_reader)
+    return apply(cfg, db, project, lot=lot, actor=actor, gate_reader=gate_reader, **extra)
+
+
+@contextmanager
+def journal(cfg, result, *, actor, lot=None):
+    """Durable host trace; undo the append if a companion lot trace fails.
+
+    The caller holds .train-canon.lock for the whole pin and journal move.
+    """
+    directory = os.path.dirname(os.path.abspath(cfg.config_base or cfg.config_path))
+    row = dict(result, host=cfg.host, actor=actor, lot=lot, event="canon-requalified",
+               at=datetime.now(timezone.utc).isoformat(),
+               guard=list(train_assembly.REQUALIFY_GUARD))
+    with open(os.path.join(directory, "train-canon.jsonl"), "a+",
+              encoding="utf-8") as stream:
+        stream.seek(0, os.SEEK_END)
+        before = stream.tell()
+        try:
+            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+            # Persist the directory entry on the first journal creation too.
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            yield
+        except BaseException:
+            stream.seek(before)
+            stream.truncate()
+            stream.flush()
+            raise
 
 
 def automatic(cfg, db, project, *, gate_reader=None):
@@ -287,29 +347,8 @@ def automatic(cfg, db, project, *, gate_reader=None):
     All local profiles follow. The durable host journal is required: a write
     failure rolls the pin writes back. A host lock serializes executor profiles.
     """
-    directory = os.path.dirname(os.path.abspath(cfg.config_base or cfg.config_path))
     def record(result):
-        row = dict(result, host=cfg.host, actor="train", event="canon-requalified",
-                   at=datetime.now(timezone.utc).isoformat(),
-                   guard=list(train_assembly.REQUALIFY_GUARD))
-        with open(os.path.join(directory, "train-canon.jsonl"), "a+",
-                  encoding="utf-8") as journal:
-            journal.seek(0, os.SEEK_END)
-            before = journal.tell()
-            try:
-                journal.write(json.dumps(row, ensure_ascii=False) + "\n")
-                journal.flush()
-                os.fsync(journal.fileno())
-                # Persist the journal's directory entry, including its first
-                # creation, before accepting the pin move as recorded.
-                directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            except BaseException:
-                journal.seek(before)
-                journal.truncate()
-                raise
+        with journal(cfg, result, actor="train"):
+            pass
     return apply(cfg, db, project, lot=None, actor="train",
                  gate_reader=gate_reader, record=record)
