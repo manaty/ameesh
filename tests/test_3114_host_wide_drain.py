@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Host-wide drain through the real Bash entry point, entirely fake SSH."""
+"""Sequential drain (#4000) through the real Bash entry point, entirely fake SSH."""
 from __future__ import annotations
 
 import json
@@ -22,6 +22,9 @@ class HostWideDrainTest(unittest.TestCase):
 
     def configure_turns(self, durations=(0, 0, 0), fail_second=False):
         self.env['DRAIN_ATTENTE'] = '1'
+        clock = self.state / 'horloge'
+        clock.write_text('100')
+        self.env.update(HORLOGE_FICHIER=str(clock))
         self.agents = [dict(name=n, host='host-agents', mode='execute', status='running')
                        for n in ('dev1', 'dev2', 'dev3')]
         (self.state / 'durations.json').write_text(json.dumps(dict(zip(
@@ -30,6 +33,8 @@ class HostWideDrainTest(unittest.TestCase):
         cli.write_text(host.AMEESH.replace(
             '        pause.touch()\n',
             "        pause.touch()\n"
+            "        with (state / 'pauses.jsonl').open('a') as f:\n"
+            "            f.write(json.dumps(sorted(p.name for p in state.glob('pause-*'))) + '\\n')\n"
             "        duration = json.loads((state / 'durations.json').read_text())[name]\n"
             "        (state / ('finish-' + name)).write_text(str(time.monotonic() + duration))\n"))
         unit = self.bin / 'systemctl'
@@ -38,17 +43,24 @@ class HostWideDrainTest(unittest.TestCase):
             "    finish = state / ('finish-' + name)\n"
             "    if finish.exists():\n"
             "        time.sleep(max(0, float(finish.read_text()) - time.monotonic()))\n"
+            + "    if finish.exists(): (state / ('finished-' + name)).touch()\n"
             + ("    if name == 'dev2': sys.exit(1)\n" if fail_second else '')
             + "    if scenario == 'stop-error'"))
 
-    def assert_all_paused_before_stop(self):
+    def assert_sequential_drains(self, names=('dev1', 'dev2', 'dev3')):
         events = (self.state / 'sequence.log').read_text().splitlines()
-        self.assertEqual(events[:3], ['pause dev1', 'pause dev2', 'pause dev3'])
-        self.assertEqual(events[3], 'stop dev1')
+        self.assertEqual(events, [event + ' ' + name for name in names
+                                  for event in ('pause', 'stop')])
+        snapshots = [json.loads(line) for line in
+                     (self.state / 'pauses.jsonl').read_text().splitlines()]
+        self.assertTrue(snapshots)
+        self.assertTrue(all(len(pauses) <= 1 for pauses in snapshots), snapshots)
 
     def assert_no_pause(self):
         self.assertEqual(list(self.state.glob('pause-*')), [])
-        for name in ('dev1', 'dev2', 'dev3'):
+        poses = [line.split()[1] for line in self.operateur().splitlines()
+                 if line.startswith('pause ')]
+        for name in poses:
             self.assertIn('resume ' + name + ' --operator', self.operateur())
 
     def stop_waits(self, p):
@@ -57,62 +69,25 @@ class HostWideDrainTest(unittest.TestCase):
             r'ameesh-runner-agent@(dev\d)\.service : arrêt prouvé — attente (\d+) s',
             p.stdout)}
 
-    def test_three_turns_overlap_instead_of_adding(self):
-        self.configure_turns((10, 20, 30))
-        start = time.monotonic()
+    def test_three_agents_are_drained_one_at_a_time_without_interrupting_turns(self):
+        self.configure_turns((0.05, 0.1, 0.15))
         p = self.run_vm()
-        elapsed = time.monotonic() - start
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assert_all_paused_before_stop()
+        self.assert_sequential_drains()
         self.assert_no_pause()
-        waits = self.stop_waits(p)
-        self.assertEqual(set(waits), {'dev1', 'dev2', 'dev3'}, p.stdout)
-        print(f"#3114 tours 10/20/30 s : balayage {elapsed:.1f} s, "
-              f"attentes {waits['dev1']}/{waits['dev2']}/{waits['dev3']} s", flush=True)
-        self.assertGreaterEqual(elapsed, 30)
-        # Les pauses sont posées avant le premier arrêt : chaque arrêt
-        # n'attend que le reste de son tour (≈10 s), jamais le tour complet
-        # de 20/30 s que la somme des drains ajoutait. L'échéance d'un tour
-        # étant absolue, une charge retarde le début de l'arrêt et raccourcit
-        # cette attente : la borne haute ne dépend pas de la charge, au
-        # contraire d'une borne sur la durée totale du balayage.
-        self.assertLessEqual(waits['dev2'], 15, p.stdout)
-        self.assertLessEqual(waits['dev3'], 15, p.stdout)
-        self.assertLessEqual(sum(waits.values()), 45, p.stdout)
+        self.assertEqual(set(self.stop_waits(p)), {'dev1', 'dev2', 'dev3'}, p.stdout)
+        for name in ('dev1', 'dev2', 'dev3'):
+            self.assertTrue((self.state / ('finished-' + name)).exists())
+            self.assertIn('--user start ameesh-runner-agent@' + name + '.service', self.units())
+        self.assertNotIn('--user restart ', self.units())
 
-    def test_idle_persona_is_drained_before_it_starts_a_turn(self):
-        # dev2 est idle au pré-drain puis commence un tour quand l'arrêt lent
-        # de dev1 démarre. La pause du pré-drain doit déjà être posée : sinon
-        # le drain de rattrapage attend ce tour et allonge le balayage.
-        self.configure_turns((10, 20, 30))
+    def test_idle_persona_is_only_paused_for_its_own_restart(self):
+        self.configure_turns()
         self.agents[1]['status'] = 'idle'
-        cli = self.bin / 'ameesh'
-        cli.write_text(
-            cli.read_text()
-            .replace(
-                "        duration = json.loads((state / 'durations.json').read_text())[name]\n",
-                "        duration = json.loads((state / 'durations.json').read_text())[name]\n"
-                "        if name == 'dev2' and not (state / 'sweep-started').exists():\n"
-                "            duration = 0\n")
-            .replace(
-                "    if scenario == 'always-busy': row['status'] = 'running'",
-                "    if scenario == 'always-busy' or (name == 'dev2'\n"
-                "            and (state / 'sweep-started').exists()\n"
-                "            and not pause.exists()):\n"
-                "        row['status'] = 'running'"))
-        unit = self.bin / 'systemctl'
-        unit.write_text(unit.read_text().replace(
-            "    with (state / 'sequence.log').open('a') as f:\n"
-            "        f.write('stop %s\\n' % name)",
-            "    with (state / 'sequence.log').open('a') as f:\n"
-            "        f.write('stop %s\\n' % name)\n"
-            "    if name == 'dev1':\n"
-            "        (state / 'sweep-started').touch()"))
         p = self.run_vm()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assert_all_paused_before_stop()
+        self.assert_sequential_drains()
         self.assert_no_pause()
-        self.assertLessEqual(self.stop_waits(p)['dev2'], 5, p.stdout)
         self.assertEqual(self.operateur().count('pause dev2 '), 1)
 
     def test_uncertain_prepose_is_reused_and_lifted(self):
@@ -159,10 +134,70 @@ class HostWideDrainTest(unittest.TestCase):
         self.configure_turns(fail_second=True)
         p = self.run_vm()
         self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assert_all_paused_before_stop()
+        self.assert_sequential_drains(('dev1', 'dev2'))
         self.assert_no_pause()
         self.assertNotIn('--user start ameesh-runner-agent@dev2.service', self.units())
         self.assertNotIn('--user stop ameesh-runner-agent@dev3.service', self.units())
+
+    def test_second_start_failure_leaves_no_pause(self):
+        self.configure_turns()
+        unit = self.bin / 'systemctl'
+        unit.write_text(unit.read_text().replace(
+            "elif 'start' in args:\n",
+            "elif 'start' in args:\n    if name == 'dev2': sys.exit(1)\n"))
+        p = self.run_vm()
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assert_sequential_drains(('dev1', 'dev2'))
+        self.assert_no_pause()
+        self.assertNotIn('pause dev3', self.operateur())
+
+    def test_second_ssh_failure_reconciles_the_current_pause(self):
+        self.configure_turns()
+        ssh = self.bin / 'ssh'
+        ssh.write_text(ssh.read_text().replace(
+            "command = argv[-1]",
+            "command = argv[-1]\n"
+            "if 'systemctl' in command and 'stop ' in command and '@dev2.' in command:\n"
+            "    sys.exit(255)"))
+        p = self.run_vm()
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assert_no_pause()
+        self.assertNotIn('pause dev3', self.operateur())
+
+    def test_transient_resume_is_reconciled_before_the_next_agent(self):
+        self.configure_turns()
+        cli = self.bin / 'ameesh'
+        cli.write_text(cli.read_text().replace(
+            "        (state / 'resume-seen').touch()",
+            "        (state / 'resume-seen').touch()\n"
+            "        if name == 'dev1':\n"
+            "            counter = state / 'resume-dev1-count'\n"
+            "            count = int(counter.read_text()) if counter.exists() else 0\n"
+            "            counter.write_text(str(count + 1))\n"
+            "            if count < 2: sys.exit(1)"))
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assert_sequential_drains()
+        self.assert_no_pause()
+        self.assertEqual((self.state / 'resume-dev1-count').read_text(), '3')
+        self.assertNotIn('NON levé', p.stdout + p.stderr)
+
+    def test_unconfirmed_resume_prevents_the_next_pause_and_is_reported(self):
+        self.configure_turns()
+        cli = self.bin / 'ameesh'
+        cli.write_text(cli.read_text().replace(
+            "        (state / 'resume-seen').touch()",
+            "        (state / 'resume-seen').touch()\n        sys.exit(1)"))
+        p = self.run_vm()
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('drain précédent non réconcilié', p.stderr)
+        self.assertIn('drain(s) NON levé(s) : dev1', p.stdout + p.stderr)
+        self.assertNotIn('pause dev2', self.operateur())
+        self.assertNotIn('pause dev3', self.operateur())
+        self.assertEqual([p.name for p in self.state.glob('pause-*')], ['pause-dev1'])
+        snapshots = [json.loads(line) for line in
+                     (self.state / 'pauses.jsonl').read_text().splitlines()]
+        self.assertTrue(all(len(pauses) <= 1 for pauses in snapshots), snapshots)
 
     def test_one_refused_pause_does_not_prevent_the_other_drains(self):
         self.configure_turns()
@@ -187,7 +222,9 @@ class HostWideDrainTest(unittest.TestCase):
             "    name = sys.argv[2]\n    if name == 'dev2': sys.exit(1)\n    # #2198/N4"))
         p = self.run_vm()
         self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertEqual(self.units(), '')
+        self.assertIn('--user start ameesh-runner-agent@dev1.service', self.units())
+        self.assertNotIn('@dev2.service', self.units())
+        self.assertNotIn('pause dev3', self.operateur())
         self.assertIn('resume dev1 --operator', self.operateur())
         self.assertEqual(list(self.state.glob('pause-*')), [])
 
@@ -200,6 +237,8 @@ class HostWideDrainTest(unittest.TestCase):
         cli.write_text(cli.read_text().replace(
             '        pause.touch()\n',
             "        pause.touch()\n"
+            "        with (state / 'pauses.jsonl').open('a') as f:\n"
+            "            f.write(json.dumps(sorted(p.name for p in state.glob('pause-*'))) + '\\n')\n"
             "        clock = Path(os.environ['HORLOGE_FICHIER'])\n"
             "        clock.write_text(str(int(clock.read_text()) + 10))\n"))
         p = self.run_vm()
@@ -207,7 +246,7 @@ class HostWideDrainTest(unittest.TestCase):
         poses = [line for line in self.operateur().splitlines() if line.startswith('pause dev')]
         self.assertEqual([line.split('--not-after ')[1].split()[0] for line in poses],
                          ['101', '111', '121'])
-        self.assert_all_paused_before_stop()
+        self.assert_sequential_drains()
         self.assert_no_pause()
 
 
@@ -216,7 +255,7 @@ class ServerWideDrainTest(unittest.TestCase):
     run_vm = server.RedemarrageServeurDrainTest.run_vm
     poste = server.RedemarrageServeurDrainTest.poste
 
-    def test_server_also_pauses_every_persona_before_first_stop(self):
+    def test_server_failure_only_pauses_the_current_persona(self):
         self.env['DRAIN_ATTENTE'] = '1'
         (self.bin / 'python3').symlink_to(sys.executable)
         self.config.write_text('VM=10.77.0.2\nPERSONAS_VM="dev1 dev2 dev3"\n')
@@ -230,14 +269,12 @@ class ServerWideDrainTest(unittest.TestCase):
         cli.write_text(server.FAKE_AMEESH.replace("'runner-dev9@mesh'", "'runner-' + name + '@mesh'"))
         p = self.run_vm()
         self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
-        lines = self.poste().splitlines()
+        self.assertIn('pause dev1 ', self.poste())
+        self.assertIn('resume dev1 --operator', self.poste())
         for name in ('dev1', 'dev2', 'dev3'):
-            self.assertIn('pause ' + name + ' ', self.poste())
-            self.assertIn('resume ' + name + ' --operator', self.poste())
             self.assertFalse((self.state / ('pause-' + name)).exists())
-        # All three pause calls precede the first lease read / stop attempt.
-        last_pause = max(i for i, line in enumerate(lines) if line.startswith('pause dev'))
-        self.assertTrue(any(line.startswith('show dev1 ') for line in lines[last_pause + 1:]))
+        for name in ('dev2', 'dev3'):
+            self.assertNotIn('pause ' + name + ' ', self.poste())
         self.assertIn('systemctl stop ameesh-runner@dev1', (self.state / 'ssh.log').read_text())
 
 
