@@ -167,11 +167,13 @@ def coverage(db, host: str, since_ts: float, *, now: float, cover_s: float) -> d
     if cover < PRESENCE_BUCKET_S:
         segments, params = _RAW_SEGMENTS, head
     else:
-        lo = math.ceil(since / PRESENCE_BUCKET_S) * PRESENCE_BUCKET_S
+        # the bucket holding `since` is read raw even when `since` starts it:
+        # the window excludes `since` itself (`sampled_at > since`)
+        lo = (math.floor(since / PRESENCE_BUCKET_S) + 1) * PRESENCE_BUCKET_S
         segments = (
             "SELECT extract(epoch FROM first_at) AS f, extract(epoch FROM last_at) AS l,"
             " readings AS n"
-            " FROM host_presence WHERE host = %s"
+            " FROM host_presence WHERE host = %s AND readings > 0"
             " AND bucket_start >= to_timestamp(%s::float8)"
             " AND bucket_start < " + _PRESENT_BUCKET
             + " UNION ALL " + _RAW_SEGMENTS + " AND sampled_at < to_timestamp(%s::float8)"

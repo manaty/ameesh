@@ -25,8 +25,18 @@
 -- une tranche ne doit jamais diverger de l'historique qu'elle résume.
 -- Insertion : cumul incrémental (un upsert par tranche touchée). Mise à jour
 -- et suppression : les tranches touchées sont recalculées depuis
--- `host_resources` (une tranche vidée est effacée) — la rétention de 7 jours
--- vide ainsi ses propres tranches.
+-- `host_resources` ; une tranche vidée reste à `readings = 0` (premier et
+-- dernier instant nuls), la lecture l'ignore et la rétention de
+-- `Hosts.record` l'efface avec les tranches de plus de 7 jours.
+--
+-- Concurrence (relecture #3921) : un recalcul lit un absolu ; il ne doit ni
+-- croiser un autre recalcul ni une insertion de la même tranche. Chaque
+-- tranche touchée est verrouillée (verrou consultatif de transaction, dans
+-- un ordre stable) avant d'être écrite : partagé pour une insertion (les
+-- cumuls se composent sous le verrou de ligne de ON CONFLICT), exclusif pour
+-- un recalcul, qui relit ensuite `host_resources` avec un instantané pris
+-- APRÈS le verrou (READ COMMITTED, celui des écrivains d'ameesh) : il voit
+-- donc toute insertion ou suppression concurrente déjà validée.
 --
 -- Additif seulement : la table est remplie depuis l'historique existant,
 -- lu par l'index (host, sampled_at) sans aller au tas ; aucun relevé n'est
@@ -36,15 +46,26 @@ create table if not exists host_presence (
     host         text not null,
     -- début de tranche, aligné sur l'époque : floor(epoch(sampled_at)/120)*120
     bucket_start timestamptz not null,
+    -- 0 : tranche vidée par une suppression, en attente de la rétention
     readings     bigint not null,
-    first_at     timestamptz not null,
-    last_at      timestamptz not null,
+    first_at     timestamptz,
+    last_at      timestamptz,
     primary key (host, bucket_start)
 );
+
+-- la rétention de `Hosts.record` efface par instant, tous hôtes confondus
+create index if not exists host_presence_bucket_idx on host_presence (bucket_start);
 
 create or replace function ameesh_presence_bucket(at timestamptz)
 returns timestamptz language sql immutable parallel safe as $$
     select to_timestamp(floor(extract(epoch from at) / 120) * 120)
+$$;
+
+-- clé du verrou consultatif d'une tranche
+create or replace function ameesh_presence_lock_key(host text, bucket timestamptz)
+returns bigint language sql immutable parallel safe as $$
+    select hashtextextended('host-presence:' || host || ':'
+                            || extract(epoch from bucket)::bigint::text, 0)
 $$;
 
 create or replace function ameesh_host_presence_sync()
@@ -52,8 +73,15 @@ returns trigger language plpgsql as $$
 declare
     hosts   text[];
     buckets timestamptz[];
+    lock_key bigint;
 begin
     if tg_op = 'INSERT' then
+        for lock_key in
+            select distinct ameesh_presence_lock_key(host, ameesh_presence_bucket(sampled_at))
+              from presence_new order by 1
+        loop
+            perform pg_advisory_xact_lock_shared(lock_key);
+        end loop;
         insert into host_presence (host, bucket_start, readings, first_at, last_at)
         select host, ameesh_presence_bucket(sampled_at), count(*),
                min(sampled_at), max(sampled_at)
@@ -79,10 +107,18 @@ begin
     if hosts is null then
         return null;
     end if;
+    for lock_key in
+        select distinct ameesh_presence_lock_key(t.host, t.bucket)
+          from unnest(hosts, buckets) as t(host, bucket) order by 1
+    loop
+        perform pg_advisory_xact_lock(lock_key);
+    end loop;
+    -- instantané pris après les verrous : les écritures concurrentes validées
+    -- de ces tranches sont vues ; une tranche vidée passe à 0
     insert into host_presence (host, bucket_start, readings, first_at, last_at)
-    select t.host, t.bucket, count(*), min(r.sampled_at), max(r.sampled_at)
+    select t.host, t.bucket, count(r.sampled_at), min(r.sampled_at), max(r.sampled_at)
       from unnest(hosts, buckets) as t(host, bucket)
-      join host_resources r
+      left join host_resources r
         on r.host = t.host
        and r.sampled_at >= t.bucket
        and r.sampled_at < t.bucket + interval '120 seconds'
@@ -91,13 +127,6 @@ begin
        set readings = excluded.readings,
            first_at = excluded.first_at,
            last_at  = excluded.last_at;
-    delete from host_presence p
-     using unnest(hosts, buckets) as t(host, bucket)
-     where p.host = t.host and p.bucket_start = t.bucket
-       and not exists (select 1 from host_resources r
-                        where r.host = t.host
-                          and r.sampled_at >= t.bucket
-                          and r.sampled_at < t.bucket + interval '120 seconds');
     return null;
 end
 $$;
