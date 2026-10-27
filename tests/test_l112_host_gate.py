@@ -606,6 +606,17 @@ for i in range(int(os.environ.get("L112_ETAPES", "3"))):
         {"type": "tool_use", "id": "t%d" % i, "name": "Bash", "input": {}}]}}), flush=True)
     note({"outil": i})
     time.sleep(float(os.environ.get("L112_DUREE", "0.6")))
+    # #3947 : l'appel en cours ne rend son résultat qu'une fois la porte
+    # *appliquée*. Sous charge, le fil de lecture du flux peut être retardé
+    # de plus d'une étape (CI h-37 : deux « fini » ; reproduit à 4 processus :
+    # le tour entier) : le témoin ne peut donc pas dépendre de son
+    # ordonnancement.
+    avant = os.environ.get("L112_AVANT")
+    if avant and i == 0:
+        with open(avant + ".pret", "w") as fh:
+            fh.write(str(i))
+        while not os.path.exists(avant + ".suite"):
+            time.sleep(0.01)
     # #3910 : le témoin « fini » est durable AVANT le tool_result qui publie
     # le point sûr. Sinon la porte peut s'appliquer entre les deux : le compte
     # lu juste après `gate_holds()` oublierait l'étape que l'exécuteur vient de
@@ -767,6 +778,26 @@ class ExecuteurTest(PgTestCase):
         ecrit_etat(self.state_path, etat("available", 1))
         os.environ["L112_ETAPES"] = "6"
         self.addCleanup(os.environ.pop, "L112_ETAPES", None)
+        # #3947 : le faux harnais retient la fin de l'appel en cours jusqu'à
+        # ce que la porte soit *appliquée* (L112_AVANT), puis bloque après le
+        # point sûr (L112_BLOC). Le témoin ne dépend plus de l'instant où le
+        # fil de lecture du flux est ordonnancé : sans cette barrière, une
+        # étape entière (CI h-37) ou le tour entier (reproduit sous charge)
+        # peut se terminer avant que l'exécuteur n'ait lu le point sûr.
+        avant = os.path.join(self.tmp, "avant")
+        bloc = os.path.join(self.tmp, "bloc")
+        os.environ.update(L112_AVANT=avant, L112_BLOC=bloc)
+        self.addCleanup(lambda: [os.environ.pop(k, None)
+                                 for k in ("L112_AVANT", "L112_BLOC")])
+
+        def relacher():
+            for chemin in (avant, bloc):
+                try:
+                    with open(chemin + ".suite", "w"):
+                        pass
+                except OSError:
+                    pass
+        self.addCleanup(relacher)
         runner = self.lance()
         self.assertTrue(attendre(lambda: any("outil" in m for m in self.harnais())))
         ecrit_etat(self.state_path, etat("draining", 2,
@@ -782,9 +813,18 @@ class ExecuteurTest(PgTestCase):
         # #3910 : le faux harnais écrit « fini » avant le tool_result qui
         # publie le point sûr : une étape franchie par l'exécuteur est donc
         # toujours comptée ici, même si la porte s'applique juste après.
+        # #3947 : la porte est déjà appliquée ; on libère l'appel en cours,
+        # qui rend son unique résultat puis bloque au point sûr.
+        with open(avant + ".suite", "w"):
+            pass
+        relache = time.monotonic()
         ack = attendre(lambda: (self.ack() or {}).get("drained") and self.ack())
         self.assertTrue(ack, "le retrait doit finir par un acquittement drained")
         self.assertEqual((ack["seq"], ack["state"], ack["held"]), (2, "draining", []))
+        # Le harnais bloque au point sûr : sans fermeture à ce point, seule
+        # l'échéance (60 s) drainerait. 30 s les distingue sous charge (#3832).
+        self.assertLess(time.monotonic() - relache, 30.0,
+                        "fermeture au point sûr, pas à l'échéance")
         vus = self.harnais()
         self.assertFalse(any(m.get("fin") for m in vus), "tour arrêté avant sa fin")
         # l'appel d'outil en cours a fini (point sûr), aucun autre après lui
@@ -799,7 +839,11 @@ class ExecuteurTest(PgTestCase):
         # rien n'est réclamé tant que l'hôte n'est pas revenu
         time.sleep(1.0)
         self.assertIsNone(registry.get(self.db, "enfant")["lease_owner"])
-        # retour à available : reprise sans geste humain, sur la même session
+        # retour à available : reprise sans geste humain, sur la même session.
+        # #3947 : les barrières ne valent que pour le premier tour ; le tour de
+        # reprise doit aller à son terme pour écrire « fin ».
+        os.environ.pop("L112_AVANT", None)
+        os.environ.pop("L112_BLOC", None)
         os.environ["L112_ETAPES"] = "1"
         ecrit_etat(self.state_path, etat("available", 3))
         self.assertTrue(attendre(lambda: any(m.get("fin") for m in self.harnais())),
