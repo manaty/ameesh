@@ -249,6 +249,36 @@ class MenageTest(unittest.TestCase):
         self.assertIn(str(usage / "bin" / "python"), chemins)
         self.assertTrue(usage.is_dir())
 
+    def test_un_pid_mort_esrch_pendant_la_lecture_est_ignore(self):
+        """`ESRCH` est la même course que `ENOENT`, pas un doute.
+
+        Le noyau peut répondre « No such process » là où `open` répondrait
+        « No such file or directory » ; le relevé doit conclure, sans rendre
+        le ménage muet ni retirer le venv d'un processus vivant.
+        """
+        courant = faux_venv(self.base, "1111111")
+        usage = faux_venv(self.base, "3333333")
+        ancien = faux_venv(self.base, "4444444")
+        self.lien(courant.name)
+        (self.proc / "4242").mkdir()
+        (self.proc / "4242" / "cmdline").write_bytes(b"")
+        (self.proc / "5252").mkdir()
+        (self.proc / "5252" / "cmdline").write_bytes(
+            cmdline(str(usage / "bin" / "python")))
+        vrai = open
+        disparu = str(self.proc / "4242" / "cmdline")
+
+        def ouvrir(chemin, *args, **kwargs):
+            if str(chemin) == disparu:
+                raise ProcessLookupError(3, "No such process")
+            return vrai(chemin, *args, **kwargs)
+
+        with mock.patch.object(bascule, "open", side_effect=ouvrir, create=True):
+            rapport = self.menager(appliquer=True)
+        self.assertIsNone(rapport["probleme"])
+        self.assertEqual(["venv-4444444"], rapport["retires"])
+        self.assertTrue(usage.is_dir(), "le venv du processus vivant a été retiré")
+
     def test_un_retrait_en_echec_n_interrompt_pas_les_autres(self):
         """Un candidat qui disparaît pendant le ménage n'interrompt pas les autres."""
         courant = faux_venv(self.base, "1111111")
