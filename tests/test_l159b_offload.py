@@ -322,8 +322,12 @@ class RunTest(OffloadBase):
         # --wait-timeout borne l'attente locale (slot, transport, push) et
         # annule le job côté VM avant de rendre la main.
         began = time.time()
-        res = self.offload("run", "--wait-timeout", "2", "--", "sh", "-c", "sleep 30")
+        res = self.offload("run", "--wait-timeout", "5", "--", "sh", "-c", "sleep 30")
         self.assertEqual(res.returncode, 124, res.stderr)
+        if "during the snapshot upload" in res.stderr:
+            # #3877 : runner chargé, le budget est parti dans l'envoi : aucun
+            # job lancé, rien à annuler. Non concluant, jamais un rouge.
+            self.skipTest("wait budget spent in the snapshot upload (loaded host)")
         self.assertIn("no result within", res.stderr)
         self.assertLess(time.time() - began, 20)
         deadline = time.time() + 10

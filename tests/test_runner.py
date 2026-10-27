@@ -595,18 +595,33 @@ class RunnerTest(PgTestCase):
         cwd = self._cwd("dort")
         self.register("dort", "claude", cwd=cwd)
         proc = self.runner_popen("--max-turns", "1", "--poll", "60")
+        lignes: list[str] = []
+        lecteur = threading.Thread(
+            target=lambda: lignes.extend(iter(proc.stdout.readline, "")), daemon=True)
+        lecteur.start()
         try:
-            time.sleep(2.0)  # LISTEN établi (pilote psql : ~0,5 s), aucun tour à faire
+            # #3877 : un `sleep(2)` fixe ne suffit pas sur un runner chargé
+            # (le message arrivait avant l'inscription du worker : tour pris
+            # au démarrage, sans réveil). On attend LISTEN et le bail de dort.
+            echeance = time.monotonic() + 30
+            while not (any(l.startswith("LISTEN") or " LISTEN " in l for l in lignes)
+                       and any("lease acquired: dort" in l for l in lignes)):
+                self.assertIsNone(proc.poll(), "".join(lignes))
+                self.assertLess(time.monotonic(), echeance, "".join(lignes))
+                time.sleep(0.05)
+            time.sleep(0.5)  # le worker s'inscrit juste après ce journal
             self.assertEqual(self.turns(), [])
             debut = time.monotonic()
             envoi = self.cli("send", "dort", "réveille-toi",
                              env=self.env(AGENT_MAIL_NAME="orchestrateur"))
             self.assertEqual(envoi.returncode, 0)
-            sortie, _ = proc.communicate(timeout=30)
+            proc.wait(timeout=30)
         finally:
             if proc.poll() is None:
                 proc.terminate()
                 proc.wait(timeout=10)
+            lecteur.join(10)
+        sortie = "".join(lignes)
         self.assertLess(time.monotonic() - debut, 25.0)
         self.assertEqual(proc.returncode, 0, sortie)
         self.assertIn("message for dort: waking the turn", sortie)
