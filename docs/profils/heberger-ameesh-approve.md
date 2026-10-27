@@ -111,6 +111,20 @@ It too is a written choice (no environment variable or option for
 `token_file`; the service refuses the configuration otherwise. The ameesh
 side reads `AMEESH_LOGIN_TOKEN_FILE`.
 
+The **server-fault journal** (`GET /fingerprints[?since=N]`, canon §16, lot
+#3889) is the third switch. ameesh-approve never shows a server failure to the
+human: the page keeps the signed answer and sends it again, and the failure is
+counted by fingerprint (route template, exception code, version; no personal
+data) in `<state_dir>/faults.json`. The service is read-only in the database,
+so it does not open the lot itself: the `fingerprints` pass of the elected
+watch role (#3885) reads this page, in the `nexlink-fingerprints/1` format,
+like any source declared in the canon. The route is **closed** until
+`fingerprints_token_file` (or `AMEESH_APPROVE_FINGERPRINTS_TOKEN_FILE`) names a
+0600 token file (`ameesh-approve gen-token --token-file F`), distinct from the
+two other tokens; it is served under the local and the public host, never to
+a browser (`Origin` refused). The watch hosts keep the same token in
+`~/.config/ameesh/fingerprints.token`.
+
 ## 4. Exposing `H` over HTTPS
 
 ### 4.1 Behind a reverse proxy (default)

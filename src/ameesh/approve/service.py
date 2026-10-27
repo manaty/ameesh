@@ -43,7 +43,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from .. import jcs, receipts
+from .. import jcs, receipts, server_faults
 from ..db import DbError
 from . import duplicate, enroll, render
 from . import config as config_mod
@@ -126,7 +126,7 @@ def _same_receipt(kept: bytes, receipt: dict) -> bool:
 class ApproveService:
     def __init__(self, cfg: ApproveConfig, db, source: ActionSource, *, service_token: str,
                  login_token: str | None = None, store: Store | None = None, clock=time.time,
-                 db_lock=None):
+                 db_lock=None, fingerprints_token: str | None = None):
         self.cfg = cfg
         self.db = db
         self.source = source
@@ -140,6 +140,17 @@ class ApproveService:
                 self._login_token_digest, self._token_digest):
             raise config_mod.ApproveConfigError(
                 "login token must be DISTINCT from the team service token")
+        self._fingerprints_digest = (
+            hashlib.sha256(fingerprints_token.encode("utf-8")).digest()
+            if fingerprints_token else None)
+        if self._fingerprints_digest is not None and any(
+                other is not None and hmac.compare_digest(self._fingerprints_digest, other)
+                for other in (self._token_digest, self._login_token_digest)):
+            raise config_mod.ApproveConfigError(
+                "fingerprints token must be DISTINCT from the service and login tokens")
+        #: §16 (#3889) : pannes serveur par empreinte, jamais montrées en clair
+        self.faults = server_faults.Journal(os.path.join(cfg.state_dir, "faults.json"),
+                                            "ameesh-approve", clock=clock)
         self.policy = receipts.Policy(rp_id=cfg.rp_id, origins=cfg.origins,
                                       allow_facades=frozenset({"webauthn"}), level=cfg.level)
 
@@ -156,6 +167,29 @@ class ApproveService:
         """L'API des défis n'est ouverte que sur choix écrit ET jeton dédié."""
         return (self.cfg.login_api == config_mod.LOGIN_API_OPEN
                 and self._login_token_digest is not None)
+
+    def check_fingerprints_token(self, presented: str | None) -> bool:
+        """Jeton de lecture du journal des pannes ; route fermée sans lui."""
+        if self._fingerprints_digest is None:
+            return False
+        presented_digest = hashlib.sha256((presented or "").encode("utf-8")).digest()
+        return (hmac.compare_digest(presented_digest, self._fingerprints_digest)
+                and bool(presented))
+
+    def subject_of(self, kind: str, token: str | None) -> str | None:
+        """L'humain d'un lien (pour compter les humains touchés par une
+        panne) ; `server_faults.HUMAN` s'il ne se lit pas ; None hors liens."""
+        if kind not in ("approve", "login", "enroll"):
+            return None
+        try:
+            record = {"approve": self.store.request_by_token,
+                      "login": self.store.login_by_token,
+                      "enroll": self.store.enroll_by_token}[kind](token)
+            approver = (record.get("approver") or (record.get("request") or {}).get("approver")
+                        if isinstance(record, dict) else None)
+        except Exception:  # noqa: BLE001 — le compte des humains ne lève jamais
+            approver = None
+        return approver if isinstance(approver, str) and approver else server_faults.HUMAN
 
     def check_login_token(self, presented: str | None) -> bool:
         """Jeton du superviseur de connexion (L232d) ; jamais le jeton d'équipe."""
@@ -438,6 +472,12 @@ class ApproveService:
             log.info("request %s: assertion refused [%s]", record["request_id"], verdict.code)
             raise ApproveError(403, verdict.code, verdict.reason)
         if not self.store.save_receipt_once(record["request_id"], receipt):
+            # §16 (#3889) : deux envois concurrents du MÊME corps (deux onglets,
+            # un renvoi après délai) : le perdant rend le reçu du gagnant
+            kept = self.store.receipt_bytes(record["request_id"])
+            if kept and _same_receipt(kept, receipt):
+                return {"request_id": record["request_id"], "decision": decision,
+                        "replayed": True}
             raise ApproveError(410, "used", "this link has already been used")
         log.info("request %s: receipt %s%s signed by %s", record["request_id"], decision,
                  " (duplicate assumed)" if record.get("assume_duplicate") is True
@@ -682,6 +722,11 @@ class ApproveService:
                 "challenge_cancel": _b64u(receipts.challenge(dict(request, decision="cancel"))),
             }
         if not self.store.save_login_receipt_once(record["login_id"], receipt):
+            kept = self.store.login_receipt_bytes(record["login_id"])   # §16 : concurrent
+            if kept and _same_receipt(kept, receipt):
+                self.store.drop_login_private(record["login_id"])
+                return {"login_id": record["login_id"], "decision": decision,
+                        "replayed": True}
             raise ApproveError(410, "used", "this challenge is already settled")
         self.store.drop_login_private(record["login_id"])
         log.info("login %s: receipt %s signed by %s", record["login_id"], decision,
@@ -758,6 +803,11 @@ class ApproveService:
         if record is None:
             raise ApproveError(404, "unknown_link", "unknown link")
         if self.store.enroll_used(record):
+            claim = self.store.enroll_claim(record) or {}
+            if claim.get("body") and not isinstance(claim.get("result"), dict):
+                # consommé, proposition pas encore écrite : la page qui l'a
+                # envoyé le renvoie ; celle-ci attend (§16, #3889)
+                raise ApproveError(503, "enroll_pending", "the passkey is being recorded")
             raise ApproveError(410, "used", "this link has already been used")
         if self.clock() >= record["exp"]:
             raise ApproveError(410, "expired", "this link has expired")
@@ -792,7 +842,29 @@ class ApproveService:
             decoded = {name: receipts.b64u_decode(body[name], name) for name in _ENROLL_FIELDS}
         except receipts.ReceiptError as exc:
             raise ApproveError(400, "format", str(exc)) from exc
-        record = self._live_enroll(token)
+        record = self.store.enroll_by_token(token)
+        if record is None:
+            raise ApproveError(404, "unknown_link", "unknown link")
+        # §16 (#3889) : un lien, un corps. Le MÊME corps renvoyé (réponse
+        # perdue, envois concurrents) rend la réponse gardée ; une panne après
+        # la consommation du lien (proposition non écrite) se reprend avec lui.
+        body_digest = hashlib.sha256(jcs.canonicalize(
+            {name: body[name] for name in sorted(keys)})).hexdigest()
+        with self.store.enroll_transition(record):
+            claim = self.store.enroll_claim(record)
+            if claim is not None:
+                if claim["body"] is None or not hmac.compare_digest(
+                        str(claim["body"]).encode(), body_digest.encode()):
+                    raise ApproveError(410, "used", "this link has already been used")
+                if isinstance(claim["result"], dict):
+                    return dict(claim["result"], replayed=True)
+            elif self.clock() >= record["exp"]:
+                raise ApproveError(410, "expired", "this link has expired")
+            return self._enroll_once(record, decoded, body_digest, claimed=claim is not None,
+                                     origin=origin)
+
+    def _enroll_once(self, record: dict, decoded: dict, body_digest: str, *, claimed: bool,
+                     origin: str) -> dict:
         try:
             entry = enroll.parse_registration(
                 attestation_object=decoded["attestationObject"],
@@ -803,15 +875,17 @@ class ApproveService:
         except enroll.EnrollError as exc:
             log.info("enrollment of %s refused [%s]", record["approver"], exc.code)
             raise ApproveError(403, exc.code, str(exc)) from exc
-        if not self.store.claim_enroll(record):
+        if not claimed and not self.store.claim_enroll(record, body_digest):
             raise ApproveError(410, "used", "this link has already been used")
         name = enroll.write_proposal(self.cfg.proposals_path, approver=record["approver"],
                                      entry=entry, rp_id=self.cfg.rp_id, origin=origin,
                                      now=self.clock())
         log.info("authenticator proposal for %s: %s", record["approver"], name)
-        return {"proposal": name, "credential_id": entry["credential_id"],
-                "key_fingerprint": entry["key_fingerprint"],
-                "backup_eligible": entry["backup_eligible"], "level": entry["level"]}
+        result = {"proposal": name, "credential_id": entry["credential_id"],
+                  "key_fingerprint": entry["key_fingerprint"],
+                  "backup_eligible": entry["backup_eligible"], "level": entry["level"]}
+        self.store.settle_enroll(record, body_digest, result)
+        return result
 
 
 def load_json_body(raw: bytes):

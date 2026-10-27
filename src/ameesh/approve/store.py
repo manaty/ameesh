@@ -413,13 +413,43 @@ class Store:
     def enroll_used(self, record: dict) -> bool:
         return os.path.exists(self._path("enroll-used", record["token_hash"]))
 
-    def claim_enroll(self, record: dict) -> bool:
-        """Consomme le jeton d'enrôlement, une seule fois."""
+    def enroll_transition(self, record: dict):
+        """§16 (#3889) : sérialise les envois d'un même lien d'enrôlement."""
+        digest = record["token_hash"]
+        if not _HASH_RE.fullmatch(digest):
+            raise ValueError("token_hash invalide")
+        return self._login_live_lock(self._path("enroll-used", digest))
+
+    def enroll_claim(self, record: dict) -> dict | None:
+        """La marque d'usage du lien : `{"body": condensat du corps, "result":
+        réponse ou None}` ; None si le lien n'est pas consommé. Une marque
+        ancienne (un horodatage) se lit `{"body": None, "result": None}`."""
+        path = self._path("enroll-used", record["token_hash"])
+        raw = self._read(path)
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            return {"body": None, "result": None}
+        return {"body": data.get("body"), "result": data.get("result")}
+
+    def claim_enroll(self, record: dict, body_digest: str = "") -> bool:
+        """Consomme le jeton d'enrôlement, une seule fois, pour CE corps."""
         digest = record["token_hash"]
         if not _HASH_RE.fullmatch(digest):
             return False
-        return self._write(self._path("enroll-used", digest),
-                           str(int(time.time())).encode("ascii"), exclusive=True)
+        mark = {"at": int(time.time()), "body": body_digest or None, "result": None}
+        return self._write(self._path("enroll-used", digest), self._dump(mark),
+                           exclusive=True)
+
+    def settle_enroll(self, record: dict, body_digest: str, result: dict) -> None:
+        """Garde la réponse de l'enrôlement : un renvoi du même corps la rend."""
+        mark = {"at": int(time.time()), "body": body_digest, "result": result}
+        self._write(self._path("enroll-used", record["token_hash"]), self._dump(mark),
+                    exclusive=False)
 
     # -- élagage -------------------------------------------------------------
     def prune(self, now: float, *, every: float = 600.0) -> int:

@@ -74,7 +74,6 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler
 
-from .. import server_faults
 from ..httpkit import BoundedHTTPServer, RateLimiter  # noqa: F401 — RateLimiter: re-exported
 from . import render
 from .service import ApproveError, ApproveService, load_json_body
@@ -110,6 +109,8 @@ _ROUTES = (
     ("login-api", "POST", re.compile(r"^/login-close/(lgn_[0-9a-z]{26})$")),
     ("login-api", "GET", re.compile(r"^/login-receipts/(lgn_[0-9a-z]{26})$")),
     ("health", "GET", re.compile(r"^/health$")),
+    # §16 (#3889) : le journal des pannes, source de la passe `fingerprints` (#3885)
+    ("fingerprints", "GET", re.compile(r"^/fingerprints$")),
     ("approve", "GET POST", re.compile(r"^/a/%s$" % _TOKEN_PATH)),
     ("login", "GET POST", re.compile(r"^/login/%s$" % _TOKEN_PATH)),
     ("enroll", "GET POST", re.compile(r"^/enroll/%s$" % _TOKEN_PATH)),
@@ -118,7 +119,9 @@ _ROUTES = (
 #: gabarit de route d'une empreinte de panne (jamais le chemin : il porte le jeton)
 _ROUTE_TEMPLATES = {"api": "/requests|/receipts/<id>", "login-api": "/login-*",
                     "health": "/health", "approve": "/a/<token>", "login": "/login/<token>",
-                    "enroll": "/enroll/<token>", "static": "/static/<file>"}
+                    "enroll": "/enroll/<token>", "static": "/static/<file>",
+                    "fingerprints": "/fingerprints"}
+_SINCE_RE = re.compile(r"^since=([0-9]{1,18})$")
 #: délai suggéré au client avant de renvoyer après une panne (secondes)
 RETRY_AFTER = 15
 #: un corps refusé mais pas plus gros que ceci est lu et jeté avant la
@@ -145,9 +148,6 @@ class ApproveHTTPServer(BoundedHTTPServer):
         self.tls = tls
         cfg = service.cfg
         self.ip_limiter = RateLimiter(cfg.rate_ip_per_minute)
-        #: §16 (#3889) : pannes serveur par empreinte, jamais montrées en clair
-        self.faults = server_faults.Journal(os.path.join(cfg.state_dir, "faults.json"),
-                                            "ameesh-approve")
         self.token_limiter = RateLimiter(cfg.rate_token_per_minute)
         super().__init__(address, ApproveHandler, max_connections=cfg.max_connections)
         port = self.server_address[1]
@@ -251,7 +251,11 @@ class ApproveHandler(BaseHTTPRequestHandler):
         if kind in ("approve", "enroll", "login") and self.command == "GET":
             titles = {404: "Unknown link", 410: "Unusable link", 409: "Obsolete request",
                       429: "Too many requests"}
-            if exc.code == "used":   # la réponse a été gardée : ce n'est pas un échec
+            if exc.code == "used" and kind == "enroll":   # gardée : pas un échec
+                return self._html(exc.status, render.message_page(
+                    "Passkey already sent", "The passkey of this link is recorded and its "
+                    "proposal awaits review. You can close this page."))
+            if exc.code == "used":
                 return self._html(exc.status, render.message_page(
                     "Already answered", "An answer to this link is already recorded. "
                     "You can close this page."))
@@ -263,9 +267,24 @@ class ApproveHandler(BaseHTTPRequestHandler):
     def _fault(self, kind: str | None, exc: BaseException, token: str | None) -> None:
         """Verse la panne au journal par empreinte : gabarit de route, classe
         d'exception, version ; le sujet est le lien (condensé), jamais la donnée."""
+        service = self.server.service
         route = "%s %s" % (self.command, _ROUTE_TEMPLATES.get(kind or "", kind or "?"))
-        self.server.faults.record(route, exc, subject=token if kind in (
-            "approve", "enroll", "login") else None)
+        service.faults.record(route, exc, subject=service.subject_of(kind or "", token))
+
+    def _fingerprints(self, raw_path: str) -> None:
+        """`GET /fingerprints[?since=N]` : une page `nexlink-fingerprints/1`,
+        au seul porteur du jeton de lecture (route fermée sans lui)."""
+        if self.headers.get("Origin") is not None:
+            raise ApproveError(403, "origin", "fingerprints: no browser allowed")
+        service = self.server.service
+        scheme, _, presented = (self.headers.get("Authorization") or "").partition(" ")
+        if scheme.lower() != "bearer" or not service.check_fingerprints_token(presented.strip()):
+            raise ApproveError(401, "unauthorized", "fingerprints token missing or invalid")
+        query = raw_path.partition("?")[2]
+        match = _SINCE_RE.fullmatch(query) if query else None
+        if query and match is None:
+            raise ApproveError(400, "format", "expected query: since=<cursor>")
+        self._json(200, service.faults.page(match.group(1) if match else None))
 
     # -- méthodes ----------------------------------------------------------
     def do_GET(self) -> None:
@@ -296,6 +315,9 @@ class ApproveHandler(BaseHTTPRequestHandler):
         if len(hosts) != 1:
             return False
         host = hosts[0].strip().lower()
+        if kind == "fingerprints":
+            # lue par la passe de veille d'un autre hôte, en HTTPS (#3885)
+            return host in self.server.local_hosts | self.server.public_hosts
         if kind in ("api", "login-api", "health"):
             allowed = self.server.local_hosts
             if self.server.service.cfg.api_via_public:
@@ -375,6 +397,8 @@ class ApproveHandler(BaseHTTPRequestHandler):
                 raise ApproveError(421, "host", "Host header not allowed")
             if kind == "static":
                 return self._static(value)
+            if kind == "fingerprints":
+                return self._fingerprints(raw_path)
             if kind == "health":
                 if self.headers.get("Origin") is not None:
                     raise ApproveError(403, "origin", "no browser allowed")

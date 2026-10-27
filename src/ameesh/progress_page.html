@@ -367,6 +367,91 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   }
   //: §16 (#3889) : délais avant un nouvel essai après une panne (ms)
   var RETRY_MS = [2000, 5000, 15000, 30000, 60000];
+
+  // outbox:begin — §16 (#3889) : la boîte d'envoi de la conversation.
+  // Chaque message est gardé sur l'appareil (localStorage) avec son
+  // Idempotency-Key AVANT l'envoi, renvoyé tel quel après une panne (réseau,
+  // 503, 429), effacé à l'accusé (200) ou au refus d'une saisie (4xx). Issue
+  // inconnue (500, clé en cours) : gardé, sans renvoi automatique, à vérifier
+  // dans la conversation ; le même texte renvoyé reprend la même clé. Une page
+  // rechargée reprend les envois en attente : jamais perdu, jamais déposé deux fois.
+  var Outbox = (function () {
+    var PREFIX = "ameesh-progress:outbox:", MAX_AGE_MS = 7 * 86400 * 1000;
+    var views = {}, flying = {};
+    function store() { try { return window.localStorage; } catch (e) { return null; } }
+    function read(agent) {
+      var s = store(); if (!s) return null;
+      try {
+        var m = JSON.parse(s.getItem(PREFIX + agent) || "null");
+        return m && typeof m.text === "string" && typeof m.key === "string" ? m : null;
+      } catch (e) { return null; }
+    }
+    function write(agent, m) { var s = store(); try { if (s) s.setItem(PREFIX + agent, JSON.stringify(m)); } catch (e) {} }
+    function drop(agent) { var s = store(); try { if (s) s.removeItem(PREFIX + agent); } catch (e) {} }
+    var quiet = {sending: function () {}, sent: function () {}, checking: function () {}, refused: function () {}};
+    function view(agent) { return views[agent] || quiet; }
+    function post(agent, m) {
+      return fetch(CHAT, {method: "POST", credentials: "omit", cache: "no-store",
+                          headers: {"Accept": "application/json",
+                                    "Content-Type": "application/json",
+                                    "Authorization": "Bearer " + TOKEN,
+                                    "Idempotency-Key": m.key},
+                          body: JSON.stringify({agent: agent, text: m.text})})
+        .then(function (r) {
+          return r.text().then(function (t) {
+            var d = {};
+            try { d = JSON.parse(t) || {}; } catch (e) { d = {message: t.trim()}; }
+            return {status: r.status, data: d};
+          });
+        }, function () { return {status: 0, data: {}}; });
+    }
+    function attempt(agent, m, n) {
+      flying[agent] = true;
+      view(agent).sending(n);
+      post(agent, m).then(function (res) {
+        if (res.status === 0 || res.status === 503 || res.status === 429) {
+          setTimeout(function () { attempt(agent, m, n + 1); }, RETRY_MS[Math.min(n, RETRY_MS.length - 1)]);
+          return;
+        }
+        flying[agent] = false;
+        if (res.status === 200) { drop(agent); view(agent).sent(); return; }
+        if (res.status >= 500 || res.data.error === "idempotency_in_progress") {
+          m.checking = true; write(agent, m); view(agent).checking(); return;
+        }
+        drop(agent);
+        view(agent).refused(res.data.message || ("HTTP " + res.status));
+      });
+    }
+    function send(agent, text) {
+      if (flying[agent]) return;
+      var m = read(agent);
+      if (!m || m.text !== text) {
+        m = {text: text, at: Date.now(),
+             key: "web-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10)};
+      }
+      m.checking = false;
+      write(agent, m);           // gardé AVANT l'envoi
+      attempt(agent, m, 0);
+    }
+    function resume() {
+      var s = store(); if (!s) return;
+      var agents = [];
+      try {
+        for (var i = s.length - 1; i >= 0; i--) {
+          var k = s.key(i);
+          if (k && k.indexOf(PREFIX) === 0) agents.push(k.slice(PREFIX.length));
+        }
+      } catch (e) { return; }
+      agents.forEach(function (agent) {
+        var m = read(agent);
+        if (!m || !(Date.now() - m.at < MAX_AGE_MS)) { drop(agent); return; }
+        if (!m.checking && !flying[agent]) attempt(agent, m, 0);
+      });
+    }
+    return {send: send, resume: resume, pending: read,
+            watch: function (agent, ui) { views[agent] = ui; if (flying[agent]) ui.sending(1); else if (read(agent) && read(agent).checking) ui.checking(); }};
+  })();
+  // outbox:end
   function dur(s) {
     if (s === null || s === undefined) return "?";
     s = Math.max(0, Math.floor(s));
@@ -449,57 +534,35 @@ p.summary { font-size: .86rem; margin: 6px 0; }
     send.type = "submit";
     var state = el("span", "conv-head");
     form.appendChild(input); form.appendChild(send); form.appendChild(state);
-    // §16 (#3889) : une panne n'est pas un échec. Le message garde sa clé
-    // (Idempotency-Key) tant qu'il n'est pas confirmé : renvoyé tel quel, il
-    // n'est jamais déposé deux fois. Seule une saisie refusée (4xx) guide.
-    var pending = null;
+    // §16 (#3889) : le message part par la boîte d'envoi (Outbox) : gardé
+    // sur l'appareil avec sa clé jusqu'à l'accusé, renvoyé tel quel.
+    Outbox.watch(name, {
+      sending: function (n) {
+        send.disabled = true; state.className = "conv-head";
+        state.textContent = n ? "sending… (the server is busy, retrying by itself)" : "sending…";
+      },
+      sent: function () {
+        send.disabled = false; input.value = ""; state.textContent = "sent";
+        loadConversation(name, list);
+      },
+      checking: function () {
+        send.disabled = false; state.className = "conv-head warn";
+        state.textContent = "being checked: look at the conversation below before sending again";
+        loadConversation(name, list);
+      },
+      refused: function (message) {
+        send.disabled = false; state.className = "conv-head warn";
+        state.textContent = "not sent: " + message;
+      }
+    });
+    var kept = Outbox.pending(name);
+    if (kept) input.value = kept.text;
     form.addEventListener("submit", function (ev) {
       ev.preventDefault();
       var text = input.value.trim();
       if (!text || send.disabled) return;
-      if (!pending || pending.text !== text) {
-        pending = {text: text, key: "web-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10)};
-      }
-      deliver(pending, 0);
+      Outbox.send(name, text);
     });
-    function deliver(msg, attempt) {
-      send.disabled = true; state.className = "conv-head";
-      state.textContent = attempt ? "sending… (the server is busy, retrying by itself)" : "sending…";
-      fetch(CHAT, {method: "POST", credentials: "omit", cache: "no-store",
-                   headers: {"Accept": "application/json",
-                             "Content-Type": "application/json",
-                             "Authorization": "Bearer " + TOKEN,
-                             "Idempotency-Key": msg.key},
-                   body: JSON.stringify({agent: name, text: msg.text})})
-        .then(function (r) {
-          return r.text().then(function (t) {
-            var d = {};
-            try { d = JSON.parse(t); } catch (e) { d = {message: t.trim()}; }
-            return {status: r.status, data: d || {}};
-          });
-        }, function () { return {status: 0, data: {}}; })
-        .then(function (res) {
-          if (res.status === 200) {
-            pending = null; input.value = ""; state.textContent = "sent";
-            send.disabled = false;
-            return loadConversation(name, list);
-          }
-          if (res.status === 0 || res.status === 503 || res.status === 429) {
-            setTimeout(function () { deliver(msg, attempt + 1); }, RETRY_MS[Math.min(attempt, RETRY_MS.length - 1)]);
-            return;
-          }
-          send.disabled = false;
-          if (res.status >= 500 || (res.data && res.data.error === "idempotency_in_progress")) {
-            // issue inconnue : peut-être déposé — on relit avant tout renvoi
-            state.textContent = "being checked: look at the conversation below before sending again";
-            state.className = "conv-head warn";
-            return loadConversation(name, list);
-          }
-          pending = null;
-          state.textContent = "not sent: " + ((res.data && res.data.message) || ("HTTP " + res.status));
-          state.className = "conv-head warn";
-        });
-    }
     wrap.appendChild(form);
     loadConversation(name, list);
     return wrap;
@@ -511,9 +574,10 @@ p.summary { font-size: .86rem; margin: 6px 0; }
           {credentials: "omit", cache: "no-store",
            headers: {"Accept": "application/json", "Authorization": "Bearer " + TOKEN}})
       .then(function (r) {
-        if (!r.ok) {
-          return r.text().then(function (t) { throw new Error("HTTP " + r.status + ": " + t.trim()); });
+        if (r.status === 401 || r.status === 404 || r.status === 400) {
+          return r.text().then(function (t) { var g = new Error(t.trim()); g.guide = true; throw g; });
         }
+        if (!r.ok) throw new Error("HTTP " + r.status);
         return r.json();
       })
       .then(function (d) {
@@ -523,7 +587,10 @@ p.summary { font-size: .86rem; margin: 6px 0; }
         entries.forEach(function (e) { list.appendChild(convEntry(e)); });
         list.scrollTop = list.scrollHeight;
       })
-      .then(null, function () {
+      .then(null, function (e) {
+        if (e && e.guide) {   // un refus (jeton, agent inconnu) guide, sans boucle
+          clear(list); list.appendChild(el("p", "empty warn", e.message)); return;
+        }
         // §16 (#3889) : on garde ce qui est affiché, et on relit plus tard
         if (!list.firstChild) list.appendChild(el("p", "empty", "conversation loading…"));
         setTimeout(function () { if (list.isConnected) loadConversation(name, list); }, RETRY_MS[2]);
@@ -601,6 +668,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   });
 
   if (MODE === "served") {
+    Outbox.resume();
     autoBox.checked = S.auto;
     btn.addEventListener("click", refresh);
     autoBox.addEventListener("change", function () { S.auto = autoBox.checked; saveHash(); });
