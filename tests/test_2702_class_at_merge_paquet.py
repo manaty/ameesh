@@ -88,10 +88,55 @@ class LotDiffRangeTest(unittest.TestCase):
              "integration/reecrit")
         return _git(self.repo, "rev-parse", "HEAD")
 
-    def test_un_gel_non_ancetre_ne_lit_pas_le_paquet(self):
+    def test_un_cherry_pick_prouve_ne_lit_pas_le_paquet(self):
         packet = self.rewritten_packet()
+        self.assertEqual(self.files(lot_measures.lot_diff_range(
+            self.repo, packet, "main", frozen=self.leger)), ["docs/leger.md"])
+
+    def test_un_squash_prouve_lit_le_delta_complet_du_lot(self):
+        _git(self.repo, "checkout", "-q", "lot/leger")
+        self.commit("docs/suite.md")
+        frozen = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "-b", "integration/squash", self.sensible)
+        _git(self.repo, "merge", "--squash", "lot/leger")
+        _git(self.repo, "commit", "-q", "-m", "lot ecrase")
+        _git(self.repo, "update-ref", "refs/heads/main", self.base)
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet squash", "integration/squash")
+        packet = _git(self.repo, "rev-parse", "HEAD")
+        self.assertEqual(self.files(lot_measures.lot_diff_range(
+            self.repo, packet, "main", frozen=frozen)),
+            ["docs/leger.md", "docs/suite.md"])
+
+    def test_une_preuve_illisible_ne_permet_pas_le_repli(self):
+        packet = self.rewritten_packet()
+        with mock.patch.object(plan_git, "probe", side_effect=RuntimeError("git unreadable")):
+            with self.assertRaises(lot_measures.UnprovenLotDiff):
+                lot_measures.lot_diff_range(self.repo, packet, "main", frozen=self.leger)
+
+    def test_un_cherry_pick_annule_ne_prouve_pas_le_gel(self):
+        packet = self.rewritten_packet()
+        copied = _git(self.repo, "rev-parse", packet + "^2")
+        _git(self.repo, "checkout", "-q", "-b", "integration/annule", packet)
+        _git(self.repo, "revert", "--no-edit", copied)
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "annule", "integration/annule")
+        cancelled = _git(self.repo, "rev-parse", "HEAD")
         with self.assertRaisesRegex(lot_measures.UnprovenLotDiff, "non ancêtre"):
-            lot_measures.lot_diff_range(self.repo, packet, "main", frozen=self.leger)
+            lot_measures.lot_diff_range(self.repo, cancelled, "main", frozen=self.leger)
+
+    def test_une_copie_posterieure_ne_prouve_pas_la_fusion(self):
+        # La cible courante porte finalement le patch, mais pas la fusion
+        # déclarée : la preuve doit être bornée au SHA de cette dernière.
+        _git(self.repo, "checkout", "-q", "-b", "integration/sans-lot", self.base)
+        self.commit("docs/autre.md")
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "reset", "--hard", self.base)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "sans lot", "integration/sans-lot")
+        earlier = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "cherry-pick", self.leger)
+        with self.assertRaisesRegex(lot_measures.UnprovenLotDiff, "non ancêtre"):
+            lot_measures.lot_diff_range(self.repo, earlier, "main", frozen=self.leger)
 
     def test_un_gel_absent_ne_lit_pas_le_paquet(self):
         with self.assertRaisesRegex(lot_measures.UnprovenLotDiff, "non ancêtre"):
@@ -99,8 +144,12 @@ class LotDiffRangeTest(unittest.TestCase):
 
     def test_la_classe_doute_sans_repli_apres_cherry_pick(self):
         packet = self.rewritten_packet()
+        # Un second commit gelé n'est pas dans le paquet : preuve partielle.
+        _git(self.repo, "checkout", "-q", "lot/leger")
+        self.commit("docs/manquant.md")
+        incomplete = _git(self.repo, "rev-parse", "HEAD")
         with mock.patch.object(review_lot.work, "milestones", return_value=[
-                {"kind": "frozen", "sha": self.leger}]), \
+                {"kind": "frozen", "sha": incomplete}]), \
                 mock.patch.object(lot_measures, "diff_range") as fallback, \
                 mock.patch.object(review_lot.lot_class, "of_lot") as classify:
             klass = review_lot.class_at_merge(None, 2823, item={"id": 2823},
@@ -204,10 +253,23 @@ class PacketClassWitness(_Witness):
         self.assertEqual(opened["class"], "light", opened)
         self.assertEqual(len(self.review_lots(lot)), 1)
 
-    def test_un_lot_reecrit_dans_un_paquet_mixte_reste_en_doute(self):
+    def test_un_lot_cherry_picke_ouvre_sa_relecture(self):
         lot = self.lot()
         self.frozen_on_branch(lot, "lot/2823-reecrit")
         packet = self.mixed_packet("lot/2823-reecrit", rewritten=True)
+        opened = review_lot.open_for_merge(self.db, lot, merged_sha=packet,
+                                           repo=self.repo, target="develop")
+        self.assertTrue(opened["created"], opened)
+        self.assertEqual(opened["class"], "light", opened)
+        self.assertEqual(len(self.review_lots(lot)), 1)
+
+    def test_un_lot_partiellement_cherry_picke_reste_en_doute(self):
+        lot = self.lot()
+        self.frozen_on_branch(lot, "lot/3938-partiel")
+        packet = self.mixed_packet("lot/3938-partiel", rewritten=True)
+        # Le gel a avancé après la composition, cas réel Nexlink #3824 :
+        # la fusion de l'ancien patch ne prouve pas la nouvelle tête.
+        self.frozen_on_branch(lot, "lot/3938-plus", name="docs/manquant.md")
         opened = review_lot.open_for_merge(self.db, lot, merged_sha=packet,
                                            repo=self.repo, target="develop")
         self.assertFalse(opened["created"], opened)
