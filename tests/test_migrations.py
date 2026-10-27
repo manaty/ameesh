@@ -320,7 +320,12 @@ class MigrationsTest(PgTestCase):
                 cfg = dataclasses.replace(self.cfg, schema=schema, statement_timeout_ms=200)
                 lent = db_mod.connect(cfg)
                 try:
-                    done = migrations.migrate(lent, directory=dossier)
+                    # The shared bench's real election lock may be held by
+                    # another schema. This test measures the migration body,
+                    # not the deliberately bounded election wait.
+                    from unittest import mock
+                    with mock.patch.object(migrations, "_LOCK", "t_" + schema):
+                        done = migrations.migrate(lent, directory=dossier)
                     self.assertEqual([m.version for m in done], [1])
                 finally:
                     lent.close()
