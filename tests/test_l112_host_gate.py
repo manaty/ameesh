@@ -606,9 +606,11 @@ for i in range(int(os.environ.get("L112_ETAPES", "3"))):
         {"type": "tool_use", "id": "t%d" % i, "name": "Bash", "input": {}}]}}), flush=True)
     note({"outil": i})
     time.sleep(float(os.environ.get("L112_DUREE", "0.6")))
+    # #3926 : journalisé AVANT le résultat — un résultat déjà lu par
+    # l'exécuteur est toujours compté par le témoin.
+    note({"fini": i})
     print(json.dumps({"type": "user", "message": {"content": [
         {"type": "tool_result", "tool_use_id": "t%d" % i, "content": "ok"}]}}), flush=True)
-    note({"fini": i})
 print(json.dumps({"type": "result", "subtype": "success", "result": "fini",
                   "total_cost_usd": 0.0, "session_id": session}), flush=True)
 note({"fin": True})
@@ -706,8 +708,12 @@ class ExecuteurTest(PgTestCase):
     def test_retrait_pendant_un_tour_au_point_sur_puis_reprise(self):
         self.agent()
         ecrit_etat(self.state_path, etat("available", 1))
-        os.environ["L112_ETAPES"] = "6"
-        self.addCleanup(os.environ.pop, "L112_ETAPES", None)
+        # #3926 : un appel d'outil de 2 s, plus long que le retard de lecture
+        # du flux par l'exécuteur sous une CI de paquet (> 0,6 s vu en
+        # h-35) : sinon l'appel suivant finit avant l'arrêt au point sûr.
+        os.environ.update(L112_ETAPES="6", L112_DUREE="2")
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in ("L112_ETAPES",
+                                                                   "L112_DUREE")])
         runner = self.lance()
         self.assertTrue(attendre(lambda: any("outil" in m for m in self.harnais())))
         ecrit_etat(self.state_path, etat("draining", 2,
@@ -738,7 +744,7 @@ class ExecuteurTest(PgTestCase):
         time.sleep(1.0)
         self.assertIsNone(registry.get(self.db, "enfant")["lease_owner"])
         # retour à available : reprise sans geste humain, sur la même session
-        os.environ["L112_ETAPES"] = "1"
+        os.environ.update(L112_ETAPES="1", L112_DUREE="0.6")
         ecrit_etat(self.state_path, etat("available", 3))
         self.assertTrue(attendre(lambda: any(m.get("fin") for m in self.harnais())),
                         "le tour doit reprendre de lui-même")
