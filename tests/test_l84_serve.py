@@ -423,5 +423,48 @@ class BuildersTest(unittest.TestCase):
         self.assertTrue(callable(mesh_cli.agent_rows))
 
 
+class FaultJournalTest(ServerMixin, unittest.TestCase):
+    """#3892 (§16) : une panne de `ameesh serve` est comptée par empreinte —
+    gabarit de route, classe d'exception, version — jamais le message reçu."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="l84-faults-")
+        cfg = type("Cfg", (), {"approve_url": None,
+                               "threads_dir": os.path.join(self.tmp, "fils"),
+                               "threads_root": os.path.join(self.tmp, "fils"),
+                               "state_dir": self.tmp})()
+        self.failure = db_mod.Unavailable("database at 10.1.2.3 refused for alice")
+
+        def read(fn):
+            raise self.failure
+        self.start(serve.Context(cfg=cfg, human="human:owner", organisation="Example"), read,
+                   rate_per_minute=1000)
+
+    def faults(self):
+        with open(os.path.join(self.tmp, "faults-serve.json"), encoding="utf-8") as fh:
+            return json.load(fh)["faults"]
+
+    def test_a_database_fault_is_journaled_by_route_template(self):
+        status, body = self.get_json("/api/v1/lots/123")
+        self.assertEqual((status, body["error"]), (503, "unavailable"))
+        [entry] = self.faults().values()
+        self.assertEqual((entry["route"], entry["exception"]),
+                         ("GET /api/v1/lots/{id}", "Unavailable"))
+        self.assertEqual(entry["occurrences"], 1)
+        raw = json.dumps(self.faults())
+        self.assertNotIn("10.1.2.3", raw)
+        self.assertNotIn("alice", raw)
+        self.assertNotIn("/lots/123", raw)
+
+    def test_an_unexpected_fault_is_journaled_too(self):
+        self.failure = RuntimeError("boom at 10.1.2.3")
+        status, body = self.get_json("/api/v1/projects")
+        self.assertEqual((status, body["error"]), (500, "internal"))
+        [entry] = self.faults().values()
+        self.assertEqual((entry["route"], entry["exception"]),
+                         ("GET /api/v1/projects", "RuntimeError"))
+        self.assertNotIn("10.1.2.3", json.dumps(self.faults()))
+
+
 if __name__ == "__main__":
     unittest.main()
