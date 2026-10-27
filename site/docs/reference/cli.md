@@ -186,6 +186,10 @@ ameesh list [--json]                       # every agent (--json: schema ameesh-
 ameesh projects [--project P] [--all] [--json]  # projects in progress: who works on what (ameesh-projects/1)
 ameesh show <agent> [--json]               # one agent
 ameesh hosts [HOST] [--history N] [--json] # host resources: last reading, limits, short history
+ameesh debit [--json] [--check] [--hours H] [--threshold DURÉE] [--ci-hours H] [--ci-slow DURÉE]
+                                           # measured mesh debt (schema ameesh-debit/1)
+ameesh events [--after ID] [--limit N] [--json] | prune [--days N] [--dry-run]
+                                           # append-only event log (L85)
 ameesh decisions [--all] [--for human:ID] [--json]  # what waits for a human
 ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since SINCE]
                 [--no-gantt] [--no-versions] [--stale-after S]
@@ -243,6 +247,42 @@ progress), the effective limits and where each comes from, and the short
 history (`--history`, default 10 readings); `--json` gives one object per host
 (schema `ameesh-host/1`).
 
+`ameesh debit` measures the debt the milestones hide: lots in `qa` or
+`blocked` by age, reviews still owed, blocking verdicts untreated, holds and
+armed wakes, idle agents with work due, turns and merges per hour, CI job
+durations (canon of 24/10/2026). `--json` prints the full
+`ameesh-debit/1` report; `--check` exits 2 when an agent wait exceeds
+`--threshold` (default 2 h; human and external waits are excluded).
+
+`ameesh events` reads the append-only event log, written by a trigger in the
+same transaction as each change: lot transitions, turns, costs, thread
+entries, decisions, receipts, alerts and pilot gestures. `--after ID` resumes
+after a position (default: the last 20 events), `--limit` bounds the page (max
+1000), `--json` prints an `ameesh-events/1` object; `prune --days N
+[--dry-run]` applies the retention by hand, one year by default.
+
+## GitHub: `ameesh github`
+
+```
+ameesh github read <path> [--ttl S]        # one REST GET through the host's shared cache (L848, L860)
+ameesh github gestes [--since 24h] [--agent A] [--match S] [--json]  # gh commands journaled per turn
+ameesh github identity <agent> [--json]    # the GitHub identity an agent resolves to
+```
+
+`github read` is the watch scripts' entry point: it serves a GitHub REST path
+(`/repos/owner/repo/…`) through the same disk cache as `ameesh notify`, with
+`If-None-Match` revalidation (a 304 costs no quota) and a stop when the
+resource's quota is exhausted; the path is normalised without its leading
+slash. It prints the JSON body on one line. Exit codes: 0 a served read
+(network, revalidation or cache), 1 a GitHub or transport error, 2 a usage
+error, 3 quota exhausted with nothing cached for that path — wait for the reset
+instead of looping. Reads only: writes (a merge, a run restart) still go
+through `gh`, and the token is neither written nor journaled. `github gestes`
+lists the `gh` commands run by agents per turn (who cancelled, merged or
+labelled), and `github identity` shows the GitHub identity an agent resolves
+to (#1645). See `docs/EXPLOITATION.md` and the GitHub-watch process
+(`processus/demandes-github.md` in the canon).
+
 ## Operating agents
 
 ```
@@ -266,6 +306,11 @@ ameesh resume <agent> [--brief FILE|-] [--fresh] [--json]
 ameesh interrupt <agent> <message…> [--from SENDER]
 ameesh host drain HOST [--for 8h] | undrain HOST | status [HOST]   # durable host withdrawal (L232e)
 ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION  # reserved host move (L232a)
+ameesh role status [ROLE] [--json] | role canary [--json]  # elected roles, leases and epochs (L165)
+ameesh role run <agent> [--min-left S] [--dry-run] [--json] -- <command…>
+                                           # run a mechanical pass on the live lease holder only
+ameesh role timers [--role R] [--install|--check|--remove] [--no-apply] [--no-sync] [--json]
+ameesh service install|uninstall|status [--agent A]… [--no-runner] [--no-notify] [--dry-run] [--json]
 ```
 
 | Option | Meaning |
@@ -307,6 +352,25 @@ close while the current turn finishes, critical agents first; `undrain` returns
 it, `status` reads the lifecycle state, and an unplanned loss is recovered only
 after a proof scoped to the source, agent and lease epoch. `ameesh handoff
 plan` reserves a host move at a lot boundary with a durable journal (L232a).
+
+**Elected roles** (L165). `role status` prints, per role, the holder and its
+lease epoch, the ranked candidates and whether each can push an alert;
+`canary` is a no-op gesture fenced by the environment's lease epoch (0
+accepted, 1 refused, 2 no lease to guard), used to prove the fencing before a
+real gesture. `role run` runs a mechanical command only on the host that holds
+the role's live lease — the epoch is passed to the command — so a timer cannot
+run the same pass twice after a failover; a delegated pass (`--pass alerts`)
+runs on the holder when it can push, else on the first candidate that can.
+`role timers` installs, verifies or removes the matching systemd timers on the
+candidates (`--install`, `--check`, `--remove`), and its diagnostics name the
+missing file or state, never a secret.
+
+**User services** (macOS). `service install` writes and loads the launchd
+agents: the host runner and `ameesh notify`, or one runner per `--agent` (the
+flag repeats, or takes a comma-separated list); `--no-runner` and `--no-notify`
+leave one side alone, and `--dry-run` prints the plists without writing.
+`uninstall` unloads and removes them; `status` reads the installed agents and
+their launchd state (`--json` for machine reading).
 
 ## Readable threads: `ameesh fil`
 
@@ -567,6 +631,29 @@ identity (`AGENT_MAIL_NAME`, or a session binding), else `inconnu` with a
 warning — never an empty actor. `work delegate` keeps its meaning (`--actor`
 is the delegator).
 
+### CI of a lot: `ameesh ci`
+
+```
+ameesh ci status <lot> [--limit N] [--json]        # latest runs and failing tests (ameesh-ci-status/1)
+ameesh ci run <lot> [--sha S] [--avis 0|1|2] [--full] [--exception incident|unblock]
+                   [--reason R] [--force] [--dry-run] [--json]
+ameesh ci cancel <lot> [--all] [--repo R] [--dry-run] [--json]
+```
+
+On a lot branch a push starts nothing: review comes before CI (canon §3). Once
+the required verdicts are on the frozen head, `ci run` requests the lot CI
+**once**, on that head, through a `ci-lot-<sha>` label (impacted + contract).
+It refuses without a `frozen` milestone `S`, a branch head and open PR head
+still at `S`, `--avis N` `ok` verdicts on that exact commit by distinct actors
+other than the assignee (0 light, 1 sensible, 2 SQL/security/prod), a workflow
+at `S` that carries the trigger, and no identical request already green or in
+flight. `--full --reason …` requests the whole suite; `--exception
+incident|unblock --reason …` runs CI beside the review and writes the
+exception on the lot (canon §11 bis); `--force` replaces a red or cancelled
+request of the same composition. `ci status` shows the latest runs and their
+failing tests, and `ci cancel` cancels the open runs of the lot that do not
+carry its frozen commit (`--all` also cancels the frozen-head run).
+
 ## Decisions: `ameesh decide`
 
 ```
@@ -624,6 +711,7 @@ ameesh agent name  --role R [--project P …] [--canon DIR] [--ref REV] [--fetch
 ameesh agent spawn [name] --by CREATOR --ttl TTL [--role R] [--project P …] [--cwd DIR] [--prompt TEXT] [--json]
 ameesh review-class [FILE …] [--diff REF] [--canon DIR] [--ref REV] [--fetch] [--json]
 ameesh process check FILE [--ref REF] [--version N] [--json]
+ameesh identity verify [TOKEN|-] [--issuer URL --client-id ID] [--domain D] [--binding subject|email]
 ```
 
 | Option | Meaning |
@@ -643,6 +731,13 @@ it reads no database and writes nothing. `--ref` and `--version` label the
 checked revision (default `file:<path>` and `0`), `--json` prints the encoded
 native document and labels. Exit 0 when the block compiles (or the card has no
 workflow), 1 on a named refusal, 2 when the file cannot be read.
+
+`ameesh identity verify` checks an OIDC identity token (the argument, `-` on
+standard input, or the configured token file) and binds its `{issuer,
+subject}` — or its `email` on an explicit `--binding email` — to a member of
+the canon (L86). It prints the bound `human` as JSON; exit 3 when no member
+matches, 1 on a named refusal (bad token, unknown issuer, unreadable
+configuration). It reads the canon, not the registry.
 
 ## Hosts, capacity and enrolment
 
@@ -785,6 +880,30 @@ verifier's policy (`AMEESH_APPROVE_RP_ID`, `AMEESH_APPROVE_ORIGINS`). Exit
 codes: 0 consistent; 1 differences, listed; 2 configuration missing or service
 unreachable. Nothing is written.
 
+## Approval bridge: `ameesh process-approvals`
+
+```
+ameesh process-approvals refresh [--config F] [--dry-run] [--json]  # read the IMA issue, write the local projection
+ameesh process-approvals check [--config F] [--json]                # freshness, counts, digests
+ameesh process-approvals show --repo R --revision SHA --path P [--source github] [--config F] [--json]
+```
+
+The IMA/GitHub approval bridge (#4006) reads the IMA approval issue (#704)
+with the bureau's GitHub token and writes a read-only local projection that
+the Process workflow gate consumes. A projection that is missing, stale,
+unreadable, writable by the group or others, or of an unknown schema is
+refused (fail-closed): the `approvals` source disappears from the snapshot and
+every guard that requires it refuses `source-unavailable`. `source=api` is
+never an authority; only the `github` read counts, and `--source` accepts
+`github` alone. `refresh` runs on `bureau-goal` (it is the only host that talks
+to GitHub) and `--dry-run` reads and normalises without writing; `check` and
+`show` make no network call, so an agent host can use them. The source block
+of the configuration (repository, issue, approvers) anchors the projection's
+identity: a copy from another repository, issue or approver is refused.
+Operator procedure and the configuration key (`approvals`) are in
+`docs/EXPLOITATION.md`; the contract is in
+`docs/design/process-workflow-registry.md`.
+
 ## Model catalogue: `ameesh models`
 
 ```
@@ -802,6 +921,25 @@ ameesh doctor [--notify-test] [--probe]       # --probe: database, schema, migra
 ameesh import-v0 [--state DIR] [--agents a,b] [--dry-run]
 ameesh export-v0 [--state DIR] [--agents a,b] [--keep]   # --keep: copy instead of move
 ```
+
+## Provenance: `ameesh provenance`
+
+```
+ameesh provenance record --commit SHA [--lot ID] [--quiet] [--json]
+ameesh provenance install [--repo R] [--json]
+ameesh provenance intent [--json]
+ameesh provenance created [--json]
+ameesh provenance show [--commit SHA | --milestone ID] [--json]
+```
+
+`#1465`: the exact origin of a commit and of a milestone — actor, session,
+turn and harness. `install` writes the git hooks of a repository: `intent`
+attests the commit that is about to be made (pre-commit), `created` records
+the object once it is born (post-commit); `record` does the same for an
+existing commit (`--lot` attaches it to a work item), and `show` reads the
+receipt, or nothing when it is unknown. A provenance receipt proves where a
+change came from; it is never human authority (see the bench authority model
+below).
 
 ## Bench authority model (Ed25519)
 
