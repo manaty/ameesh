@@ -360,6 +360,28 @@ class BackgroundSignalTest(unittest.TestCase):
         self.assertTrue(platform.become_subreaper())
         self._detached_fork_on_term(double=True)
 
+    def _wait_pid(self, pidfile: str, timeout: float = 10.0):
+        """Le PID du descendant détaché, dès que son fichier est complet.
+
+        Le double fork écrit `grandchild.pid` par renommage atomique ; sous
+        `--parallel`, la chaîne peut dépasser la grâce du test avant que le
+        fichier n'apparaisse. `.tmp` est lu aussi : si le renommage n'a pas
+        encore eu lieu, le PID y est déjà.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            for path in (pidfile, pidfile + ".tmp"):
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        raw = fh.read().strip()
+                except OSError:
+                    continue
+                if raw.isdigit():
+                    return int(raw)
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.01)
+
     def _detached_fork_on_term(self, *, double=False):
         with tempfile.TemporaryDirectory(prefix="ameesh-detached-fork-") as tmp:
             pidfile = os.path.join(tmp, "grandchild.pid")
@@ -408,26 +430,47 @@ class BackgroundSignalTest(unittest.TestCase):
                                          ended=0, deadline=1, grace_s=1,
                                          handles={child.pid: held})
                 self.tracker.entries = [entry]
-                self.tracker.TERM_GRACE_S = .5
+                # Un double fork + setsid sous --parallel peut ne pas être
+                # ordonnancé dans la demi-seconde d'origine : l'enfant
+                # d'origine était tué avant d'avoir attendu son descendant,
+                # et le pid n'existait pas encore. La grâce n'est pas ce que
+                # ce test mesure.
+                self.tracker.TERM_GRACE_S = 10
                 with mock.patch.object(background.storage, "of") as store:
                     self.tracker.tick(now=0)
                     self.assertIsNone(entry.pgid)
                     self.tracker.tick(now=2)
-                    with open(pidfile) as f:
-                        grandchild = int(f.read())
+                    grandchild = self._wait_pid(pidfile)
+                    self.assertIsNotNone(
+                        grandchild, "le descendant détaché n'a pas publié son pid")
                     self.assertTrue(platform.alive(grandchild))
                     store.return_value.turn_resources.close_turn.assert_called_once_with(
                         "detached-fork", orphan=True, containers=None)
             finally:
-                if grandchild is None and os.path.exists(pidfile):
-                    with open(pidfile) as f:
-                        grandchild = int(f.read())
+                if grandchild is None:
+                    grandchild = self._wait_pid(pidfile, timeout=5)
                 if grandchild is not None:
                     try:
                         os.kill(grandchild, signal.SIGKILL)
                         os.waitpid(grandchild, 0)
                     except (ProcessLookupError, ChildProcessError):
                         pass
+                else:
+                    # Dernier recours : un descendant qui n'a jamais publié
+                    # son pid garde le répertoire temporaire non vide. Sa
+                    # ligne de commande porte le chemin de ce répertoire.
+                    try:
+                        table = platform.process_table()
+                    except Exception:
+                        table = []
+                    for proc in table:
+                        if proc["pid"] == os.getpid():
+                            continue
+                        if pidfile in platform.command_line(proc["pid"]):
+                            try:
+                                os.kill(proc["pid"], signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
                 if held is not None:
                     held.send(signal.SIGKILL)
                     held.close()

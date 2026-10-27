@@ -22,12 +22,14 @@ from .test_cluster import TEST_DSN, _dsn_for
 
 ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-executor.sql")
 
-#: Les rôles du contrat module (`role-module-writers.sql`) ont des noms fixes
-#: et vivent dans le CLUSTER, pas dans la base du run : sur le banc partagé,
-#: deux runs simultanés du module se marchaient dessus (DROP ROLE 2BP01, ACL
-#: laissée par l'autre run). Les verrous consultatifs étant pris par base, on
-#: sérialise la séquence création/usage/destruction dans une transaction
-#: persistante sur la base du banc, commune aux runs (y compris en psql).
+#: `ameesh_canon_sync` est le nom fixe que le déclencheur de politique de la
+#: migration 0363 refuse de remplacer, et aucune migration ne lui accorde de
+#: droit dans les schémas voisins : il reste le nom de production, créé et
+#: détruit sous ce verrou. Les deux groupes d'écriture, eux, reçoivent EXECUTE
+#: dans chaque schéma migré tant qu'ils existent (migration 0427) : un nom
+#: fixe y laisse une ACL qui empêche `DROP ROLE` (h-32 v2, #3842, --parallel).
+#: Leurs noms de test sont donc suffixés par processus, et le script du contrat
+#: est exécuté sur une copie où seuls ces deux noms sont remplacés.
 MODULE_WRITERS_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('ameesh-role-module-writers', 0))"
 
 
@@ -235,20 +237,35 @@ class RoleExecutorTest(PgTestCase):
 
     def test_module_writer_role_contract_and_executor_separation(self):
         q = db_mod.quote_ident
-        names = ("ameesh_canon_sync", "ameesh_it_proof", "ameesh_it_qa")
-        # noms fixes du contrat, partagés par le cluster : sérialiser les runs
-        # concurrents du banc (cf. MODULE_WRITERS_LOCK).
+        # 0427 accorde EXECUTE à ces deux noms dans chaque schéma migré tant
+        # qu'ils existent : les suffixer par processus empêche un worker
+        # parallèle de laisser une ACL sur un rôle qu'on s'apprête à détruire.
+        suffix = uuid.uuid4().hex[:8]
+        canon = "ameesh_canon_sync"
+        proof = "ameesh_it_proof_%s" % suffix
+        qa = "ameesh_it_qa_%s" % suffix
+        names = (canon, proof, qa)
+        # Le nom de canon sync est figé par le déclencheur de 0363 : le verrou
+        # sérialise sa création/destruction entre les runs du banc.
         with self.admin_db.transaction() as lock_db:
             lock_db.execute(MODULE_WRITERS_LOCK)
             placeholders = ", ".join(["%s"] * len(names))
             existing = {r["rolname"] for r in self.db.query(
                 "SELECT rolname FROM pg_roles WHERE rolname IN (%s)" % placeholders, names)}
             script = os.path.join(REPO, "deploy", "sql", "role-module-writers.sql")
+            with open(script, encoding="utf-8") as source_file:
+                source = source_file.read()
+            for fixed, scoped in (("ameesh_it_proof", proof), ("ameesh_it_qa", qa)):
+                self.assertIn(fixed, source)
+                source = source.replace(fixed, scoped)
+            scoped_script = os.path.join(self.tmp, "role-module-writers-%s.sql" % suffix)
+            with open(scoped_script, "w", encoding="utf-8") as target:
+                target.write(source)
 
             def run_writers():
                 return subprocess.run(
                     ["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
-                     "-f", script], capture_output=True, text=True, timeout=60,
+                     "-f", scoped_script], capture_output=True, text=True, timeout=60,
                     env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
 
             try:
@@ -258,12 +275,12 @@ class RoleExecutorTest(PgTestCase):
                 # #2274: the review catch-up activation bound stays owner-only;
                 # granting canon sync DML on it would move the review horizon.
                 self.assertFalse(self.db.query(
-                    "SELECT has_table_privilege('ameesh_canon_sync', %s,"
+                    "SELECT has_table_privilege(%s, %s,"
                     " 'INSERT,UPDATE,DELETE') AS p",
-                    ("%s.review_catch_up" % q(self.schema),))[0]["p"])
+                    (canon, "%s.review_catch_up" % q(self.schema)))[0]["p"])
                 # #2481: a full work row projects its reserved migration slots;
                 # both isolated writers read the lot through that projection.
-                for writer_role in ("ameesh_it_proof", "ameesh_it_qa"):
+                for writer_role in (proof, qa):
                     with self.subTest(writer_role=writer_role):
                         self.assertTrue(self.db.query(
                             "SELECT has_table_privilege(%s, %s, 'SELECT') AS p",
@@ -309,7 +326,7 @@ class RoleExecutorTest(PgTestCase):
                                 self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
                                                 (q(self.database), q(member)))
                                 self.db.execute("REVOKE %s FROM %s" % (q(group), q(member)))
-                    self.db.execute("GRANT %s TO %s" % (q("ameesh_it_qa"), q(inherited)))
+                    self.db.execute("GRANT %s TO %s" % (q(qa), q(inherited)))
                     self.db.execute("GRANT %s TO %s" % (q(inherited), q(member)))
                     for grantee in (inherited, member):
                         with self.subTest(temp_member=grantee):
@@ -345,10 +362,10 @@ class RoleExecutorTest(PgTestCase):
                 for name in names:
                     self.assertNotEqual(self.as_host("SET ROLE %s" % q(name)).returncode, 0)
                 with self.db.transaction() as tx:
-                    tx.execute("SET LOCAL ROLE ameesh_canon_sync")
+                    tx.execute("SET LOCAL ROLE %s" % q(canon))
                     ModuleStore(tx).replace("", modules.declarations(federation()))
                 # Neither executor nor proof/QA writer is a policy writer.
-                for writer in ("ameesh_it_proof", "ameesh_it_qa"):
+                for writer in (proof, qa):
                     with self.assertRaises(db_mod.DbError), self.db.transaction() as tx:
                         tx.execute("SET LOCAL ROLE %s" % writer)
                         ModuleStore(tx).replace("", [])
