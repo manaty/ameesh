@@ -13,7 +13,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import deps, menage
+from ameesh import deps, housekeeping as hk, menage
 
 from . import support  # noqa: F401  (isolated environment, L142)
 
@@ -600,6 +600,31 @@ class ReviewFixesTests(_Base):
         self.assertTrue(os.path.isdir(entry))
         self.assertEqual(len(deps.gc_node_modules(self.cache, now=later,
                                                   holders=lambda _p: [])), 1)
+
+    def test_7_gc_deletes_nothing_when_the_worktree_inventory_expired(self):
+        """#3802 B/P1 (cx1) : si le budget expire PENDANT l'inventaire des
+        worktrees, la liste est incomplète ; l'entrée peut avoir un lien
+        vivant dans un worktree omis, donc rien n'est supprimé."""
+        pkg = _package(os.path.join(self.base, "w1"))
+        entry, done = self._complete_entry(pkg)
+        other = _package(os.path.join(self.base, "w2"))
+        os.unlink(os.path.join(pkg, "node_modules"))
+        for name in os.listdir(os.path.join(entry, deps.LINKS)):
+            os.unlink(os.path.join(entry, deps.LINKS, name))
+        os.symlink(done["target"], os.path.join(other, "node_modules"))
+        later = time.time() + 10 * 24 * 3600
+        clock = [0.0]
+        budget = hk.PassBudget(10.0, clock=lambda: clock[0])
+
+        def worktrees():
+            clock[0] = 20.0        # the inventory itself consumed the budget
+            return []              # the worktree with the live link is omitted
+
+        lines = deps.gc_node_modules(self.cache, now=later, worktrees=worktrees,
+                                     holders=lambda _p: [], budget=budget)
+        self.assertTrue(os.path.isdir(entry), "an incomplete inventory must keep it")
+        self.assertIn("inventory incomplete",
+                      " ".join(line.get("detail") or "" for line in lines))
 
     @unittest.skipUnless(deps.platform.is_linux(),
                          "les fichiers projetés se lisent dans /proc/<pid>/maps (Linux)")
