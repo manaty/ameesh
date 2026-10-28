@@ -1785,10 +1785,30 @@ def waive_review(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict
     relecteur, retirer la marque (`clear_reviewer`), sortir de qa ou geler
     une autre tête rend la revue à nouveau due."""
     who, item = _review_item(cfg, db, item_id, actor)
-    # Un verdict bloquant COURANT demande une correction, pas une dispense :
-    # la marque dormirait et dispenserait la revue suivante à tort. Les
-    # transitions se lisent dans l'ordre chronologique (`lot_transitions`),
-    # pas le journal complet, qui rend le plus récent d'abord.
+    if _blocked_current(db, item_id, item):
+        raise WorkError(
+            "verdict not required refused: lot %s carries a current blocked "
+            "verdict — a fix is due, not a waiver (#1979)" % item_id)
+    if _waived(item):
+        # #4109 : la désignation d'un véhicule sans delta propre a déjà posé
+        # la dispense ; le composeur horaire la redemande sans second journal.
+        return item
+    return _write_reviewer(db, item_id, REVIEWER_NONE, who,
+                           "verdict not required: no re-verdict due (#1979)")
+
+
+def _waived(item: dict) -> bool:
+    names = item.get("reviewers")
+    if names is None:
+        names = [item.get("reviewer")]
+    return REVIEWER_NONE in [str(name or "").strip() for name in names]
+
+
+def _blocked_current(db: Db, item_id: int, item: dict) -> bool:
+    """Un verdict bloquant COURANT demande une correction, pas une dispense :
+    la marque dormirait et dispenserait la revue suivante à tort. Les
+    transitions se lisent dans l'ordre chronologique (`lot_transitions`),
+    pas le journal complet, qui rend le plus récent d'abord."""
     from . import progress  # import tardif : progress importe ce module
     store = storage.of(db)
     transitions = store.progress.lot_transitions([int(item_id)])
@@ -1797,12 +1817,25 @@ def waive_review(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict
     agents = {r["name"] for r in store.progress.agents(None) if r.get("name")}
     jalons = progress._jalons_de_lot(item, transitions, [], milestones(db, item_id),
                                      agents=agents)
-    if jalons.get("verdict_kind") == "blocked" and jalons.get("verdict_current"):
-        raise WorkError(
-            "verdict not required refused: lot %s carries a current blocked "
-            "verdict — a fix is due, not a waiver (#1979)" % item_id)
-    return _write_reviewer(db, item_id, REVIEWER_NONE, who,
-                           "verdict not required: no re-verdict due (#1979)")
+    return bool(jalons.get("verdict_kind") == "blocked" and jalons.get("verdict_current"))
+
+
+def waive_ownless_vehicle(db: Db, item_id: int, actor: str, event: str) -> bool:
+    """#4109 : la dispense de `waive_review`, posée par la désignation.
+
+    Un véhicule dont le delta propre est vide n'a aucun avis dû : ses membres
+    sont relus sur leur tête gelée. Le geste est mécanique (§7), sans
+    autorité de pilote ; il s'écrit dans la transaction de l'appelant. Rien
+    n'est écrit hors `qa`, sur une dispense déjà posée ni sous un verdict
+    bloquant courant. Rend True si la dispense a été écrite."""
+    item = get(db, int(item_id))
+    if item is None or item.get("state") != "qa" or _waived(item):
+        return False
+    if _blocked_current(db, int(item_id), item):
+        return False
+    row = storage.of(db).work.designate_reviewer(int(item_id), REVIEWER_NONE,
+                                                actor=actor, event=event)
+    return row is not None
 
 
 def check_external_executor(db: Db, executor: str, *, cfg=None) -> str:

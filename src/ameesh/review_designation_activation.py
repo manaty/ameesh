@@ -112,6 +112,9 @@ LIGHT_WHY = ("light lot: no pre-merge reviewer is due (the other-family review"
              " happens after merge)")
 #: why an empty frozen diff keeps no reviewer
 NO_PATH_WHY = "no changed path: no review due"
+#: journal line of the waiver posed on a vehicle without own delta (#4109)
+VEHICLE_WAIVER_EVENT = ("verdict not required: vehicle without own delta, members "
+                        "reviewed (#1979, #4109)")
 #: a frozen range longer than this is not read in one selection (bounded work)
 MAX_COMMITS = 500
 #: #2681 : le seuil et la lecture des auteurs sont celles de la porte et du
@@ -2093,6 +2096,21 @@ def _note_none(db, item: Mapping, freeze: Mapping, why: str) -> None:
         "%s automatic reviewer designation: none — %s" % (prefix, why), SENDER)
 
 
+def _waive_ownless_vehicle(db, item: Mapping, inputs: "Inputs") -> None:
+    """#4109 : un véhicule sans delta propre reçoit la dispense de re-verdict.
+
+    La désignation conclut NONE (« no changed path ») : aucun avis n'est dû,
+    les membres portent les leurs. Sans la dispense (#1979), les portes
+    attendaient pourtant « verdict from a reviewer (none designated) » et un
+    agent devait se désigner. Un véhicule avec une résolution ou un commit
+    propre, ou un lot ordinaire sans chemin, ne change pas."""
+    from . import packet_reviews
+
+    if inputs.paths or inputs.commits or not packet_reviews.is_vehicle(item):
+        return
+    work.waive_ownless_vehicle(db, int(item["id"]), SENDER, VEHICLE_WAIVER_EVENT)
+
+
 def _none_outcome(db, lot: int, freeze: Mapping) -> Optional[dict]:
     """The journaled light/no-review outcome of this freeze, or None."""
     freeze_id = int((freeze or {}).get("id") or 0)
@@ -2955,6 +2973,7 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
                    "why": LIGHT_WHY if inputs.paths else NO_PATH_WHY}
             _note_none(tx, item, freeze, out["why"])
             _sync_reviewers(tx, item, freeze, [])
+            _waive_ownless_vehicle(tx, item, inputs)
         else:
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads))
             if out.get("state") in (rd.DESIGNATED, rd.WAITING):
@@ -3465,6 +3484,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                     return _stale(freeze)
                 _note_none(tx, item, freeze, why)
                 _sync_reviewers(tx, item, freeze, [])
+                _waive_ownless_vehicle(tx, item, inputs)
             return {"state": rd.NONE, "required": 0, "reviewers": [],
                     "freeze": freeze, "why": why}
         with db.transaction() as tx:
