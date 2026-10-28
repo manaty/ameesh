@@ -14,7 +14,7 @@ import threading
 import unittest
 from unittest import mock
 
-from ameesh import registry, veille, work
+from ameesh import cost, registry, harness_adoption as veille, work
 from ameesh.adapters import HarnessMissing
 
 from .support import PgTestCase
@@ -88,6 +88,40 @@ class ReportRuleTest(unittest.TestCase):
             decision = veille.decide(veille.Report(
                 report(price={"kind": kind, "projected_7d_usd": 1.0})))
             self.assertEqual(decision.action, "owner", kind)
+
+    def test_a_more_expensive_model_from_the_schedule_is_not_equal(self):
+        """deepseek-flash -> deepseek-pro : le barème de cost.py tranche,
+        même si le rapport écrit « equal » et des tarifs égaux."""
+        data = report(object="model", from_version="deepseek-flash",
+                      to_version="deepseek-pro")
+        decision = veille.decide(veille.Report(data), prices=cost.DEFAULT_PRICES)
+        self.assertEqual(decision.action, "owner")
+        self.assertEqual(decision.price, "higher")
+
+    def test_an_unknown_model_price_requires_the_owner(self):
+        data = report(object="model", from_version="model-inconnu-a",
+                      to_version="model-inconnu-b",
+                      price={"kind": "equal", "projected_7d_usd": 1.0})
+        decision = veille.decide(veille.Report(data), prices=cost.DEFAULT_PRICES)
+        self.assertEqual(decision.action, "owner")
+        self.assertEqual(decision.price, "unknown")
+
+    def test_disjoint_rates_are_not_equal(self):
+        data = report(price={"kind": "equal", "projected_7d_usd": 1.0,
+                             "from": {"input": 0.3},
+                             "to": {"output": 1.2}})
+        decision = veille.decide(veille.Report(data), prices=cost.DEFAULT_PRICES)
+        # le modèle (deepseek-flash) reste connu et égal ; les tarifs
+        # incomplets ne changent donc pas la décision pour un harnais
+        self.assertEqual(decision.action, "automatic")
+        unknown = report(object="model", from_version="model-inconnu-a",
+                         to_version="model-inconnu-b",
+                         price={"kind": "equal", "projected_7d_usd": 1.0,
+                                "from": {"input": 0.3},
+                                "to": {"output": 1.2}})
+        decision = veille.decide(veille.Report(unknown), prices=cost.DEFAULT_PRICES)
+        self.assertEqual(decision.action, "owner")
+        self.assertEqual(decision.price, "unknown")
 
     def test_owner_decision_needs_the_seven_day_projection(self):
         decision = veille.decide(veille.Report(
@@ -293,13 +327,14 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(self._bins()["canary"], self.bins["h1"])
 
     def test_model_adoption_switches_the_model_setting(self):
-        model_report = self._report(object="model", from_version="deepseek-flash",
-                                    to_version="deepseek-v4.1-flash-1017")
+        prices = {"model-old": [0.30, 0.006, 1.20],
+                  "model-new": [0.30, 0.006, 1.20]}
+        model_report = self._report(object="model", from_version="model-old",
+                                    to_version="model-new")
         result = veille.adopt(self.cfg, self.db, self.lot, model_report,
-                              now=1000.0)
+                              prices=prices, now=1000.0)
         self.assertEqual(result["result"], "canary")
-        self.assertEqual(registry.get(self.db, "canary")["model"],
-                         "deepseek-v4.1-flash-1017")
+        self.assertEqual(registry.get(self.db, "canary")["model"], "model-new")
         self.assertIsNone(registry.get(self.db, "impl")["harness_bin"])
         self.assertIn("harness_bin", registry.get(self.db, "canary"))
 
@@ -340,14 +375,14 @@ class AdoptionTest(PgTestCase):
 
     def test_report_note_is_read_back(self):
         work.note(self.db, self.lot, "veille-report: " + json.dumps(
-            dict(report(), evaluation_lot=self.lot)), actor="author")
+            dict(report(), evaluation_lot=self.lot)), actor="canary")
         parsed = veille.report_from_lot(self.db, self.lot)
         self.assertEqual(parsed.evaluation_lot, self.lot)
         self.assertEqual(parsed.harness, "deepseek")
 
     def test_tick_discovers_a_report_note_and_starts_the_canary(self):
         work.note(self.db, self.lot, "veille-report: " + json.dumps(
-            dict(report(), evaluation_lot=self.lot)), actor="author")
+            dict(report(), evaluation_lot=self.lot)), actor="canary")
         out = veille.tick(self.cfg, self.db, now=1000.0, bins=self.bins,
                           rules=Rules(30 * 60))
         self.assertEqual(out["discovered"][0]["result"], "canary")
@@ -355,17 +390,32 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(state["stage"], "canary")
         self.assertEqual(self._bins()["canary"], self.bins["h1"])
 
+    def test_discovery_ignores_a_report_written_by_another_agent(self):
+        work.note(self.db, self.lot, "veille-report: " + json.dumps(
+            dict(report(), evaluation_lot=self.lot)), actor="intruder")
+        out = veille.tick(self.cfg, self.db, now=1000.0, bins=self.bins,
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["discovered"][0]["result"], "ignored")
+        self.assertIsNone(veille.load(self.db, self.lot))
+        # le rapport du bon auteur, lui, est adopté
+        work.note(self.db, self.lot, "veille-report: " + json.dumps(
+            dict(report(), evaluation_lot=self.lot)), actor="canary")
+        out = veille.tick(self.cfg, self.db, now=1001.0, bins=self.bins,
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["discovered"][0]["result"], "canary")
+        self.assertEqual(veille.load(self.db, self.lot)["state"]["stage"], "canary")
+
     def test_cli_adopt_and_show(self):
         path = os.path.join(self.tmp, "report-4293.json")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(dict(report(), evaluation_lot=self.lot), fh)
-        done = self.mesh("veille", "adopt", str(self.lot), "--report", path,
+        done = self.mesh("harness", "adopt", str(self.lot), "--report", path,
                          "--bin", "h1=" + self.bins["h1"],
                          "--bin", "h2=" + self.bins["h2"], "--json")
         self.assertEqual(done.returncode, 0, done.stderr)
         payload = json.loads(done.stdout)
         self.assertEqual(payload["result"], "canary", payload)
-        show = self.mesh("veille", "show", str(self.lot), "--json")
+        show = self.mesh("harness", "show-adoption", str(self.lot), "--json")
         self.assertEqual(show.returncode, 0, show.stderr)
         payload = json.loads(show.stdout)
         self.assertEqual(payload["state"]["stage"], "canary")

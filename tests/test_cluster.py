@@ -238,7 +238,7 @@ FERMEES = {
     # superviseur (alertes), le texte d'erreur libre du fournisseur reste fermé
     "provider_account_credits": {"detail"},
     # #4293 : état interne d'une adoption de version (rapport de rejeu, séquence
-    # canari/bascule, valeurs inverses), tenu et lu par `ameesh veille`, pas par
+    # canari/bascule, valeurs inverses), tenu et lu par `ameesh harness adopt`, pas par
     # le rôle superviseur ; fermé aux deux rôles, aucun GRANT modifié.
     "harness_adoptions": {"lot_id", "project", "harness", "object",
                           "from_version", "to_version", "stage", "report",

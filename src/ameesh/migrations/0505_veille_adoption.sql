@@ -12,7 +12,7 @@
 -- `harness_adoptions` : l'état mécanique d'une adoption, par lot d'évaluation.
 -- Le rapport de rejeu (lot B) y est figé avec son empreinte ; `state` porte la
 -- séquence (canari, hôte suivant, valeurs inverses). Les transitions sont
--- aussi notées au journal du lot (`veille-adoption:`) pour la relecture. La
+-- aussi notées au journal du lot (`harness-adoption:`) pour la relecture. La
 -- table n'a pas de clé étrangère : un lot fermé garde la trace de son
 -- adoption, et une adoption ne s'écrit que sur un lot existant (vérifié avant).
 CREATE TABLE IF NOT EXISTS harness_adoptions (

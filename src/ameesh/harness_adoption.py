@@ -19,7 +19,7 @@ binôme/modèle précédent et clôt l'adoption ; le geste inverse est consigné
 le lot.
 
 État : la table `harness_adoptions` (migration 0505) porte la séquence ; chaque
-transition est aussi notée au journal du lot (`veille-adoption:`), pour la
+transition est aussi notée au journal du lot (`harness-adoption:`), pour la
 relecture. Les rapports sont figés avec leur empreinte : un second rapport sur
 le même lot est refusé (une nouvelle évaluation est un nouveau lot).
 
@@ -30,15 +30,14 @@ exister sur l'hôte (l'exécuteur refuse un binaire absent : hôte non prêt) ;
 l'installation de la nouvelle version reste le fait de l'hôte (L17), ce module
 ne l'exécute pas.
 
-  ameesh veille adopt <lot> --report FICHIER|- [--bin [HÔTE=]CHEMIN …]
+  ameesh harness adopt <lot> --report FICHIER|- [--bin [HÔTE=]CHEMIN …]
                             [--agent NOM] [--requester NOM] [--dry-run]
-  ameesh veille tick [--project P] [--now EPOCH] [--bin [HÔTE=]CHEMIN …]
-  ameesh veille show <lot>
-  ameesh veille rollback <lot> --reason TEXTE
+  ameesh harness tick [--project P] [--now EPOCH] [--bin [HÔTE=]CHEMIN …]
+  ameesh harness show-adoption <lot>
+  ameesh harness rollback-adoption <lot> --reason TEXTE
 """
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -46,16 +45,16 @@ import re
 import sys
 import time
 
-from . import config as config_mod
+from . import cost
 from . import db as db_mod
 from . import decisions, registry, storage, work
 
 #: schéma du rapport produit par le lot B
 REPORT_SCHEMA = "ameesh-veille-report/1"
 #: schéma de l'état d'une adoption
-STATE_SCHEMA = "ameesh-veille-adoption/1"
+STATE_SCHEMA = "ameesh-harness-adoption/1"
 #: préfixe des notes de journal (état lisible par un humain)
-NOTE_PREFIX = "veille-adoption:"
+NOTE_PREFIX = "harness-adoption:"
 #: préfixe des notes qui portent le rapport machine du lot B
 REPORT_PREFIX = "veille-report:"
 #: durées de la règle owner (spec §4) : 24 h ou 10 tours
@@ -217,12 +216,17 @@ class Report:
                              separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    def effective_price(self) -> str:
-        """La nature de prix, recalculée quand les tarifs la contredisent.
+    def effective_price(self, prices: dict | None = None) -> str:
+        """La nature de prix, recalculée au barème quand la version change.
 
-        Un rapport qui dit « égal » alors que le tarif de sortie augmente est
-        une augmentation : on ne l'adopte pas sans l'owner. Un fournisseur ou
-        un forfait qui change est nommé comme tel.
+        Un rapport qui dit « égal » alors que le tarif augmente est une
+        augmentation. Le prix est lu au **barème de `cost.py`** (le fichier du
+        poste, sinon `DEFAULT_PRICES`) pour un modèle : deux modèles connus se
+        comparent ; un prix inconnu ou incomplet ne vaut jamais « égal » et
+        part en décision owner. Les tarifs du rapport ne servent que s'ils sont
+        complets des deux côtés (entrée, cache, sortie) et seulement pour
+        confirmer ou contredire le barème ; ils ne peuvent pas rendre « égal »
+        un prix que le barème dit plus cher.
         """
         frm, to = self.price_from, self.price_to
         if (frm.get("provider") and to.get("provider")
@@ -230,9 +234,36 @@ class Report:
             return "new_provider"
         if frm.get("plan") and to.get("plan") and frm["plan"] != to["plan"]:
             return "plan_change"
-        for key in ("input", "cached_input", "output", "cache_write"):
+        # prix complet du rapport : les trois composantes, des deux côtés
+        report_known = all(key in frm and key in to
+                           for key in ("input", "cached_input", "output"))
+        if self.object == "model":
+            from_model, to_model = self.from_version, self.to_version
+        else:
+            from_model = to_model = self.model
+        schedule = cost.load_prices() if prices is None else prices
+        from_known = (cost.known_price(schedule, from_model)
+                      if from_model else None)
+        to_known = cost.known_price(schedule, to_model) if to_model else None
+        # un tarif commun que le rapport dit plus cher suffit à refuser
+        # l'automatique, même si les trois composantes ne sont pas fournies
+        for key in ("input", "output", "cached_input"):
             if key in frm and key in to and to[key] > frm[key]:
                 return "higher"
+        schedule = cost.load_prices() if prices is None else prices
+        from_known = (cost.known_price(schedule, from_model)
+                      if from_model else None)
+        to_known = cost.known_price(schedule, to_model) if to_model else None
+        if from_known is not None and to_known is not None:
+            for index in (0, 2, 1):  # entrée, sortie, cache
+                if to_known[index] > from_known[index]:
+                    return "higher"
+        elif report_known:
+            for key in ("input", "output", "cached_input"):
+                if to[key] > frm[key]:
+                    return "higher"
+        else:
+            return "unknown"
         if self.price_kind != "equal":
             return self.price_kind
         return "equal"
@@ -275,20 +306,29 @@ def parse_report(text: str) -> Report:
     raise VeilleError("report: no %s document found" % REPORT_SCHEMA)
 
 
-def report_from_lot(db, lot: int) -> Report:
+def report_from_lot(db, lot: int, *, allowed_actors=None) -> Report:
     """Le rapport le plus récent noté sur le lot (journal, du plus récent au
-    plus ancien), sinon dans son corps. Aucun fichier local n'est supposé."""
+    plus ancien), sinon dans son corps. Aucun fichier local n'est supposé.
+
+    `allowed_actors` (découverte automatique) restreint la lecture aux notes
+    de ces auteurs : un rapport écrit par un autre agent ne déclenche pas une
+    adoption. Le corps du lot n'a pas d'auteur vérifiable et n'est donc lu que
+    sans restriction (geste explicite `ameesh harness adopt`)."""
+    allowed = set(allowed_actors) if allowed_actors is not None else None
     for event in work.events(db, int(lot), limit=None):
+        if allowed is not None and (event.get("actor") or "") not in allowed:
+            continue
         text = str(event.get("note") or "")
         if REPORT_PREFIX in text or REPORT_SCHEMA in text:
             try:
                 return parse_report(text)
             except VeilleError:
                 continue
-    item = work.get(db, int(lot)) or {}
-    body = str(item.get("body") or "")
-    if REPORT_PREFIX in body or REPORT_SCHEMA in body:
-        return parse_report(body)
+    if allowed is None:
+        item = work.get(db, int(lot)) or {}
+        body = str(item.get("body") or "")
+        if REPORT_PREFIX in body or REPORT_SCHEMA in body:
+            return parse_report(body)
     raise VeilleError("lot #%s: no readable %s note (write it with "
                       "`ameesh work note %s -`, or pass --report FILE)"
                       % (lot, REPORT_SCHEMA, lot))
@@ -410,7 +450,7 @@ def journal(db, lot: int, state: dict, text: str, *, actor: str = "ameesh") -> N
         work.note(db, int(lot), "%s %s %s" % (NOTE_PREFIX, state["stage"], text),
                   actor=actor or "ameesh")
     except Exception as exc:  # noqa: BLE001 — une note ne défait pas un geste fait
-        print("veille: lot #%s: note not written (%s)" % (lot, exc), file=sys.stderr)
+        print("harness-adoption: lot #%s: note not written (%s)" % (lot, exc), file=sys.stderr)
 
 
 def _lock(db) -> bool:
@@ -460,9 +500,9 @@ class Decision:
         self.reason = reason
 
 
-def decide(report: Report) -> Decision:
+def decide(report: Report, prices: dict | None = None) -> Decision:
     """La règle owner, sans effet de bord."""
-    price = report.effective_price()
+    price = report.effective_price(prices)
     if report.conclusion == "regression" or report.quality_regression:
         why = "regression"
         if report.conclusion == "regression" and report.quality_regression:
@@ -713,14 +753,14 @@ def _cutoff_seconds(cfg, project: str, now: float, rules=None) -> float:
 def adopt(cfg, db, lot: int, report: Report, *, bins: dict | None = None,
           agent: str | None = None, requester: str | None = None,
           actor: str = "", dry_run: bool = False, now: float | None = None,
-          rules=None) -> dict:
+          rules=None, prices: dict | None = None) -> dict:
     """Fige un rapport sur un lot, sous le verrou des gestes de veille."""
     if not _lock(db):
         raise VeilleError("another veille gesture holds the lock")
     try:
         return _adopt_locked(cfg, db, lot, report, bins=bins, agent=agent,
                              requester=requester, actor=actor, dry_run=dry_run,
-                             now=now, rules=rules)
+                             now=now, rules=rules, prices=prices)
     finally:
         _unlock(db)
 
@@ -728,7 +768,7 @@ def adopt(cfg, db, lot: int, report: Report, *, bins: dict | None = None,
 def _adopt_locked(cfg, db, lot: int, report: Report, *, bins: dict | None = None,
                   agent: str | None = None, requester: str | None = None,
                   actor: str = "", dry_run: bool = False, now: float | None = None,
-                  rules=None) -> dict:
+                  rules=None, prices: dict | None = None) -> dict:
     """Fige un rapport sur un lot et applique la règle du §4.
 
     Idempotent : rejouer le même rapport rend l'état courant sans second
@@ -755,7 +795,7 @@ def _adopt_locked(cfg, db, lot: int, report: Report, *, bins: dict | None = None
                 "report": existing.get("report")}
     project = item.get("app") or ""
     state = _state_defaults(report, project=project, now=now)
-    decision = decide(report)
+    decision = decide(report, prices)
     row = {"lot_id": int(lot), "project": project, "report": report.raw,
            "_db": db}
     if dry_run:
@@ -1075,7 +1115,7 @@ def tick(cfg, db, *, now: float | None = None, project: str | None = None,
     """Avance toutes les adoptions ouvertes. Un seul passage à la fois."""
     now = time.time() if now is None else float(now)
     if not _lock(db):
-        return {"schema": "ameesh-veille-tick/1", "result": "busy",
+        return {"schema": "ameesh-harness-adoption-tick/1", "result": "busy",
                 "adoptions": []}
     try:
         discovered = discover(cfg, db, now=now, project=project, bins=bins,
@@ -1101,7 +1141,7 @@ def tick(cfg, db, *, now: float | None = None, project: str | None = None,
             except Exception as exc:  # noqa: BLE001 — une adoption ne bloque pas les autres
                 results.append({"lot": row["lot_id"], "result": "error",
                                 "reason": "%s: %s" % (type(exc).__name__, exc)})
-        return {"schema": "ameesh-veille-tick/1", "result": "ok",
+        return {"schema": "ameesh-harness-adoption-tick/1", "result": "ok",
                 "adoptions": results, "discovered": discovered}
     finally:
         _unlock(db)
@@ -1132,7 +1172,12 @@ def discover(cfg, db, *, now: float, project: str | None = None,
     for row in rows:
         lot = int(row["id"])
         try:
-            report = report_from_lot(db, lot)
+            item = work.get(db, lot) or {}
+            assignee = item.get("assignee") or ""
+            if not assignee:
+                raise VeilleError("evaluation lot has no assignee: report author "
+                                  "cannot be checked")
+            report = report_from_lot(db, lot, allowed_actors={assignee})
             hosts = sorted({agent.get("host") or ""
                             for agent in _agents(db, report.harness)
                             if agent.get("host")})
@@ -1237,7 +1282,7 @@ def _print_result(result: dict, as_json: bool) -> None:
     if outcome == "ok":
         rows = result.get("adoptions") or []
         if not rows and not result.get("discovered"):
-            print("veille: no open adoption")
+            print("harness-adoption: no open adoption")
         for row in rows:
             print("lot #%s: %s%s" % (row.get("lot"), row.get("result"),
                                      (" — " + row["reason"]) if row.get("reason") else ""))
@@ -1298,58 +1343,7 @@ def run(cfg, args) -> int:
         _print_result(result, args.json)
         return 0
     except (VeilleError, decisions.DecisionError) as exc:
-        print("veille: %s" % exc, file=sys.stderr)
+        print("harness-adoption: %s" % exc, file=sys.stderr)
         return 1
     finally:
         db.close()
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="ameesh veille", description=__doc__)
-    sub = parser.add_subparsers(dest="veille_command", required=True)
-
-    p_adopt = sub.add_parser("adopt", help="freeze a replay report and apply §4")
-    p_adopt.add_argument("id", type=int, help="evaluation work item")
-    p_adopt.add_argument("--report", default=None,
-                         help="report file, or - for standard input (default: the "
-                              "latest report note of the lot)")
-    p_adopt.add_argument("--bin", action="append", default=[],
-                         metavar="[HOST=]PATH",
-                         help="new harness binary (all hosts, or one host)")
-    p_adopt.add_argument("--agent", default=None, help="canary agent (default: automatic)")
-    p_adopt.add_argument("--requester", default=None,
-                         help="agent filing the owner decision (default: assignee)")
-    p_adopt.add_argument("--actor", default=None)
-    p_adopt.add_argument("--dry-run", action="store_true")
-    p_adopt.add_argument("--now", type=float, default=None)
-    p_adopt.add_argument("--json", action="store_true")
-    p_adopt.set_defaults(func=run)
-
-    p_tick = sub.add_parser("tick", help="advance open adoptions (canary, rollout)")
-    p_tick.add_argument("--project", default=None)
-    p_tick.add_argument("--bin", action="append", default=[], metavar="[HOST=]PATH")
-    p_tick.add_argument("--actor", default=None)
-    p_tick.add_argument("--now", type=float, default=None)
-    p_tick.add_argument("--dry-run", action="store_true")
-    p_tick.add_argument("--json", action="store_true")
-    p_tick.set_defaults(func=run)
-
-    p_show = sub.add_parser("show", help="show an adoption")
-    p_show.add_argument("id", type=int)
-    p_show.add_argument("--json", action="store_true")
-    p_show.set_defaults(func=run)
-
-    p_roll = sub.add_parser("rollback", help="restore the previous version")
-    p_roll.add_argument("id", type=int)
-    p_roll.add_argument("--reason", required=True)
-    p_roll.add_argument("--actor", default=None)
-    p_roll.add_argument("--now", type=float, default=None)
-    p_roll.add_argument("--json", action="store_true")
-    p_roll.set_defaults(func=run)
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
-    cfg = config_mod.load()
-    return run(cfg, args)

@@ -13,16 +13,22 @@ B rejoue les 3 derniers lots livrés, C adopte.
 | meilleure ou équivalente, qualité sans régression | **égal** | automatique : canari, puis hôte par hôte |
 | meilleure ou équivalente, qualité sans régression | plus cher, nouveau fournisseur ou changement de forfait | **décision de l'owner** (`ameesh decide`), aucun hôte changé ; la décision porte le rapport et le coût projeté sur 7 jours |
 
-Le prix est **recalculé** : un rapport qui dit `equal` alors que le tarif
-d'entrée, de cache ou de sortie augmente est traité comme `higher` ; un
-fournisseur ou un forfait qui change est nommé. Un modèle plus cher sans
-projection à 7 jours est bloqué, pas adopté.
+Le prix est **recalculé** : pour un modèle, le barème de `cost.py` (fichier du
+poste, sinon `DEFAULT_PRICES`) compare les deux modèles — `deepseek-flash` →
+`deepseek-pro` est `higher` même si le rapport écrit `equal`. Un prix inconnu
+ou incomplet (modèle absent du barème, tarifs du rapport incomplets des deux
+côtés) ne vaut **jamais** `equal` : il part en décision owner. Les tarifs du
+rapport ne peuvent pas rendre « égal » un prix que le barème dit plus cher ;
+un tarif commun que le rapport dit plus cher suffit à refuser l'automatique.
+Un fournisseur ou un forfait qui change est nommé (`new_provider`,
+`plan_change`). Un modèle plus cher sans projection à 7 jours est bloqué, pas
+adopté.
 
 ## Rapport de rejeu (contrat avec B, #4292)
 
 Un objet JSON, schéma `ameesh-veille-report/1`, noté sur le lot d'évaluation
 (une ligne `veille-report: {…}` ou un bloc ```` ```json ````) et/ou passé à
-`ameesh veille adopt --report FICHIER`. Champs requis :
+`ameesh harness adopt --report FICHIER`. Champs requis :
 
 ```json
 {
@@ -65,22 +71,22 @@ Un objet JSON, schéma `ameesh-veille-report/1`, noté sur le lot d'évaluation
 
 ```bash
 # démarre l'adoption ; le rapport est lu dans le fichier, sinon dans le journal
-ameesh veille adopt 4278 --report /tmp/rapport-4278.json \
+ameesh harness adopt 4278 --report /tmp/rapport-4278.json \
     --bin ameesh-agents-1=/opt/harness/0.2.1-rc.4/bin/dsh \
     --bin ameesh-agents-2=/opt/harness/0.2.1-rc.4/bin/dsh
 
 # un seul --bin /chemin s'applique à tous les hôtes connus du harnais
-ameesh veille adopt 4278 --bin /opt/harness/0.2.1-rc.4/bin/dsh
+ameesh harness adopt 4278 --bin /opt/harness/0.2.1-rc.4/bin/dsh
 
-# avance (canari, bascule, retour) ; appelé par ameesh-veille.timer
-ameesh veille tick
-ameesh veille tick --dry-run --json
+# avance (canari, bascule, retour) ; appelé par ameesh-harness-adoption.timer
+ameesh harness tick
+ameesh harness tick --dry-run --json
 
 # état lisible ou machine
-ameesh veille show 4278 [--json]
+ameesh harness show-adoption 4278 [--json]
 
 # retour arrière explicite, tracé dans le lot
-ameesh veille rollback 4278 --reason "régression observée sur agents-2"
+ameesh harness rollback-adoption 4278 --reason "régression observée sur agents-2"
 ```
 
 `--agent NOM` force l'agent du canari ; par défaut, le premier agent au repos
@@ -90,8 +96,10 @@ désigne l'agent qui dépose la décision owner (par défaut l'assigné du lot).
 Le tick **découvre** aussi les lots d'évaluation ouverts dont le titre
 commence par « Évaluer » et qui portent une note `veille-report:` sans
 adoption : il les adopte sans qu'un humain lance `adopt`. C'est le chemin
-normal A → B → C ; `ameesh veille adopt` reste disponible pour un rapport
-fourni en fichier ou pour forcer un agent de canari.
+normal A → B → C ; `ameesh harness adopt` reste disponible pour un rapport
+fourni en fichier ou pour forcer un agent de canari. Le rapport découvert
+n'est lu que s'il a été noté par l'**assigné du lot** : une note d'un autre
+agent ne déclenche aucune adoption.
 
 ## Canari et bascule
 
@@ -117,7 +125,7 @@ Le retour est consigné dans le lot et dans l'état de l'adoption
 (`inverse.version`, `inverse.restore`). Il est appliqué :
 
 - automatiquement quand le canari sort des bornes ;
-- par `ameesh veille rollback <lot> --reason …`, à tout moment, y compris
+- par `ameesh harness rollback-adoption <lot> --reason …`, à tout moment, y compris
   après `done` : chaque agent retrouve exactement son `harness_bin` ou son
   `model` d'avant la bascule (y compris `NULL`).
 
@@ -143,17 +151,17 @@ marge de la règle owner (§4) et du canon §7.
 Sur **un** hôte qui a la base (le poste de release ou un hôte d'agents) :
 
 ```bash
-install -m 0644 deploy/systemd/ameesh-veille.service \
-                   deploy/systemd/ameesh-veille.timer ~/.config/systemd/user/
+install -m 0644 deploy/systemd/ameesh-harness-adoption.service \
+                   deploy/systemd/ameesh-harness-adoption.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now ameesh-veille.timer
-journalctl --user -u ameesh-veille -f
+systemctl --user enable --now ameesh-harness-adoption.timer
+journalctl --user -u ameesh-harness-adoption -f
 ```
 
 Le tick est sans effet tant qu'aucune adoption n'est ouverte. Un seul tick
 tourne à la fois (verrou consultatif en base) ; plusieurs hôtes peuvent porter
 le timer sans double geste. Chaque transition laisse une note
-`veille-adoption:` au journal du lot, en plus de la table
+`harness-adoption:` au journal du lot, en plus de la table
 `harness_adoptions` (migration 0505).
 
 ## Portée des changements
