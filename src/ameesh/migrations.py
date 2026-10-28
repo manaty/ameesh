@@ -315,6 +315,20 @@ def target_numbers(checkout: str, layout: Layout, target: str) -> dict[int, list
     locale à défaut — jamais l'arbre de travail, le paquet installé, la branche
     du lot ni une autre branche. Rend None quand aucune ref de la cible
     n'existe (l'appelant le dit) ; rien n'est récupéré (pas de fetch)."""
+    resolved = target_commit(checkout, target)
+    if resolved is None:
+        return None
+    label, commit = resolved
+    found: dict[int, list[str]] = {}
+    for name in tree_files(checkout, layout, commit):
+        found.setdefault(int(_REPO_FILE_RE.match(name).group(1)), []).append(
+            "%s:%s" % (label, name))
+    return found
+
+
+def target_commit(checkout: str, target: str) -> tuple[str, str] | None:
+    """`(libellé, commit)` de la branche cible : `origin/<branche>` publiée
+    d'abord, la locale à défaut (#1333, #2620) ; None si aucune n'existe."""
     text = (target or "").strip()
     if not text:
         return None
@@ -328,17 +342,22 @@ def target_numbers(checkout: str, layout: Layout, target: str) -> dict[int, list
                        (text, text)):
         commit = _git(checkout, "rev-parse", "--verify", "--quiet",
                       ref + "^{commit}").strip()
-        if not commit:
-            continue
-        found: dict[int, list[str]] = {}
-        names = _git(checkout, "ls-tree", "--name-only", commit, layout.directory + "/")
-        for path in names.split():
-            match = _REPO_FILE_RE.match(os.path.basename(path))
-            if match:
-                found.setdefault(int(match.group(1)), []).append(
-                    "%s:%s" % (label, os.path.basename(path)))
-        return found
+        if commit:
+            return label, commit
     return None
+
+
+def tree_files(checkout: str, layout: Layout, commit: str) -> dict[str, str]:
+    """#4100 : nom → blob des fichiers numérotés du dossier de migrations au
+    commit `commit` (vide si le dossier manque)."""
+    found: dict[str, str] = {}
+    for line in _git(checkout, "ls-tree", commit, layout.directory + "/").splitlines():
+        meta, _, path = line.partition("\t")
+        name = os.path.basename(path)
+        parts = meta.split()
+        if len(parts) == 3 and parts[1] == "blob" and _REPO_FILE_RE.match(name):
+            found[name] = parts[2]
+    return found
 
 
 def applied(db: PsqlDriver | PsycopgDriver) -> dict[int, str]:

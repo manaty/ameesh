@@ -1312,9 +1312,334 @@ class NumeroAtterriTest(PgTestCase):
         later = self._lot(n=2)
         self.assertEqual(self._nx(later)["migration"], 377)
         self._merged(later, actor="sweeper")
-        self.assertEqual(self._slot(later), {"number": 377, "status": "landed"})
+        # #4100 : aucun fichier 377 ni dans le commit ni sur la cible : relâché
+        self.assertEqual(self._slot(later), {"number": 377, "status": "released"})
         self._merged(later, actor="pilote", migration_landed=375)
         self.assertEqual(self._slot(later), {"number": 375, "status": "landed"})
+
+    # -- #4100 : le relevé suit le numéro posé par un paquet ------------------
+
+    def _write(self, name, content):
+        path = os.path.join(self.nexlink, NEXLINK.directory, name)
+        with open(path, "w") as fh:
+            fh.write(content)
+
+    def _head(self):
+        return subprocess.check_output(
+            ["git", "-C", self.nexlink, "rev-parse", "HEAD"], text=True).strip()
+
+    def _packet(self, name, *renamed, content="--"):
+        """La branche du lot porte `name` ; le paquet la fusionne sur develop,
+        puis renumérote vers `renamed` (le premier par `git mv`, les suivants
+        sont des copies). Rend le commit de la branche."""
+        directory = NEXLINK.directory
+        _git(self.nexlink, "checkout", "-qb", "agent/z-%s" % name)
+        self._write(name, content)
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", name)
+        sha = self._head()
+        _git(self.nexlink, "checkout", "-q", "develop")
+        _git(self.nexlink, "merge", "-q", "--no-ff", "-m", "paquet", "agent/z-%s" % name)
+        if renamed:
+            _git(self.nexlink, "mv", "%s/%s" % (directory, name),
+                 "%s/%s" % (directory, renamed[0]))
+            for other in renamed[1:]:
+                self._write(other, content)
+            _git(self.nexlink, "add", ".")
+            _git(self.nexlink, "commit", "-qm", "renumérotation")
+        return sha
+
+    def _notes(self, lot):
+        return [e["note"] for e in work.events(self.db, lot["id"])]
+
+    def test_le_paquet_ferme_suit_la_renumerotation(self):
+        """#4100 : une renumérotation 377 → 378 dans un paquet fermé par le
+        relevé (sans `migration_landed` déclaré) donne landed=378 ; 377 n'est
+        plus tenu et l'allocateur propose le premier libre au-dessus de la tête
+        réelle de la cible."""
+        lot = self._lot()
+        self.assertEqual(self._nx(lot)["migration"], 377)
+        _commit(self.nexlink, NEXLINK.directory, "377_other.sql")
+        sha = self._packet("377_key.sql", "378_key.sql")
+        done = work.close_merged(self.db, lot["id"], sha=sha, actor="packet:develop",
+                                 source="packet manifest", repo=self.nexlink)
+        self.assertEqual(done["result"], "merged", done)
+        item = work.get(self.db, lot["id"])
+        self.assertEqual((item["migration_landed"], item["migration_landed_repo"]),
+                         (378, "manaty/nexlink"))
+        self.assertEqual(self._slot(lot), {"number": 378, "status": "landed"})
+        self.assertTrue(any(
+            "migration 378 landed (reserved 377, renumbered: 377_key.sql → 378 (by name))"
+            in n for n in self._notes(lot)), self._notes(lot))
+        _git(self.nexlink, "branch", "-qD", "agent/z-377_key.sql")
+        self.assertEqual(self._nx(self._lot(n=2))["migration"], 379)
+
+    def test_le_contenu_identifie_un_fichier_renomme(self):
+        """#4100 : nom changé avec le numéro, contenu identique : l'empreinte
+        du contenu désigne le numéro posé."""
+        lot = self._lot()
+        self._nx(lot)
+        _commit(self.nexlink, NEXLINK.directory, "377_other.sql")
+        sha = self._packet("377_key.sql", "378_renamed.sql", content="create table k();")
+        work.close_merged(self.db, lot["id"], sha=sha, actor="packet:develop",
+                          source="packet manifest", repo=self.nexlink)
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 378)
+        self.assertEqual(self._slot(lot), {"number": 378, "status": "landed"})
+
+    def test_deux_candidats_relachent_sans_deviner(self):
+        """#4100 : deux candidats (378_key, 379_key) : rien n'est deviné, la
+        réservation 377 est relâchée et le journal dit pourquoi."""
+        lot = self._lot()
+        self._nx(lot)
+        _commit(self.nexlink, NEXLINK.directory, "377_other.sql")
+        sha = self._packet("377_key.sql", "378_key.sql", "379_key.sql")
+        done = work.close_merged(self.db, lot["id"], sha=sha, actor="packet:develop",
+                                 source="packet manifest", repo=self.nexlink)
+        self.assertEqual(done["result"], "merged", done)
+        self.assertIsNone(work.get(self.db, lot["id"])["migration_landed"])
+        self.assertEqual(self._slot(lot), {"number": 377, "status": "released"})
+        self.assertTrue(any(
+            "migration 377 released (not landed: 377_key.sql absent from develop,"
+            " ambiguous matches 378, 379)" in n for n in self._notes(lot)),
+            self._notes(lot))
+
+    def test_un_fichier_pose_tel_quel_ne_change_rien(self):
+        lot = self._lot()
+        self._nx(lot)
+        sha = self._packet("377_key.sql")
+        work.close_merged(self.db, lot["id"], sha=sha, actor="packet:develop",
+                          source="packet manifest", repo=self.nexlink)
+        self.assertIsNone(work.get(self.db, lot["id"])["migration_landed"])
+        self.assertEqual(self._slot(lot), {"number": 377, "status": "landed"})
+        self.assertFalse(any("renumbered" in n or "not landed" in n
+                             for n in self._notes(lot)), self._notes(lot))
+
+    def test_un_numero_reoccupe_par_un_autre_fichier_est_suivi(self):
+        """#4100 : nexlink 600 — le numéro réservé porte depuis un AUTRE
+        fichier sur la cible ; la migration du lot est suivie sous son numéro
+        posé, pas tenue pour posée."""
+        lot = self._lot()
+        self._nx(lot)
+        sha = self._packet("377_key.sql", "376_key.sql")
+        _commit(self.nexlink, NEXLINK.directory, "377_autre_lot.sql")
+        # 376 est déjà occupé par 376_b.sql : le paquet a posé 376_key à côté
+        work.close_merged(self.db, lot["id"], sha=sha, actor="packet:develop",
+                          source="packet manifest", repo=self.nexlink)
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 376)
+
+    def _unit(self, lot, name, content="--"):
+        """Une unité de composition sur develop (un parent, trailer du lot) qui
+        pose `name`, déjà renuméroté par le compositeur."""
+        self._write(name, content)
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "composition : #%d\n\nameesh-work: %d"
+             % (lot["id"], lot["id"]))
+        return self._head()
+
+    def test_la_composition_ferme_sur_l_unite_renumerotee(self):
+        """#4100 (revue cx3) : la composition ferme le lot sur l'unité du
+        paquet, déjà renumérotée (602 → 599 : 377 → 378 ici), pas sur sa
+        source. Le fichier du lot est lu à son dernier gel ; et 377, réoccupé
+        depuis par un autre fichier, ne le fait pas tenir pour posé."""
+        lot = self._lot()
+        self._nx(lot)
+        _git(self.nexlink, "checkout", "-qb", "agent/z-src")
+        self._write("377_key.sql", "create table k();")
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "source")
+        source = self._head()
+        work.milestone(self.db, lot["id"], "frozen", sha=source, actor="ouvrier")
+        _git(self.nexlink, "checkout", "-q", "develop")
+        unit = self._unit(lot, "378_key.sql", "create table k();")
+        _commit(self.nexlink, NEXLINK.directory, "377_autre_lot.sql")
+        done = work.close_merged(self.db, lot["id"], sha=unit, actor="composition:9",
+                                 source="package composition #9", repo=self.nexlink)
+        self.assertEqual(done["result"], "merged", done)
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 378)
+        self.assertEqual(self._slot(lot), {"number": 378, "status": "landed"})
+        self.assertTrue(any("377_key.sql → 378 (by name)" in n for n in self._notes(lot)),
+                        self._notes(lot))
+
+    def test_sync_packets_sans_gel_suit_l_unite(self):
+        """#4100 (revue cx3) : `sync-packets` sur un lot SANS gel ferme sur le
+        commit de composition (trailer) ; l'unité ajoute un seul fichier
+        numéroté, présent sur la cible : c'est le numéro posé."""
+        from ameesh import packet_close
+
+        lot = self._lot()
+        self._nx(lot)
+        unit = self._unit(lot, "378_key.sql")
+        os.makedirs(os.path.join(self.nexlink, "reviews"), exist_ok=True)
+        with open(os.path.join(self.nexlink, "reviews", "integration-paquet-9.md"),
+                  "w") as fh:
+            fh.write("# Paquet 9\n\n## Composition (1 unité)\n\n"
+                     "| unité | lot | source | commit | note |\n|---|---|---|---|---|\n"
+                     "| 1 | #%d | `%s` | `%s` | renumérotée 377 → 378 |\n"
+                     % (lot["id"], unit, unit))
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "manifeste")
+        report = packet_close.sync(self.db, self.nexlink, target="develop",
+                                   actor="packet:develop")
+        self.assertEqual([r["result"] for r in report["results"]], ["merged"], report)
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 378)
+        self.assertEqual(self._slot(lot), {"number": 378, "status": "landed"})
+        self.assertTrue(any("378_key.sql added by unit" in n for n in self._notes(lot)),
+                        self._notes(lot))
+
+    def _merge_unit(self, lot, branch, resolution):
+        """Une unité `paquet-compose.py` : `git merge --no-ff` de la branche
+        du lot, en conflit sur `seed.txt` ; la résolution, DANS le commit
+        d'unité, renumérote (`resolution` : [(ancien, nouveau, contenu)])."""
+        directory = NEXLINK.directory
+        with open(os.path.join(self.nexlink, "seed.txt"), "w") as fh:
+            fh.write("develop\n")
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "seed develop")
+        proc = subprocess.run(["git", "-C", self.nexlink, "merge", "--no-ff", "--no-commit",
+                               branch], capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0, "le conflit attendu n'a pas eu lieu")
+        with open(os.path.join(self.nexlink, "seed.txt"), "w") as fh:
+            fh.write("résolu\n")
+        for old, new, content in resolution:
+            _git(self.nexlink, "mv", "%s/%s" % (directory, old), "%s/%s" % (directory, new))
+            if content is not None:
+                self._write(new, content)
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "vehicule : #%d\n\nameesh-work: %d"
+             % (lot["id"], lot["id"]))
+        return self._head()
+
+    def _lot_branch(self, name, content):
+        _git(self.nexlink, "checkout", "-qb", "agent/m-%s" % name)
+        with open(os.path.join(self.nexlink, "seed.txt"), "w") as fh:
+            fh.write("lot\n")
+        self._write(name, content)
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", name)
+        _git(self.nexlink, "checkout", "-q", "develop")
+        return "agent/m-%s" % name
+
+    def _manifest(self, lot, unit):
+        os.makedirs(os.path.join(self.nexlink, "reviews"), exist_ok=True)
+        with open(os.path.join(self.nexlink, "reviews", "integration-paquet-9.md"),
+                  "w") as fh:
+            fh.write("# Paquet 9\n\n## Composition (1 unité)\n\n"
+                     "| unité | lot | source | commit | note |\n|---|---|---|---|---|\n"
+                     "| 1 | #%d | `%s` | `%s` | renumérotée |\n" % (lot["id"], unit, unit))
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "manifeste")
+
+    def test_sync_packets_sans_gel_unite_de_fusion_renumerotee(self):
+        """#4100 (revue dev3) : l'unité réelle est un `merge --no-ff` dont la
+        résolution de conflit renumérote 377 → 378 ; lot sans gel, fermé par
+        `sync-packets` sur ce commit à deux parents : landed=378."""
+        from ameesh import packet_close
+
+        lot = self._lot()
+        self._nx(lot)
+        branch = self._lot_branch("377_key.sql", "create table k();")
+        unit = self._merge_unit(lot, branch, [("377_key.sql", "378_key.sql", None)])
+        self._manifest(lot, unit)
+        report = packet_close.sync(self.db, self.nexlink, target="develop",
+                                   actor="packet:develop")
+        self.assertEqual([r["result"] for r in report["results"]], ["merged"], report)
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 378)
+        self.assertEqual(self._slot(lot), {"number": 378, "status": "landed"})
+
+    def test_unite_de_fusion_qui_renomme_et_reecrit(self):
+        """#4100 (revue dev3) : la résolution change nom ET contenu ; ni le
+        nom ni l'empreinte ne correspondent, l'unique fichier numéroté
+        qu'ajoute l'unité (comparée à sa première parente) est le posé."""
+        from ameesh import packet_close
+
+        lot = self._lot()
+        self._nx(lot)
+        branch = self._lot_branch("377_key.sql", "create table k();")
+        unit = self._merge_unit(lot, branch,
+                                [("377_key.sql", "378_cle.sql", "create table k2();")])
+        self._manifest(lot, unit)
+        packet_close.sync(self.db, self.nexlink, target="develop", actor="packet:develop")
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 378)
+        self.assertTrue(any("378_cle.sql added by unit" in n for n in self._notes(lot)),
+                        self._notes(lot))
+
+    def test_avance_rapide_puis_renumerotation(self):
+        """#4100 (revue cx2) : la source S est sur la ligne de premier parent
+        de la cible (avance rapide), puis R renomme 377 → 378 ; gel et preuve
+        = S. La base calculée égale S : le fichier du lot est celui que la
+        cible n'a plus, suivi par son nom (landed=378, pas de relâchement)."""
+        lot = self._lot()
+        self._nx(lot)
+        self._write("377_key.sql", "create table k();")
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "S")
+        source = self._head()
+        work.milestone(self.db, lot["id"], "frozen", sha=source, actor="ouvrier")
+        _git(self.nexlink, "mv", NEXLINK.directory + "/377_key.sql",
+             NEXLINK.directory + "/378_key.sql")
+        _git(self.nexlink, "commit", "-qm", "R")
+        work.close_merged(self.db, lot["id"], sha=source, actor="git:develop",
+                          source="branch", repo=self.nexlink)
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 378)
+        self.assertEqual(self._slot(lot), {"number": 378, "status": "landed"})
+        # revue dev3 (b) : le fichier vient d'un commit ANTÉRIEUR de la
+        # branche (S1) et la tête gelée S2 le porte seulement
+        later = self._lot(n=3)
+        self.assertEqual(self._nx(later)["migration"], 379)
+        self._write("379_early.sql", "create table e();")
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "S1")
+        _commit(self.nexlink, "docs", "s2.md")
+        frozen = self._head()
+        work.milestone(self.db, later["id"], "frozen", sha=frozen, actor="ouvrier")
+        _git(self.nexlink, "mv", NEXLINK.directory + "/379_early.sql",
+             NEXLINK.directory + "/380_early.sql")
+        _git(self.nexlink, "commit", "-qm", "R")
+        work.close_merged(self.db, later["id"], sha=frozen, actor="git:develop",
+                          source="branch", repo=self.nexlink)
+        self.assertEqual(work.get(self.db, later["id"])["migration_landed"], 380)
+        self.assertEqual(self._slot(later), {"number": 380, "status": "landed"})
+        # le même chemin sans renumérotation : posé tel quel, rien à dire
+        other = self._lot(n=2)
+        self.assertEqual(self._nx(other)["migration"], 381)
+        _commit(self.nexlink, NEXLINK.directory, "381_plain.sql")
+        work.close_merged(self.db, other["id"], sha=self._head(), actor="git:develop",
+                          source="branch", repo=self.nexlink)
+        self.assertIsNone(work.get(self.db, other["id"])["migration_landed"])
+        self.assertEqual(self._slot(other), {"number": 381, "status": "landed"})
+
+    def test_la_reparation_d_un_lot_deja_fusionne_passe_par_le_meme_chemin(self):
+        """#4100 : un lot fusionné avant le suivi (créneau atterri au numéro
+        réservé) est réparé par `ameesh work merged <id> --sha S --repo R`,
+        journalisé ; sans candidat unique, l'ancien numéro est relâché."""
+        lot, other = self._lot(), self._lot(n=2)
+        self._nx(lot)
+        self._nx(other)
+        self.assertEqual(self._nx(other)["migration"], 378)
+        _commit(self.nexlink, NEXLINK.directory, "377_other.sql")
+        sha = self._packet("377_key.sql", "380_key.sql")
+        work.close_merged(self.db, lot["id"], sha=sha, actor="packet:develop",
+                          source="packet manifest")   # sans clone : rien de suivi
+        self.assertEqual(self._slot(lot), {"number": 377, "status": "landed"})
+        sha2 = self._packet("378_x.sql", "381_x.sql", "382_x.sql")
+        work.close_merged(self.db, other["id"], sha=sha2, actor="packet:develop",
+                          source="packet manifest")
+        proc = self.mesh("work", "merged", str(lot["id"]), "--sha", sha,
+                         "--repo", self.nexlink, "--actor", "bureau")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("landed migration 380 recorded (manaty/nexlink) — reserved 377",
+                      proc.stdout)
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 380)
+        self.assertEqual(self._slot(lot), {"number": 380, "status": "landed"})
+        done = work.merged(self.db, other["id"], sha=sha2, repo=self.nexlink, actor="bureau")
+        self.assertEqual(done["result"], "landed", done)
+        self.assertEqual(self._slot(other), {"number": 378, "status": "released"})
+        self.assertTrue(any("migration 378 released (not landed: 378_x.sql absent from"
+                            " develop, ambiguous matches 381, 382)" in n
+                            for n in self._notes(other)), self._notes(other))
+        # rejouée, la réparation ne réécrit rien
+        again = work.merged(self.db, lot["id"], sha=sha, repo=self.nexlink, actor="bureau")
+        self.assertEqual(again["result"], "already", again)
 
     def test_rattrapage_et_correction_d_un_lot_deja_fusionne(self):
         lot = self._lot()

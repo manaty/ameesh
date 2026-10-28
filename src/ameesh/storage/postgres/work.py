@@ -436,14 +436,31 @@ def _land_default_slot(tx, item_id, number, repo) -> None:
     `merged` ; un paquet qui renumérote (602 → 599) laissait donc `landed` à
     602, numéro jamais posé sur la cible. Le numéro déclaré (`migration_landed`,
     #1567) le remplace, dans la transaction qui l'écrit. Seul l'index des
-    créneaux `reserved` est unique : aucune course d'allocation ici."""
+    créneaux `reserved` est unique : aucune course d'allocation ici.
+    #4100 : un créneau relâché par le relevé (aucun numéro posé sûr) est
+    rétabli `landed` au numéro déclaré ensuite."""
     if not has_migration_slots(tx):
         return
     tx.execute(
-        "UPDATE work_migration_reservations SET number = %s, updated_at = now()"
-        " WHERE work_item_id = %s AND slot = 'default' AND status = 'landed'"
-        "   AND target_repo = %s AND number <> %s",
+        "UPDATE work_migration_reservations SET number = %s, status = 'landed',"
+        "       updated_at = now()"
+        " WHERE work_item_id = %s AND slot = 'default'"
+        "   AND status IN ('landed', 'released') AND target_repo = %s"
+        "   AND (number <> %s OR status = 'released')",
         (int(number), int(item_id), "github.com/" + repo, int(number)))
+
+
+def _release_landed_slot(tx, item_id, number, repo) -> None:
+    """#4100 : le créneau `default` atterri à un numéro que la cible ne porte
+    pas, et que le relevé n'a pu suivre sous aucun autre (aucun candidat, ou
+    plusieurs) : il est relâché, jamais deviné. La note de l'appelant le dit."""
+    if not has_migration_slots(tx):
+        return
+    tx.execute(
+        "UPDATE work_migration_reservations SET status = 'released', updated_at = now()"
+        " WHERE work_item_id = %s AND slot = 'default' AND status = 'landed'"
+        "   AND target_repo = %s AND number = %s",
+        (int(item_id), "github.com/" + repo, int(number)))
 
 
 class _Refrozen(Exception):
@@ -2439,6 +2456,36 @@ class WorkItems(interface.WorkItems):
             _land_default_slot(tx, item_id, number, repo)
             return rows[0]
 
+    def landed_slot(self, item_id) -> dict | None:
+        """#4100 : le créneau `default` atterri du lot (`number`, `repo` sous la
+        forme `owner/repo`), ou None."""
+        if not has_migration_slots(self.db):
+            return None
+        rows = self.db.query(
+            "SELECT number, target_repo FROM work_migration_reservations"
+            " WHERE work_item_id = %s AND slot = 'default' AND status = 'landed'",
+            (int(item_id),))
+        if not rows:
+            return None
+        repo = str(rows[0]["target_repo"] or "")
+        return {"number": int(rows[0]["number"]),
+                "repo": repo[len("github.com/"):] if repo.startswith("github.com/") else repo}
+
+    def release_landed_slot(self, item_id, number, repo, *, note, actor) -> dict | None:
+        """#4100 : relâche le créneau atterri `number` d'un lot déjà fusionné
+        ou promu, avec sa ligne de journal, en une transaction ; None si le lot
+        n'est pas terminal."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT __COLUMNS__ FROM work_items WHERE id = %s"
+                "   AND state IN ('merged', 'promoted') FOR UPDATE".replace(
+                    "__COLUMNS__", item_columns(self.db)), (int(item_id),))
+            if not rows:
+                return None
+            _release_landed_slot(tx, item_id, number, repo)
+            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            return rows[0]
+
     def migration_landed_holder(self, number, repo) -> dict | None:
         """Le lot qui nomme déjà ce numéro atterri dans ce dépôt (#1567)."""
         rows = self.db.query(
@@ -3221,7 +3268,8 @@ class WorkItems(interface.WorkItems):
 
     @_retry_deadlock
     def close_merged(self, item_id, *, current, sha, actor, note, pr_ref,
-                     frozen_id=None, landed=None, unfrozen=False) -> dict | None:
+                     frozen_id=None, landed=None, unfrozen=False,
+                     release_landed=None) -> dict | None:
         """`current` → `merged` si le lot y est encore (sinon None, rien d'écrit),
         en UNE transaction : transition, journal, puis le jalon `merged` (posé
         par le trigger de 0013) reçoit le commit et l'auteur de la fusion.
@@ -3291,6 +3339,8 @@ class WorkItems(interface.WorkItems):
                 self._release_migration(tx, item_id, rows[0], why="fusion", actor=actor)
                 if number is not None:
                     _land_default_slot(tx, item_id, number, repo)
+                elif release_landed is not None:
+                    _release_landed_slot(tx, item_id, *release_landed)
                 tx.query(
                     "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
                     " WHERE id = (SELECT id FROM work_item_milestones"
