@@ -31,7 +31,7 @@ The accepted spelling is normalized at these boundaries:
 * external session bindings and current/history session reads;
 * lot assignees, delegations and assignee filters;
 * thread sender and recipients;
-* canon agent/admission lookup and host `work_dirs` entries;
+* canon agent/admission lookup and host `workspaces.dirs` entries;
 * runner `--agents` and interactive attach;
 * settings, including the local `permission_mode` file, and key operations.
 

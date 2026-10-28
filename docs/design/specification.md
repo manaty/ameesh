@@ -175,9 +175,10 @@ policy:
     min_disk_free: 2GiB
     min_btrfs_unallocated: 10GiB         # #246 : btrfs seulement
     min_btrfs_metadata_headroom: 1GiB
-  work_dirs: {deepseek7: ~/wt/deepseek7-lot12}   # dossier par agent (L35), prioritaire
-  work_roots: {acme-web: ~/acme/acme-web, nexlink: "~/dev/nexlink-{agent}"}   # par projet (L31)
-  work_root: ~/src               # défaut : work_root/<projet>
+  workspaces:                    # L101 : espace de travail et ménage
+    dirs: {deepseek7: ~/wt/deepseek7-lot12}   # dossier par agent (L35), prioritaire
+    roots: {acme-web: ~/acme/acme-web, nexlink: "~/dev/nexlink-{agent}"}   # par projet (L31)
+    root: ~/src                  # défaut : root/<projet>
 ```
 
 **Appareil indisponible** (#3070, canon §12) : `indisponible_jusqu_au` (jour
@@ -194,25 +195,32 @@ la règle a cessé d'elle-même.
 réglage de l'hôte, jamais de la persona. Ordre de résolution, le premier qui
 donne un chemin gagne :
 
-1. `work_dirs[<agent>]` — un dossier nommé pour un agent précis ;
-2. `work_roots[<projet>]` — le projet est l'équipe (`team`) de l'agent ;
-3. `work_root/<projet>` (sans projet : `work_root`) ;
+1. `workspaces.dirs[<agent>]` — un dossier nommé pour un agent précis ;
+2. `workspaces.roots[<projet>]` — le projet est l'équipe (`team`) de l'agent ;
+3. `workspaces.root/<projet>` (sans projet : `workspaces.root`) ;
 4. **repli transitoire** : le `cwd` d'une ancienne fiche `Placement`
    (constat `admission-cwd-inherited`, note de `canon sync`) ;
 5. rien : `cwd` vide au registre, constat `host-work-dir-missing`.
 
-Les trois formes de la politique acceptent le gabarit **`{agent}`**, remplacé
-par le nom de l'agent (`~/dev/nexlink-{agent}` → `~/dev/nexlink-codex2`). C'est
-la forme retenue pour « un worktree par agent » : une seule ligne exprime la
-convention d'un hôte entier, reste une règle de l'hôte (0029 : la persona n'a
-pas de position) et ne demande aucune mise à jour du canon quand un agent est
-admis. `work_dirs` couvre les **exceptions** (un agent dont le dossier ne suit
-pas la convention) ; il ne sert pas de registre complet des positions. Tout
-autre gabarit (`{projet}`, `{}`), une accolade orpheline ou un chemin vide est
-une erreur `host-policy-invalid` de `canon check` et le chemin n'est pas
-retenu : une faute de frappe ne devient jamais un dossier littéral. Un
-`work_dirs` qui nomme un agent absent du canon est un avertissement
+Les trois formes de `policy.workspaces` acceptent le gabarit **`{agent}`**,
+remplacé par le nom de l'agent (`~/dev/nexlink-{agent}` →
+`~/dev/nexlink-codex2`). C'est la forme retenue pour « un worktree par
+agent » : une seule ligne exprime la convention d'un hôte entier, reste une
+règle de l'hôte (0029 : la persona n'a pas de position) et ne demande aucune
+mise à jour du canon quand un agent est admis. `workspaces.dirs` couvre les
+**exceptions** (un agent dont le dossier ne suit pas la convention) ; il ne
+sert pas de registre complet des positions. Tout autre gabarit (`{projet}`,
+`{}`), une accolade orpheline ou un chemin vide est une erreur
+`host-policy-invalid` de `canon check` et le chemin n'est pas retenu : une
+faute de frappe ne devient jamais un dossier littéral. Un `workspaces.dirs`
+qui nomme un agent absent du canon est un avertissement
 (`host-work-dir-agent-unknown`).
+
+L101 : les anciennes clés `work_dirs`, `work_roots`, `work_root` et
+`housekeeping` restent lues comme alias de `policy.workspaces`, avec
+l'avertissement `host-policy-legacy-key` et sans date de retrait ; donner les
+deux formes pour la même clé est une erreur `host-policy-invalid`. Une clé
+inconnue sous `workspaces` est un avertissement `host-workspaces-unknown`.
 
 **`type: Placement`** — une **admission** (L31, 0029) : persona → hôtes admis
 (noms ou étiquettes), sans `cwd` ; l'hôte et le dossier de travail sont de
@@ -231,8 +239,8 @@ Les anciennes fiches (`host:` unique, `cwd:`) restent lues : `host` vaut un
 hôte admis unique. Leur `cwd` est **ignoré** (`admission-cwd-ignored`) sur un
 hôte dont la politique donne un dossier pour l'agent ; sur un hôte qui n'en
 donne pas, il sert de **repli transitoire** (L35, `admission-cwd-inherited` :
-« cwd hérité de la fiche Placement, à migrer vers `policy.work_dirs` /
-`work_roots` »). L31 l'ignorait toujours : un hôte qui n'avait rien déclaré
+« cwd hérité de la fiche Placement, à migrer vers `policy.workspaces.dirs` /
+`roots` »). L31 l'ignorait toujours : un hôte qui n'avait rien déclaré
 recevait un `cwd` vide et ses agents restaient bloqués à la mise à jour.
 
 **Calendrier de retrait du repli** : lu et signalé dès L35 (v1.3.x / v1.4) ;
@@ -360,14 +368,14 @@ Erreurs bloquantes : fiche `Agent` sans `responsible` ou avec `approve` dans
 `capabilities` ; `responsible` qui ne résout pas vers un `Member` humain ;
 `Placement` vers un agent ou un hôte inconnu, ou sans `hosts` ni `host_tags` ;
 admission qui viole la politique de l'hôte (C4) ; deux admissions pour un même
-agent ; `policy.resources` illisible (L31) ; `policy.work_root`,
-`work_roots` ou `work_dirs` illisible, vide ou au gabarit inconnu (L35) ;
+agent ; `policy.resources` illisible (L31) ; `policy.workspaces.root`,
+`roots` ou `dirs` illisible, vide ou au gabarit inconnu (L35, L101) ;
 **`harness` non vide sans
 descripteur connu** (`agent-harness-unknown`, `host-harness-unknown`, L16).
 Avertissements : hôte sans admission, agent sans admission, agent sans
 `harness`, `cwd` d'admission ignoré (`admission-cwd-ignored`, L31) ou hérité
 en repli (`admission-cwd-inherited`, L35), agent admis sans dossier de travail
-sur un hôte (`host-work-dir-missing`, L35), `work_dirs` vers un agent inconnu
+sur un hôte (`host-work-dir-missing`, L35), `workspaces.dirs` vers un agent inconnu
 (`host-work-dir-agent-unknown`, L35), étiquette
 d'admission qui ne correspond à aucun hôte (`admission-tag-unknown`), clé de
 `policy.resources` inconnue. Sortie lisible et `--json` (code, gravité,
@@ -393,7 +401,7 @@ agent admis sur l'hôte courant, les colonnes **déclaratives** du registre
 0388) est la liste de la fiche, sinon `[team]`, sinon une liste vide ; `team`
 en est le premier. Il ne touche jamais
 aux colonnes d'**état** (bail, session, statut, dépense, consigne). Le `cwd`
-vient de la politique de l'hôte (`work_dirs`, `work_roots`, `work_root`, §4.2),
+vient de la politique de l'hôte (`workspaces.dirs`, `roots`, `root`, §4.2),
 avec le repli transitoire sur le `cwd` d'une ancienne admission ; ce repli, ou
 l'absence de tout dossier, est écrit dans la ligne de `canon sync` de l'agent. L'hôte de la ligne est un **état d'exécution** (0029) : `sync` ne
 déplace jamais un agent dont l'hôte courant est admis, même s'il synchronise un

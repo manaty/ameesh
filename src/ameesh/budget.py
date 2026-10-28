@@ -311,11 +311,14 @@ def status(cfg: Config, db, *, last: int = 5) -> dict:
         events = storage.of(db).budgets.events(max(0, last))
     except db_mod.DbError:
         events = []
-    from . import account_budget
+    from . import account_budget, provider_credits
     return {"schema": "ameesh-budget/1", "limits": limits.as_dict(),
             "rows": list(limits.rows), "spend": spend, "paused": paused, "events": events,
             # #1469 : enveloppes par compte de facturation (jour calendaire)
-            "accounts": account_budget.usage(db)}
+            "accounts": account_budget.usage(db),
+            # #4164 : l'état réel des crédits de chaque compte fournisseur, à
+            # côté des enveloppes (une enveloppe ne voit pas un compte épuisé)
+            "provider_credits": provider_credits.listing(db)}
 
 
 def _moment(epoch) -> str:
@@ -380,6 +383,16 @@ def format_status(data: dict) -> str:
                            _fmt_usd(a["reserved"]), _fmt_usd(a["kept"]),
                            _fmt_usd(a["remaining"]), a["period"], a["tz"],
                            account_budget.moment(a.get("reset_ts"), a["tz"])))
+    if "provider_credits" in data:
+        from . import provider_credits
+        rows = data["provider_credits"] or []
+        if rows:
+            out.append("provider accounts (real credit state, shared by all hosts):")
+            for r in rows:
+                out.append("  %-18s %s" % (provider_credits.who(r["harness"], r.get("account")),
+                                           provider_credits.describe(r)))
+        else:
+            out.append("provider accounts: no credit exhaustion seen")
     if data["paused"]:
         out.append("paused for budget:")
         for p in data["paused"]:

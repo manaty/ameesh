@@ -90,6 +90,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    revoke get
    placements      recorded
    progress        lots lot_events lot_transitions lot_event_last lot_hold_events
+                   packet_exits
                    lot_milestones lot_actions actions agents costs packages
                    package_items lot_messages
    projects        board
@@ -1168,6 +1169,51 @@ class Accounts(Domain):
     @abc.abstractmethod
     def switches(self, host: str, harness: str | None, limit: int) -> list[dict]:
         """Les dernières bascules de l'hôte (toutes ou d'un harnais), récentes d'abord."""
+
+
+# --------------------------------------------------------------------------
+# crédits du compte fournisseur, par compte logique (#4164)
+# --------------------------------------------------------------------------
+
+class ProviderCredits(Domain):
+    """État réel des crédits d'un compte fournisseur (`ok|low|exhausted`).
+
+    Clé : le compte **logique** (`harness`, `account`), le même sur tous les
+    hôtes — le solde prépayé est celui du fournisseur. Les lignes ne portent
+    que des noms, une raison courte et le texte d'erreur borné du
+    fournisseur : jamais de secret ni d'invite. Instants de la base (`now()`).
+    """
+
+    @abc.abstractmethod
+    def get(self, harness: str, account: str) -> dict | None:
+        """La ligne du compte (`state`, `since_ts`, `checked_ts`,
+        `next_probe_ts`, `reason`, `detail`, `source`, `agent`, `host`),
+        None si le compte n'a jamais été vu."""
+
+    @abc.abstractmethod
+    def listing(self) -> list[dict]:
+        """Toutes les lignes, par harnais puis compte."""
+
+    @abc.abstractmethod
+    def mark_exhausted(self, harness: str, account: str, *, reason: str,
+                       detail: str | None, source: str, agent: str | None,
+                       host: str | None, probe_after_s: float) -> bool:
+        """Pose `exhausted` (prochaine sonde dans `probe_after_s`). Vrai si
+        c'est une **transition** (le compte n'était pas déjà épuisé) ; sinon
+        seuls l'heure du contrôle et le détail sont actualisés — l'échéance de
+        sonde n'avance que par `claim_probe`."""
+
+    @abc.abstractmethod
+    def mark_ok(self, harness: str, account: str, *, source: str,
+                agent: str | None = None, host: str | None = None) -> bool:
+        """Pose `ok`. Vrai si c'est une transition depuis `low`/`exhausted`
+        (une seule des écritures concurrentes l'obtient)."""
+
+    @abc.abstractmethod
+    def claim_probe(self, harness: str, account: str, interval_s: float) -> bool:
+        """Réserve atomiquement la sonde d'un compte épuisé dont l'échéance
+        est passée, et repousse la suivante de `interval_s`. Vrai pour un
+        seul appelant par échéance."""
 
 
 # --------------------------------------------------------------------------
@@ -3537,6 +3583,15 @@ class Progress(Domain):
                 last[lot] = max(last.get(lot, float("-inf")), float(ts))
         return [{"work_item_id": lot, "last_ts": last[lot]} for lot in sorted(last)]
 
+    def packet_exits(self, *, since_ts: float) -> list[dict]:
+        """#4369 : notes de composition de porteur (tout état) qui nomment
+        des unités retirées (`slo.VEHICLE_EXIT_MARK`), écrites depuis
+        `since_ts` (id, work_item_id, note, created_ts). La sortie d'une unité
+        doit survivre à la fusion ou à la clôture de son porteur. Repli : aucune
+        sortie connue — l'horloge part alors du GO, le sens qui n'éteint
+        aucune alerte."""
+        return []
+
     def lot_hold_events(self, item_ids: Sequence[int],
                         patterns: Sequence[str]) -> list[dict]:
         """Événements utiles à la lecture des retenues (#1664) : les
@@ -5092,6 +5147,7 @@ class Storage(abc.ABC):
     turn_costs: TurnCosts
     accounts: Accounts
     account_windows: AccountWindows
+    provider_credits: ProviderCredits
     credentials: Credentials
     budgets: Budgets
     api_requests: ApiRequests

@@ -97,6 +97,8 @@ SCHEMA_KEYS = (
     "staging.before_packet_seconds",
     "accounts.pace_multipliers",
     "accounts.underused_loss",
+    "paquet.attente_mediane_s",
+    "paquet.max_paquets",
     "packet_tests.unit_timeout_seconds",
     "packet_tests.parallel",
     "production.branch",
@@ -148,6 +150,8 @@ BINDINGS = {
     "before_packet_seconds": "staging.before_packet_seconds",
     "pace_multipliers": "accounts.pace_multipliers",
     "underused_loss": "accounts.underused_loss",
+    "attente_mediane_s": "paquet.attente_mediane_s",
+    "max_paquets": "paquet.max_paquets",
     "unit_timeout_seconds": "packet_tests.unit_timeout_seconds",
     "unit_tests_parallel": "packet_tests.parallel",
     "production_branch": "production.branch",
@@ -194,6 +198,8 @@ DICT_BINDINGS = {
     "before_packet_seconds": "staging.before_packet_seconds",
     "pace_multipliers": "accounts.pace_multipliers",
     "underused_loss": "accounts.underused_loss",
+    "attente_mediane_s": "paquet.attente_mediane_s",
+    "max_paquets": "paquet.max_paquets",
     "unit_timeout_seconds": "packet_tests.unit_timeout_seconds",
 }
 #: clés du bloc `prevalidation` dans un mapping, seulement dans un fichier
@@ -489,6 +495,13 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "accounts.pace_multipliers":
         # #3647 : la table des multiplicateurs par compte, recopiée en mapping
         return value == "<dict>"
+    if key == "paquet.attente_mediane_s":
+        # #3256 C : une durée en secondes, strictement positive
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and value > 0)
+    if key == "paquet.max_paquets":
+        # #3256 C : le nombre de paquets simultanés, au moins deux
+        return type(value) is int and value >= 2
     if key == "production.branch":
         # #3022 : la branche de prod d'un projet se lit dans le canon
         # (`projects.<projet>.production.branch`), jamais recopiée en dur.
@@ -524,6 +537,10 @@ def _binding_key(name: str, value, train_context: bool,
         key = "accounts.underused_loss"
     if key is None and lower.endswith("pace_multipliers"):
         key = "accounts.pace_multipliers"
+    if key is None and lower.endswith("attente_mediane_s"):
+        key = "paquet.attente_mediane_s"
+    if key is None and lower.endswith("max_paquets"):
+        key = "paquet.max_paquets"
     if key is None and lower.endswith("unit_timeout_seconds"):
         key = "packet_tests.unit_timeout_seconds"
     if key is None and lower.endswith("unit_tests_parallel"):

@@ -5,8 +5,8 @@ agent execution. Business modules own their domain vocabulary and behavior.
 Git used for the canon, identity and persona memory remains infrastructure;
 git branches and pull requests as work products belong to development tooling.
 
-`work_lifecycle` centralizes the current persisted lifecycle spellings and the
-compatibility delivery connector. `work` re-exports its public state groups.
+`work_lifecycle` centralizes the current persisted lifecycle spellings. `work`
+re-exports its public state groups.
 Readers should use these groups rather than repeat storage spellings:
 
 - `ACTIVE`: requested work and work in progress.
@@ -56,6 +56,22 @@ one. `work move`, `work list --state` and the lots API filter accept either
 spelling, and `work show` and `--json` carry a derived `lifecycle` field
 beside `state`. Storage does not change: the v1 spellings stay persisted
 until the storage switch.
+
+L99 tranche 2 (#4350) makes `work.deliver(db, id, connector=…, evidence=…,
+actor=…)` the single delivery verb. The core owns two connectors: `document`
+(delivered outside the target, evidence `{sha}` of the reviewed head, behind
+`work close --delivered`) and `done` (delivered without merge, no evidence,
+behind `work close --done`). `git-merge` is declared by the built-in `dev`
+tooling provider in `DELIVERY_CONNECTORS` and read through
+`registry.delivery_connectors()`; its evidence is either `{sha}`/`{pr}` (a
+declared merge, `work merged`) or `{action}` (a merge confirmed by the gate).
+`dev` is not a lifecycle module: it is absent from `discover()` and the canon
+cannot select it. Installed entry points cannot declare connectors, and a name
+declared twice or taken by the core is refused. `registry.merge_connector()`
+replaces `work_lifecycle.delivery_connector()`. The lot journal names the
+connector (`[via <connector>]`); storage is unchanged. Merges observed by the
+sweeps and the packet and merge-queue paths (`plan_git`, `plan_github`,
+`packet_close`, `merge_pr`, `fire`) still call `work.close_merged` directly.
 
 The boundary check preserves the current runtime behavior. Module activation,
 renamed persisted states, validation as a stored state, extraction of development

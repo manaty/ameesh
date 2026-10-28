@@ -23,6 +23,12 @@ journal or credential:
                                    key first, approved snapshots restored,
                                    exact new files removed.
 
+The staged `plan.json` may name `"delegation": "canaux"` (#4327): the same
+commands then prepare and execute the separately signed bundle of the
+`ameesh-handoff` and `ameesh-secrets` channel accounts (`bootstrap-canaux.py`,
+`installateur-canaux.py`), which publishes no tree and requires the release
+bootstrap already installed. Its rollback is again its own signed decision.
+
 Every effect gesture is appended to a private hash-chained journal
 (`gestes.jsonl`): code digest, bundle digest, step, intent, receipt digest or
 a fixed failure category, never a document body, secret or provider text.
@@ -57,6 +63,8 @@ def module(name):
 
 entry=module('entree-operateur')
 installer=module('installateur-bootstrap')
+channels=module('bootstrap-canaux')
+channel_installer=module('installateur-canaux')
 bootstrap=entry.bootstrap
 delegation=bootstrap.delegation
 protocol=bootstrap.protocol
@@ -70,7 +78,9 @@ ENROLLMENT='/etc/ameesh-admin/backend.json'
 CONFIG='/etc/ameesh-admin/config.json'
 HOST_KEY='/etc/ssh/ssh_host_ed25519_key.pub'
 PLAN_FIELDS={'plan','account_ids','expires_at'}
-PLAN_OPTIONAL={'probe_turn','runtime_seal'}
+PLAN_OPTIONAL={'probe_turn','runtime_seal','delegation'}
+#: Signed bundle kinds a staged plan may name; release is the default.
+DELEGATIONS=('release','canaux')
 COMMANDS=('inventory','prepare','plan','install','revoke-question','revoke')
 SIGNED=('plan','install','revoke')
 GENESIS='0'*64
@@ -78,6 +88,37 @@ GENESIS='0'*64
 
 class BackendError(ValueError):
     pass
+
+
+class Release:
+    """The release bootstrap bundle (#4323): ameesh-release and its trees."""
+    name='release'
+    steps,options,revoke_options=bootstrap.STEPS,bootstrap.OPTIONS,bootstrap.REVOKE_OPTIONS
+    prefix,revoke_prefix=bootstrap.PREFIX,bootstrap.REVOKE_PREFIX
+    scopes,question,revoke_question=bootstrap.scopes,bootstrap.question,bootstrap.revoke_question
+    authority,revoke_authority=bootstrap.SignedBootstrapAuthority,bootstrap.SignedBootstrapRevokeAuthority
+    directories=installer.DIRECTORIES
+    private=('/etc/ameesh-release','/var/lib/ameesh-release','/opt/ameesh-release/store')
+    keys=frozenset({files_mod.KEY})
+    errors=(entry.OperatorError,bootstrap.BootstrapError)
+
+
+class Channels:
+    """The channel accounts bundle (#4327): ameesh-handoff and ameesh-secrets."""
+    name='canaux'
+    steps,options,revoke_options=channels.STEPS,channels.OPTIONS,channels.REVOKE_OPTIONS
+    prefix,revoke_prefix=channels.PREFIX,channels.REVOKE_PREFIX
+    scopes,question,revoke_question=channels.scopes,channels.question,channels.revoke_question
+    authority,revoke_authority=channels.SignedChannelAuthority,channels.SignedChannelRevokeAuthority
+    directories=channels.delegation.DIRECTORIES
+    private=channels.delegation.PRIVATE
+    keys=frozenset(channels.delegation.KEYS)
+    errors=(channels.BootstrapError,channels.delegation.DelegationError)
+
+
+def kind_of(bundle):
+    """The kind a prepared bundle declares; its question is then rechecked."""
+    return Channels if isinstance(bundle,dict) and bundle.get('kind')==channels.delegation.KIND else Release
 
 
 def code_digest(directory=None):
@@ -229,7 +270,9 @@ class Backend:
         except (OSError,ValueError):
             raise BackendError('staged plan unavailable') from None
         if (not isinstance(value,dict) or not PLAN_FIELDS<=set(value)
-                or not set(value)<=PLAN_FIELDS|PLAN_OPTIONAL or not isinstance(value['plan'],dict)):
+                or not set(value)<=PLAN_FIELDS|PLAN_OPTIONAL or not isinstance(value['plan'],dict)
+                or value.get('delegation','release') not in DELEGATIONS
+                or (value.get('delegation')=='canaux' and set(value)&{'probe_turn','runtime_seal'})):
             raise BackendError('exact staged plan required')
         if value['plan'].get('host')!=self.enrollment['host'] or value['plan'].get('machine_id')!=self.machine():
             raise BackendError('staged plan names another host')
@@ -248,18 +291,26 @@ class Backend:
 
     def inventory(self,operation):
         stage,value=self.staged(operation)
-        expected=entry.destinations(plan=value['plan'],account_ids=value['account_ids'],
-            probe_turn=value.get('probe_turn'),runtime_seal=value.get('runtime_seal'))
+        if value.get('delegation')=='canaux':
+            expected=channels.destinations(plan=value['plan'],account_ids=value['account_ids'])
+        else:
+            expected=entry.destinations(plan=value['plan'],account_ids=value['account_ids'],
+                probe_turn=value.get('probe_turn'),runtime_seal=value.get('runtime_seal'))
         return dict(operation=operation,host=self.enrollment['host'],machine_id=self.machine(),
                     host_key_sha256=self.host_key(),files={path:self.observe(path) for path in expected})
 
     def prepare(self,operation):
         stage,value=self.staged(operation)
         observed=self.inventory(operation)['files']
-        prepared=entry.prepare(operation=operation,plan=value['plan'],account_ids=value['account_ids'],
-            trees={'runtime':str(stage/'runtime'),'sources':str(stage/'sources')},observed=observed,
-            probe_turn=value.get('probe_turn'),expires_at=value['expires_at'],db=self.db,
-            runtime_seal=value.get('runtime_seal'))
+        if value.get('delegation')=='canaux':
+            # No staged tree: the channels run the installed release trees.
+            prepared=entry.Prepared(operation,*channels.prepare(operation=operation,plan=value['plan'],
+                account_ids=value['account_ids'],observed=observed,expires_at=value['expires_at']))
+        else:
+            prepared=entry.prepare(operation=operation,plan=value['plan'],account_ids=value['account_ids'],
+                trees={'runtime':str(stage/'runtime'),'sources':str(stage/'sources')},observed=observed,
+                probe_turn=value.get('probe_turn'),expires_at=value['expires_at'],db=self.db,
+                runtime_seal=value.get('runtime_seal'))
         bundle=stage/'bundle.json'
         if bundle.exists() or bundle.is_symlink():
             # Never re-render a reviewed bundle: a resumed install keeps it.
@@ -293,11 +344,12 @@ class Backend:
         if (not isinstance(bundle,dict) or bundle.get('host')!=self.enrollment['host']
                 or bundle.get('machine_id')!=self.machine()):
             raise BackendError('prepared bundle names another host')
+        kind=kind_of(bundle)
         try:
-            expires=json.loads(question[len(bootstrap.PREFIX):])['expires_at']
-            exact=(question.startswith(bootstrap.PREFIX)
-                   and question==bootstrap.question(operation,bundle,expires_at=expires))
-        except (KeyError,TypeError,ValueError):
+            expires=json.loads(question[len(kind.prefix):])['expires_at']
+            exact=(question.startswith(kind.prefix)
+                   and question==kind.question(operation,bundle,expires_at=expires))
+        except (KeyError,TypeError,ValueError,*kind.errors):
             exact=False
         if not exact:
             raise BackendError('prepared question does not match its bundle')
@@ -308,12 +360,14 @@ class Backend:
             raise BackendError('signed decision required')
         if self.db is None:
             raise BackendError('enrolled decision registry required')
-        kind=bootstrap.SignedBootstrapRevokeAuthority if revoke else bootstrap.SignedBootstrapAuthority
-        return kind(self.db,decision,operation,bundle)
+        kind=kind_of(bundle)
+        return (kind.revoke_authority if revoke else kind.authority)(self.db,decision,operation,bundle)
 
-    def adapter(self,authority):
-        return installer.BootstrapHostAdapter(self.admin/'effects',authority=authority,
-                                              system=self.system,root=self.root)
+    def adapter(self,authority,bundle):
+        # One effects journal for both kinds: operations are distinct stages.
+        factory=(channel_installer.ChannelHostAdapter if kind_of(bundle) is Channels
+                 else installer.BootstrapHostAdapter)
+        return factory(self.admin/'effects',authority=authority,system=self.system,root=self.root)
 
     def journal(self):
         return self.admin/'controller'
@@ -325,12 +379,12 @@ class Backend:
         host state, the staged trees, the controller journal and the signed
         decision. `authorized` is false while any step lacks its authority.
         """
-        prepared=self.prepared(operation); bundle=prepared.bundle
+        prepared=self.prepared(operation); bundle=prepared.bundle; kind=kind_of(bundle)
         authority=authority or self.authority(decision,operation,bundle)
-        scopes=bootstrap.scopes(operation,bundle)
+        scopes=kind.scopes(operation,bundle)
         record=self.record(operation)
         steps=[]
-        for step in bootstrap.STEPS:
+        for step in kind.steps:
             try:
                 allowed=authority.validate(operation,scopes[step],step) is True
             except Exception:
@@ -342,7 +396,7 @@ class Backend:
             revocable=revoke_authority.validate(operation,scopes['revoke'],'revoke') is True
         except Exception:
             revocable=False
-        return dict(dry_run=True,operation=operation,host=bundle['host'],machine_id=bundle['machine_id'],
+        return dict(dry_run=True,delegation=kind.name,operation=operation,host=bundle['host'],machine_id=bundle['machine_id'],
                     bundle_digest=bundle['digest'],decision=decision,
                     authorized=all(item['authorized'] for item in steps),
                     complete=record.get('complete') is True,intent=record.get('intent'),
@@ -364,7 +418,13 @@ class Backend:
             return 'untrusted'
 
     def effects(self,step,operation,bundle):
-        stage=self.stage(operation)
+        stage=self.stage(operation); kind=kind_of(bundle)
+        if step=='preflight' and kind is Channels:
+            return dict(machine_id=self.system.machine()==bundle['machine_id'],
+                        host_key=self.host_key()==bundle['plan']['host_key_sha256'],
+                        **{logical:self.tree(self.path(logical))==bundle['plan'][field]
+                           for logical,field in channel_installer.TREES.items()},
+                        dispatchers={name:self.path(path).is_file() for name,path in bundle['dispatchers'].items()})
         if step=='preflight':
             return dict(machine_id=self.system.machine()==bundle['machine_id'],
                         host_key=self.host_key()==bundle['plan']['host_key_sha256'],
@@ -372,15 +432,14 @@ class Backend:
                         sources=self.tree(stage/'sources')==bundle['plan']['source_tree_sha256'])
         if step=='layout':
             result={}
-            for logical,mode in installer.DIRECTORIES.items():
+            for logical,mode in kind.directories.items():
                 target=self.path(logical)
                 if not target.exists() and not target.is_symlink():
                     result[logical]='create %04o'%mode
                     continue
                 info=target.lstat()
                 ok=(stat.S_ISDIR(info.st_mode) and info.st_uid==os.geteuid()
-                    and (stat.S_IMODE(info.st_mode)==mode or not logical.startswith(
-                        ('/etc/ameesh-release','/var/lib/ameesh-release','/opt/ameesh-release/store'))))
+                    and (stat.S_IMODE(info.st_mode)==mode or not logical.startswith(tuple(kind.private))))
                 result[logical]='present' if ok else 'mismatch'
             return result
         if step in ('runtime','sources'):
@@ -388,22 +447,28 @@ class Backend:
             pinned=bundle['plan']['runtime_tree_sha256' if step=='runtime' else 'source_tree_sha256']
             current=self.tree(self.path(logical))
             return {logical:'publish '+pinned if current is None else 'present' if current==pinned else 'conflict'}
-        if step=='account':
-            ids=bundle['account']
+        if step=='account' or step in channels.ACCOUNT_STEPS and kind is Channels:
+            if kind is Channels:
+                ids=bundle['accounts'][channels.ACCOUNT_STEPS[step]]
+                observe=channels.account.Named(self.system,ids['name'],ids['home'])
+            else:
+                ids=bundle['account']; observe=self.system
             try:
-                group,user=self.system.group(),self.system.account()
+                group,user=observe.group(),observe.account()
             except Exception:
                 return dict(account='unavailable')
             def state(observed,wanted):
                 if observed is None:
                     return 'create'
                 return 'present' if all(observed.get(k)==v for k,v in wanted.items()) else 'conflict'
-            return dict(group=state(group,dict(gid=ids['gid'])),account=state(user,dict(uid=ids['uid'],gid=ids['gid'])),
-                        uid=ids['uid'],gid=ids['gid'])
+            return dict(group=state(group,dict(gid=ids['gid'])),
+                        account=state(user,dict(uid=ids['uid'],gid=ids['gid'],home=ids.get('home',
+                                                bootstrap.account.HOME))),
+                        name=ids['name'],uid=ids['uid'],gid=ids['gid'])
         if step in ('configuration','enable'):
             result={}
             for logical,info in sorted(bundle['files'].items()):
-                if (logical==files_mod.KEY)!=(step=='enable'):
+                if (logical in kind.keys)!=(step=='enable'):
                     continue
                 try:
                     current=self.observe(logical)
@@ -417,6 +482,11 @@ class Backend:
                 result['reload']=bundle['services']['ssh_reload']
                 result['ready']=self.ready(bundle)
             return result
+        if step=='validate' and kind is Channels:
+            return dict(commands=['visudo -c -f /etc/sudoers.d/'+channel['account']
+                                  for channel in channels.delegation.CHANNELS.values()]
+                                 +['sshd -T (effective delegation per channel account)'],
+                        ready=self.ready(bundle))
         if step=='validate':
             return dict(commands=['visudo -c -f /etc/sudoers.d/ameesh-release','sshd -T (effective delegation)'],
                         ready=self.ready(bundle),
@@ -425,6 +495,8 @@ class Backend:
 
     def ready(self,bundle):
         try:
+            if kind_of(bundle) is Channels:
+                return self.system.trees_ready(bundle) is True
             return self.system.ready(bundle) is True
         except Exception:
             return False
@@ -447,21 +519,24 @@ class Backend:
         return result
 
     def revoke_question(self,operation,expires_at):
-        bundle=self.prepared(operation).bundle
-        question=bootstrap.revoke_question(operation,bundle,expires_at=expires_at)
+        bundle=self.prepared(operation).bundle; kind=kind_of(bundle)
+        question=kind.revoke_question(operation,bundle,expires_at=expires_at)
         if len(question.encode())>entry.MAX_QUESTION:
             raise BackendError('revoke question exceeds the signed limit')
         return dict(operation=operation,bundle_digest=bundle['digest'],question=question,
-                    options=bootstrap.REVOKE_OPTIONS)
+                    options=kind.revoke_options)
 
     def install(self,operation,decision,authority=None):
         prepared=self.prepared(operation)
         authority=authority or self.authority(decision,operation,prepared.bundle)
-        adapter=JournaledAdapter(self.adapter(authority),self.gestes,'install')
+        adapter=JournaledAdapter(self.adapter(authority,prepared.bundle),self.gestes,'install')
         base=dict(command='install',operation=operation,bundle_digest=prepared.bundle['digest'],decision=decision)
         self.gestes.append(phase='start',**base)
         try:
-            outcome=entry.install(prepared,authority=authority,adapter=adapter,journal=self.journal())
+            if kind_of(prepared.bundle) is Channels:
+                outcome=channels.run(self.journal(),operation,prepared.bundle,authority=authority,adapter=adapter)
+            else:
+                outcome=entry.install(prepared,authority=authority,adapter=adapter,journal=self.journal())
         except Exception as error:
             self.gestes.append(phase='held',category=type(error).__name__,**base)
             raise
@@ -477,10 +552,10 @@ class Backend:
         """
         prepared=self.prepared(operation); bundle=prepared.bundle
         authority=authority or self.authority(decision,operation,bundle,revoke=True)
-        scopes=bootstrap.scopes(operation,bundle)
+        scopes=kind_of(bundle).scopes(operation,bundle)
         request=dict(operation=operation,step='revoke',action_id=operation+':revoke',
                      scope_digest=scopes['revoke'],bundle=bundle)
-        adapter=JournaledAdapter(self.adapter(authority),self.gestes,'revoke')
+        adapter=JournaledAdapter(self.adapter(authority,bundle),self.gestes,'revoke')
         def run():
             with protocol.locked(self.journal(),bundle['host']):
                 return adapter.perform('revoke',request)
@@ -545,9 +620,10 @@ def main(argv=None):
             raise BackendError('backend code must be installed root-owned') from None
         enrollment=json.loads(Backend.private(runtime.trusted(ENROLLMENT),4096))
         db=connect() if command!='inventory' else None
-        backend=Backend(system=installer.LinuxHost(),enrollment=enrollment,db=db)
+        # LinuxChannels extends LinuxHost: one fixed system for both kinds.
+        backend=Backend(system=channel_installer.LinuxChannels(),enrollment=enrollment,db=db)
         result=dispatch(backend,command,operation,decision)
-    except (BackendError,entry.OperatorError,bootstrap.BootstrapError) as error:
+    except (BackendError,*Release.errors,*Channels.errors) as error:
         print(json.dumps(dict(ok=False,error=str(error))),file=sys.stderr)
         return 2
     except Exception as error:

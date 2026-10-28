@@ -52,7 +52,7 @@ from . import db as db_mod
 from . import planned_waits
 from . import storage
 
-UNDERUSE_TYPES = ("plan_underused", "idle_capacity", "orchestrator_held", "host_underused",
+UNDERUSE_TYPES = ("host_idle_reserved", "baseline_oversized", "plan_underused", "idle_capacity", "orchestrator_held", "host_underused",
                   "backlog_empty")
 
 #: `balance_low` (L94, ajout validé par le propriétaire) : solde bas d'un
@@ -1650,6 +1650,11 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,
                           load_max=host_underused_load, turns_max=host_underused_turns,
                           idle_mail_s=idle_mail_s, canons=canons, verdicts=verdicts)
+    from . import host_capacity_alerts
+    out += host_capacity_alerts.alerts(
+        cfg, db, listing, now, canons=canons,
+        readings={host: reading for host, (reading, _verdict) in verdicts.items()},
+        held_hosts=held_hosts, orchestrators=orchestras)
     out += balance_low(db, listing, now, hours=balance_hours, min_usd=balance_min_usd,
                        window_s=balance_window_s)
     out += backlog_empty(db, listing, now, idle_s=backlog_empty_s)

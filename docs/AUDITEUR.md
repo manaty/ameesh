@@ -977,7 +977,7 @@ appliquée à l'exploitation et au code d'ameesh.
 Après la fusion de sa fiche dans le canon. La fiche choisit le harnais, le
 fournisseur, le modèle et le mode d'authentification, et déclare l'effort ; le
 placement le met sur un hôte qui admet ce harnais et ce mode ; la politique de
-l'hôte lui donne son dossier de travail (`work_dirs.auditeur`, ci-dessous
+l'hôte lui donne son dossier de travail (`workspaces.dirs.auditeur`, ci-dessous
 `<dossier>`).
 
 ```sh

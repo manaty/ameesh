@@ -439,7 +439,7 @@ class BuildersTest(unittest.TestCase):
     def test_cli_builders_are_shared(self):
         # one serialisation: the API calls the functions the CLI prints
         source = (ROOT / "src" / "ameesh" / "serve.py").read_text(encoding="utf-8")
-        for name in ("mesh_cli.agent_rows", "mesh_cli.agent_detail", "mesh_cli.work_rows",
+        for name in ("mesh_cli.agent_rows", "mesh_cli.agent_detail_json", "mesh_cli.work_rows",
                      "mesh_cli.work_detail", "mesh_cli.host_views",
                      "actions_cli.decisions_view", "projects.snapshot", "progress.snapshot",
                      "budget.status", "exploitation.alerts"):

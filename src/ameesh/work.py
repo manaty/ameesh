@@ -46,7 +46,7 @@ from .storage.postgres import work as _pg
 # Public compatibility exports; the vocabulary is also usable without importing
 # storage or the command layer (housekeeping, progress and capacity readers).
 from .work_lifecycle import (ACTIVE, COMPLETED, DELIVERED, STATES, TERMINAL,
-                             TO_VALIDATE, WAITING, delivery_connector)
+                             TO_VALIDATE, WAITING)
 #: déjà fusionnés : une fusion constatée n'y change rien
 MERGED_STATES = DELIVERED
 #: raisons d'une fermeture explicite (`ameesh work close`) : abandonné,
@@ -2726,8 +2726,12 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                  pr_ref: str | None = None, frozen_id: int | None = None,
                  declared: bool = False, extra: str = "", repo: str | None = None,
                  landed: tuple[int, str] | None = None, unfrozen: bool = False,
-                 content_guard=None, retry_review: bool = False) -> dict:
+                 content_guard=None, retry_review: bool = False,
+                 connector: str = "") -> dict:
     """Fusion constatée : le lot passe `merged` et son jalon `merged` est posé.
+
+    `connector` (L99 T2, #4350) : le connecteur de `deliver` qui porte la
+    fusion, noté au journal ; vide pour un constat des balayages.
 
     Idempotent : un lot déjà fusionné reste tel quel (`already`). Jamais de
     réouverture silencieuse : un lot fermé (abandonné, remplacé) n'est pas
@@ -2839,10 +2843,11 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                     release_landed = (probe["release"], probe["repo"])
                 mention = _landing_note(probe, item["migration"])
                 extra = "%s — %s" % (extra, mention) if extra else mention
-        note = "merge %s%s%s%s%s" % (
+        note = "merge %s%s%s%s%s%s" % (
             "declared" if declared else "seen",
             " by %s" % source if source else "", " — %s" % pr_ref if pr_ref else "",
-            " (commit %s)" % sha[:12] if sha else "", " — %s" % extra if extra else "")
+            " (commit %s)" % sha[:12] if sha else "", " — %s" % extra if extra else "",
+            _connector_mention(connector))
         threads: list = []
         try:
             from . import work_dependencies
@@ -3148,6 +3153,19 @@ def _merge_proof_repo(item: dict, repo: str | None, cfg=None, *,
 def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = "",
            repo: str | None = None, migration_landed: int | None = None, cfg=None,
            announce=None, pr: str | None = None) -> dict:
+    """`ameesh work merged` : la livraison `git-merge` de `deliver` (L99 T2),
+    preuve `{sha, pr}` ; voir `record_merge`."""
+    evidence = {"sha": sha}
+    if pr is not None:
+        evidence["pr"] = pr
+    return deliver(db, item_id, connector=_merge_connector(), evidence=evidence,
+                   actor=actor, note=note, repo=repo, migration_landed=migration_landed,
+                   cfg=cfg, announce=announce)
+
+
+def record_merge(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = "",
+                 repo: str | None = None, migration_landed: int | None = None, cfg=None,
+                 announce=None, pr: str | None = None) -> dict:
     """`ameesh work merged <id> --sha S | --pr owner/repo#N` : une fusion faite
     hors PR et sans gel (fusion locale sur la branche cible), ou une PR
     fusionnée hors du dépôt du lot (#2603), se déclare en une fois.
@@ -3257,7 +3275,8 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
             done = close_merged(db, item_id, sha=text, actor=actor,
                                 source=actor or UNKNOWN_ACTOR, declared=True, extra=extra,
                                 landed=landed, pr_ref=pr_ref, repo=proof_repo,
-                                retry_review=retry_review, **proof_guard)
+                                retry_review=retry_review, connector=_merge_connector(),
+                                **proof_guard)
         else:
             with db.transaction() as tx:
                 fence.hold(tx)
@@ -3265,7 +3284,7 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
                                     source=actor or UNKNOWN_ACTOR, declared=True,
                                     extra=extra, landed=landed, pr_ref=pr_ref,
                                     repo=proof_repo, retry_review=retry_review,
-                                    **proof_guard)
+                                    connector=_merge_connector(), **proof_guard)
     except DbError as exc:
         # #1567 : course perdue sur l'index unique (dépôt, numéro atterri) —
         # message lisible plutôt que la DbError brute ; la pré-vérification a
@@ -3584,6 +3603,67 @@ def _record_landed(db: Db, item: dict, landed: tuple[int, str], *, actor: str,
             "detail": "%s — file %s" % (text, _migration_file(number, repo, cfg))}
 
 
+def deliver(db: Db, item_id: int, *, connector: str, evidence: dict | None = None,
+            actor: str = "", **options) -> dict:
+    """L99 T2 (#4350) : le verbe unique de toute livraison d'un lot.
+
+    `connector` choisit la voie et sa preuve (`evidence`) :
+    - `git-merge` (module `dev`, lu dans le registre) : une fusion sur la cible,
+      `{sha, pr}` déclarée (`ameesh work merged`) ou `{action}` confirmée par
+      la porte ; rend le constat de `close_merged` ;
+    - `document` (cœur) : livré hors cible, `{sha: <tête relue>}`
+      (`close --delivered`) ; rend la ligne fermée ;
+    - `done` (cœur) : livré sans fusion, `{}` (`close --done`).
+    `options` sont celles de la voie (`note`, `repo`, `cfg`…). Le journal du
+    lot nomme le connecteur ; aucun nouveau stockage."""
+    name = str(connector or "").strip()
+    core = {"document": _deliver_document, "done": _deliver_done}
+    if name in core:
+        handler = core[name]
+    else:
+        from .modules import registry
+        found = registry.delivery_connectors().get(name)
+        if found is None:
+            raise WorkError("unknown delivery connector %r (known: %s)" % (
+                connector, ", ".join(sorted([*core, *registry.delivery_connectors()]))))
+        handler = found[1]
+    if evidence is not None and not isinstance(evidence, dict):
+        raise WorkError("delivery evidence must be a mapping, not %r" % (evidence,))
+    return handler(db, item_id, evidence=dict(evidence or {}), actor=actor, **options)
+
+
+def _merge_connector() -> str:
+    from .modules import registry
+    return registry.merge_connector()
+
+
+def _connector_mention(connector: str) -> str:
+    """La trace du connecteur dans une note du journal (L99 T2)."""
+    return " [via %s]" % connector if connector else ""
+
+
+def _deliver_document(db: Db, item_id: int, *, evidence: dict, actor: str = "",
+                      note: str = "") -> dict:
+    """Connecteur `document` : livré hors cible, la tête relue en preuve (#988)."""
+    sha = evidence.pop("sha", "")
+    if evidence:
+        raise WorkError("document: unknown evidence %s (sha only)"
+                        % ", ".join(sorted(evidence)))
+    if not _SHA_RE.match((sha or "").strip().lower()):
+        raise WorkError("--delivered: the reviewed head (--sha, 7 to 64 hex characters), "
+                        "not %r" % (sha,))
+    return _close(db, item_id, delivered=True, sha=sha, note=note, actor=actor,
+                  connector="document")
+
+
+def _deliver_done(db: Db, item_id: int, *, evidence: dict, actor: str = "",
+                  note: str = "") -> dict:
+    """Connecteur `done` : livré sans fusion (un avis, une analyse, #1280)."""
+    if evidence:
+        raise WorkError("done: takes no evidence, not %s" % ", ".join(sorted(evidence)))
+    return _close(db, item_id, done=True, note=note, actor=actor, connector="done")
+
+
 def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int | None = None,
           delivered: bool = False, done: bool = False, sha: str = "", note: str = "",
           actor: str = "") -> dict:
@@ -3631,11 +3711,23 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
         raise WorkError("pass one of --abandoned, --superseded-by <id>, "
                         "--delivered --sha <reviewed head>, --done")
     head = (sha or "").strip().lower()
-    if delivered and not _SHA_RE.match(head):
-        raise WorkError("--delivered: the reviewed head (--sha, 7 to 64 hex characters), "
-                        "not %r" % (sha,))
     if not delivered and head:
         raise WorkError("--sha only makes sense with --delivered")
+    if delivered:
+        return deliver(db, item_id, connector="document", evidence={"sha": sha},
+                       actor=actor, note=note)
+    if done:
+        return deliver(db, item_id, connector="done", evidence={}, actor=actor, note=note)
+    return _close(db, item_id, abandoned=abandoned, superseded_by=superseded_by,
+                  note=note, actor=actor)
+
+
+def _close(db: Db, item_id: int, *, abandoned: bool = False,
+           superseded_by: int | None = None, delivered: bool = False, done: bool = False,
+           sha: str = "", note: str = "", actor: str = "", connector: str = "") -> dict:
+    """Le corps de `close` : une porte, déjà choisie et validée par l'appelant
+    (`close`, ou les connecteurs `document` et `done` de `deliver`)."""
+    head = (sha or "").strip().lower()
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -3695,7 +3787,8 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
         reason, base = "delivered", "delivered (head %s)" % head[:12]
     else:
         reason, base = "done", "done"
-    text = base + (" — %s" % note.strip() if note and note.strip() else "")
+    text = (base + (" — %s" % note.strip() if note and note.strip() else "")
+            + _connector_mention(connector))
     from . import work_dependencies
     threads: list = []
     with db.transaction() as tx:

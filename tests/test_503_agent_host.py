@@ -102,6 +102,16 @@ if sys.argv[1:] == ['pause', '--help']:
 if sys.argv[1:] == ['list', '--json']:
     if scenario == 'list-error': sys.exit(1)
     if scenario == 'bad-json': print('not json'); sys.exit(0)
+    # #4373 : lecture vide passagère (code 0, aucune sortie), puis liste
+    # valide à la relecture ; `list-vide` ne rend jamais la liste.
+    if scenario == 'list-vide-puis-ok' and not (state / 'liste-vide-faite').exists():
+        (state / 'liste-vide-faite').touch()
+        sys.exit(0)
+    if scenario == 'list-255-puis-ok' and not (state / 'liste-255-faite').exists():
+        (state / 'liste-255-faite').touch()
+        sys.exit(255)
+    if scenario == 'list-vide':
+        sys.exit(0)
     print((state / 'agents.json').read_text())
 elif sys.argv[1] == 'show':
     name = sys.argv[2]
@@ -1596,6 +1606,40 @@ class AgentHostTest(unittest.TestCase):
                 p = self.run_vm(scenario=scenario)
                 self.assertNotEqual(p.returncode, 0)
                 self.assertEqual(self.gestes(), [])
+
+    def test_transient_empty_registry_is_reread_not_a_failure(self):
+        """#4373 : une lecture vide passagère de `list --json` (relève d'un
+        rôle élu, lien coupé) est relue ; le staging redémarre les agents."""
+        p = self.run_vm(scenario='list-vide-puis-ok')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('JSONDecodeError', p.stderr)
+        for name in ('dev8', 'dev9'):
+            self.assertIn('--user start ameesh-runner-agent@%s.service' % name,
+                          self.units())
+
+    def test_transient_empty_registry_is_reread_by_controler(self):
+        """#4373 : la relecture vaut aussi pour l'étape controler."""
+        p = self.run_vm('controler', scenario='list-vide-puis-ok')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('contrôles verts', p.stdout)
+
+    def test_lost_transport_on_registry_read_is_reread(self):
+        """#4373 : un transport SSH perdu (255) sur `list --json` est passager,
+        comme pour les lectures `show` de #4358 ; relu, il ne fait pas échouer
+        l'étape."""
+        p = self.run_vm(scenario='list-255-puis-ok')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('--user start ameesh-runner-agent@dev9.service',
+                      self.units())
+
+    def test_persistent_empty_registry_is_an_explicit_failure(self):
+        """#4373 : un registre encore vide après relectures reste un échec
+        explicite — aucun geste, aucun hôte vert sans liste."""
+        p = self.run_vm(scenario='list-vide')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.gestes(), [])
+        self.assertIn('registre de host-agents : lecture vide', p.stderr)
+        self.assertNotIn('JSONDecodeError', p.stderr)
 
     def test_empty_host_is_not_green(self):
         p = self.run_vm(agents=[])

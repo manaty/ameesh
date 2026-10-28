@@ -61,6 +61,7 @@ from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import rate_limit as rate_limit_mod
 from . import account_window
+from . import provider_credits
 from . import persona_memory as memory_mod
 from . import train_events
 from . import events as events_mod, turn_stages
@@ -844,6 +845,18 @@ class AgentWorker(threading.Thread):
             and str(agent.get("status_text") or "").startswith(auth_failure.STATUS_PREFIX)
             and str(agent.get("last_error") or "").startswith(auth_failure.STATUS_PREFIX)) \
             else ""
+        #: #4164 : `status_text` du blocage « provider_credits_exhausted » posé
+        #: (ou hérité d'un exécuteur précédent), '' hors blocage
+        self._credits_status = (agent.get("status_text") or "") if (
+            agent.get("status") == "blocked"
+            and provider_credits.is_held(agent.get("status_text"))
+            and provider_credits.is_held(agent.get("last_error"))) else ""
+        #: #4164 : (harnais, compte) de la sonde bornée que porte le tour en
+        #: cours, None hors sonde
+        self._credits_probe = None
+        #: #4164 (B1 cx2) : (harnais, compte, raison) d'une sonde échue, à
+        #: réserver seulement si `_pick` choisit vraiment un tour
+        self._credits_candidate = None
         #: dernière résolution du binaire journalisée (L106)
         self.resolution_seen = ""
         #: L106 : arrêt propre demandé par la garde d'alimentation (texte de la
@@ -2539,6 +2552,10 @@ class AgentWorker(threading.Thread):
             # forced rotation or noting a cancellation on every pass.
             return False
         if not self.budget_ok() or not self.auth_ready():
+            return False
+        if self._credits_exhausted():
+            # #4164 (B mty-amh-docs-01) : aucun appel de modèle sur un compte
+            # sans crédit, résumé compris ; la rotation attend son retour à ok
             return False
         if self.turn_harness() != account_turn.session_harness(self):
             # #389 r1 : le tour partirait sous un autre harnais que celui de
@@ -5116,6 +5133,166 @@ class AgentWorker(threading.Thread):
                        "the agent resumes." % texte, meta={"action": "auth_reprise"})
         return True
 
+    # -- crédits du compte fournisseur (#4164) -------------------------------
+    def credits_ready(self) -> bool:
+        """Garde de `pick()` : le compte du prochain tour a-t-il du crédit ?
+
+        Compte `exhausted` : aucun tour, blocage `provider_credits_exhausted`
+        (fencé), consigne gardée, ni échec rapide ni arrêt — sauf la sonde
+        bornée (un tour par compte et par `provider_credits.PROBE_S`). Ici la
+        sonde échue est seulement **candidate** : `pick()` ne la réserve
+        qu'une fois un tour choisi (B1 cx2 : un agent sans travail ne la
+        consomme pas). Compte `ok` de nouveau : blocage levé."""
+        self._credits_probe = None
+        self._credits_candidate = None
+        if not self._credits_tracked():
+            return True
+        compte = account_turn.for_turn(self)
+        if compte is account_turn.INVALID:
+            return True
+        harness = self.turn_harness()
+        account = auth_failure.account_name(compte)
+        try:
+            row = provider_credits.exhausted(self.db, harness, account)
+        except db_mod.DbError as exc:
+            # garde ouverte sur panne de lecture : l'échec du tour, lui,
+            # reclassera le compte
+            log_async("[%s] provider credits unreadable (%s): turn allowed"
+                      % (self.name, db_mod.explain(exc)))
+            return True
+        if not row:
+            return self._credits_release()
+        echeance = row.get("next_probe_ts")
+        if echeance is None or float(echeance) <= time.time():
+            # la base reste seule juge de l'échéance (`claim_probe`, dans pick)
+            self._credits_candidate = (harness, account, row.get("reason") or "")
+            return True
+        self._credits_block(harness, account, row.get("reason") or "")
+        return False
+
+    def _credits_tracked(self) -> bool:
+        """#4164 : l'état partagé des crédits s'applique-t-il à ce worker ?
+        Non en simulation, ni pour l'exécuteur médié (pas d'état partagé du
+        compte), ni pour une construction partielle documentée (`__new__`
+        sans `__init__`, doublures #811/#1270 : ni `cfg` ni exécuteur
+        complet) — avis B ameesh-dev3."""
+        runner = getattr(self, "runner", None)
+        if getattr(self, "cfg", None) is None or runner is None:
+            return False
+        return not (getattr(runner, "dry_run", False) or getattr(runner, "mediated", False))
+
+    def _credits_exhausted(self) -> bool:
+        """#4164 : le compte du prochain tour est-il épuisé ? Lecture seule
+        (ni sonde ni blocage), pour les appels de modèle hors `pick` (résumé
+        de rotation). Ouvert sur panne de lecture, comme `credits_ready`."""
+        if not self._credits_tracked():
+            return False
+        compte = account_turn.for_turn(self)
+        if compte is account_turn.INVALID:
+            return False
+        try:
+            return bool(provider_credits.exhausted(
+                self.db, self.turn_harness(), auth_failure.account_name(compte)))
+        except db_mod.DbError:
+            return False
+
+    def _credits_claim(self) -> bool:
+        """#4164 (B1 cx2) : un tour est choisi alors que le compte est épuisé
+        et sa sonde échue — la réserve atomiquement (un seul agent par
+        échéance) et lève le blocage. Faux si un autre agent l'a prise, ou
+        si le bail est perdu : le tour ne part pas."""
+        candidat, self._credits_candidate = getattr(self, "_credits_candidate", None), None
+        if not candidat:
+            return True
+        harness, account, reason = candidat
+        try:
+            pris = provider_credits.claim_probe(self.db, harness, account)
+        except db_mod.DbError as exc:
+            log_async("[%s] probe claim unreadable (%s): no turn"
+                      % (self.name, db_mod.explain(exc)))
+            pris = False
+        if not pris:
+            self._credits_block(harness, account, reason)
+            return False
+        self._credits_probe = (harness, account)
+        log_async("[%s] %s: probe turn on %s (one every %ds)"
+                  % (self.name, provider_credits.REASON,
+                     provider_credits.who(harness, account),
+                     int(provider_credits.PROBE_S)))
+        # le tour choisi a souvent déjà remplacé la marque (consigne prise :
+        # `running`) — « kept » n'est pas un refus ; seul le bail perdu l'est
+        self._credits_release(probe=True)
+        if self.lease_lost.is_set():
+            self._credits_probe = None
+            return False
+        return True
+
+    def _credits_block(self, harness: str, account: str, reason: str) -> None:
+        """Pose (fencé) le blocage d'un agent dont le compte est épuisé ;
+        journal et fil une fois par blocage."""
+        texte = provider_credits.status_text(harness, account)
+        agent = self.agent or {}
+        if texte == self._credits_status and agent.get("status") == "blocked" \
+                and agent.get("status_text") == texte:
+            return
+        if self._credits_status and self._credits_status != texte:
+            registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
+                                        self.epoch, self._credits_status,
+                                        provider_credits.STATUS_PREFIX)
+            self._credits_status = ""
+        issue = registry.set_marked_block(
+            self.db, self.name, self.runner.runner_id, self.epoch, texte,
+            "%s %s" % (provider_credits.STATUS_PREFIX, reason),
+            provider_credits.STATUS_PREFIX)
+        if issue == "lease":
+            self.lease_lost.set()
+            return
+        if issue == "kept":
+            return
+        self._credits_note(harness, account, reason, texte)
+
+    def _credits_note(self, harness: str, account: str, reason: str, texte: str,
+                      turn: bool = False) -> None:
+        self._credits_status = texte
+        nom = provider_credits.who(harness, account)
+        log_async("[%s] %s (%s) — no turn until the account has credits again "
+                  "(probe every %ds)" % (self.name, texte, reason,
+                                         int(provider_credits.PROBE_S)))
+        self._fil_note(
+            "%s: provider account %s has no credits left (%s). The instruction stays "
+            "requested, with no retry loop and no fast failure; one probe turn per "
+            "%d min checks the account, and the agent resumes on its own once it "
+            "has credits again." % ("Turn failed" if turn else "Turn held", nom, reason,
+                                    int(provider_credits.PROBE_S // 60)),
+            meta={"action": provider_credits.REASON, "harnais": harness,
+                  "compte": account, "raison": reason,
+                  "source": "tour" if turn else "garde"})
+
+    def _credits_release(self, probe: bool = False) -> bool:
+        """Compte `ok` (ou sonde accordée) : le blocage encore posé est levé."""
+        if not self._credits_status:
+            return True
+        texte = self._credits_status
+        issue = registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
+                                            self.epoch, texte,
+                                            provider_credits.STATUS_PREFIX)
+        if issue == "lease":
+            self.lease_lost.set()
+            return False
+        self._credits_status = ""
+        if issue == "kept":
+            row = registry.get(self.db, self.name)
+            if row is not None:
+                self.agent = row
+            return False
+        if not probe:
+            log_async("[%s] %s lifted: the account has credits again — resuming"
+                      % (self.name, texte))
+            self._fil_note("Block %s lifted: the provider account has credits again, "
+                           "the agent resumes." % texte,
+                           meta={"action": "provider_credits_reprise"})
+        return True
+
     def _relay_credential_ready(self) -> bool:
         from . import relay
         harness = self.turn_harness()
@@ -5182,7 +5359,14 @@ class AgentWorker(threading.Thread):
         # urgents, donc hors de ce que le tour choisi sert — ne doit pas être
         # effacée au début du tour : elle l'arrête.
         frontiere = _preemption_generation(self)
+        # #4164 (B2 cx2) : les reprises que `_pick` consomme en choisissant
+        # (suite après plafond, reprise d'attach, relance), rendues si la
+        # sonde du compte épuisé est perdue et que le tour ne part pas
+        reprises = (getattr(self, "suite", None), getattr(self, "_reprise_attach", False),
+                    getattr(self, "nudged", False))
         spec = self._pick()
+        if spec is None:
+            self._credits_candidate = None  # aucun tour : la sonde reste libre
         if spec is not None:
             # Le tour urgent, lui, sert la demande qui l'a fait choisir : sa
             # frontière est relue après la sélection, sinon il se tuerait
@@ -5198,6 +5382,17 @@ class AgentWorker(threading.Thread):
                     registry.restore_prompt(self.db, self.name, self.runner.runner_id,
                                             self.epoch)
                 self._servir(())  # #2810 : ce tour ne partira pas
+                self._credits_candidate = None
+                return None
+            # #4164 (B1 cx2) : la sonde d'un compte épuisé n'est réservée que
+            # pour un tour réellement choisi ; perdue (autre agent), la
+            # consigne repart en attente comme ci-dessus.
+            if not self._credits_claim():
+                if spec.get("kind") == "prompt":
+                    registry.restore_prompt(self.db, self.name, self.runner.runner_id,
+                                            self.epoch)
+                self.suite, self._reprise_attach, self.nudged = reprises
+                self._servir(())
                 return None
             # transportée par le spec : `rotate_for_lot` et les copies de
             # `_run_guarded_turn` la gardent (dict(spec, …)).
@@ -5262,6 +5457,11 @@ class AgentWorker(threading.Thread):
         # consigne ni courrier consommés, aucune relance ; reprise dès qu'il
         # (ou un autre, par la bascule de `budget_ok`) est sain.
         if not self.auth_ready():
+            return None
+        # #4164 : le compte du tour n'a plus de crédit chez le fournisseur —
+        # ni consigne ni courrier consommés (le tour reste demandé), sauf la
+        # sonde bornée ; reprise d'elle-même quand le compte repasse `ok`.
+        if not self.credits_ready():
             return None
         # L30 : session ouverte sous un autre compte et non reprenable → résumé
         # sous l'ancien compte, avant de consommer quoi que ce soit (jamais en
@@ -8248,6 +8448,40 @@ class AgentWorker(threading.Thread):
                 self._turn_end_mono = self.last_activity  # #3451
                 self._auth_note(nom_harnais, account, raison_auth, texte, turn=True)
                 return False
+            # #4164 : le compte fournisseur n'a plus de crédit — pas une panne
+            # passagère ni un échec rapide : le compte passe `exhausted`, la
+            # consigne reste demandée, aucun autre tour du compte n'est accordé
+            # (hors sonde bornée) jusqu'à son retour à `ok`.
+            stderr_credits = auth_failure.stderr_tail(stderr_path, start=stderr_debut)
+            raison_credits = None if self.runner.mediated else provider_credits.classify(
+                harness, error, stderr_credits)
+            if raison_credits:
+                self.fast_failure = False
+                account = auth_failure.account_name(compte)
+                sonde = self._credits_probe
+                self._credits_probe = None
+                transition = self._avec_reprise(
+                    "provider credits", provider_credits.mark_exhausted, self.db,
+                    harness, account, reason=raison_credits,
+                    detail=provider_credits.detail_of(error, stderr_credits),
+                    source="probe" if sonde else "turn", agent=self.name,
+                    host=self.cfg.host)
+                if self._session_en_attente is not None:
+                    self._avec_reprise("turn session", self._enregistre_session)
+                texte = provider_credits.status_text(harness, account)
+                self._avec_reprise(
+                    "end of turn", registry.end_turn,
+                    self.db, self.name, self.runner.runner_id, self.epoch,
+                    status="blocked", status_text=texte,
+                    error="%s %s" % (provider_credits.STATUS_PREFIX, raison_credits),
+                    cost_usd=cost)
+                self.last_activity = time.monotonic()
+                self._turn_end_mono = self.last_activity  # #3451
+                if transition or not sonde:
+                    self._credits_note(harness, account, raison_credits, texte, turn=True)
+                else:
+                    self._credits_status = texte  # sonde négative : rien de neuf à dire
+                return False
             session_fille_ecartee = bool(session and adapters.child_session_refused(error))
             if session_fille_ecartee:
                 # L166 : la session reprise était une session fille ; la
@@ -8314,6 +8548,20 @@ class AgentWorker(threading.Thread):
         # authentification, bail) sont rendus plus haut ; le refus d'une
         # session fille est écarté ici — il ne compte pas dans la série (B2)
         # et ne l'efface pas non plus : seul un succès remet la série à zéro.
+        sonde_credits, self._credits_probe = getattr(self, "_credits_probe", None), None
+        if ok and sonde_credits:
+            # #4164 : la sonde bornée a abouti — le compte a de nouveau du
+            # crédit ; les agents retenus reprennent à leur prochain sondage
+            if self._avec_reprise("provider credits", provider_credits.mark_ok,
+                                  self.db, sonde_credits[0], sonde_credits[1],
+                                  source="probe", agent=self.name, host=self.cfg.host):
+                log_async("[%s] provider account %s has credits again (probe turn "
+                          "succeeded): held agents resume"
+                          % (self.name, provider_credits.who(*sonde_credits)))
+                self._fil_note(
+                    "Probe turn succeeded: provider account %s has credits again, "
+                    "its held agents resume in order." % provider_credits.who(*sonde_credits),
+                    meta={"action": "provider_credits_reprise", "source": "sonde"})
         if ok:
             self.failure_streak = 0
             self.failure_since = 0.0

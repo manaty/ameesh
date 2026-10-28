@@ -119,6 +119,10 @@ class CoherenceTest(PgTestCase):
         self.assertIn("Corriger la ligne deux (code)", body)
         self.assertIn("Obsolètes probables", body)
         self.assertIn("Nettoyer src/gone.py", body)
+        # #4262: no deterministic closure is claimed for an obsolescence.
+        self.assertIn("Les fermetures déterministes éventuelles (déjà fait) "
+                      "sont justifiées", body)
+        self.assertNotIn("déjà fait, obsolète", body)
 
     def test_restoration_after_deletion_is_a_digest_not_a_closure(self):
         # B1 cx2 (#4172): a path already gone when the lot is filed may be a

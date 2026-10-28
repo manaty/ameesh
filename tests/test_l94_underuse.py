@@ -613,7 +613,10 @@ class BalanceLowTest(_Base):
 class NotifyTest(_Base):
     def test_types_par_defaut_texte_et_resume(self):
         for kind in sous_utilisation.UNDERUSE_TYPES:
-            self.assertIn(kind, notify.DEFAULT_TYPES)
+            if kind in ('host_idle_reserved', 'baseline_oversized'):
+                self.assertNotIn(kind, notify.DEFAULT_TYPES)  # #4151: agents only
+            else:
+                self.assertIn(kind, notify.DEFAULT_TYPES)
             self.assertIn(kind, exploitation.ALERT_TYPES)
         alerte = {"type": "plan_underused", "agent": None, "harness": "codex",
                   "account": "secondaire", "gauge": "codex-10080min", "since": self.now - JOUR,

@@ -226,13 +226,14 @@ class BoutEnBoutTest(PgTestCase):
         """Canon d'exemple, racine de travail de l'hôte atelier ramenée au bac à sable."""
         source = os.path.join(self.ws, "source-canon")
         shutil.copytree(EXAMPLE, source)
-        # L31 (0029) : le dossier de travail vient de `policy.work_roots` de
-        # l'hôte, plus du `cwd` (ignoré) du placement.
+        # L31 (0029) : le dossier de travail vient de `policy.workspaces.roots`
+        # de l'hôte (l'ancienne clé `work_roots` reste un alias), plus du `cwd`
+        # (ignoré) du placement.
         path = os.path.join(source, "hotes", "atelier.md")
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
-        text, count = re.subn(r"(?m)^  work_roots: .*$",
-                              "  work_roots: {%s: %s}" % (PROJECT, self.travail["orchestre"]),
+        text, count = re.subn(r"(?m)^    roots: .*$",
+                              "    roots: {%s: %s}" % (PROJECT, self.travail["orchestre"]),
                               text)
         self.assertEqual(count, 1, "hotes/atelier.md")
         with open(path, "w", encoding="utf-8") as fh:

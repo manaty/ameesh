@@ -127,6 +127,30 @@ def merge_tree(repo: str, base: str, tip: str) -> dict:
     return {"state": "clean", "files": [], "tree": tree, "detail": ""}
 
 
+def changed_files(repo: str, base: str, source: str) -> list[str]:
+    """Les fichiers modifiés par `source` depuis sa base de fusion avec `base`.
+
+    C'est la lecture du partage en paquets parallèles (#3256 C) : deux lots
+    qui nomment un même fichier ne doivent pas partir dans deux paquets. Un
+    diff illisible est une erreur (`CandidateError`), jamais une liste vide
+    supposée : le composeur ne partagerait alors pas.
+    """
+    if not base or not source:
+        raise CandidateError("changed files: base and source are required")
+    proc = subprocess.run(
+        ["git", "-C", repo, "diff", "--name-only", "--no-renames", "-z",
+         "%s...%s" % (base, source)],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise CandidateError(
+            "git diff %s...%s: %s"
+            % (base[:12], source[:12],
+               proc.stderr.decode("utf-8", "replace").strip()[:300]))
+    return sorted({name for name in proc.stdout.decode("utf-8", "replace").split("\0")
+                   if name})
+
+
 def _ancestor(repo: str, tip: str, base: str) -> bool:
     """Le contenu du lot est-il déjà dans la cible (tête ancêtre) ?"""
     proc = subprocess.run(
@@ -655,6 +679,10 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     for entry in candidates:
         # Après les remises : ni une résolution de conflit ni une surcharge
         # de hold ne peuvent lever un prérequis encore bloquant.
+        entry["dependencies"] = sorted({
+            int(edge["blocker_id"])
+            for edge in dependencies.get(entry["work_item"], [])
+            if edge.get("blocker_id") is not None})
         for edge in dependencies.get(entry["work_item"], []):
             if edge["blocking"]:
                 entry["causes"].append(_cause(
@@ -665,6 +693,14 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
                 entry["ready"] = False
         if entry["ready"] and not entry["source"]:
             entry["source"] = entry["published_head"]
+        # #3256 C : les fichiers modifiés d'un lot prêt, pour ne jamais
+        # partager deux lots qui se croisent entre deux paquets parallèles.
+        if entry["ready"]:
+            try:
+                entry["files"] = changed_files(where, package_base, entry["source"])
+            except CandidateError as exc:
+                entry["error"] = "cannot read the changed files: %s" % exc
+                entry["ready"] = False
         if entry["error"]:
             errors.append("#%d : %s" % (entry["work_item"], entry["error"]))
             # #3813 : la même erreur, attribuée au lot. L'export lisible peut
@@ -803,6 +839,10 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
         "source": "",
         "remise": None,
         "remises": [],
+        # #3256 C : les fichiers modifiés (partage en paquets disjoints) et
+        # les prérequis explicites du lot, même non bloquants.
+        "files": [],
+        "dependencies": [],
         # #3375 : le hold de pilote actif, et la surcharge explicite éventuelle
         "pilot_hold": None,
         "hold_override": "",

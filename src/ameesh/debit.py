@@ -858,7 +858,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
           installed: str | None = None,
           holds: Mapping[int, Mapping[str, Mapping[str, Any]]] | None = None,
           closure_allowed=None,
-          ci_unreadable: Iterable[str] = ()) -> dict:
+          ci_unreadable: Iterable[str] = (),
+          packets: Iterable[Mapping[str, Any]] = (),
+          zone: str = "UTC") -> dict:
     """Le rapport de débit, calculé sans I/O (témoins et tests).
 
     `closure_allowed` est l'autorité de levée (#3219) partagée par `read`
@@ -1410,6 +1412,12 @@ def build(*, items: Iterable[Mapping[str, Any]],
                         if float(row["duration_s"]) > ci_slow_s),
                        key=lambda row: -float(row["duration_s"]))[:20]
 
+    # -- attente qa_merge par jour (#3256 C) --------------------------------
+    from . import packet_parallel
+    qa_merge = packet_parallel.daily_waits(
+        packets, [mark for marks in milestones_by_lot.values() for mark in marks],
+        zone=zone, now=now)
+
     # -- total et sortie -----------------------------------------------------
     totals = {
         "lots": len(by_id),
@@ -1441,6 +1449,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
                     "phrases": list(devices.get("phrases") or ()),
                     "sources": list(devices.get("sources") or ()),
                     "unreadable": list(devices.get("unreadable") or ())},
+        "qa_merge": qa_merge,
         "totals": totals,
         "slow_waits": slow_waits,
         "human_waits": human_waits,
@@ -1602,6 +1611,22 @@ _CI_SQL = """
      LIMIT %s
 """
 
+#: #3256 C : l'ouverture de chaque paquet d'un lot, pour l'attente qa_merge.
+#: La composition est datée par la création du porteur (stable sur une
+#: recomposition) ; le gel effectif de l'unité est celui enregistré par
+#: `work packet record`, et le jalon verdict de la même tête est lu par
+#: `packet_parallel.daily_waits`. La lecture ne part **pas** des lots de
+#: `_ITEMS_SQL` : un lot fusionné en est exclu, et c'est justement un lot relu
+#: puis composé que la mesure doit compter (relecture auditeur du 28/10).
+_PACKETS_SQL = """
+    SELECT m.package_id, m.work_item_id, m.frozen_sha,
+           extract(epoch FROM p.created_at)::float8 AS composed_ts
+      FROM work_packet_members m
+      JOIN work_items p ON p.id = m.package_id
+     WHERE p.created_at > to_timestamp(%s)
+     ORDER BY p.created_at, m.work_item_id
+"""
+
 
 def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
          wait_s: float = DEFAULT_WAIT_S, ci_hours: int = DEFAULT_CI_HOURS,
@@ -1617,15 +1642,36 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
     if len(items) >= MAX_ITEMS:
         unreadable.append("open-lot limit reached (%d): list truncated" % MAX_ITEMS)
     ids = [int(row["id"]) for row in items]
-    if not ids:
-        milestones: list[dict] = []
-        events: list[dict] = []
-    else:
+    # #3256 C : la mesure qa_merge part des **membres de paquet** de la
+    # fenêtre, jamais des seuls lots ouverts (`_ITEMS_SQL` écarte un lot
+    # fusionné, alors que son attente est justement mesurée). Les jalons de ces
+    # lots sont lus au même passage.
+    from . import packet_parallel
+    qa_window = now - (packet_parallel.DAYS + 1) * 86400
+    packets = _rows(db, _PACKETS_SQL, (qa_window,))
+    packet_ids = {int(row["work_item_id"]) for row in packets}
+    all_ids = sorted(set(ids) | packet_ids)
+    if all_ids:
         # Tableau passé en littéral : le pilote `psql` de secours n'adapte pas
         # une liste Python en tableau PostgreSQL (le pilote psycopg si).
-        packed = ",".join(str(int(ident)) for ident in ids)
+        packed = ",".join(str(int(ident)) for ident in all_ids)
         milestones = _rows(db, _MILESTONES_SQL, (packed,))
-        events = _rows(db, _EVENTS_SQL, (packed, horizon))
+    else:
+        milestones = []
+    if ids:
+        packed_open = ",".join(str(int(ident)) for ident in ids)
+        events = _rows(db, _EVENTS_SQL, (packed_open, horizon))
+    else:
+        events = []
+    # Le jour de la mesure qa_merge est le jour local du canon (§11 bis) ;
+    # un canon illisible ne devine pas Europe/Paris : il dit UTC, sans
+    # ajouter une lecture illisible au rapport des lots.
+    zone = "UTC"
+    try:
+        from . import mechanics
+        zone = mechanics.configured(cfg).timezone
+    except Exception:  # noqa: BLE001 - zone de repli explicite, jamais devinée
+        pass
     agents = _rows(db, _AGENTS_SQL)
     turns = _rows(db, _TURNS_SQL, (now - int(hours) * 3600,))
     merges = _rows(db, _MERGES_SQL,
@@ -1714,7 +1760,7 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    now=now, hours=hours, wait_s=wait_s, ci_hours=ci_hours,
                    ci_slow_s=ci_slow_s, devices=devices, installed=installed,
                    holds=holds, closure_allowed=closure_allowed,
-                   ci_unreadable=ci_unreadable)
+                   ci_unreadable=ci_unreadable, packets=packets, zone=zone)
     report["unreadable"] = list(dict.fromkeys(list(report["unreadable"]) + unreadable))
     return report
 
@@ -1833,6 +1879,15 @@ def format_text(report: Mapping[str, Any]) -> str:
     lines.append("Tours/h : %s · Fusions/h : %s" % (
         " ".join(str(row["turns"]) for row in throughput.get("hours") or []),
         " ".join(str(row["merges"]) for row in throughput.get("hours") or [])))
+    qa_merge = report.get("qa_merge") or {}
+    yesterday = qa_merge.get("yesterday") or {}
+    if yesterday.get("count"):
+        lines.append("Attente qa_merge de la veille (%s) : médiane %s sur %d lot(s), "
+                     "p90 %s" % (yesterday.get("day"), _duration(yesterday.get("median_s")),
+                                 yesterday.get("count"), _duration(yesterday.get("p90_s"))))
+    else:
+        lines.append("Attente qa_merge de la veille (%s) : aucun lot relu mesuré"
+                     % (yesterday.get("day") or "?"))
     ci = report.get("ci") or {}
     groups = ci.get("by_workflow") or []
     if groups:

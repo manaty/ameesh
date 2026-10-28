@@ -65,6 +65,11 @@ Un lot prêt peut être retiré de la composition par `--exclude LOT` (répétab
 motif aux écartés du manifeste — B de relecture, regel, rouge local —, sans quoi
 le motif neutre « exclu par le pilote » est écrit (#4201).
 
+#3256 C : `--only LOT` (répétable) borne la composition à un groupe de lots
+prêts — celui d'un paquet parallèle. Tout autre lot prêt est écrit aux écartés
+avec le motif « paquet parallèle : autre groupe disjoint », jamais composé
+dans deux paquets.
+
 #4113 : hors banc sans base, la même garde d’époque que `packet record`
 est relue avant la composition, entre unités, avant chaque série de tests et
 avant publication. Une perte de bail arrête avant l’opération suivante ;
@@ -177,6 +182,13 @@ MERGED_LINE = "porteur fusionné pendant les tests par unité"
 #: #4201 : motif neutre d'un `--exclude` sans `--exclude-reason`. Le vrai motif
 #: (B de relecture, regel, rouge local) est celui que le pilote écrit.
 EXCLUDE_DEFAULT_REASON = "exclu par le pilote"
+#: #3256 C : motif écrit pour un lot prêt que `--only` laisse à l'autre paquet
+#: parallèle ; il n'est ni perdu ni composé deux fois.
+PARALLEL_EXCLUDE_REASON = "paquet parallèle : autre groupe disjoint"
+#: #3256 C : un lot du groupe qui n'est plus prêt (gel, avis, conflit) est
+#: écarté avec ce motif, jamais une erreur qui garde la cible réservée.
+PARALLEL_GROUP_NOT_READY = "paquet parallèle : lot du groupe non prêt"
+PARALLEL_GROUP_GONE = "paquet parallèle : lot du groupe introuvable"
 #: sorties qui ne prouvent pas un rouge du lot (environnement, base absente)
 INCONCLUSIVE_RE = re.compile(
     r"(OperationalError|could not connect|connection refused|"
@@ -2449,6 +2461,8 @@ def keep_tested(repo: Path, carrier: int, name: str, base_sha: str, head: str,
     mark = "%sbase=%s tête=%s réf=%s" % (TESTED_MARK, base_sha, head, ref)
     if tests:
         mark += " tests=%s" % tests
+    # Le tic peut réécrire la marque si cette première note échoue.
+    print(mark, flush=True)
     cmd = ["ameesh", "work", "note", str(carrier), mark]
     if sender:
         cmd += ["--actor", sender]
@@ -2689,6 +2703,40 @@ def compose_packet(args: argparse.Namespace) -> int:
                           if candidate.lot not in set(excluded)]
             errors = errors + excluded_discards
             error_lots |= set(excluded)
+        # #3256 C : deux paquets parallèles partent de la même liste prête ;
+        # `--only` borne celui-ci à son groupe. Tout lot prêt hors du groupe
+        # est écrit « écarté » dans ce manifeste (motif vrai), jamais composé
+        # dans les deux paquets.
+        only = {int(lot) for lot in (getattr(args, "only", None) or [])}
+        if only:
+            present = {candidate.lot for candidate in candidates}
+            # #3256 C : un lot du groupe qui n'est plus prêt (gel, avis,
+            # conflit) est **écarté avec son motif**, pas une erreur d'entrée :
+            # `resume` et `recompose` repassent le même groupe, et un refus
+            # garderait la cible réservée avec MARK_STUCK (avis auditeur B2).
+            by_lot = {int(entry.get("work_item") or 0): entry
+                      for entry in payload.get("candidates") or []}
+            missing = sorted(only - present - set(excluded) - error_lots)
+            for lot in missing:
+                entry = by_lot.get(lot) or {}
+                causes = ", ".join(str(cause.get("code") or "")
+                                   for cause in entry.get("causes") or ()
+                                   if cause.get("code"))
+                detail = (str(entry.get("error") or "").strip()
+                          or causes or "lot absent de la liste calculée")
+                errors.append(Discarded(
+                    lot,
+                    (PARALLEL_GROUP_NOT_READY if entry else PARALLEL_GROUP_GONE),
+                    detail))
+            outside = [candidate for candidate in candidates
+                       if candidate.lot not in only]
+            if outside:
+                candidates = [candidate for candidate in candidates
+                              if candidate.lot in only]
+                errors = errors + [
+                    Discarded(candidate.lot, PARALLEL_EXCLUDE_REASON,
+                              "--only, second paquet parallèle (#3256 C)")
+                    for candidate in outside]
         for item in errors:
             print("écarté #%d : %s — %s"
                   % (item.lot, item.reason, item.detail), flush=True)
@@ -2971,6 +3019,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="#4201 : motif du lot exclu, apparié par ordre aux "
                              "--exclude (répétable) ; sans motif, le manifeste "
                              "écrit « %s »" % EXCLUDE_DEFAULT_REASON)
+    parser.add_argument("--only", type=int, action="append", default=[],
+                        metavar="LOT",
+                        help="#3256 C : ne composer que ces lots prêts (répétable) ; "
+                             "les autres, prêts, sont écrits aux écartés avec le "
+                             "motif du paquet parallèle, jamais composés deux fois")
     parser.add_argument("--replay", default=None, metavar="REF",
                         help="rejouer le manifeste d'une référence et comparer "
                              "les arbres (avec --candidates-json : refuser une "
@@ -3000,8 +3053,8 @@ def main(argv: list[str] | None = None) -> int:
                              "heures (défaut : 24 ; 0 = jamais)")
     parser.add_argument("--publish", default=None, metavar="REF",
                         help="#4237 : publier sans retester la tête testée gardée "
-                             "sous REF (%s<nom>) : chaîne vérifiée, puis packet "
-                             "record, inclusion, poussée, PR, gel, courrier ; "
+                             "sous REF (%s<nom>) : chaîne et branche vérifiées, "
+                             "corps de PR, note, ci-full et courrier ; "
                              "sortie %d si la chaîne est refusée"
                              % (TESTED_REF_PREFIX, PUBLISH_REFUSED))
     parser.add_argument("--publish-sha", default=None, metavar="SHA",

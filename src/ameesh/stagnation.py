@@ -45,6 +45,7 @@ import time
 from typing import Iterable
 
 from . import work_lifecycle as lifecycle
+from .modules import registry
 from . import storage
 
 #: seuil par défaut d'un lot stagnant (secondes)
@@ -62,7 +63,7 @@ _LEGACY = {"freeze": "correction", "verdict": "verdict", "fix": "correction", "m
 DONE_STATES = lifecycle.COMPLETED
 #: états d'action qui attendent un humain
 _HUMAN_ACTION_STATES = ("proposed", "unknown")
-MERGE_CONNECTOR = lifecycle.delivery_connector()
+MERGE_CONNECTOR = registry.merge_connector()
 
 _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhdj]?)\s*$", re.I)
 _UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "j": 86400}

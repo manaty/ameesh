@@ -74,7 +74,8 @@ policy:
     - codex
   providers: [deepseek, openai]
   credential_modes: [api-key]
-  work_roots: {acme-web: /srv/acme/acme-web}
+  workspaces:
+    roots: {acme-web: /srv/acme/acme-web}
   max_agents: 2
 ---
 ```
@@ -82,19 +83,23 @@ policy:
 The host name is what the runner of that machine uses (`AMEESH_HOST`, else the
 machine's host name).
 
-The host also says **where agents work**: `policy.work_roots` gives a working
-directory per team (here every `acme-web` agent on `banc` works in
-`/srv/acme/acme-web`). Since v1.3.1, `policy.work_dirs` names a directory per
-agent, and the `{agent}` template gives one worktree per agent:
+The host also says **where agents work**: `policy.workspaces.roots` gives a
+working directory per team (here every `acme-web` agent on `banc` works in
+`/srv/acme/acme-web`). Since v1.3.1, `policy.workspaces.dirs` names a directory
+per agent, and the `{agent}` template gives one worktree per agent:
 
 ```yaml
 policy:
-  work_roots: {acme-web: "/srv/acme/acme-web-{agent}"}   # /srv/acme/acme-web-ouvrier, …
-  work_dirs: {relecteur: /srv/acme/review}               # a named exception
+  workspaces:
+    roots: {acme-web: "/srv/acme/acme-web-{agent}"}   # /srv/acme/acme-web-ouvrier, …
+    dirs: {relecteur: /srv/acme/review}               # a named exception
 ```
 
-The first path found wins: `work_dirs[<agent>]`, then `work_roots[<team>]`,
-then `work_root/<team>`. Optional `policy.resources` limits (memory, swap,
+The first path found wins: `workspaces.dirs[<agent>]`, then
+`workspaces.roots[<team>]`, then `workspaces.root/<team>`. The legacy keys
+`work_dirs`, `work_roots` and `work_root` are still read as aliases, with a
+`host-policy-legacy-key` warning and no removal date; giving the same key in
+both forms is a `host-policy-invalid` error. Optional `policy.resources` limits (memory, swap,
 load, disk) are described in
 [Runner and leases](../concepts/runner-and-leases.md#host-resources-and-back-pressure).
 
@@ -156,7 +161,7 @@ installed on the host.
     host's policy gives a directory (`admission-cwd-ignored`); otherwise it is
     used as a transitional fallback, with the warning
     `admission-cwd-inherited`. That fallback is removed in v1.5.0 at the
-    latest: move the directory to the host's `work_dirs` or `work_roots`.
+    latest: move the directory to the host's `workspaces.dirs` or `roots`.
 
 ## 6. Review policies (optional)
 
@@ -242,7 +247,7 @@ keeps its canon in `~/development/partner/home`, a federation whose `id` is
     - a `Member` card for each human responsible there (humans are resolved in
       the agent's own canon);
     - a `Host` card for this host: that canon's policy here (harnesses,
-      providers, modes, `work_dirs` of its agents). Give it the **same
+      providers, modes, `workspaces.dirs` of its agents). Give it the **same
       `max_agents`** as the first canon's card: the smallest one caps the
       whole runner;
     - an `Agent` and a `Placement` card for each of its agents.

@@ -159,7 +159,7 @@ sudo deploy/guest/install-pilot.sh --check # every line "ok"
 
 Only once the canon PR (manaty/home#24, a draft until that day) is merged: the Host fiche gets `policy.lend` (the
 offer above, the one in `/etc/ameesh/guard.json`) and `max_agents: 15` (13
-own agents + 2 guests), without `volatile`; `policy.work_dirs` puts the guests'
+own agents + 2 guests), without `volatile`; `policy.workspaces.dirs` puts the guests'
 work under `/srv/ameesh-guest/work/{agent}`; the placements of deepseek6 and
 deepseek1 move from manaty-mesh-1 to ameesh-agents-1, which keeps
 `max_agents: 0` there. Their runners on manaty-mesh-1 are
@@ -170,7 +170,7 @@ three steps bureau did by hand on the first activation), then starts the
 runners. Everything is checked before anything is done:
 
 * **its clone**: the agent's project (`team`, here `nexlink`) and its work
-  folder (`policy.work_dirs`, `/srv/ameesh-guest/work/{agent}`) are read in
+  folder (`policy.workspaces.dirs`, `/srv/ameesh-guest/work/{agent}`) are read in
   the canon (`--canon`, at `origin/main`, by ameesh's reader, as the
   checkout's owner); the canon holds no forge for a project, so `--repo`
   gives it: `https` only, no user or token in the URL. The guest clones it

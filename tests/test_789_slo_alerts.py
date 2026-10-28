@@ -499,7 +499,8 @@ class PaquetTest(_Base):
             reader.record_packet(
                 carrier["id"], branch="integration/paquet-test",
                 base_sha="c" * 40, head_sha=head, units=units,
-                note="packet composition recorded", actor="orch")
+                note=slo.PACKET_COMPOSITION_NOTE + "units (branch integration/paquet-test)",
+                actor="orch")
 
         unit = {"work_item_id": self.lot["id"], "unit_sha": "d" * 40,
                 "source_sha": source, "frozen_sha": source}
@@ -528,11 +529,95 @@ class PaquetTest(_Base):
             self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
                             (head, carrier["id"]))
             record([])
+            # #4369 : la sortie est notée au journal de l'unité ; datée avant
+            # l'instant du banc, elle laisse l'alerte revenir.
+            self._backdate_exit(self.GO + HEURE)
             self.assertIn(self.lot["id"], [a["lot"] for a in self.slo()])
             record([unit])
             self.assertEqual(self.slo(), [])
             work.close(self.db, carrier["id"], abandoned=True, actor="orch")
             self.assertIn(self.lot["id"], [a["lot"] for a in self.slo()])
+
+    def _backdate_exit(self, at):
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = to_timestamp(%s)"
+            " WHERE note LIKE %s",
+            (float(at), "%" + slo.VEHICLE_EXIT_MARK + "%"))
+
+    def test_unite_en_vehicule_puis_retiree_repart_de_la_sortie(self):
+        # #4369, cas #4284 dans le paquet Nexlink 233 : membre d'une
+        # composition enregistrée et ouverte, le lot est à l'étape
+        # « véhicule » (aucune alerte d'unité, la CI du paquet tourne) ;
+        # retiré par la recomposition, il revient à `verdict_merge`, mais le
+        # temps passé dans le véhicule ne compte pas : pas de saut au ×3.
+        self.qa_at(self.GO)
+        head, source = "b" * 40, "a" * 40
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (source, self.lot["id"]))
+        self.db.execute("UPDATE work_item_milestones SET sha = %s"
+                        " WHERE work_item_id = %s AND kind IN ('frozen', 'verdict')",
+                        (source, self.lot["id"]))
+        carrier = self.packet(body="composition enregistrée", head=head)
+        reader = storage.of(self.db).work
+        other = work.add(self.db, title="autre unité", assignee="dev1")
+
+        def record(units):
+            reader.record_packet(
+                carrier["id"], branch="integration/paquet-test",
+                base_sha="c" * 40, head_sha=head, units=units,
+                note=slo.PACKET_COMPOSITION_NOTE + "units (branch integration/paquet-test)",
+                actor="orch")
+
+        unit = {"work_item_id": self.lot["id"], "unit_sha": "d" * 40,
+                "source_sha": source, "frozen_sha": source}
+        with mock.patch.object(planned_waits, "packet_attachments", return_value={}):
+            record([unit])
+            self.now = self.GO + 3 * HEURE
+            self.assertEqual(self.slo(), [])
+            rows = storage.of(self.db).operations.open_lots_activity(None)
+            info = stagnation.describe(self.db, rows, now=self.now,
+                                       open_items=rows)[self.lot["id"]]
+            self.assertEqual((info["planned_wait"] or {}).get("what"), "packet")
+            self.assertEqual(info["planned_wait"]["vehicle"], carrier["id"])
+            # Recomposition sans le lot (il a fait rougir la CI du paquet).
+            record([{"work_item_id": other["id"], "unit_sha": "f" * 40,
+                     "source_sha": "e" * 40, "frozen_sha": "e" * 40}])
+            # Une seule ligne, sur le porteur ; le journal des unités reste muet.
+            notes = [ev["note"] for ev in storage.of(self.db).progress.lot_events(
+                [carrier["id"], self.lot["id"], other["id"]])
+                if slo.VEHICLE_EXIT_MARK in ev["note"]]
+            self.assertEqual(len(notes), 1, notes)
+            self.assertTrue(notes[0].endswith(
+                "%s#%d" % (slo.VEHICLE_EXIT_MARK, self.lot["id"])), notes)
+            self._backdate_exit(self.now)
+            self.now += 10 * 60
+            self.assertEqual([a for a in self.slo() if a["lot"] == self.lot["id"]], [])
+            # Avis cx2 (B/P2) : le porteur fusionne ou se ferme sans l'unité ;
+            # sa sortie reste lue, l'horloge ne recule pas au GO.
+            work.close(self.db, carrier["id"], abandoned=True, actor="orch")
+            self.now += 10 * 60
+            self.assertEqual([a for a in self.slo() if a["lot"] == self.lot["id"]], [])
+            self.now += 25 * 60
+            alerts = [a for a in self.slo() if a["lot"] == self.lot["id"]]
+        self.assertEqual([(a["step"], a["level"]) for a in alerts],
+                         [("verdict_merge", 1)], alerts)
+        self.assertAlmostEqual(alerts[0]["vehicle_exit_ts"], self.GO + 3 * HEURE, delta=1)
+        for text in self.briefs(alerts[0]).values():
+            self.assertIn("left its packet at recomposition", text)
+            self.assertNotIn("reassign it now", text)
+
+    def test_vehicle_exits_lit_la_derniere_sortie_des_notes_de_composition(self):
+        # #4369 : un composeur qui rejoue le paquet pas à pas « retire » puis
+        # remet les unités ; seule la dernière sortie compte, et une unité
+        # revenue dans le véhicule est tue par son appartenance, pas par ceci.
+        note = slo.PACKET_COMPOSITION_NOTE + "1 unit(s) a..b (branch x)"
+        events = [
+            {"note": note + slo.VEHICLE_EXIT_MARK + "#12, #34", "created_ts": 100.0},
+            {"note": note, "created_ts": 150.0},
+            {"note": note + slo.VEHICLE_EXIT_MARK + "#34", "created_ts": 200.0},
+            {"note": "hold: removed: #56", "created_ts": 300.0},
+        ]
+        self.assertEqual(slo.vehicle_exits(events), {12: 100.0, 34: 200.0})
 
     def test_composition_perimee_ne_tait_pas_le_slo(self):
         self.qa_at(self.GO)
