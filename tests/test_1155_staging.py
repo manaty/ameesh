@@ -1632,8 +1632,11 @@ class SanteCourrierTest(unittest.TestCase):
         self.assertEqual(rapport['sonde']['destinataire'], 'cx1')
         self.assertEqual(rapport['sonde']['tour'], 'ok')
 
-    def sonde(self, etat, repond=False, attente=0.2, accuse_remis=False):
-        """La sonde sur faux courrier/registre (#1460) : remise a 100.0."""
+    def sonde(self, etat, repond=False, attente=0.2, accuse_remis=False, lots=()):
+        """La sonde sur faux courrier/registre (#1460) : remise a 100.0.
+
+        ``lots`` : les lots ouverts de la cible (``work.open_lots``), pour le
+        verdict « travail en cours » (#4181)."""
         envoye = {}
 
         def send(db, sender, dest, corps, **kw):
@@ -1647,7 +1650,8 @@ class SanteCourrierTest(unittest.TestCase):
         def unread(db, nom):
             return [m for m in history(db, nom) if not m['delivered_ts']]
 
-        with mock.patch.object(self.mod.mail, 'send', side_effect=send), \
+        with mock.patch.object(self.mod.work, 'open_lots', return_value=list(lots)), \
+             mock.patch.object(self.mod.mail, 'send', side_effect=send), \
              mock.patch.object(self.mod.mail, 'get', return_value={'delivered_ts': 100.0}), \
              mock.patch.object(self.mod.mail, 'unread', side_effect=unread), \
              mock.patch.object(self.mod.mail, 'history', side_effect=history), \
@@ -1679,6 +1683,41 @@ class SanteCourrierTest(unittest.TestCase):
         out = self.sonde({'last_turn_ts': 99.0, 'status': 'running'}, repond=True)
         self.assertIsNone(out['delai_s'])
         self.assertEqual(out['tour'], 'reponse vue, tour non termine')
+
+    def test_probe_conclusive_when_the_target_works_a_build_lot(self):
+        """#4181 : la cible a repondu puis travaille un lot (build) ; le tour
+        long fait un vrai travail, la chaine de l'hote est prouvee."""
+        out = self.sonde({'last_turn_ts': 99.0, 'status': 'running'}, repond=True,
+                         lots=[{'id': 4176, 'state': 'build'}])
+        self.assertIsNotNone(out['delai_s'])
+        self.assertTrue(out['concluant'])
+        self.assertIn('travail en cours', out['tour'])
+        self.assertEqual(out['travail'], {'lot': 4176, 'state': 'build'})
+
+    def test_probe_conclusive_when_the_target_is_in_qa(self):
+        """#4181 : un lot en qa est aussi un travail en cours."""
+        out = self.sonde({'last_turn_ts': 99.0, 'status': 'running'}, repond=True,
+                         lots=[{'id': 4181, 'state': 'qa'}])
+        self.assertIsNotNone(out['delai_s'])
+        self.assertTrue(out['concluant'])
+        self.assertEqual(out['travail'], {'lot': 4181, 'state': 'qa'})
+
+    def test_probe_taken_but_unstarted_lot_stays_inconclusive(self):
+        """#4181 : un lot seulement pris (intake) ne prouve pas un tour de
+        travail ; le garde de #1460 reste entier."""
+        out = self.sonde({'last_turn_ts': 99.0, 'status': 'running'}, repond=True,
+                         lots=[{'id': 4176, 'state': 'intake'}])
+        self.assertIsNone(out['delai_s'])
+        self.assertFalse(out['concluant'])
+        self.assertEqual(out['tour'], 'reponse vue, tour non termine')
+
+    def test_probe_failed_turn_stays_ko_even_with_a_lot_in_progress(self):
+        """#4181 : l'echec du tour prime sur le travail en cours."""
+        out = self.sonde({'last_turn_ts': 101.0, 'status': 'blocked',
+                          'last_error': 'timeout (124)'}, repond=True,
+                         lots=[{'id': 4176, 'state': 'build'}])
+        self.assertIsNone(out['delai_s'])
+        self.assertIn('timeout (124)', out['tour'])
 
     def test_probe_ko_when_the_turn_ends_in_error_after_the_answer(self):
         out = self.sonde({'last_turn_ts': 101.0, 'status': 'running',

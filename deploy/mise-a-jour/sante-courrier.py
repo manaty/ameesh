@@ -47,7 +47,9 @@ Read-only checks, then one real delivery probe:
   real turn with working tools, and a failed or blocked turn after delivery is
   KO at once. The answer alone is not enough either: a blocked harness can
   answer the tool and then stay alive until its timeout, so the turn's end
-  (``last_turn_ts``) is required too;
+  (``last_turn_ts``) is required too — unless the target is working a lot in
+  ``build``/``qa``: that long turn does real work, the report names it (``travail``)
+  and the probe is conclusive (#4181);
 * dead letters (recipient stopped or unknown) are reported, never blocking.
 
 The JSON report (`--json`) is the structured proof consumed by `actif.py`
@@ -91,6 +93,8 @@ DEFAULT_SOUFFRANCE = 900.0
 DEFAULT_ATTENTE_CIBLE = 300.0
 #: seconds between two registry reads while the named target is waited for
 INTERVALLE_CIBLE = 5.0
+#: etats d'un lot qui prouvent un tour de travail (pas une simple prise, #4181)
+ETATS_TRAVAIL = ("build", "qa")
 
 PROBE_TEMPLATE = """Sonde de sante staging (#1155), hote {hote}, commit {sha}.
 Message automatique du systeme : il verifie qu'un tour reel s'execute sur cet
@@ -489,9 +493,29 @@ def turn_finished(db, name: str, delivered: float, row: dict | None = None) -> b
     return float(row.get("last_turn_ts") or 0) >= delivered
 
 
+def travail_en_cours(db, name: str) -> dict | None:
+    """Le lot que la cible travaille, ou None (#4181).
+
+    Un agent qui a répondu à la sonde et tient un lot en ``build``/``qa`` fait
+    un tour long légitime : ce tour prouve la chaîne de l'hôte, il ne prouve
+    pas un harnais bloqué (#1460). Un lot seulement pris (``intake``) ne suffit
+    pas : rien ne dit encore que le tour travaille, et le garde de #1460
+    (accusé puis harnais vivant jusqu'au timeout) reste entier.
+    """
+    for item in work.open_lots(db, name):
+        if item.get("state") in ETATS_TRAVAIL:
+            return item
+    return None
+
+
 def probe(db, row: dict, sha: str, attente: float,
           hote_mesure: str | None = None) -> dict:
     """Drop one system message and wait (bounded) for the answered, ended turn.
+
+    An answered turn still running is conclusive when the target is working a
+    lot (``build``/``qa``, #4181): the long turn does real work, and the
+    ``travail`` report names it. Without that work, the #1460 guard applies:
+    the answer must be followed by a turn end.
 
     ``hote_mesure`` is the health target named in the body and the payload; it
     defaults to the recipient's host (local probe). For a server without
@@ -536,6 +560,16 @@ def probe(db, row: dict, sha: str, attente: float,
                 # harness finished it (dev4/47164: ack then alive until timeout)
                 return dict(out, delai_s=round(time.monotonic() - debut, 1), tour="ok")
             else:
+                travail = travail_en_cours(db, row["name"])
+                if travail is not None:
+                    # #4181 : le tour long travaille un lot pris ou repris
+                    # pendant la sonde ; c'est un vrai tour, pas un harnais
+                    # bloque (#1460). Le rapport nomme le lot.
+                    return dict(out, delai_s=round(time.monotonic() - debut, 1),
+                                tour="ok (travail en cours : lot #%s)"
+                                % travail.get("id"),
+                                travail={"lot": travail.get("id"),
+                                         "state": travail.get("state")})
                 out["tour"] = "reponse vue, tour non termine"
         time.sleep(2.0)
     # #4089 (canon §3) : seul un negatif est concluant. Remis sans tour
@@ -667,6 +701,9 @@ def main(argv: list[str] | None = None) -> int:
             via = ""
             if resultat["hote_destinataire"] != args.hote:
                 via = " (hote %s)" % resultat["hote_destinataire"]
+            travail = resultat.get("travail") or {}
+            if travail:
+                via += " (travail en cours : lot #%s)" % travail.get("lot")
             print("courrier %s : sonde remise et accusee par %s en %ss (message %s)%s"
                   % (args.hote, resultat["destinataire"], resultat["delai_s"],
                      resultat["message"], via))
