@@ -60,6 +60,9 @@ REVIEW_SOURCE_PREFIX = "review-after-merge:"
 #: le titre d'un lot de relecture après fusion (review_lot.title_of), repris
 #: par les relectures ouvertes à la main : `REVUE #<parent> : …`.
 REVIEW_TITLE_RE = re.compile(r"^\s*REVUE\s*#\s*(\d+)\b", re.IGNORECASE)
+#: expéditeur des événements qu'ameesh écrit lui-même (échéance d'une
+#: délégation, rafraîchissement d'un lot généré par la veille des versions)
+SYSTEM_SENDER = "ameesh"
 #: #1280 : les missions de relecture ouvertes à la main hors convention
 #: `REVUE #N` : `R1 <harnais> #<parent> …` (cas #1249), et ses variantes
 #: observées `R1 delta Codex #1037 r2`, `R1 Codex de #1066`. La forme est
@@ -661,6 +664,33 @@ def open_with_source(db: Db, source: str, *, limit: int = 1000) -> dict | None:
                     found is None or int(item["id"]) < int(found["id"])):
                 found = item
     return found
+
+
+def with_source(db: Db, source: str, *, limit: int = 50) -> list[dict]:
+    """#4291 : lots portant exactement `source`, tous états confondus, du plus
+    récent au plus ancien. Lecture seule, bornée ; `by_source` garde son ordre
+    historique (`id`) pour les empreintes."""
+    rows = list(storage.of(db).work.by_source(source))
+    rows.sort(key=lambda row: (str(row.get("updated_at") or ""), int(row["id"])),
+              reverse=True)
+    return rows[:int(limit)] if limit else rows
+
+
+def update_generated(db: Db, item_id: int, *, title: str, body: str,
+                     priority: int | None = None, note: str = "",
+                     actor: str = SYSTEM_SENDER) -> dict | None:
+    """#4291 : rafraîchit le titre, le corps et (seulement à la hausse) la
+    priorité d'un lot généré encore ouvert, avec une ligne de journal.
+
+    Une priorité plus basse (2 ou 3) ne remplace jamais une priorité plus
+    haute déjà posée, par un humain notamment : la détection automatique ne
+    rétrograde pas un lot. Rend le lot relu, ou None s'il n'est plus ouvert.
+    """
+    if not (title or "").strip():
+        raise WorkError("generated title required")
+    return storage.of(db).work.update_generated(
+        int(item_id), title=title.strip(), body=body, priority=priority,
+        note=(note or "").strip(), actor=actor)
 
 
 def add_or_note(db: Db, *, source: str, occurrence: str, actor: str = "",
@@ -2372,8 +2402,6 @@ def count_builds(db: Db, assignee: str) -> int:
 # délégation à échéance (L40, point 5 de la décision 0030)
 # --------------------------------------------------------------------------
 
-#: expéditeur des événements qu'ameesh écrit lui-même (échéance d'une délégation)
-SYSTEM_SENDER = "ameesh"
 #: issues d'une délégation au registre `work_item_delegations`
 DELEGATION_OUTCOMES = ("soldee", "rendue", "remplacee", "annulee")
 

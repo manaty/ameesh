@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #3264 A / #4291 — veille quotidienne des versions de harnais et de modèles.
+# Un tic par jour, décalé pour ne pas lancer tous les hôtes à la même seconde ;
+# `Persistent=true` rattrape le passage manqué quand l'hôte était éteint.
+[Unit]
+Description=ameesh daily harness and model version watch (#3264 A)
+
+[Timer]
+OnCalendar=*-*-* 06:17:00
+RandomizedDelaySec=600
+AccuracySec=60s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

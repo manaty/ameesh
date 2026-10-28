@@ -77,6 +77,9 @@
   ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
         reserved host move at a lot boundary, durable journal (L232a);
   ameesh harness list|show|check|versions  harnesses (L16, L120);
+  ameesh veille scan [--dry-run] [--json] [--no-probe] [--harness ID]
+        #3264 A: daily watch of harness/model versions; one evaluation lot per
+        harness, priority 1 on a vendor recommendation (config `veille.sources`);
   ameesh heavy [--nice N] -- <command> | --status [--json]
         heavy suite (tests, build) in one of the host's capped slots (L131);
   ameesh host drain HOST [--for 8h] | undrain HOST | reconcile HOST | status [HOST]
@@ -232,6 +235,8 @@ MESH_COMMANDS = (
     "models",
     # L16 : descripteurs de harnais (`ameesh harness list|show|check`)
     "harness",
+    # #3264 A : veille quotidienne des versions (`ameesh veille scan`)
+    "veille",
     # L30 : comptes multiples par fournisseur (`ameesh accounts list|use|auto`)
     "accounts",
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)

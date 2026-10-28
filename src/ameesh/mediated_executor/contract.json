@@ -4862,6 +4862,7 @@
     "first_after",
     "last_before",
     "ledger",
+    "models_used",
     "paid_lines",
     "spent_between",
     "unpriced"
@@ -4990,6 +4991,7 @@
     "unassign",
     "unassign_surplus",
     "unassigned_lots",
+    "update_generated",
     "waiting_episodes",
     "wip_exceptions",
     "without_project",
