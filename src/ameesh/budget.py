@@ -40,6 +40,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -435,6 +436,27 @@ def add_parsers(sub) -> None:
     pr = bsub.add_parser("release", help="#1469: release a kept account reservation "
                          "(uncertain turn checked by a human)")
     pr.add_argument("reservation", type=int)
+    # #4166 : prépayé déclaré d'un compte fournisseur sans API de solde
+    ppre = bsub.add_parser(
+        "prepaid", help="#4166: prepaid amount of a provider account (no balance "
+        "API): `set`, `unset`, `show`")
+    psub = ppre.add_subparsers(dest="prepaid_command")
+    pps = psub.add_parser("set", help="declare the amount available NOW (a top-up "
+                         "restarts the projection from this instant)")
+    pps.add_argument("--harness", required=True, metavar="HARNESS")
+    pps.add_argument("--account", default="", metavar="ACCOUNT",
+                     help="logical account (default: the harness's default credential)")
+    pps.add_argument("--usd", type=float, required=True, metavar="USD")
+    pps.set_defaults(func=cmd_budget)
+    ppu = psub.add_parser("unset", help="remove the declared prepaid amount")
+    ppu.add_argument("--harness", required=True, metavar="HARNESS")
+    ppu.add_argument("--account", default="", metavar="ACCOUNT")
+    ppu.set_defaults(func=cmd_budget)
+    ppshow = psub.add_parser("show", help="declared prepaid amounts and assessed "
+                             "balances")
+    ppshow.add_argument("--json", action="store_true")
+    ppshow.set_defaults(func=cmd_budget)
+    ppre.set_defaults(func=cmd_budget)
     pshow = bsub.add_parser("show", help="caps in force (default)")
     pshow.add_argument("--json", action="store_true")
     pshow.add_argument("--last", type=int, default=5)
@@ -453,6 +475,8 @@ def cmd_budget(cfg: Config, args: argparse.Namespace) -> int:
             else:
                 print(format_status(data))
             return 0
+        if what == "prepaid":
+            return _cmd_prepaid(cfg, db, args)
         if what == "release" or getattr(args, "account", None):
             return _cmd_account(cfg, db, args, what)
         if what == "set":
@@ -555,6 +579,82 @@ def _cmd_account(cfg: Config, db, args: argparse.Namespace, what: str) -> int:
         print("%s (effective immediately on all runners)" % texte)
     else:
         print("budget of billing account %s: unchanged (%s)" % (account, _fmt_usd(old)))
+    return 0
+
+
+#: #4166 : un compte fournisseur logique (harnais, nom de compte) est un nom,
+#: pas un identifiant de facturation : même forme que les autres slugs.
+_PROVIDER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _cmd_prepaid(cfg: Config, db, args: argparse.Namespace) -> int:
+    """#4166 : prépayé déclaré d'un compte fournisseur sans API de solde.
+
+    Autorité humaine (comme un plafond de budget) : une session d'agent est
+    refusée. La déclaration ne change jamais l'état `exhausted` (seule la
+    sonde le rouvre, #4164) ; l'évaluation qui suit pose `low`/`ok` depuis le
+    solde projeté, et le fil garde une trace lisible."""
+    from . import provider_credits
+    sub = getattr(args, "prepaid_command", None) or "show"
+    if sub == "show":
+        rows = provider_credits.listing(db)
+        if getattr(args, "json", False):
+            print(json.dumps({"schema": "ameesh-provider-credits/1",
+                              "provider_credits": rows},
+                             ensure_ascii=False, indent=2, default=str))
+        elif not rows:
+            print("provider accounts: no credit state recorded")
+        else:
+            for row in rows:
+                print("  %-24s %s" % (provider_credits.who(
+                    row["harness"], row.get("account")),
+                    provider_credits.describe(row)))
+        return 0
+    harness = (getattr(args, "harness", "") or "").strip().lower()
+    account = (getattr(args, "account", "") or "").strip()
+    if not _PROVIDER_RE.match(harness):
+        print("invalid harness: %r" % harness, file=sys.stderr)
+        return 2
+    if account and not _PROVIDER_RE.match(account):
+        print("invalid account: %r" % account, file=sys.stderr)
+        return 2
+    try:
+        actor = authorize(cfg, db)
+    except BudgetError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if sub == "set":
+        value = args.usd
+        if not value > 0 or value != value or value == float("inf"):
+            print("invalid prepaid amount: %r (strictly positive USD expected)"
+                  % value, file=sys.stderr)
+            return 2
+        _changed, old = provider_credits.declare(db, harness, account, value, actor=actor)
+        texte = ("Provider account %s prepaid amount declared: %s → %.2f USD, by %s "
+                 "(the balance is projected from the settled spend from now on)."
+                 % (provider_credits.who(harness, account), _fmt_usd(old), value, actor))
+        fil.record(cfg, db, sender=actor, recipients=[], text=texte,
+                   meta={"action": "provider_prepaid", "audit": "budget",
+                         "harness": harness, "account": account,
+                         "old_usd": old, "new_usd": value})
+        row = provider_credits.assess_one(db, harness, account)
+        print("%s\n%s" % (texte, provider_credits.describe(row)))
+        return 0
+    # unset
+    changed, old = provider_credits.clear(db, harness, account, actor=actor)
+    if not changed:
+        print("no prepaid amount declared for %s"
+              % provider_credits.who(harness, account))
+        return 0
+    texte = ("Provider account %s prepaid amount removed (%s), by %s: the balance "
+             "is no longer projected." % (
+                 provider_credits.who(harness, account), _fmt_usd(old), actor))
+    fil.record(cfg, db, sender=actor, recipients=[], text=texte,
+               meta={"action": "provider_prepaid", "audit": "budget",
+                     "harness": harness, "account": account,
+                     "old_usd": old, "new_usd": None})
+    row = provider_credits.assess_one(db, harness, account)
+    print("%s\n%s" % (texte, provider_credits.describe(row)))
     return 0
 
 

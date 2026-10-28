@@ -1182,13 +1182,20 @@ class ProviderCredits(Domain):
     hôtes — le solde prépayé est celui du fournisseur. Les lignes ne portent
     que des noms, une raison courte et le texte d'erreur borné du
     fournisseur : jamais de secret ni d'invite. Instants de la base (`now()`).
+
+    #4166 : `low` s'évalue sur un **montant de référence** — le prépayé
+    déclaré par un humain, sinon le dernier sommet de la série de soldes — et
+    un solde projeté (dépense réglée) ou réel (API du fournisseur). L'état et
+    son instant (`since`) sont la clé d'alerte ; `balance_usd`, `ratio` et
+    `runway_ts` sont le dernier relevé, pour l'affichage et les alertes.
     """
 
     @abc.abstractmethod
     def get(self, harness: str, account: str) -> dict | None:
         """La ligne du compte (`state`, `since_ts`, `checked_ts`,
-        `next_probe_ts`, `reason`, `detail`, `source`, `agent`, `host`),
-        None si le compte n'a jamais été vu."""
+        `next_probe_ts`, `reason`, `detail`, `source`, `agent`, `host`, et
+        #4166 `prepaid_usd`, `prepaid_ts`, `prepaid_by`, `balance_usd`,
+        `ratio`, `runway_ts`), None si le compte n'a jamais été vu."""
 
     @abc.abstractmethod
     def listing(self) -> list[dict]:
@@ -1197,17 +1204,49 @@ class ProviderCredits(Domain):
     @abc.abstractmethod
     def mark_exhausted(self, harness: str, account: str, *, reason: str,
                        detail: str | None, source: str, agent: str | None,
-                       host: str | None, probe_after_s: float) -> bool:
+                       host: str | None, probe_after_s: float,
+                       balance_usd: float | None = None,
+                       ratio: float | None = None,
+                       runway_ts: float | None = None) -> bool:
         """Pose `exhausted` (prochaine sonde dans `probe_after_s`). Vrai si
         c'est une **transition** (le compte n'était pas déjà épuisé) ; sinon
         seuls l'heure du contrôle et le détail sont actualisés — l'échéance de
-        sonde n'avance que par `claim_probe`."""
+        sonde n'avance que par `claim_probe`. Le relevé (#4166) est facultatif
+        et n'écrase pas l'ancien quand il est absent."""
+
+    @abc.abstractmethod
+    def mark_low(self, harness: str, account: str, *, reason: str,
+                 detail: str | None, source: str, agent: str | None,
+                 host: str | None, balance_usd: float | None,
+                 ratio: float | None, runway_ts: float | None) -> bool:
+        """Pose `low` avec le relevé qui l'a décidé. Vrai si c'est une
+        **transition** (depuis `ok` ou `exhausted` : des crédits sont revenus,
+        mais bas) ; un compte déjà `low` garde son `since` (une seule alerte
+        par épisode) et ne voit que son relevé actualisé."""
 
     @abc.abstractmethod
     def mark_ok(self, harness: str, account: str, *, source: str,
-                agent: str | None = None, host: str | None = None) -> bool:
-        """Pose `ok`. Vrai si c'est une transition depuis `low`/`exhausted`
-        (une seule des écritures concurrentes l'obtient)."""
+                agent: str | None = None, host: str | None = None,
+                balance_usd: float | None = None, ratio: float | None = None,
+                runway_ts: float | None = None) -> bool:
+        """Pose `ok` et le relevé éventuel. Vrai si c'est une transition
+        depuis `low`/`exhausted` (une seule des écritures concurrentes
+        l'obtient)."""
+
+    @abc.abstractmethod
+    def declare_prepaid(self, harness: str, account: str, *, usd: float,
+                        actor: str) -> tuple[bool, float | None]:
+        """Déclare le montant prépayé disponible **maintenant** (un humain) :
+        `prepaid_usd`, `prepaid_at = now()`, `prepaid_by = actor`, et le
+        relevé repart de ce montant. Rend `(changé, ancien montant)`. N'écrit
+        jamais `state` : l'évaluation qui suit décide (et un compte `exhausted`
+        ne repasse `ok` qu'à la sonde, #4164)."""
+
+    @abc.abstractmethod
+    def clear_prepaid(self, harness: str, account: str, *, actor: str
+                      ) -> tuple[bool, float | None]:
+        """Retire la déclaration prépayée (l'état repasse par l'évaluation).
+        Rend `(changé, ancien montant)`."""
 
     @abc.abstractmethod
     def claim_probe(self, harness: str, account: str, interval_s: float) -> bool:

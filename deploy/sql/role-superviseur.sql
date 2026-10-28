@@ -529,11 +529,13 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'host', 'harness', 'account', 'state', 'reason', 'source', 'checked_at',
         'failing_since', 'expires_at', 'last_failure_at', 'failures'
     ]),
-    -- provider account credits (#4164, 0500): account NAMES and their state;
+    -- provider account credits (#4164, 0500 ; #4166, 0504): account NAMES,
+    -- their state, the declared prepaid and the last assessed balance;
     -- `detail` (provider error text, free) stays closed
     ('provider_account_credits', ARRAY[
         'harness', 'account', 'state', 'since', 'checked_at', 'next_probe_at',
-        'reason', 'source', 'agent', 'host'
+        'reason', 'source', 'agent', 'host', 'prepaid_usd', 'prepaid_at',
+        'prepaid_by', 'balance_usd', 'ratio', 'runway_at'
     ]),
     -- plafonds de budget du mesh (L70, 0042) et leur journal : de l'ÉTAT
     -- (montants, acteur), aucun contenu
