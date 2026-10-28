@@ -3,6 +3,7 @@
 « ameesh ne s'arrête jamais, il s'améliore »).
 
   ameesh work backlog add --title T --value "valeur attendue" --score N
+                          [--estimate 30m] [--estimate-source S] [--size s|m|l]
                           [--priority 1|2|3] [--source S] [--team E]
                           [--requires CAP …] [--body B] [--package F]
                           [--chantier C] [--review-of LOT]
@@ -38,6 +39,17 @@ Tant qu'un lot de roadmap du projet est prenable, un élément sous le seuil
 `assign_refusal`) : un agent libre ne le prend que faute de travail plus
 utile. La prise au repos (`auto_take`) tenait déjà plus large : toute la file
 attend tant qu'un lot d'un projet attend un preneur (0037, ci-dessous).
+
+**Durée estimée (#4117)** : comme `work add`, `work backlog add` reçoit
+`--estimate`, `--estimate-source` et `--size`, et un agent qui crée un **lot**
+sans durée est refusé (L157). Une ligne sous le seuil ne crée pas de lot : le
+panier qu'elle ouvre prend l'estimation de la table publiée par l'auditeur —
+le groupe du type (`improvement`) et de la taille déclarée, à défaut un groupe
+plus large — avec la source « référence table #N » ; `--estimate` explicite
+l'emporte. Sans table de référence, l'agent doit donner l'estimation pour
+ouvrir un panier ; une ligne ajoutée à un panier déjà ouvert ne crée pas de
+lot et n'en exige pas. Aucun rétro-remplissage : les lots existants, y
+compris un panier déjà ouvert, gardent leur estimation.
 
 **Prise automatique** (`auto_take`, appelée à chaque passage d'`ameesh
 notify`, et par l'exécuteur de chaque hôte pour ses propres agents — #804) :
@@ -189,6 +201,8 @@ BASKET_PREFIX = "backlog-basket:"
 #: (`--review-of`), en tête de sa source : l'élément est une suite d'avis
 REVIEW_OF_PREFIX = "review-of:#"
 BASKET_LINE_NOTE = interface.BASKET_LINE_NOTE
+#: #4117 : la source d'une estimation prise dans la table de référence
+REFERENCE_SOURCE = "référence table #%s"
 
 
 class BacklogError(ValueError):
@@ -536,7 +550,8 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         required_capabilities=None, body: str = "", package: str | None = None,
         actor: str = "", app: str | None = None, creator: str | None = None,
         cfg=None, new_project: bool = False, chantier: str | None = None,
-        review_of=None, now: float | None = None) -> dict:
+        review_of=None, now: float | None = None, estimate=None,
+        estimate_source: str | None = None, size: str | None = None) -> dict:
     """Ajoute un élément à la file. La valeur attendue est obligatoire : la
     file ne reçoit pas de travail pour occuper.
 
@@ -551,7 +566,16 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
     sinon le lot relu, sinon le projet) : le lot rendu est alors le panier,
     avec `basket` vrai, `basket_lines` et `basket_opened`. `review_of` nomme
     le lot relu ; au seuil, il est gardé en tête de la source (`review-of:#N`).
-    Un P2 sensible d'ameesh (`sensitive_p2`) garde la route historique."""
+    Un P2 sensible d'ameesh (`sensitive_p2`) garde la route historique.
+
+    #4117 : `estimate` (durée), sa source et `size` (`s`, `m`, `l`) sont posés
+    dès la création, comme `work add` (L157). Un agent qui crée un **lot**
+    sans estimation est refusé ; une ligne sous le seuil ne crée pas de lot,
+    et le panier qu'elle ouvre prend l'estimation de la table de référence
+    (type et taille, source « référence table #N »). Sans référence, l'agent
+    doit estimer pour ouvrir un panier ; une ligne ajoutée à un panier déjà
+    ouvert n'en exige pas. Un panier déjà ouvert n'est jamais réestimé par
+    une ligne. Les lots existants ne sont pas rétro-remplis."""
     title = (title or "").strip()
     if not title:
         raise BacklogError("title required")
@@ -567,7 +591,11 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         raise BacklogError("value score out of range: %d (1 to 100)" % value_score)
     if int(priority) not in PRIORITIES:
         raise BacklogError("priority 1 (high), 2 (normal) or 3 (low): %r" % priority)
-    from . import work, work_projects
+    from . import estimates, work, work_projects
+    minutes = estimates.parse(estimate) if estimate not in (None, "") else None
+    if size not in (None, "") and size not in work.SIZES:
+        raise BacklogError("unknown size: %r (s, m or l)" % (size,))
+    estimate_source = " ".join(str(estimate_source or "").split()) or None
     cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     if new_project and app is None:
         raise BacklogError("--new-project goes with --app <project>")
@@ -597,16 +625,36 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
             and not source.startswith(REVIEW_OF_PREFIX):
         # la relecture d'origine reste lisible : l'élément est une suite d'avis
         source = ("%s%d %s" % (REVIEW_OF_PREFIX, int(reviewed["id"]), source)).strip()
-    if rule is None or value_score >= rule.lot_min_value:
+    basket_route = rule is not None and value_score < rule.lot_min_value
+    estimate_by = None
+    if basket_route and minutes is None:
+        # #4117 : le panier n'est pas un lot choisi ; il prend la référence
+        # publiée par l'auditeur (le groupe du type et de la taille déclarée).
+        ref = estimates.proposal(db, type=ITEM_TYPE, size=size or None)
+        median = int(round(float(ref.get("median_minutes") or 0))) if ref else 0
+        if median > 0:
+            minutes = median
+            estimate_source = REFERENCE_SOURCE % ref.get("id")
+            estimate_by = estimates.REFERENCE_ESTIMATOR
+    if not basket_route:
+        # Un lot est bien créé : la garde L157 s'applique avant l'écriture.
+        estimates.check(db, creator or actor, minutes, option="--estimate 2h")
+    if minutes and estimate_by is None:
+        estimate_by = actor or ""
+    if not basket_route:
         return storage.of(db).work.backlog_add(
             title=title, body=body or "", source=source, expected_value=expected_value,
             value_score=value_score, priority=int(priority), team=team,
             required_capabilities=capabilities,
             package_id=fiche["id"] if fiche else None,
             package_parent=fiche.get("parent") if fiche else None,
-            note="improvement backlog (value %d): %s%s" % (
-                value_score, expected_value, "; %s" % introduced if introduced else ""),
-            actor=actor, app=project)
+            note="improvement backlog (value %d): %s%s%s" % (
+                value_score, expected_value,
+                "; estimate: %s" % estimates.label(minutes) if minutes else "",
+                "; %s" % introduced if introduced else ""),
+            actor=actor, app=project, estimate_minutes=minutes,
+            estimate_source=estimate_source, estimate_by=estimate_by,
+            change_size=size or None)
     label, fiche = _chantier(chantier, fiche, reviewed, project)
     day = _basket_day(rule, now)
     line = "- [value %d, P%d] %s — %s (source: %s; by %s)" % (
@@ -614,20 +662,29 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         source or "—", actor or creator or "?")
     if (body or "").strip():
         line += "\n" + "\n".join("  " + row for row in str(body).strip().splitlines())
-    item = storage.of(db).work.backlog_basket_add(
-        key=basket_key(project, label, day),
-        title="Panier « %s » du %s : défauts non bloquants (N, P2, P3)" % (label, day),
-        expected_value=("défauts non bloquants du chantier « %s », regroupés (canon §2 "
-                        "l.129) : chacun sous le seuil de lot (%d)"
-                        % (label, rule.lot_min_value)),
-        line=line, value_score=value_score, priority=int(priority), team=team,
-        required_capabilities=capabilities,
-        package_id=fiche["id"] if fiche else None,
-        package_parent=fiche.get("parent") if fiche else None,
-        note="%s (value %d < lot threshold %d, canon %s): %s%s" % (
-            BASKET_LINE_NOTE, value_score, rule.lot_min_value, rule.commit[:12],
-            " ".join(title.split())[:120], "; %s" % introduced if introduced else ""),
-        actor=actor, app=project)
+    try:
+        item = storage.of(db).work.backlog_basket_add(
+            key=basket_key(project, label, day),
+            title="Panier « %s » du %s : défauts non bloquants (N, P2, P3)" % (label, day),
+            expected_value=("défauts non bloquants du chantier « %s », regroupés (canon §2 "
+                            "l.129) : chacun sous le seuil de lot (%d)"
+                            % (label, rule.lot_min_value)),
+            line=line, value_score=value_score, priority=int(priority), team=team,
+            required_capabilities=capabilities,
+            package_id=fiche["id"] if fiche else None,
+            package_parent=fiche.get("parent") if fiche else None,
+            note="%s (value %d < lot threshold %d, canon %s): %s%s" % (
+                BASKET_LINE_NOTE, value_score, rule.lot_min_value, rule.commit[:12],
+                " ".join(title.split())[:120], "; %s" % introduced if introduced else ""),
+            actor=actor, app=project, estimate_minutes=minutes,
+            estimate_source=estimate_source, estimate_by=estimate_by,
+            change_size=size or None,
+            # La garde est lue SOUS le verrou du panier : une ligne ajoutée à
+            # un panier déjà ouvert ne crée pas de lot et n'est pas refusée.
+            estimate_required=estimates.is_agent(db, creator or actor))
+    except interface.BasketEstimateRequired:
+        raise estimates.EstimateError(
+            estimates.REQUIRED % (creator or actor, "add --estimate 2h")) from None
     return dict(item, basket=True)
 
 
@@ -1717,6 +1774,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
 # --------------------------------------------------------------------------
 
 def add_parsers(work_sub, func) -> None:
+    from . import work
     p = work_sub.add_parser("backlog", help="continuous improvement backlog (L119, 0037)")
     sub = p.add_subparsers(dest="backlog_command")
     p_add = sub.add_parser("add", help="add an item with an expected value")
@@ -1727,6 +1785,15 @@ def add_parsers(work_sub, func) -> None:
                        help="value score from 1 to 100 (highest is taken first)")
     p_add.add_argument("--priority", type=int, default=DEFAULT_PRIORITY,
                        choices=list(PRIORITIES), help="1 high, 2 normal (default), 3 low")
+    p_add.add_argument("--estimate", default=None, metavar="DURATION",
+                       help="#4117: estimated duration of the item (L157): 90m, 2h, 1h30, "
+                            "1,5h, 2d (or minutes) — mandatory for an agent creating a lot; "
+                            "a basket line without one takes the published reference")
+    p_add.add_argument("--estimate-source", default=None, metavar="SOURCE",
+                       help="#4117: where the estimate comes from (design, bug history ×1.3…)")
+    p_add.add_argument("--size", default=None, choices=list(work.SIZES),
+                       help="#4117: size of the change: s small, m medium, l large — a key "
+                            "of the reference estimate (L157b)")
     p_add.add_argument("--source", default="",
                        help="where the item comes from (finding, alert, decision, debt...)")
     p_add.add_argument("--team", default=None, help="team that can take it")
@@ -1775,7 +1842,7 @@ def run(db: Db, args, cfg=None) -> int:
     import sys
     command = getattr(args, "backlog_command", None)
     if command == "add":
-        from . import identity
+        from . import estimates, identity
         cfg = cfg if cfg is not None else getattr(db, "cfg", None)
         # L118c: the creator is this session, whatever `--actor` says (`work add`)
         binding = identity.resolve_binding(cfg, db) if cfg is not None else None
@@ -1790,20 +1857,34 @@ def run(db: Db, args, cfg=None) -> int:
                        else args.actor, cfg=cfg,
                        new_project=getattr(args, "new_project", False),
                        chantier=getattr(args, "chantier", None),
-                       review_of=getattr(args, "review_of", None))
+                       review_of=getattr(args, "review_of", None),
+                       estimate=getattr(args, "estimate", None),
+                       estimate_source=getattr(args, "estimate_source", None),
+                       size=getattr(args, "size", None))
         except BacklogError as exc:
             print("error: %s" % exc, file=sys.stderr)
             return 2
         if args.json:
             print(json.dumps(item, ensure_ascii=False, default=str))
-        elif item.get("basket"):
-            print("line added to basket #%d (%s, %d line(s), value %d): %s — under the "
-                  "canon's lot threshold, no lot is created (canon §2)" % (
-                      item["id"], "opened" if item.get("basket_opened") else "open",
-                      item.get("basket_lines") or 0, item["value_score"], item["title"]))
         else:
-            print("item #%d added to the backlog (value %d, priority %d): %s" % (
-                item["id"], item["value_score"], item["priority"], item["title"]))
+            suffix = (" — estimated %s" % estimates.label(item["estimate_minutes"])
+                      if item.get("estimate_minutes") else "")
+            if item.get("basket"):
+                print("line added to basket #%d (%s, %d line(s), value %d): %s — under the "
+                      "canon's lot threshold, no lot is created (canon §2)%s" % (
+                          item["id"], "opened" if item.get("basket_opened") else "open",
+                          item.get("basket_lines") or 0, item["value_score"],
+                          item["title"], suffix))
+            else:
+                print("item #%d added to the backlog (value %d, priority %d): %s%s" % (
+                    item["id"], item["value_score"], item["priority"], item["title"],
+                    suffix))
+            # L157b/#4117 : la référence en vigueur, LUE (comme `work add`)
+            print("reference: %s" % estimates.proposal_label(
+                estimates.proposal(db, type=item.get("type"),
+                                   size=item.get("change_size"))))
+            if not item.get("estimate_minutes"):
+                print("warning: %s" % estimates.missing(item["id"]), file=sys.stderr)
         return 0
     if command == "list":
         rows = items(db, open_only=not args.all, limit=args.limit)

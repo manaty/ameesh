@@ -413,6 +413,10 @@ def format_report(rep: dict) -> str:
 # vient de ce passage (le biais est rangé dans la table publiée).
 
 REFERENCE_SCHEMA = "ameesh-estimate-reference/1"
+#: #4117 : auteur d'une estimation prise dans la table publiée, quand le lot
+#: n'a pas d'estimation propre (`work backlog add` d'un panier). Distinct de
+#: l'agent qui crée l'élément : le biais par auteur garde la vraie origine.
+REFERENCE_ESTIMATOR = "reference"
 #: un groupe de moins de lots ne sert pas de référence (on remonte d'un cran)
 MIN_LOTS = 3
 #: ratio réel/estimé médian d'un estimateur hors de cette plage : `estimate_bias`
@@ -691,10 +695,11 @@ def lookup(body: dict, *, type=None, size=None, host=None, harness=None) -> dict
 
 def proposal(db, *, type=None, size=None, assignee=None) -> dict | None:  # noqa: A002
     """L'estimation de référence d'un lot (pour `work add` et `work show`) :
-    `{median_minutes, p80_minutes, lots, level, …, published_ts,
+    `{id, median_minutes, p80_minutes, lots, level, …, published_ts,
     published_by}`, ou None (pas de table publiée, aucun groupe assez
-    fourni). Lit la table en vigueur et le registre ; aucun calcul sur
-    l'historique."""
+    fourni). `id` est celui de la table en vigueur : la source d'une
+    estimation automatique la cite (« référence table #N », #4117). Lit la
+    table en vigueur et le registre ; aucun calcul sur l'historique."""
     ref = current_reference(db)
     if ref is None:
         return None
@@ -709,7 +714,7 @@ def proposal(db, *, type=None, size=None, assignee=None) -> dict | None:  # noqa
     group = lookup(ref["body"], type=type, size=size, host=host, harness=harness)
     if group is None:
         return None
-    return dict(group, published_ts=ref.get("published_ts"),
+    return dict(group, id=ref.get("id"), published_ts=ref.get("published_ts"),
                 published_by=ref.get("published_by") or None)
 
 

@@ -198,8 +198,8 @@ l'enregistrer.
 Demande du propriétaire (2026-10-11, lot L157) : ameesh prévoit la roadmap
 complète des projets, donc **tout lot porte une durée estimée dès sa
 création**, posée par celui qui le conçoit. Un lot créé par un agent sans
-estimation est refusé (`work add`, `mail send --new-lot`) ; un humain reçoit
-un avertissement.
+estimation est refusé (`work add`, `work backlog add`, `mail send --new-lot`) ;
+un humain reçoit un avertissement.
 
 **Ne jamais répondre « je ne peux pas donner d'heure ».** À une question sur
 une durée ou une date de livraison, répondre toujours par une heure : celle de
@@ -212,11 +212,12 @@ par un refus. Un lot sans estimation s'estime à ce moment-là
 | Situation | Commande |
 |---|---|
 | Créer un lot | `ameesh work add --title "RÉF : titre" --estimate 2h --estimate-source conception` |
+| Enregistrer un défaut non bloquant | `ameesh work backlog add --title "…" --value "…" --score 10 --estimate 20m [--size s\|m\|l]` (sous le seuil, le panier prend la référence s'il n'y a pas d'estimation) |
 | Confier un nouveau travail | `ameesh mail send <agent> "…" --new-lot "RÉF : titre" --estimate 90m` |
 | Estimer ou ré-estimer un lot existant | `ameesh work plan <id> --estimate 1h30 --estimate-source "revue du découpage"` |
 | Voir l'estimation, le réel et l'écart | `ameesh work show <id>`, `ameesh projects` (colonne DURÉE) |
 | Écarts passés, pour calibrer | `ameesh work estimates [--app <projet>]` |
-| Estimation de référence (table de l'auditeur) | affichée par `ameesh work add` et `ameesh work show` ; `--size s\|m\|l` à la création |
+| Estimation de référence (table de l'auditeur) | affichée par `ameesh work add`, `ameesh work backlog add` et `ameesh work show` ; `--size s\|m\|l` à la création |
 
 * La durée est du temps **écoulé** (horloge murale), du début du travail à
   la fusion, attentes comprises : `90m`, `2h`, `1h30`, `1,5h`, `2d` (48 h),
@@ -228,13 +229,15 @@ par un refus. Un lot sans estimation s'estime à ce moment-là
   (2026-10-11) : « tu estimes 10 fois trop les tâches d'agents ». À son
   passage quotidien, l'auditeur publie une table de référence tirée des lots
   livrés : par type de lot, taille du changement, hôte et harnais de
-  l'assigné, la médiane et le p80 de la durée réelle. `ameesh work add`
-  l'affiche à la création (« référence : médiane 25 min · p80 40 min
-  (evolution, moyen, 12 lots ; table du … par auditeur) ») et `ameesh work
-  show` la rappelle ; ameesh la lit, sans rien recalculer. Déclarer la taille
-  du changement (`--size s|m|l` : petit, moyen, gros) et l'assigné affine le
-  groupe ; faute de trois lots semblables, ameesh remonte au groupe
-  plus large (type et taille, puis type, puis tous les lots). On s'écarte
+  l'assigné, la médiane et le p80 de la durée réelle. `ameesh work add` et
+  `ameesh work backlog add` l'affichent à la création (« référence : médiane
+  25 min · p80 40 min (evolution, moyen, 12 lots ; table du … par auditeur) »)
+  et `ameesh work show` la rappelle ; ameesh la lit, sans rien recalculer.
+  Déclarer la taille du changement (`--size s|m|l` : petit, moyen, gros) et
+  l'assigné affine le groupe ; faute de trois lots semblables, ameesh remonte
+  au groupe plus large (type et taille, puis type, puis tous les lots). Un
+  panier ouvert par `work backlog add` sous le seuil prend cette médiane à
+  défaut d'estimation explicite (source « référence table #N »). On s'écarte
   de la référence **en le justifiant** dans la source
   (`--estimate-source "référence ×2 : migration de données"`).
 * **Estimer par phases.** Une estimation additionne, et sa source détaille,

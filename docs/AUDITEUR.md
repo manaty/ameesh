@@ -464,10 +464,10 @@ par lui-même (une lecture, pas un sous-agent) :
    seul calcul sur l'historique : par type de lot, taille déclarée du
    changement, hôte et harnais de l'assigné, la médiane et le p80 de la durée
    réelle des lots livrés ; pour chaque auteur d'estimation, le ratio
-   réel/estimé (médiane, p80). `ameesh work add` et `ameesh work show` ne font
-   que LIRE la dernière table publiée pour proposer l'estimation de
-   référence : aucune analyse à la demande (précision du propriétaire,
-   2026-10-11). Un estimateur hors de ×0,5–×2 sur au moins trois lots est
+   réel/estimé (médiane, p80). `ameesh work add`, `ameesh work backlog add`
+   et `ameesh work show` ne font que LIRE la dernière table publiée pour
+   proposer l'estimation de référence : aucune analyse à la demande (précision
+   du propriétaire, 2026-10-11). Un estimateur hors de ×0,5–×2 sur au moins trois lots est
    rangé dans `bias` : l'alerte `estimate_bias` en découle, adressée à
    l'estimateur et aux orchestrateurs de son équipe, jusqu'à la publication
    suivante qui ne le relève plus. Republier une table identique n'écrit
