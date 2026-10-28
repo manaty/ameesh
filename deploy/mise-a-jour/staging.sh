@@ -864,9 +864,9 @@ if [ "$SERVEUR_ABSENT" = 1 ]; then
 fi
 if [ "$A_BLANC" = 1 ]; then
   if [ "$POSTE_ABSENT" = 1 ]; then
-    echo "  etapes : verifier les VM de la sequence ; sauvegarde du serveur sur manaty-mesh-1 (poste absent ; sautee si le serveur est reporte) ; migrations appliquees depuis une VM d'agents (additif, dry-run d'abord) ; puis par hote installer, redemarrer, controler, sante"
+    echo "  etapes : verifier les VM de la sequence ; sauvegarde du serveur sur manaty-mesh-1 (poste absent ; sautee si le serveur est reporte) ; migrations appliquees depuis une VM d'agents (additif, dry-run d'abord) ; puis par hote installer, redemarrer, timers (agents et poste), controler, sante"
   else
-    echo "  etapes : verifier partout, sauvegarder+migrer ${SHA_TRAVE} (additif), puis par hote installer, redemarrer, controler, sante"
+    echo "  etapes : verifier partout, sauvegarder+migrer ${SHA_TRAVE} (additif), puis par hote installer, redemarrer, timers (agents et poste), controler, sante"
   fi
   if [ "$SEQUENCE_COMPLETE" = 1 ]; then
     echo "  sequence complete et saine : attestation « staging actif » et courrier aux rapporteurs"
@@ -993,6 +993,13 @@ for nom in "${HOTES[@]}"; do
   etape "$nom : redemarrer"
   exec_hote "$nom" redemarrer || echec_hote "$nom" redemarrer "redemarrage en echec"
   trace "$nom" redemarrer ok
+  # #4416 : installer les nouvelles unites avant leur controle, sur le poste
+  # et les VM d'agents ; le serveur historique n'expose pas cette action.
+  if [ "$(mode_de "$nom")" != serveur ]; then
+    etape "$nom : timers"
+    exec_hote "$nom" timers || echec_hote "$nom" timers "installation des minuteries en echec"
+    trace "$nom" timers ok
+  fi
   etape "$nom : controler"
   exec_hote "$nom" controler || echec_hote "$nom" controler "controles en echec"
   trace "$nom" controler ok
