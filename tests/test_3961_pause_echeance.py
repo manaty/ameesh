@@ -175,7 +175,9 @@ class EcheanceTest(PgTestCase):
         self.assertEqual(len(alertes), 1)
         alerte = alertes[0]
         self.assertEqual(alerte["agent"], "worker")
-        self.assertGreaterEqual(alerte["value"], 31 * 60)
+        # #4168 : age() recule avec clock_timestamp() de la base, la tenue se
+        # mesure à l'horloge du runner puis int() tronque : marge de 5 s.
+        self.assertGreaterEqual(alerte["value"], 31 * 60 - 5)
         self.assertEqual(alerte["threshold"], exploitation.DEFAULT_LONG_OPERATOR_PAUSE_S)
         self.assertIn("no deadline", alerte["detail"])
         self.assertIn("human:alice", alerte["detail"])
