@@ -50,6 +50,23 @@ class HostIdleTest(unittest.TestCase):
         self.assertEqual(self.project(lots=[dict(state='blocked', wake_ts=NOW + 1801)])['state'], 'idle')
         self.assertEqual(self.project(lots=[dict(state='closed', wake_ts=NOW - 1)])['state'], 'idle')
 
+    def test_held_nonactionable_session_does_not_reserve_host(self):
+        lot = dict(id=42, state='build', assignee='worker', updated_ts=7000)
+        agent = self.agent(session_work_item='42', session_lot_state='build',
+                           actionable_lots=1)
+        out = self.project(agents=[agent], lots=[lot], holds={42: dict(since=7000)})
+        self.assertEqual(out['leases'], 0)
+        self.assertEqual(out['state'], 'idle')
+        self.assertEqual(self.project(agents=[agent], lots=[lot])['state'], 'busy')
+        # A second actionable lot, mail or a near wake still requires the host.
+        self.assertEqual(self.project(agents=[dict(agent, actionable_lots=2)],
+                                     lots=[lot], holds={42: dict(since=7000)})['state'], 'busy')
+        self.assertEqual(self.project(agents=[dict(agent, unread=1)], lots=[lot],
+                                     holds={42: dict(since=7000)})['state'], 'busy')
+        for wake in (NOW - 1, NOW + 60):
+            self.assertEqual(self.project(agents=[agent], lots=[dict(lot, wake_ts=wake)],
+                                         holds={42: dict(since=7000)})['state'], 'busy')
+
     def test_recent_activity_resets_the_window(self):
         for key in ('status_since_ts', 'last_turn_ts', 'last_turn_recorded_ts'):
             self.assertEqual(self.project(agents=[self.agent(**{key: NOW - 100})])['state'], 'busy')

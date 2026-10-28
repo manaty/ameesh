@@ -5,6 +5,7 @@ A quiet instant is not an idle interval. Published samples must cover the
 interval without missing turns or freshness gaps; agent and lot activity can
 only shorten that interval. This module never drains or changes a host.
 """
+import datetime
 import time
 
 from . import resources, storage
@@ -14,7 +15,7 @@ DONE = frozenset(('merged', 'promoted', 'closed'))
 
 
 def project(reading, history, agents, lots, *, now, idle_after_s=1800,
-            fresh_within=180, capacity='burst', cost_eur_h=None):
+            fresh_within=180, capacity='burst', cost_eur_h=None, holds=None):
     """Pure projection. None inputs mean unreadable sources, never empty ones."""
     out = resources.footprint(reading)
     out.update(active_turns=None, leases=None, runs=0,
@@ -38,6 +39,10 @@ def project(reading, history, agents, lots, *, now, idle_after_s=1800,
     if agents is None or lots is None:
         unknown.append('agent/lot activity unreadable')
         return out
+    from .backlog import _hold_blocks
+    held_lots = {int(lot['id']) for lot in lots if lot.get('id') is not None
+                 and _hold_blocks(lot, (holds or {}).get(int(lot['id'])), now)}
+    today = datetime.date.fromtimestamp(now).isoformat()
     busy = bool(turns)
     since = 0.0
     leases = 0
@@ -48,11 +53,18 @@ def project(reading, history, agents, lots, *, now, idle_after_s=1800,
         # Runner leases live between turns. Only a lease with an open session
         # lot is a lot lease; a runner without a lot does not reserve work.
         lot_lease = (agent.get('lease_live') and agent.get('session_lot_state')
-                     and agent['session_lot_state'] not in DONE)
+                     and agent['session_lot_state'] not in DONE
+                     and str(agent.get('session_work_item')) not in
+                     {str(ident) for ident in held_lots})
         leases += bool(lot_lease)
+        held_actions = sum(lot.get('assignee') == agent.get('name')
+                           and lot.get('state') in ('intake', 'build')
+                           and str(lot.get('planned_start') or '')[:10] <= today
+                           and lot.get('id') in held_lots for lot in lots)
+        actionable = max(0, int(agent.get('actionable_lots') or 0) - held_actions)
         busy |= bool(lot_lease or agent.get('turn_started_ts')
                      or agent.get('status') in ('running', 'working')
-                     or agent.get('actionable_lots') or agent.get('unread')
+                     or actionable or agent.get('unread')
                      or agent.get('passive_unread') or agent.get('has_pending_prompt'))
         for key in ('status_since_ts', 'last_turn_ts', 'last_turn_recorded_ts'):
             value = resources.finite_float(agent.get(key))
@@ -114,13 +126,14 @@ def capacities(canons, names, *, protected=(), baseline_hosts=2):
 
 def snapshot(cfg, db, canons, readings, *, now=None):
     """Read all common sources once, then project each host. No mutations."""
-    from . import election, host_lifecycle
+    from . import election, host_lifecycle, planned_waits
     now = time.time() if now is None else now
     idle_s = max(1.0, float(cfg.idle_after_s))
     fresh = staleness_s(cfg.resource_interval)
     names = set(readings) | {h.title for c in canons for h in c.hosts}
     protected = set()
     agents = lots = None
+    holds = {}
     try:
         agents = storage.of(db).operations.listing()
         # Bounded per-agent read includes closed lots: closing work also
@@ -129,6 +142,19 @@ def snapshot(cfg, db, canons, readings, *, now=None):
         for agent in agents:
             rows = storage.of(db).work.items(state=None, assignee=agent['name'], limit=1000)
             lots[agent['name']] = rows if len(rows) < 1000 else None
+        by_id = {int(lot['id']): lot for rows in lots.values() if rows is not None
+                 for lot in rows}
+        for agent in agents:
+            ident = str(agent.get('session_work_item') or '')
+            if ident.isdigit() and int(ident) not in by_id:
+                row = storage.of(db).work.get(int(ident))
+                if row is not None:
+                    by_id[int(ident)] = row
+        ids = {ident for ident, lot in by_id.items() if lot.get('state') not in DONE}
+        if ids:
+            events = storage.of(db).progress.lot_hold_events(
+                sorted(ids), planned_waits.HOLD_NOTE_PATTERNS)
+            holds = planned_waits.pilot_holds(db, events, cfg=cfg, strict=True)
         for name in host_lifecycle.critical_names(cfg, db):
             role = election.status(db, name)
             if role.get('holder'):
@@ -152,13 +178,20 @@ def snapshot(cfg, db, canons, readings, *, now=None):
                 host_lots = None
                 break
             host_lots.extend(rows)
+        if host_lots is not None:
+            present = {lot['id'] for lot in host_lots}
+            for agent in members or []:
+                ident = str(agent.get('session_work_item') or '')
+                if ident.isdigit() and int(ident) in by_id and int(ident) not in present:
+                    host_lots.append(by_id[int(ident)])
+                    present.add(int(ident))
         try:
             history = storage.of(db).hosts.since(host, idle_s + fresh)
         except Exception:
             history = None
         out[host] = project(reading, history, members, host_lots, now=now,
                             idle_after_s=idle_s, fresh_within=fresh,
-                            capacity=capacity[host], cost_eur_h=costs[host])
+                            capacity=capacity[host], cost_eur_h=costs[host], holds=holds)
     return out
 
 
