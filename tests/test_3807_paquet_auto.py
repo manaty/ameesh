@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import pathlib
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -554,6 +556,134 @@ class PaquetAutoBanc(unittest.TestCase):
         with self.assertRaises(paquet_auto.InputError):
             paquet_auto.clear_local_branch(self.repo, branch, log=lambda _l: None)
         self.assertTrue(path.exists())
+
+    # -- #4329 : verrou de composition par nom de paquet -------------------
+    def test_verrou_de_composition_par_nom(self) -> None:
+        name = "h-verrou"
+        self.assertIsNone(paquet_auto.composition_holder(self.repo, name))
+        lock = paquet_auto.PackageLock(self.repo, name)
+        lock.acquire()
+        try:
+            self.assertEqual(
+                paquet_auto.composition_holder(self.repo, name),
+                (socket.gethostname(), os.getpid()))
+            with self.assertRaises(paquet_auto.CompositionBusy):
+                paquet_auto.PackageLock(self.repo, name).acquire()
+            self.assertIsNone(paquet_auto.composition_holder(self.repo, "h-autre"))
+        finally:
+            lock.release()
+        self.assertIsNone(paquet_auto.composition_holder(self.repo, name))
+
+    def test_clear_ignore_son_propre_verrou(self) -> None:
+        # La composition qui recompose tient elle-même le verrou : la reprise
+        # doit continuer à fermer le worktree de sa tentative morte.
+        branch = "integration/paquet-h-propre"
+        kept = paquet_auto.make_worktree(self.repo, self.base, branch)
+        self.addCleanup(shutil.rmtree, kept, True)
+        lock = paquet_auto.PackageLock(self.repo, "h-propre")
+        lock.acquire()
+        try:
+            paquet_auto.clear_local_branch(self.repo, branch,
+                                           log=lambda _l: None)
+        finally:
+            lock.release()
+        self.assertFalse(kept.exists())
+        self.assertIsNone(paquet_auto.rev(self.repo, "refs/heads/" + branch))
+
+    def test_recomposition_ne_touche_pas_un_worktree_vivant(self) -> None:
+        # #4329 : le lancement manuel et le tic ne se partagent pas le même
+        # nom de paquet ; le worktree du vivant reste, puis se nettoie à sa
+        # mort (le noyau rend le flock).
+        branch = "integration/paquet-h-verrou-vivant"
+        kept = paquet_auto.make_worktree(self.repo, self.base, branch)
+        self.addCleanup(shutil.rmtree, kept, True)
+        marker = pathlib.Path(self.tmp.name) / "verrou-pris"
+        code = (
+            "import importlib.util, pathlib, sys, time\n"
+            "spec = importlib.util.spec_from_file_location("
+            "'paquet_auto_lock', sys.argv[1])\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "sys.modules[spec.name] = module\n"
+            "spec.loader.exec_module(module)\n"
+            "module.PackageLock(pathlib.Path(sys.argv[2]), sys.argv[3]).acquire()\n"
+            "pathlib.Path(sys.argv[4]).write_text('locked', encoding='ascii')\n"
+            "time.sleep(120)\n")
+        child = subprocess.Popen(
+            [sys.executable, "-c", code, str(SCRIPT), str(self.repo),
+             "h-verrou-vivant", str(marker)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        def stop() -> None:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=10)
+            for pipe in (child.stdout, child.stderr):
+                if pipe is not None:
+                    pipe.close()
+
+        self.addCleanup(stop)
+        deadline = time.time() + 20
+        while (not marker.exists() and child.poll() is None
+               and time.time() < deadline):
+            time.sleep(0.05)
+        if not marker.exists():
+            child.kill()
+            _out, err = child.communicate(timeout=10)
+            self.fail("verrou enfant non pris : %s" % err)
+        with self.assertRaises(paquet_auto.CompositionBusy) as caught:
+            paquet_auto.clear_local_branch(self.repo, branch,
+                                           log=lambda _l: None)
+        message = str(caught.exception)
+        self.assertIn("composition en cours", message)
+        self.assertIn("%s:%d" % (socket.gethostname(), child.pid), message)
+        self.assertTrue(kept.exists())
+        child.kill()
+        child.wait(timeout=10)
+        paquet_auto.clear_local_branch(self.repo, branch, log=lambda _l: None)
+        self.assertFalse(kept.exists())
+        self.assertIsNone(paquet_auto.rev(self.repo, "refs/heads/" + branch))
+
+    def test_purge_ne_touche_pas_une_composition_vivante(self) -> None:
+        path = pathlib.Path(self.tmp.name) / "paquet-auto-vivant"
+        branch = "integration/paquet-h-purge-vivante"
+        self.git("worktree", "add", "-b", branch, str(path), self.base,
+                 cwd=self.repo)
+        self.addCleanup(lambda: self.git(
+            "worktree", "remove", "--force", str(path), cwd=self.repo,
+            check=False))
+        with mock.patch.object(paquet_auto, "composition_holder",
+                               return_value=("hote", 12345)):
+            removed = paquet_auto.prune_stale_worktrees(
+                self.repo, 1, now=time.time() + 3600)
+        self.assertNotIn(str(path), removed)
+        self.assertTrue(path.exists())
+
+    def test_main_rend_le_code_de_composition_en_cours(self) -> None:
+        with mock.patch.object(
+                paquet_auto, "compose_packet",
+                side_effect=paquet_auto.CompositionBusy("banc", "hote", 7)):
+            code = paquet_auto.main(["--name", "banc", "--carrier", "1"])
+        self.assertEqual(code, paquet_auto.IN_PROGRESS_RC)
+
+    def test_compose_packet_refuse_une_composition_vivante(self) -> None:
+        # Deux compositions du même nom : la seconde s'arrête au verrou, avant
+        # de lire l'état ou de toucher au worktree de la première.
+        name = "h-compose-vivante"
+        args = argparse.Namespace(
+            repo=str(self.repo), name=name, target="main", carrier=99,
+            force=True, no_packet_record=True, local=True, keep_worktree=False,
+            keep_failed_hours=24.0, tests_timeout=10, pilot="pilote")
+        lock = paquet_auto.PackageLock(self.repo, name)
+        lock.acquire()
+        try:
+            with self.assertRaises(paquet_auto.CompositionBusy) as caught:
+                paquet_auto.compose_packet(args)
+        finally:
+            lock.release()
+        self.assertIn("composition en cours", str(caught.exception))
+        branch = paquet_auto.package_branch(name)
+        self.assertIsNone(paquet_auto.rev(self.repo, "refs/heads/" + branch))
+        self.assertEqual(paquet_auto._worktrees_on(self.repo, branch), [])
 
     def test_branche_de_candidat_invalide_refusee_avant_fetch(self) -> None:
         candidate = paquet_auto.Candidate(
