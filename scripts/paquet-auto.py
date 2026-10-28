@@ -220,13 +220,15 @@ INCONCLUSIVE_RE = re.compile(
     re.IGNORECASE,
 )
 #: le **message** d'une exception d'environnement (sans les noms de types :
-#: un `AssertionError: expected OperationalError` reste un rouge réel)
+#: un `AssertionError: expected OperationalError` reste un rouge réel, et un
+#: `ValueError: expected QueryCanceled` aussi : le nom psycopg est reconnu par
+#: la ligne d'exception, pas par le message)
 ENV_MESSAGE_RE = re.compile(
     r"could not connect|connection refused|server closed the connection|"
     r"database system is starting up|psql: error|"
     r"No such file or directory: 'psql'|"
     r"could not translate host name|Temporary failure in name resolution|"
-    r"QueryCanceled|canceling statement|statement timeout|timeout expired|"
+    r"canceling statement|statement timeout|timeout expired|"
     r"No module named 'psycopg'",
     re.IGNORECASE,
 )
@@ -236,13 +238,43 @@ OK_RE = re.compile(r"^OK(?: \(skipped=(\d+)\))?", re.MULTILINE)
 FAILED_SUMMARY_RE = re.compile(r"^FAILED \((.*?)\)", re.MULTILINE)
 FAIL_HEADER_RE = re.compile(r"^FAIL: ", re.MULTILINE)
 ERROR_HEADER_RE = re.compile(r"^ERROR: .*$", re.MULTILINE)
-#: une ligne d'exception effective, en colonne 0 : nom simple (`ValueError`)
-#: ou pointé (`psycopg.errors.QueryCanceled`), le dernier segment commençant
-#: par une majuscule. Les en-têtes unittest `FAIL:`/`ERROR:` et les lignes
-#: source (indentées) ne sont pas des exceptions.
-EXCEPTION_LINE_RE = re.compile(
-    r"^(?!FAIL:|ERROR:)((?:[a-z_][\w]*\.)+_?[A-Z][\w]*|_?[A-Z][\w]*):\s*(.*)$",
-    re.MULTILINE)
+#: la ligne qui ouvre une trace Python ; la dernière du bloc porte l'exception
+#: effective.
+TRACEBACK_RE = re.compile(r"^Traceback \(most recent call last\):\s*$",
+                          re.MULTILINE)
+#: lignes de suite d'un message psycopg3 : ce ne sont pas des exceptions
+_EXCEPTION_CONTINUATIONS = ("CONTEXT", "DETAIL", "HINT", "QUERY", "STATEMENT")
+
+
+def last_exception(block: str) -> tuple[str, str] | None:
+    """Le nom et le message de la dernière exception effective d'un bloc.
+
+    On part du **dernier** `Traceback (most recent call last):` et on lit la
+    première ligne non vide en colonne 0 après ses frames indentées : c'est la
+    ligne d'exception, avec ou sans message (`ValueError` nu). Les lignes de
+    suite psycopg3 (`CONTEXT:`, `DETAIL:`, `HINT:`…) ne sont jamais
+    l'exception ; une ligne source est indentée. None quand le bloc n'a pas de
+    traceback ou pas de ligne d'exception lisible (sortie psql, trace
+    tronquée).
+    """
+    matches = list(TRACEBACK_RE.finditer(block or ""))
+    if not matches:
+        return None
+    for raw in (block or "")[matches[-1].end():].splitlines():
+        if not raw.strip():
+            continue
+        if raw[:1].isspace():
+            continue
+        name, sep, message = raw.partition(":")
+        name = name.strip()
+        if name in _EXCEPTION_CONTINUATIONS:
+            return None
+        if not name:
+            continue
+        return name, (message.strip() if sep else "")
+    return None
+
+
 BLOCK_END_RE = re.compile(r"^=+$", re.MULTILINE)
 #: le seuil de preuve forte de #3801, le même que `paquet_horaire.classify`
 STRONG_EVIDENCE = 4
@@ -388,17 +420,18 @@ class TestRun:
         """La dernière exception effective du bloc est-elle une panne ?
 
         Le **nom du type** ne suffit pas : `AssertionError: expected
-        OperationalError` est un rouge réel. On ne lit que la **dernière**
-        exception du bloc, en colonne 0 : une exception réelle chaînée après
-        une annulation de requête reste réelle, et une ligne source n'est
-        jamais une exception (#4217, B de la revue). Un nom psycopg sans
-        suffixe `Error` (`QueryCanceled`) est lu comme les autres. Sans ligne
-        d'exception (sortie psql), on cherche un motif d'infrastructure.
+        OperationalError` est un rouge réel. On lit la ligne d'exception
+        effective du **dernier** traceback : les frames indentées, les lignes
+        source et les suites psycopg3 (`CONTEXT:`, `DETAIL:`…) ne sont pas des
+        exceptions ; un nom nu (`ValueError`) est lu. Une exception réelle
+        chaînée après une annulation de requête reste réelle, et un nom psycopg
+        sans suffixe `Error` (`QueryCanceled`) est lu comme les autres. Sans
+        traceback (sortie psql), on cherche un motif d'infrastructure.
         """
-        lines = EXCEPTION_LINE_RE.findall(block)
-        if not lines:
+        exception = last_exception(block)
+        if exception is None:
             return bool(INCONCLUSIVE_RE.search(block))
-        kind, message = lines[-1]
+        kind, message = exception
         name = kind.rsplit(".", 1)[-1]
         if name == "AssertionError":
             return False

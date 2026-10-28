@@ -496,6 +496,91 @@ class FixtureErrorTest(unittest.TestCase):
              paquet_auto.unittest_failures(output)],
             ["tests.test_x.T.test_x"])
 
+    def test_une_ligne_context_apres_un_vrai_rouge_ne_change_rien(self) -> None:
+        output = (
+            "======================================================================\n"
+            "ERROR: test_x (tests.test_x.T.test_x)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_x.py\", line 10, in test_x\n"
+            "ValueError: invalid application state\n"
+            "CONTEXT:  SQL statement \"SELECT 1\"\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 1 test in 0.1s\n"
+            "FAILED (errors=1)\n")
+        run = paquet_auto.TestRun("unité #1", ["tests.test_x"], 1, output, 0.1)
+        self.assertFalse(run.inconclusive)
+        self.assertTrue(run.real_failure)
+        self.assertEqual(
+            [failure["test"] for failure in
+             paquet_auto.unittest_failures(output)],
+            ["tests.test_x.T.test_x"])
+
+    def test_context_psycopg_ne_devient_pas_l_exception(self) -> None:
+        output = (
+            "======================================================================\n"
+            "ERROR: tearDownClass (tests.test_l56_role_executor.RoleExecutorTest)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "psycopg.errors.QueryCanceled: canceling statement due to statement timeout\n"
+            "CONTEXT:  SQL statement \"SELECT pg_sleep(1)\"\n"
+            "PL/pgSQL function inline_code_block line 1 at PERFORM\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 33 tests in 42.0s\n"
+            "FAILED (errors=1)\n")
+        run = paquet_auto.TestRun(
+            "unité #1", ["tests.test_l56_role_executor"], 1, output, 42.0)
+        self.assertTrue(run.inconclusive)
+        self.assertFalse(run.real_failure)
+        self.assertEqual(paquet_auto.unittest_failures(output), [])
+
+    def test_un_valueerror_nu_chainee_reste_reel(self) -> None:
+        output = (
+            "======================================================================\n"
+            "ERROR: test_x (tests.test_x.T.test_x)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "psycopg.errors.QueryCanceled: canceling statement due to statement timeout\n"
+            "CONTEXT:  SQL statement \"SELECT pg_sleep(1)\"\n"
+            "PL/pgSQL function inline_code_block line 1 at PERFORM\n"
+            "\n"
+            "During handling of the above exception, another exception occurred:\n"
+            "\n"
+            "Traceback (most recent call last):\n"
+            "ValueError\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 1 test in 0.1s\n"
+            "FAILED (errors=1)\n")
+        run = paquet_auto.TestRun("unité #1", ["tests.test_x"], 1, output, 0.1)
+        self.assertFalse(run.inconclusive)
+        self.assertTrue(run.real_failure)
+        self.assertEqual(
+            [failure["test"] for failure in
+             paquet_auto.unittest_failures(output)],
+            ["tests.test_x.T.test_x"])
+
+    def test_un_valueerror_qui_cite_querycanceled_reste_reel(self) -> None:
+        output = (
+            "======================================================================\n"
+            "ERROR: test_x (tests.test_x.T.test_x)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "ValueError: expected QueryCanceled from the driver\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 1 test in 0.1s\n"
+            "FAILED (errors=1)\n")
+        run = paquet_auto.TestRun("unité #1", ["tests.test_x"], 1, output, 0.1)
+        self.assertFalse(run.inconclusive)
+        self.assertTrue(run.real_failure)
+        self.assertEqual(
+            [failure["test"] for failure in
+             paquet_auto.unittest_failures(output)],
+            ["tests.test_x.T.test_x"])
+
     def check(self, *, own, neighbors):
         composition = paquet_auto.Composition(
             units=[paquet_auto.Unit(1, "a" * 40, "b" * 40)],
