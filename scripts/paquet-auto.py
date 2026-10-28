@@ -44,6 +44,11 @@ Ce qui reste au pilote, hors de ce script : « verdict non requis », la CI
 complète (`ameesh ci run --full`), le feu et toute fusion sur la cible. Le
 script ne fusionne jamais la cible et ne déclare aucun verdict.
 
+Un lot prêt peut être retiré de la composition par `--exclude LOT` (répétable,
+#3845) ; `--exclude-reason TEXTE` (répétable, apparié par ordre) écrit son vrai
+motif aux écartés du manifeste — B de relecture, regel, rouge local —, sans quoi
+le motif neutre « exclu par le pilote » est écrit (#4201).
+
 #4113 : hors banc sans base, la même garde d’époque que `packet record`
 est relue avant la composition, entre unités, avant chaque série de tests et
 avant publication. Une perte de bail arrête avant l’opération suivante ;
@@ -102,6 +107,9 @@ FREEZE_TIMEOUT = 600
 GIT_TIMEOUT = 300
 #: un rouge local n'est retiré du paquet qu'une fois ; au-delà, un agent lit.
 MAX_RECOMPOSITIONS = 1
+#: #4201 : motif neutre d'un `--exclude` sans `--exclude-reason`. Le vrai motif
+#: (B de relecture, regel, rouge local) est celui que le pilote écrit.
+EXCLUDE_DEFAULT_REASON = "exclu par le pilote"
 #: sorties qui ne prouvent pas un rouge du lot (environnement, base absente)
 INCONCLUSIVE_RE = re.compile(
     r"(OperationalError|could not connect|connection refused|"
@@ -677,6 +685,42 @@ def _errors_by_lot(payload: dict) -> list[Discarded]:
 def error_discards(payload: dict) -> list[Discarded]:
     """Les lots que `paquet-candidats` rend en erreur, jamais composés."""
     return _errors_by_lot(payload)
+
+
+def check_exclude_reasons(requested: list[int], reasons: list[str]) -> None:
+    """#4201 : `--exclude-reason` s'apparie par ordre aux `--exclude`."""
+    if len(reasons) > len(requested):
+        raise InputError(
+            "--exclude-reason : %d raison(s) pour %d --exclude ; apparier "
+            "chaque raison à son lot, dans l'ordre"
+            % (len(reasons), len(requested)))
+
+
+def exclude_discards(requested: list[int], reasons: list[str],
+                     error_lots: set[int]) -> list[Discarded]:
+    """#4201 : les lots retirés par `--exclude`, avec le motif du pilote.
+
+    `--exclude-reason` est répétable et s'apparie **par ordre** aux `--exclude` :
+    la i-ème raison décrit le i-ème lot exclu. Sans raison, le motif neutre
+    « exclu par le pilote » ; une raison de plus que de lots est une entrée
+    invalide (faute de frappe plutôt que motif perdu). Un lot déjà écarté par la
+    liste calculée n'est pas répété au manifeste mais consomme sa raison :
+    l'appariement des suivants ne glisse pas.
+    """
+    check_exclude_reasons(requested, reasons)
+    discards: list[Discarded] = []
+    seen: set[int] = set()
+    for index, lot in enumerate(requested):
+        if lot in seen:
+            continue
+        seen.add(lot)
+        if lot in error_lots:
+            continue
+        reason = reasons[index].strip() if index < len(reasons) else ""
+        discards.append(Discarded(
+            lot, reason or EXCLUDE_DEFAULT_REASON,
+            "--exclude, recomposition sans lui"))
+    return discards
 
 
 def compute_candidates(worktree: Path, target: str, base_sha: str,
@@ -1520,7 +1564,7 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
     ]
     if composition.discarded:
         for item in composition.discarded:
-            motive = item.reason
+            motive = _cell(item.reason)
             if item.detail:
                 motive += " — " + _cell(item.detail)
             lines.append("| #%d | %s |" % (item.lot, motive))
@@ -2095,6 +2139,8 @@ def compose_packet(args: argparse.Namespace) -> int:
     validate_target(repo, args.target)
     if args.carrier <= 0:
         raise InputError("--carrier : un identifiant de lot positif attendu")
+    check_exclude_reasons(list(getattr(args, "exclude", None) or []),
+                          list(getattr(args, "exclude_reason", None) or []))
     branch = package_branch(args.name)
     validate_branch(repo, branch, "--name")
     rel = manifest_rel(args.name)
@@ -2134,16 +2180,18 @@ def compose_packet(args: argparse.Namespace) -> int:
                                                  base_sha, ready_out)
         errors = error_discards(payload)
         error_lots = {item.lot for item in errors}
-        # #3845 : un lot retiré sur un rouge de ci-full (paquet-horaire.py,
-        # unité nommée par #3801) n'est pas recomposé ; il reste au manifeste.
-        excluded = [lot for lot in getattr(args, "exclude", None) or []
-                    if lot not in error_lots]
+        # #3845/#4201 : un lot retiré sur un rouge de ci-full (paquet-horaire.py,
+        # unité nommée par #3801) ou par le pilote n'est pas recomposé ; il reste
+        # au manifeste, avec le vrai motif quand `--exclude-reason` le donne.
+        requested = list(getattr(args, "exclude", None) or [])
+        excluded_discards = exclude_discards(
+            requested, list(getattr(args, "exclude_reason", None) or []),
+            error_lots)
+        excluded = [item.lot for item in excluded_discards]
         if excluded:
             candidates = [candidate for candidate in candidates
                           if candidate.lot not in set(excluded)]
-            errors = errors + [Discarded(
-                lot, "retiré : ci-full rouge attribuée à son unité (#3801)",
-                "--exclude, recomposition sans lui") for lot in excluded]
+            errors = errors + excluded_discards
             error_lots |= set(excluded)
         for item in errors:
             print("écarté #%d : %s — %s"
@@ -2346,6 +2394,11 @@ def main(argv: list[str] | None = None) -> int:
                         metavar="LOT",
                         help="#3845 : ne pas composer ce lot prêt (répétable) ; "
                              "il est écrit aux écartés du manifeste")
+    parser.add_argument("--exclude-reason", action="append", default=[],
+                        metavar="TEXTE",
+                        help="#4201 : motif du lot exclu, apparié par ordre aux "
+                             "--exclude (répétable) ; sans motif, le manifeste "
+                             "écrit « %s »" % EXCLUDE_DEFAULT_REASON)
     parser.add_argument("--replay", default=None, metavar="REF",
                         help="rejouer le manifeste d'une référence et comparer "
                              "les arbres (avec --candidates-json : refuser une "

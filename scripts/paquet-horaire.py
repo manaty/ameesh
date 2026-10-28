@@ -106,6 +106,9 @@ ATTEMPT_RE = re.compile(
     r"par=(\S+):(\d+)(?: run=(\S+) sans=([\d,]+))?(?: epoque=(\d+))?")
 FAILED_RE = re.compile(r"^paquet-horaire: échec (composition|recomposition) n=(\d+) base=(\S+)")
 MAX_RECOMPOSITIONS = 1
+#: #4201 : motif écrit au manifeste pour le retrait automatique d'une unité dont
+#: la ci-full attribuée est rouge (`paquet-auto` seul écrit le motif neutre).
+EXCLUDE_CI_FULL_REASON = "retiré : ci-full rouge attribuée à son unité (#3801)"
 #: lancements de paquet-auto pour une même étape (même tête de départ)
 MAX_ATTEMPTS = 3
 #: un porteur sans tentative plus jeune que ce délai : création en cours
@@ -395,7 +398,8 @@ def manifest_at(ctx: Context, item: dict, sha: str) -> str:
 
 
 def paquet_auto(ctx: Context, name: str, carrier: int, *,
-                exclude: list[int] = (), force: bool = False) -> Result:
+                exclude: list[int] = (), exclude_reason: str = "",
+                force: bool = False) -> Result:
     cmd = [ctx.python, str(SCRIPT_DIR / "paquet-auto.py"), "--repo", str(ctx.repo),
            "--target", ctx.target, "--name", name, "--carrier", str(carrier),
            "--pilot", ctx.pilot, "--from", ctx.actor]
@@ -403,6 +407,9 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
         cmd.append("--force")
     for lot in exclude:
         cmd += ["--exclude", str(lot)]
+    if exclude_reason:
+        for _lot in exclude:
+            cmd += ["--exclude-reason", exclude_reason]
     if ctx.dry_run:
         ctx.say("[essai] %s" % " ".join(cmd))
         return Result(0, "aucun lot prêt : rien à composer (essai)\n", "")
@@ -621,6 +628,8 @@ def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
     ctx.note(carrier, mark)
     # une reprise (n > 1) réécrit une branche peut-être déjà poussée
     result = paquet_auto(ctx, name, carrier, exclude=this.exclude,
+                         exclude_reason=(EXCLUDE_CI_FULL_REASON
+                                         if this.step == RECOMPOSITION else ""),
                          force=this.step == RECOMPOSITION or this.n > 1)
     return after_compose(ctx, carrier, name, result, this)
 

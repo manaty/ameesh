@@ -216,6 +216,10 @@ class FollowTest(Base):
         auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
         self.assertIn("--force", auto)
         self.assertEqual(auto[auto.index("--exclude") + 1], "3801")
+        # #4201 : la recomposition automatique dit son vrai motif au manifeste.
+        self.assertEqual(auto[auto.index("--exclude-reason") + 1],
+                         ph.EXCLUDE_CI_FULL_REASON)
+        self.assertIn("ci-full rouge attribuée", ph.EXCLUDE_CI_FULL_REASON)
         self.assertIn("mty-amh-impl-02", [to for to, _ in self.shell.mails])
         notes = ph.marks(self.shell.items[4000])
         self.assertTrue(any(n.startswith(ph.MARK_ATTEMPT + "recomposition n=1 base=%s"
@@ -690,6 +694,23 @@ class ExcludeOptionTest(unittest.TestCase):
             ph.auto.compose_packet = original
         self.assertEqual(rc, 0)
         self.assertEqual(parsed, [[3801, 3755]])
+
+    def test_paquet_auto_accepte_exclude_reason_apparie(self):
+        # #4201 : --exclude-reason est répétable et suit l'ordre des --exclude.
+        parsed = []
+        original = ph.auto.compose_packet
+        ph.auto.compose_packet = lambda args: parsed.append(
+            (args.exclude, args.exclude_reason)) or 0
+        try:
+            rc = ph.auto.main([
+                "--name", "h-x", "--carrier", "9",
+                "--exclude", "3801", "--exclude-reason", "B de relecture",
+                "--exclude", "3755", "--exclude-reason", "rouge local"])
+        finally:
+            ph.auto.compose_packet = original
+        self.assertEqual(rc, 0)
+        self.assertEqual(parsed, [([3801, 3755],
+                                   ["B de relecture", "rouge local"])])
 
     def test_paquet_auto_courrier_avec_expediteur(self):
         seen = []
