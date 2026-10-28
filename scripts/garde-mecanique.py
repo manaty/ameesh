@@ -17,7 +17,7 @@ script (il porte les motifs et les exemptions). Pour chaque clé du schéma
 fuseau, cadence des paquets, plafond de lots en build, politique CI, familles
 et indépendance des avis, politique de fusion, seuils et plafonds de
 prévalidation, seuil de lot du backlog (#2584), seuil et marges du staging
-hors créneau (#3291) — et exige une exemption nommée et datée pour un littéral
+hors créneau (#3291), rythme des comptes de forfait (#3647) — et exige une exemption nommée et datée pour un littéral
 historique.
 
 Une exemption vit dans `EXEMPTIONS` ci-dessous : chemin, paramètre, littéral
@@ -95,6 +95,8 @@ SCHEMA_KEYS = (
     "staging.waiting_lots_min",
     "staging.before_cutoff_seconds",
     "staging.before_packet_seconds",
+    "accounts.pace_multipliers",
+    "accounts.underused_loss",
     "production.branch",
     "projects",
 )
@@ -142,6 +144,8 @@ BINDINGS = {
     "waiting_lots_min": "staging.waiting_lots_min",
     "before_cutoff_seconds": "staging.before_cutoff_seconds",
     "before_packet_seconds": "staging.before_packet_seconds",
+    "pace_multipliers": "accounts.pace_multipliers",
+    "underused_loss": "accounts.underused_loss",
     "production_branch": "production.branch",
 }
 
@@ -184,6 +188,8 @@ DICT_BINDINGS = {
     "waiting_lots_min": "staging.waiting_lots_min",
     "before_cutoff_seconds": "staging.before_cutoff_seconds",
     "before_packet_seconds": "staging.before_packet_seconds",
+    "pace_multipliers": "accounts.pace_multipliers",
+    "underused_loss": "accounts.underused_loss",
 }
 #: clés du bloc `prevalidation` dans un mapping, seulement dans un fichier
 #: qui parle de prévalidation
@@ -346,7 +352,9 @@ def _literal(node: ast.AST):
     ordinaire ou un chemin calculé ne l'est pas.
     """
     if isinstance(node, ast.Constant):
-        if isinstance(node.value, (str, int, bool)) or node.value is None:
+        # #3647 : un réel aussi (`underused_loss`, une part de quota) ; chaque
+        # clé borne ensuite le type qu'elle accepte (`_valid_binding`)
+        if isinstance(node.value, (str, int, bool, float)) or node.value is None:
             return True, node.value
         return False, None
     if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
@@ -469,6 +477,13 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key.startswith("staging."):
         # #3291 : un seuil de lots ou une marge en secondes, entiers positifs
         return type(value) is int and value > 0
+    if key == "accounts.underused_loss":
+        # #3647 : la perte prévue au reset qui relève le rythme, une part ]0, 1[
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and 0 < value < 1)
+    if key == "accounts.pace_multipliers":
+        # #3647 : la table des multiplicateurs par compte, recopiée en mapping
+        return value == "<dict>"
     if key == "production.branch":
         # #3022 : la branche de prod d'un projet se lit dans le canon
         # (`projects.<projet>.production.branch`), jamais recopiée en dur.
@@ -500,6 +515,10 @@ def _binding_key(name: str, value, train_context: bool,
         key = "projects"
     if key is None and lower.endswith("lot_min_value"):
         key = "backlog.lot_min_value"
+    if key is None and lower.endswith("underused_loss"):
+        key = "accounts.underused_loss"
+    if key is None and lower.endswith("pace_multipliers"):
+        key = "accounts.pace_multipliers"
     if key is None:
         return None
     if key == "timezone" and not train_context:

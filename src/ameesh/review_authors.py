@@ -20,9 +20,10 @@ auteurs, avec les mêmes exceptions du canon §2 :
   auteur de la tête (#2888) : sa famille n'est plus éligible. Le seuil ne
   décide que de la recevabilité process (une correction trop grosse revient à
   l'auteur), jamais de l'indépendance. Le correcteur reste tenu hors des
-  relecteurs par son nom (#2739). Exception #3518 : une correction dont tous
-  les chemins sont des tests reconnus (§11 bis), hors plan CI et hors classe
-  sensible du projet, garde seulement cette exclusion personnelle ;
+  relecteurs par son nom (#2739). Exception #3518/#3577 : une correction dont
+  tous les chemins sont des tests reconnus (§11 bis), hors plan CI, garde
+  seulement cette exclusion personnelle, même sous un chemin sensible ; la
+  classe du lot ne change pas ;
 * une réécriture d'historique **à contenu identique** n'efface pas la
   provenance (#2924) : les auteurs des gels antérieurs du même lot dont le
   contenu subsiste restent auteurs de la tête. Une consolidation sur une cible
@@ -40,7 +41,8 @@ auteurs, avec les mêmes exceptions du canon §2 :
   n'est plus contenu par une ref (objet pendant d'un force-push, #3399) garde
   ses auteurs connus dont le contenu survit ; seuls ses inconnus cessent de
   bloquer. Le refus fermé B5 ne vaut que pour un gel encore accessible ;
-* un commit **déjà dans la cible** au moment de la lecture ne compte ni comme
+* un commit **déjà dans la cible** au moment de la lecture, par ascendance ou
+  patch-id verbatim identique (#3762), ne compte ni comme
   auteur ni comme tiers du lot (#3116) : la plage reportée d'un ancien gel,
   calculée avant un rebase, peut contenir du develop déjà relu sous son propre
   lot ; un inconnu d'un gel antérieur qui n'est plus ancêtre de la tête et dont
@@ -277,7 +279,12 @@ def reference_author(db, item: Mapping, milestone: Optional[Mapping], families,
     if families_out is not None:
         families_out[name.lower()] = set(proven)
     family = next(iter(proven)) if len(proven) == 1 else ""
-    return {"name": name, "family": family}
+    row = {"name": name, "family": family}
+    if len(proven) > 1:
+        # #3584 : un auteur prouvé sous plusieurs familles transporte tout
+        # l'ensemble ; la désignation et la porte excluent chacune d'elles.
+        row["families"] = sorted(proven)
+    return row
 
 
 def designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
@@ -329,12 +336,14 @@ def change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
 
 
 def _test_only_correction(repo: str, entries, project: str) -> bool:
-    """All changed paths must be test adaptations (§2/§11 bis, #3518).
+    """All changed paths must be test adaptations (§2/§11 bis, #3518/#3577).
 
-    Reuse the vehicle's test recognition and the project risk class. CI plans,
-    sensitive paths and unreadable or
-    empty diffs never buy an exception to the author-family exclusion.
-    --no-renames includes both sides of a move out of product code.
+    Reuse the vehicle's test recognition. CI plans, unreadable or empty diffs
+    and an unreadable project policy never buy an exception to the author-family
+    exclusion. A sensitive path does not prevent it (#3577): the correction
+    keeps its author family eligible for the product delta while the lot's
+    class is unchanged. --no-renames includes both sides of a move out of
+    product code.
     """
     from . import config, lot_class, packet_reviews, work
 
@@ -357,8 +366,10 @@ def _test_only_correction(repo: str, entries, project: str) -> bool:
             work.configured_canons(config.load()), project, sorted(changed))
     except Exception:  # noqa: BLE001 - unknown policy never grants an exception
         return False
-    return (not klass.get("doubt")
-            and klass.get("class") in (lot_class.LIGHT, lot_class.NORMAL))
+    # #3577: the risk class no longer forbids the exception — a test-only
+    # correction stays test-only under a sensitive path. The policy must still
+    # be readable (no doubt): an unknown policy never grants an exception.
+    return not klass.get("doubt")
 
 
 def _registered(db, name: str) -> bool:
@@ -411,25 +422,30 @@ def commit_actor(repo: str, sha: str, db=None) -> tuple[str, float]:
     return actor, stamp
 
 
-def commits_written_by(repo: str, commits: Sequence[str], name: str,
-                       db=None) -> Optional[bool]:
-    """Un commit de la plage porte `name` comme **auteur Git** (`%ae`).
+def commit_ids_written_by(repo: str, commits: Sequence[str], name: str,
+                          db=None) -> Optional[list]:
+    """Les commits de la plage dont `name` est l'**auteur Git** (`%ae`).
 
     L'auteur Git est la signature du contenu ; le committer (`commit_actor`)
     est l'agent qui a créé l'objet. Un amend ou un rebase conserve l'auteur
     d'origine et change le committer : les deux ont écrit la plage (#2808).
     Le nom Git seul ne prouve rien : l'adresse `<nom>@ameesh.invalid` est
     exigée, comme pour le committer, ou l'ancienne `<nom>@ameesh.local` datée
-    (`%at`) d'avant la convention, vers un agent du registre (#3111)."""
+    (`%at`) d'avant la convention, vers un agent du registre (#3111).
+
+    Rend la liste des SHA, vide si aucun, `None` si la lecture est impossible
+    (un doute n'est pas une absence de preuve). #3742 : le refus de gel nomme
+    les commits à renvoyer à l'assigné, d'où la liste et non un booléen."""
     if not repo or not name:
-        return False
+        return []
     shas = [str(sha).strip() for sha in commits or () if str(sha).strip()]
     if not shas:
-        return False
+        return []
     text = plan_git._out(repo, "log", "--no-walk", "--format=%H%x1f%ae%x1f%at", *shas)
     if text is None or len(str(text).splitlines()) != len(set(shas)):
         return None                     # unreadable is not proof of absence
     wanted = str(name).strip().lower()
+    found = []
     for line in str(text).splitlines():
         fields = line.split("\x1f")
         if len(fields) != 3:
@@ -439,8 +455,18 @@ def commits_written_by(repo: str, commits: Sequence[str], name: str,
         except ValueError:
             return None
         if _agent_of_email(db, fields[1], stamp) == wanted:
-            return True
-    return False
+            found.append(str(fields[0]).strip())
+    return found
+
+
+def commits_written_by(repo: str, commits: Sequence[str], name: str,
+                       db=None) -> Optional[bool]:
+    """`True` si un commit de la plage porte `name` comme auteur Git.
+
+    Même lecture que [`commit_ids_written_by`] (#3111) ; le doute reste
+    `None`, jamais une absence de preuve."""
+    found = commit_ids_written_by(repo, commits, name, db)
+    return None if found is None else bool(found)
 
 
 def actor_family(db, actor: str, at_ts: float, families) -> str:
@@ -549,8 +575,28 @@ def target_commit(repo: str, target: str) -> str:
     return ""
 
 
+def _applied_in(repo: str, target: str, sha: str) -> bool:
+    """Le patch est encore appliqué : le rejouer ne change pas la cible.
+
+    Un patch-id historique seul ne suffit pas après un revert ou une
+    réécriture. Toute fusion conflictuelle ou lecture impossible garde l'auteur.
+    """
+    try:
+        tree = _tree_of(repo, target)
+        if not tree:
+            return False
+        proc = plan_git._git(repo, "merge-tree", "--write-tree",
+                             "--merge-base", sha + "^", target, sha)
+        if proc.returncode != 0:
+            return False
+        lines = proc.stdout.decode("utf-8", "strict").splitlines()
+        return bool(lines and lines[0].strip() == tree)
+    except Exception:  # noqa: BLE001 - sans preuve, garder l'auteur
+        return False
+
+
 def _not_in_target(repo: str, commits, target: str) -> list:
-    """Les commits de la liste qui ne sont PAS atteignables depuis `target`.
+    """Les commits qui ne sont dans `target` ni par ascendance ni par patch.
 
     #3116 : un commit déjà dans la cible a été relu sous son propre lot ; il
     ne compte ni comme auteur ni comme tiers du lot, qu'il vienne de la plage
@@ -564,7 +610,16 @@ def _not_in_target(repo: str, commits, target: str) -> list:
     l'entrée telle quelle l'écartait alors comme « dans la cible », à l'envers
     du doute : on ne retire désormais que l'entrée **prouvée** dans la cible,
     et une entrée non résolue reste. Un identifiant complet est normalisé sans
-    sonde ; seule une forme non canonique est résolue localement."""
+    sonde ; seule une forme non canonique est résolue localement.
+
+    #3762 : un rebase change le SHA sans changer le patch. Les copies déjà
+    intégrées dans la cible ne portent plus d'auteur du lot, y compris dans
+    les gels antérieurs. Les patch-id **verbatim** conservent les espaces
+    (significatifs en Python) ; fusions, diffs vides ou lecture impossible
+    restent dans la liste. La recherche cible est bornée ; dépasser la borne
+    ne peut que conserver des auteurs, jamais en retirer sans preuve. Un
+    patch historique n'est écarté que si son rejeu laisse la cible inchangée,
+    pour conserver l'auteur après un revert ou une réécriture de la cible."""
     wanted = [str(commit).strip() for commit in commits or ()
               if str(commit).strip()]
     if not wanted or not target:
@@ -587,7 +642,34 @@ def _not_in_target(repo: str, commits, target: str) -> list:
         if canonical and canonical not in outside:
             continue
         kept.append(canonical or commit)
-    return kept
+    if not kept:
+        return kept
+    try:
+        # Borne commune à TOUS les candidats : exclure l'union de leurs
+        # ancêtres masquerait la cible dès qu'un candidat descend de celle-ci.
+        base = plan_git._out(repo, "merge-base", "--octopus", str(target), *kept)
+        if not base:
+            return kept
+        # Un seul parcours de la cible, puis lecture des seuls candidats.
+        on_target = plan_git._patch_ids(
+            repo, "--max-count=%d" % plan_git.MAX_TARGET_COMMITS,
+            "%s..%s" % (base, target))
+        if not on_target:
+            return kept
+    except Exception:  # noqa: BLE001 - pas de preuve : garder les auteurs
+        return kept
+    equivalent = set()
+    for sha in set(kept):
+        try:
+            # Une entrée par commit : deux copies du même patch doivent être
+            # écartées toutes les deux (le dictionnaire est indexé par patch).
+            patches = plan_git._patch_ids(repo, "--no-walk", sha)
+        except Exception:  # noqa: BLE001 - ce candidat reste dans le doute
+            continue
+        if (patches and patches.keys() <= on_target.keys()
+                and _applied_in(repo, str(target), sha)):
+            equivalent.add(sha)
+    return [sha for sha in kept if sha not in equivalent]
 
 
 def _survives_rewrite(repo: str, head: str, sha: str, cache: dict,
@@ -1992,6 +2074,10 @@ def _forge_fetch(repo: str, sha: str) -> bool:
     Un SHA abrégé ne se demande pas (Git exige l'identifiant complet), un
     dépôt sans `origin` n'a pas de forge, et un objet que la forge ne sert pas
     laisse l'absence : le refus fermé de #2924 B5 reste la règle.
+
+    #3648 : le dépôt scratch de `merge-pr` (`git init`, sans `origin`) porte
+    sa forge dans `ameesh.forge` (`plan_git.forge_remote`) ; sans elle, un
+    gel antérieur écrasé par push forcé n'y était jamais rapatrié.
     """
     text = plan_git.full_commit_id(sha)
     if not text:
@@ -2002,11 +2088,12 @@ def _forge_fetch(repo: str, sha: str) -> bool:
     except Exception:  # noqa: BLE001 - dépôt illisible : aucune récupération
         return False
     try:
-        if plan_git._out(repo, "remote", "get-url", "origin") is None:
+        forge = plan_git.forge_remote(repo)
+        if forge is None:
             return False
         proc = plan_git._git(
             repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-            "--", "origin", text, timeout=plan_git.FETCH_TIMEOUT)
+            "--", forge, text, timeout=plan_git.FETCH_TIMEOUT)
     except Exception:  # noqa: BLE001 - forge injoignable : absence
         return False
     if proc.returncode != 0:
@@ -2021,7 +2108,9 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            commits: Sequence[str], repo: str, families, *,
                            base: str = "", head: str = "", provider=None,
                            strict: bool = False, target: str = "",
-                           recover=None, admitted_heads=()) -> tuple[list, list, list]:
+                           recover=None, admitted_heads=(),
+                           exclusions_out: Optional[list] = None,
+                           commits_out: Optional[dict] = None) -> tuple[list, list, list]:
     """Auteurs/correcteurs des gels antérieurs dont le contenu subsiste (#2924).
 
     Rend `(auteurs, inconnus, correcteurs)` à fusionner dans la lecture de la
@@ -2030,6 +2119,10 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     provenance illisible d'un gel antérieur qui n'est pas déjà couverte par la
     plage courante ajoute un inconnu : l'appelant strict refuse, la désignation
     attend (jamais de famille supposée).
+
+    `commits_out` (#3742) reçoit, pour chaque acteur conservé, les SHA écrits
+    dans les gels antérieurs ; il ne sert qu'à nommer les commits d'un refus de
+    gel et ne change aucune décision.
 
     #2924 B7 : `recover(sha)` est une source de réparation supplémentaire du
     # gel antérieur absent (le dépôt de l'agent, une autre origine) ; #3147
@@ -2303,8 +2396,11 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         earlier = _commits_between(repo, start, sha)
         if earlier is not None:
             earlier = _not_in_target(repo, earlier, target_sha)
-            for admitted in admitted_heads:
-                earlier = _not_in_target(repo, earlier, admitted)
+            # #3544 : l'exclusion du report se trace comme celle de la plage
+            # courante, avec le gel antérieur d'où vient la plage.
+            from . import provenance_scope
+            earlier = provenance_scope.exclude(repo, earlier, admitted_heads,
+                                               exclusions_out, carried_from=sha)
         if earlier is None:
             if strict:
                 raise review_provenance.ProvenanceError(
@@ -2354,6 +2450,14 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                 continue
             carried.setdefault(actor, set()).update(
                 value for value in proven if value)
+            if commits_out is not None:
+                key = next((name for name in commits_out
+                            if name.lower() == actor.lower()), actor)
+                values = commits_out.setdefault(key, [])
+                for sha in written.get(actor) or ():
+                    value = str(sha or "").strip()
+                    if value and value not in values:
+                        values.append(value)
         for actor in review_commits:
             # #3335 : la trace « correcteur » exige la preuve de contenu même
             # quand le gel antérieur est un ancêtre de la tête (stored) ; un
@@ -2406,7 +2510,9 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             strict: bool = False, trace: bool = False,
             families_out: Optional[dict] = None,
             base: str = "", head: str = "", target: str = "",
-            recover=None, admitted_heads=()) -> tuple[list, list, list]:
+            recover=None, admitted_heads=(),
+            exclusions_out: Optional[list] = None,
+            commits_out: Optional[dict] = None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
@@ -2417,11 +2523,18 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     exact de reçus (#1465) ; `strict` fait d'un reçu corrompu une erreur (le
     train), au lieu d'une absence (la désignation attend). `trace=True`
     (désignation) ajoute aux auteurs du repli `proof: turn-journal` et
-    `fallback_commits` ; le train et la porte gardent la forme exacte
-    `{name, family}`. `families_out` reçoit, par acteur en minuscules,
-    l'ensemble des familles **prouvées** : une famille vide peut être une
-    absence de preuve ou une ambiguïté, et l'appelant qui doit les distinguer
-    ne peut pas la deviner.
+    `fallback_commits`. Une entrée est `{name, family}`, plus `families` quand
+    plusieurs familles sont prouvées (#3584) : le train et la porte reçoivent
+    alors tout l'ensemble, jamais une famille devinée. `families_out` reçoit,
+    par acteur en minuscules, l'ensemble des familles **prouvées** : une
+    famille vide peut être une absence de preuve ou une ambiguïté, et
+    l'appelant qui doit les distinguer ne peut pas la deviner.
+
+    `commits_out` (#3742) associe à chaque acteur des listes de SHA que cette
+    lecture lui attribue : la plage courante, puis les commits des gels
+    antérieurs qui ont porté sa famille jusqu'à cette tête. Il ne sert qu'à
+    nommer les commits d'un refus de gel ; aucune décision ne le lit, et son
+    absence ne change rien.
 
     Un commit sans reçu est attribué au committer d'adresse d'agent : un commit
     du titulaire de référence reste le sien ; un relecteur désigné reste
@@ -2434,12 +2547,13 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     (#2888) : leur famille est exclue comme celle de tout auteur, et l'agent
     lui-même ne relit pas son propre correctif. `correctors` garde leur trace
     (provenance réelle) pour l'exclusion personnelle ; ce n'est plus une
-    éligibilité de famille. Exception #3518 : un correctif de tests seuls,
-    non sensible selon le projet, reste dans `correctors` avec `test_only`,
-    quelle que soit sa taille, mais n'ajoute pas un auteur produit. La
-    désignation ignore sa famille et exclut toujours son nom. Le report des
-    gels antérieurs garde cette distinction. Un correctif au-delà du seuil ou de conception est
-    aussi un auteur, mais n'est pas un « correcteur » de premier tour.
+    éligibilité de famille. Exception #3518/#3577 : un correctif de tests
+    seuls, même sous un chemin sensible, reste dans `correctors` avec
+    `test_only`, quelle que soit sa taille, mais n'ajoute pas un auteur
+    produit. La désignation ignore sa famille et exclut toujours son nom. Le
+    report des gels antérieurs garde cette distinction. Un correctif au-delà
+    du seuil ou de conception est aussi un auteur, mais n'est pas un
+    « correcteur » de premier tour.
     #3335 : cette promotion et la trace « correcteur » suivent la survie du
     contenu (#3220). Un correctif de relecteur dont aucune ligne significative
     ne subsiste plus dans la tête n'exclut plus sa famille ; une ligne qui
@@ -2487,6 +2601,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     porte du même véhicule. Leurs commits sont écartés de la plage courante
     et des gels antérieurs, comme ceux de la cible ; aucun autre tiers
     ne bénéficie de cette exclusion. Une lecture Git impossible ne retire rien.
+    Une portée est un gel (texte) ou la portée de `provenance_scope` (dict,
+    #3533). #3544 : `exclusions_out` reçoit les commits écartés du report des
+    gels antérieurs (`carried_from` = le gel reporté) ; la plage courante est
+    tracée par la porte.
 
     #3116 : `target` est la cible au moment de la lecture (commit ou ref). Un
     commit qui y est déjà entré ne compte ni comme auteur ni comme tiers du
@@ -2500,7 +2618,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     target_sha = target_commit(repo, target) or target_commit(repo, base)
     commits = _not_in_target(repo, commits, target_sha)
     for admitted in admitted_heads:
-        commits = _not_in_target(repo, commits, admitted)
+        commits = _not_in_target(repo, commits, admitted["head"]
+                                 if isinstance(admitted, dict) else admitted)
     proven_reference: dict = dict(reference_families or {})
     if reference is None:
         reference = reference_author(db, item, milestone, families,
@@ -2513,6 +2632,17 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     unknown: list[str] = []
     review_commits: dict[str, list[tuple[str, str]]] = {}
     proofs: dict[str, set[str]] = {}
+
+    def record_commit(actor: str, sha: str) -> None:
+        """#3742 : le commit attribué à un acteur, pour nommer un refus de gel."""
+        if commits_out is None or not actor or not sha:
+            return
+        key = next((name for name in commits_out
+                    if name.lower() == actor.lower()), actor)
+        values = commits_out.setdefault(key, [])
+        if sha not in values:
+            values.append(sha)
+
     for raw in commits or ():
         sha = str(raw or "").strip()
         if not sha:
@@ -2546,6 +2676,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                 # a réellement tourné ; la famille de gel prend le relais
                 proven = actor_family(db, actor, stamp, families) or author_family
                 by_name.setdefault(actor, set()).add(proven)
+                record_commit(actor, sha)
                 proofs.setdefault(actor, set()).add(sha[:12])
                 continue
             if actor in reviewers:
@@ -2564,12 +2695,14 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         proven = _family(receipt.get("harness"), families)
         if actor == author_name:
             by_name.setdefault(actor, set()).add(proven)
+            record_commit(actor, sha)
         elif actor in reviewers:
             # sa correction est un contenu de la tête (#2888) ; le seuil ne
             # décide que de la trace « correcteur de premier tour »
             review_commits.setdefault(actor, []).append((sha, proven))
         else:
             by_name.setdefault(actor, set()).add(proven)
+            record_commit(actor, sha)
     # #3335 : un correctif de relecteur ne pèse que s'il est encore dans la
     # tête. La promotion en auteur (#2888) et la trace « correcteur » suivent la
     # survie du contenu (#3220) : un commit de relecteur dont aucune ligne ne
@@ -2590,12 +2723,14 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         authored = next((name for name in by_name
                          if name.lower() == author_name.lower()), "")
         if not authored:
-            written = commits_written_by(repo, commits, author_name, db)
+            written = commit_ids_written_by(repo, commits, author_name, db)
             if written is None:
                 unknown.extend(str(sha)[:12] for sha in commits if str(sha)[:12] not in unknown)
             elif written:
                 authored = author_name
                 by_name.setdefault(authored, set())
+                for sha in written:
+                    record_commit(authored, sha)
         if authored:
             for family in proven_reference.get(author_name.lower()) or ():
                 if family:
@@ -2605,8 +2740,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     # #2888 : toute correction d'un relecteur désigné fait de lui un auteur de
     # la tête, quelle que soit sa taille. Le seuil du §2 ne décide que de la
     # recevabilité process (une correction trop grosse revient à l'auteur),
-    # jamais de l'indépendance. #3518 : seuls les tests non sensibles font
-    # exception à l'exclusion de famille ; le nom reste exclu.
+    # jamais de l'indépendance. #3518/#3577 : les tests seuls font exception à
+    # l'exclusion de famille, même sous un chemin sensible ; le nom reste exclu.
     small_correctors: set[str] = set()
     test_correctors: set[str] = set()
     for actor, entries in sorted(review_commits.items()):
@@ -2621,9 +2756,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             test_correctors.add(actor)
         else:
             by_name.setdefault(actor, set())
-            for _sha, proven in entries:
+            for sha, proven in entries:
                 if proven:
                     by_name[actor].add(proven)
+                record_commit(actor, sha)
         if actor in test_correctors or (not design and total <= REVIEWER_FIX_LINES):
             small_correctors.add(actor)
     # #2924 : les auteurs des gels antérieurs dont le contenu subsiste restent
@@ -2632,7 +2768,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     carried, carried_unknown, carried_correctors = _carried_from_previous(
         db, item, milestone, commits, repo, families, base=base, head=head,
         provider=provider, strict=strict, target=target_sha, recover=recover,
-        admitted_heads=admitted_heads)
+        admitted_heads=admitted_heads, exclusions_out=exclusions_out,
+        commits_out=commits_out)
     unknown.extend(carried_unknown)
     for row in carried:
         values = row.get("families")
@@ -2648,12 +2785,17 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         proven = {value for value in by_name[actor] if value}
         if families_out is not None:
             families_out[actor.lower()] = set(proven)
-        # un acteur à deux familles prouvées est ambigu : jamais deviné
+        # un acteur à deux familles prouvées est ambigu : jamais deviné, et
+        # l'ensemble est transporté pour que la désignation et la porte en
+        # excluent chacune (#3584), au lieu de le lire comme une famille
+        # inconnue.
         family = next(iter(proven)) if len(proven) == 1 else ""
         row = {"name": actor, "family": family}
+        if len(proven) > 1:
+            row["families"] = sorted(proven)
         if trace and proofs.get(actor):
-            # #2721 : la trace est celle de la désignation (`trace=True`) ; le
-            # train et la porte gardent la forme exacte `{name, family}`.
+            # #2721 : la trace est celle de la désignation (`trace=True`) ;
+            # l'ensemble `families` reste porté par la ligne (#3584).
             row["proof"] = "turn-journal"
             row["fallback_commits"] = sorted(proofs[actor])
         out.append(row)

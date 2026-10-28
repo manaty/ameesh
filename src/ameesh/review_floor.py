@@ -15,6 +15,13 @@ dépend pas d'un gel : le plancher survit aux regels et suit le lot dans un
 véhicule ; sur un véhicule, il s'applique à son delta propre
 (`packet_reviews.need`).
 
+#3557 : poser ou relever le plancher sur un lot gelé **complète la désignation
+de ce gel** jusqu'à `max(barème, plancher)` familles distinctes (les sièges
+déjà désignés sont gardés, les manquants choisis par la même sélection
+déterministe). La complétion est journalisée et sans courrier double ;
+`work reviewers <lot> --apply` fait de même si le compte enregistré est
+inférieur au plancher.
+
 Autorité : celle de `--actor` des corrections (humain, orchestrateur ou agent
 de conception déclaré, `history=False`). Un plancher posé par un humain ne se
 baisse que par un humain. Seule cette commande écrit une ligne qui compte :
@@ -112,19 +119,48 @@ def apply(klass: dict, db, lot: int, *, cfg=None) -> dict:
                                                        str(exc)[:200])
         return klass
     if found["floor"]:
-        klass["reviews_floor"] = found["floor"]
-        klass["reviews_floor_by"] = found["actor"]
+        # #3554 : le plancher automatique d'une baisse du canon (posé par la
+        # classe, `reviews_floor`) ne se perd pas sous un plancher de pilote
+        # plus bas que lui.
+        floor = int(found["floor"])
+        if floor >= int(klass.get("reviews_floor") or 0):
+            klass["reviews_floor"] = floor
+            klass["reviews_floor_by"] = found["actor"]
     return klass
 
 
+def _complete_designation(cfg, db, lot: int, floor: int):
+    """#3557 : complète la désignation du dernier gel après le plancher.
+
+    Rien quand le plancher est retiré, quand l'hôte ne lit pas de canon (la
+    désignation automatique n'y existe pas) ou quand le lot n'a pas de gel :
+    `designate` rend alors `unfrozen` sans écrire. Le travail de désignation
+    reste hors de la transaction du plancher : la ligne du plancher est un
+    fait acquis, même si la complétion échoue ou attend une famille."""
+    if int(floor) <= 0:
+        return None
+    from . import review_designation_activation as activation
+
+    if not activation.enabled(cfg):
+        return None
+    return activation.designate(cfg, db, int(lot))
+
+
 def set_floor(cfg, db, lot: int, floor: int, *, reason: str = "",
-              actor: Optional[str] = None) -> dict:
+              actor: Optional[str] = None, complete: bool = True) -> dict:
     """Pose (ou retire, `floor=0`) le plancher d'avis du lot, journalisé.
 
     Rend `{lot, floor, previous, actor, changed}` ; `changed` est vrai dès
     qu'une ligne est écrite, y compris une recharge humaine à valeur égale.
     WorkError si l'acteur n'est pas pilote, si le lot est fermé, ou si un
-    plancher posé par un humain serait baissé par un agent."""
+    plancher posé par un humain serait baissé par un agent.
+
+    #3557 : sur un lot gelé, un plancher qui dépasse le compte enregistré
+    **complète la désignation de ce gel** (sièges conservés, familles
+    manquantes choisies par la sélection déterministe et notifiées) ; le
+    résultat de cette complétion est rendu sous `designation`. `complete=False`
+    écrit le plancher seul (rejeu d'une version antérieure, `--apply` fera le
+    reste)."""
     if type(floor) is not int or not 0 <= floor <= MAX_FLOOR:
         raise work.WorkError("review floor must be 0, 1 or 2, not %r" % (floor,))
     who = work.corrector(cfg, db, actor, what="review floor", history=False)
@@ -149,18 +185,28 @@ def set_floor(cfg, db, lot: int, floor: int, *, reason: str = "",
            "actor": who,
            "changed": floor != previous["floor"]
                       or (human and floor > previous["human_floor"])}
-    if not out["changed"]:
-        return out
-    text = "%s %d" % (PREFIX, floor)
-    why = " ".join((reason or "").split())
-    if why:
-        text += " — " + why
-    # #3183 (B1 cx2) : la preuve structurée authentifie la ligne ; aucune
-    # écriture à texte libre du journal ne remplit `evidence`.
-    evidence = {"schema": EVIDENCE_SCHEMA, "floor": floor, "actor": who}
-    with db.transaction() as tx:
-        tx.execute("INSERT INTO work_item_events (work_item_id, state, note, actor, evidence)"
-                   " VALUES (%s, %s, %s, %s, %s::jsonb)",
-                   (int(lot), item["state"], text, who, json.dumps(evidence)))
-        tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s", (int(lot),))
+    if out["changed"]:
+        text = "%s %d" % (PREFIX, floor)
+        why = " ".join((reason or "").split())
+        if why:
+            text += " — " + why
+        # #3183 (B1 cx2) : la preuve structurée authentifie la ligne ; aucune
+        # écriture à texte libre du journal ne remplit `evidence`.
+        evidence = {"schema": EVIDENCE_SCHEMA, "floor": floor, "actor": who}
+        with db.transaction() as tx:
+            # #3557 : le verrou de la ligne du lot sérialise avec
+            # `add_milestone` (qui le prend avant d'insérer un gel et de lire
+            # le plancher). Un gel concurrent lit donc le plancher écrit ici
+            # ou la complétion qui suit voit son jalon achevé — jamais un gel
+            # à l'ancien compte sans complétion.
+            tx.execute("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                       (int(lot),))
+            tx.execute("INSERT INTO work_item_events (work_item_id, state, note, actor, evidence)"
+                       " VALUES (%s, %s, %s, %s, %s::jsonb)",
+                       (int(lot), item["state"], text, who, json.dumps(evidence)))
+            tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s", (int(lot),))
+    if complete:
+        # #3557 : une recharge de la même valeur retente aussi la complétion
+        # (le plancher a pu être écrit par une version sans complétion).
+        out["designation"] = _complete_designation(cfg, db, int(lot), floor)
     return out

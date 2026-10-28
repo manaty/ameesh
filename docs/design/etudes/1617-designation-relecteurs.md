@@ -48,6 +48,14 @@ read and returns a decision:
 - **explicit wait**: if independent families are missing, or an author's family
   is unknown, the state is `waiting` with the missing number, and a **capacity
   notification** goes to the pilot — never an implicit admission.
+- **partial designation** (#3596, 25 October 2026): when fewer independent
+  families are available than required, the available seats are designated **at
+  once** in the same order (pace, load, name); the state stays `waiting` with
+  `missing` = the remaining seats, and the capacity notification names the seats
+  already provided. A retry of the same freeze keeps those automatic seats (a
+  manual name never counts them twice, and they are not mailed again) and
+  provides only the missing ones; a new freeze retires them as before. An
+  unknown author family still designates nobody.
 - **mails**: each reviewer receives the lot, the `frozen` milestone and the
   **exact** SHA to review, the verdict command on that SHA, and the rule of §2
   (fixing a blocker oneself makes one an author: their review no longer counts,
@@ -167,9 +175,12 @@ the whole journal.
 A designation is **final** for its freeze; a wait is a **retryable marker**:
 one notification per freeze, and if capacity returns — or if the author
 evidence arrives — the designation replaces the marker for the same freeze, the
-mails to reviewers leaving only then, once. An unknown author provenance (#1465
-missing for a commit of the freeze) is not guessed: the designation moves to
-waiting with a notification, never a reviewer chosen at random.
+mails to reviewers leaving only then, once. Since #3596 a waiting mark may name
+the **partial** seats already provided: a retry keeps them, mails only the new
+seat, and a later full designation records the same seats plus the new one. An
+unknown author provenance (#1465 missing for a commit of the freeze) is not
+guessed: the designation moves to waiting with a notification, never a reviewer
+chosen at random.
 
 What must come from outside, and from whom:
 
@@ -473,6 +484,12 @@ diagnosis separates four facts:
   attempt and the 200-note scan window is walked over successive passes, so a
   backlog larger than one pass cannot starve the older freezes. The recovery
   command is therefore optional.
+  Since #3596 a manual seat alone does not make the lot resolved: the retry
+  reads the coverage once (the same policy reading as the recovery), then
+  journals `review-designation-manual:<lot>:<freeze>:` when the manual seats
+  cover the required opinions, and that marker makes the lot skipped on the
+  next pass. When they do not cover, the missing automatic seat is designated
+  beside them — one manual claude seat no longer hides the missing codex one.
 
 A remaining limit, not on the light path: the `pre-commit`/`post-commit`
 provenance hooks are installed at session open in the session's `cwd` repository

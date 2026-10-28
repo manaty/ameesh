@@ -2,10 +2,12 @@
 # #2097 — conclusion des checks « tests (flux) » quand l'agrégat n'a pas tourné.
 #
 # Le balayage #856 vit dans le job agrégé `tests` de tests.yml. GitHub ne
-# démarre jamais un job encore en file quand l'exécution est annulée :
-# `always()` n'y change rien. Un run annulé avant l'agrégat — poussée
-# remplacée, annulation à la main — laissait donc les checks « tests (flux)
-# <part> » dont l'étape `close` n'a pas tourné `in_progress` pour toujours
+# démarre pas toujours un job encore en file quand l'exécution est annulée,
+# `always()` compris : l'agrégat a démarré après l'annulation au run
+# 40180614008, jamais au run 38917093257 (#3564). Un run annulé avant
+# l'agrégat — poussée remplacée, annulation à la main — pouvait donc laisser
+# les checks « tests (flux) <part> » dont l'étape `close` n'a pas tourné
+# `in_progress` pour toujours
 # (run 38917093257, tête 7c0b34b195b9 : deux checks sur cinq encore en cours) ;
 # aucun jeton utilisateur ne peut les conclure (403 « You must authenticate via
 # a GitHub App. » : ils appartiennent à l'application GitHub Actions), et le

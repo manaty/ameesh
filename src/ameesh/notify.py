@@ -60,19 +60,25 @@ secrets (ntfy token, Slack webhook) come from an environment variable or a
 0600 file that the config NAMES — a secret value written in the config is
 refused. See docs/EXPLOITATION.md, "Alertes poussées — ameesh notify".
 
-Reliability: the delivery state is kept in `<state>/notify/state.json` (a
-lasting alert is not resent after a restart; an alert resolved while
-stopped is sent on restart); rate limited per human (beyond that, a
-summary, whose members enter the `notified` ledger once the summary is
-delivered); a failing channel does not block the others and is retried on
-later passes, a bounded number of times. #2395: the state also keeps a
-persistent `notified` ledger — one notification per alert identity (same
-`since`, same severity) and per human, even if the alert resolves and comes
-back, and even after `ameesh notify` restarts; `slo_breach` is never pushed
-to the owner (canon §9, owner decision 18/10), including from an old
-persisted summary bucket.
+Reliability: #3576 — the delivery state lives in the shared database
+(`notify_state`, a `ameesh-notify-state/1` document) under its own execution
+lease: the `alerts` pass may change host (#3383) without re-pushing a lasting
+alert or losing a resolution, and a holder whose lease expired cannot
+overwrite the new holder's state. `<state>/notify/state.json` remains the
+local document (read before the database for the #532 local console, and the
+fallback when the database is unreachable); the shared state supersedes it
+at the first pass that takes the lease. A lasting alert is not resent after
+a restart; an alert resolved while stopped is sent on restart; rate limited
+per human (beyond that, a summary, whose members enter the `notified` ledger
+once the summary is delivered); a failing channel does not block the others
+and is retried on later passes, a bounded number of times. #2395: the state
+also keeps a persistent `notified` ledger — one notification per alert
+identity (same `since`, same severity) and per human, even if the alert
+resolves and comes back, and even after `ameesh notify` restarts;
+`slo_breach` is never pushed to the owner (canon §9, owner decision 18/10),
+including from an old persisted summary bucket.
 
-Channels: `desktop`, `ntfy`, `slack`, `app`. L66 — the `desktop` channel
+Channels: `desktop`, `ntfy`, `slack`, `app`, `nexlink`. L66 — the `desktop` channel
 follows the OS through `ameesh.platform.notify`: `notify-send` on Linux,
 `osascript` on macOS, a Windows toast through `powershell.exe` under WSL2;
 native Windows comes with L67. `ameesh doctor --notify-test` says which
@@ -83,6 +89,17 @@ application reads the alerts through the mesh's event stream
 view. Declaring it in a route says that this human's alerts are read in the
 application; without it, a human whose only interface is the application
 would be counted as having no channel.
+
+`nexlink` (#3536, owner decision #138440) pushes the alert into the owner's
+Nexlink app through a signed HMAC request; the content is encrypted to the
+account's X25519 key-wrap key (generation 1) and wrapped per active key, so
+the hub only stores the envelope (`ameesh.nexlink_alerts`). Without an
+active key the alert is sent *content-free* (the app shows "mesh alert" and
+opens the console): no detail leaves the mesh. The optional `fallback`
+names an `ntfy`/`slack` channel that receives the same text, prefixed
+"repli nexlink —", after the second consecutive failure (or at once on a
+permanent error), once per alert; the primary keeps being retried, and a
+fallback success does not mark the alert delivered on the Nexlink side.
 """
 from __future__ import annotations
 
@@ -96,14 +113,16 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import config as config_mod
 from . import db as db_mod
-from . import alert_briefs, exploitation, fil, notify_gap, sous_utilisation, storage
+from . import alert_briefs, exploitation, fil, nexlink_alerts, notify_gap, \
+    sous_utilisation, storage
 from .config import Config
 from .platform import notify as platform_notify
 
@@ -136,6 +155,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #1883 : deux configurations de l'hôte déclarent le même nom de
                  # compte vers deux dossiers — lecture ambiguë, compte refusé
                  "account_identity",
+                 # #3647 : un rythme de compte local, hors du canon (§11)
+                 "account_pace_local",
                  # #313 : un autre mesh de l'hôte déclare le même identifiant de
                  # compte — quota et sessions partagés, contraire à 0033
                  "account_shared",
@@ -191,11 +212,21 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "budget_drift",
                  # #532: a local PgBouncer pool queues its mesh clients
                  "pgbouncer_pool_waiting")
-CHANNEL_KINDS = ("desktop", "ntfy", "slack", "app")
+CHANNEL_KINDS = ("desktop", "ntfy", "slack", "app", "nexlink")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_TIMEOUT_S = 10.0
 DEFAULT_INTERVAL_S = 30.0
+#: #3630 : anti-rebond du push `dead_runner` au propriétaire. Une coupure de
+#: bail courte (hôte volatil, bail de 90 s renouvelé toutes les 30 s) est
+#: reprise seule par l'exécuteur ; l'alerte n'est poussée qu'au-delà de cette
+#: grâce, mesurée depuis l'échéance du bail (`since`). Le seuil de détection
+#: (`--dead-grace`, 30 s) ne change pas : `ameesh alerts` voit la coupure.
+#: Les coupures mesurées sur pc-smichea le 25/10 (relecture #3630) vont
+#: jusqu'à 5,2 min après l'échéance (dev1 22:12:32 → 22:17:43) ; 8 min laisse
+#: ~2,8 min de marge. Une panne réelle qui persiste au-delà pousse une alerte,
+#: puis un seul `resolved`.
+DEAD_RUNNER_NOTIFY_GRACE_S = 480.0
 #: fenêtre de la limite de débit, et intervalle minimal entre deux résumés
 RATE_WINDOW_S = 60.0
 #: #2395 : rétention du registre `notified` (une notification par identité
@@ -216,6 +247,8 @@ CHANNEL_OPTIONS = {
     # L90 : l'application embarquée lit le journal d'événements ; le canal ne
     # porte ni adresse ni secret, il déclare seulement la route.
     "app": ("type", "timeout"),
+    # #3536 : API de l'app Nexlink, secret nommé + repli remote push.
+    "nexlink": ("type", "timeout", "url", "token_env", "token_file", "fallback"),
 }
 TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per_minute",
             "max_attempts", "interval", "timeout")
@@ -309,6 +342,10 @@ TYPE_LABELS = {
     # #2729 : plus aucun tour n'aboutit — la préemption prioritaire se répète ;
     # pas poussée par défaut (à ajouter dans `notify.types`), lue par `ameesh alerts`
     "preemption_streak": "agent preempted turn after turn",
+    # #3733 : briefée aux orchestrateurs de l'équipe et aux auditeurs
+    # (alert_briefs) ; pas poussée aux humains par défaut (à ajouter dans
+    # `notify.types`)
+    "rate_limited_chronic": "agent rate-limited a large share of the last hour",
     "critical_roles_unreadable": "canon unreadable: critical roles held",
     # #1466: briefed to the orchestrators and auditors (alert_briefs); not
     # pushed to humans by default (add it to `notify.types` to receive it)
@@ -320,6 +357,8 @@ TYPE_LABELS = {
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
+                # #3536 : « jamais de dépassement » — l'owner le sait tout de suite
+                "account_overage",
                 "credential_failing", "critical_budget_pause", "critical_turn_failures",
                 "owner_key_registered",
                 "land_uncertain", "db_connections_high", "pgbouncer_pool_waiting",
@@ -348,11 +387,15 @@ class NotifyConfigError(ValueError):
 
 class ChannelError(RuntimeError):
     """Échec d'envoi sur un canal. `permanent` : inutile de retenter tel quel
-    (binaire absent, secret manquant) — journalisé une fois, pas de retentative."""
+    (binaire absent, secret manquant) — journalisé une fois, pas de retentative.
+    `status` : le code HTTP quand le canal en a reçu un (#3536 : 409, 429…)."""
 
-    def __init__(self, message: str, permanent: bool = False):
+    def __init__(self, message: str, permanent: bool = False, status: int | None = None,
+                 body: bytes = b""):
         super().__init__(message)
         self.permanent = permanent
+        self.status = status
+        self.body = body
 
 
 # --------------------------------------------------------------------------
@@ -452,6 +495,19 @@ def _channel(name: str, raw) -> Channel:
         if not _TOPIC_RE.match(str(raw["topic"])):
             raise NotifyConfigError("notify.channels.%s.topic invalid: %r"
                                     % (name, raw["topic"]))
+    if kind == "nexlink":
+        if not raw.get("url"):
+            raise NotifyConfigError("notify.channels.%s: `url` is required" % name)
+        check_url(str(raw["url"]), "notify.channels.%s.url" % name)
+        parts = urllib.parse.urlsplit(str(raw["url"]))
+        if parts.query or parts.fragment:
+            raise NotifyConfigError(
+                "notify.channels.%s.url: query or fragment not allowed (the "
+                "channel appends `/mesh/alerts`)" % name)
+        if not raw.get("token_env") and not raw.get("token_file"):
+            raise NotifyConfigError(
+                "notify.channels.%s: name the shared secret (`token_env` or "
+                "`token_file`), never a value in the configuration" % name)
     for key in ("token_env", "webhook_env"):
         if key in raw and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(raw[key] or "")):
             raise NotifyConfigError("notify.channels.%s.%s: invalid variable name"
@@ -529,6 +585,35 @@ def parse_config(raw) -> NotifyConfig:
             else:
                 raise NotifyConfigError("channel %r used in routes but not declared "
                                         "(notify.channels)" % name)
+    # #3536 : le repli d'un canal `nexlink` est un canal DÉCLARÉ, remote push,
+    # jamais lui-même (pas de chaîne de replis).
+    for name, channel in channels.items():
+        if channel.kind != "nexlink" or not channel.options.get("fallback"):
+            continue
+        fallback = str(channel.options["fallback"])
+        target = channels.get(fallback)
+        if target is None:
+            raise NotifyConfigError(
+                "notify.channels.%s.fallback: channel %r is not declared "
+                "(notify.channels)" % (name, fallback))
+        if target.name == channel.name:
+            raise NotifyConfigError(
+                "notify.channels.%s.fallback: a channel cannot fall back to itself" % name)
+        if target.kind not in NEXLINK_FALLBACK_KINDS:
+            raise NotifyConfigError(
+                "notify.channels.%s.fallback: %r is a %s channel; a nexlink fallback "
+                "must be one of %s" % (name, fallback, target.kind,
+                                       ", ".join(NEXLINK_FALLBACK_KINDS)))
+    # #3536 : le repli ne double pas un canal déjà routé vers le même humain
+    for human, names in list(routes.items()) + [(None, default)]:
+        for name in names:
+            channel = channels[name]
+            fallback = channel.options.get("fallback") if channel.kind == "nexlink" else None
+            if fallback and fallback in names:
+                raise NotifyConfigError(
+                    "notify.routes.%s: %r and its nexlink fallback %r are both routed "
+                    "to the same human (double send); keep only the nexlink channel "
+                    "and let `fallback` cover it" % (human or "(default)", name, fallback))
     rate = int(_positive(raw.get("rate_per_minute", DEFAULT_RATE_PER_MINUTE),
                          "notify.rate_per_minute"))
     attempts = max(1, int(_positive(raw.get("max_attempts", DEFAULT_MAX_ATTEMPTS),
@@ -552,6 +637,13 @@ class Message:
     body: str
     urgent: bool = False
     low: bool = False
+    #: #3536 : identité portée jusqu'au canal `nexlink` (les autres canaux
+    #: l'ignorent) ; `alert_id` est posé par `_attempt`, qui connaît l'humain.
+    alert_id: str | None = None
+    event: str = "raised"
+    occurred_at: str | None = None
+    kind: str | None = None
+    context: dict = field(default_factory=dict)
 
     @property
     def text(self) -> str:
@@ -604,6 +696,27 @@ def _clean(text, limit: int = 300) -> str:
 
 def local_time(ts) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+
+
+def iso_utc(ts) -> str:
+    """L'instant UTC du protocole Nexlink (`2026-10-25T11:41:27Z`)."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+
+
+def _content_context(alert: dict) -> dict:
+    """Champs structurés joints au texte chiffré (jamais le détail brut)."""
+    context = {name: alert.get(name) for name in
+               ("lot", "decision", "host", "since", "agent", "project")
+               if alert.get(name) is not None}
+    if alert.get("title") is not None:      # le titre du LOT, pas celui du message
+        context["lot_title"] = alert.get("title")
+    return context
+
+
+def _identify(message: Message, alert: dict, event: str, now: float) -> Message:
+    """Marque un message de l'identité que le canal `nexlink` transporte."""
+    return replace(message, kind=str(alert.get("type") or "?"), event=event,
+                   occurred_at=iso_utc(now), context=_content_context(alert))
 
 
 def duration(seconds) -> str:
@@ -664,7 +777,8 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
         title = "ameesh: %sorphan lots (%s)" % (
             "resolved — " if event == "resolved" else "", subject)
         text = "[orphan_lot] %s\n%s" % (subject, _clean(alert.get("detail"), GROUPED_DETAIL_LIMIT))
-        return Message(title, text, low=event == "resolved", urgent=event != "resolved")
+        return _identify(Message(title, text, low=event == "resolved",
+                                 urgent=event != "resolved"), alert, event, now)
     label = TYPE_LABELS.get(kind, kind.replace("_", " "))
     subject = _subject(alert)
     since = alert.get("since")
@@ -680,7 +794,7 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
                                                                local_time(start)))
         else:
             lines.append("resolved")
-        return Message(title, "\n".join(lines), low=True)
+        return _identify(Message(title, "\n".join(lines), low=True), alert, event, now)
     title = "ameesh: %s%s" % (label, suffix)
     detail = _clean(alert.get("detail"))
     lines = ["[%s] %s" % (kind, subject)]
@@ -694,7 +808,9 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     # L94, L106 : une alerte peut se dire urgente elle-même (`balance_low`
     # sous 12 h, `host_power_low` au seuil d'arrêt), au-delà des types
     # toujours urgents
-    return Message(title, body, urgent=kind in URGENT_TYPES or bool(alert.get("urgent")))
+    return _identify(Message(title, body,
+                             urgent=kind in URGENT_TYPES or bool(alert.get("urgent"))),
+                     alert, event, now)
 
 
 def _summary_raised_counts(raised) -> dict:
@@ -719,7 +835,8 @@ def _summary_resolved_count(resolved) -> int:
     return int(resolved or 0)
 
 
-def render_summary(bucket: dict, host: str) -> Message:
+def render_summary(bucket: dict, host: str, *, alert_id: str | None = None,
+                   occurred_at: str | None = None) -> Message:
     raised = _summary_raised_counts(bucket.get("raised"))
     resolved = _summary_resolved_count(bucket.get("resolved"))
     total = sum(raised.values()) + resolved
@@ -737,13 +854,23 @@ def render_summary(bucket: dict, host: str) -> Message:
             "%d %s" % (n, TYPE_LABELS.get(kind, kind)) for kind, n in sorted(raised.items())
             if kind in sous_utilisation.UNDERUSE_TYPES)))
     body = "%s\nsee `ameesh alerts` on host %s" % ("; ".join(parts) or "—", host)
-    return Message(title, body, urgent=any(k in URGENT_TYPES for k in raised))
+    return Message(title, body, urgent=any(k in URGENT_TYPES for k in raised),
+                   alert_id=alert_id, kind="summary", occurred_at=occurred_at)
+
+
+def test_alert_id(human: str, channel: Channel, host: str) -> str:
+    """Identité stable d'un message de test (le statut/accusé la réutilise)."""
+    return nexlink_alerts.alert_id_for(
+        "test|%s|%s|%s" % (human, channel.name, host))
 
 
 def render_test(human: str, channel: Channel, host: str) -> Message:
-    return Message("ameesh: test message",
-                   "Channel %s (%s) of %s, from host %s: operations alerts will "
-                   "reach you here." % (channel.name, channel.kind, human, host))
+    return replace(Message("ameesh: test message",
+                           "Channel %s (%s) of %s, from host %s: operations alerts "
+                           "will reach you here." % (channel.name, channel.kind, human,
+                                                     host)),
+                   alert_id=test_alert_id(human, channel, host), kind="test",
+                   occurred_at=iso_utc(time.time()))
 
 
 # --------------------------------------------------------------------------
@@ -839,19 +966,48 @@ def channel_secrets(channel: Channel, env: dict | None = None) -> tuple:
 #: #3383: the channel kinds that reach a human from ANY host. The alerts role
 #: timer pushes from whichever candidate holds the lease: `desktop` needs that
 #: host's graphical session, `app` only records the alert in the event log.
-REMOTE_PUSH_KINDS = ("ntfy", "slack")
+REMOTE_PUSH_KINDS = ("ntfy", "slack", "nexlink")
+
+#: #3536 : canaux admis comme repli d'un canal `nexlink` (jamais un autre
+#: `nexlink` : pas de chaîne de replis, pas de récursion de couverture).
+NEXLINK_FALLBACK_KINDS = ("ntfy", "slack")
+#: durée du cache des clés key-wrap d'un compte (`GET /mesh/alerts/keys`).
+NEXLINK_KEYS_TTL_S = 3600.0
 
 
-def remote_push_problem(channel: Channel, env: dict | None = None) -> str:
+def remote_push_problem(channel: Channel, env: dict | None = None,
+                        ncfg: "NotifyConfig | None" = None) -> str:
     """'' when ``channel`` can push from this environment, else why.
 
     The secret is resolved exactly as `Sender` does (file or environment
     variable, then L46's value check); the reason names the variable or the
-    file, never the value.
+    file, never the value. #3536: a `nexlink` channel also needs the
+    `cryptography` extra; when either the extra or the secret is missing but
+    its configured `fallback` is a remote push whose own secret resolves
+    (``ncfg`` given), the channel is still covered.
     """
     if channel.kind not in REMOTE_PUSH_KINDS:
         return "%s: %s is not a remote push" % (channel.name, channel.kind)
     env = dict(os.environ if env is None else env)
+    if channel.kind == "nexlink":
+        problem = ""
+        if not nexlink_alerts.crypto_available():
+            problem = ("channel %s: the `cryptography` module is missing "
+                       "(install the `ameesh[crypto]` extra)" % channel.name)
+        else:
+            try:
+                value = _secret(channel, env, "token_env", "token_file", None, True)
+                check_secret_value(value, "channel %s: mesh secret" % channel.name)
+            except ChannelError as exc:
+                problem = str(exc)
+        if not problem:
+            return ""
+        fallback = (ncfg.channels.get(str(channel.options.get("fallback") or ""))
+                    if ncfg is not None else None)
+        if (fallback is not None and fallback.name != channel.name
+                and not remote_push_problem(fallback, env)):
+            return ""
+        return problem
     try:
         if channel.kind == "slack":
             value = _secret(channel, env, "webhook_env", "webhook_file",
@@ -866,12 +1022,95 @@ def remote_push_problem(channel: Channel, env: dict | None = None) -> str:
     return ""
 
 
-def _post(url: str, data: bytes, headers: dict, timeout: float, *, show_url: bool,
-          secrets: tuple = ()) -> None:
-    """`show_url=False` : l'URL est un secret — aucun message d'erreur ne la
+def fallback_readiness(ncfg: NotifyConfig, channel: Channel,
+                       env: dict | None = None) -> dict | None:
+    """#3536 : l'état du repli d'un canal `nexlink`, affiché par `--test`.
+
+    ``None`` sans repli ; sinon ``{channel, ready[, problem]}``. La question
+    posée est celle de `role timers --check` : le repli est-il un remote push
+    utilisable depuis cet environnement ?
+    """
+    if channel.kind != "nexlink":
+        return None
+    name = channel.options.get("fallback")
+    if not name:
+        return None
+    target = ncfg.channels.get(str(name))
+    if target is None:
+        return {"channel": str(name), "ready": False,
+                "problem": "channel not declared"}
+    problem = remote_push_problem(target, env)
+    out = {"channel": target.name, "ready": not problem}
+    if problem:
+        out["problem"] = problem
+    return out
+
+
+def nexlink_crypto_problem(channel: Channel, env: dict | None = None,
+                           ncfg: "NotifyConfig | None" = None) -> str:
+    """#3619 : le manque de l'extra `crypto` d'un canal `nexlink`, ou ''.
+
+    Le chiffrement n'est pas optionnel : sans `cryptography`, un canal routé
+    ne s'active pas. Le repli `ntfy`/`slack` déclaré et utilisable le couvre
+    (#3536), comme pour `role timers --check`. Le secret du canal primaire
+    n'est pas regardé : ce contrôle porte sur la dépendance de l'hôte, pas
+    sur une credential (#3402).
+    """
+    if channel.kind != "nexlink" or nexlink_alerts.crypto_available():
+        return ""
+    env = dict(os.environ if env is None else env)
+    fallback = (ncfg.channels.get(str(channel.options.get("fallback") or ""))
+                if ncfg is not None else None)
+    if (fallback is not None and fallback.name != channel.name
+            and not remote_push_problem(fallback, env)):
+        return ""
+    return ("the `cryptography` module is missing (install the "
+            "`ameesh[psycopg,crypto]` extra)")
+
+
+def nexlink_activation(cfg, env: dict | None = None) -> tuple[bool, list[str]]:
+    """#3619 : `ameesh doctor` — les canaux `nexlink` routés de cet hôte.
+
+    Rend ``(ok, lignes)``. Un canal routé qui ne peut pas chiffrer et que
+    aucun repli utilisable ne couvre est refusé (``ok=False``) et nommé,
+    **avant tout envoi** : l'activation échoue fermée, jamais par un
+    `ModuleNotFoundError` au premier envoi. Un canal couvert par son repli
+    reste prêt (#3536). Aucun canal `nexlink` routé : ``(True, [])``.
+    """
+    try:
+        ncfg = parse_config(getattr(cfg, "notify", None))
+    except NotifyConfigError as exc:
+        return False, ["configuration refused: %s" % " ".join(str(exc).split())[:200]]
+    names = set()
+    for route in ncfg.routes.values():
+        names.update(route)
+    names.update(ncfg.default)
+    ok = True
+    lines = []
+    for name in sorted(names):
+        channel = ncfg.channels.get(str(name))
+        if channel is None or channel.kind != "nexlink":
+            continue
+        problem = nexlink_crypto_problem(channel, env, ncfg=ncfg)
+        if problem:
+            ok = False
+            lines.append("channel %s refused: %s" % (channel.name, problem))
+        else:
+            lines.append("channel %s ready" % channel.name)
+    return ok, lines
+
+
+def _request(url: str, data: bytes | None, headers: dict, timeout: float, *,
+             method: str = "POST", show_url: bool = True,
+             secrets: tuple = ()) -> tuple[int, bytes]:
+    """Une requête HTTP ; rend ``(statut, corps)`` et lève `ChannelError`.
+
+    `show_url=False` : l'URL est un secret — aucun message d'erreur ne la
     contient (L46 : message fixe pour une URL invalide, et tout texte venu
     d'une exception est nettoyé). `secrets` : autres valeurs à ne jamais
-    laisser passer (jeton d'un en-tête)."""
+    laisser passer (jeton d'un en-tête). Le code HTTP est porté par
+    `ChannelError.status` (#3536 : 409, 429).
+    """
     hidden = tuple(secrets) + (() if show_url else (url,))
 
     def clean(text) -> str:
@@ -882,18 +1121,20 @@ def _post(url: str, data: bytes, headers: dict, timeout: float, *, show_url: boo
     opener = urllib.request.build_opener(*handlers)
     where = (" (%s)" % url) if show_url else ""
     try:
-        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
         with opener.open(request, timeout=timeout) as response:
-            response.read(4096)
+            return int(getattr(response, "status", 0) or 0), response.read(65536)
     except urllib.error.HTTPError as exc:
         try:
-            extrait = clean(exc.read(300).decode("utf-8", "replace"))
+            payload = exc.read(4096)
+            extrait = clean(payload[:300].decode("utf-8", "replace"))
         except OSError:
-            extrait = ""
+            payload, extrait = b"", ""
         finally:
             exc.close()
         raise ChannelError("HTTP %d%s%s" % (exc.code, where,
-                                           ": %s" % extrait if extrait else "")) from None
+                                           ": %s" % extrait if extrait else ""),
+                           status=int(exc.code), body=payload) from None
     except urllib.error.URLError as exc:
         raise ChannelError("unreachable%s: %s" % (where, clean(exc.reason))) from None
     except (http.client.InvalidURL, ValueError) as exc:
@@ -904,6 +1145,13 @@ def _post(url: str, data: bytes, headers: dict, timeout: float, *, show_url: boo
         raise ChannelError("send failed%s: %s" % (where, clean(exc))) from None
     except (OSError, http.client.HTTPException) as exc:
         raise ChannelError("send failed%s: %s" % (where, clean(exc))) from None
+
+
+def _post(url: str, data: bytes, headers: dict, timeout: float, *, show_url: bool,
+          secrets: tuple = ()) -> None:
+    """Le POST historique (ntfy, Slack) : le corps de la réponse est ignoré."""
+    _request(url, data, headers, timeout, method="POST", show_url=show_url,
+             secrets=secrets)
 
 
 def _header(value: str) -> str:
@@ -927,6 +1175,10 @@ class Sender:
     def __init__(self, env: dict | None = None, timeout: float = DEFAULT_TIMEOUT_S):
         self.env = dict(os.environ if env is None else env)
         self.timeout = timeout
+        #: #3536 : clés key-wrap par URL (`GET /mesh/alerts/keys`, TTL 1 h)
+        self._nexlink_keys: dict = {}
+        #: #3536 : dernier envoi par canal (le statut/accusé de `--test`)
+        self.last: dict = {}
 
     def send(self, channel: Channel, message: Message) -> None:
         timeout = float(channel.options.get("timeout") or self.timeout)
@@ -970,6 +1222,201 @@ class Sender:
         _post(url, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
               {"Content-Type": "application/json; charset=utf-8"}, timeout,
               show_url=False)   # l'URL d'un webhook est un secret : jamais journalisée
+
+    # -- #3536 : canal nexlink ------------------------------------------------
+    def _nexlink_secret(self, channel: Channel) -> str:
+        """Le secret HMAC nommé du canal ; jamais une valeur de la config."""
+        secret = _secret(channel, self.env, "token_env", "token_file", None, True)
+        return check_secret_value(secret, "channel %s: mesh secret" % channel.name)
+
+    def _nexlink_key_id(self) -> str:
+        """L'identité HMAC de l'émetteur (`AMEESH_NEXLINK_KEY_ID`, sinon v1)."""
+        value = str(self.env.get("AMEESH_NEXLINK_KEY_ID")
+                    or nexlink_alerts.MESH_ALERT_KEY_ID)
+        # la valeur entre dans la chaîne signée ET dans un en-tête : pas de
+        # blanc, de retour à la ligne ni de séparateur de champ
+        if not re.match(r"^[A-Za-z0-9._-]{1,64}$", value):
+            raise ChannelError("AMEESH_NEXLINK_KEY_ID: invalid key id",
+                               permanent=True)
+        return value
+
+    def _nexlink_call(self, channel: Channel, method: str, path: str,
+                      payload: dict | None, timeout: float) -> bytes:
+        """Une requête signée vers l'API Nexlink ; rend le corps 2xx."""
+        url = str(channel.options["url"]).rstrip("/") + path
+        body = (b"" if payload is None else
+                json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":")).encode("utf-8"))
+        secret = self._nexlink_secret(channel)
+        headers = nexlink_alerts.mesh_headers(secret, body,
+                                              key_id=self._nexlink_key_id())
+        headers["Accept"] = "application/json"
+        if payload is not None:
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        _, raw = _request(url, body if method != "GET" else None, headers, timeout,
+                          method=method, show_url=True, secrets=(secret,))
+        return raw
+
+    @staticmethod
+    def _json_object(raw: bytes, what: str) -> dict:
+        try:
+            data = json.loads(bytes(raw).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise ChannelError("%s: invalid JSON response" % what,
+                               permanent=True) from None
+        if not isinstance(data, dict):
+            raise ChannelError("%s: JSON object expected" % what, permanent=True)
+        return data
+
+    def _nexlink_keys_for(self, channel: Channel, timeout: float) -> dict:
+        """Les clés key-wrap actives du compte owner (cache 1 h)."""
+        url = str(channel.options["url"]).rstrip("/") + "/mesh/alerts/keys"
+        cached = self._nexlink_keys.get(url)
+        now = time.time()
+        if cached and now - cached[0] < NEXLINK_KEYS_TTL_S:
+            return cached[1]
+        raw = self._nexlink_call(channel, "GET", "/mesh/alerts/keys", None, timeout)
+        data = self._json_object(raw, "mesh alerts keys")
+        account = data.get("account_id")
+        try:
+            nexlink_alerts.uuid_bytes(account)
+        except ValueError:
+            raise ChannelError("mesh alerts keys: invalid account_id",
+                               permanent=True) from None
+        keys = data.get("keys")
+        if not isinstance(keys, list):
+            raise ChannelError("mesh alerts keys: `keys` list expected",
+                               permanent=True)
+        active = []
+        for entry in keys:
+            if not isinstance(entry, dict):
+                raise ChannelError("mesh alerts keys: object expected", permanent=True)
+            if entry.get("active") is False:
+                continue
+            alg = entry.get("alg")
+            if alg not in (None, nexlink_alerts.KEY_ALG):
+                raise ChannelError("mesh alerts keys: unsupported alg %r" % (alg,),
+                                   permanent=True)
+            try:
+                gen = int(entry.get("gen"))
+                public = bytes.fromhex(str(entry.get("public_key") or ""))
+            except (TypeError, ValueError):
+                raise ChannelError("mesh alerts keys: invalid key entry",
+                                   permanent=True) from None
+            key_id = str(entry.get("key_id") or "")
+            if not key_id or gen <= 0 or len(public) != 32:
+                raise ChannelError("mesh alerts keys: invalid key entry",
+                                   permanent=True)
+            active.append({"key_id": key_id, "gen": gen, "public_key": public})
+        data = {"account_id": str(account), "keys": active}
+        self._nexlink_keys[url] = (now, data)
+        return data
+
+    def _nexlink_envelope(self, message: Message, keys: dict) -> dict:
+        """L'enveloppe claire : identité + chiffré + un wrap par clé active."""
+        alert_id = message_alert_id(message)
+        occurred_at = message.occurred_at or iso_utc(time.time())
+        # #3537 refuse tout champ inconnu (`forbidNonWhitelisted`) : le clair
+        # ne porte que les champs du DTO ; l'événement reste dans le chiffré.
+        envelope = {"v": nexlink_alerts.ENVELOPE_V, "alert_id": alert_id,
+                    "severity": "urgent" if message.urgent else "normal",
+                    "occurred_at": occurred_at}
+        active = keys.get("keys") or []
+        if not active:
+            # content-free : aucun détail ne quitte le mesh, ce n'est pas un échec
+            envelope["content_free"] = True
+            return envelope
+        try:
+            cek = nexlink_alerts.new_cek()
+            nonce, sealed = nexlink_alerts.seal_content(
+                cek,
+                nexlink_alerts.content_plaintext(message.title, message.body,
+                                                 kind=message.kind,
+                                                 event=message.event,
+                                                 context=message.context),
+                nexlink_alerts.content_aad(alert_id, occurred_at))
+            wraps = []
+            for key in active:
+                wrapped = nexlink_alerts.wrap_to_x25519(
+                    key["public_key"],
+                    nexlink_alerts.WrapContext(keys["account_id"], key["gen"]),
+                    cek)
+                wraps.append({"key_id": key["key_id"], "gen": key["gen"],
+                              "wrap": nexlink_alerts.b64e(wrapped)})
+        except nexlink_alerts.CryptoUnavailable as exc:
+            raise ChannelError(str(exc), permanent=True) from None
+        except (ValueError, TypeError) as exc:
+            raise ChannelError("nexlink encryption: %s" % _clean(exc, 120),
+                               permanent=True) from None
+        envelope.update({"ciphertext": nexlink_alerts.b64e(sealed),
+                         "nonce": nexlink_alerts.b64e(nonce), "wraps": wraps})
+        return envelope
+
+    def _nexlink_post(self, channel: Channel, envelope: dict, delivery: str,
+                      timeout: float) -> bytes:
+        url = str(channel.options["url"]).rstrip("/") + "/mesh/alerts"
+        body = json.dumps(envelope, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":")).encode("utf-8")
+        secret = self._nexlink_secret(channel)
+        headers = nexlink_alerts.mesh_headers(secret, body,
+                                              key_id=self._nexlink_key_id())
+        headers.update({"Accept": "application/json",
+                        "Content-Type": "application/json; charset=utf-8",
+                        "X-Mesh-Idempotency-Key": delivery})
+        _, raw = _request(url, body, headers, timeout, method="POST", show_url=True,
+                          secrets=(secret,))
+        return raw
+
+    def _nexlink(self, channel: Channel, message: Message, timeout: float) -> None:
+        """Pousse une alerte dans l'app Nexlink (POST signé, contenu chiffré)."""
+        alert_id = message_alert_id(message)
+        if (message.event or "raised") != "raised":
+            # #3537 v1 ne stocke que l'alerte levée (pas d'état de résolution
+            # dans son schéma) ; la ligne de l'app reste levée, sans 400.
+            self.last[channel.name] = {"alert_id": alert_id,
+                                       "skipped": message.event or "raised"}
+            return
+        delivery = nexlink_alerts.delivery_key(message.event or "raised", alert_id)
+        keys = self._nexlink_keys_for(channel, timeout)
+        envelope = self._nexlink_envelope(message, keys)
+        try:
+            raw = self._nexlink_post(channel, envelope, delivery, timeout)
+        except ChannelError as exc:
+            if exc.status == 409 and b"key_unknown" in (exc.body or b""):
+                # clé de wrap inconnue : on relit les clés et on réessaie une fois
+                self._nexlink_keys.pop(str(channel.options["url"]).rstrip("/")
+                                       + "/mesh/alerts/keys", None)
+                keys = self._nexlink_keys_for(channel, timeout)
+                envelope = self._nexlink_envelope(message, keys)
+                try:
+                    raw = self._nexlink_post(channel, envelope, delivery, timeout)
+                except ChannelError as again:
+                    if again.status == 409:
+                        raise ChannelError("key_unknown after refreshing keys",
+                                           permanent=True, status=409,
+                                           body=again.body) from None
+                    raise
+            elif exc.status and 400 <= exc.status < 500 and exc.status not in (409, 429):
+                raise ChannelError(str(exc), permanent=True, status=exc.status,
+                                   body=exc.body) from None
+            else:
+                raise
+        accepted = self._json_object(raw, "mesh alert accepted")
+        if accepted.get("accepted") is False:
+            raise ChannelError("mesh alert not accepted", permanent=True)
+        self.last[channel.name] = {"alert_id": alert_id, "delivery": delivery,
+                                   "accepted": accepted.get("accepted"),
+                                   "duplicate": accepted.get("duplicate"),
+                                   "id": accepted.get("id")}
+
+    def receipt(self, channel: Channel, alert_id: str,
+                timeout: float | None = None) -> dict:
+        """`GET /mesh/alerts/{id}` signé : l'accusé de lecture (jamais sondé)."""
+        if timeout is None:
+            timeout = float(channel.options.get("timeout") or self.timeout)
+        path = "/mesh/alerts/" + urllib.parse.quote(str(alert_id), safe="")
+        raw = self._nexlink_call(channel, "GET", path, None, timeout)
+        return self._json_object(raw, "mesh alert receipt")
 
     def _app(self, channel: Channel, message: Message, timeout: float) -> None:
         """L90 : le canal de l'interface embarquée. Rien à pousser : l'alerte
@@ -1105,7 +1552,30 @@ def state_path(cfg: Config) -> str:
 
 def empty_state() -> dict:
     return {"schema": STATE_SCHEMA, "active": {}, "resolved": {}, "rate": {},
-            "summary": {}, "last_summary": {}, "briefs": {}, "notified": {}}
+            "summary": {}, "last_summary": {}, "briefs": {}, "notified": {},
+            #: #3536 : replis nexlink déjà envoyés (une fois par alert_id)
+            "fallback": {},
+            #: #3761 : verdicts de porte des avis, relus seulement quand le
+            #: gel, la cible, les jalons ou le canon changent
+            "gates": {}}
+
+
+#: #3576 : le document d'envoi et son bail d'exécution sont partagés en base
+#: (`notify_state`), pour que la passe `alerts` change d'hôte sans re-pousser.
+#: La durée du bail couvre le `TimeoutStartSec=10min` de l'unité de rôle
+#: (`role_timers.render_service`) : un passage anormalement long ne livre
+#: jamais au-delà de l'expiration de son unité.
+STATE_SCOPE = "alerts"
+STATE_LEASE_S = 600.0
+
+
+def _state_from_document(data) -> dict | None:
+    """Valide un document `ameesh-notify-state/1` ; None s'il n'en est pas un."""
+    if not isinstance(data, dict) or data.get("schema") != STATE_SCHEMA:
+        return None
+    state = empty_state()
+    state.update({k: v for k, v in data.items() if k in state and isinstance(v, dict)})
+    return state
 
 
 def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
@@ -1115,7 +1585,8 @@ def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-        if not isinstance(data, dict) or data.get("schema") != STATE_SCHEMA:
+        state = _state_from_document(data)
+        if state is None:
             raise ValueError("unexpected schema")
     except FileNotFoundError:
         return empty_state()
@@ -1131,8 +1602,6 @@ def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
             log("unreadable delivery state (%s): set aside as %s, starting from an empty "
                 "state" % (exc, aside))
         return empty_state()
-    state = empty_state()
-    state.update({k: v for k, v in data.items() if k in state and isinstance(v, dict)})
     return state
 
 
@@ -1146,6 +1615,193 @@ def save_state(path: str, state: dict) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+
+
+#: Un jeton par processus : un PID recyclé après un redémarrage ne reprend
+#: jamais le bail de son incarnation précédente (l'epoch, lui, ne recule pas).
+_STATE_RUN = os.urandom(4).hex()
+
+
+def state_owner(cfg: Config) -> str:
+    """Identité du processus sur le bail d'état : hôte, PID et jeton de run.
+
+    Une relève change d'hôte, donc d'owner ; le jeton empêche un PID recyclé
+    de se faire passer pour l'ancien détenteur.
+    """
+    host = str(getattr(cfg, "host", None) or "?").strip() or "?"
+    return "%s:%d:%s" % (host, os.getpid(), _STATE_RUN)
+
+
+def load_shared_state(db) -> dict | None:
+    """#3576 : le document partagé de la passe alerts, None tant qu'il n'est
+    pas amorcé (premier détenteur depuis la migration)."""
+    return _state_from_document(storage.of(db).notify_liveness.read_state(STATE_SCOPE))
+
+
+def save_shared_state(db, state: dict, *, owner: str, epoch: int) -> bool:
+    """Écrit le document sous le bail vivant `(owner, epoch)` ; False s'il a
+    été perdu ou a expiré (le détenteur ne doit alors plus livrer)."""
+    return storage.of(db).notify_liveness.save_state(
+        STATE_SCOPE, state, owner=owner, epoch=epoch)
+
+
+def _local_entry_owned(entry, host) -> bool:
+    """Une entrée de console appartient-elle à cet hôte ?
+
+    Les `LOCAL_TYPES` naissent de la console d'UN hôte (`pgbouncer_local`
+    pose `alert.host`) : le document partagé en porte plusieurs, et un hôte
+    ne doit ni résoudre ni fusionner celle d'un autre (#3576, relecture cx1).
+    """
+    alert = (entry or {}).get("alert") or {}
+    return (alert.get("type") in LOCAL_TYPES
+            and str(alert.get("host") or "") == str(host or ""))
+
+
+def _summary_key_host(key) -> str | None:
+    """L'hôte d'une clé d'alerte (`key_of` est une liste JSON), ou None."""
+    try:
+        parsed = json.loads(key)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, list) or len(parsed) < 3:
+        return None
+    return str(parsed[2] or "")
+
+
+def _merge_local_state(local: dict, shared: dict, host, *,
+                       removed=()) -> None:
+    """Reporte dans l'état partagé ce que seul le passage local a produit.
+
+    `run_local_pass` tourne avant la base (#532) : ses alertes de console
+    (`LOCAL_TYPES`) et son registre ne peuvent pas venir du document partagé.
+    Seules les entrées de CET hôte traversent : une entrée de console d'un
+    autre hôte reste à lui. Une résolution locale retire la clé de `active` du
+    document partagé, sinon elle y reste et le passage suivant la re-résout à
+    chaque tick (relecture cx1). `removed` porte les clés que le passage local
+    a retirées même quand `_resolved` n'écrit rien (acknowledged, notifiee,
+    sans_canal, type retiré) : sans elles, la clé resterait active dans le
+    partagé et une ligne resolved repartirait à chaque tick (relecture dev4).
+    Tout le reste est remplacé par l'état partagé — c'est la règle du
+    dédoublonnage entre hôtes.
+    """
+    owned_keys = set()
+    for key, entry in (local.get("active") or {}).items():
+        if _local_entry_owned(entry, host):
+            shared["active"][key] = entry
+            owned_keys.add(key)
+    for key, entry in (local.get("resolved") or {}).items():
+        if _local_entry_owned(entry, host):
+            shared["active"].pop(key, None)
+            shared["resolved"][key] = entry
+            owned_keys.add(key)
+    for identity, sent_ts in (local.get("notified") or {}).items():
+        shared["notified"][identity] = max(
+            float(sent_ts), float(shared["notified"].get(identity, 0.0)))
+    for human, stamps in (local.get("rate") or {}).items():
+        known = {float(stamp) for stamp in shared["rate"].get(human) or ()}
+        shared["rate"][human] = list(shared["rate"].get(human) or ()) + [
+            stamp for stamp in stamps if float(stamp) not in known]
+    for human, bucket in (local.get("summary") or {}).items():
+        if not isinstance(bucket, dict):
+            continue
+        for event in ("raised", "resolved"):
+            members = bucket.get(event)
+            if not isinstance(members, dict):
+                continue
+            for identity, member in members.items():
+                if not isinstance(member, dict) or member.get("type") not in LOCAL_TYPES:
+                    continue
+                if member.get("key") not in owned_keys \
+                        and _summary_key_host(member.get("key")) != str(host or ""):
+                    continue
+                target = shared["summary"].get(human)
+                if not isinstance(target, dict):
+                    target = shared["summary"][human] = {}
+                target.setdefault(event, {})[identity] = member
+    for key in removed or ():
+        shared["active"].pop(key, None)
+
+
+def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
+                       log=None) -> tuple[tuple[str, int] | None, bool]:
+    """Prend le bail d'état partagé et lit le document (rendu ``(bail,
+    livre)``).
+
+    ``livre`` est faux quand un autre hôte détient le bail : ce passage se
+    met en veille, sans livrer ni écrire (l'autre hôte le fait). En
+    ``--dry-run``, le document est lu sans bail et rien n'est écrit.
+    """
+    log = log or notifier.log
+    if dry_run:
+        shared = load_shared_state(db)
+        if shared is not None:
+            _merge_local_state(notifier.state, shared, getattr(cfg, "host", None),
+                               removed=notifier.local_resolved_keys)
+            notifier.state = shared
+            notifier.local_resolved_keys.clear()
+        return None, True
+    owner = state_owner(cfg)
+    try:
+        epoch = storage.of(db).notify_liveness.acquire_state(
+            STATE_SCOPE, owner, STATE_LEASE_S)
+    except db_mod.DbError as exc:
+        if getattr(exc, "sqlstate", None) != "42P01":
+            raise
+        # The migration is applied before the runners (§14), but the owner
+        # channel must not fall silent on a host updated ahead of the base:
+        # deliver from the local document, loudly, until `ameesh migrate`.
+        log("shared delivery state table missing (migration 0487 not applied): "
+            "delivering from the local state, duplicates possible until it is")
+        return None, True
+    if epoch is None:
+        log("another host holds the alerts delivery state (shared lease): "
+            "standing by, nothing is delivered")
+        return None, False
+    try:
+        shared = load_shared_state(db)
+        if shared is None:
+            # Premier détenteur depuis la migration : son état local amorce le
+            # document partagé (les autres hôtes liront celui-ci). Le passage
+            # local a déjà retiré ses clés résolues de `active` ; aucun
+            # tombstone n'est donc nécessaire dans le document amorcé.
+            save_shared_state(db, notifier.state, owner=owner, epoch=epoch)
+            notifier.local_resolved_keys.clear()
+        else:
+            _merge_local_state(notifier.state, shared, getattr(cfg, "host", None),
+                               removed=notifier.local_resolved_keys)
+            notifier.state = shared
+            notifier.local_resolved_keys.clear()
+    except Exception:
+        # Ne pas garder un bail qu'aucune passe n'utilisera (base tombée
+        # entre la prise et la lecture) : le prochain essai doit pouvoir le
+        # prendre sans attendre son expiration.
+        try:
+            storage.of(db).notify_liveness.release_state(STATE_SCOPE, owner, epoch)
+        except Exception:
+            pass
+        raise
+    return (owner, epoch), True
+
+
+def leave_shared_state(db, notifier, lease, *, log=None) -> bool:
+    """Écrit le document partagé sous le bail, puis le rend.
+
+    False si l'écriture a été refusée (bail perdu ou expiré) : la livraison a
+    eu lieu, l'état n'est plus celui du détenteur courant.
+    """
+    if lease is None:
+        return True
+    owner, epoch = lease
+    log = log or notifier.log
+    saved = False
+    try:
+        saved = save_shared_state(db, notifier.state, owner=owner, epoch=epoch)
+        if not saved:
+            log("alerts delivery state NOT saved: the shared lease was lost or "
+                "expired; the next holder may re-push")
+        return saved
+    finally:
+        storage.of(db).notify_liveness.release_state(STATE_SCOPE, owner, epoch)
 
 
 def key_of(alert: dict) -> str:
@@ -1193,6 +1849,20 @@ def _notification_id(key, severity, human, since=None) -> str:
     return json.dumps([key, severity, human, since], ensure_ascii=False)
 
 
+def message_alert_id(message: Message) -> str:
+    """L'identité stable d'un message pour le canal `nexlink`.
+
+    Posée par `_attempt` (identité du registre `notified` en UUIDv5) et par
+    `_summaries` (identité de l'épisode de bucket) ; un message construit
+    sans elle (test ad hoc) en reçoit une dérivée de son texte, stable entre
+    deux essais et valide comme UUID pour l'API #3537.
+    """
+    if message.alert_id:
+        return message.alert_id
+    return nexlink_alerts.alert_id_for(
+        "%s\n%s" % (message.title, message.body))
+
+
 def _since_of(alert: dict):
     """`since` de l'épisode, arrondi comme dans `exploitation.alert_key` ; None
     si l'alerte n'en a pas (elle n'entre alors pas au registre `notified`)."""
@@ -1214,6 +1884,25 @@ def _entry_severity(entry: dict):
         return None
     from . import alert_ack
     return alert_ack.severity(alert)
+
+
+def _held_dead_runner(alert: dict, now: float) -> bool:
+    """#3630 : l'alerte `dead_runner` est encore dans sa grâce d'anti-rebond.
+
+    La grâce se mesure depuis l'échéance du bail (`since`), comme la
+    détection : une coupure courte (60 s) reprise avant l'échéance de la
+    grâce ne pousse rien. Une alerte sans `since` n'est jamais retenue — on
+    ne tait pas une alerte incomplète —, ni un âge illisible.
+    """
+    if alert.get("type") != "dead_runner":
+        return False
+    since = alert.get("since")
+    if since is None:
+        return False
+    try:
+        return float(now) - float(since) < DEAD_RUNNER_NOTIFY_GRACE_S
+    except (TypeError, ValueError):
+        return False
 
 
 def forces_owner(alert: dict) -> bool:
@@ -1311,8 +2000,15 @@ class Notifier:
         #: None le coupe (défaut : aucun balayage du mesh actif à ce stade)
         self.wip = wip
         self.state = state if state is not None else empty_state()
+        #: #3576 (relecture dev4) : clés de console retirées de `active` par le
+        #: passage local, à retirer du document partagé à la fusion suivante.
+        #: En mémoire seulement : une console calmée sans envoi ne laisse
+        #: aucune entrée `resolved`, et la clé resterait active dans le partagé.
+        self.local_resolved_keys: set = set()
         self.dry_run = dry_run
         self.sender = sender or (DrySender() if dry_run else Sender(timeout=ncfg.timeout))
+        #: les enregistrements du dernier passage (remplacé par `run_pass`)
+        self._records: list = []
         self.emit = emit or (lambda record: None)
         self.log = log or _stderr_log
         self.clock = clock or time.time
@@ -1362,8 +2058,17 @@ class Notifier:
             # #1179 : la console du pool local n'est pas lue par la passe
             # ordinaire ; `run_local_pass` la lit depuis `cfg` seule et reste
             # seul juge de ses alertes. Une console illisible n'y échoue plus.
-            current = exploitation.alerts(self.cfg, db, now=now, local_pool=False,
-                                          unreadable=unreadable, **thresholds)
+            # #3761 : la porte des avis est un calcul Git coûteux mais stable
+            # tant que le gel, la cible, les jalons et le canon ne bougent pas ;
+            # son verdict est porté par l'état de la passe (document partagé).
+            gate_cache = self.state.get("gates")
+            if not isinstance(gate_cache, dict):
+                gate_cache = self.state["gates"] = {}
+            from . import canon as canon_mod
+            with canon_mod.configured_cache():
+                current = exploitation.alerts(
+                    self.cfg, db, now=now, local_pool=False,
+                    unreadable=unreadable, gate_cache=gate_cache, **thresholds)
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
@@ -1455,6 +2160,11 @@ class Notifier:
             muted = key not in audible
             # A partial orphan group only mentions its unacknowledged members.
             alert = audible.get(key, alert)
+            if entry is None and _held_dead_runner(alert, now):
+                # #3630 : coupure courte, peut-être déjà reprise à la passe
+                # suivante ; rien n'est poussé, et faute d'entrée active,
+                # aucune résolution ne partira.
+                continue
             level = alert_ack.severity(alert)
             if (entry is not None and alert.get("type") == "slo_breach"
                     and entry.get("status") == "envoi" and entry.get("human")
@@ -1565,8 +2275,14 @@ class Notifier:
         if "take" in selected:
             from . import alert_ack
             thresholds = alert_ack.default_thresholds()
-            current = exploitation.alerts(self.cfg, db, now=now, local_pool=False,
-                                          **thresholds)
+            gate_cache = self.state.get("gates")
+            if not isinstance(gate_cache, dict):
+                gate_cache = self.state["gates"] = {}
+            from . import canon as canon_mod
+            with canon_mod.configured_cache():
+                current = exploitation.alerts(
+                    self.cfg, db, now=now, local_pool=False,
+                    gate_cache=gate_cache, **thresholds)
             if self.handoff:
                 self._budget_handoff(db, now)
             if self.take:
@@ -1606,6 +2322,9 @@ class Notifier:
         wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}
         active = self.state["active"]
         for key, alert in wanted.items():
+            # Une console qui represse la même clé annule le tombstone de
+            # résolution en attente de fusion (#3576, relecture dev4).
+            self.local_resolved_keys.discard(key)
             entry = active.get(key)
             if entry is None:
                 entry = active[key] = {
@@ -1625,22 +2344,38 @@ class Notifier:
     def _local_resolutions(self, wanted: dict, now: float) -> None:
         """Résout les alertes locales que la console ne montre plus, et retente
         les résolutions en vol. Les autres types ne sont jamais touchés : la
-        base peut simplement être non observée."""
+        base peut simplement être non observée.
+
+        #3576 : l'état partagé porte les alertes de console de tous les hôtes ;
+        un hôte ne résout que les siennes (`alert.host`), jamais celle d'un
+        autre dont la console ne dit rien ici (relecture cx1)."""
+        host = getattr(self.cfg, "host", None)
+        # Résolutions déjà en vol AVANT ce tour : seules celles-là se soldent
+        # ici ; celle que `_resolved` vient d'ajouter doit atteindre la fusion
+        # de l'état partagé (#3576, relecture cx1).
+        before = set(self.state["resolved"])
         for key in list(self.state["active"]):
             if key in wanted:
                 continue
             entry = self.state["active"][key]
-            if entry["alert"].get("type") not in LOCAL_TYPES:
+            if not _local_entry_owned(entry, host):
                 continue
             del self.state["active"][key]
+            # #3576 (relecture dev4) : la fusion doit retirer la clé du partagé
+            # même quand `_resolved` ne garde rien (acknowledged, notifiee,
+            # sans_canal, type retiré) — sinon l'entrée y reste active et une
+            # résolution repart à chaque tick.
+            self.local_resolved_keys.add(key)
             if entry["alert"].get("type") not in self.ncfg.types:
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
             self._resolved(key, entry, now)
         for key in list(self.state["resolved"]):
+            if key not in before:
+                continue
             entry = self.state["resolved"][key]
-            if entry["alert"].get("type") not in LOCAL_TYPES:
+            if not _local_entry_owned(entry, host):
                 continue
             self._retry(entry, "resolved", now)
             if not self._pending(entry):
@@ -1665,6 +2400,12 @@ class Notifier:
         bucket = self._normalize_summary_bucket(human, bucket)
         member = self._summary_member(entry, human)
         identity = self._summary_member_id(member)
+        frozen = bucket.get("frozen") or {}
+        if identity in (frozen.get("raised") or {}):
+            # L'alerte est dans l'épisode déjà figé : annuler l'épisode et
+            # remettre ses autres membres dans le stock vivant, avec une
+            # nouvelle identité (le contenu du résumé change).
+            self._summary_cancel_frozen(bucket)
         members = bucket["raised"]
         if identity in members:
             del members[identity]
@@ -1677,7 +2418,7 @@ class Notifier:
                         and str(old.get("key") or "").startswith("legacy:")):
                     del members[old_id]
                     break
-        if not members and not bucket["resolved"]:
+        if not self._summary_has_members(bucket):
             self.state["summary"].pop(human, None)
 
     def _mute(self, entry: dict) -> None:
@@ -1869,6 +2610,14 @@ class Notifier:
             newest = sorted(kept.items(), key=lambda item: float(item[1]))[-NOTIFIED_MAX:]
             kept = dict(newest)
         self.state["notified"] = kept
+        # #3536 : même rétention pour le registre des replis nexlink
+        fallback = self.state.get("fallback") or {}
+        kept = {key: ts for key, ts in fallback.items()
+                if now - float(ts) < NOTIFIED_RETENTION_S}
+        if len(kept) > NOTIFIED_MAX:
+            newest = sorted(kept.items(), key=lambda item: float(item[1]))[-NOTIFIED_MAX:]
+            kept = dict(newest)
+        self.state["fallback"] = kept
 
     # -- levée ----------------------------------------------------------------
     def _event(self, db, kind: str, key: str, alert: dict) -> None:
@@ -2182,6 +2931,19 @@ class Notifier:
                     continue
                 meta = dict(payload, reminder=name in reminders)
                 try:
+                    if kind == "slo_breach" and alert.get("lot"):
+                        # #3512: the alert snapshot can predate a merge. Check
+                        # again before each delivery, including the desk thread.
+                        item = storage.of(db).work.get(int(alert["lot"]))
+                        # A missing row is no evidence that delivery happened.
+                        if item is not None and item.get("state") in (
+                                "merged", "promoted", "closed"):
+                            break
+                        if item is not None and alert.get("step") == "verdict_merge":
+                            from . import slo_delivery
+                            if slo_delivery.merge_observed(
+                                    self.cfg, db, item, overview=listing):
+                                break
                     if name == "thread:bureau":
                         # #3036 : la route humaine — le fil lisible du lot,
                         # comme la copie du bureau externe (#2602/#2640).
@@ -2313,10 +3075,13 @@ class Notifier:
             self._adopt_summary_entry(entry, bucket)
             self._summary_add(bucket, "resolved", entry)
             return
-        delivered = [name for name, st in entry["channels"].items() if st.get("ok")]
+        # #3536 : un repli livré n'est pas une livraison du primaire ; la
+        # résolution ne repart pas sur le pseudo-canal `nexlink→ntfy`.
+        delivered = [name for name, st in entry["channels"].items()
+                     if st.get("ok") and not st.get("fallback_of")]
         if not delivered:
-            self.log("alert [%s] %s resolved before any successful send: nothing is sent"
-                     % (alert.get("type"), _subject(alert)))
+            self.log("alert [%s] %s resolved before any successful primary send: "
+                     "nothing is sent" % (alert.get("type"), _subject(alert)))
             self._record("resolved", entry, "abandonnee", {})
             return
         resolved = {"alert": alert, "raised_ts": entry.get("raised_ts"), "resolved_ts": now,
@@ -2329,8 +3094,13 @@ class Notifier:
             self._record("resolved", resolved, "resumee", {})
             return
         self._attempt(resolved, "resolved", now)
-        if self._pending(resolved):
-            self.state["resolved"][key] = resolved
+        # #3576 : garder l'entrée même quand l'envoi a réussi. Le passage
+        # local tourne AVANT la lecture de l'état partagé ; c'est cette entrée
+        # qui dit à `_merge_local_state` de retirer la clé de `active` du
+        # document partagé (sinon la console calme la re-résout à chaque
+        # tick). Le passage complet supprime une entrée soldée dans le même
+        # tour (boucle `resolved` de `run_pass`), donc rien ne s'accumule.
+        self.state["resolved"][key] = resolved
 
     # -- envoi ----------------------------------------------------------------
     def _pending(self, entry: dict) -> list:
@@ -2343,9 +3113,29 @@ class Notifier:
 
     def _attempt(self, entry: dict, event: str, now: float) -> None:
         message = render(entry["alert"], event, now, raised_ts=entry.get("raised_ts"))
+        # #3536 : l'identité que porte le canal nexlink — le registre `notified`
+        # (#2395) haché, donc stable d'un redémarrage à l'autre ; l'instant est
+        # figé au premier essai pour que deux essais envoient les mêmes octets.
+        # Un épisode sans `since` (`account_overage`) n'a pas d'identité au
+        # registre : son `raised_ts`, figé dans l'entrée, distingue deux
+        # occurrences successives sans changer l'identité des retries
+        # (relecture cx3 B/P2).
+        since = _since_of(entry["alert"])
+        episode = since if since is not None else round(
+            float(entry.get("raised_ts") or now), 3)
+        identity = _notification_id(key_of(entry["alert"]), _entry_severity(entry),
+                                    entry.get("human"), episode)
+        occurred_at = entry.get("occurred_at") or iso_utc(now)
+        entry["occurred_at"] = occurred_at
+        message = replace(message,
+                          alert_id=nexlink_alerts.alert_id_for(identity),
+                          occurred_at=occurred_at)
         results = {}
+        fallbacks = {}
         for name in self._pending(entry):
             st = entry["channels"][name]
+            if st.get("fallback_of"):
+                continue                # un repli : traité après les primaires
             channel = self.ncfg.channels.get(name)
             if channel is None:          # canal retiré de la configuration
                 st.update(attempts=self.ncfg.max_attempts, error="channel removed")
@@ -2367,16 +3157,107 @@ class Notifier:
                 " — GIVING UP (%d attempt(s))" % st["attempts"] if last
                 else " — retried on next pass (%d/%d)"
                 % (st["attempts"], self.ncfg.max_attempts)))
+            if channel.kind == "nexlink":
+                self._nexlink_fallback(entry, channel, message, st, error, fallbacks)
+        # #3536 (relecture cx1 B/P1) : le repli garde son propre compteur et
+        # son propre état `pending`. Il part dans le même passage (immédiat sur
+        # erreur permanente) et il est retenté même quand le primaire est
+        # épuisé — sinon un premier échec temporaire du repli perdait l'alerte.
+        for name in [name for name in self._pending(entry)
+                     if (entry["channels"].get(name) or {}).get("fallback_of")]:
+            result = self._attempt_fallback(entry, name, message, now)
+            if result is not None:
+                results[name] = result
+                fallbacks[entry["channels"][name].get("target") or name] = result
         if results:
+            primary_ok = any(
+                value == "ok" and not (entry["channels"].get(name) or {}).get("fallback_of")
+                for name, value in results.items())
             delivery = ("a_blanc" if self.dry_run else
                         "envoyee" if any(v == "ok" for v in results.values()) else "echec")
-            if event == "raised" and any(v == "ok" for v in results.values()):
+            if event == "raised" and primary_ok:
                 # #2395 : au moins un canal a livré — l'alerte est marquée au
                 # registre AVANT le journal, pour qu'un arrêt juste après ne la
                 # fasse pas repartir à la reprise. Un échec total n'est pas
                 # marqué : les canaux restent retentés comme avant.
+                # #3536 : un repli réussi ne compte pas — le primaire continue,
+                # pour que la ligne durable de l'app existe quand l'API revient.
                 self._mark_notified(entry, now)
-            self._record(event, entry, delivery, results, message)
+            self._record(event, entry, delivery, results, message,
+                         fallback=fallbacks or None)
+
+    def _nexlink_fallback(self, entry: dict, channel: Channel, message: Message,
+                          st: dict, error: ChannelError, out: dict) -> None:
+        """#3536 : met le repli `ntfy`/`slack` du canal `nexlink` en attente.
+
+        Déclenché au 2e échec consécutif ou tout de suite sur une erreur
+        permanente ; une seule fois par alerte (registre `fallback`). Le texte
+        enverra « repli nexlink — » ; le primaire reste retenté, et un repli
+        réussi ne vaut pas livraison côté Nexlink.
+        """
+        name = channel.options.get("fallback")
+        if not name:
+            return
+        target = self.ncfg.channels.get(str(name))
+        if target is None or target.name == channel.name:
+            return
+        # #3536 (relecture dev4/cx1, cas max_attempts=1) : le seuil de
+        # déclenchement ne doit pas dépasser le nombre d'essais configuré,
+        # sinon un échec transitoire du dernier essai n'ouvre jamais le repli.
+        threshold = min(2, self.ncfg.max_attempts)
+        if not (error.permanent or int(st.get("attempts") or 0) >= threshold):
+            return
+        key = "%s→%s" % (channel.name, target.name)
+        if key in entry.setdefault("channels", {}):
+            return
+        alert_id = message_alert_id(message)
+        if alert_id in (self.state.get("fallback") or {}):
+            out[target.name] = "déjà envoyé"
+            return
+        entry["channels"][key] = {"ok": False, "attempts": 0, "error": None,
+                                  "fallback_of": channel.name,
+                                  "target": target.name}
+        out[target.name] = "en attente"
+
+    def _attempt_fallback(self, entry: dict, name: str, message: Message,
+                          now: float) -> str | None:
+        """Envoie (ou annule) un repli en attente ; rend le résultat du journal."""
+        st = entry["channels"][name]
+        if st.get("ok"):
+            return None
+        primary = entry["channels"].get(str(st.get("fallback_of") or ""))
+        if primary is not None and primary.get("ok"):
+            # le primaire a fini par livrer : le repli n'a plus d'objet
+            st.update(ok=True, error=None, cancelled=True)
+            return "annulé"
+        target = self.ncfg.channels.get(str(st.get("target") or ""))
+        if target is None:
+            st.update(attempts=self.ncfg.max_attempts,
+                      error="fallback channel removed")
+            return "failed: fallback channel removed"
+        fallback = replace(message, title="[repli] " + message.title,
+                           body="repli nexlink — " + message.body)
+        ok, failure = self._send(target, fallback)
+        st["attempts"] = st.get("attempts", 0) + 1
+        if ok:
+            st.update(ok=True, error=None, ts=round(now, 3))
+            self.state.setdefault("fallback", {})[message_alert_id(message)] = \
+                round(now, 3)
+            self.log("[%s] %s: fallback %s sent (primary: %s)"
+                     % (message.kind or "alert", _clean(message.title, 80),
+                        target.name, _clean(primary.get("error") if primary else "", 120)))
+            return "a_blanc" if self.dry_run else "ok"
+        st["error"] = str(failure)
+        if failure.permanent:
+            st["attempts"] = self.ncfg.max_attempts
+        last = st["attempts"] >= self.ncfg.max_attempts
+        self.log("[%s] %s: fallback %s failed: %s%s"
+                 % (message.kind or "alert", _clean(message.title, 80),
+                    target.name, failure,
+                    " — GIVING UP (%d attempt(s))" % st["attempts"] if last
+                    else " — retried on next pass (%d/%d)"
+                    % (st["attempts"], self.ncfg.max_attempts)))
+        return "failed: %s" % failure
 
     def _send(self, channel: Channel, message: Message) -> tuple:
         try:
@@ -2405,17 +3286,35 @@ class Notifier:
     @staticmethod
     def _summary_member(entry: dict, human: str) -> dict:
         alert = entry.get("alert") or {}
+        since = _since_of(alert)
+        # #3536 (B/P2 cx3) : un épisode sans `since` (`account_overage`) n'a
+        # pas d'identité au registre. Son `raised_ts`, figé dans l'entrée, doit
+        # entrer dans l'identité du membre de résumé : sinon deux occurrences
+        # successives partagent le même membre et la seconde est perdue quand
+        # le premier épisode se clôt.
+        episode = since
+        if episode is None:
+            raised = entry.get("raised_ts")
+            try:
+                episode = round(float(raised), 3) if raised is not None else None
+            except (TypeError, ValueError):
+                episode = None
         return {"key": entry.get("key") or key_of(alert),
                 "severity": _entry_severity(entry),
                 "type": alert.get("type"),
-                "since": _since_of(alert),
+                "since": since,
+                "episode": episode,
                 "human": human}
 
     @staticmethod
     def _summary_member_id(member: dict) -> str:
-        """Même identité que le registre `notified` : clé, sévérité, humain."""
+        """L'identité d'un membre : clé, sévérité, humain et épisode — `since`
+        quand il existe, sinon le `raised_ts` de secours (#3536 B/P2 cx3)."""
+        episode = member.get("episode")
+        if episode is None:
+            episode = member.get("since")
         return _notification_id(member.get("key"), member.get("severity"),
-                                member.get("human"), member.get("since"))
+                                member.get("human"), episode)
 
     def _owner_human(self, human) -> bool:
         owner = normalize_human(self.ncfg.default_human)
@@ -2486,6 +3385,7 @@ class Notifier:
                               "severity": member.get("severity"),
                               "type": member.get("type"),
                               "since": member.get("since"),
+                              "episode": member.get("episode"),
                               "human": human}
                 if self._summary_forbidden(human, normalized["type"]):
                     self.log("owner rate summary: slo_breach member filtered (#2395)")
@@ -2519,6 +3419,7 @@ class Notifier:
                               "severity": member.get("severity"),
                               "type": member.get("type"),
                               "since": member.get("since"),
+                              "episode": member.get("episode"),
                               "human": human}
                 if self._summary_forbidden(human, normalized["type"]):
                     continue
@@ -2546,6 +3447,15 @@ class Notifier:
         bucket["raised"] = self._normalize_summary_raised(human, bucket.get("raised"))
         bucket["resolved"] = self._normalize_summary_resolved(human, bucket.get("resolved"))
         bucket["attempts"] = int(bucket.get("attempts") or 0)
+        if not isinstance(bucket.get("channels"), dict):
+            bucket["channels"] = {}
+        frozen = bucket.get("frozen")
+        if isinstance(frozen, dict):
+            for event in ("raised", "resolved"):
+                if not isinstance(frozen.get(event), dict):
+                    frozen[event] = {}
+        elif "frozen" in bucket:
+            bucket.pop("frozen", None)
         return bucket
 
     def _bucket(self, human: str) -> dict:
@@ -2588,11 +3498,7 @@ class Notifier:
         for entry in (self.state.get("active") or {}).values():
             if not isinstance(entry, dict) or entry.get("human") != human:
                 continue
-            alert = entry.get("alert") or {}
-            member = {"key": entry.get("key") or key_of(alert),
-                      "severity": entry.get("severity"),
-                      "type": alert.get("type"), "since": _since_of(alert),
-                      "human": human}
+            member = self._summary_member(entry, human)
             ids.add(self._summary_member_id(member))
         return ids
 
@@ -2602,6 +3508,18 @@ class Notifier:
         un résumé précédent — ne repart pas ; une résolution dont l'alerte est
         revenue (active) est dépassée et ne part pas non plus."""
         active = self._active_member_ids(human)
+        frozen = bucket.get("frozen") or {}
+        # Un membre de l'épisode figé peut avoir été livré en direct (ou son
+        # alerte revenue) depuis le gel : l'épisode est annulé et ses autres
+        # membres repartent sous une nouvelle identité, plutôt que de garder
+        # un contenu périmé sous le même `alert_id`.
+        stale = any(
+            isinstance(member, dict) and self._member_already_notified(member)
+            for member in (frozen.get("raised") or {}).values())
+        stale = stale or any(identity in active
+                             for identity in (frozen.get("resolved") or {}))
+        if stale:
+            self._summary_cancel_frozen(bucket)
         raised = bucket.get("raised") or {}
         for identity, member in list(raised.items()):
             if isinstance(member, dict) and self._member_already_notified(member):
@@ -2611,11 +3529,80 @@ class Notifier:
             if identity in active:
                 del resolved[identity]
 
+    def _summary_alert_id(self, human: str, bucket: dict) -> str:
+        """L'identité d'un résumé est celle de son épisode de bucket, pas celle
+        de son texte (#3536, relecture cx3 B/P2) : deux résumés successifs
+        « 1 dead_runner » restent deux lignes dans l'app. L'épisode et
+        l'`alert_id` sont figés dans l'état, donc les retries envoient le même
+        UUID et l'API #3537 les déduplique."""
+        alert_id = bucket.get("alert_id")
+        if isinstance(alert_id, str) and alert_id:
+            return alert_id
+        episode = bucket.get("episode")
+        if not isinstance(episode, str) or not episode:
+            episode = uuid.uuid4().hex
+            bucket["episode"] = episode
+        alert_id = nexlink_alerts.alert_id_for("summary|%s|%s" % (human, episode))
+        bucket["alert_id"] = alert_id
+        return alert_id
+
+    @staticmethod
+    def _summary_has_members(bucket: dict) -> bool:
+        frozen = bucket.get("frozen") or {}
+        return bool(bucket.get("raised") or bucket.get("resolved")
+                    or frozen.get("raised") or frozen.get("resolved"))
+
+    @staticmethod
+    def _summary_clear_episode(bucket: dict) -> None:
+        for key in ("frozen", "alert_id", "episode", "occurred_at", "channels"):
+            bucket.pop(key, None)
+        bucket["attempts"] = 0
+
+    def _summary_freeze(self, bucket: dict) -> dict:
+        """Fige les membres du résumé avant son premier envoi (#3536, relecture
+        cx1) : un membre arrivé ensuite ne peut pas changer le contenu sous le
+        même `alert_id`, sinon l'API #3537 déduplique le retry et le membre
+        ajouté est perdu. Les nouveaux membres forment l'épisode suivant."""
+        frozen = bucket.get("frozen")
+        if isinstance(frozen, dict) and (frozen.get("raised") or frozen.get("resolved")):
+            return frozen
+        frozen = {"raised": dict(bucket.get("raised") or {}),
+                  "resolved": dict(bucket.get("resolved") or {})}
+        if not frozen["raised"] and not frozen["resolved"]:
+            return frozen
+        bucket["frozen"] = frozen
+        for key in ("alert_id", "episode", "occurred_at", "channels"):
+            bucket.pop(key, None)
+        return frozen
+
+    def _summary_finish_episode(self, bucket: dict, now: float, *,
+                                notified: bool) -> None:
+        """Clôt l'épisode figé : ses membres quittent le stock vivant ; ceux
+        qui sont arrivés entre-temps restent pour l'épisode suivant."""
+        frozen = bucket.get("frozen") or {}
+        for event in ("raised", "resolved"):
+            live = bucket.get(event) or {}
+            for identity in (frozen.get(event) or {}):
+                live.pop(identity, None)
+        if notified:
+            self._mark_summary_notified(frozen, now)
+        self._summary_clear_episode(bucket)
+
+    def _summary_cancel_frozen(self, bucket: dict) -> None:
+        """Annule un épisode figé (membre acquitté) : ses autres membres
+        repartent dans le stock vivant sous une nouvelle identité."""
+        frozen = bucket.get("frozen") or {}
+        for event in ("raised", "resolved"):
+            live = bucket.setdefault(event, {})
+            for identity, member in (frozen.get(event) or {}).items():
+                live.setdefault(identity, member)
+        self._summary_clear_episode(bucket)
+
     def _summaries(self, now: float) -> None:
         for human in list(self.state["summary"]):
             bucket = self._bucket(human)
             self._drop_notified_members(bucket, human)
-            if not bucket["raised"] and not bucket["resolved"]:
+            if not self._summary_has_members(bucket):
                 # Stock entièrement filtré (ancien résumé SLO owner, #2395 B1).
                 del self.state["summary"][human]
                 continue
@@ -2627,37 +3614,90 @@ class Notifier:
                 self.log("rate summary for %s lost: no channel left" % human)
                 del self.state["summary"][human]
                 continue
-            message = render_summary(bucket, self.cfg.host)
-            results, ok = {}, False
+            frozen = self._summary_freeze(bucket)
+            alert_id = self._summary_alert_id(human, bucket)
+            occurred_at = bucket.get("occurred_at") or iso_utc(now)
+            bucket["occurred_at"] = occurred_at
+            message = render_summary(frozen, self.cfg.host, alert_id=alert_id,
+                                     occurred_at=occurred_at)
+            states = bucket.setdefault("channels", {})
             for channel in channels:
+                states.setdefault(channel.name, {"ok": False, "attempts": 0,
+                                                 "error": None})
+            entry = {"alert": {"type": "summary"}, "human": human,
+                     "source": "debit", "channels": states}
+            results, fallbacks = {}, {}
+            primary_ok = False
+            for channel in channels:
+                state = states[channel.name]
+                if (state.get("fallback_of") or state.get("ok")
+                        or int(state.get("attempts") or 0) >= self.ncfg.max_attempts):
+                    continue
                 sent, error = self._send(channel, message)
-                ok = ok or sent
-                results[channel.name] = ("a_blanc" if self.dry_run else "ok") if sent \
-                    else "failed: %s" % error
-                if not sent:
-                    self.log("rate summary → %s, channel %s: %s" % (human, channel.name,
-                                                                    error))
+                state["attempts"] = int(state.get("attempts") or 0) + 1
+                if sent:
+                    state.update(ok=True, error=None, ts=round(now, 3))
+                    results[channel.name] = "a_blanc" if self.dry_run else "ok"
+                    primary_ok = True
+                    continue
+                if error.permanent:
+                    state["attempts"] = self.ncfg.max_attempts
+                state["error"] = str(error)
+                results[channel.name] = "failed: %s" % error
+                self.log("rate summary → %s, channel %s: %s" % (human, channel.name,
+                                                                error))
+                if channel.kind == "nexlink":
+                    # #3536 (relecture cx3 B/P1) : un résumé de débit passe par
+                    # le même repli qu'une alerte directe. Sans cela, une API
+                    # nexlink en panne perdait le résumé malgré un repli sain.
+                    self._nexlink_fallback(entry, channel, message, state, error,
+                                           fallbacks)
+            for name in [name for name, state in states.items()
+                         if state.get("fallback_of")]:
+                state = states[name]
+                if (state.get("ok")
+                        or int(state.get("attempts") or 0) >= self.ncfg.max_attempts):
+                    continue
+                result = self._attempt_fallback(entry, name, message, now)
+                if result is not None:
+                    results[name] = result
+                    fallbacks[state.get("target") or name] = result
+            # Un primaire épuisé ne bloque plus le repli ; un repli en échec
+            # temporaire est retenté même quand tous les primaires ont donné.
+            primary_pending = any(
+                not states[channel.name].get("ok")
+                and int(states[channel.name].get("attempts") or 0)
+                < self.ncfg.max_attempts
+                for channel in channels)
+            fallback_pending = any(
+                state.get("fallback_of") and not state.get("ok")
+                and int(state.get("attempts") or 0) < self.ncfg.max_attempts
+                for state in states.values())
             self.state["rate"].setdefault(human, []).append(now)
-            entry = {"alert": {"type": "summary"}, "human": human, "source": "debit"}
             bucket["attempts"] = int(bucket.get("attempts") or 0) + 1
-            if ok and not self.dry_run:
-                # #2395 B2 : les membres livrés par le résumé entrent au
-                # registre, sinon la même alerte repart en envoi direct après
-                # la fenêtre. Après succès seulement ; un échec reste retenté.
-                self._mark_summary_notified(bucket, now)
-            if ok or bucket["attempts"] >= self.ncfg.max_attempts:
-                if not ok:
+            if primary_ok or (not primary_pending and not fallback_pending):
+                if not primary_ok:
                     self.log("rate summary → %s: GIVING UP after %d attempt(s)"
                              % (human, bucket["attempts"]))
-                del self.state["summary"][human]
+                # #2395 B2 : les membres livrés par le résumé entrent au
+                # registre, sinon la même alerte repart en envoi direct après
+                # la fenêtre. Après succès du primaire seulement ; un repli
+                # réussi ne vaut pas livraison du primaire.
+                self._summary_finish_episode(bucket, now,
+                                             notified=primary_ok and not self.dry_run)
+                if not self._summary_has_members(bucket):
+                    del self.state["summary"][human]
+                # Les membres arrivés après le gel forment l'épisode suivant,
+                # à la fenêtre de débit suivante.
                 self.state["last_summary"][human] = now
             self._record("summary", entry,
-                         "a_blanc" if self.dry_run else ("envoyee" if ok else "echec"),
-                         results, message)
+                         "a_blanc" if self.dry_run else ("envoyee" if primary_ok else "echec"),
+                         results, message, fallback=fallbacks or None)
 
     # -- journal ----------------------------------------------------------------
     def _record(self, event: str, entry: dict, delivery: str, channels: dict,
-                message: Message | None = None) -> None:
+                message: Message | None = None,
+                fallback: dict | None = None) -> None:
         alert = entry.get("alert") or {}
         record = {"schema": NOTIFY_SCHEMA, "event": event, "type": alert.get("type"),
                   "agent": alert.get("agent"), "lot": alert.get("lot"),
@@ -2666,6 +3706,12 @@ class Notifier:
                   "channels": channels, "ts": round(float(self.clock()), 3)}
         if message is not None:
             record["title"], record["text"] = message.title, message.body
+            # #3536 : l'identité poussée dans l'app (utile au `--json` et à la
+            # qualification du canal)
+            if message.alert_id:
+                record["alert_id"] = message.alert_id
+        if fallback:
+            record["fallback"] = fallback
         self._records.append(record)
         self.emit(record)
 
@@ -2946,15 +3992,46 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
               "alerts, then `ameesh role timers --install` (docs/EXPLOITATION.md, "
               "\"Alertes poussées\")" % human, file=sys.stderr)
         return 2
-    results = send_test(ncfg, human, cfg.host)
+    sender = Sender(timeout=ncfg.timeout)
+    results = send_test(ncfg, human, cfg.host, sender=sender)
+    channels = {channel.name: channel for channel in ncfg.channels_for(human)}
     for name, error in results:
+        receipt = None
+        channel = channels.get(name)
+        last = sender.last.get(name) or {}
+        if error is None and channel is not None and channel.kind == "nexlink" \
+                and last.get("alert_id"):
+            # #3536 : l'accusé de lecture, une lecture (jamais un sondage) ;
+            # son échec ne change pas le résultat de l'envoi.
+            try:
+                receipt = sender.receipt(channel, last["alert_id"])
+            except ChannelError as exc:
+                receipt = {"error": str(exc)}
+        fallback = (fallback_readiness(ncfg, channel, sender.env)
+                    if channel is not None else None)
         if args.json:
-            print(json.dumps({"schema": NOTIFY_SCHEMA, "event": "test", "human": human,
-                              "channel": name, "ok": error is None, "error": error},
-                             ensure_ascii=False, sort_keys=True))
+            record = {"schema": NOTIFY_SCHEMA, "event": "test", "human": human,
+                      "channel": name, "ok": error is None, "error": error}
+            if receipt is not None:
+                record["receipt"] = receipt
+            if fallback is not None:
+                record["fallback"] = fallback
+            print(json.dumps(record, ensure_ascii=False, sort_keys=True))
         else:
             print("%s → %s: %s" % (name, human, "sent" if error is None
                                    else "FAILED: %s" % error))
+            if receipt is not None:
+                if "error" in receipt:
+                    print("  receipt: unavailable (%s)" % _clean(receipt["error"], 120))
+                else:
+                    print("  receipt: accepted_at=%s pushed=%s read_at=%s"
+                          % (receipt.get("accepted_at"), receipt.get("pushed"),
+                             receipt.get("read_at")))
+            if fallback is not None:
+                print("  fallback %s: %s" % (
+                    fallback["channel"],
+                    "ready" if fallback["ready"] else
+                    "MISSING: %s" % _clean(fallback.get("problem"), 120)))
     return 0 if all(error is None for _, error in results) else 1
 
 
@@ -3004,6 +4081,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     seuils = exploitation.thresholds(args)
     interval = _interval(args, ncfg)
     db = None
+    lease = None
     try:
         while True:
             # #532 : la console du pool local se lit depuis `cfg` seule, avant
@@ -3017,12 +4095,45 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
                 if db is None:
                     db = db_mod.connect(cfg)
                     db_mod.require_schema(db)
+                if alerts_pass:
+                    # #3576 : l'état de livraison est partagé et un seul hôte
+                    # livre. Sans le bail, ce passage se met en veille sans
+                    # rien pousser ni écrire (l'autre hôte le fait).
+                    lease, deliver = enter_shared_state(
+                        db, notifier, cfg, dry_run=args.dry_run)
+                    if not deliver:
+                        # Le bail ne ferme QUE la livraison d'alertes : les
+                        # autres passes (take, issues, github-watch, ci) de ce
+                        # service gardent leur tour, selon sa sélection.
+                        if only is not None:
+                            rest = frozenset(only) - {"alerts"}
+                        else:
+                            rest = frozenset(ONLY_PASSES) - {"alerts"} - set(skip or ())
+                        if rest:
+                            notifier.run_pass(db, thresholds=seuils, only=rest)
+                        if args.once:
+                            return 0
+                        time.sleep(interval)
+                        continue
                 notifier.run_pass(db, thresholds=seuils)
                 if alerts_pass and not args.dry_run:
-                    save_state(path, notifier.state)
+                    # #3576 : le document partagé d'abord (le bail peut
+                    # expirer), le miroir local ensuite quoi qu'il arrive.
+                    try:
+                        leave_shared_state(db, notifier, lease)
+                    finally:
+                        lease = None
+                        save_state(path, notifier.state)
             except db_mod.SchemaMissing:
                 raise
             except db_mod.DbError as exc:
+                if lease is not None and db is not None:
+                    try:
+                        storage.of(db).notify_liveness.release_state(
+                            STATE_SCOPE, lease[0], lease[1])
+                    except Exception:
+                        pass  # le bail expirera ; la base est déjà en défaut
+                    lease = None
                 if args.once:
                     raise
                 _stderr_log("database unavailable (%s): retrying in %ds" % (exc, interval))
@@ -3038,6 +4149,12 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        if lease is not None and db is not None:
+            try:
+                storage.of(db).notify_liveness.release_state(
+                    STATE_SCOPE, lease[0], lease[1])
+            except Exception:
+                pass
         if db is not None:
             db.close()
         if lock is not None:

@@ -208,8 +208,10 @@ class Handoffs(interface.Handoffs):
                                    (plan["source"], plan["lifecycle_generation"], plan["agent"]))
                 threshold = 180 if origins[0]["critical"] else 900
                 if plan.get("loss_after") != threshold or not tx.query(
-                    "SELECT host FROM host_resources WHERE host=%s GROUP BY host "
-                    "HAVING max(sampled_at)<clock_timestamp()-make_interval(secs=>%s)",
+                    "SELECT host FROM (VALUES (%s::text)) v(host)"
+                    " WHERE (SELECT max(sampled_at) FROM host_resources r"
+                    "         WHERE r.host = v.host)"
+                    "       < clock_timestamp()-make_interval(secs=>%s)",
                     (plan["source"], threshold)):
                     return None
             states = tx.query("SELECT host FROM canon_state WHERE host IN (%s,%s) AND canon=%s"

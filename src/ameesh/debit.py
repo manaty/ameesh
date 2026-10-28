@@ -36,7 +36,10 @@ externe et le geste attendu (`hold: attente bureau : …`,
 externes », avec une relance à cet exécutant — à l'échéance déclarée
 (`(due 2026-10-25 12:00 UTC)`), sinon après le seuil du débit — et non à
 l'agent. Une attente externe, même échue, ne fait pas sortir `--check` 2 : le
-rapport la relance à chaque passage.
+rapport la relance à chaque passage. #3773 : le hold peut aussi déclarer un
+tiers extérieur sans nommer le bureau ni l'owner (`hold: attente externe :
+revue Apple`) ; le débit le range dans les mêmes « attentes externes », avec
+la même relance à l'échéance ou au seuil.
 
 Un lot relu (tous ses avis rendus) dont `branch_target` est la branche d'un
 autre lot **ouvert** n'est pas une attente de paquet : il ne peut entrer
@@ -53,6 +56,8 @@ import statistics
 import sys
 import time
 from typing import Any, Iterable, Mapping
+
+from . import work_lifecycle
 
 SCHEMA = "ameesh-debit/1"
 
@@ -124,8 +129,25 @@ GESTURES = {
     "hold_external": "relancer {actor} sur le geste attendu : {gesture} "
                      "(attente externe déclarée, pas un agent à assigner ; "
                      "canon §10)",
+    "hold_external_third": "suivre le tiers extérieur sur le geste attendu : "
+                           "{gesture} (attente externe déclarée, pas un agent "
+                           "à assigner ; relancer le pilote à l'échéance, "
+                           "canon §10)",
     "wake_overdue": "réveiller l'assigné : le réveil programmé est échu",
 }
+
+
+def _external_gesture(declared: Mapping[str, Any]) -> str:
+    """Le geste affiché pour une attente externe (#3498, #3773).
+
+    Un exécutant nommé (bureau, owner) se relance ; un tiers extérieur
+    (`externe`) se suit, et la relance va au pilote."""
+    if str(declared.get("executor") or "") == "externe":
+        return GESTURES["hold_external_third"].format(
+            gesture=declared.get("gesture") or "")
+    actor = "le bureau" if declared.get("executor") == "bureau" else "l'owner"
+    return GESTURES["hold_external"].format(
+        actor=actor, gesture=declared.get("gesture") or "")
 
 
 class DebitError(ValueError):
@@ -419,6 +441,8 @@ _OPEN_STATES = ("intake", "build", "qa")
 _CLOSURE_STATES = ("blocked", "waiting_human")
 #: états terminaux (le jalon, pas seulement la colonne)
 _TERMINAL_STATES = ("merged", "closed", "delivered")
+#: états finis au journal (promu, fermé) : plus aucune attente (#3672)
+_CLOSED_STATES = work_lifecycle.TERMINAL
 
 
 def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
@@ -875,6 +899,12 @@ def build(*, items: Iterable[Mapping[str, Any]],
     unreadable: list[str] = list(devices.get("unreadable") or ())
 
     for ident, item in by_id.items():
+        # #3672 : un lot fermé (ou promu) au journal n'attend plus rien, même
+        # sans jalon terminal (#3585, fermé « superseded » puis retenu par
+        # une note `hold:`) ; ses holds et réveils ne sont pas des attentes.
+        # Un lot `merged` reste lu : il peut attendre son déploiement.
+        if state_by_lot.get(ident) in _CLOSED_STATES:
+            continue
         lot_milestones = milestones_by_lot.get(ident, [])
         lot_events = events_by_lot.get(ident, [])
         freeze = _latest_freeze(lot_milestones)
@@ -1125,10 +1155,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
             "state": state_by_lot.get(lot),
             "since_ts": since, "since": row.get("since"),
             "age_s": row.get("age_s"),
-            "gesture": GESTURES["hold_external"].format(
-                actor=("le bureau" if declared["executor"] == "bureau"
-                       else "l'owner"),
-                gesture=declared["gesture"]),
+            "gesture": _external_gesture(declared),
             "declared": declared["gesture"], "hold_by": row.get("by"),
             "cause": row.get("cause"),
             "due_ts": due_ts, "due": _iso(due_ts),
@@ -1638,8 +1665,8 @@ def format_text(report: Mapping[str, Any]) -> str:
     if external:
         reminders = [row for row in external if row.get("reminder_due")]
         lines.append("")
-        lines.append("Attentes externes, hors --check (%d) — exécutant déclaré, "
-                     "pas un agent à assigner%s :"
+        lines.append("Attentes externes, hors --check (%d) — exécutant ou tiers "
+                     "déclaré, pas un agent à assigner%s :"
                      % (len(external),
                         " ; %d relance(s) due(s)" % len(reminders)
                         if reminders else ""))
@@ -1651,9 +1678,12 @@ def format_text(report: Mapping[str, Any]) -> str:
                             str(row.get("title") or "")[:48]))
             lines.append("         → %s" % row.get("gesture"))
             if row.get("reminder_due"):
+                # #3773 : un tiers extérieur (`externe`) se suit au bureau ;
+                # les autres exécutants gardent la règle #3498 (bureau, sinon
+                # owner).
                 lines.append("         ! relance due le %s — porter au %s (canon §10)"
                              % (row.get("reminder") or "?",
-                                "bureau" if row.get("who") == "bureau"
+                                "bureau" if row.get("who") in ("bureau", "externe")
                                 else "owner"))
     else:
         lines.append("Attentes externes, hors --check : aucune.")

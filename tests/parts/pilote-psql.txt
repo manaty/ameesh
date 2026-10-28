@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# Modules « pilote » : ceux que la CI d'une PR de lot passe AUSSI avec le pilote
-# psql (L116). Le reste de la suite ne dépend pas du pilote : il tourne avec
-# psycopg sur la PR de lot, et la suite psql complète tourne sur main,
-# release/*, integration/*, à la main (workflow_dispatch) et sur une PR de
-# release (source ou cible release/* ou integration/*, sans cette liste). Un
-# module ajouté ici doit exister
+# Modules « pilote » : ceux que la CI passe AUSSI avec le pilote psql (L116).
+# Le reste de la suite ne dépend pas du pilote : il tourne avec psycopg.
+# #3749 : sur main, release/*, integration/*, à la main et sur une PR de
+# release, psql passe cette liste et tout le contrat (toujours.txt) ; la
+# suite psql complète ne tourne plus que de nuit
+# (.github/workflows/psql-nocturne.yml). Un module ajouté ici doit exister
 # (scripts/test-parts.py refuse un nom inconnu).
 #
 # L1211 (canon §3) : sur une branche de lot, le pilote psql ne voit que les
@@ -28,6 +28,9 @@ test_1677_prise_empilee  # stockage : blocage par dépendances lu sous verrou (v
 test_2076_multiple_reviewers  # stockage : désignations concurrentes, retrait et compatibilité des anciens runners (#2076)
 test_3250_freeze_target_refresh  # stockage : cible rafraîchie hors transaction et gel conservé sur échec du fetch (#3250)
 test_3503_jit  # driver : jit=off dans le paquet de démarrage et le chemin DSN `options=`, session persistante, doctor (#3503)
+test_3556_auto_take_holds  # stockage : holds pilote ciblés, levée et réveil avant prise automatique (#3556)
+test_3565_hold_race  # stockage : hold/assign relu sous la transaction de prise, proposition filtrée (#3565)
+test_3643_host_critical_names  # stockage : noms critiques du drain lus dans critical_roles du canon (#3643)
 test_420_qa_role  # SQL: QA role, runner binding and TEMP registry spoofing (#420, #919)
 test_1132_jauges_perimees  # stockage : provenance des relevés (production, source), dédup par fraîcheur, gauge_latest (#1132)
 test_2179_roadmap_cli  # stockage : import transactionnel, clés stables, CAS et filtre projet avant LIMIT (#2179)
@@ -50,6 +53,7 @@ test_2905_stale_spend_key  # stockage : un spend_key périmé après retour arri
 test_2951_github_observation  # stockage : fraîcheur ci_queue_state, silence GitHub et résolution par tout notificateur (#2951)
 test_3344_map_stale  # stockage : relevé ci_map_state (0480), alerte map_stale d'une carte de plus de 48 h (#3344)
 test_3397_alerts_lenteur  # stockage : index turn_costs du dernier tour (0481), porte fermée sans Git, alerte partagée (#3397)
+test_3512_slo_merged  # stockage : fusion observée avant état/composition et relecture avant courrier SLO (#3512)
 test_423_agent_aliases  # storage: alias namespace guards, audit, same fenced lease/session and canon sync (#423)
 test_1022_creneau_landed  # storage: une fusion lande le creneau de migration, une liberation sans atterrissage le libere (#1022)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
@@ -114,3 +118,4 @@ test_migrations  # couche base : migrations sur un schéma neuf
 test_process_registry  # stockage/driver : reçus transactionnels, verrous FOR UPDATE/FOR SHARE, concurrence et annulation (#1922)
 test_registry_lease  # verrous et baux : comportement différent entre psql et psycopg
 test_undeliverable  # courrier en souffrance : renvoi en une transaction (psql persistant), lecture jointe à la vue par projet (une requête)
+test_3752_gabarit  # #3752 : le schéma cloné du gabarit vaut migrate(), rejoué par le pilote psql comme psycopg

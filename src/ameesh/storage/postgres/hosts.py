@@ -14,11 +14,17 @@ la base (`now()`) sauf quand un test la fournit.
 from __future__ import annotations
 
 import json
+import math
 from contextlib import contextmanager
 from typing import Any
 
 from .. import interface
 from ... import db as db_mod
+
+#: #3631 : largeur des tranches de `host_resource_slots`, en secondes — la
+#: même que `resources.LEND_SLOT_S` (10 min), la seule que `lend_basis` sait
+#: servir par les tranches ; une autre largeur retombe sur l'historique.
+SLOT_S = 600.0
 
 #: une liste de textes passée en paramètre : `NULL` si vide/None, sinon un
 #: JSON que l'instruction convertit en `text[]`
@@ -67,6 +73,19 @@ MEASURE_COLUMNS = (
 def _volumes_param(volumes) -> str | None:
     """#253: the reading's filesystems as a JSON parameter, None without."""
     return json.dumps(list(volumes)) if volumes is not None else None
+
+
+def _free_mem(reading) -> int | None:
+    """`mem_available_bytes + guest_mem_bytes`, None if either is unknown.
+
+    The same expression `lend_basis` reads over the history: SQL NULL
+    propagates, so a reading with only one of the two measures does not
+    count toward the minimum (L159d)."""
+    mem = reading.get("mem_available_bytes")
+    guest = reading.get("guest_mem_bytes")
+    if mem is None or guest is None:
+        return None
+    return int(mem) + int(guest)
 
 
 def _reading(row: dict) -> dict:
@@ -202,12 +221,53 @@ class Hosts(interface.HostResources):
              json.dumps(reading.get("cgroup") or {}, ensure_ascii=False),
              *(reading.get(column) for column in MEASURE_COLUMNS)),
         )
+        # #3631 : la tranche est écrite dans la MÊME transaction que le relevé
+        # — elle ne peut pas manquer à un relevé publié, ni exister sans lui.
+        sample = rows[0]
+        sampled_ts = float(sample.get("sampled_ts") or 0.0)
+        slot_start = math.floor(sampled_ts / SLOT_S) * SLOT_S
+        free_mem = _free_mem(reading)
+        # #3631 (relecture) : les relevés d'un exécuteur peuvent omettre
+        # `app_cpu` (premier relevé, part invitée inconnue). psycopg envoie
+        # alors NULL sans type et `CASE WHEN %s IS NULL` / `to_timestamp(%s)`
+        # n'ont pas de contexte pour le déduire (IndeterminateDatatype, $4) :
+        # le relevé — donc la tranche — était perdu. Les mêmes flottants sont
+        # donc typés explicitement, comme `free_mem_min` en bigint.
+        self.db.execute(
+            """
+            INSERT INTO host_resource_slots
+                (host, slot_start, readings, cpu_sum, cpu_n, free_mem_min,
+                 first_cpu_at, last_cpu_at)
+            VALUES (%s, to_timestamp(%s::float8), 1,
+                    coalesce(%s::float8, 0),
+                    CASE WHEN %s::float8 IS NULL THEN 0 ELSE 1 END,
+                    %s::bigint, to_timestamp(%s::float8),
+                    to_timestamp(%s::float8))
+            ON CONFLICT (host, slot_start) DO UPDATE
+               SET readings = host_resource_slots.readings + 1,
+                   cpu_sum = host_resource_slots.cpu_sum + excluded.cpu_sum,
+                   cpu_n = host_resource_slots.cpu_n + excluded.cpu_n,
+                   free_mem_min = LEAST(host_resource_slots.free_mem_min,
+                                        excluded.free_mem_min),
+                   first_cpu_at = LEAST(host_resource_slots.first_cpu_at,
+                                        excluded.first_cpu_at),
+                   last_cpu_at = GREATEST(host_resource_slots.last_cpu_at,
+                                          excluded.last_cpu_at)
+            """,
+            (reading.get("host") or "", slot_start,
+             reading.get("app_cpu"), reading.get("app_cpu"), free_mem,
+             sampled_ts if reading.get("app_cpu") is not None else None,
+             sampled_ts if reading.get("app_cpu") is not None else None))
         # Historique court : au-delà de sept jours, la ligne n'a plus d'usage
-        # et la table ne doit pas grandir sans fin.
+        # et la table ne doit pas grandir sans fin. Les tranches suivent la
+        # même rétention.
         self.db.execute(
             "DELETE FROM host_resources"
             " WHERE sampled_at < now() - interval '7 days'", ())
-        return _reading(rows[0])
+        self.db.execute(
+            "DELETE FROM host_resource_slots"
+            " WHERE slot_start < now() - interval '7 days'", ())
+        return _reading(sample)
 
     def latest(self, host) -> dict | None:
         rows = self.db.query(
@@ -222,19 +282,34 @@ class Hosts(interface.HostResources):
         return [_reading(row) for row in reversed(rows)]
 
     def current(self, host) -> list[dict]:
+        # #2851 : les colonnes coûteuses (`ameesh_host_gate_state`) ne sont
+        # calculées que pour le dernier relevé de chaque hôte.
+        # #3631 : la liste des hôtes est un parcours de l'index (`host`, …)
+        # — les entrées seulement, pas le tas ; le dernier relevé se lit
+        # ensuite par l'index (hôte, instant) — plus de DISTINCT ON sur les
+        # 335 000 lignes de l'historique à chaque passe d'alertes.
+        # #3741 : PostgreSQL ne saute pas d'une clé d'index à la suivante —
+        # `SELECT DISTINCT host` restait un parcours parallèle de tout le tas
+        # (2,5 s à vide, 10 s sous charge). Le parcours récursif lit une entrée
+        # d'index par hôte (`host` est NOT NULL).
         params: list[Any] = []
         where = ""
         if host:
-            where = " WHERE host = %s"
+            where = " WHERE b.host = %s"
             params.append(host)
-        # #2851 : les colonnes coûteuses (`ameesh_host_gate_state`) ne sont
-        # calculées que pour les derniers relevés. Le DISTINCT ON sur les
-        # seules clés primaires laissait sinon la fonction s'exécuter sur tout
-        # l'historique : ~1 s par lecture, et `alerts` en fait quatre.
         rows = self.db.query(
-            "SELECT " + READING_COLUMNS + " FROM host_resources WHERE id IN ("
-            "SELECT DISTINCT ON (host) id FROM host_resources"
-            + where + " ORDER BY host, sampled_at DESC, id DESC) ORDER BY host",
+            "WITH RECURSIVE b(host) AS ("
+            "  (SELECT host FROM host_resources ORDER BY host LIMIT 1)"
+            "  UNION ALL"
+            "  SELECT (SELECT h.host FROM host_resources h WHERE h.host > b.host"
+            "           ORDER BY h.host LIMIT 1)"
+            "    FROM b WHERE b.host IS NOT NULL)"
+            "SELECT r.* FROM b"
+            " CROSS JOIN LATERAL ("
+            "  SELECT " + READING_COLUMNS + " FROM host_resources h"
+            "   WHERE h.host = b.host"
+            "   ORDER BY h.sampled_at DESC, h.id DESC LIMIT 1) r"
+            + where + " ORDER BY r.host",
             tuple(params))
         return [_reading(row) for row in rows]
 
@@ -328,6 +403,43 @@ class Hosts(interface.HostResources):
             "FROM harness_versions" + where + " ORDER BY harness, host", tuple(params))
 
     def lend_basis(self, host, since_s, slot_s, percentile) -> dict:
+        """L159d : la base de la capacité prêtable, sur `since_s` secondes.
+
+        #3631 : les tranches de 10 min sont tenues à jour par `record` ; la
+        lecture porte sur ~1 000 lignes par hôte (7 jours) au lieu de
+        ~135 000 lignes larges de `host_resources`. La sémantique est celle de
+        L159d : `samples` compte tous les relevés (comme l'historique),
+        `span_s` couvre du premier au dernier relevé dont `app_cpu` est
+        connu, `min_free_mem_bytes` est le minimum de
+        `mem_available + guest_mem`, et `app_cpu_p95` est le centile des
+        moyennes par tranche. Une autre largeur de tranche que celle que la
+        table résume retombe sur l'historique (contrat inchangé, appelant
+        hors du pas de mesure).
+        """
+        if abs(float(slot_s) - SLOT_S) > 1e-9:
+            return self._lend_basis_history(host, since_s, slot_s, percentile)
+        rows = self.db.query(
+            """
+            SELECT coalesce(sum(readings), 0)::int AS samples,
+                   coalesce(extract(epoch from max(last_cpu_at) - min(first_cpu_at)),
+                            0)::float8 AS span_s,
+                   min(free_mem_min)::bigint AS min_free_mem_bytes,
+                   (SELECT percentile_cont(%s) WITHIN GROUP (
+                              ORDER BY cpu_sum / nullif(cpu_n, 0))
+                      FROM host_resource_slots
+                     WHERE host = %s
+                       AND slot_start >= now() - make_interval(secs => %s)
+                       AND cpu_n > 0)::float8 AS app_cpu_p95
+              FROM host_resource_slots
+             WHERE host = %s
+               AND slot_start >= now() - make_interval(secs => %s)
+            """, (float(percentile), host, float(since_s),
+                  host, float(since_s)))
+        return rows[0] if rows else {"samples": 0, "span_s": 0.0,
+                                     "min_free_mem_bytes": None, "app_cpu_p95": None}
+
+    def _lend_basis_history(self, host, since_s, slot_s, percentile) -> dict:
+        """#3631 : the historical query, kept for a non-summarised slot width."""
         rows = self.db.query(
             """
             WITH s AS (

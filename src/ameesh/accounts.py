@@ -153,7 +153,7 @@ import shutil
 import stat
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, NamedTuple
 
 from . import auth_failure, harnesses, platform, storage
@@ -294,9 +294,20 @@ class Profile:
     overage_cap: float = OVERAGE_CAP
     short_window_cap: float | None = None
     #: #1075: multiplies the elapsed share of the pace cap (1.0 = nominal
-    #: pace). Configured per account in the host's `accounts` key; there is no
-    #: implicit value, neither by name nor by default folder.
+    #: pace). #3647: compiled from the canon (`accounts.pace_multipliers` of
+    #: `processus/mecanique.yaml`, `with_canon_pace`), identical on every host;
+    #: the host's `accounts` key only applies, signalled, while the canon
+    #: declares no such block or cannot be read.
     pace_multiplier: float = 1.0
+    #: #3647: the multiplier declared by the host's configuration (None = not
+    #: declared), kept to signal a local setting that differs from the canon
+    pace_local: float | None = None
+    #: #3647: where `pace_multiplier` comes from: `canon`, or `local` (canon
+    #: block absent or unreadable: legacy setting, signalled)
+    pace_source: str = "local"
+    #: #3647 (owner decision #141793 a): the forecast loss at reset above which
+    #: a window's pace is raised (`underused_floor`); None = no raise
+    underused_loss: float | None = None
     #: #1469: the provider billing account this profile spends from, shared by
     #: every key, profile name, agent and host that bills it (`account_budget`);
     #: empty = no daily account envelope applies
@@ -509,6 +520,8 @@ def parse(raw) -> dict[str, list[Profile]]:
                 raise AccountError("account %s/%s: priority must be an integer"
                                    % (harness, name))
             pace_multiplier = _pace_multiplier(harness, name, item.get("pace_multiplier"))
+            pace_local = (None if item.get("pace_multiplier") is None
+                          else pace_multiplier)
             billing = str(item.get("billing_account") or "")
             if billing and not BILLING_RE.match(billing):
                 raise AccountError("account %s/%s: invalid billing_account %r"
@@ -555,7 +568,7 @@ def parse(raw) -> dict[str, list[Profile]]:
                 hourly_usd=hourly, min_balance=min_balance,
                 check_credentials=bool(item.get("check_credentials", True)),
                 priority=priority, overage=overage, **caps,
-                pace_multiplier=pace_multiplier, declared=True,
+                pace_multiplier=pace_multiplier, pace_local=pace_local, declared=True,
                 billing_account=billing, reserve_usd=reserve,
                 pace_ceiling=pace_ceiling,
                 pace_ceiling_end=pace_ceiling_end,
@@ -603,15 +616,107 @@ def _refuse_shared_homes(harness: str, profiles: list[Profile]) -> None:
             seen[home] = (profile.name, declare)
 
 
+# --------------------------------------------------------------------------
+# #3647 : rythme compilé du canon (§11, décision owner #141793 a)
+# --------------------------------------------------------------------------
+
+#: durée de vie de la règle de rythme lue au canon, par configuration : la
+#: compilation coûte une lecture Git, et `profiles` est lu à chaque tour
+CANON_PACE_TTL_S = 60.0
+_CANON_PACE: dict = {}
+
+
+def canon_pace(cfg, *, now: float | None = None):
+    """`(AccountsPace | None, erreur)` : le rythme des comptes du canon appliqué.
+
+    `(règle, "")` : le bloc `accounts` de `processus/mecanique.yaml` au commit
+    exact du canon ; `(None, "")` : le canon ne déclare pas ce bloc ;
+    `(None, erreur)` : canon illisible. Dans les deux derniers cas, le réglage
+    local de l'hôte reste appliqué et l'alerte `account_pace_local` le dit
+    (`pace_drift`) — jamais un rythme local en silence.
+    """
+    from . import mechanics
+    now = time.monotonic() if now is None else now
+    key = id(cfg)
+    cached = _CANON_PACE.get(key)
+    if cached is not None and cached[0] is cfg and now - cached[1] < CANON_PACE_TTL_S:
+        return cached[2]
+    try:
+        value = (mechanics.configured(cfg).accounts, "")
+    except mechanics.MechanicsError as exc:
+        value = (None, str(exc))
+    except Exception as exc:  # noqa: BLE001 — lecture Git : le réglage local tient, signalé
+        value = (None, "canon unreadable: %s" % exc)
+    if len(_CANON_PACE) >= 16:
+        _CANON_PACE.clear()
+    _CANON_PACE[key] = (cfg, now, value)
+    return value
+
+
+def with_canon_pace(cfg, declared: dict[str, list[Profile]]) -> dict[str, list[Profile]]:
+    """#3647 : les profils déclarés, au rythme compilé du canon.
+
+    Avec un bloc `accounts` au canon, le multiplicateur de chaque compte est
+    celui du canon (×1 s'il n'y figure pas) et le seuil de relèvement
+    (`underused_loss`) y est posé : deux hôtes aux configurations locales
+    différentes calculent le même rythme pour le même compte. Sans ce bloc, ou
+    canon illisible, les profils sont rendus tels quels (réglage local)."""
+    rule, _error = canon_pace(cfg) if cfg is not None else (None, "")
+    if rule is None:
+        return declared
+    return {harness: [replace(profile,
+                              pace_multiplier=rule.multiplier(harness, profile.name),
+                              pace_source="canon",
+                              underused_loss=rule.underused_loss)
+                      for profile in items]
+            for harness, items in declared.items()}
+
+
+def pace_drift(cfg) -> list[dict]:
+    """#3647 : les comptes dont le rythme local n'est pas celui du canon.
+
+    Une ligne par compte : `pace_multiplier` déclaré par l'hôte et différent du
+    canon (ignoré), ou réglage local appliqué faute de bloc `accounts` au canon
+    ou de canon lisible. Configuration de comptes illisible : rien d'ici, les
+    alertes de compte le disent déjà."""
+    try:
+        declared = parse(getattr(cfg, "accounts", None) or {})
+    except AccountError:
+        return []
+    rule, error = canon_pace(cfg)
+    out = []
+    for harness, items in declared.items():
+        for profile in items:
+            local = profile.pace_local
+            if rule is not None:
+                canon_value = rule.multiplier(harness, profile.name)
+                if local is None or local == canon_value:
+                    continue
+                out.append({"harness": harness, "account": profile.name,
+                            "local": local, "canon": canon_value, "applied": canon_value,
+                            "detail": "local pace_multiplier ×%g ignored: the canon "
+                                      "sets ×%g" % (local, canon_value)})
+            elif local is not None and local != 1.0:
+                out.append({"harness": harness, "account": profile.name,
+                            "local": local, "canon": None, "applied": local,
+                            "detail": "local pace_multiplier ×%g applied: %s" % (
+                                local, error or "the canon declares no accounts pace")})
+    return out
+
+
 def profiles(cfg, harness: str) -> list[Profile]:
     """Les comptes déclarés pour ce harnais (liste vide : aucun, comportement d'avant L30).
 
     #313/#2580 : avec `accounts_shared: refuse` ou `account_sharing: strict`,
     un compte dont l'identifiant est déclaré aussi par un autre mesh de
-    l'hôte porte son refus (`refused`)."""
+    l'hôte porte son refus (`refused`). #3647 : au rythme compilé du canon
+    (`with_canon_pace`)."""
     from . import account_claims
+    declared = parse(getattr(cfg, "accounts", None) or {})
+    if harness not in declared:
+        return []
     return account_claims.mark_refused(
-        cfg, parse(getattr(cfg, "accounts", None) or {}).get(harness, []))
+        cfg, with_canon_pace(cfg, {harness: declared[harness]})[harness])
 
 
 def homes(cfg, harness: str) -> list[str]:
@@ -952,6 +1057,9 @@ class Evaluation:
     #: L226b: held back by an absolute rule (in overage, past a fixed cap),
     #: not only by its pace: no budget setting lifts it
     hard: bool = False
+    #: #3647 : {clé de jauge: perte prévue au reset} des fenêtres dont le
+    #: rythme est relevé (`underused_floor`)
+    raises: dict = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -1206,6 +1314,112 @@ def pace_ceiling(profile: Profile, gauges, gauge, now: float) -> Ceiling:
     return Ceiling(base, from_ts=from_ts, end=end)
 
 
+def underused_floor(profile: Profile, gauges, gauge, now: float) -> float | None:
+    """#3647 (décision owner #141793 a, canon §11) : le rythme relevé d'une
+    fenêtre sous-utilisée, ou None.
+
+    Quand la perte prévue au reset de la fenêtre — sa part de quota inutilisée
+    si rien ne change (`Gauge.expiring`, la « lost at reset » d'`accounts
+    list`) — dépasse le seuil du canon (`underused_loss`), le plafond de
+    rythme ne descend pas sous `1 − underused_loss` : c'est le relèvement
+    minimal qui ramène la perte prévue au seuil. Il ne dépasse jamais le
+    plafond de rythme du compte (`Gauge.pace_cap`), et les plafonds fixes
+    s'appliquent ensuite (`limits`) : jamais d'overage.
+
+    Aucun relèvement sans seuil déclaré, sur un relevé périmé (#1561 : la
+    perte n'y est pas annoncée), sur une fenêtre non datée ou échue, ni sur un
+    compte en overage. Calcul déterministe, sans état : le même relevé donne
+    le même rythme sur chaque hôte."""
+    threshold = profile.underused_loss
+    if threshold is None or in_overage(gauges, now):
+        return None
+    found = gauge.expiring(now)
+    if found is None or found[1] <= threshold or stale_reading(gauges, now):
+        return None
+    return 1.0 - threshold
+
+
+def underused_floors(profile: Profile, gauges, now: float) -> dict:
+    """{clé de jauge: plancher} des fenêtres au rythme relevé (#3647)."""
+    out = {}
+    for gauge in gauges:
+        floor = underused_floor(profile, gauges, gauge, now)
+        if floor is not None:
+            out[gauge.key] = floor
+    return out
+
+
+def raise_reason(profile: Profile, lost: float) -> str:
+    """#3647 : la raison d'un rythme relevé, affichée et journalisée."""
+    return "pace raised: forecast loss at reset %.0f%% > %.0f%%" % (
+        lost * 100, (profile.underused_loss or 0.0) * 100)
+
+
+#: #3647 : journal des relèvements de rythme, dans le dossier d'état de l'hôte
+RAISES_JOURNAL = "pace_raises.jsonl"
+#: la fin du journal relue pour ne journaliser qu'une fois chaque relèvement
+_RAISES_TAIL = 65536
+
+
+def journal_raises(book, profile: Profile, gauges, raises: dict, now: float) -> int:
+    """#3647 : journalise chaque relèvement de rythme avec la lecture des jauges.
+
+    Une ligne JSON par fenêtre et par remise à zéro (`resets_at`) : le premier
+    tour qui relève le rythme l'écrit, les suivants la retrouvent à la fin du
+    journal et n'écrivent rien. Verrou exclusif de l'hôte pendant la relecture
+    et l'écriture. **Ne lève jamais** : le journal ne doit pas casser la garde
+    de budget. Rend le nombre de lignes écrites."""
+    import fcntl
+    import json
+    state_dir = getattr(book, "state_dir", None)
+    if not state_dir or not raises:
+        return 0
+    path = os.path.join(state_dir, RAISES_JOURNAL)
+    by_key = {g.key: g for g in gauges}
+    try:
+        with open(path, "a+", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - _RAISES_TAIL))
+            seen = set()
+            for line in fh.read().splitlines():
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(item, dict):
+                    seen.add((item.get("harness"), item.get("account"),
+                              item.get("key"), item.get("resets_at")))
+            written = 0
+            for key, lost in sorted(raises.items()):
+                gauge = by_key.get(key)
+                if gauge is None:
+                    continue
+                ident = (profile.harness, profile.name, key, gauge.resets_at)
+                if ident in seen:
+                    continue
+                fh.write(json.dumps({
+                    "ts": round(now, 3), "harness": profile.harness,
+                    "account": profile.name, "key": key,
+                    "resets_at": gauge.resets_at, "lost": round(lost, 4),
+                    "threshold": profile.underused_loss,
+                    "floor": round(1.0 - profile.underused_loss, 4),
+                    "pace_multiplier": profile.pace_multiplier,
+                    "pace_source": profile.pace_source,
+                    "reason": raise_reason(profile, lost),
+                    "gauges": [{"key": g.key, "used": g.used, "elapsed": round(g.elapsed(now), 4),
+                                "resets_at": g.resets_at, "window_s": g.window_s,
+                                "read_at": getattr(g, "read_at", None),
+                                "source": getattr(g, "source", "")} for g in gauges],
+                }, sort_keys=True) + "\n")
+                written += 1
+            fh.flush()
+            return written
+    except Exception:  # noqa: BLE001 — journal facultatif : jamais fatal
+        return 0
+
+
 def pace_ceilings(profile: Profile, gauges, now: float) -> dict:
     """{clé de jauge: Ceiling} pour toutes les fenêtres du compte (#1176)."""
     return {gauge.key: pace_ceiling(profile, gauges, gauge, now)
@@ -1232,7 +1446,8 @@ def fixed_caps(profile: Profile, gauges, *, critical: bool = False) -> list[tupl
 
 
 def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
-           reserve: bool = False, ceilings: dict | None = None) -> dict:
+           reserve: bool = False, ceilings: dict | None = None,
+           floors: dict | None = None) -> dict:
     """{gauge key: (cap, label)}: the usage each window of the account is held
     to (L226b), the lowest of
     * the pace cap of the guard (0019), or on the short window the account's
@@ -1258,17 +1473,24 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
     calculés pour ce compte ; sans eux, ils le sont ici. Le plafond de rythme
     est celui du compte (`pace_ceiling`), ou son plafond de fin de fenêtre
     quand `overage_impossible` le prouve.
+
+    `floors` (#3647, `underused_floors`) : le rythme relevé des fenêtres
+    sous-utilisées ; sans eux, il est calculé ici. La réserve des
+    non-critiques et les plafonds fixes s'appliquent par-dessus.
     """
     fixed = fixed_caps(profile, gauges, critical=critical)
     cut = RESERVE if reserve else 0.0
     if ceilings is None:
         ceilings = pace_ceilings(profile, gauges, now)
+    if floors is None:
+        floors = underused_floors(profile, gauges, now)
     out = {}
     for gauge in gauges:
         ceiling = ceilings.get(gauge.key)
         pace = (gauge.held_cap(now, cut, profile.pace_multiplier,
                                ceiling.value if ceiling is not None
-                               else profile.pace_ceiling), "pace cap")
+                               else profile.pace_ceiling,
+                               floors.get(gauge.key, 0.0)), "pace cap")
         if profile.short_window_cap is not None and gauge.window_s <= SHORT_WINDOW_S:
             base = (max(0.0, profile.short_window_cap - cut), "short window cap")
             if reserve:
@@ -1383,8 +1605,12 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         result.until = max(resets) if resets and len(resets) == len(spent) else None
         return result
     result.ceilings = pace_ceilings(profile, result.gauges, now)
+    floors = underused_floors(profile, result.gauges, now)
+    result.raises = {g.key: g.expiring(now)[1] for g in result.gauges if g.key in floors}
+    if result.raises and record:
+        journal_raises(book, profile, result.gauges, result.raises, now)
     result.limits = limits(profile, result.gauges, now, critical=critical, reserve=reserve,
-                           ceilings=result.ceilings)
+                           ceilings=result.ceilings, floors=floors)
     depasses = []
     for gauge in result.gauges:
         # fenêtre remise à zéro depuis le relevé : vierge (L71 : `used_at`
@@ -1402,6 +1628,8 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         result.held = (gauge.key, gauge.used)
         ceiling = result.ceilings.get(gauge.key)
         raised = ", %s" % ceiling.reason if ceiling is not None and ceiling.reason else ""
+        if gauge.key in result.raises:
+            raised += ", %s" % raise_reason(profile, result.raises[gauge.key])
         if label == "pace cap":
             result.reason = ("plan %s %s: %.0f%% used with %.0f%% of the window elapsed "
                              "(pace cap %.0f%%%s)" % (
@@ -1612,6 +1840,10 @@ def explain(result: Evaluation, now: float) -> str:
     gauges = result.gauges
     if not gauges:
         return "no reading: unverified"
+    if _empty_after_reset(gauges, now):
+        # #3586 : la fenêtre remise à zéro est vide ; ce n'est pas une mesure
+        # courante (le relevé est ancien), mais c'est un 0 % sûr à essayer.
+        return "stale reading (window reset since the reading): 0% used, tried first"
     if stale_reading(gauges, now):
         last = lag(gauges, now, result.limits)[1]
         suffix = (", last %s %.0f%%" % (last.key, last.used * 100)
@@ -1701,15 +1933,37 @@ def _informative_partial(gauges, result: Evaluation, now: float) -> bool:
     return True
 
 
+def _empty_after_reset(gauges, now: float) -> bool:
+    """#3586 : un relevé antérieur au reset ne pèse plus quand tout vaut 0 %.
+
+    Une fenêtre remise à zéro depuis la lecture est vide (`used_at` rend 0,
+    L71) ; si **toutes** les fenêtres valent 0 % à `now`, le relevé ancien ne
+    prouve aucun budget entamé. Il n'est plus classé « périmé derrière tout
+    état vérifié » (#1561) : il s'essaie en premier, comme un relevé absent
+    (L117), et le premier tour relit la jauge (`evaluate`/`record_gauges`) —
+    c'est la sonde qui confirme le 0 %. Un compte réellement au seuil reste
+    écarté par `Evaluation.ok`/`placeable` ; `auth_blocked` et les plafonds
+    durs restent intacts, jamais d'overage.
+
+    Sans gauge (relevé absent), la règle L117 existante s'applique : ce helper
+    ne la double pas.
+    """
+    gauges = list(gauges)
+    return bool(gauges) and stale_reading(gauges, now) \
+        and all(g.used_at(now) <= 0.0 for g in gauges)
+
+
 def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
     """La clé de classement d'un compte (0034 amendée, #1561, #1580, #1566).
 
     * la fraîcheur du relevé (#1561, #1566 N1) : sans relevé d'abord (L117,
       amendement 0034 du 2026-10-10 — un compte jamais utilisé compte pour
       0 % et passe en premier, pour ne pas laisser un forfait inutilisé), puis
-      un relevé courant — ou un relevé partiel encore informatif
-      (`_informative_partial`, GO pilote du 15/10) —, puis un relevé périmé,
-      qui ne passe jamais avant un état vérifié ;
+      un relevé dont la fenêtre remise à zéro est vide (0 % partout, #3586 —
+      essayé comme L117, la sonde du premier tour confirme), puis un relevé
+      courant — ou un relevé partiel encore informatif (`_informative_partial`,
+      GO pilote du 15/10) —, puis un relevé périmé, qui ne passe jamais avant
+      un état vérifié ;
     * la perte par seconde d'ici la remise à zéro (`lost_rate`, la plus
       rapide d'abord, #1789/N1) ;
     * le retard sur le rythme (`lag`, le plus petit rapport d'abord) ;
@@ -1725,11 +1979,17 @@ def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
     équilibre les comptes et porte les plafonds fixes (L226b)."""
     result = evaluations[profile.name]
     gauges = result.gauges
+    if _empty_after_reset(gauges, now):
+        # #3586 : 0 % partout, aucun budget entamé à départager — l'ordre
+        # déclaré décide, comme entre deux relevés absents (L117) ; la sonde
+        # du premier tour relit la jauge et confirme le 0 %.
+        return (0, 0.0, 0.0, float("inf"), 0.0, priority(profile))
     found = expiry(gauges, now)
     # #1561 : absent (0, L117), courant (1), périmé (2) — le périmé après tout
     # état vérifié ; #1580/#1789 : le budget perdu avant le retard, lui-même
     # avant l'ordre déclaré ; #1566 N1 : un partiel encore informatif garde le
-    # rang d'un courant.
+    # rang d'un courant ; #3586 : un relevé dont la fenêtre remise à zéro est
+    # vide (0 % partout) s'essaie en premier, comme L117.
     if not gauges:
         freshness = 0
     elif not stale_reading(gauges, now) or _informative_partial(gauges, result, now):
@@ -1779,6 +2039,13 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
     Sans preuve, il reste périmé (fraîcheur 2) ; un relevé écarté par
     `placeable` ne revient pas par cette règle.
 
+    #3586 : un relevé périmé dont la fenêtre remise à zéro est **vide** (0 %
+    partout à `now`, `_empty_after_reset`) ne porte aucun budget entamé à
+    départager : il s'essaie en premier, comme un relevé absent (L117), et
+    l'ordre déclaré décide ; la sonde du premier tour relit la jauge et
+    confirme le 0 %. La borne #1672 (`placeable`) reste : un relevé plus vieux
+    que la fenêtre ouverte n'entre pas.
+
     Un relevé **absent** garde la règle L117 (amendement 0034 du 2026-10-10) :
     un compte jamais utilisé compte pour 0 % et passe en premier, pour ne pas
     laisser un forfait inutilisé. Un relevé dont **toutes** les fenêtres
@@ -1812,6 +2079,12 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
         # compte pour 0 % et passe en premier — la raison le dit, sans
         # prétendre à un 0 % mesuré (#1561).
         why = "no reading: unverified, tried first (L117)"
+    elif _empty_after_reset(gauges, now):
+        # #3586 : la fenêtre remise à zéro est vide ; le relevé s'essaie en
+        # premier comme L117, la sonde du premier tour confirme le 0 %.
+        why = explain(evaluations[first.name], now)
+        if len(ranked) > 1 and priority(first) != priority(ranked[1]):
+            why += ", first in the failover order (priority %d)" % priority(first)
     elif stale_reading(gauges, now):
         # #1561 : un relevé périmé est essayé faute de mieux (L71), pas choisi
         # sur un rythme qui n'est plus mesuré. #1672 ne l'écarte que lorsqu'il
@@ -2405,9 +2678,11 @@ def report(cfg, db, book, *, now: float | None = None,
     # unique, partagée par le refus des profils et la ligne d'affichage.
     shares = account_claims.shared(cfg, db=db, now=now)
     by_share = {(item["harness"], item["account"]): item for item in shares}
+    # #3647 : au rythme compilé du canon, comme `profiles` (le choix)
     declared = {harness: account_claims.mark_refused(cfg, items, now=now,
                                                      shares=shares)
-                for harness, items in parse(getattr(cfg, "accounts", None) or {}).items()}
+                for harness, items in with_canon_pace(
+                    cfg, parse(getattr(cfg, "accounts", None) or {})).items()}
     store = storage.of(db).accounts if db is not None else None
     rows: list[dict] = []
     for harness, items in declared.items():
@@ -2456,6 +2731,10 @@ def report(cfg, db, book, *, now: float | None = None,
                 # #1227 N3 : ces lecteurs recalculent le plafond de rythme du
                 # compte, pas seulement sa valeur
                 "pace_multiplier": profile.pace_multiplier,
+                # #3647 : sa source (canon, ou réglage local signalé) et les
+                # fenêtres au rythme relevé ({clé: perte prévue})
+                "pace_source": profile.pace_source,
+                "pace_raises": dict(result.raises),
                 # L226b: failover order and overage flags
                 "priority": priority(profile),
                 "overage": _overage_row(profile, result.gauges, now),
@@ -2598,6 +2877,12 @@ def format_rows(rows: list[dict]) -> str:
                          % ("", "", "", ""))
         if row["reason"]:
             lines.append("%-9s %-14s %-7s %-8s ↳ %s" % ("", "", "", "", row["reason"]))
+        if row.get("pace_raises"):
+            # #3647 : fenêtres au rythme relevé (perte prévue au-delà du canon)
+            lines.append("%-9s %-14s %-7s %-8s ↳ pace raised (forecast loss at reset "
+                         "above the canon threshold): %s" % ("", "", "", "", ", ".join(
+                             "%s %.0f%%" % (key, lost * 100)
+                             for key, lost in sorted(row["pace_raises"].items()))))
         if row.get("losses"):
             lines.append("%-9s %-14s %-7s %-8s ↳ lost at reset if nothing changes: %s"
                          % ("", "", "", "", ", ".join(

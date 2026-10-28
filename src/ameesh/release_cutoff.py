@@ -616,6 +616,35 @@ def reading_is_green(reading: dict) -> bool:
     return False
 
 
+def ci_state_text(reading: dict | None) -> str:
+    """#3641 : l'état réel de la CI de la tête, pour les rapports de coupe.
+
+    #2692 ne laissait hériter qu'une tête **en cours** ; #3633 étend
+    l'héritage d'arbre à une tête rouge, annulée ou absente. Le rapport ne
+    peut donc plus écrire « en cours » par défaut : il nomme ce qui a été lu,
+    et la preuve d'arbre reste citée à part.
+    """
+    if not reading:
+        return "absente"
+    if reading_is_green(reading):
+        return "verte"
+    if reading.get("negative") or reading.get("required_negative"):
+        return "rouge"
+    if reading.get("pending"):
+        return "en cours"
+    if reading.get("unconcluded"):
+        return "non conclue"
+    if reading.get("missing"):
+        return "absente"
+    if reading.get("inconclusive"):
+        return "non concluante"
+    if reading.get("failed"):
+        return "rouge"
+    if not reading.get("runs", 1):
+        return "absente"
+    return "non verte"
+
+
 def commit_is_green(repo: str, project: "ProjectRelease", sha: str,
                     reading: dict | None = None) -> bool:
     """The exact commit is green; a non-green release commit inherits its chain.
@@ -668,6 +697,25 @@ def _latest_green_tag(repo: str, head: str, project: "ProjectRelease") -> str | 
     return None
 
 
+def _release_on_green_tree(repo: str, project: "ProjectRelease", candidates, reference):
+    """#3641 : la plus récente release dont le parent porte une preuve d'arbre.
+
+    Une coupe sur une tête rouge à arbre vert crée V sur M (`[skip ci]`) ; la
+    coupe suivante doit repartir de V, déjà taguée, et non du vert antérieur
+    B (sinon `staging_pending.regressions(B)` retient le paquet suivant et le
+    tag existe déjà). On rejoue la preuve d'arbre sur le parent M de V contre
+    la référence verte B : mêmes gardes de contenu que #2692/#3633. Rend le
+    candidat `(release, parent, lecture du parent, lecture de la release)`, ou
+    None."""
+    if not reference:
+        return None
+    for candidate in candidates:
+        release, merge, reading, _own = candidate
+        if tree_green(repo, project, merge, reference, reading=reading) is not None:
+            return candidate
+    return None
+
+
 def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100,
                *, evidence: dict | None = None) -> str | None:
     """The green content of the history, without a release-chain cap.
@@ -678,18 +726,50 @@ def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100
     a red child of it. A landing merge is recognised directly, so any number of
     successive red cutoffs works. Without a landing merge, only a truly green
     first-parent commit is accepted; if none is found the caller refuses (N5).
+
+    #3641 : un commit de release `V` posé sur une tête rouge dont l'arbre est
+    celui d'une tête de paquet verte (#3633) est le vert le plus récent. Son
+    propre CI est absente (`[skip ci]`) et son parent M est rouge ; sans cette
+    reconnaissance, la coupe suivante sautait V et repartait de B.
+
+    `evidence` reçoit la lecture du vert retenu et, quand c'est une release sur
+    arbre vert, `tree_reference` : le vert B dont la suite a prouvé l'arbre de
+    M. La coupe part de V, mais la preuve de suite se rejoue contre B.
     """
     cursor = head
+    candidates: list[tuple[str, str, dict, dict]] = []
     for _ in range(limit):
         reading = ci_reading(project, cursor)
         if commit_is_green(repo, project, cursor, reading=reading):
+            chosen = _release_on_green_tree(repo, project, candidates, cursor)
+            if chosen is not None:
+                if evidence is not None:
+                    evidence.update(chosen[3])
+                    # #3641 : la référence de suite de `tree_green` est le
+                    # vert qui a prouvé l'arbre de M, jamais la release V
+                    # elle-même (sans suite) ; la coupe, elle, part de V.
+                    evidence["tree_reference"] = cursor
+                return chosen[0]
             if evidence is not None:
                 evidence.update(reading)
             return cursor
         if _landing_release(repo, cursor):
             # Exact CI first: a re-validated landing is green content, never
             # an inheritance from its red first parent.
-            return _latest_green_tag(repo, head, project)
+            reference = _latest_green_tag(repo, head, project)
+            chosen = _release_on_green_tree(repo, project, candidates, reference)
+            if chosen is not None:
+                if evidence is not None:
+                    evidence["tree_reference"] = reference
+                return chosen[0]
+            return reference
+        if _release_commit(repo, cursor):
+            parent = _git(repo, "rev-parse", "--verify", "%s^1" % cursor)
+            if not parent.returncode:
+                merge = (parent.stdout or "").strip()
+                if merge and packet_head(repo, merge) is not None:
+                    candidates.append(
+                        (cursor, merge, ci_reading(project, merge), reading))
         parent = _git(repo, "rev-parse", "--verify", "%s^1" % cursor)
         if parent.returncode:
             break
@@ -984,6 +1064,7 @@ class ProjectRelease:
     lock_wait_s: float = LOCK_WAIT_S
     version_bump: str = "level"
     suite_tolerated: tuple = ()
+    model: str = "semver"
 
     @classmethod
     def from_config(cls, cfg, name: str, entry: dict) -> "ProjectRelease":
@@ -991,7 +1072,7 @@ class ProjectRelease:
             raise ReleaseError("release.projects.%s: an object is required" % name)
         unknown = set(entry) - {"repo", "target", "remote", "staging", "report",
                                 "github", "window_s", "staging_timeout_s",
-                                "lock_ttl_s", "lock_wait_s", "version_bump"}
+                                "lock_ttl_s", "lock_wait_s", "version_bump", "model"}
         if unknown:
             raise ReleaseError("release.projects.%s: unknown key(s) %s"
                                % (name, ", ".join(sorted(unknown))))
@@ -1007,6 +1088,13 @@ class ProjectRelease:
             humans = [h.strip() for h in str(getattr(cfg, "humans", "") or "").split(",")
                       if h.strip()]
             report = humans[0] if humans else "smichea"
+        model = entry.get("model", "semver")
+        if model not in ("semver", "nexlink"):
+            raise ReleaseError("release model: semver | nexlink expected")
+        if model == "nexlink" and (name != "nexlink" or target != "develop"
+                                    or "staging" in entry):
+            raise ReleaseError("nexlink model requires project nexlink, target develop, "
+                               "and its closed staging workflow list (no staging script)")
         bump = entry.get("version_bump", "level")
         if bump not in ("level", "patch"):
             raise ReleaseError("release.projects.%s.version_bump: level | patch" % name)
@@ -1035,7 +1123,7 @@ class ProjectRelease:
             staging_timeout_s=number("staging_timeout_s", STAGING_TIMEOUT_S),
             lock_ttl_s=number("lock_ttl_s", LOCK_TTL_S),
             lock_wait_s=number("lock_wait_s", LOCK_WAIT_S), version_bump=bump,
-            suite_tolerated=tolerated)
+            suite_tolerated=tolerated, model=model)
 
 
 def projects(cfg) -> dict[str, ProjectRelease]:
@@ -1103,8 +1191,9 @@ class Plan:
     notes: str
     # N4: the base carries the previous tag's exact tree, nothing to release.
     empty: bool = False
-    #: #2692: the target head's CI is still in progress, but its tree is the
-    #: packet head's green content; the evidence (head, runs) or None.
+    #: #2692: the target head's CI is not green (#3633: red, cancelled, absent
+    #: or in progress), but its tree is the packet head's green content; the
+    #: evidence (head, runs) or None.
     tree_green: dict | None = None
     #: #3291: this green candidate would discard content already active.
     kept_active: dict[str, str] = dataclasses.field(default_factory=dict)
@@ -1327,16 +1416,20 @@ def tree_green(repo: str, project: "ProjectRelease", sha: str, reference: str | 
                reading: dict | None = None) -> dict | None:
     """#2692: the head's tree is content a green packet head validated.
 
-    Only a head whose own CI is still in progress may inherit (a concluded red
-    stays red, even with an equal tree). The packet merge must carry the
-    packet head's exact tree (no conflict resolution), that head must be green,
-    and its jobs must prove the same full suite as the target's last green
-    commit. Returns the evidence or None; a read failure stays transient.
+    The packet merge must carry the packet head's exact tree (no conflict
+    resolution), that head must be green, and its jobs must prove the same
+    full suite as the target's last green commit. Returns the evidence or
+    None; a read failure stays transient.
+
+    #3633 (décision owner #141353 a, 26/10/2026) : la CI propre de la tête
+    n'entre plus en compte. Rouge, annulée, absente ou en cours, une tête dont
+    l'arbre est celui d'une tête de paquet entièrement verte vaut verte pour
+    la coupe — le contenu a déjà passé la suite complète, et le critère se
+    calcule sans jugement (canon §7, §11 bis). Avant, seule une tête encore en
+    cours héritait.
     """
     own = ci_reading(project, sha) if reading is None else reading
-    if own.get("green") or own.get("failed") or own.get("missing"):
-        return None
-    if not own.get("pending"):
+    if own.get("green"):
         return None
     if not reference or reference == sha:
         return None
@@ -1383,6 +1476,9 @@ def tree_proof_text(head: str, proof: dict) -> str:
 
 def build_plan(cfg, project: ProjectRelease, *, now: float,
                version: str | None = None) -> Plan:
+    if project.model == "nexlink":
+        from . import nexlink_release
+        return nexlink_release.plan(cfg, project, now=now, version=version)
     rules, source = compiled_rules(cfg, project.name)
     cutoff_at, cutoff_label = cutoff_slot(rules, now)
     fetch(project.repo, project.remote, project.target)
@@ -1395,8 +1491,13 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
         base_reading = {}
         green_commit = last_green(project.repo, head, project, evidence=base_reading)
         # #2692: a packet merge whose tree is the green packet head's content
-        # is green while the target's own CI is still in progress.
-        tree_proof = tree_green(project.repo, project, head, green_commit,
+        # is green — #3633 : whatever the target's own CI says (décision
+        # owner #141353 a).
+        # #3641 : V (release sur tête rouge à arbre vert) est la base de
+        # coupe, mais la suite se prouve contre le vert B qui a validé l'arbre
+        # de sa tête M — V n'a pas de suite propre.
+        tree_reference = base_reading.get("tree_reference") or green_commit
+        tree_proof = tree_green(project.repo, project, head, tree_reference,
                                 reading=reading)
         if tree_proof is not None:
             green, green_commit = True, head
@@ -2033,9 +2134,9 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
     lines.append("Après: %s (commit %s)." % (version, release_sha[:12]))
     if plan and plan.tree_green:
         proof = plan.tree_green
-        lines.append("CI tête: en cours ; arbre identique à la tête de paquet %s, "
+        lines.append("CI tête: %s ; arbre identique à la tête de paquet %s, "
                      "suite complète verte (preuve %s)."
-                     % (proof["head"][:12], ", ".join(
+                     % (ci_state_text(plan.ci), proof["head"][:12], ", ".join(
                          run["url"] or "run %s" % run["id"] for run in proof["runs"])))
     elif plan and plan.ci:
         state = "verte" if reading_is_green(plan.ci) else "non verte"
@@ -2109,6 +2210,10 @@ def execute(cfg, db, project: ProjectRelease, *, now: float | None = None,
             version: str | None = None) -> dict:
     """One release attempt; the report is the durable answer."""
     now = time.time() if now is None else float(now)
+    if project.model == "nexlink":
+        from . import nexlink_release
+        return nexlink_release.execute(cfg, db, project, now=now, force=force,
+                                       no_staging=no_staging, version=version)
     state = load_state(cfg)
     state_slot = project_state(state, project.name)
     rules, source = compiled_rules(cfg, project.name)
@@ -2269,9 +2374,9 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
             "correction ouvert" % (plan.head[:12], ", ".join(plan.ci["inconclusive"])))
     if plan.tree_green:
         deviations.append(
-            "tête %s: CI en cours, arbre identique à la tête de paquet %s "
+            "tête %s: CI %s, arbre identique à la tête de paquet %s "
             "(suite complète verte, %s)"
-            % (plan.head[:12], plan.tree_green["head"][:12],
+            % (plan.head[:12], ci_state_text(plan.ci), plan.tree_green["head"][:12],
                ", ".join(run["url"] or "run %s" % run["id"]
                          for run in plan.tree_green["runs"])))
     elif not plan.green:

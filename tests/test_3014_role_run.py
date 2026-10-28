@@ -268,6 +268,7 @@ class NotifyOnlyTest(unittest.TestCase):
         with mock.patch.object(notify, "Notifier", return_value=fake) as ctor, \
                 mock.patch.object(notify.db_mod, "connect", return_value=fake), \
                 mock.patch.object(notify.db_mod, "require_schema"), \
+                mock.patch.object(notify, "load_shared_state", return_value=None), \
                 mock.patch.object(notify.time, "sleep", side_effect=KeyboardInterrupt):
             self.assertEqual(notify.cmd_notify(self._cfg(), notify.NotifyConfig(), args), 0)
         self.assertEqual(ctor.call_args.kwargs["skip"],

@@ -5,7 +5,7 @@
     scripts/test-plan.py plan --out plan.json [--map carte.json.gz] [--event EVENT]
                               [--base SHA] [--ref REF]
                               [--base-ref B] [--head-ref H] [--mode auto|lot|full]
-                              [--github-output F] [--summary F] [--annotations]
+                              [--psql-full true|false] [--github-output F] [--summary F] [--annotations]
     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
                                [--summary F]
     scripts/test-plan.py tally leaks.json [leaks.json…]
@@ -55,12 +55,21 @@ both drivers, and no lane that skips the tests either.
 **Release pull requests keep the full suite (canon §3).** A pull request
 whose source or target is `release/**` or the package integration branch
 (§12) is a release PR: like the `push` to those branches, it runs the full
-suite under both drivers (`PARTS` in full), with no version-only or
-documentation-only fast lane and without the psql pilot list — the branch
-context comes from the workflow (`--base-ref`, `--head-ref`, L1211). The
-same holds for the fallback plan, so an unreadable map never narrows a
-release to the pilot list. Only the full suite prepares the merge of a
-release.
+suite (`PARTS` in full), with no version-only or documentation-only fast
+lane and never the impacted selection of a lot — the branch context comes
+from the workflow (`--base-ref`, `--head-ref`, L1211). The same holds for
+the fallback plan, so an unreadable map never narrows a release to a lot's
+selection. Only the full suite prepares the merge of a release.
+
+**The full suite is psycopg; psql runs its pilot list (#3749).** Owner rule
+of 26/10 (canon home#184): a full suite in ten minutes of wall time at most.
+Outside a lot, psql no longer replays the whole suite: it runs the pilot list
+(`tests/parts/pilote-psql.txt`: the database layer, migrations, storage and
+what is proper to a driver) plus the whole contract list
+(`tests/parts/toujours.txt`), in the full-suite part count; psycopg runs the
+whole suite. The whole suite under psql runs at night
+(`.github/workflows/psql-nocturne.yml`, `--psql-full true`): psql only, every
+module, no psycopg part — psycopg already ran it on every push to `main`.
 
 **Documentation-only** (L161a): a pull request whose whole diff is
 documentation, and a push to `main` whose whole pushed range (`--base`,
@@ -1547,9 +1556,9 @@ def release_pr(base_ref: str | None = None, head_ref: str | None = None) -> str:
     """Why this pull request is a release one (canon §3), or "".
 
     A source or target branch under `release/**` or `integration/**` is a
-    release PR: the full suite, both drivers, no version/documentation fast
-    lane and no psql pilot list — the target of a lot PR, `main`, keeps the
-    selection. The reason goes to the plan and the summary.
+    release PR: the full suite (psycopg whole, psql pilot list + contract,
+    #3749), no version/documentation fast lane and never a lot's impacted
+    selection — the target of a lot PR, `main`, keeps the selection. The reason goes to the plan and the summary.
     """
     for role, ref in (("target", _branch(base_ref)), ("source", _branch(head_ref))):
         if ref.startswith(RELEASE_PREFIXES):
@@ -1805,7 +1814,7 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
               head: str = "HEAD", repo: pathlib.Path = REPO,
               base: str = "HEAD^1", ref: str = "",
               base_ref: str | None = None, head_ref: str | None = None,
-              mode: str = "auto") -> dict:
+              mode: str = "auto", psql_full: bool = False) -> dict:
     """The plan of one run; `mode` says which CI this is (canon §3).
 
     `auto` (default): inferred from the event, as before — a pull request
@@ -1816,6 +1825,10 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     the frozen head always means the tests ran. `full`: the whole suite, for a
     release or an explicit `--full` request (#1343, `ci-full-<sha>`), never a
     lane that skips the tests either.
+
+    #3749 : outside a lot, psql runs its pilot list and the contract, not the
+    whole suite; `psql_full` (the night run) gives psql every module and
+    psycopg no part.
     """
     now = now or datetime.datetime.now(datetime.timezone.utc)
     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
@@ -1831,7 +1844,7 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     plan = {"schema": PLAN_SCHEMA, "event": event, "generated": now.isoformat(timespec="seconds"),
             "head": os.environ.get("AMEESH_CI_TETE") or _rev(head, repo),
             "tested": _rev(head, repo), "release": release, "mode": mode,
-            "docs_fallback": False,
+            "psql_full": psql_full, "docs_fallback": False,
             "refs": {"base": base_ref, "head": head_ref},
             **nature(event, base=base, head=head, repo=repo, ref=ref)}
     if mode in ("lot", "full"):
@@ -1896,7 +1909,7 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     #: (`docs_fallback`) : elle sautait les parts, elle ne peut pas finir en
     #: sélection réduite.
     lot = ((mode == "lot" or (mode == "auto" and pr)) and not release
-           and not plan["docs_fallback"])
+           and not plan["docs_fallback"] and not psql_full)
     #: L1211 : une branche de lot ne lance que les impactés et le contrat ;
     #: tout doute rend la suite complète (lot_selection). La sélection se
     #: contente d'une part par pilote tant que l'estimation le permet.
@@ -1910,6 +1923,16 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
         if driver == "psql" and lot:
             selected = psql_pr_modules(read_list(PILOT_FILE, modules, required=True),
                                        always)
+        elif driver == "psql" and not psql_full:
+            # #3749 : hors lot (paquet, main, release), psql passe sa liste
+            # pilote et tout le contrat ; la suite psql entière est nocturne.
+            selected = psql_pr_modules(read_list(PILOT_FILE, modules, required=True),
+                                       contract)
+        if driver == "psycopg" and psql_full:
+            # #3749 : le nocturne ne rejoue que psql ; psycopg a déjà passé la
+            # suite entière sur chaque poussée de main.
+            plan["parts"][driver] = []
+            continue
         if chosen_set is not None:
             selected = [m for m in selected if m in chosen_set]
         # #3343 : une sélection impactée garde les parts d'un lot ; dès que le
@@ -1943,13 +1966,16 @@ def _rev(rev: str, repo: pathlib.Path) -> str:
 
 def fallback_plan(event: str, error: str, base_ref: str | None = None,
                   head_ref: str | None = None, mode: str = "auto",
-                  ref: str = "") -> dict:
+                  ref: str = "", psql_full: bool = False) -> dict:
     """The plan when planning itself failed: full suite, alphabetical order.
 
     The lot shape of `mode` is kept: a lot CI that cannot plan still runs the
     full suite on both drivers, with the full-suite part counts (#3343) and the
     psql pilot list — never fewer parts than the impacted selection would have
-    had.
+    had. #3749 : outside a lot too, psql runs the pilot list and the whole
+    contract, as an explicit module list split by the static weights; if
+    either list cannot be read, psql runs the whole suite. The night run
+    (`psql_full`) keeps the whole suite under psql and no psycopg part.
     """
     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
     head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
@@ -1957,31 +1983,53 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
     if mode == "lot":
         #: #1343 : le repli d'un dispatch de lot garde la règle release/**.
         release = release or release_pr(None, _branch(ref))
-    pr = event == "pull_request"
-    #: L1211 : le repli d'une PR de release garde les deux pilotes complets,
-    #: jamais la liste pilote psql d'un lot ; le repli d'un lot (PR ou CI au
-    #: gel, #1343) garde sa forme de lot.
-    lot = (mode == "lot" or (mode == "auto" and pr)) and not release
+    #: #3749 : le repli d'un lot comme celui d'une release passe psycopg en
+    #: entier et, sous psql, la liste pilote ET tout le contrat — en liste
+    #: explicite : test-parts.py ne joint pas toujours.txt à `pilot_list`
+    #: (R1 cx3). Une liste illisible rend la suite psql entière.
     why = "planning failed" + (f"; {release}" if release else "")
     modules = parts.modules()
     plan = {"schema": PLAN_SCHEMA, "event": event, "head": "", "tested": "",
             "version_only": False, "docs_only": False, "why": why, "mode": mode,
-            "release": release, "refs": {"base": base_ref, "head": head_ref},
+            "release": release, "psql_full": psql_full,
+            "refs": {"base": base_ref, "head": head_ref},
             "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
             "unknown_blocks": [], "foundation": [], "removed": [], "changed": 0,
             "importers": {}, "certified": {}, "uncovered": [],
             "doc_readers": [],
             "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
+    psql_split = None
+    if not psql_full:
+        try:
+            pilot = read_list(PILOT_FILE, modules, required=True)
+            contract = read_list(ALWAYS_FILE, modules, required=True)
+            if not pilot or not contract:
+                raise ValueError("empty pilot or contract list")
+            chosen = psql_pr_modules(pilot, contract)
+            weighed, _ = parts.weight(chosen, "psql")
+            psql_split = [(part, sum(weighed[m] for m in part))
+                          for part in parts.split(weighed, PARTS["psql"][1])]
+        except (Exception, SystemExit) as exc:  # the fallback must not fail
+            plan["unsure"].append(f"psql lists unreadable ({exc}); whole suite under psql")
     for driver, (n_pr, n_other) in PARTS.items():
         # #3343 : le repli est toujours la suite complète, y compris pour une
         # branche de lot : il prend les parts de main, sinon les trois parts
         # psql d'un lot dépassent le plafond de 60 min.
         n = n_other
+        if driver == "psycopg" and psql_full:
+            plan["parts"][driver] = []
+            continue
+        if driver == "psql" and psql_split is not None:
+            plan["parts"][driver] = [
+                {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": part,
+                 "pilot_list": True, "estimate_s": round(estimate, 1)}
+                for i, (part, estimate) in enumerate(psql_split, 1)]
+            continue
         # no module list: scripts/test-parts.py splits the suite itself (L116)
         plan["parts"][driver] = [
             {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": None,
-             "pilot_list": driver == "psql" and lot, "estimate_s": 0}
+             "pilot_list": False, "estimate_s": 0}
             for i in range(1, n + 1)]
     plan["selection"] = {"mode": "full", "why": why, "modules": len(modules),
                          "impacted": 0, "contract": 0, "selected": len(modules), "skipped": 0,
@@ -2064,6 +2112,14 @@ def summary(plan: dict) -> str:
     else:
         lines.append(f"* full suite: {sel['selected']} module(s) run"
                      + (f" ({sel['why']})" if sel.get("why") else ""))
+    if sel.get("mode") != "skipped":
+        psql_n = len({m for p in plan["parts"].get("psql", []) for m in p["modules"] or ()})
+        if plan.get("psql_full"):
+            lines.append("* psql night run (#3749): the whole suite under psql, "
+                         "no psycopg part")
+        elif sel.get("mode") == "full":
+            lines.append(f"* psql (#3749): pilot list + contract, {psql_n} module(s); "
+                         "the whole suite under psql runs at night (psql-nocturne.yml)")
     lines.append(f"* selection sure: {'yes' if plan['sure'] else 'no'}; impacted-only safe: "
                  f"{'yes' if plan['phase2_safe'] else 'no'}"
                  + (f" ({plan['phase2_why']})" if plan.get("phase2_why") else ""))
@@ -2228,6 +2284,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--mode", choices=("auto", "lot", "full"), default="auto",
                    help="auto (event), lot (ci-lot freeze request: impacted + "
                         "contract, #1343) or full (ci-full request: whole suite)")
+    p.add_argument("--psql-full", default="false",
+                   help="true: the psql night run (#3749), the whole suite under "
+                        "psql and no psycopg part; anything else: false")
     p.add_argument("--github-output", help="appends the job outputs to this file")
     p.add_argument("--summary", help="appends the Markdown summary to this file")
     p.add_argument("--annotations", action="store_true",
@@ -2264,18 +2323,19 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "plan":
+        psql_full = args.psql_full.strip().lower() == "true"
         card, why = _load_map(args.map)
         if card is None and args.map:
             print(f"map: {why}", file=sys.stderr)
         try:
             plan = make_plan(args.event, card, base=args.base, ref=args.ref,
                              base_ref=args.base_ref, head_ref=args.head_ref,
-                             mode=args.mode)
+                             mode=args.mode, psql_full=psql_full)
         except Exception as exc:  # planning must never block the suite
             print(f"plan: {type(exc).__name__}: {exc}; fallback plan", file=sys.stderr)
             plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}",
                                  base_ref=args.base_ref, head_ref=args.head_ref,
-                                 mode=args.mode, ref=args.ref)
+                                 mode=args.mode, ref=args.ref, psql_full=psql_full)
         pathlib.Path(args.out).write_text(json.dumps(plan, indent=1, ensure_ascii=False)
                                           + "\n", encoding="utf-8")
         if args.github_output:

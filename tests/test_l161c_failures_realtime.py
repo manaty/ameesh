@@ -98,6 +98,72 @@ class FauxGitHub:
         self.appels.append(("update", ident, output, conclusion))
 
 
+class TapNodeTest(unittest.TestCase):
+    """#3783 : le lecteur reconnaît les lignes `not ok` d'un log node réel."""
+
+    def fixture(self) -> str:
+        return (REPO / "tests" / "fixtures" / "l3783-node-tap.log").read_text(
+            encoding="utf-8")
+
+    def test_log_node_reel(self):
+        """Le log du job `scripts` du run 40354337937 rend ses trois témoins."""
+        failures = ci.tap_failures(self.fixture())
+        self.assertEqual(
+            [f["test"] for f in failures],
+            ["CI-JOB-TIMEOUTS: every job carries a bounded timeout-minutes",
+             "the fail-closed wiring bites: dropping the plan from the terminal is caught",
+             "CI-TMPDIR (#686): the /tmp-heavy workflows keep their temp files on the runner"])
+        self.assertEqual(failures[0]["failed_at"], "2026-10-26T15:58:08.902448Z")
+        self.assertIn("timeout-minutes outside [5, 180] minutes", failures[0]["excerpt"])
+        self.assertIn("ci-job-timeouts.test.mjs", failures[0]["module"])
+        # ni le `# fail 3` du résumé ni les `ok` du log ne sont des tests
+        self.assertEqual(len(failures), 3)
+
+    def test_directives_et_faux_positifs(self):
+        text = "\n".join([
+            "TAP version 13",
+            "ok 1 - un test vert",
+            "not ok 2 - attendu # TODO",
+            "not ok 3 - sauté # SKIP",
+            "error: |-",
+            "  not ok dans une ligne d'extrait, sans numéro",
+            "not ok 4 - réellement rouge",
+            "  ---",
+            "  error: 'boom'",
+            "  ...",
+        ])
+        failures = ci.tap_failures(text)
+        self.assertEqual([f["test"] for f in failures], ["réellement rouge"])
+        self.assertIn("boom", failures[0]["excerpt"])
+
+    def test_ligne_numerotee_hors_ligne_ou_dans_extrait(self):
+        """#3783 B/P2 de la relecture : une ligne TAP citée n'est pas un test.
+
+        Seule une ligne qui *commence* par un résultat TAP après le préfixe
+        GitHub compte ; un extrait d'assertion ou un bloc YAML numéroté reste
+        du diagnostic, tandis qu'un vrai sous-test indenté est reconnu."""
+        text = "\n".join([
+            "error: expected not ok 1 - exemple",
+            "console.log('not ok 2 - exemple')",
+            "not ok 3 - vrai échec",
+            "  ---",
+            "  error: |-",
+            "    not ok 4 - dans le bloc YAML",
+            "  ...",
+            "    not ok 5 - sous-test indenté",
+            "      ---",
+            "      error: 'boom'",
+            "      ...",
+        ])
+        self.assertEqual([f["test"] for f in ci.tap_failures(text)],
+                         ["vrai échec", "sous-test indenté"])
+
+    def test_nom_tap_echappe_et_ansi(self):
+        text = "\x1b[31m2026-10-26T15:58:08.9024484Z not ok 7 - \\#686 : TMPDIR\x1b[0m\n"
+        failures = ci.tap_failures(text)
+        self.assertEqual([f["test"] for f in failures], ["#686 : TMPDIR"])
+
+
 class PublicationTest(unittest.TestCase):
     def setUp(self):
         self.dossier = pathlib.Path(tempfile.mkdtemp())
@@ -334,6 +400,9 @@ class FauxApi:
         self.attempts: dict[tuple[int, int], dict] = {}
         #: #845 : chemins appelés, pour compter les appels de la garde
         self.paths: list[str] = []
+        #: #3783 : logs de job lus (`(dépôt, job_id) -> texte`) et appels vus
+        self.log_text: dict[int, str] = {}
+        self.log_calls: list[tuple[str, int]] = []
         #: tête de branche rendue par l'API (#1161)
         self.branches = {}
         #: annulations demandées (#1161), et l'erreur que l'écriture rend
@@ -350,6 +419,11 @@ class FauxApi:
                 if int(run["id"]) == int(run_id):
                     bucket.remove(run)
         self.done[int(run_id)] = {"status": "completed", "conclusion": "cancelled"}
+
+    def log(self, repo, job_id):
+        """#3783 : le log d'un job, comme `ci.gh_job_log` le rendrait."""
+        self.log_calls.append((repo, int(job_id)))
+        return self.log_text.get(int(job_id), "")
 
     def _status_runs(self, path):
         for status, bucket in (("queued", self.queued), ("pending", self.pending),
@@ -493,7 +567,8 @@ class WatcherTest(PgTestCase):
         self.cfg_ci = dataclasses.replace(
             self.cfg, github={"projects": {"ameesh": DEPOT}, "host": self.cfg.host})
         self.api = FauxApi()
-        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel)
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                                  logs=self.api.log)
         # une exécution verte de main déjà relevée : la référence du rouge hérité
         # (nommée `tests.yml` : la migration 0433 nomme les lignes antérieures)
         st = storage.of(self.db)
@@ -680,6 +755,56 @@ class WatcherTest(PgTestCase):
         self.assertEqual(len(report["runs"][0]["failures"]), 2)
         texte = "\n".join(ci.render_status(report))
         self.assertIn("red  2 failure(s)", texte)
+
+    def test_rouge_sans_flux_lit_les_not_ok_tap(self):
+        """#3783 : un job `node --test` rouge sans flux JSON donne ses tests.
+
+        Le run 40354337937 (paquet Nexlink 191) avait trois `not ok` TAP et
+        `ameesh ci status` rendait « red 0 failure(s) » : le verdict disait
+        « no failed test seen » et le rouge passait pour non concluant."""
+        sha = "a1" * 20
+        self.api.live = [run_view(210, sha, "lot/1-un")]
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.api.attempt_jobs[(210, 1)] = [
+            job_view("scripts", status="completed", conclusion="failure", job_id=991)]
+        self.api.log_text[991] = (REPO / "tests" / "fixtures"
+                                  / "l3783-node-tap.log").read_text(encoding="utf-8")
+        # l'exécution tourne encore : le relevé ne paie pas les logs
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(self.api.log_calls, [])
+        self.api.live = []
+        self.api.done[210] = completed(".github/workflows/tests.yml", "failure")
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("urgent")) for o in out],
+                         [("failures", True), ("verdict", None)])
+        mails = self.mails("dev-a")
+        self.assertEqual(len(mails), 2)
+        self.assertTrue(mail.is_urgent(mails[0]))
+        self.assertIn("CI-JOB-TIMEOUTS", mails[0]["body"])
+        self.assertIn("red, 3 failure(s)", mails[1]["body"])
+        self.assertNotIn("no failed test", mails[1]["body"])
+        self.assertEqual(self.payload_of(mails[1])["ci"]["failures"], 3)
+        report = ci.status_of(self.db, self.lot["id"])
+        self.assertEqual(len(report["runs"][0]["failures"]), 3)
+        texte = "\n".join(ci.render_status(report))
+        self.assertIn("red  3 failure(s)", texte)
+        self.assertIn("CI-TMPDIR (#686)", texte)
+        self.assertEqual(self.api.log_calls, [(DEPOT, 991)])
+
+    def test_rouge_sans_test_tap_ne_l_invente_pas(self):
+        """#3783 : un job rouge sans `not ok` reste non concluant (canon §3) —
+        une panne d'installation n'est pas un test négatif."""
+        self.api.live = [run_view(211, "a2" * 20, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self.api.live = []
+        self.api.done[211] = completed(".github/workflows/tests.yml", "failure")
+        self.api.attempt_jobs[(211, 1)] = [
+            job_view("scripts", status="completed", conclusion="failure", job_id=992)]
+        self.api.log_text[992] = "npm ERR! install failed\n# fail 0\n"
+        self.watcher.tick(self.db)
+        verdict = self.mails("dev-a")[-1]
+        self.assertIn("no failed test seen", verdict["body"])
+        self.assertEqual(storage.of(self.db).ci.failures(DEPOT, 211), [])
 
     def test_vert_sans_echec(self):
         self.api.live = [run_view(202, "d" * 40, "lot/1-un")]
@@ -1988,6 +2113,36 @@ class WatcherTest(PgTestCase):
                    if a["type"] == "ci_main_red"]
         self.assertEqual(len(alertes), 1)
         self.assertIn("backend-suite.yml", alertes[0]["detail"])
+
+    def test_dispatch_d_une_suite_qui_ne_suit_pas_la_base(self):
+        """#3686 : un `workflow_dispatch` refusé sur une base où la suite ne
+        tourne jamais autrement (manaty/nexlink main, 26/10 05:46Z) ne lève pas
+        `ci_main_red`, conclu ou en cours ; un dispatch rouge d'une suite qui
+        tourne aussi en push sur la base alerte comme avant."""
+        st = storage.of(self.db)
+        sha = "f6" * 20
+        # une ancienne PR dont la tête est main (synchronisation main →
+        # develop) ne fait pas suivre la base à la suite
+        st.ci.open_run(DEPOT, 2990, head_sha="f5" * 20, branch="main", event="pull_request",
+                       base="main", work_item_id=None, url=None, workflow="backend-suite.yml")
+        st.ci.conclude(DEPOT, 2990, "success")
+        # backend-suite.yml : dispatch seul sur main, refusé par sa garde
+        st.ci.open_run(DEPOT, 3001, head_sha=sha, branch="main", event="workflow_dispatch",
+                       base="main", work_item_id=None, url=None, workflow="backend-suite.yml")
+        st.ci.add_failure(DEPOT, 3001, run_attempt=1, part="job", test="backend",
+                          module="", status="echec", inherited=False, excerpt="",
+                          replay="", duration_s=None, failed_at=None)
+        self.assertEqual(ci.main_red(self.db), [])  # en cours : rien
+        st.ci.conclude(DEPOT, 3001, "failure")
+        self.assertEqual(ci.main_red(self.db), [])
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
+                          if a["type"] == "ci_main_red"], [])
+        # tests.yml tourne en push sur main (setUp, run 100) : son dispatch rouge compte
+        st.ci.open_run(DEPOT, 3002, head_sha=sha, branch="main", event="workflow_dispatch",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.conclude(DEPOT, 3002, "failure")
+        self.assertEqual([(r["run_id"], r["workflow"]) for r in ci.main_red(self.db)],
+                         [(3002, "tests.yml")])
 
     def test_main_rouge_execution_orpheline_ecartee(self):
         """#1453 N1 : une exécution de main jamais conclue (supprimée, l'API

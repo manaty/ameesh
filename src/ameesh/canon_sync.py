@@ -152,6 +152,7 @@ from . import receipts, registry, storage
 from . import visibility as visibility_mod
 from .canon import Canon, Finding
 from .config import NAME_RE
+from . import db as db_mod
 from .db import Db, DbError
 
 #: préfixes de `status_text` posés par sync (et reconnus par lui seul)
@@ -247,6 +248,23 @@ AUTH_STATE_SKIPPED = AUTH_SKIPPED   # rien écrit, sans erreur
 AUTH_STATE_ERROR = "error"   # refus, ou erreurs (membre gelé, entrée illisible…) : non-ok
 #: auteur des entrées du fil écrites par sync
 FIL_SENDER = "ameesh:canon-sync"
+#: #3741 : en tête du diagnostic durable d'une erreur PASSAGÈRE de la base
+#: (délai de requête, verrou, connexion) qui n'a pas été annoncée au fil
+QUIET_MARK = "[transient database error, not announced] "
+#: SQLSTATE d'une erreur passagère : requête annulée (dont statement_timeout),
+#: verrou indisponible, interblocage, sérialisation ; et la classe 08
+#: (connexion)
+_TRANSIENT_SQLSTATES = frozenset((db_mod.QUERY_CANCELED, "55P03",
+                                  db_mod.DEADLOCK_DETECTED, "40001"))
+
+
+def transient_db_error(exc: BaseException) -> bool:
+    """#3741 : l'erreur de base passera-t-elle d'elle-même au prochain sync ?
+    Classée par son SQLSTATE ou son type, jamais par son texte."""
+    if isinstance(exc, (db_mod.Unavailable, receipts.RegistryLockError)):
+        return True
+    state = getattr(exc, "sqlstate", None) or ""
+    return state in _TRANSIENT_SQLSTATES or state.startswith("08")
 
 
 @dataclass
@@ -267,6 +285,8 @@ class AuthenticatorSync:
     notes: list[str] = field(default_factory=list)
     #: L44 (0031) : canon du registre ('' = canon par défaut, sinon son id)
     canon: str = ""
+    #: #3741 : refus dû à une erreur passagère de la base (`transient_db_error`)
+    transient: bool = False
 
     @property
     def errors(self) -> list[str]:
@@ -616,11 +636,30 @@ def record_authenticators(db: Db, host: str, done: AuthenticatorSync,
     ou diagnostic différent du précédent) est écrite dans le fil du projet,
     et le retour à la normale aussi — un exécuteur qui resynchronise
     périodiquement ne répète pas la même entrée, mais rien n'est silencieux.
+
+    #3741 : une erreur PASSAGÈRE de la base (`done.transient` : délai de
+    requête, verrou, connexion) qui suit un état sans erreur n'est pas
+    annoncée — sous charge, chaque délai dépassé écrivait deux diffusions à
+    « all » (l'erreur, puis le retour à la normale au sync suivant), dix fois
+    en une matinée. Elle reste inscrite dans l'état durable, marquée
+    `QUIET_MARK` ; si le sync suivant échoue encore, l'erreur est annoncée
+    (le diagnostic marqué diffère), et le retour à la normale n'est annoncé
+    que si une erreur l'a été.
     """
     status, diagnostic = done.state, done.diagnostic()
-    previous = storage.of(db).canon.record_auth_state(host, status, diagnostic, key)
+    quiet = status == AUTH_STATE_ERROR and done.transient
+    st = storage.of(db).canon
+    previous = st.record_auth_state(
+        host, status, _clip(QUIET_MARK + diagnostic) if quiet else diagnostic, key)
     before = (previous.get("auth_status"), previous.get("auth_diagnostic") or "") \
         if previous is not None else (None, "")
+    was_quiet = before[0] == AUTH_STATE_ERROR and before[1].startswith(QUIET_MARK)
+    if quiet:
+        if before[0] != AUTH_STATE_ERROR:
+            return
+        # une erreur précède : passagère répétée (annoncée maintenant) ou
+        # erreur déjà annoncée — le diagnostic durable perd sa marque
+        st.record_auth_state(host, status, diagnostic, key)
     # L44 (0031) : chaque canon a son registre ; le fil dit lequel
     which = " (canon %s)" % key if key else ""
     option = " --canon %s" % key if key else ""
@@ -630,7 +669,7 @@ def record_authenticators(db: Db, host: str, done: AuthenticatorSync,
             "Details: ameesh canon sync --host %s%s; durable state: ameesh canon check "
             "--host %s%s." % (host, which, diagnostic or "?", host, option, host, option)),
             done)
-    elif status != AUTH_STATE_ERROR and before[0] == AUTH_STATE_ERROR:
+    elif status != AUTH_STATE_ERROR and before[0] == AUTH_STATE_ERROR and not was_quiet:
         _post_authenticators(db, host, status, (
             "canon sync on %s%s: authenticator registry error-free again "
             "(%s)%s." % (host, which, status, " — %s" % diagnostic if diagnostic else "")),
@@ -1178,14 +1217,15 @@ def sync_authenticators(db: Db, canon: Canon, *, trusted_ref: str | None = None,
             lambda lock: _sync_locked(lock, canon, trusted_ref, bootstrap_ref, host, key,
                                       checkout_block))
     except receipts.RegistryLockError as exc:
-        return AuthenticatorSync(AUTH_REFUSED, "%s: transaction rolled back" % exc, canon=key)
+        return AuthenticatorSync(AUTH_REFUSED, "%s: transaction rolled back" % exc, canon=key,
+                                 transient=True)
     except _Concurrent as exc:
         return AuthenticatorSync(AUTH_REFUSED, "%s: transaction rolled back, authenticator "
                                                "registry unchanged" % exc, canon=key)
     except DbError as exc:
         return AuthenticatorSync(AUTH_REFUSED, "database: %s — transaction rolled back, "
                                                "authenticator registry unchanged" % exc,
-                                 canon=key)
+                                 canon=key, transient=transient_db_error(exc))
     except ValueError as exc:
         return AuthenticatorSync(AUTH_REFUSED, "module policy: %s — transaction rolled back" % exc,
                                  canon=key)

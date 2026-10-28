@@ -5,14 +5,14 @@ Description=One privileged typed handoff request (H8)
 Type=exec
 User=root
 Group=root
-ExecStart=/opt/ameesh-release/runtime/bin/python -I -B /opt/ameesh-release/lib/dispatch-local-handoff.py
+ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/ameesh-runtime-seal.py
 StandardInput=socket
 StandardOutput=null
 StandardError=journal
 Environment=PATH=/usr/bin:/bin LANG=C LC_ALL=C
 WorkingDirectory=/
 UMask=0077
-RuntimeMaxSec=65
+RuntimeMaxSec=85
 TimeoutStopSec=5
 KillMode=control-group
 NoNewPrivileges=yes

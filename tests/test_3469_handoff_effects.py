@@ -43,6 +43,7 @@ def _module(name, filename):
 
 
 companion = _module('handoff_companion', 'hote-handoff.py')
+release_module = _module('ameesh_handoff_release', 'environnement-versionne.py')
 bridge_module = _module('handoff_bridge', 'pont-handoff.py')
 factory_module = _module('handoff_factory', 'fabrique-handoff.py')
 
@@ -175,9 +176,16 @@ class Fixture:
     def _effects(self, **changes):
         value = dict(self.execution)
         value.update(changes)
-        return companion.HostEffects(enrollment=value, system=self.system,
-                                     git=self.git,
-                                     work_dir=lambda agent, project: str(self.work / agent))
+        effects = companion.HostEffects(
+            enrollment=value, system=self.system, git=self.git,
+            work_dir=lambda agent, project: str(self.work / agent))
+        # #3785: the companion loads its versioned-environment helper from the
+        # directory of its pinned source. A checkout can be group-writable
+        # (umask 0002, shared clone), which the production trusted-file check
+        # rightly refuses; the fixture supplies the same pinned helper directly
+        # so a release read never depends on the checkout's host permissions.
+        effects._release = release_module
+        return effects
 
 
 class RequestMixin:
@@ -431,6 +439,21 @@ class EffectsTest(RequestMixin, unittest.TestCase):
         self.assertEqual(receipt['release_revision'], COMMIT)
         self.assertIs(receipt['executor_enabled'], False)
         self.assertEqual(self.fx.system.stops, 0)
+
+    def test_release_read_does_not_depend_on_checkout_permissions(self):
+        """#3785: a group-writable checkout must not refuse the fixture.
+
+        The host checkout may be group-writable (umask 0002, shared clone),
+        which the production trusted-file check refuses by design. Simulate
+        that host state: the fixture's release read must still succeed.
+        """
+        def untrusted(path, **kwargs):
+            raise companion.Refused('file')
+
+        with mock.patch.object(companion, '_trusted_file', side_effect=untrusted):
+            receipt = self.fx.effects.perform(self.request(self.fx, 'prepare'))
+        self.assertIs(receipt['ok'], True)
+        self.assertEqual(receipt['release_revision'], COMMIT)
 
     def test_prepare_refuses_a_missing_release(self):
         (self.fx.store / 'current').unlink()

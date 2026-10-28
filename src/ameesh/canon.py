@@ -1598,6 +1598,347 @@ def _git_env() -> dict:
 NO_LAZY_FETCH = {"GIT_NO_LAZY_FETCH": "1"}
 
 
+#: #3753 : cache, dans le processus, des lectures git qui ne dépendent que du
+#: **contenu** du dépôt. Une entrée n'est posée que pour une commande dont
+#: toutes les révisions sont des objets adressés par leur SHA complet
+#: (`_content_cache_key`) : une tête qui bouge produit une autre clé, et
+#: aucune ref symbolique, aucun chemin du dépôt de travail, ni aucune lecture
+#: d'état (fetch, statut, remote, refs) n'entre ici. Un échec n'est jamais
+#: retenu : un objet absent peut être rapatrié plus tard par un fetch.
+_CONTENT_CACHE: dict = {}
+_CONTENT_CACHE_LOCK = threading.Lock()
+_CONTENT_CACHE_BYTES = 0
+_CONTENT_CACHE_HITS = 0
+_CONTENT_CACHE_MISSES = 0
+CONTENT_CACHE_MAX_ENTRIES = 4096
+CONTENT_CACHE_MAX_BYTES = 32 * 1024 * 1024
+
+_FULL_SHA = r"[0-9a-f]{40}(?:[0-9a-f]{24})?"
+#: une révision **déjà résolue** : un SHA, éventuellement suffixé d'un
+#: parcours d'objet (`^{commit}`, `^1`, `~2`, `^@`) ou d'un chemin de blob
+#: (`<sha>:dir/fichier`). Rien qui puisse désigner une ref mouvante.
+_REV_ATOM_RE = re.compile(
+    r"^%s(?:\^[0-9]*|\^[@!]|\^\{[a-z]+\}|~[0-9]*)?(?::.*)?$" % _FULL_SHA)
+
+#: options sans effet sur l'état du dépôt, par sous-commande. Une option
+#: inconnue n'est pas cachée (elle pourrait lire l'index, les refs ou un
+#: programme externe) : le cache reste exact même quand le code évolue.
+_CACHE_OPTIONS = {
+    "show": {
+        "exact": {"-s", "-p", "-z", "--no-patch", "--no-color", "--no-renames",
+                  "--name-only", "--name-status", "--numstat", "--shortstat",
+                  "--stat", "--raw", "--patch", "--full-index", "--binary",
+                  "--no-ext-diff", "--no-textconv", "--no-prefix",
+                  "--default-prefix", "--full-diff"},
+        "prefix": ("--format=", "--pretty=", "--date=", "--unified=",
+                   "--abbrev=", "--diff-filter=", "--find-renames=",
+                   "--stat=", "--stat-width=", "--stat-name-width=",
+                   "--stat-count=", "--inter-hunk-context=", "--color=",
+                   "--word-diff=", "--src-prefix=", "--dst-prefix=",
+                   "--line-prefix=", "--relative=", "--diff-algorithm="),
+    },
+    "diff": {
+        "exact": {"-z", "--name-only", "--name-status", "--numstat",
+                  "--shortstat", "--stat", "--raw", "--patch", "--no-color",
+                  "--no-renames", "--no-ext-diff", "--no-textconv",
+                  "--full-index", "--binary", "--no-prefix",
+                  "--default-prefix", "--quiet", "--exit-code",
+                  "--find-renames"},
+        "prefix": ("--unified=", "--diff-filter=", "--find-renames=",
+                   "--stat=", "--stat-width=", "--stat-name-width=",
+                   "--stat-count=", "--inter-hunk-context=", "--color=",
+                   "--word-diff=", "--src-prefix=", "--dst-prefix=",
+                   "--line-prefix=", "--relative=", "--diff-algorithm=",
+                   "--abbrev="),
+    },
+    "log": {
+        "exact": {"-p", "-z", "--no-merges", "--merges", "--no-color",
+                  "--first-parent", "--reverse", "--no-walk", "--not",
+                  "--boundary", "--topo-order", "--date-order",
+                  "--author-date-order", "--ancestry-path", "--left-right",
+                  "--cherry-pick", "--graph"},
+        "prefix": ("--format=", "--pretty=", "--date=", "--max-count=",
+                   "--abbrev=", "--author=", "--grep=",
+                   "--diff-filter=", "--find-renames="),
+    },
+    "rev-list": {
+        "exact": {"--no-merges", "--merges", "--parents", "--first-parent",
+                  "--reverse", "--count", "--left-right", "--cherry-pick",
+                  "--no-color", "--not", "--boundary", "--topo-order",
+                  "--date-order", "--author-date-order", "--ancestry-path"},
+        "prefix": ("--max-count=", "--format=", "--pretty=", "--abbrev=",
+                   "--date=", "--diff-filter=", "--find-renames="),
+    },
+    "ls-tree": {
+        "exact": {"-r", "-z", "-l", "-t", "--full-tree", "--name-only",
+                  "--name-status", "--object-only", "--full-name", "--long"},
+        "prefix": (),
+    },
+    "merge-base": {
+        "exact": {"--is-ancestor", "--octopus", "--independent"},
+        "prefix": (),
+    },
+    "grep": {
+        "exact": {"--no-color", "-l", "-I", "-F", "-h", "-a", "-n", "-i",
+                  "-w", "-E", "-G", "-P", "--no-line-number", "--no-column",
+                  "--full-name", "--null", "-z"},
+        "prefix": (),
+    },
+    "merge-tree": {"exact": {"--write-tree"}, "prefix": ()},
+    "rev-parse": {
+        "exact": {"--verify", "--quiet", "-q", "--end-of-options"},
+        "prefix": (),
+    },
+}
+#: options qui prennent leur valeur dans l'argument suivant ; la valeur n'est
+#: pas une révision, elle est consommée avec l'option.
+_CACHE_OPTION_VALUES = frozenset(("-n", "-f", "-e", "--max-count", "--format",
+                                  "--pretty", "--date", "--unified",
+                                  "--diff-filter", "--find-renames", "--abbrev",
+                                  "--author", "--grep"))
+#: sous-commandes qui peuvent faire disparaître des objets : leurs entrées de
+#: cache pour ce dépôt sont oubliées (une lecture d'un objet supprimé ne doit
+#: pas survivre au passage qui l'a supprimé).
+_CACHE_DROP_COMMANDS = frozenset(("gc", "prune", "repack", "init", "clone"))
+
+
+def _repo_cache_key(repo: str) -> str:
+    """Le dépôt lu, indépendamment d'un chemin relatif ou d'un lien."""
+    return os.path.realpath(os.path.abspath(repo or "."))
+
+
+def _content_cache_clear(repo: str | None = None) -> None:
+    """Vide le cache de contenu (tout, ou les seules entrées d'un dépôt).
+
+    Les tests s'en servent pour compter des lancements ; la production n'a
+    pas besoin de l'appeler à la main (les commandes destructrices ci-dessus
+    oublient d'elles-mêmes le dépôt concerné).
+    """
+    global _CONTENT_CACHE_BYTES
+    with _CONTENT_CACHE_LOCK:
+        if repo is None:
+            _CONTENT_CACHE.clear()
+            _CONTENT_CACHE_BYTES = 0
+            return
+        root = _repo_cache_key(repo)
+        for key in [key for key in _CONTENT_CACHE if key[0] == root]:
+            _CONTENT_CACHE.pop(key, None)
+        _CONTENT_CACHE_BYTES = sum(
+            len(value[1]) + len(value[2]) for value in _CONTENT_CACHE.values())
+
+
+def _content_cache_stats() -> dict:
+    """Compteurs du cache (témoins de #3753) ; sans effet sur la lecture."""
+    with _CONTENT_CACHE_LOCK:
+        return {"entries": len(_CONTENT_CACHE), "bytes": _CONTENT_CACHE_BYTES,
+                "hits": _CONTENT_CACHE_HITS, "misses": _CONTENT_CACHE_MISSES}
+
+
+def _content_cache_take(key):
+    global _CONTENT_CACHE_HITS
+    with _CONTENT_CACHE_LOCK:
+        value = _CONTENT_CACHE.get(key)
+        if value is not None:
+            _CONTENT_CACHE_HITS += 1
+        return value
+
+
+def _content_cache_put(key, proc: subprocess.CompletedProcess) -> None:
+    """Retient une lecture réussie, dans les bornes de mémoire du cache."""
+    global _CONTENT_CACHE_BYTES
+    size = len(proc.stdout) + len(proc.stderr)
+    if size > CONTENT_CACHE_MAX_BYTES:
+        return
+    with _CONTENT_CACHE_LOCK:
+        old = _CONTENT_CACHE.pop(key, None)
+        if old is not None:
+            _CONTENT_CACHE_BYTES -= len(old[1]) + len(old[2])
+        _CONTENT_CACHE[key] = (proc.returncode, proc.stdout, proc.stderr)
+        _CONTENT_CACHE_BYTES += size
+        while (_CONTENT_CACHE and
+               (len(_CONTENT_CACHE) > CONTENT_CACHE_MAX_ENTRIES
+                or _CONTENT_CACHE_BYTES > CONTENT_CACHE_MAX_BYTES)):
+            oldest = next(iter(_CONTENT_CACHE))
+            _rc, out, err = _CONTENT_CACHE.pop(oldest)
+            _CONTENT_CACHE_BYTES -= len(out) + len(err)
+
+
+def _content_rev(text: str) -> bool:
+    """L'argument est-il une révision **déjà résolue** (jamais une ref) ?"""
+    text = str(text or "")
+    if not text:
+        return False
+    if text.startswith("^") and len(text) > 1:
+        text = text[1:]
+    for separator in ("...", ".."):
+        if separator in text:
+            left, _, right = text.partition(separator)
+            if _REV_ATOM_RE.match(left) and _REV_ATOM_RE.match(right):
+                return True
+    return bool(_REV_ATOM_RE.match(text))
+
+
+def _content_options(sub: str, tokens: list[str]):
+    """([positionnels], [chemins après --]) ou None si une option est inconnue."""
+    rules = _CACHE_OPTIONS[sub]
+    positional: list[str] = []
+    paths: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            paths = tokens[index + 1:]
+            break
+        if not token.startswith("-"):
+            positional.append(token)
+            index += 1
+            continue
+        if token in rules["exact"]:
+            index += 1
+            continue
+        if any(token.startswith(prefix) for prefix in rules["prefix"]):
+            # `%d`/`%D` (décorations), `%g` (reflog), `%G` (signature), `%N`
+            # (notes) et `%S` (ref) lisent l'état des refs, pas le seul objet.
+            if (token.startswith(("--format=", "--pretty="))
+                    and re.search(r"%(?:d|D|g|G|N|S)", token)):
+                return None
+            index += 1
+            continue
+        if token in _CACHE_OPTION_VALUES:
+            if index + 1 >= len(tokens):
+                return None
+            if (token in ("--format", "--pretty")
+                    and re.search(r"%(?:d|D|g|G|N|S)", tokens[index + 1])):
+                return None
+            index += 2
+            continue
+        if token.startswith("-n") and token[2:].isdigit():
+            index += 1
+            continue
+        if re.fullmatch(r"-\d+", token):
+            index += 1
+            continue
+        if re.fullmatch(r"-[MC]\d*%?", token):
+            index += 1
+            continue
+        return None
+    return positional, paths
+
+
+def _all_sha_lines(stdin: bytes | None) -> bool:
+    """Un stdin de `cat-file --batch` ne contient que des SHA complets."""
+    if not stdin:
+        return False
+    try:
+        lines = stdin.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        return False
+    lines = [line.strip() for line in lines if line.strip()]
+    return bool(lines) and all(re.fullmatch(_FULL_SHA, line) for line in lines)
+
+
+def _batch_has_missing(stdout: bytes) -> bool:
+    """`cat-file --batch` a-t-il répondu « missing » pour un objet ?
+
+    Une réponse négative n'est pas un contenu : elle peut changer après un
+    fetch, donc elle ne se cache pas. On suit les en-têtes, jamais le contenu
+    (qui pourrait contenir le mot « missing »).
+    """
+    position = 0
+    try:
+        while position < len(stdout):
+            end = stdout.index(b"\n", position)
+            header = stdout[position:end].split(b" ")
+            position = end + 1
+            if len(header) < 3:
+                return True
+            if header[1] == b"missing":
+                return True
+            size = int(header[2])
+            position += size + 1
+    except (ValueError, IndexError):
+        return True
+    return False
+
+
+def _content_cache_key(repo: str, args: tuple[str, ...],
+                       stdin: bytes | None, env_extra: dict | None):
+    """La clé de cache d'une lecture de contenu, ou None si non cachable."""
+    if not args:
+        return None
+    sub = args[0]
+    tokens = list(args[1:])
+    if sub == "cat-file":
+        if len(tokens) == 1 and tokens[0] in ("--batch", "--batch-check"):
+            if not _all_sha_lines(stdin):
+                return None
+        elif len(tokens) == 2 and tokens[0] in ("blob", "-e", "-t", "-s", "-p"):
+            if not _content_rev(tokens[1]):
+                return None
+        else:
+            return None
+        paths: list[str] = []
+    elif sub == "patch-id":
+        if tokens not in (["--verbatim"], ["--stable"],
+                          ["--verbatim", "--stable"]):
+            return None
+        if stdin is None:
+            return None
+        paths = []
+    elif sub in _CACHE_OPTIONS:
+        parsed = _content_options(sub, tokens)
+        if parsed is None:
+            return None
+        positional, paths = parsed
+        if sub == "rev-parse":
+            if len(positional) != 1 or paths:
+                return None
+        elif sub == "ls-tree":
+            if len(positional) != 1:
+                return None
+        elif sub == "diff":
+            if not (len(positional) == 2
+                    or (len(positional) == 1 and ".." in positional[0])):
+                return None
+        elif sub in ("merge-base", "merge-tree"):
+            if len(positional) != 2 or paths:
+                return None
+        elif sub == "rev-list":
+            if not positional or paths:
+                return None
+        elif sub == "grep":
+            # sans révision, `git grep` lit l'arbre de travail : jamais caché
+            if len(positional) != 1:
+                return None
+        elif sub in ("show", "log"):
+            if not positional:
+                return None
+        else:                       # pragma: no cover - table fermée
+            return None
+        if not all(_content_rev(value) for value in positional):
+            return None
+    else:
+        return None
+    return (_repo_cache_key(repo), tuple(args), stdin or b"",
+            tuple(sorted((env_extra or {}).items())))
+
+
+def _content_cache_store(args: tuple[str, ...],
+                         proc: subprocess.CompletedProcess) -> bool:
+    """Le résultat est-il une lecture définitive qui peut être retenue ?"""
+    sub = args[0] if args else ""
+    if sub == "cat-file" and any(
+            flag in args for flag in ("--batch", "--batch-check")):
+        return (proc.returncode == 0
+                and not _batch_has_missing(proc.stdout))
+    if sub == "merge-base" and "--is-ancestor" in args:
+        return proc.returncode in (0, 1)
+    if sub == "grep":
+        # 1 = aucun motif trouvé : une réponse définitive, pas un échec
+        return proc.returncode in (0, 1)
+    return proc.returncode == 0
+
+
 def _git(repo: str, *args: str, stdin: bytes | None = None,
          timeout: float = GIT_TIMEOUT, env_extra: dict | None = None,
          deadline: Deadline | None = None,
@@ -1608,6 +1949,7 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
     une échéance épuisée lève `GitDeadline` : la découverte bornée s'arrête,
     elle ne se lit pas comme un canon illisible.
     """
+    global _CONTENT_CACHE_MISSES
     if deadline is not None:
         if deadline.expired():
             raise GitDeadline("git %s: canon deadline exhausted"
@@ -1616,11 +1958,18 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
     cmd = ["git", "--no-pager", "--no-replace-objects", "--literal-pathspecs",
            "-c", "core.fsmonitor=false", "-c", "core.hooksPath=%s" % os.devnull,
            *args]
+    key = _content_cache_key(repo, args, stdin, env_extra)
+    if key is not None:
+        hit = _content_cache_take(key)
+        if hit is not None:
+            return subprocess.CompletedProcess(cmd, hit[0], hit[1], hit[2])
+        with _CONTENT_CACHE_LOCK:
+            _CONTENT_CACHE_MISSES += 1
     env = _git_env()
     if env_extra:
         env.update(env_extra)
     try:
-        return subprocess.run(cmd, cwd=repo, input=stdin, capture_output=True,
+        proc = subprocess.run(cmd, cwd=repo, input=stdin, capture_output=True,
                               env=env, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         # Deux cas distincts portent le même FileNotFoundError : l'exécutable
@@ -1639,6 +1988,14 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
         # dossier…) : le canon est illisible, jamais une exception qui
         # empêcherait « canon sync » d’enregistrer l’état fermé.
         raise GitError("git %s: %s" % (args[0], exc.strerror or exc)) from exc
+    if key is not None and _content_cache_store(args, proc):
+        _content_cache_put(key, proc)
+    if args and args[0] in _CACHE_DROP_COMMANDS and proc.returncode == 0:
+        # `gc`/`prune` peuvent supprimer des objets : une lecture retenue pour
+        # ce dépôt ne doit pas survivre à leur disparition. `init`/`clone`
+        # couvrent un chemin réutilisé par un autre dépôt.
+        _content_cache_clear(repo)
+    return proc
 
 
 def _git_out(repo: str, *args: str, timeout: float = GIT_TIMEOUT,
@@ -1905,9 +2262,11 @@ def git_read(repo: str, commit: str, path: str, *,
         return None
 
 
-def git_remotes(repo: str) -> list[str]:
+def git_remotes(repo: str, *, deadline: Deadline | None = None) -> list[str]:
+    """Les dépôts distants ; avec ``deadline`` (#3572), une échéance épuisée
+    lève `GitDeadline` au lieu de se lire « aucun dépôt distant »."""
     try:
-        return (_git_out(repo, "remote") or "").split()
+        return (_git_out(repo, "remote", deadline=deadline) or "").split()
     except GitError:
         return []
 
@@ -1915,7 +2274,8 @@ def git_remotes(repo: str) -> list[str]:
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]*$")
 
 
-def remote_branch(repo: str, name: str) -> str | None:
+def remote_branch(repo: str, name: str, *,
+                  deadline: Deadline | None = None) -> str | None:
     """La branche de suivi distant que `name` désigne (`origin/main`), ou None.
 
     `main` → `origin/main` ; `origin/main` (un dépôt distant connu) et
@@ -1932,7 +2292,7 @@ def remote_branch(repo: str, name: str) -> str | None:
         short = text[len("refs/remotes/"):]
     elif text.startswith("refs/heads/"):
         short = "%s/%s" % (DEFAULT_REMOTE, text[len("refs/heads/"):])
-    elif "/" in text and text.split("/", 1)[0] in git_remotes(repo):
+    elif "/" in text and text.split("/", 1)[0] in git_remotes(repo, deadline=deadline):
         short = text
     else:
         short = "%s/%s" % (DEFAULT_REMOTE, text)

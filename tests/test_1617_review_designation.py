@@ -215,11 +215,12 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(one["state"], rd.DESIGNATED)
         self.assertEqual([r["name"] for r in one["reviewers"]], ["codex-one"])
         self.assertEqual(one["families"], ["codex"])
-        # Deux avis hors claude et hors deepseek : la seule famille restante ne suffit pas.
+        # Deux avis hors claude et hors deepseek : la seule famille restante ne
+        # suffit pas, mais elle est pourvue tout de suite (#3596).
         two = rd.select(families=FAMILIES, required=2, authors=authors, candidates=pool)
         self.assertEqual(two["state"], rd.WAITING)
         self.assertEqual(two["missing"], 1)
-        self.assertEqual(two["reviewers"], [])
+        self.assertEqual([r["name"] for r in two["reviewers"]], ["codex-one"])
         self.assertEqual(two["families"], ["codex"])
 
     def test_author_with_unknown_family_waits_instead_of_guessing(self):
@@ -282,7 +283,7 @@ class SelectionTest(unittest.TestCase):
                            authors=[{"name": "impl-02", "family": "deepseek"}],
                            candidates=pool)
         self.assertEqual(picked["state"], rd.WAITING)
-        self.assertEqual(picked["reviewers"], [])
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["codex-ok"])
         self.assertEqual(picked["missing"], 1)
         self.assertEqual(picked["families"], ["codex"])
 
@@ -366,6 +367,7 @@ class SelectionTest(unittest.TestCase):
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
                                   row("claude-two", harness="claude", session="claude")))
         self.assertEqual(picked["state"], rd.WAITING)
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-one"])
         self.assertEqual(picked["missing"], 1)
         self.assertEqual(picked["families"], ["claude"])
         self.assertIn("claude", picked["why"])
@@ -433,6 +435,77 @@ class SelectionTest(unittest.TestCase):
                          ["nx-1", "nx-2"])
         self.assertEqual(len(candidates(*rows, project="ameesh")), 1)
         self.assertEqual(len(candidates(*rows, project="")), 3)
+
+
+class MultiFamilyAuthorTest(unittest.TestCase):
+    """#3584 — un auteur prouvé sous plusieurs familles exclut chacune d'elles.
+
+    Un agent codex gelé pendant la pause Codex tourne en repli deepseek : ses
+    gels antérieurs prouvent codex, sa session de repli deepseek. La lecture
+    rend `{family: "", families: ["codex", "deepseek"]}` : ce n'est ni une
+    famille inconnue, ni une ambiguïté à refuser.
+    """
+
+    MULTI = {"name": "cx1", "family": "",
+             "families": ["codex", "deepseek"]}
+
+    def test_the_proven_set_is_not_an_unknown_family(self):
+        self.assertEqual(rd.families_of([self.MULTI]),
+                         ({"cx1"}, {"codex", "deepseek"}))
+        self.assertEqual(rd.unknown_families([self.MULTI]), [])
+        self.assertEqual(rd.unknown_families([{"name": "cx1", "family": ""}]),
+                         ["cx1"])
+
+    def test_a_test_only_corrector_is_never_unknown(self):
+        # #3658 : un correcteur test_only n'interdit que son nom (#3518),
+        # dans `unknown_families` comme dans `families_of`.
+        rows = [{"name": "impl-06", "family": "deepseek"},
+                {"name": "dev4", "family": "claude", "test_only": True}]
+        self.assertEqual(rd.unknown_families(rows), [])
+        self.assertEqual(rd.families_of(rows), ({"impl-06", "dev4"}, {"deepseek"}))
+
+    def test_one_opinion_from_an_outside_family_is_designated(self):
+        picked = rd.select(
+            families=FAMILIES, required=1, authors=[self.MULTI],
+            candidates=candidates(
+                row("claude-one", harness="claude", session="claude"),
+                row("codex-one", harness="codex", session="codex"),
+                row("deepseek-one", harness="deepseek", session="deepseek")))
+        self.assertEqual(picked["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-one"])
+
+    def test_two_opinions_name_both_excluded_families_not_unknown(self):
+        picked = rd.select(
+            families=FAMILIES, required=2, authors=[self.MULTI],
+            candidates=candidates(
+                row("claude-one", harness="claude", session="claude"),
+                row("codex-one", harness="codex", session="codex"),
+                row("deepseek-one", harness="deepseek", session="deepseek")))
+        self.assertEqual(picked["state"], rd.WAITING)
+        # #3596 : le siège de la famille disponible est pourvu dès le gel ;
+        # l'autre famille reste à couvrir, et le message la nomme par exclusion,
+        # jamais comme une famille inconnue.
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-one"])
+        self.assertEqual(picked["missing"], 1)
+        self.assertIn("codex", picked["why"])
+        self.assertIn("deepseek", picked["why"])
+        self.assertNotIn("unknown", picked["why"])
+
+    def test_a_manual_reviewer_of_an_excluded_family_does_not_cover_a_seat(self):
+        seats = rd.manual_seats(
+            [{"name": "manual-codex", "family": "codex"},
+             {"name": "manual-claude", "family": "claude"}],
+            authors=[self.MULTI], families=FAMILIES)
+        self.assertEqual(seats, [{"name": "manual-claude", "family": "claude"}])
+
+    def test_an_author_without_any_proof_still_waits(self):
+        picked = rd.select(
+            families=FAMILIES, required=1,
+            authors=[{"name": "cx1", "family": ""}],
+            candidates=candidates(
+                row("claude-one", harness="claude", session="claude")))
+        self.assertEqual(picked["state"], rd.WAITING)
+        self.assertIn("author family unknown", picked["why"])
 
 
 class NexlinkPolicyTest(unittest.TestCase):
@@ -547,6 +620,22 @@ class ApplyTest(unittest.TestCase):
             latest = self.port.latest_freeze(LOT["id"]) or {}
             args["freeze_sha"] = latest.get("sha") or SHA_A
         return rd.apply(LOT, **dict({"families": FAMILIES}, **args))
+
+    def test_a_multi_family_author_designates_outside_both_families(self):
+        # #3584 : l'auteur a gelé sous codex puis tourné en repli deepseek ;
+        # la désignation exclut les deux familles et prend claude.
+        self.authors = [{"name": "cx1", "family": "",
+                         "families": ["codex", "deepseek"]}]
+        self.pool = candidates(
+            row("claude-one", harness="claude", session="claude"),
+            row("codex-one", harness="codex", session="codex"),
+            row("deepseek-one", harness="deepseek", session="deepseek"))
+        out = self.apply(
+            policy={"rules": [{"paths": ["src/ameesh/**"], "reviews": 1}]},
+            required=1)
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["claude-one"])
+        self.assertEqual(out["authors"][0]["families"], ["codex", "deepseek"])
 
     def test_an_abbreviated_freeze_is_the_same_head(self):
         # #1775 N1 : un jalon frozen peut porter un SHA abrégé alors que le
@@ -688,13 +777,18 @@ class ApplyTest(unittest.TestCase):
         out = self.apply(candidates=pool)
         self.assertEqual(out["state"], rd.WAITING)
         self.assertEqual(out["missing"], 1)
+        # #3596 : la famille disponible est pourvue tout de suite ; le manque
+        # est notifié au pilote, et le relecteur reçoit sa demande.
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["claude-one"])
         self.assertEqual(len(self.port.commits), 1)
         self.assertEqual(self.port.messages[0][0], "mesh-design")
         self.assertIn("No implicit admission", self.port.messages[0][1])
+        self.assertIn("Designation at freeze incomplete", self.port.messages[0][1])
+        self.assertEqual(self.port.messages[1][0], "claude-one")
         again = self.apply(candidates=pool)
         self.assertTrue(again.get("replayed"))
         self.assertEqual(len(self.port.commits), 1)
-        self.assertEqual(len(self.port.messages), 1)
+        self.assertEqual(len(self.port.messages), 2)
 
     def test_light_lot_designates_nobody(self):
         out = self.apply(paths=["docs/guide.md"], risk="light")
@@ -749,11 +843,18 @@ class ApplyTest(unittest.TestCase):
                           row("claude-two", harness="claude", session="claude"))
         first = self.apply(candidates=pool)
         self.assertEqual(first["state"], rd.WAITING)
-        self.assertEqual(len(self.port.messages), 1)
+        self.assertEqual([r["name"] for r in first["reviewers"]], ["claude-one"])
+        self.assertEqual(len(self.port.messages), 2)  # avis de manque + demande claude
         second = self.apply(candidates=self.pool)  # claude + codex disponibles
         self.assertEqual(second["state"], rd.DESIGNATED)
         self.assertFalse(second.get("replayed"))
+        # #3596 : claude garde son siège et ne reçoit pas de seconde demande ;
+        # codex est ajouté seul.
+        self.assertEqual([r["name"] for r in second["reviewers"]],
+                         ["claude-one", "codex-one"])
         self.assertEqual(len(self.port.messages), 3)
+        self.assertEqual(self.port.messages[2][0], "codex-one")
+        self.assertEqual([to for to, _body in self.port.messages].count("claude-one"), 1)
         third = self.apply(candidates=self.pool)
         self.assertTrue(third.get("replayed"))
         self.assertEqual(len(self.port.messages), 3)

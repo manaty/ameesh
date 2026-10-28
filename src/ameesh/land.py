@@ -161,9 +161,19 @@ def _fire_guard(landing, *, gh=None) -> dict | None:
 
     #2306 : une lecture passagère des checks (5xx, délai) ne prouve pas un
     manque ; la ligne reste en file et repart au passage suivant, au lieu
-    d'éjecter le lot."""
+    d'éjecter le lot.
+
+    #3550 : la ligne de file lue par le passage est un instantané ; une
+    sortie de file survenue depuis retire l'autorisation de fusionner. Le
+    dernier geste relit l'identité de l'entrée (génération, cible, gel) et
+    s'arrête si elle a disparu ou changé."""
     from . import fire, packet_guard
     row = landing.row or {}
+    if getattr(landing, "entry", None) is not None and landing.queue_gone():
+        landing.release = True
+        return {"lot": landing.lot, "result": "taken-out", "detail": (
+            "the queue entry of lot #%d was removed or replaced before the merge: "
+            "nothing merged" % landing.lot)}
     try:
         packet_guard.check_merge(landing.db, landing.lot, row.get("branch") or "",
                                  row.get("target") or "", row.get("frozen_sha") or "")
@@ -635,6 +645,15 @@ class _Landing:
         self.locks.pop(self.key, None)
         return False
 
+    def queue_gone(self) -> bool:
+        """#3550: the queue entry this landing follows is no longer there, or
+        has been replaced (another generation, target or freeze). The stale
+        snapshot from the pass never authorizes a merge."""
+        entry = next((r for r in self.ops.queue()
+                      if int(r["work_item_id"]) == self.lot), None)
+        return entry is None or tuple(entry.get(k) for k in (
+            "generation", "target", "frozen_id", "frozen_sha")) != self.entry
+
     def fence_hold(self) -> None:
         """L165 (EP4) : renouvelle le bail élu juste avant l'effet externe.
 
@@ -778,7 +797,9 @@ class _Landing:
 def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=None,
               gh=_gh, parts=None) -> dict:
     """Lands (or follows the landing of) `row`, the head of its queue.
-    Returns `{lot, result: landed|landing|retry|ejected|busy|error, …}`.
+    Returns `{lot, result: landed|landing|retry|ejected|taken-out|busy|error, …}`.
+    `taken-out` (#3550): the queue entry was removed or replaced since the
+    pass read it; nothing is merged.
 
     L1651 (#1650) : `parts` porte la requalification d'un lot dont la CI
     individuelle est remplacée par celle d'un paquet (§12, #1467) — les
@@ -806,6 +827,16 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
     projects = tuple(radar.settings_of(cfg).projects.values())
     key = lock_key(project, row["target"])
     ops = storage.of(db).work
+    # #3550: `row` is the pass's snapshot, not the queue's current state. A
+    # take-out (or a replacement entry) before this landing means there is no
+    # work left to land: stop before taking the lease or reading the forge.
+    identity = ("generation", "target", "frozen_id", "frozen_sha")
+    current = next((r for r in ops.queue() if int(r["work_item_id"]) == lot), None)
+    if current is None or tuple(current.get(k) for k in identity) != \
+            tuple(row.get(k) for k in identity):
+        return {"lot": lot, "result": "taken-out", "detail": (
+            "the queue entry of lot #%d was removed or replaced before its landing: "
+            "nothing merged" % lot)}
     epoch = ops.land_lock(key, owner, LOCK_TTL_S, epoch=locks.get(key)) \
         if key in locks else None
     if epoch is None:
@@ -1357,7 +1388,14 @@ def uncertain(db, now: float | None = None) -> list[dict]:
 
 def run_pass(cfg, db, project, report: dict, *, owner: str, locks=None, gh=_gh) -> list[dict]:
     """After the queue pass (`report["queue"]`): lands the head of each
-    queue of `project`, when it declares `land`. Never raises."""
+    queue of `project`, when it declares `land`. Never raises.
+
+    #3560: a row the train enrolled (`packet_allocated`, its `packet` receipt
+    on the current generation) is the train's: the train lands it with its
+    packet (`train_git.promote`). The queue pass never lands it, whatever its
+    state: landing it alone ejected it for want of a lot CI (`ci_required`,
+    impossible on `agent/**` under §11 bis), and the ejected row then refused
+    every later enrollment of the lot (#2376, #3537)."""
     if project.land == "off":
         return []
     out = []
@@ -1367,7 +1405,8 @@ def run_pass(cfg, db, project, report: dict, *, owner: str, locks=None, gh=_gh) 
         return [{"result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}]
     for target, listed in sorted(((report.get("queue") or {}).get("targets") or {}).items()):
         head = next((rows[o["lot"]] for o in listed if o["lot"] in rows
-                     and rows[o["lot"]]["state"] in ("queued", "landing")), None)
+                     and rows[o["lot"]]["state"] in ("queued", "landing")
+                     and not rows[o["lot"]].get("packet_allocated")), None)
         if head is None:
             continue
         try:
@@ -1387,13 +1426,18 @@ BLOCKED_AFTER_S = float(os.environ.get("AMEESH_MERGE_BLOCKED_MIN", "30")) * 60
 
 def blocked(db, now: float | None = None) -> list[dict]:
     """Heads of queue (rank 1, or landing) that have not moved for
-    `BLOCKED_AFTER_S`: the queue is stuck behind them."""
+    `BLOCKED_AFTER_S`: the queue is stuck behind them.
+
+    #3569: a row the train enrolled (`packet_allocated`) is not one: the
+    queue pass skips it (`run_pass`, #3560) and the train moves it with its
+    packet, whose CI may run longer than this delay."""
     now = time.time() if now is None else now
     try:
         rows = storage.of(db).work.queue()
     except Exception:  # noqa: BLE001 - database without 0058
         return []
     return [r for r in rows if r["state"] in ("queued", "landing")
+            and not r.get("packet_allocated")
             and (r["state"] == "landing" or r.get("rank") == 1)
             and now - float(r.get("updated_ts") or now) >= BLOCKED_AFTER_S]
 
@@ -1434,6 +1478,11 @@ def run(cfg, db, args) -> int:
         if not rows:
             raise LandError("lot #%d is not in a queue" % args.id)
         row = rows[0]
+        if row.get("packet_allocated"):
+            # #3560 : la ligne d'un lot inscrit par le train est portée par le
+            # train, jamais atterrie seule (même règle que `run_pass`).
+            raise LandError("lot #%d was enrolled by the train: its packet lands it, not the "
+                            "queue" % args.id)
         if row["state"] == "queued" and row.get("rank") != 1:
             raise LandError("lot #%d is ranked %s in the queue of %s, not 1"
                             % (args.id, row.get("rank") or "—", row["target"]))

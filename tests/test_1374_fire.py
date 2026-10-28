@@ -12,13 +12,17 @@ Témoins demandés par le lot : lot sans feu, mauvaise tête, feu retiré, CI
 incomplète ou rouge, événement de fusion terminal ; témoins du gel corrigé :
 verdicts avant PR/file/CI, avis indépendants et blocages non masqués, sortie de
 file et garde de `land` après retrait, jalons relus sous bail, bail renouvelé,
-et autorité pilote déclarée. Tests sans base (routage, jalons, GitHub simulé),
-puis sur Postgres (règles de `give`/`withdraw`, bail, CLI, garde de `land`)."""
+et autorité pilote déclarée. #3598 : `give`/`withdraw` attendent la fenêtre
+libre du bail `fire:<lot>`, refusent à la borne en nommant le détenteur, et un
+passage ne s'arme pas sur un feu retiré pendant l'attente. Tests sans base
+(routage, jalons, GitHub simulé), puis sur Postgres (règles de `give`/`withdraw`,
+bail, CLI, garde de `land`)."""
 from __future__ import annotations
 
 import os
 import subprocess
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -709,6 +713,40 @@ class TargetKeyTest(unittest.TestCase):
             self.assertNotEqual(seen[0][1], fire.LOCK_TTL_S)
 
 
+class LeaseWaitTest(unittest.TestCase):
+    """#3598 : l'attente du bail `fire:<lot>` par `give`/`withdraw`."""
+
+    def test_wait_lock_retries_with_backoff_until_released(self):
+        handles = [None, None, ("ops", "owner", 7, "fire:42")]
+        calls, slept = [], []
+
+        def lock(db, lot):
+            calls.append(lot)
+            return handles.pop(0)
+
+        with mock.patch.object(fire, "_lock", side_effect=lock):
+            handle = fire._wait_lock(None, 42, wait=10.0, sleep=slept.append,
+                                     clock=iter([0.0, 0.0, 1.0]).__next__)
+        self.assertEqual(handle[3], "fire:42")
+        self.assertEqual(calls, [42, 42, 42])
+        self.assertEqual(slept, [fire.LOCK_WAIT_FIRST_S, fire.LOCK_WAIT_FIRST_S * 2])
+
+    def test_wait_lock_refuses_at_the_bound_with_the_holder(self):
+        holder = {"owner": "pass:r5:4242", "expires_at": "2026-10-25T19:00:00Z",
+                  "left_s": 3.0}
+        with mock.patch.object(fire, "_lock", return_value=None), \
+                mock.patch.object(fire, "_land_holder", return_value=holder):
+            with self.assertRaises(fire.FireError) as caught:
+                fire._wait_lock(None, 42, wait=10.0, sleep=lambda _s: None,
+                                clock=iter([0.0, 0.0, 10.0]).__next__)
+        message = str(caught.exception)
+        self.assertIn("another fire operation holds lot #42", message)
+        self.assertIn("pass:r5:4242", message)
+        self.assertIn("2026-10-25T19:00:00Z", message)
+        self.assertIn("3s left", message)
+        self.assertIn("waited 10s", message)
+
+
 class ActTest(unittest.TestCase):
     """Le routage d'un passage : verdicts avant PR/file/CI, fusion au geste
     effectif, jamais d'auto-fusion laissée armée, jamais deux gestes
@@ -780,6 +818,17 @@ class ActTest(unittest.TestCase):
         calls["_disarm"].assert_called_once()
         self.assertIn("no active fire", calls["_disarm"].call_args.args[3])
         calls["_leave_queue"].assert_called_once()
+        calls["_merge_pr"].assert_not_called()
+
+    def test_fire_withdrawn_before_the_gesture_stops_the_pass(self):
+        """P1-3 (#1374) : le passage relit le feu sous son bail ; un unfire
+        arrivé entre-temps l'arrête avant la fusion (#3598, témoin 3)."""
+        out, calls = self._act(
+            _marks(_mark("frozen", A), _mark("fire", A)), _status(),
+            fresh=(self.ROW, _marks(_mark("frozen", A), _mark("fire", A),
+                                    _mark("unfire", A))))
+        self.assertEqual(out["result"], "withdrawn")
+        self.assertIn("withdrawn before the merge", out["detail"])
         calls["_merge_pr"].assert_not_called()
 
     def test_merged_pr_is_terminal(self):
@@ -1116,7 +1165,7 @@ class FireDbTest(PgTestCase):
         self.assertIsNotNone(epoch)
         try:
             with self.assertRaises(fire.FireError) as caught:
-                fire.give(self.db, lot, sha=A, actor="pilote")
+                fire.give(self.db, lot, sha=A, actor="pilote", wait=0.05)
             self.assertIn("another fire operation", str(caught.exception))
         finally:
             ops.land_unlock(key, "another-host", epoch)
@@ -1124,10 +1173,84 @@ class FireDbTest(PgTestCase):
         epoch = ops.land_lock(key, "another-host", 60.0)
         try:
             with self.assertRaises(fire.FireError) as caught:
-                fire.withdraw(self.db, lot, actor="pilote")
+                fire.withdraw(self.db, lot, actor="pilote", wait=0.05)
             self.assertIn("another fire operation", str(caught.exception))
         finally:
             ops.land_unlock(key, "another-host", epoch)
+
+    def test_give_waits_for_the_lease_to_be_released(self):
+        """#3598 : le bail rendu pendant l'attente, le feu se donne."""
+        lot = self._frozen_lot(A)
+        key = "fire:%d" % lot
+        other = self.connect()
+        self.addCleanup(other.close)
+        their_ops = storage.of(other).work
+        epoch = their_ops.land_lock(key, "another-host", 60.0)
+        self.assertIsNotNone(epoch)
+        self.addCleanup(their_ops.land_unlock, key, "another-host", epoch)
+        timer = threading.Timer(
+            0.3, lambda: their_ops.land_unlock(key, "another-host", epoch))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        row = fire.give(self.db, lot, sha=A, actor="pilote", wait=5.0)
+        self.assertEqual(row["kind"], "fire")
+        self.assertTrue(fire.state(self.db, lot)["active"])
+
+    def test_withdraw_waits_for_the_lease_to_be_released(self):
+        """#3598 : le retrait attend la fenêtre libre ; le passage l'ayant
+        rendue, le feu se retire."""
+        lot = self._frozen_lot(A)
+        fire.give(self.db, lot, sha=A, actor="pilote")
+        key = "fire:%d" % lot
+        other = self.connect()
+        self.addCleanup(other.close)
+        their_ops = storage.of(other).work
+        epoch = their_ops.land_lock(key, "pass:r5:4242", 60.0)
+        self.assertIsNotNone(epoch)
+        self.addCleanup(their_ops.land_unlock, key, "pass:r5:4242", epoch)
+        timer = threading.Timer(
+            0.3, lambda: their_ops.land_unlock(key, "pass:r5:4242", epoch))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        row = fire.withdraw(self.db, lot, actor="pilote", wait=5.0)
+        self.assertEqual(row["kind"], "unfire")
+        self.assertFalse(fire.state(self.db, lot)["active"])
+
+    def test_give_refusal_names_the_holder_and_its_expiry(self):
+        """#3598 : à la borne, le refus dit qui tient le bail et jusqu'à quand."""
+        lot = self._frozen_lot(A)
+        ops = storage.of(self.db).work
+        key = "fire:%d" % lot
+        epoch = ops.land_lock(key, "pass:r5:4242", 60.0)
+        self.assertIsNotNone(epoch)
+        try:
+            with self.assertRaises(fire.FireError) as caught:
+                fire.give(self.db, lot, sha=A, actor="pilote", wait=0.05)
+        finally:
+            ops.land_unlock(key, "pass:r5:4242", epoch)
+        message = str(caught.exception)
+        self.assertIn("another fire operation holds lot #%d" % lot, message)
+        self.assertIn("pass:r5:4242", message)
+        self.assertIn("until", message)
+
+    def test_withdraw_refusal_names_the_holder_and_its_expiry(self):
+        """#3598 : le retrait refusé à la borne nomme le détenteur et son
+        échéance, comme `give`."""
+        lot = self._frozen_lot(A)
+        fire.give(self.db, lot, sha=A, actor="pilote")
+        ops = storage.of(self.db).work
+        key = "fire:%d" % lot
+        epoch = ops.land_lock(key, "pass:r5:4242", 60.0)
+        self.assertIsNotNone(epoch)
+        try:
+            with self.assertRaises(fire.FireError) as caught:
+                fire.withdraw(self.db, lot, actor="pilote", wait=0.05)
+        finally:
+            ops.land_unlock(key, "pass:r5:4242", epoch)
+        message = str(caught.exception)
+        self.assertIn("another fire operation holds lot #%d" % lot, message)
+        self.assertIn("pass:r5:4242", message)
+        self.assertIn("until", message)
 
     def test_pass_skips_a_lot_without_fire(self):
         lot = work.add(self.db, title="un lot", branch="lot/1-un-lot")["id"]
@@ -1687,10 +1810,15 @@ class CompleteAuthorsTest(unittest.TestCase):
         self.assertEqual(got.get("merger"), "codex",
                          "l'auteur d'une fusion ajoute du contenu au lot")
 
-    def test_two_historical_families_for_a_coauthor_refuse(self):
-        # R8 B de cx2 : la famille vide rendue par reading peut cacher deux
-        # familles historiques prouvées ; le registre courant ne les remplace
-        # pas, la porte refuse au lieu de laisser rev1 relire son travail.
+    def test_two_historical_families_for_a_coauthor_are_excluded_not_refused(self):
+        # #3584 (décision du 26/10, notée au lot) : un ensemble de familles
+        # prouvées n'est pas une famille inconnue. L'ancien refus de #2681 R8
+        # (une famille vide pouvait cacher deux preuves) est remplacé par
+        # l'exclusion de **chaque** famille : ni codex ni claude ne peuvent
+        # compter pour rev1, et rev1 lui-même reste exclu par son nom. C'est au
+        # moins aussi strict pour l'indépendance, sans bloquer la relecture
+        # quand une famille hors de l'ensemble existe. Sans famille restante,
+        # la porte se ferme (aucune admission implicite).
         with tempfile.TemporaryDirectory() as tmp:
             git = self._git(tmp)
             base, _head = self._repo(tmp, git)
@@ -1723,10 +1851,24 @@ class CompleteAuthorsTest(unittest.TestCase):
                                       return_value=("claude", "codex", "deepseek")), \
                     mock.patch.object(review_authors, "_commit_receipt",
                                       side_effect=providers):
-                with self.assertRaises(merge_queue._ProvenanceError):
-                    merge_queue._complete_authors(
-                        _EmptyHistoryDb(), item, second, tmp, "main",
-                        klass={"class": "sensitive", "base_sha": base}, marks=[])
+                authors, _families = merge_queue._complete_authors(
+                    _EmptyHistoryDb(), item, second, tmp, "main",
+                    klass={"class": "sensitive", "base_sha": base}, marks=[])
+        got = {entry["name"]: (entry["family"], entry.get("families") or ())
+               for entry in authors}
+        self.assertEqual(got.get("author"), ("deepseek", ()))
+        self.assertEqual(got.get("rev1"), ("", ["claude", "codex"]))
+        # Sans famille restante hors de l'ensemble, la porte se ferme : ni
+        # rev1 (co-auteur, et exclu par son nom) ni rev2 (claude) ne comptent.
+        marks = _marks(_mark("frozen", second), _verdict("rev1", sha=second),
+                       _verdict("rev2", sha=second))
+        with mock.patch.object(merge_queue, "actor_family", side_effect=family):
+            gate = merge_queue.review_gate(
+                None, marks, second, item=item, families=FAM.values(),
+                klass={"class": "sensitive"}, required=1, authors=authors,
+                authors_complete=True)
+        self.assertFalse(gate["ok"], gate["why"])
+        self.assertEqual(gate["accepted"], [])
 
     def test_a_malformed_receipt_refuses_instead_of_the_git_fallback(self):
         # R8 B de cx2 : strict=True fait d'un reçu contradictoire une erreur,
@@ -1747,9 +1889,13 @@ class CompleteAuthorsTest(unittest.TestCase):
                         _EmptyHistoryDb(), item, frozen, tmp, "main",
                         klass={"class": "sensitive", "base_sha": base}, marks=[])
 
-    def test_two_historical_families_for_the_reference_refuse(self):
-        # R9 B de cx2 : l'assigné lui-même peut avoir deux familles
-        # historiques prouvées ; il n'est plus exempté de l'ambiguïté.
+    def test_two_historical_families_for_the_reference_are_excluded_not_refused(self):
+        # #3584 (décision du 26/10, notée au lot) : la référence elle-même
+        # peut avoir deux familles historiques. L'ancien refus de #2681 R9
+        # est remplacé par l'exclusion des deux : un avis claude ou codex ne
+        # compte pas, un avis d'une famille hors de l'ensemble (ici deepseek)
+        # reste recevable. L'avis du relecteur de la famille de l'auteur tombe
+        # donc, sans admettre implicitement le lot.
         with tempfile.TemporaryDirectory() as tmp:
             git = self._git(tmp)
             base, _head = self._repo(tmp, git)
@@ -1774,7 +1920,7 @@ class CompleteAuthorsTest(unittest.TestCase):
                 return receipts.get(sha)
 
             def family(_db, name, **_kw):
-                return {"author": "deepseek"}.get(name, "")
+                return {"author": "", "rev2": "claude", "dev1": "deepseek"}.get(name, "")
 
             item = {"id": 7, "assignee": "author", "branch_target": "main"}
             with mock.patch.object(merge_queue, "actor_family", side_effect=family), \
@@ -1782,10 +1928,21 @@ class CompleteAuthorsTest(unittest.TestCase):
                                       return_value=("claude", "codex", "deepseek")), \
                     mock.patch.object(review_authors, "_commit_receipt",
                                       side_effect=providers):
-                with self.assertRaises(merge_queue._ProvenanceError):
-                    merge_queue._complete_authors(
-                        _EmptyHistoryDb(), item, second, tmp, "main",
-                        klass={"class": "sensitive", "base_sha": base}, marks=[])
+                authors, _families = merge_queue._complete_authors(
+                    _EmptyHistoryDb(), item, second, tmp, "main",
+                    klass={"class": "sensitive", "base_sha": base}, marks=[])
+        self.assertEqual(authors, [{"name": "author", "family": "",
+                                    "families": ["claude", "codex"]}])
+        # La porte exclut claude et codex : seul dev1 (deepseek) compte.
+        marks = _marks(_mark("frozen", second), _verdict("rev2", sha=second),
+                       _verdict("dev1", sha=second))
+        with mock.patch.object(merge_queue, "actor_family", side_effect=family):
+            gate = merge_queue.review_gate(
+                None, marks, second, item=item, families=FAM.values(),
+                klass={"class": "sensitive"}, required=1, authors=authors,
+                authors_complete=True)
+        self.assertTrue(gate["ok"], gate)
+        self.assertEqual([row["actor"] for row in gate["accepted"]], ["dev1"])
 
     def test_an_unreadable_author_range_refuses(self):
         # Une plage que le lecteur partagé ne peut pas lire ne laisse pas

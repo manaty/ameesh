@@ -46,7 +46,9 @@ def ameesh() -> tuple[Workflow, ...]:
     absent and supply no packet CI: the train refuses it.
     The full matrix is 8 psycopg parts, 16 psql parts, the short macOS
     platform job and the aggregate ``tests`` check; doc-only and version lanes
-    are conditional outside this contract.
+    are conditional outside this contract. #3749: the 16 psql parts run the
+    pilot list and the contract, the whole suite under psql is nightly
+    (``psql-nocturne.yml``, outside the packet proof).
 
     #3198: the packet run no longer carries the full macOS suite (8 psycopg
     parts under macOS, hours long); it lives in ``.github/workflows/macos.yml``
@@ -74,14 +76,41 @@ def ameesh() -> tuple[Workflow, ...]:
         event="push",
         called=".github/workflows/tests.yml",
         sources=((".github/workflows/paquet.yml", "0d4e4c9cae703575b33aa393d6a1c95a81e5c896"),
-                 (".github/workflows/tests.yml", "2fc4381f3ea37a6ae832b19d0ca3332137bd2118"),
-                 ("scripts/test-plan.py", "e7d7836e0b3164aaa4ca492a1c2ae1e6045d1ef4"),
-                 ("scripts/test-parts.py", "2265308c9fed248852bfd9ec41ba8f79266f0647"),
+                 (".github/workflows/tests.yml", "6cb779b5821b78619fbf2a976d6c5bc57057f641"),
+                 ("scripts/test-plan.py", "5967f9cadb9664b8cff9d675b3fc6a4dd405d68b"),
+                 ("scripts/test-parts.py", "8536c6ee43aa2b72a324d2de9c697ec98614c30a"),
                  ("scripts/ci-flow.py", "b633b95258f03db4d0760d3f47855a0e832ac8a4"),
-                 ("scripts/ci-agregat.py", "7de7ca4b3463f27f1fa90d32e0020fbbce25b17b"),
+                 ("scripts/ci-agregat.py", "d10a3b6d11f9abf4b9a4e16de68b1ba1a6ccc6f1"),
                  ("scripts/map.py", "7a7516683643ff7cd66abf3d50147b25446a03bb")),
         pins_at="src/ameesh/train_contracts.py",
     ),)
+
+
+def stale_pins(root: str, workflows=None) -> list[tuple[str, str | None, str, str]]:
+    """#3606: the contract sources whose blob under ``root`` differs from its pin.
+
+    ``root`` is the root of a built tree, not necessarily a Git worktree: a
+    freeze checks a ``git archive`` extraction, so the blob is computed from
+    the file with ``git hash-object`` instead of being read from a commit
+    object. Returns ``(path, tree blob or None, pinned blob, pin file)`` for
+    each stale source; an empty list means every audited source matches its
+    pin. A source missing from the tree has no blob and is stale too.
+
+    Only static contracts (``Workflow`` tuples) can be checked this way. The
+    Nexlink contract is dynamic and pins sources of the Nexlink repository,
+    which an ameesh tree does not carry; this check applies to the project
+    tree that declares them.
+    """
+    from . import plan_git
+    if workflows is None:
+        workflows = ameesh()
+    stale = []
+    for workflow in workflows:
+        for path, pinned in workflow.sources:
+            actual = plan_git._out(root, "hash-object", "--", path)
+            if actual != pinned:
+                stale.append((path, actual, pinned, workflow.pins_at or "?"))
+    return stale
 
 
 #: Nexlink target commit whose selector was audited. Only the shared

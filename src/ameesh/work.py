@@ -433,6 +433,50 @@ def forcer(cfg, db, explicit: str | None = None) -> str:
         "own bound session, a human terminal says --actor human:<id>" % text)
 
 
+def publisher(cfg, db, explicit: str | None = None) -> str:
+    """#3501 : l'auteur de `work estimates --publish` (L157b), le passage de
+    l'auditeur ; WorkError pour tout autre. Chaque publication renvoyait les
+    briefs `estimate_bias` à tous les estimateurs biaisés : le 25/10, un agent
+    a republié la table une minute après l'auditeur pour clore sa propre
+    alerte. Une session liée (bail du runner ou liaison de session,
+    `identity.BOUND_SOURCES`, L244) publie en son nom, et seulement si cet
+    agent est l'auditeur (`is_auditor`) ; un `AGENT_MAIL_NAME` seulement
+    auto-déclaré ne suffit pas, et une identité refusée ne retombe pas sur le
+    terminal humain. Une session sans identité ne nomme qu'un humain
+    (`--actor human:<id>`) : sans liaison, un nom d'agent est refusé (revue
+    de mty-amh-impl-05, comme #540 r2 pour `forcer`)."""
+    from . import identity
+    from .agent_names import resolve
+
+    text = resolve((explicit or "").strip(), db=db, operation="work.publisher")
+    binding = identity.resolve_binding(cfg, db)
+    if not binding.ok and (binding.name or binding.source != "none"
+                           or os.environ.get("AGENT_MAIL_NAME")):
+        raise WorkError("--publish refused: invalid session identity (%s)"
+                        % (binding.reason or "unbound identity"))
+    refus = ("--publish refused: %s is not the auditor; the reference table (L157b) "
+             "is the auditor's pass (persona auditeur, or auditeur role on its Agent "
+             "card in the canon); work estimates without --publish reads it")
+    if binding.name:
+        if text and text != binding.name:
+            raise WorkError("--publish refused: this session belongs to %s, it does "
+                            "not publish on behalf of %s" % (binding.name, text))
+        if binding.source not in identity.BOUND_SOURCES:
+            raise WorkError("--publish refused: identity %s is %s, not bound (runner "
+                            "lease or `ameesh mail bind`)" % (binding.name, binding.source))
+        if is_auditor(cfg, db, binding.name):
+            return binding.name
+        raise WorkError(refus % binding.name)
+    if not text:
+        raise WorkError("--publish: say who publishes (--actor human:<id>)")
+    if text.startswith(HUMAN_PREFIX) and len(text) > len(HUMAN_PREFIX):
+        return text
+    raise WorkError(
+        "--publish refused: %s is not a human and this session has no bound agent "
+        "identity (runner lease or `ameesh mail bind`); the auditor publishes from "
+        "its own bound session, a human terminal says --actor human:<id>" % text)
+
+
 def milestone_actor(cfg, db, explicit: str | None = None, *, kind: str = "") -> str:
     """#2928 : l'auteur d'un jalon `frozen`/`verdict`, vérifié au chemin d'écriture.
 
@@ -567,7 +611,14 @@ def add(
     title or the source looks like a non-blocking follow-up (N, P2, P3) — the
     route to the backlog, to be shown by the caller. Nothing is ever refused:
     a human request, a blocking defect and the review-after-merge lot pass
-    unchanged."""
+    unchanged.
+
+    #3744 : le corps « - » est refusé quel que soit l'appelant (comme la
+    note, #3683) : c'est le marqueur de l'entrée standard, jamais un énoncé."""
+    if (body or "").strip() == "-":
+        raise WorkError("body refused: `-` alone is not a statement; write the text, "
+                        "or pass `--body -` to ameesh work add to read it on standard "
+                        "input")
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.add")
     return _create(db, title=title, type=type, source=source, app=app, body=body,
@@ -2763,7 +2814,7 @@ def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
         if not commit:
             raise WorkError("commit %s not found in the lot's repository" % sha)
         target = item.get("branch_target") or plan_git.default_target(checkout)
-        head = plan_git._commit(checkout, target) if target else None
+        head = plan_git._target_tip(checkout, target) if target else None
         if not head:
             raise WorkError("merge target %r not found (fetch or configure ameesh.target)"
                             % target)
@@ -3682,6 +3733,10 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
     if not (text or "").strip():
         raise WorkError("empty note")
     text = text.strip()
+    if text == "-":
+        # #3683 : « - » est le marqueur de l'entrée standard, jamais une note.
+        raise WorkError("note refused: `-` alone is not a note; write the text, "
+                        "or pass `-` to ameesh work note to read it on standard input")
     from . import review_floor
     if review_floor.is_floor_note(text):
         # #3183 : la ligne du plancher d'avis est lue par la porte ; seule la

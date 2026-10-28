@@ -60,7 +60,12 @@ chaque passage un relevé (`Watcher.tick`) :
    exécution de PR restée `pending` plus de cinq minutes est signalée à
    l'assigné ;
 3. pour chaque exécution suivie, les check runs « tests (flux) » de sa tête :
-   chaque échec nouveau est enregistré (`ci_test_failures`, 0055) ;
+   chaque échec nouveau est enregistré (`ci_test_failures`, 0055) ; un dépôt
+   qui ne publie pas ce flux (Nexlink, qui lance `node --test`) livre ses
+   échecs en TAP : quand une exécution conclut rouge sans aucun événement, les
+   logs des jobs en échec sont lus et leurs lignes `not ok` deviennent les
+   tests en échec (#3783). Un job rouge sans `not ok` reste sans nom de test —
+   une panne d'installation n'est pas un test négatif (canon §3) ;
 4. une exécution qui n'est plus en cours est conclue : verdict ;
 5. une exécution relancée (`gh run rerun`, geste courant sous saturation)
    garde son `run_id` et change d'`run_attempt` (#901) : si GitHub la dit de
@@ -188,11 +193,44 @@ ECHECS = ("echec", "erreur")
 #: conclusion GitHub → état de `ci_runs`
 _CONCLUSIONS = {"success": "success", "neutral": "success", "skipped": "success",
                 "cancelled": "cancelled", "stale": "cancelled"}
+
+
+def conclusion_status(run: dict | None) -> str:
+    """L'état `ci_runs` d'une exécution GitHub, ou "" si elle n'est pas conclue.
+
+    Un relevé ne doit lire les logs TAP d'un job qu'une fois l'exécution
+    conclue rouge (#3783) : pendant qu'elle tourne, la liste des jobs coûte
+    un appel par passage sans rien apporter au verdict."""
+    if not run or (run.get("status") or "") != "completed":
+        return ""
+    return _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
+
+
 #: #846 : conclusions d'un check run de job qui disent un main rouge, même
 #: sans événement de test publié (panne d'installation, délai dépassé)
 FAILED_JOB_CONCLUSIONS = ("failure", "timed_out")
 #: #846 : part des échecs de job relevés ainsi (`ci_test_failures.part`)
 JOB_PART = "job"
+#: #3783 : un échec de test lu dans le log d'un job (`node --test`, TAP) —
+#: le flux JSON de `scripts/ci-flow.py` n'existe que pour ameesh ; un dépôt
+#: qui n'a pas ce publisher (Nexlink) ne laissait aucun nom de test, et un
+#: rouge se lisait « no failed test seen » (résultat non concluant, canon §3).
+#: Une ligne TAP est préfixée par l'horodatage du log GitHub (`…Z `), et un
+#: sous-test est indenté : la reconnaissance est ancrée au début de la ligne
+#: (après ce préfixe), sinon « error: expected not ok 1 - exemple » deviendrait
+#: un faux échec. Le numéro est obligatoire (node numérote chaque test), ce qui
+#: écarte les lignes d'extrait sans numéro.
+TAP_RESULT_RE = re.compile(r"^\s*(not ok|ok)\s+\d+\s*(?:-\s*)?(.*\S)\s*$")
+#: une ligne `not ok … # TODO` / `# SKIP` est une attente, pas un échec
+TAP_DIRECTIVE_RE = re.compile(r"\s+#\s*(?:TODO|SKIP)\b", re.IGNORECASE)
+#: échappements TAP (`\#`, `\\`) : le nom affiché est celui du test
+TAP_ESCAPE_RE = re.compile(r"\\([#\\])")
+#: séquences ANSI du log brut (`gh api` refuse de les imprimer sans option)
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+#: horodatage du log GitHub Actions, préfixe de chaque ligne
+LOG_TS_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z")
+#: lignes de diagnostic gardées dans l'extrait d'un échec TAP
+TAP_EXCERPT_LINES = 20
 #: lignes d'extrait au plus dans un message
 EXCERPT_LINES = 40
 #: échecs détaillés au plus dans un message (les autres : leur nom)
@@ -414,6 +452,98 @@ def events_of(check_runs, run_id: int, attempt: int | None = None) -> list[dict]
             if key not in seen:
                 seen.add(key)
                 out.append(ev)
+    return out
+
+
+def _log_line(line: str) -> str:
+    """Une ligne de log GitHub : sans séquence ANSI ni préfixe d'horodatage.
+
+    Le log brut de l'API (`actions/jobs/<id>/logs`) commence chaque ligne par
+    `2026-…Z ` ; `gh run view --log-failed` y ajoute le job et l'étape, avant
+    ce même horodatage. On ne retire l'horodatage que s'il est dans le préfixe
+    (jamais un horodatage qui ferait partie du nom d'un test)."""
+    line = ANSI_RE.sub("", str(line or "")).replace("\ufeff", "").rstrip("\r")
+    match = LOG_TS_RE.search(line)
+    if match is not None and match.start() <= 160 \
+            and "not ok" not in line[:match.start()]:
+        line = line[match.end():]
+        if line.startswith(" "):
+            line = line[1:]
+    return line
+
+
+def _tap_failed_at(line: str) -> str | None:
+    """L'horodatage GitHub d'une ligne de log, ou None (ligne sans préfixe)."""
+    match = LOG_TS_RE.search(str(line or ""))
+    if match is None:
+        return None
+    # Postgres garde la microseconde ; le log GitHub en porte sept.
+    return re.sub(r"(\.\d{6})\d+Z$", r"\1Z", match.group(0))
+
+
+def tap_failures(text: str) -> list[dict]:
+    """Les tests en échec lus dans un log TAP de node (#3783).
+
+    Rend `[{test, excerpt, failed_at, module}]`, dans l'ordre du log. Un
+    dépôt qui ne publie pas le flux JSON d'`scripts/ci-flow.py` (Nexlink)
+    n'avait aucun nom de test : son rouge se lisait « no failed test seen »
+    et passait pour non concluant (canon §3). Les lignes `not ok` de
+    `node --test` sont la preuve négative ; `# TODO` et `# SKIP` restent des
+    attentes, et le numéro de test est obligatoire.
+
+    La reconnaissance est ancrée au début de la ligne TAP (après le préfixe
+    GitHub) : une ligne de console ou d'assertion qui contient « not ok 1 - … »
+    n'est pas un test. Le bloc de diagnostic YAML (`---` … `...`) qui suit un
+    résultat est traversé sans y lire de test : un extrait qui cite une ligne
+    TAP numérotée ne doit pas devenir une preuve négative (relecture #3783).
+    """
+    out: list[dict] = []
+    seen: dict[str, dict] = {}
+    current: dict | None = None
+    in_yaml = False
+    after_result = False
+    for raw in str(text or "").splitlines():
+        line = _log_line(raw)
+        stripped = line.strip()
+        if in_yaml:
+            if stripped == "...":
+                in_yaml = False
+                current = None
+                continue
+            if current is not None:
+                location = re.match(r"\s*location:\s*'?(.*?)'?\s*$", line)
+                if location:
+                    current["module"] = location.group(1).strip()
+                if len(current["excerpt"]) < TAP_EXCERPT_LINES:
+                    current["excerpt"].append(line.rstrip())
+            continue
+        match = TAP_RESULT_RE.match(line)
+        if match is not None:
+            after_result = True
+            current = None
+            if match.group(1) != "not ok":
+                continue
+            name = TAP_ESCAPE_RE.sub(r"\1", match.group(2).strip())
+            if not name or TAP_DIRECTIVE_RE.search(match.group(2)) or name in seen:
+                continue
+            current = {"test": name, "excerpt": [], "failed_at": _tap_failed_at(raw),
+                       "module": ""}
+            seen[name] = current
+            out.append(current)
+            continue
+        if stripped == "---" and after_result:
+            after_result = False
+            in_yaml = True
+            if current is not None:
+                current["excerpt"].append(line.rstrip())
+            continue
+        # Toute autre ligne (préambule, `# Subtest:`, sortie de console) ne
+        # peut pas être un résultat TAP ; elle ferme l'attente du bloc.
+        after_result = False
+        if current is not None and stripped.startswith(("# Subtest:", "ok ", "Bail out!")):
+            current = None
+    for entry in out:
+        entry["excerpt"] = "\n".join(entry["excerpt"]).strip()
     return out
 
 
@@ -681,6 +811,27 @@ def recipient_of(lot: dict | None) -> str | None:
 # relevé
 # --------------------------------------------------------------------------
 
+def gh_job_log(gh=None, *, timeout: float = 120.0):
+    """La fonction `(dépôt, job_id) -> texte du log` (#3783).
+
+    `gh api` suit la redirection signée de GitHub et ne transmet le jeton
+    qu'à l'API ; `--allow-escape-sequences` est requis par `gh` dès qu'un log
+    porte une séquence ANSI (npm en écrit). Une erreur est levée : l'appelant
+    la journalise et laisse le relevé continuer."""
+    from . import plan_github
+
+    client = plan_github.Gh(gh=gh, timeout=timeout)
+
+    def read(repo: str, job_id: int) -> str:
+        path = "repos/%s/actions/jobs/%s/logs" % (repo, int(job_id))
+        code, out, err = client.run(["api", "--allow-escape-sequences", path])
+        if code != 0:
+            raise plan_github.GithubError("gh api %s: exit code %d: %s" % (
+                path, code, " ".join((err or out or "—").split())[:300]))
+        return out
+    return read
+
+
 def gh_api(gh=None, *, cache_dir=None, ttl=None, clock=None):
     """La fonction `chemin -> JSON` de l'API GitHub : le jeton partagé, avec
     le cache et le quota partagés (#848) quand ils sont donnés, sinon le repli
@@ -849,9 +1000,15 @@ class Watcher:
     passage, et un quota épuisé arrête le passage sans boucle."""
 
     def __init__(self, cfg, *, api=None, cancel=None, log=None, clock=None,
-                 dry_run: bool = False, ttl=None):
+                 dry_run: bool = False, ttl=None, logs=None):
         self.cfg = cfg
         self.api = api
+        #: #3783 : lecture du log d'un job (`(dépôt, job_id) -> texte`). None :
+        #: pas de lecture de log (tests, ou `gh` absent) ; le relevé normal et
+        #: le flux JSON gardent leur comportement.
+        self.logs = logs
+        self._parsed_logs: set = set()
+        self._warned_logs: set = set()
         #: l'écriture d'annulation GitHub (`repos/<repo>/actions/runs/<id>/cancel`) ;
         #: None : `gh api -X POST` en production, jamais en test sans le dire
         self.cancel = cancel
@@ -1072,6 +1229,15 @@ class Watcher:
             if self.api is None:
                 self.api = gh_api(cache_dir=getattr(self.cfg, "state_dir", None),
                                   ttl=self._cache_ttl(), clock=self.clock)
+                if self.logs is None:
+                    # #3783 : les logs de jobs passent par `gh` (redirection
+                    # signée, jeton jamais envoyé au stockage) ; sans `gh`, le
+                    # relevé garde le flux JSON et le verdict sans nom de test.
+                    try:
+                        self.logs = gh_job_log()
+                    except Exception as exc:  # noqa: BLE001 - jamais fatal
+                        self.log("CI: job logs unavailable (%s)"
+                                 % " ".join(str(exc).split())[:200])
             out: list[dict] = []
             for repo in repos:
                 try:
@@ -1145,8 +1311,9 @@ class Watcher:
             if (run.get("status") or "") == "completed":
                 finishing[int(row["run_id"])] = run
         for row in running:
-            out += self._failures(db, repo, row, bases)
             run = finishing.get(int(row["run_id"]))
+            out += self._failures(db, repo, row, bases,
+                                  terminal=conclusion_status(run))
             if run is None:
                 continue
             others = [r for r in running if int(r["run_id"]) not in finishing
@@ -1275,7 +1442,8 @@ class Watcher:
                 row = st.ci.run(repo, run_id)
             if row is None or (run.get("status") or "") != "completed":
                 continue
-            out += self._failures(db, repo, row, bases)
+            out += self._failures(db, repo, row, bases,
+                                  terminal=conclusion_status(run))
             pending = [r for r in st.ci.running(repo) if r.get("head_sha") == head
                        and r.get("branch") == branch
                        and int(r["run_id"]) not in settled]
@@ -1427,7 +1595,13 @@ class Watcher:
             self.log("CI %s run %s: failures unreadable (%s)"
                      % (repo, run_id, " ".join(str(exc).split())[:200]))
             return
-        for ev in events_of(checks.get("check_runs"), run_id):
+        events = events_of(checks.get("check_runs"), run_id)
+        if not events:
+            # #3783 : même lecture TAP pour la base — la référence du rouge
+            # hérité porte alors les noms de tests de nexlink, pas seulement
+            # ses jobs.
+            events = self._log_failures(repo, row)
+        for ev in events:
             st.ci.add_failure(repo, run_id, run_attempt=event_attempt(ev),
                               part=str(ev.get("part") or ""), test=ev["test"],
                               module=ev.get("module") or "", status=ev.get("statut"),
@@ -1853,8 +2027,15 @@ class Watcher:
             return None
         return pilots[0]
 
-    def _failures(self, db, repo: str, row: dict, bases=BASE_BRANCHES) -> list[dict]:
+    def _failures(self, db, repo: str, row: dict, bases=BASE_BRANCHES,
+                  terminal: str = "") -> list[dict]:
         """Les échecs nouveaux d'une exécution suivie, et leur message.
+
+        `terminal` : le statut GitHub de l'exécution quand elle vient de
+        conclure. Sur un rouge sans aucun événement de flux (dépôt sans
+        `scripts/ci-flow.py`, Nexlink), les logs TAP des jobs en échec sont
+        lus (#3783) ; le relevé ne les paie donc pas à chaque passage d'une
+        exécution encore en cours.
 
         Un événement de l'attempt courant enregistré pendant que la ligne était
         encore à l'attempt précédent (liste en retard, #828) n'est pas
@@ -1867,6 +2048,8 @@ class Watcher:
                           % (repo, row["head_sha"])) or {}
         events = events_of(checks.get("check_runs"), int(row["run_id"]))
         self._record_failed_jobs(st, repo, row, bases)
+        if not events and terminal == "failure":
+            events = self._log_failures(repo, row)
         if not events:
             return []
         reference = st.ci.base_failures(repo, row.get("base") or bases[0],
@@ -1958,6 +2141,62 @@ class Watcher:
         return [{"action": "failures", "repo": repo, "run_id": row["run_id"],
                  "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
                  "message_id": message_id}]
+
+    def _log_failures(self, repo: str, row: dict) -> list[dict]:
+        """#3783 : les tests en échec lus dans les logs TAP des jobs rouges.
+
+        Uniquement quand l'exécution est conclue rouge et qu'aucun événement
+        de flux n'a été publié : Nexlink lance `node --test` sans le publisher
+        d'`scripts/ci-flow.py`, donc `ci_test_failures` restait vide et le
+        verdict disait « no failed test seen ». Le job lui-même n'est pas un
+        test : un log sans ligne `not ok` ne rend aucun échec (une panne
+        d'installation reste non concluante, canon §3), il n'est pas inventé.
+        Les jobs déjà lus sont retenus par `(dépôt, exécution, tentative,
+        job)` : un passage suivant ne retélécharge pas leur log."""
+        if self.logs is None:
+            return []
+        run_id = int(row["run_id"])
+        attempt = int(row.get("run_attempt") or 1)
+        try:
+            jobs = self.api("repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100"
+                            % (repo, run_id, attempt)) or {}
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
+            key = (repo, run_id, attempt, "jobs")
+            if key not in self._warned_logs:
+                self._warned_logs.add(key)
+                self.log("CI %s run %s: job list unreadable (%s)"
+                         % (repo, run_id, " ".join(str(exc).split())[:200]))
+            return []
+        out: list[dict] = []
+        for job in jobs.get("jobs") or ():
+            if (job.get("conclusion") or "") not in FAILED_JOB_CONCLUSIONS:
+                continue
+            try:
+                job_id = int(job.get("id"))
+            except (TypeError, ValueError):
+                continue
+            key = (repo, run_id, attempt, job_id)
+            if key in self._parsed_logs:
+                continue
+            try:
+                text = self.logs(repo, job_id)
+            except Exception as exc:  # noqa: BLE001 - un log absent n'est pas un verdict
+                if key not in self._warned_logs:
+                    self._warned_logs.add(key)
+                    self.log("CI %s run %s job %s: log unreadable (%s)"
+                             % (repo, run_id, job_id, " ".join(str(exc).split())[:200]))
+                continue
+            self._parsed_logs.add(key)
+            part = str(job.get("name") or JOB_PART)
+            for tap in tap_failures(text):
+                out.append({"v": 1, "schema": SCHEMA, "type": "test",
+                            "execution": run_id, "attempt": attempt,
+                            "part": part, "module": tap.get("module") or "",
+                            "test": tap["test"], "statut": "echec",
+                            "extrait": tap.get("excerpt") or "",
+                            "rejouer": "", "duree_s": None,
+                            "ts": tap.get("failed_at")})
+        return out
 
     def _record_failed_jobs(self, st, repo: str, row: dict,
                             bases=BASE_BRANCHES) -> None:
@@ -2152,8 +2391,28 @@ def status_of(db, item_id: int, limit: int = 5) -> dict:
         failures = st.ci.failures(row["repo"], int(row["run_id"]))
         runs.append(dict(row, failures=[{k: f.get(k) for k in (
             "part", "test", "status", "inherited", "replay", "failed_ts")} for f in failures]))
-    return {"schema": STATUS_SCHEMA, "work_item": int(item_id), "title": item.get("title"),
-            "branch": item.get("branch"), "runs": runs}
+    report = {"schema": STATUS_SCHEMA, "work_item": int(item_id), "title": item.get("title"),
+              "branch": item.get("branch"), "runs": runs}
+    carrier = _carrier_of(db, item)
+    if carrier is not None:
+        report["carrier"] = carrier
+    return report
+
+
+def _carrier_of(db, item: dict) -> dict | None:
+    """#3611 : la publication d'un porteur `integration/**` gelé, lue au
+    journal (`packet_automerge.publication`) : sans demande `ci-full`, le run
+    push de son workflow de paquet ne produit pas le check requis de la cible
+    — et ce veilleur ne suit pas ce workflow (`WORKFLOWS`). None hors porteur
+    ou sans gel."""
+    from . import packet_automerge
+    if not packet_automerge.carrier(item.get("branch")):
+        return None
+    frozen = frozen_of(db, int(item["id"]))
+    sha = str((frozen or {}).get("sha") or "").strip().lower()
+    if not sha:
+        return None
+    return dict(packet_automerge.publication(db, int(item["id"]), sha), sha=sha)
 
 
 _STATUS_FR = {"running": "running", "success": "green", "failure": "red",
@@ -2168,6 +2427,29 @@ def render_status(report: dict) -> list[str]:
     if not report["runs"]:
         lines.append("  no CI run seen (seen by `ameesh notify` on the host "
                      "named by github.host)")
+    carrier = report.get("carrier")
+    if carrier:
+        sha, lot = carrier["sha"][:12], report["work_item"]
+        if carrier.get("armed"):
+            lines.append("  packet carrier: auto-merge armed on %s → %s (PR #%s): ameesh "
+                         "merges it once the required checks are green"
+                         % (sha, carrier.get("base") or "?", carrier.get("pr")))
+        elif carrier.get("requested"):
+            lines.append("  packet carrier: ci-full requested on %s but the auto-merge is not "
+                         "armed (see the lot's `auto-merge not-armed` note): rerun `ameesh ci "
+                         "run %d --full --reason …`" % (sha, lot))
+        else:
+            # #3614 : le journal ne dit pas si la forge impose des checks à la
+            # cible ; sans check imposé (Nexlink), le feu atterrit le porteur
+            # (`fire._carrier_gap`) — la ligne reste conditionnelle.
+            lines.append("  packet carrier: no ci-full request on the frozen head %s — if the "
+                         "target's forge requires checks (ameesh: `tests` on main), a push run "
+                         "of the packet workflow does not produce them and nothing merges it: "
+                         "open its PR if none, then `ameesh ci run %d --full --reason …` "
+                         "(#2813); without required checks (Nexlink), the fire lands it. The "
+                         "journal alone does not tell which: the fire reads the protection and "
+                         "answers `not-ready` with this cause when it applies (#3611)"
+                         % (sha, lot))
     for run in report["runs"]:
         state = _STATUS_FR.get(run["status"], run["status"])
         attempt = int(run.get("run_attempt") or 1)
@@ -3492,7 +3774,8 @@ def _arm_packet(cfg, db, decision: dict, gh, args) -> dict | None:
         out = packet_automerge.arm(
             cfg, db, args.id, slug=decision["repo"], number=decision["pr"], sha=decision["sha"],
             target=decision.get("base_ref") or "", gh=packet_automerge.gh_of(gh),
-            actor=getattr(args, "actor", "") or work.SYSTEM_SENDER)
+            actor=getattr(args, "actor", "") or work.SYSTEM_SENDER,
+            checkout=getattr(args, "prevalidation_repo", "") or "")
     except Exception as exc:  # noqa: BLE001 - l'étiquette est posée : jamais fatal
         out = {"state": "error", "why": "%s: %s" % (type(exc).__name__, exc)}
     decision["auto_merge"] = out

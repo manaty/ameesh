@@ -37,11 +37,13 @@ queue.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import tempfile
+import time
 from collections.abc import Mapping
 from types import SimpleNamespace
 
@@ -62,6 +64,11 @@ class QueueError(RuntimeError):
     """A lot that cannot enter the queue: actionable message."""
 
 
+class QueueWithdrawn(QueueError):
+    """#3532: the lot was taken out of the queue after the gesture that
+    wanted to put it back (`enter(withdrawn_after=…)`)."""
+
+
 class RegistryReadError(QueueError):
     """#2521 : le registre des agents n'a pas pu être lu.
 
@@ -73,6 +80,10 @@ class RegistryReadError(QueueError):
 # --------------------------------------------------------------------------
 # entering and leaving
 # --------------------------------------------------------------------------
+
+def _utc(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
 
 def _same(a: str | None, b: str | None) -> bool:
     """Two full commit ids, equal (never a prefix: `readiness` resolves them)."""
@@ -157,6 +168,25 @@ SENSITIVE_REVIEWS = 1
 CRITICAL_REVIEWS = 2
 
 
+def _entry_critical(entry) -> bool:
+    """Ce chemin classé prouve-t-il SQL, la sécurité ou la prod ?
+
+    `critical: true` du canon fait foi, même porté par une entrée sans chemin.
+    Sinon les motifs de secours de `CRITICAL_SCOPE` lisent le chemin des seuls
+    **chemins changés**, sauf la documentation Markdown classée légère ou
+    normale (le canon peut la classer ainsi).
+    """
+    if entry.get("critical") is True:
+        return True
+    path = str(entry.get("path") or "")
+    if not path:
+        return False
+    if (str(entry.get("class") or "") in ("light", "normal")
+            and _PROSE.search(path)):
+        return False
+    return any(rx.search(path) for rx in CRITICAL_SCOPE)
+
+
 def critical_scope(klass) -> bool:
     """Le diff gelé touche-t-il SQL, la sécurité ou la prod (deux avis) ?
 
@@ -170,20 +200,13 @@ def critical_scope(klass) -> bool:
     classe n'est pas critique pour autant : `required_verdicts` le garde
     sensible, à un avis (canon §2, owner 15/10 ; #2394). Une déclaration
     `critical: true` du canon reste lue même portée par une entrée sans
-    chemin."""
+    chemin.
+
+    Depuis #3542, `required_verdicts` n'oppose ce plancher qu'aux chemins
+    qu'aucune règle `train_reviews` ne nomme ; cette fonction reste la lecture
+    globale du diff, pour les autres lecteurs."""
     files = (klass or {}).get("files") or ()
-    for entry in files:
-        if entry.get("critical") is True:
-            return True
-        path = str(entry.get("path") or "")
-        if not path:
-            continue
-        if (str(entry.get("class") or "") in ("light", "normal")
-                and _PROSE.search(path)):
-            continue
-        if any(rx.search(path) for rx in CRITICAL_SCOPE):
-            return True
-    return False
+    return any(_entry_critical(entry) for entry in files)
 
 
 def required_verdicts(klass) -> int:
@@ -195,6 +218,14 @@ def required_verdicts(klass) -> int:
     #2696) : le classement le lit et le porte (`train_reviews`), la porte
     l'applique comme la désignation au gel ; un chemin léger déclaré à deux
     avis les exige sans être reclassé, et le doute ne l'efface pas.
+    #3542 : le nombre d'une règle qui **nomme** le chemin fait foi, même si le
+    chemin correspond à `CRITICAL_SCOPE` ; celui-ci ne relève plus que les
+    chemins qu'aucune règle ne nomme, et une règle attrape-tout (`**`) ne
+    l'abaisse jamais. `critical: true` du canon reste un plancher explicite,
+    pour tous les projets. Sous doute (#2394, dev2 #138909), cette lecture par
+    chemin est ignorée — le doute dit que le besoin n'est pas lisible — et
+    `CRITICAL_SCOPE` relève le chemin critique non nommé ; le compte global
+    déclaré reste un plancher.
     Les motifs de secours `CRITICAL_SCOPE` ne s'appliquent qu'au projet ameesh
     (ou à un appel sans projet connu) : pour les autres projets, la politique
     compilée fait foi (#2696, cas pilote Nexlink `desktop/host/**`) ; une
@@ -224,6 +255,43 @@ def required_verdicts(klass) -> int:
     return max(base, int(klass.get("reviews_floor") or 0))
 
 
+def _named_verdicts(klass, cls: str, project: str) -> int:
+    """Le compte par chemin, quand le classement porte la lecture du canon.
+
+    Une règle `train_reviews` qui **nomme** un chemin fixe son nombre : elle
+    fait foi contre `CRITICAL_SCOPE` (#3542). Un `critical: true` du canon
+    reste un plancher explicite pour tous les projets ; le plancher de classe
+    (`light_reviews` compris) s'applique toujours. Une règle `**` couvre tous
+    les chemins sans en nommer aucun : elle peut relever le compte (maximum),
+    jamais abaisser le plancher critique.
+    """
+    from . import lot_class
+    named = klass.get("train_reviews_paths") or {}
+    wide = int(klass.get("train_reviews_wide") or 0)
+    floor = (int(klass.get("light_reviews") or 0)
+             if cls == lot_class.LIGHT else SENSITIVE_REVIEWS)
+    highest = floor
+    for entry in klass.get("files") or ():
+        path = str(entry.get("path") or "")
+        explicit = entry.get("critical") is True
+        if not path:
+            if explicit:
+                highest = max(highest, CRITICAL_REVIEWS)
+            continue
+        count = named.get(path)
+        if count is None:
+            value = max(floor, wide)
+            if explicit or (project in ("", "ameesh")
+                            and _entry_critical(entry)):
+                value = max(value, CRITICAL_REVIEWS)
+        else:
+            value = max(floor, int(count), wide)
+            if explicit:
+                value = max(value, CRITICAL_REVIEWS)
+        highest = max(highest, value)
+    return highest
+
+
 def _scale_verdicts(klass) -> int:
     """Le compte du barème seul (classe et chemins), sans plancher de pilote."""
     from . import lot_class
@@ -236,6 +304,15 @@ def _scale_verdicts(klass) -> int:
         # canon §8 : « en cas de doute, le lot est sensible » — jamais léger,
         # jamais critique par le seul doute (#2394).
         cls = lot_class.SENSITIVE
+    # #3542 : un classement qui porte la lecture par chemin fait foi chemin
+    # par chemin ; les classements antérieurs (et les appelants qui n'ont que
+    # la classe) gardent la lecture globale ci-dessous. Un doute (#2394,
+    # dev2 #138909) ne lit jamais ces comptes : ils viennent d'un canon
+    # lisible alors que le doute dit que le besoin ne l'est pas ; une règle
+    # nommante à 1 y ferait tomber le plancher critique d'un chemin non nommé.
+    # Le compte global déclaré reste un plancher dans la lecture de doute.
+    if not klass.get("doubt") and "train_reviews_paths" in klass and files:
+        return _named_verdicts(klass, cls, project)
     # #2696 : le canon compilé fait foi hors ameesh. Les motifs de secours
     # décrivent les chemins d'ameesh ; sur un lot Nexlink, `host-linux` (un
     # crate sous `desktop/`) ne devient pas un chemin de prod par `host[-_]`.
@@ -329,7 +406,7 @@ def _same_sha(a, b, repo: str | None = None) -> bool:
     return False
 
 
-def actor_family(db, name, *, families=None) -> str:
+def actor_family(db, name, *, families=None, declared=False) -> str:
     """La famille de modèle d'un agent, "" si elle n'est pas connue.
 
     `claude`, `codex`, `deepseek` sont les familles du canon compilé
@@ -344,6 +421,10 @@ def actor_family(db, name, *, families=None) -> str:
     qui ne peuvent rien en faire d'autre l'attrapent explicitement. Un canon
     illisible, lui, rend "" : les appelants qui doivent nommer le canon
     (`review_gate`) le lisent avant et échouent fermé avec son diagnostic.
+
+    `declared` (#3578) lit le harnais **déclaré** de l'agent, jamais celui de
+    sa session courante : la famille d'un verdict sans reçu ne doit pas suivre
+    un repli ultérieur (codex en repli deepseek).
     """
     from . import registry, review_lot
     name = str(name or "").strip()
@@ -359,15 +440,52 @@ def actor_family(db, name, *, families=None) -> str:
             families = review_lot.compiled_families(db)
         except review_lot.FamiliesError:
             return ""
-    return review_lot.family_of(registry.live_harness(row), families)
+    harness = (str(row.get("harness") or "") if declared
+               else registry.live_harness(row))
+    return review_lot.family_of(harness, families)
 
 
-
-def _actor_family(db, name, families) -> str:
+def _actor_family(db, name, families, *, declared=False) -> str:
     """`actor_family` avec les familles déjà lues (ou None : il les lit)."""
     if families is None:
-        return actor_family(db, name)
-    return actor_family(db, name, families=families)
+        return actor_family(db, name, declared=declared)
+    return actor_family(db, name, families=families, declared=declared)
+
+
+def _author_families(entry) -> set:
+    """Toutes les familles prouvées d'une entrée auteur (#3584).
+
+    `family` porte la famille unique ; `families` porte l'ensemble quand
+    l'acteur a écrit sous plusieurs familles. Une entrée sans preuve rend un
+    ensemble vide, jamais une famille devinée."""
+    from . import review_designation
+    return review_designation.proven_families(entry)
+
+
+def verdict_family(db, mark, *, families=None, receipt=None) -> str:
+    """La famille de modèle d'un verdict (#3578), "" si elle n'est pas connue.
+
+    C'est le harnais de son **reçu exact** (#1465/#2928) : la famille sous
+    laquelle l'avis a été rendu. Sans reçu (classe légère, verdict antérieur),
+    la famille **déclarée** de l'acteur ; jamais le harnais de sa session
+    courante — un `ok` rendu sous codex par un agent aujourd'hui en repli
+    deepseek reste codex. `receipt` évite de relire un reçu déjà lu.
+    Lève `RegistryReadError` comme `actor_family` quand le repli lit le
+    registre."""
+    from . import review_lot
+    actor = str((mark or {}).get("actor") or "").strip()
+    if not actor or actor.startswith(work.HUMAN_PREFIX):
+        return ""
+    if receipt is None:
+        receipt = _exact_verdict_receipt(db, mark)
+    if receipt is not None:
+        if families is None:
+            try:
+                families = review_lot.compiled_families(db)
+            except review_lot.FamiliesError:
+                return ""
+        return review_lot.family_of(receipt.get("harness"), families)
+    return _actor_family(db, actor, families, declared=True)
 
 
 def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
@@ -449,7 +567,7 @@ def _waiver(db, item) -> tuple:
 
 def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None,
                            commits=None, strict=False, families_out=None,
-                           target="", admitted_heads=()):
+                           target="", admitted_heads=(), exclusions_out=None):
     """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2888).
 
     Lecture des commits exacts de la plage gelée et de leur provenance, la même
@@ -484,7 +602,8 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     authors, unknown, correctors = act.attribution_of_head(
         db, item, milestone, repo, base, frozen, families=families or (),
         commits=commits, strict=strict, families_out=families_out,
-        target=target or base, admitted_heads=admitted_heads)
+        target=target or base, admitted_heads=tuple(admitted_heads),
+        exclusions_out=exclusions_out)
     if unknown:
         raise ValueError("author provenance unknown for frozen commit(s): %s"
                          % ", ".join(unknown))
@@ -526,7 +645,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None, families=None, required=None, family_of=None,
                 authors=None, authors_complete=False, cfg=None, project=None,
                 target=None, vehicle=None, exclude_author_family=None,
-                distinct_families=None, admitted_heads=()) -> dict:
+                distinct_families=None, admitted_heads=(), production_cache=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     `admitted_heads` ne vient que de la porte du véhicule : les gels de ses
@@ -651,8 +770,10 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # l'indépendance est prouvée, vide quand la porte se ferme sans la lire.
 
     Rend `{ok, why, class, required, accepted, accepted_unfiltered, blocked,
-    waived, author, author_family, authors, corrections, on_freeze, unproven,
-    completed_ts, vehicle, attribution_read}` ; ne lève jamais.
+    waived, author, author_family, author_families, authors, corrections,
+    on_freeze, unproven, completed_ts, vehicle, attribution_read}` ; ne lève
+    jamais. `author_families` porte toutes les familles prouvées exclues
+    (#3584) ; `author_family` reste la famille unique, vide si plusieurs.
     `attribution_read` prouve une lecture effective de la provenance ; une
     dispense ou une porte sans avis requis ne fournit pas cette preuve.
     """
@@ -682,7 +803,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
            "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "authors": [],
            "corrections": [], "on_freeze": 0, "unproven": [], "vehicle": None,
-           "attribution_read": False,
+           "attribution_read": False, "provenance_exclusions": [],
+           "provenance_manifest": "",
            "exclude_author_family": exclude_author_family,
            "distinct_families": distinct_families}
     if not frozen:
@@ -754,6 +876,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # relecteur » : un faux ok ne masque plus un vrai block, et un faux block
     # ne bloque plus une tête.
     unproven: list[dict] = []
+    receipts: dict = {}
     if cls == lot_class.SENSITIVE and db is not None:
         proven: list = []
         for mark in on_freeze:
@@ -763,12 +886,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 # n'a pas de tour managé (sa signature est un autre contrôle).
                 proven.append(mark)
                 continue
-            if _exact_verdict_receipt(db, mark) is None:
+            receipt = _exact_verdict_receipt(db, mark)
+            if receipt is None:
                 unproven.append({"id": mark.get("id"),
                                  "actor": mark.get("actor") or "",
                                  "verdict": mark.get("verdict") or "",
                                  "at_ts": mark.get("at_ts")})
             else:
+                # #3578 : le reçu lu ici donne aussi la famille du verdict.
+                receipts[id(mark)] = receipt
                 proven.append(mark)
         on_freeze = proven
     out["unproven"] = unproven
@@ -816,15 +942,32 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             return "" if value is None else str(value)
         return _actor_family(db, name, families)
 
+    def _verdict_family(mark):
+        # #3578 : la famille d'un verdict est celle de son reçu (harnais au
+        # moment de l'avis), à défaut la famille déclarée de l'acteur — jamais
+        # le harnais de sa session courante. Le train (`family_of`) porte déjà
+        # sa lecture historique des verdicts (`verdict_families`).
+        if family_of is not None:
+            return _family_of(mark.get("actor"))
+        return verdict_family(db, mark, families=families,
+                              receipt=receipts.get(id(mark)))
+
     provided: dict[str, str] = {}
+    provided_families: dict[str, set] = {}
     for entry in authors or ():
         if isinstance(entry, Mapping):
             name = str(entry.get("name") or "").strip()
             family = str(entry.get("family") or "").strip()
+            proven = _author_families(entry)
         else:
-            name, family = str(entry or "").strip(), ""
-        if name and family:
+            name, family, proven = str(entry or "").strip(), "", set()
+        if not name:
+            continue
+        if family:
             provided.setdefault(name.lower(), family)
+            proven = set(proven) | {family.strip().lower()}
+        if proven:
+            provided_families.setdefault(name.lower(), set()).update(proven)
     # #3397 : la porte se ferme sans lire la plage gelée quand les `ok` de la
     # tête sont déjà trop peu nombreux pour atteindre le compte requis, quels
     # que soient leurs auteurs. `_attribution_on_freeze` lit Git sur chaque
@@ -845,7 +988,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         # avis indépendants ; aucune décision ne lit `accepted` sur une porte
         # fermée (`packet_candidates` exige `ok`).
         unfiltered = [{"actor": str(mark.get("actor") or ""),
-                       "family": _family_of(mark.get("actor")),
+                       "family": _verdict_family(mark),
                        "id": mark.get("id"), "at_ts": mark.get("at_ts")}
                       for mark in sorted(latest_ok, key=_mark_order)]
         out["accepted_unfiltered"] = unfiltered
@@ -873,6 +1016,36 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # La même lecture rend les correcteurs (#2739) et échoue fermé quand la
     # provenance manque : une porte qui ne peut pas prouver qui a écrit la tête
     # ne compte pas un avis non prouvé (l'indépendance ne se suppose pas).
+    try:
+        from . import provenance_scope
+        if production_cache is None:
+            production_cache = (vehicle or {}).pop("production_cache", {})
+        cache_key = str(repo) + "\n" + str((item or {}).get("app") or "")
+        if cache_key not in production_cache:
+            try:
+                production_cache[cache_key] = (provenance_scope.production(cfg, item, repo), "")
+            except Exception as exc:  # noqa: BLE001 - failure grants no exclusion
+                production_cache[cache_key] = (None, str(exc))
+        production, publication_error = production_cache[cache_key]
+        if publication_error:
+            out["production_scope_error"] = publication_error
+        inherited = tuple((vehicle or {}).get("admitted_heads") or ())
+        scopes = tuple(admitted_heads) + inherited + ((production,) if production else ())
+        if scopes and repo:
+            from . import review_authors
+            boundary = (review_authors.target_commit(repo, target or (klass or {}).get("target") or "")
+                        or (klass or {}).get("base_sha"))
+            if boundary:
+                listing = plan_git._out(repo, "rev-list", "%s..%s" % (boundary, frozen))
+                if listing is None:
+                    raise ValueError("provenance exclusion range unreadable")
+                provenance_scope.exclude(repo, listing.split(), scopes,
+                                         out["provenance_exclusions"])
+        out["provenance_manifest"] = provenance_scope.manifest(out["provenance_exclusions"])
+    except Exception as exc:  # unreadable publication never authorizes exclusions
+        out["error"] = str(exc)
+        out["why"] = "provenance scope unreadable: %s" % exc
+        return out
     corrections: set = set()
     proven_families: dict = {}
     try:
@@ -883,7 +1056,10 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                                              strict=True,
                                              families_out=proven_families,
                                              target=target or "",
-                                             admitted_heads=admitted_heads)
+                                             admitted_heads=scopes,
+                                             exclusions_out=out["provenance_exclusions"])
+        # #3544 : le report des gels antérieurs complète la trace.
+        out["provenance_manifest"] = provenance_scope.manifest(out["provenance_exclusions"])
     except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
         out["error"] = str(exc)
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
@@ -912,7 +1088,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # puis rouvert en claude au registre garde codex comme référence (#2892).
     # `proven_families` distingue une famille vide par absence de preuve d'une
     # famille vide par ambiguïté (B1) : seule l'absence garde le repli
-    # historique, l'ambiguïté refuse plus bas.
+    # historique ; l'ensemble prouvé est exclu famille par famille (#3584).
     reference_entry = next(
         (row for row in range_authors or ()
          if isinstance(row, Mapping) and author
@@ -937,31 +1113,25 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             range_authors)
     else:
         reference_is_author = True
-    # #2961 B1 : une famille vide n'est pas toujours une absence de preuve.
-    # `families_out` porte les familles réellement prouvées : >1 pour la
-    # référence est une **ambiguïté** (journal du gel codex + reçu de commit
-    # claude, par exemple), jamais un choix à faire au registre courant
-    # (#2755). L'absence de preuve garde, elle, le repli historique.
+    # #2961 B1 / #3584 : une famille vide n'est pas toujours une absence de
+    # preuve. `families_out` porte les familles réellement prouvées ; >1 pour
+    # la référence (journal du gel codex + reçu de commit claude, par exemple)
+    # n'est pas une ambiguïté à refuser : chacune de ses familles est exclue,
+    # et aucune famille unique n'est devinée au registre courant (#2755).
+    # L'absence de preuve garde, elle, le repli historique.
     reference_proven: set = set()
-    if attribution is not None and author and reference_is_author:
-        reference_proven = set(proven_families.get(author.lower()) or ())
-        if len(reference_proven) > 1:
-            out["error"] = ("ambiguous historical author family for %s: %s"
-                            % (author, ", ".join(sorted(reference_proven))))
-            out["why"] = (
-                "no review verdict ok on the freeze %s (class: %s): the reference "
-                "author %s has %d proven model families (%s), so no verdict can be "
-                "proven independent (canon §2: independence is never assumed)"
-                % (frozen[:12], cls, author, len(reference_proven),
-                   ", ".join(sorted(reference_proven))))
-            return out
+    if author and reference_is_author:
+        if attribution is not None:
+            reference_proven = set(proven_families.get(author.lower()) or ())
+        reference_proven |= set(provided_families.get(author.lower()) or ())
     try:
         if family_of is not None:
             author_family = _family_of(author)
             if not author_family and author.lower() in provided:
                 author_family = provided[author.lower()]
-        elif reference_is_author and len(reference_proven) == 1:
-            author_family = next(iter(reference_proven))
+        elif reference_is_author and reference_proven:
+            author_family = (next(iter(reference_proven))
+                             if len(reference_proven) == 1 else "")
         elif reference_entry is not None and not exact:
             author_family = str(reference_entry.get("family") or "")
             if not author_family:
@@ -982,40 +1152,27 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       % (frozen[:12], cls, exc))
         return out
     out["author_family"] = author_family
-    # #2961 (auditeur) : la même distinction pour les autres auteurs lus. Une
-    # entrée sans famille peut cacher deux familles prouvées ; `_complete_authors`
-    # refuse déjà ce cas (R9 B cx2), la porte du composeur doit faire de même.
-    for entry in authors or ():
-        if not isinstance(entry, Mapping):
-            continue
-        name = str(entry.get("name") or "").strip()
-        if not name or str(entry.get("family") or "").strip():
-            continue
-        if author and name.lower() == author.lower():
-            continue
-        proven = set(proven_families.get(name.lower()) or ())
-        if len(proven) > 1:
-            out["error"] = ("ambiguous historical author family for %s: %s"
-                            % (name, ", ".join(sorted(proven))))
-            out["why"] = (
-                "no review verdict ok on the freeze %s (class: %s): the author %s "
-                "has %d proven model families (%s), so no verdict can be proven "
-                "independent (canon §2: independence is never assumed)"
-                % (frozen[:12], cls, name, len(proven), ", ".join(sorted(proven))))
-            return out
+    # #3584 : un auteur lu sans famille unique mais avec un ensemble prouvé
+    # n'est pas refusé ici : `recognized` porte l'ensemble et la porte exclut
+    # chacune de ses familles. Une entrée sans aucune preuve reste refusée
+    # plus bas (famille inconnue, indépendance non prouvée).
     # #2681/#2808/#2888 : les auteurs **reconnus** de la tête, quand l'appelant
     # les a lus (`review_authors.authors`). Un tiers avec reçu exact et tout
     # relecteur qui a poussé un correctif, même petit, s'y ajoutent : leur
     # famille est exclue.
     recognized: dict = {}
     if author and not exact and reference_is_author:
-        recognized[author.lower()] = {"name": author, "family": author_family}
+        row = {"name": author, "family": author_family}
+        if len(reference_proven) > 1:
+            row["families"] = sorted(reference_proven)
+        recognized[author.lower()] = row
     for entry in authors or ():
         if isinstance(entry, Mapping):
             name = str(entry.get("name") or "").strip()
             family = str(entry.get("family") or "").strip()
+            proven = _author_families(entry)
         else:
-            name, family = str(entry or "").strip(), ""
+            name, family, proven = str(entry or "").strip(), "", set()
         if not name:
             continue
         key = name.lower()
@@ -1028,7 +1185,16 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             # l'assigné n'est pas une référence : seul un reçu de commit le
             # nomme auteur.
             continue
-        if not family:
+        if family:
+            proven = set(proven) | {family.strip().lower()}
+        # #3658 : défense en profondeur — une entrée sans `families` garde
+        # l'ensemble que la lecture de la plage a prouvé pour ce nom, avant
+        # tout repli sur la seule famille du registre.
+        proven = set(proven) | set(proven_families.get(key) or ())
+        if not proven:
+            # Absence de preuve (aucun ensemble) : le repli historique du
+            # registre reste, comme avant #3584. Une famille inconnue y est
+            # refusée par le contrôle strict plus bas.
             try:
                 family = _family_of(name)
             except RegistryReadError as exc:
@@ -1038,11 +1204,24 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                               "proven independent (canon §2: independence is never assumed)"
                               % (frozen[:12], cls, exc, name))
                 return out
+            if family:
+                proven = {family.strip().lower()}
         known = recognized.get(key)
         if known is None:
-            recognized[key] = {"name": name, "family": family}
-        elif family and not known["family"]:
-            known["family"] = family
+            row = {"name": name, "family": ""}
+            if len(proven) == 1:
+                row["family"] = next(iter(proven))
+            elif len(proven) > 1:
+                row["families"] = sorted(proven)
+            recognized[key] = row
+        else:
+            merged = _author_families(known) | proven
+            known.pop("families", None)
+            if len(merged) > 1:
+                known["family"] = ""
+                known["families"] = sorted(merged)
+            elif len(merged) == 1:
+                known["family"] = next(iter(merged))
     out["authors"] = sorted(recognized.values(), key=lambda entry: entry["name"].lower())
     # L'indépendance ne se suppose jamais (canon §2, décision 18855a) : une
     # classe sensible — y compris un doute de classe, qui peut cacher SQL, la
@@ -1069,14 +1248,20 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         return out
     if strict:
         for entry in recognized.values():
-            if entry["family"] or entry["name"].lower().startswith(work.HUMAN_PREFIX):
+            # #3584 : un ensemble prouvé (même de plusieurs familles) est une
+            # preuve ; seule une entrée sans aucune famille reste inconnue.
+            if (_author_families(entry)
+                    or entry["name"].lower().startswith(work.HUMAN_PREFIX)):
                 continue
             out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s "
                           "has no known model family, so no verdict can be proven "
                           "independent (canon §2: independence is never assumed)"
                           % (frozen[:12], cls, entry["name"]))
             return out
-    author_families = {entry["family"] for entry in recognized.values() if entry["family"]}
+    author_families: set = set()
+    for entry in recognized.values():
+        author_families.update(_author_families(entry))
+    out["author_families"] = sorted(author_families)
     accepted = []
     for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
                        key=_mark_order):
@@ -1086,7 +1271,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if actor and actor.lower() in corrections:
             continue                      # l'auteur d'un correctif ne le relit pas (#2739)
         try:
-            family = _family_of(actor)
+            family = _verdict_family(mark)
         except RegistryReadError as exc:
             out["error"] = str(exc)
             out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
@@ -1140,8 +1325,110 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     return out
 
 
+#: #3761 : la porte des avis se relit à chaque passe d'alertes. Sa lecture
+#: Git (survie du contenu des correctifs, auteurs de la plage gelée) coûtait
+#: 4 à 5 min de CPU par passe et re-prouvait les mêmes faits tant que le gel,
+#: la cible et les jalons ne bougeaient pas. Le cache ne garde que le verdict
+#: booléen de la porte, indexé par les entrées dont il dépend ; une entrée
+#: périmée (TTL) ou dont la signature change est relue.
+#:
+#: Le cache ne nourrit que la passe d'alertes (`exploitation._slo_breaches`) :
+#: aucun chemin de fusion ne le lit. Une fusion refait toujours la porte
+#: complète ; un verdict mémorisé ne peut donc jamais autoriser un merge.
+GATE_CACHE_VERSION = "3761.2"
+#: Une famille d'acteur ou un reçu de provenance peut changer sans nouveau
+#: jalon : la porte se relit au plus tard après ce délai.
+GATE_CACHE_TTL_S = 3600.0
+#: Le document partagé reste petit : au-delà, les plus anciennes entrées
+#: partent (la porte se relit alors au prochain passage).
+GATE_CACHE_MAX_ENTRIES = 2000
+
+#: Les modules qui décident du verdict de porte. Leur contenu entre dans la
+#: signature : une règle changée par un lot (#3762 par exemple) ne doit jamais
+#: servir un verdict calculé par le code d'avant, même si les jalons et le gel
+#: sont identiques. C'est une empreinte du code réellement exécuté, pas le
+#: numéro de paquet (qui ne bouge qu'aux releases).
+_GATE_CODE_FILES = (
+    "merge_queue.py", "review_authors.py", "review_designation_activation.py",
+    "lot_class.py", "plan_git.py", "canon.py", "review_lot.py", "review.py",
+    "provenance_scope.py", "packet_reviews.py",
+)
+_GATE_CODE_FINGERPRINT: str | None = None
+
+
+def _gate_code_version() -> str:
+    """La version du code de la porte : numéro de paquet + empreinte source.
+
+    L'empreinte est calculée une fois par processus. Un arbre de test lancé par
+    `PYTHONPATH=src` et une installation déployée ont donc chacun la leur."""
+    global _GATE_CODE_FINGERPRINT
+    if _GATE_CODE_FINGERPRINT is not None:
+        return _GATE_CODE_FINGERPRINT
+    digest = hashlib.sha256()
+    root = os.path.dirname(os.path.abspath(__file__))
+    for name in _GATE_CODE_FILES:
+        digest.update(name.encode("utf-8"))
+        try:
+            with open(os.path.join(root, name), "rb") as fh:
+                digest.update(fh.read())
+        except OSError:
+            digest.update(b"unreadable")
+    try:
+        from . import version as ameesh_version
+        label = ameesh_version()
+    except Exception:  # noqa: BLE001 - version illisible : l'empreinte suffit
+        label = "unknown"
+    _GATE_CODE_FINGERPRINT = "%s+%s" % (label, digest.hexdigest()[:16])
+    return _GATE_CODE_FINGERPRINT
+
+
+def _gate_cache_signature(cfg, item, marks, repo, frozen, target, base,
+                          base_sha, klass=None) -> str:
+    """Les entrées dont le verdict de porte dépend, sans lecture Git.
+
+    Les jalons sont figés par identifiant et contenu (une annulation ou un
+    verdict ajouté change la signature) ; la cible et sa base entrent dans la
+    clé, car un commit déjà fusionné ne compte plus comme auteur (#3116). Le
+    canon et sa référence décident de la classe et des familles compilées ;
+    la version du code de la porte périme tout résultat d'avant une règle."""
+    item = dict(item or {})
+    mark_sig = sorted(
+        (str(mark.get("id") or ""), str(mark.get("kind") or ""),
+         str(mark.get("sha") or ""), str(mark.get("actor") or ""),
+         str(mark.get("verdict") or ""), str(mark.get("at_ts") or ""),
+         bool(mark.get("annulled")))
+        for mark in marks or () if isinstance(mark, Mapping))
+    return GATE_CACHE_VERSION + ":" + hashlib.sha256(json.dumps([
+        GATE_CACHE_VERSION,
+        _gate_code_version(),
+        str(item.get("id") or ""), str(item.get("app") or ""),
+        str(item.get("assignee") or ""), str(item.get("package_id") or ""),
+        str(item.get("branch_target") or ""), str(item.get("type") or ""),
+        str(repo or ""), str(frozen or ""), str(target or ""),
+        str(base or ""), str(base_sha or ""),
+        str(getattr(cfg, "canon", "") or ""),
+        str(getattr(cfg, "canon_ref", "") or ""),
+        str((klass or {}).get("class") or ""),
+        mark_sig,
+    ], sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _gate_cache_store(cache, lot, signature, ok, now: float) -> None:
+    """Retient un verdict concluant ; une lecture illisible ne se cache pas."""
+    if not isinstance(cache, dict) or not isinstance(ok, bool):
+        return
+    cache[str(lot)] = {"key": signature, "ok": bool(ok),
+                       "at": round(float(now), 3)}
+    if len(cache) > GATE_CACHE_MAX_ENTRIES:
+        oldest = sorted(cache, key=lambda key: float(
+            (cache.get(key) or {}).get("at") or 0.0))
+        for key in oldest[:len(cache) - GATE_CACHE_MAX_ENTRIES]:
+            cache.pop(key, None)
+
+
 def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
-                         overview=None) -> dict | None:
+                         overview=None, gate_cache=None,
+                         now: float | None = None) -> dict | None:
     """La porte des avis du dernier gel d'un lot, lue comme la composition du
     paquet (`packet_candidates`) : dépôt retrouvé par le commit gelé (#2559,
     l'hôte qui lit le lot n'est pas toujours celui de son auteur), gel résolu
@@ -1150,11 +1437,19 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
     `overview` : les lignes de `registry.overview` déjà lues par l'appelant
     (une passe SLO sur N lots = une lecture, #2564) ; `None` les relit.
 
+    `gate_cache` (#3761) : dictionnaire de verdicts déjà lus, porté par l'état
+    de la passe d'alertes. Une signature identique et fraîche rend le verdict
+    sans relire Git ; une entrée absente, périmée ou de signature différente
+    relit la porte et remplace l'entrée. `None` garde la lecture complète.
+    Seule `exploitation._slo_breaches` passe un cache : le feu, la file et le
+    paquet l'appellent sans, donc une fusion ne lit jamais un verdict mémorisé.
+
     Rend None quand la lecture n'est pas concluante (pas de gel, dépôt
     introuvable, classe en doute sans chemin lisible) : l'appelant ne doit
     jamais lire None comme une porte ouverte. Lecture seule."""
     from . import lot_class
 
+    now = time.time() if now is None else float(now)
     freeze = plan_git.latest_freeze(marks or ())
     frozen = str((freeze or {}).get("sha") or "").strip()
     repo, resolved = (lot_class.repo_for_freeze(db, cfg, item, frozen,
@@ -1170,8 +1465,25 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
         target = lot_class.default_base(cfg, item, repo) if repo else None
         base = _class_base(repo, target) if target else None
         base_sha = plan_git._commit(repo, base) if base else None
+    except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
+        return None
+    lot = int((item or {}).get("id") or 0)
+    signature = _gate_cache_signature(cfg, item, marks, repo, frozen, target,
+                                      base, base_sha, klass) \
+        if gate_cache is not None else None
+    if gate_cache is not None:
+        entry = gate_cache.get(str(lot))
+        if isinstance(entry, dict) and isinstance(entry.get("ok"), bool) \
+                and entry.get("key") == signature:
+            try:
+                age = now - float(entry.get("at"))
+            except (TypeError, ValueError):
+                age = None
+            if age is not None and 0.0 <= age <= GATE_CACHE_TTL_S:
+                return {"ok": bool(entry.get("ok")), "cached": True}
+    try:
         klass = klass or lot_class.of_lot(
-            db, int((item or {}).get("id") or 0), cfg=cfg, item=item,
+            db, lot, cfg=cfg, item=item,
             repo=repo or None, head=frozen or None, milestones=marks or None,
             base=base, base_sha=base_sha)
     except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
@@ -1184,11 +1496,14 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
     if not frozen:
         return None
     try:
-        return review_gate(db, marks or [], frozen,
+        gate = review_gate(db, marks or [], frozen,
                            repo=klass.get("repo") or repo or None,
                            klass=klass, item=item, cfg=cfg, target=target)
     except Exception:  # noqa: BLE001 - une porte illisible ne conclut pas
         return None
+    if gate_cache is not None and isinstance(gate, dict):
+        _gate_cache_store(gate_cache, lot, signature, gate.get("ok"), now)
+    return gate
 
 
 def _remote_branch(name: str) -> str:
@@ -1490,9 +1805,10 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     #2924 B7 : le clone scratch de `merge-pr` ne contient que la cible et la
     tête. Un gel antérieur réécrit y est absent ; la porte tente de le
     rapatrier par SHA depuis le dépôt de l'agent puis l'origine du projet
-    (`recover`), et ne refuse que si cette récupération échoue. Les familles
-    ambiguës d'un même acteur (`families_out`) refusent la porte, jamais une
-    famille devinée.
+    (`recover`), et ne refuse que si cette récupération échoue. Un acteur
+    prouvé sous plusieurs familles (`families_out`, #3584) rend tout l'ensemble
+    dans `families` : chacune de ses familles est exclue, jamais une famille
+    unique devinée.
 
     Un auteur hors registre (outil, humain non préfixé) n'a pas de famille de
     modèle à comparer : il est omis de la liste, jamais supposé. Un correctif
@@ -1541,15 +1857,19 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     proven_families: dict[str, set] = {}
     found: dict[str, dict] = {}
 
-    def add(name, family="") -> None:
+    def add(name, family="", families=()) -> None:
         name = str(name or "").strip()
         if not name or name.lower().startswith(work.HUMAN_PREFIX) or ":" in name:
             return
         key = name.lower()
-        if key not in found:
-            found[key] = {"name": name, "family": str(family or "").strip()}
-        elif family and not found[key]["family"]:
-            found[key]["family"] = str(family).strip()
+        row = found.setdefault(key, {"name": name, "families": set()})
+        values = [family]
+        if isinstance(families, (list, tuple, set, frozenset)):
+            values.extend(families)
+        for value in values:
+            value = str(value or "").strip().lower()
+            if value:
+                row["families"].add(value)
 
     if db is None:
         # Sans magasin (banc, dry-run), la provenance n'est pas lisible : on
@@ -1594,7 +1914,7 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
             name = str(entry.get("name") or "").strip()
             if name:
                 reader_names.add(name.lower())
-            add(name, entry.get("family"))
+            add(name, entry.get("family"), entry.get("families"))
         for sha in unknown or ():
             # #2924 B5 : un inconnu qui n'est même pas un commit lisible (un gel
             # antérieur absent du dépôt scratch, un marqueur « freeze:N ») ne
@@ -1609,29 +1929,34 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
         add(name)
     authors: list[dict] = []
     for key, entry in found.items():
-        family = entry["family"]
-        if not family:
+        proven = set(entry["families"])
+        if not proven:
             # Une entrée du lecteur partagé sans famille unique peut cacher
             # plusieurs familles historiques prouvées (#2681) : le registre
             # courant ne les remplace pas, même pour l'assigné (R9 B de cx2).
             # Une absence de preuve reste distinguable d'une ambiguïté : seule
             # la référence garde alors son repli historique.
-            proven = proven_families.get(key) or set()
-            if len(proven) > 1:
-                raise _ProvenanceError(
-                    "the family of the author %s is ambiguous (%s); the current "
-                    "registry cannot replace it"
-                    % (entry["name"], ", ".join(sorted(proven))))
-            if key in reader_names and not proven and key != reference_name:
-                raise _ProvenanceError(
-                    "the family of the author %s is not proven; the current "
-                    "registry cannot replace it" % entry["name"])
-            try:
-                family = actor_family(db, entry["name"], families=families)
-            except RegistryReadError as exc:
-                raise _ProvenanceError("the agent registry cannot be read (%s)"
-                                       % exc) from exc
-            entry["family"] = family
+            proven = set(proven_families.get(key) or ())
+        if len(proven) > 1:
+            # #3584 : un ensemble prouvé n'est pas une famille inconnue. On
+            # exclut chacune de ses familles au lieu de refuser l'ensemble ;
+            # la porte ne devine jamais une famille unique.
+            authors.append({"name": entry["name"], "family": "",
+                            "families": sorted(proven)})
+            continue
+        if len(proven) == 1:
+            authors.append({"name": entry["name"],
+                            "family": next(iter(proven))})
+            continue
+        if key in reader_names and key != reference_name:
+            raise _ProvenanceError(
+                "the family of the author %s is not proven; the current "
+                "registry cannot replace it" % entry["name"])
+        try:
+            family = actor_family(db, entry["name"], families=families)
+        except RegistryReadError as exc:
+            raise _ProvenanceError("the agent registry cannot be read (%s)"
+                                   % exc) from exc
         if family:
             authors.append({"name": entry["name"], "family": family})
     return authors, families
@@ -2379,17 +2704,19 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None,
     commit — the reader is pinned to `sha` — can stand for a part of this
     one."""
     from . import plan_github, radar
-    requirement = "ci_required" if getattr(project, "ci_required", False) else "no PR"
+    # #3560 : le texte `ci_required` est celui que `queue_add` reconnaît
+    # (`storage.interface.CI_REQUIRED_EJECTION`) ; « no PR » ne l'est pas.
+    required = (storage.interface.CI_REQUIRED_EJECTION
+                if getattr(project, "ci_required", False)
+                else "requires CI on the frozen commit (no PR)")
     try:
         runs = (commit_ci or (lambda s: radar.commit_ci(project, s, branch=branch)))(sha)
     except plan_github.GithubError as exc:
-        raise QueueError("project %s requires CI on the frozen commit (%s), "
-                         "unreadable (%s): try again once gh works"
-                         % (project.name, requirement, exc)) from exc
+        raise QueueError("project %s %s, unreadable (%s): try again once gh works"
+                         % (project.name, required, exc)) from exc
     if not runs["runs"]:
-        raise QueueError("project %s requires CI on the frozen commit (%s): no run "
-                         "on %s yet (push it, let the workflows run)"
-                         % (project.name, requirement, sha[:12]))
+        raise QueueError("project %s %s: no run on %s yet (push it, let the workflows run)"
+                         % (project.name, required, sha[:12]))
     if allow_inconclusive and parts is None and runs.get("acceptable"):
         # #3085 : tous les checks ont conclu, aucun n'est négatif ; les non
         # concluants se consignent, la porte du feu/paquet ne les attend pas.
@@ -2476,11 +2803,18 @@ def required_full_ci(project, sha: str, full_ci=None, *, lot=None) -> None:
 
 
 def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None,
-          clone=None, commit_ci=None, full_ci=None, cfg=None, parts=None) -> dict:
+          clone=None, commit_ci=None, full_ci=None, cfg=None, parts=None,
+          withdrawn_after: float | None = None) -> dict:
     """Puts `lot` into the queue of its target, once `readiness` passes.
     `parts` is `readiness`'s (L1651): the caller that requalifies a lot (§12
     package manifest) passes the due contexts it vouches for, `()` to disable
-    the per-lot proof for that gesture."""
+    the per-lot proof for that gesture.
+
+    #3532: `withdrawn_after` (epoch instant) is the gesture's own date — the
+    fire's grant for its fallback. A take-out written since then is final
+    for that gesture: `QueueWithdrawn`, checked again in the insertion's
+    transaction. #3550: only a take-out of the same target and freeze binds
+    the gesture; an old entry of another target or freeze does not."""
     # L165 (EP4) : l'entrée en file est un geste du pilote hors base (la file
     # poussera). Le bail élu est vérifié avant les lectures de préparation et
     # journalisé dans la transaction de l'écriture ; le radar et un humain ne
@@ -2509,6 +2843,8 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
         waived_note = ", verdict waived by %s (#1979)" % (
             ready.get("waived_by") or "pilot")
 
+    guard = {} if withdrawn_after is None else {"withdrawn_after": withdrawn_after}
+
     def add(tx):
         return storage.of(tx).work.queue_add(
             lot, target=ready["target"], frozen_sha=ready["frozen_sha"],
@@ -2518,7 +2854,7 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
                 ", PR #%s green" % ready["pr"] if ready["pr"] else "",
                 ready.get("class") or "?", " (%s)" % ready["class_why"]
                 if ready.get("class_why") else "", parts_note, waived_note),
-            actor=actor)
+            actor=actor, **guard)
 
     if fence is None:
         row = add(db)
@@ -2527,6 +2863,13 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
             fence.hold(tx)
             row = add(tx)
     if row is None:
+        if withdrawn_after is not None:
+            at = storage.of(db).work.queue_withdrawn_since(
+                lot, withdrawn_after, target=ready["target"],
+                frozen_id=ready.get("frozen_id"))
+            if at is not None:
+                raise QueueWithdrawn("lot #%d was taken out of the queue of %s at %s"
+                                     % (lot, ready["target"], _utc(at)))
         raise QueueError("lot #%d is no longer open" % lot)
     # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
     row["class"] = ready.get("class")
@@ -2547,6 +2890,28 @@ def leave(db, lot: int, *, actor: str = "", reason: str = "") -> bool:
         return storage.of(tx).work.queue_remove(
             lot, note="merge queue: taken out%s" % (" (%s)" % reason if reason else ""),
             actor=actor)
+
+
+def live_train(cfg, db, lot: int) -> dict | None:
+    """#3532: the live train whose plan carries `lot` (`{key, stamp, phase}`),
+    None otherwise. Its withdrawal condemns that train: `queue remove` says so
+    without refusing. Best effort: an unreadable train is no warning."""
+    from .train import TERMINAL
+    try:
+        ops = storage.of(db).work
+        row = next((r for r in ops.queue() if int(r["work_item_id"]) == lot), None)
+        if row is None:
+            return None
+        for name in sorted(declared_projects(cfg)):
+            key = "%s:%s" % (name, _remote_branch(row["target"]))
+            state = ops.train_read(key) or {}
+            members = (state.get("plan") or {}).get("members") or ()
+            if state.get("phase") not in TERMINAL and \
+                    any(int(m.get("work_item_id") or 0) == lot for m in members):
+                return {"key": key, "stamp": state.get("stamp"), "phase": state.get("phase")}
+    except Exception:  # noqa: BLE001 - an advisory read never blocks the gesture
+        return None
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -3144,8 +3509,16 @@ def run(cfg, db, args) -> int:
                                  row.get("class") or "?"))
             return 0
         if args.queue_command == "remove":
+            train = live_train(cfg, db, args.id)
             done = leave(db, args.id, actor=args.actor, reason=args.message)
-            print(json.dumps({"lot": args.id, "removed": done}) if args.json else
+            if done and train:
+                print("warning: lot #%d is a member of the live train %s (%s, phase %s): "
+                      "this take-out invalidates it; it lands nothing and frees the target "
+                      "once its CI ends" % (args.id, train["stamp"] or "?", train["key"],
+                                            train["phase"]), file=sys.stderr)
+            print(json.dumps(dict({"lot": args.id, "removed": done},
+                                  **({"train": train} if done and train else {})))
+                  if args.json else
                   "lot #%d %s" % (args.id, "taken out of the queue" if done
                                   else "was not queued"))
             return 0

@@ -78,7 +78,7 @@ SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
                 "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts",
-                "required_statuses", "required_checks")
+                "required_statuses", "required_checks", "production_branch")
 #: L1651 : clés de la déclaration `ci_parts` (les espaces réservés d'`argv`
 #: sont ceux du contrat, `ci_parts.PLACEHOLDERS`)
 CI_PARTS_KEYS = ("selector", "rev", "argv", "schema", "due")
@@ -213,6 +213,8 @@ class Project:
     #: de plan prouvé (`Upgrade to GitHub Pro…`) ; l'absence de clé garde le
     #: refus fail-closed. Ce drapeau distingue `[]` de l'absence.
     required_checks_declared: bool = False
+    #: #3533: published ancestry excluded from packet author attribution.
+    production_branch: str = ""
 
 
 @dataclass
@@ -340,13 +342,15 @@ def parse_settings(raw) -> Settings:
         if not isinstance(repo, str) or not repo.strip():
             raise SettingsError("%s.repo: repository path expected" % where)
         texts = {}
-        for key in ("migrations", "target", "github"):
+        for key in ("migrations", "target", "github", "production_branch"):
             text = value.get(key) or ""
             if not isinstance(text, str):
                 raise SettingsError("%s.%s: text expected" % (where, key))
             texts[key] = text.strip().strip("/")
         if texts["target"]:
             plan_git.check_ref(texts["target"], "cible")
+        if texts["production_branch"]:
+            plan_git.check_ref(texts["production_branch"], "production_branch")
         if texts["github"] and not _GITHUB_RE.match(texts["github"]):
             raise SettingsError("%s.github: \"owner/repo\" repository expected" % where)
         land = value.get("land") or "off"
@@ -503,6 +507,7 @@ def parse_settings(raw) -> Settings:
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
                                  migrations=texts["migrations"], target=texts["target"],
                                  github=texts["github"], land=land,
+                                 production_branch=texts["production_branch"],
                                  gates=tuple(gates), merge_method=method,
                                  lease_ref=lease_ref,
                                  generated=tuple(generated), path_gates=tuple(by_path),
@@ -2064,6 +2069,41 @@ def run_result(run) -> str:
     return conclusion_result(run.get("status"), run.get("conclusion"))
 
 
+#: #3639 : l'API rend au plus 1 000 check-runs par commit (10 pages de 100).
+CHECK_RUNS_PAGE = 100
+CHECK_RUNS_MAX_PAGES = 10
+
+
+def commit_check_runs(gh, slug: str, sha: str) -> list:
+    """Tous les check-runs du commit `sha`, page par page (#3639).
+
+    Une tête qui porte la suite complète dépasse 100 check-runs (141 sur
+    fb8b7403, 145 sur 47d72915). Une seule page la rendait illisible, et la
+    coupe ne lisait plus la CI de main. Les gardes restent celles d'une page :
+    chaque réponse est bien formée, le total ne change pas d'une page à
+    l'autre, et le nombre lu à la fin est égal au total. Sinon la lecture lève
+    `GithubError` et n'est jamais prise pour « pas de CI ». La première page
+    garde l'URL d'avant ; seules les suivantes portent `&page=`."""
+    from . import plan_github
+    path = "repos/%s/commits/%s/check-runs?filter=all&per_page=%d" % (
+        slug, sha, CHECK_RUNS_PAGE)
+    runs: list = []
+    total = None
+    for page in range(1, CHECK_RUNS_MAX_PAGES + 1):
+        data = plan_github._json(gh, ["api", path if page == 1 else "%s&page=%d" % (path, page)])
+        if (not isinstance(data, dict) or type(data.get("total_count")) is not int
+                or not isinstance(data.get("check_runs"), list)
+                or (total is not None and data["total_count"] != total)):
+            raise plan_github.GithubError("commit checks: malformed or truncated response")
+        total = data["total_count"]
+        runs.extend(data["check_runs"])
+        if len(runs) >= total or len(data["check_runs"]) < CHECK_RUNS_PAGE:
+            break
+    if total is None or len(runs) != total:
+        raise plan_github.GithubError("commit checks: malformed or truncated response")
+    return runs
+
+
 def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
               required=()) -> dict:
     """L160g (#473, `ci_required`): GitHub's CI on the commit `sha` itself
@@ -2167,16 +2207,9 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
              else ("success" if (run.get("conclusion") or "").lower() in CI_DUE_OK else "failed"))
     # Actions alone cannot certify a commit: GitHub Apps and classic commit
     # statuses can also block it. Read the same exact SHA, never the PR head.
-    checks = plan_github._json(gh, ["api", "repos/%s/commits/%s/check-runs?filter=all&per_page=100"
-                                   % (slug, sha)])
-    if (not isinstance(checks, dict) or type(checks.get("total_count")) is not int
-            or not isinstance(checks.get("check_runs"), list)
-            or checks["total_count"] != len(checks["check_runs"])
-            or checks["total_count"] >= 100):
-        raise plan_github.GithubError("commit checks: malformed or truncated response")
     external = {}
     activity = {}
-    for check in checks["check_runs"]:
+    for check in commit_check_runs(gh, slug, sha):
         if (not isinstance(check, dict) or check.get("head_sha") != sha
                 or not isinstance(check.get("app"), dict)
                 or type(check["app"].get("id")) is not int

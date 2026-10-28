@@ -7,10 +7,11 @@ import shutil
 import subprocess
 import threading
 import types
+import unittest
 from unittest import mock
 
-from ameesh import (registry, resolutions, storage, train, train_admissions,
-                    train_candidates, train_git, train_history, train_policy, work)
+from ameesh import (merge_queue, plan_github, radar, registry, resolutions, storage, train,
+                    train_admissions, train_candidates, train_git, train_history, train_policy, work)
 from ameesh.db import DbError
 from .support import PgTestCase
 from .test_1467_train_review import author, verdict
@@ -21,7 +22,7 @@ BASE, HEAD = "a" * 40, "b" * 40
 class TrainAdmissionsTest(PgTestCase):
     def setUp(self):
         super().setUp()
-        self.project = types.SimpleNamespace(name="admission-test", repo=self.tmp, target="main")
+        self.project = types.SimpleNamespace(name="ameesh", repo=self.tmp, target="main")
         self.ops = storage.of(self.db).work
         self.history = mock.Mock(db=self.db, path=self.tmp)
         self.history.qualify.side_effect = lambda row, base, **kw: dict(
@@ -66,7 +67,9 @@ class TrainAdmissionsTest(PgTestCase):
             self.entry, BASE, required=2,
             klass={"class": "sensitive",
                    "files": [{"path": "content", "class": "sensitive",
-                              "rule": ["content"]}]})
+                              "rule": ["content"]}],
+                   "project": "", "train_reviews_paths": {},
+                   "train_reviews_wide": 0})
 
     def test_other_source_and_inactive_queue_rows_do_not_enter(self):
         foreign = self.enqueue(source="github.com/foreign/repository")
@@ -130,7 +133,9 @@ class TrainAdmissionsTest(PgTestCase):
     def test_policy_must_name_exact_subject_and_version_with_valid_review_count(self):
         valid = self.requirement(None, self.entry, BASE, self.tmp)
         for fields in (dict(lot=999999), dict(base=HEAD), dict(head=BASE), dict(policy_commit=""),
-                       dict(risk="release"), dict(risk="sensitive", reviews=0), dict(reviews=True)):
+                       dict(risk="release"), dict(risk="sensitive", reviews=0), dict(reviews=True),
+                       dict(train_reviews_paths={"content": 3}),
+                       dict(train_reviews_paths=[]), dict(train_reviews_wide=3)):
             self.requirement.side_effect = None
             self.requirement.return_value = dataclasses.replace(valid, **fields)
             with self.subTest(fields=fields), self.assertRaises(train.TrainError):
@@ -143,7 +148,8 @@ class TrainAdmissionsTest(PgTestCase):
             self.qualify()
 
     def recorded_admission(self, *, light=False, reviewed=True, path="content",
-                           reviews=2, reviewers=(("r1", "claude"), ("r2", "codex"))):
+                           reviews=2, reviewers=(("r1", "claude"), ("r2", "codex")),
+                           rule_paths=None):
         env = dict(os.environ, GIT_AUTHOR_NAME="fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
                    GIT_COMMITTER_NAME="fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
         def git(*args):
@@ -167,7 +173,7 @@ class TrainAdmissionsTest(PgTestCase):
                     default="light" if light else "sensitive", rules=[])}),
                 train_reviews=dict(schema="ameesh-train-reviews-policy/1", projects={
                     self.project.name: dict(rules=[] if light else [
-                        dict(paths=[path], reviews=reviews)])}))), fh)
+                        dict(paths=list(rule_paths or [path]), reviews=reviews)])}))), fh)
         git("add", "federation.yaml")
         base, first, head = commit("base"), commit("author"), commit("correction")
         self.admissions.policy = train_policy.Versioned(self.tmp, base, self.project.name)
@@ -272,7 +278,7 @@ class TrainAdmissionsTest(PgTestCase):
             with self.assertRaisesRegex(train.TrainError, "admission withdrawn"):
                 enrollment.enroll(candidate, base, actor="fixture")
         self.assertEqual(self.ops.queue(None), [])
-        with self.assertRaisesRegex(train.TrainError, "changed/withdrawn"):
+        with self.assertRaisesRegex(train.TrainError, "allocation of this freeze was withdrawn"):
             enrollment.enroll(candidate, base, actor="fixture")
 
     def test_enrollment_rechecks_a_blocking_vote_committed_after_allocation(self):
@@ -310,7 +316,7 @@ class TrainAdmissionsTest(PgTestCase):
                                                  verdict=None, note="new freeze before write")
             return actual(*args, **kwargs)
         with mock.patch.object(preparation.ops, "queue_add", side_effect=refrozen):
-            with self.assertRaisesRegex(train.TrainError, "subject, freeze or queue changed/withdrawn"):
+            with self.assertRaisesRegex(train.TrainError, "reservation lost, or the subject or freeze changed"):
                 self.enrollment(preparation).enroll(
                     candidate, base, actor="fixture")
         self.assertEqual(self.ops.queue(None), [])
@@ -331,6 +337,58 @@ class TrainAdmissionsTest(PgTestCase):
         self.assertEqual(self.ops.queue(None), [])
         admitted = self.enrollment(preparation).enroll(candidate, base, actor="fixture")
         self.assertEqual(unknown.enroll(candidate, base, actor="restart"), admitted)
+
+    def test_3560_legacy_queue_row_is_not_marked_as_a_train_enrollment(self):
+        self.recorded_admission()
+        (row,) = self.ops.queue(None)
+        self.assertIs(row["packet_allocated"], False)
+
+    def test_3560_enrolled_row_is_marked_and_an_other_ejection_names_the_blocking_cause(self):
+        base, _, _, item, candidate, preparation, _ = self.enrollment_fixture()
+        admitted = self.enrollment(preparation).enroll(candidate, base, actor="fixture")
+        self.assertIs(admitted["entry"]["packet_allocated"], True)
+        (row,) = self.ops.queue(None)
+        self.assertIs(row["packet_allocated"], True)
+        self.ops.queue_update(item, state="ejected", reason="stacked trial: conflict not covered on a.py",
+                              note="ejected", actor="radar")
+        self.assertFalse(self.enrollment(preparation).decide(candidate, base)["recover"])
+        with self.assertRaisesRegex(train.TrainError,
+                                    r"existing queue row blocks it \(state ejected.*stacked trial"):
+            self.enrollment(preparation).enroll(candidate, base, actor="next-cutoff")
+
+    def test_3560_enrolled_then_ejected_ci_required_is_enrolled_again_at_the_next_composition(self):
+        base, _, head, item, candidate, preparation, _ = self.enrollment_fixture()
+        admitted = self.enrollment(preparation).enroll(candidate, base, actor="fixture")
+        first = admitted["entry"]
+        # what the radar queue did to #2376 and #3537 before #3560
+        self.ops.queue_update(item, state="ejected", note="ejected", actor="radar",
+                              reason="project fixture %s: no run on %s yet"
+                                     % (storage.interface.CI_REQUIRED_EJECTION, head[:12]))
+        decision = self.enrollment(preparation).decide(candidate, base)
+        self.assertIs(decision["initial"], False)
+        self.assertIs(decision["recover"], True)
+        again = self.enrollment(preparation).enroll(candidate, base, actor="next-cutoff")
+        entry = again["entry"]
+        self.assertEqual((entry["state"], entry["reason"], entry["packet_allocated"]), ("queued", "", True))
+        self.assertGreater(entry["generation"], first["generation"])
+        self.assertEqual((entry["frozen_id"], entry["frozen_sha"]), (first["frozen_id"], first["frozen_sha"]))
+        # a replay at the following cutoff keeps the requeued generation
+        self.assertEqual(self.enrollment(preparation).enroll(candidate, base, actor="replay")["entry"], entry)
+
+    def test_3560_ci_required_ejection_of_a_refrozen_allocation_still_refuses(self):
+        base, _, head, item, candidate, preparation, _ = self.enrollment_fixture()
+        self.enrollment(preparation).enroll(candidate, base, actor="fixture")
+        reason = "project fixture %s: no run" % storage.interface.CI_REQUIRED_EJECTION
+        self.ops.queue_update(item, state="ejected", reason=reason, note="ejected", actor="radar")
+        self.ops.add_milestone(item, "frozen", sha=head, actor="author", verdict=None, note="regel")
+        refrozen = next(mark for mark in self.ops.milestones(item, None)
+                        if mark["kind"] == "frozen" and mark["note"] == "regel")
+        with self.assertRaisesRegex(train.TrainError, "latest exact freeze"):
+            self.enrollment(preparation).enroll(candidate, base, actor="next-cutoff")
+        candidate = dict(candidate, candidate=dict(candidate["candidate"], declared=refrozen))
+        with self.assertRaisesRegex(train.TrainError, "existing queue row blocks it"):
+            self.enrollment(preparation).enroll(candidate, base, actor="next-cutoff")
+        self.assertEqual(self.ops.queue(None)[0]["state"], "ejected")
 
     def test_recorded_enrollment_survives_clone_loss_and_fresh_connection_then_reports_withdrawal(self):
         base, _, _, item, candidate, preparation, _ = self.enrollment_fixture()
@@ -359,7 +417,7 @@ class TrainAdmissionsTest(PgTestCase):
         refused = restarted.enroll_many([candidate], base, actor="restarted-fixture")
         self.assertEqual(refused["admitted"], [])
         self.assertEqual([r["work_item_id"] for r in refused["deferred"]], [item])
-        self.assertIn("changed/withdrawn", refused["deferred"][0]["reason"])
+        self.assertIn("allocation of this freeze was withdrawn", refused["deferred"][0]["reason"])
         self.assertEqual(self.ops.queue(None), [])
 
     def test_light_admission_with_no_verdict_uses_versioned_zero_review_policy(self):
@@ -378,20 +436,19 @@ class TrainAdmissionsTest(PgTestCase):
             self.admissions.qualify([entry], base, "packet")
 
     def test_critical_sensitive_lot_with_two_same_family_reviews_is_refused_at_admission(self):
-        # deploy/** is a critical (production) path: the merge gate requires two
-        # distinct model families even when the per-path count rule says one.
-        # Admission must apply that same reading before the freeze, not let the
-        # lot enter a packet and withdraw it after the freeze.
+        # #3542 : deploy/** est un chemin critique, mais aucune règle ne le
+        # nomme ici : une règle `**` à un avis ne baisse pas le plancher de
+        # deux familles. L'admission doit lire le même besoin que la porte.
         base, _, _, entry = self.recorded_admission(
             path="deploy/mise-a-jour/bascule.py", reviews=1,
-            reviewers=(("r1", "claude"), ("r2", "claude")))
+            reviewers=(("r1", "claude"), ("r2", "claude")), rule_paths=["**"])
         with self.assertRaisesRegex(train.TrainError, "no review verdict ok"):
             self.admissions.qualify([entry], base, "packet")
 
     def test_critical_sensitive_lot_with_two_families_is_admitted(self):
         base, first, head, entry = self.recorded_admission(
             path="deploy/mise-a-jour/bascule.py", reviews=1,
-            reviewers=(("r1", "claude"), ("r2", "codex")))
+            reviewers=(("r1", "claude"), ("r2", "codex")), rule_paths=["**"])
         proof = self.admissions.qualify([entry], base, "packet")["members"][0]
         self.assertEqual((proof["policy"]["risk"], proof["policy"]["reviews"]),
                          ("sensitive", 2))
@@ -538,6 +595,91 @@ class PacketAllocationTest(PgTestCase):
                 self.assertIsNone(self.allocate())
                 self.assertEqual(self.ops.queue(None)[0]["generation"], existing["generation"])
                 self.assertEqual(self.ops.queue(None)[0]["state"], state)
+
+    def eject_for_want_of_ci(self, reason=None):
+        self.ops.queue_update(self.item, state="ejected", note="radar landing", actor="radar",
+                              reason=reason or "project fixture %s: no run on %s yet"
+                              % (storage.interface.CI_REQUIRED_EJECTION, HEAD[:12]))
+
+    def receipts(self):
+        return self.db.query("SELECT generation, kind FROM integration_train_queue_receipts"
+                             " WHERE work_item_id = %s ORDER BY id", (self.item,))
+
+    def test_3560_ci_required_ejection_of_the_allocation_is_requeued_under_a_new_generation(self):
+        row = self.allocate()
+        self.eject_for_want_of_ci()
+        again = self.allocate(actor="next-cutoff")
+        self.assertEqual((again["state"], again["reason"], again["rank"], again["landing_sha"]),
+                         ("queued", "", None, None))
+        self.assertGreater(again["generation"], row["generation"])
+        self.assertIs(again["packet_allocated"], True)
+        self.assertEqual(self.ops.queue(None), [again])
+        self.assertEqual(self.receipts(), [{"generation": row["generation"], "kind": "packet"},
+                                           {"generation": again["generation"], "kind": "packet"}])
+        self.assertTrue(any("#3560" in (event.get("note") or "")
+                            for event in work.events(self.db, self.item)))
+        self.assertEqual(self.allocate(actor="replay"), again)
+        # a writer still on the ejected generation is fenced out
+        self.assertIsNone(self.ops.queue_update(
+            self.item, state="ejected", reason="stale", entry=(row["generation"], "main",
+                                                               row["frozen_id"], HEAD)))
+        self.assertEqual(self.ops.queue(None), [again])
+
+    def test_3560_a_concurrent_ejection_for_another_cause_wins_over_the_requeue(self):
+        row = self.allocate()
+        self.eject_for_want_of_ci()
+        other = self.connect()
+        self.addCleanup(other.close)
+        read, raced_once = self.ops._queue_row, []
+        def raced(db, item_id):
+            current = read(db, item_id)
+            if not raced_once:
+                # an ejection only writes merge_queue: it commits between the
+                # read and the requeue, same generation, for a cause that refuses
+                raced_once.append(storage.of(other).work.queue_update(
+                    item_id, state="ejected", note="radar landing", actor="radar",
+                    reason="stacked trial: conflict"))
+            return current
+        with mock.patch.object(self.ops, "_queue_row", side_effect=raced):
+            self.assertIsNone(self.allocate(actor="next-cutoff"))
+        self.assertEqual(raced_once[0]["reason"], "stacked trial: conflict")
+        (current,) = self.ops.queue(None)
+        self.assertEqual((current["state"], current["reason"], current["generation"]),
+                         ("ejected", "stacked trial: conflict", row["generation"]))
+        self.assertEqual([r["kind"] for r in self.receipts()], ["packet"])
+
+    def test_3560_only_a_ci_required_ejection_of_the_same_allocation_is_requeued(self):
+        self.allocate()
+        self.eject_for_want_of_ci(reason="stacked trial: conflict not covered on a.py")
+        self.assertIsNone(self.allocate())
+        self.eject_for_want_of_ci()
+        for change in (dict(source="another-origin"), dict(target="develop"), dict(frozen_sha=BASE)):
+            with self.subTest(change=change):
+                self.assertIsNone(self.allocate(**change))
+        self.assertEqual(self.ops.queue(None)[0]["state"], "ejected")
+
+    def test_3560_ci_required_ejection_of_an_individual_row_is_not_adopted(self):
+        existing = self.allocate(packet=None)
+        self.eject_for_want_of_ci()
+        self.assertIsNone(self.allocate())
+        self.assertEqual(self.ops.queue(None)[0]["generation"], existing["generation"])
+        self.assertEqual(self.receipts(), [])
+
+    def test_3560_ci_required_ejection_after_refreeze_is_not_requeued(self):
+        self.allocate()
+        self.eject_for_want_of_ci()
+        mark = self.ops.add_milestone(self.item, "frozen", sha=HEAD, actor="fixture",
+                                      verdict=None, note="regel")
+        self.assertIsNone(self.allocate())
+        self.assertIsNone(self.allocate(frozen_id=mark["id"]))
+        self.assertEqual(self.ops.queue(None)[0]["state"], "ejected")
+
+    def test_3560_withdrawn_allocation_is_not_requeued(self):
+        self.allocate()
+        self.eject_for_want_of_ci()
+        self.assertTrue(self.ops.queue_remove(self.item, note="withdrawn", actor="assignee"))
+        self.assertIsNone(self.allocate())
+        self.assertEqual(self.ops.queue(None), [])
 
     def test_free_text_packet_receipt_cannot_adopt_an_individual_generation(self):
         existing = self.allocate(packet=None)
@@ -715,3 +857,26 @@ class PacketAllocationTest(PgTestCase):
             self.assertTrue(ops.queue_remove(self.item, note="retry removal", actor="fixture"))
         self.assertEqual(other.query("SELECT kind FROM integration_train_queue_receipts WHERE kind = %s",
                                      (kind,)), [dict(kind=kind)])
+
+
+class CiRequiredEjectionTextTest(unittest.TestCase):
+    """#3560: the queue writes the text `queue_add` recognizes, and only for
+    a project that requires CI on the frozen commit."""
+
+    def eject(self, ci_required, reader):
+        project = radar.Project("nexlink", "/r", github="o/nexlink", ci_required=ci_required)
+        with self.assertRaises(merge_queue.QueueError) as raised:
+            merge_queue._required_ci(project, HEAD, reader)
+        return dict(state="ejected", reason=str(raised.exception))
+
+    def test_no_run_or_unreadable_ci_is_recognized_only_under_ci_required(self):
+        def unreadable(sha):
+            raise plan_github.GithubError("gh down")
+        for reader in (lambda sha: {"runs": []}, unreadable):
+            with self.subTest(reader=reader):
+                self.assertTrue(storage.interface.ci_required_ejection(self.eject(True, reader)))
+                self.assertFalse(storage.interface.ci_required_ejection(self.eject(False, reader)))
+        red = self.eject(True, lambda sha: {"runs": ["x"], "pending": [], "failed": ["x"]})
+        self.assertFalse(storage.interface.ci_required_ejection(red))
+        self.assertFalse(storage.interface.ci_required_ejection(dict(red, state="queued",
+            reason=storage.interface.CI_REQUIRED_EJECTION)))

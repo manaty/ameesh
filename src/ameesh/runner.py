@@ -618,6 +618,12 @@ class AgentWorker(threading.Thread):
                 # marqueur d'avant `retry at` : repli sur la date de la ligne
                 self.rate_limit_retry_at = (float(agent.get("status_since_ts") or 0.0)
                                             + etat_debit["wait"])
+        #: #3733 : épisodes de débit passager clos de l'heure glissante, et
+        #: début de leur série ; le cumul est écrit dans `status_text` (un
+        #: succès ne l'efface pas) et lu par `rate_limited_chronic`. Relus de
+        #: la ligne avec les bornes réelles des épisodes (#3743).
+        self.rate_limit_window, self.rate_limit_window_since = rate_limit_mod.window_restore(
+            rate_limit_mod.window_state(agent.get("status_text")), etat_debit)
         self.last_activity = time.monotonic()
         #: #408 : dernière lecture des lots actionnables (règle 1)
         self._lot_wake_checked = float("-inf")
@@ -1937,7 +1943,7 @@ class AgentWorker(threading.Thread):
             if row.get("status") in ("running", "idle", "queued"):
                 registry.set_status(self.db, self.name,
                                     "queued" if row.get("pending_prompt") else "idle",
-                                    status_text=texte)
+                                    status_text=self._fenetre_debit(texte, paused=True))
         except db_mod.DbError as exc:
             log_async("[%s] withdrawal state not written (%s)" % (self.name, db_mod.explain(exc)))
 
@@ -6949,7 +6955,34 @@ class AgentWorker(threading.Thread):
         if self.preemption_streak:
             texte = exploitation_mod.preemption_status_text(
                 texte, self.preemption_streak, since=self.preemption_since)
-        return texte
+        return self._fenetre_debit(texte, paused=True)
+
+    def _clos_episode_debit(self, fin: float) -> None:
+        """#3733 : l'épisode de débit passager en cours, fini à `fin` (début
+        du tour qui l'a terminé), entre dans la fenêtre glissante. Un quota
+        n'y entre pas : L48 l'arrête déjà."""
+        if self.rate_limit == rate_limit_mod.RATE_LIMITED and self.rate_limit_since:
+            self.rate_limit_window.append(
+                (self.rate_limit_since, max(self.rate_limit_since, float(fin))))
+
+    def _fenetre_debit(self, texte: str, *, paused: bool = False) -> str:
+        """#3733 : `texte` suffixé du cumul de débit passager de l'heure
+        glissante (épisode en cours compris) ; tel quel sans cumul, et la
+        série se referme quand la fenêtre est vide."""
+        now = time.time()
+        en_cours = (self.rate_limit_since
+                    if self.rate_limit == rate_limit_mod.RATE_LIMITED else 0.0)
+        self.rate_limit_window = rate_limit_mod.window_prune(self.rate_limit_window, now)
+        debuts = [s for s, _e in self.rate_limit_window] + ([en_cours] if en_cours else [])
+        if not debuts:
+            self.rate_limit_window_since = 0.0
+            return texte
+        if not self.rate_limit_window_since:
+            self.rate_limit_window_since = min(debuts)
+        return rate_limit_mod.window_text(
+            texte, rate_limit_mod.window_total(self.rate_limit_window, now, en_cours),
+            len(debuts), self.rate_limit_window_since, now,
+            closed=self.rate_limit_window, ongoing=en_cours, paused=paused)
 
     def _run_turn(self, spec: dict) -> bool:
         """Un tour, sous battement de bail **dès la préparation** (#2544).
@@ -7857,7 +7890,8 @@ class AgentWorker(threading.Thread):
                                self.db, self.name, self.runner.runner_id, self.epoch)
             self._avec_reprise("statut de fin de tour", registry.set_status,
                                self.db, self.name, "queued",
-                               status_text="tour interrompu : l'hôte se retire (%s)" % raison)
+                               status_text=self._fenetre_debit(
+                                   "tour interrompu : l'hôte se retire (%s)" % raison, paused=True))
             self._fil_note(
                 "Tour interrompu après %ds : l'hôte se retire (%s). La consigne repart "
                 "en attente ; le travail reprendra dans la même session au retour de "
@@ -7872,7 +7906,8 @@ class AgentWorker(threading.Thread):
                                self.db, self.name, self.runner.runner_id, self.epoch)
             self._avec_reprise("end-of-turn status", registry.set_status,
                                self.db, self.name, "queued",
-                               status_text="turn stopped: restart requested")
+                               status_text=self._fenetre_debit(
+                                   "turn stopped: restart requested", paused=True))
             return False
         if self.host_yield is not None and not preempte:
             # L159f : l'hôte se retire — comme une préemption : la consigne
@@ -7885,7 +7920,8 @@ class AgentWorker(threading.Thread):
                                self.db, self.name, self.runner.runner_id, self.epoch)
             self._avec_reprise("end-of-turn status", registry.set_status,
                                self.db, self.name, "queued",
-                               status_text="turn interrupted: the host is withdrawing (%s)" % raison)
+                               status_text=self._fenetre_debit(
+                                   "turn interrupted: the host is withdrawing (%s)" % raison, paused=True))
             self._fil_note(
                 "Turn interrupted after %ds: the host is withdrawing (%s). The turn's "
                 "instruction goes back in the queue; the work resumes in the same "
@@ -7898,9 +7934,9 @@ class AgentWorker(threading.Thread):
             # repart en attente, `pick()` servira le message en tête au tour
             # suivant, sur la même session. Le fil garde la trace.
             from . import exploitation as exploitation_mod
-            texte_fin = exploitation_mod.preemption_status_text(
+            texte_fin = self._fenetre_debit(exploitation_mod.preemption_status_text(
                 "turn interrupted: priority message", self.preemption_streak,
-                since=self.preemption_since)
+                since=self.preemption_since))
             if self.preemption_streak == exploitation_mod.PREEMPTIONS_ALERT:
                 # #2729 : une alerte, pas seulement une ligne de journal — sans
                 # elle, 185 tours préemptés d'affilée sont passés inaperçus.
@@ -8001,6 +8037,7 @@ class AgentWorker(threading.Thread):
                 if genre == self.rate_limit:
                     self.rate_limit_streak += 1
                 else:
+                    self._clos_episode_debit(started)
                     self.rate_limit = genre
                     self.rate_limit_streak = 1
                     self.rate_limit_since = time.time()
@@ -8009,6 +8046,7 @@ class AgentWorker(threading.Thread):
                 self.rate_limit_retry_at = (time.time() + rate_limit_mod.delay(
                     self.rate_limit_streak))
             elif not session_fille_ecartee:
+                self._clos_episode_debit(started)
                 self.rate_limit = None
                 self.rate_limit_streak = 0
                 self.rate_limit_since = 0.0
@@ -8026,6 +8064,7 @@ class AgentWorker(threading.Thread):
         if ok:
             self.failure_streak = 0
             self.failure_since = 0.0
+            self._clos_episode_debit(started)
             self.rate_limit, self.rate_limit_streak, self.rate_limit_since = None, 0, 0.0
             self.rate_limit_retry_at = 0.0
         elif not session_fille_ecartee:
@@ -8051,6 +8090,8 @@ class AgentWorker(threading.Thread):
             texte_fin = exploitation_mod.turn_failure_status_text(
                 texte_fin, self.failure_streak,
                 critical=account_turn.is_critical(self), since=self.failure_since)
+        # #3733 : le cumul de débit de l'heure survit au succès
+        texte_fin = self._fenetre_debit(texte_fin)
         self._avec_reprise(
             "end of turn", registry.end_turn,
             self.db, self.name, self.runner.runner_id, self.epoch,
@@ -8553,6 +8594,11 @@ RELOADABLE_FIELDS = frozenset({
     "accounts_shared", "account_sharing", "account_registry",
     # binaires de harnais de l'hôte (L106), lus au lancement de chaque tour
     "harness_bins",
+    # #3568 : la route de poussée (clé `notify`) décide le délégué de la passe
+    # alerts que cet hôte publie avec son relevé de candidature ; l'ajouter
+    # sans redémarrer évite de laisser un hôte fraîchement routé en `notify_ok`
+    # faux jusqu'au prochain redémarrage de l'exécuteur.
+    "notify",
 })
 
 

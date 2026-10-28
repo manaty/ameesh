@@ -60,7 +60,14 @@ A lot is stale when it is open and inactive beyond the configured threshold
   hold), the lot is not stale. A new freeze, a vehicle left without a freeze,
   a vehicle moved to `blocked`, `ameesh work landing <id> --clear`, a closed
   or merged vehicle, or a past deadline all give the signal back: the pilot
-  renews the declaration explicitly on the new head. A
+  renews the declaration explicitly on the new head. Since #3641, a re-freeze
+  never carries the declaration automatically: the declarant is warned
+  (vehicle journal and mail) and must renew it, because ancestry and revert
+  detection do not prove the unit's content is still on the new head. The
+  warning is revalidated under the landing lock and the vehicle row lock — the
+  new head must still be the vehicle's current freeze and the declaration must
+  still carry its old pin — so a delayed older freeze neither overwrites nor
+  warns about a declaration renewed since. A
   self, unknown or finished vehicle does not suppress the alert; nor does
   prose, a bare admission to a packet or an old transport chain.
 
@@ -120,6 +127,15 @@ A lot is stale when it is open and inactive beyond the configured threshold
   report repeats the reminder to the bureau/owner (§10). A non-pilot hold
   that carries the declaration is not external — it stays a plain agent wait
   and the debit says so in `unreadable`.
+
+  #3773 : the same hold may declare an **external third party** without
+  naming the bureau or the owner — `hold: attente externe : revue Apple`,
+  `hold: attente externe : examen du store`. The third party is in the
+  gesture and the debit reports the executor as `externe`; the hold enters
+  `external_waits` like a named executor's, outside `slow_waits`, with the
+  same reminder at the declared deadline or after the threshold, carried to
+  the bureau (§10). Prose without the colon separator (`attente externe de
+  l'APK`) declares nothing.
 
 Grouped views (`work list`, `progress --json`, the stale alert, the dependency
 labels) read the hold from a targeted storage stream

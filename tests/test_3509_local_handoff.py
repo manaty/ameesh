@@ -124,6 +124,8 @@ class AlarmOutcomeTest(unittest.TestCase):
         from .test_3470_handoff_activation import EffectTest, companion
         fixture = EffectTest()
         fixture.setUp()
+        # Isolate the fixture helper from checkout permissions (for example umask 0002).
+        fixture.fx.effects._release = load("environnement-versionne")
         self.addCleanup(fixture.doCleanups)
         fixture.prepared()
         self.assertIs(fixture.call('admit')['ok'], True)
@@ -151,6 +153,7 @@ class AlarmOutcomeTest(unittest.TestCase):
                 mock.patch.object(companion, 'load_execution', return_value={}), \
                 mock.patch.object(dispatch, 'os',
                     mock.Mock(geteuid=mock.Mock(return_value=0),
+                              devnull=os.devnull,
                               dup=mock.Mock(return_value=123))), \
                 mock.patch.object(dispatch.socket, 'socket', return_value=channel), \
                 mock.patch.object(dispatch.signal, 'signal',

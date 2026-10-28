@@ -203,6 +203,18 @@ BASKET_LINE_NOTE = "basket line"
 #: défini ici, seul.
 EXTERNAL_EXECUTOR_NOTE = "external executor:"
 EXTERNAL_EXECUTOR_CLEARED_NOTE = "external executor cleared"
+#: #3560 : la cause d'éjection de la file quand le projet exige une CI sur le
+#: commit gelé (`ci_required`) et qu'aucun run ne s'y lit (`merge_queue._required_ci`).
+#: Sur une ligne d'inscription au paquet, ce n'est pas un échec du lot : le §11 bis
+#: ne lance aucune CI de lot, la CI complète du paquet en tient lieu. Le texte est
+#: défini ici, seul : la file l'écrit, `queue_add` et le train le relisent.
+CI_REQUIRED_EJECTION = "requires CI on the frozen commit (ci_required)"
+
+
+def ci_required_ejection(row) -> bool:
+    """#3560 : une ligne de file `ejected` pour la seule absence de CI de lot."""
+    return bool(row) and row.get("state") == "ejected" \
+        and CI_REQUIRED_EJECTION in str(row.get("reason") or "")
 
 
 class Domain(abc.ABC):
@@ -247,7 +259,11 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
-        """Agent by primary or alias; alias resolutions are durably audited."""
+        """Agent by primary or alias; alias resolutions are durably audited.
+
+        #3729 : la ligne porte aussi `last_mail_ts` et `last_mail_host`, le
+        dernier message déposé et l'hôte qui l'a déposé — le signe de vie que
+        `ameesh show` affiche comme `ameesh list` depuis #3337."""
 
     @abc.abstractmethod
     def resolve_name(self, name: str, *, operation: str = "lookup") -> str:
@@ -302,6 +318,18 @@ class Agents(Domain):
     @abc.abstractmethod
     def overview(self) -> list[dict]:
         """Vue d'observabilité (`mesh list --json`), colonnes du canon comprises."""
+
+    @abc.abstractmethod
+    def reachability(self) -> list[dict]:
+        """#3631 : les seules colonnes qui disent si un relecteur désigné lira
+        son courrier — `name`, `aliases`, `retired_ts`, `mode`, `status`,
+        `host`.
+
+        La passe de redésignation lit ce fait à chaque synchronisation de
+        canon sur chaque exécuteur : `overview()` y joignait le canon, les
+        baux et des colonnes larges, et expirait sous la pression de la base
+        commune (639 passes perdues en 24 h). Aucune décision de sélection
+        n'est prise ici, seulement la preuve de joignabilité."""
 
     @abc.abstractmethod
     def claimable(self, host: str, names: Sequence[str] | None, *,
@@ -1561,8 +1589,12 @@ class WorkItems(Domain):
         lock on the reference and refuse the creation (`DbError`) when any lot,
         whatever its state, already carries it. Two hosts creating the incident
         of the same run serialize: the second sees the first and the caller
-        re-reads the winner. Off by default: several lots may legitimately
-        share a reference except where the identity is one per execution.
+        re-reads the winner. #3607 : the re-read covers the exact `source` too,
+        not only `issue_ref` — the identity of an execution is also carried
+        there (`ci-incident:<repo>:<run>`), and the ticket sync may have moved
+        the winner's `issue_ref` to its mirror ticket between the lock wait and
+        the re-read. Off by default: several lots may legitimately share a
+        reference except where the identity is one per execution.
 
         `external_executor` (#3447) : le lot est créé réservé à un exécutant
         externe déclaré (agent `externe` avec responsable humain, ou humain),
@@ -1722,7 +1754,8 @@ class WorkItems(Domain):
     def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
                   actor: str, source: str = "", frozen_id: int | None = None,
                   packet: dict | None = None, packet_initial: bool = False,
-                  lease: tuple | None = None) -> dict | None:
+                  lease: tuple | None = None,
+                  withdrawn_after: float | None = None) -> dict | None:
         """L160e (0058): puts (or puts back) the lot in the merge queue of
         `target`, state `queued`, with a journal line; `source`: the
         repository it was queued from (`merge_queue.source_of`). None if the
@@ -1738,7 +1771,12 @@ class WorkItems(Domain):
         provider: absence of a queue row cannot prove never-withdrawn for
         historical lots. It cannot override a recorded withdrawal.
         `lease` (#1467): optional `(target key, owner, epoch)`, locked after
-        the lot and checked live before allocation/replay, in this transaction."""
+        the lot and checked live before allocation/replay, in this transaction.
+        `withdrawn_after` (#3532): an epoch instant; refuses (None) when a
+        typed `removed` receipt of the lot was written at or after it, read
+        under the lot row lock that `queue_remove` takes first. #3550: the
+        receipt only binds the entry it removed — `target` and `frozen_id`
+        (the expected freeze) scope it."""
 
     @abc.abstractmethod
     def queue_update(self, item_id: int, *, state: str | None = None,
@@ -1764,8 +1802,20 @@ class WorkItems(Domain):
     def queue_remove(self, item_id: int, *, note: str, actor: str) -> bool:
         """L160e (0058): takes the lot out of the queue, with a journal line.
         Locks the lot before its queue row and records a typed `removed`
-        receipt for the deleted row's freeze in the same transaction.
-        A free-text journal note cannot write this receipt."""
+        receipt for the deleted row's freeze and target in the same
+        transaction. A free-text journal note cannot write this receipt."""
+
+    @abc.abstractmethod
+    def queue_withdrawn_since(self, item_id: int, since_ts: float, *,
+                              target: str | None = None,
+                              frozen_id: int | None = None) -> float | None:
+        """#3532: the epoch instant of the lot's latest typed `removed`
+        receipt written at or after `since_ts`, None without one. #3550:
+        `target` and `frozen_id` restrict the read to the queue entry the
+        caller is about to replace; a removal of another target or of an
+        older freeze is not a take-out of that entry. Legacy receipts without
+        a target still match (they cannot be told apart); a receipt without a
+        freeze never matches a named freeze."""
 
     @abc.abstractmethod
     def land_lock(self, key: str, owner: str, ttl_s: float, *,
@@ -1779,6 +1829,12 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def land_unlock(self, key: str, owner: str, epoch: int) -> bool:
         """L160e2 (0058): frees the lease, if still held at that epoch."""
+
+    @abc.abstractmethod
+    def land_holder(self, key: str) -> dict | None:
+        """#3598: the live holder of the merge lease of `key`, for a refusal
+        message: `{owner, expires_at, left_s}`, or None. A diagnostic read,
+        never a guard; server-only, like `land_lock`/`land_unlock`."""
 
     @abc.abstractmethod
     def train_read(self, key: str) -> dict | None:
@@ -1856,7 +1912,11 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def queue(self, target: str | None = None) -> list[dict]:
         """L160e (0058): the queue rows (of `target`, else every target),
-        ranked first, then by arrival."""
+        ranked first, then by arrival.
+
+        #3560: `packet_allocated` is true when the row's current generation
+        carries the train's `packet` receipt: the train enrolled it and lands
+        it itself; the radar queue never lands it."""
 
     @abc.abstractmethod
     def set_branch_head(self, item_id: int, branch: str, head: str | None) -> bool:
@@ -1909,6 +1969,19 @@ class WorkItems(Domain):
         """L539 : les lots portant exactement cette `issue_ref`, **quel que
         soit leur état** — l'identité d'un lot de relecture après fusion
         survit à sa fermeture, sinon un second lot serait ouvert."""
+
+    @abc.abstractmethod
+    def by_source(self, source: str) -> list[dict]:
+        """#3607 : les lots dont la `source` vaut exactement cette référence,
+        **quel que soit leur état**, la comparaison étant à la casse près
+        (comme `by_issue_ref` : la casse d'un dépôt GitHub ne fait pas une
+        autre exécution). L'identité d'un incident de CI vit aussi dans
+        `source` (`ci-incident:<repo>:<run>`) : un lot ouvert à la main la
+        porte quand la synchro des tickets a remplacé son `issue_ref` par le
+        ticket miroir. Sans cette lecture, l'ouverture automatique doublerait
+        l'incident. Aucun motif : préfixe et suffixe ne matchent pas, et une
+        `source` vide ne désigne rien (sans la garde, elle rendrait tous les
+        lots sans source)."""
 
     @abc.abstractmethod
     def lock(self, item_id: int) -> dict | None:
@@ -2319,7 +2392,8 @@ class WorkItems(Domain):
         d'abord. Chaque ligne porte `package_id`, `work_item_id`,
         `package_branch`, `base_sha`, `head_sha`, `unit_sha`, `source_sha`,
         `frozen_sha`, `recorded_by`, `recorded_ts`, l'état du porteur
-        (`package_state`) et son jalon de fusion (`package_merged_sha`)."""
+        (`package_state`), son jalon de fusion (`package_merged_sha`) et sa
+        tête gelée (`package_frozen_sha`, #3634)."""
 
     @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
@@ -4069,7 +4143,9 @@ class Housekeeping(Domain):
 
         #2617 : un signalement `orphan` (ré-écrit toutes les 12 h pour une
         entrée non attribuée) compte une fois par chemin, avec sa dernière
-        taille ; les autres actions comptent leurs lignes."""
+        taille ; #3728 : un relevé `unremovable` aussi (réécrit à chaque
+        passage tant que l'épisode dure) ; les autres actions comptent leurs
+        lignes."""
 
     @abc.abstractmethod
     def last_measure(self, host: str | None) -> list[dict]:
@@ -4375,7 +4451,9 @@ class CiResults(Domain):
     @abc.abstractmethod
     def latest_concluded(self, branches: Sequence[str]) -> list[dict]:
         """Par dépôt, branche et workflow, sur la dernière tête conclue de la
-        branche, l'exécution conclue verte ou rouge la plus récente."""
+        branche, l'exécution conclue verte ou rouge la plus récente. #3686 :
+        un `workflow_dispatch` d'un workflow qui ne tourne jamais autrement
+        sur la branche n'y compte pas (geste d'opérateur, pas l'état fusionné)."""
 
     @abc.abstractmethod
     def head_replaced(self, repo: str, branch: str, head_sha: str, run_id: int) -> bool:
@@ -4637,6 +4715,36 @@ class NotifyLiveness(Domain):
     @abc.abstractmethod
     def release_brief(self, recipient: str, human: str) -> None:
         """Rend une réclamation dont le courrier n'a pas pu être déposé."""
+
+    # -- #3576 : état de livraison partagé de la passe alerts ----------------
+    @abc.abstractmethod
+    def acquire_state(self, scope: str, owner: str, ttl_seconds: float) -> int | None:
+        """Prend le bail d'exécution de l'état `scope` ; rend son epoch.
+
+        La ligne d'état est créée au premier appel (`body` vide, à amorcer).
+        Un bail non expiré d'un AUTRE owner refuse la prise (`None`) ; le même
+        owner le reprend à une epoch neuve. `expires_at` est lu avec l'heure
+        réelle de la base, jamais avec l'horloge de l'hôte.
+        """
+
+    @abc.abstractmethod
+    def read_state(self, scope: str) -> dict | None:
+        """Le document de livraison partagé, ou None tant qu'il n'est pas
+        amorcé (ligne absente, `body` vide ou schéma inconnu).
+
+        Lecture sans verrou : un écrivain doit avoir pris le bail, l'appelant
+        ne livre que sous ce bail.
+        """
+
+    @abc.abstractmethod
+    def save_state(self, scope: str, body: dict, *, owner: str, epoch: int) -> bool:
+        """Écrit le document sous le bail `(owner, epoch)`, s'il est encore
+        vivant ; False si le bail a été perdu ou a expiré (rien n'est écrit :
+        un détenteur périmé ne remplace jamais l'état du nouveau)."""
+
+    @abc.abstractmethod
+    def release_state(self, scope: str, owner: str, epoch: int) -> bool:
+        """Rend le bail d'exécution de l'état, à son epoch."""
 
 
 class Storage(abc.ABC):

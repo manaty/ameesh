@@ -489,9 +489,21 @@ class Agents(interface.Agents):
         return rows[0]
 
     def get(self, name) -> dict | None:
-        rows = self.db.query("SELECT %s FROM agent_registry WHERE name = "
-                             "(SELECT ameesh_resolve_agent_name(%%s, %%s))" % AGENT_COLUMNS,
-                             (name, "agents.get"))
+        # #3729 : le dernier message déposé et son hôte, comme `overview`
+        # (#3337) — `ameesh show` lit la même preuve de vie que `list`.
+        rows = self.db.query(
+            """
+            SELECT %s, presence.last_mail_ts, presence.last_mail_host
+              FROM agent_registry
+              LEFT JOIN LATERAL (
+                  SELECT extract(epoch from m.created_at)::float8 AS last_mail_ts,
+                         m.host AS last_mail_host
+                    FROM agent_mailbox m
+                   WHERE m.sender = agent_registry.name
+                   ORDER BY m.id DESC LIMIT 1) presence ON true
+             WHERE name = (SELECT ameesh_resolve_agent_name(%%s, %%s))
+            """ % AGENT_COLUMNS,
+            (name, "agents.get"))
         return rows[0] if rows else None
 
     def resolve_name(self, name, *, operation="lookup") -> str:
@@ -520,6 +532,10 @@ class Agents(interface.Agents):
                    (SELECT extract(epoch from m.created_at)::float8
                       FROM agent_mailbox m WHERE m.sender = o.name
                      ORDER BY m.id DESC LIMIT 1) AS last_mail_ts,
+                   -- #3729 : l'hôte du dernier dépôt, pour nommer un signe de
+                   -- vie venu d'ailleurs que l'hôte déclaré.
+                   (SELECT m.host FROM agent_mailbox m WHERE m.sender = o.name
+                     ORDER BY m.id DESC LIMIT 1) AS last_mail_host,
                    lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
                    public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
                    passive_unread,
@@ -566,6 +582,19 @@ class Agents(interface.Agents):
             """.replace("__GOVERNED__", canon_governed_sql("o"))
                .replace("__CLAIM_OK__", canon_claim_predicate_sql("r"))
         )
+
+    def reachability(self) -> list[dict]:
+        # #3631 : la passe de redésignation n'a besoin que de ces six
+        # colonnes ; `overview()` y ajoutait le canon, les baux, les jauges et
+        # des colonnes larges (`pending_prompt`, `last_error`), et expirait
+        # sous la pression de la base commune. `retired_ts` est la forme que
+        # lit `review_designation.is_retired`.
+        return self.db.query(
+            "SELECT name, aliases,"
+            "       extract(epoch from retired_at)::float8 AS retired_ts,"
+            "       mode, status, host"
+            "  FROM agent_registry"
+            " ORDER BY name")
 
     def claimable(self, host, names, *, require_responsible) -> list[dict]:
         # L165 (EP1) : un agent `releve: election` est visible sur tout hôte

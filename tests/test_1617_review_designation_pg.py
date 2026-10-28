@@ -18,6 +18,7 @@ from ameesh import review_designation as rd
 #: #2451 : familles explicites ; l'activation passe celles du canon compilé
 FAMILIES = ("claude", "codex", "deepseek")
 from ameesh import review_designation_pg as pg
+from ameesh import review_designation_activation as activation
 from ameesh import registry, storage, work
 
 from .support import PgTestCase
@@ -57,6 +58,23 @@ class Test1617ReviewDesignationPgMark(unittest.TestCase):
         self.assertEqual(found["state"], rd.DESIGNATED)
         self.assertEqual(found["freeze"], {"id": 12, "sha": SHA_A})
         self.assertEqual(found["reviewers"], [{"name": "r1", "family": "claude"}])
+
+    def test_a_multi_family_author_keeps_its_proven_set(self):
+        # #3584 : la marque garde tout l'ensemble, pas la seule réduction
+        # ambiguë à "".
+        note = pg._mark_note(
+            3, 12, state=rd.WAITING, required=1, reviewers=[], missing=1,
+            why="one eligible family", policy_ref="canon@deadbeef", sha=SHA_A,
+            authors=[{"name": "cx1", "family": "",
+                      "families": ["codex", "deepseek"],
+                      "proof": "turn-journal",
+                      "fallback_commits": [SHA_A[:12]]}])
+        found = pg.designation_of(note)
+        self.assertEqual(found["authors"], [{
+            "name": "cx1", "family": "",
+            "families": ["codex", "deepseek"],
+            "proof": "turn-journal",
+            "fallback_commits": [SHA_A[:12]]}])
 
 
 class Test1617ReviewDesignationPg(PgTestCase):
@@ -334,6 +352,35 @@ class Test1617ReviewDesignationPg(PgTestCase):
         self.assertEqual(len(self.marks()), 2)
         self.assertEqual(pg.designation_of(self.marks()[-1])["state"], rd.DESIGNATED)
 
+    def test_a_partial_waiting_mark_is_completed_on_the_same_freeze(self):
+        # #3596 : une famille disponible est pourvue tout de suite ; la marque
+        # `waiting` porte son siège, et la reprise n'ajoute que le manquant.
+        self.freeze()
+        out = self.run_apply(pg.PgPort(self.db),
+                             candidates=[rd.Candidate("r1", "claude")])
+        self.assertEqual(out["state"], rd.WAITING)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"])
+        self.assertEqual(out["missing"], 1)
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot", "r1"])
+        mark = pg.designation_of(self.marks()[0])
+        self.assertEqual(mark["state"], rd.WAITING)
+        self.assertEqual(mark["reviewers"], [{"name": "r1", "family": "claude"}])
+        self.assertEqual(mark["missing"], 1)
+        # rejoué sans capacité nouvelle : une seule marque, aucun second courrier
+        again = self.run_apply(pg.PgPort(self.db),
+                               candidates=[rd.Candidate("r1", "claude")])
+        self.assertTrue(again.get("replayed"))
+        self.assertEqual(len(self.mailbox()), 2)
+        self.assertEqual(len(self.marks()), 1)
+        # codex revient : la marque du même gel gagne codex seul, claude reste
+        out3 = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
+        self.assertEqual(out3["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in out3["reviewers"]], ["r1", "r2"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()],
+                         ["pilot", "r1", "r2"])
+        self.assertEqual(len(self.marks()), 2)
+        self.assertEqual(pg.designation_of(self.marks()[-1])["state"], rd.DESIGNATED)
+
     def test_a_waiting_designation_needs_a_recipient(self):
         self.freeze()
         with self.assertRaises(rd.DesignationError):
@@ -514,14 +561,15 @@ class Test1617FrozenHook(PgTestCase):
         self.assertEqual(drained, [self.schema])
 
     # -- #1634 : une notification impossible n'annule pas le gel ---------
-    def waiting_freeze(self, notify):
+    def waiting_freeze(self, notify, *, candidates=()):
         """Gel par le hook sans relecteur désignable, notifiant `notify`."""
         def hook(tx, milestone, threads):
             seen["out"] = rd.apply(
                 dict(self.item, state="build"), families=FAMILIES, policy=RULES,
                 paths=["src/ameesh/db.py"], port=pg.PgPort(tx, after_commit=threads),
                 freeze_sha=milestone["sha"],
-                authors=[{"name": "author", "family": "deepseek"}], candidates=[],
+                authors=[{"name": "author", "family": "deepseek"}],
+                candidates=list(candidates),
                 risk="sensitive", base="c" * 40, policy_ref="canon@deadbeef",
                 notify=notify)
 
@@ -566,6 +614,23 @@ class Test1617FrozenHook(PgTestCase):
         self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
         self.assertNotIn("undeliverable", pg.designation_of(self.marks()[0])["why"])
         self.assertFalse([n for n in self.notes() if n.startswith("désignation au gel")])
+
+    def test_a_partial_waiting_designation_keeps_a_deliverable_request(self):
+        # #3596 : sans destinataire pour l'avis de capacité, le siège dont la
+        # demande de relecture part vraiment reste pourvu ; seul l'avis manque.
+        row, out = self.waiting_freeze(
+            "", candidates=[rd.Candidate("r1", "claude")])
+        self.assertEqual(out["state"], rd.WAITING)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"])
+        self.assertEqual(out["missing"], 1)
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1"])
+        mark = pg.designation_of(self.marks()[0])
+        self.assertEqual(mark["state"], rd.WAITING)
+        self.assertEqual(mark["reviewers"], [{"name": "r1", "family": "claude"}])
+        self.assertIn("notification undeliverable at freeze", mark["why"])
+        lisible = [n for n in self.notes() if n.startswith("désignation au gel")]
+        self.assertEqual(len(lisible), 1)
+        self.assertIn("— (no recipient)", lisible[0])
 
     def test_an_unknown_reviewer_keeps_the_freeze_and_waits(self):
         def hook(tx, milestone, threads):
@@ -642,3 +707,23 @@ class Test1617FrozenHook(PgTestCase):
                 self.lot, "verdict", sha=SHA_A, actor="me", verdict="ok", note="",
                 on_frozen=lambda *args: None)
         self.assertEqual(self.milestones(), [])
+
+
+class FrozenAuthorsFamiliesTest(PgTestCase):
+    """#3584 : la lecture durable garde l'ensemble des familles prouvées."""
+
+    def test_a_freeze_mark_keeps_the_proven_family_set(self):
+        item = work.add(self.db, title="auteurs multi-familles", app="ameesh")
+        lot = int(item["id"])
+        freeze = storage.of(self.db).work.add_milestone(
+            lot, "frozen", sha=SHA_A, actor="cx1", verdict=None, note="")
+        note = pg._mark_note(
+            lot, int(freeze["id"]), state=rd.WAITING, required=1,
+            reviewers=[], missing=1, why="one eligible family",
+            authors=[{"name": "cx1", "family": "",
+                      "families": ["codex", "deepseek"]}],
+            policy_ref="canon@deadbeef", sha=SHA_A, unknown=())
+        storage.of(self.db).work.note(lot, "build", note, "ameesh")
+        self.assertEqual(activation.frozen_authors(self.db, work.get(self.db, lot)),
+                         [{"name": "cx1", "family": "",
+                           "families": ["codex", "deepseek"]}])

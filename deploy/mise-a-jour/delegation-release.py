@@ -48,7 +48,10 @@ DIRECTORIES={
 #: Protected enrollment documents an operator may add to the reviewed bootstrap
 #: inventory, with their exact fixed mode. A caller never chooses a destination.
 TURN_DOCUMENT='/etc/ameesh-release/turn.json'
-ENROLLMENT_DOCUMENTS={TURN_DOCUMENT:0o600}
+SEAL_DOCUMENT='/etc/ameesh-release/runtime-seal.json'
+SEAL_ENTRY='/usr/local/libexec/ameesh-runtime-seal.py'
+SEAL_LOCK='/etc/ameesh-release/runtime-seal.lock'
+ENROLLMENT_DOCUMENTS={TURN_DOCUMENT:0o600,SEAL_DOCUMENT:0o600}
 ENROLLMENT_LIMIT=8192
 
 
@@ -81,8 +84,15 @@ def enrollment_documents(enrollment):
             raise DelegationError('enrollment document is not JSON') from None
         if (not isinstance(content,str) or not isinstance(value,dict)
                 or content!=json.dumps(value,sort_keys=True,separators=(',',':'))
-                or len(content.encode())>ENROLLMENT_LIMIT):
+                or len(content.encode())>(8*1024*1024 if path==SEAL_DOCUMENT else ENROLLMENT_LIMIT)):
             raise DelegationError('canonical enrollment document required')
+        if path==SEAL_DOCUMENT:
+            spec=importlib.util.spec_from_file_location('bootstrap_seal',Path(__file__).with_name('scellement-runtime.py'))
+            seal=importlib.util.module_from_spec(spec); spec.loader.exec_module(seal)
+            try:
+                seal.validate(value)
+            except (ValueError,TypeError,KeyError):
+                raise DelegationError('invalid seal manifest') from None
         documents[path]=content
     return documents
 
@@ -207,6 +217,15 @@ def render(plan, *, account_ids=None,previous_files=None,enrollment=None):
     files['/etc/systemd/system/ameesh-release-controller.service']=root_file(0o644,unit.UNIT)
     for path,content in enrollment.items():
         files[path]=root_file(ENROLLMENT_DOCUMENTS[path],content)
+    if SEAL_DOCUMENT in enrollment:
+        seal=json.loads(enrollment[SEAL_DOCUMENT])
+        if (seal['machine_id']!=plan['machine_id']
+                or seal['trees']['runtime']['digest']!=plan['runtime_tree_sha256']
+                or seal['trees']['lib']['digest']!=plan['source_tree_sha256']):
+            raise DelegationError('seal must bind the signed bootstrap trees and host')
+        files[SEAL_ENTRY]=root_file(0o555,Path(__file__).with_name('scellement-runtime.py').read_text())
+        # The lock is an enrolled persistent inode, not a replaceable config.
+        # Creation and lifetime are managed by the administrator before run().
     previous_files = validate_previous(previous_files, files)
     review = dict(version=1,host=plan['host'],machine_id=plan['machine_id'],
             plan=plan,policy_id=restart.policy_id(plan['policy']),files=files,previous_files=previous_files,
