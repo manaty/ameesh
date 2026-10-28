@@ -2,7 +2,7 @@
 """Alerts pushed to the responsible human (lot L38, decision 0030 point 4).
 
   ameesh notify [--once] [--dry-run] [--json] [--interval S]
-                [--only alerts|take|issues|github-watch|ci|fingerprints]
+                [--only alerts|take|issues|github-watch|ci|fingerprints|coherence]
                 [--skip issues|github-watch|ci|alerts] [--long-turn S]
                 [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
@@ -134,11 +134,11 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 #: `alerts` owns the delivery state and its lock; `take` observes the alerts
 #: but writes no state; `issues`, `github-watch` and `ci` are independent.
 ONLY_PASSES = ("alerts", "take", "issues", "github-watch", "ci")
-#: #3885 (canon §16): passes that exist ONLY under `ameesh role run`. The
-#: full notifier never runs them (a source must be read by the lease holder
-#: alone); they are accepted by `--only`, and the pass itself refuses without
-#: `AMEESH_ROLE`.
-ROLE_ONLY_PASSES = ("fingerprints",)
+#: #3885 (canon §16) and #4172: passes that exist ONLY under `ameesh role run`.
+#: The full notifier never runs them (a source must be read by the lease
+#: holder alone, and the coherence pass writes lots); they are accepted by
+#: `--only`, and the pass itself refuses without `AMEESH_ROLE`.
+ROLE_ONLY_PASSES = ("fingerprints", "coherence")
 #: #3327: the passes a role timer carries. A full notifier may skip exactly
 #: these (and only these) from its loop; every other pass (take, budget
 #: handoff, WIP sweep) stays in the service. #3383: `alerts` joined them — the
@@ -2624,6 +2624,8 @@ class Notifier:
             self._ci_failures(db)
         if "fingerprints" in selected:
             self._fingerprints(db, now)
+        if "coherence" in selected:
+            self._coherence(db, now)
         return records
 
     def run_local_pass(self, now: float | None = None) -> list:
@@ -2843,6 +2845,29 @@ class Notifier:
                 self.log(ci.describe(record))
         except Exception as exc:  # noqa: BLE001 - jamais fatal au passage des alertes
             self.log("CI: poll failed (%s)" % _clean(exc, 200))
+
+    # -- cohérence du backlog (#4172) ---------------------------------------
+    def _coherence(self, db, now: float) -> None:
+        """La passe de cohérence du backlog, sous le bail du rôle élu.
+
+        #4172 : elle ferme les constats déterministes (déjà fait, obsolète)
+        avec leur justification dans le journal du lot, et envoie UN digest
+        par projet au PO pour les doublons et les contradictions. Le service
+        complet ne la lance jamais : elle n'est admise que sous `ameesh role
+        run`, où le bail désigne un seul hôte.
+        """
+        from . import backlog_coherence
+        if not (os.environ.get("AMEESH_ROLE") or "").strip():
+            raise backlog_coherence.CoherenceError(
+                "coherence pass refused: run it under the elected role "
+                "(`ameesh role run <role> -- ameesh notify --once --only "
+                "coherence`), never from the full notifier")
+        reports = backlog_coherence.tick(
+            self.cfg, db, now=now, apply=not self.dry_run, log=self.log)
+        errors = [report["error"] for report in reports if report.get("error")]
+        if errors:
+            raise backlog_coherence.CoherenceError(
+                "coherence pass incomplete: %s" % "; ".join(errors)[:500])
 
     # -- empreintes d'échec (canon §16, #3885) --------------------------------
     def _fingerprints(self, db, now: float) -> None:

@@ -132,3 +132,8 @@ Two open lots linked `conflicts_with` with no recorded decision raise one
 assignee. The alert falls when the decision is recorded with `--decide`
 (journaled on both lots, with its author), when the link is removed or when
 either lot finishes. Migration 0501 adds `work_item_links`.
+
+The backlog coherence pass (#4172, `docs/WORK-COHERENCE.md`) is the periodic
+consumer of these links: it proposes `duplicates` and finds textual
+contradictions, and its digest asks the PO to record the typed link or a
+justified closure. It never creates a typed link on its own.
