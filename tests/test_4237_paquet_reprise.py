@@ -224,7 +224,7 @@ class EpochLostTest(unittest.TestCase):
             record_packet="", run_inclusion=(0, "ok"), pull_request_state=None,
             ensure_pull_request=(7, "http://pr"), freeze_carrier="",
             request_full_ci="", note_carrier="", send_mail=None,
-            remove_worktree=None)
+            remove_worktree=None, PackageLock=mock.DEFAULT)
         with mock.patch.multiple(auto, **{k: mock.DEFAULT for k in patches}) as mocks, \
                 mock.patch.object(auto, "check_epoch", side_effect=guard), \
                 mock.patch.object(auto, "check_local_tests", side_effect=tests), \
@@ -232,6 +232,9 @@ class EpochLostTest(unittest.TestCase):
                 mock.patch.object(auto, "keep_tested") as keep:
             for key, value in patches.items():
                 mocks[key].return_value = value
+            # #4329 : le verrou de composition exige un dépôt git réel ; ce
+            # témoin monte un dépôt factice et mocke déjà tous les gestes git.
+            mocks["PackageLock"].return_value = mock.MagicMock()
             with self.assertRaises(auto.EpochLost):
                 auto.compose_packet(args)
         return tmp, keep, push, mocks
