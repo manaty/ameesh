@@ -19,6 +19,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ameesh import db as db_mod
 from ameesh import fil, httpkit, mesh_cli, registry, serve, server_faults, storage, work
@@ -384,6 +385,21 @@ class ServePgTest(ServerMixin, PgTestCase):
         _s, decisions = self.get_json("/api/v1/decisions")
         expected = cli("decisions", "--for", "human:owner", "--json")
         self.assertEqual(dict(decisions, schema=None), dict(expected, schema=None))
+
+    def test_agent_survives_unavailable_footprint(self):
+        from ameesh import canon, host_idle, mesh_cli
+        for module, method in ((canon, "load_configured"), (res, "current"),
+                               (host_idle, "snapshot")):
+            with self.subTest(source=method), mock.patch.object(
+                    module, method, side_effect=OSError("unreadable")):
+                row = mesh_cli.agent_detail(self.db, "a1", cfg=self.cfg)
+                self.assertEqual(row["name"], "a1")
+                self.assertIsNone(row["footprint"])
+                self.assertEqual(row["footprint_unavailable"], "unreadable")
+                status, data = self.get_json("/api/v1/agents/a1")
+                self.assertEqual(status, 200, data)
+                self.assertEqual(data["agent"]["footprint_unavailable"], "unreadable")
+                self.assertIsNone(data["agent"]["footprint"])
 
     def test_unknown_objects_are_404(self):
         for path in ("/api/v1/agents/nobody", "/api/v1/lots/999999", "/api/v1/hosts/nowhere",

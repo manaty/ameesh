@@ -209,11 +209,15 @@ def agent_detail(db, name: str, *, cfg=None) -> dict | None:
     row["key_updated_ts"] = (info or {}).get("key_updated_ts")
     row["key_revoked_ts"] = (info or {}).get("key_revoked_ts")
     row["footprint"] = None
+    row["footprint_unavailable"] = None
     if cfg is not None and row.get("host"):
         from . import host_idle, resources, canon as canon_mod
-        readings = {r["host"]: r for r in resources.current(db, row["host"])}
-        row["footprint"] = host_idle.snapshot(
-            cfg, db, canon_mod.load_configured(cfg), readings).get(row["host"])
+        try:
+            readings = {r["host"]: r for r in resources.current(db, row["host"])}
+            row["footprint"] = host_idle.snapshot(
+                cfg, db, canon_mod.load_configured(cfg), readings).get(row["host"])
+        except Exception as exc:  # optional diagnostics must not hide the agent
+            row["footprint_unavailable"] = " ".join(str(exc).split())[:120]
     return row
 
 
@@ -1218,6 +1222,8 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
             status = "pause-next" if pause.get("after_turn") else "op-paused"
         if row.get("footprint"):
             print(host_idle.line(row["footprint"]))
+        elif row.get("footprint_unavailable"):
+            print("footprint: not checked (%s)" % row["footprint_unavailable"])
         print("agent    : %s" % row["name"])
         print("workspace: %s" % (row.get("chantier") or "—"))
         print("harness  : %-9s host: %-12s status: %s%s" % (
