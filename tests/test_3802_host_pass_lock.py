@@ -133,6 +133,8 @@ class HostPassLockTest(unittest.TestCase):
         self.assertIsNotNone(lock)
         lock.close()
 
+    @unittest.skipUnless(os.path.isdir("/proc/self/fd"),
+                         "témoin des descripteurs : /proc/self/fd (Linux)")
     def test_no_descriptor_of_the_lock_survives_the_pass(self):
         seen = {}
 
@@ -223,6 +225,7 @@ class HostPassLockTest(unittest.TestCase):
             report = self.passage(progress=boom)
         self.assertEqual(report["budget"]["timed_out"], False)
 
+    @unittest.skipUnless(os.path.exists("/proc/locks"), "Linux /proc/locks")
     def test_a_holder_without_record_names_its_pid_and_claims_no_age(self):
         """#3802 N1 : pas d'enregistrement = pas d'âge, donc pas de fausse
         alerte sur un runner simplement vieux."""
