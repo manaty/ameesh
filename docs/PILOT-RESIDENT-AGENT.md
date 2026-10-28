@@ -243,6 +243,11 @@ series with no understood cause stops the pilot immediately, evidence kept.
 The controlled B5c/B5d failure is understood and counted; a second, unexplained
 failure in the same run stops it.
 
+The 11:00 and 23:00 staging cuts (10:00Z and 22:00Z) fall inside the 24 h
+window; they restart the runners and are recorded as lease epochs and
+incidents, not imputed. The pilot stops only if a resident group outlives its
+lease or a resident survives a cut.
+
 ## State
 
 T1/T2 are merged and active in staging (`771e447`, h-19; main `47bf1fe68` after
