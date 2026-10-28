@@ -52,6 +52,7 @@ class LinuxChannels(installer.LinuxHost):
         # The release bootstrap installed these trees; a different or writable
         # tree means the dispatchers would not be the reviewed ones.
         try:
+            measured={}
             for logical,field in TREES.items():
                 observed=runtime.inventory(logical)
                 if observed['digest']!=bundle['plan'][field]:
@@ -59,10 +60,15 @@ class LinuxChannels(installer.LinuxHost):
                 for relative in observed['dirs']+list(observed['files']):
                     if (Path(logical)/relative).stat().st_mode & 0o222:
                         return False
+                measured[logical]=observed
+            # Presence is not enough: each dispatcher must be a file of the
+            # measured source tree, so its bytes are bound by the pinned digest.
+            lib='/opt/ameesh-release/lib'
             for dispatcher in bundle['dispatchers'].values():
-                runtime.trusted(dispatcher)
-                if not Path(dispatcher).is_file():
+                relative=str(Path(dispatcher).relative_to(lib))
+                if relative not in measured[lib]['files']:
                     return False
+                runtime.trusted(dispatcher)
         except Exception:
             return False
         return True

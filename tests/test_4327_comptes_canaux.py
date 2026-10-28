@@ -208,6 +208,25 @@ class LinuxChannelsTest(unittest.TestCase):
             self.assertFalse(host.trees_ready(bundle))
         self.assertEqual(calls,[])
 
+    def test_dispatchers_must_belong_to_the_measured_source_tree(self):
+        bundle=delegation.render(plan(),account_ids=IDS)
+        host,calls=self.host(lambda args:'')
+        def inventory(files):
+            def measured(logical):
+                field='runtime_tree_sha256' if logical.endswith('runtime') else 'source_tree_sha256'
+                return dict(digest=bundle['plan'][field],dirs=[],
+                            files={} if logical.endswith('runtime') else dict.fromkeys(files,'0'*64))
+            return measured
+        trusted=mock.patch.object(adapter_mod.runtime,'trusted',side_effect=lambda path:path)
+        # Read-only measured files (the fixture never touches the real /opt).
+        readonly=mock.patch.object(adapter_mod.Path,'stat',return_value=os.stat_result((0o100444,)+(0,)*9))
+        with trusted,readonly,mock.patch.object(adapter_mod.runtime,'inventory',
+                                       side_effect=inventory(['hote-handoff.py','hote-secrets.py'])):
+            self.assertTrue(host.trees_ready(bundle))
+        with trusted,readonly,mock.patch.object(adapter_mod.runtime,'inventory',
+                                                side_effect=inventory(['hote-secrets.py'])):
+            self.assertFalse(host.trees_ready(bundle))
+
 
 class Fixture:
     def setUp(self):
@@ -278,7 +297,11 @@ class BackendChannelTest(Fixture,unittest.TestCase):
 
     def test_dry_run_renders_the_exact_channel_plan_without_any_effect(self):
         before=tree_state(self.root)
-        result=self.backend.plan(self.operation,7,authority=self.authority,revoke_authority=self.authority)
+        refused=AssertionError('dry run must not execute')
+        with mock.patch.object(adapter_mod.ChannelHostAdapter,'perform',side_effect=refused), \
+                mock.patch.object(channels,'run',side_effect=refused), \
+                mock.patch.object(channels.release,'_run',side_effect=refused):
+            result=self.backend.plan(self.operation,7,authority=self.authority,revoke_authority=self.authority)
         self.assertEqual(tree_state(self.root),before)
         self.assertFalse((self.root/'var/lib/ameesh-release-bootstrap/.admin/effects').exists())
         self.assertEqual(result['delegation'],'canaux'); self.assertTrue(result['authorized'])
