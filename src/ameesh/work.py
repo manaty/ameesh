@@ -2784,6 +2784,20 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             return {"id": int(item_id), "result": "refused", "item": item,
                     "detail": "lot closed (%s): merge seen%s, not reopened"
                               % (item.get("close_reason"), " (%s)" % pr_ref if pr_ref else "")}
+        release_landed = None
+        if landed is None and item.get("migration") is not None:
+            # #4100 : un paquet qui a renuméroté la migration ; le créneau
+            # atterri suit le numéro posé, ou l'ancien est relâché — la note
+            # le dit
+            probe = _landing_probe(db, item, item["migration"], item.get("migration_repo"),
+                                   sha, repo, getattr(db, "cfg", None))
+            if probe is not None:
+                if "landed" in probe:
+                    landed = (probe["landed"], probe["repo"])
+                else:
+                    release_landed = (probe["release"], probe["repo"])
+                mention = _landing_note(probe, item["migration"])
+                extra = "%s — %s" % (extra, mention) if extra else mention
         note = "merge %s%s%s%s%s" % (
             "declared" if declared else "seen",
             " by %s" % source if source else "", " — %s" % pr_ref if pr_ref else "",
@@ -2831,7 +2845,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                 row = storage.of(tx).work.close_merged(
                     item_id, current=state, sha=sha, actor=actor, note=closure_note,
                     pr_ref=pr_ref, frozen_id=frozen_id, landed=landed,
-                    unfrozen=unfrozen)
+                    unfrozen=unfrozen, release_landed=release_landed)
                 if row is not None:
                     _notify_released(tx, item_id, blocker_state="merged",
                                      after_commit=threads)
@@ -3184,6 +3198,11 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
         landed = (number, landed_repo)
     if landed is not None and item["state"] in MERGED_STATES:
         return _record_landed(db, item, landed, actor=actor, cfg=cfg)
+    if landed is None and item["state"] in MERGED_STATES and (repo or "").strip() and text:
+        # #4100 : rattrapage d'un lot fusionné avant le suivi automatique
+        repaired = _repair_landing(db, item, text, repo.strip(), actor=actor, cfg=cfg)
+        if repaired is not None:
+            return repaired
     extra = (note or "").strip()
     if landed is not None:
         mention = "migration %s landed" % migration_layout(
@@ -3243,6 +3262,156 @@ def _landed_number(number) -> int:
     if not 1 <= value <= 9999:
         raise WorkError("migration number outside 0001-9999: %s" % number)
     return value
+
+
+def _landing_probe(db: Db, item: dict, reserved, slug, sha: str, repo: str | None,
+                   cfg=None) -> dict | None:
+    """#4100 : le numéro qu'un paquet a réellement posé pour la migration
+    réservée `reserved` (dépôt `slug`) du lot, lu dans le clone `repo`.
+
+    Le constat de fusion d'un balayage (paquet fermé par `sync-packets`,
+    branche entrée dans sa cible par `sync-branches`) ne déclare pas
+    `migration_landed` : le créneau atterrissait au numéro réservé, même quand
+    le paquet l'avait renuméroté (#4062 600 → 595, #4079 602 → 599). Le fichier
+    `<N>_<nom>.sql` du lot est lu au commit vu (`sha`) ; s'il est sur la cible
+    tel quel, rien à faire (None). Sinon la cible est cherchée par le nom après
+    le numéro, puis, à défaut, par l'empreinte du contenu (blob) :
+    - un seul candidat M → `{"landed": M, "repo": slug, "how": …}` ;
+    - aucun, plusieurs, ou M déjà nommé par un autre lot →
+      `{"release": N, "repo": slug, "why": …}` : l'ancien numéro est relâché,
+      jamais deviné.
+    Une lecture impossible (autre dépôt, commit ou cible illisible) rend None :
+    le constat de fusion n'en dépend jamais."""
+    from . import migrations
+
+    if reserved is None or not slug or not repo or not sha:
+        return None
+    reserved = int(reserved)
+    try:
+        target = _migration_target(item, repo, cfg)
+        layout = migrations.layout_for(slug, cfg)
+        if not target:
+            return None
+        origin = migrations.origin_repo(repo)
+        if layout is None or not origin or origin.lower() != str(slug).lower():
+            return None
+        if not migrations._git(repo, "rev-parse", "--verify", "--quiet",
+                               "%s^{commit}" % sha).strip():
+            return None
+        resolved = migrations.target_commit(repo, target)
+        if resolved is None:
+            return None
+        present = migrations.tree_files(repo, layout, resolved[1])
+        # les fichiers du lot : ceux que la cible n'avait pas quand le lot y
+        # est entré (premier parent du commit de fusion sur la ligne de la
+        # cible ; la base commune pour une composition ou un squash)
+        base = _merge_base_before(repo, sha, resolved[1])
+        before = migrations.tree_files(repo, layout, base) if base else {}
+        ours = {name: blob for name, blob in migrations.tree_files(repo, layout, sha).items()
+                if int(migrations._REPO_FILE_RE.match(name).group(1)) == reserved
+                and name not in before}
+        if any(name in present for name in ours):
+            return None
+
+        def number(name: str) -> int:
+            return int(migrations._REPO_FILE_RE.match(name).group(1))
+
+        def rest(name: str) -> str:
+            return name[migrations._REPO_FILE_RE.match(name).end():]
+
+        on_target = {number(name) for name in present}
+        if not ours:
+            if reserved in on_target:
+                return None   # le numéro porte un autre fichier : rien à dire
+            return {"release": reserved, "repo": slug,
+                    "why": "no file %s_* in commit %s nor on %s" % (reserved, sha[:12], target)}
+        if len(ours) > 1:
+            return {"release": reserved, "repo": slug,
+                    "why": "several files numbered %s in commit %s" % (reserved, sha[:12])}
+        (name, blob), = ours.items()
+        how = "name"
+        found = {number(other) for other in present
+                 if rest(other) == rest(name) and number(other) != reserved}
+        if not found:
+            how = "content"
+            found = {number(other) for other, other_blob in present.items()
+                     if other_blob == blob and number(other) != reserved}
+        if len(found) != 1:
+            return {"release": reserved, "repo": slug,
+                    "why": "%s absent from %s, %s" % (
+                        name, target, "no renumbered match" if not found else
+                        "ambiguous matches %s" % ", ".join(str(n) for n in sorted(found)))}
+        landed = found.pop()
+        holder = storage.of(db).work.migration_landed_holder(landed, slug)
+        if holder is not None and int(holder["id"]) != int(item["id"]):
+            return {"release": reserved, "repo": slug,
+                    "why": "%s absent from %s, %s already landed by #%s" % (
+                        name, target, landed, holder["id"])}
+        return {"landed": landed, "repo": slug,
+                "how": "%s → %s (by %s)" % (name, landed, how)}
+    except (OSError, ValueError, AttributeError, RuntimeError):
+        return None
+
+
+def _repair_landing(db: Db, item: dict, sha: str, repo: str, *, actor: str,
+                    cfg=None) -> dict | None:
+    """#4100 : un lot déjà fusionné dont le créneau atterri tient encore le
+    numéro réservé (fusion constatée avant le suivi automatique) passe par le
+    même relevé que la fermeture : numéro posé enregistré, ou ancien numéro
+    relâché, journalisé. None quand il n'y a rien à dire (numéro atterri déjà
+    déclaré, aucun créneau atterri, fichier posé tel quel, lecture impossible)."""
+    if item.get("migration_landed") is not None:
+        return None
+    slot = storage.of(db).work.landed_slot(int(item["id"]))
+    if slot is None:
+        return None
+    probe = _landing_probe(db, item, slot["number"], slot["repo"], sha, repo, cfg)
+    if probe is None:
+        return None
+    if "landed" in probe:
+        return _record_landed(
+            db, dict(item, migration=slot["number"], migration_repo=slot["repo"]),
+            (probe["landed"], probe["repo"]), actor=actor, cfg=cfg)
+    note = _landing_note(probe, slot["number"])
+    row = storage.of(db).work.release_landed_slot(int(item["id"]), probe["release"],
+                                                  probe["repo"], note=note, actor=actor)
+    if row is None:
+        return None
+    return {"id": int(item["id"]), "result": "landed", "item": row, "detail": note}
+
+
+def _merge_base_before(repo: str, sha: str, target: str) -> str:
+    """#4100 : la tête de la cible juste avant l'entrée de `sha` — la base
+    commune quand `sha` n'est pas ancêtre (composition, squash), sinon la base
+    avec le premier parent du commit qui l'a fait entrer sur la ligne de
+    premier parent de la cible. Vide si illisible."""
+    from . import migrations
+
+    if not _is_ancestor(repo, sha, target):
+        return migrations._git(repo, "merge-base", sha, target).strip()
+    line = migrations._git(repo, "rev-list", "--first-parent", "--ancestry-path",
+                           "%s..%s" % (sha, target)).split()
+    if not line:
+        return ""
+    return migrations._git(repo, "merge-base", "%s^1" % line[-1], sha).strip()
+
+
+def _is_ancestor(repo: str, sha: str, target: str) -> bool:
+    import subprocess
+
+    try:
+        return subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", sha, target],
+                              capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _landing_note(probe: dict, reserved) -> str:
+    """#4100 : la ligne de journal du numéro suivi ou relâché."""
+    if "landed" in probe:
+        return "migration %s landed (reserved %s, renumbered: %s)" % (
+            probe["landed"], reserved, probe["how"])
+    return "migration %s released (not landed: %s)" % (probe["release"], probe["why"])
 
 
 def _landed_repo(item: dict, cfg=None) -> str:
