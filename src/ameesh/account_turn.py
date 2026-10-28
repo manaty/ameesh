@@ -129,9 +129,14 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None)
     # Le cooldown et le plafond de tours actifs sont lus en base, donc sur
     # tous les hôtes ; l'agent en cours est exclu du compte (il ne se bloque
     # pas lui-même au moment de choisir).
-    raison_courte = account_window.reason(
+    raison_courte, levee = account_window.reason_and_lift(
         worker.db, harness, choice.profile.name, exclude_agent=worker.name,
         profile=choice.profile)
+    if levee is not None:
+        # #3218 : le worker se réveille à la levée, pas au sondage suivant
+        note = getattr(worker, "note_due_at", None)
+        if note is not None:
+            note(levee)
     log_choice(worker, harness, choice)
     worker._account = choice.profile
     if raison_courte:

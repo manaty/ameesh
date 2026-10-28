@@ -437,6 +437,7 @@
               "lot.updated",
               "turn.started",
               "turn.ended",
+              "turn.stages",
               "agent.updated",
               "agent.moved",
               "cost.recorded",

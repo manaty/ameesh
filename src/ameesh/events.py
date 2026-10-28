@@ -12,6 +12,9 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
   lot.updated          a lot's transition, note or assignment (work_item_events)
   turn.started         an agent goes `running`
   turn.ended           an agent leaves `running`
+  turn.stages          the stage receipt of a mail turn: per-stage timestamps
+                       and durations from the message to the harness's first
+                       output (#3218, written by the runner, `turn_stages`)
   agent.updated        another change of status, lease, mode or stop reason
   agent.moved          a manual move of a `releve: hote` agent to another
                        admitted host (#3299, written with the move)
@@ -76,7 +79,8 @@ import time
 from . import storage
 
 CHANNEL = "ameesh_events"
-TYPES = ("lot.updated", "turn.started", "turn.ended", "agent.updated", "agent.moved",
+TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages", "agent.updated",
+         "agent.moved",
          "cost.recorded", "thread.entry", "decision.created", "decision.closed",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
          "alert.resolved", "pilot.gesture", "staging.attested")
