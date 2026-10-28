@@ -59,8 +59,14 @@ auteurs, avec les mêmes exceptions du canon §2 :
 * un ancien commit sans reçu et sans attribution ne bloque plus quand son
   contenu a disparu, ou quand le même auteur l'a réémis avec reçu exact et
   patch-id verbatim identique dans la plage courante (#3301, constat
-  mesh-design du 24/10/2026 sur #3033). Cela ne crée aucun reçu tardif et ne
-  retire jamais un auteur historique prouvé ;
+  mesh-design du 24/10/2026 sur #3033). #4387 : la réémission, par l'**auteur
+  de référence** de la tête, de la **tête d'un gel antérieur écrite par
+  l'acteur de ce gel** et sortie de l'histoire (« correctif de relecteur
+  réécrit par l'auteur », canon §2) vaut aussi, à patch-id verbatim identique
+  et reçu exact ; un autre auteur ne peut toujours pas officialiser le patch
+  d'un tiers, et un commit tiers de la plage antérieure qui survit garde son
+  inconnu. Cela ne crée aucun reçu tardif et ne retire jamais un auteur
+  historique prouvé ;
 * quand le reçu exact manque (commit restauré par rebase, correction poussée
   hors du hook), le commit est attribué à la famille de session de son
   committer, lue au journal des tours (`turn_costs`, `_turns_harness`) : un
@@ -3181,6 +3187,37 @@ def _received_patch_authors(db, repo: str, commits: Sequence[str], families,
     return out
 
 
+def _received_patch_ids(db, repo: str, commits: Sequence[str],
+                        cache: dict, *, actor: str, provider=None) -> set:
+    """Les patch-id réémis verbatim par `actor` avec un reçu exact (#4387).
+
+    Même preuve que [`_received_patch_authors`] : le reçu nomme l'acteur et
+    l'auteur Git du commit est cet acteur — un reçu de committer ne prouve pas
+    l'auteur Git. Sert à l'exception du canon §2 (tête d'un gel antérieur
+    réécrite par l'auteur de la lecture, commit retiré et cité) : le patch de
+    l'ancienne tête réémis par la référence avec son propre reçu n'est plus un
+    inconnu. Un `actor` vide ne prouve rien : aucun acteur anonyme
+    n'officialise un patch.
+    """
+    wanted = str(actor or "").strip().casefold()
+    out: set = set()
+    if not wanted or db is None or not repo:
+        return out
+    for sha in commits or ():
+        try:
+            receipt = _commit_receipt(provider, db, sha, strict=True)
+        except review_provenance.ProvenanceError:
+            continue                    # une preuve invalide n'excuse rien
+        if not receipt:
+            continue
+        if str(receipt.get("actor") or "").strip().casefold() != wanted:
+            continue
+        pair = _authored_patch(db, repo, sha, cache)
+        if pair and pair[0] == wanted:
+            out.add(pair[1])
+    return out
+
+
 def _prior_correctors(repo: str, review_commits: Mapping, project: str = "") -> dict:
     """Les correctifs de premier tour d'un gel antérieur, par acteur.
 
@@ -3454,7 +3491,8 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            recover=None, admitted_heads=(),
                            exclusions_out: Optional[list] = None,
                            commits_out: Optional[dict] = None,
-                           fetch: bool = True) -> tuple[list, list, list]:
+                           fetch: bool = True,
+                           reference_name: str = "") -> tuple[list, list, list]:
     """Auteurs/correcteurs des gels antérieurs dont le contenu subsiste (#2924).
 
     Rend `(auteurs, inconnus, correcteurs)` à fusionner dans la lecture de la
@@ -3493,6 +3531,15 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     patch-id verbatim dans la plage courante. Cela n'atteste jamais le vieux
     committer et ne retire aucun auteur déjà prouvé ; une contradiction reste
     refusée. Un contenu prouvé disparu n'ajoute plus d'inconnu non plus.
+
+    #4387 : `reference_name` est l'auteur de référence de la tête lue. La
+    **tête** d'un gel antérieur sans reçu, **écrite par l'acteur du gel** et
+    sortie de l'histoire, réémise à patch-id verbatim identique **par cette
+    référence** avec son reçu exact dans la plage courante, ne reste pas
+    inconnue : c'est le geste du canon §2 (le correctif d'un relecteur est
+    réécrit par l'auteur, le commit retiré et cité). Un commit tiers de la
+    plage antérieure garde son inconnu (#2721), et la même réémission par un
+    autre acteur ne vaut rien (#3301).
     #3116 : `target` est la cible au moment de la lecture (un commit ou une
     ref). Un commit qui y est déjà entré a été relu sous son propre lot : il ne
     compte ni comme auteur ni comme tiers, même s'il apparaît dans la plage
@@ -3581,9 +3628,28 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     file_cache: dict = {}
     patch_cache: dict = {}
     received_patches = None
+    reference_patches = None
     delivered, delivered_read = None, False
 
-    def obsolete_missing(commit: str, *, stored: bool) -> bool:
+    def reemitted_by_reference(patch: str) -> bool:
+        """#4387 : ce patch a-t-il été réémis par l'auteur de référence ?
+
+        Seul le geste du canon §2 (correctif de relecteur réécrit par
+        l'auteur) dispense un inconnu ; `_received_patch_ids` exige le reçu
+        exact de la référence et son auteur Git. Un patch absent ou un acteur
+        vide ne dispense rien.
+        """
+        nonlocal reference_patches
+        if not reference_name or not patch:
+            return False
+        if reference_patches is None:
+            reference_patches = _received_patch_ids(
+                db, repo, commits, patch_cache,
+                actor=reference_name, provider=provider)
+        return patch in reference_patches
+
+    def obsolete_missing(commit: str, *, stored: bool, freeze_head: str,
+                         freeze_actor: str) -> bool:
         nonlocal received_patches
         if plan_git.full_commit_id(commit) in current_set:
             return False                # aucune dispense de la plage courante
@@ -3599,7 +3665,20 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         if received_patches is None:
             received_patches = _received_patch_authors(
                 db, repo, commits, families, patch_cache, provider=provider)
-        return pair in received_patches
+        if pair in received_patches:
+            return True
+        # #4387 : la réémission par la référence ne vaut que pour la **tête**
+        # d'un gel antérieur, écrite par l'acteur de ce gel, sortie de
+        # l'histoire. Un commit tiers de la plage antérieure que l'auteur
+        # recopierait garde son inconnu (contenu tiers qui survit, #2721/
+        # #3116), et un ancêtre de la tête garde sa lecture d'ascendance.
+        if not plan_git.same_commit(commit, freeze_head):
+            return False
+        if str(freeze_actor or "").strip().casefold() != pair[0]:
+            return False
+        if _is_ancestor(repo, commit, head_sha) is not False:
+            return False
+        return reemitted_by_reference(pair[1])
 
     def survives(written: Mapping, stored: bool, actor: str, *,
                  every: bool = False, content: bool = False) -> bool:
@@ -3873,7 +3952,9 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                 provider=provider, strict=strict, target=target_sha,
                 head=head_sha, base=base, cache=file_cache,
                 ignore_unknown=ignore_unknown,
-                ignore_missing=lambda commit: obsolete_missing(commit, stored=stored))
+                ignore_missing=lambda commit: obsolete_missing(
+                    commit, stored=stored, freeze_head=sha,
+                    freeze_actor=str(row.get("actor") or "")))
         except Exception as exc:  # noqa: BLE001 - un gel antérieur illisible
             access = at_ref(sha)
             if strict:
@@ -4308,7 +4389,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         db, item, milestone, commits, repo, families, base=base, head=head,
         provider=provider, strict=strict, target=target_sha, recover=recover,
         admitted_heads=admitted_heads, exclusions_out=exclusions_out,
-        commits_out=commits_out, fetch=fetch)
+        commits_out=commits_out, fetch=fetch, reference_name=author_name)
     unknown.extend(carried_unknown)
     for row in carried:
         values = row.get("families")
