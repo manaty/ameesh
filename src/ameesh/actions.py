@@ -77,6 +77,7 @@ from . import db as db_mod
 from . import authority, fil, jcs, receipts, storage, work
 from .connectors import ACTION_CLASSES, SEVERITY, Action, ConnectorError, Outcome
 from .db import Db, DbError
+from .modules import registry
 
 STATES = ("proposed", "approved", "launched", "confirmed", "failed", "unknown", "cancelled")
 TERMINAL = ("confirmed", "cancelled")
@@ -433,14 +434,14 @@ def _close_lot_on_merge(db: Db, action_id: str, by: str) -> None:
     l'action est déjà enregistrée, la fermeture du lot est une conséquence."""
     try:
         action = get(db, action_id)
-        if action is None or action.get("connector") != work.delivery_connector() \
+        merge = registry.merge_connector()
+        if action is None or action.get("connector") != merge \
                 or action.get("state") != "confirmed" or not action.get("work_item"):
             return
-        from . import work as work_mod
-        done = work_mod.close_merged(
-            db, int(action["work_item"]), sha=action.get("external_ref") or "",
-            actor=action.get("auth_approver") or by or work.delivery_connector(),
-            source="the gate (action %s)" % action_id, pr_ref=action.get("target"))
+        # L99 T2 (#4350) : la livraison passe par le verbe unique ; le
+        # connecteur relit l'action confirmée comme preuve.
+        done = work.deliver(db, int(action["work_item"]), connector=merge,
+                            evidence={"action": action_id}, actor=by)
         if done["result"] == "refused":
             fil.warn("work item #%s: %s" % (action["work_item"], done["detail"]))
     except Exception as exc:  # noqa: BLE001 - conséquence, jamais un obstacle

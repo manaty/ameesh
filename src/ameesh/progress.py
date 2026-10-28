@@ -68,6 +68,7 @@ import time
 from typing import Iterable
 
 from . import work_lifecycle as lifecycle
+from .modules import registry
 from . import config as config_mod
 from . import cost as cost_mod
 from . import db as db_mod
@@ -109,7 +110,7 @@ _FR_AGENT = {"working": "working", "idle": "idle", "paused": "paused",
              "stopped": "stopped"}
 
 #: connecteur de fusion (L5) : son approbation vaut verdict, sa confirmation fusion
-MERGE_CONNECTOR = lifecycle.delivery_connector()
+MERGE_CONNECTOR = registry.merge_connector()
 _WAITING = lifecycle.WAITING
 
 #: ce que la vue ne sait pas encore lire (dit dans le JSON, jamais deviné)

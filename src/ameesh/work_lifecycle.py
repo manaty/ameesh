@@ -5,7 +5,8 @@ Values remain the persisted v1 spellings. L99 T1 (#4349) adds the generic
 names as aliases: `canonical` returns the persisted spelling and
 `lifecycle_name` the generic one. TERMINAL means no further normal
 transition is allowed; COMPLETED means the task no longer needs production
-work. A recorded delivery can still be promoted, so those groups differ.
+work. A recorded delivery can still be promoted, so those groups differ. Delivery
+connectors are read from the module registry (L99 T2, `work.deliver`).
 """
 from __future__ import annotations
 
@@ -65,8 +66,3 @@ def lifecycle_name(state: str) -> str:
     """Le nom générique du cycle de vie d'un état, quelle que soit son
     orthographe (L99 T1)."""
     return GENERIC_NAMES[canonical(state)]
-
-
-def delivery_connector() -> str:
-    """Compatibility default; module selection will replace this in L98/L100."""
-    return "git-merge"

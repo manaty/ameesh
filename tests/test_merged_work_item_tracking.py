@@ -107,7 +107,7 @@ class MergedCommandTest(_Base):
             note = work.events(self.db, lot["id"])[0]
             self.assertEqual(note["actor"], "claude1")
             self.assertEqual(note["note"], "merge declared by claude1 (commit %s) — fusion "
-                                           "locale sur develop" % sha[:12])
+                                           "locale sur develop [via git-merge]" % sha[:12])
 
     def test_idempotent_et_jamais_de_reouverture(self):
         lot = work.add(self.db, title="lot")
