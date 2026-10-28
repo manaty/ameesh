@@ -62,11 +62,12 @@ auteurs, avec les mêmes exceptions du canon §2 :
   mesh-design du 24/10/2026 sur #3033). #4387 : la réémission, par l'**auteur
   de référence** de la tête, de la **tête d'un gel antérieur écrite par
   l'acteur de ce gel** et sortie de l'histoire (« correctif de relecteur
-  réécrit par l'auteur », canon §2) vaut aussi, à patch-id verbatim identique
-  et reçu exact ; un autre auteur ne peut toujours pas officialiser le patch
-  d'un tiers, et un commit tiers de la plage antérieure qui survit garde son
-  inconnu. Cela ne crée aucun reçu tardif et ne retire jamais un auteur
-  historique prouvé ;
+  réécrit par l'auteur », canon §2, **petit et sans conception**) vaut aussi,
+  à patch-id verbatim identique et reçu exact ; l'acteur reste correcteur
+  exclu par son nom, sa famille redevient éligible. Un autre auteur ne peut
+  toujours pas officialiser le patch d'un tiers, et un commit tiers de la
+  plage antérieure qui survit garde son inconnu. Cela ne crée aucun reçu
+  tardif et ne retire jamais un auteur historique prouvé ;
 * quand le reçu exact manque (commit restauré par rebase, correction poussée
   hors du hook), le commit est attribué à la famille de session de son
   committer, lue au journal des tours (`turn_costs`, `_turns_harness`) : un
@@ -3537,9 +3538,11 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     sortie de l'histoire, réémise à patch-id verbatim identique **par cette
     référence** avec son reçu exact dans la plage courante, ne reste pas
     inconnue : c'est le geste du canon §2 (le correctif d'un relecteur est
-    réécrit par l'auteur, le commit retiré et cité). Un commit tiers de la
-    plage antérieure garde son inconnu (#2721), et la même réémission par un
-    autre acteur ne vaut rien (#3301).
+    réécrit par l'auteur, le commit retiré et cité). Le §2 borne le geste au
+    **petit** correctif sans conception (`REVIEWER_FIX_LINES`) et exclut le
+    correcteur **par son nom**, famille éligible. Un commit tiers de la plage
+    antérieure garde son inconnu (#2721), et la même réémission par un autre
+    acteur ne vaut rien (#3301).
     #3116 : `target` est la cible au moment de la lecture (un commit ou une
     ref). Un commit qui y est déjà entré a été relu sous son propre lot : il ne
     compte ni comme auteur ni comme tiers, même s'il apparaît dans la plage
@@ -3622,6 +3625,10 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     current_set = {plan_git.full_commit_id(value) for value in commits or ()}
     carried: dict[str, set] = {}
     correctors: dict[str, dict] = {}
+    # #4387 (avis auditeur B1) : les acteurs des têtes de gel dispensées
+    # restent exclus nominalement du choix des relecteurs (§2) ; leur famille
+    # n'est pas exclue (le correctif est repris par l'auteur).
+    dispensed: set[str] = set()
     unknown: list[str] = []
     processed: list[str] = []
     survival: dict[str, bool] = {}
@@ -3678,7 +3685,16 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             return False
         if _is_ancestor(repo, commit, head_sha) is not False:
             return False
-        return reemitted_by_reference(pair[1])
+        # Le §2 ne permet à l'auteur de reprendre qu'un **petit** correctif
+        # (même seuil que `_prior_correctors`) : une tête de gel plus grosse
+        # ou de conception garde son inconnu (avis auditeur B2).
+        measured = change(repo, commit)
+        if measured is None or measured[1] or measured[0] > REVIEWER_FIX_LINES:
+            return False
+        if not reemitted_by_reference(pair[1]):
+            return False
+        dispensed.add(str(freeze_actor).strip())
+        return True
 
     def survives(written: Mapping, stored: bool, actor: str, *,
                  every: bool = False, content: bool = False) -> bool:
@@ -4053,6 +4069,12 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                 if name in correctors and not correctors[name].get("test_only"):
                     row.pop("test_only", None)
                 correctors[name] = row
+    # #4387 (avis auditeur B1) : l'acteur d'une tête de gel dispensée est un
+    # correcteur du §2, exclu **par son nom** seulement ; sa famille reste
+    # éligible. Une trace déjà connue garde sa famille (ne pas l'effacer).
+    for name in sorted(dispensed):
+        correctors.setdefault(name, {"name": name, "family": "",
+                                     "families": []})
     authors = []
     for actor in sorted(carried):
         proven = {value for value in carried[actor] if value}
