@@ -191,7 +191,7 @@ def agent_rows(cfg: Config, db) -> list:
     return _annotate_agents(cfg, db, rows)
 
 
-def agent_detail(db, name: str, *, cfg=None) -> dict | None:
+def agent_detail(db, name: str, *, cfg=None, footprint: bool = False) -> dict | None:
     """The object of `ameesh show --json` (also `GET /api/v1/agents/{a}`)."""
     # L61 : la ligne et la clé en un seul aller-retour (db.batched)
     row, info = db_mod.batched(db, lambda db: (
@@ -210,7 +210,11 @@ def agent_detail(db, name: str, *, cfg=None) -> dict | None:
     row["key_revoked_ts"] = (info or {}).get("key_revoked_ts")
     row["footprint"] = None
     row["footprint_unavailable"] = None
-    if cfg is not None and row.get("host"):
+    # #4375 : l'empreinte de l'hôte (#4150) coûte ~15 s (host_idle.snapshot :
+    # ~170 requêtes et le canon rechargé) ; `show` est lu par vm.sh sous une
+    # borne de 30 s et par les runners. Elle n'est calculée que sur demande ;
+    # `ameesh hosts` la porte.
+    if footprint and cfg is not None and row.get("host"):
         from . import host_idle, resources, canon as canon_mod
         try:
             readings = {r["host"]: r for r in resources.current(db, row["host"])}
