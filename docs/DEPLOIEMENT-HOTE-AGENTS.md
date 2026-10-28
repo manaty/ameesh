@@ -151,8 +151,14 @@ normale du §11, consignée en WARNING (reprise locale non concluante) sans
 retour arrière. Une réservation `@restart` écrite par l’exécuteur arrêté
 n’y change rien : un hôte encore sur l’ancien code l’ignore et elle expire
 en 90 s. L’échec tient si aucun autre hôte candidat ne détient un bail
-vivant au moment du contrôle. En cas d’échec, la commande indique l’unité et la commande
-`journalctl --user` à lancer sous `ameesh` sur la VM.
+vivant au moment du contrôle. Une persona dont l’unité est désactivée
+(`UnitFileState=disabled` ou `masked`, résident expérimental) n’a pas
+d’exécuteur actif attendu : le contrôle et le redémarrage la classent hors
+périmètre, sans exiger de bail et sans relancer son unité. Un agent retiré
+du registre (`retired_ts` dans `ameesh list`) est également hors périmètre.
+Une unité absente ou illisible reste une erreur. En cas d’échec, la commande
+indique l’unité et la commande `journalctl --user` à lancer sous `ameesh`
+sur la VM.
 
 ## Installer une révision gelée, revenir en arrière
 

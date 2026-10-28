@@ -487,6 +487,11 @@ names = set()
 for r in rows:
     if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute":
         continue
+    # #4239 : un agent retire du registre (resident experimental, cas
+    # pilot-resident-4064) sort du staging ; ameesh list le montre encore
+    # avec retired_ts.
+    if r.get("retired_ts"):
+        continue
     if r.get("status") == "stopped" and not avec_arretes:
         continue
     name = r.get("name")
@@ -501,6 +506,16 @@ print("\n".join(names))' "$HOTE_AGENTS" "$arretes") || return 1
 }
 
 unite_agents() { printf 'ameesh-runner-agent@%s.service' "$1"; }
+# #4239 : une unité désactivée (résident expérimental, persona hors service)
+# n'a aucun exécuteur actif attendu. Le staging la classe hors périmètre : il
+# n'exige ni bail ni unité active et ne la relance pas. Une unité absente ou
+# illisible reste une erreur : seul l'état `disabled`/`masked` est reconnu.
+unite_hors_perimetre() {  # persona
+  local etat
+  etat=$(utilisateur_agents systemctl --user show -p UnitFileState --value \
+    "$(unite_agents "$1")" 2>/dev/null) || return 1
+  [ "$etat" = disabled ] || [ "$etat" = masked ]
+}
 echec_agent() {
   echo "$1 : $2 — journalctl --user -u $(unite_agents "$1") -n 50 (utilisateur ameesh sur $AGENTS_SSH)" >&2
 }
@@ -1060,6 +1075,17 @@ redemarrer_agents() {
       # Ne jamais poser le drain suivant tant que le précédent reste suivi.
       # Le trap réconcilie et rapporte toute pause restante, même sur échec.
       exiger_drain_precedent_leve "$p" || return 1
+      # #4239 : relire le placement et écarter une unité désactivée avant
+      # toute pause (résident expérimental, aucun exécuteur actif attendu).
+      etat=$(etat_agent "$p") || return 1
+      IFS='|' read -r st deja_pause detail <<<"$etat"
+      if [ "$st" = skip ]; then
+        echo "$p : déplacé ou mode non execute ($detail), ignoré"; continue
+      fi
+      if unite_hors_perimetre "$p"; then
+        echo "$p : unité désactivée, aucun exécuteur à relancer — hors périmètre"
+        continue
+      fi
       preparer_drain "$p" || return 1
       drain_est_indisponible "$p" && continue
       # Le placement peut changer : relire avant de toucher une unité que cet
@@ -1566,6 +1592,12 @@ controler_agents() {
   noms=$(agents_du_registre) || return 1
   while IFS= read -r p; do
     etape "$p"
+    # #4239 : une unité désactivée (résident expérimental) n'a pas d'exécuteur
+    # actif attendu : hors périmètre, ni unité active ni bail exigés.
+    if unite_hors_perimetre "$p"; then
+      echo "$p : unité désactivée, aucun exécuteur actif attendu — hors périmètre"
+      continue
+    fi
     utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")" \
       && utilisateur_agents journalctl --user -u "$(unite_agents "$p")" -n 15 --no-pager \
       || { echec_agent "$p" "unité inactive ou journal inaccessible"; echec=1; }

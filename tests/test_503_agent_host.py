@@ -133,6 +133,10 @@ elif sys.argv[1] == 'show':
         (state / 'levee-humaine').touch()
     if scenario == 'expired': row['lease_expires_ts'] = time.time()-1
     if scenario == 'no-lease': row['lease_owner'] = None
+    # #4239 : résident expérimental sans bail, unité désactivée.
+    if scenario == 'resident-sans-bail' and name == 'pilot-resident':
+        row['lease_owner'] = None; row['lease_epoch'] = 0
+        row['lease_expires_ts'] = None
     if scenario == 'foreign-owner': row['lease_owner'] = 'another-runner'
     if scenario == 'default-owner':
         # #3311 : le propriétaire par défaut est host:MainPID ; le banc fournit
@@ -380,7 +384,10 @@ elif 'restart' in args:
     if scenario == 'restart-error': sys.exit(1)
     (state / ('restart-' + name)).touch()
 elif 'show' in args:
-    if 'ActiveState' in args:
+    if 'UnitFileState' in args:
+        # #4239 : une unité désactivée n'a pas d'exécuteur actif attendu.
+        print('disabled' if (state / ('disabled-' + name)).exists() else 'enabled')
+    elif 'ActiveState' in args:
         if (state / ('failed-' + name)).exists(): print('failed')
         else: print('inactive' if stopped() else 'active')
     elif 'MainPID' in args:
@@ -602,7 +609,13 @@ class AgentHostTest(unittest.TestCase):
 
     def units(self):
         path = self.state / 'units.log'
-        return path.read_text() if path.exists() else ''
+        if not path.exists():
+            return ''
+        # #4239 : la sonde `UnitFileState` est une lecture de périmètre, pas
+        # une opération d'unité ; elle ne compte pas dans le journal observé.
+        lignes = [l for l in path.read_text().splitlines()
+                  if 'show -p UnitFileState' not in l]
+        return '\n'.join(lignes) + ('\n' if lignes else '')
 
     def operateur(self):
         """#2152 : les gestes de pause/reprise réellement demandés au CLI."""
@@ -1393,6 +1406,56 @@ class AgentHostTest(unittest.TestCase):
                       ' concluante (sans retour)', p.stdout)
         self.assertIn('contrôles verts', p.stdout)
         self.assertNotIn('bail absent', p.stderr)
+
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
+    def test_disabled_experimental_resident_is_out_of_scope(self):
+        """#4239 : un résident expérimental sans bail et à l'unité désactivée
+        n'a pas d'exécuteur actif attendu ; il ne bloque ni le contrôle
+        préalable ni le redémarrage du staging."""
+        agents = [dict(name=n, host='host-agents', mode='execute', status='idle')
+                  for n in ('dev7', 'dev8', 'dev9', 'pilot-resident')]
+        (self.state / 'disabled-pilot-resident').touch()
+        p = self.run_vm('controler', 'resident-sans-bail', agents=agents)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('pilot-resident : unité désactivée, aucun exécuteur actif'
+                      ' attendu — hors périmètre', p.stdout)
+        self.assertNotIn('pilot-resident : unité inactive', p.stderr)
+        self.assertNotIn('pilot-resident : bail absent', p.stderr)
+        self.assertIn('contrôles verts', p.stdout)
+        p = self.run_vm('redemarrer', 'resident-sans-bail', agents=agents)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('pilot-resident : unité désactivée, aucun exécuteur à'
+                      ' relancer — hors périmètre', p.stdout)
+        self.assertNotIn('--user stop ameesh-runner-agent@pilot-resident.service',
+                         self.units())
+        self.assertNotIn('--user start ameesh-runner-agent@pilot-resident.service',
+                         self.units())
+        starts = self.starts()
+        for n in ('dev7', 'dev8', 'dev9'):
+            self.assertIn('--user start ameesh-runner-agent@%s.service' % n, starts)
+
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
+    def test_retired_agent_is_out_of_scope(self):
+        """#4239 : un agent retiré du registre reste dans `ameesh list` avec
+        `retired_ts` ; le staging ne le mène plus (cas pilot-resident-4064,
+        retiré par le pilote pendant le staging v1.27.0)."""
+        agents = [dict(name=n, host='host-agents', mode='execute', status='idle')
+                  for n in ('dev7', 'dev8', 'dev9')]
+        agents.append(dict(name='pilot-retired', host='host-agents',
+                           mode='execute', status='idle', retired_ts=1.0))
+        p = self.run_vm('controler', agents=agents)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('pilot-retired', p.stdout)
+        self.assertNotIn('pilot-retired', p.stderr)
+        self.assertIn('contrôles verts', p.stdout)
+        p = self.run_vm('redemarrer', agents=agents)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for action in ('stop', 'start'):
+            self.assertNotIn('--user %s ameesh-runner-agent@pilot-retired.service'
+                             % action, self.units())
+        starts = self.starts()
+        for n in ('dev7', 'dev8', 'dev9'):
+            self.assertIn('--user start ameesh-runner-agent@%s.service' % n, starts)
 
     @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_check_visits_every_registered_agent(self):
