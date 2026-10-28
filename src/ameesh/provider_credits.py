@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#4164 — crédits du compte fournisseur : épuisement, garde, alerte, reprise.
 
-Incident OpenAI IMA du 28/10 (~05:28Z, manaty/ameesh#3181) : l'organisation
+Incident fournisseur OpenAI du 28/10 (~05:28Z, manaty/ameesh#3181) : l'organisation
 n'avait plus de crédits prépayés (`429 insufficient_quota`), l'enveloppe
 ameesh affichait 27,6 USD sur 500, et ameesh a continué d'accorder des tours
 qui échouaient tous, sans alerter personne. Une enveloppe de dépense ne voit
