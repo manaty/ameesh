@@ -143,8 +143,32 @@ class ComposeTest(Base):
         self.assertEqual(self.shell.ran("work", "add"), [])
 
     def test_heure_deja_servie(self):
-        self.shell.lists[""] = [dict(carrier(), state="merged", created_ts=NOW - 60)]
-        self.assertIn("déjà créé", ph.tick(self.ctx))
+        # #4171 : un porteur clos sans fusion garde le créneau (pas de
+        # recomposition à chaque tic).
+        for reason in ("abandoned", "superseded"):
+            self.shell.lists[""] = [dict(carrier(), state="closed", close_reason=reason,
+                                         created_ts=NOW - 60)]
+            self.assertIn("déjà créé", ph.tick(self.ctx))
+        self.assertEqual(self.shell.ran("work", "add"), [])
+
+    def test_porteur_fusionne_dans_l_heure_libere_le_creneau(self):
+        # #4171 (décision #154026 a) : fusion vue → le suivant se compose
+        # sans attendre l'heure suivante.
+        for state, reason in (("merged", ""), ("promoted", ""), ("closed", "delivered")):
+            row = dict(carrier(lot=3990), state=state, close_reason=reason,
+                       created_ts=NOW - 60)
+            self.assertFalse(ph.slot_served([row], NOW, ZONE, "ameesh", "main"), state)
+        self.shell.lists[""] = [dict(carrier(lot=3990), state="merged", created_ts=NOW - 60)]
+        self.shell.items[4000] = carrier()
+        self.assertIn("ci-full demandée", ph.tick(self.ctx))
+        self.assertEqual(len(self.shell.ran("work", "add")), 1)
+
+    def test_porteur_ouvert_dans_l_heure_reserve_la_cible(self):
+        self.shell.lists["qa"] = [carrier(lot=3990, created=NOW - 60)]
+        self.shell.lists[""] = [carrier(lot=3990, created=NOW - 60)]
+        self.shell.items[3990] = carrier(lot=3990, created=NOW - 60)
+        ph.tick(self.ctx)
+        self.assertTrue(ph.slot_served(self.shell.lists[""], NOW, ZONE, "ameesh", "main"))
         self.assertEqual(self.shell.ran("work", "add"), [])
 
     def test_reservation_par_un_autre_porteur(self):
