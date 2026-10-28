@@ -126,7 +126,13 @@
       "cpu": 3.0,
       "memory_bytes": 10737418240,
       "disk_bytes": 85899345920
-     }
+     },
+     "reserved_cpu": null,
+     "reserved_mem_bytes": null,
+     "used_cpu": null,
+     "used_mem_bytes": null,
+     "reserved_cpu_source": "machine",
+     "reserved_mem_source": "machine"
     },
     "guard": {
      "kind": "ameesh-guard",

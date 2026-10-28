@@ -1068,6 +1068,49 @@ MEASURE_FIELDS = ("cpu_count", "app_cpu", "guest_cpu", "mem_total_bytes",
                   "tmp_used_bytes", "on_ac", "battery_percent")
 
 
+def footprint(reading: dict | None) -> dict:
+    """#4147: reserved/used capacity, derived only from this host's sample.
+
+    Container limits come from the executor's published cgroup, never from
+    the viewer's machine. An unlimited container resource falls back to the
+    physical machine independently of the other resource. A VM reserves the
+    whole machine even when its runner lives in a bounded systemd slice.
+    CPU usage is in cores (not a percentage); absent counters stay unknown.
+    The sample timestamp is retained: this projection does not prove idleness.
+    """
+    reading = reading or {}
+    cg = reading.get("cgroup") or {}
+    container = cg.get("container") is True
+
+    def nonnegative(value):
+        value = finite_float(value)
+        return value if value is not None and value >= 0 else None
+
+    cpu = nonnegative(reading.get("cpu_count"))
+    memory = parse_bytes(reading.get("mem_total_bytes"))
+    quota = nonnegative(cg.get("cpu_quota")) if container else None
+    ceiling = parse_bytes(cg.get("mem_max_bytes")) if container else None
+    if container:
+        used_cpu = nonnegative(cg.get("cpu_used"))
+        used_memory = parse_bytes(cg.get("mem_current_bytes"))
+    else:
+        used_cpu = nonnegative(reading.get("app_cpu"))
+        guest_cpu = nonnegative(reading.get("guest_cpu"))
+        if used_cpu is not None:
+            used_cpu += guest_cpu or 0.0
+        available = parse_bytes(reading.get("mem_available_bytes"))
+        used_memory = (max(0, memory - available)
+                       if memory is not None and available is not None else None)
+    return {
+        "reserved_cpu": quota if quota is not None else cpu,
+        "reserved_mem_bytes": ceiling if ceiling is not None else memory,
+        "used_cpu": used_cpu,
+        "used_mem_bytes": used_memory,
+        "reserved_cpu_source": "cgroup" if quota is not None else "machine",
+        "reserved_mem_source": "cgroup" if ceiling is not None else "machine",
+    }
+
+
 def measure(reading: dict | None, offer: dict | None = None) -> dict:
     """The common measure of a reading (study L159 §1.4), as the guard
     publishes it in `ameesh-host-state/1` (`measure`) and as `ameesh hosts
@@ -1083,6 +1126,7 @@ def measure(reading: dict | None, offer: dict | None = None) -> dict:
     psi_values = {key: reading.get(column) for key, column in MEASURE_PSI_KEYS}
     out: dict = {"ts": reading.get("sampled_ts"), "window_s": reading.get("cpu_window_s")}
     out.update({key: reading.get(key) for key in MEASURE_FIELDS})
+    out.update(footprint(reading))
     out.update({
         "psi": psi_values if any(v is not None for v in psi_values.values()) else None,
         "app_psi": None,
