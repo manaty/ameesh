@@ -105,6 +105,8 @@ FREEZE_CHECKS_SCRIPT = "scripts/freeze-checks.py"
 DEFAULT_TIMEOUT = 1800
 FREEZE_TIMEOUT = 600
 GIT_TIMEOUT = 300
+#: #4245 : `RESTART_RESERVE_S` (90 s) de l'élection, plus la lecture
+EPOCH_CHECK_TIMEOUT = 150
 #: un rouge local n'est retiré du paquet qu'une fois ; au-delà, un agent lit.
 MAX_RECOMPOSITIONS = 1
 #: #4201 : motif neutre d'un `--exclude` sans `--exclude-reason`. Le vrai motif
@@ -896,8 +898,10 @@ finally:
     if conn is not None:
         conn.close()
 """
+    # #4245 : la garde attend la reprise d'un rôle réservé à cet hôte
+    # (redémarrage d'exécuteur, 90 s au plus) avant de conclure
     proc = run_command([project_python(worktree), "-c", code, str(carrier)],
-                       cwd=worktree, env=python_env(worktree), timeout=30)
+                       cwd=worktree, env=python_env(worktree), timeout=EPOCH_CHECK_TIMEOUT)
     if proc.returncode:
         raise PaquetAutoError("composition interrompue avant la prochaine opération : %s"
                               % _output(proc))

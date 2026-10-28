@@ -41,7 +41,7 @@ with mock.patch.object(auto, 'project_python', return_value='project-python'), \
      mock.patch.dict(auto.os.environ, {'AMEESH_ROLE': 'composer'}):
     auto.check_epoch(4113, Path('.'))
 assert run.call_args.args[0][0] == 'project-python'
-assert run.call_args.kwargs['timeout'] == 30
+assert run.call_args.kwargs['timeout'] == auto.EPOCH_CHECK_TIMEOUT == 150
 assert 'ameesh.db' not in sys.modules
 """
         proc = subprocess.run(['/usr/bin/python3', '-S', '-c', code, str(script)],

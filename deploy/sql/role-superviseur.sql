@@ -255,7 +255,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- 0484 (#3460, décision #135690 a) : retrait d'un agent — un instant,
         -- le nom de qui l'a retiré et la raison de cet état (même nature que
         -- `stop_reason` et `status_text`, pas de contenu)
-        'retired_at', 'retired_by', 'retired_reason'
+        'retired_at', 'retired_by', 'retired_reason',
+        -- #4245 (0503) : lignée de bail au même hôte (un nom d'hôte et une
+        -- époque, même nature que `host` et `lease_epoch`, pas de contenu)
+        'lease_lineage_host', 'lease_lineage_epoch'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',

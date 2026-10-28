@@ -60,11 +60,28 @@ workflow for it. A runner process with neither `AGENT_MAIL_NAME` nor
 `AMEESH_ROLE` passes through too; only a session or a role command opened
 under a lease is fenced.
 
+#4245: an executor restart on the SAME host (the #4086 reservation) moves
+the epoch from E to E+2 without the role ever leaving the host; a timer
+command opened at E (a packet composition, 20 to 60 min) was refused and
+lost its attempt. An `AMEESH_ROLE` command at epoch E is therefore accepted
+at E' > E when the lease's **same-host lineage** covers E: every holder since
+`lease_lineage_epoch <= E` was on `lease_lineage_host`, which is the row's
+host and the command's own (`AMEESH_ROLE_HOST`). The lineage is kept by a
+trigger for every lease writer (migration 0503): a holder on another host
+restarts it, so a lease that went elsewhere between E and E' is still
+refused (#4087). While the role is free under a live restart reservation to
+this host, the gate waits for the reclaim, bounded by the reservation, then
+refuses. An accepted gate renews the live lease (its owner and epoch E') and
+journals both epochs; `Gate.hold` re-checks the lineage under the row lock.
+Agent sessions (`AGENT_MAIL_NAME`) keep the exact epoch: the runner hands
+them the new one.
+
 Nothing here contains a secret: the event carries the agent, gesture, ref,
 epoch and holder host, never a token.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import time
 from dataclasses import dataclass, field
@@ -84,6 +101,8 @@ DEFAULT_TTL_S = 300.0
 #: extra time added to a lease renewed for an external call whose timeout is
 #: `margin_s`: the call must have the whole margin left, not exactly it
 RENEW_GRACE_S = 30.0
+#: #4245: polling period while a restart reservation to this host is pending
+RESERVATION_POLL_S = 2.0
 
 
 class GestureRefused(ValueError):
@@ -114,6 +133,9 @@ class Gate:
     #: (holding the 300 s default on a volatile host would delay its failover,
     #: #3123)
     host_lease_ttl: float | None = None
+    #: #4245: the epoch the command entered with, when the gate accepted it at
+    #: a later epoch of the same-host lineage (`epoch` is the live one renewed)
+    entered_epoch: int = 0
 
     def hold(self, db, *, ttl_s: float = DEFAULT_TTL_S, margin_s: float = 0.0) -> int:
         """Renew the lease and journal the gesture, in the same transaction.
@@ -177,6 +199,14 @@ class Gate:
                     "gesture %s refused for %s: the agent is stopped at epoch %s "
                     "(no gesture from a stopped role)"
                     % (self.gesture, self.agent, self.epoch))
+            if self.entered_epoch and not _lineage_covers(
+                    _lineage(tx, self.agent), self.entered_epoch, self.host):
+                # #4245: under the row lock `renew` took; the lineage only
+                # changes with the holder, the epoch or the host
+                raise GestureRefused(_refusal(tx, dataclasses.replace(
+                    self, epoch=self.entered_epoch,
+                    reason="same-host lineage broken since epoch %s"
+                    % self.entered_epoch)))
             left = float(expires) - time.time()
             if left < margin:
                 raise GestureRefused(
@@ -188,6 +218,10 @@ class Gate:
                     "host": self.host}
             if self.role:
                 data["role"] = self.role
+            if self.entered_epoch:
+                data["epoch"] = self.entered_epoch
+                data["lease_epoch"] = self.epoch
+                data["lineage"] = "same-host"
             return storage.of(tx).events.record(
                 EVENT, "agent:%s" % self.agent, self.project, data)
 
@@ -275,6 +309,83 @@ def _is_database(db) -> bool:
     return callable(getattr(db, "query", None)) and callable(getattr(db, "execute", None))
 
 
+def _lineage(db, name: str) -> dict:
+    """#4245: the lease row with its same-host lineage (migration 0503).
+
+    Empty when it cannot be read (a schema without the columns, a backend
+    without SQL): no lineage is then presumed and the exact epoch rules.
+    """
+    if not _is_database(db):
+        return {}
+    try:
+        rows = db.query(
+            """
+            SELECT host, lease_owner, lease_epoch, status,
+                   lease_lineage_host, lease_lineage_epoch,
+                   (lease_expires_at IS NOT NULL
+                    AND lease_expires_at > clock_timestamp()) AS live
+              FROM agent_registry WHERE name = %s
+            """, (name,))
+    except Exception:  # noqa: BLE001 - no lineage read, no stale epoch accepted
+        return {}
+    return dict(rows[0]) if rows else {}
+
+
+def _lineage_covers(row: dict, epoch: int, host: str) -> bool:
+    """#4245: the live lease descends from `epoch` without leaving `host`.
+
+    Every holder since `lease_lineage_epoch` was on `lease_lineage_host`
+    (trigger of 0503); a session of epoch E is covered at E' > E when that
+    base is at most E and the lineage host is the row's and the session's.
+    """
+    try:
+        current = int(row.get("lease_epoch") or 0)
+        base = row.get("lease_lineage_epoch")
+        base = None if base is None else int(base)
+    except (TypeError, ValueError):
+        return False
+    return bool(host and base is not None and row.get("live")
+                and row.get("lease_owner")
+                and str(row.get("status") or "") != "stopped"
+                and base <= int(epoch) < current
+                and row.get("lease_lineage_host") == row.get("host") == host)
+
+
+def _await_reclaim(db, name: str, host: str, *, sleep=None, clock=None) -> dict:
+    """#4245: the role is free under a restart reservation to `host` (#4086):
+    wait for the restarted executor's claim, at most for what is left of the
+    reservation. Returns the lineage row read last (possibly still free)."""
+    from . import role_handover_pg
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    row = _lineage(db, name)
+    deadline = None
+    while row and not (row.get("live") and row.get("lease_owner")):
+        try:
+            reserved = role_handover_pg.restart_reservation(db, name)
+        except Exception:  # noqa: BLE001 - no reservation read, no wait
+            reserved = None
+        if not reserved or reserved.get("host") != host:
+            break
+        if deadline is None:
+            deadline = clock() + max(0.0, float(reserved.get("left_s") or 0.0))
+        if clock() >= deadline:
+            break
+        sleep(min(RESERVATION_POLL_S, max(0.0, deadline - clock())))
+        row = _lineage(db, name)
+    return row
+
+
+def _same_host(db, name: str, epoch: int, *, sleep=None, clock=None) -> dict | None:
+    """#4245: the live lease row when it covers `epoch` on this command's host
+    (`AMEESH_ROLE_HOST`, set by `ameesh role run`), else None."""
+    host = (os.environ.get("AMEESH_ROLE_HOST") or "").strip()
+    if not host:
+        return None
+    row = _await_reclaim(db, name, host, sleep=sleep, clock=clock)
+    return row if _lineage_covers(row, epoch, host) else None
+
+
 def _role_gate(cfg, db, role: str, gesture: str, ref: str,
                project: str | None) -> Gate:
     """`AMEESH_ROLE` (EP5 `ameesh role run`): the epoch in the environment is
@@ -332,11 +443,31 @@ def _role_gate(cfg, db, role: str, gesture: str, ref: str,
             raise GestureRefused(
                 "gesture %s refused: role %s but the session names %s"
                 % (gesture, canonical, bound))
+    if int(row.get("lease_epoch") or 0) != epoch:
+        # #4245: an executor restart on this host moved the epoch (and the
+        # runner id); the command keeps the role if the lineage covers it
+        lineage = _same_host(db, canonical, epoch)
+        if lineage is not None:
+            host = str(lineage.get("host") or "")
+            ttl, rule = effective_ttl(_cfg(db, cfg), host)
+            return Gate(canonical, str(lineage.get("lease_owner") or ""),
+                        int(lineage["lease_epoch"]), gesture, (ref or "").strip(),
+                        project, host=host, role=canonical,
+                        reason="same-host lineage since epoch %s"
+                        % lineage.get("lease_lineage_epoch"),
+                        lease_ttl=ttl, host_lease_ttl=rule, entered_epoch=epoch)
+        try:  # the wait may have seen a claim: name the holder read now
+            row = registry.get(db, role) or row
+        except Exception:  # noqa: BLE001 - the refusal below stands
+            pass
     current_owner = str(row.get("lease_owner") or "")
     declared_owner = (os.environ.get("AMEESH_LEASE_OWNER")
                       or os.environ.get("AMEESH_RUNNER_ID")
                       or os.environ.get("AGENT_MESH_RUNNER_ID") or "").strip()
-    if declared_owner and current_owner and declared_owner != current_owner:
+    # #4245: a stale epoch is refused below as such (the fence names the
+    # holder), not as an owner mismatch: the caller reads it as a fence
+    if (declared_owner and current_owner and declared_owner != current_owner
+            and int(row.get("lease_epoch") or 0) == epoch):
         raise GestureRefused(
             "gesture %s refused for role %s: the live lease is held by %s, "
             "not by %s" % (gesture, canonical, current_owner, declared_owner))
