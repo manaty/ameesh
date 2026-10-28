@@ -989,12 +989,18 @@ class AgentHostTest(unittest.TestCase):
     def test_reads_are_bounded_by_their_own_deadline(self):
         """#2198/N4 : list/show/--help ont une borne plus courte que celle des
         gestes de drain ; une lecture lente ne bloque pas le balayage."""
+        # #4358 : une lecture coupée est vide, donc non concluante : relue
+        # en fin de balayage puis laissée en l'état, sans échec de l'étape.
+        # Un seul essai et un seul agent : deux lectures coupées en tout.
         self.env.update(DRAIN_APPEL_DELAI='10', DRAIN_MARGE_LOCALE='1',
-                        DRAIN_LECTURE_DELAI='1')
+                        DRAIN_LECTURE_DELAI='1', LECTURE_ESSAIS='1')
+        agents = [dict(name='dev9', host='host-agents', mode='execute', status='idle')]
         debut = time.monotonic()
-        p = self.run_vm(scenario='show-lent')
+        p = self.run_vm(scenario='show-lent', agents=agents)
         ecoule = time.monotonic() - debut
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('laissée(s) en l\'état (non concluant) : dev9', p.stdout)
+        self.assertEqual(self.starts(), [])
         # #3832 : 8 s reste strictement sous la borne des gestes de drain
         # (10 s) et laisse la marge d'ordonnancement de --parallel.
         self.assertLess(ecoule, 8,
