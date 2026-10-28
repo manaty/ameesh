@@ -1,0 +1,408 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#4293 (#3264 C) : adoption d'une version de harnais ou de modèle.
+
+La règle du §4 est déterministe ; les gestes sont simulés sur une base de test :
+le canari nomme un agent, les mesures viennent de `turn_costs`, la bascule
+pose `agent_registry.harness_bin` (harnais) ou `model` (modèle). Aucun binaire
+n'est lancé ici : l'exécuteur est couvert par la résolution d'adaptateur.
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+import unittest
+from unittest import mock
+
+from ameesh import registry, veille, work
+from ameesh.adapters import HarnessMissing
+
+from .support import PgTestCase
+
+
+def report(**overrides) -> dict:
+    data = {
+        "schema": veille.REPORT_SCHEMA,
+        "evaluation_lot": 1,
+        "harness": "deepseek",
+        "object": "harness",
+        "from_version": "0.2.0-rc.2",
+        "to_version": "0.2.1-rc.4",
+        "model": "deepseek-flash",
+        "provider": "deepseek",
+        "effort": "max",
+        "conclusion": "equivalent",
+        "quality": {"regression": False, "note": 7.0, "defects": []},
+        "price": {
+            "kind": "equal",
+            "from": {"input": 0.30, "cached_input": 0.006, "output": 1.20},
+            "to": {"input": 0.30, "cached_input": 0.006, "output": 1.20},
+            "projected_7d_usd": 4.2,
+        },
+        "bounds": {"cost_usd": [0.005, 0.02], "duration_s": [5, 20]},
+        "bench": [{"lot": 1, "class": "light"}],
+    }
+    data.update(overrides)
+    return data
+
+
+class Rules:
+    def __init__(self, seconds: float):
+        self.seconds = float(seconds)
+
+    def next_cutoff(self, now: float) -> float:
+        return float(now) + self.seconds
+
+
+class ReportRuleTest(unittest.TestCase):
+    def test_regression_refuses_without_any_gesture(self):
+        decision = veille.decide(veille.Report(report(conclusion="regression")))
+        self.assertEqual(decision.action, "refused")
+
+    def test_quality_regression_refuses(self):
+        decision = veille.decide(veille.Report(
+            report(quality={"regression": True, "note": 5.0})))
+        self.assertEqual(decision.action, "refused")
+
+    def test_equal_price_without_regression_is_automatic(self):
+        decision = veille.decide(veille.Report(report()))
+        self.assertEqual(decision.action, "automatic")
+        self.assertEqual(decision.price, "equal")
+
+    def test_higher_price_requires_the_owner(self):
+        decision = veille.decide(veille.Report(
+            report(price={"kind": "higher", "projected_7d_usd": 12.0,
+                          "from": {"output": 1.0}, "to": {"output": 2.0}})))
+        self.assertEqual(decision.action, "owner")
+        self.assertEqual(decision.price, "higher")
+
+    def test_equal_kind_with_a_higher_rate_is_not_trusted(self):
+        decision = veille.decide(veille.Report(
+            report(price={"kind": "equal", "projected_7d_usd": 1.0,
+                          "from": {"output": 1.0}, "to": {"output": 3.0}})))
+        self.assertEqual(decision.action, "owner")
+        self.assertEqual(decision.price, "higher")
+
+    def test_new_provider_and_plan_change_require_the_owner(self):
+        for kind in ("new_provider", "plan_change"):
+            decision = veille.decide(veille.Report(
+                report(price={"kind": kind, "projected_7d_usd": 1.0})))
+            self.assertEqual(decision.action, "owner", kind)
+
+    def test_owner_decision_needs_the_seven_day_projection(self):
+        decision = veille.decide(veille.Report(
+            report(price={"kind": "higher", "from": {"output": 1.0},
+                          "to": {"output": 2.0}})))
+        self.assertEqual(decision.action, "blocked")
+        self.assertIn("projected_7d_usd", decision.reason)
+
+    def test_canary_verdict_uses_the_replay_bounds(self):
+        parsed = veille.Report(report())
+        ok, why = veille.canary_verdict(
+            parsed, {"turns": 10, "cost_usd": 0.01, "duration_s": 12.0})
+        self.assertTrue(ok, why)
+        ok, why = veille.canary_verdict(
+            parsed, {"turns": 10, "cost_usd": 0.5, "duration_s": 12.0})
+        self.assertFalse(ok)
+        self.assertIn("cost_usd", why[0])
+
+    def test_report_round_trips_from_note_and_fence(self):
+        parsed = veille.parse_report("veille-report: " + json.dumps(report()))
+        self.assertEqual(parsed.to_version, "0.2.1-rc.4")
+        parsed = veille.parse_report(
+            "note\n```json\n" + json.dumps(report()) + "\n```\n")
+        self.assertEqual(parsed.harness, "deepseek")
+
+    def test_report_refuses_a_wrong_schema_or_a_missing_evaluation_lot(self):
+        with self.assertRaises(veille.VeilleError):
+            veille.Report(report(schema="other/1"))
+        with self.assertRaises(veille.VeilleError):
+            veille.Report(report(evaluation_lot=0))
+
+    def test_identical_versions_are_refused(self):
+        with self.assertRaises(veille.VeilleError):
+            veille.Report(report(to_version="0.2.0-rc.2"))
+
+    def test_bounds_must_carry_a_measurable_metric(self):
+        with self.assertRaises(veille.VeilleError):
+            veille.Report(report(bounds={"quality_note": [6, 8]}))
+
+
+class AdoptionTest(PgTestCase):
+    def setUp(self):
+        super().setUp()
+        for name, host in (("canary", "h1"), ("impl", "h1"), ("other", "h2")):
+            registry.upsert(
+                self.db, name, chantier="ameesh", harness="deepseek", host=host,
+                cwd=self.tmp, session_id=None, status="idle", status_text="",
+                model="deepseek-flash", budget_usd=None)
+        self.item = work.add(self.db, title="Évaluer dsh 0.2.1-rc.4", app="ameesh",
+                             assignee="canary")
+        self.lot = int(self.item["id"])
+        self.bins = {"h1": "/opt/harness/0.2.1-rc.4/bin/dsh",
+                     "h2": "/opt/harness/0.2.1-rc.4/bin/dsh"}
+
+    def _report(self, **over):
+        data = report(**over)
+        data["evaluation_lot"] = self.lot
+        return veille.Report(data)
+
+    def _turn(self, agent, usd, duration, at):
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, turn, model, session, usd,"
+            " input_tokens, cached_input_tokens, output_tokens, started_at,"
+            " recorded_at) VALUES (%s, 'deepseek', 't', 'm', 's', %s, 0, 0, 0,"
+            " to_timestamp(%s), to_timestamp(%s))",
+            (agent, usd, float(at), float(at) + float(duration)))
+
+    def _bins(self):
+        return {name: registry.get(self.db, name)["harness_bin"]
+                for name in ("canary", "impl", "other")}
+
+    def test_automatic_adoption_goes_canary_then_host_by_host(self):
+        result = veille.adopt(self.cfg, self.db, self.lot, self._report(),
+                              bins=self.bins, now=1000.0)
+        self.assertEqual(result["result"], "canary")
+        self.assertEqual(self._bins(), {
+            "canary": self.bins["h1"], "impl": None, "other": None})
+        state = veille.load(self.db, self.lot)["state"]
+        self.assertEqual(state["stage"], "canary")
+        self.assertEqual(state["target_agent"], "canary")
+
+        # pas encore de mesure : on attend (24 h pas écoulées)
+        out = veille.tick(self.cfg, self.db, now=1000.0 + 3600,
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "canary")
+        for _ in range(10):
+            self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
+        out = veille.tick(self.cfg, self.db, now=1000.0 + 5000,
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "rollout")
+        self.assertEqual(veille.load(self.db, self.lot)["state"]["stage"], "rollout")
+
+        # hôte h1 : le canari y est déjà, les autres agents passent aussi
+        out = veille.tick(self.cfg, self.db, now=1000.0 + 5100,
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "rollout")
+        self.assertEqual(self._bins()["impl"], self.bins["h1"])
+        self.assertIsNone(self._bins()["other"])
+        # hôte h2 : une coupure est trop proche, rien ne bouge
+        out = veille.tick(self.cfg, self.db, now=1000.0 + 5200,
+                          rules=Rules(10 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "waiting_cutoff")
+        self.assertIsNone(self._bins()["other"])
+        # puis entre deux tours, hors marge
+        out = veille.tick(self.cfg, self.db, now=1000.0 + 5300,
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "rollout")
+        self.assertEqual(self._bins()["other"], self.bins["h2"])
+        out = veille.tick(self.cfg, self.db, now=1000.0 + 5400,
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "done")
+        self.assertEqual(veille.load(self.db, self.lot)["state"]["stage"], "done")
+
+    def test_a_running_turn_holds_the_host_switch(self):
+        veille.adopt(self.cfg, self.db, self.lot, self._report(), bins=self.bins,
+                     now=1000.0)
+        for _ in range(10):
+            self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
+        veille.tick(self.cfg, self.db, now=1000.0 + 5000, rules=Rules(30 * 60))
+        self.db.execute("UPDATE agent_registry SET status = 'running' "
+                        "WHERE name = 'impl'")
+        out = veille.tick(self.cfg, self.db, now=1000.0 + 5100,
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "waiting_turn")
+        self.assertIsNone(self._bins()["impl"])
+
+    def test_canary_regression_restores_the_previous_version(self):
+        veille.adopt(self.cfg, self.db, self.lot, self._report(), bins=self.bins,
+                     now=1000.0)
+        for _ in range(10):
+            self._turn("canary", 0.5, 10.0, 1000.0 + 4000)
+        out = veille.tick(self.cfg, self.db, now=1000.0 + 5000,
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "refused")
+        self.assertIsNone(self._bins()["canary"])
+        state = veille.load(self.db, self.lot)["state"]
+        self.assertEqual(state["stage"], "refused")
+        self.assertEqual(state["inverse"]["version"], "0.2.0-rc.2")
+        self.assertIn("cost_usd", state["reason"])
+
+    def test_report_regression_changes_no_host(self):
+        result = veille.adopt(self.cfg, self.db, self.lot,
+                              self._report(conclusion="regression"),
+                              bins=self.bins, now=1000.0)
+        self.assertEqual(result["result"], "refused")
+        self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
+        self.assertEqual(self.db.query(
+            "SELECT count(*)::int AS n FROM harness_adoptions")[0]["n"], 1)
+
+    def test_a_second_report_on_the_same_lot_is_refused(self):
+        veille.adopt(self.cfg, self.db, self.lot, self._report(), bins=self.bins,
+                     now=1000.0)
+        second = self._report(to_version="0.2.2-rc.1")
+        with self.assertRaises(veille.VeilleError):
+            veille.adopt(self.cfg, self.db, self.lot, second, bins=self.bins,
+                         now=1000.0)
+
+    def test_higher_price_opens_the_owner_decision_without_a_gesture(self):
+        higher = self._report(price={
+            "kind": "higher", "projected_7d_usd": 12.5,
+            "from": {"input": 0.30, "output": 1.20},
+            "to": {"input": 0.40, "output": 1.60}})
+        with mock.patch.object(veille.decisions, "ask",
+                               return_value={"id": 91, "state": "pending"}) as ask:
+            result = veille.adopt(self.cfg, self.db, self.lot, higher,
+                                  bins=self.bins, now=1000.0)
+        self.assertEqual(result["result"], "waiting_owner")
+        self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
+        question = ask.call_args.kwargs["question"]
+        self.assertIn("12.50", question)
+        self.assertEqual(ask.call_args.kwargs["recommend"], "adopt")
+        state = veille.load(self.db, self.lot)["state"]
+        self.assertEqual(state["decision_id"], 91)
+
+    def test_owner_approval_starts_the_canary_owner_refusal_changes_nothing(self):
+        higher = self._report(price={
+            "kind": "higher", "projected_7d_usd": 12.5,
+            "from": {"output": 1.20}, "to": {"output": 1.60}})
+        with mock.patch.object(veille.decisions, "ask",
+                               return_value={"id": 91, "state": "pending"}):
+            veille.adopt(self.cfg, self.db, self.lot, higher, bins=self.bins,
+                         now=1000.0)
+        with mock.patch.object(veille.decisions, "get",
+                               return_value={"state": "answered",
+                                             "answer": {"option": "refuse"}}):
+            out = veille.tick(self.cfg, self.db, now=1001.0, rules=Rules(1800))
+        self.assertEqual(out["adoptions"][0]["result"], "refused")
+        self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
+
+    def test_owner_approval_starts_the_canary(self):
+        higher = self._report(price={
+            "kind": "higher", "projected_7d_usd": 12.5,
+            "from": {"output": 1.20}, "to": {"output": 1.60}})
+        with mock.patch.object(veille.decisions, "ask",
+                               return_value={"id": 91, "state": "pending"}):
+            veille.adopt(self.cfg, self.db, self.lot, higher, bins=self.bins,
+                         now=1000.0)
+        with mock.patch.object(veille.decisions, "get",
+                               return_value={"state": "answered",
+                                             "answer": {"option": "adopt"}}):
+            out = veille.tick(self.cfg, self.db, now=1001.0, rules=Rules(1800))
+        self.assertEqual(out["adoptions"][0]["result"], "canary")
+        self.assertEqual(self._bins()["canary"], self.bins["h1"])
+
+    def test_model_adoption_switches_the_model_setting(self):
+        model_report = self._report(object="model", from_version="deepseek-flash",
+                                    to_version="deepseek-v4.1-flash-1017")
+        result = veille.adopt(self.cfg, self.db, self.lot, model_report,
+                              now=1000.0)
+        self.assertEqual(result["result"], "canary")
+        self.assertEqual(registry.get(self.db, "canary")["model"],
+                         "deepseek-v4.1-flash-1017")
+        self.assertIsNone(registry.get(self.db, "impl")["harness_bin"])
+        self.assertIn("harness_bin", registry.get(self.db, "canary"))
+
+    def test_rollback_restores_the_previous_values(self):
+        self.db.execute("UPDATE agent_registry SET harness_bin = '/opt/old/dsh' "
+                        "WHERE name = 'impl'")
+        veille.adopt(self.cfg, self.db, self.lot, self._report(), bins=self.bins,
+                     now=1000.0)
+        for _ in range(10):
+            self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
+        veille.tick(self.cfg, self.db, now=1000.0 + 5000, rules=Rules(30 * 60))
+        veille.tick(self.cfg, self.db, now=1000.0 + 5100, rules=Rules(30 * 60))
+        self.assertEqual(self._bins()["impl"], self.bins["h1"])
+        out = veille.rollback(self.cfg, self.db, self.lot,
+                              reason="regression observed on the host",
+                              now=1000.0 + 5200)
+        self.assertEqual(out["result"], "rolled_back")
+        self.assertEqual(self._bins(), {"canary": None, "impl": "/opt/old/dsh",
+                                        "other": None})
+        state = veille.load(self.db, self.lot)["state"]
+        self.assertEqual(state["stage"], "rolled_back")
+        self.assertEqual(state["inverse"]["version"], "0.2.0-rc.2")
+
+    def test_adopt_is_idempotent_for_the_same_report(self):
+        first = veille.adopt(self.cfg, self.db, self.lot, self._report(),
+                             bins=self.bins, now=1000.0)
+        second = veille.adopt(self.cfg, self.db, self.lot, self._report(),
+                              bins=self.bins, now=2000.0)
+        self.assertEqual(second["result"], "unchanged")
+        self.assertEqual(first["state"]["stage"], second["state"]["stage"])
+
+    def test_dry_run_writes_nothing(self):
+        result = veille.adopt(self.cfg, self.db, self.lot, self._report(),
+                              bins=self.bins, now=1000.0, dry_run=True)
+        self.assertEqual(result["result"], "dry-run")
+        self.assertIsNone(veille.load(self.db, self.lot))
+        self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
+
+    def test_report_note_is_read_back(self):
+        work.note(self.db, self.lot, "veille-report: " + json.dumps(
+            dict(report(), evaluation_lot=self.lot)), actor="author")
+        parsed = veille.report_from_lot(self.db, self.lot)
+        self.assertEqual(parsed.evaluation_lot, self.lot)
+        self.assertEqual(parsed.harness, "deepseek")
+
+    def test_tick_discovers_a_report_note_and_starts_the_canary(self):
+        work.note(self.db, self.lot, "veille-report: " + json.dumps(
+            dict(report(), evaluation_lot=self.lot)), actor="author")
+        out = veille.tick(self.cfg, self.db, now=1000.0, bins=self.bins,
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["discovered"][0]["result"], "canary")
+        state = veille.load(self.db, self.lot)["state"]
+        self.assertEqual(state["stage"], "canary")
+        self.assertEqual(self._bins()["canary"], self.bins["h1"])
+
+    def test_cli_adopt_and_show(self):
+        path = os.path.join(self.tmp, "report-4293.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(dict(report(), evaluation_lot=self.lot), fh)
+        done = self.mesh("veille", "adopt", str(self.lot), "--report", path,
+                         "--bin", "h1=" + self.bins["h1"],
+                         "--bin", "h2=" + self.bins["h2"], "--json")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        payload = json.loads(done.stdout)
+        self.assertEqual(payload["result"], "canary", payload)
+        show = self.mesh("veille", "show", str(self.lot), "--json")
+        self.assertEqual(show.returncode, 0, show.stderr)
+        payload = json.loads(show.stdout)
+        self.assertEqual(payload["state"]["stage"], "canary")
+        self.assertEqual(registry.get(self.db, "canary")["harness_bin"],
+                         self.bins["h1"])
+
+    def test_runner_adapter_uses_the_agent_harness_bin(self):
+        from ameesh.runner import AgentWorker
+        binary = os.path.join(self.tmp, "dsh")
+        with open(binary, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(binary, 0o755)
+        worker = AgentWorker.__new__(AgentWorker)
+        threading.Thread.__init__(worker, name="canary", daemon=True)
+        worker.agent = {"name": "canary", "harness": "deepseek",
+                        "harness_bin": binary}
+        worker.descriptor_seen = None
+        worker.resolution_seen = ""
+        worker.turn_harness = lambda: "deepseek"
+        adapter = worker._adapter()
+        self.assertEqual(adapter.binary, binary)
+        # un chemin absent est une erreur d'hôte, jamais un repli silencieux
+        worker.agent = {"name": "canary", "harness": "deepseek",
+                        "harness_bin": os.path.join(self.tmp, "absent")}
+        with self.assertRaises(HarnessMissing):
+            worker._adapter()
+
+    def test_ameesh_set_accepts_an_absolute_harness_bin(self):
+        binary = os.path.join(self.tmp, "dsh")
+        with open(binary, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(binary, 0o755)
+        done = self.mesh("set", "canary", "harness_bin=" + binary)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(registry.get(self.db, "canary")["harness_bin"], binary)
+        done = self.mesh("set", "canary", "harness_bin=relative/dsh")
+        self.assertEqual(done.returncode, 2)
+        done = self.mesh("set", "canary", "harness_bin=")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIsNone(registry.get(self.db, "canary")["harness_bin"])

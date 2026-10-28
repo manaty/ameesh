@@ -77,6 +77,8 @@
   ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
         reserved host move at a lot boundary, durable journal (L232a);
   ameesh harness list|show|check|versions  harnesses (L16, L120);
+  ameesh veille adopt|tick|show|rollback   adoption of a harness or model version
+        (#3264 C): auto at equal price after a canary, owner decision otherwise;
   ameesh heavy [--nice N] -- <command> | --status [--json]
         heavy suite (tests, build) in one of the host's capped slots (L131);
   ameesh host drain HOST [--for 8h] | undrain HOST | reconcile HOST | status [HOST]
@@ -374,6 +376,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L85: the event log of `GET /api/v1/events`
         from . import events
         return events.main(rest)
+    if command == "veille":
+        # #4293 (#3264 C) : adoption d'une version de harnais ou de modèle
+        from . import veille
+        return veille.main(rest)
     if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
