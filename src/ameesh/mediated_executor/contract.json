@@ -4769,6 +4769,7 @@
     "pending_recipients",
     "pending_recipients_sorted",
     "review_requests",
+    "staging_emission",
     "unread_active",
     "unread_counts",
     "unread_mid_turn",
