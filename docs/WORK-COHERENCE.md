@@ -9,15 +9,14 @@ looks for the four families the owner described in manaty/ameesh#3185:
 |---|---|---|
 | already done | a merged change of the base ref references the lot (`ameesh-work: <id>`, `lot/<id>-…` merge) | **closed** (reason `done`) with the proof in the lot journal |
 | probably done | a merged change touches the code the lot cites (same line, or the whole file when no line is cited) | **digest** to the project's PO: a touch is not a proof |
-| obsolete | every cited path is absent from the base ref, at least one was removed by a merged change **after the lot was filed**, and the lot's title carries no action verb from either list | **closed** (reason `abandoned`) with the proof in the lot journal |
-| probably obsolete | the cited paths are gone but the deletion predates the lot, or the lot's title carries an action verb (add/restore/keep or remove/disable) | **digest** to the project's PO: an absence is not a proof |
+| probably obsolete | every cited path is absent from the base ref and at least one was removed by a merged change | **digest** to the project's PO: an absence or a deletion is not a proof |
 | duplicate | two open lots have the same normalised title, or the same non-empty issue reference and at least two significant title words in common | **digest** to the project's PO |
 | contradiction | two open lots cite the same path and their titles start with opposite verbs (`add`/`remove`, `ajouter`/`supprimer`, …) | **digest** to the project's PO |
 
-Only `already done` and the narrow `obsolete` are deterministic. A closure is
-a normal `work.close` gesture: it takes the same locks and releases the same
-dependents. The probably-done and probably-obsolete lots, the duplicate and the
-contradiction are **never** closed by the pass; the PO answers with a typed link
+Only `already done` is deterministic. A closure is a normal `work.close`
+gesture: it takes the same locks and releases the same dependents. The
+probably-done and probably-obsolete lots, the duplicate and the contradiction
+are **never** closed by the pass; the PO answers with a typed link
 (`ameesh work links <lot> --add <other> --kind duplicates|conflicts_with`,
 #4167) or with a justified closure.
 
@@ -72,11 +71,12 @@ The JSON output is one object:
 * **A moved component is not obsolete.** If the cited path is gone but a file
   with the same basename exists elsewhere in the base ref, the lot is not
   closed: the move is not a proof that the component disappeared.
-* **An absence is not a proof by itself.** A deletion closes an obsolete lot
-  only when it happened **after** the lot was filed and the lot's title carries
-  no action verb (add/restore/keep or remove/disable); a restoration request
-  filed after the deletion stays open and goes to the digest as probably
-  obsolete (#4172 B1).
+* **An absence is not a proof by itself.** Every missing/removed path goes to
+  the digest as probably obsolete, whatever its deletion date or the lot title:
+  a restoration or data-recovery request can follow a deletion, and a lexical
+  verb list cannot decide. No automatic obsolete closure exists today; a
+  structured explicit proof of obsolescence would be needed to add one
+  (#4172 B1 dev2/cx2/cx1).
 * **A line is a precise claim.** When a lot cites both a bare path (in its
   title) and a `path:line` (in its body), only the line is used for the code
   check; otherwise a commit touching another line of the same file would
@@ -107,7 +107,8 @@ elected host is enough, and the digest is idempotent across ticks.
 ## Reference fixture
 
 `tests/test_4172_backlog_coherence.py` plants a duplicate, an already-done lot
-(reference), a probably-done lot (code touch), an obsolete path (deleted after
-the lot), a restoration request filed after a deletion, and a contradiction. It checks that only the deterministic findings are closed, that
-the probably-done lot, the duplicate and the contradiction stay open, that exactly one digest is sent to the PO, and that a
-second pass sends no second digest.
+(reference), a probably-done lot (code touch), an obsolete path, a restoration
+request filed after a deletion, and a contradiction. It checks that only the
+already-done reference is closed, that the probably-done/probably-obsolete
+lots, the duplicate and the contradiction stay open, that exactly one digest is
+sent to the PO, and that a second pass sends no second digest.

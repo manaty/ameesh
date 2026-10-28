@@ -2,9 +2,9 @@
 """#4172 (manaty/ameesh#3185, volet 2): backlog coherence pass.
 
 A fixture backlog plants one duplicate, one already-done lot, one obsolete
-path and one contradiction. Only the deterministic findings are closed; the
-duplicate and the contradiction go into one digest for the PO. A second pass
-sends no second digest.
+path and one contradiction. Only the already-done reference is closed; the
+probably-done and probably-obsolete lots, the duplicate and the contradiction
+go into one digest for the PO. A second pass sends no second digest.
 """
 from __future__ import annotations
 
@@ -86,8 +86,9 @@ class CoherenceTest(PgTestCase):
         self.assertIn(("already_done", self.already_ref["id"], 0), findings)
         # a touch of the cited line is a hint for the PO, never a closure
         self.assertIn(("probably_done", self.already_code["id"], 0), findings)
-        self.assertIn(("obsolete", self.obsolete["id"], 0), findings)
-        self.assertIn(("obsolete", self.obsolete_basename["id"], 0), findings)
+        self.assertIn(("probably_obsolete", self.obsolete["id"], 0), findings)
+        self.assertIn(("probably_obsolete", self.obsolete_basename["id"], 0),
+                      findings)
         self.assertIn(("duplicate", self.dup_b["id"], self.dup_a["id"]), findings)
         contradiction = {row for row in findings if row[0] == "contradiction"}
         self.assertEqual(len(contradiction), 1)
@@ -95,26 +96,18 @@ class CoherenceTest(PgTestCase):
         applied = backlog_coherence.apply_report(self.db, report, cfg=self.test_cfg)
         closed = {(row["kind"], row["lot"]) for row in applied["closures"]
                   if row["result"] == "closed"}
-        self.assertEqual(closed, {("already_done", self.already_ref["id"]),
-                                  ("obsolete", self.obsolete["id"]),
-                                  ("obsolete", self.obsolete_basename["id"])})
+        self.assertEqual(closed, {("already_done", self.already_ref["id"])})
         for row in applied["closures"]:
             item = work.get(self.db, row["lot"])
             self.assertEqual(item["state"], "closed")
         self.assertEqual(work.get(self.db, self.already_ref["id"])["close_reason"], "done")
-        self.assertEqual(work.get(self.db, self.obsolete["id"])["close_reason"],
-                         "abandoned")
-        self.assertEqual(work.get(self.db, self.obsolete_basename["id"])["close_reason"],
-                         "abandoned")
-        for lot_id in (self.dup_a["id"], self.dup_b["id"], self.add["id"],
+        for lot_id in (self.obsolete["id"], self.obsolete_basename["id"],
+                       self.dup_a["id"], self.dup_b["id"], self.add["id"],
                        self.remove["id"], self.already_code["id"]):
             self.assertNotEqual(work.get(self.db, lot_id)["state"], "closed")
         notes = [event["note"] for event in
                  work.events(self.db, self.already_ref["id"])]
         self.assertTrue(any("coherence: already done" in note
-                            for note in notes), notes)
-        notes = [event["note"] for event in work.events(self.db, self.obsolete["id"])]
-        self.assertTrue(any("coherence: obsolete" in note
                             for note in notes), notes)
         sent = self.db.query(
             "SELECT id, body FROM agent_mailbox WHERE recipient = 'human:po'")
@@ -124,6 +117,8 @@ class CoherenceTest(PgTestCase):
         self.assertIn("Ajouter le mode Y", body)
         self.assertIn("Supprimer le mode Y", body)
         self.assertIn("Corriger la ligne deux (code)", body)
+        self.assertIn("Obsolètes probables", body)
+        self.assertIn("Nettoyer src/gone.py", body)
 
     def test_restoration_after_deletion_is_a_digest_not_a_closure(self):
         # B1 cx2 (#4172): a path already gone when the lot is filed may be a
@@ -205,6 +200,7 @@ class CoherenceTest(PgTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("already done", result.stdout)
         self.assertIn("probably done", result.stdout)
+        self.assertIn("probably obsolete", result.stdout)
         self.assertEqual(work.get(self.db, self.already_ref["id"])["state"], "intake")
 
 
