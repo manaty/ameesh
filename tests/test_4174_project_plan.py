@@ -145,6 +145,55 @@ class DispatchTest(_Lots):
         self.assertEqual([t["item"]["id"] for t in self.take()], [evo["id"]])
         self.assertEqual(work.get(self.db, bug["id"])["assignee"], "claude1")
 
+    def test_untakeable_bug_does_not_block_enhancement(self):
+        self.agent("claude1", team="nexlink")
+        evo = self.lot("enhancement")
+        bug = self.lot("device bug", type="bug")
+        self.db.execute("UPDATE work_items SET required_capabilities = '{ios-device}' WHERE id = %s",
+                        (bug["id"],))
+        self.assertEqual([t["item"]["id"] for t in self.take()], [evo["id"]])
+        self.assertIsNone(work.get(self.db, bug["id"])["assignee"])
+
+    def test_agent_filter_keeps_bug_for_capable_agent(self):
+        self.agent("claude1", team="nexlink")
+        self.agent("claude2", team="nexlink", capabilities=["ios-device"])
+        evo = self.lot("enhancement")
+        bug = self.lot("device bug", type="bug")
+        self.db.execute("UPDATE work_items SET required_capabilities = '{ios-device}' WHERE id = %s",
+                        (bug["id"],))
+        self.assertEqual({t["item"]["id"] for t in self.take()}, {evo["id"], bug["id"]})
+        self.assertEqual(work.get(self.db, bug["id"])["assignee"], "claude2")
+
+    def test_directory_refusal_does_not_block_enhancement(self):
+        self.agent("claude1", team="nexlink")
+        evo = self.lot("enhancement")
+        bug = self.lot("bug without directory", type="bug")
+        original = backlog._directory_ready
+
+        def directory(cfg, db, agent, item, project, **kwargs):
+            return item["id"] != bug["id"] and original(
+                cfg, db, agent, item, project, **kwargs)
+
+        with patch.object(backlog, "_directory_ready", side_effect=directory):
+            self.assertEqual([t["item"]["id"] for t in self.take()], [evo["id"]])
+        self.assertIsNone(work.get(self.db, bug["id"])["assignee"])
+
+    def test_new_untakeable_bug_does_not_rollback_enhancement(self):
+        self.agent("claude1", team="nexlink")
+        evo = self.lot("enhancement")
+        check = work.check_assignee
+        inserted = []
+
+        def add_bug(*args, **kwargs):
+            if not inserted:
+                inserted.append(self.lot("device bug", type="bug")["id"])
+                self.db.execute("UPDATE work_items SET required_capabilities = '{ios-device}' WHERE id = %s",
+                                (inserted[0],))
+            return check(*args, **kwargs)
+
+        with patch.object(work, "check_assignee", side_effect=add_bug):
+            self.assertEqual([t["item"]["id"] for t in self.take()], [evo["id"]])
+
     def test_new_bug_after_selection_rolls_back_evolution_assignment(self):
         self.agent("claude1", team="nexlink")
         evo = self.lot("enhancement")

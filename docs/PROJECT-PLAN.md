@@ -14,7 +14,13 @@ does not close the peer or remove the conflict link.
 
 A dispatchable bug puts its project in the bug phase. Enhancements wait until
 no bug is dispatchable. Bugs awaiting a human, review or deployment do not
-block enhancements. Every dispatch rechecks the plan; a new bug preempts at
+block enhancements. During dispatch, the bug phase is evaluated for each agent
+with its capabilities, review eligibility and working directory. If that agent
+can take no ready bug, it may take an enhancement; the other agents retain
+their own candidate lists. The assignment transaction repeats these checks,
+including for a bug that appeared after selection. The read-only CLI shows
+project readiness before these agent-specific checks.
+Every dispatch rechecks the plan; a new bug preempts at
 the next dispatch without interrupting assigned work. Priorities, planned
 start/end/delivery dates, age and lot number order available lots; unfinished
 dependencies precede their dependants in the waiting list. Dates are the same

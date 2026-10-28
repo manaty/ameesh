@@ -36,8 +36,12 @@ def order_key(item):
             float(item.get("created_ts") or 0), int(item["id"]))
 
 
-def evaluate(rows, *, project, rule=None, holds=None, now=None):
-    """Pure report. An assigned build/qa/deployment bug is not dispatchable."""
+def evaluate(rows, *, project, rule=None, holds=None, now=None, can_take=None, phase=True):
+    """Readiness, optionally scoped to an agent before bug preemption.
+
+    ``phase=False`` retains both kinds for the initial dispatcher candidate
+    pool; each agent applies its own phase without deleting others' candidates.
+    """
     from . import backlog
     stamp = time.time() if now is None else float(now)
     today = dt.datetime.fromtimestamp(stamp).date().isoformat()
@@ -71,9 +75,11 @@ def evaluate(rows, *, project, rule=None, holds=None, now=None):
                           ("conflicts_with", "open_conflicts")):
             if row.get(key):
                 reasons.append("%s: %s" % (kind, ", ".join("#%s" % i for i in row[key])))
+        if not reasons and can_take is not None and not can_take(row):
+            reasons.append("not takeable by this dispatcher")
         entries.append(dict(row, ready=not reasons, waiting=reasons))
     bugs = sorted(int(r["id"]) for r in entries if r["ready"] and r["type"] == "bug")
-    if bugs:
+    if bugs and phase:
         for row in entries:
             if row["type"] != "bug":
                 row["waiting"].append("bug phase: %s" % ", ".join("#%s" % i for i in bugs))
@@ -103,24 +109,25 @@ def acceptance_rule(cfg, project):
     return entry.get("spec_acceptance")
 
 
-def report(db, project, *, cfg=None, now=None):
+def report(db, project, *, cfg=None, now=None, can_take=None, phase=True):
     from . import backlog
     cfg = cfg or getattr(db, "cfg", None)
     rule = acceptance_rule(cfg, project)
     rows = storage.of(db).work.project_plan_rows(project)
     holds = backlog._take_holds(db, rows, cfg=cfg)
-    return evaluate(rows, project=project, rule=rule, holds=holds, now=now)
+    return evaluate(rows, project=project, rule=rule, holds=holds, now=now,
+                    can_take=can_take, phase=phase)
 
 
-def eligible(db, items, *, cfg=None, now=None):
+def eligible(db, items, *, cfg=None, now=None, can_take=None, phase=True):
     """Use the full project backlog, never a truncated candidate window."""
-    reports = {p: report(db, p, cfg=cfg, now=now)
+    reports = {p: report(db, p, cfg=cfg, now=now, can_take=can_take, phase=phase)
                for p in {str(i.get("app") or i.get("lot_team") or "").strip() for i in items}}
     ready = {i for r in reports.values() for i in r["ready"]}
     return sorted((i for i in items if int(i["id"]) in ready), key=order_key)
 
 
-def assignment_ready(db, item, done, *, cfg=None, now=None):
+def assignment_ready(db, item, done, *, cfg=None, now=None, can_take=None):
     """Recheck under the assignment's row lock; our own assignment is ignored."""
     from . import backlog
     project = str(item.get("app") or item.get("lot_team") or "").strip()
@@ -134,4 +141,4 @@ def assignment_ready(db, item, done, *, cfg=None, now=None):
     rule = acceptance_rule(cfg, project)
     holds = backlog._take_holds(db, rows, cfg=cfg)
     return int(done["id"]) in evaluate(rows, project=project, rule=rule,
-                                       holds=holds, now=now)["ready"]
+                                       holds=holds, now=now, can_take=can_take)["ready"]

@@ -1179,7 +1179,7 @@ class _HoldPlaced(Exception):
 
 def _assign_ready(db, item: dict, assignee: str, note: str, take,
                   cap: int, *, cfg=None, hold_guard: bool = False,
-                  now: float | None = None) -> dict | None:
+                  now: float | None = None, plan_can_take=None) -> dict | None:
     """La prise conditionnelle d'un élément prêt (`assign_capped`,
     `ready_only`), ou None s'il a été pris, bloqué, ou si l'agent a atteint
     le plafond §4 entre-temps.
@@ -1212,7 +1212,8 @@ def _assign_ready(db, item: dict, assignee: str, note: str, take,
                     raise _HoldPlaced
                 if done.get("type") != ITEM_TYPE:
                     from . import project_plan
-                    if not project_plan.assignment_ready(tx, item, done, cfg=cfg, now=now):
+                    if not project_plan.assignment_ready(tx, item, done, cfg=cfg, now=now,
+                                                         can_take=plan_can_take):
                         raise _HoldPlaced
             return done
     except _HoldPlaced:
@@ -1508,7 +1509,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if lot_takeable(item, today, holds=holds, now=now)
             and now - float(item.get("created_ts") or now) >= LOT_MIN_AGE_S]
     from . import project_plan
-    lots = project_plan.eligible(db, lots, cfg=cfg, now=now)
+    lots = project_plan.eligible(db, lots, cfg=cfg, now=now, phase=False)
     room = 0
     if idle_s > 0 and max_per_hour > 0:
         room = int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S, AUTO_TAKE_NOTE)
@@ -1633,8 +1634,16 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if not auditor_mod.may_take(agent, canons):
                 continue
             auditors = auditor_mod.cards([agent], canons)
-            lots = project_plan.eligible(db, lots, cfg=cfg, now=now)
-            for item in list(lots):
+            # Read-only predicate: also used while the assignment row is locked.
+            def plan_can_take(item):
+                return (lot_fits(item, agent, auditor=row["name"] in auditors,
+                                 card=auditors.get(row["name"]), others=listing, db=db)
+                        and _directory_ready(cfg, db, agent, item, _lot_project(item),
+                                             canons=canons, dry_run=True, notes=dir_notes))
+
+            agent_lots = project_plan.eligible(db, lots, cfg=cfg, now=now,
+                                               can_take=plan_can_take)
+            for item in agent_lots:
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
                                 card=auditors.get(row["name"]), others=listing, db=db):
                     continue
@@ -1668,7 +1677,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     # toutes les dépendances sont satisfaites.
                     done = _assign_ready(db, item, check["assignee"], note,
                                          work.takes_rule(check), cap(),
-                                         cfg=cfg, hold_guard=True, now=now)
+                                         cfg=cfg, hold_guard=True, now=now,
+                                         plan_can_take=plan_can_take)
                 except storage.PendingLot:
                     break                   # le lot reste à l'agent suivant
                 if done is None:
