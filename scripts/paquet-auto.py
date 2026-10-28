@@ -217,6 +217,7 @@ class TestRun:
     added: list = field(default_factory=list)
     #: Rouge écarté après rejeu des seuls voisins sur la base (#4048).
     ignored_red: bool = False
+    log_path: str = ""
 
     @property
     def green(self) -> bool:
@@ -1048,6 +1049,27 @@ def _dedupe_modules(worktree: Path, modules) -> list[str]:
     return out
 
 
+def save_test_log(run: TestRun) -> TestRun:
+    """Preuve locale privée, hors arbre jetable ; 48 h et 100 séries au plus."""
+    from ameesh.config import load
+
+    root = Path(load().state_dir) / "roles" / "mesh-design" / "test-logs"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    files = sorted(root.glob("series-*.log"), key=lambda p: p.stat().st_mtime,
+                   reverse=True)
+    cutoff = time.time() - 48 * 3600
+    for index, path in enumerate(files):
+        if index >= 99 or path.stat().st_mtime < cutoff:
+            path.unlink(missing_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="series-",
+                                     suffix=".log", dir=root, delete=False) as log:
+        log.write("%s\nmodules: %s\nreturncode: %s\nseconds: %.3f\n\n%s"
+                  % (run.label, ", ".join(run.modules), run.returncode,
+                     run.seconds, run.output))
+        run.log_path = log.name
+    return run
+
+
 def run_tests(worktree: Path, label: str, modules: list[str], *,
               timeout: int) -> TestRun:
     if not modules:
@@ -1058,13 +1080,14 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
         proc = run_command(
             [project_python(worktree), "-m", "unittest", "-q", *modules],
             cwd=worktree, timeout=timeout, env=python_env(worktree))
-        return TestRun(label=label, modules=list(modules),
+        result = TestRun(label=label, modules=list(modules),
                        returncode=proc.returncode, output=_output(proc),
                        seconds=time.monotonic() - start)
     except PaquetAutoError as exc:
-        return TestRun(label=label, modules=list(modules), returncode=None,
+        result = TestRun(label=label, modules=list(modules), returncode=None,
                        output=str(exc), seconds=time.monotonic() - start,
                        timed_out=True)
+    return save_test_log(result)
 
 
 def run_freeze_checks(worktree: Path, *, timeout: int) -> tuple[int, str, float]:
@@ -1505,9 +1528,10 @@ def _inconclusive_lines(tests: list[TestRun]) -> list[str]:
         if not run.inconclusive:
             continue
         modules = ", ".join(run.modules) or "aucun module"
-        lines.append("- NON CONCLUANT : %s — modules %s — %s — extrait : %s"
+        lines.append("- NON CONCLUANT : %s — modules %s — %s — extrait : %s%s"
                      % (run.label.replace("#", ""), modules, run.motive(),
-                        _one_line(run.excerpt())[:240]))
+                        _one_line(run.excerpt())[:240],
+                        (" — journal local : " + run.log_path) if run.log_path else ""))
     return lines
 
 
