@@ -854,6 +854,9 @@ class AgentWorker(threading.Thread):
         #: #4164 : (harnais, compte) de la sonde bornée que porte le tour en
         #: cours, None hors sonde
         self._credits_probe = None
+        #: #4164 (B1 cx2) : (harnais, compte, raison) d'une sonde échue, à
+        #: réserver seulement si `_pick` choisit vraiment un tour
+        self._credits_candidate = None
         #: dernière résolution du binaire journalisée (L106)
         self.resolution_seen = ""
         #: L106 : arrêt propre demandé par la garde d'alimentation (texte de la
@@ -5132,9 +5135,12 @@ class AgentWorker(threading.Thread):
 
         Compte `exhausted` : aucun tour, blocage `provider_credits_exhausted`
         (fencé), consigne gardée, ni échec rapide ni arrêt — sauf la sonde
-        bornée, réservée atomiquement (un tour par compte et par
-        `provider_credits.PROBE_S`). Compte `ok` de nouveau : blocage levé."""
+        bornée (un tour par compte et par `provider_credits.PROBE_S`). Ici la
+        sonde échue est seulement **candidate** : `pick()` ne la réserve
+        qu'une fois un tour choisi (B1 cx2 : un agent sans travail ne la
+        consomme pas). Compte `ok` de nouveau : blocage levé."""
         self._credits_probe = None
+        self._credits_candidate = None
         if self.runner.dry_run or self.runner.mediated:
             return True  # l'exécuteur médié n'a pas l'état partagé du compte
         compte = account_turn.for_turn(self)
@@ -5144,7 +5150,6 @@ class AgentWorker(threading.Thread):
         account = auth_failure.account_name(compte)
         try:
             row = provider_credits.exhausted(self.db, harness, account)
-            sonde = bool(row) and provider_credits.claim_probe(self.db, harness, account)
         except db_mod.DbError as exc:
             # garde ouverte sur panne de lecture : l'échec du tour, lui,
             # reclassera le compte
@@ -5152,17 +5157,45 @@ class AgentWorker(threading.Thread):
                       % (self.name, db_mod.explain(exc)))
             return True
         if not row:
-            self._credits_probe = None
             return self._credits_release()
-        if sonde:
-            self._credits_probe = (harness, account)
-            log_async("[%s] %s: probe turn on %s (one every %ds)"
-                      % (self.name, provider_credits.REASON,
-                         provider_credits.who(harness, account),
-                         int(provider_credits.PROBE_S)))
-            return self._credits_release(probe=True)
+        echeance = row.get("next_probe_ts")
+        if echeance is None or float(echeance) <= time.time():
+            # la base reste seule juge de l'échéance (`claim_probe`, dans pick)
+            self._credits_candidate = (harness, account, row.get("reason") or "")
+            return True
         self._credits_block(harness, account, row.get("reason") or "")
         return False
+
+    def _credits_claim(self) -> bool:
+        """#4164 (B1 cx2) : un tour est choisi alors que le compte est épuisé
+        et sa sonde échue — la réserve atomiquement (un seul agent par
+        échéance) et lève le blocage. Faux si un autre agent l'a prise, ou
+        si le bail est perdu : le tour ne part pas."""
+        candidat, self._credits_candidate = getattr(self, "_credits_candidate", None), None
+        if not candidat:
+            return True
+        harness, account, reason = candidat
+        try:
+            pris = provider_credits.claim_probe(self.db, harness, account)
+        except db_mod.DbError as exc:
+            log_async("[%s] probe claim unreadable (%s): no turn"
+                      % (self.name, db_mod.explain(exc)))
+            pris = False
+        if not pris:
+            self._credits_block(harness, account, reason)
+            return False
+        self._credits_probe = (harness, account)
+        log_async("[%s] %s: probe turn on %s (one every %ds)"
+                  % (self.name, provider_credits.REASON,
+                     provider_credits.who(harness, account),
+                     int(provider_credits.PROBE_S)))
+        # le tour choisi a souvent déjà remplacé la marque (consigne prise :
+        # `running`) — « kept » n'est pas un refus ; seul le bail perdu l'est
+        self._credits_release(probe=True)
+        if self.lease_lost.is_set():
+            self._credits_probe = None
+            return False
+        return True
 
     def _credits_block(self, harness: str, account: str, reason: str) -> None:
         """Pose (fencé) le blocage d'un agent dont le compte est épuisé ;
@@ -5297,6 +5330,8 @@ class AgentWorker(threading.Thread):
         # effacée au début du tour : elle l'arrête.
         frontiere = _preemption_generation(self)
         spec = self._pick()
+        if spec is None:
+            self._credits_candidate = None  # aucun tour : la sonde reste libre
         if spec is not None:
             # Le tour urgent, lui, sert la demande qui l'a fait choisir : sa
             # frontière est relue après la sélection, sinon il se tuerait
@@ -5312,6 +5347,16 @@ class AgentWorker(threading.Thread):
                     registry.restore_prompt(self.db, self.name, self.runner.runner_id,
                                             self.epoch)
                 self._servir(())  # #2810 : ce tour ne partira pas
+                self._credits_candidate = None
+                return None
+            # #4164 (B1 cx2) : la sonde d'un compte épuisé n'est réservée que
+            # pour un tour réellement choisi ; perdue (autre agent), la
+            # consigne repart en attente comme ci-dessus.
+            if not self._credits_claim():
+                if spec.get("kind") == "prompt":
+                    registry.restore_prompt(self.db, self.name, self.runner.runner_id,
+                                            self.epoch)
+                self._servir(())
                 return None
             # transportée par le spec : `rotate_for_lot` et les copies de
             # `_run_guarded_turn` la gardent (dict(spec, …)).

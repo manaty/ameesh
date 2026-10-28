@@ -218,6 +218,49 @@ class AcceptanceTest(_CreditsBase):
             a1.watchdog_stop.set()
             a2.watchdog_stop.set()
 
+    def test_an_agent_without_work_never_takes_the_probe(self):
+        # B1 cx2: the due probe is claimed only for a turn actually chosen
+        _r1, oisif = self._worker("oisif", "codex", {})
+        _r2, actif = self._worker("actif", "codex", {})
+        try:
+            provider_credits.mark_exhausted(self.db, "codex", "", reason="insufficient_quota")
+            registry.set_pending_prompt(self.db, "actif", "travail")
+            self._probe_due()
+            echeance = self._row()["next_probe_ts"]
+            self.assertIsNone(self._turn(oisif))         # nothing to do
+            self.assertEqual(self.turns(), [])
+            self.assertEqual(self._row()["next_probe_ts"], echeance)  # probe still free
+            self.assertIsNotNone(self._turn(actif))      # the agent with work probes
+            self.assertEqual(len(self.turns()), 1)
+            self.assertEqual(self._row()["state"], "ok")
+            ligne = registry.get(self.db, "actif")
+            self.assertEqual((ligne["status"], ligne["pending_prompt"]), ("idle", None))
+        finally:
+            oisif.watchdog_stop.set()
+            actif.watchdog_stop.set()
+
+    def test_a_probe_lost_to_another_agent_keeps_the_instruction(self):
+        _r, worker = self._worker("tard", "codex", {})
+        try:
+            provider_credits.mark_exhausted(self.db, "codex", "", reason="insufficient_quota")
+            self._probe_due()
+            # another runner claims the due probe between the gate and the choice
+            vrai = provider_credits.claim_probe
+
+            def course(db, harness, account, *a, **kw):
+                vrai(db, harness, account)                 # the other runner wins
+                return vrai(db, harness, account, *a, **kw)
+
+            with mock.patch.object(provider_credits, "claim_probe", side_effect=course):
+                self.assertIsNone(self._turn(worker, "travail"))
+            self.assertEqual(self.turns(), [])
+            ligne = registry.get(self.db, "tard")
+            self.assertEqual((ligne["status"], ligne["status_text"], ligne["pending_prompt"]),
+                             ("blocked", "provider_credits_exhausted: codex/(default)",
+                              "travail"))
+        finally:
+            worker.watchdog_stop.set()
+
     def test_a_plan_usage_limit_is_not_an_exhaustion(self):
         _r, worker = self._worker("plan", "codex", {})
         try:
