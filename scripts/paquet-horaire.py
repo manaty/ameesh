@@ -110,8 +110,9 @@ MAX_RECOMPOSITIONS = 1
 MAX_ATTEMPTS = 3
 #: un porteur sans tentative plus jeune que ce délai : création en cours
 CREATION_GRACE = 300
-#: forfait du porteur (L157) : les porteurs manuels h-29…h-32 étaient à 90 min
-CARRIER_ESTIMATE = "90m"
+#: #4113, mesure auditeur #153989 du 28/10 : médiane 164 min, 112 paquets.
+CARRIER_ESTIMATE = "165m"
+CARRIER_ESTIMATE_SOURCE = "auditeur #153989, 28/10/2026 : médiane 164 min sur 112 paquets (#4113)"
 CREATED_RE = re.compile(r"^lot #(\d+) created", re.MULTILINE)
 SCRIPT_DIR = Path(__file__).resolve().parent
 LIST_LIMIT = 300
@@ -540,7 +541,7 @@ def compose(ctx: Context, rows: list[dict]) -> str:
         "--app", ctx.project, "--assignee", ctx.pilot, "--priority", "1",
         "--branch", branch, "--target", ctx.target,
         "--estimate", CARRIER_ESTIMATE,
-        "--estimate-source", "forfait du porteur horaire (#3845)",
+        "--estimate-source", CARRIER_ESTIMATE_SOURCE,
         "--source", "paquet-horaire (#3845), minuterie",
         "--body", "Paquet horaire composé sans agent par scripts/paquet-horaire.py "
                   "(#3845) : %d lot(s) prêt(s) à la lecture (%s)."
