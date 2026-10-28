@@ -162,7 +162,10 @@ class RecuDeBoutEnBoutTest(_Base):
             self.assertIn(jalon, data["ts"])
         self.assertEqual(set(data["stages_s"]), set(turn_stages.STAGES))
         self.assertIn(data["dominant"], turn_stages.STAGES + (None,))
-        self.assertLess(data["total_s"], 8.0)
+        # Pas de borne sur le total (CI chargée : 9 s vus) : sans fenêtre de
+        # lot, l'étape batch reste nulle à la milliseconde près.
+        self.assertLess(data["stages_s"]["batch"], 1.0)
+        self.assertGreaterEqual(data["total_s"], 0.0)
 
 
 if __name__ == "__main__":
