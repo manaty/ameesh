@@ -148,6 +148,9 @@
         turn's account can resume it, otherwise a deterministic resume brief;
   ameesh review-class [--project P] [--diff REF | FILE ...]
         review class of the changed files from the project's policy;
+  ameesh replay bench|run|report   banc de rejeu comparatif (#3264 B, L15) :
+        trois lots livrés sur leur base gelée, version installée et version
+        évaluée, relecture croisée à l'aveugle ;
   ameesh role canary [--json]   L165 (EP7 P3) : geste sans effet gardé par
         l'époque du bail de l'environnement (AMEESH_ROLE + AMEESH_LEASE_EPOCH,
         ou session liée) ; 0 accepté (un `pilot.gesture` canary), 1 refusé
@@ -422,6 +425,11 @@ def _dispatch(argv: list[str] | None) -> int:
         # L123 : l'agent de conversation du propriétaire
         from . import chat
         return chat.main(rest)
+    if command == "replay":
+        # #3264 B (L15) : le banc de rejeu comparatif, isolé et sans effet de
+        # bord ; la sélection lit les lots, le rapport est un fichier.
+        from . import replay
+        return replay.main(rest)
     if command in EXPLOITATION_COMMANDS:
         from . import exploitation
         return exploitation.main(argv)
