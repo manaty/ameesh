@@ -2028,6 +2028,23 @@ class SanteCourrierTest(unittest.TestCase):
                       remplacement['raison'])
         self.assertIn('remplacante ameesh-dev5', pourquoi)
 
+    def test_4126_remplacante_liberee_pendant_attente(self):
+        t, mono, dormir = self.horloge()
+        rows = self.rangs_4126()
+        rows[1] = dict(rows[1], status='running')
+        def relire(db, nom):
+            row = next(r for r in rows if r['name'] == nom)
+            return dict(row, status='idle') if nom == 'ameesh-dev5' else row
+        with mock.patch.object(self.mod.registry, 'get', side_effect=relire), \
+             mock.patch.object(self.mod.time, 'monotonic', side_effect=mono), \
+             mock.patch.object(self.mod.time, 'sleep', side_effect=dormir), \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0):
+            cible, pourquoi, remplacement = self.mod.selection(
+                None, rows, 'ameesh-dev3', 300.0, 1000.0)
+        self.assertEqual(t[0], 300.0)
+        self.assertEqual(cible['name'], 'ameesh-dev5')
+        self.assertEqual(remplacement['remplacante'], 'ameesh-dev5')
+
     def test_4126_aucune_libre_reste_sans_sonde(self):
         t, mono, dormir = self.horloge()
         rows = self.rangs_4126()

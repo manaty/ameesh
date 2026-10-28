@@ -443,8 +443,8 @@ def selection(db, pool: list[dict], sonde: str, borne: float, now: float,
     etat, attendu, motif = attendre_cible(db, sonde, borne)
     if etat is not None:
         return etat, None, None
-    autres = [r for r in pool if r["name"] != sonde
-              and driven(r, time.time()) and libre(r)]
+    # Re-read alternatives after the wait; the snapshot may still say busy.
+    autres = [r for r in pool if r["name"] != sonde]
     cible, _ = revalider(db, autres)
     if cible is None:
         return None, "%s ; aucune autre persona menee libre" % motif, None
