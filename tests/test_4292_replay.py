@@ -465,7 +465,7 @@ def _fake_agent(adapter, prompt, *, run_dir, cwd, env, harness, model, effort,
             "settings": {"model": model, "effort": effort}}
 
 
-def _fake_tests(tree, modules, *, command="", timeout=0):
+def _fake_tests(tree, modules, *, command="", timeout=0, env=None):
     return {"status": "ran", "passed": True, "exit": 0, "duration_s": 1.0,
             "modules": modules, "counts": {"ran": 1, "failures": 0, "errors": 0,
                                            "skipped": 0},
@@ -482,7 +482,8 @@ class _NullAdapter:
 def _fake_review(adapter, prompt, *, run_dir, env, harness, model, effort,
                  timeout, prices):
     return {"score": 8.0, "defects": [], "summary": "ok", "error": "",
-            "cost_usd": 0.01, "duration_s": 1.0}
+            "cost_usd": 0.01, "duration_s": 1.0, "exit": 0,
+            "timed_out": False}
 
 
 def _plan(tmp: str, lot, **overrides):
@@ -548,17 +549,81 @@ class ExecuteTest(unittest.TestCase):
             plan = _plan(tmp, self._lot(root, base))
             seen = {}
 
-            def tests(tree, modules, *, command="", timeout=0):
+            def tests(tree, modules, *, command="", timeout=0, env=None):
                 with open(os.path.join(tree, "tests", "test_ref.py"),
                           encoding="utf-8") as fh:
                     seen["test"] = fh.read()
                 seen["solution"] = os.path.exists(os.path.join(tree, "solution.py"))
-                return _fake_tests(tree, modules, command=command, timeout=timeout)
+                seen["env"] = env or {}
+                return _fake_tests(tree, modules, command=command,
+                                   timeout=timeout, env=env)
 
             replay.execute(plan, run_agent=_fake_agent, test_runner=tests,
                            review_agent=_fake_review)
             self.assertEqual(seen["test"], "ref = 1\n")
             self.assertTrue(seen["solution"])
+
+    def test_replayed_tests_receive_the_isolated_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, base = _repo(tmp)
+            plan = _plan(tmp, self._lot(root, base))
+            seen = {}
+
+            def tests(tree, modules, *, command="", timeout=0, env=None):
+                seen.update(env or {})
+                return _fake_tests(tree, modules, command=command,
+                                   timeout=timeout, env=env)
+
+            replay.execute(plan, run_agent=_fake_agent, test_runner=tests,
+                           review_agent=_fake_review)
+            self.assertIn("invalid@127.0.0.1:1", seen.get("AMEESH_DSN", ""))
+            self.assertTrue(seen.get("AMEESH_STATE", "").startswith(plan.work_root))
+            self.assertTrue(seen.get("AGENT_MAIL_STATE", "").startswith(plan.work_root))
+            self.assertTrue(seen.get("HOME", "").startswith(plan.work_root))
+
+    def test_an_errored_run_is_not_a_conclusion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, base = _repo(tmp)
+            plan = _plan(tmp, self._lot(root, base))
+
+            def agent(adapter, prompt, *, run_dir, cwd, env, harness, model,
+                      effort, timeout, prices):
+                result = _fake_agent(adapter, prompt, run_dir=run_dir, cwd=cwd,
+                                     env=env, harness=harness, model=model,
+                                     effort=effort, timeout=timeout, prices=prices)
+                result["exit"] = 1
+                result["error"] = "sortie 1"
+                return result
+
+            report = replay.execute(plan, run_agent=agent,
+                                    test_runner=_fake_tests,
+                                    review_agent=_fake_review)
+            entry = report["lots"][0]
+            self.assertEqual(entry["quality"], "incomplete")
+            self.assertEqual(entry["verdict"], "incomplete")
+            self.assertIn("rejeu non concluant", " ".join(entry["errors"]))
+            self.assertIn("relecture non lancée", " ".join(entry["errors"]))
+            self.assertEqual(report["conclusion"], "incomplete")
+            self.assertEqual(report["budget"]["reviews"], 0)
+
+    def test_an_errored_review_is_not_quality(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, base = _repo(tmp)
+            plan = _plan(tmp, self._lot(root, base))
+
+            def reviewer(*args, **kwargs):
+                review = _fake_review(*args, **kwargs)
+                review["error"] = "sortie 1"
+                return review
+
+            report = replay.execute(plan, run_agent=_fake_agent,
+                                    test_runner=_fake_tests,
+                                    review_agent=reviewer)
+            entry = report["lots"][0]
+            self.assertEqual(entry["quality"], "incomplete")
+            self.assertEqual(entry["verdict"], "incomplete")
+            self.assertIn("relecture non concluante", " ".join(entry["errors"]))
+            self.assertEqual(report["conclusion"], "incomplete")
 
     def test_model_evaluation_changes_the_model_and_keeps_the_harness(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -796,17 +861,20 @@ class ReuseIdentityTest(unittest.TestCase):
             plan = _plan(tmp, lot)
             good = {"version": "old", "label": "0.1",
                     "model": "claude-sonnet-5", "exit": 0,
+                    "timed_out": False, "error": "",
                     "isolation": {"base": base}}
             self.assertIs(replay._reuse_run(
                 {"lots": [{"lot": 7, "runs": {"old": good}}]},
                 plan, lot, "old"), good)
-            for key, value in (("label", "0.9"), ("model", "autre"),
-                               ("version", "new")):
+            cases = [("label", "0.9"), ("model", "autre"), ("version", "new"),
+                     ("exit", 1), ("timed_out", True), ("error", "sortie 1"),
+                     ("pending", True)]
+            for key, value in cases:
                 bad = dict(good)
                 bad[key] = value
                 self.assertIsNone(replay._reuse_run(
                     {"lots": [{"lot": 7, "runs": {"old": bad}}]},
-                    plan, lot, "old"))
+                    plan, lot, "old"), key)
             bad = dict(good)
             bad["isolation"] = {"base": "f" * 40}
             self.assertIsNone(replay._reuse_run(
@@ -821,19 +889,21 @@ class ReuseIdentityTest(unittest.TestCase):
             good = {"score": 8.0, "reviewer": plan.reviewer,
                     "reviewer_version": plan.reviewer_version,
                     "reviewer_model": plan.reviewer_model,
-                    "reviewer_effort": plan.reviewer_effort}
+                    "reviewer_effort": plan.reviewer_effort,
+                    "exit": 0, "timed_out": False, "error": ""}
             self.assertIs(replay._reuse_review(
                 {"lots": [{"lot": 7, "reviews": {"old": good}}]},
                 plan, lot, "old"), good)
-            for key, value in (("reviewer", "claude"),
-                               ("reviewer_version", "9"),
-                               ("reviewer_model", "autre"),
-                               ("reviewer_effort", "low")):
+            cases = [("reviewer", "claude"), ("reviewer_version", "9"),
+                     ("reviewer_model", "autre"), ("reviewer_effort", "low"),
+                     ("score", None), ("exit", 1), ("timed_out", True),
+                     ("error", "sortie 1")]
+            for key, value in cases:
                 bad = dict(good)
                 bad[key] = value
                 self.assertIsNone(replay._reuse_review(
                     {"lots": [{"lot": 7, "reviews": {"old": bad}}]},
-                    plan, lot, "old"))
+                    plan, lot, "old"), key)
 
 
 class ReportTest(unittest.TestCase):

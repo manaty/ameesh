@@ -1194,6 +1194,27 @@ def run_review(adapter, prompt: str, *, run_dir: str, cwd: str | None = None,
 # comparaison et conclusion
 # --------------------------------------------------------------------------
 
+def run_valid(result: dict | None) -> bool:
+    """Une mesure de rejeu valide : le harnais a terminé normalement.
+
+    Un tour sorti en erreur, interrompu ou sans code de sortie n'est pas une
+    mesure comparable : il ne compte ni dans la qualité ni dans une
+    conclusion (relecture B2/P2 de #4292)."""
+    return (bool(result) and result.get("exit") == 0
+            and not result.get("timed_out") and not result.get("error")
+            and not result.get("pending"))
+
+
+def review_valid(review: dict | None) -> bool:
+    """Une relecture valide : note présente et relecteur terminé normalement.
+
+    Une note lue malgré un `error`, un délai dépassé ou une sortie non nulle
+    ne vaut pas qualité (relecture B2/P2 de #4292)."""
+    return (bool(review) and review.get("score") is not None
+            and review.get("exit") == 0 and not review.get("timed_out")
+            and not review.get("error"))
+
+
 def compare_runs(old: dict, new: dict) -> dict:
     """Le verdict d'un lot : `better`, `equal`, `regression` ou `failed`.
 
@@ -1636,7 +1657,15 @@ def _run_one(plan: Plan, lot: BenchLot, version: str, blind: str, run_dir: str,
     isolation = materialize(lot.repo, lot.base, tree)
     prompt = replay_prompt(lot)
     env = harness_env(plan.harness, env_file=plan.env_file)
-    env = isolate_env(env, os.path.join(run_dir, "isolation"))
+    isolation_dir = os.path.join(run_dir, "isolation")
+    env = isolate_env(env, isolation_dir)
+    # Les tests du lot tournent dans le même environnement isolé que le
+    # harnais : jamais le DSN, l'état ni la boîte réels de l'appelant
+    # (relecture B1/P1 de #4292). Ni clé du harnais ni foyer dsh : un test
+    # n'a aucune raison d'appeler le fournisseur.
+    test_env = dict(env)
+    test_env["HOME"] = os.path.join(isolation_dir, "home")
+    test_env.pop(KEY_ENV.get(plan.harness), None)
     env.update(adapter.env())
     use_dsh_home = os.path.join(run_dir, "dsh-home")
     home_info = None
@@ -1661,7 +1690,7 @@ def _run_one(plan: Plan, lot: BenchLot, version: str, blind: str, run_dir: str,
     # rejeu est jugé par la référence, pas par ses propres témoins.
     result["tests"] = {"injected": inject_tests(lot.repo, lot.frozen, tree, lot.tests)}
     result["tests"].update(test_runner(tree, modules, command=plan.test_command,
-                                       timeout=plan.test_cap_s))
+                                       timeout=plan.test_cap_s, env=test_env))
     return result
 
 
@@ -1706,7 +1735,7 @@ def _reuse_run(report: dict | None, plan: Plan, lot: BenchLot,
         if int(entry.get("lot") or 0) != int(lot.lot):
             continue
         run = (entry.get("runs") or {}).get(version)
-        if not run or run.get("exit") is None or run.get("pending"):
+        if not run_valid(run):
             continue
         if run.get("version") != version or run.get("label") != label:
             continue
@@ -1731,7 +1760,7 @@ def _reuse_review(report: dict | None, plan: Plan, lot: BenchLot,
         if int(entry.get("lot") or 0) != int(lot.lot):
             continue
         review = (entry.get("reviews") or {}).get(version)
-        if not review or review.get("score") is None:
+        if not review_valid(review):
             continue
         if review.get("reviewer") != plan.reviewer:
             continue
@@ -1868,7 +1897,7 @@ def execute(plan: Plan, *, run_agent=run_harness, test_runner=run_tests,
                  "base": lot.base, "frozen": lot.frozen,
                  "base_source": lot.base_source, "files": list(lot.files),
                  "tests": list(lot.tests), "runs": {}, "reviews": {},
-                 "blind": {}, "verdict": "incomplete"}
+                 "blind": {}, "verdict": "incomplete", "errors": []}
         # A/B tirés par lot : l'ordre ne révèle jamais la version, et le
         # dossier de chaque soumission porte le nom aveugle
         names = ["A", "B"]
@@ -1906,9 +1935,25 @@ def execute(plan: Plan, *, run_agent=run_harness, test_runner=run_tests,
             replayed[version] = result
             runs += 1
             spent += float(result.get("cost_usd") or 0.0)
+            if not run_valid(result):
+                entry["errors"].append(
+                    "#%s %s: rejeu non concluant (%s)"
+                    % (lot.lot, version,
+                       result.get("error") or "sortie %s" % result.get("exit")))
             write()
         for version in ("old", "new"):
             if version not in replayed:
+                continue
+            if not run_valid(replayed[version]):
+                # Un rejeu en erreur ne se relit pas : la relecture ne
+                # fabrique pas une qualité sur une mesure absente (B2/P2).
+                entry["reviews"][version] = {
+                    "score": None, "defects": [], "summary": "",
+                    "error": "rejeu non concluant: pas de relecture",
+                    "cost_usd": 0.0, "exit": None, "timed_out": False}
+                entry["errors"].append(
+                    "#%s %s: relecture non lancée (rejeu non concluant)"
+                    % (lot.lot, version))
                 continue
             if reviews >= plan.max_reviews:
                 stop("plafond de relectures atteint (%d)" % plan.max_reviews)
@@ -1936,23 +1981,40 @@ def execute(plan: Plan, *, run_agent=run_harness, test_runner=run_tests,
                 review = {"score": None, "defects": [], "summary": "",
                           "error": str(exc), "cost_usd": 0.0}
             entry["reviews"][version] = review
-            replayed[version]["review"] = review
+            if review_valid(review):
+                replayed[version]["review"] = review
+            else:
+                entry["errors"].append(
+                    "#%s %s: relecture non concluante (%s)"
+                    % (lot.lot, version,
+                       review.get("error") or "sortie %s" % review.get("exit")))
+                replayed[version]["review"] = {
+                    "score": None, "defects": [], "summary": "",
+                    "error": review.get("error") or "relecture non concluante"}
             reviews += 1
             spent += float(review.get("cost_usd") or 0.0)
             write()
-        if "old" in replayed and "new" in replayed:
-            comparison = compare_runs(replayed["old"], replayed["new"])
+        old_run = replayed.get("old")
+        new_run = replayed.get("new")
+        old_review = entry["reviews"].get("old")
+        new_review = entry["reviews"].get("new")
+        if (run_valid(old_run) and run_valid(new_run)
+                and review_valid(old_review) and review_valid(new_review)):
+            comparison = compare_runs(old_run, new_run)
             entry["verdict"] = comparison["verdict"]
             entry["deltas"] = comparison["deltas"]
             entry["reasons"] = {"worse": comparison["worse"],
                                 "better": comparison["better"]}
-        scores = [(entry["reviews"].get(version) or {}).get("score")
-                  for version in ("old", "new")]
+        else:
+            # Mesure ou relecture invalide : la conclusion du lot reste non
+            # concluante, jamais « égale » par défaut (B2/P2 de #4292).
+            entry["verdict"] = "incomplete"
         tests = [((entry["runs"].get(version) or {}).get("tests") or {}).get("passed")
                  for version in ("old", "new")]
-        entry["quality"] = ("complete" if all(score is not None for score in scores)
-                            and all(value is not None for value in tests)
-                            else "incomplete")
+        entry["quality"] = (
+            "complete" if run_valid(old_run) and run_valid(new_run)
+            and review_valid(old_review) and review_valid(new_review)
+            and all(value is not None for value in tests) else "incomplete")
         write()
     write()
     if not plan.keep:
@@ -2088,6 +2150,9 @@ def report_markdown(report: dict) -> str:
                   "",
                   "Verdict : **%s**%s." % (entry.get("verdict") or "?",
                                           _reasons(entry)), ""]
+        if entry.get("errors"):
+            lines += ["Erreurs :", ""] + ["- %s" % error
+                                          for error in entry["errors"]] + [""]
     lines += ["## Conclusion", "",
               "**%s** — bruit admis : ±%d %% coût et durée, ±%g point de note." % (
                   report.get("conclusion") or "?",
