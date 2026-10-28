@@ -508,6 +508,25 @@ class PaquetTest(_Base):
         with mock.patch.object(planned_waits, "packet_attachments", return_value={}):
             record([unit])
             self.assertEqual(self.slo(), [])
+            # #4111: packet record precedes the branch-head sweep.
+            self.db.execute("UPDATE work_items SET branch_head = NULL WHERE id = %s",
+                            (carrier["id"],))
+            self.assertEqual(self.slo(), [])
+            self.db.execute(
+                "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor)"
+                " VALUES (%s, 'frozen', to_timestamp(%s), %s, 'orch')",
+                (carrier["id"], self.GO, "e" * 40))
+            self.assertIn(self.lot["id"], [a["lot"] for a in self.slo()])
+            self.db.execute("UPDATE work_item_milestones SET sha = %s"
+                            " WHERE work_item_id = %s AND kind = 'frozen'",
+                            (head, carrier["id"]))
+            self.assertEqual(self.slo(), [])
+            # A later observed adaptation must not be hidden by that record.
+            self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                            ("e" * 40, carrier["id"]))
+            self.assertIn(self.lot["id"], [a["lot"] for a in self.slo()])
+            self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                            (head, carrier["id"]))
             record([])
             self.assertIn(self.lot["id"], [a["lot"] for a in self.slo()])
             record([unit])
