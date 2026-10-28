@@ -110,7 +110,7 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
             entry = root / "entry.cjs"
             entry.write_text('console.log("COMMAND RAN");')
             env = dict(os.environ, NODE_OPTIONS=deepseek_cgroup.node_options())
-            for module in (None, "unexpected", "0.1.5-rc.2", "0.2.0-rc.2"):
+            for module in (None, "unexpected", "0.1.5-rc.2", "0.2.0-rc.2", "0.2.1-rc.4"):
                 if module:
                     provider = root / "node_modules/@deepseek-ai/dsh-subprocess-local"
                     provider.mkdir(parents=True, exist_ok=True)
@@ -326,6 +326,24 @@ assert.equal(code,127);
         self.assertEqual(result.stdout, "")
         self.assertIn("cgroup guard must be loaded with --require", result.stderr)
 
+    def test_reviewed_pins_cover_both_transition_versions(self):
+        # #4278: the fleet moves from dsh 0.2.0-rc.2 to 0.2.1-rc.4 one host at
+        # a time. Both provider entries stay pinned; the helper modules are
+        # byte-identical and shared.
+        code = ("console.log(JSON.stringify(require(" +
+                json.dumps(str(deepseek_cgroup.PRELOAD)) + ").REVIEWED))")
+        result = subprocess.run([NODE, "-e", code], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reviewed = json.loads(result.stdout)
+        self.assertEqual(reviewed["provider"], "@deepseek-ai/dsh-subprocess-local")
+        self.assertEqual(set(reviewed["versions"]), {"0.2.0-rc.2", "0.2.1-rc.4"})
+        entries = [record["entry"] for record in reviewed["versions"].values()]
+        self.assertEqual(len(set(entries)), 2)
+        for version, record in reviewed["versions"].items():
+            with self.subTest(version=version):
+                self.assertEqual(len(record["files"]), 4)
+                self.assertIn(record["entry"], record["files"])
+
 
 class PlacementCheckTest(unittest.TestCase):
     def test_outside_scope_and_reparented_scope_member_are_reported(self):
@@ -450,12 +468,13 @@ class RealProviderTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         reviewed = json.loads(result.stdout)
         self.assertEqual(reviewed["provider"], manifest["name"])
-        self.assertEqual(reviewed["version"], manifest["version"])
+        record = reviewed["versions"].get(manifest["version"])
+        self.assertIsNotNone(record, "installed provider version is not reviewed")
         files = {hashlib.sha256(path.read_bytes()).hexdigest(): path.name
                  for path in (root / "lib").glob("*.js")}
-        self.assertEqual(set(reviewed["files"]), set(files))
+        self.assertEqual(set(record["files"]), set(files))
         entry = root / manifest["main"]
-        self.assertEqual(reviewed["entry"], hashlib.sha256(entry.read_bytes()).hexdigest())
+        self.assertEqual(record["entry"], hashlib.sha256(entry.read_bytes()).hexdigest())
 
     def test_reviewed_provider_in_cache_or_preload_options_is_refused(self):
         for kind in ("cache", "require", "import"):

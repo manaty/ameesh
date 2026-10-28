@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Temporary adapter for dsh 0.2.0-rc.2 / subprocess-local 0.2.0-rc.2.
+// Temporary adapter for dsh 0.2.0-rc.2 and 0.2.1-rc.4
+// (subprocess-local 0.2.0-rc.2 and 0.2.1-rc.4).
 // Check the actual imported provider, including profile-local overrides, then
 // modify only that module's bindings. No global child_process interception.
 'use strict';
@@ -12,15 +13,26 @@ const { createRequire, registerHooks, syncBuiltinESMExports } = nodeModule;
 const threads = require('node:worker_threads');
 
 const PROVIDER = '@deepseek-ai/dsh-subprocess-local';
-const VERSION = '0.2.0-rc.2';
-const INDEX_HASH = 'e40106ed35a1e1744c016e77f2cf59b07f87969bb7c4b424d26fb08da75e3922';
+// Provider versions reviewed for this adapter. The fleet is upgraded from dsh
+// 0.2.0-rc.2 to 0.2.1-rc.4 one host at a time (lot #4278), so both entries are
+// pinned during the transition; keeping the old one costs nothing.
+// 0.2.1-rc.4's entry only differs from 0.2.0-rc.2's by the literal-argv scope
+// probe, a listener check and terminal ownership; the child_process import and
+// the systemd-run scope call sites are unchanged.
+const ENTRIES = Object.freeze({
+  '0.2.0-rc.2': 'e40106ed35a1e1744c016e77f2cf59b07f87969bb7c4b424d26fb08da75e3922',
+  '0.2.1-rc.4': '2964d94d6aa735f79e5cd5f54035a9d73b371e8060dda7e3bf666593428c04f4',
+});
+const ENTRY_HASHES = new Set(Object.values(ENTRIES));
 // Include every provider module the entry imports (runner-launch-B2zsQ1Dz.js
 // and output.js), plus its separate ./runner export (runner.js); pinning the
 // latter is harmless although the entry does not import it (#2275, #2280).
-const HASHES = new Set([INDEX_HASH,
+// Those three modules are byte-identical in both reviewed versions.
+const SHARED_HASHES = [
   '6df08adc4a27f278878a5f4cde8b551b51e647b922ac7d6591fd62d272ced153',
   '4e21528dfdb3e92bdce2340945dc4dcb202e4a4af0bbeb8b97585f67735d30c1',
-  '4f77ef6da608d36df168c99177e9b527e7145df1418845eba567635e64a4c2a3']);
+  '4f77ef6da608d36df168c99177e9b527e7145df1418845eba567635e64a4c2a3'];
+const HASHES = new Set([...ENTRY_HASHES, ...SHARED_HASHES]);
 const CP_IMPORT = 'import { execFile, spawn, spawnSync } from "node:child_process";';
 
 function fail(error) {
@@ -170,7 +182,8 @@ function protectWorkers() {
 
 function verifySource(info, source) {
   const hash = crypto.createHash('sha256').update(source).digest('hex');
-  if (info.pkg.name !== PROVIDER || info.pkg.version !== VERSION || !HASHES.has(hash)) {
+  if (info.pkg.name !== PROVIDER || !Object.hasOwn(ENTRIES, info.pkg.version) ||
+      !HASHES.has(hash)) {
     throw new Unavailable(`unreviewed ${PROVIDER} ${info.pkg.version} (${hash}) at ${info.file}; review the cgroup adapter before running tools`);
   }
   return hash;
@@ -242,8 +255,8 @@ function installLoader(rejectProvider = false) {
         if (loaded.source === null || loaded.source === undefined) throw new Unavailable('provider source is unavailable for verification');
         const source = typeof loaded.source === 'string' ? loaded.source : Buffer.from(loaded.source).toString('utf8');
         const hash = verifySource(info, source);
-        if (entryURLs.has(url) && hash !== INDEX_HASH) throw new Unavailable('provider export does not select the reviewed runtime entry');
-        if (hash !== INDEX_HASH) return loaded;
+        if (entryURLs.has(url) && !ENTRY_HASHES.has(hash)) throw new Unavailable('provider export does not select the reviewed runtime entry');
+        if (!ENTRY_HASHES.has(hash)) return loaded;
         if (!source.includes(CP_IMPORT)) throw new Unavailable('reviewed provider bindings are missing');
         return { ...loaded, source: source.replace(CP_IMPORT, scopedBindings()) };
       } catch (error) {
@@ -280,7 +293,7 @@ function activate() {
   if (!info) throw new Unavailable('cannot locate resolved provider metadata');
   // CJS resolution is an early availability check. The load hook checks the
   // actual ESM/import condition's source before evaluating it as well.
-  if (verifySource(info, fs.readFileSync(entry)) !== INDEX_HASH) {
+  if (verifySource(info, fs.readFileSync(entry)) !== ENTRIES[info.pkg.version]) {
     throw new Unavailable('CLI provider export does not select the reviewed runtime entry');
   }
   installLoader();
@@ -294,8 +307,11 @@ module.exports = { verifySource, installLoader, scopedBindings };
 // Read-only pin record, used by the real-provider regression to prove that the
 // installed provider is the reviewed one (#2275). Not a permission input.
 module.exports.REVIEWED = Object.freeze({
-  provider: PROVIDER, version: VERSION, entry: INDEX_HASH,
-  files: Object.freeze([...HASHES])
+  provider: PROVIDER,
+  versions: Object.freeze(Object.fromEntries(Object.entries(ENTRIES).map(([version, entry]) => [
+    version,
+    Object.freeze({entry, files: Object.freeze([entry, ...SHARED_HASHES])}),
+  ]))),
 });
 if (process.platform === 'linux') {
   try {
