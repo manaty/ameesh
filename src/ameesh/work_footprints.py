@@ -148,12 +148,18 @@ def set_paths(db, item_id: int, paths: Iterable[str], *, actor: str) -> dict:
     return result
 
 
-def record_estimate(db, cfg, item: dict, *, actor: str, repo: Optional[str] = None) -> dict | None:
-    """L'estimation d'intake du lot (titre et corps), écrite si elle trouve un
-    chemin ; jamais d'échec de la création pour elle (appelant)."""
+def estimate_lot(cfg, item: dict, repo: Optional[str] = None) -> list[str]:
+    """L'estimation d'intake d'un lot (créé ou à créer : `app`, `title`,
+    `body`, `branch_target`), résolue dans un clone du dépôt s'il y en a un."""
     clone, target = _clone_and_target(cfg, item, repo)
-    paths = estimate("%s\n%s" % (item.get("title") or "", item.get("body") or ""),
-                     clone, _ref(clone, target) if clone and target else "")
+    return estimate("%s\n%s" % (item.get("title") or "", item.get("body") or ""),
+                    clone, _ref(clone, target) if clone and target else "")
+
+
+def record_estimate(db, cfg, item: dict, *, actor: str, repo: Optional[str] = None) -> dict | None:
+    """`--estimate` : l'estimation d'intake du lot, réécrite si elle trouve un
+    chemin."""
+    paths = estimate_lot(cfg, item, repo)
     if not paths:
         return None
     return storage.of(db).work_footprints.replace(

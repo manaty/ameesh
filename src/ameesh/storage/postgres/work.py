@@ -614,7 +614,8 @@ class WorkItems(interface.WorkItems):
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
             estimate_source=None, change_size=None, queued_note=None,
             forced_note=None, mark_item_id=None, mark_note="",
-            parent_lot=None, unique_ref=False, external_executor=None) -> dict:
+            parent_lot=None, unique_ref=False, external_executor=None,
+            footprint=None) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
         #540 : `queued_note` (voir l'interface).
@@ -650,7 +651,13 @@ class WorkItems(interface.WorkItems):
         `parent_lot`, par identifiant croissant), le verrou d'agent ensuite.
         `assign` verrouille la ligne du lot puis l'agent (`_pending`) ;
         l'ordre inverse ici (agent puis parent) interbloquait l'ajout d'une
-        suite avec l'attribution de son parent."""
+        suite avec l'attribution de son parent.
+
+        #4173 : `footprint` (chemins normalisés) est l'empreinte d'intake,
+        écrite dans la même transaction. Un lot créé attribué occupe aussitôt
+        son empreinte : sous le verrou du graphe (pris avant toute ligne de
+        lot, ordre de la prise), une empreinte qui chevauche celle d'un lot
+        occupant du même dépôt lève `FootprintOverlap` et annule la création."""
         with self.db.transaction() as tx:
             if unique_ref and str(issue_ref or "").strip():
                 # #2954 : deux watchers (deux hôtes) peuvent ouvrir l'incident
@@ -659,6 +666,8 @@ class WorkItems(interface.WorkItems):
                 # commit du premier, voit sa ligne.
                 tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
                          "lower(%s), 0))", (issue_ref,))
+            if footprint and assignee:
+                tx.execute(_DEPENDENCIES_LOCK)
             # #540 : lignes de lots d'abord, par identifiant croissant, puis
             # le verrou d'agent de `_pending` — même ordre que `assign`.
             marked = None
@@ -729,6 +738,18 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._estimate_row(int(item["id"]), estimate_minutes,
                                             estimate_source, actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            if footprint:
+                for path in sorted(set(footprint)):
+                    tx.execute("INSERT INTO work_item_footprints"
+                               "(work_item_id, source, path, created_by)"
+                               " VALUES (%s, 'intake', %s, %s)",
+                               (int(item["id"]), path, actor or ""))
+                WorkItems(tx)._event(int(item["id"]), "intake", "Footprint (intake): %s"
+                                     % ", ".join(sorted(set(footprint))), actor)
+                if assignee:
+                    overlaps = WorkItems(tx)._footprint_overlaps(item["id"])
+                    if overlaps:
+                        raise interface.FootprintOverlap(overlaps)
             if behind is not None:
                 item["forced_behind" if forced_note else "queued_behind"] = behind
             if parent_lot is not None:

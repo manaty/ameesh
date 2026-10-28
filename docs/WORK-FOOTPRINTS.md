@@ -50,11 +50,16 @@ repository:
   re-checks the rule under the dependency-graph lock after locking the lot;
 - is refused by `ameesh work assign`, which names the overlapping lots and
   paths. Nothing is written. Reassigning a lot that already occupies its
-  footprint is not affected.
+  footprint is not affected;
+- cannot be *created* assigned: `ameesh work add --assignee` writes the intake
+  footprint in the creation transaction, and an overlap rolls it back. The
+  command then creates the lot unassigned, with a warning naming the
+  overlapping lots; it waits, and is taken after their merge.
 
-Both paths take the same advisory lock before checking, so two concurrent
-attributions of overlapping lots decide one after the other. When the
-occupying lot merges, the waiting lot becomes takeable at the next pass.
+All three paths take the same advisory lock before checking, so two
+concurrent attributions or creations of overlapping lots decide one after
+the other. When the occupying lot merges, the waiting lot becomes takeable at
+the next pass.
 
 Footprints set or refreshed on lots that are *already* in progress are not
 retroactive: `ameesh work footprint` shows the overlap, and the pilot decides.

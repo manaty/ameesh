@@ -152,6 +152,67 @@ class PriseTest(_Empreintes):
         self.assertEqual(sum(1 for r in results if r is not None), 1, results)
 
 
+class CreationAttribueeTest(_Empreintes):
+    """B1 de cx2 : un lot créé attribué occupe aussitôt son empreinte — la
+    création est gardée comme l'attribution, dans sa propre transaction."""
+
+    def test_creation_attribuee_refusee_puis_libre_permise(self):
+        premier = work.add(self.db, title="premier", app="nexlink",
+                           assignee="human:proprio", footprint=["src/a.py"])
+        self.assertEqual(fp.paths_of(self.db, premier["id"]), ["src/a.py"])
+        before = self.db.query("SELECT count(*)::int AS n FROM work_items")[0]["n"]
+        with self.assertRaises(storage.FootprintOverlap) as ctx:
+            work.add(self.db, title="second", app="nexlink", assignee="human:autre",
+                     footprint=["src"])
+        self.assertEqual({r["id"] for r in ctx.exception.overlaps}, {premier["id"]})
+        self.assertEqual(self.db.query("SELECT count(*)::int AS n FROM work_items")[0]["n"],
+                         before)
+        libre = work.add(self.db, title="second", app="nexlink", footprint=["src"])
+        self.assertIsNone(libre["assignee"])
+        self.assertEqual(fp.paths_of(self.db, libre["id"]), ["src"])
+        # autre dépôt : rien n'attend
+        work.add(self.db, title="ailleurs", app="ameesh", assignee="human:autre",
+                 footprint=["src"])
+
+    def test_creations_attribuees_concurrentes_une_seule_passe(self):
+        barrier = threading.Barrier(2, timeout=15)
+        created, refused, errors = [], [], []
+
+        def create(i):
+            connection = db_mod.connect(self.cfg)
+            try:
+                barrier.wait()
+                created.append(work.add(connection, title="c%d" % i, app="nexlink",
+                                        assignee="human:a%d" % i, footprint=["src/a.py"]))
+            except storage.FootprintOverlap as exc:
+                refused.append(exc)
+            except Exception as exc:  # noqa: BLE001 - remonté par l'assertion
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        workers = [threading.Thread(target=create, args=(i,), daemon=True) for i in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(30)
+        self.assertEqual(errors, [])
+        self.assertEqual((len(created), len(refused)), (1, 1))
+
+    def test_cli_cree_libre_avec_un_avertissement(self):
+        work.add(self.db, title="premier", app="nexlink", assignee="human:proprio",
+                 footprint=["src/ameesh/backlog.py"])
+        proc = self.mesh("work", "add", "--title", "corriger src/ameesh/backlog.py",
+                         "--app", "nexlink", "--assignee", "human:autre",
+                         "--estimate", "1h")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("created unassigned", proc.stderr)
+        self.assertIn("footprint: src/ameesh/backlog.py", proc.stdout)
+        row = self.db.query("SELECT id, assignee FROM work_items WHERE title LIKE 'corriger%'")
+        self.assertEqual(len(row), 1)
+        self.assertIsNone(row[0]["assignee"])
+
+
 class ProprieteTest(_Empreintes):
     """Propriété : quelle que soit la suite de gestes de l'ordonnanceur (prises
     au repos, attributions manuelles, fusions, empreintes posées sur des lots
@@ -189,8 +250,17 @@ class ProprieteTest(_Empreintes):
         for step in range(60):
             lot = rng.choice(lots)
             current = work.get(self.db, lot["id"])
-            gesture = rng.choice(("take", "take", "assign", "merge", "footprint"))
-            if gesture == "take":
+            gesture = rng.choice(("take", "take", "assign", "merge", "footprint", "create"))
+            if gesture == "create":
+                try:
+                    lots.append(work.add(
+                        self.db, title="cree %d/%d" % (seed, step),
+                        app=rng.choice(("nexlink", "nexlink", "ameesh")),
+                        assignee="human:%s" % rng.choice(agents),
+                        footprint=rng.sample(self.UNIVERS, rng.randint(1, 3))))
+                except storage.FootprintOverlap:
+                    pass
+            elif gesture == "take":
                 WorkItems(self.db).assign(lot["id"], rng.choice(agents), current=None,
                                           note="t", actor="t", ready_only=True)
             elif gesture == "assign" and not current["assignee"]:

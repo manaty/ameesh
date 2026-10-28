@@ -1726,8 +1726,13 @@ class WorkItems(Domain):
             queued_note: str | None = None, forced_note: str | None = None,
             mark_item_id: int | None = None, mark_note: str = "",
             parent_lot: int | None = None, unique_ref: bool = False,
-            external_executor: str | None = None) -> dict:
-        """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
+            external_executor: str | None = None,
+            footprint: list | None = None) -> dict:
+        """#4173 : `footprint`, l'empreinte d'intake écrite avec le lot ; un lot
+        créé attribué dont elle chevauche celle d'un lot en cours du même dépôt
+        lève `FootprintOverlap` (rien n'est écrit).
+
+        Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
         si `estimate_minutes`, L157 ; avec la taille déclarée du changement
