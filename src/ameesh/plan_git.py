@@ -347,20 +347,67 @@ def ref_reachable(repo: str, rev: str, *,
     return bool(proc.stdout.strip())
 
 
+#: #4255 : filtres de clone partiel qui gardent l'histoire des **commits**.
+#: `object:type=<type>` n'omet pas le type demandé mais **tous les autres**
+#: (git-rev-list(1)) : `object:type=blob`, `tree` ou `tag` omet donc des
+#: commits et coupe l'ascendance. Un filtre absent, inconnu ou combiné
+#: (`combine:`) reste un doute : la liste blanche est volontairement close.
+_COMMIT_KEEPING_FILTER_RE = re.compile(
+    r"^(?:blob:none|blob:limit=\d+[kmgKMG]?|tree:\d+|sparse:oid=\S+"
+    r"|object:type=commit)$")
+
+
+def _partial_clone_keeps_commits(repo: str) -> bool:
+    """Les remotes *promisor* de `repo` gardent-ils toute l'histoire ?
+
+    #4255 : le caractère partiel d'un clone ne dit rien de son histoire de
+    commits ; c'est le **filtre** qui décide. `blob:none`, `blob:limit`,
+    `tree:<profondeur>`, `sparse:oid` et `object:type=commit` n'omettent que
+    des blobs, des arbres ou des tags : l'ascendance reste prouvable.
+    `object:type=blob|tree|tag` omet tout ce qui n'est pas du type demandé,
+    commits compris : le doute refuse. Un promisor sans filtre lisible, ou
+    avec un filtre inconnu, rend False. Un dépôt sans promisor est complet.
+    """
+    proc = _git(repo, "config", "--local", "--get-regexp",
+                r"^remote\..*\.promisor$")
+    if proc.returncode == 1:        # aucun remote promisor : rien de filtré
+        return True
+    if proc.returncode != 0:
+        return False
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        key = line.split(None, 1)[0]
+        if not key.startswith("remote.") or not key.endswith(".promisor"):
+            return False
+        remote = key[len("remote."):-len(".promisor")]
+        if not remote:
+            return False
+        # la valeur peut être implicite (`promisor` seul) : `--bool` tranche
+        if _out(repo, "config", "--local", "--bool", "--get",
+                "remote.%s.promisor" % remote) != "true":
+            continue
+        spec = _out(repo, "config", "--local", "--get",
+                    "remote.%s.partialclonefilter" % remote)
+        if not spec or not _COMMIT_KEEPING_FILTER_RE.match(spec):
+            return False
+    return True
+
+
 def _history_complete(repo: str) -> bool:
     """Le dépôt porte-t-il une histoire de commits complète (non superficielle) ?
 
-    Un clone **partiel** (remote *promisor* : `blob:none`, `tree:0`, ...) garde
-    toute l'histoire des commits : git ne filtre que des blobs et des arbres,
-    et l'ascendance ne lit que les commits. Le refuser fermait `--supersedes`
-    dès qu'un dépôt connu du lot était un clone partiel (#4242 : clone
-    `blob:none` de mty-amh-docs-01). Seul un clone superficiel coupe
-    l'ascendance. Un dépôt illisible rend False (le doute refuse)."""
+    Un clone **superficiel** coupe l'ascendance : il rend False. Un clone
+    **partiel** (remote *promisor*) ne la coupe que si son filtre omet des
+    commits : `blob:none`, `tree:<profondeur>`, `sparse:` ou
+    `object:type=commit` gardent toute l'histoire des commits (#4242), tandis
+    qu'`object:type=blob|tree|tag` l'omet et reste un doute (#4255). Un dépôt
+    illisible rend False (le doute refuse)."""
     try:
         shallow = _out(repo, "rev-parse", "--is-shallow-repository")
         if shallow is None:
             return False
-        return str(shallow).strip().lower() != "true"
+        if str(shallow).strip().lower() == "true":
+            return False
+        return _partial_clone_keeps_commits(repo)
     except Exception:  # noqa: BLE001 - dépôt illisible : preuve impossible
         return False
 
@@ -440,11 +487,12 @@ def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
       heads/tags qui pointe un **descendant** du gel le rend donc accessible
       (#3399 B1 cx1) ;
     - un nombre de pointes à rapatrier au-delà de son budget, un `ls-remote`
-      ou un fetch illisible, un dépôt superficiel : `None` (preuve
-      impossible, l'appelant refuse). Aucune ref annoncée n'est ignorée sans
-      que le doute soit rendu : l'absence n'est jamais déduite d'une ref non
-      lue. Un clone partiel n'est pas un doute : ses commits sont complets
-      (#4242).
+      ou un fetch illisible, un dépôt superficiel ou un clone partiel dont le
+      filtre peut omettre des commits : `None` (preuve impossible, l'appelant
+      refuse). Aucune ref annoncée n'est ignorée sans que le doute soit rendu :
+      l'absence n'est jamais déduite d'une ref non lue. Un clone partiel dont
+      le filtre garde les commits (`blob:none`, `tree:<profondeur>`,
+      `sparse:`, `object:type=commit`) n'est pas un doute (#4242, #4255).
 
     Rend True (accessible), False (aucune ref distante ne le contient, prouvé)
     ou None (vérification impossible)."""
