@@ -46,7 +46,9 @@ class MeasureTest(unittest.TestCase):
     def test_critical_external_and_ephemeral_agents_are_not_wakeable(self):
         listing = team(1, 1) + [agent("auditeur"), agent("chat", mode="externe"),
                                 agent("probe", ephemeral=True),
-                                agent("dormeur", operator_paused=True)]
+                                agent("dormeur", operator_paused=True),
+                                agent("retraite", retired_ts=900.0),
+                                agent("sans_executeur", lease_live=False)]
         item = self.measures(listing)["ameesh"]
         self.assertEqual(item.wakeable, ["dev0", "devb0"])
         self.assertEqual(item.idle, ["dev0"])
@@ -201,6 +203,16 @@ class PassTest(PgTestCase):
         work.assign(self.db, int(made["id"]), "devb0", actor="pilote")
         out = self.run_pass(1800 + 3700)
         self.assertNotIn("fallback", [g["kind"] for g in out])
+
+    def test_a_lot_created_already_assigned_is_not_a_startable_arrival(self):
+        self.run_pass(0)
+        self.run_pass(1800)
+        registry.upsert(self.db, "devb9", harness="deepseek", host=self.cfg.host, cwd=self.tmp)
+        with mock.patch("ameesh.pilot_gesture.gate", return_value=None):
+            work.add(self.db, title="déjà confié", app="ameesh", actor="pilote",
+                     assignee="devb9")
+        out = self.run_pass(1800 + 3700)
+        self.assertEqual([g["kind"] for g in out], ["fallback"])
 
     def test_exhausted_roadmap_sleeps_idle_executors_alerts_and_wakes(self):
         self.run_pass(0)

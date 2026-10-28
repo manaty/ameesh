@@ -96,11 +96,15 @@ def wakeable(listing: list, canons, *, configured: bool) -> list:
     """§1 : les agents d'exécution réveillables — mode `execute`, ni
     éphémères, ni arrêtés, ni en pause (budget ou opérateur), ni chat de
     l'owner, ni critiques ou relecteurs (rôles critiques du canon ; un
-    verdict inconnu vaut critique, `critical_verdict`)."""
+    verdict inconnu vaut critique, `critical_verdict`). Un agent retiré
+    (`retired_ts` : le retrait laisse statut, mode et bail) ou sans exécuteur
+    vivant n'est pas une capacité : il diluerait la part au repos."""
     from .chat import is_chat_agent
     out = []
     for row in listing:
-        if row.get("ephemeral") or is_chat_agent(row):
+        if row.get("ephemeral") or is_chat_agent(row) or row.get("retired_ts"):
+            continue
+        if not su._awake_runner(row):
             continue
         if (row.get("mode") or "execute") != "execute":
             continue
@@ -257,16 +261,31 @@ def _create(cfg, db, project: str, item: Measure, since_ts: float, now: float, *
     return out
 
 
-def _created_since(lots: list, project: str, split: dict, waits: dict) -> list:
-    """Les lots du projet créés depuis le lot de découpage qu'aucune attente
-    ne retient (démarrables à leur création, pris ou non depuis)."""
+#: la note d'attribution d'un lot qui n'avait pas d'assigné (`work.assign`)
+TAKEN_FROM_NOBODY = "(before: nobody)"
+
+
+def _created_since(db, lots: list, project: str, split: dict, waits: dict) -> list:
+    """Les lots du projet arrivés démarrables depuis le lot de découpage :
+    créés depuis, qu'aucune attente ne retient, et créés SANS assigné —
+    encore sans assigné, ou pris depuis (`assigned to … (before: nobody)`).
+    Un lot créé déjà assigné n'est pas passé par la file."""
     from . import projects as projects_mod
     start = float(split.get("created_ts") or 0.0)
-    return [int(lot["id"]) for lot in lots
-            if int(lot["id"]) != int(split["id"])
-            and projects_mod.lot_project(lot) == project
-            and float(lot.get("created_ts") or 0.0) >= start
-            and int(lot["id"]) not in waits]
+    out = []
+    for lot in lots:
+        ident = int(lot["id"])
+        if (ident == int(split["id"]) or ident in waits
+                or projects_mod.lot_project(lot) != project
+                or float(lot.get("created_ts") or 0.0) < start):
+            continue
+        if not (lot.get("assignee") or "").strip():
+            out.append(ident)
+            continue
+        taken = work.events_noted(db, ident, "assigned to")
+        if any(TAKEN_FROM_NOBODY in (row.get("note") or "") for row in taken):
+            out.append(ident)
+    return out
 
 
 def _fallback(db, project: str, split: dict, created: list, now: float, *,
@@ -405,7 +424,7 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
         if split.get("created_ts") is None or dry_run:
             continue
         done = _fallback(db, project, split,
-                         _created_since(lots, project, split, waits), now, actor=actor)
+                         _created_since(db, lots, project, split, waits), now, actor=actor)
         if done:
             out.append(dict(done, kind="fallback", project=project))
     return out
