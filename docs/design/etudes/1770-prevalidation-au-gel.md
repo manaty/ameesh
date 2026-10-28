@@ -83,6 +83,15 @@ ameesh work prevalidate <lot> --sha <tête> --plan <plan.json> --host <vm>
   plan ne peut pas compter comme contrat un module absent de ces fichiers ;
   la sélection doit être exactement `classes du canon ∪ contrats` (tout module
   en trop est un élargissement, tout module manquant un contrat perdu) ;
+- **le guest n'est pas le poste** (#4071) : le profil d'offload `ameesh`
+  déclare dans `GUEST_EXCLUSIONS`, module par module et avec une raison, les
+  tests qu'il ne peut pas exécuter (unités systemd, HOME/UID ou canaux Unix
+  courts du poste, recette libpq, snapshot sans histoire). `validate` les
+  retire du **plan envoyé au guest** — jamais de la suite complète, qui les
+  garde — et le rapport les nomme (`excluded`) en séparant leurs échecs
+  éventuels (`excluded_failed`) d'un rouge réel : un échec de test exclu est
+  non concluant (§3). Aucun rapprochement par motif de nom ; une entrée se
+  justifie par un run réel (#4044) ;
 - **liaison tête / arbre / plan** : `--repo` (ou le cwd) est l'arbre unique du
   geste. Son `HEAD` doit être le `--sha` annoncé — sinon `head-moved`. Le
   contenu envoyé n'est **pas** une photographie de l'arbre de travail : c'est
