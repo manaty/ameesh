@@ -353,23 +353,35 @@ def hold_release_ts(events: Iterable[dict], *,
     return released
 
 
-#: #4369 : préfixe de la note écrite au journal d'une unité retirée d'un
-#: paquet par sa recomposition (`WorkItems.record_packet`).
-VEHICLE_EXIT_NOTE = "packet exit: "
+#: #4369 : marque ajoutée à la note de composition du porteur
+#: (`PACKET_COMPOSITION_NOTE`) quand la recomposition retire des unités
+#: (`WorkItems.record_packet`) : « ; removed: #12, #34 ».
+VEHICLE_EXIT_MARK = "; removed: "
 
 
-def vehicle_exit_ts(events: Iterable[dict]) -> float | None:
-    """Le dernier instant où le lot est sorti d'un véhicule (#4369).
+def vehicle_exits(events: Iterable[dict]) -> dict[int, float]:
+    """`{lot: dernier instant de sortie d'un véhicule}` (#4369).
 
     Membre d'une composition enregistrée et ouverte, le lot est à l'étape
     « véhicule » : son retard est celui du paquet, l'unité n'alerte pas
     (#2919). Retiré par une recomposition, il revient à `verdict_merge` ; le
     temps passé dans le véhicule n'est pas le sien, l'horloge repart de la
-    sortie. `None` sans sortie notée."""
-    stamps = [float(ev["created_ts"]) for ev in events or ()
-              if ev.get("created_ts") is not None
-              and str(ev.get("note") or "").startswith(VEHICLE_EXIT_NOTE)]
-    return max(stamps) if stamps else None
+    sortie. `events` : journaux de porteurs ; seules leurs notes de
+    composition portant la marque comptent."""
+    out: dict[int, float] = {}
+    for ev in events or ():
+        note = str(ev.get("note") or "")
+        at = ev.get("created_ts")
+        if at is None or not note.startswith(PACKET_COMPOSITION_NOTE):
+            continue
+        _, mark, tail = note.partition(VEHICLE_EXIT_MARK)
+        if not mark:
+            continue
+        for word in tail.replace(",", " ").split():
+            if word.startswith("#") and word[1:].isdigit():
+                lot = int(word[1:])
+                out[lot] = max(out.get(lot, float("-inf")), float(at))
+    return out
 
 
 def last_hold_release(events: Iterable[dict],
@@ -501,7 +513,8 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               ci_green_ts: float | None = None,
               hold_releases: Iterable[float] = (),
               reviews: Iterable[dict] = (),
-              fixes: Iterable[dict] = ()) -> list:
+              fixes: Iterable[dict] = (),
+              vehicle_exit_ts: float | None = None) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -528,6 +541,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
 
     #2562 : le délai intake part au plus tôt du début planifié (minuit
     local). Avant cette date, aucune ligne intake en cours ne court.
+
+    #4369 : `vehicle_exit_ts` (sortie du véhicule, `vehicle_exits`) décale
+    de même le départ de `verdict_merge` en cours : retiré d'un paquet, le lot
+    ne paie pas le temps passé dedans.
 
     #2217 : quand le lot vient d'être pris en charge (dernière ligne
     `assigned to … (before: …)` il y a moins de `HANDOVER_GRACE_S`), les
@@ -729,7 +746,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     # couru reste acquis (un lot déjà en retard alerte le pilote pour qu'il le
     # débloque), le temps du parcage ne compte pas.
     lifted = last_hold_release(events, hold_releases)
-    exited = vehicle_exit_ts(events)
+    exited = vehicle_exit_ts
     stopped = current_hold_start(events, state)
     running_now = now if stopped is None else min(now, stopped)
 

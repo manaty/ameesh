@@ -18,7 +18,7 @@ import random
 import time
 
 from ...db import DbError, in_transaction, is_unique_violation
-from ...slo import VEHICLE_EXIT_NOTE
+from ...slo import VEHICLE_EXIT_MARK
 from .. import interface
 from . import catalog as _catalog
 from .work_footprints import (occupying_sql as footprint_occupying_sql,
@@ -3280,13 +3280,17 @@ class WorkItems(interface.WorkItems):
             if not rows:
                 raise DbError("packet #%s: no such work item" % package_id)
             # #4369 : une unité que la recomposition retire sort du véhicule ;
-            # son journal le dit, l'horloge « verdict → fusion » repart de là
-            # (`slo.vehicle_exit_ts`) au lieu de compter le temps du véhicule.
+            # la note du porteur la nomme, l'horloge « verdict → fusion »
+            # repart de là (`slo.vehicle_exits`). Une seule ligne par
+            # recomposition, même quand le composeur rejoue le paquet pas à pas.
             kept = {int(unit["work_item_id"]) for unit in units}
-            previous = tx.query(
-                "SELECT w.id, w.state FROM work_packet_members m"
-                "  JOIN work_items w ON w.id = m.work_item_id"
-                " WHERE m.package_id = %s ORDER BY w.id", (int(package_id),))
+            removed = [int(row["work_item_id"]) for row in tx.query(
+                "SELECT work_item_id FROM work_packet_members WHERE package_id = %s"
+                " ORDER BY work_item_id", (int(package_id),))
+                if int(row["work_item_id"]) not in kept]
+            if removed:
+                note = "%s%s%s" % (note or "", VEHICLE_EXIT_MARK,
+                                   ", ".join("#%d" % lot for lot in removed))
             tx.execute("DELETE FROM work_packet_members WHERE package_id = %s",
                        (int(package_id),))
             for unit in units:
@@ -3298,13 +3302,6 @@ class WorkItems(interface.WorkItems):
                     (int(package_id), int(unit["work_item_id"]), branch, base_sha,
                      head_sha, unit["unit_sha"], unit.get("source_sha") or "",
                      unit.get("frozen_sha") or "", actor or ""))
-            for row in previous:
-                if int(row["id"]) not in kept:
-                    WorkItems(tx)._event(
-                        int(row["id"]), row["state"],
-                        "%sremoved from packet #%d at recomposition (%s)"
-                        % (VEHICLE_EXIT_NOTE, int(package_id), str(head_sha or "")[:12]),
-                        actor)
             WorkItems(tx)._event(int(package_id), rows[0]["state"], note, actor)
             return WorkItems(tx).packet_members(package_ids=[int(package_id)])
 

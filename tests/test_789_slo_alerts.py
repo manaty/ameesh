@@ -499,7 +499,8 @@ class PaquetTest(_Base):
             reader.record_packet(
                 carrier["id"], branch="integration/paquet-test",
                 base_sha="c" * 40, head_sha=head, units=units,
-                note="packet composition recorded", actor="orch")
+                note=slo.PACKET_COMPOSITION_NOTE + "units (branch integration/paquet-test)",
+                actor="orch")
 
         unit = {"work_item_id": self.lot["id"], "unit_sha": "d" * 40,
                 "source_sha": source, "frozen_sha": source}
@@ -540,8 +541,8 @@ class PaquetTest(_Base):
     def _backdate_exit(self, at):
         self.db.execute(
             "UPDATE work_item_events SET created_at = to_timestamp(%s)"
-            " WHERE work_item_id = %s AND note LIKE %s",
-            (float(at), self.lot["id"], slo.VEHICLE_EXIT_NOTE + "%"))
+            " WHERE note LIKE %s",
+            (float(at), "%" + slo.VEHICLE_EXIT_MARK + "%"))
 
     def test_unite_en_vehicule_puis_retiree_repart_de_la_sortie(self):
         # #4369, cas #4284 dans le paquet Nexlink 233 : membre d'une
@@ -564,7 +565,8 @@ class PaquetTest(_Base):
             reader.record_packet(
                 carrier["id"], branch="integration/paquet-test",
                 base_sha="c" * 40, head_sha=head, units=units,
-                note="packet composition recorded", actor="orch")
+                note=slo.PACKET_COMPOSITION_NOTE + "units (branch integration/paquet-test)",
+                actor="orch")
 
         unit = {"work_item_id": self.lot["id"], "unit_sha": "d" * 40,
                 "source_sha": source, "frozen_sha": source}
@@ -580,13 +582,13 @@ class PaquetTest(_Base):
             # Recomposition sans le lot (il a fait rougir la CI du paquet).
             record([{"work_item_id": other["id"], "unit_sha": "f" * 40,
                      "source_sha": "e" * 40, "frozen_sha": "e" * 40}])
-            exits = [ev for ev in storage.of(self.db).progress.lot_events(
-                [self.lot["id"]]) if ev["note"].startswith(slo.VEHICLE_EXIT_NOTE)]
-            self.assertEqual(len(exits), 1)
-            self.assertIn("#%d" % carrier["id"], exits[0]["note"])
-            self.assertEqual(
-                [ev for ev in storage.of(self.db).progress.lot_events([other["id"]])
-                 if ev["note"].startswith(slo.VEHICLE_EXIT_NOTE)], [])
+            # Une seule ligne, sur le porteur ; le journal des unités reste muet.
+            notes = [ev["note"] for ev in storage.of(self.db).progress.lot_events(
+                [carrier["id"], self.lot["id"], other["id"]])
+                if slo.VEHICLE_EXIT_MARK in ev["note"]]
+            self.assertEqual(len(notes), 1, notes)
+            self.assertTrue(notes[0].endswith(
+                "%s#%d" % (slo.VEHICLE_EXIT_MARK, self.lot["id"])), notes)
             self._backdate_exit(self.now)
             self.now += 10 * 60
             self.assertEqual([a for a in self.slo() if a["lot"] == self.lot["id"]], [])
@@ -598,6 +600,19 @@ class PaquetTest(_Base):
         for text in self.briefs(alerts[0]).values():
             self.assertIn("left its packet at recomposition", text)
             self.assertNotIn("reassign it now", text)
+
+    def test_vehicle_exits_lit_la_derniere_sortie_des_notes_de_composition(self):
+        # #4369 : un composeur qui rejoue le paquet pas à pas « retire » puis
+        # remet les unités ; seule la dernière sortie compte, et une unité
+        # revenue dans le véhicule est tue par son appartenance, pas par ceci.
+        note = slo.PACKET_COMPOSITION_NOTE + "1 unit(s) a..b (branch x)"
+        events = [
+            {"note": note + slo.VEHICLE_EXIT_MARK + "#12, #34", "created_ts": 100.0},
+            {"note": note, "created_ts": 150.0},
+            {"note": note + slo.VEHICLE_EXIT_MARK + "#34", "created_ts": 200.0},
+            {"note": "hold: removed: #56", "created_ts": 300.0},
+        ]
+        self.assertEqual(slo.vehicle_exits(events), {12: 100.0, 34: 200.0})
 
     def test_composition_perimee_ne_tait_pas_le_slo(self):
         self.qa_at(self.GO)
