@@ -820,12 +820,13 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
             open_lot = work.open_with_source(db, key)
             if open_lot is not None:
                 marker = _marker(open_lot.get("body") or "")
-                if marker and marker.get("kind") == "harness" \
-                        and obj.get("kind") == "model":
+                if obj.get("kind") == "model" and marker and (
+                        marker.get("kind") != "model"
+                        or marker.get("name") != obj.get("name")):
                     actions.append({"harness": source.harness,
                                     "action": "kept-model",
                                     "lot": int(open_lot["id"]),
-                                    "reason": "harness evaluation lot open"})
+                                    "reason": "another evaluation lot is open"})
                     continue
                 actions.append({"harness": source.harness, "action": "would-update",
                                 "lot": int(open_lot["id"]),
@@ -843,16 +844,17 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
                 open_lot = work.open_with_source(tx, key)
                 if open_lot is not None:
                     marker = _marker(open_lot.get("body") or "")
-                    if marker and marker.get("kind") == "harness" \
-                            and obj.get("kind") == "model":
-                        # Un lot harnais ouvert garde son objet : un modèle
-                        # nouveau ne le remplace jamais (B1 #4291). Le relevé
-                        # précédent n'avance pas pour ce modèle, qui sera
-                        # repris quand le lot harnais sera clos.
+                    if obj.get("kind") == "model" and marker and (
+                            marker.get("kind") != "model"
+                            or marker.get("name") != obj.get("name")):
+                        # Un lot ouvert garde son objet : un modèle différent
+                        # ne le remplace jamais (B de l'auditeur, #4291). Le
+                        # relevé précédent n'avance pas pour ce modèle, qui
+                        # sera repris quand le lot sera clos.
                         actions.append({"harness": source.harness,
                                         "action": "kept-model",
                                         "lot": int(open_lot["id"]),
-                                        "reason": "harness evaluation lot open; "
+                                        "reason": "another evaluation lot is open; "
                                                   "model signal deferred"})
                         continue
                     current_priority = open_lot.get("priority")
@@ -1021,10 +1023,27 @@ def scan(cfg, db, *, sources=None, dry_run: bool = False, probe: bool = True,
                 # le prochain passage doit pouvoir comparer
                 continue
             provider = models.get("source") or ""
+            decision = entry.get("decision") or {}
+            obj = decision.get("object") or {}
+            known = set(models.get("previous") or ())
+            if models.get("baseline"):
+                # premier relevé : il pose la ligne de base entière, sans
+                # prétendre qu'un modèle est nouveau
+                allowed = set(models["served"])
+            else:
+                # n'avance que les modèles déjà connus et celui qui est
+                # l'objet du lot : un modèle nouveau non évalué reste en
+                # attente pour un passage suivant (B de l'auditeur, #4291)
+                allowed = set(known)
+                if obj.get("kind") == "model":
+                    allowed.add(obj.get("name"))
+            to_upsert = [name for name in models["served"] if name in allowed]
+            if not to_upsert:
+                continue
             try:
                 storage.of(db).catalog.upsert_models([
                     {"provider": provider, "model_id": name, "source": provider}
-                    for name in models["served"]])
+                    for name in to_upsert])
             except Exception as exc:  # noqa: BLE001 - un catalogue ne juge pas
                 report["errors"].append("%s: catalog: %s: %s" % (
                     entry["harness"], type(exc).__name__,

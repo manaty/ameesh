@@ -213,6 +213,8 @@ class VeilleDbTest(PgTestCase):
         super().setUp()
         self.db.execute("DELETE FROM harness_versions")
         self.db.execute("DELETE FROM turn_costs")
+        self.db.execute("DELETE FROM model_catalog")
+        self.db.execute("DELETE FROM model_harness")
 
     # -- helpers ---------------------------------------------------------
     def configure(self, *, provider="", changelog=CHANGELOG, host="vm-a",
@@ -383,6 +385,62 @@ class VeilleDbTest(PgTestCase):
                            provider="deepseek", listing=listing)
         self.assertEqual(report["actions"][0]["action"], "none", report)
         self.assertEqual(self.lots(), [])
+
+    def test_harness_lot_does_not_catalogue_an_unevaluated_model(self):
+        self.record("vm-a", "0.2.0-rc.2")
+        self.catalog("deepseek-old")
+        listing = lambda: SourceResult(
+            source="deepseek", complete=True,
+            models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),
+                    ModelSeen(provider="deepseek", model_id="deepseek-new")))
+        first = self.scan(["0.2.0-rc.2", "0.2.1-rc.4"],
+                          tags={"rc": "0.2.1-rc.4"}, provider="deepseek",
+                          listing=listing)
+        self.assertEqual(first["actions"][0]["action"], "created", first)
+        known = {row["model_id"] for row in storage.of(self.db).catalog.listing()}
+        self.assertNotIn("deepseek-new", known)
+        # once the harness lot is closed and the hosts are on the evaluated
+        # version, the pending model opens its own lot
+        self.db.execute("UPDATE work_items SET state = 'closed',"
+                        " close_reason = 'done' WHERE id = %s",
+                        (first["actions"][0]["lot"],))
+        self.record("vm-a", "0.2.1-rc.4")
+        second = self.scan(["0.2.1-rc.4"], tags={"latest": "0.2.1-rc.4"},
+                           provider="deepseek", listing=listing)
+        self.assertEqual(second["actions"][0]["action"], "created", second)
+        lot = work.get(self.db, second["actions"][0]["lot"])
+        self.assertIn("Évaluer le modèle deepseek-new", lot["title"])
+
+    def test_two_new_models_keep_one_pending(self):
+        self.record("vm-a", "1.0")
+        self.catalog("deepseek-old")
+        listing = lambda: SourceResult(
+            source="deepseek", complete=True,
+            models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),
+                    ModelSeen(provider="deepseek", model_id="deepseek-new1"),
+                    ModelSeen(provider="deepseek", model_id="deepseek-new2")))
+        first = self.scan(["1.0"], tags={"latest": "1.0"},
+                          provider="deepseek", listing=listing)
+        self.assertEqual(first["actions"][0]["action"], "created", first)
+        first_lot = work.get(self.db, first["actions"][0]["lot"])
+        self.assertIn("deepseek-new2", first_lot["title"])
+        known = {row["model_id"] for row in storage.of(self.db).catalog.listing()}
+        self.assertEqual(known, {"deepseek-old", "deepseek-new2"})
+        # the second new model is still pending and must not replace the open
+        # model lot
+        second = self.scan(["1.0"], tags={"latest": "1.0"},
+                           provider="deepseek", listing=listing)
+        self.assertEqual(second["actions"][0]["action"], "kept-model", second)
+        known = {row["model_id"] for row in storage.of(self.db).catalog.listing()}
+        self.assertNotIn("deepseek-new1", known)
+        self.db.execute("UPDATE work_items SET state = 'closed',"
+                        " close_reason = 'done' WHERE id = %s",
+                        (first["actions"][0]["lot"],))
+        third = self.scan(["1.0"], tags={"latest": "1.0"},
+                          provider="deepseek", listing=listing)
+        self.assertEqual(third["actions"][0]["action"], "created", third)
+        lot = work.get(self.db, third["actions"][0]["lot"])
+        self.assertIn("deepseek-new1", lot["title"])
 
     def test_canary_keeps_the_harness_lot_object(self):
         self.record("vm-a", "0.2.0-rc.2")
