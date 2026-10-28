@@ -1073,33 +1073,48 @@ class StagingTest(unittest.TestCase):
 
     def test_bureau_outil_de_sonde_absent_ne_remet_rien_en_arriere(self):
         """#3976, temoin : python de sonde absent sur la VM (127) = non
-        concluant : aucun retour, sequence arretee en 3 et dite."""
+        concluant : aucun retour ; #4126 (decision du pilote) : la sequence
+        continue sur les hotes suivants, et actif.py juge la mention."""
         (self.state / 'scenario').write_text('ssh-python=127\n')
         p = self.run_bureau()
-        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
-        self.assertNotIn(('ameesh-agents-1', 'retour'), self.actions())
-        self.assertNotIn(('ameesh-agents-2', 'installer'), self.actions())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertFalse([a for a in self.actions() if a[1] == 'retour'])
+        self.assertIn(('ameesh-agents-2', 'installer'), self.actions())
         self.assertIn('non concluante', p.stderr)
+        self.assertIn('la sequence continue', p.stderr)
         trace = [t for t in self.traces() if t['etape'] == 'sante']
-        self.assertEqual([(t['hote'], t['verdict']) for t in trace],
-                         [('ameesh-agents-1', 'non-concluant')])
+        self.assertEqual(trace[0]['hote'], 'ameesh-agents-1')
+        self.assertEqual({t['verdict'] for t in trace}, {'non-concluant'})
         self.assertIn('code 127', trace[0]['detail'])
         self.assertFalse([t for t in self.traces() if t['etape'] == 'retour'])
-        self.assertNotIn('actif.py', ' '.join(self.calls()))
+        self.assertIn(('sequence', 'ok'), [(t['etape'], t['verdict'])
+                                           for t in self.traces()])
+        self.assertIn('sonde non concluante (reportee au staging suivant)', p.stderr)
 
     def test_sonde_non_concluante_en_local_ne_remet_rien_en_arriere(self):
         """Poste : outil absent (127) ou base injoignable (rapport non
-        concluant, 3) n'est jamais un hote malsain."""
+        concluant, 3) n'est jamais un hote malsain ; #4126 : la sequence
+        continue, la notification le dit, actif.py est appele."""
         for code in ('127', '3'):
             with self.subTest(code=code):
                 (self.state / 'calls.log').write_text('')
                 (self.state / 'scenario').write_text('code-sonde=%s\n' % code)
                 p = self.run_staging()
-                self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
                 self.assertFalse([a for a in self.actions() if a[1] == 'retour'])
                 self.assertIn('non concluante', p.stderr)
                 self.assertTrue(any(l.startswith('venv-python - ') for l in self.calls()),
                                 'notification attendue')
+                self.assertIn('actif.py', ' '.join(self.calls()))
+
+    def test_4126_attente_cible_transmise_a_la_sonde(self):
+        """#4126 : ATTENTE_CIBLE (BASCULE_ENV, 300 s par defaut) borne
+        l'attente d'une cible nommee occupee."""
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        sondes = [l for l in self.calls() if 'sante-courrier.py' in l]
+        self.assertTrue(sondes, self.calls())
+        self.assertIn('--attente-cible 300', sondes[0])
 
     def test_outside_main_is_refused_without_override(self):
         self.repo.joinpath('marque').write_text('y\n')
@@ -1964,6 +1979,190 @@ class SanteCourrierTest(unittest.TestCase):
             self.assertEqual(code, 0, sortie.getvalue())
             self.assertEqual(json.loads(sortie.getvalue())['verdict'], 'sans-sonde')
             envoi.assert_not_called()
+
+    # --- #4126 : cible nommee occupee : attente bornee, puis remplacante ---
+    def horloge(self):
+        """time.monotonic/time.sleep factices : sleep avance l'horloge."""
+        t = [0.0]
+        return t, (lambda: t[0]), (lambda d: t.__setitem__(0, t[0] + d))
+
+    def rangs_4126(self, maintenant=1000.0):
+        mene = dict(mode='execute', host='ameesh-agents-1', lease_owner='r',
+                    lease_expires_ts=maintenant + 900)
+        return [dict(mene, name='ameesh-dev3', status='running'),
+                dict(mene, name='ameesh-dev5', status='idle')]
+
+    def test_4126_cible_nommee_liberee_avant_la_borne_est_sondee(self):
+        t, mono, dormir = self.horloge()
+        rows = self.rangs_4126()
+        occupee, libre = rows[0], dict(rows[0], status='idle')
+        etats = iter([occupee, occupee, libre])
+        with mock.patch.object(self.mod.registry, 'get',
+                               side_effect=lambda db, nom: next(etats)), \
+             mock.patch.object(self.mod.time, 'monotonic', side_effect=mono), \
+             mock.patch.object(self.mod.time, 'sleep', side_effect=dormir), \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0):
+            cible, pourquoi, remplacement = self.mod.selection(
+                None, rows, 'ameesh-dev3', 300.0, 1000.0)
+        self.assertEqual(cible['name'], 'ameesh-dev3')
+        self.assertIsNone(pourquoi)
+        self.assertIsNone(remplacement)
+        self.assertEqual(t[0], 10.0)
+
+    def test_4126_cible_occupee_a_la_borne_remplacee_par_une_libre(self):
+        t, mono, dormir = self.horloge()
+        rows = self.rangs_4126()
+        etats = {r['name']: r for r in rows}
+        with mock.patch.object(self.mod.registry, 'get',
+                               side_effect=lambda db, nom: etats[nom]), \
+             mock.patch.object(self.mod.time, 'monotonic', side_effect=mono), \
+             mock.patch.object(self.mod.time, 'sleep', side_effect=dormir), \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0):
+            cible, pourquoi, remplacement = self.mod.selection(
+                None, rows, 'ameesh-dev3', 300.0, 1000.0)
+        self.assertEqual(cible['name'], 'ameesh-dev5')
+        self.assertEqual(t[0], 300.0)
+        self.assertEqual(remplacement['cible_nommee'], 'ameesh-dev3')
+        self.assertEqual(remplacement['remplacante'], 'ameesh-dev5')
+        self.assertIn('cible nommee ameesh-dev3 occupee (running) apres 300.0s',
+                      remplacement['raison'])
+        self.assertIn('remplacante ameesh-dev5', pourquoi)
+
+    def test_4126_remplacante_liberee_pendant_attente(self):
+        t, mono, dormir = self.horloge()
+        rows = self.rangs_4126()
+        rows[1] = dict(rows[1], status='running')
+        def relire(db, nom):
+            row = next(r for r in rows if r['name'] == nom)
+            return dict(row, status='idle') if nom == 'ameesh-dev5' else row
+        with mock.patch.object(self.mod.registry, 'get', side_effect=relire), \
+             mock.patch.object(self.mod.time, 'monotonic', side_effect=mono), \
+             mock.patch.object(self.mod.time, 'sleep', side_effect=dormir), \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0):
+            cible, pourquoi, remplacement = self.mod.selection(
+                None, rows, 'ameesh-dev3', 300.0, 1000.0)
+        self.assertEqual(t[0], 300.0)
+        self.assertEqual(cible['name'], 'ameesh-dev5')
+        self.assertEqual(remplacement['remplacante'], 'ameesh-dev5')
+
+    def test_4126_aucune_libre_reste_sans_sonde(self):
+        t, mono, dormir = self.horloge()
+        rows = self.rangs_4126()
+        rows[1] = dict(rows[1], operator_paused=True)
+        etats = {r['name']: r for r in rows}
+        with mock.patch.object(self.mod.registry, 'get',
+                               side_effect=lambda db, nom: etats[nom]), \
+             mock.patch.object(self.mod.time, 'monotonic', side_effect=mono), \
+             mock.patch.object(self.mod.time, 'sleep', side_effect=dormir), \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0):
+            cible, pourquoi, remplacement = self.mod.selection(
+                None, rows, 'ameesh-dev3', 300.0, 1000.0)
+        self.assertIsNone(cible)
+        self.assertIsNone(remplacement)
+        self.assertIn('occupee (running)', pourquoi)
+        self.assertIn('aucune autre persona menee libre', pourquoi)
+
+    def test_4126_cible_sans_bail_n_est_pas_attendue(self):
+        """Sans bail vivant, aucun tour ne la liberera : remplacee aussitot."""
+        t, mono, dormir = self.horloge()
+        rows = self.rangs_4126()
+        rows[0] = dict(rows[0], status='idle', lease_expires_ts=10.0)
+        etats = {r['name']: r for r in rows}
+        with mock.patch.object(self.mod.registry, 'get',
+                               side_effect=lambda db, nom: etats[nom]), \
+             mock.patch.object(self.mod.time, 'monotonic', side_effect=mono), \
+             mock.patch.object(self.mod.time, 'sleep', side_effect=dormir), \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0):
+            cible, pourquoi, remplacement = self.mod.selection(
+                None, rows, 'ameesh-dev3', 300.0, 1000.0)
+        self.assertEqual(t[0], 0.0)
+        self.assertEqual(cible['name'], 'ameesh-dev5')
+        self.assertIn('sans bail vivant', remplacement['raison'])
+
+    def test_4126_cible_nommee_absente_reste_une_erreur(self):
+        with self.assertRaises(SystemExit):
+            self.mod.selection(None, self.rangs_4126(), 'inconnu', 300.0, 1000.0)
+
+    def principal_4126(self, registre_get, faux_get, faux_history, argv):
+        maintenant = 1000.0
+        envois = {}
+
+        def faux_send(db, sender, recipient, body, **kw):
+            envois.update(recipient=recipient,
+                          jeton=body.split('--ack ')[1].split()[0])
+            return 7
+
+        t, mono, dormir = self.horloge()
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+             mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.registry, 'overview',
+                               return_value=self.rangs_4126()), \
+             mock.patch.object(self.mod.registry, 'get', side_effect=registre_get), \
+             mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'sans_executeur', return_value=[]), \
+             mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod, 'canal_humain', return_value=[]), \
+             mock.patch.object(self.mod.mail, 'send', side_effect=faux_send), \
+             mock.patch.object(self.mod.mail, 'get', side_effect=faux_get), \
+             mock.patch.object(self.mod.mail, 'history',
+                               side_effect=lambda db, nom, **kw: faux_history(nom, envois)), \
+             mock.patch.object(self.mod.time, 'time', return_value=maintenant), \
+             mock.patch.object(self.mod.time, 'monotonic', side_effect=mono), \
+             mock.patch.object(self.mod.time, 'sleep', side_effect=dormir), \
+             redirect_stdout(sortie):
+            code = self.mod.main(argv)
+        return code, json.loads(sortie.getvalue()), envois
+
+    def test_4126_main_remplacante_ok_et_nommee_dans_le_rapport(self):
+        """Incident 28/10 02:29Z : SONDE_AMEESH_AGENTS_1=ameesh-dev3 en tour
+        jusqu'a la borne ; ameesh-dev5 libre prend la sonde, verdict ok."""
+        etats = {r['name']: r for r in self.rangs_4126()}
+
+        def registre_get(db, nom):
+            if nom == 'ameesh-dev5' and etats.get('_remis'):
+                return dict(etats[nom], last_turn_ts=1001.0)
+            return etats[nom]
+
+        def faux_get(db, message_id):
+            etats['_remis'] = True
+            return {'id': message_id, 'delivered_ts': 1000.0}
+
+        code, rapport, envois = self.principal_4126(
+            registre_get, faux_get,
+            lambda nom, envois: [{'sender': nom, 'body': envois['jeton']}],
+            ['--hote', 'ameesh-agents-1', '--sonde', 'ameesh-dev3',
+             '--attente', '30', '--attente-cible', '300', '--json'])
+        self.assertEqual(code, 0, rapport)
+        self.assertEqual(rapport['verdict'], 'ok')
+        self.assertEqual(envois['recipient'], 'ameesh-dev5')
+        self.assertEqual(rapport['sonde']['destinataire'], 'ameesh-dev5')
+        self.assertEqual(rapport['remplacement']['cible_nommee'], 'ameesh-dev3')
+        self.assertEqual(rapport['remplacement']['remplacante'], 'ameesh-dev5')
+        self.assertIn('remplacante ameesh-dev5', rapport['pourquoi'])
+
+    def test_4126_main_vraie_erreur_de_tour_reste_un_echec(self):
+        """La remplacante dont le tour echoue reste un KO (negatif concluant)."""
+        etats = {r['name']: r for r in self.rangs_4126()}
+
+        def registre_get(db, nom):
+            if nom == 'ameesh-dev5' and etats.get('_remis'):
+                return dict(etats[nom], last_turn_ts=1001.0, status='blocked',
+                            last_error='harnais en echec')
+            return etats[nom]
+
+        def faux_get(db, message_id):
+            etats['_remis'] = True
+            return {'id': message_id, 'delivered_ts': 1000.0}
+
+        code, rapport, _ = self.principal_4126(
+            registre_get, faux_get, lambda nom, envois: [],
+            ['--hote', 'ameesh-agents-1', '--sonde', 'ameesh-dev3',
+             '--attente', '30', '--json'])
+        self.assertEqual(code, 1, rapport)
+        self.assertEqual(rapport['verdict'], 'ko')
+        self.assertIn('tour en echec : harnais en echec', rapport['sonde']['tour'])
+        self.assertEqual(rapport['remplacement']['remplacante'], 'ameesh-dev5')
 
     def test_main_revalide_une_cible_mise_en_pause_avant_envoi(self):
         """#2190 : une cible libre dans la photo mais mise en pause avant

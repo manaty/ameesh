@@ -37,7 +37,12 @@ Read-only checks, then one real delivery probe:
   the turn: probing either would measure its queue, not the host's chain, so
   neither is chosen (#2190). When every driven persona is busy or paused, the
   verdict is ``sans-sonde`` with those targets named — never a KO caused by the
-  wait. Delivery alone is recorded when the harness
+  wait. A target NAMED by the operator (``SONDE_<HOTE>``) that is busy or
+  paused is waited for, within ``--attente-cible`` (300 s), then probed; still
+  busy at the bound, another driven and free persona of the same pool
+  replaces it, and the report names the replacement and why (``remplacement``,
+  #4126). Only when none is free is the verdict ``sans-sonde``. Delivery alone
+  is recorded when the harness
   starts, before a refused harness exits 127 (#1460): only the answer proves a
   real turn with working tools, and a failed or blocked turn after delivery is
   KO at once. The answer alone is not enough either: a blocked harness can
@@ -82,6 +87,10 @@ from ameesh import budget, chat, config, db as db_mod, mail, registry, storage, 
 DEFAULT_ATTENTE = 300.0
 #: an active message older than this while its recipient is idle is stuck
 DEFAULT_SOUFFRANCE = 900.0
+#: seconds a busy or paused named target is waited for before a replacement
+DEFAULT_ATTENTE_CIBLE = 300.0
+#: seconds between two registry reads while the named target is waited for
+INTERVALLE_CIBLE = 5.0
 
 PROBE_TEMPLATE = """Sonde de sante staging (#1155), hote {hote}, commit {sha}.
 Message automatique du systeme : il verifie qu'un tour reel s'execute sur cet
@@ -361,6 +370,89 @@ def choisir_croise(rows: list[dict], hote: str, cible: str, now: float):
     return libres[0], None
 
 
+def attendre_cible(db, nom: str, borne: float):
+    """(row, attendu_s, pourquoi) : the named target once free, or why not.
+
+    #4126 : a named target in a turn (or paused) only queues the probe; it is
+    re-read until it is free, within ``borne`` seconds, then probed. A target
+    gone or without a live lease is not waited for: no turn will free it.
+    """
+    debut = time.monotonic()
+    while True:
+        etat = registry.get(db, nom)
+        attendu = round(time.monotonic() - debut, 1)
+        if etat is None or not driven(etat, time.time()):
+            return None, attendu, "cible nommee %s sans bail vivant" % nom
+        if libre(etat):
+            return etat, attendu, None
+        reste = borne - (time.monotonic() - debut)
+        if reste <= 0:
+            return None, attendu, "cible nommee %s occupee (%s) apres %ss d'attente" % (
+                nom, motif_non_libre(etat), attendu)
+        time.sleep(min(INTERVALLE_CIBLE, reste))
+
+
+def revalider(db, candidats: list[dict]):
+    """(row, pourquoi) : the first candidate still driven and free when re-read.
+
+    The selection comes from a registry snapshot: a candidate may have entered
+    a turn or been paused since. A last read avoids queueing the probe behind a
+    busy agent (#2190); the next free candidate is then taken (#4126). With no
+    candidate left, the reason is the first candidate's.
+    """
+    premier = None
+    for row in candidats:
+        etat = registry.get(db, row["name"])
+        if etat is None or not driven(etat, time.time()):
+            motif = "cible %s sans bail vivant" % row["name"]
+        elif not libre(etat):
+            motif = cible_occupee(etat)
+        else:
+            return row, None
+        premier = premier or motif
+    return None, premier
+
+
+def selection(db, pool: list[dict], sonde: str, borne: float, now: float,
+              croise: bool = False):
+    """(row, pourquoi, remplacement) : the probe target among ``pool``.
+
+    ``auto`` takes the first driven and free persona, re-read before use. A
+    named target is waited for (``attendre_cible``) ; still not free, it is
+    replaced by another driven and free persona of the pool, and
+    ``remplacement`` names both and the reason (#4126, no family imposed, as
+    #4089). With none free, the verdict stays ``sans-sonde`` (canon §3).
+    ``croise`` : the pool is the other hosts' personas (server without
+    executant, avis R2 B1 #1323).
+    """
+    portee = "sur un autre hote" if croise else "sur cet hote"
+    if sonde == "jamais":
+        return None, "sonde desactivee", None
+    if sonde == "auto":
+        menes = [r for r in pool if driven(r, now)]
+        if not menes:
+            return None, "aucune persona menee (bail vivant) %s" % portee, None
+        libres = [r for r in menes if libre(r)]
+        if not libres:
+            return None, pourquoi_occupees(portee, menes), None
+        cible, pourquoi = revalider(db, libres)
+        return cible, pourquoi, None
+    if not any(r["name"] == sonde for r in pool):
+        raise SystemExit("sonde : %s n'est pas une persona %s" % (
+            sonde, "d'un autre hote" if croise else "de l'hote"))
+    etat, attendu, motif = attendre_cible(db, sonde, borne)
+    if etat is not None:
+        return etat, None, None
+    # Re-read alternatives after the wait; the snapshot may still say busy.
+    autres = [r for r in pool if r["name"] != sonde]
+    cible, _ = revalider(db, autres)
+    if cible is None:
+        return None, "%s ; aucune autre persona menee libre" % motif, None
+    remplacement = {"cible_nommee": sonde, "remplacante": cible["name"],
+                    "raison": motif, "attente_s": attendu}
+    return cible, "remplacante %s : %s" % (cible["name"], motif), remplacement
+
+
 def answered(db, name: str, jeton: str) -> bool:
     """The persona's own ack, even if its next hook already delivered it."""
     return any(m.get("sender") == name and jeton in (m.get("body") or "")
@@ -466,6 +558,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="hote sans executant : sonde croisee vers un autre hote")
     parser.add_argument("--attente", type=float, default=DEFAULT_ATTENTE)
     parser.add_argument("--souffrance", type=float, default=DEFAULT_SOUFFRANCE)
+    parser.add_argument("--attente-cible", type=float, default=DEFAULT_ATTENTE_CIBLE,
+                        help="attente d'une cible nommee occupee avant une remplacante")
     parser.add_argument("--sha", default="", help="commit en cours d'installation")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -475,7 +569,8 @@ def main(argv: list[str] | None = None) -> int:
     rapport = {"hote": args.hote, "verdict": "ko", "personas": 0,
                "sha": args.sha, "souffrance": [], "sans_executeur": [],
                "boites_mortes": [], "canal_humain": [],
-               "sonde": None, "pourquoi": None, "attente_s": args.attente,
+               "sonde": None, "pourquoi": None, "remplacement": None,
+               "attente_s": args.attente,
                "souffrance_s": args.souffrance}
     conn = None
     erreur_base = None
@@ -511,27 +606,17 @@ def main(argv: list[str] | None = None) -> int:
                 # le serveur sans executant n'a aucune persona locale : sa chaine
                 # se prouve par une remise a travers lui, vers une persona menee
                 # d'un autre hote (avis R2 B1 #1323).
-                if args.sonde == "jamais":
-                    cible, pourquoi = None, "sonde desactivee"
-                else:
-                    cible, pourquoi = choisir_croise(personas(conn), args.hote,
-                                                     args.sonde, now)
+                pool = [r for r in personas(conn) if r.get("host") != args.hote]
+                cible, pourquoi, remplacement = selection(
+                    conn, pool, args.sonde, args.attente_cible, now, croise=True)
             else:
-                cible, pourquoi = choose(rows, args.sonde, now)
+                cible, pourquoi, remplacement = selection(
+                    conn, rows, args.sonde, args.attente_cible, now)
         except SystemExit as exc:
             # une cible nommee absente est une erreur de sonde, pas une trace
             # vide : le rapport KO la porte (#2190).
             raise RuntimeError("sonde invalide : %s" % exc) from None
-        if cible is not None:
-            # la selection vient d'une photo du registre : la cible a pu entrer
-            # en tour ou etre mise en pause entre-temps. Une derniere lecture
-            # evite d'envoyer la sonde dans la file d'un agent non libre
-            # (#2190).
-            etat = registry.get(conn, cible["name"])
-            if etat is None or not driven(etat, time.time()):
-                cible, pourquoi = None, "cible %s sans bail vivant" % cible["name"]
-            elif not libre(etat):
-                cible, pourquoi = None, cible_occupee(etat)
+        rapport["remplacement"] = remplacement
         resultat = (probe(conn, cible, args.sha, args.attente, args.hote)
                     if cible is not None else None)
         verdict = "ok"
@@ -544,7 +629,8 @@ def main(argv: list[str] | None = None) -> int:
             verdict = "sans-sonde"
         rapport.update(verdict=verdict, souffrance=souffrance,
                        sans_executeur=sans, boites_mortes=mortes,
-                       canal_humain=canal, sonde=resultat, pourquoi=pourquoi)
+                       canal_humain=canal, sonde=resultat, pourquoi=pourquoi,
+                       remplacement=remplacement)
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001 — le rapport KO porte l'erreur
@@ -584,6 +670,8 @@ def main(argv: list[str] | None = None) -> int:
             print("courrier %s : sonde remise et accusee par %s en %ss (message %s)%s"
                   % (args.hote, resultat["destinataire"], resultat["delai_s"],
                      resultat["message"], via))
+        if rapport.get("remplacement"):
+            print("courrier %s : %s" % (args.hote, rapport["pourquoi"]))
     return {"ko": 1, "non-concluant": 3}.get(rapport["verdict"], 0)
 
 

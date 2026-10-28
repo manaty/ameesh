@@ -418,14 +418,17 @@ class ActifTest(unittest.TestCase):
         self.assertEqual(code, 3, erreur)
         self.assertIn('hors staging', erreur)
 
-    def test_serveur_avec_personas_non_menee_refusee(self):
+    def test_serveur_avec_personas_non_menee_mention_non_concluante(self):
         """Porte fermee : un serveur qui porte des executants sans persona
-        menee reste un `sans-sonde`, jamais une sonde croisee."""
+        menee reste un `sans-sonde`, jamais une sonde croisee ; #4126 : il est
+        atteste avec la mention, sans preuve de remise."""
         self.ecrire(journal_serveur(personas=2, verdict='sans-sonde'))
         code, _, erreur = self.lancer(*self.hotes(modes={'manaty-mesh-1': 'serveur'}),
                                       '--rapporteur', 'docs01')
-        self.assertEqual(code, 3, erreur)
-        self.assertIn('sonde non remise', erreur)
+        self.assertEqual(code, 0, erreur)
+        attestation = json.loads(self.attestations()[0].read_text())
+        self.assertIsNone(attestation['hotes']['manaty-mesh-1']['sonde'])
+        self.assertIn('manaty-mesh-1', attestation['non_concluants'])
 
     def test_serveur_avec_personas_sonde_croisee_refusee(self):
         """Une sonde croisee n'est acceptee que pour un serveur a 0 persona."""
@@ -631,7 +634,8 @@ class ActifTest(unittest.TestCase):
 
     def test_sonde_sans_remise_refusee(self):
         """B2 : un verdict `sans-sonde` (auto sans persona menee, ou
-        SONDE_<HOTE>=jamais) n'atteste pas une activation."""
+        SONDE_<HOTE>=jamais) n'atteste pas une activation ; #4126 : sur TOUS
+        les hotes, aucune remise reelle ne prouve la chaine."""
         evenements = journal_complet()
         for e in evenements:
             if e['etape'] == 'sante':
@@ -640,9 +644,92 @@ class ActifTest(unittest.TestCase):
         self.ecrire(evenements)
         code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
         self.assertEqual(code, 3, erreur)
-        self.assertIn('sonde', erreur)
+        self.assertIn('aucune sonde concluante', erreur)
         self.assertEqual(self.attestations(), [])
         self.assertEqual(self.envois, [])
+
+    def test_4126_deux_ok_un_sans_sonde_attestation_avec_mention(self):
+        """#4126, temoin du pilote : un hote `sans-sonde` (cible nommee
+        occupee, aucune libre) ne retient plus l'attestation ; elle porte la
+        mention « sonde non concluante : <raison> », reportee au staging
+        suivant, et le courrier la dit."""
+        evenements = journal_complet()
+        for e in evenements:
+            if e['etape'] == 'sante' and e['hote'] == 'ameesh-agents-1':
+                e['detail'] = detail_sonde(
+                    'ameesh-agents-1', verdict='sans-sonde',
+                    pourquoi='cible nommee ameesh-dev3 occupee (running)')
+        self.ecrire(evenements)
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 0, erreur)
+        attestation = json.loads(self.attestations()[0].read_text())
+        self.assertEqual(
+            attestation['non_concluants'],
+            {'ameesh-agents-1': 'sonde non concluante : cible nommee ameesh-dev3 '
+                                'occupee (running)'})
+        preuve = attestation['hotes']['ameesh-agents-1']
+        self.assertIsNone(preuve['sonde'])
+        self.assertEqual(preuve['report'], 'staging suivant')
+        self.assertIsNotNone(attestation['hotes']['ameesh-agents-2']['sonde'])
+        self.assertEqual(len(self.envois), 1)
+        self.assertIn('sonde non concluante : cible nommee ameesh-dev3',
+                      self.envois[0]['corps'])
+        self.assertIn('reportee au staging suivant', self.envois[0]['corps'])
+
+    def test_4126_trace_non_concluante_attestee_avec_sa_raison(self):
+        """#4126 : la trace `non-concluant` de staging.sh (outil absent : pas
+        de rapport ; base injoignable : rapport `non-concluant`) donne la
+        mention, avec le texte de la trace ou l'erreur du rapport."""
+        rapport = json.dumps({'hote': 'ameesh-agents-2', 'verdict': 'non-concluant',
+                              'sha': SHA, 'erreur': 'OperationalError: base'})
+        for detail, rapport_objet, attendu in (
+                ('sonde de courrier non concluante (code 127)', None, 'code 127'),
+                ('sonde de courrier non concluante (code 3)', json.loads(rapport),
+                 'OperationalError: base')):
+            with self.subTest(attendu=attendu):
+                self.envois.clear(); self.deposes.clear()
+                for chemin in self.attestations():
+                    chemin.unlink()
+                evenements = journal_complet()
+                for e in evenements:
+                    if e['etape'] == 'sante' and e['hote'] == 'ameesh-agents-2':
+                        e.update(verdict='non-concluant', detail=detail)
+                        if rapport_objet:
+                            e['rapport'] = rapport_objet
+                self.ecrire(evenements)
+                code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+                self.assertEqual(code, 0, erreur)
+                attestation = json.loads(self.attestations()[0].read_text())
+                self.assertIn(attendu, attestation['non_concluants']['ameesh-agents-2'])
+                self.assertEqual(attestation['hotes']['ameesh-agents-2']['etapes']['sante'],
+                                 'non-concluant')
+
+    def test_4126_un_hote_en_echec_aucune_attestation(self):
+        """#4126, temoin du pilote : un negatif (sante ko) retient
+        l'attestation, meme si un autre hote n'est que non concluant."""
+        evenements = journal_complet()
+        for e in evenements:
+            if e['etape'] == 'sante' and e['hote'] == 'ameesh-agents-1':
+                e['detail'] = detail_sonde('ameesh-agents-1', verdict='sans-sonde',
+                                           pourquoi='occupee')
+            if e['etape'] == 'sante' and e['hote'] == 'ameesh-agents-2':
+                e['verdict'] = 'ko'
+        self.ecrire(evenements)
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertEqual(self.attestations(), [])
+        self.assertEqual(self.envois, [])
+
+    def test_4126_rapport_non_concluant_d_un_autre_hote_refuse(self):
+        """Un rapport `sans-sonde` d'un autre hote reste une preuve etrangere."""
+        evenements = journal_complet()
+        for e in evenements:
+            if e['etape'] == 'sante' and e['hote'] == 'ameesh-agents-1':
+                e['detail'] = detail_sonde('ameesh-agents-2', verdict='sans-sonde')
+        self.ecrire(evenements)
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('autre hote', erreur)
 
     def test_sonde_detail_textuel_ou_absent_refuse(self):
         """B2 : un detail libre ou absent ne prouve pas une remise reelle."""

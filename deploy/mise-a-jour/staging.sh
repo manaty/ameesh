@@ -38,8 +38,11 @@
 # defaut), par ssh (#3976). Le journal est recopie a actif.py, qui ecrit son
 # attestation sur la VM et la depose aussi dans le journal partage du mesh
 # (`ameesh_events`, #3981) ; le poste la relit sans ssh.
-# Une sonde qui n'a pas pu tourner (outil absent, ssh, base injoignable) est
-# non concluante (canon §3) : aucun retour de l'hote, sequence arretee en 3.
+# Une sonde qui n'a pas pu tourner (outil absent, ssh, base injoignable) ou
+# n'a pas conclu (sans-sonde) est non concluante (canon §3) : aucun retour de
+# l'hote, la sequence continue et l'attestation porte, pour cet hote, la
+# mention « sonde non concluante : <raison> », reportee au staging suivant
+# (#4126, decision du pilote ; analogie §12). Seul un negatif la retient.
 #
 # Sans HOTES_STAGING (cas de bureau-goal, qui n'a qu'un fichier par VM), la
 # topologie est composee des bascule-a1.env, bascule-a2.env et bascule-agents-3.env du dossier de
@@ -59,7 +62,9 @@
 # PERSONAS_VM peut etre vide (hote sans executant).
 #
 # Options lues dans BASCULE_ENV : SONDE_<HOTE> (cible de la sonde de courrier,
-# par defaut la premiere persona menee de l'hote), ATTENTE_COURRIER (300 s),
+# par defaut la premiere persona menee de l'hote ; occupee, elle est attendue
+# ATTENTE_CIBLE secondes (300 s), puis remplacee par une persona libre du meme
+# hote, #4126), ATTENTE_COURRIER (300 s),
 # SOUFFRANCE_COURRIER (900 s), NOTIF_STAGING (mesh-design), DRAIN_ATTENTE
 # (vm.sh, 0 = jamais, > 0 = pause immédiate), LOTS_VERIF et RAPPORTEURS_VERIF
 # (voir le signal ci-dessous).
@@ -122,7 +127,8 @@
 # de l'etape `sante` est le rapport JSON de sante-courrier.py (hote, commit,
 # verdict, message de sonde remis, destinataire, delai) : c'est la preuve
 # structuree que actif.py exige (#1323) ; un verdict `sans-sonde` n'en est pas
-# une et aucun signal de reussite n'est emis dans ce cas.
+# une : l'attestation le dit pour cet hote (« sonde non concluante »), sans
+# le compter comme prouve (#4126).
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -154,6 +160,9 @@ TRAVAIL_OUTILS="$HOME_OUTILS/.local/state/ameesh/mise-a-jour"
 #: quotidien et pouvant contenir une execution precedente du meme jour.
 DEPUIS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ATTENTE_COURRIER=${ATTENTE_COURRIER:-300}
+ATTENTE_CIBLE=${ATTENTE_CIBLE:-300}
+#: hotes dont la sonde n'a pas conclu (#4126) : nommes en fin de sequence
+NON_CONCLUANTS=()
 SOUFFRANCE_COURRIER=${SOUFFRANCE_COURRIER:-900}
 NOTIF_STAGING=${NOTIF_STAGING:-mesh-design}
 LOTS_VERIF=${LOTS_VERIF:-}
@@ -757,7 +766,8 @@ sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
   fi
   if [ "$SONDE" = 1 ] && [ "$sans" != jamais ]; then
     etape "courrier de $nom (sonde de remise reelle)"
-    args_sonde=(--sonde "${cible_sonde:-auto}" --attente "$ATTENTE_COURRIER")
+    args_sonde=(--sonde "${cible_sonde:-auto}" --attente "$ATTENTE_COURRIER"
+      --attente-cible "$ATTENTE_CIBLE")
   else
     etape "courrier de $nom (lecture seule, sonde desactivee)"
     args_sonde=(--sonde jamais)
@@ -828,15 +838,17 @@ echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
 # #3976 : la sonde n'a pas pu tourner (outil absent, ssh, base injoignable)
 # ou n'a pas conclu (#4089 : remise sans tour termine, attente budget) :
 # non concluant (canon §3), jamais « malsain ». Aucun retour de l'hote, qui a
-# passe installer, redemarrer et controler ; la sequence s'arrete et le dit.
+# passe installer, redemarrer et controler. #4126 (decision du pilote) : la
+# sequence continue ; l'attestation porte la mention de cet hote, reportee
+# au staging suivant.
 sonde_non_concluante() {  # nom
   local nom=$1 detail
   detail="sonde de courrier non concluante (code ${SANTE_RC:-?}) : outil empeche ou tour non conclu, aucun retour"
   trace "$nom" sante non-concluant "$detail" "$SANTE_DETAIL"
-  echo "!! $nom : $detail ; $nom reste sur $SHA_TRAVE, sequence arretee avant les hotes suivants" >&2
-  notifier "staging : sonde de $nom non concluante, sequence arretee sans retour" \
-    "Le staging $SHA_TRAVE a installe, redemarre et controle $nom, mais sa sonde de courrier n'a pas conclu ($detail). Non concluant (canon §3) : $nom n'est PAS remis en arriere ; sequence arretee avant les hotes suivants, aucune attestation. Corriger l'outil ou attendre la fin de l'attente nommee, puis relancer (un hote deja au commit n'est pas reinstalle). Sortie de la sonde : ${SANTE_DETAIL:-vide}. Trace : $JOURNAL"
-  exit 3
+  NON_CONCLUANTS+=("$nom")
+  echo "!! $nom : $detail ; $nom reste sur $SHA_TRAVE, la sequence continue (mention dans l'attestation)" >&2
+  notifier "staging : sonde de $nom non concluante, sequence poursuivie sans retour" \
+    "Le staging $SHA_TRAVE a installe, redemarre et controle $nom, mais sa sonde de courrier n'a pas conclu ($detail). Non concluant (canon §3) : $nom n'est PAS remis en arriere et la sequence continue ; l'attestation portera « sonde non concluante » pour $nom, a reprendre au staging suivant. Sortie de la sonde : ${SANTE_DETAIL:-vide}. Trace : $JOURNAL"
 }
 
 # --- plan -----------------------------------------------------------------
@@ -989,7 +1001,7 @@ for nom in "${HOTES[@]}"; do
   sante_hote "$nom" || rc=$?
   case $rc in
     0) ;;
-    3) sonde_non_concluante "$nom" ;;
+    3) sonde_non_concluante "$nom"; continue ;;
     *) echec_hote "$nom" sante "sante en echec" ;;
   esac
   # `detail` reste le rapport JSON (lu par actif.py) ; le meme contenu part en
@@ -998,6 +1010,9 @@ for nom in "${HOTES[@]}"; do
 done
 
 etape "sequence staging terminee : ${HOTES[*]} sur $SHA_TRAVE"
+if [ "${#NON_CONCLUANTS[@]}" -gt 0 ]; then
+  echo "sonde non concluante (reportee au staging suivant) : ${NON_CONCLUANTS[*]}" >&2
+fi
 echo "traces : $JOURNAL"
 trace sequence sequence ok
 

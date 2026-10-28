@@ -23,6 +23,13 @@ le signal que si l'ACTIVATION est prouvee, hote par hote :
   `ok` et sonde reellement remise (message, destinataire, hote destinataire,
   delai), du bon hote et du bon commit — un detail absent, textuel ou
   `sans-sonde` ne prouve rien ;
+* #4126 (decision du pilote, canon §3 et analogie §12) : une sante non
+  concluante (trace `non-concluant`, ou rapport `sans-sonde`/`non-concluant`)
+  ne retient plus l'attestation. L'hote y figure sans preuve de remise, avec
+  la mention « sonde non concluante : <raison> », reportee au staging suivant
+  (`non_concluants`). Seul un negatif (tour en echec, courrier non remis, ko)
+  la retient ; sans AUCUNE remise reelle, rien n'est prouve (comme
+  `--sans-sonde`) ;
 * un hote en mode `serveur` sans executant (0 persona locale, comme
   manaty-mesh-1) ne peut pas etre prouve par une remise locale : sa preuve est
   une sonde CROISEE remise a une persona d'un autre hote canonique, dont la
@@ -101,6 +108,11 @@ MODES = ("agents", "poste", "serveur")
 MODE_DEFAUT = "agents"
 #: etapes qui, par hote, prouvent l'activation et pas seulement l'installation
 ETAPES_REQUISES = ("installer", "redemarrer", "controler", "sante")
+#: #4126 : verdicts de sante qui ne concluent pas (ni preuve ni negatif)
+NON_CONCLUANT = "non-concluant"
+VERDICTS_NON_CONCLUANTS = ("sans-sonde", NON_CONCLUANT)
+#: report d'une sonde non concluante, dans l'attestation et le courrier
+REPORT_NON_CONCLUANT = "staging suivant"
 #: etat par defaut des attestations (meme arbre que le journal de staging)
 ETAT_DEFAUT = Path.home() / ".local/state/ameesh/mise-a-jour"
 #: fenetre de depart de la reconciliation d'emission ; elle double tant
@@ -219,6 +231,45 @@ def preuve_sonde(hote: str, detail: object, sha: str,
             "delai_s": float(delai), "hote_destinataire": destinataire_hote}
 
 
+def mention_non_concluante(hote: str, evenement: dict, sha: str) -> str | None:
+    """« sonde non concluante : <raison> » pour une sante qui n'a pas conclu,
+    None si la sante doit prouver une remise (#4126).
+
+    La trace `non-concluant` de staging.sh porte le rapport en objet
+    `rapport` (absent si l'outil n'a pas tourne : la raison est alors le
+    texte de la trace) ; une trace `ok` dont le rapport dit `sans-sonde` ou
+    `non-concluant` n'a rien prouve non plus. Un rapport d'un autre hote ou
+    d'un autre commit reste une preuve etrangere, jamais une mention.
+    """
+    rapport = evenement.get("rapport")
+    if not isinstance(rapport, dict):
+        try:
+            rapport = json.loads(evenement.get("detail") or "")
+        except (TypeError, ValueError):
+            rapport = None
+        rapport = rapport if isinstance(rapport, dict) else None
+    trace_nc = evenement.get("verdict") == NON_CONCLUANT
+    if not trace_nc and (rapport is None
+                         or rapport.get("verdict") not in VERDICTS_NON_CONCLUANTS):
+        return None
+    raison = ""
+    if rapport is not None:
+        if rapport.get("hote") != hote:
+            raise PreuveManquante("%s : rapport de sonde d'un autre hote (%r)"
+                                  % (hote, rapport.get("hote")))
+        if not prefixe_du_commit(sha, str(rapport.get("sha") or "")):
+            raise PreuveManquante("%s : rapport de sonde d'un autre commit" % hote)
+        sonde = rapport.get("sonde") if isinstance(rapport.get("sonde"), dict) else {}
+        raison = str(rapport.get("erreur") or sonde.get("tour")
+                     or rapport.get("pourquoi") or "")
+        if sonde.get("destinataire"):
+            raison = "%s (sonde %s a %s)" % (raison, sonde.get("message"),
+                                             sonde["destinataire"])
+    if not raison and trace_nc:
+        raison = str(evenement.get("detail") or "")
+    return "sonde non concluante : %s" % ((raison.strip() or "raison non dite")[:300])
+
+
 def horodatage(ts: object) -> float | None:
     """Instant ISO UTC du journal en epoch, ou None s'il est illisible."""
     if not isinstance(ts, str):
@@ -335,12 +386,24 @@ def preuves(evenements: list[dict], sha: str, actifs: dict[str, str],
         for evenement in apres:
             if evenement.get("etape") in ETAPES_REQUISES:
                 etapes[evenement["etape"]] = evenement.get("verdict")
-        manquantes = [etape for etape in ETAPES_REQUISES if etapes.get(etape) != "ok"]
+        manquantes = [etape for etape in ETAPES_REQUISES if etapes.get(etape) != "ok"
+                      and not (etape == "sante" and etapes.get(etape) == NON_CONCLUANT)]
         if manquantes:
             raise PreuveManquante("%s : preuve(s) manquante(s) ou en echec : %s"
                                   % (hote, ", ".join(manquantes)))
-        detail = next((e.get("detail") for e in reversed(apres)
-                       if e.get("etape") == "sante"), None)
+        sante = next(e for e in reversed(apres) if e.get("etape") == "sante")
+        detail = sante.get("detail")
+        mention = mention_non_concluante(hote, sante, sha)
+        if mention is not None:
+            # #4126 : ni preuve ni negatif ; l'hote est atteste avec la
+            # mention, reportee au staging suivant, sans remise a relire.
+            resultat[hote] = {"actif": actif,
+                              "etapes": {e: etapes[e] for e in ETAPES_REQUISES},
+                              "sante": detail, "sonde": None,
+                              "non_concluant": mention,
+                              "report": REPORT_NON_CONCLUANT,
+                              "redemarrage_ts": None}
+            continue
         sonde = preuve_sonde(hote, detail, sha, modes.get(hote, MODE_DEFAUT))
         redemarrages = [e for e in apres
                         if e.get("etape") == "redemarrer" and e.get("verdict") == "ok"]
@@ -352,6 +415,13 @@ def preuves(evenements: list[dict], sha: str, actifs: dict[str, str],
                           "etapes": {e: etapes[e] for e in ETAPES_REQUISES},
                           "sante": detail, "sonde": sonde,
                           "redemarrage_ts": redemarrage_ts}
+    # #4126 : une mention ne remplace la preuve que pour un hote ; sans aucune
+    # remise reelle, rien ne prouve la chaine (comme --sans-sonde).
+    if all(p.get("sonde") is None for p in resultat.values()):
+        raise PreuveManquante(
+            "aucune sonde concluante (%s) : activation non prouvee"
+            % "; ".join("%s : %s" % (h, p["non_concluant"])
+                        for h, p in sorted(resultat.items())))
     return resultat, reportes
 
 
@@ -407,6 +477,8 @@ def verifier_remises(preuve: dict, sha: str) -> None:
     try:
         for hote in preuve:
             sonde = preuve[hote]["sonde"]
+            if sonde is None:
+                continue  # #4126 : sonde non concluante, aucune remise a relire
             apres_ts = (preuve[hote].get("redemarrage_ts")
                         if sonde["hote_destinataire"] != hote else None)
             verifier_remise(conn, hote, sonde, sha, apres_ts)
@@ -492,6 +564,8 @@ def attestation_partagee(attestation: dict) -> dict:
         compacte = {"actif": preuve.get("actif")}
         if isinstance(preuve.get("etapes"), dict):
             compacte["etapes"] = preuve["etapes"]
+        if preuve.get("non_concluant"):
+            compacte["non_concluant"] = preuve["non_concluant"]
         hotes[hote] = compacte
     return {
         "schema": attestation.get("schema"),
@@ -501,6 +575,7 @@ def attestation_partagee(attestation: dict) -> dict:
         "sha_court": attestation.get("sha_court"),
         "hotes": hotes,
         "reportes": attestation.get("reportes") or {},
+        "non_concluants": attestation.get("non_concluants") or {},
         "lots": attestation.get("lots") or [],
         "rapporteurs": attestation.get("rapporteurs") or [],
     }
@@ -554,9 +629,13 @@ def corps_courrier(attestation: dict, chemin: Path) -> str:
             detail = " — sonde %s remise a %s en %ss%s" % (
                 sonde.get("message"), sonde.get("destinataire"),
                 sonde.get("delai_s"), via)
+        if preuve.get("non_concluant"):
+            detail = " — %s ; reportee au %s" % (
+                preuve["non_concluant"], preuve.get("report") or REPORT_NON_CONCLUANT)
         lignes.append("- %s : actif %s (%s)%s"
                       % (hote, preuve["actif"][:9],
-                         ", ".join("%s ok" % e for e in ETAPES_REQUISES), detail))
+                         ", ".join("%s %s" % (e, (preuve.get("etapes") or {}).get(e, "ok"))
+                                   for e in ETAPES_REQUISES), detail))
     for hote, detail in sorted(reportes.items()):
         lignes.append("- %s : REPORTE — %s ; mise a jour a son retour, jamais "
                       "en dessous" % (hote, (detail or {}).get("raison") or "absent"))
@@ -664,6 +743,9 @@ def main(argv: list[str] | None = None) -> int:
         "journal": str(journal),
         "hotes": preuve,
         "reportes": reportes,
+        #: #4126 : hotes attestes sans preuve de remise, sonde a reprendre
+        "non_concluants": {h: p["non_concluant"] for h, p in sorted(preuve.items())
+                           if p.get("non_concluant")},
         "lots": sorted(set(args.lot)),
         "rapporteurs": sorted(set(args.rapporteur)),
         "notifies": notifies,
