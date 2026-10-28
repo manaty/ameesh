@@ -159,6 +159,21 @@ class KeepTestedTest(Chain):
         match = auto.TESTED_RE.match(cmd[4])
         self.assertEqual(match.groups(), (self.base, self.head, ref))
 
+    def test_note_refusee_marque_encore_lisible_par_le_tic(self):
+        import contextlib
+        import io
+        output = io.StringIO()
+        refused = subprocess.CompletedProcess([], 1, b"", b"indisponible")
+        with mock.patch.object(auto, "run_command", return_value=refused), \
+                contextlib.redirect_stdout(output):
+            ref = auto.keep_tested(self.repo, 4000, NAME, self.base, self.head)
+        self.assertEqual(git(self.origin, "rev-parse", ref), self.head)
+        marks = [line for line in output.getvalue().splitlines()
+                 if auto.TESTED_RE.match(line)]
+        self.assertEqual(len(marks), 1)
+        self.assertEqual(auto.TESTED_RE.match(marks[0]).groups(),
+                         (self.base, self.head, ref))
+
 
 class EpochLostTest(unittest.TestCase):
     def test_record_refuse_par_la_garde_est_une_perte_de_bail(self):
@@ -457,6 +472,22 @@ class ResumeTestedTest(HoraireBase):
 class FrozenHeadLinkTest(HoraireBase):
     """#4237 (B cx1) : depuis #4304 la tentative gèle H avant ses tests ; le gel
     A→H ne vaut plus aboutissement."""
+
+    def test_gel_etranger_apres_tentative_non_repris(self):
+        item = self.lost()
+        foreign = "f" * 40
+        item["freeze"]["declared"].update(sha=foreign, at_ts=NOW - 100)
+        self.assertIsNone(ph.pending(self.ctx, item, foreign))
+        self.assertEqual(self.autos(), [])
+
+    def test_marque_de_sortie_repare_la_note_perdue(self):
+        item = self.lost()
+        mark = item["events"].pop(1)["note"]
+        attempt = ph.attempts(item)[0]
+        result = ph.Result(1, mark + "\n", REFUSAL)
+        ph.after_compose(self.ctx, 4000, NAME, result, attempt)
+        self.assertEqual(ph.tested_since(item, attempt.ts),
+                         ("e" * 40, HEAD2, TESTED_REF))
 
     def test_gel_a_vers_h_reprend_la_tentative_de_la_base_a(self):
         item = self.lost(ph.MARK_FENCED + "recomposition n=1 base=%s époque=288" % HEAD,

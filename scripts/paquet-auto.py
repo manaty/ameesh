@@ -2449,6 +2449,8 @@ def keep_tested(repo: Path, carrier: int, name: str, base_sha: str, head: str,
     mark = "%sbase=%s tête=%s réf=%s" % (TESTED_MARK, base_sha, head, ref)
     if tests:
         mark += " tests=%s" % tests
+    # Le tic peut réécrire la marque si cette première note échoue.
+    print(mark, flush=True)
     cmd = ["ameesh", "work", "note", str(carrier), mark]
     if sender:
         cmd += ["--actor", sender]
@@ -3000,8 +3002,8 @@ def main(argv: list[str] | None = None) -> int:
                              "heures (défaut : 24 ; 0 = jamais)")
     parser.add_argument("--publish", default=None, metavar="REF",
                         help="#4237 : publier sans retester la tête testée gardée "
-                             "sous REF (%s<nom>) : chaîne vérifiée, puis packet "
-                             "record, inclusion, poussée, PR, gel, courrier ; "
+                             "sous REF (%s<nom>) : chaîne et branche vérifiées, "
+                             "corps de PR, note, ci-full et courrier ; "
                              "sortie %d si la chaîne est refusée"
                              % (TESTED_REF_PREFIX, PUBLISH_REFUSED))
     parser.add_argument("--publish-sha", default=None, metavar="SHA",

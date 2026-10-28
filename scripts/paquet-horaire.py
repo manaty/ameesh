@@ -749,6 +749,13 @@ def pending(ctx: Context, item: dict, sha: str) -> Attempt | None:
     échec ou arrêt en cours de tests, ou tentative encore vivante.
     """
     found = attempts(item)
+    if found and sha:
+        kept = tested_since(item, found[-1].ts)
+        expected = (found[-1].publish.rsplit("@", 1)[-1]
+                    if found[-1].publish else kept[1] if kept else "")
+        # Un autre gel ne donne pas à cette tentative le droit de le remplacer.
+        if expected and expected != sha and frozen_ts(item) > found[-1].ts:
+            return None
     if found and found[-1].base == sha:
         return found[-1]
     if found and sha:
@@ -867,6 +874,11 @@ def tested_since(item: dict, since: float) -> tuple[str, str, str] | None:
 def after_compose(ctx: Context, carrier: int, name: str, result: Result,
                   this: Attempt) -> str:
     step = this.step
+    # La sauvegarde Git réussit parfois alors que sa note échoue ; récupérer
+    # la marque exacte de la sortie avant de journaliser le refus de garde.
+    for line in result.stdout.splitlines():
+        if auto.TESTED_RE.match(line):
+            ctx.note(carrier, line)
     # N1 de relecture : la fin de la sortie seulement (l'erreur qui arrête
     # paquet-auto), pas une phrase citée plus haut par un test rouge
     if result.returncode != 0 and FENCE_REFUSAL_RE.search(auto._tail(result.text, 10)):
