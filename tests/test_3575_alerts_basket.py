@@ -221,10 +221,47 @@ class AlertsTimerGapTest(unittest.TestCase):
     def gap(self, **kw):
         kw.setdefault("directory", self.dir)
         kw.setdefault("apply", False)
-        return role_timers.alerts_timer_gap(role="mesh-design", **kw)
+        kw.setdefault("role", "mesh-design")
+        return role_timers.alerts_timer_gap(**kw)
 
     def test_the_installed_unit_is_ready(self):
         self.assertEqual(self.gap(), "")
+
+    def test_another_elected_role_reads_the_installed_role(self):
+        # #4114: one alerts unit per host, rendered for mesh-design. The
+        # auditeur is a candidate on the same host: its pass is the same
+        # global pass, so the unit is not "out of date" for it.
+        self.assertEqual(self.gap(role="auditeur"), "")
+        self.assertEqual(self.gap(role="orchestrateur"), "")
+
+    def test_another_role_still_reads_a_stale_unit(self):
+        (self.dir / self.spec.service).write_text(
+            role_timers.render_service(self.spec, role="mesh-design").replace(
+                " --pass alerts", ""),
+            encoding="utf-8")
+        self.assertIn("ameesh-role-alerts.service is out of date",
+                      self.gap(role="auditeur"))
+
+    def test_another_role_still_needs_the_timer_enabled(self):
+        def systemctl(*args, **kwargs):
+            return SimpleNamespace(
+                returncode=1 if "is-enabled" in args else 0,
+                stdout="", stderr="")
+
+        with mock.patch.object(role_timers, "_systemctl", side_effect=systemctl):
+            gap = self.gap(role="auditeur", apply=True)
+        self.assertIn("ameesh-role-alerts.timer is not enabled", gap)
+
+    def test_a_unit_that_names_no_role_is_out_of_date(self):
+        (self.dir / self.spec.service).write_text("# hand-written\n",
+                                                  encoding="utf-8")
+        self.assertIn("ameesh-role-alerts.service is out of date",
+                      self.gap(role="auditeur"))
+
+    def test_the_installed_role_is_read_from_the_service(self):
+        content = (self.dir / self.spec.service).read_text(encoding="utf-8")
+        self.assertEqual(role_timers.alerts_service_role(content), "mesh-design")
+        self.assertEqual(role_timers.alerts_service_role(""), "")
 
     def test_a_missing_timer_is_named(self):
         (self.dir / self.spec.timer).unlink()
