@@ -584,7 +584,8 @@ class FreshTest(unittest.TestCase):
                 ph.check_fresh(ctx)
 
     def test_main_refuse_sans_aucun_geste(self):
-        saved = (ph.check_fresh, ph.tick, ph.align_schema)
+        saved = (ph.check_fresh, ph.tick, ph.align_schema, ph.read_pause)
+        ph.read_pause = lambda project, target: None
         ticked = []
         def stale(ctx):
             raise ph.HoraireError("code périmé")
@@ -594,7 +595,7 @@ class FreshTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=False):
                 self.assertEqual(ph.main(["tick", "--repo", str(ROOT)]), 1)
         finally:
-            ph.check_fresh, ph.tick, ph.align_schema = saved
+            ph.check_fresh, ph.tick, ph.align_schema, ph.read_pause = saved
         self.assertEqual(ticked, [])
 
 
@@ -689,7 +690,8 @@ class GitIdentityTest(unittest.TestCase):
     """#3916 : un HOME sans .gitconfig, la composition commite quand même."""
 
     def test_main_pose_l_identite_du_pilote(self):
-        saved = (ph.check_fresh, ph.tick, ph.align_schema)
+        saved = (ph.check_fresh, ph.tick, ph.align_schema, ph.read_pause)
+        ph.read_pause = lambda project, target: None
         seen = []
         ph.check_fresh = ph.align_schema = lambda ctx: None
         ph.tick = lambda ctx: seen.append(
@@ -709,7 +711,7 @@ class GitIdentityTest(unittest.TestCase):
                 self.assertEqual(ph.main(["tick", "--repo", str(ROOT),
                                           "--pilot", "pilote-x"]), 0)
         finally:
-            ph.check_fresh, ph.tick, ph.align_schema = saved
+            ph.check_fresh, ph.tick, ph.align_schema, ph.read_pause = saved
         self.assertEqual(seen, [("pilote-x", "pilote-x@ameesh.invalid")])
 
     def test_commit_sans_gitconfig(self):

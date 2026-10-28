@@ -34,6 +34,9 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
                        transaction of its lease check
   staging.attested     a complete staging sequence, its active hosts and its
                        commit (no table: written by `actif.py`, #3981)
+  packet.pause         a bounded pause of the hourly packet tick, or its end
+                       (no table: written by `paquet-horaire.py pause|resume`,
+                       read by its tick and `role timers --check`, #4361)
 
 `data` holds identifiers and states, never free text: the client rereads the
 object through the API.
@@ -83,7 +86,8 @@ TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages", "agent.upda
          "agent.moved",
          "cost.recorded", "thread.entry", "decision.created", "decision.closed",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
-         "alert.resolved", "pilot.gesture", "staging.attested")
+         "alert.resolved", "pilot.gesture", "staging.attested",
+         "packet.pause")
 RETENTION_ENV = "AMEESH_EVENTS_RETENTION_DAYS"
 RETENTION_DAYS = 365
 #: the table refuses to delete an event younger than this (migration 0396)

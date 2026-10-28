@@ -956,6 +956,30 @@ def check(report: dict, *, directory: Path, apply: bool = True,
     return problems
 
 
+def paquet_pause_note(db, report: dict, path: str | None = None, *,
+                      now: float | None = None) -> str:
+    """#4361: the active pause of the hourly packet tick, as a warning.
+
+    The pause (``paquet-horaire.py pause``) keeps the timer active, so
+    ``--check`` stays green; it is named here so a staging return check does
+    not read a silent tick as healthy. Empty when there is no pause, no
+    packet pass, or the log cannot be read (never a failure).
+    """
+    if not any(item.get("name") == PAQUET_PASS and not item.get("blocked")
+               for item in report.get("timers") or ()):
+        return ""
+    from . import packet_pause
+    env = _env_file(os.path.expanduser(path or PAQUET_ENV))
+    target = (env.get("AMEESH_PAQUET_TARGET") or "main").strip() or "main"
+    try:
+        data = packet_pause.active(db, project="ameesh", target=target, now=now)
+    except Exception:  # noqa: BLE001 - a log read never fails the check
+        return ""
+    if not data:
+        return ""
+    return "%s: %s (timer active, ticks skip)" % (PAQUET_PASS, packet_pause.describe(data))
+
+
 def warnings(report: dict) -> list[str]:
     """Passes blocked for a missing secret: reported, never a failure (#3402).
 
@@ -1119,6 +1143,9 @@ def main(argv: list[str] | None = None) -> int:
             problems = check(report, directory=directory, apply=not args.no_apply,
                              bin_path=args.bin)
             notes = warnings(report)
+            paused = paquet_pause_note(db, report) if args.role == DEFAULT_ROLE else ""
+            if paused:
+                notes.append(paused)
             if args.json:
                 print(json.dumps(dict(report, problems=problems, warnings=notes),
                                  ensure_ascii=False, sort_keys=True))
