@@ -474,6 +474,38 @@ redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unit�
   etape "$u : arrêt prouvé — attente $(( $(horloge) - debut )) s"
   unite_systemctl "$u" start || { echo "$u : le démarrage échoue" >&2; return 1; }
 }
+# #4373 : `list --json` est relu tant qu'il n'est pas un tableau JSON, au plus
+# LECTURE_ESSAIS fois (même politique que lire_show, #4358) : une sortie vide
+# ou coupée (code 0 vide, 124, 137, 255) est passagère — relève d'un rôle élu,
+# lien qui tombe — et ne fait plus échouer l'étape de staging. Une erreur
+# explicite du CLI reste un échec (#3114). Un registre encore illisible après
+# relectures rend rc 3 : sans liste, l'appelant ne peut ni redémarrer ni
+# contrôler les exécuteurs, et un hôte vide ne doit pas être vert (#4239).
+lire_liste() {  # → tableau JSON sur une ligne ; rc 3 si illisible
+  local sortie essai rc essais=${LECTURE_ESSAIS:-3} ecart=${LECTURE_ECART:-3}
+  # #4358 valide ces paramètres quand il les définit ; seuls, on les borne à
+  # la même politique (3 lectures, 3 s d'écart).
+  [[ $essais =~ ^[0-9]+$ ]] && [ "$essais" -gt 0 ] || essais=3
+  [[ $ecart =~ ^[0-9]+$ ]] || ecart=3
+  for ((essai = 1; essai <= essais; essai++)); do
+    rc=0; sortie=$(ameesh_agents_lecture list --json) || rc=$?
+    if [ "$rc" = 0 ] && sortie=$(python3 -c 'import json,sys
+rows = json.loads(sys.stdin.read())
+if not isinstance(rows, list): sys.exit(1)
+print(json.dumps(rows))' <<<"$sortie" 2>/dev/null); then
+      printf '%s\n' "$sortie"
+      return 0
+    fi
+    if ((essai < essais)); then sleep "$ecart"; fi
+  done
+  case $rc in
+    0|124|137|255)
+      echo "registre de $HOTE_AGENTS : lecture vide, tronquée, coupée ou sans transport (code $rc, $essais essais)" >&2
+      return 3 ;;
+  esac
+  echo "registre de $HOTE_AGENTS : lecture en erreur (code $rc)" >&2
+  return 1
+}
 # Lecture sur l'hôte, jamais depuis PERSONAS_VM ni les unités déjà actives :
 # une unité manquante doit être contrôlée elle aussi. Ignorer et nommer les
 # noms invalides ; ne pas transformer un registre vide en succès.
@@ -481,9 +513,10 @@ redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unit�
 # déploiement doit recharger leur unité si elle tourne encore (#1633), là où le
 # contrôleur ne les attend pas (aucun bail d'une persona arrêtée).
 agents_du_registre() {
-  local arretes=${1:-} noms
-  noms=$(ameesh_agents_lecture list --json | python3 -c 'import json,re,sys
-rows = json.load(sys.stdin)
+  local arretes=${1:-} noms liste
+  liste=$(lire_liste) || return $?
+  noms=$(python3 -c 'import json,re,sys
+rows = json.loads(sys.stdin.read())
 avec_arretes = sys.argv[2:] == ["avec-arretes"]
 # Même règle que ameesh.config.NAME_RE (config.py:48), utilisée par
 # registry._check_name : 1 à 64 caractères, lettres/chiffres puis . _ -.
@@ -505,7 +538,7 @@ for r in rows:
     names.add(name)
 names = sorted(names)
 if not names: sys.exit("aucun agent à mener sur " + sys.argv[1])
-print("\n".join(names))' "$HOTE_AGENTS" "$arretes") || return 1
+print("\n".join(names))' "$HOTE_AGENTS" "$arretes" <<<"$liste") || return 1
   printf '%s\n' "$noms"
 }
 
