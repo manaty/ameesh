@@ -508,7 +508,9 @@ class RestartLeaseTest(unittest.TestCase):
         proc = self.restart("lease")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("JSONDecodeError", proc.stderr)
-        self.assertIn("bail illisible", proc.stdout)
+        # poste.sh : « bail illisible » ; vm.sh (sous-classe) : « registre … illisible ».
+        self.assertRegex(proc.stdout, r"WARNING dev9: (bail|registre) .*illisible")
+        self.assertIn("non concluant", proc.stdout)
         self.assertIsNone(self.op_position("stop"))
         self.assertIsNone(self.op_position("start"))
 
