@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#4134 (E de #2846) : première admission native TPK et réconciliation des versions.
 
-Deux niveaux de preuve, tous deux sur les artefacts réels mais hors dépôt :
+Qualification réelle sur des artefacts hors dépôt et témoins synthétiques :
 
 * la carte TPK publiée au pin `thepackengers/home@83525af...` compile en
   `process-workflow/1` avec la forme approuvée (14 étapes, 46 arêtes, 7 types,
@@ -14,7 +14,9 @@ Deux niveaux de preuve, tous deux sur les artefacts réels mais hors dépôt :
   `artifact_repos` omet `thepackengers/home` sont refusées.
 
 Les fixtures (carte et commentaires #704) sont capturées hors du dépôt, dans le
-coffre du bureau ; le test est sauté sans elles. Aucun contenu privé n'est
+coffre du bureau ; seuls les tests de qualification réelle sont sautés sans
+elles. Les témoins de régression utilisent un workflow public synthétique et
+restent exécutés en CI sans ces fixtures. Aucun contenu privé n'est
 commité. Pour la qualification officielle, les deux variables sont posées sur
 bureau-goal, avec le code 1.26.0/904cefc et le jeton #4005.
 """
@@ -36,6 +38,7 @@ from ameesh import process_approvals as pa
 from ameesh import process_card
 from ameesh import process_registry as pr
 from ameesh import process_verifiers as pv
+from ameesh import process_workflow as pw
 
 #: les fixtures sont lues AVANT `tests.support`, qui retire de l'environnement
 #: toute variable AMEESH_* hors réglages du banc (L142).
@@ -48,6 +51,7 @@ from .support import PgTestCase  # noqa: E402 (import after the capture)
 from .test_process_approvals import (APPROVER, ISSUE, REPO, _comment,  # noqa: E402
                                      _issue)
 from .test_process_registry import ACME_ACTOR, ACME_EPOCH, ACME_RUNNER  # noqa: E402
+from .test_process_workflow import fixture as workflow_fixture  # noqa: E402
 
 UTC = dt.timezone.utc
 
@@ -118,7 +122,7 @@ class TpkCardPinTest(unittest.TestCase):
 
 
 class TpkAdmissionTest(PgTestCase):
-    """Le registre B réel, sur PostgreSQL, avec la projection #704 réelle."""
+    """Registre B réel ; témoins synthétiques et qualification privée explicite."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -136,13 +140,9 @@ class TpkAdmissionTest(PgTestCase):
             "                            lease_expires_at)"
             " VALUES (%s, 'idle', %s, %s, now() + interval '1 hour')",
             (ACME_ACTOR, ACME_RUNNER, ACME_EPOCH))
-        self.card_path = CARD_FIXTURE
-        if not self.card_path:
-            self.skipTest("set %s to the card captured at the published pin"
-                          % CARD_FIXTURE_ENV)
-        self.artifact = process_card.check_page(
-            self.card_path, ref=PIN, version=1).artifact
-        self.assertIsNotNone(self.artifact)
+        # Public synthetic workflow: admission guards need an exact reference,
+        # not the private TPK card or its topology.
+        self.artifact = pw.compile_workflow(workflow_fixture(), ref=PIN, version=1)
         self.fixture_path = APPROVALS_FIXTURE
         self.tmp = tempfile.mkdtemp(prefix="t4134-", dir=os.environ.get("TMPDIR"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -163,6 +163,12 @@ class TpkAdmissionTest(PgTestCase):
             now=now or dt.datetime.now(UTC))
 
     def real(self) -> pa.Projection:
+        if not CARD_FIXTURE:
+            self.skipTest("set %s to the card captured at the published pin"
+                          % CARD_FIXTURE_ENV)
+        self.artifact = process_card.check_page(
+            CARD_FIXTURE, ref=PIN, version=1).artifact
+        self.assertIsNotNone(self.artifact)
         if not self.fixture_path:
             self.skipTest("set %s to the #704 fixture captured on bureau-goal"
                           % APPROVALS_FIXTURE_ENV)
@@ -332,6 +338,22 @@ class TpkAdmissionTest(PgTestCase):
             self.transfer(lot, path=path, approval=str(approval["id"]),
                           artifact_repos=False)
         self.assertEqual(caught.exception.code, "verifier-refused")
-        self.assertIn("approvals", str(caught.exception))
+        self.assertEqual(
+            caught.exception.message,
+            "collection approvals non collectee (projection absente ou perimee)")
+        # The registry deliberately hides source collection errors. Check the
+        # reader as well to prove this is the repository scope refusal.
+        with self.assertRaises(pa.ProjectionError) as source_error:
+            pa.load_projection(path=path, identity=pa.ApprovalIdentity(
+                repo=REPO, issue=ISSUE, approvers=(APPROVER,)))
+        self.assertEqual(source_error.exception.code, "projection-source")
+        self.assertIn("approval artifact is outside the identity",
+                      str(source_error.exception))
         self.assertEqual(self.events(lot), [])
         self.assertIsNone(self.ref(lot))
+
+        # The same projection and artifact pass once the identity covers home.
+        receipt = self.transfer(lot, path=path, approval=str(approval["id"]))
+        self.assertTrue(receipt.accepted)
+        self.assertEqual(self.ref(lot), PIN)
+        self.assertEqual(len(self.events(lot)), 1)
