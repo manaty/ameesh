@@ -1847,6 +1847,22 @@ class RequestTest(GelTestCase):
         self.assertEqual(gh.poses(), [])
         self.assertEqual(self.marques("reserve"), [])
 
+    def test_vehicule_teste_par_le_composeur_saute_la_prevalidation(self):
+        # #4136 : véhicule de paquet-auto, tests locaux au manifeste ; ni rouge
+        # ni non concluant, la demande part et le journal le dit.
+        gh = Gh()
+        why = ("prevalidation skipped: vehicle tested by the composer "
+               "(manifest %s)" % GEL[:12])
+        with mock.patch("ameesh.prevalidation_calls.gate_packet",
+                        return_value={"state": "skipped", "sha": GEL, "why": why,
+                                      "manifest": "reviews/integration-paquet.md"}):
+            code, notes = self.run_cmd(self.packet_api(), gh,
+                                       args=self.packet_args(), packet=False)
+        self.assertEqual(code, 0, notes)
+        self.assertIn(LABEL_FULL, gh.poses())
+        self.assertIn(why, notes)
+        self.assertFalse(any(n.startswith("prevalidation-unavailable") for n in notes), notes)
+
     def test_paquet_indisponible_continue_et_journalise(self):
         # Décision pilote 19/10 : une prévalidation indisponible ne bloque
         # jamais ; le motif est journalisé pour le manifeste du porteur.

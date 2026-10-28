@@ -3798,6 +3798,17 @@ def _packet_prevalidation(cfg, db, item, decision, args) -> int:
         map_path=getattr(args, "prevalidation_map", "") or "",
         deadline=prevalidation_calls.caller_deadline(
             getattr(args, "prevalidation_budget", None)))
+    if result.get("state") == "skipped":
+        #: #4136 : véhicule testé par paquet-auto, ni rouge ni non concluant.
+        try:
+            work.note(db, args.id, result["why"], actor="ameesh", once=True)
+        except Exception:  # noqa: BLE001 - une note ne bloque pas la demande
+            pass
+        decision["prevalidation"] = {"state": "skipped", "manifest": result.get("manifest"),
+                                     "sha": result.get("sha")}
+        if not getattr(args, "json", False):
+            print("  " + result["why"])
+        return 0
     if result.get("state") == "red":
         #: décision pilote 19/10 : seul un rouge bloque la demande de CI.
         why = result.get("why") or "run-red"
