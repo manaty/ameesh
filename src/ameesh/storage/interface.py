@@ -162,6 +162,7 @@ from __future__ import annotations
 from .conversations import Conversations
 from .provenance import Provenance
 from .work_dependencies import WorkDependencies
+from .work_footprints import WorkFootprints
 from .migration_reservations import MigrationReservations
 
 import abc
@@ -1658,6 +1659,17 @@ class PendingLot(RuntimeError):
         self.lot = lot
 
 
+class FootprintOverlap(RuntimeError):
+    """#4173 : l'attribution d'un lot qui n'occupait pas encore son empreinte
+    est refusée — elle chevauche celle d'un lot occupant du même dépôt
+    (`overlaps` : lignes de `work_footprints.overlapping`) ; rien n'est écrit."""
+
+    def __init__(self, overlaps: list):
+        self.overlaps = list(overlaps)
+        super().__init__("footprint overlaps lot(s) %s" % ", ".join(
+            "#%d" % int(i) for i in sorted({int(r["id"]) for r in self.overlaps})))
+
+
 class BasketEstimateRequired(RuntimeError):
     """#4117 : `backlog_basket_add` allait OUVRIR un panier pour un agent sans
     estimation ni référence publiée ; `backlog.add` le traduit en
@@ -1714,8 +1726,13 @@ class WorkItems(Domain):
             queued_note: str | None = None, forced_note: str | None = None,
             mark_item_id: int | None = None, mark_note: str = "",
             parent_lot: int | None = None, unique_ref: bool = False,
-            external_executor: str | None = None) -> dict:
-        """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
+            external_executor: str | None = None,
+            footprint: list | None = None) -> dict:
+        """#4173 : `footprint`, l'empreinte d'intake écrite avec le lot ; un lot
+        créé attribué dont elle chevauche celle d'un lot en cours du même dépôt
+        lève `FootprintOverlap` (rien n'est écrit).
+
+        Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
         si `estimate_minutes`, L157 ; avec la taille déclarée du changement
@@ -5084,6 +5101,7 @@ class Storage(abc.ABC):
     nonces: Nonces
     work: WorkItems
     work_dependencies: WorkDependencies
+    work_footprints: WorkFootprints
     provenance: Provenance
     migration_reservations: MigrationReservations
     lot_sessions: LotSessions

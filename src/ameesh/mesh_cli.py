@@ -1924,6 +1924,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "links":     # #4167 : liens typés entre lots
             from . import work_dependencies
             return work_dependencies.run_links(db, args)
+        if args.work_command == "footprint":   # #4173 : empreinte de lot (#3185)
+            from . import work_footprints
+            return work_footprints.run(cfg, db, args)
         if args.work_command == "landing":   # #1945 : atterrissage planifié sur un véhicule
             from . import work_dependencies
             return work_dependencies.run_landing(db, args)
@@ -2021,17 +2024,36 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             except intake_neighbors.IntakeNeighborsError as exc:
                 raise work.WorkError(str(exc)) from None
             note = "; ".join(part for part in (segment, introduced) if part)
-            item = work.add(
-                db, title=args.title, type=args.type, source=args.source, app=args.app,
+            # #4173 : l'empreinte d'intake (chemins cités), écrite par la
+            # création même ; jamais d'échec de la création pour l'estimer.
+            from . import work_footprints
+            try:
+                footprint = work_footprints.estimate_lot(cfg, {
+                    "app": args.app or "", "title": args.title, "body": args.body or "",
+                    "branch_target": args.target or ""})
+            except Exception as exc:  # noqa: BLE001 - la création n'attend pas l'estimation
+                footprint = []
+                print("warning: footprint not estimated: %s" % exc, file=sys.stderr)
+            add_kwargs = dict(
+                title=args.title, type=args.type, source=args.source, app=args.app,
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
-                assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
+                budget_usd=args.budget, actor=args.actor,
                 package=args.package, externe=args.externe, cfg=cfg,
                 external_executor=args.external_executor,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
                 estimate=minutes, estimate_source=args.estimate_source, size=args.size,
                 note=note,
                 force=args.force,
-                parent_lot=args.parent_lot)
+                parent_lot=args.parent_lot, footprint=footprint)
+            try:
+                item = work.add(db, assignee=args.assignee, **add_kwargs)
+            except storage.FootprintOverlap as exc:
+                # #4173 : attribué, le lot chevaucherait un lot en cours du même
+                # dépôt — il est créé libre et attend la fusion (prise L165).
+                item = work.add(db, assignee=None, **add_kwargs)
+                check = None
+                print("warning: created unassigned: %s"
+                      % work_footprints.refusal(item["id"], exc.overlaps), file=sys.stderr)
             print("lot #%d created in %s: %s%s%s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan: %s)" % item["package_id"] if item.get("package_id") else "",
@@ -2075,6 +2097,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             for neighbor in infos.get("neighbors") or ():
                 print("neighbor: %s" % intake_neighbors.format_neighbor(neighbor),
                       file=sys.stderr)
+            if footprint:
+                print("footprint: %s" % ", ".join(footprint))
             return 0
         if args.work_command == "fingerprint":
             # #3885 : primitive idempotente de la règle §16 — un lot par
@@ -3926,6 +3950,8 @@ def build_parser() -> argparse.ArgumentParser:
     work_dependencies.add_parser(work_sub, cmd_work)
     work_dependencies.add_landing_parser(work_sub, cmd_work)
     work_dependencies.add_links_parser(work_sub, cmd_work)
+    from . import work_footprints
+    work_footprints.add_parser(work_sub, cmd_work)
     pw_mig = work_sub.add_parser(
         "migration", help="reserve the next free migration number for the work item (L122), "
                           "before writing the file; idempotent, visible in work show")
