@@ -353,6 +353,37 @@ def hold_release_ts(events: Iterable[dict], *,
     return released
 
 
+#: #4369 : marque ajoutée à la note de composition du porteur
+#: (`PACKET_COMPOSITION_NOTE`) quand la recomposition retire des unités
+#: (`WorkItems.record_packet`) : « ; removed: #12, #34 ».
+VEHICLE_EXIT_MARK = "; removed: "
+
+
+def vehicle_exits(events: Iterable[dict]) -> dict[int, float]:
+    """`{lot: dernier instant de sortie d'un véhicule}` (#4369).
+
+    Membre d'une composition enregistrée et ouverte, le lot est à l'étape
+    « véhicule » : son retard est celui du paquet, l'unité n'alerte pas
+    (#2919). Retiré par une recomposition, il revient à `verdict_merge` ; le
+    temps passé dans le véhicule n'est pas le sien, l'horloge repart de la
+    sortie. `events` : journaux de porteurs ; seules leurs notes de
+    composition portant la marque comptent."""
+    out: dict[int, float] = {}
+    for ev in events or ():
+        note = str(ev.get("note") or "")
+        at = ev.get("created_ts")
+        if at is None or not note.startswith(PACKET_COMPOSITION_NOTE):
+            continue
+        _, mark, tail = note.partition(VEHICLE_EXIT_MARK)
+        if not mark:
+            continue
+        for word in tail.replace(",", " ").split():
+            if word.startswith("#") and word[1:].isdigit():
+                lot = int(word[1:])
+                out[lot] = max(out.get(lot, float("-inf")), float(at))
+    return out
+
+
 def last_hold_release(events: Iterable[dict],
                       hold_releases: Iterable[float] = ()) -> float | None:
     """La dernière levée d'une retenue, d'état ou de pilote (#3555).
@@ -467,6 +498,14 @@ def _row(step: Step, start, *, now: float, critical: bool, done_ts=None,
     return row
 
 
+def _after_vehicle(start: float, exited: float | None, extra: dict) -> float:
+    """#4369 : `verdict_merge` repart de la sortie du véhicule, si elle suit."""
+    if exited is None or exited <= start:
+        return start
+    extra["vehicle_exit_ts"] = round(exited, 3)
+    return exited
+
+
 def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               now: float | None = None, packet_slot: float | None = None,
               dependencies: Iterable[dict] = (), packet: bool = False,
@@ -474,7 +513,8 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               ci_green_ts: float | None = None,
               hold_releases: Iterable[float] = (),
               reviews: Iterable[dict] = (),
-              fixes: Iterable[dict] = ()) -> list:
+              fixes: Iterable[dict] = (),
+              vehicle_exit_ts: float | None = None) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -501,6 +541,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
 
     #2562 : le délai intake part au plus tôt du début planifié (minuit
     local). Avant cette date, aucune ligne intake en cours ne court.
+
+    #4369 : `vehicle_exit_ts` (sortie du véhicule, `vehicle_exits`) décale
+    de même le départ de `verdict_merge` en cours : retiré d'un paquet, le lot
+    ne paie pas le temps passé dedans.
 
     #2217 : quand le lot vient d'être pris en charge (dernière ligne
     `assigned to … (before: …)` il y a moins de `HANDOVER_GRACE_S`), les
@@ -702,6 +746,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     # couru reste acquis (un lot déjà en retard alerte le pilote pour qu'il le
     # débloque), le temps du parcage ne compte pas.
     lifted = last_hold_release(events, hold_releases)
+    exited = vehicle_exit_ts
     stopped = current_hold_start(events, state)
     running_now = now if stopped is None else min(now, stopped)
 
@@ -764,6 +809,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                     if lifted is not None and lifted > start:
                         start = lifted
                         extra["hold_released_ts"] = round(lifted, 3)
+                    start = _after_vehicle(start, exited, extra)
                     out.append(_row(step, start, now=running_now,
                                     critical=critical, target=target,
                                     escalate=not packet, **extra))
@@ -778,6 +824,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                     # repart d'elle, le parcage n'est pas un retard.
                     start = lifted
                     extra["hold_released_ts"] = round(lifted, 3)
+                start = _after_vehicle(start, exited, extra)
                 out.append(_row(step, start, now=running_now, critical=critical,
                                 target=target, escalate=not packet, **extra))
 

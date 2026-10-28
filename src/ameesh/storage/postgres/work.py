@@ -18,6 +18,7 @@ import random
 import time
 
 from ...db import DbError, in_transaction, is_unique_violation
+from ...slo import VEHICLE_EXIT_MARK
 from .. import interface
 from . import catalog as _catalog
 from .work_footprints import (occupying_sql as footprint_occupying_sql,
@@ -3272,6 +3273,18 @@ class WorkItems(interface.WorkItems):
                 (int(package_id),))
             if not rows:
                 raise DbError("packet #%s: no such work item" % package_id)
+            # #4369 : une unité que la recomposition retire sort du véhicule ;
+            # la note du porteur la nomme, l'horloge « verdict → fusion »
+            # repart de là (`slo.vehicle_exits`). Une seule ligne par
+            # recomposition, même quand le composeur rejoue le paquet pas à pas.
+            kept = {int(unit["work_item_id"]) for unit in units}
+            removed = [int(row["work_item_id"]) for row in tx.query(
+                "SELECT work_item_id FROM work_packet_members WHERE package_id = %s"
+                " ORDER BY work_item_id", (int(package_id),))
+                if int(row["work_item_id"]) not in kept]
+            if removed:
+                note = "%s%s%s" % (note or "", VEHICLE_EXIT_MARK,
+                                   ", ".join("#%d" % lot for lot in removed))
             tx.execute("DELETE FROM work_packet_members WHERE package_id = %s",
                        (int(package_id),))
             for unit in units:

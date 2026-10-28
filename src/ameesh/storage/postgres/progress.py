@@ -86,6 +86,17 @@ class Progress(interface.Progress):
             "  FROM work_item_events WHERE work_item_id IN (%s)"
             " GROUP BY work_item_id" % _marks(ids), tuple(ids))
 
+    def packet_exits(self, *, since_ts) -> list[dict]:
+        from ...slo import PACKET_COMPOSITION_NOTE, VEHICLE_EXIT_MARK
+
+        return self.db.query(
+            "SELECT id, work_item_id, note,"
+            "       extract(epoch from created_at)::float8 AS created_ts"
+            "  FROM work_item_events"
+            " WHERE created_at >= to_timestamp(%s) AND note LIKE %s"
+            " ORDER BY id",
+            (float(since_ts), PACKET_COMPOSITION_NOTE + "%" + VEHICLE_EXIT_MARK + "%"))
+
     def lot_hold_events(self, item_ids, patterns) -> list[dict]:
         ids = [int(i) for i in item_ids]
         if not ids:
