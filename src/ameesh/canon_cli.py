@@ -422,6 +422,15 @@ def _show_one(canon: canon_mod.Canon, args: argparse.Namespace) -> int:
         print("  %-14s → %-24s %-13s%s" % (
             pl.agent or "?", cibles or "—", pl.credential_mode or "—",
             " (cwd ignored: %s)" % pl.cwd if pl.cwd else ""))
+    if canon.pipelines:
+        # L103 (#4395) : cartes Pipeline, compilées par `canon check`
+        print("pipelines  :")
+        for pl in canon.pipelines:
+            print("  %-24s %-18s %s" % (
+                pl.name or "?", pl.responsible or "NO RESPONSIBLE",
+                "%d stages, %d transitions" % (len(pl.artifact.stages),
+                                               len(pl.artifact.transitions))
+                if pl.artifact is not None and pl.valid else "INVALID"))
     print("findings   : %s (details: ameesh canon check)" % _summary(findings))
     return 0
 
