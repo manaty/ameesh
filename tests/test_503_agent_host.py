@@ -1272,9 +1272,14 @@ class AgentHostTest(unittest.TestCase):
         for n in ('dev7', 'dev8', 'dev9'):
             self.assertIn('--user start ameesh-runner-agent@%s.service' % n, starts)
 
-    def test_restart_reserved_role_taken_by_other_host_fails(self):
-        """#4112 : l'exécuteur arrêté avait réservé le rôle à cet hôte (#4086) ;
-        une reprise ailleurs n'est plus l'issue normale, c'est un échec."""
+    def test_restart_reserved_role_taken_by_other_host_is_a_warning(self):
+        """#4239 : une relève légitime pendant le redémarrage, même après une
+        réservation @restart, est un non-concluant — jamais un retour arrière.
+
+        Cas du staging v1.27.0 : agents-1 avait réservé le rôle mesh-design,
+        mais un hôte encore sur l'ancien code ignorait la réservation (ou elle
+        expirait en 90 s) et l'élection reprenait le rôle à une époque
+        supérieure. Le balayage doit poursuivre, dev8 n'étant pas en échec."""
         agents = [dict(name=n, host='host-agents', mode='execute', status='idle')
                   for n in ('dev7', 'dev8', 'dev9')]
         (self.state / 'role-dev8.json').write_text(json.dumps({
@@ -1286,14 +1291,19 @@ class AgentHostTest(unittest.TestCase):
             '01:02:03 [dev8] elected role reserved to host-agents for 90s'
             ' (executor restart)\n')
         p = self.run_vm('redemarrer', 'elu-ailleurs', agents=agents)
-        self.assertNotEqual(p.returncode, 0)
-        self.assertIn('dev8 : rôle élu réservé à host-agents, mais bail du rôle'
-                      ' élu repris par other-host (époque 9 > 7) — journalctl',
-                      p.stderr)
-        self.assertIn('ERREUR: 1 agent(s) sans bail repris : dev8', p.stdout)
-        self.assertNotIn('WARNING dev8', p.stdout)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('WARNING dev8: bail du rôle élu repris par other-host '
+                      '(époque 9 > 7) — reprise normale — réservation @restart'
+                      ' écrite puis non honorée (relève légitime §11, sans'
+                      ' retour)', p.stdout)
+        self.assertNotIn('bail non repris', p.stderr)
+        self.assertNotIn('sans bail repris', p.stdout)
+        self.assertIn('dev8 : redémarré', p.stdout)
         self.assertIn('dev7 : redémarré', p.stdout)
         self.assertIn('dev9 : redémarré', p.stdout)
+        starts = self.starts()
+        for n in ('dev7', 'dev8', 'dev9'):
+            self.assertIn('--user start ameesh-runner-agent@%s.service' % n, starts)
 
     def test_restart_lease_failure_continues_the_sweep(self):
         """#3412 : un vrai échec de bail ne stoppe que cet agent."""
@@ -1361,6 +1371,28 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('contrôles verts', p.stdout)
         self.assertNotIn('restart', self.units())
         self.assertNotIn('start', self.units())
+
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
+    def test_check_elected_role_taken_by_other_host_is_a_warning(self):
+        """#4239 : une relève légitime pendant `controler` aussi est un
+        non-concluant, pas une preuve locale manquante qui ferait revenir
+        l'hôte en arrière."""
+        agents = [dict(name=n, host='host-agents', mode='execute', status='idle')
+                  for n in ('dev7', 'dev8', 'dev9')]
+        (self.state / 'role-dev8.json').write_text(json.dumps({
+            'name': 'dev8', 'elected': True, 'holder': 'other-host',
+            'lease_owner': 'runner-dev8@other-host', 'epoch': 9,
+            'candidates': [{'host': 'other-host', 'ready': True},
+                           {'host': 'host-agents', 'ready': True}]}))
+        # le faux registre ne change le bail qu'après un redémarrage simulé
+        (self.state / 'restart-dev8').touch()
+        p = self.run_vm('controler', 'elu-ailleurs', agents=agents)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('WARNING dev8: bail du rôle élu repris par other-host '
+                      '(époque 9 > 0) — reprise normale — preuve locale non'
+                      ' concluante (sans retour)', p.stdout)
+        self.assertIn('contrôles verts', p.stdout)
+        self.assertNotIn('bail absent', p.stderr)
 
     @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_check_visits_every_registered_agent(self):

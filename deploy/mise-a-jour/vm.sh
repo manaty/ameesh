@@ -392,11 +392,12 @@ if epoque <= avant or holder not in candidats:
 print("bail du rôle élu repris par %s (époque %d > %d) — reprise normale"
       % (holder, epoque, avant))' "$avant" "$HOTE_AGENTS" <<<"$rapport"
 }
-# #4112 : l'exécuteur arrêté a-t-il réservé le rôle élu à cet hôte (#4086) ?
-# Son journal depuis le début du redémarrage le dit (`elected role reserved
-# to <hôte>`). Avec la réservation, une reprise ailleurs n'est plus l'issue
-# normale du §11 mais un échec ; sans elle (ancien code à l'arrêt, journal
-# illisible), elle reste un avertissement (#3412).
+# #4112/#4239 : l'exécuteur arrêté a-t-il réservé le rôle élu à cet hôte
+# (#4086) ? Son journal depuis le début du redémarrage le dit (`elected role
+# reserved to <hôte>`). La réservation ne fait plus échouer la reprise
+# ailleurs : un hôte encore sur l'ancien code l'ignore, et elle expire en
+# 90 s ; la relève reste l'issue normale du §11 (#4239). Le journal qualifie
+# seulement l'avertissement (reprise locale non concluante, sans retour).
 reservation_ecrite() {  # persona epoch-depuis
   local journal
   journal=$(utilisateur_agents journalctl --user -u "$(unite_agents "$1")" \
@@ -1135,17 +1136,19 @@ redemarrer_agents() {
         echo "WARNING $p: not checked: no lease before the restart, no sign of life"
         non_verifiees+=("$p")
       elif ! attendu=$(proprietaire_de "$p") || ! attendre_bail "$avant" "$attendu" "$p"; then
-        # #3412 : un rôle élu repris par un autre hôte candidat est une issue
-        # normale ; un vrai échec ne stoppe que cet agent, le balayage continue
-        # (#2184/N2) et la sortie nomme les échecs à la fin.
+        # #3412/#4239 : un rôle élu repris par un autre hôte candidat est une
+        # issue normale ; un vrai échec ne stoppe que cet agent, le balayage
+        # continue (#2184/N2) et la sortie nomme les échecs à la fin.
         if detail=$(role_elu_repris_ailleurs "$p" "$avant"); then
-          # #4112 : sauf si l'exécuteur arrêté l'avait réservé à cet hôte.
+          # #4112 : l'exécuteur arrêté avait pu réserver le rôle à cet hôte,
+          # mais #4239 : un hôte encore sur l'ancien code l'ignore et elle
+          # expire en 90 s — la relève ailleurs reste légitime (§11). C'est
+          # une reprise locale non concluante, jamais un retour arrière.
           if reservation_ecrite "$p" "$(( ${heure%.*} - 5 ))"; then
-            echec_agent "$p" "rôle élu réservé à $HOTE_AGENTS, mais ${detail% — reprise normale}"
-            echecs+=("$p")
-            continue
+            echo "WARNING $p: $detail — réservation @restart écrite puis non honorée (relève légitime §11, sans retour)"
+          else
+            echo "WARNING $p: $detail"
           fi
-          echo "WARNING $p: $detail"
         else
           echec_agent "$p" "active, mais bail non repris"
           echecs+=("$p")
@@ -1557,7 +1560,7 @@ preuve_venv_agents() {  # persona → 0 si le MainPID vivant exécute le venv in
 }
 
 controler_agents() {
-  local noms p ligne heure attendu echec=0
+  local noms p ligne heure attendu detail echec=0
   etape "code installé sur $HOTE_AGENTS"
   releve_agents || { echo "relevé du code impossible" >&2; echec=1; }
   noms=$(agents_du_registre) || return 1
@@ -1568,9 +1571,19 @@ controler_agents() {
       || { echec_agent "$p" "unité inactive ou journal inaccessible"; echec=1; }
     preuve_venv_agents "$p" \
       || { echec_agent "$p" "le MainPID vivant n'exécute pas le venv installé"; echec=1; }
-    ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
-      && bail_valide 0 "$attendu" "$heure" <<<"$ligne" \
-      || { echec_agent "$p" "bail absent, étranger ou expiré, ou preuve illisible"; echec=1; }
+    if ! { ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
+             && bail_valide 0 "$attendu" "$heure" <<<"$ligne"; }; then
+      # #4239 : un rôle élu repris par un autre hôte candidat pendant le
+      # contrôle est une relève normale (§11), pas une preuve locale
+      # manquante ; l'échec ne tient que si le rôle reste sans titulaire.
+      # Époque 0 : le contrôle n'a pas d'époque d'avant, tout détenteur
+      # vivant ailleurs convient.
+      if detail=$(role_elu_repris_ailleurs "$p" 0); then
+        echo "WARNING $p: $detail — preuve locale non concluante (sans retour)"
+      else
+        echec_agent "$p" "bail absent, étranger ou expiré, ou preuve illisible"; echec=1
+      fi
+    fi
   done <<<"$noms"
   # #3345 : un profil de runner peut diverger de config.json sans bruit (train
   # resté en shadow, github absent). Contrôle léger, sans base, avant le doctor

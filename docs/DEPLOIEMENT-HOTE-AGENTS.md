@@ -145,9 +145,14 @@ Le contrôle sans redémarrage exige toujours le bail, le propriétaire
 attendu et une époque positive. L’horloge est celle de PostgreSQL, lue via
 `db.connect(config.load())` dans le venv distant et l’environnement du
 runner ; aucun DSN n’est passé en argument de processus. Un changement
-d’hôte pendant le contrôle fait échouer la preuve. En cas d’échec, la
-commande indique l’unité et la commande `journalctl --user` à lancer sous
-`ameesh` sur la VM.
+d’hôte pendant le contrôle fait échouer la preuve, sauf pour un rôle élu
+repris par un autre hôte candidat à une époque supérieure : c’est la relève
+normale du §11, consignée en WARNING (reprise locale non concluante) sans
+retour arrière. Une réservation `@restart` écrite par l’exécuteur arrêté
+n’y change rien : un hôte encore sur l’ancien code l’ignore et elle expire
+en 90 s. L’échec ne tient que si le rôle reste sans titulaire au-delà du
+délai de relève. En cas d’échec, la commande indique l’unité et la commande
+`journalctl --user` à lancer sous `ameesh` sur la VM.
 
 ## Installer une révision gelée, revenir en arrière
 
