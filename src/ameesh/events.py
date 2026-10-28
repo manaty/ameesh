@@ -39,7 +39,9 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
                        read by its tick and `role timers --check`, #4361)
 
 `data` holds identifiers and states, never free text: the client rereads the
-object through the API.
+object through the API. One bounded exception: `packet.pause` carries the
+pause's `reason` (normalized, 200 characters at most, `packet_pause`), the
+only place the tick and `role timers --check` read it from (#4361).
 
 **Delivery order.** A `bigserial` is taken at insertion, not at commit: the
 event 10 of a long transaction can become visible after the event 11. A
