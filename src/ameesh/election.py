@@ -80,11 +80,15 @@ MATCH_S = 180.0
 #: the old holder waits this long, after a planned release, before reclaiming
 #: (the challenger is rank 0 and may have crashed: the role must not stay free)
 HANDOVER_RECLAIM_MARGIN_S = 60.0
-#: #4086: an executor that stops while holding an elected role reserves it to
-#: its own host this long: the restarted executor reclaims first and keeps the
-#: session; a host that does not come back leaves the role to the ranked
-#: candidates once it expires (relief well under five minutes, §11)
-RESTART_RESERVE_S = 90.0
+#: #4086/#4253: an executor that stops while holding an elected role reserves
+#: it to its own host this long: the restarted executor reclaims first and
+#: keeps the session; a host that does not come back leaves the role to the
+#: ranked candidates once it expires. 90 s was shorter than the measured
+#: restart: on the always-on hosts the worst stop-to-reclaim over seven days
+#: is 195 s (28/10: 179 s), so the reservation covers it with margin. With the
+#: rank delay of the next ready candidate (20 s for the current two
+#: candidates, 40 s with three) the relief stays under five minutes (§11).
+RESTART_RESERVE_S = 240.0
 #: `_capacity`: a load of 2×CPU is the default admission ceiling (L31, 0028)
 LOAD_CEILING_FACTOR = 2.0
 #: memory headroom that counts as full capacity (above the 1 GiB floor)
