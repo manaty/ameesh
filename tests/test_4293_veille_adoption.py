@@ -8,6 +8,7 @@ n'est lancé ici : l'exécuteur est couvert par la résolution d'adaptateur.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import threading
@@ -553,8 +554,9 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(self._bins()["canary"], self.bins["h1"])
 
     def test_b_real_report_path_is_discovered_without_bin(self):
-        """La sortie réelle de B (#4292) : une note de trois lignes et un
-        fichier JSON ; le timer n'a pas de --bin, le binaire du rapport sert."""
+        """La sortie réelle de B (#4292), canari sur l'hôte du tick : une note
+        de trois lignes et un fichier JSON ; le timer n'a pas de --bin, le
+        binaire du rapport sert sur place."""
         path = os.path.join(self.tmp, "b-report.json")
         raw = b_report()
         raw["evaluated"]["old"]["binary"] = self.old_bin
@@ -566,7 +568,8 @@ class AdoptionTest(PgTestCase):
                 "dans le rapport.\n"
                 "Rapport : %s" % path)
         work.note(self.db, self.lot, note, actor="canary")
-        out = veille.tick(self.cfg, self.db, now=1000.0, bins={},
+        local_cfg = dataclasses.replace(self.cfg, host="h1")
+        out = veille.tick(local_cfg, self.db, now=1000.0, bins={},
                           rules=Rules(30 * 60))
         self.assertEqual(out["discovered"][0]["result"], "canary")
         state = veille.load(self.db, self.lot)["state"]
@@ -574,9 +577,9 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(state["canary_bin"], self.new_bin)
         self.assertEqual(self._bins()["canary"], self.new_bin)
 
-    def test_no_bin_default_for_another_host_without_a_map(self):
-        """new_binary ne vaut que pour le canari : la bascule d'un autre hôte
-        exige une carte explicite, jamais un chemin local supposé."""
+    def test_b_report_binary_is_refused_on_another_host(self):
+        """new_binary est local au tick : un canari distant sans carte
+        explicite est bloqué, aucun harness_bin ne change (avis B 16:54)."""
         path = os.path.join(self.tmp, "b-report.json")
         raw = b_report()
         raw["evaluated"]["old"]["binary"] = self.old_bin
@@ -586,20 +589,38 @@ class AdoptionTest(PgTestCase):
         work.note(self.db, self.lot,
                   "Rejeu comparatif deepseek : meilleure.\n"
                   "Banc : #1 (light).\nRapport : %s" % path, actor="canary")
-        veille.tick(self.cfg, self.db, now=1000.0, bins={},
-                    rules=Rules(30 * 60))
-        for _ in range(10):
-            self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
-        veille.tick(self.cfg, self.db, now=1000.0 + 5000, bins={},
-                    rules=Rules(30 * 60))
-        out = veille.tick(self.cfg, self.db, now=1000.0 + 5100, bins={},
+        out = veille.tick(self.cfg, self.db, now=1000.0, bins={},
                           rules=Rules(30 * 60))
-        self.assertEqual(out["adoptions"][0]["result"], "blocked")
+        self.assertEqual(out["discovered"][0]["result"], "blocked")
         state = veille.load(self.db, self.lot)["state"]
         self.assertEqual(state["stage"], "blocked")
-        self.assertIn("no --bin", state["reason"])
-        self.assertIsNone(self._bins()["impl"])
-        self.assertIsNone(self._bins()["other"])
+        self.assertIn("explicit --bin", state["reason"])
+        self.assertEqual(self._bins(), {"canary": None, "impl": None,
+                                        "other": None})
+
+    def test_b_report_binary_is_refused_for_an_explicit_remote_canary(self):
+        """Le garde de start_canary tient aussi quand l'agent est nommé : le
+        chemin du rapport ne traverse pas un hôte distant."""
+        result = veille.adopt(self.cfg, self.db, self.lot, self._report(),
+                              bins={}, agent="other", now=1000.0,
+                              rules=self.rules)
+        self.assertEqual(result["result"], "blocked")
+        self.assertIn("explicit map", result["state"]["reason"])
+        self.assertEqual(self._bins(), {"canary": None, "impl": None,
+                                        "other": None})
+
+    def test_explicit_bin_for_a_remote_canary_is_not_probed_here(self):
+        """Un chemin explicite vise l'hôte distant : sa forme est vérifiée,
+        pas son exécution sur le tick (X_OK ne vaut que sur place)."""
+        remote_bin = os.path.join(self.tmp, "remote-dsh")
+        with open(remote_bin, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(remote_bin, 0o644)
+        result = veille.adopt(self.cfg, self.db, self.lot, self._report(),
+                              bins={"h1": remote_bin}, now=1000.0,
+                              rules=self.rules)
+        self.assertEqual(result["result"], "canary")
+        self.assertEqual(self._bins()["canary"], remote_bin)
 
     def test_explicit_bins_map_from_the_timer_switches_every_host(self):
         path = os.path.join(self.tmp, "b-report.json")
@@ -634,8 +655,12 @@ class AdoptionTest(PgTestCase):
                                         "other": self.new_bin})
 
     def test_a_nonexistent_bin_is_refused_before_any_gesture(self):
-        result = veille.adopt(self.cfg, self.db, self.lot, self._report(),
-                              bins={"h1": "/nonexistent/dsh", "h2": self.new_bin},
+        # h1 est l'hôte du tick : le chemin explicite y est éprouvé (X_OK)
+        # avant toute écriture.
+        local_cfg = dataclasses.replace(self.cfg, host="h1")
+        result = veille.adopt(local_cfg, self.db, self.lot, self._report(),
+                              bins={"h1": "/nonexistent/dsh",
+                                    "h2": self.new_bin},
                               now=1000.0, rules=self.rules)
         self.assertEqual(result["result"], "blocked")
         self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})

@@ -867,7 +867,8 @@ def canary_verdict(report: Report, metrics: dict) -> tuple[bool, list[str]]:
 # canari et bascule
 # --------------------------------------------------------------------------
 
-def _pick_canary(db, report: Report, *, bins: dict | None, agent: str | None) -> dict:
+def _pick_canary(db, report: Report, *, bins: dict | None, agent: str | None,
+                 cfg=None) -> dict:
     if agent:
         row = registry.get(db, agent)
         if row is None:
@@ -895,11 +896,21 @@ def _pick_canary(db, report: Report, *, bins: dict | None, agent: str | None) ->
     if not candidates:
         raise VeilleError("no idle agent of harness %s: canary waits for the end "
                           "of a turn" % report.harness)
-    if report.object == "harness" and bins:
-        candidates = [row for row in candidates
-                      if bins.get(row.get("host") or "") or report.new_binary]
+    if report.object == "harness":
+        # #4293 (avis B cx1/auditeur du 16:54) : `report.new_binary` est un
+        # chemin LOCAL au tick. Il ne vaut que pour un canari sur CET hôte ;
+        # un canari distant exige une carte explicite (le chemin y est
+        # installé, jamais supposé).
+        local_host = getattr(cfg, "host", "") or ""
+        explicit = bins or {}
+        candidates = [
+            row for row in candidates
+            if explicit.get(row.get("host") or "")
+            or (local_host and report.new_binary
+                and (row.get("host") or "") == local_host)]
         if not candidates:
-            raise VeilleError("no agent of %s on a host with a --bin path"
+            raise VeilleError("no agent of %s on a host with an explicit --bin "
+                              "path (or on the tick host for report.new_binary)"
                               % report.harness)
     # un agent au repos d'abord, puis le nom : déterministe et stable
     candidates.sort(key=lambda row: (row.get("status") != "idle",
@@ -983,13 +994,25 @@ def start_canary(cfg, db, row: dict, state: dict, report: Report, *,
     if remaining < CUTOFF_MARGIN_S:
         raise VeilleError("cutoff in %.0f s (< %d): canary waits"
                           % (remaining, CUTOFF_MARGIN_S))
-    target = _pick_canary(db, report, bins=_bins_from_state(state), agent=agent)
+    target = _pick_canary(db, report, bins=_bins_from_state(state), agent=agent,
+                          cfg=cfg)
     host = target.get("host") or ""
     value: str | None = None
     bin_path = None
     if report.object == "harness":
-        bin_path = _check_bin(_bins_from_state(state).get(host)
-                              or report.new_binary, executable=True)
+        explicit = _bins_from_state(state).get(host)
+        local = bool(host) and host == (getattr(cfg, "host", "") or "")
+        if explicit:
+            # un chemin explicite peut viser un hôte distant : on vérifie sa
+            # forme, pas son exécution ici (X_OK n'a de sens que sur place).
+            bin_path = _check_bin(explicit, executable=local)
+        elif local:
+            bin_path = _check_bin(report.new_binary, executable=True)
+        else:
+            raise VeilleError(
+                "no --bin path for host %s: report.new_binary is local to the "
+                "tick host %s; give an explicit map for this host"
+                % (host or "?", getattr(cfg, "host", "") or "?"))
         value = bin_path
     else:
         value = report.to_version
