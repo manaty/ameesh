@@ -353,6 +353,25 @@ def hold_release_ts(events: Iterable[dict], *,
     return released
 
 
+#: #4369 : préfixe de la note écrite au journal d'une unité retirée d'un
+#: paquet par sa recomposition (`WorkItems.record_packet`).
+VEHICLE_EXIT_NOTE = "packet exit: "
+
+
+def vehicle_exit_ts(events: Iterable[dict]) -> float | None:
+    """Le dernier instant où le lot est sorti d'un véhicule (#4369).
+
+    Membre d'une composition enregistrée et ouverte, le lot est à l'étape
+    « véhicule » : son retard est celui du paquet, l'unité n'alerte pas
+    (#2919). Retiré par une recomposition, il revient à `verdict_merge` ; le
+    temps passé dans le véhicule n'est pas le sien, l'horloge repart de la
+    sortie. `None` sans sortie notée."""
+    stamps = [float(ev["created_ts"]) for ev in events or ()
+              if ev.get("created_ts") is not None
+              and str(ev.get("note") or "").startswith(VEHICLE_EXIT_NOTE)]
+    return max(stamps) if stamps else None
+
+
 def last_hold_release(events: Iterable[dict],
                       hold_releases: Iterable[float] = ()) -> float | None:
     """La dernière levée d'une retenue, d'état ou de pilote (#3555).
@@ -465,6 +484,14 @@ def _row(step: Step, start, *, now: float, critical: bool, done_ts=None,
         row["escalation"] = False
     row.update(extra)
     return row
+
+
+def _after_vehicle(start: float, exited: float | None, extra: dict) -> float:
+    """#4369 : `verdict_merge` repart de la sortie du véhicule, si elle suit."""
+    if exited is None or exited <= start:
+        return start
+    extra["vehicle_exit_ts"] = round(exited, 3)
+    return exited
 
 
 def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
@@ -702,6 +729,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     # couru reste acquis (un lot déjà en retard alerte le pilote pour qu'il le
     # débloque), le temps du parcage ne compte pas.
     lifted = last_hold_release(events, hold_releases)
+    exited = vehicle_exit_ts(events)
     stopped = current_hold_start(events, state)
     running_now = now if stopped is None else min(now, stopped)
 
@@ -764,6 +792,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                     if lifted is not None and lifted > start:
                         start = lifted
                         extra["hold_released_ts"] = round(lifted, 3)
+                    start = _after_vehicle(start, exited, extra)
                     out.append(_row(step, start, now=running_now,
                                     critical=critical, target=target,
                                     escalate=not packet, **extra))
@@ -778,6 +807,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                     # repart d'elle, le parcage n'est pas un retard.
                     start = lifted
                     extra["hold_released_ts"] = round(lifted, 3)
+                start = _after_vehicle(start, exited, extra)
                 out.append(_row(step, start, now=running_now, critical=critical,
                                 target=target, escalate=not packet, **extra))
 

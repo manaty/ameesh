@@ -571,6 +571,16 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                 move = ("bureau: merge it directly — its `canon/…` branch targets the canon "
                         "repository (manaty/home), outside the ameesh package; the "
                         "pilot/composer cannot carry it, do not wait for them")
+        elif alert.get("vehicle_exit_ts") is not None:
+            # #4369 : retiré du paquet par sa recomposition ; le temps passé
+            # dans le véhicule n'est pas compté, l'horloge part de la sortie.
+            left = time.strftime("%H:%M", time.gmtime(float(alert["vehicle_exit_ts"])))
+            move = ("%s: the lot left its packet at recomposition (%sZ; the clock runs "
+                    "from there, not from the GO) — do not reassign or nudge its holder; "
+                    "%s return it to build with the cause (ameesh work move %d build) "
+                    "or include it in the next package"
+                    % ("bureau or auditor" if level >= 3 else "pilot", left,
+                       "push the composer/pilot to" if level >= 3 else "either", lot))
         elif level >= 3:
             move = ("bureau or auditor: the lot waits for its merge vehicle/package — "
                     "the composer/pilot carries it, and reassigning or nudging its holder "
