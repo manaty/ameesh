@@ -370,10 +370,24 @@ def answered(db, name: str, jeton: str) -> bool:
 def failed_turn(db, name: str, delivered: float, row: dict | None = None) -> str:
     """Why the turn that received the probe failed, or "" (same DB clock)."""
     row = (registry.get(db, name) or {}) if row is None else row
-    if float(row.get("last_turn_ts") or 0) < delivered:
+    if float(row.get("last_turn_ts") or 0) < delivered or attente_budget(row):
         return ""
     if row.get("last_error") or row.get("status") == "blocked":
         return str(row.get("last_error") or row.get("status_text") or "blocked")
+    return ""
+
+
+def attente_budget(row: dict) -> str:
+    """The deliberate wait under ``budget : `` (start gap, account pause), or "".
+
+    #4089 : the runner holds the turn after the start gap of the account
+    (#3779) and writes it under ``budget.PAUSE_PREFIX``; that is a wait, not a
+    failed turn (as ``sans_executeur`` already reads it).
+    """
+    for texte in (row.get("last_error") or "",
+                  row.get("status_text") if row.get("status") == "blocked" else ""):
+        if (texte or "").startswith(budget.PAUSE_PREFIX):
+            return texte
     return ""
 
 
@@ -404,9 +418,11 @@ def probe(db, row: dict, sha: str, attente: float,
                                "destinataire_hote": row.get("host") or ""}})
     out = {"message": message_id, "destinataire": row["name"], "delai_s": None,
            "remise_s": None, "hote_destinataire": row.get("host") or "",
-           "statut_cible": row.get("status") or "idle", "tour": "non remis"}
+           "statut_cible": row.get("status") or "idle", "tour": "non remis",
+           "concluant": True}
     fin = debut + attente
     repondu = False
+    budget_vu = ""
     while time.monotonic() < fin:
         message = mail.get(db, message_id)
         livre = float((message or {}).get("delivered_ts") or 0)
@@ -420,6 +436,7 @@ def probe(db, row: dict, sha: str, attente: float,
             echec = failed_turn(db, row["name"], livre, etat)
             if echec:
                 return dict(out, tour="tour en echec : %s" % echec[:200])
+            budget_vu = attente_budget(etat) or budget_vu
             if not repondu:
                 out["tour"] = "remis, sans reponse de l'outil"
             elif turn_finished(db, row["name"], livre, etat):
@@ -429,6 +446,14 @@ def probe(db, row: dict, sha: str, attente: float,
             else:
                 out["tour"] = "reponse vue, tour non termine"
         time.sleep(2.0)
+    # #4089 (canon §3) : seul un negatif est concluant. Remis sans tour
+    # termine, ou retenu par une attente budget : non concluant, nomme.
+    if out["remise_s"] is not None and (budget_vu or out["tour"] != (
+            "remis, sans reponse de l'outil") or not turn_finished(
+                db, row["name"], livre)):
+        out["concluant"] = False
+        if budget_vu:
+            out["tour"] = "%s (attente %s)" % (out["tour"], budget_vu[:200])
     return out
 
 
@@ -510,8 +535,11 @@ def main(argv: list[str] | None = None) -> int:
         resultat = (probe(conn, cible, args.sha, args.attente, args.hote)
                     if cible is not None else None)
         verdict = "ok"
-        if souffrance or sans or (resultat is not None and resultat["delai_s"] is None):
+        if souffrance or sans or (resultat is not None and resultat["delai_s"] is None
+                                  and resultat.get("concluant", True)):
             verdict = "ko"
+        elif resultat is not None and resultat["delai_s"] is None:
+            verdict = "non-concluant"
         elif resultat is None:
             verdict = "sans-sonde"
         rapport.update(verdict=verdict, souffrance=souffrance,
@@ -545,8 +573,9 @@ def main(argv: list[str] | None = None) -> int:
             print("courrier %s : sonde non passee (%s)"
                   % (args.hote, rapport["pourquoi"]))
         elif resultat["delai_s"] is None:
-            print("courrier %s : KO sonde a %s, %s (message %s, attente %ss)"
-                  % (args.hote, resultat["destinataire"], resultat["tour"],
+            print("courrier %s : %s sonde a %s, %s (message %s, attente %ss)"
+                  % (args.hote, "KO" if resultat.get("concluant", True)
+                     else "non concluante", resultat["destinataire"], resultat["tour"],
                      resultat["message"], args.attente))
         else:
             via = ""
@@ -555,7 +584,7 @@ def main(argv: list[str] | None = None) -> int:
             print("courrier %s : sonde remise et accusee par %s en %ss (message %s)%s"
                   % (args.hote, resultat["destinataire"], resultat["delai_s"],
                      resultat["message"], via))
-    return 1 if rapport["verdict"] == "ko" else 0
+    return {"ko": 1, "non-concluant": 3}.get(rapport["verdict"], 0)
 
 
 if __name__ == "__main__":
