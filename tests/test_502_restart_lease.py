@@ -143,6 +143,10 @@ if [ -e "$FAKE_STATE/vide" ]; then
   fi
   exit 0
 fi
+# La première lecture de statut reste valide ; les suivantes deviennent vides.
+if [ -e "$FAKE_STATE/vide-apres-statut" ]; then
+  mv "$FAKE_STATE/vide-apres-statut" "$FAKE_STATE/vide"
+fi
 scenario=$(cat "$FAKE_STATE/scenario")
 # #1152/R1 : le statut peut rester `running` à chaque lecture (incident
 # impl07) ; le fichier `statut_force` le fige pour le témoin de starvation.
@@ -495,6 +499,16 @@ class RestartLeaseTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("JSONDecodeError", proc.stderr)
         self.assertIn("WARNING dev9: registre illisible (lecture vide)", proc.stdout)
+        self.assertIsNone(self.op_position("stop"))
+        self.assertIsNone(self.op_position("start"))
+
+    def test_empty_lease_read_after_valid_status_is_non_conclusive(self):
+        with open(os.path.join(self.state, "vide-apres-statut"), "w", encoding="utf-8") as fh:
+            fh.write("toujours")
+        proc = self.restart("lease")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("JSONDecodeError", proc.stderr)
+        self.assertIn("bail illisible", proc.stdout)
         self.assertIsNone(self.op_position("stop"))
         self.assertIsNone(self.op_position("start"))
 
