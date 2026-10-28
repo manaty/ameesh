@@ -11,6 +11,7 @@ sur les vrais enregistrements #704 est separe
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime as dt
 import hashlib
 import io
@@ -36,6 +37,7 @@ NOW = dt.datetime(2026, 10, 27, 12, 0, 0, tzinfo=UTC)
 REPO = "thepackengers/issue-manager-agent"
 ISSUE = 704
 APPROVER = "smichea"
+AUTHORITY = "example-authority"
 FULL_A = "d918149d9d301f0ba7a2aff80e196e8e3b1e30ac"
 FULL_B = "6c771e2e16bc04e8ce3b04a55df67ad4aca77cb8"
 PATH_A = "knowledge/architecture/ima-ameesh-work-contract.md"
@@ -82,7 +84,8 @@ class ApprovalCase(unittest.TestCase):
         os.chmod(self.token_file, 0o600)
         self.projection_path = os.path.join(self.tmp, "projection.json")
         self.identity = pa.ApprovalIdentity(
-            repo=REPO, issue=ISSUE, approvers=(APPROVER,))
+            repo=REPO, issue=ISSUE, approvers=(APPROVER,),
+            authority=AUTHORITY)
 
     @staticmethod
     def _cleanup(path: str) -> None:
@@ -106,7 +109,7 @@ class ApprovalCase(unittest.TestCase):
         values = {
             "repo": REPO, "issue": ISSUE, "approvers": (APPROVER,),
             "token_file": self.token_file,
-            "projection": self.projection_path,
+            "authority": AUTHORITY, "projection": self.projection_path,
         }
         values.update(overrides)
         return pa.Source(**values)
@@ -172,7 +175,7 @@ class ApprovalCase(unittest.TestCase):
                       {item["code"] for item in projection.refusals})
 
     def test_a_pin_resolved_by_a_branch_cannot_forge_a_commit(self):
-        source = self.source(artifact_repos=("target/repo",))
+        source = self.source(artifact_repos=("target/repo",), authority=AUTHORITY)
         body = ("Owner approval \u2014 16 October 2026\n\n"
                 "target/repo@abc1234:docs/a.md\n")
         projection = self.build(
@@ -466,7 +469,7 @@ class ApprovalCase(unittest.TestCase):
     def test_local_identity_refuses_another_source(self):
         foreign = self.source(repo="other/repo", issue=123,
                               approvers=("attacker",),
-                              artifact_repos=("target/repo",))
+                              artifact_repos=("target/repo",), authority=AUTHORITY)
         body = _body(FULL_A, PATH_A, repo="target/repo")
         projection = pa.build_projection(
             foreign, _issue(), [_comment(1100, body, login="attacker")],
@@ -476,7 +479,7 @@ class ApprovalCase(unittest.TestCase):
             self.load(now=NOW)
         self.assertEqual(caught.exception.code, "projection-source")
         config = {"approvals": {
-            "projection": self.projection_path,
+            "authority": AUTHORITY, "projection": self.projection_path,
             "source": {"repo": REPO, "issue": ISSUE,
                        "approvers": [APPROVER]}}}
         with self.assertRaises(pa.ProjectionError) as caught:
@@ -495,7 +498,7 @@ class ApprovalCase(unittest.TestCase):
         self.assertEqual(caught.exception.code, "projection-source")
 
     def test_local_identity_refuses_an_extra_artifact_repo(self):
-        widened = self.source(artifact_repos=("target/repo",))
+        widened = self.source(artifact_repos=("target/repo",), authority=AUTHORITY)
         body = _body(FULL_A, PATH_A, repo="target/repo")
         projection = pa.build_projection(
             widened, _issue(), [_comment(1102, body)], now=NOW)
@@ -505,7 +508,7 @@ class ApprovalCase(unittest.TestCase):
         self.assertEqual(caught.exception.code, "projection-source")
         identity = pa.ApprovalIdentity(
             repo=REPO, issue=ISSUE, approvers=(APPROVER,),
-            artifact_repos=("target/repo",))
+            artifact_repos=("target/repo",), authority=AUTHORITY)
         loaded = self.load(now=NOW, identity=identity)
         self.assertEqual(loaded.approvals[0].artifact.repo, "target/repo")
 
@@ -518,6 +521,36 @@ class ApprovalCase(unittest.TestCase):
         with self.assertRaises(pa.ProjectionError) as caught:
             pa.identity_from_config({"projection": self.projection_path})
         self.assertEqual(caught.exception.code, "projection-source")
+
+    def test_authority_comes_from_configuration(self):
+        # #4259 : aucune autorite par defaut dans le code ; la projection
+        # porte celle de la configuration et l'hote exige la meme.
+        projection = self.build([_comment(1104, _body(FULL_A, PATH_A))])
+        self.assertEqual(projection.authority, AUTHORITY)
+        self.assertEqual(projection.as_dict()["authority"], AUTHORITY)
+        self.write(projection)
+        self.assertEqual(self.load(now=NOW).authority, AUTHORITY)
+        other = dataclasses.replace(self.identity, authority="other-authority")
+        with self.assertRaises(pa.ProjectionError) as caught:
+            self.load(now=NOW, identity=other)
+        self.assertEqual(caught.exception.code, "projection-source")
+        with self.assertRaises(pa.ReaderError) as caught:
+            pa.build_projection(self.source(authority=""), _issue(), [],
+                                now=NOW)
+        self.assertEqual(caught.exception.code, "reader-config")
+        section = {"projection": self.projection_path,
+                   "source": {"repo": REPO, "issue": ISSUE,
+                              "approvers": [APPROVER],
+                              "token_file": self.token_file}}
+        with self.assertRaises(pa.ReaderError) as caught:
+            pa.source_from_config(section)
+        self.assertEqual(caught.exception.code, "reader-config")
+        with self.assertRaises(pa.ProjectionError) as caught:
+            pa.identity_from_config(section)
+        self.assertEqual(caught.exception.code, "projection-source")
+        section["authority"] = AUTHORITY
+        self.assertEqual(pa.source_from_config(section).authority, AUTHORITY)
+        self.assertEqual(pa.identity_from_config(section).authority, AUTHORITY)
 
     # -- projection locale -------------------------------------------------
 
@@ -647,7 +680,7 @@ class ApprovalCase(unittest.TestCase):
     def test_token_value_in_configuration_is_refused(self):
         with self.assertRaises(pa.ReaderError) as caught:
             pa.source_from_config({
-                "projection": self.projection_path,
+                "authority": AUTHORITY, "projection": self.projection_path,
                 "source": {"repo": REPO, "issue": ISSUE,
                            "approvers": [APPROVER],
                            "token": "ghp_secret", "token_file": self.token_file},
@@ -657,7 +690,7 @@ class ApprovalCase(unittest.TestCase):
 
     def test_api_base_is_https_outside_loopback(self):
         section = {
-            "projection": self.projection_path,
+            "authority": AUTHORITY, "projection": self.projection_path,
             "source": {"repo": REPO, "issue": ISSUE, "approvers": [APPROVER],
                        "token_file": self.token_file,
                        "api_base": "http://api.github.com"},
@@ -760,7 +793,7 @@ class ApprovalCase(unittest.TestCase):
         projection = self.build([_comment(1034, _body(FULL_A, PATH_A))])
         self.write(projection)
         config = {"approvals": {
-            "projection": self.projection_path, "max_age_s": 300,
+            "authority": AUTHORITY, "projection": self.projection_path, "max_age_s": 300,
             "source": {"repo": REPO, "issue": ISSUE,
                        "approvers": [APPROVER]}}}
         context = self._context()
@@ -783,14 +816,14 @@ class ApprovalCase(unittest.TestCase):
     def test_read_sources_omits_a_foreign_projection(self):
         foreign = self.source(repo="other/repo", issue=123,
                               approvers=("attacker",),
-                              artifact_repos=("target/repo",))
+                              artifact_repos=("target/repo",), authority=AUTHORITY)
         body = _body(FULL_A, PATH_A, repo="target/repo")
         projection = pa.build_projection(
             foreign, _issue(), [_comment(1104, body, login="attacker")],
             now=NOW)
         self.write(projection)
         config = {"approvals": {
-            "projection": self.projection_path,
+            "authority": AUTHORITY, "projection": self.projection_path,
             "source": {"repo": REPO, "issue": ISSUE,
                        "approvers": [APPROVER]}}}
         with mock.patch.object(pa.config_mod, "load", return_value=config):
@@ -802,7 +835,7 @@ class ApprovalCase(unittest.TestCase):
         with mock.patch.object(
                 pa.config_mod, "load",
                 return_value={"approvals": {
-                    "projection": self.projection_path,
+                    "authority": AUTHORITY, "projection": self.projection_path,
                     "source": {"repo": REPO, "issue": ISSUE,
                                "approvers": [APPROVER]}}}):
             self.assertNotIn("approvals", pr.read_sources(context))
@@ -812,7 +845,7 @@ class ApprovalCase(unittest.TestCase):
         with mock.patch.object(
                 pa.config_mod, "load",
                 return_value={"approvals": {
-                    "projection": self.projection_path, "max_age_s": 300,
+                    "authority": AUTHORITY, "projection": self.projection_path, "max_age_s": 300,
                     "source": {"repo": REPO, "issue": ISSUE,
                                "approvers": [APPROVER]}}}):
             self.assertNotIn("approvals", pr.read_sources(context))
@@ -909,7 +942,7 @@ class ApprovalCase(unittest.TestCase):
         port = server.server_address[1]
         config = {
             "approvals": {
-                "projection": self.projection_path,
+                "authority": AUTHORITY, "projection": self.projection_path,
                 "max_age_s": 300,
                 "source": {
                     "repo": REPO, "issue": ISSUE, "approvers": [APPROVER],

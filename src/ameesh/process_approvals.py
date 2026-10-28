@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Pont d'approbation IMA/GitHub, avec revocation (#4006, C de #2846).
+"""Pont d'approbation GitHub, avec revocation (#4006, C de #2846).
 
 Le proprietaire a tranche l'hebergement (decision #143364, option a) : **un
 seul lecteur, sur la VM bureau-goal**, avec un jeton GitHub existant en
-lecture des issues du depot IMA. Les hotes d'agents ne parlent jamais a
+lecture des issues du depot source. Les hotes d'agents ne parlent jamais a
 GitHub : ils lisent une **projection locale en lecture seule**, produite par
 le bureau. La projection est fail-closed : absente, illisible, perimee, ou
 issue d'une autre source, elle est refusee.
 
-Ce module ne decide pas a la place d'IMA. Il lit les enregistrements
-d'approbation que le proprietaire a ecrits sur l'issue IMA #704 et les
-normalise :
+Ce module ne decide pas a la place de l'autorite configuree. Il lit les
+enregistrements d'approbation que le proprietaire a ecrits sur l'issue
+source et les normalise :
 
 * auteur : le commentaire doit venir d'un approbateur configure, de type
   ``User`` (jamais un bot) ;
@@ -25,7 +25,7 @@ normalise :
 * fraicheur : la projection porte ``generated_at`` / ``expires_at`` et un
   consommateur impose en plus son propre age maximal ;
 * autorite : ``source=api`` n'est jamais une autorite ; seule la source
-  ``github`` de la projection, elle-meme adossee a l'issue IMA, compte.
+  ``github`` de la projection, elle-meme adossee a l'issue source, compte.
 
 Aucun secret n'entre dans Git, dans la projection ou dans un message
 d'erreur : la configuration **nomme** le fichier 0600 du jeton, elle n'en
@@ -33,7 +33,8 @@ contient jamais la valeur. Le lecteur reseau tourne sur bureau-goal ; les
 hotes ne lisent qu'un fichier JSON, avec des permissions verifiees.
 
 Format de projection (``ameesh-approvals/1``) : ``schema``, ``authority``
-(``ima``), ``source`` (depot, issue, etat, ``source_digest``), ``generated_at``,
+(``approvals.authority`` de la configuration, sans defaut : #4259),
+``source`` (depot, issue, etat, ``source_digest``), ``generated_at``,
 ``expires_at``, ``approvers``, ``approvals``, ``revocations``, ``refusals``,
 ``reader`` et ``digest`` (JCS + SHA-256 du reste). Les approbations sont
 normalisees ; les refus sont des temoins sans contenu de commentaire.
@@ -57,7 +58,7 @@ Codes de refus stables (ils ne remplacent pas les codes Process de #4007) :
   ``out-of-scope``, ``revocation-unscoped``, ``revocation-time``.
 
 Qualification : le code et les tests sur fixtures ne dependent pas de #4005.
-La qualification sur les vrais enregistrements #704 se fait depuis
+La qualification sur les vrais enregistrements se fait depuis
 bureau-goal, une fois le jeton consigne au lot #4005 (voir
 ``tests/test_process_approvals_704.py``).
 """
@@ -87,8 +88,9 @@ from . import httpkit, jcs
 SCHEMA = "ameesh-approvals/1"
 #: schema d'un bloc structure dans un commentaire (avenir)
 ENVELOPE_SCHEMA = "ameesh-approval/1"
-#: l'autorite reste IMA ; la projection n'en est qu'une lecture
-AUTHORITY = "ima"
+#: nom de l'autorite d'approbation : `approvals.authority` de la
+#: configuration, jamais une valeur propre a un mesh dans le code (#4259)
+_AUTHORITY_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 #: source acceptee par le consommateur ; ``api`` ne l'est jamais
 SOURCE_GITHUB = "github"
 SOURCE_API = "api"
@@ -263,6 +265,7 @@ class Source:
     api_base: str = DEFAULT_API_BASE
     max_comments: int = MAX_COMMENTS
     reader: str = ""
+    authority: str = ""
 
     @property
     def repos(self) -> tuple[str, ...]:
@@ -282,6 +285,7 @@ class ApprovalIdentity:
     issue: int
     approvers: tuple[str, ...]
     artifact_repos: tuple[str, ...] = ()
+    authority: str = ""
 
     @property
     def repos(self) -> tuple[str, ...]:
@@ -373,6 +377,7 @@ class Projection:
     digest: str = ""
     reader: Mapping[str, Any] = field(default_factory=dict)
     path: str = ""
+    authority: str = ""
 
     def current(self) -> tuple[Approval, ...]:
         return tuple(a for a in self.approvals if a.state == "current")
@@ -387,6 +392,7 @@ class Projection:
             "repo": str(source.get("repo") or ""),
             "issue": int(source.get("issue") or 0),
             "approvers": list(self.approvers),
+            "authority": self.authority,
         }
 
     def as_source(self) -> dict:
@@ -396,7 +402,7 @@ class Projection:
     def _payload(self) -> dict:
         return {
             "schema": SCHEMA,
-            "authority": AUTHORITY,
+            "authority": self.authority,
             "source": dict(self.source),
             "generated_at": _iso(self.generated_at),
             "expires_at": _iso(self.expires_at),
@@ -474,11 +480,19 @@ def _check_api_base(value: Any) -> str:
     return text
 
 
+def _check_authority(value: Any) -> str:
+    text = _require_text(value, "authority", maximum=64).lower()
+    if not _AUTHORITY_RE.fullmatch(text):
+        raise ValueError("authority: lowercase name expected")
+    return text
+
+
 def source_from_config(section: Any) -> Source:
     """Construit et valide la configuration du lecteur (bureau-goal).
 
-    La section attendue est ``cfg["approvals"]`` : ``projection``, ``source``
-    (``repo``, ``issue``, ``approvers``, ``token_file``, ...). Un
+    La section attendue est ``cfg["approvals"]`` : ``authority``,
+    ``projection``, ``source`` (``repo``, ``issue``, ``approvers``,
+    ``token_file``, ...). Un
     ``token_file`` est obligatoire ; une valeur de jeton dans la configuration
     est refusee (``reader-config``), jamais ignoree.
     """
@@ -496,6 +510,7 @@ def source_from_config(section: Any) -> Source:
         raise ReaderError("reader-config",
                           "a token value is never read from the configuration")
     try:
+        authority = _check_authority(section.get("authority"))
         projection = _require_text(section.get("projection"), "projection",
                                    maximum=4096)
         if not os.path.isabs(os.path.expanduser(projection)):
@@ -540,15 +555,16 @@ def source_from_config(section: Any) -> Source:
                   projection=os.path.abspath(os.path.expanduser(projection)),
                   artifact_repos=artifact_repos, ttl_s=ttl_s,
                   timeout_s=timeout_s, total_timeout_s=total_timeout_s,
-                  api_base=api_base, max_comments=max_comments, reader=reader)
+                  api_base=api_base, max_comments=max_comments, reader=reader,
+                  authority=authority)
 
 
 def identity_from_config(section: Any) -> ApprovalIdentity:
     """Identite de source attendue, lue dans ``approvals.source``.
 
     Les hotes n'ont pas besoin de ``token_file`` (jamais lu par la lecture
-    locale) ; ils declarent ``repo``, ``issue``, ``approvers`` et, si besoin,
-    ``artifact_repos``. Sans ce bloc, la projection est refusee : un fichier
+    locale) ; ils declarent ``authority`` (au niveau de ``approvals``),
+    ``repo``, ``issue``, ``approvers`` et, si besoin, ``artifact_repos``. Sans ce bloc, la projection est refusee : un fichier
     valide ne prouve pas sa provenance.
     """
     if not isinstance(section, Mapping):
@@ -560,6 +576,7 @@ def identity_from_config(section: Any) -> ApprovalIdentity:
         raise ProjectionError("projection-source",
                               "approvals.source identity is required")
     try:
+        authority = _check_authority(section.get("authority"))
         repo = _check_repo(raw.get("repo"), "source repo")
         issue = _as_int(raw.get("issue"), "source issue", minimum=1,
                         maximum=10**9)
@@ -580,11 +597,14 @@ def identity_from_config(section: Any) -> ApprovalIdentity:
     except (TypeError, ValueError) as exc:
         raise ProjectionError("projection-source", str(exc)) from exc
     return ApprovalIdentity(repo=repo, issue=issue, approvers=approvers,
-                            artifact_repos=artifact_repos)
+                            artifact_repos=artifact_repos, authority=authority)
 
 
 def _check_identity(projection: Projection, identity: ApprovalIdentity) -> None:
     source = projection.source
+    if not identity.authority or projection.authority != identity.authority:
+        raise ProjectionError("projection-source",
+                              "projection authority does not match the identity")
     if str(source.get("repo") or "") != identity.repo:
         raise ProjectionError("projection-source",
                               "projection repository does not match the identity")
@@ -647,7 +667,7 @@ class GitHubTransport:
         self.source = source
         try:
             self._token = httpkit.read_token_file(
-                source.token_file, what="IMA GitHub token",
+                source.token_file, what="approval GitHub token",
                 hint="fichier 0600 nomme par approvals.source.token_file",
                 error=ValueError)
         except (OSError, ValueError) as exc:
@@ -707,7 +727,7 @@ def _get_json(transport: Any, path: str, *, what: str) -> Any:
 
 def read_source(source: Source, *, transport: Any = None,
                 now: dt.datetime | None = None) -> tuple[dict, list[dict]]:
-    """Lit l'issue IMA et ses commentaires, avec bornes et delai total."""
+    """Lit l'issue source et ses commentaires, avec bornes et delai total."""
     if transport is None:
         transport = GitHubTransport(source)
     deadline = time.monotonic() + source.total_timeout_s
@@ -1262,6 +1282,10 @@ def build_projection(source: Source, issue: Mapping, comments: Iterable[Mapping]
                      reader: str = "") -> Projection:
     """Normalise l'issue et ses commentaires ; ne fait aucun reseau si
     ``resolve`` est fourni ou si les SHA complets sont dans les corps."""
+    try:
+        authority = _check_authority(source.authority)
+    except (TypeError, ValueError) as exc:
+        raise ReaderError("reader-config", str(exc)) from exc
     generated = _utc(now)
     fetched = _utc(fetched_at or generated)
     approvers = tuple(source.approvers)
@@ -1330,7 +1354,8 @@ def build_projection(source: Source, issue: Mapping, comments: Iterable[Mapping]
         approvers=approvers, approvals=tuple(approvals),
         revocations=tuple(revocations), refusals=tuple(refusals),
         reader={"name": reader or source.reader,
-                "ameesh": _version()})
+                "ameesh": _version()},
+        authority=authority)
     # Le digest couvre tout sauf lui-meme.
     digest = hashlib.sha256(jcs.canonicalize(projection._payload())).hexdigest()
     return replace(projection, digest=digest)
@@ -1499,8 +1524,10 @@ def _parse_projection(payload: Any, *, now: dt.datetime,
         raise ProjectionError("projection-invalid", "JSON object expected")
     if payload.get("schema") != SCHEMA:
         raise ProjectionError("projection-invalid", "unknown projection schema")
-    if payload.get("authority") != AUTHORITY:
-        raise ProjectionError("projection-invalid", "authority must be IMA")
+    try:
+        authority = _check_authority(payload.get("authority"))
+    except (TypeError, ValueError) as exc:
+        raise ProjectionError("projection-invalid", str(exc)) from exc
     source = payload.get("source")
     if not isinstance(source, Mapping):
         raise ProjectionError("projection-invalid", "source: JSON object expected")
@@ -1597,7 +1624,7 @@ def _parse_projection(payload: Any, *, now: dt.datetime,
                 "source_digest": source_digest},
         generated_at=generated, expires_at=expires, approvers=approvers,
         approvals=approvals, revocations=revocations, refusals=tuple(refusals),
-        reader=dict(reader))
+        reader=dict(reader), authority=authority)
 
 
 def load_projection(config: Any = None, *, path: str | None = None,
@@ -1761,7 +1788,8 @@ def projection_from_source(source: Any, *, now: dt.datetime | None = None) -> Pr
                 "source_digest": str(meta.get("source_digest") or "")},
         generated_at=generated, expires_at=expires, approvers=approvers,
         approvals=approvals, revocations=(), refusals=(),
-        digest=str(meta.get("digest") or ""))
+        digest=str(meta.get("digest") or ""),
+        authority=str(meta.get("authority") or ""))
 
 
 def approval_for_source(source: Any, *, repo: str, revision: str, path: str,
@@ -1871,7 +1899,7 @@ def write_projection(projection: Projection, path: str, *,
 
 
 __all__ = [
-    "AUTHORITY", "Approval", "ApprovalError", "ApprovalRefusal", "Artifact",
+    "Approval", "ApprovalError", "ApprovalRefusal", "Artifact",
     "ENVELOPE_SCHEMA", "GitHubTransport", "Projection", "ProjectionError",
     "ReaderError", "Revocation", "SCHEMA", "SOURCE_API", "SOURCE_GITHUB",
     "Source", "build_projection", "load_projection", "local_projection",

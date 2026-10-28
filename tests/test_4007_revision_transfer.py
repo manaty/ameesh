@@ -38,7 +38,7 @@ from ameesh import process_registry as pr
 from ameesh import process_verifiers as pv
 
 from .support import PgTestCase
-from .test_process_approvals import (APPROVER, FULL_A, FULL_B, ISSUE, PATH_A,
+from .test_process_approvals import (APPROVER, AUTHORITY, FULL_A, FULL_B, ISSUE, PATH_A,
                                      PATH_B, REPO, _body, _comment, _issue)
 from .test_process_registry import ACME_ACTOR, ACME_EPOCH, ACME_RUNNER, _Spec
 
@@ -54,7 +54,7 @@ def _now() -> dt.datetime:
 
 def _source() -> pa.Source:
     return pa.Source(repo=REPO, issue=ISSUE, approvers=(APPROVER,),
-                     token_file="/nonexistent", projection="/nonexistent")
+                     authority=AUTHORITY, token_file="/nonexistent", projection="/nonexistent")
 
 
 def _approval(ident: int = COMMENT, *, full: str = FULL_B, path: str = PATH_B,
@@ -140,7 +140,7 @@ class TransferVerifierTest(unittest.TestCase):
         self.assertEqual(receipt["verifier"], "revision_transfer")
         self.assertEqual(receipt["contract"], "revision-transfer/1")
         self.assertEqual(receipt["approval_source"], "github")
-        self.assertEqual(receipt["authority"], "ima")
+        self.assertNotIn("authority", receipt)
         self.assertEqual(receipt["sources"], ["approvals"])
         self.assertEqual(set(receipt["source_sha256"]),
                          {"ameesh.process_verifiers", "ameesh.process_approvals"})
@@ -196,7 +196,7 @@ class TransferVerifierTest(unittest.TestCase):
         proof = result.facts["proof"]
         self.assertEqual(proof["contract"], pv.TRANSFER_CONTRACT)
         self.assertEqual(proof["approval_source"], "github")
-        self.assertEqual(proof["authority"], "ima")
+        self.assertEqual(proof["authority"], AUTHORITY)
         self.assertEqual((proof["lot"], proof["project"]), (LOT, "acme"))
         self.assertEqual(proof["workflow_ref"], PIN)
         self.assertEqual(proof["approval"]["comment_id"], COMMENT)
@@ -363,7 +363,7 @@ class TransferRegistryTest(PgTestCase):
 
     def transfer(self, lot: int):
         config = {"approvals": {
-            "projection": self.projection_path,
+            "authority": AUTHORITY, "projection": self.projection_path,
             "source": {"repo": REPO, "issue": ISSUE, "approvers": [APPROVER]}}}
         with mock.patch.object(pa.config_mod, "load", return_value=config):
             return pr.transfer_revision(

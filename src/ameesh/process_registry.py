@@ -1241,7 +1241,7 @@ def transfer_revision(db: Db, *, work_item_id: int, command_id: str,
 
     #4007: slice C installs it (`process_verifiers.install_verifiers`,
     contract `revision-transfer/1`). Its proof source is the conditional
-    `approvals` collection of `read_sources` (IMA #704 projection, #4006):
+    `approvals` collection of `read_sources` (approval projection, #4006):
     the current approval of the exact pinned artifact, cited by the
     `evidence` (`approval`, `lot`, `project`). The accepted proof lands in the
     receipt under `verification.facts.proof`.
@@ -1381,7 +1381,7 @@ def receipt_of(db: Db, work_item_id: int, command_id: str) -> dict | None:
 #: Collections actually collected for slice C (no `observations`:
 #: the source is not installed, a verifier that requires it must refuse).
 #: `approvals` is conditional: it is present only when the host has a fresh,
-#: valid local projection of the IMA #704 records (#4006).
+#: valid local projection of the approval records (#4006).
 SOURCE_KEYS = ("milestones", "receipts", "decisions", "deliveries",
                "approvals")
 
@@ -1407,7 +1407,7 @@ def read_sources(context: VerificationContext) -> dict[str, Any]:
     * `deliveries`: native `delivered` milestones, `{id, sha, accepted}` — `id`
       is projected as a string (#1994): it is the client reference that C
       compares;
-    * `approvals` (#4006): the local IMA/GitHub projection,
+    * `approvals` (#4006): the local GitHub approval projection,
       `{"projection": {generated_at, expires_at, digest, source_digest, repo,
       issue}, "records": [{id, comment_id, author, artifact, state,
       superseded_by, revoked_by, ...}]}`. The key is **absent** when the
