@@ -2401,8 +2401,15 @@ class AuthenticatorWriteGuardTest(_AuthenticatorCase):
         def run():
             conn = self.connect()
             try:
-                results["done"] = canon_sync.sync_authenticators(conn, loaded,
-                                                                 bootstrap_ref="main")
+                # La transaction TIENT la session dont le backend attendra le
+                # verrou : avec le pilote psql, une requête hors transaction
+                # ouvre un backend éphémère, dont le pid ne serait pas celui
+                # qui attend ; le fil principal filtre pg_locks sur CE pid.
+                with conn.transaction() as tx:
+                    results["pid"] = int(tx.query(
+                        "SELECT pg_backend_pid() AS pid")[0]["pid"])
+                    results["done"] = canon_sync.sync_authenticators(
+                        tx, loaded, bootstrap_ref="main")
             except BaseException as exc:        # rendu au fil principal
                 results["done"] = exc
             finally:
@@ -2419,10 +2426,11 @@ class AuthenticatorWriteGuardTest(_AuthenticatorCase):
             blockers = None
             deadline = time.monotonic() + 15
             while blockers is None and time.monotonic() < deadline and worker.is_alive():
-                rows = self.db.query(
+                pid = results.get("pid")
+                rows = (self.db.query(
                     "SELECT pg_blocking_pids(pid) AS blockers FROM pg_locks "
-                    "WHERE locktype = 'advisory' AND NOT granted AND database = "
-                    "(SELECT oid FROM pg_database WHERE datname = current_database())")
+                    "WHERE locktype = 'advisory' AND NOT granted AND pid = %s",
+                    (pid,)) if pid is not None else [])
                 blockers = [int(p) for p in rows[0]["blockers"]] if rows else None
                 if blockers is None:
                     time.sleep(0.05)
