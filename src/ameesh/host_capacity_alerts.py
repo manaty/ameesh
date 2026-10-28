@@ -77,7 +77,12 @@ def alerts(cfg, db, listing, now, *, canons, readings, held_hosts=(), orchestrat
                 if h not in excluded and h not in held_hosts}
     if not readings:
         return []
-    footprints = host_idle.snapshot(cfg, db, canons, readings, now=now, listing=listing)
+    # The alert pass runs every 30 s: read the lots of the agents on the
+    # candidate hosts only, not of the whole mesh (53 per-agent reads, about
+    # 8 MB per pass on the real base). Members, lots and holds of these hosts
+    # are the same; the full listing still names holders in project().
+    members = [a for a in listing if a.get('host') in readings]
+    footprints = host_idle.snapshot(cfg, db, canons, readings, now=now, listing=members)
     return project(footprints, listing, now=now, idle_after_s=cfg.idle_after_s,
                    baseline_hosts=cfg.baseline_hosts, held_hosts=held_hosts,
                    draining_hosts=excluded, orchestrators=orchestrators)

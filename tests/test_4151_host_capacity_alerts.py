@@ -91,13 +91,15 @@ class CapacityAlertsTest(unittest.TestCase):
         cfg = config.Config()
         reading = dict(sampled_ts=NOW, turns_in_progress=0, cgroup={'limits_readable': True})
         store.host_lifecycle.listing.return_value = []
-        listing = [dict(name='worker', host='burst')]
+        listing = [dict(name='worker', host='burst'), dict(name='busy', host='other')]
         with mock.patch.object(storage, 'of', return_value=store), \
                 mock.patch.object(host_idle, 'snapshot', return_value={'burst': self.footprint()}) as snapshot:
             out = subject.alerts(cfg, 'db', listing, NOW, canons=[],
                                  readings={'burst': reading})
             self.assertEqual([a['type'] for a in out], ['host_idle_reserved'])
-            self.assertIs(snapshot.call_args.kwargs['listing'], listing)
+            # only the agents of the candidate hosts are read (alert pass cost)
+            self.assertEqual(snapshot.call_args.kwargs['listing'],
+                             [dict(name='worker', host='burst')])
             snapshot.reset_mock()
             for mode in ('draining', 'returning', 'lost', 'idle-drained'):
                 store.host_lifecycle.listing.return_value = [dict(host='burst', mode=mode)]
