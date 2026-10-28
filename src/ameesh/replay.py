@@ -793,6 +793,23 @@ def isolate_env(env: dict, directory: str) -> dict:
     return env
 
 
+def isolated_test_env(env: dict, directory: str) -> dict:
+    """L'environnement des tests du lot rejoué, sans identité de l'appelant.
+
+    Les tests sont du code produit par le rejeu : ils ne doivent voir ni la
+    base, ni la boîte, ni l'état ameesh réels (`isolate_env`), ni le foyer
+    d'un harnais, ni la clé d'un fournisseur. `HOME` est privé pour que les
+    lectures par défaut ne retrouvent pas les fichiers réels (B1/P1 de
+    #4292, avis cx2/cx3)."""
+    out = isolate_env(env, directory)
+    out["HOME"] = os.path.join(directory, "home")
+    for name in list(out):
+        if name.endswith("_API_KEY") or name in (
+                "DSH_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+            out.pop(name, None)
+    return out
+
+
 def probe_version(adapter) -> str | None:
     """La version du binaire d'un adaptateur (`--version`), ou None.
 
@@ -1661,11 +1678,9 @@ def _run_one(plan: Plan, lot: BenchLot, version: str, blind: str, run_dir: str,
     env = isolate_env(env, isolation_dir)
     # Les tests du lot tournent dans le même environnement isolé que le
     # harnais : jamais le DSN, l'état ni la boîte réels de l'appelant
-    # (relecture B1/P1 de #4292). Ni clé du harnais ni foyer dsh : un test
-    # n'a aucune raison d'appeler le fournisseur.
-    test_env = dict(env)
-    test_env["HOME"] = os.path.join(isolation_dir, "home")
-    test_env.pop(KEY_ENV.get(plan.harness), None)
+    # (relecture B1/P1 de #4292). Foyers de harnais et clés des fournisseurs
+    # sont retirés aussi : un test n'a aucune raison de les joindre.
+    test_env = isolated_test_env(env, isolation_dir)
     env.update(adapter.env())
     use_dsh_home = os.path.join(run_dir, "dsh-home")
     home_info = None
@@ -1699,8 +1714,18 @@ def _review_one(plan: Plan, lot: BenchLot, result: dict, blind: str,
     """Une relecture aveugle de la soumission `blind`."""
     adapter = plan.reviewer_adapter
     env = harness_env(plan.reviewer, env_file=plan.env_file)
-    env = isolate_env(env, os.path.join(run_dir, "isolation"))
+    isolation_dir = os.path.join(run_dir, "isolation")
+    env = isolate_env(env, isolation_dir)
     env.update(adapter.env())
+    home_info = None
+    if plan.reviewer == "deepseek":
+        # Même foyer privé que le rejeu principal : profil sans hooks,
+        # sessions exclues, HOME privé. Un relecteur ne voit ni le profil
+        # réel ni ses hooks (B1/P1 de #4292, avis cx2/cx3).
+        review_home = os.path.join(run_dir, "dsh-home")
+        home_info = isolated_dsh_home(plan.dsh_home, review_home)
+        env["DSH_HOME"] = review_home
+        env["HOME"] = os.path.join(isolation_dir, "home")
     prompt = review_prompt(lot, blind, result)
     review = review_agent(adapter, prompt, run_dir=run_dir, env=env,
                           harness=plan.reviewer, model=plan.reviewer_model,
@@ -1710,6 +1735,9 @@ def _review_one(plan: Plan, lot: BenchLot, result: dict, blind: str,
     review["reviewer_version"] = plan.reviewer_version
     review["reviewer_model"] = plan.reviewer_model
     review["reviewer_effort"] = plan.reviewer_effort
+    review["isolation"] = {"dsh_home": home_info,
+                           "home": ("isolated" if plan.reviewer == "deepseek"
+                                    else "harness-credentials")}
     return review
 
 

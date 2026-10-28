@@ -574,12 +574,68 @@ class ExecuteTest(unittest.TestCase):
                 return _fake_tests(tree, modules, command=command,
                                    timeout=timeout, env=env)
 
-            replay.execute(plan, run_agent=_fake_agent, test_runner=tests,
-                           review_agent=_fake_review)
+            sentinels = {
+                "DSH_HOME": "/real/dsh",
+                "DEEPSEEK_API_KEY": "dsh-key",
+                "ANTHROPIC_API_KEY": "claude-key",
+                "OPENAI_API_KEY": "codex-key",
+                "CLAUDE_CONFIG_DIR": "/real/claude",
+                "CODEX_HOME": "/real/codex",
+            }
+            with mock.patch.dict(os.environ, sentinels):
+                replay.execute(plan, run_agent=_fake_agent, test_runner=tests,
+                               review_agent=_fake_review)
             self.assertIn("invalid@127.0.0.1:1", seen.get("AMEESH_DSN", ""))
             self.assertTrue(seen.get("AMEESH_STATE", "").startswith(plan.work_root))
             self.assertTrue(seen.get("AGENT_MAIL_STATE", "").startswith(plan.work_root))
             self.assertTrue(seen.get("HOME", "").startswith(plan.work_root))
+            for name in sentinels:
+                self.assertNotIn(name, seen, name)
+
+    def test_a_deepseek_reviewer_gets_a_private_home_and_dsh_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, base = _repo(tmp)
+            source = os.path.join(tmp, "dsh-source")
+            profile = os.path.join(source, "profiles", "agent")
+            os.makedirs(profile)
+            with open(os.path.join(profile, "cordis.yml"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("- id: agent-default-model\n"
+                         "- insert:\n    - id: hooks-claude-code\n"
+                         "      name: \"@deepseek-ai/dsh-hooks-claude-code\"\n")
+            plan = _plan(tmp, self._lot(root, base), reviewer="deepseek",
+                         reviewer_adapter=_NullAdapter(), dsh_home=source)
+            seen = {}
+
+            def reviewer(adapter, prompt, *, run_dir, env, harness, model,
+                         effort, timeout, prices):
+                seen.update(env)
+                return _fake_review(adapter, prompt, run_dir=run_dir, env=env,
+                                    harness=harness, model=model,
+                                    effort=effort, timeout=timeout,
+                                    prices=prices)
+
+            with mock.patch.dict(os.environ, {"DSH_HOME": "/real/dsh",
+                                              "HOME": "/real/home"}):
+                report = replay.execute(plan, run_agent=_fake_agent,
+                                        test_runner=_fake_tests,
+                                        review_agent=reviewer)
+            self.assertTrue(seen["DSH_HOME"].startswith(plan.work_root))
+            self.assertNotEqual(os.path.abspath(seen["DSH_HOME"]),
+                                os.path.abspath(source))
+            self.assertTrue(seen["HOME"].startswith(plan.work_root))
+            with open(os.path.join(seen["DSH_HOME"], "hooks.json"),
+                      encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh), {"hooks": {}})
+            with open(os.path.join(seen["DSH_HOME"], "profiles", "agent",
+                                   "cordis.yml"), encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertIn("agent-default-model", text)
+            self.assertNotIn("hooks", text.lower())
+            review = report["lots"][0]["reviews"]["old"]
+            self.assertEqual(review["isolation"]["home"], "isolated")
+            self.assertTrue(review["isolation"]["dsh_home"]["destination"]
+                            .startswith(plan.work_root))
 
     def test_an_errored_run_is_not_a_conclusion(self):
         with tempfile.TemporaryDirectory() as tmp:
