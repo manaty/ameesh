@@ -719,11 +719,49 @@ def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
     return after_compose(ctx, carrier, name, result, this)
 
 
+def frozen_ts(item: dict) -> float:
+    freeze = item.get("freeze") or {}
+    declared = freeze.get("declared") or {}
+    return float(declared.get("at_ts") or 0)
+
+
+def achieved(item: dict, sha: str, since: float) -> bool:
+    """#4237 : la tête gelée `sha` est finie : publiée par le tic (ci demandée)
+    ou dite verte par paquet-auto après ses tests par unité (depuis `since`)."""
+    if MARK_CI + sha in marks(item):
+        return True
+    for ev in _events(item):
+        if float(ev.get("created_ts") or 0) < since:
+            continue
+        match = auto.TESTS_DONE_RE.match(str(ev.get("note") or ""))
+        if match and sha.startswith(match.group(1)):
+            return True
+    return False
+
+
 def pending(ctx: Context, item: dict, sha: str) -> Attempt | None:
-    """La dernière tentative, si elle n'a pas abouti (la tête gelée n'a pas bougé)."""
+    """La dernière tentative, si elle n'a pas abouti.
+
+    La tête gelée n'a pas bougé depuis sa marque ; ou (#4237, B cx1) elle a
+    bougé vers la tête que la tentative a elle-même poussée et gelée avant ses
+    tests (#4304 : gel postérieur à la marque, ou tête qu'elle publie), sans
+    que cette tête soit finie (`achieved`) : refus de garde après les tests,
+    échec ou arrêt en cours de tests, ou tentative encore vivante.
+    """
     found = attempts(item)
     if found and found[-1].base == sha:
         return found[-1]
+    if found and sha:
+        last = found[-1]
+        own = (frozen_ts(item) >= last.ts > 0
+               or last.publish.endswith("@" + sha))
+        # un gel posé après « reprise épuisée » est la main d'un agent
+        stuck = [float(ev.get("created_ts") or 0) for ev in _events(item)
+                 if str(ev.get("note") or "") == MARK_STUCK + last.key
+                 and float(ev.get("created_ts") or 0) >= last.ts]
+        if own and not achieved(item, sha, last.ts) \
+                and not (stuck and frozen_ts(item) > stuck[-1]):
+            return last
     if not sha and not found:
         # porteur créé, arrêt avant la première marque : une tentative 0 morte
         created = float(item.get("created_ts") or 0)

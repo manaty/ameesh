@@ -362,9 +362,13 @@ class HoraireBase(Base):
     def autos(self):
         return [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)]
 
-    def lost(self, *after, step="composition", base="-", extra=""):
-        """Tentative d'agents-1 (époque 288), tests verts, record refusé."""
-        item = carrier(sha="" if base == "-" else base, created=NOW - 3600)
+    def lost(self, *after, step="composition", base="-", extra="", frozen=HEAD2):
+        """Tentative d'agents-1 (époque 288) sur le gel `base` (A) ; comme depuis
+        #4304, elle a poussé et gelé sa tête `frozen` (H) avant ses tests,
+        verts, puis vu son geste suivant refusé (B cx1 : gel A→H réel)."""
+        item = carrier(sha=frozen or ("" if base == "-" else base), created=NOW - 3600)
+        if frozen:
+            item["freeze"]["declared"]["at_ts"] = NOW - 3000 + 0.5
         notes = [ph.MARK_ATTEMPT + "%s n=1 base=%s par=agents-1:42%s epoque=288"
                  % (step, base, extra),
                  "%sbase=%s tête=%s réf=%s" % (auto.TESTED_MARK, "e" * 40, HEAD2, TESTED_REF)]
@@ -448,6 +452,61 @@ class ResumeTestedTest(HoraireBase):
         self.shell.auto_out = "aucune unité composée\n"
         ph.tick(self.ctx)
         self.assertNotIn("--publish", self.autos()[0])
+
+
+class FrozenHeadLinkTest(HoraireBase):
+    """#4237 (B cx1) : depuis #4304 la tentative gèle H avant ses tests ; le gel
+    A→H ne vaut plus aboutissement."""
+
+    def test_gel_a_vers_h_reprend_la_tentative_de_la_base_a(self):
+        item = self.lost(ph.MARK_FENCED + "recomposition n=1 base=%s époque=288" % HEAD,
+                         step="recomposition", base=HEAD, extra=" run=77 sans=3801")
+        self.assertEqual(ph.frozen_sha(item), HEAD2)
+        self.assertEqual(ph.pending(self.ctx, item, HEAD2).base, HEAD)
+        ph.tick(self.ctx)
+        autos = self.autos()
+        self.assertEqual(len(autos), 1)
+        self.assertEqual(autos[0][autos[0].index("--publish-sha") + 1], HEAD2)
+
+    def test_tete_publiee_par_le_tic_vaut_aboutissement(self):
+        item = self.lost(ph.MARK_CI + HEAD2)
+        self.assertIsNone(ph.pending(self.ctx, item, HEAD2))
+        self.assertIn("ci-full en cours", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+
+    def test_tests_verts_dits_par_paquet_auto_publies_sans_reprise(self):
+        # paquet-auto a fini, le tic est mort avant sa publication
+        item = self.lost()
+        item["events"][1]["note"] = (
+            "paquet %s : tests par unité verts sur la tête poussée %s (2 unité(s)) ; "
+            "inclusion verte ; manifeste reviews/x.md" % (NAME, HEAD2[:12]))
+        self.assertIsNone(ph.pending(self.ctx, item, HEAD2))
+        self.assertIn("ci-full demandée sur %s" % HEAD2[:12], ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+
+    def test_tentative_vivante_pendant_ses_tests_attendue(self):
+        item = self.lost()
+        del item["events"][1:]
+        item["events"][0]["note"] = item["events"][0]["note"].replace(
+            "par=agents-1:42", "par=agents-2:7").replace("epoque=288", "epoque=289")
+        self.assertIn("en cours", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+        self.assertEqual(self.shell.ran("ci", "run"), [])
+
+    def test_gel_anterieur_a_la_tentative_vaut_aboutissement_d_avant(self):
+        item = self.lost(ph.MARK_CI + HEAD2)
+        item["events"] = [ev for ev in item["events"]
+                          if not ev["note"].startswith(ph.MARK_CI)]
+        item["freeze"]["declared"]["at_ts"] = NOW - 3500
+        item["events"][0]["note"] = item["events"][0]["note"].replace("base=-", "base=%s" % HEAD)
+        self.assertIsNone(ph.pending(self.ctx, item, HEAD2))
+
+    def test_gel_a_la_main_apres_reprise_epuisee_rend_la_main_au_suivi(self):
+        item = self.lost(ph.MARK_FAILED + "composition n=1 base=- rc=1",
+                         ph.MARK_STUCK + "composition base=-")
+        self.assertIsNotNone(ph.pending(self.ctx, item, HEAD2))
+        item["freeze"]["declared"]["at_ts"] = NOW - 100
+        self.assertIsNone(ph.pending(self.ctx, item, HEAD2))
 
 
 class PilotRecomposeTest(HoraireBase):

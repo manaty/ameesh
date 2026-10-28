@@ -151,6 +151,10 @@ TESTED_REF_PREFIX = "refs/ameesh/paquet-auto/teste/"
 TESTED_MARK = "paquet-auto: tête testée "
 TESTED_RE = re.compile(
     r"^paquet-auto: tête testée base=([0-9a-f]{40}) tête=([0-9a-f]{40}) réf=(\S+)")
+#: #4237 (B cx1) : la note de fin des tests par unité verts sur la tête poussée
+#: (#4304) ; paquet-horaire y lit qu'une tentative gelée avant ses tests a abouti
+TESTS_DONE_RE = re.compile(
+    r"^paquet \S+ : tests par unité .* sur la tête poussée ([0-9a-f]{12}) ")
 #: le refus de `pilot_gesture` (« gesture packet refused for … »)
 REFUSAL_RE = re.compile(r"\bgesture \w+ refused\b|GestureRefused")
 #: sortie de `--publish` sur une chaîne refusée : recomposer
