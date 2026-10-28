@@ -193,11 +193,12 @@ def snapshot(cfg, db, canons, readings, *, now=None, listing=None):
         agents = None
     capacity, costs = capacities(canons, names, protected=protected,
                                  baseline_hosts=cfg.baseline_hosts)
-    # The leader/reserve guard can only change the capacity when the canon
-    # declares fewer than the baseline hosts; computing the election for it
-    # costs seconds per view and would be discarded (#4178).
-    if agents is not None and (sum(v == 'baseline' for v in capacity.values())
-                               < cfg.baseline_hosts):
+    # Ordinary views need elections only for an underspecified baseline
+    # (#4178). A supplied listing also serves the A3 alert projection: its
+    # reclassification proposals must retain guards even with a full baseline.
+    if agents is not None and (listing is not None or
+                              sum(v == 'baseline' for v in capacity.values())
+                              < cfg.baseline_hosts):
         from . import election, host_lifecycle
         try:
             for name in host_lifecycle.critical_names(cfg, db):

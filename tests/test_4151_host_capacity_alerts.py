@@ -2,6 +2,7 @@
 """Read-only reserved-capacity warnings: fresh evidence, agents and quiet holds."""
 import time
 import unittest
+from types import SimpleNamespace as NS
 from unittest import mock
 
 from ameesh import (alert_briefs, config, exploitation, host_capacity_alerts as subject,
@@ -63,6 +64,33 @@ class CapacityAlertsTest(unittest.TestCase):
         self.assertEqual(self.alerts(fps, draining_hosts={'extra'}), [])
         fps['extra']['idle_since'] = NOW - 1700
         self.assertEqual(self.alerts(fps), [])
+
+    def test_full_baseline_still_protects_elected_burst_leader(self):
+        store = mock.MagicMock()
+        store.work.items.return_value = []
+        reading = dict(sampled_ts=NOW, turns_in_progress=0, cpu_count=8,
+                       mem_total_bytes=16000, mem_available_bytes=12000,
+                       app_cpu=0.25, cgroup={'container': False, 'limits_readable': True})
+        store.hosts.since.return_value = [dict(reading, sampled_ts=t)
+                                         for t in range(7600, NOW + 1, 60)]
+        listing = [dict(name=h, host=h, status='idle', lease_live=True,
+                        session_lot_state=None, actionable_lots=0, unread=0,
+                        passive_unread=0, status_since_ts=7000, last_turn_ts=7000)
+                   for h in ('a', 'b', 'leader')]
+        canon = NS(hosts=[NS(title=h, fiche=NS(data={'capacity': 'baseline'}))
+                          for h in ('a', 'b')])
+        role = dict(holder='leader', candidates=[dict(host='a', ready=True)])
+        with mock.patch.object(storage, 'of', return_value=store), \
+                mock.patch('ameesh.host_lifecycle.critical_names', return_value={'pilot'}), \
+                mock.patch('ameesh.election.status', return_value=role):
+            footprints = host_idle.snapshot(config.Config(resource_interval=60), 'db',
+                                             [canon], {h: reading for h in ('a', 'b', 'leader')},
+                                             now=NOW, listing=listing)
+        self.assertEqual(footprints['leader']['capacity'], 'burst')
+        self.assertTrue(footprints['leader']['baseline_guard'])
+        alerts = subject.project(footprints, listing, now=NOW)
+        alert, = [a for a in alerts if a['type'] == 'baseline_oversized']
+        self.assertEqual(alert['burst_candidates'], ['b'])
 
     def test_keys_stay_stable_when_bounded_idle_window_advances(self):
         alert, = self.alerts()
