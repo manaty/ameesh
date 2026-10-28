@@ -1915,6 +1915,22 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "fire":   # #1374 : le feu du pilote au gel
             from . import fire
             return fire.run(cfg, db, args)
+        if args.work_command == "coherence":     # #4172 : passe de cohérence
+            from . import backlog_coherence
+            reports = backlog_coherence.tick(
+                cfg, db, apply=args.apply, project=args.project,
+                repo=args.repo, actor=args.actor)
+            if args.json:
+                print(json.dumps({"schema": backlog_coherence.SCHEMA,
+                                  "projects": reports}, ensure_ascii=False,
+                                 indent=2, default=str))
+                return 0
+            if not reports:
+                print("no open lot")
+                return 0
+            for report in reports:
+                print(backlog_coherence.format_report(report))
+            return 1 if any(report.get("error") for report in reports) else 0
         if args.work_command == "neighbors":
             # #2988 : lecture seule, AVANT la création — les lots voisins du
             # projet (même fichier, titre proche, ligne déjà changée depuis la
@@ -3743,6 +3759,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_work = sub.add_parser("work", help="work items (work_items)")
     work_sub = p_work.add_subparsers(dest="work_command")
+    pw_coherence = work_sub.add_parser(
+        "coherence", help="#4172: backlog coherence pass over the open lots of a "
+                          "project (already done, obsolete, duplicates, "
+                          "contradictions); deterministic closures and one digest "
+                          "per project with --apply")
+    pw_coherence.add_argument("--project", "--app", dest="project", default=None,
+                              help="one project (default: every project with open lots)")
+    pw_coherence.add_argument("--repo", default=None, metavar="DIR",
+                              help="local clone of the project's repository (default: the "
+                                   "one declared for the project, else the current one)")
+    pw_coherence.add_argument("--apply", action="store_true",
+                              help="close the deterministic findings and send the digest "
+                                   "(default: read-only report)")
+    pw_coherence.add_argument("--actor", default="ameesh",
+                              help="journal actor of the closures (default: ameesh)")
+    pw_coherence.add_argument("--json", action="store_true")
+    pw_coherence.set_defaults(func=cmd_work)
     pw_neighbors = work_sub.add_parser(
         "neighbors", help="#2988: read-only preview of the lots already touching this "
                           "constat (same file, close title, line changed since the "
