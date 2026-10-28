@@ -5145,8 +5145,8 @@ class AgentWorker(threading.Thread):
         consomme pas). Compte `ok` de nouveau : blocage levé."""
         self._credits_probe = None
         self._credits_candidate = None
-        if self.runner.dry_run or self.runner.mediated:
-            return True  # l'exécuteur médié n'a pas l'état partagé du compte
+        if not self._credits_tracked():
+            return True
         compte = account_turn.for_turn(self)
         if compte is account_turn.INVALID:
             return True
@@ -5170,11 +5170,22 @@ class AgentWorker(threading.Thread):
         self._credits_block(harness, account, row.get("reason") or "")
         return False
 
+    def _credits_tracked(self) -> bool:
+        """#4164 : l'état partagé des crédits s'applique-t-il à ce worker ?
+        Non en simulation, ni pour l'exécuteur médié (pas d'état partagé du
+        compte), ni pour une construction partielle documentée (`__new__`
+        sans `__init__`, doublures #811/#1270 : ni `cfg` ni exécuteur
+        complet) — avis B ameesh-dev3."""
+        runner = getattr(self, "runner", None)
+        if getattr(self, "cfg", None) is None or runner is None:
+            return False
+        return not (getattr(runner, "dry_run", False) or getattr(runner, "mediated", False))
+
     def _credits_exhausted(self) -> bool:
         """#4164 : le compte du prochain tour est-il épuisé ? Lecture seule
         (ni sonde ni blocage), pour les appels de modèle hors `pick` (résumé
         de rotation). Ouvert sur panne de lecture, comme `credits_ready`."""
-        if self.runner.dry_run or self.runner.mediated:
+        if not self._credits_tracked():
             return False
         compte = account_turn.for_turn(self)
         if compte is account_turn.INVALID:
