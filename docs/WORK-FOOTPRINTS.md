@@ -4,7 +4,9 @@ A lot's **footprint** is the set of files or modules (directories) it is
 expected to touch, relative to the root of its repository (`app`). The
 scheduler never runs two lots of the same repository whose footprints
 overlap: the second one waits for the first one's merge, and so starts on the
-updated base. A wrong footprint costs one lot of waiting, never a conflict.
+updated base. A footprint that is too broad costs one lot of waiting; one that
+is too narrow (or unknown) does not hold anything back, so the diff refresh
+matters.
 
 ```sh
 ameesh work footprint 212                      # show it, and the lots in progress it overlaps
@@ -22,10 +24,17 @@ The footprint is the union of three sources (`work_item_footprints`, 0502):
   and body (the same detection as the intake neighbors). With a local clone of
   the repository, a bare file name becomes its path when it is unique. A cited
   path absent from the repository is kept: it is often the file to create.
-- `manual`: set by `--set`; it replaces the intake estimate.
+- `manual`: set by `--set` (a pilot gesture: human, orchestrator or design
+  agent, since it can lift a wait); it replaces the intake estimate.
 - `diff`: the files the lot's branch actually changes since its base on the
-  target (`git diff --name-only target...head`). Refreshed when the lot is
-  frozen (frozen head) and by `--refresh` (branch head).
+  target (`git diff --name-only --no-renames target...head`: a renamed file
+  keeps both its old and new paths). Refreshed when the lot is frozen (frozen
+  head; a failure is a warning, never a failed freeze) and by `--refresh`
+  (branch head).
+
+Without a local clone, a bare file name cited at intake (`foo.py`) stays at the
+repository root and may be narrower than the real path (`src/foo.py`):
+`--set` or the diff refresh corrects it.
 
 Every change writes one line in the lot's journal (`Footprint (source): …`).
 
@@ -61,5 +70,6 @@ concurrent attributions or creations of overlapping lots decide one after
 the other. When the occupying lot merges, the waiting lot becomes takeable at
 the next pass.
 
-Footprints set or refreshed on lots that are *already* in progress are not
-retroactive: `ameesh work footprint` shows the overlap, and the pilot decides.
+Footprint writes take the same lock, so a footprint never changes between
+a check and the attribution it guards. Footprints set or refreshed on lots
+that are *already* in progress are not retroactive: `ameesh work footprint` shows the overlap, and the pilot decides.

@@ -88,6 +88,7 @@ test_l160e_merge_queue  # stockage : file de fusion (upsert, rang NULL à l'éje
 test_l160g_migration_reservations  # L160g: atomic legacy imports and repository-scoped radar
 test_l161c_failures_realtime  # stockage : ci_runs/ci_test_failures, migration 0433, verdicts multi-workflows (#1110) ; relevé CI (ci_runner_state, ci_queue_state, 0426) sous les deux pilotes (#845)
 test_l162_tmpfs  # stockage : signalements de /tmp filtrés par `kind` (housekeeping.recent, L162)
+test_4173_empreinte  # stockage : empreintes de lot, garde de chevauchement sous le verrou du graphe (prise, attribution, création attribuée), concurrence (#4173)
 test_l165_prise_lots  # stockage : lots à confier, équipe de la fiche, EXISTS sur décisions et jalons (booléens) (L165)
 test_l165b_agents_libres  # stockage : `active_lots` du listing des agents, comptage et date prévue (L165b)
 test_l165c_sessions_par_lot  # stockage : sessions mises de côté par (agent, lot), bascule fencée par le bail, lots actionnables, réveils (L165b, #408)

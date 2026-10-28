@@ -197,7 +197,7 @@ def refusal(item_id: int, rows: list) -> str:
         lot, row.get("state") or "?",
         ", %s" % row["assignee"] if row.get("assignee") else "",
         row.get("path"), row.get("other_path")) for lot, row in sorted(by_lot.items())]
-    return ("lot %s not assigned: its footprint overlaps lot(s) in progress in the same "
+    return ("lot #%s not assigned: its footprint overlaps lot(s) in progress in the same "
             "repository: %s. It waits for their merge and starts on the updated base "
             "(#3185); a wrong footprint is corrected with `ameesh work footprint %s "
             "--set PATH…`" % (item_id, "; ".join(parts), item_id))
@@ -243,6 +243,13 @@ def run(cfg, db, args) -> int:
     actor = args.actor or "ameesh"
     if work.get(db, args.id) is None:
         raise work.WorkError("lot %s not found" % args.id)
+    if (args.paths or args.clear) and not work.is_pilot(cfg, db, actor):
+        # une empreinte posée à la main peut lever une attente : geste de
+        # pilote, comme l'exception §4 (`--estimate`/`--refresh` sont
+        # déterministes et restent ouverts)
+        raise work.WorkError("footprint --set/--clear refused: %s is neither a human nor "
+                             "an orchestrator/design agent (pilot gesture)"
+                             % (actor or "nobody"))
     if args.paths:
         set_paths(db, args.id, args.paths, actor=actor)
     elif args.clear:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..work_footprints import WorkFootprints as Contract
-from .work_dependencies import _DONE_SQL
+from .work_dependencies import _DONE_SQL, _LOCK as _GRAPH_LOCK
 
 #: Un lot OCCUPE son empreinte dès qu'il est confié ou démarré, jusqu'à sa
 #: fusion (ou sa fermeture) : sa branche peut encore entrer en conflit. Un lot
@@ -52,6 +52,10 @@ class WorkFootprints(Contract):
         sources = sorted({str(source)} | {str(s) for s in replaces})
         wanted = sorted({str(p) for p in paths})
         with self.db.transaction() as tx:
+            # Le verrou de la garde (prise, attribution, création attribuée),
+            # pris avant la ligne du lot comme elles : une empreinte ne change
+            # pas entre leur contrôle et leur écriture (B2 de la relecture).
+            tx.execute(_GRAPH_LOCK)
             rows = tx.query("SELECT id, state FROM work_items WHERE id = %s"
                             " FOR NO KEY UPDATE", (int(item_id),))
             if not rows:

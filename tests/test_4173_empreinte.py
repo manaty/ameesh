@@ -213,6 +213,75 @@ class CreationAttribueeTest(_Empreintes):
         self.assertIsNone(row[0]["assignee"])
 
 
+class EcritureEmpreinteTest(_Empreintes):
+    def test_b2_l_ecriture_attend_le_verrou_de_la_garde(self):
+        """B2 de mty-amh-docs-01 : une empreinte posée pendant une attribution
+        en cours (verrou du graphe tenu entre son contrôle et son écriture)
+        attend la fin de celle-ci — jamais d'empreinte changée sous la garde."""
+        from ameesh.storage.postgres.work_dependencies import _LOCK
+        lot = self.lot("cible")
+        holder = db_mod.connect(self.cfg)
+        done = threading.Event()
+
+        def write():
+            connection = db_mod.connect(self.cfg)
+            try:
+                fp.set_paths(connection, lot["id"], ["src/a.py"], actor="pilote")
+                done.set()
+            finally:
+                connection.close()
+
+        try:
+            with holder.transaction() as tx:
+                tx.execute(_LOCK)
+                worker = threading.Thread(target=write, daemon=True)
+                worker.start()
+                self.assertFalse(done.wait(1.0), "l'écriture n'a pas attendu le verrou")
+            worker.join(30)
+        finally:
+            holder.close()
+        self.assertTrue(done.is_set())
+        self.assertEqual(fp.paths_of(self.db, lot["id"]), ["src/a.py"])
+
+    def test_refresh_par_le_diff_garde_l_estimation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def git(*args):
+                subprocess.run(["git", "-C", tmp, *args], check=True, capture_output=True,
+                               env=dict(os.environ, GIT_AUTHOR_NAME="t",
+                                        GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                                        GIT_COMMITTER_EMAIL="t@t"))
+            git("init", "-q", "-b", "main")
+            with open(os.path.join(tmp, "a.py"), "w") as handle:
+                handle.write("a\n")
+            git("add", ".")
+            git("commit", "-qm", "base")
+            git("checkout", "-qb", "lot/x")
+            os.makedirs(os.path.join(tmp, "src"))
+            with open(os.path.join(tmp, "src", "b.py"), "w") as handle:
+                handle.write("b\n")
+            git("add", ".")
+            git("commit", "-qm", "lot")
+            lot = self.lot("lot", branch="lot/x", branch_target="main")
+            self.footprint(lot, "docs", source="intake")
+            result = fp.refresh(self.db, self.cfg, lot["id"], actor="test", repo=tmp)
+            self.assertEqual(result["paths"], ["docs", "src/b.py"])
+            sources = {(r["source"], r["path"]) for r in
+                       storage.of(self.db).work_footprints.for_items([lot["id"]])}
+            self.assertEqual(sources, {("intake", "docs"), ("diff", "src/b.py")})
+
+    def test_set_est_un_geste_de_pilote(self):
+        lot = self.lot("lot")
+        proc = self.mesh("work", "footprint", str(lot["id"]), "--set", "src",
+                         "--actor", "ameesh-dev99")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("pilot gesture", proc.stderr)
+        self.assertEqual(fp.paths_of(self.db, lot["id"]), [])
+        proc = self.mesh("work", "footprint", str(lot["id"]), "--set", "src",
+                         "--actor", "human:proprio")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(fp.paths_of(self.db, lot["id"]), ["src"])
+
+
 class ProprieteTest(_Empreintes):
     """Propriété : quelle que soit la suite de gestes de l'ordonnanceur (prises
     au repos, attributions manuelles, fusions, empreintes posées sur des lots

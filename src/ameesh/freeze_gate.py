@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from typing import TYPE_CHECKING, Sequence
 
 from . import storage
@@ -909,6 +910,7 @@ def milestone(
             from . import work_footprints
             work_footprints.refresh(db, getattr(db, "cfg", None), item_id,
                                     actor=actor or "ameesh", head=sha.strip())
-        except Exception:  # noqa: BLE001 - le gel est écrit ; l'empreinte se refait
-            pass
+        except Exception as exc:  # noqa: BLE001 - le gel est écrit ; l'empreinte se refait
+            print("warning: footprint not refreshed from the frozen head: %s "
+                  "(`ameesh work footprint %s --refresh`)" % (exc, item_id), file=sys.stderr)
     return row
