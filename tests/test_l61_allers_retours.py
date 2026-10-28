@@ -364,6 +364,23 @@ class TestCacheCanon(unittest.TestCase):
         finally:
             canon_mod.load = original
 
+    def test_seeded_window_does_not_read_again(self):
+        """#4178: a caller that already holds the canons seeds the window."""
+        from types import SimpleNamespace
+
+        from ameesh import canon as canon_mod
+
+        cfg = SimpleNamespace(canon="/tmp/canon", canon_ref="", canon_untrusted=False,
+                              canon_entries=None)
+        seeded = [SimpleNamespace(id="home", root="/tmp/canon")]
+        original = canon_mod.load
+        canon_mod.load = lambda *args, **kwargs: self.fail("seeded canon was read again")
+        try:
+            with canon_mod.configured_cache(cfg, seeded):
+                self.assertEqual(canon_mod.load_configured(cfg), seeded)
+        finally:
+            canon_mod.load = original
+
 
 if __name__ == "__main__":
     unittest.main()

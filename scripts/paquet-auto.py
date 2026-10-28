@@ -50,10 +50,15 @@ l'ordre, sans agent :
 9. le résultat des tests au corps de la PR et au journal du porteur,
    courrier au pilote.
 
-Ce qui reste au pilote, hors de ce script : « verdict non requis » (sans lui,
-aucune fusion automatique : les tests par unité finissent avant), le feu et
+Ce qui reste au pilote, hors de ce script : « verdict non requis », le feu et
 toute fusion sur la cible. Le script ne fusionne jamais la cible et ne déclare
-aucun verdict.
+aucun verdict. La ci-full demandée dès la poussée arme pourtant la fusion
+automatique (#2813), et un porteur sans delta propre n'attend aucun verdict :
+le paquet peut fusionner au vert **avant la fin des tests par unité** (canon
+§11 bis, panier #4322). La ci-full tranche ; si la PR est fusionnée pendant les
+tests, le script ne recompose plus rien : un rouge d'unité va au porteur et au
+pilote (corriger en avant ou revert), et la ligne `MERGED_LINE` dit à
+`paquet-horaire.py` de ne rien publier.
 
 Un lot prêt peut être retiré de la composition par `--exclude LOT` (répétable,
 #3845) ; `--exclude-reason TEXTE` (répétable, apparié par ordre) écrit son vrai
@@ -73,6 +78,20 @@ carte sont pesés par `tests/parts/durees.json` pour le pilote des tests
 (`test_driver`), que le manifeste nomme : sous psql, la suite est ~6 fois plus
 lente que la mesure psycopg de la carte.
 
+#4237 : un refus de geste (bail relevé, `GestureRefused`) **après des tests
+verts** ne perd plus le paquet : depuis #4304, la tête est déjà poussée,
+enregistrée et gelée avant ses tests ; sa fin (corps de PR, note, ci-full,
+courrier) est perdue. La tête testée est poussée sous
+`refs/ameesh/paquet-auto/teste/<nom>` et dite au journal du porteur
+(`paquet-auto: tête testée …`). Le détenteur courant finit sans retester par
+`--publish <réf> --publish-sha <tête>` : la réf, la branche du paquet sur
+origin et la marque désignent la même tête ; la chaîne est vérifiée (base =
+tête fraîche de la cible ; une fusion par unité du manifeste, son second
+parent = la source de la liste calculée, donc la tête gelée enregistrée, et
+l'arbre égal à la fusion propre des deux parents ; le manifeste seul
+au-dessus) ; les tests d'origine restent ceux du manifeste. Une chaîne
+refusée sort en 3 : le porteur se recompose.
+
 Modes :
 
 * normal : composition réelle, poussée, PR, gel, ci-full, tests et courrier ;
@@ -90,7 +109,7 @@ Modes :
 
 Codes de retour : 0 composition réussie (ou aucun lot prêt), 1 échec
 opérationnel (git, test, contrôle, poussée, PR, gel, courrier), 2 entrée
-invalide.
+invalide, 3 tête testée non publiable (`--publish`, #4237).
 """
 from __future__ import annotations
 
@@ -132,6 +151,19 @@ FREEZE_TIMEOUT = 600
 GIT_TIMEOUT = 300
 #: #4245 : `RESTART_RESERVE_S` (90 s) de l'élection, plus la lecture
 EPOCH_CHECK_TIMEOUT = 150
+#: #4237 : la tête testée gardée sur un refus de geste, et sa marque au journal
+TESTED_REF_PREFIX = "refs/ameesh/paquet-auto/teste/"
+TESTED_MARK = "paquet-auto: tête testée "
+TESTED_RE = re.compile(
+    r"^paquet-auto: tête testée base=([0-9a-f]{40}) tête=([0-9a-f]{40}) réf=(\S+)")
+#: #4237 (B cx1) : la note de fin des tests par unité verts sur la tête poussée
+#: (#4304) ; paquet-horaire y lit qu'une tentative gelée avant ses tests a abouti
+TESTS_DONE_RE = re.compile(
+    r"^paquet \S+ : tests par unité .* sur la tête poussée ([0-9a-f]{12}) ")
+#: le refus de `pilot_gesture` (« gesture packet refused for … »)
+REFUSAL_RE = re.compile(r"\bgesture \w+ refused\b|GestureRefused")
+#: sortie de `--publish` sur une chaîne refusée : recomposer
+PUBLISH_REFUSED = 3
 #: un rouge local n'est retiré du paquet qu'une fois ; au-delà, un agent lit.
 MAX_RECOMPOSITIONS = 1
 #: #4304 : la ligne du manifeste poussé avant les tests par unité (relue par
@@ -139,6 +171,9 @@ MAX_RECOMPOSITIONS = 1
 TESTS_PARALLEL_LINE = ("- Tests locaux : joués par le composeur après la poussée, "
                        "en parallèle de la CI complète (#4304) ; résultat à la PR, "
                        "au porteur et au courrier du pilote.")
+#: #4322 : début de ligne quand la PR a fusionné pendant les tests par unité ;
+#: `paquet-horaire.py` (after_compose) n'appelle alors pas publish.
+MERGED_LINE = "porteur fusionné pendant les tests par unité"
 #: #4201 : motif neutre d'un `--exclude` sans `--exclude-reason`. Le vrai motif
 #: (B de relecture, regel, rouge local) est celui que le pilote écrit.
 EXCLUDE_DEFAULT_REASON = "exclu par le pilote"
@@ -196,6 +231,14 @@ class InputError(PaquetAutoError):
 
 class GitError(PaquetAutoError):
     """Une commande git a échoué."""
+
+
+class EpochLost(PaquetAutoError):
+    """#4237 : un geste refusé par la garde d'époque (bail relevé)."""
+
+
+class ChainRefused(PaquetAutoError):
+    """#4237 : une tête testée que `--publish` ne publie pas (chaîne, base)."""
 
 
 @dataclass
@@ -933,8 +976,9 @@ finally:
     proc = run_command([project_python(worktree), "-c", code, str(carrier)],
                        cwd=worktree, env=python_env(worktree), timeout=EPOCH_CHECK_TIMEOUT)
     if proc.returncode:
-        raise PaquetAutoError("composition interrompue avant la prochaine opération : %s"
-                              % _output(proc))
+        error = EpochLost if REFUSAL_RE.search(_output(proc)) else PaquetAutoError
+        raise error("composition interrompue avant la prochaine opération : %s"
+                    % _output(proc))
 
 
 def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int,
@@ -1485,6 +1529,13 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             shared[module] = shared.get(module, 0) + 1
     if composition.selection:
         log("tests voisins : %s" % composition.selection)
+    # #4298 : sans `ameesh` dans le PATH, ni créneau ni schéma isolé : des
+    # séries simultanées partageraient la base ; repli en série, dit au journal
+    if parallel > 1 and shutil.which("ameesh") is None:
+        log("tests ciblés : `ameesh` absent du PATH, pas de créneau `ameesh "
+            "heavy` : séries jouées l'une après l'autre (au lieu de %d à la "
+            "fois)" % parallel)
+        parallel = 1
     # le créneau de l'hôte n'est demandé qu'en parallèle : la série reste le
     # geste antérieur, à l'identique
     slots = {"heavy": True} if parallel > 1 else {}
@@ -1840,7 +1891,8 @@ def record_packet(worktree: Path, carrier: int, base_sha: str, head: str,
            "--branch", branch, "--target", target]
     proc = run_command(cmd, cwd=worktree, timeout=DEFAULT_TIMEOUT)
     if proc.returncode != 0:
-        raise PaquetAutoError(
+        error = EpochLost if REFUSAL_RE.search(_output(proc)) else PaquetAutoError
+        raise error(
             "ameesh work packet record a échoué (rc %d) : %s"
             % (proc.returncode, _tail(_output(proc))))
     return _output(proc)
@@ -2008,6 +2060,41 @@ def withdraw_packet(worktree: Path, carrier: int, pr_number: int | None,
         if proc.returncode != 0:
             failed.append("gh pr close #%d : %s" % (pr_number, _tail(_output(proc))))
     return failed
+
+
+def merged_during_tests(args: argparse.Namespace, worktree: Path, head: str,
+                        runs: list[TestRun], faulty: list[int], branch: str,
+                        rel: str) -> int:
+    """#4322 : la PR a fusionné au vert pendant les tests par unité (§11 bis).
+
+    Rien n'est recomposé ni retiré : les unités sont sur la cible. Le résultat
+    va au journal du porteur ; un rouge part au pilote (corriger en avant ou
+    revert). La dernière ligne (`MERGED_LINE`) dit à `paquet-horaire.py` de ne
+    pas publier sur un porteur déjà fusionné.
+    """
+    red = ", ".join("#%d" % lot for lot in faulty)
+    summary = ("rouges pour %s (%s)" % (red, _tests_summary(runs)) if faulty
+               else "verts (%s)" % _tests_summary(runs))
+    print(note_carrier(
+        worktree, args.carrier,
+        "paquet %s : PR fusionnée au vert pendant les tests par unité ; tests "
+        "par unité %s sur la tête %s ; manifeste %s (#4322)"
+        % (args.name, summary, head[:12], rel)), flush=True)
+    if faulty:
+        body = ("Paquet %s (%s, tête %s) : la ci-full verte a fusionné la PR "
+                "pendant les tests par unité, puis ceux-ci ont rougi pour %s "
+                "(%s). Rien n'est retiré ni recomposé : les unités sont sur la "
+                "cible. Rouge après fusion : corriger en avant ou revert "
+                "(canon §11 bis) ; un rouge local seul reste non bloquant.\n"
+                % (args.name, branch, head[:12], red, _tests_summary(runs)))
+        try:
+            send_mail(args.pilot, args.carrier, body, getattr(args, "sender", None))
+        except PaquetAutoError as error:
+            print("courrier non envoyé : %s\n\n%s" % (error, body),
+                  file=sys.stderr, flush=True)
+    print("%s : %s, tête %s, tests par unité %s" % (
+        MERGED_LINE, branch, head[:12], summary), flush=True)
+    return 0
 
 
 def send_mail(recipient: str, lot: int, body: str,
@@ -2340,6 +2427,208 @@ def _write_id_file(path: Path, lots) -> None:
                     encoding="utf-8")
 
 
+def keep_tested(repo: Path, carrier: int, name: str, base_sha: str, head: str,
+                *, tests: str = "", sender: str | None = None) -> str:
+    """#4237 : la tête testée survit au refus de geste.
+
+    Poussée sous une réf réservée (lisible depuis l'hôte du détenteur courant)
+    et dite au journal du porteur, avec le résumé des tests par unité (le
+    manifeste poussé avant eux ne les porte pas, #4304) ; le tic du détenteur
+    finit la publication par `--publish` sans retester. Rien ici ne lève : le
+    refus d'origine reste l'erreur rendue.
+    """
+    ref = TESTED_REF_PREFIX + name
+    proc = git(repo, "push", "origin", "+%s:%s" % (head, ref),
+               check=False)
+    if proc.returncode != 0:
+        print("tête testée %s non poussée (%s) : le détenteur recompose"
+              % (head[:12], _tail(_decode(proc.stderr), 5)), file=sys.stderr)
+        ref = "-"
+    else:
+        print("tête testée %s gardée sous %s" % (head[:12], ref), flush=True)
+    mark = "%sbase=%s tête=%s réf=%s" % (TESTED_MARK, base_sha, head, ref)
+    if tests:
+        mark += " tests=%s" % tests
+    cmd = ["ameesh", "work", "note", str(carrier), mark]
+    if sender:
+        cmd += ["--actor", sender]
+    try:
+        noted = run_command(cmd, cwd=repo, timeout=GIT_TIMEOUT)
+    except PaquetAutoError as error:
+        print("marque de tête testée non écrite : %s" % error, file=sys.stderr)
+        return ref
+    if noted.returncode != 0:
+        print("marque de tête testée non écrite : %s" % _tail(_output(noted), 5),
+              file=sys.stderr)
+    return ref
+
+
+def check_chain(repo: Path, head: str, base_sha: str, rel: str,
+                candidates: list[Candidate]) -> list[tuple[list[int], str]]:
+    """#4237 : la tête testée est-elle publiable telle quelle sur `base_sha` ?
+
+    Le manifeste seul au-dessus d'une chaîne de fusions (premier parent) qui
+    part de la tête fraîche de la cible ; une fusion par ligne de la table
+    `## Composition`, dans l'ordre, son second parent égal à la source de la
+    ligne et à la source de chacun de ses lots dans la liste calculée (la tête
+    gelée enregistrée, ou sa remise), et son **arbre** égal à la fusion
+    déterministe de ses deux parents (`git merge-tree --write-tree`, la même
+    stratégie que `paquet-compose`) : un contenu glissé dans une fusion aux
+    parents conformes est refusé. Rend la table ; sinon `ChainRefused`.
+    """
+    parents = out(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
+    files = out(repo, "diff-tree", "--no-commit-id", "--name-only", "-r",
+                head).splitlines()
+    if len(parents) != 1 or files != [rel]:
+        raise ChainRefused("la tête %s n'est pas le seul commit du manifeste %s"
+                           % (head[:12], rel))
+    try:
+        specs = parse_composition_table(out(repo, "show", "%s:%s" % (head, rel)))
+    except InputError as error:
+        raise ChainRefused(str(error)) from error
+    lines = out(repo, "rev-list", "--first-parent", "--parents", "--reverse",
+                "%s..%s" % (base_sha, parents[0]), check=False).splitlines()
+    merges = [line.split() for line in lines]
+    if not merges or len(merges[0]) < 2 or merges[0][1] != base_sha:
+        raise ChainRefused("tête %s composée sur une autre base que la tête "
+                           "de la cible %s" % (head[:12], base_sha[:12]))
+    if len(merges) != len(specs) or any(len(merge) != 3 for merge in merges):
+        raise ChainRefused("%d commit(s) sous le manifeste pour %d unité(s) : "
+                           "une fusion à deux parents par unité attendue"
+                           % (len(merges), len(specs)))
+    by_lot = {candidate.lot: candidate for candidate in candidates}
+    for (lots, source), merge in zip(specs, merges):
+        second = merge[2]
+        merged = git(repo, "merge-tree", "--write-tree", merge[1], second, check=False)
+        tree = _decode(merged.stdout).split("\n", 1)[0].strip()
+        if merged.returncode != 0 or tree != tree_of(repo, merge[0]):
+            raise ChainRefused("fusion %s : arbre différent de la fusion propre de "
+                               "ses parents (%s)" % (merge[0][:12],
+                                                    "conflit" if merged.returncode
+                                                    else (tree[:12] or "?")))
+        if not second.startswith(source.lower()):
+            raise ChainRefused("fusion %s : second parent %s, manifeste %s"
+                               % (merge[0][:12], second[:12], source[:12]))
+        for lot in lots:
+            candidate = by_lot.get(lot)
+            if candidate is None:
+                raise ChainRefused("#%d n'est plus prêt sur %s" % (lot, base_sha[:12]))
+            if (rev(repo, candidate.source) or candidate.source) != second:
+                raise ChainRefused("#%d : source enregistrée %s, composée %s"
+                                   % (lot, candidate.source[:12], second[:12]))
+    return specs
+
+
+def publish_tested(args: argparse.Namespace) -> int:
+    """#4237 : publier une tête testée gardée, sans retester."""
+    repo = Path(args.repo).resolve()
+    validate_name(args.name)
+    validate_target(repo, args.target)
+    if args.carrier <= 0:
+        raise InputError("--carrier : un identifiant de lot positif attendu")
+    branch = package_branch(args.name)
+    validate_branch(repo, branch, "--name")
+    rel = manifest_rel(args.name)
+    guard = lambda: check_epoch(args.carrier, repo)  # noqa: E731
+    guard()
+    fetched = git(repo, "fetch", "--no-tags", "origin", args.publish, check=False,
+                  timeout=GIT_TIMEOUT)
+    head = rev(repo, "FETCH_HEAD") if fetched.returncode == 0 else rev(repo, args.publish)
+    if not head:
+        raise ChainRefused("tête testée %s introuvable (ni sur origin ni ici)"
+                           % args.publish)
+    # la réf est mobile : seule la tête attestée par la marque est publiée
+    if head != args.publish_sha:
+        raise ChainRefused("%s désigne %s, la marque de tests atteste %s"
+                           % (args.publish, head[:12], args.publish_sha[:12]))
+    base_sha = fresh_base(repo, args.target)
+    print("paquet %s : publication de la tête testée %s sur %s %s"
+          % (args.name, head, args.target, base_sha), flush=True)
+    # #4304 : la tête est poussée, enregistrée et gelée avant ses tests ; seule
+    # la fin reste due, sur la branche du paquet qui la désigne toujours
+    remote_sha = remote_branch(repo, branch)
+    if remote_sha:
+        git(repo, "fetch", "--no-tags", "origin", branch, check=False)
+        remote_sha = rev(repo, "origin/" + branch) or remote_sha
+    if remote_sha != head:
+        raise ChainRefused("%s sur origin désigne %s, pas la tête testée %s"
+                           % (branch, (remote_sha or "rien")[:12], head[:12]))
+    worktree = Path(tempfile.mkdtemp(prefix="paquet-auto-publie-",
+                                     dir=os.environ.get("TMPDIR")))
+    worktree.rmdir()
+    reader = Path(tempfile.mkdtemp(prefix="paquet-auto-base-",
+                                   dir=os.environ.get("TMPDIR")))
+    reader.rmdir()
+    tmp = tempfile.TemporaryDirectory(prefix="paquet-auto-", dir=os.environ.get("TMPDIR"))
+    success = False
+    try:
+        git(repo, "worktree", "add", "--detach", str(worktree), head)
+        git(repo, "worktree", "add", "--detach", str(reader), base_sha)
+        ready_out = Path(tmp.name) / "prets.txt"
+        # la liste calculée par le code de la cible, à sa tête (comme à la composition)
+        candidates, _payload = compute_candidates(reader, args.target, base_sha, ready_out)
+        specs = check_chain(worktree, head, base_sha, rel, candidates)
+        print("chaîne vérifiée : %d unité(s) sur %s" % (len(specs), base_sha[:12]),
+              flush=True)
+        units = "\n".join("- %s `%s`" % (", ".join("#%d" % lot for lot in row_lots),
+                                         source[:12]) for row_lots, source in specs)
+        origin = ("Tête `%s` poussée et gelée par un détenteur précédent du bail, "
+                  "tests par unité verts, refusée au geste suivant ; fin publiée "
+                  "par reprise (#4237), tests non rejoués : résumé à la marque "
+                  "« tête testée » du porteur #%d." % (head[:12], args.carrier))
+        guard()
+        state = pull_request_state(worktree, branch)
+        pr_number: int | None = None
+        pr_url = ""
+        if state and state != "OPEN":
+            print("PR %s : corps non mis à jour" % state.lower(), flush=True)
+        else:
+            body = "\n".join([
+                "ameesh-work: %d" % args.carrier, "",
+                "Paquet horaire %s (§12), base `%s` `%s`, **%d unité(s)**."
+                % (args.name, args.target, base_sha[:12], len(specs)), "",
+                units, "", origin, "",
+                "- Contrôle d'inclusion : vert.",
+                "- Manifeste : `%s`." % rel, "",
+                "Porteur : #%d. « Verdict non requis » et CI complète restent au pilote."
+                % args.carrier, ""])
+            pr_number, pr_url = ensure_pull_request(
+                worktree, branch, args.target,
+                "Paquet %s — %d unités sur %s %s" % (
+                    args.name, len(specs), args.target, base_sha[:12]), body)
+        print(note_carrier(
+            worktree, args.carrier,
+            "paquet %s : fin publiée par scripts/paquet-auto.py --publish (#4237) "
+            "sur la tête poussée %s, tests par unité d'origine verts (non rejoués) ; "
+            "manifeste %s" % (args.name, head[:12], rel)), flush=True)
+        print(request_full_ci(worktree, args.carrier, head), flush=True)
+        pr = ("PR #%d %s" % (pr_number, pr_url)) if pr_number else (pr_url or "PR non lue")
+        mail = "\n".join([
+            "Paquet %s publié sans retester : tête `%s` sur %s `%s` (branche `%s`, %s)."
+            % (args.name, head, args.target, base_sha[:12], branch, pr), "",
+            units, "", origin, "",
+            "« Verdict non requis » et la ci-full restent tes gestes ; aucune "
+            "fusion sur %s." % args.target, ""])
+        try:
+            send_mail(args.pilot, args.carrier, mail, getattr(args, "sender", None))
+        except PaquetAutoError as error:
+            print("courrier non envoyé : %s\n\n%s" % (error, mail), file=sys.stderr)
+            raise
+        print("courrier envoyé à %s" % args.pilot, flush=True)
+        if args.publish.startswith(TESTED_REF_PREFIX):
+            git(repo, "push", "origin", ":" + args.publish, check=False)
+        success = True
+        return 0
+    finally:
+        remove_worktree(repo, reader)
+        shutil.rmtree(reader, ignore_errors=True)
+        tmp.cleanup()
+        if success and not args.keep_worktree:
+            remove_worktree(repo, worktree)
+        elif not success:
+            print("worktree conservé pour diagnostic : %s" % worktree, file=sys.stderr)
+
+
 def compose_packet(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     validate_name(args.name)
@@ -2519,6 +2808,18 @@ def compose_packet(args: argparse.Namespace) -> int:
                 parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
             if not faulty:
                 break
+            if pushed:
+                # #4322 : la ci-full verte a pu fusionner la tête pendant les
+                # tests ; ses unités sont sur la cible, rien à retirer
+                state = pull_request_state(worktree, branch)
+                if state == "MERGED":
+                    success = True
+                    return merged_during_tests(
+                        args, worktree, head, runs, faulty, branch, rel)
+                if state and state != "OPEN":
+                    raise PaquetAutoError(
+                        "PR de %s %s pendant les tests par unité : rien n'est "
+                        "recomposé, un agent lit" % (branch, state.lower()))
             if recomp >= MAX_RECOMPOSITIONS:
                 raise PaquetAutoError(
                     "tests locaux encore rouges après recomposition : %s ; "
@@ -2580,17 +2881,29 @@ def compose_packet(args: argparse.Namespace) -> int:
                 success = True
                 empty = True
                 return 0
-        if guard is not None:
-            guard()
+        inconclusive = sum(1 for run in runs if run.inconclusive)
+        tests_note = ("verts" if not inconclusive
+                      else "verts + %d non concluant(s) consigné(s)" % inconclusive)
+        try:
+            if guard is not None:
+                guard()
+        except EpochLost:
+            # #4237 : tête déjà poussée et gelée (#4304), tests verts : le
+            # détenteur courant en finit la publication sans retester
+            if not args.local:
+                keep_tested(repo, args.carrier, args.name, base_sha, head,
+                            tests="%s (%s)" % (tests_note, _tests_summary(runs)),
+                            sender=getattr(args, "sender", None))
+            raise
         if args.local:
             print("paquet %s prêt localement : branche %s, tête %s"
                   % (args.name, branch, head), flush=True)
             success = True
             return 0
-        inconclusive = sum(1 for run in runs if run.inconclusive)
-        tests_note = ("verts" if not inconclusive
-                      else "verts + %d non concluant(s) consigné(s)" % inconclusive)
         state = pull_request_state(worktree, branch)
+        if state == "MERGED":
+            success = True
+            return merged_during_tests(args, worktree, head, runs, [], branch, rel)
         if state and state != "OPEN":
             print("PR %s pendant les tests par unité : corps non mis à jour"
                   % state.lower(), flush=True)
@@ -2642,7 +2955,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="expéditeur du courrier (défaut : AMEESH_ROLE, sinon "
                              "l'identité liée)")
     parser.add_argument("--local", action="store_true",
-                        help="s'arrêter après le manifeste et packet record")
+                        help="composition de contrôle : manifeste, packet "
+                             "record et tests par unité, sans poussée, PR, gel, "
+                             "ci-full ni courrier")
     parser.add_argument("--force", action="store_true",
                         help="recomposer un paquet existant : réécrit la "
                              "branche distante sous --force-with-lease (retirer "
@@ -2683,6 +2998,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep-failed-hours", type=float, default=24.0,
                         help="N1 : purger un worktree d'échec au-delà de N "
                              "heures (défaut : 24 ; 0 = jamais)")
+    parser.add_argument("--publish", default=None, metavar="REF",
+                        help="#4237 : publier sans retester la tête testée gardée "
+                             "sous REF (%s<nom>) : chaîne vérifiée, puis packet "
+                             "record, inclusion, poussée, PR, gel, courrier ; "
+                             "sortie %d si la chaîne est refusée"
+                             % (TESTED_REF_PREFIX, PUBLISH_REFUSED))
+    parser.add_argument("--publish-sha", default=None, metavar="SHA",
+                        help="#4237 : avec --publish, le SHA complet de la tête "
+                             "testée (marque `%s`) ; une réf qui en diffère est "
+                             "refusée" % TESTED_MARK.strip())
     parser.add_argument("--no-packet-record", action="store_true",
                         help="banc : ne pas lire/écrire la base (porteur, packet record)")
     args = parser.parse_args(argv)
@@ -2714,12 +3039,23 @@ def main(argv: list[str] | None = None) -> int:
             raise InputError("--candidates-json ne s'applique qu'à --replay")
         if not args.carrier:
             raise InputError("--carrier : le lot porteur est requis")
+        if args.publish:
+            if not re.fullmatch(r"[0-9a-f]{40}", args.publish_sha or ""):
+                raise InputError("--publish exige --publish-sha : le SHA complet "
+                                 "attesté par la marque de tests")
+            if args.local or args.no_packet_record or args.exclude:
+                raise InputError("--publish : ni --local, ni --no-packet-record, "
+                                 "ni --exclude (la tête testée est publiée telle quelle)")
+            return publish_tested(args)
         if args.no_packet_record and not args.local:
             raise InputError("--no-packet-record est réservé au banc avec --local")
         return compose_packet(args)
     except InputError as error:
         print("paquet-auto : %s" % error, file=sys.stderr)
         return 2
+    except ChainRefused as error:
+        print("paquet-auto : tête testée non publiable : %s" % error, file=sys.stderr)
+        return PUBLISH_REFUSED
     except PaquetAutoError as error:
         print("paquet-auto : %s" % error, file=sys.stderr)
         return 1

@@ -93,8 +93,11 @@ Chaque lot est rejoué :
 - sur sa base gelée (le SHA de base de son gel), avec son brief et son corps
   d'origine ;
 - dans un arbre isolé, sans push, sans courrier et sans effet de bord ;
-- une fois avec la version installée et une fois avec la version évaluée, avec
-  le même modèle, le même effort et le même plafond de tour.
+- deux fois, en ne faisant varier que le **paramètre évalué** : le harnais
+  (version installée contre version évaluée) ou le modèle (modèle utilisé
+  contre modèle évalué). Les paramètres non évalués restent constants d'un
+  rejeu à l'autre : pour un harnais, le modèle, l'effort et le plafond de
+  tour ; pour un modèle, le harnais, l'effort et le plafond de tour.
 
 ### 3.2 Les mesures
 
@@ -106,8 +109,9 @@ Chaque lot est rejoué :
      ajoutés ou modifiés par le lot, plus ses modules voisins (carte
      d'impact) ;
   2. **une relecture croisée à l'aveugle** par un relecteur d'une autre famille
-     que le harnais évalué : une note de 0 à 10 et la liste des défauts. Le
-     relecteur ne sait pas quelle version a produit quel rejeu.
+     que le harnais qui exécute les rejeux : une note de 0 à 10 et la liste
+     des défauts. Le relecteur ne sait pas quelle version a produit quel
+     rejeu.
 
 ### 3.3 Budget
 
@@ -125,14 +129,21 @@ conclusion :
   et ±1 point sur la note ;
 - **régression**.
 
+Le rapport nomme le **paramètre évalué** — harnais ou modèle — et les
+paramètres maintenus constants (le paramètre non évalué, l'effort et le
+plafond de tour), pour qu'on ne lise jamais « même modèle » quand c'est le
+modèle qui change.
+
 ### 3.5 Acceptation de B
 
 - Le rejeu d'un lot livré sur sa base gelée ne pousse rien et n'écrit dans
   aucune file.
-- Les deux versions tournent avec le même modèle, le même effort et le même
-  plafond.
+- Les deux rejeux ne diffèrent que par le paramètre évalué — le harnais ou le
+  modèle ; le paramètre non évalué (modèle ou harnais), l'effort et le plafond
+  de tour restent constants.
 - Le relecteur ne voit pas la version.
-- Le rapport donne les trois mesures pour chacun des trois lots.
+- Le rapport donne les trois mesures pour chacun des trois lots, et nomme le
+  paramètre évalué ainsi que les paramètres maintenus constants.
 
 ## 4. Lot C : adoption **[owner]**
 

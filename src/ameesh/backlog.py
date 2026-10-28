@@ -641,6 +641,13 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         estimates.check(db, creator or actor, minutes, option="--estimate 2h")
     if minutes and estimate_by is None:
         estimate_by = actor or ""
+    # #4186 : la file d'amélioration est un chemin de création comme un autre ;
+    # le panier unionne les chemins de ses lignes, le lot direct les porte.
+    footprint: list = []
+    if project:
+        from . import work_footprints
+        footprint = work_footprints.estimate_for_creation(
+            cfg, app=project, title=title, body=body or "")
     if not basket_route:
         return storage.of(db).work.backlog_add(
             title=title, body=body or "", source=source, expected_value=expected_value,
@@ -654,7 +661,7 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
                 "; %s" % introduced if introduced else ""),
             actor=actor, app=project, estimate_minutes=minutes,
             estimate_source=estimate_source, estimate_by=estimate_by,
-            change_size=size or None)
+            change_size=size or None, footprint=footprint)
     label, fiche = _chantier(chantier, fiche, reviewed, project)
     day = _basket_day(rule, now)
     line = "- [value %d, P%d] %s — %s (source: %s; by %s)" % (
@@ -678,7 +685,7 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
                 " ".join(title.split())[:120], "; %s" % introduced if introduced else ""),
             actor=actor, app=project, estimate_minutes=minutes,
             estimate_source=estimate_source, estimate_by=estimate_by,
-            change_size=size or None,
+            change_size=size or None, footprint=footprint,
             # La garde est lue SOUS le verrou du panier : une ligne ajoutée à
             # un panier déjà ouvert ne crée pas de lot et n'est pas refusée.
             estimate_required=estimates.is_agent(db, creator or actor))
@@ -980,15 +987,21 @@ def roadmap_waiting(db: Db, project: str, *, now: float | None = None) -> list:
     hors file d'amélioration (`unassigned_lots`, dépendances fusionnées),
     prenable (`lot_takeable` : ni décision, ni production, équipe connue, début
     prévu échu), sans attente planifiée (`waiting_project_lots`), qui n'est ni
-    une relecture après fusion ni une suite d'avis."""
+    une relecture après fusion ni une suite d'avis.
+
+    #4250 : la portée réelle est celle de `unassigned_lots` — la file des lots
+    non assignés de TOUS les projets, dans la limite que fixe l'appelant — puis
+    le filtre du projet ; seuls les holds des candidats du projet sont lus
+    (#3565)."""
     from . import review_lot, sous_utilisation
     project = str(project or "").strip()
     if not project:
         return []
     stamp = time.time() if now is None else float(now)
     today = time.strftime("%Y-%m-%d", time.localtime(stamp))
-    # #3565 : le projet filtre AVANT la lecture des holds — seuls les candidats
-    # du projet sont lus, au lieu des 200 lots de tous les projets.
+    # #3565 : le projet filtre AVANT la lecture des holds — seuls les holds des
+    # candidats du projet sont lus. La file elle-même (`unassigned_lots`) couvre
+    # tous les projets : c'est le coût réel de ce passage, revu au panier #4250.
     candidates = [item for item in storage.of(db).work.unassigned_lots(200)
                   if _lot_project(item) == project]
     holds = _take_holds(db, candidates)

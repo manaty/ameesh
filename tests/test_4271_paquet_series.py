@@ -210,6 +210,7 @@ class SeriesTest(unittest.TestCase):
                                side_effect=lambda _w, unit: own[unit.lot]), \
                 mock.patch.object(paquet_auto, "contract_modules",
                                   return_value=["tests.test_contrat"]), \
+                mock.patch.object(paquet_auto.shutil, "which", return_value="/bin/ameesh"), \
                 mock.patch.object(paquet_auto, "run_tests", side_effect=fake_run):
             runs, faulty, _removals = paquet_auto.check_local_tests(
                 pathlib.Path("."), composition, timeout=900, parallel=4,
@@ -220,6 +221,36 @@ class SeriesTest(unittest.TestCase):
         self.assertEqual(sorted(calls), [("contrats", True, 900),
                                          ("unité #1", True, 900),
                                          ("unité #2", True, 900)])
+
+    def test_sans_ameesh_dans_le_path_repli_en_serie_dit(self) -> None:
+        # #4298 : ni créneau ni schéma isolé : pas de séries simultanées
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, "a", "1" * 40),
+                   paquet_auto.Unit(2, "b", "2" * 40)],
+            discarded=[], head="3" * 40)
+        calls, lines = [], []
+
+        def fake_run(_worktree, label, modules, *, timeout, heavy=False):
+            calls.append((label, heavy))
+            return _green(label, modules)
+
+        own = {1: ["tests.test_un"], 2: ["tests.test_deux"]}
+        with mock.patch.object(paquet_auto, "unit_test_modules",
+                               side_effect=lambda _w, unit: own[unit.lot]), \
+                mock.patch.object(paquet_auto, "contract_modules",
+                                  return_value=["tests.test_contrat"]), \
+                mock.patch.object(paquet_auto.shutil, "which", return_value=None), \
+                mock.patch.object(paquet_auto, "_run_series",
+                                  wraps=paquet_auto._run_series) as series, \
+                mock.patch.object(paquet_auto, "run_tests", side_effect=fake_run):
+            runs, faulty, _removals = paquet_auto.check_local_tests(
+                pathlib.Path("."), composition, timeout=900, parallel=4,
+                select=lambda *_: ({}, ""), log=lines.append)
+        self.assertEqual(faulty, [])
+        self.assertEqual(series.call_args.kwargs["parallel"], 1)
+        self.assertEqual(calls, [("unité #1", False), ("unité #2", False),
+                                 ("contrats", False)])
+        self.assertTrue(any("absent du PATH" in line for line in lines))
 
 
 class HeavyRunTest(unittest.TestCase):

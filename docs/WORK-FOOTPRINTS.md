@@ -20,12 +20,18 @@ ameesh work footprint 212 --clear              # drop the estimate (diff rows st
 
 The footprint is the union of three sources (`work_item_footprints`, 0502):
 
-- `intake`: estimated by `ameesh work add` from the paths cited by the title
-  and body (the same detection as the intake neighbors). With a local clone of
+- `intake`: estimated at creation from the paths cited by the title and body
+  (the same detection as the intake neighbors), for **every** creation path:
+  `ameesh work add`, `agent-mail --new-lot`, incident, fingerprint, review-lot,
+  packet carrier, improvement backlog and basket lines. With a local clone of
   the repository, a bare file name becomes its path when it is unique. A cited
   path absent from the repository is kept: it is often the file to create.
+  Paths are relative to the repository root; an absolute path, `~` or a drive
+  letter is refused rather than silently made relative.
 - `manual`: set by `--set` (a pilot gesture: human, orchestrator or design
-  agent, since it can lift a wait); it replaces the intake estimate.
+  agent, since it can lift a wait); it replaces the intake estimate. While a
+  manual footprint exists, `--estimate` writes nothing (it would add intake
+  rows under the correction); `--clear` then `--estimate` re-estimates.
 - `diff`: the files the lot's branch actually changes since its base on the
   target (`git diff --name-only --no-renames target...head`: a renamed file
   keeps both its old and new paths). Refreshed when the lot is frozen (frozen

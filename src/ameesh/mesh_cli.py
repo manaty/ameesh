@@ -73,7 +73,7 @@ from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, progress, registry
 from . import rebalance as rebalance_mod
-from . import fil, release, signing, storage, work
+from . import fil, release, signing, storage, work, work_lifecycle
 from .config import Config
 from .db import Db
 from .deprecated import HiddenAliasParser
@@ -191,7 +191,7 @@ def agent_rows(cfg: Config, db) -> list:
     return _annotate_agents(cfg, db, rows)
 
 
-def agent_detail(db, name: str, *, cfg=None) -> dict | None:
+def agent_detail(db, name: str, *, cfg=None, footprint: bool = False) -> dict | None:
     """The object of `ameesh show --json` (also `GET /api/v1/agents/{a}`)."""
     # L61 : la ligne et la clé en un seul aller-retour (db.batched)
     row, info = db_mod.batched(db, lambda db: (
@@ -210,7 +210,11 @@ def agent_detail(db, name: str, *, cfg=None) -> dict | None:
     row["key_revoked_ts"] = (info or {}).get("key_revoked_ts")
     row["footprint"] = None
     row["footprint_unavailable"] = None
-    if cfg is not None and row.get("host"):
+    # #4375 : l'empreinte de l'hôte (#4150) coûte ~15 s (host_idle.snapshot :
+    # ~170 requêtes et le canon rechargé) ; `show` est lu par vm.sh sous une
+    # borne de 30 s et par les runners. Elle n'est calculée que sur demande ;
+    # `ameesh hosts` la porte.
+    if footprint and cfg is not None and row.get("host"):
         from . import host_idle, resources, canon as canon_mod
         try:
             readings = {r["host"]: r for r in resources.current(db, row["host"])}
@@ -1776,6 +1780,8 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
                   work.delays(db, ids=[row["id"] for row in rows])}
         for row in rows:
             row["delays"] = delays.get(row["id"])
+            # #4349 : le nom générique à côté de l'orthographe persistée v1.
+            row["lifecycle"] = work_lifecycle.lifecycle_name(row["state"])
         if freeze:
             marks: dict = {}
             for mark in storage.of(db).progress.lot_milestones(
@@ -1801,6 +1807,8 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
         item = work.get(db, lot_id)
         if item is None:
             return None
+        # #4349 : le nom générique du cycle de vie, à côté de l'état v1.
+        item["lifecycle"] = work_lifecycle.lifecycle_name(item["state"])
         item["events"] = work.events(db, lot_id)
         item["milestones"] = work.milestones(db, lot_id)
         # #2988 : la tête relue écrite à la création (`reviewed head:`), ou
@@ -2050,7 +2058,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             except storage.FootprintOverlap as exc:
                 # #4173 : attribué, le lot chevaucherait un lot en cours du même
                 # dépôt — il est créé libre et attend la fusion (prise L165).
+                # #4186 : le lot naît SANS assigné, donc `--externe` (qui force
+                # l'attribution à un agent externe) n'a plus d'objet : le garder
+                # ferait échouer la seconde création (« --externe without
+                # assignee ») et le lot ne naîtrait pas du tout.
+                add_kwargs["externe"] = False
                 item = work.add(db, assignee=None, **add_kwargs)
+                # le lot est libre : l'attribution de la tentative refusée ne
+                # doit plus s'afficher (`_print_assignment` plus bas).
                 check = None
                 print("warning: created unassigned: %s"
                       % work_footprints.refusal(item["id"], exc.overlaps), file=sys.stderr)
@@ -2320,8 +2335,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
             print("lot      : #%d %s" % (item["id"], item["title"]))
-            print("type     : %-10s state: %-14s assignee: %s" % (
-                item["type"], item["state"], item.get("assignee") or "—"))
+            print("type     : %-10s state: %-14s lifecycle: %-14s assignee: %s" % (
+                item["type"], item["state"], item["lifecycle"],
+                item.get("assignee") or "—"))
             if item.get("external_executor"):
                 print("executor : %s (external, reserved; not assignable)" % (
                     item["external_executor"]))
@@ -3919,7 +3935,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_fp_open.add_argument("--json", action="store_true")
     pw_fp_open.set_defaults(func=cmd_work)
     pw_list = work_sub.add_parser("list")
-    pw_list.add_argument("--state", default=None)
+    pw_list.add_argument("--state", default=None,
+                         help="filter by state: v1 spelling (build, qa…) or its "
+                              "generic name (in_progress, to_validate…, #4349)")
     pw_list.add_argument("--assignee", default=None)
     pw_list.add_argument("--limit", type=int, default=50)
     pw_list.add_argument("--json", action="store_true")
@@ -3989,7 +4007,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_mig.set_defaults(func=cmd_work)
     pw_move = work_sub.add_parser("move")
     pw_move.add_argument("id", type=int)
-    pw_move.add_argument("state", choices=list(work.STATES))
+    pw_move.add_argument("state", choices=list(work_lifecycle.ACCEPTED_STATES),
+                         help="v1 spelling or generic lifecycle name (#4349)")
     pw_move.add_argument("--note", default=None)
     pw_move.add_argument("--actor", default="",
                          help="default: the session's bound identity (AGENT_MAIL_NAME)")

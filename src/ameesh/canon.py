@@ -107,6 +107,21 @@ RULES_BLOC_LIMIT = BRIEF_MAX_BYTES - 2 - BRIEF_TEXT_MIN_BYTES
 #: compris, doivent y tenir — `canon check` le vérifie (`process-rules-block-*`).
 RULES_BLOC_ROOM = (RULES_BLOC_LIMIT - len((PROCESS_RULES_HEADER + "\n").encode("utf-8"))
                    - len(("\n" + PROCESS_RULES_FOOTER).encode("utf-8")))
+#: #4250 : plancher de compatibilité du bloc de règles. `canon check` mesure le
+#: bloc avec la limite de la PLUS ANCIENNE version d'ameesh encore servie sur
+#: les hôtes du canon, jamais avec celle de l'hôte local : pendant un staging,
+#: un hôte en 1.26.0 (19 000 − 2 − 4 000 = 14 998) reçoit encore les briefs
+#: alors qu'un hôte en 1.27.0 en accepte 17 498. Sans ce plancher, une PR de
+#: canon validée sur l'hôte récent coupe la fin des règles sur l'hôte en retard
+#: (cas home#209 sur agents-3, 28/10/2026). Ces bornes restent le plancher tant
+#: qu'une version installée est inconnue ; les relever quand plus aucun hôte ne
+#: peut tourner en 1.26.0 (le plus ancien hôte servi fait foi).
+BRIEF_MAX_BYTES_COMPAT = 19000
+BRIEF_TEXT_MIN_BYTES_COMPAT = 4000
+RULES_BLOC_LIMIT_COMPAT = BRIEF_MAX_BYTES_COMPAT - 2 - BRIEF_TEXT_MIN_BYTES_COMPAT
+RULES_BLOC_ROOM_COMPAT = (RULES_BLOC_LIMIT_COMPAT
+                          - len((PROCESS_RULES_HEADER + "\n").encode("utf-8"))
+                          - len(("\n" + PROCESS_RULES_FOOTER).encode("utf-8")))
 #: #1372, #3126, #3867 : plafond d'une projection seule (octets UTF-8) : la place
 #: entière des règles. Une projection au-delà est signalée et coupée à ce
 #: plafond, jamais silencieusement. Ce n'est PAS un budget suffisant : les
@@ -4186,13 +4201,19 @@ _CANONS = threading.local()
 
 
 @contextlib.contextmanager
-def configured_cache():
+def configured_cache(cfg=None, canons=None):
     """Read the configured canons once inside the block.
 
     The cache never outlives the block: a long-lived process (`alerts
-    --follow`, the runner) must see canon changes at its next read."""
+    --follow`, the runner) must see canon changes at its next read.
+
+    ``cfg``/``canons`` seed the window with a list the caller has already
+    read (#4178): a projection that received its canons does not read them
+    again for each delegated authority check."""
     previous = getattr(_CANONS, "loaded", None)
     _CANONS.loaded = {}
+    if cfg is not None and canons is not None:
+        _CANONS.loaded[_configured_key(cfg, False)] = list(canons)
     try:
         yield
     finally:
@@ -4830,11 +4851,13 @@ def _validate_process_block(canon: Canon, add) -> None:
     Le bloc porte toutes les cartes Process valides du canon (projection ou
     texte entier, titres et lignes de métadonnées, diagnostics) : chaque agent
     de ce canon reçoit le même. Il est construit par `reprise` (même code que
-    le brief) et mesuré dans le cas le plus serré (`RULES_BLOC_LIMIT`, texte du
-    brief à sa réserve pleine). Dès 90 % de la place : avertissement ; au-delà
-    (le brief coupe la fin des règles) : erreur, qui ne bloque aucun agent
-    (`blocking` : sujet Process) mais fait échouer `canon check`. Le constat
-    nomme les cartes et leur poids, de la plus lourde à la plus légère."""
+    le brief) et mesuré dans le cas le plus serré de la PLUS ANCIENNE version
+    servie (`RULES_BLOC_LIMIT_COMPAT`, #4250), pas seulement de l'hôte local :
+    pendant un staging, un hôte en retard coupe les briefs à l'ancienne limite
+    alors que l'hôte récent valide la PR. Dès 90 % de la place : avertissement ;
+    au-delà (le brief coupe la fin des règles) : erreur, qui ne bloque aucun
+    agent (`blocking` : sujet Process) mais fait échouer `canon check`. Le
+    constat nomme les cartes et leur poids, de la plus lourde à la plus légère."""
     from . import reprise
     servies = [p for p in canon.processes if p.valid]
     if not servies:
@@ -4848,7 +4871,7 @@ def _validate_process_block(canon: Canon, add) -> None:
     rules = "\n\n".join(t for _, t in fragments if t).strip()
     if not rules:
         return
-    bloc = reprise._rules_bloc(rules, RULES_BLOC_LIMIT, diagnostics)
+    bloc = reprise._rules_bloc(rules, RULES_BLOC_LIMIT_COMPAT, diagnostics)
     taille = len(bloc.encode("utf-8"))
     cartes = ", ".join(
         "%s (%d)" % (p.title, len(t.encode("utf-8")))
@@ -4856,16 +4879,18 @@ def _validate_process_block(canon: Canon, add) -> None:
     sujet = {"process": ", ".join(p.title for p, _ in fragments)}
     if rules not in bloc:
         add("process-rules-block-too-long", ERROR,
-            "Process rules block: %d bytes of rules for %d bytes of room (brief "
-            "block limit %d) — a brief with a full text cuts the end of the rules; "
-            "shorten the cards: %s"
-            % (len(rules.encode("utf-8")), RULES_BLOC_ROOM, RULES_BLOC_LIMIT, cartes),
+            "Process rules block: %d bytes of rules for %d bytes of room (oldest "
+            "served version's brief block limit %d) — a brief with a full text cuts "
+            "the end of the rules; shorten the cards: %s"
+            % (len(rules.encode("utf-8")), RULES_BLOC_ROOM_COMPAT,
+               RULES_BLOC_LIMIT_COMPAT, cartes),
             servies[0].fiche, **sujet)
-    elif taille * 10 >= RULES_BLOC_LIMIT * 9:
+    elif taille * 10 >= RULES_BLOC_LIMIT_COMPAT * 9:
         add("process-rules-block-near-limit", WARNING,
-            "Process rules block: %d bytes of %d (at least 90%%) — shorten the "
-            "cards before a brief cuts the end of the rules: %s"
-            % (taille, RULES_BLOC_LIMIT, cartes), servies[0].fiche, **sujet)
+            "Process rules block: %d bytes of %d for the oldest served version (at "
+            "least 90%%) — shorten the cards before a brief cuts the end of the "
+            "rules: %s"
+            % (taille, RULES_BLOC_LIMIT_COMPAT, cartes), servies[0].fiche, **sujet)
 
 
 def errors(findings: Iterable[Finding]) -> list[Finding]:

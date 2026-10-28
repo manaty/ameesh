@@ -33,6 +33,10 @@
 #                manque (#3327) ; sans effet sur un hôte non candidat
 #   controler    unités actives, journal récent, venv du MainPID vivant,
 #                ameesh doctor et minuteries de rôle sur le serveur
+#   (agents)     redemarrer et controler mènent aussi toute unité
+#                ameesh-runner-agent@ active sur l'hôte hors de sa liste du
+#                registre (candidat d'un rôle élu, bail ailleurs, #4248) :
+#                redémarrée et venv prouvé, sans bail exigé
 #   retour       bascule en arrière vers le venv précédent conservé, puis
 #                redémarre
 #
@@ -515,6 +519,28 @@ unite_hors_perimetre() {  # persona
   etat=$(utilisateur_agents systemctl --user show -p UnitFileState --value \
     "$(unite_agents "$1")" 2>/dev/null) || return 1
   [ "$etat" = disabled ] || [ "$etat" = masked ]
+}
+# #4248 : un rôle élu (§11) a un exécuteur sur chaque hôte candidat, mais le
+# registre ne porte que l'hôte du bail : agents_du_registre ne voit pas ici le
+# candidat en attente, qui restait sur l'ancien code puis reprenait le bail.
+# Les unités actives de l'hôte font foi pour le code chargé. $1… : personas
+# déjà menées par le registre ; sortie : les autres unités actives.
+unites_hors_registre() {
+  local sortie u p q connu
+  sortie=$(utilisateur_agents systemctl --user list-units 'ameesh-runner-agent@*.service' \
+    --state=active --plain --no-legend) \
+    || { echo "unités ameesh-runner-agent@ actives illisibles sur $HOTE_AGENTS" >&2; return 1; }
+  while read -r u _; do
+    [ -n "$u" ] || continue
+    p=${u#ameesh-runner-agent@}; p=${p%.service}
+    if [ "$(unite_agents "$p")" != "$u" ] \
+        || ! [[ $p =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+      echo "unité $u : nom invalide, ignorée" >&2; continue
+    fi
+    connu=0
+    for q in "$@"; do [ "$q" = "$p" ] && connu=1; done
+    [ "$connu" = 1 ] || printf '%s\n' "$p"
+  done <<<"$sortie"
 }
 echec_agent() {
   echo "$1 : $2 — journalctl --user -u $(unite_agents "$1") -n 50 (utilisateur ameesh sur $AGENTS_SSH)" >&2
@@ -1047,8 +1073,8 @@ preparer_drain() {  # une seule persona, juste avant son arrêt
 
 redemarrer_agents() {
   local noms p st avant ligne heure attendu tenu restantes
-  local etat deja_pause detail
-  local non_verifiees=() echecs=()
+  local etat deja_pause detail hors
+  local non_verifiees=() echecs=() echecs_hors=()
   DRAINS_INDISPONIBLES=()
   DRAINS_NON_LEVES=()
   # #1633 : inclure les personas arrêtées pour recharger leur unité active.
@@ -1183,13 +1209,35 @@ redemarrer_agents() {
       fi
       echo "$p : redémarré (était $st)"
   done
+  # #4248 : candidats d'un rôle élu dont le bail est sur un autre hôte (ou
+  # unités que le registre ne place plus ici) : arrêt prouvé puis démarrage,
+  # sans drain (la pause viserait la persona sur l'hôte du bail) ni preuve de
+  # bail (ils n'en tiennent pas) ; `controler` prouve ensuite leur venv.
+  if ! hors=$(unites_hors_registre "${restantes[@]}"); then
+    echecs_hors+=("(liste illisible)")
+  else
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      if redemarrer_hors_tour "$(unite_agents "$p")" \
+          && unite_systemctl "$(unite_agents "$p")" is-active --quiet; then
+        echo "$p : unité active hors registre de $HOTE_AGENTS (candidat d'un rôle élu) — redémarrée sur le nouveau code, bail non attendu"
+      else
+        echec_agent "$p" "unité active hors registre : arrêt non prouvé ou ne redémarre pas"
+        echecs_hors+=("$p")
+      fi
+    done <<<"$hors"
+  fi
   if [ "${#non_verifiees[@]}" -gt 0 ]; then
     etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
+  fi
+  if [ "${#echecs_hors[@]}" -gt 0 ]; then
+    etape "ERREUR: unité(s) active(s) hors registre non redémarrée(s) : ${echecs_hors[*]} — elles restent sur l'ancien code"
   fi
   if [ "${#echecs[@]}" -gt 0 ]; then
     etape "ERREUR: ${#echecs[@]} agent(s) sans bail repris : ${echecs[*]} — balayage poursuivi, les autres redémarrés"
     return 1
   fi
+  [ "${#echecs_hors[@]}" = 0 ] || return 1
   if [ "${#DRAINS_INDISPONIBLES[@]}" -gt 0 ]; then
     etape "ERREUR: drain(s) indisponible(s) : ${DRAINS_INDISPONIBLES[*]} — agents laissés en l'état, balayage poursuivi"
     return 1
@@ -1586,7 +1634,7 @@ preuve_venv_agents() {  # persona → 0 si le MainPID vivant exécute le venv in
 }
 
 controler_agents() {
-  local noms p ligne heure attendu detail echec=0
+  local noms p ligne heure attendu detail hors connus echec=0
   etape "code installé sur $HOTE_AGENTS"
   releve_agents || { echo "relevé du code impossible" >&2; echec=1; }
   noms=$(agents_du_registre) || return 1
@@ -1617,6 +1665,19 @@ controler_agents() {
       fi
     fi
   done <<<"$noms"
+  # #4248 : un candidat de rôle élu actif ici, bail ailleurs, doit lui aussi
+  # vivre sur le venv installé (l'hôte n'est pas sain sinon) ; aucun bail exigé.
+  mapfile -t connus <<<"$noms"
+  if ! hors=$(unites_hors_registre "${connus[@]}"); then
+    echec=1
+  else
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      etape "$p (unité active hors registre de $HOTE_AGENTS : candidat, bail non exigé)"
+      preuve_venv_agents "$p" \
+        || { echec_agent "$p" "le MainPID vivant n'exécute pas le venv installé"; echec=1; }
+    done <<<"$hors"
+  fi
   # #3345 : un profil de runner peut diverger de config.json sans bruit (train
   # resté en shadow, github absent). Contrôle léger, sans base, avant le doctor
   # complet : il nomme le profil et la feuille divergente.

@@ -615,13 +615,26 @@ def add(
     unchanged.
 
     #3744 : le corps « - » est refusé quel que soit l'appelant (comme la
-    note, #3683) : c'est le marqueur de l'entrée standard, jamais un énoncé."""
+    note, #3683) : c'est le marqueur de l'entrée standard, jamais un énoncé.
+
+    #4186 : sans `footprint`, l'estimation d'intake est calculée ici, pour
+    tous les chemins de création qui passent par `add` (`agent-mail
+    --new-lot`, incident, empreinte §16, lot de relecture, porteur de paquet,
+    `add_or_note`) et pas seulement le CLI. Sans `cfg` (aucun projet connu),
+    rien n'est deviné : l'empreinte reste inconnue. `_decision_lot` appelle
+    `_create` directement et n'en porte pas : une question n'occupe pas de
+    fichiers."""
     if (body or "").strip() == "-":
         raise WorkError("body refused: `-` alone is not a statement; write the text, "
                         "or pass `--body -` to ameesh work add to read it on standard "
                         "input")
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.add")
+    if footprint is None:
+        from . import work_footprints
+        footprint = work_footprints.estimate_for_creation(
+            cfg if cfg is not None else getattr(db, "cfg", None),
+            app=app, title=title, body=body, branch_target=branch_target or "")
     return _create(db, title=title, type=type, source=source, app=app, body=body,
                    issue_ref=issue_ref, workstream=workstream, assignee=assignee,
                    budget_usd=budget_usd, actor=actor, package=package, externe=externe,
@@ -1682,7 +1695,8 @@ def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str, *,
     return row
 
 
-def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
+def _reviewer_request(db: Db, item: dict, reviewer: str, who: str, *,
+                      cfg=None) -> dict:
     """The request mail that wakes a manually designated reviewer (#2478).
 
     A designation writes the reviewer column and the journal; without a mail
@@ -1696,6 +1710,11 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
     caller can surface it without losing the designation. A human reviewer has
     no runner to wake and gets no mailbox request. An earlier request that
     already covers this reviewer and head is reused, not sent again (#2495).
+
+    On a frozen head, the mail reads the reviewer's room as a corrector first
+    (`review_correction.check`, the `--if-corrector` preview): too tight, it
+    opens with "do not push" (#4325). An unreadable preview keeps the rule
+    text, never delays the request.
     """
     from . import mail, plan_git
     from .review_designation import (REQUEST_KIND, covering_request,
@@ -1727,7 +1746,18 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
                                   "manual": True}}
     if freeze:
         payload["review_request"]["freeze"] = freeze
-    body = manual_reviewer_message(item, freeze=freeze, actor=who)
+    correction = None
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    if freeze and cfg is not None:
+        from . import review_correction
+
+        try:
+            correction = review_correction.check(cfg, db, int(item["id"]), name,
+                                                 fetch=True)
+        except Exception:  # noqa: BLE001 - un aperçu ne retient pas la demande
+            correction = None
+    body = manual_reviewer_message(item, freeze=freeze, actor=who,
+                                   correction=correction)
     try:
         message_id = mail.send(
             db, who or SYSTEM_SENDER, name, body, kind=REQUEST_KIND,
@@ -1764,7 +1794,7 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
     if warning:
         row["reviewer_warning"] = warning
     if not remove:
-        row.update(_reviewer_request(db, item, name, who))
+        row.update(_reviewer_request(db, item, name, who, cfg=cfg))
     return row
 
 
@@ -3826,12 +3856,23 @@ def get(db: Db, item_id: int) -> dict | None:
     return storage.of(db).work.get(item_id)
 
 
+def _canonical_state(state: str) -> str:
+    """#4349 : l'orthographe persistée v1 d'un état (v1 ou alias générique),
+    sinon `WorkError` nommant les orthographes acceptées."""
+    from .work_lifecycle import ACCEPTED_STATES, canonical
+    try:
+        return canonical(state)
+    except ValueError:
+        raise WorkError("unknown state: %r (%s)"
+                        % (state, ", ".join(ACCEPTED_STATES))) from None
+
+
 def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
                limit: int = 50) -> list[dict]:
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.list_items")
-    if state and state not in STATES:
-        raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
+    if state:
+        state = _canonical_state(state)
     return storage.of(db).work.items(state=state, assignee=assignee, limit=limit)
 
 
@@ -3899,14 +3940,16 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     consommer de boucle d'auteur (`loops` inchangé, pas de refus à
     `MAX_QA_LOOPS`) : le retrait est un geste du pilote, pas un renvoi de
     relecture. Seulement qa → build ; l'appelant a vérifié qui exclut
-    (`corrector`)."""
+    (`corrector`).
+
+    `state` accepte l'orthographe v1 et le nom générique du cycle de vie
+    (#4349 : `in_progress` pour `build`, `validated` pour `merged`…)."""
+    state = _canonical_state(state)
     if package_exclusion and correct is not None:
         raise WorkError("--package-exclusion and --correct are distinct gestures")
     if package_exclusion and state != "build":
         raise WorkError("--package-exclusion: a lot excluded from a package returns "
                         "to build (ameesh work move %s build --package-exclusion)" % item_id)
-    if state not in STATES:
-        raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
         raise WorkError("to close a lot: ameesh work close <id> --abandoned | "
                         "--superseded-by <id> | --delivered --sha <reviewed head> | --done")

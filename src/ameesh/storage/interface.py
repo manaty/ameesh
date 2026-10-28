@@ -2643,14 +2643,16 @@ class WorkItems(Domain):
                     package_parent: str | None, note: str, actor: str,
                     app: str = "", estimate_minutes: int | None = None,
                     estimate_source: str | None = None, estimate_by: str | None = None,
-                    change_size: str | None = None) -> dict:
+                    change_size: str | None = None, footprint: list | None = None) -> dict:
         """Crée un élément de la file : un lot `improvement` en `intake`, sans
         assigné, et sa première ligne de journal ; rend le lot.
 
         `app`: its project (L118c), empty when unknown. #4117 : `estimate_minutes`
         (avec sa source et son auteur) et `change_size` sont posés en même temps
         que le lot et sa ligne d'historique (`work_item_estimates`), comme
-        `work.add` (L157) ; `estimate_by` vaut `actor` quand il est omis."""
+        `work.add` (L157) ; `estimate_by` vaut `actor` quand il est omis.
+        #4186 : `footprint` (chemins normalisés) est l'empreinte d'intake,
+        écrite avec la création."""
 
     @abc.abstractmethod
     def backlog_basket_add(self, *, key: str, title: str, expected_value: str, line: str,
@@ -2661,7 +2663,8 @@ class WorkItems(Domain):
                            estimate_source: str | None = None,
                            estimate_by: str | None = None,
                            change_size: str | None = None,
-                           estimate_required: bool = False) -> dict:
+                           estimate_required: bool = False,
+                           footprint: list | None = None) -> dict:
         """#2584 (canon §2 l.129) : ajoute une ligne au panier ouvert `key`
         d'un chantier, ou ouvre ce panier ; rend le panier.
 
@@ -2685,7 +2688,11 @@ class WorkItems(Domain):
         pas OUVRIR un panier sans estimation ni référence (L157) ; la garde
         est lue sous le verrou du panier, au point `opened`, pour qu'une ligne
         ajoutée à un panier déjà ouvert ne soit jamais refusée. Le refus lève
-        `BasketEstimateRequired`, que `backlog.add` traduit."""
+        `BasketEstimateRequired`, que `backlog.add` traduit.
+
+        #4186 : `footprint` est l'union des chemins cités par cette ligne avec
+        ceux déjà connus du panier (jamais un remplacement) ; l'empreinte est
+        écrite avec la création de la ligne."""
 
     @abc.abstractmethod
     def backlog(self, *, open_only: bool, limit: int,

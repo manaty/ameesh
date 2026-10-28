@@ -38,6 +38,10 @@ Inputs, all from machine sources (never a note, an assignment or a name):
   author; any other commit makes the designation wait, because an unknown
   family cannot prove independence. #2721 names that fallback in the mark
   (`proof: turn-journal`, `fallback_commits`), never as an exact receipt;
+  #4343 : quand le lot déclare un prérequis (`work dependencies`) dont une tête
+  gelée précède sa tête, la lecture d'auteurs commence à cette tête : les
+  commits du parent sont relus dans le parent, et leur provenance inconnue ne
+  bloque pas l'enfant;
 - **candidates**: the registry rows of the lot's project, real session family
   only (`registry.live_harness`), availability and open-lot load;
 - **pilot**: the project's `orchestrateur` in the canon, when registered; an
@@ -629,6 +633,54 @@ def _repository(db, cfg, item: Mapping, frozen_sha: str, *,
     return _fetch_from_local_clone(
         list(candidates) + list(hints) + list(neighbours), slug, frozen_sha,
         str((item or {}).get("branch") or "").strip(), set())
+
+
+def _declared_parent_heads(db, item: Mapping, repo: str, head: str) -> tuple[str, ...]:
+    """Les têtes gelées des prérequis déclarés qui précèdent `head` (#4343).
+
+    Un lot empilé sur la tête gelée de son prérequis (`work dependencies`) porte
+    dans la plage lue depuis la cible les commits du parent. Ces commits ont été
+    relus sur la tête du parent : ils ne sont pas des auteurs de l'enfant, et la
+    provenance inconnue d'un commit du parent ne bloque pas l'enfant. On ne
+    retire donc que ce qui est **prouvé** prérequis : une arête explicite du
+    graphe, un gel du parent lisible dans ce dépôt, et l'ascendance de cette
+    tête sur la tête lue. Une lecture impossible (graphe, frise du parent ou
+    objet git) ne retire rien : le doute conserve les auteurs.
+
+    Comme #3513 pour les têtes des membres admis, la borne est une tête gelée,
+    pas la cible : les commits qui la précèdent sont hors de la lecture
+    d'auteurs du lot. Le parent garde sa propre lecture ; l'enfant ne relit que
+    son delta.
+    """
+    lot = int((item or {}).get("id") or 0)
+    head_full = plan_git.local_commit(repo, str(head or ""))
+    if not lot or not head_full:
+        return ()
+    try:
+        edges = storage.of(db).work_dependencies.for_items([lot]) or ()
+    except Exception:  # noqa: BLE001 - graphe illisible : aucun parent retiré
+        return ()
+    heads: list[str] = []
+    for edge in edges:
+        try:
+            parent = int((edge or {}).get("blocker_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not parent or parent == lot:
+            continue
+        try:
+            rows = work.milestones(db, parent) or ()
+        except Exception:  # noqa: BLE001 - frise du parent illisible : aucun retrait
+            continue
+        for row in rows:
+            if str((row or {}).get("kind") or "") != "frozen":
+                continue
+            frozen = plan_git.local_commit(repo, str((row or {}).get("sha") or ""))
+            if not frozen or frozen == head_full or frozen in heads:
+                continue
+            if canon_mod.git_contains(repo, frozen, head_full):
+                heads.append(frozen)
+    return tuple(heads)
 
 
 def _resolve_base(repo: str, base: str) -> str:
@@ -1679,10 +1731,15 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     latest = _latest_freeze_marker(db, int(lot),
                                    before_id=int(freeze.get("id") or 0))
     author_commits: dict = {}
+    # #4343 : un lot empilé sur un prérequis déclaré ne relit pas les commits
+    # du parent (gelé et relu sur sa propre tête) ; la provenance inconnue d'un
+    # commit du parent ne bloque donc pas l'enfant.
+    parent_heads = _declared_parent_heads(db, item, repo, frozen_sha)
     authors, unknown, correctors = review_authors.reading(
         db, item, freeze, commits, repo, families=policy.families, trace=True,
         base=start, head=frozen_sha, target=read_target,
         commits_out=author_commits, fetch=fetch,
+        admitted_heads=parent_heads,
         milestone_proof=milestone_proof)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,

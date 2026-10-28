@@ -46,6 +46,10 @@ class InstallerTest(unittest.TestCase):
         program=stage/'runtime/bin/python'; program.write_bytes(b'synthetic executable, never launched'); program.chmod(0o700)
         (stage/'sources').mkdir(mode=0o700)
         (stage/'sources/hote-release.py').write_text('# synthetic pinned source\n')
+        # A setgid parent (offload guest job directory) is inherited by mkdir;
+        # the staged trees must not carry it (runtime.inventory refuses 07000).
+        for directory in (stage.parent,stage,stage/'runtime',stage/'runtime/bin',stage/'sources'):
+            directory.chmod(0o700)
         plan=dict(base.bundle['plan'],runtime_tree_sha256=installer.runtime.inventory(stage/'runtime')['digest'],
                   source_tree_sha256=installer.runtime.inventory(stage/'sources')['digest'])
         self.bundle=installer.bootstrap.delegation.render(plan,account_ids=dict(uid=987,gid=987))
@@ -122,6 +126,7 @@ class InstallerTest(unittest.TestCase):
         # repaired, even a more restrictive one.
         sandbox=Path(self.root)/'sandbox'; sandbox.mkdir(mode=0o700)
         existing=sandbox/'usr/local/libexec'; existing.mkdir(parents=True,mode=0o700)
+        existing.chmod(0o700)  # no setgid inherited from the guest job directory
         real_stat=Path.stat
         def root_owned(path,*,follow_symlinks=True):
             # The sandbox is not root-owned; only the ownership check is faked.

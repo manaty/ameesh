@@ -350,6 +350,45 @@ class DanglingSupersedeWithRemoteTest(_DanglingSupersededFreezeFixture):
         self.assertIn("ameesh-freeze-supersedes: %d" % int(self.op_freeze["id"]),
                       row["note"])
 
+    def test_commit_keeping_partial_filters_still_prove_absence(self):
+        # #4255 : c'est le filtre qui décide, pas le caractère partiel. Ceux
+        # qui ne retirent que des blobs, des arbres ou des tags gardent toute
+        # l'histoire des commits : la preuve d'absence reste possible.
+        self.add_remote()
+        self.repo.git("config", "remote.origin.promisor", "true")
+        for spec in ("blob:none", "blob:limit=1m", "tree:0",
+                     "sparse:oid=HEAD:.gitignore", "object:type=commit"):
+            with self.subTest(spec=spec):
+                self.repo.git("config", "remote.origin.partialclonefilter", spec)
+                self.assertTrue(plan_git._history_complete(self.repo.root))
+        self.assertFalse(plan_git.remote_reachable(self.repo.root, self.op))
+
+    def test_a_partial_filter_that_omits_commits_is_a_doubt(self):
+        # #4255 : `object:type=<type>` n'omet pas le type demandé mais **tous
+        # les objets qui n'en sont pas** (git-rev-list(1)) : `blob`, `tree` ou
+        # `tag` omettent donc des commits. L'ascendance ne se prouve plus :
+        # le doute refuse, il ne conclut jamais à une absence.
+        self.add_remote()
+        self.repo.git("config", "remote.origin.promisor", "true")
+        for spec in ("object:type=blob", "object:type=tree",
+                     "object:type=tag"):
+            with self.subTest(spec=spec):
+                self.repo.git("config", "remote.origin.partialclonefilter", spec)
+                self.assertFalse(plan_git._history_complete(self.repo.root))
+        self.assertIsNone(plan_git.remote_reachable(self.repo.root, self.op))
+        with self.assertRaises(work.WorkError) as caught:
+            self.supersede()
+        self.assertIn("cannot", str(caught.exception))
+
+    def test_a_promisor_without_a_readable_filter_is_a_doubt(self):
+        # #4255 : sans filtre lisible, rien ne dit ce qui manque au clone.
+        # L'admettre supposerait l'histoire complète : le doute refuse.
+        self.add_remote()
+        self.repo.git("config", "remote.origin.promisor", "true")
+        self.assertFalse(plan_git._history_complete(self.repo.root))
+        self.repo.git("config", "remote.origin.partialclonefilter", "inconnu")
+        self.assertFalse(plan_git._history_complete(self.repo.root))
+
     def test_the_partial_presence_probe_stays_local(self):
         # #4242 : sans `NO_LAZY_FETCH`, `cat-file --batch-check` réveille le
         # promisor pour chaque pointe absente (60 s de délai mesuré sur un

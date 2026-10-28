@@ -28,7 +28,9 @@ rougit, l'annulation non requise ne verdit pas sans consignation.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import pathlib
 import re
 import unittest
@@ -176,7 +178,15 @@ class SilentSuccessTest(unittest.TestCase):
         # Les tests qui n'exercent pas le comptage des jobs n'appellent pas
         # l'API : une lecture vide est un repli valide (`jobs=[]`), et évite
         # de dépendre de `GITHUB_RUN_ID` quand la suite tourne dans Actions.
-        return agregat.main(args, gh=gh, jobs=[] if jobs is None else jobs)
+        # #4295 : le script écrit ses verdicts en commandes de workflow
+        # (`::error`, `::warning`) ; les laisser partir sur la sortie de la
+        # suite fait lire au runner des annotations de test comme de vrais
+        # échecs (run macos 40665926877, part 8/8 : « psql (failure) »).
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = agregat.main(args, gh=gh, jobs=[] if jobs is None else jobs)
+        self.output = out.getvalue()
+        return code
 
     def test_annulation_non_requise_consignee_publie_neutral_et_ne_rougit_pas(self):
         gh = self.FakeGh()
@@ -217,6 +227,9 @@ class SilentSuccessTest(unittest.TestCase):
         self.assertEqual(self.run_main(["--psql", "failure", "--psql-parts", "[1]"],
                                        gh=gh), 1)
         self.assertEqual(gh.created, [(agregat.DETAIL_CHECK, "failure")])
+        # #4295 : l'annotation existe toujours, mais reste capturée par le
+        # test au lieu d'être publiée sur la sortie de la suite.
+        self.assertIn("::error title=tests : négatif prouvé::", self.output)
 
     def test_vert_complet_publie_success(self):
         gh = self.FakeGh()
