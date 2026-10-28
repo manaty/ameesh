@@ -73,6 +73,28 @@ class PassBudgetTest(unittest.TestCase):
         now[0] = 10.0
         self.assertEqual(budget.timeout(20.0), 0.0)
 
+    def test_a_phase_slice_stops_at_its_own_deadline_not_the_pass(self):
+        """#4234 : la phase worktrees s'arrête à son plafond ; le passage
+        garde le reste de son budget pour les phases suivantes."""
+        now = [0.0]
+        budget = PassBudget(100.0, clock=lambda: now[0])
+        sliced = budget.slice(10.0)
+        now[0] = 9.0
+        self.assertFalse(sliced.expired())
+        self.assertEqual(sliced.remaining(), 1.0)
+        self.assertFalse(sliced.reserved(0.5))
+        now[0] = 9.5
+        self.assertTrue(sliced.reserved(0.5))
+        self.assertEqual(sliced.timeout(20.0), 0.5)
+        now[0] = 10.0
+        self.assertTrue(sliced.expired())
+        # le budget du passage n'a pas été consommé par la tranche
+        self.assertEqual(budget.remaining(), 90.0)
+        self.assertFalse(budget.expired())
+        # une fenêtre de retrait dans la tranche ne déborde jamais celle-ci
+        window = sliced.window(0.5)
+        self.assertEqual(window.remaining(), 0.0)
+
 
 class HostPassLockTest(unittest.TestCase):
     def setUp(self):
@@ -176,6 +198,30 @@ class HostPassLockTest(unittest.TestCase):
         with mock.patch.object(hk, "_run_pass", side_effect=second):
             self.passage()
         self.assertEqual(seen[1]["cursor"], [42.0, 7])
+
+    def test_progress_reports_the_start_and_each_phase(self):
+        """#4234 : une passe longue n'est plus muette — « started » est dit
+        dès le verrou pris, puis chaque phase, avant le rapport final."""
+        seen = []
+
+        def during(*args, **kwargs):
+            kwargs["budget"].check("tmp")
+            return {}
+
+        with mock.patch.object(hk, "_run_pass", side_effect=during):
+            report = self.passage(progress=seen.append)
+        self.assertEqual(seen[:2], ["started", "phase:tmp"])
+        self.assertFalse(report["budget"]["timed_out"])
+
+    def test_a_broken_progress_display_never_breaks_the_pass(self):
+        """#4234 : la progression est un diagnostic ; un affichage cassé
+        (pipe fermé, callback fautif) ne fait pas échouer le ménage."""
+        def boom(_message):
+            raise RuntimeError("display broken")
+
+        with mock.patch.object(hk, "_run_pass", return_value={}):
+            report = self.passage(progress=boom)
+        self.assertEqual(report["budget"]["timed_out"], False)
 
     def test_a_holder_without_record_names_its_pid_and_claims_no_age(self):
         """#3802 N1 : pas d'enregistrement = pas d'âge, donc pas de fausse
@@ -653,14 +699,16 @@ class HostPassBlockedTest(PgTestCase):
         lock.close()
 
     def test_the_tail_phases_run_when_the_worktrees_eat_the_budget(self):
-        """#3802 B1 : la réserve garde conteneurs, volumes, scopes, /tmp et
-        mesure vivants même quand la phase worktrees consomme tout le reste."""
+        """#3802 B1/#4234 : la tranche worktrees est plafonnée et porte déjà la
+        réserve ; conteneurs, volumes, scopes, /tmp et mesure tournent même
+        quand elle a consommé son temps."""
         now = [0.0]
         budget = hk.PassBudget(hk.HOST_PASS_BUDGET_S, clock=lambda: now[0])
         called = {}
 
         def long_worktrees(db, host, **kwargs):
             called["reserve"] = kwargs.get("reserve_s")
+            called["budget"] = kwargs.get("budget")
             now[0] = hk.HOST_PASS_BUDGET_S - hk.HOST_PASS_RESERVE_S + 1
             return [], []
 
@@ -695,7 +743,12 @@ class HostPassBlockedTest(PgTestCase):
                 mock.patch.object(hk, "measure", side_effect=measured):
             report = hk._run_pass(self.cfgl, self.db, policy, host="pc",
                                   actor="test", artifact_scan=False, budget=budget)
-        self.assertEqual(called.get("reserve"), hk.HOST_PASS_RESERVE_S)
+        # la tranche est déjà bornée par la réserve : le retrait ne la retire
+        # pas une seconde fois (sinon plus aucun arbre ne serait examiné)
+        self.assertEqual(called.get("reserve"), 0.0)
+        self.assertIsInstance(called.get("budget"), hk._BudgetSlice)
+        self.assertEqual(called["budget"].deadline,
+                         hk.HOST_PASS_WORKTREES_BUDGET_S)
         for name in ("containers", "volumes", "scopes", "orphans", "measure"):
             self.assertTrue(called.get(name), "%s did not run" % name)
         self.assertNotEqual(report.get("status"), "timed_out")

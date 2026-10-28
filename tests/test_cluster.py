@@ -149,6 +149,12 @@ FERMEES = {
     # en attendant un classement, aucun GRANT modifié.
     "work_item_links": {"work_item_id", "other_id", "kind", "created_by", "created_at",
                         "decision", "decided_by", "decided_at"},
+    # #4173 (0502) : empreinte d'un lot (chemins de fichiers du dépôt, source,
+    # tête du diff). État interne lu par l'ordonnancement (prise, attribution) ;
+    # fermé aux deux rôles superviseur en attendant un classement, aucun GRANT
+    # modifié.
+    "work_item_footprints": {"work_item_id", "source", "path", "head", "created_by",
+                             "created_at"},
     # #1770 (0450) : le rapport de prévalidation au gel (sélection, tests, hôte,
     # chemin du plan) est une preuve interne lue par l'exécuteur, pas un état
     # de supervision ; table fermée aux deux rôles, aucun GRANT modifié.

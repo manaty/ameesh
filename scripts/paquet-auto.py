@@ -20,29 +20,40 @@ l'ordre, sans agent :
    le lot est écarté avec le motif « conflit, coupure suivante » et le script
    passe au suivant. Aucune résolution : résoudre est un jugement, il reste à
    un agent ;
-4. les contrôles locaux : `scripts/freeze-checks.py`, puis
-   `tests/parts/toujours.txt`, `tests.test_l161f_plan`, `tests.test_cluster`
-   et les modules de test apportés par chaque unité. Un test ciblé **rouge**
-   est attribué par la même lecture que #3801 (`packet_red`) : l'unité
-   désignée par une preuve forte est retirée, son auteur est prévenu, et le
-   paquet est recomposé **une seule fois** sans elle (#3931). Un rouge non
+4. `scripts/freeze-checks.py` sur la tête composée ;
+5. le manifeste `reviews/integration-paquet-<nom>.md` : base et SHA de la
+   cible, table `## Composition` produite par `paquet-compose.py --units`
+   (gabarit #3629), admissions, écartés et leur motif, freeze-checks ; ses
+   tests par unité y sont dits « en parallèle de la CI » (#4304) ;
+6. `ameesh work packet record` (liaison des unités au porteur), puis
+   `scripts/paquet-inclusion.py` sur la tête ;
+7. **dès ce point** (canon §6, #4304) : poussée de
+   `integration/paquet-<nom>`, PR ouverte ou mise à jour, gel
+   `ameesh work milestone <porteur> frozen --sha <tête>` et demande
+   `ameesh ci run <porteur> --full` — la CI complète part sans attendre les
+   tests par unité ;
+8. les tests par unité, pendant la CI : `tests/parts/toujours.txt`,
+   `tests.test_l161f_plan`, `tests.test_cluster` et les modules de test
+   apportés par chaque unité. Un test ciblé **rouge** est attribué par la
+   même lecture que #3801 (`packet_red`) : l'unité désignée par une preuve
+   forte est retirée, son auteur est prévenu, et le paquet est recomposé
+   **une seule fois** sans elle (#3931), étapes 4 à 7 rejouées : la tête
+   recomposée remplace la poussée (bail sur la tête poussée), est regelée et
+   sa ci-full demandée ; une PR déjà close ou fusionnée arrête là ; une
+   recomposition sans unité annule la CI et ferme la PR. Un rouge non
    attribuable garde le geste antérieur : une unité dont le module propre a
    rougi est retirée, un contrat rouge arrête (l'attribution demande un
    agent). Un run **non concluant** (délai, base absente, psql/psycopg
-   indisponible, rc inattendu) est consigné au manifeste, à la PR et au
+   indisponible, rc inattendu) est consigné à la PR, au porteur et au
    courrier, sans retirer d'unité ni arrêter le paquet : le canon §3 le veut,
    la ci-full tranche ;
-5. le manifeste `reviews/integration-paquet-<nom>.md` : base et SHA de la
-   cible, table `## Composition` produite par `paquet-compose.py --units`
-   (gabarit #3629), admissions, écartés et leur motif, contrôles locaux ;
-6. `scripts/paquet-inclusion.py` sur la tête finale, puis `ameesh work packet
-   record` (liaison des unités au porteur) ;
-7. poussée de `integration/paquet-<nom>`, PR ouverte ou mise à jour, gel
-   `ameesh work milestone <porteur> frozen --sha <tête>`, courrier au pilote.
+9. le résultat des tests au corps de la PR et au journal du porteur,
+   courrier au pilote.
 
-Ce qui reste au pilote, hors de ce script : « verdict non requis », la CI
-complète (`ameesh ci run --full`), le feu et toute fusion sur la cible. Le
-script ne fusionne jamais la cible et ne déclare aucun verdict.
+Ce qui reste au pilote, hors de ce script : « verdict non requis » (sans lui,
+aucune fusion automatique : les tests par unité finissent avant), le feu et
+toute fusion sur la cible. Le script ne fusionne jamais la cible et ne déclare
+aucun verdict.
 
 Un lot prêt peut être retiré de la composition par `--exclude LOT` (répétable,
 #3845) ; `--exclude-reason TEXTE` (répétable, apparié par ordre) écrit son vrai
@@ -54,11 +65,19 @@ est relue avant la composition, entre unités, avant chaque série de tests et
 avant publication. Une perte de bail arrête avant l’opération suivante ;
 une opération déjà lancée peut finir. Aucun résultat de test n’est réutilisé.
 
+#4271 : `--tests-parallel N` joue les séries des unités et celle des contrats
+en même temps (au plus N), chacune dans un créneau `ameesh heavy` de l'hôte et
+bornée par `--tests-timeout` (au-delà : non concluant, canon §3) ;
+paquet-horaire les lit dans `packet_tests` du canon compilé. Les voisins de la
+carte sont pesés par `tests/parts/durees.json` pour le pilote des tests
+(`test_driver`), que le manifeste nomme : sous psql, la suite est ~6 fois plus
+lente que la mesure psycopg de la carte.
+
 Modes :
 
-* normal : composition réelle, poussée, PR, gel et courrier ;
-* `--local` : s'arrête après le manifeste et `packet record`, sans poussée,
-  PR, gel ni courrier (composition de contrôle) ;
+* normal : composition réelle, poussée, PR, gel, ci-full, tests et courrier ;
+* `--local` : manifeste, `packet record` et tests par unité, sans poussée,
+  PR, gel, ci-full ni courrier (composition de contrôle) ;
 * `--replay <réf> [--candidates-json <sortie paquet-candidats --json>]` :
   rejoue la table `## Composition` d'un manifeste déjà gelé depuis `--base`,
   reprend le manifeste de `--réf` tel quel (métadonnée, aucun effet sur le
@@ -83,7 +102,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -103,10 +124,21 @@ REMISE_PREFIX = "refs/ameesh/resolutions/"
 REMISE_LOCAL = "refs/ameesh/paquet-auto/remise/"
 FREEZE_CHECKS_SCRIPT = "scripts/freeze-checks.py"
 DEFAULT_TIMEOUT = 1800
+#: #4271 : séries jouées en même temps, quand l'appelant ne dit rien (série)
+DEFAULT_PARALLEL = 1
+#: #4271 : code de sortie d'`ameesh heavy` arrêté par sa borne (`heavy.CAPPED_EXIT`)
+HEAVY_CAPPED_EXIT = 124
 FREEZE_TIMEOUT = 600
 GIT_TIMEOUT = 300
+#: #4245 : `RESTART_RESERVE_S` (90 s) de l'élection, plus la lecture
+EPOCH_CHECK_TIMEOUT = 150
 #: un rouge local n'est retiré du paquet qu'une fois ; au-delà, un agent lit.
 MAX_RECOMPOSITIONS = 1
+#: #4304 : la ligne du manifeste poussé avant les tests par unité (relue par
+#: `prevalidation_calls.composer_tested`, #4136 : ne pas la reformuler seule).
+TESTS_PARALLEL_LINE = ("- Tests locaux : joués par le composeur après la poussée, "
+                       "en parallèle de la CI complète (#4304) ; résultat à la PR, "
+                       "au porteur et au courrier du pilote.")
 #: #4201 : motif neutre d'un `--exclude` sans `--exclude-reason`. Le vrai motif
 #: (B de relecture, regel, rouge local) est celui que le pilote écrit.
 EXCLUDE_DEFAULT_REASON = "exclu par le pilote"
@@ -896,8 +928,10 @@ finally:
     if conn is not None:
         conn.close()
 """
+    # #4245 : la garde attend la reprise d'un rôle réservé à cet hôte
+    # (redémarrage d'exécuteur, 90 s au plus) avant de conclure
     proc = run_command([project_python(worktree), "-c", code, str(carrier)],
-                       cwd=worktree, env=python_env(worktree), timeout=30)
+                       cwd=worktree, env=python_env(worktree), timeout=EPOCH_CHECK_TIMEOUT)
     if proc.returncode:
         raise PaquetAutoError("composition interrompue avant la prochaine opération : %s"
                               % _output(proc))
@@ -1035,9 +1069,10 @@ def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
         return {}, ""
     if not script.is_file():
         return {}, "modules voisins non sélectionnés : %s absent" % ATTRIBUTION_SCRIPT
+    driver = test_driver(worktree)
     payload = {
         "schema": "ameesh-paquet-selection-request/1",
-        "base": base_sha, "budget": budget,
+        "base": base_sha, "budget": budget, "driver": driver,
         "units": [{"lot": unit.lot, "unit_sha": unit.commit}
                   for unit in composition.units],
     }
@@ -1081,6 +1116,12 @@ def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
     else:
         note = "carte d'impact absente (%s) : seuls les modules `support` " \
             "sont ajoutés" % (card.get("why") or card.get("status") or "?")
+    priced = report.get("durations") or {}
+    if priced.get("table"):
+        note += " ; durées `%s` (pilote %s)" % (priced["table"], driver)
+    elif priced:
+        note += " ; durées %s (pilote %s)" % (
+            "de la carte" if priced.get("card") else "forfaitaires", driver)
     note += " ; budget de carte %d s par unité, %.0f s pris" % (budget, spent)
     if dropped:
         note += ", %d module(s) au-delà du budget non joué(s)" % dropped
@@ -1176,19 +1217,50 @@ def _save_test_log(run: TestRun) -> TestRun:
     return run
 
 
+def test_driver(worktree: Path) -> str:
+    """#4271 : le pilote Postgres des tests joués par ce script.
+
+    Celui que l'environnement impose (`AMEESH_DRIVER`, comme
+    `ameesh.config`), sinon psycopg si l'interpréteur des tests le porte,
+    sinon psql : la durée d'un module en dépend d'un facteur ~6."""
+    for name in ("AMEESH_DRIVER", "AGENT_MESH_DRIVER"):
+        wanted = (os.environ.get(name) or "").strip()
+        if wanted in ("psycopg", "psql"):
+            return wanted
+        if wanted:
+            break
+    return "psycopg" if _supports_psycopg(project_python(worktree)) else "psql"
+
+
+_SERIES = iter(range(1, 1 << 30))
+
+
 def run_tests(worktree: Path, label: str, modules: list[str], *,
-              timeout: int) -> TestRun:
+              timeout: int, heavy: bool = False) -> TestRun:
+    """Une série unittest bornée par `timeout` (au-delà : non concluant).
+
+    #4271 : avec `heavy`, la série prend un créneau de l'hôte
+    (`ameesh heavy --max-duration`) et son propre schéma par défaut : la borne
+    est tenue par `heavy`, qui arrête tout le groupe de la série ; l'attente
+    d'un créneau a la même borne en plus."""
     if not modules:
         return TestRun(label=label, modules=[], returncode=0, output="",
                        seconds=0.0)
     start = time.monotonic()
+    cmd = [project_python(worktree), "-m", "unittest", "-q", *modules]
+    env = python_env(worktree)
+    wait = 0
+    wrapper = shutil.which("ameesh") if heavy else None
+    if wrapper:
+        cmd = [wrapper, "heavy", "--max-duration", "%ds" % timeout, "--", *cmd]
+        env["AMEESH_SCHEMA"] = "t_paq_%d_%d" % (os.getpid(), next(_SERIES))
+        wait = timeout + 60
     try:
-        proc = run_command(
-            [project_python(worktree), "-m", "unittest", "-q", *modules],
-            cwd=worktree, timeout=timeout, env=python_env(worktree))
+        proc = run_command(cmd, cwd=worktree, timeout=timeout + wait, env=env)
         result = TestRun(label=label, modules=list(modules),
                        returncode=proc.returncode, output=_output(proc),
-                       seconds=time.monotonic() - start)
+                       seconds=time.monotonic() - start,
+                       timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT)
     except PaquetAutoError as exc:
         result = TestRun(label=label, modules=list(modules), returncode=None,
                        output=str(exc), seconds=time.monotonic() - start,
@@ -1324,10 +1396,57 @@ def designated_removals(attribution: dict, failures: list[dict], *,
     return list(by_lot.values()), ""
 
 
+def _run_series(jobs: list, *, parallel: int, guard=None) -> list[TestRun]:
+    """#4271 : les séries `jobs` (sans argument), leurs résultats dans l'ordre.
+
+    En série (`parallel` <= 1), `guard` passe avant chaque série et une garde
+    refusée arrête la suite. En parallèle, `guard` passe au départ de chaque
+    série ; un refus (ou toute erreur d'une série) annule celles qui ne sont
+    pas parties et remonte une fois les séries en cours terminées."""
+    if parallel <= 1 or len(jobs) <= 1:
+        out = []
+        for job in jobs:
+            if guard is not None:
+                guard()
+            out.append(job())
+        return out
+    stop = threading.Event()
+    lock = threading.Lock()
+
+    def start(job):
+        if stop.is_set():
+            return None
+        try:
+            if guard is not None:
+                with lock:
+                    guard()
+            return job()
+        except BaseException:
+            stop.set()
+            raise
+
+    pool = ThreadPoolExecutor(max_workers=min(parallel, len(jobs)),
+                              thread_name_prefix="paquet-series")
+    try:
+        futures = [pool.submit(start, job) for job in jobs]
+        results, error = [], None
+        for future in futures:
+            try:
+                results.append(future.result())
+            except BaseException as exc:  # noqa: BLE001 - remonté après les autres
+                error = error or exc
+        if error is not None:
+            raise error
+        return results
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
 def check_local_tests(worktree: Path, composition: Composition, *,
                       timeout: int, log=print,
                       attribute=None, base_sha: str = "",
-                      select=None, on_base=None, guard=None) -> tuple[list[TestRun], list[int],
+                      select=None, on_base=None, guard=None,
+                      parallel: int = DEFAULT_PARALLEL) -> tuple[list[TestRun], list[int],
                                                           list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
@@ -1349,6 +1468,11 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     l'a sélectionné ; un rouge partagé reste à l'attribution et à la ci-full.
     Un rouge de module voisin aussi rouge sur la base (`base_failures`,
     injectable par `on_base`) ne compte pas : environnement ou préexistant.
+
+    #4271 : avec `parallel` > 1, les séries des unités et celle des contrats
+    sont indépendantes et jouées en même temps (au plus `parallel`), chacune
+    dans un créneau `ameesh heavy` de l'hôte ; leurs résultats sont lus dans
+    l'ordre des unités, comme en série. `guard` est relu avant chaque série.
     """
     runs: list[TestRun] = []
     red: list[tuple[TestRun, list[dict]]] = []
@@ -1361,10 +1485,11 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             shared[module] = shared.get(module, 0) + 1
     if composition.selection:
         log("tests voisins : %s" % composition.selection)
-    pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str]]] = []
+    # le créneau de l'hôte n'est demandé qu'en parallèle : la série reste le
+    # geste antérieur, à l'identique
+    slots = {"heavy": True} if parallel > 1 else {}
+    planned: list[tuple[Unit, list[str], list[dict], list[str]]] = []
     for unit in composition.units:
-        if guard is not None:
-            guard()
         proper = unit_test_modules(worktree, unit)
         added = []
         for row in neighbors.get(unit.lot, []):
@@ -1380,7 +1505,25 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                 % (unit.lot, len(added),
                    ", ".join("%s (%s)" % (row["module"], row["reason"])
                              for row in added)))
-        run = run_tests(worktree, "unité #%d" % unit.lot, modules, timeout=timeout)
+        planned.append((unit, proper, added, modules))
+
+    def unit_job(label: str, modules: list[str]):
+        return lambda: run_tests(worktree, label, modules, timeout=timeout,
+                                 **slots)
+
+    def contract_job():
+        modules = contract_modules(worktree)
+        return run_tests(worktree, "contrats", modules, timeout=timeout, **slots)
+
+    jobs = [unit_job("unité #%d" % unit.lot, modules)
+            for unit, _proper, _added, modules in planned] + [contract_job]
+    if slots:
+        log("tests ciblés : %d série(s), %d à la fois, créneaux `ameesh heavy`, "
+            "borne %d s par série" % (len(jobs), min(parallel, len(jobs)), timeout))
+    results = _run_series(jobs, parallel=parallel, guard=guard)
+    contract = results.pop()
+    pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str]]] = []
+    for (unit, proper, added, modules), run in zip(planned, results):
         run.added = added
         runs.append(run)
         if run.inconclusive:
@@ -1429,10 +1572,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             run.ignored_red = True
             log("tests unité #%d : rouge des seuls voisins, aussi rouges sur la "
                 "base ou non rejoués — sans effet" % unit.lot)
-    if guard is not None:
-        guard()
-    modules = contract_modules(worktree)
-    contract = run_tests(worktree, "contrats", modules, timeout=timeout)
+    modules = contract.modules
     runs.append(contract)
     contract_red = False
     if contract.inconclusive:
@@ -1529,10 +1669,15 @@ def _cell(value: str) -> str:
 
 def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
                    composition: Composition, table: str,
-                   tests: list[TestRun], freeze_seconds: float,
+                   tests: list[TestRun] | None, freeze_seconds: float,
                    ready_count: int = 0, waiting: int = 0,
                    errors: int = 0) -> str:
     """Le manifeste §12, lisible par `paquet-inclusion.py` (#1644/#2409).
+
+    #4304 : `tests=None` — le manifeste est écrit et poussé avant les tests par
+    unité, qui tournent en parallèle de la CI complète ; il le dit
+    (`TESTS_PARALLEL_LINE`) et leur résultat va à la PR, au porteur et au
+    courrier.
 
     La table d'admissions ne porte que le lot et sa source : un id cité dans
     un objet (`#N`) serait relu par le contrôle d'inclusion comme un lot
@@ -1579,8 +1724,12 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
         "## Contrôles locaux",
         "",
         "- `scripts/freeze-checks.py` : vert en %.1f s." % freeze_seconds,
-        "- Tests locaux : %s." % _tests_summary(tests),
     ]
+    if tests is None:
+        lines.append(TESTS_PARALLEL_LINE)
+        tests = []
+    else:
+        lines.append("- Tests locaux : %s." % _tests_summary(tests))
     lines += _neighbor_lines(composition, tests)
     inconclusive = _inconclusive_lines(tests)
     if inconclusive:
@@ -1807,6 +1956,60 @@ def freeze_carrier(worktree: Path, carrier: int, head: str, note: str) -> str:
     return _output(proc)
 
 
+def request_full_ci(worktree: Path, carrier: int, head: str) -> str:
+    """#4304 : la ci-full de la tête poussée, sans attendre les tests par unité.
+
+    Jamais fatal : `ameesh ci run` est idempotent sur un run en vol de la même
+    composition, et `paquet-horaire.py` (publish) la redemande après le retour.
+    """
+    cmd = ["ameesh", "ci", "run", str(carrier), "--full", "--sha", head,
+           "--avis", "0", "--reason",
+           "paquet-auto : tête poussée dès la composition (canon §6, #4304)"]
+    proc = run_command(cmd, cwd=worktree, timeout=FREEZE_TIMEOUT)
+    if proc.returncode != 0:
+        return ("ci-full non demandée sur %s (rc %d, le publish de paquet-horaire "
+                "la redemande) : %s" % (head[:12], proc.returncode, _tail(_output(proc))))
+    return "ci-full demandée sur %s" % head[:12]
+
+
+def note_carrier(worktree: Path, carrier: int, note: str) -> str:
+    """Une note au journal du porteur ; une erreur est dite, jamais fatale."""
+    proc = run_command(["ameesh", "work", "note", str(carrier), note],
+                       cwd=worktree, timeout=GIT_TIMEOUT)
+    if proc.returncode != 0:
+        return "note du porteur #%d non écrite : %s" % (carrier, _tail(_output(proc)))
+    return "note du porteur #%d écrite" % carrier
+
+
+def pull_request_state(worktree: Path, branch: str) -> str:
+    """L'état de la PR de la branche (OPEN, MERGED, CLOSED), "" si illisible."""
+    view = _gh(worktree, "pr", "view", branch, "--json", "state")
+    if view.returncode != 0:
+        return ""
+    try:
+        return str(json.loads(_decode(view.stdout)).get("state") or "").upper()
+    except (ValueError, AttributeError):
+        return ""
+
+
+def withdraw_packet(worktree: Path, carrier: int, pr_number: int | None,
+                    reason: str) -> list[str]:
+    """#4304 : un paquet déjà poussé qui n'a plus d'unité : CI annulée, PR close.
+
+    Rend les échecs (dits, jamais fatals) : le porteur est clos par l'appelant.
+    """
+    failed: list[str] = []
+    proc = run_command(["ameesh", "ci", "cancel", str(carrier), "--all"],
+                       cwd=worktree, timeout=GIT_TIMEOUT)
+    if proc.returncode != 0:
+        failed.append("ci cancel #%d : %s" % (carrier, _tail(_output(proc))))
+    if pr_number:
+        proc = _gh(worktree, "pr", "close", str(pr_number), "--comment", reason)
+        if proc.returncode != 0:
+            failed.append("gh pr close #%d : %s" % (pr_number, _tail(_output(proc))))
+    return failed
+
+
 def send_mail(recipient: str, lot: int, body: str,
               sender: str | None = None) -> str:
     cmd = ["agent-mail", "send", recipient, "-", "--lot", str(lot)]
@@ -1878,7 +2081,9 @@ def notify_removals(repo: Path, name: str, removals: list[Removal], *,
 
 def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
             composition: Composition, candidates: list[Candidate],
-            tests: list[TestRun], inclusion_rc: int, freeze_seconds: float) -> str:
+            tests: list[TestRun] | None, inclusion_rc: int,
+            freeze_seconds: float) -> str:
+    """Le corps de la PR ; `tests=None` à la poussée, avant les tests (#4304)."""
     by_lot = {candidate.lot: candidate for candidate in candidates}
     units = ", ".join("#%d" % unit.lot for unit in composition.units) or "aucun"
     discarded = ", ".join("#%d" % item.lot for item in composition.discarded) or "aucun"
@@ -1899,17 +2104,19 @@ def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
         title = _one_line(candidate.title if candidate else "")[:160]
         lines.append("- #%d `%s`%s" % (
             unit.lot, unit.source[:12], (": " + title) if title else ""))
-    lines += [
-        "- Tests locaux : %s." % _tests_summary(tests),
-    ]
-    lines += ["  " + line for line in _inconclusive_lines(tests)]
+    if tests is None:
+        lines.append("- Tests par unité : en cours, en parallèle de la CI "
+                     "complète (#4304).")
+    else:
+        lines.append("- Tests locaux : %s." % _tests_summary(tests))
+        lines += ["  " + line for line in _inconclusive_lines(tests)]
     lines += [
         "- Contrôle d'inclusion : %s." % ("vert" if inclusion_rc == 0 else "à lire"),
         "- Freeze-checks : vert (%.1f s)." % freeze_seconds,
         "- Manifeste : `%s`." % manifest_rel(name),
         "",
-        "Porteur : #%d. « Verdict non requis » et CI complète restent au pilote."
-        % carrier,
+        "Porteur : #%d. CI complète demandée dès la poussée (#4304) ; "
+        "« verdict non requis » reste au pilote." % carrier,
         "",
     ]
     return "\n".join(lines)
@@ -1936,9 +2143,9 @@ Paquet {name} composé sans agent : tête `{head}` sur {target} `{base}` (branch
 - Tests locaux : {tests}.
 - {non_section}
 - Inclusion : {inclusion}.
-- Gel : `ameesh work milestone` posé sur la tête ; manifeste `{manifest}`.
+- Gel : `ameesh work milestone` posé sur la tête dès la poussée, ci-full demandée (#4304) ; manifeste `{manifest}`.
 
-« Verdict non requis » et la ci-full restent tes gestes ; aucune fusion sur {target}.
+« Verdict non requis » reste ton geste ; aucune fusion sur {target}.
 """.format(
         name=name, head=head, target=target, base=base_sha[:12],
         branch=branch, pr=pr, n=len(composition.units), units=units,
@@ -2222,6 +2429,32 @@ def compose_packet(args: argparse.Namespace) -> int:
         runs: list[TestRun] = []
         freeze_seconds = 0.0
         recomp = 0
+        # #4304 (canon §6) : la tête est poussée, gelée et sa ci-full demandée
+        # dès la composition et les freeze-checks verts ; les tests par unité
+        # tournent ensuite, en parallèle de la CI. Un rouge retire l'unité et la
+        # tête recomposée remplace la poussée (bail sur la tête poussée).
+        lease = remote_sha
+        pushed = ""
+        pr_number: int | None = None
+        pr_url = ""
+        inclusion_rc = 0
+        head = ""
+        composition.discarded = errors + composition.discarded
+        ready_count = len([lot for lot in (payload.get("ready") or [])
+                           if int(lot) not in error_lots])
+        expected_file = Path(tmp.name) / "attendus.txt"
+
+        def title() -> str:
+            return "Paquet %s — %d unités sur %s %s" % (
+                args.name, len(composition.units), args.target, base_sha[:12])
+
+        def body(tests: list[TestRun] | None) -> str:
+            return pr_body(name=args.name, target=args.target, base_sha=base_sha,
+                           carrier=args.carrier, composition=composition,
+                           candidates=candidates, tests=tests,
+                           inclusion_rc=inclusion_rc,
+                           freeze_seconds=freeze_seconds)
+
         while True:
             if guard is not None:
                 guard()
@@ -2232,9 +2465,58 @@ def compose_packet(args: argparse.Namespace) -> int:
                     "freeze-checks rouge sur la tête composée :\n%s"
                     % _tail(freeze_output))
             print("freeze-checks : vert (%.1f s)" % freeze_seconds, flush=True)
+            table = composition_table(worktree, base_sha)
+            manifest_text = build_manifest(
+                name=args.name, target=args.target, base_sha=base_sha,
+                carrier=args.carrier, composition=composition, table=table,
+                tests=None, freeze_seconds=freeze_seconds,
+                ready_count=ready_count,
+                waiting=len(payload.get("waiting") or []),
+                errors=len(errors))
+            head = write_manifest(worktree, rel, manifest_text, name=args.name,
+                                  units=len(composition.units),
+                                  discarded=len(composition.discarded))
+            print("manifeste %s : tête %s" % (rel, head), flush=True)
+            if not args.no_packet_record:
+                print(record_packet(worktree, args.carrier, base_sha, head,
+                                    branch, args.target), flush=True)
+            _write_id_file(expected_file, [unit.lot for unit in composition.units])
+            inclusion_rc, inclusion_output = run_inclusion(
+                worktree, worktree / rel, head, ready_out, expected_file)
+            print(inclusion_output, flush=True)
+            if inclusion_rc != 0:
+                raise PaquetAutoError(
+                    "contrôle d'inclusion rouge sur la tête %s : voir le rapport "
+                    "ci-dessus" % head[:12])
+            print("inclusion : vert", flush=True)
+            if not args.local:
+                if guard is not None:
+                    guard()
+                if pushed:
+                    state = pull_request_state(worktree, branch)
+                    if state and state != "OPEN":
+                        raise PaquetAutoError(
+                            "PR de %s %s pendant les tests par unité : la "
+                            "recomposition n'est pas poussée, un agent lit"
+                            % (branch, state.lower()))
+                push_branch(worktree, branch, force_lease=lease)
+                print("poussée : %s%s" % (branch, " (recomposition)"
+                                          if lease else ""), flush=True)
+                lease = pushed = head
+                pr_number, pr_url = ensure_pull_request(
+                    worktree, branch, args.target, title(), body(None))
+                print("PR : %s" % (pr_url or pr_number or "?"), flush=True)
+                note = ("paquet %s poussé par scripts/paquet-auto.py dès la "
+                        "composition (canon §6, #4304) : %d unités, %d écartés, "
+                        "inclusion verte, tests par unité en cours ; manifeste %s"
+                        % (args.name, len(composition.units),
+                           len(composition.discarded), rel))
+                print(freeze_carrier(worktree, args.carrier, head, note), flush=True)
+                print(request_full_ci(worktree, args.carrier, head), flush=True)
             runs, faulty, removals = check_local_tests(
                 worktree, composition, timeout=args.tests_timeout,
-                base_sha=base_sha, guard=guard)
+                base_sha=base_sha, guard=guard,
+                parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
             if not faulty:
                 break
             if recomp >= MAX_RECOMPOSITIONS:
@@ -2271,7 +2553,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                 worktree, base_sha, candidates, args.carrier,
                 compose_script=compose_script,
                 record_package=not args.no_packet_record, guard=guard)
-            composition.discarded.extend(reasons)
+            composition.discarded = errors + composition.discarded + reasons
             # `--local` est une composition de contrôle : aucun courrier.
             failed: list[str] = []
             if not getattr(args, "local", False):
@@ -2282,6 +2564,16 @@ def compose_packet(args: argparse.Namespace) -> int:
                 print("courriers d'auteur non envoyés : %s"
                       % " ; ".join(failed), file=sys.stderr, flush=True)
             if not composition.units:
+                if pushed:
+                    # la tête poussée n'a plus d'unité : sa CI et sa PR tombent,
+                    # paquet-horaire clôt le porteur sur la ligne ci-dessous.
+                    for line in withdraw_packet(
+                            worktree, args.carrier, pr_number,
+                            "Paquet %s : aucune unité après recomposition "
+                            "(tests par unité rouges), PR close par "
+                            "scripts/paquet-auto.py (#4304)." % args.name):
+                        print("retrait du paquet poussé : %s" % line,
+                              file=sys.stderr, flush=True)
                 print("aucune unité après recomposition : %s"
                       % ", ".join("#%d" % item.lot
                                   for item in composition.discarded), flush=True)
@@ -2290,62 +2582,27 @@ def compose_packet(args: argparse.Namespace) -> int:
                 return 0
         if guard is not None:
             guard()
-        composition.discarded = errors + composition.discarded
-        table = composition_table(worktree, base_sha)
-        ready_count = len([lot for lot in (payload.get("ready") or [])
-                           if int(lot) not in error_lots])
-        manifest_text = build_manifest(
-            name=args.name, target=args.target, base_sha=base_sha,
-            carrier=args.carrier, composition=composition, table=table,
-            tests=runs, freeze_seconds=freeze_seconds,
-            ready_count=ready_count,
-            waiting=len(payload.get("waiting") or []),
-            errors=len(errors))
-        head = write_manifest(worktree, rel, manifest_text, name=args.name,
-                              units=len(composition.units),
-                              discarded=len(composition.discarded))
-        print("manifeste %s : tête %s" % (rel, head), flush=True)
-        if not args.no_packet_record:
-            print(record_packet(worktree, args.carrier, base_sha, head,
-                                branch, args.target), flush=True)
-        expected_file = Path(tmp.name) / "attendus.txt"
-        _write_id_file(expected_file, [unit.lot for unit in composition.units])
-        inclusion_rc, inclusion_output = run_inclusion(
-            worktree, worktree / rel, head, ready_out, expected_file)
-        print(inclusion_output, flush=True)
-        if inclusion_rc != 0:
-            raise PaquetAutoError(
-                "contrôle d'inclusion rouge sur la tête %s : voir le rapport "
-                "ci-dessus" % head[:12])
-        print("inclusion : vert", flush=True)
         if args.local:
             print("paquet %s prêt localement : branche %s, tête %s"
                   % (args.name, branch, head), flush=True)
             success = True
             return 0
-        if guard is not None:
-            guard()
-        push_branch(worktree, branch, force_lease=remote_sha)
-        print("poussée : %s%s" % (branch, " (recomposition)"
-                                  if remote_sha else ""), flush=True)
-        title = "Paquet %s — %d unités sur %s %s" % (
-            args.name, len(composition.units), args.target, base_sha[:12])
-        body = pr_body(name=args.name, target=args.target, base_sha=base_sha,
-                       carrier=args.carrier, composition=composition,
-                       candidates=candidates, tests=runs,
-                       inclusion_rc=inclusion_rc,
-                       freeze_seconds=freeze_seconds)
-        pr_number, pr_url = ensure_pull_request(
-            worktree, branch, args.target, title, body)
-        print("PR : %s" % (pr_url or pr_number or "?"), flush=True)
         inconclusive = sum(1 for run in runs if run.inconclusive)
         tests_note = ("verts" if not inconclusive
                       else "verts + %d non concluant(s) consigné(s)" % inconclusive)
-        note = ("paquet %s composé par scripts/paquet-auto.py : %d unités, "
-                "%d écartés, tests locaux %s, inclusion verte ; manifeste %s"
-                % (args.name, len(composition.units),
-                   len(composition.discarded), tests_note, rel))
-        print(freeze_carrier(worktree, args.carrier, head, note), flush=True)
+        state = pull_request_state(worktree, branch)
+        if state and state != "OPEN":
+            print("PR %s pendant les tests par unité : corps non mis à jour"
+                  % state.lower(), flush=True)
+        else:
+            pr_number, pr_url = ensure_pull_request(
+                worktree, branch, args.target, title(), body(runs))
+        print(note_carrier(
+            worktree, args.carrier,
+            "paquet %s : tests par unité %s sur la tête poussée %s (%s) ; "
+            "inclusion verte ; manifeste %s"
+            % (args.name, tests_note, head[:12], _tests_summary(runs), rel)),
+            flush=True)
         mail = mail_body(name=args.name, target=args.target, base_sha=base_sha,
                          carrier=args.carrier, head=head, branch=branch,
                          composition=composition, tests=runs,
@@ -2417,6 +2674,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tests-timeout", type=int, default=DEFAULT_TIMEOUT,
                         help="borne d'une exécution unittest (défaut : %d s)"
                         % DEFAULT_TIMEOUT)
+    parser.add_argument("--tests-parallel", type=int, default=DEFAULT_PARALLEL,
+                        help="#4271 : séries d'unités jouées en même temps, "
+                             "dans les créneaux `ameesh heavy` (défaut : %d, "
+                             "en série)" % DEFAULT_PARALLEL)
     parser.add_argument("--keep-worktree", action="store_true",
                         help="conserver le worktree jetable (diagnostic)")
     parser.add_argument("--keep-failed-hours", type=float, default=24.0,

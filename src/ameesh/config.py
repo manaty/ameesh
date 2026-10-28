@@ -77,6 +77,12 @@ def _as_float(value, default: float) -> float:
         return default
 
 
+def _as_bounded_positive(value, default):
+    """Finite positive mesh setting; malformed input keeps the configured value."""
+    parsed = _as_float(value, default)
+    return parsed if 1 <= parsed <= 86400 else default
+
+
 def _as_share(value, default: float) -> float:
     """Part entre 0 et 1 ; illisible ou hors bornes : défaut."""
     part = _as_float(value, default)
@@ -240,6 +246,9 @@ class Config:
     #: conception et auditeur du canon) : jamais en pause budget tant qu'un
     #: compte a de la marge (voir docs/COMPTES.md § 7)
     critical_agents: tuple[str, ...] = ()
+    #: #4150: read-only host idle window and protected baseline size.
+    idle_after_s: float = 1800.0
+    baseline_hosts: int = 2
     #: L242b : part du plafond horaire payé au token du mesh au-delà de
     #: laquelle un agent NON critique s'arrête (décision de mesh-design du
     #: 2026-10-12 : 0.75, soit 15 $ sur 20) ; un critique va jusqu'au plafond
@@ -469,8 +478,9 @@ class Config:
     #: configuration de l'HÔTE désigné (`projects` : projet → dépôt et dossier
     #: des migrations), validée par `ameesh.radar`.
     radar: dict = field(default_factory=dict)
-    #: #4006 : pont d'approbation IMA/GitHub. Clé `approvals` du fichier de
-    #: configuration : `projection` (chemin local en lecture seule),
+    #: #4006 : pont d'approbation GitHub. Clé `approvals` du fichier de
+    #: configuration : `authority` (nom de l'autorité, sans défaut : #4259),
+    #: `projection` (chemin local en lecture seule),
     #: `max_age_s`, `owner_uid` éventuel, et côté bureau `source` (dépôt,
     #: issue, approbateurs, `token_file` 0600, TTL). Jamais de valeur de
     #: jeton ici : seulement le chemin du fichier qui le porte.
@@ -975,6 +985,8 @@ def load(env: dict | None = None) -> Config:
         interrupt_senders=_as_names(
             pick("AMEESH_INTERRUPT_SENDERS", "AGENT_MESH_INTERRUPT_SENDERS")
         ) or cfg.interrupt_senders,
+        idle_after_s=_as_bounded_positive(pick("AMEESH_IDLE_AFTER_S"), cfg.idle_after_s),
+        baseline_hosts=int(_as_bounded_positive(pick("AMEESH_BASELINE_HOSTS"), cfg.baseline_hosts)),
         critical_agents=_as_names(pick("AMEESH_CRITICAL_AGENTS")) or tuple(
             n.strip() for n in (cfg.critical_agents.split(",")
                                 if isinstance(cfg.critical_agents, str)

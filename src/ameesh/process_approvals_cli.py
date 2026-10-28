@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Commandes du pont d'approbation IMA/GitHub (#4006).
+"""Commandes du pont d'approbation GitHub (#4006).
 
-* ``ameesh process-approvals refresh`` : sur bureau-goal, lit l'issue IMA
-  (#704 par défaut de la configuration), normalise et écrit la projection
+* ``ameesh process-approvals refresh`` : sur bureau-goal, lit l'issue source
+  (celle de la configuration), normalise et écrit la projection
   locale en lecture seule. Jamais de valeur de jeton dans la sortie.
 * ``ameesh process-approvals check`` : sur un hôte, charge la projection et
   dit si elle est fraîche, avec les compteurs et les empreintes.
@@ -14,15 +14,16 @@ fichier JSON passé à ``--config``) ::
 
     {
       "approvals": {
-        "projection": "/var/lib/ameesh/approvals/ima-704.json",
+        "authority": "<autorite>",
+        "projection": "/var/lib/ameesh/approvals/<autorite>-<issue>.json",
         "max_age_s": 300,
         "owner_uid": 0,
         "source": {
-          "repo": "thepackengers/issue-manager-agent",
-          "issue": 704,
-          "approvers": ["smichea"],
-          "artifact_repos": ["thepackengers/home"],
-          "token_file": "/etc/ameesh/secrets/ima-github.token",
+          "repo": "<org>/<depot>",
+          "issue": <issue>,
+          "approvers": ["<login>"],
+          "artifact_repos": ["<org>/<depot-des-artefacts>"],
+          "token_file": "/etc/ameesh/secrets/<autorite>-github.token",
           "api_base": "https://api.github.com",
           "ttl_s": 300,
           "timeout_s": 10,
@@ -32,6 +33,8 @@ fichier JSON passé à ``--config``) ::
       }
     }
 
+``authority`` nomme l'autorité d'approbation du mesh (obligatoire, sans
+défaut : la projection et l'identité des hôtes doivent porter la même).
 ``token_file`` nomme le secret 0600 ; la valeur n'est jamais lue depuis le
 JSON. ``owner_uid`` est optionnel : quand il est posé, la projection et son
 dossier doivent appartenir à cet uid (0 pour un fichier synchronisé par root).
@@ -80,7 +83,7 @@ def _summary(projection: approvals.Projection, *,
         states[approval.state] = states.get(approval.state, 0) + 1
     summary = {
         "schema": approvals.SCHEMA,
-        "authority": approvals.AUTHORITY,
+        "authority": projection.authority,
         "projection": projection.path,
         "generated_at": approvals._iso(projection.generated_at),
         "expires_at": approvals._iso(projection.expires_at),
@@ -166,7 +169,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ameesh process-approvals",
-        description="Pont d'approbation IMA/GitHub (#4006)")
+        description="Pont d'approbation GitHub (#4006)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     refresh = sub.add_parser("refresh",

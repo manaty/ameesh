@@ -47,10 +47,11 @@ class PlanTest(unittest.TestCase):
         self.assertTrue(report["candidate"])
         # #3383: the alert delivery joined the three observation passes
         self.assertEqual([item["name"] for item in report["timers"]],
-                         ["github-watch", "issues", "ci", "alerts"])
+                         ["github-watch", "issues", "ci", "alerts", "coherence"])
         by_name = {item["name"]: item for item in report["timers"]}
         self.assertEqual(by_name["ci"]["interval_s"], 60)
         self.assertEqual(by_name["issues"]["interval_s"], 90)
+        self.assertEqual(by_name["coherence"]["interval_s"], 6 * 3600)
         # The watch keeps a 5 min wake-up for the takeover; its persisted
         # cursor keeps the declared 900 s cadence.
         self.assertEqual(by_name["github-watch"]["interval_s"], 90)
@@ -110,6 +111,15 @@ class RenderTest(unittest.TestCase):
         self.assertIn("Type=oneshot", text)
         self.assertIn("TimeoutStartSec=10min", text)
 
+    def test_coherence_service_runs_the_pass_with_its_own_bound(self):
+        spec = role_timers.TimerSpec(
+            "coherence", "coherence", role_timers.COHERENCE_INTERVAL_S,
+            "ameesh — backlog coherence pass")
+        text = role_timers.render_service(spec, role="mesh-design",
+                                          bin_path="/opt/ameesh/bin/ameesh")
+        self.assertIn("--only coherence", text)
+        self.assertIn("TimeoutStartSec=30min", text)
+
     def test_timer_wakes_the_service_and_installs_as_a_user_timer(self):
         text = role_timers.render_timer(self.spec)
         self.assertIn("OnUnitActiveSec=60s", text)
@@ -141,8 +151,8 @@ class InstallTest(unittest.TestCase):
 
     def test_install_writes_the_units_and_limits_the_full_notifier(self):
         result = role_timers.install(self.report, directory=self.dir, apply=False)
-        self.assertEqual(len(result["installed"]), 9)  # 4 services + 4 timers + drop-in
-        for name in ("github-watch", "issues", "ci", "alerts"):
+        self.assertEqual(len(result["installed"]), 11)  # 5 services + 5 timers + drop-in
+        for name in ("github-watch", "issues", "ci", "alerts", "coherence"):
             self.assertTrue((self.dir / ("ameesh-role-%s.service" % name)).is_file())
             self.assertTrue((self.dir / ("ameesh-role-%s.timer" % name)).is_file())
         dropin = self.dir / "ameesh-notify.service.d" / "10-role-timers.conf"
@@ -192,7 +202,7 @@ class InstallTest(unittest.TestCase):
     def test_remove_deletes_the_units_and_the_dropin(self):
         role_timers.install(self.report, directory=self.dir, apply=False)
         result = role_timers.remove(self.report, directory=self.dir, apply=False)
-        self.assertEqual(len(result["removed"]), 9)
+        self.assertEqual(len(result["removed"]), 11)
         self.assertFalse((self.dir / "ameesh-role-ci.timer").exists())
         self.assertFalse((self.dir / "ameesh-notify.service.d" / "10-role-timers.conf").exists())
 

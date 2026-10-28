@@ -221,6 +221,9 @@ class LaunchTest(unittest.TestCase):
                 seal.main([])
             child.assert_not_called()
 
+    # #4294: the launch compares the pin with this host's /etc/machine-id
+    # (Linux VM); without it the second refusal would prove nothing.
+    @unittest.skipUnless(Path('/etc/machine-id').exists(), '/etc/machine-id absent : scellement Linux seulement')
     def test_absent_and_old_pin_execute_nothing(self):
         pin=Path(self.temp.name)/'pin'
         self.invoke(pin)

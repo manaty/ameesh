@@ -1,6 +1,7 @@
 # DeepSeek tool placement (#490)
 
-DeepSeek Harness 0.2.0-rc.2 uses `dsh-subprocess-local` 0.2.0-rc.2 to
+DeepSeek Harness 0.2.0-rc.2 and 0.2.1-rc.4 use
+`dsh-subprocess-local` 0.2.0-rc.2 and 0.2.1-rc.4 respectively to
 launch ordinary commands and PTYs through `systemd-run --user --scope`.
 These transient `dsh-subprocess-*.scope` units live under `app.slice`, outside
 the runner service. The runner's `MemoryMax` and any future weights therefore
@@ -19,15 +20,20 @@ Independently, every actual provider module load is checked before evaluation,
 including **profile-local `node_modules` overrides**, absolute URLs used by
 the dsh loader, and ESM `import` conditions differing from `require`.
 The checked bytes are the source returned by Node's load chain, not `pkg.main`.
-The reviewed provider entry is:
+The reviewed provider entries are:
 
 ```
 @deepseek-ai/dsh-subprocess-local 0.2.0-rc.2
 e40106ed35a1e1744c016e77f2cf59b07f87969bb7c4b424d26fb08da75e3922
+
+@deepseek-ai/dsh-subprocess-local 0.2.1-rc.4
+2964d94d6aa735f79e5cd5f54035a9d73b371e8060dda7e3bf666593428c04f4
 ```
 
-The entry's imported helper modules are pinned too, along with its separate
-`./runner` export:
+Both are pinned while the fleet moves from dsh 0.2.0-rc.2 to 0.2.1-rc.4 one
+host at a time (#4278); keeping the old entry costs nothing. The entry's
+imported helper modules are byte-identical in both versions and are pinned too,
+along with the separate `./runner` export:
 
 ```
 runner-launch-B2zsQ1Dz.js 6df08adc4a27f278878a5f4cde8b551b51e647b922ac7d6591fd62d272ced153
@@ -43,6 +49,13 @@ adds no Linux `systemd-run` call site: `execFile` still runs only `systemctl`
 queries, and the scope probe and launch keep the reviewed `spawnSync`/`spawn`
 bindings. `node-pty`, `koffi` and `@deepseek-ai/dsh-lazy-require` are loaded
 lazily, without changing the guarded `child_process` bindings.
+
+The 0.2.1-rc.4 delta keeps the same import line and the same `systemd-run
+--user --scope` probe/launch call sites. It adds an optional
+`--expand-environment=no` argument to the probe (with a fallback when the user
+manager rejects it), a listener check that selects the native scope path, and
+terminal ownership hardening. None of that evaluates the guard's bindings
+differently; only the entry hash changes.
 
 For the verified entry only, the loader replaces its `child_process` import
 with module-local bindings refusing dsh's native scope probe before any user

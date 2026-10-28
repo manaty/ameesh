@@ -39,7 +39,12 @@ l'agent. Une attente externe, même échue, ne fait pas sortir `--check` 2 : le
 rapport la relance à chaque passage. #3773 : le hold peut aussi déclarer un
 tiers extérieur sans nommer le bureau ni l'owner (`hold: attente externe :
 revue Apple`) ; le débit le range dans les mêmes « attentes externes », avec
-la même relance à l'échéance ou au seuil.
+la même relance à l'échéance ou au seuil. #4235 : un hold de pilote peut
+déclarer une **fenêtre d'observation** — une attente voulue et datée
+(`hold: fenêtre : …`, échéance armée par `--wake-at`) ; jusqu'à l'échéance,
+le débit la range dans `window_waits`, hors `slow_waits`, et `--check` ne
+sort pas 2 : rien n'est actionnable avant. À l'échéance, le hold redevient
+une attente ordinaire et le réveil échu la signale.
 
 Un lot relu (tous ses avis rendus) dont `branch_target` est la branche d'un
 autre lot **ouvert** n'est pas une attente de paquet : il ne peut entrer
@@ -133,6 +138,8 @@ GESTURES = {
                            "{gesture} (attente externe déclarée, pas un agent "
                            "à assigner ; relancer le pilote à l'échéance, "
                            "canon §10)",
+    "hold_window": "fenêtre voulue et datée : aucune relance avant le {due} ; "
+                   "à l'échéance, {motif}",
     "wake_overdue": "réveiller l'assigné : le réveil programmé est échu",
 }
 
@@ -148,6 +155,17 @@ def _external_gesture(declared: Mapping[str, Any]) -> str:
     actor = "le bureau" if declared.get("executor") == "bureau" else "l'owner"
     return GESTURES["hold_external"].format(
         actor=actor, gesture=declared.get("gesture") or "")
+
+
+def _window_gesture(declared: Mapping[str, Any], due: str | None) -> str:
+    """Le geste affiché pour une fenêtre d'observation (#4235).
+
+    Le motif est cité, borné : c'est ce qui est attendu à l'échéance ; le
+    texte complet reste dans `cause`."""
+    motif = " ".join(str(declared.get("motif") or "").split())
+    if len(motif) > 200:
+        motif = motif[:199].rstrip() + "…"
+    return GESTURES["hold_window"].format(due=due or "?", motif=motif)
 
 
 class DebitError(ValueError):
@@ -846,7 +864,12 @@ def build(*, items: Iterable[Mapping[str, Any]],
     `closure_allowed` est l'autorité de levée (#3219) partagée par `read`
     (`planned_waits.lift_authority`) : un pilote lève toute la retenue de
     fermeture, un auteur ordinaire seulement la sienne. Sans elle (appel sans
-    base), une levée ne retire que la retenue de son propre auteur."""
+    base), une levée ne retire que la retenue de son propre auteur.
+
+    #4235 : un hold de pilote qui déclare une **fenêtre d'observation** avec
+    son échéance armée (`planned_waits.observation_hold`) est listé dans
+    `window_waits`, hors `slow_waits`, jusqu'à cette échéance ; il redevient
+    une attente ordinaire ensuite."""
     # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
     # (`work.set_external_executor`) et ce lecteur. #3498 : même lecture pour
     # la déclaration d'attente externe d'un hold.
@@ -905,10 +928,13 @@ def build(*, items: Iterable[Mapping[str, Any]],
     #: #3498 : une déclaration externe vaut pour le lot, pas seulement pour le
     #: hold qui la porte ; les autres retenues du même lot sont couvertes.
     external_by_lot: dict[int, dict] = {}
+    #: #4235 : même règle pour une fenêtre d'observation déclarée.
+    window_by_lot: dict[int, dict] = {}
     wakes_out: list[dict] = []
     device_holds: list[dict] = []
     undeployed_holds: list[dict] = []
     external_waits: list[dict] = []
+    window_waits: list[dict] = []
     unreadable: list[str] = list(devices.get("unreadable") or ())
 
     for ident, item in by_id.items():
@@ -1004,6 +1030,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
                         who=review["name"], lot=ident)})
         # holds (les lots mergés peuvent encore attendre un déploiement)
         lot_holds: list[dict] = []
+        rejected_window: list[str] = []
         for hold in hold_by_lot.get(ident, {}).values():
             if terminal_ts is not None and float(hold.get("since") or 0.0) <= terminal_ts:
                 continue
@@ -1019,6 +1046,25 @@ def build(*, items: Iterable[Mapping[str, Any]],
                     "it stays an agent wait (#3498)"
                     % (ident, hold.get("by") or "?"))
                 declared = None
+            # #4235 : une fenêtre d'observation est un geste de pilote, comme
+            # la déclaration externe ; une échéance illisible ne devine rien et
+            # laisse le hold en attente d'agent (le sens sûr).
+            window = planned_waits.observation_hold(note)
+            if window is not None:
+                if holds_authoritative and hold.get("pilot") is False:
+                    # Le lot peut être couvert par la fenêtre d'un autre hold :
+                    # le constat n'est écrit que si aucune fenêtre ne tient.
+                    rejected_window.append(hold.get("by") or "?")
+                    window = None
+                else:
+                    due_ts = parse_wake_due("(due %s)" % window["due"])
+                    if due_ts is None:
+                        unreadable.append(
+                            "lot %d: observation window due date unreadable: %s"
+                            % (ident, window["due"]))
+                        window = None
+                    else:
+                        window["due_ts"] = due_ts
             device = match_device(note, devices)
             versions = _versions(note)
             version = max(versions) if versions else None
@@ -1036,6 +1082,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
             }
             if declared is not None:
                 entry["external"] = declared
+            if window is not None:
+                entry["observation"] = window
             holds_out.append(entry)
             lot_holds.append(entry)
             if device:
@@ -1051,6 +1099,21 @@ def build(*, items: Iterable[Mapping[str, Any]],
             external_by_lot[ident] = chosen
             for entry in lot_holds:
                 entry["external_lot"] = True
+        # #4235 : une fenêtre déclarée couvre les autres retenues du lot (le
+        # témoin #4027 porte deux holds, dont un de l'assigné non pilote) ;
+        # une attente externe, plus explicite, garde la priorité.
+        window_here = [entry for entry in lot_holds if entry.get("observation")]
+        if window_here and ident not in external_by_lot:
+            chosen = max(window_here,
+                         key=lambda entry: float(entry.get("since_ts") or 0.0))
+            window_by_lot[ident] = chosen
+            for entry in lot_holds:
+                entry["window_lot"] = True
+        elif rejected_window:
+            for by in rejected_window:
+                unreadable.append(
+                    "lot %d: observation window declared by %s, not a pilot "
+                    "hold: it is not a window (#4235)" % (ident, by))
         # réveils
         wake = wake_state(lot_events)
         if (wake is not None and wake.get("due_ts") is not None
@@ -1128,6 +1191,10 @@ def build(*, items: Iterable[Mapping[str, Any]],
     for row in holds_out:
         if int(row["lot"]) in external_by_lot:
             continue                    # #3498 : attente externe, pas d'agent
+        window = window_by_lot.get(int(row["lot"]))
+        if (window is not None
+                and now < float(window["observation"]["due_ts"])):
+            continue                # #4235 : fenêtre voulue et datée, à part
         state = state_by_lot.get(int(row["lot"]))
         # canon §11 bis : un correctif fusionné non déployé se traite sans
         # l'owner ; même une note qui cite une règle ou un go de l'owner ne
@@ -1174,6 +1241,30 @@ def build(*, items: Iterable[Mapping[str, Any]],
             "due_ts": due_ts, "due": _iso(due_ts),
             "reminder_ts": reminder_ts, "reminder": _iso(reminder_ts),
             "reminder_due": bool(reminder_ts is not None and now >= reminder_ts),
+            **dependents_of(lot),
+        })
+    # #4235 : une fenêtre d'observation est une attente voulue et datée ; elle
+    # est listée à part **jusqu'à son échéance**, sans relance ni sortie 2 :
+    # rien n'est actionnable avant. À l'échéance, le hold redevient une attente
+    # ordinaire (et le réveil échu garde son geste). Une attente externe, plus
+    # explicite, reste prioritaire.
+    for lot, row in window_by_lot.items():
+        declared = row["observation"]
+        due_ts = float(declared["due_ts"])
+        if lot in external_by_lot or now >= due_ts:
+            continue
+        window_waits.append({
+            "lot": lot, "title": row["title"], "app": row["app"],
+            "assignee": row.get("assignee"),
+            "who": row.get("by"), "kind": "hold_window",
+            "state": state_by_lot.get(lot),
+            "since_ts": row.get("since_ts"), "since": row.get("since"),
+            "age_s": row.get("age_s"),
+            "gesture": _window_gesture(declared, _iso(due_ts)),
+            "declared": declared["motif"], "hold_by": row.get("by"),
+            "cause": row.get("cause"),
+            "due_ts": due_ts, "due": _iso(due_ts),
+            "due_in_s": due_ts - now,
             **dependents_of(lot),
         })
     #: un réveil sur une attente externe relance l'assigné qui doit porter le
@@ -1336,6 +1427,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "external_waits": len(external_waits),
         "external_reminders": len([row for row in external_waits
                                    if row.get("reminder_due")]),
+        "window_waits": len(window_waits),
         "slow_ci_runs": len([run for run in runs
                              if float(run["duration_s"]) > ci_slow_s]),
     }
@@ -1355,6 +1447,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "external_waits": sorted(
             external_waits,
             key=lambda row: (-float(row.get("age_s") or 0.0), row["lot"])),
+        "window_waits": sorted(
+            window_waits, key=lambda row: (float(row["due_ts"]), row["lot"])),
         "qa": sorted(qa, key=lambda row: (-float(row["age_s"] or 0.0), row["lot"])),
         "blocked_reviews": sorted(blocked_reviews,
                                   key=lambda row: (-float(row["age_s"] or 0.0),
@@ -1700,15 +1794,32 @@ def format_text(report: Mapping[str, Any]) -> str:
                                 else "owner"))
     else:
         lines.append("Attentes externes, hors --check : aucune.")
+    windows = report.get("window_waits") or []
+    if windows:
+        lines.append("")
+        lines.append("Fenêtres d'observation, hors --check (%d) — attente voulue "
+                     "et datée, aucune relance avant l'échéance :" % len(windows))
+        for row in windows[:20]:
+            lines.append("  #%-6d %-16s %8s  %-22s %s"
+                         % (int(row.get("lot") or 0), str(row.get("kind")),
+                            _duration(row.get("age_s")),
+                            str(row.get("who") or "?")[:22],
+                            str(row.get("title") or "")[:48]))
+            lines.append("         → échéance %s : %s"
+                         % (row.get("due") or "?", row.get("gesture")))
+    else:
+        lines.append("Fenêtres d'observation, hors --check : aucune.")
     reviews = report.get("reviews_by_reviewer") or []
     lines.append("")
     lines.append("Avis dus par relecteur : %s" % (
         " · ".join("%s %d (max %s)" % (row["reviewer"], row["count"],
                                        _duration(row.get("oldest_age_s")))
                    for row in reviews[:12]) or "aucun"))
-    lines.append("Holds : %d · réveils : %d · sur appareil indisponible : %d · "
-                 "sur correctif non déployé : %d · relances externes : %d"
+    lines.append("Holds : %d · réveils : %d · fenêtres : %d · sur appareil "
+                 "indisponible : %d · sur correctif non déployé : %d · relances "
+                 "externes : %d"
                  % (totals.get("holds", 0), totals.get("wakes", 0),
+                    totals.get("window_waits", 0),
                     totals.get("device_holds", 0), totals.get("undeployed_holds", 0),
                     totals.get("external_reminders", 0)))
     idle = report.get("idle_agents_with_work") or []
@@ -1765,8 +1876,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="ne pas lire les jobs GitHub (durée par workflow seulement)")
     parser.add_argument("--check", action="store_true",
                         help="sortir 2 si une attente d'agent dépasse le seuil "
-                             "(hors attentes humaines et externes, même avec une "
-                             "relance due ; aucun « rien à signaler »)")
+                             "(hors attentes humaines, externes et fenêtres "
+                             "d'observation non échues, même avec une relance "
+                             "due ; aucun « rien à signaler »)")
     parser.add_argument("--canon", action="append", default=None,
                         help="racine d'un canon à lire pour les appareils (répétable)")
     parser.add_argument("--installed", default=None,

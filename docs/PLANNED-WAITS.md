@@ -137,6 +137,19 @@ A lot is stale when it is open and inactive beyond the configured threshold
   the bureau (§10). Prose without the colon separator (`attente externe de
   l'APK`) declares nothing.
 
+  #4235 : a pilot hold may declare an **observation window** — a wanted,
+  dated wait — as `hold: fenêtre : <motif>` (or `hold: fenêtre d'observation
+  : …`, `hold: observation : …`, and the journal preamble
+  `hold: (pilote …) Fenêtre d'observation voulue : …`), with its deadline
+  armed by `--wake-at` (`[réveil programmé: …]`) or written `(due …)`. Until
+  the deadline, `ameesh debit` lists it in `window_waits`, outside
+  `slow_waits`, and `--check` does not fire: nothing is actionable before the
+  deadline. At the deadline the hold becomes an ordinary agent wait again
+  (and the overdue wake keeps its gesture). As with an external declaration,
+  the window covers the lot's other holds, a non-pilot hold does not subtract
+  it (the debit says so in `unreadable`), and an unreadable deadline guesses
+  nothing: the hold stays an agent wait.
+
 Grouped views (`work list`, `progress --json`, the stale alert, the dependency
 labels) read the hold from a targeted storage stream
 (`Progress.lot_hold_events`: state transitions plus the `hold:`/lift notes,

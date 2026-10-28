@@ -19,6 +19,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ameesh import db as db_mod
 from ameesh import fil, httpkit, mesh_cli, registry, serve, server_faults, storage, work
@@ -385,6 +386,21 @@ class ServePgTest(ServerMixin, PgTestCase):
         expected = cli("decisions", "--for", "human:owner", "--json")
         self.assertEqual(dict(decisions, schema=None), dict(expected, schema=None))
 
+    def test_agent_survives_unavailable_footprint(self):
+        from ameesh import canon, host_idle, mesh_cli
+        for module, method in ((canon, "load_configured"), (res, "current"),
+                               (host_idle, "snapshot")):
+            with self.subTest(source=method), mock.patch.object(
+                    module, method, side_effect=OSError("unreadable")):
+                row = mesh_cli.agent_detail(self.db, "a1", cfg=self.cfg)
+                self.assertEqual(row["name"], "a1")
+                self.assertIsNone(row["footprint"])
+                self.assertEqual(row["footprint_unavailable"], "unreadable")
+                status, data = self.get_json("/api/v1/agents/a1")
+                self.assertEqual(status, 200, data)
+                self.assertEqual(data["agent"]["footprint_unavailable"], "unreadable")
+                self.assertIsNone(data["agent"]["footprint"])
+
     def test_unknown_objects_are_404(self):
         for path in ("/api/v1/agents/nobody", "/api/v1/lots/999999", "/api/v1/hosts/nowhere",
                      "/api/v1/threads/nothing"):
@@ -416,7 +432,7 @@ class BuildersTest(unittest.TestCase):
                      "budget.status", "exploitation.alerts"):
             self.assertIn(name + "(", source)
         cli = (ROOT / "src" / "ameesh" / "mesh_cli.py").read_text(encoding="utf-8")
-        for name in ("agent_detail(db, args.agent)", "work_rows(db,",
+        for name in ("agent_detail(db, args.agent, cfg=cfg)", "work_rows(db,",
                      # #1905 : `work show` passe aussi repo= et target= (arguments nommés à défaut)
                      "work_detail(cfg, db, args.id", "_host_json(part)"):
             self.assertIn(name, cli)

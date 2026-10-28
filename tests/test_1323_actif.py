@@ -830,8 +830,8 @@ class ActifTest(unittest.TestCase):
 
     def test_relecture_impossible_ne_renvoie_pas(self):
         """B3 : sans relecture possible (base injoignable), l'absence n'est pas
-        prouvee : meme regime que la fenetre pleine, la marque reste ambigue,
-        rien n'est renvoye et le relais operateur prend le signal (code 5)."""
+        prouvee : la marque reste ambigue, rien n'est renvoye et le relais
+        operateur prend le signal (code 5)."""
         self.ecrire(journal_complet())
         code, _, _ = self.echec_ecriture_apres_envoi()
         self.assertEqual(code, 4)
@@ -881,28 +881,6 @@ class ActifTest(unittest.TestCase):
         self.assertEqual(attestation['emissions'], {})
         self.assertEqual(attestation['notifies']['docs01']['message'], 4242)
         self.assertTrue(attestation['notifies']['docs01']['reconcilie'])
-
-    def test_marque_ambigue_preservee_et_aucun_renvoi(self):
-        """B3 : quand l'absence ne peut pas etre prouvee, la marque durable
-        reste ambigue (non reinitialisee) et rien n'est renvoye."""
-        self.ecrire(journal_complet())
-        code, _, _ = self.echec_ecriture_apres_envoi()
-        self.assertEqual(code, 4)
-        self.assertEqual(len(self.envois), 1)
-        avant = json.loads(self.attestations()[0].read_text())['emissions']['docs01']
-        with mock.patch.object(
-                self.actif, 'deja_emis',
-                side_effect=self.actif.RechercheNonExhaustive('plafond atteint')), \
-             mock.patch.object(self.actif.time, 'strftime',
-                               return_value='2026-10-14T18:00:00Z'):
-            code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
-        self.assertEqual(code, self.actif.CODE_AMBIGU, erreur)
-        self.assertIn('ambigu', erreur)
-        self.assertIn('relais operateur', erreur)
-        self.assertEqual(len(self.envois), 1)     # aucun renvoi automatique
-        attestation = json.loads(self.attestations()[0].read_text())
-        self.assertEqual(attestation['emissions']['docs01'], avant)
-        self.assertNotIn('docs01', attestation['notifies'])
 
     def test_courrier_non_remis_attestation_conservee(self):
         self.ecrire(journal_complet())

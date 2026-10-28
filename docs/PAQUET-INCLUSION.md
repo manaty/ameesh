@@ -222,6 +222,13 @@ Sur fusion propre, il crée le commit et affiche son SHA. Sur conflit, il ne
 commite pas : le message complet est déjà dans `.git/MERGE_MSG` ; on résout, on
 `git add`, puis `git commit --no-edit`. Le trailer reste en fin de message.
 
+Le contrôle d'inclusion **vérifie ce trailer** sur chaque merge de la table de
+composition (#4240) : un lot composé sans `ameesh-work: <lot>` est un défaut
+bloquant, rendu avant la CI complète et le feu. C'est ce qui manquait au paquet
+Nexlink 229 du 28/10 : les sept merges de lots n'avaient pas de trailer, la CI
+a été lancée, puis annulée après l'échec de `packet record` au gel ; il a fallu
+réécrire les sept messages, à arbre identique, et recomposer.
+
 Le sujet nomme chaque lot avec la tête composée, `#<lot> <tête>` (#2360) : un
 `#N` seul n'est qu'une citation. Une fois les unités composées, le **corps du
 lot porteur** et le manifeste reprennent la ligne que le script imprime :
@@ -289,15 +296,25 @@ restent la preuve de ses lots.
 3. **Cohérence de la liste.** Les lots composés hors liste attendue sont
    affichés (la liste peut être incomplète), ainsi que les lots attendus et
    expliqués.
+4. **Trailers de composition (#4240).** Chaque entrée de composition dont le
+   commit est une **fusion** doit porter un trailer `ameesh-work: <lot>` pour
+   chacun des lots qu'elle compose. Un merge de lot sans trailer n'est pas une
+   unité de paquet : `packet record` l'ignore ou échoue, et la porte des
+   familles d'auteurs lit alors les auteurs de la tête entière. Le contrôle le
+   refuse **ici**, avant la CI complète et le feu, au lieu de le découvrir au
+   gel après une CI annulée et une recomposition (paquet Nexlink 229, 28/10).
+   Le défaut se corrige en réécrivant le message, à arbre identique ; le
+   rapport donne le commit et le lot.
 
 Sortie : un rapport lisible ou `--json` (schéma `ameesh-paquet-inclusion/1`).
 Codes de retour : `0` aucun défaut ; `1` une inclusion manquante, un lot prêt
 ni composé ni écarté avec un motif, un lot composé alors que la liste calculée
-le dit en erreur, un contenu absent non expliqué ou un commit introuvable, ou
-bien, sous `--strict`, un contenu partiel ou vide non expliqué ; `2` entrée
-invalide (manifeste ou tête introuvable, fichier de lots absent ou illisible,
-ligne `!lot` sans motif, aucune source de liste prête, `--no-ready` refusé, ou
-aucune source de liste attendue sans `--no-expected`).
+le dit en erreur, un contenu absent non expliqué, un commit introuvable ou un
+merge de composition sans trailer `ameesh-work:`, ou bien, sous `--strict`, un
+contenu partiel ou vide non expliqué ; `2` entrée invalide (manifeste ou tête
+introuvable, fichier de lots absent ou illisible, ligne `!lot` sans motif,
+aucune source de liste prête, `--no-ready` refusé, ou aucune source de liste
+attendue sans `--no-expected`).
 
 ## Ce qu'il ne prouve pas
 

@@ -348,17 +348,19 @@ def ref_reachable(repo: str, rev: str, *,
 
 
 def _history_complete(repo: str) -> bool:
-    """Le dépôt porte-t-il une histoire complète (ni shallow ni partielle) ?
+    """Le dépôt porte-t-il une histoire de commits complète (non superficielle) ?
 
-    Une ascendance ne se prouve que sur une histoire complète : dans un clone
-    superficiel ou partiel, l'absence d'un ancêtre ne prouve pas qu'il n'est
-    pas dans la ref. Un dépôt illisible rend False (le doute refuse)."""
+    Un clone **partiel** (remote *promisor* : `blob:none`, `tree:0`, ...) garde
+    toute l'histoire des commits : git ne filtre que des blobs et des arbres,
+    et l'ascendance ne lit que les commits. Le refuser fermait `--supersedes`
+    dès qu'un dépôt connu du lot était un clone partiel (#4242 : clone
+    `blob:none` de mty-amh-docs-01). Seul un clone superficiel coupe
+    l'ascendance. Un dépôt illisible rend False (le doute refuse)."""
     try:
         shallow = _out(repo, "rev-parse", "--is-shallow-repository")
-        if str(shallow or "").strip().lower() == "true":
+        if shallow is None:
             return False
-        promisor = _out(repo, "config", "--get-regexp", r"^remote\..*\.promisor$")
-        return not str(promisor or "").strip()
+        return str(shallow).strip().lower() != "true"
     except Exception:  # noqa: BLE001 - dépôt illisible : preuve impossible
         return False
 
@@ -438,10 +440,11 @@ def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
       heads/tags qui pointe un **descendant** du gel le rend donc accessible
       (#3399 B1 cx1) ;
     - un nombre de pointes à rapatrier au-delà de son budget, un `ls-remote`
-      ou un fetch illisible, un dépôt shallow/partiel : `None` (preuve
+      ou un fetch illisible, un dépôt superficiel : `None` (preuve
       impossible, l'appelant refuse). Aucune ref annoncée n'est ignorée sans
       que le doute soit rendu : l'absence n'est jamais déduite d'une ref non
-      lue.
+      lue. Un clone partiel n'est pas un doute : ses commits sont complets
+      (#4242).
 
     Rend True (accessible), False (aucune ref distante ne le contient, prouvé)
     ou None (vérification impossible)."""
@@ -475,10 +478,15 @@ def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
         return False
     # Présence locale en un seul processus (`cat-file --batch-check`), puis
     # ascendance. Un objet absent est rapatrié par SHA exact, dans la limite
-    # de son budget (heads/tags ou autres refs).
+    # de son budget (heads/tags ou autres refs). #4242 : la sonde doit rester
+    # locale — sans `NO_LAZY_FETCH`, un clone partiel réveille le promisor pour
+    # chaque pointe absente (mesuré : 60 s de délai sur un clone `blob:none`,
+    # un objet à la fois) ; l'absence se lit ici, le fetch borné ci-dessous ne
+    # rapatrie que les pointes manquantes.
     try:
         proc = _git(repo, "cat-file", "--batch-check",
-                    stdin=("\n".join(candidates) + "\n").encode())
+                    stdin=("\n".join(candidates) + "\n").encode(),
+                    env_extra=NO_LAZY_FETCH)
     except (GitError, OSError):
         return None
     if proc.returncode != 0:

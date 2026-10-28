@@ -145,9 +145,20 @@ Le contrôle sans redémarrage exige toujours le bail, le propriétaire
 attendu et une époque positive. L’horloge est celle de PostgreSQL, lue via
 `db.connect(config.load())` dans le venv distant et l’environnement du
 runner ; aucun DSN n’est passé en argument de processus. Un changement
-d’hôte pendant le contrôle fait échouer la preuve. En cas d’échec, la
-commande indique l’unité et la commande `journalctl --user` à lancer sous
-`ameesh` sur la VM.
+d’hôte pendant le contrôle fait échouer la preuve, sauf pour un rôle élu
+repris par un autre hôte candidat à une époque supérieure : c’est la relève
+normale du §11, consignée en WARNING (reprise locale non concluante) sans
+retour arrière. Une réservation `@restart` écrite par l’exécuteur arrêté
+n’y change rien : un hôte encore sur l’ancien code l’ignore et elle expire
+en 90 s. L’échec tient si aucun autre hôte candidat ne détient un bail
+vivant au moment du contrôle. Une persona dont l’unité est désactivée
+(`UnitFileState=disabled` ou `masked`, résident expérimental) n’a pas
+d’exécuteur actif attendu : le contrôle et le redémarrage la classent hors
+périmètre, sans exiger de bail et sans relancer son unité. Un agent retiré
+du registre (`retired_ts` dans `ameesh list`) est également hors périmètre.
+Une unité absente ou illisible reste une erreur. En cas d’échec, la commande
+indique l’unité et la commande `journalctl --user` à lancer sous `ameesh`
+sur la VM.
 
 ## Installer une révision gelée, revenir en arrière
 
@@ -402,11 +413,14 @@ L’émission est bornée et **idempotente** : un seul courrier par rapporteur e
 par commit, même si la séquence est relancée. La clé d’émission est écrite
 dans l’attestation (champ `emissions`) **avant** l’envoi ; une relance relit
 le courrier déjà déposé portant cette clé et le réconcilie au lieu de le
-renvoyer. Cette recherche est **exhaustive** : la fenêtre relue double tant
-qu’elle est pleine, une absence n’est donc retenue que prouvée. Si l’absence
-ne peut pas être prouvée (base injoignable, ou fenêtre toujours pleine au
-plafond), la marque d’émission est **préservée** et rien n’est renvoyé
-automatiquement : `actif.py` sort en code 5 et `staging.sh` le signale, le
+renvoyer. Cette recherche est **ciblée** : le destinataire, l’expéditeur
+système et la clé sont filtrés dans la requête, puis la première ligne est
+lue (`LIMIT 1`), sans fenêtre sur l’historique de la boîte et sans plafond —
+une boîte de plus de 20 000 courriers ne cache donc plus un dépôt ancien.
+Une absence n’est retenue que si cette lecture aboutit à vide. Si la lecture
+échoue (base injoignable, erreur de requête), l’absence n’est pas prouvée :
+la marque d’émission est **préservée** et rien n’est renvoyé
+automatiquement ; `actif.py` sort en code 5 et `staging.sh` le signale, le
 relais opérateur vérifie le dépôt avant toute relance. Si l’envoi échoue et
 que l’absence est prouvée, la clé reste en attente et la relance renvoie une
 seule fois. L’attestation est réécrite en place, par un temporaire unique

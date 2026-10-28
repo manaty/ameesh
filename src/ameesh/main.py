@@ -110,6 +110,8 @@
   ameesh models list|show|discover      model catalog and discovery;
   ameesh module <name> …              installed project module commands, --list
                                       for installation evidence;
+  ameesh modules [--json]             discovered modules (built in and ameesh.modules
+                                      entry points): version, capabilities (L98);
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
         alerts PUSHED to the responsible human (desktop, ntfy, Slack;
         `notify` key of the host configuration; L38);
@@ -127,7 +129,7 @@
   ameesh process check <page.md> [--ref REF] [--version N] [--json]
         compile the workflow block of a canon Process card (#2225);
   ameesh process-approvals refresh|check|show
-        IMA/GitHub approval bridge (#4006): bureau reader on bureau-goal,
+        GitHub approval bridge (#4006): bureau reader on bureau-goal,
         fail-closed local projection for the hosts; source=api is never an
         authority;
   ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since 24h]
@@ -308,6 +310,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "module":
         from . import modules
         return modules.main(rest)
+    if command == "modules":
+        # L98 (#4308) : lecture du registre, sans import d'implémentation.
+        from .modules import registry
+        return registry.main(rest)
     if command in ("--version", "version"):
         from . import version
         print("ameesh %s" % version())
@@ -453,7 +459,7 @@ def _dispatch(argv: list[str] | None) -> int:
         from . import approve_check
         return approve_check.main(rest)
     if command == "process-approvals":
-        # #4006 : pont d'approbation IMA/GitHub (projection locale fail-closed)
+        # #4006 : pont d'approbation GitHub (projection locale fail-closed)
         from . import process_approvals_cli
         return process_approvals_cli.main(rest)
     print("ameesh: unknown subcommand %r" % command, file=sys.stderr)

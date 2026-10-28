@@ -1,0 +1,17 @@
+# Littéraux propres à un mesh client, refusés dans src/ameesh/** (#4259,
+# règle owner du 28/10/2026, canon processus/lots.md §7) : ameesh est
+# générique, les valeurs d'un client vivent dans sa configuration.
+#
+# Une expression régulière Python par ligne, insensible à la casse ; les
+# lignes vides et celles qui commencent par « # » sont ignorées. Pour un
+# nouveau client, ajouter ses motifs ici (organisation, dépôts, sigles,
+# noms de personnes).
+#
+# Exceptions : les commentaires Python (traces d'incident) et les
+# migrations SQL (src/ameesh/migrations/**) ne sont pas lus.
+
+# TPK (ThePackengers)
+thepackengers
+issue-manager-agent
+\btpk\b
+\bima\b

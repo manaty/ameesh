@@ -392,11 +392,12 @@ if epoque <= avant or holder not in candidats:
 print("bail du rôle élu repris par %s (époque %d > %d) — reprise normale"
       % (holder, epoque, avant))' "$avant" "$HOTE_AGENTS" <<<"$rapport"
 }
-# #4112 : l'exécuteur arrêté a-t-il réservé le rôle élu à cet hôte (#4086) ?
-# Son journal depuis le début du redémarrage le dit (`elected role reserved
-# to <hôte>`). Avec la réservation, une reprise ailleurs n'est plus l'issue
-# normale du §11 mais un échec ; sans elle (ancien code à l'arrêt, journal
-# illisible), elle reste un avertissement (#3412).
+# #4112/#4239 : l'exécuteur arrêté a-t-il réservé le rôle élu à cet hôte
+# (#4086) ? Son journal depuis le début du redémarrage le dit (`elected role
+# reserved to <hôte>`). La réservation ne fait plus échouer la reprise
+# ailleurs : un hôte encore sur l'ancien code l'ignore, et elle expire en
+# 90 s ; la relève reste l'issue normale du §11 (#4239). Le journal qualifie
+# seulement l'avertissement (reprise locale non concluante, sans retour).
 reservation_ecrite() {  # persona epoch-depuis
   local journal
   journal=$(utilisateur_agents journalctl --user -u "$(unite_agents "$1")" \
@@ -486,6 +487,11 @@ names = set()
 for r in rows:
     if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute":
         continue
+    # #4239 : un agent retire du registre (resident experimental, cas
+    # pilot-resident-4064) sort du staging ; ameesh list le montre encore
+    # avec retired_ts.
+    if r.get("retired_ts"):
+        continue
     if r.get("status") == "stopped" and not avec_arretes:
         continue
     name = r.get("name")
@@ -500,6 +506,16 @@ print("\n".join(names))' "$HOTE_AGENTS" "$arretes") || return 1
 }
 
 unite_agents() { printf 'ameesh-runner-agent@%s.service' "$1"; }
+# #4239 : une unité désactivée (résident expérimental, persona hors service)
+# n'a aucun exécuteur actif attendu. Le staging la classe hors périmètre : il
+# n'exige ni bail ni unité active et ne la relance pas. Une unité absente ou
+# illisible reste une erreur : seul l'état `disabled`/`masked` est reconnu.
+unite_hors_perimetre() {  # persona
+  local etat
+  etat=$(utilisateur_agents systemctl --user show -p UnitFileState --value \
+    "$(unite_agents "$1")" 2>/dev/null) || return 1
+  [ "$etat" = disabled ] || [ "$etat" = masked ]
+}
 echec_agent() {
   echo "$1 : $2 — journalctl --user -u $(unite_agents "$1") -n 50 (utilisateur ameesh sur $AGENTS_SSH)" >&2
 }
@@ -1059,6 +1075,17 @@ redemarrer_agents() {
       # Ne jamais poser le drain suivant tant que le précédent reste suivi.
       # Le trap réconcilie et rapporte toute pause restante, même sur échec.
       exiger_drain_precedent_leve "$p" || return 1
+      # #4239 : relire le placement et écarter une unité désactivée avant
+      # toute pause (résident expérimental, aucun exécuteur actif attendu).
+      etat=$(etat_agent "$p") || return 1
+      IFS='|' read -r st deja_pause detail <<<"$etat"
+      if [ "$st" = skip ]; then
+        echo "$p : déplacé ou mode non execute ($detail), ignoré"; continue
+      fi
+      if unite_hors_perimetre "$p"; then
+        echo "$p : unité désactivée, aucun exécuteur à relancer — hors périmètre"
+        continue
+      fi
       preparer_drain "$p" || return 1
       drain_est_indisponible "$p" && continue
       # Le placement peut changer : relire avant de toucher une unité que cet
@@ -1135,17 +1162,19 @@ redemarrer_agents() {
         echo "WARNING $p: not checked: no lease before the restart, no sign of life"
         non_verifiees+=("$p")
       elif ! attendu=$(proprietaire_de "$p") || ! attendre_bail "$avant" "$attendu" "$p"; then
-        # #3412 : un rôle élu repris par un autre hôte candidat est une issue
-        # normale ; un vrai échec ne stoppe que cet agent, le balayage continue
-        # (#2184/N2) et la sortie nomme les échecs à la fin.
+        # #3412/#4239 : un rôle élu repris par un autre hôte candidat est une
+        # issue normale ; un vrai échec ne stoppe que cet agent, le balayage
+        # continue (#2184/N2) et la sortie nomme les échecs à la fin.
         if detail=$(role_elu_repris_ailleurs "$p" "$avant"); then
-          # #4112 : sauf si l'exécuteur arrêté l'avait réservé à cet hôte.
+          # #4112 : l'exécuteur arrêté avait pu réserver le rôle à cet hôte,
+          # mais #4239 : un hôte encore sur l'ancien code l'ignore et elle
+          # expire en 90 s — la relève ailleurs reste légitime (§11). C'est
+          # une reprise locale non concluante, jamais un retour arrière.
           if reservation_ecrite "$p" "$(( ${heure%.*} - 5 ))"; then
-            echec_agent "$p" "rôle élu réservé à $HOTE_AGENTS, mais ${detail% — reprise normale}"
-            echecs+=("$p")
-            continue
+            echo "WARNING $p: $detail — réservation @restart écrite puis non honorée (relève légitime §11, sans retour)"
+          else
+            echo "WARNING $p: $detail"
           fi
-          echo "WARNING $p: $detail"
         else
           echec_agent "$p" "active, mais bail non repris"
           echecs+=("$p")
@@ -1557,20 +1586,36 @@ preuve_venv_agents() {  # persona → 0 si le MainPID vivant exécute le venv in
 }
 
 controler_agents() {
-  local noms p ligne heure attendu echec=0
+  local noms p ligne heure attendu detail echec=0
   etape "code installé sur $HOTE_AGENTS"
   releve_agents || { echo "relevé du code impossible" >&2; echec=1; }
   noms=$(agents_du_registre) || return 1
   while IFS= read -r p; do
     etape "$p"
+    # #4239 : une unité désactivée (résident expérimental) n'a pas d'exécuteur
+    # actif attendu : hors périmètre, ni unité active ni bail exigés.
+    if unite_hors_perimetre "$p"; then
+      echo "$p : unité désactivée, aucun exécuteur actif attendu — hors périmètre"
+      continue
+    fi
     utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")" \
       && utilisateur_agents journalctl --user -u "$(unite_agents "$p")" -n 15 --no-pager \
       || { echec_agent "$p" "unité inactive ou journal inaccessible"; echec=1; }
     preuve_venv_agents "$p" \
       || { echec_agent "$p" "le MainPID vivant n'exécute pas le venv installé"; echec=1; }
-    ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
-      && bail_valide 0 "$attendu" "$heure" <<<"$ligne" \
-      || { echec_agent "$p" "bail absent, étranger ou expiré, ou preuve illisible"; echec=1; }
+    if ! { ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
+             && bail_valide 0 "$attendu" "$heure" <<<"$ligne"; }; then
+      # #4239 : un rôle élu repris par un autre hôte candidat pendant le
+      # contrôle est une relève normale (§11), pas une preuve locale
+      # manquante ; l'échec ne tient que si le rôle reste sans titulaire.
+      # Époque 0 : le contrôle n'a pas d'époque d'avant, tout détenteur
+      # vivant ailleurs convient.
+      if detail=$(role_elu_repris_ailleurs "$p" 0); then
+        echo "WARNING $p: $detail — preuve locale non concluante (sans retour)"
+      else
+        echec_agent "$p" "bail absent, étranger ou expiré, ou preuve illisible"; echec=1
+      fi
+    fi
   done <<<"$noms"
   # #3345 : un profil de runner peut diverger de config.json sans bruit (train
   # resté en shadow, github absent). Contrôle léger, sans base, avant le doctor

@@ -28,7 +28,12 @@ non plus, puisqu'un revert laisse la tête du lot ancêtre de la tête du paquet
   premier parent) doivent encore être présentes à la tête, fichier par
   fichier. Un contenu absent ou partiel n'est pas une preuve d'omission — une
   adaptation d'union peut réécrire une ligne — mais c'est un signal à lire
-  **avant** le feu.
+  **avant** le feu ;
+* les **trailers `ameesh-work:`** des commits de composition : chaque entrée
+  non retirée doit porter un trailer par lot qu'elle compose (#4240). Sans
+  lui, `packet record` échoue et la porte des familles d'auteurs voit tous les
+  auteurs de la tête : le composeur s'arrête ici, avant la CI complète, au
+  lieu de recomposer après une CI annulée (paquet Nexlink 229, 28/10).
 
 Verdicts d'une entrée de composition : `présent` (toutes les lignes ajoutées
 sont là, ou le blob est identique), `partiel` (une partie seulement), `absent`
@@ -60,11 +65,12 @@ invalide. Sur une recomposition, la liste est recalculée sur la cible de la
 recomposition (`scripts/paquet-candidats.py --ready-out`).
 Codes de retour : 0 si aucun défaut ; 1 si une inclusion manquante, un lot
 prêt ni composé ni écarté avec un motif, un lot composé alors que la liste
-calculée le dit en erreur (#3813), un contenu absent non expliqué ou un commit
-introuvable, ou bien, sous `--strict`, un contenu partiel ou vide non
-expliqué ; 2 si l'entrée est invalide (manifeste ou tête introuvable, fichier
-de lots absent ou illisible, ligne `!lot` sans motif, aucune source de liste
-prête, ou aucune source de liste attendue sans `--no-expected`).
+calculée le dit en erreur (#3813), un contenu absent non expliqué, un commit
+introuvable, ou un commit de composition sans trailer `ameesh-work:` (#4240),
+ou bien, sous `--strict`, un contenu partiel ou vide non expliqué ; 2 si
+l'entrée est invalide (manifeste ou tête introuvable, fichier de lots absent
+ou illisible, ligne `!lot` sans motif, aucune source de liste prête, ou aucune
+source de liste attendue sans `--no-expected`).
 Le script est en lecture seule : aucun réseau, aucune écriture dans le dépôt.
 """
 
@@ -99,6 +105,8 @@ NO_ADMISSION_HEADING_RE = re.compile(
 EXCLUSION_HEADING_RE = re.compile(
     r"écart|ecart|retrait|retir|revert|report|exclu|différ", re.IGNORECASE)
 READY_ERROR_RE = re.compile(r"^!(\d+)\s*(?::\s*(.*))?$")
+#: le trailer d'une unité de composition, même forme que `packet_link.TRAILER`
+TRAILER_RE = re.compile(r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?(\d+)[ \t]*$")
 
 
 class GitError(RuntimeError):
@@ -480,6 +488,8 @@ def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
         "retrait": entry.retrait,
         "verdict": None,
         "ancestor": None,
+        "trailers": [],
+        "trailers_missing": [],
         "paths": [],
         "messages": [],
     }
@@ -506,6 +516,28 @@ def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
         # « retrait consigné mais contenu présent » le cas échéant.
         result["verdict"] = "retrait_consigné"
         return result
+
+    # #4240 : un merge de composition sans trailer `ameesh-work:` pour un lot
+    # qu'il porte n'est pas une unité de paquet. `packet record` l'ignore ou
+    # échoue, et la porte des familles d'auteurs lit alors les auteurs de la
+    # tête entière. On l'arrête ici, avant la CI complète et le feu, plutôt
+    # qu'après une CI annulée et une recomposition (paquet Nexlink 229). Seuls
+    # les commits de fusion sont des unités : un manifeste peut citer un commit
+    # de contenu (remise, adaptation) sans lui demander de trailer.
+    parents = git(repo, "rev-list", "--parents", "-n", "1", commit).stdout.decode(
+        "ascii", "replace").split()
+    if len(parents) >= 3:
+        body = git(repo, "show", "-s", "--format=%B", commit).stdout.decode(
+            "utf-8", "replace")
+        trailers = sorted({int(match.group(1))
+                           for match in TRAILER_RE.finditer(body)})
+        missing = [lot for lot in entry.lots if lot not in trailers]
+        result["trailers"] = trailers
+        result["trailers_missing"] = missing
+        if missing:
+            result["messages"].append(
+                "commit de composition sans trailer `ameesh-work:` pour %s"
+                % ", ".join("#%d" % lot for lot in missing))
 
     parent = rev_parse(repo, f"{commit}^")
     if parent is None:
@@ -723,6 +755,15 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
     contents: list[dict] = []
     errors: list[str] = []
     warnings: list[str] = []
+    # #4240 : les commits de composition dont le message n'a pas le trailer du
+    # lot qu'ils portent. Le défaut est bloquant : la composition n'est pas
+    # déclarable, `packet record` échoue ou ignore l'unité.
+    trailers_missing: list[dict] = [
+        {"row": result["row"], "line": result["line"], "lot": lot,
+         "commit": result["commit"] or ""}
+        for result in entry_results
+        for lot in result.get("trailers_missing") or ()
+    ]
     # #3813 : un lot en erreur n'est pas composable. Absent du manifeste, il y
     # est consigné comme écarté avec le motif du calcul, sans recopie manuelle.
     computed_errors: dict[int, str] = {
@@ -851,6 +892,13 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
                 f"erreur ({motive})")
     errors.extend(f"#{item['lot']} : {item['reason']}" for item in omissions)
     errors.extend(f"#{item['lot']} : {item['reason']}" for item in removed)
+    for item in trailers_missing:
+        errors.append(
+            "entrée %s #%d : commit de composition %s sans trailer "
+            "`ameesh-work: %d` (poser le trailer sur le message, à arbre "
+            "identique, avant la CI complète et le feu)"
+            % (item["row"], item["lot"], (item["commit"] or "")[:12],
+               item["lot"]))
     for result in entry_results:
         if not result["lots"] and result["verdict"] in ("commit_inconnu",
                                                         "non_vérifiable"):
@@ -887,6 +935,7 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
         "explained": {str(lot): reason for lot, reason in sorted(explained.items())},
         "weak": {str(lot): reason for lot, reason in sorted(manifest.weak.items())},
         "entries": entry_results,
+        "trailers_missing": trailers_missing,
         "omissions": omissions,
         "ready_omissions": [item for item in omissions if item.get("ready")],
         "removed": removed,
@@ -941,6 +990,18 @@ def render(payload: dict) -> str:
             )
     out.append("")
 
+    if payload.get("trailers_missing"):
+        out.append(
+            f"TRAILERS DE COMPOSITION MANQUANTS "
+            f"({len(payload['trailers_missing'])})"
+        )
+        for item in payload["trailers_missing"]:
+            out.append(
+                f"  entrée {item['row']} #{item['lot']} — commit "
+                f"{(item['commit'] or '')[:12]} sans `ameesh-work: "
+                f"{item['lot']}` (ligne {item['line']})"
+            )
+        out.append("")
     if payload["omissions"]:
         out.append(f"INCLUSIONS MANQUANTES ({len(payload['omissions'])})")
         for item in payload["omissions"]:

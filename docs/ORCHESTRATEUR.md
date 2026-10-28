@@ -625,7 +625,9 @@ scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
 
 Il sort `1` si un lot attendu **ou prêt** manque au manifeste (ni composition
 ni « écarté » motivé), si un lot que la liste calculée dit en erreur y est
-composé, ou si le contenu d'un lot composé a disparu de la tête (revert non
+composé, si un merge de composition n'a pas son trailer `ameesh-work: <lot>`
+(#4240 : le composeur corrige le message avant la CI, au lieu de la découvrir
+au gel), ou si le contenu d'un lot composé a disparu de la tête (revert non
 consigné) — l'ascendance d'une tête ne suffit pas après un revert (#1638).
 Sans liste prête, il sort `2` (`--no-ready` est refusé) ; sans liste attendue,
 il sort `2` sauf `--no-expected` explicite. Un fichier de lots prêts fourni

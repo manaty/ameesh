@@ -191,7 +191,7 @@ def agent_rows(cfg: Config, db) -> list:
     return _annotate_agents(cfg, db, rows)
 
 
-def agent_detail(db, name: str) -> dict | None:
+def agent_detail(db, name: str, *, cfg=None) -> dict | None:
     """The object of `ameesh show --json` (also `GET /api/v1/agents/{a}`)."""
     # L61 : la ligne et la clé en un seul aller-retour (db.batched)
     row, info = db_mod.batched(db, lambda db: (
@@ -208,6 +208,16 @@ def agent_detail(db, name: str) -> dict | None:
     row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
     row["key_updated_ts"] = (info or {}).get("key_updated_ts")
     row["key_revoked_ts"] = (info or {}).get("key_revoked_ts")
+    row["footprint"] = None
+    row["footprint_unavailable"] = None
+    if cfg is not None and row.get("host"):
+        from . import host_idle, resources, canon as canon_mod
+        try:
+            readings = {r["host"]: r for r in resources.current(db, row["host"])}
+            row["footprint"] = host_idle.snapshot(
+                cfg, db, canon_mod.load_configured(cfg), readings).get(row["host"])
+        except Exception as exc:  # optional diagnostics must not hide the agent
+            row["footprint_unavailable"] = " ".join(str(exc).split())[:120]
     return row
 
 
@@ -534,6 +544,8 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
 
     holds = host_holds.live(db)
     latest_by_host = {row["host"]: row for row in res.current(db)}
+    from . import host_idle
+    footprints = host_idle.snapshot(cfg, db, canons, latest_by_host)
     # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
     # worktrees suivis)
     hk = storage.of(db).housekeeping
@@ -559,6 +571,7 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
         stale, age = _host_reading_staleness(cfg, latest)
         parts.append({
             "name": name, "fiches": fiches, "physical": physical, "latest": latest,
+            "footprint": footprints.get(name),
             "host": fiches[0][1] if fiches else None,
             "admissions": {canon.id: _host_admissions(canon, name)
                            for canon, _fiche in fiches},
@@ -579,6 +592,9 @@ def _host_json(part: dict) -> dict:
     from . import resources as res
     host, physical, latest = part["host"], part["physical"], part["latest"]
     limits = physical["limits"]
+    measurement = res.measure(latest, limits.get("lend")) if latest is not None else None
+    if measurement is not None:
+        measurement.update(part.get("footprint") or {})
     return {
         "schema": "ameesh-host/1",
         "host": part["name"],
@@ -595,6 +611,7 @@ def _host_json(part: dict) -> dict:
                     "admissions": part["admissions"].get(canon.id, 0)}
                    for canon, fiche in part["fiches"]],
         "latest": latest,
+        "footprint": part.get("footprint"),
         # #3452 : l'âge du relevé et sa péremption, à côté de la mesure
         # qu'ils qualifient (un relevé périmé ne porte pas de pression)
         "sampled_age_s": part.get("sampled_age_s"),
@@ -604,8 +621,7 @@ def _host_json(part: dict) -> dict:
         # L159d: the offer, and the common measure (study §1.4)
         # whose lendable capacity it caps
         "offer": limits.get("lend"),
-        "measure": (res.measure(latest, limits.get("lend"))
-                    if latest is not None else None),
+        "measure": measurement,
         "pressure": part["verdict"],
         # L64: what the last reading could not measure
         "unmeasured": res.unmeasured(latest),
@@ -686,6 +702,9 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 continue
             age = _fmt_age(now - float(latest.get("sampled_ts") or now))
             print("%s — %s; measured %s" % (name, resp, age))
+            if part.get("footprint"):
+                from . import host_idle
+                print("  " + host_idle.line(part["footprint"]))
             _print_hold(part["hold"])
             _print_host_fiches(fiches, physical, admissions, many=many)
 
@@ -1186,10 +1205,11 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     from . import progress
     db = _open(cfg)
     try:
-        row = agent_detail(db, args.agent)
+        row = agent_detail(db, args.agent, cfg=cfg)
         if row is None:
             print(USAGE_HINT % ("unknown agent: %s" % args.agent), file=sys.stderr)
             return 1
+        from . import host_idle
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2))
             return 0
@@ -1200,6 +1220,10 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         status = row.get("status")
         if pause and status not in ("stopped", "dead", "blocked"):
             status = "pause-next" if pause.get("after_turn") else "op-paused"
+        if row.get("footprint"):
+            print(host_idle.line(row["footprint"]))
+        elif row.get("footprint_unavailable"):
+            print("footprint: not checked (%s)" % row["footprint_unavailable"])
         print("agent    : %s" % row["name"])
         print("workspace: %s" % (row.get("chantier") or "—"))
         print("harness  : %-9s host: %-12s status: %s%s" % (
@@ -1900,6 +1924,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "links":     # #4167 : liens typés entre lots
             from . import work_dependencies
             return work_dependencies.run_links(db, args)
+        if args.work_command == "footprint":   # #4173 : empreinte de lot (#3185)
+            from . import work_footprints
+            return work_footprints.run(cfg, db, args)
         if args.work_command == "landing":   # #1945 : atterrissage planifié sur un véhicule
             from . import work_dependencies
             return work_dependencies.run_landing(db, args)
@@ -1915,6 +1942,22 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "fire":   # #1374 : le feu du pilote au gel
             from . import fire
             return fire.run(cfg, db, args)
+        if args.work_command == "coherence":     # #4172 : passe de cohérence
+            from . import backlog_coherence
+            reports = backlog_coherence.tick(
+                cfg, db, apply=args.apply, project=args.project,
+                repo=args.repo, actor=args.actor)
+            if args.json:
+                print(json.dumps({"schema": backlog_coherence.SCHEMA,
+                                  "projects": reports}, ensure_ascii=False,
+                                 indent=2, default=str))
+                return 0
+            if not reports:
+                print("no open lot")
+                return 0
+            for report in reports:
+                print(backlog_coherence.format_report(report))
+            return 1 if any(report.get("error") for report in reports) else 0
         if args.work_command == "neighbors":
             # #2988 : lecture seule, AVANT la création — les lots voisins du
             # projet (même fichier, titre proche, ligne déjà changée depuis la
@@ -1981,17 +2024,36 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             except intake_neighbors.IntakeNeighborsError as exc:
                 raise work.WorkError(str(exc)) from None
             note = "; ".join(part for part in (segment, introduced) if part)
-            item = work.add(
-                db, title=args.title, type=args.type, source=args.source, app=args.app,
+            # #4173 : l'empreinte d'intake (chemins cités), écrite par la
+            # création même ; jamais d'échec de la création pour l'estimer.
+            from . import work_footprints
+            try:
+                footprint = work_footprints.estimate_lot(cfg, {
+                    "app": args.app or "", "title": args.title, "body": args.body or "",
+                    "branch_target": args.target or ""})
+            except Exception as exc:  # noqa: BLE001 - la création n'attend pas l'estimation
+                footprint = []
+                print("warning: footprint not estimated: %s" % exc, file=sys.stderr)
+            add_kwargs = dict(
+                title=args.title, type=args.type, source=args.source, app=args.app,
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
-                assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
+                budget_usd=args.budget, actor=args.actor,
                 package=args.package, externe=args.externe, cfg=cfg,
                 external_executor=args.external_executor,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
                 estimate=minutes, estimate_source=args.estimate_source, size=args.size,
                 note=note,
                 force=args.force,
-                parent_lot=args.parent_lot)
+                parent_lot=args.parent_lot, footprint=footprint)
+            try:
+                item = work.add(db, assignee=args.assignee, **add_kwargs)
+            except storage.FootprintOverlap as exc:
+                # #4173 : attribué, le lot chevaucherait un lot en cours du même
+                # dépôt — il est créé libre et attend la fusion (prise L165).
+                item = work.add(db, assignee=None, **add_kwargs)
+                check = None
+                print("warning: created unassigned: %s"
+                      % work_footprints.refusal(item["id"], exc.overlaps), file=sys.stderr)
             print("lot #%d created in %s: %s%s%s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan: %s)" % item["package_id"] if item.get("package_id") else "",
@@ -2035,6 +2097,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             for neighbor in infos.get("neighbors") or ():
                 print("neighbor: %s" % intake_neighbors.format_neighbor(neighbor),
                       file=sys.stderr)
+            if footprint:
+                print("footprint: %s" % ", ".join(footprint))
             return 0
         if args.work_command == "fingerprint":
             # #3885 : primitive idempotente de la règle §16 — un lot par
@@ -3743,6 +3807,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_work = sub.add_parser("work", help="work items (work_items)")
     work_sub = p_work.add_subparsers(dest="work_command")
+    pw_coherence = work_sub.add_parser(
+        "coherence", help="#4172: backlog coherence pass over the open lots of a "
+                          "project (already done, obsolete, duplicates, "
+                          "contradictions); deterministic closures and one digest "
+                          "per project with --apply")
+    pw_coherence.add_argument("--project", "--app", dest="project", default=None,
+                              help="one project (default: every project with open lots)")
+    pw_coherence.add_argument("--repo", default=None, metavar="DIR",
+                              help="local clone of the project's repository (default: the "
+                                   "one declared for the project, else the current one)")
+    pw_coherence.add_argument("--apply", action="store_true",
+                              help="close the deterministic findings and send the digest "
+                                   "(default: read-only report)")
+    pw_coherence.add_argument("--actor", default="ameesh",
+                              help="journal actor of the closures (default: ameesh)")
+    pw_coherence.add_argument("--json", action="store_true")
+    pw_coherence.set_defaults(func=cmd_work)
     pw_neighbors = work_sub.add_parser(
         "neighbors", help="#2988: read-only preview of the lots already touching this "
                           "constat (same file, close title, line changed since the "
@@ -3869,6 +3950,8 @@ def build_parser() -> argparse.ArgumentParser:
     work_dependencies.add_parser(work_sub, cmd_work)
     work_dependencies.add_landing_parser(work_sub, cmd_work)
     work_dependencies.add_links_parser(work_sub, cmd_work)
+    from . import work_footprints
+    work_footprints.add_parser(work_sub, cmd_work)
     pw_mig = work_sub.add_parser(
         "migration", help="reserve the next free migration number for the work item (L122), "
                           "before writing the file; idempotent, visible in work show")
@@ -4111,7 +4194,10 @@ def build_parser() -> argparse.ArgumentParser:
                "\"hold: attente bureau : <geste>\" (or owner), with an optional "
                "\"(due 2026-10-25 12:00 UTC)\"; ameesh debit lists it as an "
                "external wait, not an agent wait. #3773: it may also declare "
-               "a third party — \"hold: attente externe : revue Apple\".")
+               "a third party — \"hold: attente externe : revue Apple\". #4235: "
+               "a pilot hold may declare an observation window — \"hold: fenêtre "
+               ": <motif>\" with --wake-at; ameesh debit lists it apart until "
+               "the deadline, outside --check.")
     pw_note.add_argument("id", type=int)
     pw_note.add_argument("text", help="the note, or - to read it on standard input "
                                       "(heredoc <<'EOF': nothing is expanded)")

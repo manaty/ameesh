@@ -264,7 +264,7 @@ def _agents(ctx: Context, db, params, query) -> dict:
 
 def _agent(ctx: Context, db, params, query) -> dict:
     from . import mesh_cli
-    row = mesh_cli.agent_detail(db, params["agent"])
+    row = mesh_cli.agent_detail(db, params["agent"], cfg=ctx.cfg)
     if row is None:
         raise ApiError(404, "not_found", "unknown agent")
     return {"schema": "ameesh-agent-detail/1", "agent": row}

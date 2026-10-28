@@ -30,6 +30,11 @@ mécanique, ce que l'outillage exécute sans agent :
 - `staging.waiting_lots_min`, `before_cutoff_seconds`, `before_packet_seconds`
   (#3291, bloc optionnel) : le seuil de lots retenus et les marges d'un
   déploiement staging hors créneau (canon §11 bis) ; bloc absent : `None`.
+- `packet_tests.unit_timeout_seconds`, `packet_tests.parallel` (#4271, bloc
+  optionnel) : le plafond d'une série de tests ciblés d'unité du paquet
+  horaire (au-delà, non concluant, canon §3) et le nombre de séries jouées en
+  même temps dans les créneaux de l'hôte ; bloc absent : `None`, et
+  paquet-horaire le dit sans supposer de valeur.
 - `projects.<projet>.production.branch` (#3022, canon §5, décision owner
   #122895) : la branche de prod d'un projet, où un lot de porte de production
   (`prod_gate`) doit être présent pour se fermer. Absente : un tel lot n'est
@@ -88,7 +93,8 @@ _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
-                  "merge", "prevalidation", "backlog", "staging", "accounts", "projects")
+                  "merge", "prevalidation", "backlog", "staging", "accounts",
+                  "packet_tests", "projects")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production")
 _PRODUCTION_KEYS = ("branch",)
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
@@ -110,6 +116,8 @@ _STAGING_KEYS = ("waiting_lots_min", "before_cutoff_seconds",
                  "before_packet_seconds")
 #: #3647 : clés du bloc optionnel `accounts` (rythme des comptes de forfait)
 _ACCOUNTS_KEYS = ("pace_multipliers", "underused_loss")
+#: #4271 : clés du bloc optionnel `packet_tests` (tests ciblés du paquet)
+_PACKET_TESTS_KEYS = ("unit_timeout_seconds", "parallel")
 #: bornes du score de valeur d'un élément de backlog (`backlog.add`)
 _VALUE_SCORE = (1, 100)
 
@@ -184,6 +192,18 @@ class Staging:
 
 
 @dataclass(frozen=True)
+class PacketTests:
+    """#4271: optional canon rule for the targeted tests of an hourly packet."""
+
+    unit_timeout_seconds: int
+    parallel: int
+
+    def to_dict(self) -> dict:
+        return {"unit_timeout_seconds": self.unit_timeout_seconds,
+                "parallel": self.parallel}
+
+
+@dataclass(frozen=True)
 class AccountsPace:
     """#3647 : le rythme des comptes de forfait, compilé du canon (§11).
 
@@ -241,6 +261,8 @@ class Document:
     staging: Staging | None = None
     #: #3647 : rythme des comptes de forfait ; None = bloc absent
     accounts: AccountsPace | None = None
+    #: #4271 : tests ciblés du paquet horaire ; None = bloc absent
+    packet_tests: PacketTests | None = None
 
     def override(self, project: str) -> ProjectOverride | None:
         for item in self.overrides:
@@ -289,6 +311,8 @@ class Document:
             payload["staging"] = self.staging.to_dict()
         if self.accounts is not None:
             payload["accounts"] = self.accounts.to_dict()
+        if self.packet_tests is not None:
+            payload["packet_tests"] = self.packet_tests.to_dict()
         return payload
 
 
@@ -783,6 +807,12 @@ def _staging(value, where: str) -> Staging:
                      for key in _STAGING_KEYS))
 
 
+def _packet_tests(value, where: str) -> PacketTests:
+    data = _mapping(value, where, _PACKET_TESTS_KEYS)
+    return PacketTests(*(_positive_int(data.get(key), where + "." + key)
+                         for key in _PACKET_TESTS_KEYS))
+
+
 def _name(value, where: str) -> str:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise MechanicsError("%s: a non-empty name is required" % where)
@@ -894,6 +924,8 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                  if "staging" in parsed else None),
         accounts=(_accounts(parsed["accounts"], source + ".accounts")
                   if "accounts" in parsed else None),
+        packet_tests=(_packet_tests(parsed["packet_tests"], source + ".packet_tests")
+                      if "packet_tests" in parsed else None),
     )
 
 

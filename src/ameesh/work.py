@@ -564,6 +564,7 @@ def add(
     mark_note: str = "",
     unique_ref: bool = False,
     external_executor: str | None = None,
+    footprint=None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -629,7 +630,7 @@ def add(
                    note=note, force=force, parent_lot=parent_lot,
                    mark_item_id=mark_item_id, mark_note=mark_note,
                    unique_ref=unique_ref, team_queue=True,
-                   external_executor=external_executor)
+                   external_executor=external_executor, footprint=footprint)
 
 
 #: #3209 : les états d'un lot encore ouvert, lus par `open_with_source`
@@ -680,7 +681,7 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             branch_target=None, priority=None, estimate=None, estimate_source=None,
             size=None, note="", force=None, parent_lot=None, mark_item_id=None,
             mark_note="", unique_ref: bool = False, team_queue: bool,
-            external_executor=None) -> dict:
+            external_executor=None, footprint=None) -> dict:
     """`add`, et `_decision_lot` (`team_queue=False`)."""
     minutes = None
     if estimate not in (None, ""):
@@ -757,7 +758,11 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             queued_note=queued and _queued_note(queued, created),
             forced_note=queued and _forced_note(queued, created, force, actor),
             mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot,
-            unique_ref=unique_ref, external_executor=external_executor)
+            unique_ref=unique_ref, external_executor=external_executor,
+            # #4173 : l'empreinte d'intake est écrite par la création même ;
+            # attribuée, celle-ci est refusée si elle chevauche un lot en cours
+            # (`FootprintOverlap`, rien n'est écrit).
+            **({"footprint": list(footprint)} if footprint else {}))
 
     if fence is None:
         item = create(db)
@@ -2144,20 +2149,26 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     from . import pilot_gesture
     fence = pilot_gesture.gate(cfg, db, "assign", "#%d" % item_id,
                                project=(item.get("app") or None))
-    if fence is None:
-        row = storage.of(db).work.assign(item_id, check["assignee"],
-                                         current=(None if claim and not previous else previous),
-                                         note=note, actor=actor, queued_note=queued,
-                                         forced_note=queued and _forced_note(check, note, force,
-                                                                             actor))
-    else:
-        with db.transaction() as tx:
-            fence.hold(tx)
-            row = storage.of(tx).work.assign(
+    try:
+        if fence is None:
+            row = storage.of(db).work.assign(
                 item_id, check["assignee"],
                 current=(None if claim and not previous else previous),
                 note=note, actor=actor, queued_note=queued,
                 forced_note=queued and _forced_note(check, note, force, actor))
+        else:
+            with db.transaction() as tx:
+                fence.hold(tx)
+                row = storage.of(tx).work.assign(
+                    item_id, check["assignee"],
+                    current=(None if claim and not previous else previous),
+                    note=note, actor=actor, queued_note=queued,
+                    forced_note=queued and _forced_note(check, note, force, actor))
+    except storage.FootprintOverlap as exc:
+        # #4173 : l'empreinte du lot chevauche celle d'un lot en cours du
+        # même dépôt — rien n'est écrit, le lot attend sa fusion.
+        from . import work_footprints
+        raise WorkError(work_footprints.refusal(item_id, exc.overlaps)) from None
     if row is None:
         if claim:
             holder = (get(db, item_id) or {}).get("assignee")

@@ -158,10 +158,22 @@ droit cloud ni Kubernetes : seuls les adaptateurs en ont.
 - Les hôtes baseline restent allumés.
 - La nuit, le mesh Manaty retombe à 2 hôtes allumés.
 
-## 4. Hors périmètre
+## 4. Partie C, côté TPK (thepackengers/devops#472)
 
-- Les pools Kapsule de TPK, l'affinité des Jobs et le réglage de
-  l'autoscaler : thepackengers/devops#472 (partie C). Le correctif
-  provisoire est thepackengers/issue-manager-agent#1116, fusionné.
+Hors ameesh, réalisée par les agents TPK. Décisions **[owner]** du
+2026-10-28 :
+
+- Pool `baseline` de `tpk-stg` : 2 × DEV1-L, fixe, sans autoscaling. Il porte
+  le pod de service IMA, `ima-document-runtime` et les hôtes ameesh d'IMA.
+- Pool `burst` : DEV1-L, min 0, max 8, pour les Jobs d'implémentation et de
+  test. Le plafond ne monte que sur mesure, quand des runs IMA attendent.
+- Terraform fait foi. Le max 24 posé à la main hors Terraform est abandonné.
+- Les agents TPK réalisent C par #472. Le maillage Manaty ne touche ni leurs
+  agents ni leur cluster.
+
+Le correctif provisoire est thepackengers/issue-manager-agent#1116,
+fusionné.
+
+## 5. Hors périmètre
 - Le placement des pods par ameesh : ameesh ne programme pas de pods.
 - La pause opérateur bornée : manaty/ameesh#3014 (lot #3961).

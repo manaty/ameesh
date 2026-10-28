@@ -104,6 +104,9 @@ MARK_WAIT = MARK + "verdict au pilote "
 MARK_ATTEMPT = MARK + "tentative "
 MARK_FAILED = MARK + "échec "
 MARK_STUCK = MARK + "reprise épuisée "
+#: #4245 : un refus de la garde d'époque (EP4) n'est pas un échec de
+#: composition (§3, non concluant) : il ne consomme pas de tentative
+MARK_FENCED = MARK + "non concluant "
 MARK_EXCLUDED = MARK + "exclu "
 COMPOSITION = "composition"
 RECOMPOSITION = "recomposition"
@@ -111,6 +114,14 @@ ATTEMPT_RE = re.compile(
     r"^paquet-horaire: tentative (composition|recomposition) n=(\d+) base=(\S+) "
     r"par=(\S+):(\d+)(?: run=(\S+) sans=([\d,]+))?(?: epoque=(\d+))?")
 FAILED_RE = re.compile(r"^paquet-horaire: échec (composition|recomposition) n=(\d+) base=(\S+)")
+FENCED_RE = re.compile(
+    r"^paquet-horaire: non concluant (composition|recomposition) n=(\d+) base=(\S+)")
+#: #4245 : le refus de `pilot_gesture` d'une session dont l'époque n'est plus
+#: celle du bail (et que la lignée au même hôte ne couvre pas)
+FENCE_REFUSAL_RE = re.compile(r"refused for \S+: this session is fenced by the lease epoch")
+#: #4245 : relances après refus de garde pour une même étape, au-delà
+#: desquelles un agent lit le journal (une garde qui refuse toujours)
+MAX_FENCED = 3
 MAX_RECOMPOSITIONS = 1
 #: #4201 : motif écrit au manifeste pour le retrait automatique d'une unité dont
 #: la ci-full attribuée est rouge (`paquet-auto` seul écrit le motif neutre).
@@ -203,6 +214,9 @@ class Context:
     dry_run: bool = False
     #: fuseau des coupures, lu au canon compilé (`mechanics.timezone`, #2449)
     zone: ZoneInfo = ZoneInfo("UTC")
+    #: #4271 : `packet_tests` du canon compilé (borne d'une série d'unité,
+    #: séries simultanées) ; None : bloc absent, les défauts de paquet-auto
+    unit_tests: object = None
     now: float = field(default_factory=time.time)
     host: str = field(default_factory=socket.gethostname)
     pid: int = field(default_factory=os.getpid)
@@ -425,6 +439,12 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
            "--pilot", ctx.pilot, "--from", ctx.actor]
     if force:
         cmd.append("--force")
+    if ctx.unit_tests is not None:
+        cmd += ["--tests-timeout", str(ctx.unit_tests.unit_timeout_seconds),
+                "--tests-parallel", str(ctx.unit_tests.parallel)]
+    else:
+        ctx.say("packet_tests absent du canon compilé : tests ciblés en série, "
+                "borne par défaut de paquet-auto (#4271)")
     for lot in exclude:
         cmd += ["--exclude", str(lot)]
     if exclude_reason:
@@ -599,6 +619,11 @@ class Attempt:
     exclude: list[int] = field(default_factory=list)
     ts: float = 0.0
     failed: bool = False
+    #: #4245 : arrêtée par un refus de garde d'époque (non concluant, §3)
+    fenced: bool = False
+    #: #4245 (B impl-04) : reprise d'un refus de garde : `--force` même à n=1,
+    #: la branche et le worktree locaux de l'essai refusé sont restés
+    force: bool = False
     epoch: int = 0  # époque du bail à l'entrée (0 : marque sans époque)
 
     @property
@@ -626,13 +651,15 @@ def attempts(item: dict) -> list[Attempt]:
                 [int(lot) for lot in (without or "").split(",") if lot],
                 float(ev.get("created_ts") or 0), epoch=int(epoch or 0)))
             continue
-        match = FAILED_RE.match(note)
+        fenced = FENCED_RE.match(note)
+        match = fenced or FAILED_RE.match(note)
         if match:
             step, n, base = match.groups()
             base = "" if base == "-" else base
             for previous in reversed(found):
                 if (previous.step, previous.n, previous.base) == (step, int(n), base):
                     previous.failed = True
+                    previous.fenced = bool(fenced)
                     break
     return found
 
@@ -650,7 +677,7 @@ def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
     result = paquet_auto(ctx, name, carrier, exclude=this.exclude,
                          exclude_reason=(EXCLUDE_CI_FULL_REASON
                                          if this.step == RECOMPOSITION else ""),
-                         force=this.step == RECOMPOSITION or this.n > 1)
+                         force=this.step == RECOMPOSITION or this.n > 1 or this.force)
     return after_compose(ctx, carrier, name, result, this)
 
 
@@ -697,6 +724,26 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
     name = branch[len(auto.PACKAGE_PREFIX):]
     if running(ctx, this):
         return "#%d : %s en cours (%s:%d)" % (carrier, this.step, this.host, this.pid)
+    if this.fenced:
+        # #4245 : refus de garde, non concluant : même numéro de tentative,
+        # borné par MAX_FENCED ; `--force` ferme la branche et le worktree
+        # locaux laissés par l'essai refusé (le refus précède la poussée)
+        fenced = sum(1 for a in attempts(item) if a.fenced and a.key == this.key)
+        if fenced < MAX_FENCED:
+            ctx.say("#%d : reprise de la %s après refus de garde (tentative %d "
+                    "non décomptée)" % (carrier, this.step, this.n))
+            return attempt(ctx, carrier, name, Attempt(this.step, this.n, this.base,
+                                                       run_id=this.run_id,
+                                                       exclude=list(this.exclude),
+                                                       force=True))
+        if MARK_STUCK + this.key in marks(item):
+            return "#%d : reprise de la %s épuisée, déjà signalée" % (carrier, this.step)
+        ctx.mail(ctx.pilot, carrier,
+                 "#%d %s : %s refusée %d fois par la garde d'époque (tête %s) ; "
+                 "plus de reprise automatique, un agent lit le journal du porteur."
+                 % (carrier, name, this.step, fenced, (this.base or "aucune")[:12]))
+        ctx.note(carrier, MARK_STUCK + this.key)
+        return "#%d : reprise de la %s épuisée (garde)" % (carrier, this.step)
     if this.n >= MAX_ATTEMPTS:
         if MARK_STUCK + this.key in marks(item):
             return "#%d : reprise de la %s épuisée, déjà signalée" % (carrier, this.step)
@@ -715,6 +762,19 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
 def after_compose(ctx: Context, carrier: int, name: str, result: Result,
                   this: Attempt) -> str:
     step = this.step
+    # N1 de relecture : la fin de la sortie seulement (l'erreur qui arrête
+    # paquet-auto), pas une phrase citée plus haut par un test rouge
+    if result.returncode != 0 and FENCE_REFUSAL_RE.search(auto._tail(result.text, 10)):
+        # #4245 : la garde EP4 a refusé un geste (bail passé ailleurs, ou
+        # lignée rompue) ; ni échec de composition ni tentative consommée
+        ctx.note(carrier, "%s%s n=%d base=%s époque=%d" % (
+            MARK_FENCED, step, this.n, this.base or "-", ctx.epoch))
+        ctx.mail(ctx.pilot, carrier,
+                 "#%d %s : %s refusée par la garde d'époque (époque %d, tentative "
+                 "%d/%d non décomptée, §3 non concluant) ; le tic suivant reprend.\n\n%s"
+                 % (carrier, name, step, ctx.epoch, this.n, MAX_ATTEMPTS,
+                    auto._tail(result.text, 10)))
+        return "#%d : %s non concluante (refus de garde d'époque)" % (carrier, step)
     if result.returncode != 0:
         ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (
             MARK_FAILED, step, this.n, this.base or "-", result.returncode))
@@ -1047,7 +1107,8 @@ def main(argv: list[str] | None = None) -> int:
     pose_git_identity(args.pilot)
     try:
         from ameesh import config as config_mod, mechanics
-        zone = ZoneInfo(mechanics.configured(config_mod.load()).timezone)
+        rules = mechanics.configured(config_mod.load())
+        zone = ZoneInfo(rules.timezone)
     except Exception as error:  # noqa: BLE001 - sans canon, aucune heure sûre
         print("paquet-horaire : fuseau du canon compilé illisible (%s)" % error,
               file=sys.stderr)
@@ -1055,7 +1116,8 @@ def main(argv: list[str] | None = None) -> int:
     ctx = Context(repo=repo, target=args.target, project=args.project,
                   pilot=args.pilot, actor=actor, shell=Shell(),
                   python=args.python or auto.project_python(repo),
-                  dry_run=args.dry_run, zone=zone, epoch=lease_epoch())
+                  dry_run=args.dry_run, zone=zone, epoch=lease_epoch(),
+                  unit_tests=getattr(rules, "packet_tests", None))
     try:
         check_fresh(ctx)
         align_schema(ctx)
