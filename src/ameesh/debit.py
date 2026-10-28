@@ -2110,15 +2110,34 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
                 db, _SPLIT_SOURCES_SQL, (",".join(str(int(l["id"])) for l in lots),))}, {})
         lots = [dict(lot, source=sources.get(int(lot["id"]), lot.get("source")))
                 for lot in lots]
-    startable = attempt("startable lots", lambda: sous_utilisation.waiting_project_lots(
-        lots, db=db, now=now), []) if lots else []
+    # B de cx1 sur ac79c550 : `waiting_project_lots(db=…)` et `_budget_held`
+    # absorbent l'échec de leur lecteur (contrat conservateur de leurs autres
+    # appelants). Ici, les lecteurs sont appelés en direct : un échec ferme
+    # l'alerte au lieu de rendre « tout démarrable » ou « personne tenu ».
+    def startable_lots():
+        from . import planned_waits
+        waiting = sous_utilisation.waiting_project_lots(lots)
+        waits = planned_waits.read(db, waiting, now=now) if waiting else {}
+        return sous_utilisation.split_startable(waiting, waits)[0]
+
+    def budget_holds(rows):
+        if cfg is None:
+            return {}
+        from . import account_turn
+        held = {}
+        for row in rows:
+            reason = account_turn.turn_hold(cfg, db, row["name"], row)
+            if reason:
+                held[row["name"]] = reason
+        return held
+
+    startable = attempt("startable lots", startable_lots, []) if lots else []
     # la tenue de budget ne se lit que pour les agents au repos (comme
     # `idle_capacity`) : un agent occupé n'entre pas dans la part au repos
     idle = sous_utilisation.idle_agents(
         [row for row in listing if not row.get("retired_ts")], now, 0.0,
         waiting_free=True, actionable_idle=True)
-    held = attempt("budget holds",
-                   lambda: sous_utilisation._budget_held(cfg, db, idle), {})
+    held = attempt("budget holds", lambda: budget_holds(idle), {})
     notes = attempt("roadmap notes", lambda: _rows(db, _ROADMAP_SQL, (horizon,)), [])
     spent = {}
     for note in notes:

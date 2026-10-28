@@ -10,6 +10,7 @@ au reset par compte.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import unittest
 from contextlib import redirect_stdout
@@ -264,7 +265,7 @@ class ReadCapacityTest(unittest.TestCase):
         unreadable: list = []
         with mock.patch("ameesh.storage.of", return_value=store), \
                 mock.patch("ameesh.mechanics.configured", return_value=rule), \
-                mock.patch("ameesh.sous_utilisation._budget_held", return_value={}), \
+                mock.patch("ameesh.account_turn.turn_hold", return_value=""), \
                 mock.patch("ameesh.sous_utilisation.critical_verdict",
                            return_value=(False, False)), \
                 mock.patch("ameesh.sous_utilisation.latest_account_gauges", return_value={}):
@@ -296,7 +297,7 @@ class ReadCapacityTest(unittest.TestCase):
         db.query.side_effect = query
         with mock.patch("ameesh.storage.of", return_value=store), \
                 mock.patch("ameesh.mechanics.configured", return_value=rule), \
-                mock.patch("ameesh.sous_utilisation._budget_held", return_value={}), \
+                mock.patch("ameesh.account_turn.turn_hold", return_value=""), \
                 mock.patch("ameesh.sous_utilisation.waiting_project_lots", return_value=[]), \
                 mock.patch("ameesh.sous_utilisation.critical_verdict",
                            return_value=(False, False)), \
@@ -305,7 +306,56 @@ class ReadCapacityTest(unittest.TestCase):
                                       canons=[], unreadable=[])
         project = [p for p in cap["projects"] if p["project"] == "ameesh"][0]
         self.assertEqual(project["decoupage"]["lot"], 90)
+        self.assertTrue(cap["gating_ok"])
         self.assertEqual(cap["alerts"], [])
+
+
+    def _read_with(self, patches):
+        """`read_capacity` sur 2/10 au repos, un lot ouvert démarrable, et des
+        lecteurs internes remplacés par `patches`."""
+        from types import SimpleNamespace
+        lot = {"id": 12, "title": "lot", "state": "intake", "assignee": None,
+               "app": "ameesh", "type": "evolution", "created_ts": T - H}
+        store = SimpleNamespace(operations=SimpleNamespace(
+            listing=lambda: team(2, 8), open_lots_activity=lambda limit: [lot]))
+        rule = SimpleNamespace(queue_fill=SimpleNamespace(repos_part=PART, repos_s=REPOS))
+        db = mock.Mock()
+        db.query.return_value = []
+        unreadable: list = []
+        base = {"ameesh.storage.of": mock.Mock(return_value=store),
+                "ameesh.mechanics.configured": mock.Mock(return_value=rule),
+                "ameesh.sous_utilisation.critical_verdict":
+                    mock.Mock(return_value=(False, False)),
+                "ameesh.sous_utilisation.latest_account_gauges": mock.Mock(return_value={}),
+                "ameesh.planned_waits.read": mock.Mock(return_value={}),
+                "ameesh.account_turn.turn_hold": mock.Mock(return_value="")}
+        base.update(patches)
+        with contextlib.ExitStack() as stack:
+            for target, value in base.items():
+                stack.enter_context(mock.patch(target, value))
+            cap = debit.read_capacity(db, cfg=object(), now=T, hours=6, turns=[],
+                                      canons=[], unreadable=unreadable)
+        return cap, unreadable
+
+    def test_internal_readers_succeeding_raise_the_alert(self):
+        cap, unreadable = self._read_with({})
+        self.assertEqual(len(cap["alerts"]), 1)
+        self.assertEqual(unreadable, [])
+
+    def test_planned_waits_failing_raises_no_alert(self):
+        # B de cx1 : `waiting_project_lots(db=…)` absorbait cet échec
+        cap, unreadable = self._read_with(
+            {"ameesh.planned_waits.read": mock.Mock(side_effect=RuntimeError("waits"))})
+        self.assertEqual(cap["alerts"], [])
+        self.assertEqual(cap["gating_unreadable"], ["startable lots"])
+        self.assertTrue(any("startable lots" in line for line in unreadable))
+
+    def test_turn_hold_failing_raises_no_alert(self):
+        # B de cx1 : `_budget_held` absorbait cet échec
+        cap, unreadable = self._read_with(
+            {"ameesh.account_turn.turn_hold": mock.Mock(side_effect=RuntimeError("hold"))})
+        self.assertEqual(cap["alerts"], [])
+        self.assertEqual(cap["gating_unreadable"], ["budget holds"])
 
 
 if __name__ == "__main__":
