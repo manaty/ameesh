@@ -378,10 +378,23 @@ class DanglingSupersedeWithRemoteTest(_DanglingSupersededFreezeFixture):
         # #4242 : un clone superficiel coupe réellement l'histoire ;
         # l'acceptation d'un clone partiel ne relâche pas ce doute.
         bare = self.add_remote()
+        # #4318 : le dépôt nu garde la tête de `init.defaultBranch` (`main` en
+        # CI) alors qu'`add_remote` pousse `master` : le clone --depth 1
+        # annoncerait un dépôt vide, sans marqueur superficiel, et le témoin
+        # serait rouge sans rien dire du produit. On fixe la tête, puis on
+        # vérifie la précondition : un clone non marqué superficiel (git,
+        # forge) est sauté explicitement, jamais rouge.
+        self.bare_git(bare, "symbolic-ref", "HEAD", "refs/heads/master")
         shallow = os.path.join(self.tmp, "shallow")
         subprocess.run(["git", "clone", "-q", "--depth", "1",
                         "file://" + bare, shallow], check=True,
                        capture_output=True, env=self.env("impl"))
+        marque = subprocess.run(
+            ["git", "-C", shallow, "rev-parse", "--is-shallow-repository"],
+            capture_output=True, text=True, env=self.env("impl")).stdout.strip()
+        if marque != "true":
+            self.skipTest("clone --depth 1 non marqué superficiel (git %s)"
+                          % self.repo.git("--version").replace("git version ", ""))
         self.assertFalse(plan_git._history_complete(shallow))
 
 
