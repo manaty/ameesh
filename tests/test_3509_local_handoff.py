@@ -326,6 +326,16 @@ class InstallerTest(unittest.TestCase):
                      self.installer.BASE / 'runtime/bin', self.installer.UNITS,
                      self.installer.RECEIPT.parent, self.installer.ENDPOINT):
             path.mkdir(parents=True, exist_ok=True)
+        # #4301: validate_bundle refuses group/other-writable directories, so
+        # set the bundle tree's modes rather than depend on the shell's umask
+        # (0002 makes mkdir produce 0o775 and the install raises "unsafe
+        # directory").
+        for path in (self.installer.BASE, self.installer.BASE / 'lib',
+                     self.installer.BASE / 'lib/systemd',
+                     self.installer.BASE / 'runtime',
+                     self.installer.BASE / 'runtime/bin', self.installer.UNITS,
+                     self.installer.RECEIPT.parent):
+            path.chmod(0o755)
         self.installer.ENDPOINT.chmod(0o700)
         for name in self.installer.NAMES:
             (self.installer.BASE / 'lib/systemd' / name).write_text('unit ' + name)
