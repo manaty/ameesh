@@ -90,6 +90,8 @@ if action == 'pause' and sys.argv[2:] == ['--help']:
         print('usage: ameesh pause AGENT --reason R [--human H] '
               '[--not-after EPOCH] [--json]')
     sys.exit(0)
+if action == 'show' and (state / ('vide-' + name)).exists():
+    sys.exit(0)  # #4358 : sortie vide, code 0 (relève d'un rôle élu)
 if action == 'show':
     paused = pause.exists()
     # #2152 : l'agent enchaîne les tours tant qu'il n'est pas drainé ; drainé,
@@ -197,6 +199,22 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         self.assertIn('systemctl start ameesh-runner@dev9', journal_ssh)
         self.assertNotIn('systemctl restart ameesh-runner@dev9', journal_ssh)
         self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_unreadable_registry_leaves_the_agent_with_a_warning(self):
+        """#4358 : une lecture `show --json` vide n'arrête plus le script par
+        JSONDecodeError ; la persona est relue en fin de balayage, puis
+        laissée en l'état avec un avertissement, sans drain posé."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'vide-dev9').touch()
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('JSONDecodeError', p.stderr)
+        self.assertIn('WARNING dev9: registre illisible (lecture vide) — relu en'
+                      ' fin de balayage', p.stdout)
+        self.assertIn('WARNING: 1 persona(s) au registre illisible', p.stdout)
+        self.assertNotIn('pause dev9', self.poste())
+        journal_ssh = (self.state / 'ssh.log').read_text()
+        self.assertNotIn('ameesh-runner@dev9', journal_ssh)
 
     def test_unsupported_cli_never_poses_a_pause(self):
         """N5 B1 : CLI antérieur à --expect-reason — aucune pause posée ;

@@ -105,6 +105,18 @@ if sys.argv[1:] == ['list', '--json']:
     print((state / 'agents.json').read_text())
 elif sys.argv[1] == 'show':
     name = sys.argv[2]
+    # #4358 : sortie VIDE, code 0 (staging h-07, relève du rôle mesh-design) ;
+    # le fichier compte les lectures vides restantes, « toujours » ne
+    # s'épuise jamais.
+    vide = state / ('vide-' + name)
+    if vide.exists():
+        reste = vide.read_text().strip()
+        if reste != 'toujours':
+            if int(reste) <= 1:
+                vide.unlink()
+            else:
+                vide.write_text(str(int(reste) - 1))
+        sys.exit(0)
     # #2198/N4 : lecture lente ; la borne de lecture doit la couper avant la
     # borne (plus longue) des gestes de drain.
     if scenario == 'show-lent':
@@ -1335,6 +1347,61 @@ class AgentHostTest(unittest.TestCase):
         starts = self.starts()
         for n in ('dev7', 'dev8', 'dev9'):
             self.assertIn('--user start ameesh-runner-agent@%s.service' % n, starts)
+
+    def _trois_agents(self):
+        return [dict(name=n, host='host-agents', mode='execute', status='idle')
+                for n in ('dev7', 'dev8', 'dev9')]
+
+    def test_restart_absorbs_a_transient_empty_read(self):
+        """#4358 : deux lectures vides puis une valide — relues sur place."""
+        (self.state / 'vide-dev8').write_text('2')
+        p = self.run_vm('redemarrer', 'lease', agents=self._trois_agents())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('JSONDecodeError', p.stderr)
+        self.assertNotIn('illisible', p.stdout)
+        for n in ('dev7', 'dev8', 'dev9'):
+            self.assertIn('%s : redémarré' % n, p.stdout)
+
+    def test_restart_defers_an_unreadable_agent_to_the_end_of_the_sweep(self):
+        """#4358 : illisible après 3 essais (relève en cours), la persona est
+        relue en fin de balayage et redémarrée — jamais un échec d'étape."""
+        (self.state / 'vide-dev8').write_text('3')
+        p = self.run_vm('redemarrer', 'lease', agents=self._trois_agents())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('JSONDecodeError', p.stderr)
+        self.assertIn('WARNING dev8: registre illisible (lecture vide) — relu en'
+                      ' fin de balayage', p.stdout)
+        self.assertLess(p.stdout.index('dev9 : redémarré'),
+                        p.stdout.index('dev8 : redémarré'))
+        self.assertNotIn('laissée(s) en l\'état', p.stdout)
+        for n in ('dev7', 'dev8', 'dev9'):
+            self.assertIn('--user start ameesh-runner-agent@%s.service' % n,
+                          self.starts())
+
+    def test_restart_leaves_a_still_unreadable_agent_with_a_warning(self):
+        """#4358 : toujours illisible, la persona est laissée en l'état avec
+        un avertissement ; le balayage et l'étape restent verts."""
+        (self.state / 'vide-dev8').write_text('toujours')
+        p = self.run_vm('redemarrer', 'lease', agents=self._trois_agents())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('JSONDecodeError', p.stderr)
+        self.assertIn('WARNING dev8: registre toujours illisible en fin de'
+                      ' balayage', p.stdout)
+        self.assertIn('WARNING: 1 persona(s) au registre illisible, laissée(s)'
+                      ' en l\'état (non concluant) : dev8', p.stdout)
+        self.assertIn('dev7 : redémarré', p.stdout)
+        self.assertIn('dev9 : redémarré', p.stdout)
+        self.assertNotIn('ameesh-runner-agent@dev8', self.units())
+
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
+    def test_check_unreadable_registry_is_not_conclusive(self):
+        """#4358 : `controler` sur un registre illisible n'échoue pas."""
+        (self.state / 'vide-dev8').write_text('toujours')
+        p = self.run_vm('controler', 'lease', agents=self._trois_agents())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('WARNING dev8: registre illisible (lecture vide) — preuve'
+                      ' de bail non concluante (sans retour)', p.stdout)
+        self.assertIn('contrôles verts', p.stdout)
 
     def test_restart_lease_failure_continues_the_sweep(self):
         """#3412 : un vrai échec de bail ne stoppe que cet agent."""

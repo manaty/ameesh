@@ -130,6 +130,15 @@ DRAIN_MARGE_LOCALE=${DRAIN_MARGE_LOCALE:-20}
 DRAIN_LECTURE_DELAI=${DRAIN_LECTURE_DELAI:-30}
 [[ $DRAIN_LECTURE_DELAI =~ ^[0-9]+$ ]] && [ "$DRAIN_LECTURE_DELAI" -gt 0 ] \
   || { echo "DRAIN_LECTURE_DELAI invalide : « $DRAIN_LECTURE_DELAI » (secondes attendues)" >&2; exit 2; }
+# #4358 : une lecture `show --json` vide ou illisible (timeout, relève d'un
+# rôle élu en cours) n'est pas concluante : relue LECTURE_ESSAIS fois à
+# LECTURE_ECART s d'écart avant d'être rendue « illisible ».
+LECTURE_ESSAIS=${LECTURE_ESSAIS:-3}
+[[ $LECTURE_ESSAIS =~ ^[0-9]+$ ]] && [ "$LECTURE_ESSAIS" -gt 0 ] \
+  || { echo "LECTURE_ESSAIS invalide : « $LECTURE_ESSAIS » (entier > 0 attendu)" >&2; exit 2; }
+LECTURE_ECART=${LECTURE_ECART:-3}
+[[ $LECTURE_ECART =~ ^[0-9]+$ ]] \
+  || { echo "LECTURE_ECART invalide : « $LECTURE_ECART » (secondes attendues)" >&2; exit 2; }
 # #2184/R3 : une pose distante peut encore committer après la dernière lecture
 # du client (SSH coupé, timeout local) ; seule une échéance absolue, comparée
 # par la base sous le verrou de ligne, refuse une pose tardive. DRAIN_ECHEANCE
@@ -364,13 +373,34 @@ ameesh_agents_lecture() {
 ameesh_local_drain() {
   appel_drain "$DRAIN_APPEL_DELAI" "$AMEESH" "$@"
 }
-lire_bail() {
+# #4358 : `show --json` d'une persona, relu tant qu'il n'est pas un objet JSON
+# (sortie vide ou tronquée, code non nul), au plus LECTURE_ESSAIS fois ; rc 3
+# quand la lecture reste illisible — un non-concluant que l'appelant traite,
+# jamais un échec de l'étape. $2… : la commande de lecture du mode.
+lire_show() {  # persona commande… → objet JSON sur une ligne ; rc 3 si illisible
+  local p=$1 sortie essai
+  shift
+  for ((essai = 1; essai <= LECTURE_ESSAIS; essai++)); do
+    if sortie=$("$@" show "$p" --json) && python3 -c 'import json,sys
+r = json.loads(sys.stdin.read())
+if not isinstance(r, dict): sys.exit(1)
+print(json.dumps(r))' <<<"$sortie" 2>/dev/null; then
+      return 0
+    fi
+    if ((essai < LECTURE_ESSAIS)); then sleep "$LECTURE_ECART"; fi
+  done
+  echo "$p : lecture du registre vide ou illisible ($LECTURE_ESSAIS essais)" >&2
+  return 3
+}
+lire_bail() {  # rc 3 : registre illisible (#4358), rc 1 : placement modifié
+  local ligne
   if [ "$MODE" = agents ]; then
-    ameesh_agents_lecture show "$1" --json | python3 -c 'import json,sys
-r=json.load(sys.stdin)
+    ligne=$(lire_show "$1" ameesh_agents_lecture) || return
+    python3 -c 'import json,sys
+r = json.loads(sys.stdin.read())
 if r.get("host") != sys.argv[1]: sys.exit("placement modifié")
-print(json.dumps(r))' "$HOTE_AGENTS"
-  else "$AMEESH" show "$1" --json; fi
+print(json.dumps(r))' "$HOTE_AGENTS" <<<"$ligne"
+  else lire_show "$1" "$AMEESH"; fi
 }
 # #3412 : après un redémarrage, un rôle élu peut passer à un autre hôte
 # candidat ; l'élection le fait à une époque supérieure, c'est l'issue normale
@@ -408,7 +438,11 @@ reservation_ecrite() {  # persona epoch-depuis
     --since "@$2" --no-pager -o cat) || return 1
   grep -qF "] elected role reserved to $HOTE_AGENTS for " <<<"$journal"
 }
-statut() { lire_bail "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status") or "")'; }
+statut() {  # #4358 : « illisible » plutôt qu'une trace JSONDecodeError
+  local ligne
+  ligne=$(lire_bail "$1") || { echo illisible; return 0; }
+  python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("status") or "")' <<<"$ligne"
+}
 heure_base() {
   if [ "$MODE" = agents ]; then
     python_agents -c 'from ameesh import config,db
@@ -574,6 +608,8 @@ echec_agent() {
 DRAINS=()  # entrées « persona<TAB>motif<TAB>échéance locale<TAB>incertain »
 DRAINS_INDISPONIBLES=()  # personas dont la pose a été refusée
 DRAINS_NON_LEVES=()      # personas dont notre pause n'a pas pu être levée
+ILLISIBLES_REPORTEES=()  # #4358 : personas relues en fin de balayage
+ILLISIBLES=()            # #4358 : personas laissées en l'état, registre illisible
 OPERATEUR_DRAIN=
 # #2184/N4 : l'horloge du drain est injectable par les bancs (fichier de
 # secondes), pour ne pas dépendre d'un budget de temps réel ; en production,
@@ -667,26 +703,56 @@ pause_etat() {  # stdin : `show --json` → « <operator_paused>|<raison> »
 r = json.loads(sys.stdin.read() or "{}")
 print("%d|%s" % (1 if r.get("operator_paused") else 0, r.get("operator_pause_reason") or ""))'
 }
+# #4358 : un registre illisible après LECTURE_ESSAIS lectures rend
+# « illisible|0|… » (rc 0) : l'appelant reporte la persona (reporter_illisible).
 etat_agent() {  # $1 persona → « statut|pause|raison du skip » (une seule lecture)
+  local ligne rc=0
   if [ "$MODE" = agents ]; then
-    ameesh_agents_lecture show "$1" --json | python3 -c 'import json,sys
-r = json.load(sys.stdin)
+    ligne=$(lire_show "$1" ameesh_agents_lecture) || rc=$?
+  else
+    ligne=$(lire_show "$1" ameesh_local_drain) || rc=$?
+  fi
+  if [ "$rc" = 3 ]; then echo "illisible|0|lecture vide ou illisible"; return 0; fi
+  [ "$rc" = 0 ] || return "$rc"
+  if [ "$MODE" = agents ]; then
+    python3 -c 'import json,sys
+r = json.loads(sys.stdin.read())
 if r.get("host") != sys.argv[1]:
     print("skip|0|hôte=%s" % (r.get("host") or "absent"))
 elif (r.get("mode") or "execute") != "execute":
     print("skip|0|mode=%s" % (r.get("mode") or "execute"))
 else:
-    print("%s|%d|" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))' "$HOTE_AGENTS"
+    print("%s|%d|" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))' "$HOTE_AGENTS" <<<"$ligne"
   else
     # #2198/N5 : le mode compte aussi en mode serveur ; sans cette garde,
     # une persona passée `externe`/`observe` était redémarrée avec les autres.
-    ameesh_local_drain show "$1" --json | python3 -c 'import json,sys
-r = json.load(sys.stdin)
+    python3 -c 'import json,sys
+r = json.loads(sys.stdin.read())
 if (r.get("mode") or "execute") != "execute":
     print("skip|0|mode=%s" % (r.get("mode") or "execute"))
 else:
-    print("%s|%d|" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))'
+    print("%s|%d|" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))' <<<"$ligne"
   fi
+}
+# #4358 : persona au registre illisible pendant le balayage (relève d'un rôle
+# élu, timeout de lecture). Non concluant : notre drain est levé, la persona
+# est relue une fois en fin de balayage (la relève a eu le temps d'aboutir,
+# §11 : moins de 5 min) ; encore illisible, elle est laissée en l'état avec un
+# avertissement. Jamais un échec de l'étape, jamais un retour arrière. Agit
+# sur `restantes` de l'appelant (redemarrer, redemarrer_agents).
+reporter_illisible() {  # persona
+  local e
+  lever_drain_sans_arreter "$1" "registre illisible" || true
+  for e in ${ILLISIBLES_REPORTEES[@]+"${ILLISIBLES_REPORTEES[@]}"}; do
+    if [ "$e" = "$1" ]; then
+      echo "WARNING $1: registre toujours illisible en fin de balayage — exécuteur laissé en l'état (non concluant, sans retour)"
+      ILLISIBLES+=("$1")
+      return 0
+    fi
+  done
+  echo "WARNING $1: registre illisible (lecture vide) — relu en fin de balayage"
+  ILLISIBLES_REPORTEES+=("$1")
+  restantes+=("$1")
 }
 # Une entrée de DRAINS : persona<TAB>motif<TAB>échéance locale<TAB>incertain.
 # L'échéance n'est attendue que si la pose est incertaine (timeout, réponse
@@ -1072,11 +1138,13 @@ preparer_drain() {  # une seule persona, juste avant son arrêt
 }
 
 redemarrer_agents() {
-  local noms p st avant ligne heure attendu tenu restantes
+  local noms p st avant ligne heure attendu tenu restantes i rc
   local etat deja_pause detail hors
   local non_verifiees=() echecs=() echecs_hors=()
   DRAINS_INDISPONIBLES=()
   DRAINS_NON_LEVES=()
+  ILLISIBLES_REPORTEES=()
+  ILLISIBLES=()
   # #1633 : inclure les personas arrêtées pour recharger leur unité active.
   noms=$(agents_du_registre avec-arretes) || return 1
   mapfile -t restantes <<<"$noms"
@@ -1097,7 +1165,9 @@ redemarrer_agents() {
     fi
   fi
   etape "exécuteurs de $HOTE_AGENTS (${#restantes[@]}), arrêt prouvé avant chaque démarrage"
-  for p in "${restantes[@]}"; do
+  # #4358 : boucle indexée, `reporter_illisible` ajoute en fin de liste.
+  for ((i = 0; i < ${#restantes[@]}; i++)); do
+      p=${restantes[i]}
       # Ne jamais poser le drain suivant tant que le précédent reste suivi.
       # Le trap réconcilie et rapporte toute pause restante, même sur échec.
       exiger_drain_precedent_leve "$p" || return 1
@@ -1105,6 +1175,7 @@ redemarrer_agents() {
       # toute pause (résident expérimental, aucun exécuteur actif attendu).
       etat=$(etat_agent "$p") || return 1
       IFS='|' read -r st deja_pause detail <<<"$etat"
+      if [ "$st" = illisible ]; then reporter_illisible "$p"; continue; fi
       if [ "$st" = skip ]; then
         echo "$p : déplacé ou mode non execute ($detail), ignoré"; continue
       fi
@@ -1118,6 +1189,7 @@ redemarrer_agents() {
       # hôte ne doit plus mener.
       etat=$(etat_agent "$p") || return 1
       IFS='|' read -r st deja_pause detail <<<"$etat"
+      if [ "$st" = illisible ]; then reporter_illisible "$p"; continue; fi
       if [ "$st" = skip ]; then
         lever_drain_sans_arreter "$p" "placement modifié" || true
         echo "$p : déplacé ou mode non execute ($detail), ignoré"; continue
@@ -1152,6 +1224,7 @@ redemarrer_agents() {
         # mais ne pas attendre : l'arrêt prouvé prend la suite.
         etat=$(etat_agent "$p") || return 1
         IFS='|' read -r st deja_pause detail <<<"$etat"
+        if [ "$st" = illisible ]; then reporter_illisible "$p"; continue; fi
         if [ "$st" = skip ]; then
           lever_drain_sans_arreter "$p" "placement modifié" || true
           echo "$p : déplacé ou mode non execute ($detail), ignoré"; continue
@@ -1170,7 +1243,9 @@ redemarrer_agents() {
         fi
       fi
       # #502: only a runner that held its lease must take it again (bail.sh)
-      ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
+      rc=0; ligne=$(lire_bail "$p") || rc=$?
+      if [ "$rc" = 3 ]; then reporter_illisible "$p"; continue; fi
+      [ "$rc" = 0 ] && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
         || { echec_agent "$p" "registre, heure de base ou ExecStart illisible, aucun restart"; return 1; }
       avant=$(bail_epoque <<<"$ligne")
       tenu=0
@@ -1229,6 +1304,9 @@ redemarrer_agents() {
   fi
   if [ "${#non_verifiees[@]}" -gt 0 ]; then
     etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
+  fi
+  if [ "${#ILLISIBLES[@]}" -gt 0 ]; then
+    etape "WARNING: ${#ILLISIBLES[@]} persona(s) au registre illisible, laissée(s) en l'état (non concluant) : ${ILLISIBLES[*]}"
   fi
   if [ "${#echecs_hors[@]}" -gt 0 ]; then
     etape "ERREUR: unité(s) active(s) hors registre non redémarrée(s) : ${echecs_hors[*]} — elles restent sur l'ancien code"
@@ -1634,7 +1712,7 @@ preuve_venv_agents() {  # persona → 0 si le MainPID vivant exécute le venv in
 }
 
 controler_agents() {
-  local noms p ligne heure attendu detail hors connus echec=0
+  local noms p ligne heure attendu detail hors connus echec=0 rc
   etape "code installé sur $HOTE_AGENTS"
   releve_agents || { echo "relevé du code impossible" >&2; echec=1; }
   noms=$(agents_du_registre) || return 1
@@ -1651,7 +1729,13 @@ controler_agents() {
       || { echec_agent "$p" "unité inactive ou journal inaccessible"; echec=1; }
     preuve_venv_agents "$p" \
       || { echec_agent "$p" "le MainPID vivant n'exécute pas le venv installé"; echec=1; }
-    if ! { ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
+    # #4358 : un registre illisible après relectures est non concluant.
+    rc=0; ligne=$(lire_bail "$p") || rc=$?
+    if [ "$rc" = 3 ]; then
+      echo "WARNING $p: registre illisible (lecture vide) — preuve de bail non concluante (sans retour)"
+      continue
+    fi
+    if ! { [ "$rc" = 0 ] && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
              && bail_valide 0 "$attendu" "$heure" <<<"$ligne"; }; then
       # #4239 : un rôle élu repris par un autre hôte candidat pendant le
       # contrôle est une relève normale (§11), pas une preuve locale
@@ -1909,11 +1993,13 @@ installer() {
 redemarrer() {
   # shellcheck source=bail.sh
   . "$ICI/bail.sh"
-  local p st avant ligne heure tenu attendu restantes
+  local p st avant ligne heure tenu attendu restantes i rc
   local etat deja_pause detail
   local non_verifiees=()
   DRAINS_INDISPONIBLES=()
   DRAINS_NON_LEVES=()
+  ILLISIBLES_REPORTEES=()
+  ILLISIBLES=()
   # le code écrit ses nouvelles colonnes (relevé de l'hôte, tours) : sans
   # elles, l'exécuteur redémarré échouerait
   exiger_migrations "$(ssh_vm "git -C $SRC rev-parse HEAD")" redemarrer
@@ -1936,7 +2022,9 @@ redemarrer() {
   # shellcheck disable=SC2206
   restantes=($PERSONAS_VM)
   etape "exécuteurs du serveur (${#restantes[@]}), arrêt prouvé avant chaque démarrage"
-  for p in "${restantes[@]}"; do
+  # #4358 : boucle indexée, `reporter_illisible` ajoute en fin de liste.
+  for ((i = 0; i < ${#restantes[@]}; i++)); do
+      p=${restantes[i]}
       # Ne jamais poser le drain suivant tant que le précédent reste suivi.
       # Le trap réconcilie et rapporte toute pause restante, même sur échec.
       exiger_drain_precedent_leve "$p" || return 1
@@ -1945,6 +2033,7 @@ redemarrer() {
       etat=$(etat_agent "$p") \
         || { echo "$p: registry unreadable — nothing restarted" >&2; exit 1; }
       IFS='|' read -r st deja_pause detail <<<"$etat"
+      if [ "$st" = illisible ]; then reporter_illisible "$p"; continue; fi
       if [ "$st" = skip ]; then
         lever_drain_sans_arreter "$p" "placement modifié" || true
         echo "$p : déplacé ou mode non execute ($detail), ignoré"; continue
@@ -1976,6 +2065,7 @@ redemarrer() {
         etat=$(etat_agent "$p") \
           || { echo "$p: registry unreadable — nothing restarted" >&2; exit 1; }
         IFS='|' read -r st deja_pause detail <<<"$etat"
+        if [ "$st" = illisible ]; then reporter_illisible "$p"; continue; fi
         if [ "$st" = skip ]; then
           lever_drain_sans_arreter "$p" "placement modifié" || true
           echo "$p : déplacé ou mode non execute ($detail), ignoré"; continue
@@ -1993,7 +2083,9 @@ redemarrer() {
         fi
       fi
       # #502: only a runner that held its lease must take it again (bail.sh)
-      ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
+      rc=0; ligne=$(lire_bail "$p") || rc=$?
+      if [ "$rc" = 3 ]; then reporter_illisible "$p"; continue; fi
+      [ "$rc" = 0 ] && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
         || { echo "$p: registry, database clock or ExecStart unreadable — nothing restarted" >&2; exit 1; }
       avant=$(bail_epoque <<<"$ligne")
       tenu=0
@@ -2018,6 +2110,9 @@ redemarrer() {
   done
   if [ ${#non_verifiees[@]} -gt 0 ]; then
     etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
+  fi
+  if [ ${#ILLISIBLES[@]} -gt 0 ]; then
+    etape "WARNING: ${#ILLISIBLES[@]} persona(s) au registre illisible, laissée(s) en l'état (non concluant) : ${ILLISIBLES[*]}"
   fi
   if [ ${#DRAINS_INDISPONIBLES[@]} -gt 0 ]; then
     etape "ERREUR: drain(s) indisponible(s) : ${DRAINS_INDISPONIBLES[*]} — agents laissés en l'état, balayage poursuivi"

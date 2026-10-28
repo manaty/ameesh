@@ -133,6 +133,16 @@ elif args[0] == "is-active":
 FAKE_AMEESH = r'''#!/bin/sh
 echo "$0 $*" >> "$FAKE_STATE/argv.log"
 [ "$1 $2" = "show dev9" ] || exit 0
+# #4358 : sortie VIDE, code 0 ; « vide » compte les lectures vides restantes,
+# « toujours » ne s'épuise jamais.
+if [ -e "$FAKE_STATE/vide" ]; then
+  reste=$(cat "$FAKE_STATE/vide")
+  if [ "$reste" != toujours ]; then
+    if [ "$reste" -le 1 ]; then rm "$FAKE_STATE/vide"
+    else echo $((reste - 1)) > "$FAKE_STATE/vide"; fi
+  fi
+  exit 0
+fi
 scenario=$(cat "$FAKE_STATE/scenario")
 # #1152/R1 : le statut peut rester `running` à chaque lecture (incident
 # impl07) ; le fichier `statut_force` le fige pour le témoin de starvation.
@@ -466,6 +476,27 @@ class RestartLeaseTest(unittest.TestCase):
         proc = self.restart("lease")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("dev9 : redémarré", proc.stdout)
+
+    def test_transient_empty_read_is_absorbed(self):
+        """#4358 : deux lectures `show --json` vides puis une valide."""
+        with open(os.path.join(self.state, "vide"), "w", encoding="utf-8") as fh:
+            fh.write("2")
+        proc = self.restart("lease")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("JSONDecodeError", proc.stderr)
+        self.assertIn("dev9 : redémarré", proc.stdout)
+
+    def test_unreadable_registry_leaves_the_unit_with_a_warning(self):
+        """#4358 : toujours vide, l'unité est laissée en l'état (non concluant),
+        jamais un arrêt du script par JSONDecodeError."""
+        with open(os.path.join(self.state, "vide"), "w", encoding="utf-8") as fh:
+            fh.write("toujours")
+        proc = self.restart("lease")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("JSONDecodeError", proc.stderr)
+        self.assertIn("WARNING dev9: registre illisible (lecture vide)", proc.stdout)
+        self.assertIsNone(self.op_position("stop"))
+        self.assertIsNone(self.op_position("start"))
 
     def test_persona_without_a_lease_before_is_not_checked(self):
         proc = self.restart("not-held")
