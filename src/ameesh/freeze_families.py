@@ -26,6 +26,10 @@ La lecture est prudente :
   Elle ne refuse que si même ce maximum est sous le besoin ;
 * les brouillons de tests seuls (`test_only`, #3518/#3577) n'excluent aucune
   famille : ils ne sont pas des auteurs du contenu produit ;
+* les commits d'un **prérequis déclaré** (`work dependencies`) dont une tête
+  gelée précède celle du lot sont hors de la lecture d'auteurs (#4343) : ils
+  sont relus dans le parent, et leur provenance inconnue ne bloque pas
+  l'enfant ;
 * une dispense `-none` (`waiver`) ou un gel reporté (#2487) ne passe pas ici :
   la désignation du gel garde son cours, comme avant.
 
