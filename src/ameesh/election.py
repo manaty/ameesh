@@ -64,6 +64,7 @@ from typing import Mapping, Sequence
 
 from . import db as db_mod
 from . import host_lifecycle
+from . import role_handover_pg as handover_pg
 from . import role_standings_pg as pg
 from . import storage
 
@@ -79,6 +80,11 @@ MATCH_S = 180.0
 #: the old holder waits this long, after a planned release, before reclaiming
 #: (the challenger is rank 0 and may have crashed: the role must not stay free)
 HANDOVER_RECLAIM_MARGIN_S = 60.0
+#: #4086: an executor that stops while holding an elected role reserves it to
+#: its own host this long: the restarted executor reclaims first and keeps the
+#: session; a host that does not come back leaves the role to the ranked
+#: candidates once it expires (relief well under five minutes, §11)
+RESTART_RESERVE_S = 90.0
 #: `_capacity`: a load of 2×CPU is the default admission ceiling (L31, 0028)
 LOAD_CEILING_FACTOR = 2.0
 #: memory headroom that counts as full capacity (above the 1 GiB floor)
@@ -361,7 +367,10 @@ def _reading_reason(db, host: str, *, now: float | None = None,
     if reading is None:
         return "no resource reading for this host", None
     now = (float(reading.get("now_ts") or 0.0) if now is None else float(now))
-    age = now - float(reading.get("sampled_ts") or 0.0)
+    # #4086: the caller's `now` may predate this read (one instant for a whole
+    # candidacy); the row's own clock, read after it, is never behind it.
+    age = max(now, float(reading.get("now_ts") or 0.0)) - float(
+        reading.get("sampled_ts") or 0.0)
     if age < 0:
         return "resource reading dated in the future", reading
     limit = freshness_s(db, host, now=now,
@@ -388,6 +397,13 @@ def _notify_reach(cfg, role: Mapping) -> tuple[bool, str]:
     whose timer does not exist (or still predates `--pass alerts`), and the
     delivery would stay silent while another routed, equipped candidate
     waits.
+
+    #4114: one alerts unit per host, rendered for the role that carries the
+    pass there (`mesh-design` by default). The check compares it with the
+    template of **that** role, not of `role` (the role being evaluated):
+    the pass is global, so the host runs it whatever role the unit names. The
+    old comparison made auditeur and orchestrateur read a false "out of date"
+    on every host and publish `notify_ok=false`.
     """
     try:
         from . import role_timers
@@ -748,6 +764,14 @@ def claim_wait(db, role: Mapping, host: str, free_since: float, *,
         reason = ((mine or {}).get("diagnostic") or
                   "no fresh standing for this host")
         return False, "not ready: " + reason, mine
+    # #4086: a holder that stopped to restart keeps its role on its host for
+    # `RESTART_RESERVE_S`: the others wait, its own executor skips the rank.
+    reserved = handover_pg.restart_reservation(db, role["name"])
+    if reserved is not None:
+        if reserved["host"] != host:
+            return (False, "restart reservation: waits %ds for %s"
+                    % (int(float(reserved["left_s"])) + 1, reserved["host"]), mine)
+        return True, "", mine
     delay = float(mine["delay_s"] or 0.0)
     ready_at = float(free_since) + delay
     if now < ready_at:

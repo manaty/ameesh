@@ -15,11 +15,20 @@ the loader, so a restart recomputes the same window deterministically.
 
 Timestamps are Postgres' clock (never the host's), as for the standings: a
 diverging host clock cannot stretch a margin.
+
+#4086: the same table carries the **restart reservation** of an executor that
+stops while it holds an elected role (drain, `vm.sh redemarrer`, update). Its
+row names the stopping host and the sentinel challenger `RESTART`; it is read
+by every candidate (`restart_reservation`), unlike a release mark, and the
+loader of release marks leaves it out. No migration: the row fits the
+existing key `(host, role, challenger)`.
 """
 from __future__ import annotations
 
 #: a release mark is small and rare; keep two days like the standings history
 HISTORY_S = 2 * 86400
+#: #4086: the challenger of a restart reservation (never a host name)
+RESTART = "@restart"
 
 
 def load(db, host: str) -> list[dict]:
@@ -35,10 +44,10 @@ def load(db, host: str) -> list[dict]:
                extract(epoch FROM released_until)::float8 AS released_ts,
                extract(epoch FROM now())::float8 AS now_ts
           FROM role_handover
-         WHERE host = %s
+         WHERE host = %s AND challenger <> %s
            AND released_until > now() - make_interval(secs => %s::float8)
          ORDER BY released_until, challenger
-        """, (host, float(HISTORY_S)))
+        """, (host, RESTART, float(HISTORY_S)))
 
 
 def release(db, host: str, name: str, challenger: str, ttl_s: float) -> None:
@@ -56,6 +65,67 @@ def release(db, host: str, name: str, challenger: str, ttl_s: float) -> None:
            SET released_until = excluded.released_until,
                updated_at = now()
         """, (host, name, challenger, max(0.0, float(ttl_s))))
+
+
+def reserve_restart(db, host: str, name: str, ttl_s: float, *,
+                    owner: str, epoch: int) -> bool:
+    """#4086: `host` stops while holding `name` and reserves it for `ttl_s`.
+
+    Written BEFORE the lease is returned, so no candidate sees the role free
+    without the reservation, and only while `owner` holds the exact live lease
+    `epoch` (B1 of the review). Same pattern as `registry.claim`: the registry
+    row is locked by name first, then the lease is re-checked by the NEXT
+    statement, under that lock, with `clock_timestamp()`. A check in the
+    locking statement itself would be evaluated before the lock wait and not
+    redone when the holder releases the row unmodified: a lease that expired
+    meanwhile would still reserve. Returns whether the reservation was written.
+    """
+    with db.transaction() as tx:
+        tx.query("SELECT name FROM agent_registry WHERE name = %s FOR UPDATE",
+                 (name,))
+        rows = tx.query(
+            """
+            INSERT INTO role_handover (host, name, challenger, released_until)
+            SELECT %s, r.name, %s,
+                   clock_timestamp() + make_interval(secs => %s::float8)
+              FROM agent_registry r
+             WHERE r.name = %s AND r.lease_owner = %s AND r.lease_epoch = %s
+               AND r.lease_expires_at > clock_timestamp()
+            ON CONFLICT (host, name, challenger) DO UPDATE
+               SET released_until = excluded.released_until,
+                   updated_at = now()
+            RETURNING host
+            """, (host, RESTART, max(0.0, float(ttl_s)), name, owner, int(epoch)))
+    return bool(rows)
+
+
+def restart_reservation(db, name: str) -> dict | None:
+    """#4086: the live restart reservation of `name`, if any.
+
+    `{"host", "left_s"}` on the database clock (`clock_timestamp()`, not the
+    reader's transaction start). Each one was written under the exact live
+    lease of its host (`reserve_restart`) and any claim consumes them all
+    (`clear_restart`), so a live one names the last holder; the latest wins
+    all the same.
+    """
+    rows = db.query(
+        """
+        SELECT host,
+               extract(epoch FROM released_until - clock_timestamp())::float8 AS left_s
+          FROM role_handover
+         WHERE name = %s AND challenger = %s
+           AND released_until > clock_timestamp()
+         ORDER BY updated_at DESC, released_until DESC
+         LIMIT 1
+        """, (name, RESTART))
+    return rows[0] if rows else None
+
+
+def clear_restart(db, name: str) -> None:
+    """#4086: `name` is held again; every restart reservation of it is spent."""
+    db.execute(
+        "DELETE FROM role_handover WHERE name = %s AND challenger = %s",
+        (name, RESTART))
 
 
 def prune(db, *, keep_s: float = HISTORY_S) -> int:
