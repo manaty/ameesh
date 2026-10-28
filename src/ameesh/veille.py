@@ -665,13 +665,67 @@ def _body(source: Source, installed: dict, published_row: dict, rec: dict,
         lines.append("")
 
     lines.append("## Évaluation attendue")
-    lines.append("Rejouer le banc comparatif de la spec #3264 §3 (3 lots livrés, "
-                 "léger, normal, sensible), avec la version installée et la "
-                 "version évaluée, même modèle, même effort, même plafond. "
-                 "Le rapport va en note du lot ; aucune adoption sans "
+    lines.extend(_evaluation_brief(source, obj, installed, billed))
+    lines.append("Le rapport va en note du lot ; aucune adoption sans "
                  "conclusion (§4). Budget : au plus 3 lots × 2 versions et "
                  "6 relectures (§3.3).")
     return "\n".join(lines) + "\n"
+
+
+def _evaluation_brief(source: Source, obj: dict, installed: dict,
+                      billed: list[str]) -> list[str]:
+    """La consigne de rejeu, conditionnée par l'objet évalué (B1 cx3 #4291).
+
+    Un harnais se rejoue à modèle, effort et plafond constants ; un modèle se
+    rejoue à harnais, effort et plafond constants, contre le modèle de
+    référence réellement facturé. Le paramètre évalué est nommé dans le
+    rapport, comme la référence (ou « à choisir » si aucun tour facturé n'est
+    connu)."""
+    reference = next((name for name in billed if name), "")
+    if obj["kind"] == "harness":
+        version = installed.get("newest") or "version installée inconnue"
+        if reference:
+            reference_line = (" ; modèle de référence réellement facturé : `%s`"
+                              % reference)
+            if len(billed) > 1:
+                reference_line += (" (autres modèles facturés : %s)"
+                                   % ", ".join("`%s`" % name for name in billed[1:]))
+        else:
+            reference_line = (" ; aucun modèle facturé n'est connu : choisir et "
+                              "consigner le modèle de référence avant de rejouer")
+        return [
+            "Rejouer le banc comparatif de la spec #3264 §3 (3 lots livrés, "
+            "léger, normal, sensible) sur le harnais `%s` : version installée "
+            "`%s` contre version évaluée `%s`." % (
+                source.harness, version, obj["version"]),
+            "Garder le même modèle, le même effort et le même plafond de tour "
+            "pour les deux rejeux%s." % reference_line,
+            "Le rapport nomme le paramètre évalué (harnais `%s`, version "
+            "installée contre version évaluée), le modèle utilisé, l'effort "
+            "et le plafond." % source.harness,
+        ]
+    if reference:
+        first = ("Rejouer le banc comparatif de la spec #3264 §3 (3 lots "
+                 "livrés, léger, normal, sensible) avec le modèle de référence "
+                 "réellement facturé `%s` et le modèle évalué `%s`, harnais "
+                 "`%s` constant." % (reference, obj["name"], source.harness))
+        if len(billed) > 1:
+            first += (" Autres modèles facturés : %s."
+                      % ", ".join("`%s`" % name for name in billed[1:]))
+        reference_text = "`%s`" % reference
+    else:
+        first = ("Rejouer le banc comparatif de la spec #3264 §3 (3 lots "
+                 "livrés, léger, normal, sensible) avec le modèle de référence "
+                 "à choisir (aucun modèle facturé connu) et le modèle évalué "
+                 "`%s`, harnais `%s` constant." % (obj["name"], source.harness))
+        reference_text = "à choisir (aucun modèle facturé connu)"
+    return [
+        first,
+        "Garder le même harnais (`%s`), le même effort et le même plafond de "
+        "tour pour les deux rejeux." % source.harness,
+        "Le rapport nomme le modèle évalué (`%s`), le modèle de référence (%s), "
+        "le harnais, l'effort et le plafond." % (obj["name"], reference_text),
+    ]
 
 
 def _model_days_hint(models: dict) -> float:

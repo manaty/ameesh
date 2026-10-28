@@ -174,6 +174,37 @@ class VersionsTest(unittest.TestCase):
                 veille.settings(types.SimpleNamespace(veille=block))
         self.assertEqual(veille.settings(types.SimpleNamespace(veille={})).sources, ())
 
+    def test_briefs_depend_on_the_evaluated_object(self):
+        installed = {"hosts": {"vm": {"version": "1.0.0"}}, "newest": "1.0.0",
+                     "differs": False, "missing": []}
+        published = {"source": "npm", "error": "", "ignored": [],
+                     "releases": [{"version": "1.1.0", "date": "2026-10-01",
+                                   "source": "npm", "url": "", "tag": ""}]}
+        decision = veille.evaluate(source(), installed, published, {}, {},
+                                   ["ref-model"])
+        body = decision["body"]
+        self.assertIn("même modèle", body)
+        self.assertIn("modèle de référence réellement facturé : `ref-model`", body)
+        self.assertIn("version installée `1.0.0` contre version évaluée `1.1.0`",
+                      body)
+        self.assertNotIn("même harnais", body)
+        # a model object keeps the harness constant and names the billed
+        # reference; it never asks for the same model as the reference
+        equal = {"source": "npm", "error": "", "ignored": [],
+                 "releases": [{"version": "1.0.0", "date": "2026-09-01",
+                               "source": "npm", "url": "", "tag": ""}]}
+        models = {"served": ["old", "new"], "new": ["new"], "complete": True}
+        decision = veille.evaluate(source(), installed, equal, {}, models, ["old"])
+        self.assertEqual(decision["object"],
+                         {"kind": "model", "name": "new", "version": "new"})
+        body = decision["body"]
+        self.assertIn("même harnais (`deepseek`)", body)
+        self.assertIn("modèle de référence réellement facturé `old`", body)
+        self.assertIn("modèle évalué `new`", body)
+        self.assertNotIn("même modèle", body)
+        decision = veille.evaluate(source(), installed, equal, {}, models, [])
+        self.assertIn("aucun modèle facturé connu", decision["body"])
+
     def test_evaluate_witness_and_priority(self):
         installed = {"hosts": {"vm-a": {"version": "0.2.0-rc.2"}},
                      "newest": "0.2.0-rc.2", "differs": False, "missing": []}
