@@ -168,6 +168,23 @@ def _assignment_deferred(item: dict, recipient: str, why: str) -> str:
                recipient, int(item["id"]), recipient))
 
 
+def _footprint_deferred(item: dict, recipient: str, overlaps: list) -> str:
+    """#4186 : l'avertissement d'une attribution différée par un chevauchement
+    d'empreinte — le message part quand même, le lot reste libre et attend la
+    fusion du lot en cours."""
+    parts = ", ".join(
+        "#%d (%s%s: %s ~ %s)" % (
+            int(row["id"]), row.get("state") or "?",
+            ", %s" % row["assignee"] if row.get("assignee") else "",
+            row.get("path"), row.get("other_path")) for row in overlaps)
+    return ("lot #%d not assigned to %s: its footprint overlaps lot(s) in progress "
+            "in the same repository (%s) — the message is dropped anyway and linked "
+            "to lot #%d, which stays unassigned and waits for the merge; to hand it "
+            "over then: ameesh work assign %d %s"
+            % (int(item["id"]), recipient, parts, int(item["id"]),
+               int(item["id"]), recipient))
+
+
 def _branch_owner(db, branch: str, exclude: int | None = None):
     """#1646 : le lot qui porte DÉJÀ cette branche, sinon None.
 
@@ -295,17 +312,30 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             # perdre le message : le lot est créé SANS assigné, l'attribution
             # est différée et l'expéditeur est averti (même règle que --lot).
             refusal = _assignee_refusal(db, recipient, cfg)
-            item = work_mod.add(db, title=title,
-                                assignee=None if refusal else recipient, actor=sender,
-                                source="mail", app=project, cfg=cfg,
-                                branch=None if (refusal or owner) else branch,
-                                estimate=minutes, note=introduced, force=force,
-                                parent_lot=parent_lot)
-            if not refusal and item.get("queue_warning"):
+            creation = dict(title=title,
+                            assignee=None if refusal else recipient, actor=sender,
+                            source="mail", app=project, cfg=cfg,
+                            branch=None if (refusal or owner) else branch,
+                            estimate=minutes, note=introduced, force=force,
+                            parent_lot=parent_lot)
+            overlapped = None
+            try:
+                item = work_mod.add(db, **creation)
+            except storage.FootprintOverlap as exc:
+                # #4186 : comme `ameesh work add --assignee`, un lot attribué
+                # qui chevauche un lot en cours naît libre et attend sa fusion ;
+                # le message part quand même, rattaché au lot (#858).
+                overlapped = exc.overlaps
+                creation["assignee"] = None
+                item = work_mod.add(db, **creation)
+            if not refusal and overlapped is None and item.get("queue_warning"):
                 raise AssignmentError(_queued(item))
-            out.update(created=True, assigned=not refusal, branch=item.get("branch"))
+            out.update(created=True, branch=item.get("branch"),
+                       assigned=not refusal and overlapped is None)
             if refusal:
                 out["warnings"].append(_assignment_deferred(item, recipient, refusal))
+            elif overlapped is not None:
+                out["warnings"].append(_footprint_deferred(item, recipient, overlapped))
             if owner is not None:
                 out["warnings"].append(_cited_branch_warning(
                     owner, branch, int(item["id"]), recipient))

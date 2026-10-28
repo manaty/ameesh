@@ -739,13 +739,7 @@ class WorkItems(interface.WorkItems):
                                             estimate_source, actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             if footprint:
-                for path in sorted(set(footprint)):
-                    tx.execute("INSERT INTO work_item_footprints"
-                               "(work_item_id, source, path, created_by)"
-                               " VALUES (%s, 'intake', %s, %s)",
-                               (int(item["id"]), path, actor or ""))
-                WorkItems(tx)._event(int(item["id"]), "intake", "Footprint (intake): %s"
-                                     % ", ".join(sorted(set(footprint))), actor)
+                WorkItems(tx)._intake_footprint(item["id"], footprint, actor)
                 if assignee:
                     overlaps = WorkItems(tx)._footprint_overlaps(item["id"])
                     if overlaps:
@@ -3468,7 +3462,7 @@ class WorkItems(interface.WorkItems):
     def backlog_add(self, *, title, body, source, expected_value, value_score, priority,
                     team, required_capabilities, package_id, package_parent, note,
                     actor, app="", estimate_minutes=None, estimate_source=None,
-                    estimate_by=None, change_size=None) -> dict:
+                    estimate_by=None, change_size=None, footprint=None) -> dict:
         with self.db.transaction() as tx:
             # #4117 : l'estimation (et sa ligne d'historique) est posée avec la
             # création, comme `work.add` (L157) ; jamais après.
@@ -3494,13 +3488,16 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._estimate_row(int(item["id"]), estimate_minutes,
                                             estimate_source, estimate_by or actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            # #4186 : la file d'amélioration n'oublie plus l'empreinte — la
+            # ligne de panier l'unionne avec celles des lignes précédentes.
+            WorkItems(tx)._intake_footprint(int(item["id"]), footprint, actor)
             return item
 
     def backlog_basket_add(self, *, key, title, expected_value, line, value_score, priority,
                            team, required_capabilities, package_id, package_parent, note,
                            actor, app="", estimate_minutes=None, estimate_source=None,
                            estimate_by=None, change_size=None,
-                           estimate_required=False) -> dict:
+                           estimate_required=False, footprint=None) -> dict:
         caps = _catalog._text_array(required_capabilities) if required_capabilities else None
         # #4117 : l'estimation ne s'applique qu'au panier OUVERT par cet ajout ;
         # une ligne ajoutée à un panier existant ne le réestime pas.
@@ -3561,6 +3558,9 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._estimate_row(item_id, estimate_minutes, estimate_source,
                                             estimate_by or actor)
             WorkItems(tx)._event(item_id, "intake", note, actor)
+            # #4186 : l'union des chemins des lignes du panier, jamais un
+            # remplacement — une ligne ajoutée à un panier ouvert l'élargit.
+            WorkItems(tx)._intake_footprint(item_id, footprint, actor)
             rows = tx.query(
                 "SELECT " + item_columns(self.db) + ","
                 "       (SELECT count(*) FROM work_item_events e"
@@ -3863,6 +3863,30 @@ class WorkItems(interface.WorkItems):
             "INSERT INTO work_item_estimates (work_item_id, minutes, source, estimated_by)"
             " VALUES (%s, %s, %s, %s)",
             (int(item_id), int(minutes), source or None, actor or ""))
+
+    def _intake_footprint(self, item_id, paths, actor) -> list[str]:
+        """#4186 : écrit les chemins d'empreinte `intake` absents (union), avec
+        leur ligne de journal — le geste commun de `add` et de la file
+        d'amélioration. Rend les chemins ajoutés (vide : rien à changer).
+        Le verrou du graphe est pris par les appelants qui gardent une création
+        attribuée ; ces lots naissent libres."""
+        wanted = sorted({str(path) for path in (paths or ()) if str(path).strip()})
+        if not wanted:
+            return []
+        have = {row["path"] for row in self.db.query(
+            "SELECT path FROM work_item_footprints"
+            " WHERE work_item_id = %s AND source = 'intake'", (int(item_id),))}
+        missing = [path for path in wanted if path not in have]
+        for path in missing:
+            self.db.execute(
+                "INSERT INTO work_item_footprints"
+                "(work_item_id, source, path, created_by)"
+                " VALUES (%s, 'intake', %s, %s) ON CONFLICT DO NOTHING",
+                (int(item_id), path, actor or ""))
+        if missing:
+            self._event(int(item_id), "intake", "Footprint (intake): %s"
+                        % ", ".join(sorted(have | set(missing))), actor)
+        return missing
 
     def set_estimate(self, item_id, minutes, *, source, actor) -> dict | None:
         """Pose l'estimation en vigueur d'un lot NON livré (ni fusionné, ni promu,

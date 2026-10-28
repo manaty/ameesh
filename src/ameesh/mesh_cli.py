@@ -2054,7 +2054,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             except storage.FootprintOverlap as exc:
                 # #4173 : attribué, le lot chevaucherait un lot en cours du même
                 # dépôt — il est créé libre et attend la fusion (prise L165).
+                # #4186 : le lot naît SANS assigné, donc `--externe` (qui force
+                # l'attribution à un agent externe) n'a plus d'objet : le garder
+                # ferait échouer la seconde création (« --externe without
+                # assignee ») et le lot ne naîtrait pas du tout.
+                add_kwargs["externe"] = False
                 item = work.add(db, assignee=None, **add_kwargs)
+                # le lot est libre : l'attribution de la tentative refusée ne
+                # doit plus s'afficher (`_print_assignment` plus bas).
                 check = None
                 print("warning: created unassigned: %s"
                       % work_footprints.refusal(item["id"], exc.overlaps), file=sys.stderr)
