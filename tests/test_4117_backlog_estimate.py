@@ -143,6 +143,19 @@ class ReferenceTest(_Base):
         self.assertEqual((basket["estimate_minutes"], basket["estimate_source"]),
                          (45, None))
 
+    def test_a_line_added_to_an_open_basket_needs_no_estimate(self):
+        # B/P2 de la relecture cx2 : sans table publiée, l'agent ajoute une
+        # ligne à un panier déjà ouvert (estimé par sa première ligne) ; aucun
+        # lot n'est créé, donc aucune estimation n'est exigée.
+        first = self.element("N1 : une", 5, estimate="45m", chantier="panier-sans-table")
+        self.assertEqual(first["estimate_minutes"], 45)
+        second = self.element("N2 : deux", 5, chantier="panier-sans-table")
+        self.assertEqual(second["id"], first["id"])
+        self.assertFalse(second["basket_opened"])
+        basket = work.get(self.db, first["id"])
+        self.assertEqual((basket["estimate_minutes"], basket["estimate_source"]),
+                         (45, None))
+
     def test_existing_lots_are_not_backfilled(self):
         legacy = work.add(self.db, title="lot existant", app="ameesh")
         _reference(self.db, size="s", median=25.0)

@@ -3382,7 +3382,8 @@ class WorkItems(interface.WorkItems):
     def backlog_basket_add(self, *, key, title, expected_value, line, value_score, priority,
                            team, required_capabilities, package_id, package_parent, note,
                            actor, app="", estimate_minutes=None, estimate_source=None,
-                           estimate_by=None, change_size=None) -> dict:
+                           estimate_by=None, change_size=None,
+                           estimate_required=False) -> dict:
         caps = _catalog._text_array(required_capabilities) if required_capabilities else None
         # #4117 : l'estimation ne s'applique qu'au panier OUVERT par cet ajout ;
         # une ligne ajoutée à un panier existant ne le réestime pas.
@@ -3402,6 +3403,12 @@ class WorkItems(interface.WorkItems):
                 "   AND assignee IS NULL"
                 " ORDER BY id LIMIT 1 FOR NO KEY UPDATE", (key,))
             opened = not rows
+            # #4117 : la garde d'estimation est lue ICI, sous le verrou du
+            # panier : une ligne ajoutée à un panier déjà ouvert ne crée aucun
+            # lot et n'a pas à porter d'estimation (P2 de la relecture cx2).
+            if opened and estimate_required and not estimate_minutes:
+                raise interface.BasketEstimateRequired(
+                    "opening a basket requires an estimate or a published reference")
             if opened:
                 rows = tx.query(
                     "INSERT INTO work_items"

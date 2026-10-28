@@ -46,9 +46,10 @@ sans durée est refusé (L157). Une ligne sous le seuil ne crée pas de lot : le
 panier qu'elle ouvre prend l'estimation de la table publiée par l'auditeur —
 le groupe du type (`improvement`) et de la taille déclarée, à défaut un groupe
 plus large — avec la source « référence table #N » ; `--estimate` explicite
-l'emporte. Sans table de référence, l'agent doit donner l'estimation. Aucun
-rétro-remplissage : les lots existants, y compris un panier déjà ouvert,
-gardent leur estimation.
+l'emporte. Sans table de référence, l'agent doit donner l'estimation pour
+ouvrir un panier ; une ligne ajoutée à un panier déjà ouvert ne crée pas de
+lot et n'en exige pas. Aucun rétro-remplissage : les lots existants, y
+compris un panier déjà ouvert, gardent leur estimation.
 
 **Prise automatique** (`auto_take`, appelée à chaque passage d'`ameesh
 notify`, et par l'exécuteur de chaque hôte pour ses propres agents — #804) :
@@ -571,9 +572,10 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
     dès la création, comme `work add` (L157). Un agent qui crée un **lot**
     sans estimation est refusé ; une ligne sous le seuil ne crée pas de lot,
     et le panier qu'elle ouvre prend l'estimation de la table de référence
-    (type et taille, source « référence table #N »). Un panier déjà ouvert
-    n'est jamais réestimé par une ligne. Les lots existants ne sont pas
-    rétro-remplis."""
+    (type et taille, source « référence table #N »). Sans référence, l'agent
+    doit estimer pour ouvrir un panier ; une ligne ajoutée à un panier déjà
+    ouvert n'en exige pas. Un panier déjà ouvert n'est jamais réestimé par
+    une ligne. Les lots existants ne sont pas rétro-remplis."""
     title = (title or "").strip()
     if not title:
         raise BacklogError("title required")
@@ -634,7 +636,9 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
             minutes = median
             estimate_source = REFERENCE_SOURCE % ref.get("id")
             estimate_by = estimates.REFERENCE_ESTIMATOR
-    estimates.check(db, creator or actor, minutes, option="--estimate 2h")
+    if not basket_route:
+        # Un lot est bien créé : la garde L157 s'applique avant l'écriture.
+        estimates.check(db, creator or actor, minutes, option="--estimate 2h")
     if minutes and estimate_by is None:
         estimate_by = actor or ""
     if not basket_route:
@@ -658,22 +662,29 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         source or "—", actor or creator or "?")
     if (body or "").strip():
         line += "\n" + "\n".join("  " + row for row in str(body).strip().splitlines())
-    item = storage.of(db).work.backlog_basket_add(
-        key=basket_key(project, label, day),
-        title="Panier « %s » du %s : défauts non bloquants (N, P2, P3)" % (label, day),
-        expected_value=("défauts non bloquants du chantier « %s », regroupés (canon §2 "
-                        "l.129) : chacun sous le seuil de lot (%d)"
-                        % (label, rule.lot_min_value)),
-        line=line, value_score=value_score, priority=int(priority), team=team,
-        required_capabilities=capabilities,
-        package_id=fiche["id"] if fiche else None,
-        package_parent=fiche.get("parent") if fiche else None,
-        note="%s (value %d < lot threshold %d, canon %s): %s%s" % (
-            BASKET_LINE_NOTE, value_score, rule.lot_min_value, rule.commit[:12],
-            " ".join(title.split())[:120], "; %s" % introduced if introduced else ""),
-        actor=actor, app=project, estimate_minutes=minutes,
-        estimate_source=estimate_source, estimate_by=estimate_by,
-        change_size=size or None)
+    try:
+        item = storage.of(db).work.backlog_basket_add(
+            key=basket_key(project, label, day),
+            title="Panier « %s » du %s : défauts non bloquants (N, P2, P3)" % (label, day),
+            expected_value=("défauts non bloquants du chantier « %s », regroupés (canon §2 "
+                            "l.129) : chacun sous le seuil de lot (%d)"
+                            % (label, rule.lot_min_value)),
+            line=line, value_score=value_score, priority=int(priority), team=team,
+            required_capabilities=capabilities,
+            package_id=fiche["id"] if fiche else None,
+            package_parent=fiche.get("parent") if fiche else None,
+            note="%s (value %d < lot threshold %d, canon %s): %s%s" % (
+                BASKET_LINE_NOTE, value_score, rule.lot_min_value, rule.commit[:12],
+                " ".join(title.split())[:120], "; %s" % introduced if introduced else ""),
+            actor=actor, app=project, estimate_minutes=minutes,
+            estimate_source=estimate_source, estimate_by=estimate_by,
+            change_size=size or None,
+            # La garde est lue SOUS le verrou du panier : une ligne ajoutée à
+            # un panier déjà ouvert ne crée pas de lot et n'est pas refusée.
+            estimate_required=estimates.is_agent(db, creator or actor))
+    except interface.BasketEstimateRequired:
+        raise estimates.EstimateError(
+            estimates.REQUIRED % (creator or actor, "add --estimate 2h")) from None
     return dict(item, basket=True)
 
 

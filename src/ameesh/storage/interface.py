@@ -1650,6 +1650,14 @@ class PendingLot(RuntimeError):
         self.lot = lot
 
 
+class BasketEstimateRequired(RuntimeError):
+    """#4117 : `backlog_basket_add` allait OUVRIR un panier pour un agent sans
+    estimation ni référence publiée ; `backlog.add` le traduit en
+    `estimates.EstimateError` (L157). Rien n'est écrit (la transaction du
+    panier est annulée). Levée seulement à l'ouverture : une ligne ajoutée à
+    un panier déjà ouvert ne crée aucun lot et n'exige pas d'estimation."""
+
+
 class ReservationContention(RuntimeError):
     """L122, #478 : le budget de réessais d'une réservation automatique est
     épuisé — le prochain numéro libre n'a pas pu être réservé à temps sous la
@@ -2615,7 +2623,8 @@ class WorkItems(Domain):
                            app: str = "", estimate_minutes: int | None = None,
                            estimate_source: str | None = None,
                            estimate_by: str | None = None,
-                           change_size: str | None = None) -> dict:
+                           change_size: str | None = None,
+                           estimate_required: bool = False) -> dict:
         """#2584 (canon §2 l.129) : ajoute une ligne au panier ouvert `key`
         d'un chantier, ou ouvre ce panier ; rend le panier.
 
@@ -2635,7 +2644,11 @@ class WorkItems(Domain):
 
         #4117 : l'estimation et la taille ne s'appliquent qu'au panier OUVERT
         par cet ajout ; une ligne ajoutée à un panier existant ne le réestime
-        pas (aucun rétro-remplissage)."""
+        pas (aucun rétro-remplissage). `estimate_required` : un agent ne peut
+        pas OUVRIR un panier sans estimation ni référence (L157) ; la garde
+        est lue sous le verrou du panier, au point `opened`, pour qu'une ligne
+        ajoutée à un panier déjà ouvert ne soit jamais refusée. Le refus lève
+        `BasketEstimateRequired`, que `backlog.add` traduit."""
 
     @abc.abstractmethod
     def backlog(self, *, open_only: bool, limit: int,
