@@ -1044,9 +1044,18 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
             MARK_FAILED, step, this.n, this.base or "-", result.returncode))
         ctx.say("#%d : tête testée refusée (%s), recomposition"
                 % (carrier, auto._tail(result.text, 3)))
+        # #3256 C : la recomposition d'un porteur parallèle garde son groupe ;
+        # le repli relit la note du porteur si la tentative ne le portait pas.
+        only = list(this.only)
+        if not only:
+            try:
+                only = carrier_group(show(ctx, carrier))
+            except HoraireError:
+                only = []
         return attempt(ctx, carrier, name, Attempt(step, this.n + 1, this.base,
                                                    run_id=this.run_id,
                                                    exclude=list(this.exclude),
+                                                   only=only,
                                                    reasons=list(this.reasons)))
     if result.returncode != 0:
         ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (

@@ -399,6 +399,19 @@ class ComposerParallelTest(unittest.TestCase):
         self.assertFalse([call for call in self.shell.calls
                           if call[0] == "ameesh" and call[1:2] == ["debit"]])
 
+    def test_publish_refused_keeps_the_group_on_recomposition(self):
+        # #3256 C / B cx1 : le repli de publication refusée ne doit pas
+        # recomposer toute la liste prête ; le porteur garde son groupe.
+        self.shell.items[4002] = carrier(lot=4002, sha=HEAD)
+        this = ph.Attempt(ph.COMPOSITION, 1, HEAD, only=[102],
+                          publish="ref@" + "b" * 40)
+        before = len(self.autos())
+        ph.after_compose(self.ctx, 4002, "h-20261027-06",
+                         ph.Result(ph.auto.PUBLISH_REFUSED, "refus\n", ""), this)
+        calls = self.autos()[before:]
+        self.assertTrue(calls)
+        self.assertEqual(self.only(calls[-1]), [102])
+
     def test_the_pair_is_followed_together(self):
         ph.compose(self.ctx, [])
         self.shell.lists["qa"] = [self.shell.items[lot]
