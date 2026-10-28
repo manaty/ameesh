@@ -27,7 +27,7 @@ and when**, without ever replacing the lease:
   dead better candidate does not make the second wait. The delay is
   client-side and polite: the atomic CAS of `registry.claim` remains the only
   arbiter, so two hosts that try together still produce one holder;
-* **hysteresis** — a holder keeps the role as long as it renews. A better
+* **hysteresis** — a ready holder keeps the role as long as it renews. A better
   candidate takes over only through a planned handover: it has stayed at
   least `HYSTERESIS_POINTS` availability points above the holder for a full
   hour (read from the standing history, with no hole beyond the freshness
@@ -521,7 +521,8 @@ def candidate_state(db, role: Mapping, host: str, *, now: float | None = None,
 # --------------------------------------------------------------------------
 def publish_self(cfg, db, host: str, *, interval_s: float = EVAL_INTERVAL_S,
                  now: float | None = None, force: bool = False,
-                 names: Sequence[str] | None = None) -> int:
+                 names: Sequence[str] | None = None,
+                 pressure: Mapping | None = None) -> int:
     """Publish the local standing of `host` for every elected role it may hold.
 
     At most one row per role and per `interval_s` unless `force`; a role this
@@ -548,6 +549,11 @@ def publish_self(cfg, db, host: str, *, interval_s: float = EVAL_INTERVAL_S,
             continue
         try:
             standing = evaluate(cfg, db, role, host, now=now)
+            # Effective runner limits include live cgroup/PSI readings.
+            if pressure and pressure.get("critical"):
+                standing["ready"] = False
+                standing["diagnostic"] = "; ".join(filter(None, (
+                    standing["diagnostic"], "critical host pressure")))
         except db_mod.Unavailable:
             raise
         except db_mod.DbError as exc:
@@ -840,6 +846,28 @@ def _streak(history: Sequence[Mapping], challenger: str, holder: str,
     return {"since": start, "seconds": now - start,
             "gap": float(last_good.get("availability") or 0.0)
             - float(other.get("availability") or 0.0)}
+
+
+def unready_successor(db, role: Mapping, *, now: float | None = None,
+                      skip: Sequence[str] = ()) -> dict | None:
+    """A ready standby for a known unready holder; the worker debounces this.
+
+    Read-only, used between turns only. An absent holder is not evidence of
+    poor health (attach/unadmitted runners must not trigger a handover).
+    """
+    if role.get("releve") != "election" or role.get("host") not in (role.get("candidats") or ()):
+        return None
+    if role.get("host") not in pg.latest(db, role["name"]):
+        return None
+    ranked = candidacy(db, role["name"], now=now)
+    holder = next((r for r in ranked if r["host"] == role.get("host")), None)
+    if holder is None or holder["ready"]:
+        return None
+    best = next((r for r in ranked if r["ready"]
+                 and r["host"] != role.get("host") and r["host"] not in skip), None)
+    if best is None:
+        return None
+    return dict(best, challenger=best["host"], health_reason=holder["diagnostic"])
 
 
 def handover(db, role: Mapping, holder_host: str, *,
