@@ -11,6 +11,43 @@ from ameesh import config, db, pilot_gesture
 
 
 class PacketEpochTests(unittest.TestCase):
+    def setUp(self):
+        def child(cmd, **kwargs):
+            try:
+                with mock.patch('sys.argv', ['-c', cmd[3]]):
+                    exec(cmd[2], {})
+                return subprocess.CompletedProcess(cmd, 0, b'', b'')
+            except Exception as exc:
+                return subprocess.CompletedProcess(cmd, 1, b'', str(exc).encode())
+        self.child = mock.patch.object(auto, 'run_command', side_effect=child)
+        self.child.start()
+        self.addCleanup(self.child.stop)
+        python = mock.patch.object(auto, 'project_python', return_value='project-python')
+        python.start()
+        self.addCleanup(python.stop)
+
+    def test_system_python_parent_uses_project_child_without_importing_project(self):
+        script = Path(auto.__file__).resolve()
+        code = """
+import importlib.util, sys
+from pathlib import Path
+from unittest import mock
+spec = importlib.util.spec_from_file_location('packet_auto_system', sys.argv[1])
+auto = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = auto
+spec.loader.exec_module(auto)
+with mock.patch.object(auto, 'project_python', return_value='project-python'), \
+     mock.patch.object(auto, 'run_command', return_value=auto.subprocess.CompletedProcess([], 0)) as run, \
+     mock.patch.dict(auto.os.environ, {'AMEESH_ROLE': 'composer'}):
+    auto.check_epoch(4113, Path('.'))
+assert run.call_args.args[0][0] == 'project-python'
+assert run.call_args.kwargs['timeout'] == 30
+assert 'ameesh.db' not in sys.modules
+"""
+        proc = subprocess.run(['/usr/bin/python3', '-S', '-c', code, str(script)],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
     def test_stale_force_refused_before_branch_cleanup_or_tests(self):
         args = argparse.Namespace(repo='.', name='epoch', target='main', carrier=4113,
                                   force=True, no_packet_record=False)
@@ -63,7 +100,7 @@ class PacketEpochTests(unittest.TestCase):
                 mock.patch.object(pilot_gesture, 'gate',
                     side_effect=pilot_gesture.GestureRefused('stale epoch')) as gate:
             with self.assertRaisesRegex(auto.PaquetAutoError, 'stale epoch'):
-                auto.check_epoch(4113)
+                auto.check_epoch(4113, Path('.'))
         gate.assert_called_once_with('cfg', conn, 'packet', 'packet compose #4113')
         conn.close.assert_called_once()
 
@@ -72,7 +109,7 @@ class PacketEpochTests(unittest.TestCase):
                 mock.patch.object(config, 'load', return_value='cfg'), \
                 mock.patch.object(db, 'connect', side_effect=RuntimeError('offline')):
             with self.assertRaisesRegex(auto.PaquetAutoError, 'offline'):
-                auto.check_epoch(4113)
+                auto.check_epoch(4113, Path('.'))
 
     def test_stale_recomposition_preserves_existing_tree(self):
         with mock.patch.object(auto, 'git') as git:
@@ -89,6 +126,6 @@ class PacketEpochTests(unittest.TestCase):
                 mock.patch.object(config, 'load', return_value='cfg'), \
                 mock.patch.object(db, 'connect', return_value=conn), \
                 mock.patch.object(pilot_gesture, 'gate', return_value=fence):
-            auto.check_epoch(4113)
+            auto.check_epoch(4113, Path('.'))
         fence.hold.assert_not_called()
         conn.close.assert_called_once()

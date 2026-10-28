@@ -829,32 +829,33 @@ def _abort_merge(worktree: Path, before: str) -> None:
             "conflit : l'arbre n'est pas propre après l'annulation :\n%s" % status)
 
 
-def check_epoch(carrier: int) -> None:
-    """#4113 : même garde que packet record, sans écriture ni renouvellement.
+def check_epoch(carrier: int, worktree: Path) -> None:
+    """#4113 : garde en lecture seule, dans le Python du projet.
 
-    Les contrôles bornent le travail perdu à une opération en cours. La garde
-    transactionnelle finale reste requise, même après ces lectures.
+    Le processus parent reste stdlib-only pour le lancement manuel système.
+    La garde transactionnelle finale reste requise après ces lectures.
     """
     if not (os.environ.get("AGENT_MAIL_NAME") or os.environ.get("AMEESH_ROLE")):
         return
-    source = str(Path(__file__).resolve().parents[1] / "src")
-    if source not in sys.path:
-        sys.path.insert(0, source)
-    from ameesh import config, db, pilot_gesture
-
-    conn = None
-    try:
-        cfg = config.load()
-        conn = db.connect(cfg)
-        if conn is None:
-            raise PaquetAutoError("base absente pour vérifier l'époque")
-        pilot_gesture.gate(cfg, conn, "packet", "packet compose #%d" % carrier)
-    except Exception as exc:
+    code = """
+import sys
+from ameesh import config, db, pilot_gesture
+conn = None
+try:
+    cfg = config.load()
+    conn = db.connect(cfg)
+    if conn is None:
+        raise RuntimeError("base absente pour vérifier l'époque")
+    pilot_gesture.gate(cfg, conn, "packet", "packet compose #%d" % int(sys.argv[1]))
+finally:
+    if conn is not None:
+        conn.close()
+"""
+    proc = run_command([project_python(worktree), "-c", code, str(carrier)],
+                       cwd=worktree, env=python_env(worktree), timeout=30)
+    if proc.returncode:
         raise PaquetAutoError("composition interrompue avant la prochaine opération : %s"
-                              % exc) from exc
-    finally:
-        if conn is not None:
-            conn.close()
+                              % _output(proc))
 
 
 def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int,
@@ -2049,7 +2050,7 @@ def compose_packet(args: argparse.Namespace) -> int:
     branch = package_branch(args.name)
     validate_branch(repo, branch, "--name")
     rel = manifest_rel(args.name)
-    guard = (lambda: check_epoch(args.carrier)) if not args.no_packet_record else None
+    guard = (lambda: check_epoch(args.carrier, repo)) if not args.no_packet_record else None
     if guard is not None:
         guard()
     base_sha = fresh_base(repo, args.target)
