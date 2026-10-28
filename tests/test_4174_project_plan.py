@@ -163,6 +163,22 @@ class DispatchTest(_Lots):
                              for e in work.events(self.db, evo["id"])))
         self.assertEqual([t["item"]["id"] for t in self.take()], inserted)
 
+    def test_malformed_project_does_not_abort_other_project_dispatch(self):
+        self.agent("claude1", team="nexlink")
+        self.agent("claude2", team="acme")
+        blocked = self.lot("bad config", app="acme")
+        ready = self.lot("valid project")
+        self.cfg = replace(self.cfg, project_planning={"acme": "invalid"})
+        self.assertEqual([t["item"]["id"] for t in self.take()], [ready["id"]])
+        self.assertIsNone(work.get(self.db, blocked["id"])["assignee"])
+        report = plan.report(self.db, "acme", cfg=self.cfg)
+        self.assertIn("invalid project spec_acceptance rule", report["lots"][0]["waiting"])
+        self.assertFalse(plan.assignment_ready(self.db, blocked, blocked, cfg=self.cfg))
+        for settings in (None, [], False):
+            with self.subTest(settings=settings):
+                cfg = replace(self.cfg, project_planning=settings)
+                self.assertEqual(plan.report(self.db, "acme", cfg=cfg)["ready"], [])
+
     def test_project_spec_marker_controls_actual_dispatch(self):
         self.agent("claude1", team="nexlink")
         evo = self.lot("enhancement", body="draft")

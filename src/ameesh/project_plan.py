@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import time
 
-from . import storage, work
+from . import storage
 
 SCHEMA = "ameesh-project-plan/1"
 
@@ -92,13 +92,21 @@ def evaluate(rows, *, project, rule=None, holds=None, now=None):
             "ready": [int(r["id"]) for r in ordered if r["ready"]], "lots": ordered}
 
 
+def acceptance_rule(cfg, project):
+    """Invalid settings block their project rather than aborting dispatch."""
+    settings = getattr(cfg, "project_planning", {})
+    if not isinstance(settings, dict):
+        return "invalid project_planning"
+    entry = settings.get(project, {})
+    if not isinstance(entry, dict):
+        return "invalid project_planning entry"
+    return entry.get("spec_acceptance")
+
+
 def report(db, project, *, cfg=None, now=None):
     from . import backlog
     cfg = cfg or getattr(db, "cfg", None)
-    settings = getattr(cfg, "project_planning", {})
-    if not isinstance(settings, dict) or not isinstance(settings.get(project, {}), dict):
-        raise work.WorkError("project_planning must map projects to settings objects")
-    rule = settings.get(project, {}).get("spec_acceptance")
+    rule = acceptance_rule(cfg, project)
     rows = storage.of(db).work.project_plan_rows(project)
     holds = backlog._take_holds(db, rows, cfg=cfg)
     return evaluate(rows, project=project, rule=rule, holds=holds, now=now)
@@ -123,8 +131,7 @@ def assignment_ready(db, item, done, *, cfg=None, now=None):
     target["assignee"] = None
     target["returned_to_queue"] = item.get("returned_to_queue", False)
     cfg = cfg or getattr(db, "cfg", None)
-    settings = getattr(cfg, "project_planning", {})
-    rule = settings.get(project, {}).get("spec_acceptance")
+    rule = acceptance_rule(cfg, project)
     holds = backlog._take_holds(db, rows, cfg=cfg)
     return int(done["id"]) in evaluate(rows, project=project, rule=rule,
                                        holds=holds, now=now)["ready"]
