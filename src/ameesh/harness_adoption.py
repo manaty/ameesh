@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#4293 (#3264 C) — adoption d'une version de harnais ou de modèle.
 
-Le lot B (#4292) produit un **rapport de rejeu** ; ce module applique la règle
+Le lot B (#4292) produit un **rapport de rejeu** (`ameesh-replay-report/1`,
+un fichier nommé par sa note de trois lignes) ; ce module lit ce rapport et
+applique la règle
 de l'owner (spec `docs/design/3264-veille-versions.md` §4) :
 
 * conclusion « meilleure » ou « équivalente », aucune régression de qualité,
   **prix égal** : adoption automatique ;
 * modèle plus cher, nouveau fournisseur ou changement de forfait : une
-  **décision de l'owner** (`ameesh decide`) avec le rapport et le coût projeté
-  sur 7 jours, sans aucun changement d'hôte ;
+  **décision de l'owner** (`ameesh decide`, **signée**) avec le rapport et le
+  coût projeté sur 7 jours, preuve revérifiée avant tout geste, sans aucun
+  changement d'hôte ;
 * régression : aucune adoption.
 
 L'adoption automatique se fait en deux temps : un **canari** (un agent du
@@ -42,6 +45,7 @@ import hashlib
 import json
 import os
 import re
+import statistics
 import sys
 import time
 
@@ -51,6 +55,12 @@ from . import decisions, registry, storage, work
 
 #: schéma du rapport produit par le lot B
 REPORT_SCHEMA = "ameesh-veille-report/1"
+#: schéma réellement écrit par `ameesh.replay` (lot B, #4292) ; C le lit et
+#: le convertit, il ne l'impose pas.
+B_REPORT_SCHEMA = "ameesh-replay-report/1"
+#: préfixe de la note de trois lignes de B (`Rapport : /chemin`)
+B_NOTE_MARK = "Rejeu comparatif"
+B_NOTE_PATH = re.compile(r"^\s*Rapport\s*:\s*(.+?)\s*$", re.M)
 #: schéma de l'état d'une adoption
 STATE_SCHEMA = "ameesh-harness-adoption/1"
 #: préfixe des notes de journal (état lisible par un humain)
@@ -64,8 +74,9 @@ CANARY_TURNS = 10
 CUTOFF_MARGIN_S = 20 * 60
 #: objets adoptables
 OBJECTS = ("harness", "model")
-#: conclusions du rapport de rejeu
-CONCLUSIONS = ("better", "equivalent", "regression")
+#: conclusions du rapport de rejeu (`incomplete` : B n'a pas conclu, jamais
+#: une adoption)
+CONCLUSIONS = ("better", "equivalent", "regression", "incomplete")
 #: natures de prix
 PRICE_KINDS = ("equal", "higher", "new_provider", "plan_change")
 #: étapes d'une adoption
@@ -171,6 +182,8 @@ class Report:
         self.model = _optional_text(raw.get("model"), "report.model")
         self.provider = _optional_text(raw.get("provider"), "report.provider")
         self.effort = _optional_text(raw.get("effort"), "report.effort")
+        self.old_binary = _path(raw.get("old_binary"), "report.old_binary")
+        self.new_binary = _path(raw.get("new_binary"), "report.new_binary")
         self.conclusion = str(raw.get("conclusion") or "")
         if self.conclusion not in CONCLUSIONS:
             raise VeilleError("report.conclusion: %r (%s)"
@@ -272,6 +285,19 @@ def _optional_text(value, name: str) -> str | None:
     return _text(value, name)
 
 
+def _path(value, name: str) -> str | None:
+    """Un chemin de binaire : pas de NUL ni de saut de ligne, mais espaces et
+    caractères non ASCII admis (contrairement à un identifiant)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise VeilleError("%s: a non-empty path is required" % name)
+    value = value.strip()
+    if "\x00" in value or "\n" in value or not os.path.isabs(value):
+        raise VeilleError("%s: invalid path %r (absolute path required)" % (name, value))
+    return value
+
+
 def parse_report(text: str) -> Report:
     """Un rapport depuis un JSON seul, une ligne `veille-report:` ou un bloc
     ```json d'une note de lot."""
@@ -303,6 +329,147 @@ def parse_report(text: str) -> Report:
     raise VeilleError("report: no %s document found" % REPORT_SCHEMA)
 
 
+def _median(values):
+    values = [float(value) for value in values if value is not None]
+    return statistics.median(values) if values else None
+
+
+def _bounds_from_b(raw: dict) -> dict:
+    """Bornes du canari dérivées des mesures de B (±10 %, spec §3.4)."""
+    lots = raw.get("lots") or []
+    costs, durations = [], []
+    for entry in lots:
+        old = ((entry.get("runs") or {}).get("old") or {})
+        if old.get("cost_usd") is not None:
+            costs.append(old["cost_usd"])
+        if old.get("duration_s") is not None:
+            durations.append(old["duration_s"])
+    bounds = {}
+    cost = _median(costs)
+    duration = _median(durations)
+    if cost is not None:
+        bounds["cost_usd"] = [cost * 0.9, cost * 1.1]
+    if duration is not None:
+        bounds["duration_s"] = [duration * 0.9, duration * 1.1]
+    if not bounds:
+        # rapport non concluant : aucune mesure n'a été produite, donc aucune
+        # adoption ; une borne large évite de refuser la lecture du rapport.
+        bounds["cost_usd"] = [0.0, 1e15]
+    return bounds
+
+
+def _spend_7d(db, harness: str) -> float:
+    rows = db.query(
+        "SELECT coalesce(sum(usd), 0)::float8 AS usd FROM turn_costs "
+        "WHERE harness = %s AND recorded_at >= now() - interval '7 days' "
+        "AND (void_reason IS NULL OR void_reason = '')", (harness,))
+    return float((rows[0] if rows else {}).get("usd") or 0.0)
+
+
+def _projected_7d(db, raw: dict) -> float | None:
+    """Coût projeté sur 7 jours d'un modèle plus cher : la dépense réelle des
+    7 derniers jours du harnais, multipliée par le rapport de coût ancien →
+    nouveau mesuré par B. Sans mesure ou sans dépense, None (la décision
+    owner sera bloquée faute de projection)."""
+    if (raw.get("evaluated") or {}).get("kind") != "model":
+        return None
+    old_costs, new_costs = [], []
+    for entry in raw.get("lots") or []:
+        runs = entry.get("runs") or {}
+        if (runs.get("old") or {}).get("cost_usd") is not None:
+            old_costs.append(runs["old"]["cost_usd"])
+        if (runs.get("new") or {}).get("cost_usd") is not None:
+            new_costs.append(runs["new"]["cost_usd"])
+    old, new = _median(old_costs), _median(new_costs)
+    if old is None or new is None or old <= 0:
+        return None
+    base = _spend_7d(db, str(raw.get("harness") or ""))
+    if base <= 0:
+        return None
+    return round(base * (float(new) / float(old)), 2)
+
+
+def from_b_replay(raw: dict, lot: int, *,
+                  projected_7d_usd: float | None = None) -> Report:
+    """Convertit le rapport réel de `ameesh.replay` (#4292) au contrat C.
+
+    B écrit `ameesh-replay-report/1` dans un fichier et ne note que son
+    chemin ; C lit le fichier, convertit les champs et dérive le prix au
+    barème (`cost.py`), les bornes du canari (±10 % des mesures de l'ancienne
+    version) et la projection à 7 jours.
+    """
+    if not isinstance(raw, dict) or raw.get("schema") != B_REPORT_SCHEMA:
+        raise VeilleError("replay report: %s required" % B_REPORT_SCHEMA)
+    evaluated = raw.get("evaluated") or {}
+    kind = str(evaluated.get("kind") or "")
+    if kind not in OBJECTS:
+        raise VeilleError("replay report: evaluated.kind %r (harness | model)"
+                          % kind)
+    old = evaluated.get("old") or {}
+    new = evaluated.get("new") or {}
+    constants = raw.get("constants") or {}
+    if kind == "model":
+        from_version = str(old.get("model") or old.get("label") or "")
+        to_version = str(new.get("model") or new.get("label") or "")
+        model = None
+    else:
+        from_version = str(old.get("label") or old.get("version") or "")
+        to_version = str(new.get("label") or new.get("version") or "")
+        model = constants.get("model") or raw.get("model")
+    conclusion = str(raw.get("conclusion") or "incomplete")
+    conclusion = {"equal": "equivalent"}.get(conclusion, conclusion)
+    if conclusion not in CONCLUSIONS:
+        raise VeilleError("replay report: unknown conclusion %r" % conclusion)
+    scores = [review.get("score")
+              for entry in raw.get("lots") or []
+              for review in (entry.get("reviews") or {}).values()
+              if review.get("score") is not None]
+    normalized = {
+        "schema": REPORT_SCHEMA,
+        "evaluation_lot": int(lot),
+        "harness": str(raw.get("harness") or ""),
+        "object": kind,
+        "from_version": from_version,
+        "to_version": to_version,
+        "model": model,
+        "provider": raw.get("provider"),
+        "effort": constants.get("effort") or raw.get("effort"),
+        "conclusion": conclusion,
+        "quality": {
+            "regression": conclusion == "regression",
+            "note": round(float(_median(scores)), 3) if scores else None,
+            "defects": [],
+        },
+        "price": {"kind": "equal", "projected_7d_usd": projected_7d_usd},
+        "bounds": _bounds_from_b(raw),
+        "bench": raw.get("lots") or [],
+        "old_binary": old.get("binary"),
+        "new_binary": new.get("binary"),
+        "source_schema": B_REPORT_SCHEMA,
+        "report_path": raw.get("report_path"),
+    }
+    return Report(normalized)
+
+
+def _from_b_note(db, text: str, lot: int) -> Report | None:
+    """Lit la note de trois lignes de B et le fichier qu'elle nomme."""
+    if B_NOTE_MARK not in text:
+        return None
+    match = B_NOTE_PATH.search(text)
+    if not match:
+        raise VeilleError("replay note does not name its report path (`Rapport : …`)")
+    path = match.group(1).strip().strip("`").strip()
+    path = os.path.abspath(os.path.expanduser(path))
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise VeilleError("replay report %s unreadable: %s" % (path, exc)) from exc
+    if not isinstance(data, dict) or data.get("schema") != B_REPORT_SCHEMA:
+        raise VeilleError("replay report %s: %s required" % (path, B_REPORT_SCHEMA))
+    return from_b_replay(data, lot, projected_7d_usd=_projected_7d(db, data))
+
+
 def report_from_lot(db, lot: int, *, allowed_actors=None) -> Report:
     """Le rapport le plus récent noté sur le lot (journal, du plus récent au
     plus ancien), sinon dans son corps. Aucun fichier local n'est supposé.
@@ -321,14 +488,19 @@ def report_from_lot(db, lot: int, *, allowed_actors=None) -> Report:
                 return parse_report(text)
             except VeilleError:
                 continue
+        if B_NOTE_MARK in text:
+            # la note de B nomme un fichier : c'est le contrat réel de #4292
+            return _from_b_note(db, text, int(lot))
     if allowed is None:
         item = work.get(db, int(lot)) or {}
         body = str(item.get("body") or "")
         if REPORT_PREFIX in body or REPORT_SCHEMA in body:
             return parse_report(body)
-    raise VeilleError("lot #%s: no readable %s note (write it with "
-                      "`ameesh work note %s -`, or pass --report FILE)"
-                      % (lot, REPORT_SCHEMA, lot))
+        if B_NOTE_MARK in body:
+            return _from_b_note(db, body, int(lot))
+    raise VeilleError("lot #%s: no readable report (C note `%s`, or B note "
+                      "`%s` naming its JSON) — pass --report FILE for a manual "
+                      "gesture" % (lot, REPORT_PREFIX, B_NOTE_MARK))
 
 
 # --------------------------------------------------------------------------
@@ -500,6 +672,10 @@ class Decision:
 def decide(report: Report, prices: dict | None = None) -> Decision:
     """La règle owner, sans effet de bord."""
     price = report.effective_price(prices)
+    if report.conclusion == "incomplete":
+        return Decision("blocked", price,
+                        "replay inconclusive (B: quality incomplete, no "
+                        "adoption)")
     if report.conclusion == "regression" or report.quality_regression:
         why = "regression"
         if report.conclusion == "regression" and report.quality_regression:
@@ -557,12 +733,54 @@ def _agents(db, harness: str, *, host: str | None = None) -> list[dict]:
         "WHERE " + where + " ORDER BY host, name", tuple(params))
 
 
-def _running(db, harness: str, host: str) -> list[str]:
+def _host_versions(db, harness: str) -> dict:
     rows = db.query(
-        "SELECT name FROM agent_registry WHERE harness = %s AND host = %s "
-        "AND status = 'running' AND retired_at IS NULL ORDER BY name",
-        (harness, host))
-    return [row["name"] for row in rows]
+        "SELECT host, version FROM harness_versions WHERE harness = %s", (harness,))
+    return {row["host"]: row.get("version") for row in rows}
+
+
+def _same_binary(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    return os.path.realpath(left) == os.path.realpath(right)
+
+
+def _target_agents(db, report: Report, *, host: str | None = None,
+                   versions: dict | None = None) -> list[dict]:
+    """Les agents encore sur la version évaluée (`from_version`).
+
+    Une bascule ne remplace jamais un agent qui tourne déjà sur un autre
+    modèle/binaire : le canari et la bascule hôte par hôte ne touchent que les
+    cibles de l'ancienne version. Règle explicite pour les valeurs héritées :
+    * harnais — `harness_bin` posé : la cible doit être l'ancien binaire
+      (`report.old_binary`) ; sans ancien binaire, on ne touche pas à une
+      surcharge explicite. `harness_bin` NULL : la version de l'hôte lue par
+      `harness_versions` doit être `from_version` ; une version inconnue est
+      exclue (fail-closed).
+    * modèle — `model` posé : il doit être `from_version` ; `model` NULL est
+      la valeur héritée de l'hôte, donc la cible.
+    """
+    versions = _host_versions(db, report.harness) if versions is None else versions
+    out = []
+    for row in _agents(db, report.harness, host=host):
+        if report.object == "harness":
+            current = row.get("harness_bin")
+            if current:
+                if _same_binary(current, report.old_binary):
+                    out.append(row)
+                continue
+            if versions.get(row.get("host") or "") == report.from_version:
+                out.append(row)
+        else:
+            current = row.get("model")
+            if current is None or current == report.from_version:
+                out.append(row)
+    return out
+
+
+def _running(db, report: Report, host: str) -> list[str]:
+    return [row["name"] for row in _target_agents(db, report, host=host)
+            if row.get("status") == "running"]
 
 
 def _apply_to_agents(db, agents: list[dict], object_name: str,
@@ -646,8 +864,12 @@ def _pick_canary(db, report: Report, *, bins: dict | None, agent: str | None) ->
         if row.get("status") == "running":
             raise VeilleError("canary agent %s is in a turn: retry between turns"
                               % agent)
+        if not any(candidate["name"] == row["name"]
+                   for candidate in _target_agents(db, report)):
+            raise VeilleError("canary agent %s is not on the evaluated version %s"
+                              % (agent, report.from_version))
         return row
-    candidates = _agents(db, report.harness)
+    candidates = _target_agents(db, report)
     # #4293 : le canari se pose ENTRE deux tours. Un agent qui tourne n'est
     # pas candidat (son tour finirait sur l'ancienne version et sa mesure
     # serait comptée) ; les autres attendent le prochain tick.
@@ -656,7 +878,8 @@ def _pick_canary(db, report: Report, *, bins: dict | None, agent: str | None) ->
         raise VeilleError("no idle agent of harness %s: canary waits for the end "
                           "of a turn" % report.harness)
     if report.object == "harness" and bins:
-        candidates = [row for row in candidates if bins.get(row.get("host") or "")]
+        candidates = [row for row in candidates
+                      if bins.get(row.get("host") or "") or report.new_binary]
         if not candidates:
             raise VeilleError("no agent of %s on a host with a --bin path"
                               % report.harness)
@@ -695,7 +918,8 @@ def start_canary(db, row: dict, state: dict, report: Report, *,
     value: str | None = None
     bin_path = None
     if report.object == "harness":
-        bin_path = _check_bin(_bins_from_state(state).get(host))
+        bin_path = _check_bin(_bins_from_state(state).get(host)
+                              or report.new_binary)
         value = bin_path
     else:
         value = report.to_version
@@ -726,12 +950,13 @@ def start_canary(db, row: dict, state: dict, report: Report, *,
 
 
 def _hosts(db, report: Report, state: dict) -> list[str]:
-    hosts = [row["host"] for row in _agents(db, report.harness)
+    hosts = [row["host"] for row in _target_agents(db, report)
              if row.get("host")]
     ordered = sorted(set(hosts))
     canary_host = state.get("canary_host")
-    if canary_host in ordered:
-        ordered.remove(canary_host)
+    if canary_host:
+        if canary_host in ordered:
+            ordered.remove(canary_host)
         ordered.insert(0, canary_host)
     return ordered
 
@@ -857,7 +1082,7 @@ def _ask_owner(cfg, db, item: dict, report: Report, decision: Decision, *,
             "adopt=adopter sur le mesh (canari puis hôtes), coût projeté %.2f USD"
             % (projected or 0.0),
             "refuse=garder %s" % report.from_version,
-        ], recommend="adopt", why=why, urgent=False)
+        ], recommend="adopt", why=why, urgent=False, needs_signature=True)
     return view
 
 
@@ -935,11 +1160,46 @@ def _advance_owner(cfg, db, row, state, report, *, now, actor, dry_run) -> dict:
             _journal(row, state, "owner did not approve: no adoption", actor=actor)
         return {"lot": row["lot_id"], "result": "refused",
                 "reason": state["reason"]}
+    # une réponse signée est revérifiée AVANT tout geste : une adoption est
+    # payante et change un harnais sur le mesh (canon §2, avis auditeur 33013)
+    ok, why = decisions.verify_proof(db, view)
+    if not ok:
+        state.update({"stage": "refused",
+                      "reason": "owner approval without a valid proof: %s" % why})
+        if not dry_run:
+            save(db, row, state)
+            _journal(row, state, state["reason"], actor=actor)
+        return {"lot": row["lot_id"], "result": "refused",
+                "reason": state["reason"]}
     return _start_from_owner(cfg, db, row, state, report, now=now,
                              actor=actor, dry_run=dry_run)
 
 
 def _start_from_owner(cfg, db, row, state, report, *, now, actor, dry_run) -> dict:
+    # la preuve est revérifiée à CHAQUE tentative de geste, y compris quand un
+    # canari avait été bloqué puis repris (une approbation consommée ou une clé
+    # révoquée depuis ne doit plus servir).
+    decision_id = state.get("decision_id")
+    if decision_id:
+        view = decisions.get(db, int(decision_id))
+        if view is None or view.get("state") != "answered" \
+                or (view.get("answer") or {}).get("option") != "adopt":
+            state.update({"stage": "refused",
+                          "reason": "owner decision is no longer an approval"})
+            if not dry_run:
+                save(db, row, state)
+                _journal(row, state, state["reason"], actor=actor)
+            return {"lot": row["lot_id"], "result": "refused",
+                    "reason": state["reason"]}
+        ok, why = decisions.verify_proof(db, view)
+        if not ok:
+            state.update({"stage": "refused",
+                          "reason": "owner approval without a valid proof: %s" % why})
+            if not dry_run:
+                save(db, row, state)
+                _journal(row, state, state["reason"], actor=actor)
+            return {"lot": row["lot_id"], "result": "refused",
+                    "reason": state["reason"]}
     if dry_run:
         return {"lot": row["lot_id"], "result": "would-start-canary"}
     state.update({"stage": "canary", "reason": "", "blocked_from": None})
@@ -1047,7 +1307,7 @@ def _advance_rollout(cfg, db, row, state, report, *, now, actor, rules,
     host = hosts[index]
     path = None
     if report.object == "harness":
-        path = _bins_from_state(state).get(host)
+        path = _bins_from_state(state).get(host) or report.new_binary
         if not path:
             if not dry_run:
                 _block(row, state, "no --bin path for host %s" % host,
@@ -1068,13 +1328,13 @@ def _advance_rollout(cfg, db, row, state, report, *, now, actor, rules,
             save(db, row, state)
         return {"lot": row["lot_id"], "result": "waiting_cutoff", "host": host,
                 "seconds_to_cutoff": round(remaining, 3)}
-    running = _running(db, report.harness, host)
+    running = _running(db, report, host)
     if running:
         if not dry_run:
             save(db, row, state)
         return {"lot": row["lot_id"], "result": "waiting_turn", "host": host,
                 "agents": running}
-    agents = _agents(db, report.harness, host=host)
+    agents = _target_agents(db, report, host=host)
     if not agents:
         state["next_host"] = index + 1
         if not dry_run:
@@ -1179,6 +1439,11 @@ def discover(cfg, db, *, now: float, project: str | None = None,
                             for agent in _agents(db, report.harness)
                             if agent.get("host")})
             expanded = _expand_bins(bins or {}, hosts)
+            if report.object == "harness" and report.new_binary:
+                # le timer n'a pas de --bin : le binaire du rapport B est la
+                # carte par défaut (surchargée par un --bin hôte=… explicite)
+                for host in hosts:
+                    expanded.setdefault(host, report.new_binary)
             result = adopt(cfg, db, lot, report, bins=expanded, actor=actor,
                            dry_run=dry_run, now=now)
             out.append({"lot": lot, "result": result.get("result")})
@@ -1314,8 +1579,12 @@ def run(cfg, args) -> int:
             if report is None:
                 report = report_from_lot(db, int(args.id))
             bins = _parse_bins(args.bin)
-            hosts = [row["host"] for row in _agents(db, report.harness) if row.get("host")]
-            bins = _expand_bins(bins, sorted(set(hosts)))
+            hosts = sorted({row["host"] for row in _agents(db, report.harness)
+                            if row.get("host")})
+            bins = _expand_bins(bins, hosts)
+            if report.object == "harness" and report.new_binary:
+                for host in hosts:
+                    bins.setdefault(host, report.new_binary)
             result = adopt(cfg, db, int(args.id), report, bins=bins,
                            agent=args.agent, requester=args.requester,
                            actor=args.actor or "ameesh", dry_run=args.dry_run,
