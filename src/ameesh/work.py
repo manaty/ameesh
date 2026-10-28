@@ -3158,7 +3158,7 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
     evidence = {"sha": sha}
     if pr is not None:
         evidence["pr"] = pr
-    return deliver(db, item_id, connector=_merge_connector(), evidence=evidence,
+    return deliver(db, item_id, connector=merge_connector(), evidence=evidence,
                    actor=actor, note=note, repo=repo, migration_landed=migration_landed,
                    cfg=cfg, announce=announce)
 
@@ -3275,7 +3275,7 @@ def record_merge(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: 
             done = close_merged(db, item_id, sha=text, actor=actor,
                                 source=actor or UNKNOWN_ACTOR, declared=True, extra=extra,
                                 landed=landed, pr_ref=pr_ref, repo=proof_repo,
-                                retry_review=retry_review, connector=_merge_connector(),
+                                retry_review=retry_review, connector=merge_connector(),
                                 **proof_guard)
         else:
             with db.transaction() as tx:
@@ -3284,7 +3284,7 @@ def record_merge(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: 
                                     source=actor or UNKNOWN_ACTOR, declared=True,
                                     extra=extra, landed=landed, pr_ref=pr_ref,
                                     repo=proof_repo, retry_review=retry_review,
-                                    connector=_merge_connector(), **proof_guard)
+                                    connector=merge_connector(), **proof_guard)
     except DbError as exc:
         # #1567 : course perdue sur l'index unique (dépôt, numéro atterri) —
         # message lisible plutôt que la DbError brute ; la pré-vérification a
@@ -3632,7 +3632,8 @@ def deliver(db: Db, item_id: int, *, connector: str, evidence: dict | None = Non
     return handler(db, item_id, evidence=dict(evidence or {}), actor=actor, **options)
 
 
-def _merge_connector() -> str:
+def merge_connector() -> str:
+    """Le connecteur d'une fusion sur la cible (`git-merge`), lu dans le registre."""
     from .modules import registry
     return registry.merge_connector()
 

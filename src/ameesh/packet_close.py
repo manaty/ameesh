@@ -335,9 +335,10 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
                 entry["result"] = "would-merge"
                 results.append(entry)
                 continue
-            done = work.close_merged(
-                db, lot, sha=unit, actor=actor or "packet:%s" % target,
-                source="packet manifest (%s)" % sources, repo=repo_dir,
+            done = work.deliver(
+                db, lot, connector=work.merge_connector(),
+                evidence={"seen": "packet manifest (%s)" % sources, "sha": unit},
+                actor=actor or "packet:%s" % target, repo=repo_dir,
                 content_guard=plan_git.content_retention)
             entry["result"] = done["result"]
             if done["result"] in ("withheld", "error"):
@@ -373,9 +374,10 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
             entry["result"] = "would-merge"
             results.append(entry)
             continue
-        done = work.close_merged(
-            db, lot, sha=found["ref"] or sha, actor=actor or "packet:%s" % target,
-            source="packet manifest (%s)" % sources,
+        done = work.deliver(
+            db, lot, connector=work.merge_connector(),
+            evidence={"seen": "packet manifest (%s)" % sources, "sha": found["ref"] or sha},
+            actor=actor or "packet:%s" % target,
             frozen_id=int(freeze["id"]) if freeze and freeze.get("id") else None,
             repo=repo_dir, content_guard=plan_git.content_retention)
         entry["result"] = done["result"]

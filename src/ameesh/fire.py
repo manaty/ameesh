@@ -1828,11 +1828,12 @@ def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str
     if dry_run:
         out["result"] = "would-merge"
         return out
-    done = work.close_merged(
-        db, lot, sha=status.get("merge_commit") or "", actor=work.SYSTEM_SENDER,
-        source="PR #%s" % status.get("number"),
-        pr_ref="%s#%s" % (slug, status.get("number")),
-        frozen_id=int(freeze["id"]) if freeze else None, repo=repo,
+    done = work.deliver(
+        db, lot, connector=work.merge_connector(),
+        evidence={"seen": "PR #%s" % status.get("number"),
+                  "sha": status.get("merge_commit") or "",
+                  "pr": "%s#%s" % (slug, status.get("number"))},
+        actor=work.SYSTEM_SENDER, frozen_id=int(freeze["id"]) if freeze else None, repo=repo,
         extra=("" if covered else "the PR merged %s, not the head the fire covered (%s): "
                "the fire did not cover this merge"
                % ((status.get("head") or "?")[:12], _norm((fire or {}).get("sha"))[:12])))
