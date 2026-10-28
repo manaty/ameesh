@@ -60,7 +60,7 @@ class Real704Qualification(unittest.TestCase):
         self.issue = fixture.get("issue") or {}
         self.comments = fixture["comments"]
         self.source = pa.Source(
-            repo=REPO, issue=ISSUE, approvers=("smichea",),
+            repo=REPO, issue=ISSUE, approvers=("smichea",), authority="ima",
             token_file=os.environ.get("AMEESH_APPROVALS_704_TOKEN_FILE",
                                       "/nonexistent/read-only-qualification"),
             projection="/nonexistent/read-only-projection.json")

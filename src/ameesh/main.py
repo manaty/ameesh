@@ -127,7 +127,7 @@
   ameesh process check <page.md> [--ref REF] [--version N] [--json]
         compile the workflow block of a canon Process card (#2225);
   ameesh process-approvals refresh|check|show
-        IMA/GitHub approval bridge (#4006): bureau reader on bureau-goal,
+        GitHub approval bridge (#4006): bureau reader on bureau-goal,
         fail-closed local projection for the hosts; source=api is never an
         authority;
   ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since 24h]
@@ -453,7 +453,7 @@ def _dispatch(argv: list[str] | None) -> int:
         from . import approve_check
         return approve_check.main(rest)
     if command == "process-approvals":
-        # #4006 : pont d'approbation IMA/GitHub (projection locale fail-closed)
+        # #4006 : pont d'approbation GitHub (projection locale fail-closed)
         from . import process_approvals_cli
         return process_approvals_cli.main(rest)
     print("ameesh: unknown subcommand %r" % command, file=sys.stderr)

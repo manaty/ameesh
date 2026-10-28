@@ -48,7 +48,7 @@ CARD_FIXTURE = os.environ.get(CARD_FIXTURE_ENV)
 APPROVALS_FIXTURE = os.environ.get(APPROVALS_FIXTURE_ENV)
 
 from .support import PgTestCase  # noqa: E402 (import after the capture)
-from .test_process_approvals import (APPROVER, ISSUE, REPO, _comment,  # noqa: E402
+from .test_process_approvals import (APPROVER, AUTHORITY, ISSUE, REPO, _comment,  # noqa: E402
                                      _issue)
 from .test_process_registry import ACME_ACTOR, ACME_EPOCH, ACME_RUNNER  # noqa: E402
 from .test_process_workflow import fixture as workflow_fixture  # noqa: E402
@@ -151,7 +151,7 @@ class TpkAdmissionTest(PgTestCase):
 
     def source(self, *, artifact_repos: bool = True) -> pa.Source:
         return pa.Source(
-            repo=REPO, issue=ISSUE, approvers=(APPROVER,),
+            repo=REPO, issue=ISSUE, approvers=(APPROVER,), authority=AUTHORITY,
             token_file="/nonexistent/qualification",
             projection="/nonexistent/projection.json",
             artifact_repos=(HOME_REPO,) if artifact_repos else ())
@@ -203,7 +203,7 @@ class TpkAdmissionTest(PgTestCase):
         source = {"repo": REPO, "issue": ISSUE, "approvers": [APPROVER]}
         if artifact_repos:
             source["artifact_repos"] = [HOME_REPO]
-        config = {"approvals": {"projection": path, "source": source}}
+        config = {"approvals": {"authority": AUTHORITY, "projection": path, "source": source}}
         with mock.patch.object(pa.config_mod, "load", return_value=config):
             return pr.transfer_revision(
                 self.db, work_item_id=lot, command_id=str(uuid.uuid4()),
@@ -250,7 +250,7 @@ class TpkAdmissionTest(PgTestCase):
         self.assertTrue(receipt["installed"])
         self.assertEqual(receipt["contract"], "revision-transfer/1")
         self.assertEqual(receipt["approval_source"], "github")
-        self.assertEqual(receipt["authority"], "ima")
+        self.assertNotIn("authority", receipt)
         self.assertEqual(receipt["references"], ["approval", "lot", "project"])
         self.assertEqual(receipt["sources"], ["approvals"])
         self.assertEqual(set(receipt["source_sha256"]),
@@ -292,7 +292,7 @@ class TpkAdmissionTest(PgTestCase):
         proof = verification["facts"]["proof"]
         self.assertEqual(proof["contract"], "revision-transfer/1")
         self.assertEqual(proof["approval_source"], "github")
-        self.assertEqual(proof["authority"], "ima")
+        self.assertEqual(proof["authority"], AUTHORITY)
         self.assertEqual(proof["lot"], lot)
         self.assertEqual(proof["project"], "tpk")
         self.assertEqual(proof["workflow_ref"], PIN)
@@ -345,7 +345,7 @@ class TpkAdmissionTest(PgTestCase):
         # reader as well to prove this is the repository scope refusal.
         with self.assertRaises(pa.ProjectionError) as source_error:
             pa.load_projection(path=path, identity=pa.ApprovalIdentity(
-                repo=REPO, issue=ISSUE, approvers=(APPROVER,)))
+                repo=REPO, issue=ISSUE, approvers=(APPROVER,), authority=AUTHORITY))
         self.assertEqual(source_error.exception.code, "projection-source")
         self.assertIn("approval artifact is outside the identity",
                       str(source_error.exception))

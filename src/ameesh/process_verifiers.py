@@ -58,7 +58,7 @@ Les reparations sont bornees par `MAX_REPAIRS` ; aucune reouverture terminale.
 
 Collections d'un snapshot (noms des sources lues par B) : `milestones`,
 `receipts`, `observations`, `decisions`, `deliveries`, `approvals` (#4006 :
-projection locale IMA/GitHub, presente seulement si elle est fraiche).
+projection locale GitHub, presente seulement si elle est fraiche).
 
 Matrice de capacite : `capabilities()` distingue une garde **connue** du
 contrat de son **installation** reelle dans le registre de B
@@ -134,7 +134,7 @@ RESERVED_VERIFIERS = (HOLD_VERIFIER, TRANSFER_VERIFIER)
 #: du contrat sont des constantes du module, jamais des parametres : aucun
 #: appelant (test compris) ne remplace la source ni n'abaisse la regle.
 TRANSFER_CONTRACT = "revision-transfer/1"
-#: Seule source d'approbation admise : la projection GitHub de l'issue IMA
+#: Seule source d'approbation admise : la projection GitHub de l'issue source
 #: (#4006) ; `api` n'est jamais une autorite.
 TRANSFER_APPROVAL_SOURCE = "github"
 #: References exigees d'un transfert : l'approbation citee, le lot et le
@@ -157,7 +157,7 @@ _RESERVED_SPECS = {
         ("decisions",),
     ),
     TRANSFER_VERIFIER: (
-        "adoption/transfert de revision Process : approbation IMA courante "
+        "adoption/transfert de revision Process : approbation courante "
         "de la revision exacte, liee au lot et au projet, approbateur "
         "independant",
         ("approvals",),
@@ -271,7 +271,7 @@ class Snapshot:
     observations: tuple[Mapping[str, Any], ...] = ()
     decisions_pending: int = 0
     deliveries: tuple[Mapping[str, Any], ...] = ()
-    #: #4006 : projection locale IMA/GitHub, `{"projection": ..., "records":
+    #: #4006 : projection locale GitHub, `{"projection": ..., "records":
     #: [...]}` ; vide quand B n'a pas collecte de projection fraiche.
     approvals: Mapping[str, Any] = field(default_factory=dict)
     sources: tuple[str, ...] = ()
@@ -1096,7 +1096,7 @@ def _transfer_pin(ref: str) -> tuple[str, str, str] | None:
 
 
 def _verify_transfer(command: Command, snapshot: Snapshot) -> Decision:
-    """Adoption ou transfert de revision Process, sur approbation IMA reelle.
+    """Adoption ou transfert de revision Process, sur approbation reelle.
 
     Contrat `TRANSFER_CONTRACT` : la revision visee (`workflow_ref`) est un
     pin exact `owner/depot@<sha>:<chemin>` ; la projection `approvals` (#4006)
@@ -1174,7 +1174,7 @@ def _verify_transfer(command: Command, snapshot: Snapshot) -> Decision:
     proof = {
         "contract": TRANSFER_CONTRACT,
         "approval_source": TRANSFER_APPROVAL_SOURCE,
-        "authority": approvals_mod.AUTHORITY,
+        "authority": _text(meta.get("authority")),
         "lot": lot,
         "project": project,
         "workflow_ref": command.workflow_ref,
@@ -1592,7 +1592,8 @@ def installation_receipt(registry: Any = None) -> dict:
 
     Dit ce qui est **reellement** installe dans le registre de B : le nom
     reserve, si l'appelable installe est bien celui de C (`installed`), le
-    contrat, la source d'approbation et l'autorite (constantes du module), et
+    contrat et la source d'approbation (constantes du module ; l'autorite
+    vient de la configuration, #4259, et figure dans la preuve), et
     l'empreinte SHA-256 des sources qui decident (ce module et le pont
     #4006). Un appelable etranger sous ce nom rend `installed=False` : le
     recu ne prouve jamais une installation qu'il n'a pas vue.
@@ -1621,7 +1622,6 @@ def installation_receipt(registry: Any = None) -> dict:
         "installed": bool(ours),
         "contract": TRANSFER_CONTRACT,
         "approval_source": TRANSFER_APPROVAL_SOURCE,
-        "authority": approvals_mod.AUTHORITY,
         "references": list(TRANSFER_REFERENCES),
         "sources": ["approvals"],
         "version": approvals_mod._version(),
