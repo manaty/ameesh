@@ -52,6 +52,10 @@ auteurs, avec les mêmes exceptions du canon §2 :
   preuve de contenu que #3220, y compris pour un commit de la plage courante
   retiré par un commit postérieur. Une ligne qui survit suffit ; une lecture
   impossible garde l'exclusion ;
+* une contribution tierce ne pèse que si elle survit dans la tête (#4179) :
+  un commit hérité d'un parent empilé puis retiré (revert, annulation) n'est
+  pas un contenu de cette tête et sa famille redevient éligible ; une ligne
+  qui survit, ou une lecture impossible, garde l'exclusion ;
 * un ancien commit sans reçu et sans attribution ne bloque plus quand son
   contenu a disparu, ou quand le même auteur l'a réémis avec reçu exact et
   patch-id verbatim identique dans la plage courante (#3301, constat
@@ -2926,6 +2930,40 @@ def _surviving_review_commits(repo: str, head: str, base: str,
     return out
 
 
+def _surviving_author_commits(repo: str, head: str, base: str,
+                              written: Mapping, cache: dict) -> dict:
+    """Les commits d'auteur tiers dont le contenu survit encore dans la tête (#4179).
+
+    Un contenu hérité d'un parent empilé puis retiré de la tête (revert, second
+    commit qui annule le premier) n'est pas un contenu de cette tête : son
+    auteur n'a pas à exclure sa famille. C'est la même preuve de contenu que
+    #3335/#3220, étendue au tiers non relecteur : une ligne significative qui
+    survit suffit à garder l'auteur, une lecture impossible le garde aussi (le
+    doute ne retire jamais une famille). La référence du lot et les correcteurs
+    gardent leur propre lecture (`reading` / `_surviving_review_commits`), les
+    auteurs des gels antérieurs leur preuve dédiée (`_carried_from_previous`).
+
+    `written` associe un acteur à ses SHA de la plage courante ; rend le même
+    mapping restreint aux commits qui survivent. Sans `head` (ou sans dépôt),
+    l'appelant n'a pas fourni de tête à prouver : rien n'est filtré.
+    """
+    if not repo or not head:
+        return dict(written or {})
+    out: dict = {}
+    for actor, shas in (written or {}).items():
+        kept = []
+        for sha in shas or ():
+            try:
+                survives = _commit_survives(repo, head, str(sha), cache, base)
+            except Exception:  # noqa: BLE001 - lecture impossible : doute
+                survives = True
+            if survives:
+                kept.append(sha)
+        if kept:
+            out[actor] = kept
+    return out
+
+
 def _freeze_content_preserved(repo: str, freeze_sha: str, head_sha: str,
                               base: str = "") -> bool:
     """Le contenu du gel est-il encore celui de la tête (même arbre) ?
@@ -4014,6 +4052,14 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     ne subsiste plus dans la tête n'exclut plus sa famille ; une ligne qui
     survit, ou une lecture de contenu impossible, la garde exclue.
 
+    #4179 : la famille d'un auteur **tiers** suit la même survie de contenu.
+    Un commit hérité d'un parent empilé puis retiré par un commit postérieur de
+    la tête (revert, annulation) n'est pas un contenu de cette tête : le
+    compter comme auteur fermerait des familles à tort. Une ligne qui survit,
+    ou une lecture impossible, garde l'exclusion. La référence du lot garde sa
+    lecture (#2808) ; les auteurs des gels antérieurs suivent
+    `_carried_from_previous` (#2924).
+
     #2721 : la famille d'un commit sans reçu vient du journal des tours **à
     l'instant du commit** (le harnais qui a réellement tourné, harnais emprunté
     compris), pas du harnais déclaré ; à défaut, le titulaire de référence
@@ -4097,6 +4143,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     # commit ; la promotion en auteur ne garde que les commits survivants.
     review_families: dict[str, dict[str, set]] = {}
     proofs: dict[str, set[str]] = {}
+    # #4179 : les commits d'un tiers de la plage courante, pour ne garder que
+    # ceux dont le contenu survit dans la tête (un parent empilé puis retiré
+    # n'est pas un auteur de cette tête).
+    third_commits: dict[str, list[str]] = {}
     # #3805 : les copies d'une même réémission partagent la liste des commits
     # candidats d'un auteur (une seule recherche `git log --all` par auteur).
     patch_receipt_cache: dict = {}
@@ -4144,6 +4194,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                         sha, set()).update(values)
                 else:
                     by_name.setdefault(actor, set()).update(values)
+                    if row["role"] == "third":
+                        third_commits.setdefault(actor, []).append(sha)
                     record_commit(actor, sha)
                 if row["proof"]:
                     proofs.setdefault(actor, set()).add(sha[:12])
@@ -4162,7 +4214,30 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             review_commits.setdefault(actor, []).append((sha, proven))
         else:
             by_name.setdefault(actor, set()).add(proven)
+            third_commits.setdefault(actor, []).append(sha)
             record_commit(actor, sha)
+    # #4179 : la famille d'un auteur tiers ne s'exclut que par le contenu qui
+    # survit dans la tête (#3335/#3220). Un commit hérité d'un parent empilé
+    # puis retiré (revert, annulation) n'est pas un contenu de cette tête : le
+    # compter comme auteur tiers fermerait des familles à tort. La référence
+    # garde sa lecture (#2808) et les correcteurs la leur ci-dessous.
+    third_surviving = _surviving_author_commits(
+        repo, head, base, third_commits, {})
+    for actor, shas in third_commits.items():
+        if author_name and str(actor).casefold() == author_name.casefold():
+            continue
+        kept = third_surviving.get(actor) or []
+        if not kept:
+            by_name.pop(actor, None)
+            if commits_out is not None:
+                for key in [name for name in commits_out
+                            if name.lower() == actor.lower()]:
+                    commits_out.pop(key, None)
+            continue
+        if commits_out is not None and set(kept) != set(shas):
+            for key in [name for name in commits_out
+                        if name.lower() == actor.lower()]:
+                commits_out[key] = list(kept)
     # #3335 : un correctif de relecteur ne pèse que s'il est encore dans la
     # tête. La promotion en auteur (#2888) et la trace « correcteur » suivent la
     # survie du contenu (#3220) : un commit de relecteur dont aucune ligne ne

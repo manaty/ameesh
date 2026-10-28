@@ -509,6 +509,13 @@ def history(db: Db, recipient: str, limit: int = 50) -> list[dict]:
     return storage.of(db).mailbox.history(recipient, limit)
 
 
+def staging_emission(db: Db, recipient: str, sender: str, key: str) -> int | None:
+    """#4180 : retrouve le signal staging, même hors des derniers courriers."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.staging_emission")
+    return storage.of(db).mailbox.staging_emission(recipient, sender, key)
+
+
 def review_requests(db: Db, recipient: str, lot: int | str) -> list[dict]:
     """#2504 : les demandes de relecture du destinataire pour ce lot.
 

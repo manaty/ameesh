@@ -321,6 +321,96 @@ class PaquetAutoBanc(unittest.TestCase):
             self.assertEqual(paquet_auto.compose_packet(args), 0)
         self.assertEqual(set(calls), {"push", "pr", "freeze", "mail"})
 
+    def test_exclude_reason_s_apparie_par_ordre(self) -> None:
+        # #4201 : la i-ème raison décrit le i-ème --exclude.
+        discards = paquet_auto.exclude_discards(
+            [7, 8], ["B de relecture", "rouge local test_l84_serve"], set())
+        self.assertEqual([(item.lot, item.reason) for item in discards],
+                         [(7, "B de relecture"),
+                          (8, "rouge local test_l84_serve")])
+
+    def test_exclude_sans_motif_ecrit_le_motif_neutre(self) -> None:
+        # #4201 : sans --exclude-reason, plus de motif générique faux.
+        discards = paquet_auto.exclude_discards([7, 8], [], set())
+        self.assertEqual([(item.lot, item.reason) for item in discards],
+                         [(7, paquet_auto.EXCLUDE_DEFAULT_REASON),
+                          (8, paquet_auto.EXCLUDE_DEFAULT_REASON)])
+        self.assertEqual(paquet_auto.EXCLUDE_DEFAULT_REASON, "exclu par le pilote")
+
+    def test_exclude_reason_ne_glisse_pas_sur_un_lot_deja_en_erreur(self) -> None:
+        # Le lot déjà écarté par la liste calculée n'est pas répété, mais sa
+        # raison reste appariée : la raison de #8 ne décrit pas #7.
+        discards = paquet_auto.exclude_discards([7, 8], ["sept", "huit"], {7})
+        self.assertEqual([(item.lot, item.reason) for item in discards],
+                         [(8, "huit")])
+
+    def test_exclude_reason_sans_lot_refuse(self) -> None:
+        with self.assertRaises(paquet_auto.InputError):
+            paquet_auto.exclude_discards([], ["motif orphelin"], set())
+
+    def test_manifeste_porte_le_motif_exclude_reason(self) -> None:
+        # Témoin #4201 : une recomposition --exclude écrit au manifeste le vrai
+        # motif du pilote, pas la phrase figée « ci-full rouge attribuée ».
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, "a" * 40, "b" * 40)],
+            discarded=[], head="c" * 40)
+        worktree = pathlib.Path(self.tmp.name) / "wt-exclude"
+        (worktree / "scripts").mkdir(parents=True)
+        (worktree / "scripts" / "paquet-compose.py").write_text(
+            "", encoding="utf-8")
+        args = argparse.Namespace(
+            repo=str(self.repo), name="banc", target="main", carrier=99,
+            base=None, local=True, no_packet_record=True, keep_worktree=False,
+            keep_failed_hours=24.0, force=False, tests_timeout=10,
+            pilot="pilote", exclude=[2],
+            exclude_reason=["B de relecture posé après la composition"])
+        manifests: list[str] = []
+
+        def capture(_worktree, _rel, text, **_kwargs):
+            manifests.append(text)
+            return "d" * 40
+
+        with mock.patch.object(paquet_auto, "fresh_base",
+                               return_value="a" * 40), \
+                mock.patch.object(paquet_auto, "prune_stale_worktrees",
+                                  return_value=[]), \
+                mock.patch.object(paquet_auto, "make_worktree",
+                                  return_value=worktree), \
+                mock.patch.object(paquet_auto, "compute_candidates",
+                                  return_value=(
+                                      [paquet_auto.Candidate(1, "a" * 40),
+                                       paquet_auto.Candidate(2, "e" * 40)],
+                                      {"ready": [1, 2], "waiting": []})), \
+                mock.patch.object(paquet_auto, "compose_candidates",
+                                  return_value=composition), \
+                mock.patch.object(paquet_auto, "run_freeze_checks",
+                                  return_value=(0, "ok", 0.1)), \
+                mock.patch.object(paquet_auto, "check_local_tests",
+                                  return_value=([], [], [])), \
+                mock.patch.object(paquet_auto, "composition_table",
+                                  return_value="## Composition (1 unité, 1 lot)\n"), \
+                mock.patch.object(paquet_auto, "write_manifest",
+                                  side_effect=capture), \
+                mock.patch.object(paquet_auto, "run_inclusion",
+                                  return_value=(0, "inclusion ok")), \
+                mock.patch.object(paquet_auto, "remove_worktree"):
+            self.assertEqual(paquet_auto.compose_packet(args), 0)
+        self.assertEqual(len(manifests), 1)
+        manifest = manifests[0]
+        self.assertIn("| #2 | B de relecture posé après la composition — "
+                      "--exclude, recomposition sans lui |", manifest)
+        self.assertNotIn("ci-full rouge attribuée", manifest)
+
+    def test_manifeste_echappe_le_motif_du_pilote(self) -> None:
+        # Le motif est du texte libre : ni `|` ni saut de ligne dans la table.
+        composition = paquet_auto.Composition(
+            units=[], discarded=[paquet_auto.Discarded(
+                7, "rouge local | test_l84_serve", "")], head="a" * 40)
+        manifest = paquet_auto.build_manifest(
+            name="banc", target="main", base_sha=self.base, carrier=99,
+            composition=composition, table="", tests=[], freeze_seconds=0.0)
+        self.assertIn("| #7 | rouge local / test_l84_serve |", manifest)
+
     def test_worktree_d_echec_ancien_est_purge(self) -> None:
         path = pathlib.Path(self.tmp.name) / "paquet-auto-vieux"
         self.git("worktree", "add", "-b", "tmp/vieux", str(path), self.base,

@@ -585,6 +585,10 @@ fidélité, sans poussée ni écriture en base). Avec
 `--candidates-json <sortie paquet-candidats --json>`, le rejeu refuse une
 unité en erreur ou non prête : h-31 v3 (`b57c0380`, #3506 en erreur) est
 refusé, h-31 v4 (`fc59a14e`, 6 unités) passe (arbre `2d15e224…`).
+`--exclude LOT` (répétable) retire un lot prêt de la composition et
+`--exclude-reason TEXTE` (répétable, apparié par ordre) écrit son vrai motif
+aux « Écartés » — B de relecture, regel, rouge local ; sans motif, le
+manifeste écrit « exclu par le pilote » (#4201).
 
 La composition **part d'une liste calculée**, jamais des seuls courriers
 (#2404) : `scripts/paquet-candidats.py` lit tous les lots `qa` du projet (sans

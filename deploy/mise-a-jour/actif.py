@@ -46,10 +46,9 @@ Le signal est durable — une attestation JSON sous
 par rapporteur, jamais deux fois pour le meme commit, meme apres une erreur
 d'ecriture survenue apres l'envoi. La cle d'emission est ecrite dans
 l'attestation AVANT l'envoi ; une relance recherche le courrier deja depose
-portant cette cle avant de renvoyer, et cette recherche est exhaustive : la
-fenetre relue double tant qu'elle est pleine, donc une absence n'est retenue
-que prouvee. Si la recherche ne peut pas prouver l'absence (fenetre toujours
-pleine au plafond, base injoignable), la marque d'emission est preservee et
+portant cette cle avant de renvoyer. La recherche filtre en base sur le
+destinataire, l'expediteur systeme et la cle, sans plafond historique. Si la
+lecture echoue (base injoignable), la marque d'emission est preservee et
 le courrier n'est PAS renvoye automatiquement : le relais operateur prend le
 signal (code de sortie 5, distinct d'un echec). Une preuve manquante n'ecrit
 ni attestation ni courrier de reussite. Aucun lot n'est clos automatiquement
@@ -115,12 +114,6 @@ VERDICTS_NON_CONCLUANTS = ("sans-sonde", NON_CONCLUANT)
 REPORT_NON_CONCLUANT = "staging suivant"
 #: etat par defaut des attestations (meme arbre que le journal de staging)
 ETAT_DEFAUT = Path.home() / ".local/state/ameesh/mise-a-jour"
-#: fenetre de depart de la reconciliation d'emission ; elle double tant
-#: qu'elle est pleine, une fenetre bornee ne prouvant pas une absence.
-HISTORIQUE_RECONCILIATION = 500
-#: plafond de la recherche exhaustive : au-dela, fenetre pleine, l'absence
-#: n'est pas prouvee et l'emission reste ambigue (aucun renvoi automatique).
-HISTORIQUE_MAX = 20000
 #: code de sortie d'une emission ambigue : rien n'a ete renvoye, le relais
 #: operateur doit verifier le depot avant toute relance manuelle.
 CODE_AMBIGU = 5
@@ -492,35 +485,16 @@ def emission_cle(sha: str, nom: str) -> str:
 
 
 def deja_emis(nom: str, cle: str) -> int | None:
-    """Id du courrier portant cette cle d'emission, ou None si son absence du
-    depot est PROUVEE.
+    """Id du signal de cette clé, ou None si son absence est prouvée.
 
-    La relecture sert a reconcilier une relance apres une erreur d'ecriture
-    survenue entre l'envoi et la sauvegarde des marques : le courrier deja
-    depose est retrouve, pas renvoye. Une fenetre bornee ne prouve pas
-    l'absence — un courrier peut etre sorti des N derniers — donc la fenetre
-    double tant qu'elle est pleine. Si elle reste pleine au plafond,
-    l'absence n'est pas prouvee : `RechercheNonExhaustive` est levee et
-    l'appelant s'abstient de renvoyer (avis R1 B3).
+    #4180 : la recherche filtre en base sur le destinataire, l'expéditeur
+    système et la clé, sans fenêtre sur l'historique. Elle retrouve aussi un
+    dépôt ancien après une erreur d'écriture des marques. Toute erreur de
+    lecture se propage : l'appelant garde alors l'émission ambiguë sans renvoi.
     """
     conn = db_mod.connect(config.load())
     try:
-        fenetre = HISTORIQUE_RECONCILIATION
-        while True:
-            lignes = mail.history(conn, nom, limit=fenetre)
-            for row in lignes:
-                if row.get("sender") != work.SYSTEM_SENDER:
-                    continue
-                charge = mail.message_payload(row).get("staging_actif") or {}
-                if isinstance(charge, dict) and charge.get("emission") == cle:
-                    return int(row["id"])
-            if len(lignes) < fenetre:
-                # fenetre non pleine : tout le depot du rapporteur a ete relu
-                return None
-            if fenetre >= HISTORIQUE_MAX:
-                raise RechercheNonExhaustive(
-                    "fenetre de %d courriers pleine : absence non prouvee" % fenetre)
-            fenetre = min(fenetre * 2, HISTORIQUE_MAX)
+        return mail.staging_emission(conn, nom, work.SYSTEM_SENDER, cle)
     finally:
         conn.close()
 
@@ -786,9 +760,8 @@ def main(argv: list[str] | None = None) -> int:
                   % (nom, exc), file=sys.stderr)
             continue
         except Exception as exc:  # noqa: BLE001 — sans relecture, absence non prouvee
-            # meme regime que la fenetre pleine au plafond : la relecture a
-            # echoue (base injoignable, erreur de lecture), donc l'absence du
-            # depot n'est pas prouvee. La marque durable reste ambigue et le
+            # la relecture a echoue (base injoignable, erreur de lecture), donc
+            # l'absence du depot n'est pas prouvee. La marque durable reste ambigue et le
             # relais operateur verifie le depot avant toute relance (code 5,
             # libelle « ambigu », comme annonce par la doc et la docstring).
             ambigus.append(nom)

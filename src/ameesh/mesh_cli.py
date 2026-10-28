@@ -1897,6 +1897,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "dependencies":
             from . import work_dependencies
             return work_dependencies.run(db, args)
+        if args.work_command == "links":     # #4167 : liens typés entre lots
+            from . import work_dependencies
+            return work_dependencies.run_links(db, args)
         if args.work_command == "landing":   # #1945 : atterrissage planifié sur un véhicule
             from . import work_dependencies
             return work_dependencies.run_landing(db, args)
@@ -3865,6 +3868,7 @@ def build_parser() -> argparse.ArgumentParser:
     from . import work_dependencies
     work_dependencies.add_parser(work_sub, cmd_work)
     work_dependencies.add_landing_parser(work_sub, cmd_work)
+    work_dependencies.add_links_parser(work_sub, cmd_work)
     pw_mig = work_sub.add_parser(
         "migration", help="reserve the next free migration number for the work item (L122), "
                           "before writing the file; idempotent, visible in work show")

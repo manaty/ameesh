@@ -1413,6 +1413,14 @@ class Mailbox(Domain):
         """Derniers messages du destinataire, du plus récent au plus ancien."""
 
     @abc.abstractmethod
+    def staging_emission(self, recipient: str, sender: str, key: str) -> int | None:
+        """#4180 : id du signal staging de cette clé, sans fenêtre historique.
+
+        Le destinataire, l'expéditeur et la clé sont filtrés avant la borne.
+        None prouve l'absence ; une erreur de lecture doit se propager.
+        """
+
+    @abc.abstractmethod
     def review_requests(self, recipient: str, lot: str) -> list[dict]:
         """#2504 : les demandes de relecture (`kind = 'request'`) du
         destinataire liées à ce lot, du plus récent au plus ancien.

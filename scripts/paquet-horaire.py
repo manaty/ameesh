@@ -23,8 +23,10 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
 1. **Réservation (§12).** Un porteur de paquet ouvert sur la cible (branche
    `integration/paquet-*` ou titre « Paquet horaire h-… ») la réserve : le tic
    suit ce porteur s'il est à lui (étapes 3-4), sinon ne fait rien.
-2. **Composition, une fois par heure.** Cible libre et aucun porteur horaire
-   créé dans l'heure locale (fuseau du canon compilé) : la liste calculée est lue
+2. **Composition, au moins une fois par heure.** Cible libre et aucun porteur
+   horaire créé dans l'heure locale (fuseau du canon compilé) dont la fusion
+   ne soit pas vue (#4171 : un porteur fusionné libère le créneau, un porteur
+   clos sans fusion le garde) : la liste calculée est lue
    (`paquet-candidats.py` depuis un worktree à la tête exacte de la cible) ;
    sans lot prêt, rien n'est créé. Sinon le lot porteur « Paquet horaire
    h-AAAAMMJJ-NN » est créé et `paquet-auto.py` compose, pousse et gèle.
@@ -91,6 +93,10 @@ TITLE_PREFIX = "Paquet horaire "
 HOURLY_RE = re.compile(r"^Paquet horaire (h-(\d{8})-(\d+))\b")
 CARRIER_BRANCH_PREFIX = "integration/paquet"
 OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
+#: #4171 : fusion vue d'un porteur (miroir de `work_lifecycle.DELIVERED` et
+#: des raisons de clôture livrée de `work.CLOSE_REASONS`).
+MERGED_STATES = ("merged", "promoted")
+MERGED_CLOSE_REASONS = ("delivered", "done")
 MARK = "paquet-horaire: "
 MARK_CI = MARK + "ci demandée "
 MARK_RED = MARK + "rouge consigné "
@@ -106,6 +112,9 @@ ATTEMPT_RE = re.compile(
     r"par=(\S+):(\d+)(?: run=(\S+) sans=([\d,]+))?(?: epoque=(\d+))?")
 FAILED_RE = re.compile(r"^paquet-horaire: échec (composition|recomposition) n=(\d+) base=(\S+)")
 MAX_RECOMPOSITIONS = 1
+#: #4201 : motif écrit au manifeste pour le retrait automatique d'une unité dont
+#: la ci-full attribuée est rouge (`paquet-auto` seul écrit le motif neutre).
+EXCLUDE_CI_FULL_REASON = "retiré : ci-full rouge attribuée à son unité (#3801)"
 #: lancements de paquet-auto pour une même étape (même tête de départ)
 MAX_ATTEMPTS = 3
 #: un porteur sans tentative plus jeune que ce délai : création en cours
@@ -296,12 +305,26 @@ def hour_start(now: float, zone: ZoneInfo) -> float:
     return local.replace(minute=0, second=0, microsecond=0).timestamp()
 
 
+def merged_seen(row: dict) -> bool:
+    """#4171 : la fusion du porteur est-elle vue (état livré, ou clos livré) ?"""
+    state = str(row.get("state") or "")
+    return state in MERGED_STATES or (
+        state == "closed" and str(row.get("close_reason") or "") in MERGED_CLOSE_REASONS)
+
+
 def slot_served(rows: list[dict], now: float, zone: ZoneInfo, project: str,
                 target: str) -> bool:
-    """Un porteur horaire a-t-il été créé dans l'heure locale courante ?"""
+    """Un porteur horaire créé dans l'heure locale courante consomme-t-il le créneau ?
+
+    #4171 (décision #154026 a) : un porteur dont la fusion est vue ne le
+    consomme plus, le suivant se compose au tic suivant ; un porteur clos sans
+    fusion (abandonné, rien composé) le garde, pour ne pas recomposer à
+    chaque tic. L'heure reste le rythme minimum.
+    """
     start = hour_start(now, zone)
     return any(is_hourly(row) and is_carrier(row, project, target)
-               and float(row.get("created_ts") or 0) >= start for row in rows)
+               and float(row.get("created_ts") or 0) >= start
+               and not merged_seen(row) for row in rows)
 
 
 def next_name(ctx: Context) -> str:
@@ -395,7 +418,8 @@ def manifest_at(ctx: Context, item: dict, sha: str) -> str:
 
 
 def paquet_auto(ctx: Context, name: str, carrier: int, *,
-                exclude: list[int] = (), force: bool = False) -> Result:
+                exclude: list[int] = (), exclude_reason: str = "",
+                force: bool = False) -> Result:
     cmd = [ctx.python, str(SCRIPT_DIR / "paquet-auto.py"), "--repo", str(ctx.repo),
            "--target", ctx.target, "--name", name, "--carrier", str(carrier),
            "--pilot", ctx.pilot, "--from", ctx.actor]
@@ -403,6 +427,9 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
         cmd.append("--force")
     for lot in exclude:
         cmd += ["--exclude", str(lot)]
+    if exclude_reason:
+        for _lot in exclude:
+            cmd += ["--exclude-reason", exclude_reason]
     if ctx.dry_run:
         ctx.say("[essai] %s" % " ".join(cmd))
         return Result(0, "aucun lot prêt : rien à composer (essai)\n", "")
@@ -525,7 +552,7 @@ def replay_locally(ctx: Context, sha: str, tests: list[str]) -> str:
 
 def compose(ctx: Context, rows: list[dict]) -> str:
     if slot_served(rows, ctx.now, ctx.zone, ctx.project, ctx.target):
-        return "porteur horaire déjà créé dans l'heure : rien à faire"
+        return "porteur horaire déjà créé dans l'heure, non fusionné : rien à faire"
     ready = ready_lots(ctx)
     if not ready:
         return "aucun lot prêt sur %s : rien à faire" % ctx.target
@@ -621,6 +648,8 @@ def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
     ctx.note(carrier, mark)
     # une reprise (n > 1) réécrit une branche peut-être déjà poussée
     result = paquet_auto(ctx, name, carrier, exclude=this.exclude,
+                         exclude_reason=(EXCLUDE_CI_FULL_REASON
+                                         if this.step == RECOMPOSITION else ""),
                          force=this.step == RECOMPOSITION or this.n > 1)
     return after_compose(ctx, carrier, name, result, this)
 

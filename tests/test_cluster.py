@@ -143,6 +143,12 @@ FERMEES = {
     # superviseur, aucun GRANT modifié.
     "work_landings": {"work_item_id", "vehicle_id", "pinned_sha", "until_on",
                       "created_by", "created_at"},
+    # #4167 (0501) : liens typés entre lots (doublon, remplacement, part,
+    # conflit) et la décision consignée sur un conflit (texte libre). État
+    # interne lu par les passes de backlog ; fermé aux deux rôles superviseur
+    # en attendant un classement, aucun GRANT modifié.
+    "work_item_links": {"work_item_id", "other_id", "kind", "created_by", "created_at",
+                        "decision", "decided_by", "decided_at"},
     # #1770 (0450) : le rapport de prévalidation au gel (sélection, tests, hôte,
     # chemin du plan) est une preuve interne lue par l'exécuteur, pas un état
     # de supervision ; table fermée aux deux rôles, aucun GRANT modifié.

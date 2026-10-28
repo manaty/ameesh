@@ -143,8 +143,66 @@ class ComposeTest(Base):
         self.assertEqual(self.shell.ran("work", "add"), [])
 
     def test_heure_deja_servie(self):
-        self.shell.lists[""] = [dict(carrier(), state="merged", created_ts=NOW - 60)]
-        self.assertIn("déjà créé", ph.tick(self.ctx))
+        # #4171 : un porteur clos sans fusion garde le créneau (pas de
+        # recomposition à chaque tic).
+        for reason in ("abandoned", "superseded"):
+            self.shell.lists[""] = [dict(carrier(), state="closed", close_reason=reason,
+                                         created_ts=NOW - 60)]
+            self.assertIn("déjà créé", ph.tick(self.ctx))
+        self.assertEqual(self.shell.ran("work", "add"), [])
+
+    def test_porteur_fusionne_dans_l_heure_libere_le_creneau(self):
+        # #4171 (décision #154026 a) : fusion vue → le suivant se compose
+        # sans attendre l'heure suivante.
+        for state, reason in (("merged", ""), ("promoted", ""), ("closed", "delivered")):
+            row = dict(carrier(lot=3990), state=state, close_reason=reason,
+                       created_ts=NOW - 60)
+            self.assertFalse(ph.slot_served([row], NOW, ZONE, "ameesh", "main"), state)
+        self.shell.lists[""] = [dict(carrier(lot=3990), state="merged", created_ts=NOW - 60)]
+        self.shell.items[4000] = carrier()
+        self.assertIn("ci-full demandée", ph.tick(self.ctx))
+        self.assertEqual(len(self.shell.ran("work", "add")), 1)
+
+    def test_sans_fusion_vue_le_creneau_reste_consomme(self):
+        # #4171 (b) : l'heure reste le rythme minimum ; seul un porteur dont la
+        # fusion est vue libère le créneau, tout autre état le garde.
+        for state, reason in (("intake", ""), ("build", ""), ("qa", ""), ("blocked", ""),
+                              ("waiting_human", ""), ("closed", "abandoned"),
+                              ("closed", "superseded"), ("closed", "")):
+            row = dict(carrier(lot=3990), state=state, close_reason=reason,
+                       created_ts=NOW - 60)
+            self.assertTrue(ph.slot_served([row], NOW, ZONE, "ameesh", "main"),
+                            (state, reason))
+        # un porteur de l'heure précédente ne consomme pas le créneau courant
+        old = dict(carrier(lot=3990), state="closed", close_reason="abandoned",
+                   created_ts=ph.hour_start(NOW, ZONE) - 1)
+        self.assertFalse(ph.slot_served([old], NOW, ZONE, "ameesh", "main"))
+
+    def test_enchainement_epoque_perimee_ne_compose_pas(self):
+        # #4171 (a) : le créneau libéré par une fusion vue ne lève pas la
+        # garde d'époque de #4113 (paquet-auto.check_epoch) : bail périmé →
+        # rien de poussé, ni gel ni ci-full, échec signalé au pilote.
+        self.shell.lists[""] = [dict(carrier(lot=3990), state="merged", created_ts=NOW - 60)]
+        self.ctx.epoch = 279
+        self.shell.auto_rc = 1
+        self.shell.auto_out = ("paquet-auto : composition interrompue avant la prochaine "
+                               "opération : époque du bail 279 périmée\n")
+        with self.assertRaises(ph.HoraireError):
+            ph.tick(self.ctx)
+        self.assertEqual(self.shell.ran("ci", "run"), [])
+        self.assertEqual(self.shell.ran("work", "reviewer"), [])
+        notes = [c[c.index("note") + 2] for c in self.shell.ran("work", "note")]
+        self.assertTrue(any(n.startswith(ph.MARK_ATTEMPT) and "epoque=279" in n
+                            for n in notes), notes)
+        self.assertTrue(any(n.startswith(ph.MARK_FAILED) for n in notes), notes)
+        self.assertIn("époque", self.shell.mails[-1][1])
+
+    def test_porteur_ouvert_dans_l_heure_reserve_la_cible(self):
+        self.shell.lists["qa"] = [carrier(lot=3990, created=NOW - 60)]
+        self.shell.lists[""] = [carrier(lot=3990, created=NOW - 60)]
+        self.shell.items[3990] = carrier(lot=3990, created=NOW - 60)
+        ph.tick(self.ctx)
+        self.assertTrue(ph.slot_served(self.shell.lists[""], NOW, ZONE, "ameesh", "main"))
         self.assertEqual(self.shell.ran("work", "add"), [])
 
     def test_reservation_par_un_autre_porteur(self):
@@ -216,6 +274,10 @@ class FollowTest(Base):
         auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
         self.assertIn("--force", auto)
         self.assertEqual(auto[auto.index("--exclude") + 1], "3801")
+        # #4201 : la recomposition automatique dit son vrai motif au manifeste.
+        self.assertEqual(auto[auto.index("--exclude-reason") + 1],
+                         ph.EXCLUDE_CI_FULL_REASON)
+        self.assertIn("ci-full rouge attribuée", ph.EXCLUDE_CI_FULL_REASON)
         self.assertIn("mty-amh-impl-02", [to for to, _ in self.shell.mails])
         notes = ph.marks(self.shell.items[4000])
         self.assertTrue(any(n.startswith(ph.MARK_ATTEMPT + "recomposition n=1 base=%s"
@@ -690,6 +752,23 @@ class ExcludeOptionTest(unittest.TestCase):
             ph.auto.compose_packet = original
         self.assertEqual(rc, 0)
         self.assertEqual(parsed, [[3801, 3755]])
+
+    def test_paquet_auto_accepte_exclude_reason_apparie(self):
+        # #4201 : --exclude-reason est répétable et suit l'ordre des --exclude.
+        parsed = []
+        original = ph.auto.compose_packet
+        ph.auto.compose_packet = lambda args: parsed.append(
+            (args.exclude, args.exclude_reason)) or 0
+        try:
+            rc = ph.auto.main([
+                "--name", "h-x", "--carrier", "9",
+                "--exclude", "3801", "--exclude-reason", "B de relecture",
+                "--exclude", "3755", "--exclude-reason", "rouge local"])
+        finally:
+            ph.auto.compose_packet = original
+        self.assertEqual(rc, 0)
+        self.assertEqual(parsed, [([3801, 3755],
+                                   ["B de relecture", "rouge local"])])
 
     def test_paquet_auto_courrier_avec_expediteur(self):
         seen = []
