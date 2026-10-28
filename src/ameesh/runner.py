@@ -1115,7 +1115,7 @@ class AgentWorker(threading.Thread):
         # L113 : le travail part au serveur sous le bail, puis le dossier est
         # effacé (même bail perdu : rien ne doit rester sur l'appareil)
         self._depot_push(final=True)
-        self._reserve_restart()
+        AgentWorker._reserve_restart(self)  # aussi sur les doublures de test
         try:
             registry.release(self.db, self.name, self.runner.runner_id, self.epoch)
         except db_mod.DbError:
@@ -1130,9 +1130,13 @@ class AgentWorker(threading.Thread):
         pour une bascule planifiée (le challenger doit pouvoir réclamer), ni
         bail perdu, ni une seconde fois. Une écriture impossible ne retient
         pas l'arrêt : la relève par rang reste la règle."""
-        runner_obj = self.runner
-        if (getattr(self, "_restart_reserved", False) or self.lease_lost.is_set()
-                or str((self.agent or {}).get("releve") or "") != "election"):
+        # doublure de test partielle : un attribut absent, aucune réservation
+        runner_obj = getattr(self, "runner", None)
+        lost = getattr(self, "lease_lost", None)
+        if (runner_obj is None or lost is None or lost.is_set()
+                or getattr(self, "_restart_reserved", False)
+                or str((getattr(self, "agent", None) or {}).get("releve") or "")
+                != "election"):
             return
         stopping = getattr(runner_obj, "restart_pending", None)
         if stopping is None or not stopping():
