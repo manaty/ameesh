@@ -109,19 +109,24 @@ def acceptance_rule(cfg, project):
     return entry.get("spec_acceptance")
 
 
-def report(db, project, *, cfg=None, now=None, can_take=None, phase=True):
+def report(db, project, *, cfg=None, now=None, can_take=None, phase=True, snapshots=None):
     from . import backlog
     cfg = cfg or getattr(db, "cfg", None)
     rule = acceptance_rule(cfg, project)
-    rows = storage.of(db).work.project_plan_rows(project)
-    holds = backlog._take_holds(db, rows, cfg=cfg)
+    if snapshots is not None and project in snapshots:
+        rows, holds = snapshots[project]
+    else:
+        rows = [dict(row) for row in storage.of(db).work.project_plan_rows(project)]
+        holds = backlog._take_holds(db, rows, cfg=cfg)
+        if snapshots is not None:
+            snapshots[project] = (rows, holds)
     return evaluate(rows, project=project, rule=rule, holds=holds, now=now,
                     can_take=can_take, phase=phase)
 
 
-def eligible(db, items, *, cfg=None, now=None, can_take=None, phase=True):
+def eligible(db, items, *, cfg=None, now=None, can_take=None, phase=True, snapshots=None):
     """Use the full project backlog, never a truncated candidate window."""
-    reports = {p: report(db, p, cfg=cfg, now=now, can_take=can_take, phase=phase)
+    reports = {p: report(db, p, cfg=cfg, now=now, can_take=can_take, phase=phase, snapshots=snapshots)
                for p in {str(i.get("app") or i.get("lot_team") or "").strip() for i in items}}
     ready = {i for r in reports.values() for i in r["ready"]}
     return sorted((i for i in items if int(i["id"]) in ready), key=order_key)
@@ -131,7 +136,7 @@ def assignment_ready(db, item, done, *, cfg=None, now=None, can_take=None):
     """Recheck under the assignment's row lock; our own assignment is ignored."""
     from . import backlog
     project = str(item.get("app") or item.get("lot_team") or "").strip()
-    rows = storage.of(db).work.project_plan_rows(project)
+    rows = storage.of(db).work.project_plan_rows(project, assignment_id=int(done["id"]))
     target = next((r for r in rows if int(r["id"]) == int(done["id"])), None)
     if target is None:
         return False
@@ -142,3 +147,11 @@ def assignment_ready(db, item, done, *, cfg=None, now=None, can_take=None):
     holds = backlog._take_holds(db, rows, cfg=cfg)
     return int(done["id"]) in evaluate(rows, project=project, rule=rule,
                                        holds=holds, now=now, can_take=can_take)["ready"]
+
+
+def mark_taken(snapshots, item_id):
+    """Reflect this pass's takes without rereading every project for each agent."""
+    for rows, _holds in snapshots.values():
+        for row in rows:
+            if int(row["id"]) == int(item_id):
+                row["assignee"] = "taken"

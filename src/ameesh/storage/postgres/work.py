@@ -3672,15 +3672,20 @@ class WorkItems(interface.WorkItems):
             "   AND starts_with(note, %s)", (float(seconds), note_prefix))
         return int(rows[0]["n"]) if rows else 0
 
-    def project_plan_rows(self, project) -> list[dict]:
+    def project_plan_rows(self, project, *, assignment_id=None) -> list[dict]:
         """#4174: complete open project snapshot, including every waiting lot."""
         return self.db.query(
+            "WITH pending_decisions AS MATERIALIZED ("
+            " SELECT DISTINCT btrim(work_item_id) AS lot FROM agent_mailbox"
+            " WHERE delivered_at IS NULL AND kind = 'request'"
+            " AND payload->'decision' IS NOT NULL) "
             "SELECT w.*, extract(epoch FROM w.created_at)::float8 AS created_ts,"
             "       extract(epoch FROM w.wake_at)::float8 AS wake_ts,"
             "       to_char(w.planned_start, 'YYYY-MM-DD') AS planned_start,"
             "       to_char(w.planned_end, 'YYYY-MM-DD') AS planned_end,"
             "       to_char(w.planned_delivery, 'YYYY-MM-DD') AS planned_delivery,"
-            "       " + requeued_sql("w") + " AS returned_to_queue,"
+            "       CASE WHEN w.state = 'build' THEN " + requeued_sql("w") +
+            " ELSE false END AS returned_to_queue,"
             "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
             "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
             "       ARRAY(SELECT d.blocker_id FROM work_item_dependencies d"
@@ -3693,18 +3698,20 @@ class WorkItems(interface.WorkItems):
             "             WHERE (l.work_item_id = w.id OR l.other_id = w.id)"
             "               AND l.kind = 'conflicts_with' AND b.state NOT IN " + _CLOSED +
             "             ORDER BY b.id) AS open_conflicts,"
-            "       EXISTS (SELECT 1 FROM agent_mailbox m WHERE m.delivered_at IS NULL"
-            "               AND m.kind = 'request' AND m.payload->'decision' IS NOT NULL"
-            "               AND btrim(m.work_item_id) = w.id::text) AS pending_decision,"
+            "       (pd.lot IS NOT NULL) AS pending_decision,"
             "       EXISTS (SELECT 1 FROM commitments c WHERE c.work_item_id = w.id"
             "               AND c.kind = 'decision' AND c.status IN ('proposed', 'open'))"
             "         AS decision_milestone"
             " FROM work_items w LEFT JOIN work_packages k ON k.id = w.package_id"
             " LEFT JOIN work_packages kp ON kp.id = w.package_parent"
+            " LEFT JOIN pending_decisions pd ON pd.lot = w.id::text"
             " WHERE coalesce(nullif(btrim(w.app), ''), nullif(btrim(w.team), ''),"
             "                nullif(btrim(k.team), ''), nullif(btrim(kp.team), ''), '') = %s"
             " AND w.state NOT IN " + _CLOSED + " AND w.type <> 'improvement'"
-            " ORDER BY w.id", REQUEUED_PARAMS + (str(project),))
+            + (" AND (w.id = %s OR (w.type = 'bug' AND w.assignee IS NULL"
+               " AND w.state IN ('intake', 'build')))" if assignment_id is not None else "") +
+            " ORDER BY w.id", REQUEUED_PARAMS + (str(project),) +
+            ((int(assignment_id),) if assignment_id is not None else ()))
 
     def unassigned_lots(self, limit) -> list[dict]:
         # #2252 : seuls les lots dont TOUTES les dépendances sont fusionnées

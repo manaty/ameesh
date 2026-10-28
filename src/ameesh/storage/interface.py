@@ -2858,8 +2858,8 @@ class WorkItems(Domain):
         hôtes confondus."""
 
     @abc.abstractmethod
-    def project_plan_rows(self, project: str) -> list[dict]:
-        """#4174: all open project lots with readiness facts and planned dates."""
+    def project_plan_rows(self, project: str, *, assignment_id: int | None = None) -> list[dict]:
+        """#4174: open project readiness; assignment_id limits to target and unassigned bugs."""
         raise NotImplementedError
 
     @abc.abstractmethod

@@ -1504,12 +1504,13 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     # priority bug beyond the former 200-row window must remain dispatchable.
     # un lot tout juste créé va sans doute être confié : on lui laisse le temps
     today = time.strftime("%Y-%m-%d", time.localtime(now))
-    holds = _take_holds(db, lots, cfg=cfg)
     lots = [item for item in lots
-            if lot_takeable(item, today, holds=holds, now=now)
+            if lot_takeable(item, today, now=now)
             and now - float(item.get("created_ts") or now) >= LOT_MIN_AGE_S]
     from . import project_plan
-    lots = project_plan.eligible(db, lots, cfg=cfg, now=now, phase=False)
+    plan_snapshots = {}
+    lots = project_plan.eligible(db, lots, cfg=cfg, now=now, phase=False,
+                                 snapshots=plan_snapshots)
     room = 0
     if idle_s > 0 and max_per_hour > 0:
         room = int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S, AUTO_TAKE_NOTE)
@@ -1642,7 +1643,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                              canons=canons, dry_run=True, notes=dir_notes))
 
             agent_lots = project_plan.eligible(db, lots, cfg=cfg, now=now,
-                                               can_take=plan_can_take)
+                                               can_take=plan_can_take, snapshots=plan_snapshots)
             for item in agent_lots:
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
                                 card=auditors.get(row["name"]), others=listing, db=db):
@@ -1658,6 +1659,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                   "kind": "lot", "notified": notified,
                                   "fallback": fallback})
                     lots.remove(item)
+                    project_plan.mark_taken(plan_snapshots, item["id"])
                     break
                 # #804 : la place est relue juste avant l'écriture — une passe
                 # concurrente a pu consommer la place depuis la sélection.
@@ -1688,11 +1690,13 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     # entre-temps
                     if not _still_free(st, item["id"]):
                         lots.remove(item)
+                        project_plan.mark_taken(plan_snapshots, item["id"])
                         continue        # pris entre-temps : lot suivant
                     if _cap_reached(st, check["assignee"], cap()):
                         break           # agent au plafond : au suivant
                     continue            # refus sous verrou : lot suivant
                 lots.remove(item)
+                project_plan.mark_taken(plan_snapshots, item["id"])
                 done = dict(done, lot_team=item["lot_team"])
                 payload = {"lot_take": {"lot": int(done["id"]), "agent": check["assignee"],
                                         "team": item["lot_team"]}}

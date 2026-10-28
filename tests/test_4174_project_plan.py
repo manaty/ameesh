@@ -75,6 +75,24 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(self.report([lot(1, body="accepted"), bug],
             rule={"mode": "marker", "field": "body", "value": "accepted"})["ready"], [1])
 
+    def test_dispatch_snapshot_read_once_and_re_evaluated_per_agent(self):
+        from unittest.mock import Mock
+        db = Mock(cfg=None)
+        rows = [dict(lot(1), app="acme"), dict(lot(2), app="acme", type="bug")]
+        snapshots = {}
+        with patch.object(plan.storage, "of") as of, \
+                patch.object(backlog, "_take_holds", return_value={}) as holds:
+            of.return_value.work.project_plan_rows.return_value = rows
+            self.assertEqual([r["id"] for r in plan.eligible(
+                db, rows, snapshots=snapshots, can_take=lambda r: r["id"] != 2)], [1])
+            self.assertEqual([r["id"] for r in plan.eligible(
+                db, rows, snapshots=snapshots)], [2])
+            plan.mark_taken(snapshots, 2)
+            self.assertEqual([r["id"] for r in plan.eligible(
+                db, rows, snapshots=snapshots)], [1])
+            of.return_value.work.project_plan_rows.assert_called_once_with("acme")
+            holds.assert_called_once()
+
     def test_cli_keeps_legacy_target_and_read_only_project(self):
         parser = argparse.ArgumentParser()
         plan_cli.add_parsers(parser.add_subparsers(dest="work_command"), lambda: None)
@@ -123,6 +141,15 @@ class ProjectSnapshotTest(PgTestCase):
         candidates = storage.of(self.db).work.unassigned_lots(None)
         self.assertGreater(len(candidates), 200)
         self.assertEqual([r["id"] for r in plan.eligible(self.db, candidates)], [self.b])
+
+    def test_locked_snapshot_only_reads_target_and_unassigned_bugs(self):
+        other = work.add(self.db, title="unrelated evolution", app="acme")["id"]
+        rows = storage.of(self.db).work.project_plan_rows("acme", assignment_id=self.a)
+        self.assertEqual({r["id"] for r in rows}, {self.a, self.b})
+        self.db.execute("UPDATE work_items SET assignee = 'elsewhere' WHERE id = %s", (self.b,))
+        rows = storage.of(self.db).work.project_plan_rows("acme", assignment_id=self.a)
+        self.assertEqual({r["id"] for r in rows}, {self.a})
+        self.assertNotIn(other, {r["id"] for r in rows})
 
     def test_project_isolation_and_scheduled_dates(self):
         self.db.execute("UPDATE work_items SET app = 'elsewhere' WHERE id = %s", (self.b,))
