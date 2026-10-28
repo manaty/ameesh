@@ -98,3 +98,37 @@ proof of delivery.
 Migration 0373 adds `work_item_dependencies`. The supervisor may read this
 graph but cannot edit it. Current graph writes and audit events commit or
 roll back together on both PostgreSQL drivers.
+
+## Typed links (#4167, manaty/ameesh#3185)
+
+Besides blocking prerequisites, lots carry typed links that record how two
+backlog items relate:
+
+```sh
+ameesh work links 212 --add 213 --kind duplicates      # 212 duplicates 213
+ameesh work links 212 --add 180 --kind supersedes      # 212 replaces 180
+ameesh work links 212 --add 200 --kind part_of         # 212 is part of 200
+ameesh work links 212 --add 214 --kind conflicts_with  # symmetric
+ameesh work links 212 --decide 214 --decision "keep 212, rescope 214"
+ameesh work links 212 --remove 213 --kind duplicates
+ameesh work links 212 --json
+```
+
+`duplicates`, `supersedes` and `part_of` are directed; the target reads them
+back as `duplicated by`, `superseded by` and `has part`. `conflicts_with` is
+symmetric: adding it from either end is the same link. A link is not a
+prerequisite: it never defers stagnation, the intake or a wake (that is
+`work dependencies`).
+
+Edits take the dependency-graph lock, are journaled on the edited lot
+(`Link added: <kind> lot #N`, `Link removed: …`) and replay without changing
+activity. A lot cannot be linked to itself, both ends must exist, and a cycle
+inside the graph of one directed kind is refused. A duplicate of, or a
+replacement for, an already finished lot is allowed; a conflict needs two open
+lots.
+
+Two open lots linked `conflicts_with` with no recorded decision raise one
+`lot_conflict_undecided` alert per link, addressed to the first lot's
+assignee. The alert falls when the decision is recorded with `--decide`
+(journaled on both lots, with its author), when the link is removed or when
+either lot finishes. Migration 0501 adds `work_item_links`.
