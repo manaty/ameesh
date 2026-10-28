@@ -3826,12 +3826,23 @@ def get(db: Db, item_id: int) -> dict | None:
     return storage.of(db).work.get(item_id)
 
 
+def _canonical_state(state: str) -> str:
+    """#4349 : l'orthographe persistée v1 d'un état (v1 ou alias générique),
+    sinon `WorkError` nommant les orthographes acceptées."""
+    from .work_lifecycle import ACCEPTED_STATES, canonical
+    try:
+        return canonical(state)
+    except ValueError:
+        raise WorkError("unknown state: %r (%s)"
+                        % (state, ", ".join(ACCEPTED_STATES))) from None
+
+
 def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
                limit: int = 50) -> list[dict]:
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.list_items")
-    if state and state not in STATES:
-        raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
+    if state:
+        state = _canonical_state(state)
     return storage.of(db).work.items(state=state, assignee=assignee, limit=limit)
 
 
@@ -3899,14 +3910,16 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     consommer de boucle d'auteur (`loops` inchangé, pas de refus à
     `MAX_QA_LOOPS`) : le retrait est un geste du pilote, pas un renvoi de
     relecture. Seulement qa → build ; l'appelant a vérifié qui exclut
-    (`corrector`)."""
+    (`corrector`).
+
+    `state` accepte l'orthographe v1 et le nom générique du cycle de vie
+    (#4349 : `in_progress` pour `build`, `validated` pour `merged`…)."""
+    state = _canonical_state(state)
     if package_exclusion and correct is not None:
         raise WorkError("--package-exclusion and --correct are distinct gestures")
     if package_exclusion and state != "build":
         raise WorkError("--package-exclusion: a lot excluded from a package returns "
                         "to build (ameesh work move %s build --package-exclusion)" % item_id)
-    if state not in STATES:
-        raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
         raise WorkError("to close a lot: ameesh work close <id> --abandoned | "
                         "--superseded-by <id> | --delivered --sha <reviewed head> | --done")
