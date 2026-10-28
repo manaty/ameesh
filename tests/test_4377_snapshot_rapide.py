@@ -12,12 +12,14 @@ from types import SimpleNamespace as NS
 from unittest import mock
 
 from ameesh import config, host_idle, host_lifecycle, storage, work
-from tests.test_4150_host_idle import HostIdleTest, NOW
+from tests import test_4150_host_idle
+
+NOW = test_4150_host_idle.NOW
 
 
 class SnapshotScopeTest(unittest.TestCase):
-    reading = HostIdleTest.reading
-    agent = HostIdleTest.agent
+    reading = test_4150_host_idle.HostIdleTest.reading
+    agent = test_4150_host_idle.HostIdleTest.agent
 
     def _store(self, agents):
         store = mock.MagicMock()
