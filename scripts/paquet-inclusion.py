@@ -30,15 +30,6 @@ non plus, puisqu'un revert laisse la tête du lot ancêtre de la tête du paquet
   adaptation d'union peut réécrire une ligne — mais c'est un signal à lire
   **avant** le feu.
 
-#4094 : dans `docs/EXECUTEUR-MEDIEE.md`, les lignes entre
-`<!-- compteurs:debut -->` et `<!-- compteurs:fin -->` sont engendrées depuis
-`contract.json` et réécrites par le commit mécanique de
-`scripts/paquet-auto.py` après composition. Ces lignes-là ne sont donc pas
-une preuve d'omission : le contrôle les écarte **par leur numéro de ligne
-dans le commit de composition**, jamais par leur texte, et compare tout le
-reste du fichier comme avant. Le bloc lui-même doit rester présent et non
-vide à la tête : sa disparition est un contenu absent, pas une adaptation.
-
 Verdicts d'une entrée de composition : `présent` (toutes les lignes ajoutées
 sont là, ou le blob est identique), `partiel` (une partie seulement), `absent`
 (aucune ligne, fichier disparu, ou suppression annulée), `vide` (aucun delta :
@@ -108,14 +99,6 @@ NO_ADMISSION_HEADING_RE = re.compile(
 EXCLUSION_HEADING_RE = re.compile(
     r"écart|ecart|retrait|retir|revert|report|exclu|différ", re.IGNORECASE)
 READY_ERROR_RE = re.compile(r"^!(\d+)\s*(?::\s*(.*))?$")
-HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-
-#: #4094 : le bloc de compteurs de la doc est engendré depuis `contract.json`
-#: et réécrit mécaniquement après composition (`scripts/paquet-auto.py`) ; ses
-#: lignes ne sont pas une preuve d'omission, le reste du fichier l'est.
-COUNTERS_PATH = "docs/EXECUTEUR-MEDIEE.md"
-COUNTERS_BEGIN = "<!-- compteurs:debut -->"
-COUNTERS_END = "<!-- compteurs:fin -->"
 
 
 class GitError(RuntimeError):
@@ -166,7 +149,7 @@ def blob_size(repo: Path, rev: str, path: str) -> int | None:
         return None
 
 
-def blob_text(repo: Path, rev: str, path: str) -> list[str] | None:
+def blob_lines(repo: Path, rev: str, path: str) -> set[str] | None:
     """Les lignes du fichier à cette révision, ou None s'il est absent/binaire."""
     proc = git(repo, "show", f"{rev}:{path}", check=False)
     if proc.returncode != 0:
@@ -174,31 +157,7 @@ def blob_text(repo: Path, rev: str, path: str) -> list[str] | None:
     data = proc.stdout
     if b"\0" in data[:8000]:
         return None
-    return data.decode("utf-8", "replace").splitlines()
-
-
-def blob_lines(repo: Path, rev: str, path: str) -> set[str] | None:
-    """Les lignes du fichier à cette révision, ou None s'il est absent/binaire."""
-    lines = blob_text(repo, rev, path)
-    return None if lines is None else set(lines)
-
-
-def generated_block_span(lines: list[str]) -> tuple[int, int] | None:
-    """L'intervalle 1-based des lignes du bloc de compteurs engendré.
-
-    `None` si les marques sont absentes, dédoublées ou inversées. Un bloc
-    vide rend un intervalle vide (`début > fin`), que l'appelant traite comme
-    un bloc perdu : le générateur en écrit toujours plusieurs lignes."""
-    begins = [i for i, line in enumerate(lines)
-              if line.strip() == COUNTERS_BEGIN]
-    ends = [i for i, line in enumerate(lines) if line.strip() == COUNTERS_END]
-    if len(begins) != 1 or len(ends) != 1:
-        return None
-    begin, end = begins[0], ends[0]
-    if end <= begin:
-        return None
-    # contenu 0-based begin+1..end-1 → lignes 1-based begin+2..end
-    return begin + 2, end
+    return set(data.decode("utf-8", "replace").splitlines())
 
 
 # --------------------------------------------------------------------------
@@ -472,20 +431,16 @@ def parse_name_status(data: bytes) -> list[tuple[str, str]]:
     return pairs
 
 
-def parse_added_numbered(
-    patch: bytes,
-) -> dict[str, list[tuple[int, str]] | None]:
-    """{chemin: [(ligne dans le nouveau fichier, texte)]} (None = binaire).
+def parse_added(patch: bytes) -> dict[str, list[str] | None]:
+    """{chemin: lignes ajoutées} (None = binaire) depuis un diff unifié -U0.
 
-    Le numéro de ligne vient de l'en-tête de hunk (`@@ -a +b @@`) : il permet
-    d'écarter précisément les lignes d'un bloc engendré (#4094) sans confondre
-    une ligne ajoutée hors bloc avec le même texte. Les en-têtes `---`/`+++`
-    ne sont lus qu'**hors hunk** (#1655 N3).
+    Les en-têtes `---`/`+++` ne sont lus qu'**hors hunk** : une ligne ajoutée
+    qui commence par « ++ » produit une ligne de diff « +++ … » et ne doit pas
+    être prise pour un en-tête de fichier (#1655 N3).
     """
-    result: dict[str, list[tuple[int, str]] | None] = {}
+    result: dict[str, list[str] | None] = {}
     path: str | None = None
     in_hunk = False
-    new_line = 0
     lines = patch.decode("utf-8", "surrogateescape").splitlines()
     for line in lines:
         if line.startswith("diff --git "):
@@ -493,22 +448,10 @@ def parse_added_numbered(
             in_hunk = False
         elif line.startswith("@@"):
             in_hunk = True
-            match = HUNK_RE.match(line)
-            new_line = int(match.group(1)) if match else 0
         elif in_hunk:
             if line.startswith("+"):
                 if path is not None:
-                    result.setdefault(path, []).append((new_line, line[1:]))
-                new_line += 1
-            elif line.startswith("-"):
-                continue
-            elif line.startswith(" "):
-                new_line += 1
-            elif line.startswith("\\"):
-                # « \ No newline at end of file » : pas une ligne du fichier
-                continue
-            else:
-                in_hunk = False
+                    result.setdefault(path, []).append(line[1:])
         elif line.startswith("+++ "):
             candidate = line[4:].strip()
             if candidate != "/dev/null":
@@ -523,15 +466,6 @@ def parse_added_numbered(
             if path is not None:
                 result[path] = None
     return result
-
-
-def parse_added(patch: bytes) -> dict[str, list[str] | None]:
-    """{chemin: lignes ajoutées} (None = binaire) depuis un diff unifié -U0."""
-    numbered = parse_added_numbered(patch)
-    return {
-        path: None if lines is None else [text for _number, text in lines]
-        for path, lines in numbered.items()
-    }
 
 
 def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
@@ -595,7 +529,7 @@ def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
         parent,
         commit,
     )
-    added_by_path = parse_added_numbered(patch_proc.stdout)
+    added_by_path = parse_added(patch_proc.stdout)
 
     checks: list[PathCheck] = []
     for status, path in name_status:
@@ -611,8 +545,8 @@ def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
                 )
             )
             continue
-        numbered = added_by_path.get(path)
-        if numbered is None and path not in added_by_path and (
+        added = added_by_path.get(path)
+        if added is None and path not in added_by_path and (
             blob_id(repo, parent, path) == blob_id(repo, commit, path)
             or blob_size(repo, commit, path) == 0
         ):
@@ -620,8 +554,8 @@ def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
             # Blobs identiques : changement de mode seul (bit exécutable,
             # #1655 N1). Blob vide au commit : fichier nouveau et vide, statut
             # A sans blob parent ni ligne (#1684).
-            numbered = []
-        if numbered is None:
+            added = []
+        if added is None:
             checks.append(
                 PathCheck(
                     path=path, status=status, added=0, present=0,
@@ -629,30 +563,10 @@ def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
                 )
             )
             continue
+        significant = [line for line in added if line.strip()]
+        ignored = len(added) - len(significant)
         head_blob = blob_id(repo, head, path)
         commit_blob = blob_id(repo, commit, path)
-        # #4094 : les lignes du bloc de compteurs engendré sont réécrites par
-        # le commit mécanique de `paquet-auto` après composition. Seules les
-        # lignes **hors** de ce bloc prouvent le contenu ; on les écarte par
-        # numéro de ligne dans le commit de composition, jamais par texte.
-        commit_block_span = None
-        block_ignored = 0
-        if path == COUNTERS_PATH and head_blob != commit_blob:
-            commit_lines = blob_text(repo, commit, path)
-            commit_block_span = (
-                generated_block_span(commit_lines)
-                if commit_lines is not None else None
-            )
-            if commit_block_span is not None and numbered:
-                first, last = commit_block_span
-                kept = [
-                    (number, line) for number, line in numbered
-                    if not first <= number <= last
-                ]
-                block_ignored = len(numbered) - len(kept)
-                numbered = kept
-        significant = [line for _number, line in numbered if line.strip()]
-        ignored = len(numbered) - len(significant)
         if head_blob is None:
             checks.append(
                 PathCheck(
@@ -681,23 +595,6 @@ def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
                 )
             )
             continue
-        if path == COUNTERS_PATH and commit_block_span is not None:
-            # Le bloc a beau être engendré, sa disparition est une perte de
-            # contenu : la tête doit encore porter un bloc non vide.
-            head_text = blob_text(repo, head, path)
-            head_span = (
-                generated_block_span(head_text)
-                if head_text is not None else None
-            )
-            if head_span is None or head_span[0] > head_span[1]:
-                checks.append(
-                    PathCheck(
-                        path=path, status=status, added=len(significant),
-                        present=0, verdict="absent",
-                        note="bloc de compteurs engendré absent de la tête",
-                    )
-                )
-                continue
         missing = [line for line in significant if line not in head_lines]
         present = len(significant) - len(missing)
         if present == 0 and significant:
@@ -706,18 +603,12 @@ def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
             verdict = "partiel"
         else:
             verdict = "adapté"
-        notes = []
-        if ignored:
-            notes.append(f"{ignored} ligne(s) vide(s) ignorée(s)")
-        if block_ignored:
-            notes.append(
-                f"{block_ignored} ligne(s) du bloc engendré ignorée(s)")
         checks.append(
             PathCheck(
                 path=path, status=status, added=len(significant), present=present,
                 verdict=verdict,
                 missing_sample=[line.strip()[:80] for line in missing[:3]],
-                note=" ; ".join(notes),
+                note=f"{ignored} ligne(s) vide(s) ignorée(s)" if ignored else "",
             )
         )
     result["paths"] = [check.__dict__ for check in checks]

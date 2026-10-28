@@ -26,7 +26,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des opérations admises et la liste des refusées (compteurs engendrés dans « Compteurs ») |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des opérations admises et la liste des refusées ; ses comptes se lisent par `contract.load()` |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -69,28 +69,16 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Les compteurs de la table et de l'interface (opérations admises, refusées,
-interface entière) sont dans le bloc « Compteurs » ci-dessous, engendré
-depuis `contract.json` : ils ne sont jamais recopiés à la main. Des lignes de
-`op` sont marquées `session: true` (contrats 1.1, 1.2, 1.3, 1.5 et 1.6) :
-elles sont servies aussi par `session/op`. Le test vérifie que chaque ligne
-existe dans `storage.interface` avec la même signature et les mêmes types. Il
-vérifie aussi que l'interface entière est classée, admise ou refusée. Toute
+Les comptes ne sont pas figés dans ce document : la table fait foi, et
+`contract.load()` les donne — `len(operations)` pour les opérations admises,
+la somme des méthodes de `refused` pour les refusées, et `interface_total`
+pour l'interface entière. Des lignes de `op` sont marquées
+`session: true` (contrats 1.1, 1.2, 1.3, 1.5 et 1.6) : elles sont servies
+aussi par `session/op`. Le test vérifie que chaque ligne existe dans
+`storage.interface` avec la même signature et les mêmes types. Il vérifie
+aussi que l'interface entière est classée, admise ou refusée. Toute
 opération ajoutée à l'interface fait donc échouer le test tant qu'elle n'est
 pas classée.
-
-### Compteurs
-
-Bloc engendré par `scripts/doc-compteurs.py` depuis
-`src/ameesh/mediated_executor/contract.json`. Ne pas l'éditer à la main :
-`scripts/paquet-auto.py` le réécrit après chaque composition et commite le
-résultat ; `tests/test_l107_executor_contract.py` refuse un bloc périmé.
-
-<!-- compteurs:debut -->
-- opérations admises : 72
-- opérations refusées : 462
-- interface entière : 534
-<!-- compteurs:fin -->
 
 `turn_resources.running_started_before` est une lecture de portée H :
 l'hôte est forcé et une règle dédiée limite les lignes aux agents admis de
