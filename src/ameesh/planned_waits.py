@@ -655,7 +655,13 @@ def recorded_packet_attachments(st, open_items, rows):
         carrier, unit = carriers.get(cid), units.get(uid)
         if carrier is None or unit is None or unit.get("state") != "qa":
             continue
-        if not plan_git.same_commit(member.get("head_sha"), carrier.get("branch_head")):
+        # #4111: composition precedes the branch sweep. Until a head is
+        # observed, use the last freeze, then the recorded composition itself.
+        # An observed head always wins: a later adaptation invalidates the record.
+        carrier_head = (carrier.get("branch_head")
+                        or member.get("package_frozen_sha")
+                        or member.get("head_sha"))
+        if not plan_git.same_commit(member.get("head_sha"), carrier_head):
             continue
         frozen = latest_freeze(marks.get(uid, ())) or {}
         current = unit.get("branch_head") or frozen.get("sha")
