@@ -397,6 +397,13 @@ def _notify_reach(cfg, role: Mapping) -> tuple[bool, str]:
     whose timer does not exist (or still predates `--pass alerts`), and the
     delivery would stay silent while another routed, equipped candidate
     waits.
+
+    #4114: one alerts unit per host, rendered for the role that carries the
+    pass there (`mesh-design` by default). The check compares it with the
+    template of **that** role, not of `role` (the role being evaluated):
+    the pass is global, so the host runs it whatever role the unit names. The
+    old comparison made auditeur and orchestrateur read a false "out of date"
+    on every host and publish `notify_ok=false`.
     """
     try:
         from . import role_timers

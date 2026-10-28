@@ -63,6 +63,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -440,6 +441,23 @@ def notify_reach(cfg, *, responsible=None, env: dict | None = None) -> tuple[lis
 #: election's readiness check so a unit left from another card is detected
 ALERTS_DESCRIPTION = "ameesh — alert delivery under the elected role lease (#3383)"
 
+#: #4114: the role an installed alerts unit runs, read from its `ExecStart`
+_ALERTS_SERVICE_ROLE = re.compile(
+    r"^ExecStart=.*\brole run (\S+) --pass alerts -- ", re.MULTILINE)
+
+
+def alerts_service_role(content: str) -> str:
+    """The role an installed ``ameesh-role-alerts.service`` runs, ``""`` if none.
+
+    #4114: there is one alerts unit per host, rendered for the role that
+    carries the pass there (``mesh-design`` by default). The election
+    evaluates every elected role on the host, so the role being evaluated is
+    not necessarily the one the unit was rendered for; the unit's own role is
+    the only one whose template can be compared with it.
+    """
+    match = _ALERTS_SERVICE_ROLE.search(str(content or ""))
+    return match.group(1) if match else ""
+
 
 def alerts_timer_gap(*, role: str, directory: Path | None = None,
                      bin_path: str = DEFAULT_BIN, apply: bool = True) -> str:
@@ -451,6 +469,13 @@ def alerts_timer_gap(*, role: str, directory: Path | None = None,
     waits. The check accepts no stale unit either: an `alerts` service
     rendered before `--pass alerts` (#3568) would stand by on every delegate.
 
+    #4114: the unit is compared with the template of the role **it names**,
+    not of `role` (the role being evaluated). The pass is global and the unit
+    is unique per host: comparing with the evaluated role made every role but
+    the installed one (auditeur, orchestrateur) read a false "out of date"
+    and publish `notify_ok=false` with an `--install` advice that changed
+    nothing.
+
     ``apply=False`` checks the files only (the install path and the tests);
     the published readiness uses the live ``systemctl --user`` state. Any
     local gap is returned as a sentence, never raised: the caller reports it
@@ -461,20 +486,28 @@ def alerts_timer_gap(*, role: str, directory: Path | None = None,
                 ".timer")
     directory = systemd_dir() if directory is None else Path(directory)
     spec = TimerSpec("alerts", "alerts", ALERTS_INTERVAL_S, ALERTS_DESCRIPTION)
-    expected = {spec.service: render_service(spec, role=role, bin_path=bin_path),
-                spec.timer: render_timer(spec)}
-    for name, content in expected.items():
-        path = directory / name
-        try:
-            current = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return ("the alerts pass would not run here: %s is missing "
-                    "(ameesh role timers --install)" % name)
-        except OSError as exc:
-            return "the alerts pass cannot be checked: %s" % exc
-        if current != content:
-            return ("the alerts pass would not run here: %s is out of date "
-                    "(ameesh role timers --install)" % name)
+    try:
+        current = (directory / spec.service).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ("the alerts pass would not run here: %s is missing "
+                "(ameesh role timers --install)" % spec.service)
+    except OSError as exc:
+        return "the alerts pass cannot be checked: %s" % exc
+    carried = alerts_service_role(current)
+    if not carried or current != render_service(spec, role=carried,
+                                                bin_path=bin_path):
+        return ("the alerts pass would not run here: %s is out of date "
+                "(ameesh role timers --install)" % spec.service)
+    try:
+        current_timer = (directory / spec.timer).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ("the alerts pass would not run here: %s is missing "
+                "(ameesh role timers --install)" % spec.timer)
+    except OSError as exc:
+        return "the alerts pass cannot be checked: %s" % exc
+    if current_timer != render_timer(spec):
+        return ("the alerts pass would not run here: %s is out of date "
+                "(ameesh role timers --install)" % spec.timer)
     if not apply:
         return ""
     try:
