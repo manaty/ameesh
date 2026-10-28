@@ -151,5 +151,23 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(errors["it"], "duplicate installed module: 'it'")
 
 
+
+class CoreReadsTest(unittest.TestCase):
+    """L98 T3 (#4406): `work add` and `work show` read modules through the registry."""
+
+    def test_admits_reads_the_project_module_types(self):
+        db = mock.Mock()
+        db.query.return_value = [{"module": "it"}]
+        self.assertTrue(registry.admits(db, "acme", "release"))
+        self.assertEqual(db.query.call_args[0][1], ("acme", "release"))
+        db.query.return_value = []
+        self.assertFalse(registry.admits(db, "acme", "release"))
+
+    def test_milestones_reads_the_lot_module_milestones(self):
+        db = mock.Mock()
+        db.query.return_value = [{"id": 2}, {"id": 1}]
+        self.assertEqual(registry.milestones(db, "7"), [{"id": 2}, {"id": 1}])
+        self.assertEqual(db.query.call_args[0][1], (7, 100))
+
 if __name__ == "__main__":
     unittest.main()

@@ -701,8 +701,8 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         from . import estimates
         minutes = estimates.parse(estimate)
     if type not in ("bug", "evolution"):
-        from .modules.storage import ModuleStore
-        if not ModuleStore(db).admits(app or workstream or "", type):
+        from .modules import registry as module_registry
+        if not module_registry.admits(db, app or workstream or "", type):
             raise WorkError("unknown type %r for project %r: enable its module in the canon"
                             % (type, app or workstream or ""))
     if size not in (None, "") and size not in SIZES:
