@@ -86,11 +86,16 @@ def elected_roles(db, host: str) -> list[dict]:
 
 
 def latest_reading(db, host: str) -> dict | None:
-    """The newest resource reading of `host`, with its age on the DB clock."""
+    """The newest resource reading of `host`, with its age on the DB clock.
+
+    #4086: `now_ts` is `clock_timestamp()`, read after the row: `now()` is the
+    start of the reader's transaction, so a reading inserted meanwhile looked
+    "dated in the future" and left its host out of the ranking.
+    """
     rows = db.query(
         """
         SELECT extract(epoch FROM sampled_at)::float8 AS sampled_ts,
-               extract(epoch FROM now())::float8 AS now_ts,
+               extract(epoch FROM clock_timestamp())::float8 AS now_ts,
                load1, cpu_count, mem_available_bytes, turns_in_progress,
                ameesh_host_gate_state(host, gate_state) AS gate_state
           FROM host_resources
@@ -112,7 +117,7 @@ def samples(db, host: str, since_ts: float) -> list[float]:
         SELECT extract(epoch FROM sampled_at)::float8 AS ts
           FROM host_resources
          WHERE host = %s AND sampled_at > to_timestamp(%s::float8)
-           AND sampled_at <= now()
+           AND sampled_at <= clock_timestamp()
          ORDER BY sampled_at, id
         """, (host, float(since_ts)))
     return [float(row["ts"]) for row in rows]
