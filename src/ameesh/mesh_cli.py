@@ -1212,6 +1212,14 @@ def _agent_credits(db, row: dict) -> tuple[str, list]:
     return harness, own or [r for r in credits if r.get("state") != provider_credits.OK]
 
 
+def agent_detail_json(db, name: str, *, cfg=None) -> dict | None:
+    """`show --json` et `/api/v1/agents/<agent>` : un seul sérialiseur (#4164)."""
+    row = agent_detail(db, name, cfg=cfg)
+    if row is None:
+        return None
+    return dict(row, provider_credits=_agent_credits(db, row)[1])
+
+
 def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     from . import progress
     db = _open(cfg)
@@ -1222,8 +1230,7 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
             return 1
         from . import host_idle
         if args.json:
-            row = dict(row, provider_credits=_agent_credits(db, row)[1])
-            print(json.dumps(row, ensure_ascii=False, indent=2))
+            print(json.dumps(agent_detail_json(db, args.agent, cfg=cfg), ensure_ascii=False, indent=2))
             return 0
         # #2200 : la pause opérateur se lit dans le résumé texte, pas seulement
         # dans le JSON — un `idle` avec bail vivant ne dit pas « ne reprendra
