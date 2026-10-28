@@ -21,10 +21,11 @@ from __future__ import annotations
 from typing import Iterable
 
 from . import work_lifecycle as lifecycle
+from .modules import registry
 from . import stagnation, storage
 from . import work as work_mod
 
-MERGE_CONNECTOR = lifecycle.delivery_connector()
+MERGE_CONNECTOR = registry.merge_connector()
 
 
 # --------------------------------------------------------------------------

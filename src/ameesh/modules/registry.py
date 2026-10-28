@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 
-from . import (_builtin, _check_types, _digest, _distribution, _entry_points,
+from . import (NAME, _builtin, _check_types, _digest, _distribution, _entry_points,
                _external, _validate_descriptor)
 
 #: Capabilities a module may declare in ``CAPABILITIES``.
@@ -123,6 +123,42 @@ def discover(*, builtin=True):
         except ValueError as exc:
             refused.append(dict(row, error=str(exc)))
     return Registry(tuple(modules), tuple(refused))
+
+
+#: L99 T2 (#4350): delivery connectors owned by the core itself (`work.deliver`)
+CORE_CONNECTORS = ("document", "done")
+
+
+def _connector_providers():
+    """Built-in providers of delivery connectors: the lifecycle modules plus the
+    development tooling (`dev`), which is not a lifecycle module. Installed
+    entry points are not read: a delivery path is reviewed core code."""
+    from . import dev
+    providers = dict(_builtin())
+    providers[dev.NAME] = dev
+    return providers
+
+
+def delivery_connectors():
+    """`{name: (provider, deliver)}` of the connectors modules declare in
+    ``DELIVERY_CONNECTORS``; a name taken twice, or by the core, is refused."""
+    found = {}
+    for provider, module in sorted(_connector_providers().items()):
+        for name, deliver in sorted((getattr(module, "DELIVERY_CONNECTORS", None)
+                                     or {}).items()):
+            if not NAME.fullmatch(name) or not callable(deliver):
+                raise ValueError("module %r: invalid delivery connector %r"
+                                 % (provider, name))
+            if name in CORE_CONNECTORS or name in found:
+                raise ValueError("duplicate delivery connector: %r" % (name,))
+            found[name] = (provider, deliver)
+    return found
+
+
+def merge_connector():
+    """Name of the connector of a merge on the target (gate actions, `merged`)."""
+    from . import dev
+    return dev.MERGE_CONNECTOR
 
 
 def main(argv):

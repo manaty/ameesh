@@ -17,6 +17,7 @@ import unittest
 
 from . import support  # isolate the runner's environment before product imports
 from ameesh import work, work_lifecycle
+from ameesh.modules import registry
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src" / "ameesh"
@@ -179,7 +180,7 @@ class GenericCoreTest(unittest.TestCase):
         self.assertEqual(work.ACTIVE, ("intake", "build"))
         self.assertEqual(work.WAITING, {"blocked", "waiting_human"})
         self.assertEqual(work.TO_VALIDATE, "qa")
-        self.assertEqual(work.delivery_connector(), "git-merge")
+        self.assertEqual(registry.merge_connector(), "git-merge")
         for state in work.TERMINAL:
             self.assertFalse(work.TRANSITIONS[state])
         self.assertIn(work_lifecycle.PROMOTED, work.TRANSITIONS[work_lifecycle.DELIVERY_RECORDED])
