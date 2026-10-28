@@ -825,10 +825,12 @@ pause_reelle() {  # $1 persona → « <operator_paused>|<raison> » de l'état r
   local ligne
   # #2184/N1 : lecture par nom, sans la garde de placement de lire_bail : un
   # agent déplacé pendant le drain doit encore pouvoir être constaté levé.
+  # #4358 (dev3) : lecture par lire_show, relue si vide ou tronquée ;
+  # illisible (rc 3) ou en erreur, l'état réel reste « illisible » (rc 1).
   if [ "$MODE" = agents ]; then
-    ligne=$(ameesh_agents_lecture show "$1" --json) || return 1
+    ligne=$(lire_show "$1" ameesh_agents_lecture) || return 1
   else
-    ligne=$(ameesh_local_drain show "$1" --json) || return 1
+    ligne=$(lire_show "$1" ameesh_local_drain) || return 1
   fi
   pause_etat <<<"$ligne"
 }

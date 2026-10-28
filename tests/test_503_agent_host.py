@@ -1170,6 +1170,9 @@ class AgentHostTest(unittest.TestCase):
     def test_lost_pause_and_reconciliation_still_attempt_conditional_cleanup(self):
         """A committed pause stays tracked when its reconciliation read fails."""
         self.env['DRAIN_ATTENTE'] = '1'
+        # #4358 : pause_reelle relit (lire_show) ; un seul essai garde la
+        # lecture de réconciliation perdue que ce témoin exige.
+        self.env['LECTURE_ESSAIS'] = '1'
         p = self.run_vm(scenario='pause-coupee-etat-perdu')
         self.assertNotEqual(p.returncode, 0)
         self.assertTrue((self.state / 'lecture-perdue').exists())
