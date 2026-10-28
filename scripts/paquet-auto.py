@@ -44,6 +44,11 @@ Ce qui reste au pilote, hors de ce script : « verdict non requis », la CI
 complète (`ameesh ci run --full`), le feu et toute fusion sur la cible. Le
 script ne fusionne jamais la cible et ne déclare aucun verdict.
 
+#4113 : hors banc sans base, la même garde d’époque que `packet record`
+est relue avant la composition, entre unités, avant chaque série de tests et
+avant publication. Une perte de bail arrête avant l’opération suivante ;
+une opération déjà lancée peut finir. Aucun résultat de test n’est réutilisé.
+
 Modes :
 
 * normal : composition réelle, poussée, PR, gel et courrier ;
@@ -217,6 +222,7 @@ class TestRun:
     added: list = field(default_factory=list)
     #: Rouge écarté après rejeu des seuls voisins sur la base (#4048).
     ignored_red: bool = False
+    log_path: str = ""
 
     @property
     def green(self) -> bool:
@@ -824,13 +830,44 @@ def _abort_merge(worktree: Path, before: str) -> None:
             "conflit : l'arbre n'est pas propre après l'annulation :\n%s" % status)
 
 
+def check_epoch(carrier: int, worktree: Path) -> None:
+    """#4113 : garde en lecture seule, dans le Python du projet.
+
+    Le processus parent reste stdlib-only pour le lancement manuel système.
+    La garde transactionnelle finale reste requise après ces lectures.
+    """
+    if not (os.environ.get("AGENT_MAIL_NAME") or os.environ.get("AMEESH_ROLE")):
+        return
+    code = """
+import sys
+from ameesh import config, db, pilot_gesture
+conn = None
+try:
+    cfg = config.load()
+    conn = db.connect(cfg)
+    if conn is None:
+        raise RuntimeError("base absente pour vérifier l'époque")
+    pilot_gesture.gate(cfg, conn, "packet", "packet compose #%d" % int(sys.argv[1]))
+finally:
+    if conn is not None:
+        conn.close()
+"""
+    proc = run_command([project_python(worktree), "-c", code, str(carrier)],
+                       cwd=worktree, env=python_env(worktree), timeout=30)
+    if proc.returncode:
+        raise PaquetAutoError("composition interrompue avant la prochaine opération : %s"
+                              % _output(proc))
+
+
 def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int,
                        *, compose_script: Path, record_package: bool,
-                       log=print) -> Composition:
+                       log=print, guard=None) -> Composition:
     """Compose les candidats dans l'ordre ; un conflit est écarté, jamais résolu."""
     units: list[Unit] = []
     discarded: list[Discarded] = []
     for candidate in candidates:
+        if guard is not None:
+            guard()
         ensure_source(worktree, candidate)
         before = rev(worktree, "HEAD")
         if before is None:
@@ -885,13 +922,15 @@ def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int
 
 def recompose(worktree: Path, base_sha: str, candidates: list[Candidate],
               carrier: int, *, compose_script: Path, record_package: bool,
-              log=print) -> Composition:
+              log=print, guard=None) -> Composition:
     """Repart de la base exacte et recompose, sans les unités fautives."""
+    if guard is not None:
+        guard()
     git(worktree, "reset", "--hard", base_sha)
     git(worktree, "clean", "-fd")
     return compose_candidates(worktree, candidates, carrier,
                               compose_script=compose_script,
-                              record_package=record_package, log=log)
+                              record_package=record_package, log=log, guard=guard)
 
 
 # ---------------------------------------------------------------------------
@@ -1048,6 +1087,51 @@ def _dedupe_modules(worktree: Path, modules) -> list[str]:
     return out
 
 
+def _state_dir() -> str:
+    """Le script n'a que la bibliothèque standard (voir `project_python`) :
+    sans le paquet `ameesh` importable, le défaut de `ameesh.config`."""
+    try:
+        from ameesh.config import load
+        return load().state_dir
+    except (ImportError, SystemExit):
+        return os.path.expanduser("~/.local/state/ameesh")
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def save_test_log(run: TestRun) -> TestRun:
+    """Preuve locale privée, hors arbre jetable ; 48 h et 100 séries au plus.
+
+    Au mieux : un journal impossible à écrire ne change rien à la série."""
+    try:
+        return _save_test_log(run)
+    except Exception as exc:  # noqa: BLE001 — la preuve ne retient pas la série
+        print("journal de série non conservé : %s" % exc, file=sys.stderr)
+        return run
+
+
+def _save_test_log(run: TestRun) -> TestRun:
+    root = Path(_state_dir()) / "roles" / "mesh-design" / "test-logs"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    files = sorted(root.glob("series-*.log"), key=_mtime, reverse=True)
+    cutoff = time.time() - 48 * 3600
+    for index, path in enumerate(files):
+        if index >= 99 or _mtime(path) < cutoff:
+            path.unlink(missing_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="series-",
+                                     suffix=".log", dir=root, delete=False) as log:
+        log.write("%s\nmodules: %s\nreturncode: %s\nseconds: %.3f\n\n%s"
+                  % (run.label, ", ".join(run.modules), run.returncode,
+                     run.seconds, run.output))
+        run.log_path = log.name
+    return run
+
+
 def run_tests(worktree: Path, label: str, modules: list[str], *,
               timeout: int) -> TestRun:
     if not modules:
@@ -1058,13 +1142,14 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
         proc = run_command(
             [project_python(worktree), "-m", "unittest", "-q", *modules],
             cwd=worktree, timeout=timeout, env=python_env(worktree))
-        return TestRun(label=label, modules=list(modules),
+        result = TestRun(label=label, modules=list(modules),
                        returncode=proc.returncode, output=_output(proc),
                        seconds=time.monotonic() - start)
     except PaquetAutoError as exc:
-        return TestRun(label=label, modules=list(modules), returncode=None,
+        result = TestRun(label=label, modules=list(modules), returncode=None,
                        output=str(exc), seconds=time.monotonic() - start,
                        timed_out=True)
+    return save_test_log(result)
 
 
 def run_freeze_checks(worktree: Path, *, timeout: int) -> tuple[int, str, float]:
@@ -1198,7 +1283,7 @@ def designated_removals(attribution: dict, failures: list[dict], *,
 def check_local_tests(worktree: Path, composition: Composition, *,
                       timeout: int, log=print,
                       attribute=None, base_sha: str = "",
-                      select=None, on_base=None) -> tuple[list[TestRun], list[int],
+                      select=None, on_base=None, guard=None) -> tuple[list[TestRun], list[int],
                                                           list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
@@ -1234,6 +1319,8 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         log("tests voisins : %s" % composition.selection)
     pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str]]] = []
     for unit in composition.units:
+        if guard is not None:
+            guard()
         proper = unit_test_modules(worktree, unit)
         added = []
         for row in neighbors.get(unit.lot, []):
@@ -1274,6 +1361,8 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                            if failure.get("module") in neighbor})
     at_base: set[str] | None = set()
     if neighbor_red:
+        if guard is not None:
+            guard()
         at_base = (on_base or base_failures)(worktree, base_sha, neighbor_red,
                                              timeout=timeout)
         log("tests voisins rouges rejoués sur la base %s : %s"
@@ -1296,6 +1385,8 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             run.ignored_red = True
             log("tests unité #%d : rouge des seuls voisins, aussi rouges sur la "
                 "base ou non rejoués — sans effet" % unit.lot)
+    if guard is not None:
+        guard()
     modules = contract_modules(worktree)
     contract = run_tests(worktree, "contrats", modules, timeout=timeout)
     runs.append(contract)
@@ -1505,9 +1596,10 @@ def _inconclusive_lines(tests: list[TestRun]) -> list[str]:
         if not run.inconclusive:
             continue
         modules = ", ".join(run.modules) or "aucun module"
-        lines.append("- NON CONCLUANT : %s — modules %s — %s — extrait : %s"
+        lines.append("- NON CONCLUANT : %s — modules %s — %s — extrait : %s%s"
                      % (run.label.replace("#", ""), modules, run.motive(),
-                        _one_line(run.excerpt())[:240]))
+                        _one_line(run.excerpt())[:240],
+                        (" — journal local : " + run.log_path) if run.log_path else ""))
     return lines
 
 
@@ -2006,6 +2098,9 @@ def compose_packet(args: argparse.Namespace) -> int:
     branch = package_branch(args.name)
     validate_branch(repo, branch, "--name")
     rel = manifest_rel(args.name)
+    guard = (lambda: check_epoch(args.carrier, repo)) if not args.no_packet_record else None
+    if guard is not None:
+        guard()
     base_sha = fresh_base(repo, args.target)
     print("paquet %s : base %s %s" % (args.name, args.target, base_sha), flush=True)
     remote_sha: str | None = None
@@ -2033,6 +2128,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                                       dir=os.environ.get("TMPDIR"))
     try:
         ready_out = Path(tmp.name) / "prets.txt"
+        if guard is not None:
+            guard()
         candidates, payload = compute_candidates(worktree, args.target,
                                                  base_sha, ready_out)
         errors = error_discards(payload)
@@ -2066,7 +2163,7 @@ def compose_packet(args: argparse.Namespace) -> int:
         composition = compose_candidates(
             worktree, candidates, args.carrier,
             compose_script=compose_script,
-            record_package=not args.no_packet_record)
+            record_package=not args.no_packet_record, guard=guard)
         if not composition.units:
             print("aucune unité composée : %s"
                   % ", ".join("#%d (%s)" % (item.lot, item.reason)
@@ -2078,6 +2175,8 @@ def compose_packet(args: argparse.Namespace) -> int:
         freeze_seconds = 0.0
         recomp = 0
         while True:
+            if guard is not None:
+                guard()
             freeze_rc, freeze_output, freeze_seconds = run_freeze_checks(
                 worktree, timeout=FREEZE_TIMEOUT)
             if freeze_rc != 0:
@@ -2087,7 +2186,7 @@ def compose_packet(args: argparse.Namespace) -> int:
             print("freeze-checks : vert (%.1f s)" % freeze_seconds, flush=True)
             runs, faulty, removals = check_local_tests(
                 worktree, composition, timeout=args.tests_timeout,
-                base_sha=base_sha)
+                base_sha=base_sha, guard=guard)
             if not faulty:
                 break
             if recomp >= MAX_RECOMPOSITIONS:
@@ -2123,7 +2222,7 @@ def compose_packet(args: argparse.Namespace) -> int:
             composition = recompose(
                 worktree, base_sha, candidates, args.carrier,
                 compose_script=compose_script,
-                record_package=not args.no_packet_record)
+                record_package=not args.no_packet_record, guard=guard)
             composition.discarded.extend(reasons)
             # `--local` est une composition de contrôle : aucun courrier.
             failed: list[str] = []
@@ -2141,6 +2240,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                 success = True
                 empty = True
                 return 0
+        if guard is not None:
+            guard()
         composition.discarded = errors + composition.discarded
         table = composition_table(worktree, base_sha)
         ready_count = len([lot for lot in (payload.get("ready") or [])
@@ -2174,6 +2275,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                   % (args.name, branch, head), flush=True)
             success = True
             return 0
+        if guard is not None:
+            guard()
         push_branch(worktree, branch, force_lease=remote_sha)
         print("poussée : %s%s" % (branch, " (recomposition)"
                                   if remote_sha else ""), flush=True)

@@ -1883,6 +1883,17 @@ class WorkItems(Domain):
         n'est pas dans un état terminal. La réservation n'est pas touchée."""
 
     @abc.abstractmethod
+    def landed_slot(self, item_id: int) -> dict | None:
+        """#4100 : le créneau `default` atterri du lot (`number`, `repo`), ou None."""
+
+    @abc.abstractmethod
+    def release_landed_slot(self, item_id: int, number: int, repo: str, *,
+                            note: str, actor: str) -> dict | None:
+        """#4100 : relâche le créneau atterri `number` d'un lot fusionné ou
+        promu (numéro absent de la cible, aucun numéro posé sûr), journalisé
+        dans la même transaction ; None si le lot n'est pas terminal."""
+
+    @abc.abstractmethod
     def migration_landed_holder(self, number: int, repo: str) -> dict | None:
         """#1567 : le lot (id, titre, état) qui nomme déjà ce numéro atterri."""
 
@@ -2567,7 +2578,8 @@ class WorkItems(Domain):
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
                      pr_ref: str | None, frozen_id: int | None = None,
                      landed: tuple[int, str] | None = None,
-                     unfrozen: bool = False) -> dict | None:
+                     unfrozen: bool = False,
+                     release_landed: tuple[int, str] | None = None) -> dict | None:
         """Fusion constatée (L29) : `current` → `merged` si le lot y est encore
         et, si `frozen_id` est donné, si ce jalon `frozen` est toujours le
         dernier gel du lot — `unfrozen` (#2444) : si le lot n'a toujours aucun

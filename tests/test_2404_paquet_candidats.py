@@ -207,6 +207,7 @@ class InventoryTest(unittest.TestCase):
         self.role_verdicts: dict[str, bool] = {}
         self.store = mock.Mock(work=FakeWork(rows),
                                progress=FakeProgress(self.marks, self.holds))
+        self.store.work_dependencies.for_items.return_value = []
         self.classes = {
             1: "normal", 2: "normal", 3: "sensitive", 4: "normal", 5: "light",
             6: "light", 7: "normal", 8: "normal", 9: "light", 12: "sensitive",
@@ -279,6 +280,40 @@ class InventoryTest(unittest.TestCase):
     # ------------------------------------------------------------------
     # #3375 : un hold de pilote actif exclut le lot de la liste calculée
     # ------------------------------------------------------------------
+
+    def test_blocking_dependency_outside_qa_excludes_reviewed_lot(self):
+        # #4139/#4134 : le parent waiting_human n'est pas candidat lui-même.
+        self.store.work_dependencies.for_items.return_value = [
+            {"work_item_id": 1, "blocker_id": 4134,
+             "blocker_state": "waiting_human", "blocking": True}]
+        payload = self.inventory()
+        entry = self.by_id(payload)[1]
+        self.assertFalse(entry["ready"])
+        self.assertNotIn(1, payload["ready"])
+        self.assertIn(1, payload["waiting"])
+        self.assertEqual(entry["causes"][0]["code"], "dependency-blocking")
+        self.assertIn("#4134 waiting_human", candidates_script.render(payload))
+
+    def test_merged_dependency_leaves_reviewed_lot_ready(self):
+        self.store.work_dependencies.for_items.return_value = [
+            {"work_item_id": 1, "blocker_id": 4134,
+             "blocker_state": "merged", "blocking": False}]
+        self.assertIn(1, self.inventory()["ready"])
+
+    def test_hold_override_cannot_lift_a_blocking_dependency(self):
+        self.hold(1, "hold: attente")
+        self.store.work_dependencies.for_items.return_value = [
+            {"work_item_id": 1, "blocker_id": 4134,
+             "blocker_state": "waiting_human", "blocking": True}]
+        entry = self.by_id(self.inventory(hold_overrides={1: "urgence"}))[1]
+        self.assertFalse(entry["ready"])
+        self.assertEqual([c["code"] for c in entry["causes"]], ["dependency-blocking"])
+
+    def test_unreadable_dependencies_refuse_the_inventory(self):
+        self.store.work_dependencies.for_items.side_effect = RuntimeError("offline")
+        with self.assertRaisesRegex(packet_candidates.CandidateError,
+                                    "cannot read blocking dependencies: offline"):
+            self.inventory()
 
     def hold(self, lot: int, note: str, *, actor: str = "human:smichea") -> dict:
         """Ajoute un événement hold/levée au journal ciblé simulé."""
@@ -612,6 +647,16 @@ class RemiseTest(InventoryTest):
                           "priority": 2, "created_ts": 11.0})
         self.classes[11] = "normal"
         _git(self.repo, "push", "-q", "origin", "--all")
+
+    def test_reviewed_remise_cannot_lift_a_blocking_dependency(self):
+        self._remise(4, "main-abc", {"shared.py": "FOUR MAIN\ntwo\n"}, verdict="ok")
+        self.store.work_dependencies.for_items.return_value = [
+            {"work_item_id": 4, "blocker_id": 4134,
+             "blocker_state": "waiting_human", "blocking": True}]
+        entry = self.by_id(self.inventory())[4]
+        self.assertTrue(entry["remise"])
+        self.assertFalse(entry["ready"])
+        self.assertEqual([c["code"] for c in entry["causes"]], ["dependency-blocking"])
 
     def test_remise_with_verdict_makes_the_lot_ready(self):
         sha = self._remise(4, "main-abc", {"shared.py": "FOUR MAIN\ntwo\n"}, verdict="ok")

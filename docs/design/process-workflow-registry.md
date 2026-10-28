@@ -573,6 +573,92 @@ API, verifiers installed by `install_verifiers`, projection read by
 receipt, and a revoked approval or a missing projection leaves no event and
 no pinned revision.
 
+## TPK admission (#4134, E of #2846)
+
+First native admission of the TPK Process revision (entry 1 of the #2846
+breakdown) and the version reconciliation. A qualification, not product code:
+the admitted revision is pinned on a dedicated test lot; no consumer mapping is
+activated and no IMA upgrade is performed.
+
+### Admitted revision and authority
+
+| object | value |
+|---|---|
+| publication pin | `thepackengers/home@83525afb03d4c70e23bdb70f80d9545c518dc15a:ameesh/processus/tpk-work-delivery.md` (merge of home#253, 2026-10-20T23:51:08Z; blob `6d677fe09e678d1e2ba1a11cf0e492585f574b45`) |
+| card | 14 751 bytes, SHA-256 `1db5cd93bbd2cb231e7ccfb47dd55f8e7a0872e00c5f767bc431bc2ad01734f0`; `updated: 2026-10-16` |
+| workflow block | 42 lines, SHA-256 `4a39217ed5a2a31014a5ecb6bc7917d89c9e6e1208cc22ddbef17aac9c9f0b91`; byte-identical to the approved contract block |
+| approved contract | `thepackengers/issue-manager-agent@6c771e2e16bc04e8ce3b04a55df67ad4aca77cb8:knowledge/architecture/ima-ameesh-process-contract.md`; approval #704/6206927953 |
+| compiled | 14 stages, 46 edges, 7 types, initial `draft`, projection `thepackengers/3` |
+
+The pin is the publication of the approved contract; the block comparison is
+raw (not a YAML re-normalisation). The card adds only presentation keys
+(`description`, `status`, `tags`, `generated`, `sources`).
+
+**Exact-artifact approval.** `revision_transfer` needs a current approval of
+the exact artifact named by `workflow_ref`. The #704 approval 6206927953
+approves the IMA contract, not the home card; the `APPROVED` review of home#253
+is a publication approval and C reads only #704 issue comments. With the real
+#704 projection (bureau G1, 2026-10-28T02:54Z: 4 approvals, 0 refusals,
+digest `5c3ce5e276db7e933ef47506450c8f02982bb691890485bf7d109effb4a49a2c`, source `a92afbd92236d3d516f2d9c3638dde031cd775aca33432d529d63447f1a49996`), the bridge answers
+`approval-missing` for the home pin; `transfer_revision` refuses
+`verifier-refused` / `evidence-missing`. The owner approval of the exact pin
+must be posted on #704; the proposed text is in decision #154308 (owner
+`smichea`, no new authority). The projection must also declare
+`thepackengers/home` in `approvals.source.artifact_repos`, otherwise the whole
+projection is refused as out of scope.
+
+### Version reconciliation
+
+| version | value | role |
+|---|---|---|
+| Process pin | home `83525afb03d4c70e23bdb70f80d9545c518dc15a` + card path | `workflow_ref` |
+| Process revision content | IMA `6c771e2e16bc04e8ce3b04a55df67ad4aca77cb8` | approved contract; approval 6206927953 |
+| native `workflow_version` | `1` | first admission sequence; **not** a TPK/IMA version (no numeric TPK version is published) |
+| native journal version | max `work_item_events.id` | `expected_version`; not a Process version |
+| IMA serving at publication | 1.11.0 @ `44a42555406f30939285316119c7c66e60d39c13` | card text; Dockerfile at `954cebc1ac8c97dda6993c545a46099d93871cdd` |
+| IMA committed qualification | 1.11.3 | historical relay 6293775913 |
+| bureau qualification | 1.11.4 @ `e15f3ef3a65a4b1f0d9ce995a45a5f5b857b4d8f` | historical relay 6293775913 |
+| IMA develop at 2026-10-28 | ameesh 1.16.0 + 8 fixes @ `92ae35324062957d5865606bf1332a47c36b3adf` | Dockerfile at `c7b0a82e36438e85ba9957b254036b2df0ae71e6`; not an admission authority |
+| ameesh publication acceptance | 1.16.0 @ `fba44801e250b88aacd9fab7166115bead75935d` | past publication check |
+| ameesh installed / staging | 1.26.0 @ `904cefc74acf6b18c2e5133a776e6e18719bc5ac` (three VMs) | code of the admission; A and C installed |
+
+The admission authority is the installed 1.26.0/904cefc (A and C active, with
+`process-verifier-install/1` `installed: true`), the exact pin and the exact
+owner approval of that pin. The IMA serving version is not upgraded by this
+admission; the card's "serving pin remains 1.11.0" is a publication-time
+statement. A new card or contract revision is a new explicit transfer, version
++1, never a silent adoption. `0` remains the unpinned default.
+
+### Receipt and witnesses
+
+* Card pin/content: `tests/test_4134_process_admission.TpkCardPinTest` on the
+  real card fixture (file SHA-256, compiled shape, 42-line block SHA-256).
+* Deterministic refusal: `TpkAdmissionTest.test_refusal_without_pin_approval`
+  on the real #704 fixture and the real B registry; no event, no pinned
+  revision, `approval-missing` in the `verifier-refused` message.
+* Configuration prerequisite:
+  `test_home_artifact_requires_artifact_repos` (the projection is refused
+  when `artifact_repos` omits `thepackengers/home`).
+* Head change and revocation: `test_head_change_is_refused` and
+  `test_revoked_approval_is_refused` (synthetic approvals, real card/registry).
+* Installation: `test_revision_transfer_installation_receipt` (contract,
+  source, authority, references, source hashes).
+* Accepted first adoption: `test_accepted_adoption_with_pin_approval`, run once
+  the owner approval exists. Its proof carries the contract, approval source,
+  authority, lot/project, `workflow_ref`/`workflow_version`, the approval
+  (`comment_id`, author, artifact) and the projection (`digest`,
+  `source_digest`); the lot moves to `draft`/`intake` with version 1 and one
+  receipt.
+* G1: bureau receipt on #4006 (2026-10-28T02:54Z): `test_process_approvals_704`
+  3 tests OK; `refresh`/`check` 4 approvals, 0 refusals; token absent from the
+  projection; `show` on the home artifact `approval-missing`.
+
+The test fixtures (card and #704 comments) stay in the bureau vault; the
+repository carries only the pin, digests, IDs and counts. No live mapping is
+added to `github.projects`; no sidecar is stopped; `planning` and `start_work`
+are not qualified by this admission. The accepted adoption is the only step
+still gated by the owner approval.
+
 ## Proofs
 
 `tests/test_process_registry.py` (77 cases, two drivers — 2 skipped while

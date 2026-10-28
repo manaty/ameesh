@@ -490,6 +490,58 @@
        "minimum": 0
       }
      }
+    },
+    "reserved_cpu": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "reserved_mem_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "used_cpu": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "used_mem_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "reserved_cpu_source": {
+     "type": [
+      "string",
+      "null"
+     ],
+     "enum": [
+      "cgroup",
+      "machine",
+      null
+     ],
+     "description": "#4147: cgroup limit of a container, else the whole machine"
+    },
+    "reserved_mem_source": {
+     "type": [
+      "string",
+      "null"
+     ],
+     "enum": [
+      "cgroup",
+      "machine",
+      null
+     ],
+     "description": "#4147: cgroup limit of a container, else the whole machine"
     }
    }
   },

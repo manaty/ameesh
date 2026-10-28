@@ -303,7 +303,8 @@ class EstimateGuardTest(Base):
                 estimates.check(None, args.actor, None)
         finally:
             estimates.is_agent = saved
-        self.assertEqual(minutes, 90)
+        self.assertEqual(minutes, 165)
+        self.assertIn("#153989", args.estimate_source)
 
 
 class ResumeTest(Base):
