@@ -253,14 +253,6 @@ def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> floa
     """
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.renew")
-    # #4231: a live lease does not prove its host can still serve the role.
-    # The worker stops its harness on refusal, then releases its fenced epoch.
-    row = get(db, name)
-    if row and row.get("releve") == "election" \
-            and row.get("lease_owner") == owner and row.get("lease_epoch") == epoch:
-        from . import election
-        if election.renewal_successor(db, row) is not None:
-            return None
     return storage.of(db).leases.renew(name, owner, epoch, ttl_seconds)
 
 

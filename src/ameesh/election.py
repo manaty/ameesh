@@ -848,21 +848,26 @@ def _streak(history: Sequence[Mapping], challenger: str, holder: str,
             - float(other.get("availability") or 0.0)}
 
 
-def renewal_successor(db, role: Mapping, *, now: float | None = None) -> dict | None:
-    """#4231: replace an unready holder without the score hysteresis.
+def unready_successor(db, role: Mapping, *, now: float | None = None,
+                      skip: Sequence[str] = ()) -> dict | None:
+    """A ready standby for a known unready holder; the worker debounces this.
 
-    This only refuses a renewal; it never steals or releases the live lease.
-    The runner stops on refusal and releases its fenced epoch, or the lease
-    expires. A challenger still has to pass the ordinary claim CAS.
+    Read-only, used between turns only. An absent holder is not evidence of
+    poor health (attach/unadmitted runners must not trigger a handover).
     """
-    if role.get("releve") != "election":
+    if role.get("releve") != "election" or role.get("host") not in (role.get("candidats") or ()):
+        return None
+    if role.get("host") not in pg.latest(db, role["name"]):
         return None
     ranked = candidacy(db, role["name"], now=now)
     holder = next((r for r in ranked if r["host"] == role.get("host")), None)
-    if holder is not None and holder["ready"]:
+    if holder is None or holder["ready"]:
         return None
-    return next((r for r in ranked
-                 if r["ready"] and r["host"] != role.get("host")), None)
+    best = next((r for r in ranked if r["ready"]
+                 and r["host"] != role.get("host") and r["host"] not in skip), None)
+    if best is None:
+        return None
+    return dict(best, challenger=best["host"], health_reason=holder["diagnostic"])
 
 
 def handover(db, role: Mapping, holder_host: str, *,

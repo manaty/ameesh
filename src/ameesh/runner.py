@@ -8506,6 +8506,8 @@ class AgentWorker(threading.Thread):
     # -- boucles -----------------------------------------------------------
     #: L165 (EP2) : fréquence de vérification d'une bascule planifiée
     HANDOVER_CHECK_S = 60.0
+    # #4231: three observations, rather than one transient pressure sample.
+    UNREADY_HANDOVER_S = 120.0
 
     def _election_handover(self) -> dict | None:
         """Une bascule planifiée est-elle due à cette fin de tour ? (EP2)
@@ -8513,7 +8515,8 @@ class AgentWorker(threading.Thread):
         Lit la ligne fraîche du registre (l'échéance du bail y est renouvelée)
         et laisse `election.handover_due` juger l'hystérésis : un challenger
         resté ≥ 5 points de disponibilité au-dessus du détenteur pendant une
-        heure. Le retour est le challenger et la durée de la supériorité.
+        heure. Une indisponibilité continue de 120 s avec successeur prêt
+        permet aussi une relève, uniquement entre les tours (#4231).
         """
         if (self.agent or {}).get("releve") != "election":
             return None
@@ -8525,11 +8528,23 @@ class AgentWorker(threading.Thread):
         try:
             row = registry.get(self.db, self.name)
             if row is None:
+                self._unready_since = None
                 return None
+            skipped = self.runner.handover_failed(self.name)
+            successor = election.unready_successor(self.db, row, skip=skipped)
+            if successor is None:
+                self._unready_since = None
+            else:
+                since = getattr(self, "_unready_since", None)
+                if since is None:
+                    since = self._unready_since = now
+                elapsed = now - since
+                if elapsed >= self.UNREADY_HANDOVER_S:
+                    return dict(successor, seconds=elapsed, gap=0.0)
             return election.handover_due(
-                self.db, row, self.runner.host,
-                skip=self.runner.handover_failed(self.name))
+                self.db, row, self.runner.host, skip=skipped)
         except db_mod.DbError as exc:
+            self._unready_since = None  # no evidence of continuous unavailability
             message = "elected-role handover not evaluated (%s)" % db_mod.explain(exc)
             if message != getattr(self, "_handover_error", None):
                 log_async(message)
@@ -8628,19 +8643,21 @@ class AgentWorker(threading.Thread):
                     # en fin de tour, le challenger le réclame à son rang.
                     handover = self._election_handover()
                     if handover:
-                        log("[%s] elected role: %s has stayed %.1f availability points "
-                            "ahead for %d min; lease released at end of turn"
-                            % (self.name, handover["challenger"], handover["gap"],
-                               max(1, int(handover["seconds"] // 60))))
-                        self._fil_note(
-                            "Elected role handed over to %s: it has stayed %.1f "
-                            "availability points ahead for %d min (planned switch at "
-                            "the end of this holder's turn)."
-                            % (handover["challenger"], handover["gap"],
-                               max(1, int(handover["seconds"] // 60))),
-                            meta={"action": "election-handover",
-                                  "challenger": handover["challenger"],
-                                  "ahead_s": round(handover["seconds"], 1)})
+                        if handover.get("health_reason"):
+                            message = ("Elected role handed over to %s: holder unready "
+                                       "for %.0fs (%s); lease released at end of turn."
+                                       % (handover["challenger"], handover["seconds"],
+                                          handover["health_reason"]))
+                        else:
+                            message = ("Elected role handed over to %s: %.1f availability "
+                                       "points ahead for %d min; lease released at end of turn."
+                                       % (handover["challenger"], handover["gap"],
+                                          max(1, int(handover["seconds"] // 60))))
+                        log("[%s] %s" % (self.name, message))
+                        self._fil_note(message, meta={"action": "election-handover",
+                            "challenger": handover["challenger"],
+                            "ahead_s": round(handover["seconds"], 1),
+                            "health_reason": handover.get("health_reason")})
                         self.runner.note_handover_release(
                             self.name, handover["challenger"],
                             float(handover.get("delay_s") or 0.0))
