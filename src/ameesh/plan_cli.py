@@ -152,7 +152,8 @@ def add_parsers(work_sub, func) -> None:
 
     p_plan = work_sub.add_parser(
         "plan", help="planned dates of a task or a WorkPackage (L96)")
-    p_plan.add_argument("target", help="task number, or package id")
+    p_plan.add_argument("target", nargs="?", help="task number, or package id")
+    p_plan.add_argument("--project", help="read the project dispatch plan and waiting reasons")
     p_plan.add_argument("--start", dest="debut", default=None,
                         help="planned start: YYYY-MM-DD, tomorrow, monday...; - clears")
     p_plan.add_argument("--debut", dest="debut", action=DeprecatedAlias, canonical="--start",
@@ -360,6 +361,28 @@ def _plan(db, args: argparse.Namespace) -> int:
     """L96 : dates prévues d'une tâche ou d'une fiche WorkPackage ; L157 :
     durée estimée d'une tâche (`--estimate`)."""
     from . import estimates, roadmap
+
+    project = getattr(args, "project", None)
+    if project:
+        if args.target is not None or any(getattr(args, k, None) is not None for k in
+                ("debut", "fin", "livraison", "estimate", "source", "estimate_source")):
+            raise work.WorkError("--project is read-only; use work plan <id> to edit dates")
+        from . import project_plan
+        out = project_plan.report(db, project)
+        if args.json:
+            print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+        else:
+            print("%s: %s" % (project, out["phase"]))
+            for row in out["lots"]:
+                dates = " · ".join("%s %s" % (label, row[key]) for label, key in
+                    (("start", "planned_start"), ("end", "planned_end"),
+                     ("delivery", "planned_delivery")) if row.get(key))
+                print("#%s %s: %s%s" % (row["id"], row["title"],
+                      "ready" if row["ready"] else "; ".join(row["waiting"]),
+                      " · " + dates if dates else ""))
+        return 0
+    if args.target is None:
+        raise work.WorkError("work plan requires a target or --project P")
 
     kwargs = {k: v for k, v in (("start", args.debut), ("end", args.fin),
                                 ("delivery", args.livraison)) if v is not None}
