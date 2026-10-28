@@ -102,7 +102,7 @@ class SignedBootstrapAuthority(signed.SignedDecisionAuthority):
         return now<expires and self._proof_live(view,now,expires)
 
 
-def run(journal,operation,bundle, *, authority,adapter):
+def _run(journal,operation,bundle, *, authority,adapter):
     """Resume exact bootstrap intents; no automatic destructive rollback.
 
     adapter validates the real host/runtime closure before copying, preserves
@@ -179,3 +179,18 @@ def run(journal,operation,bundle, *, authority,adapter):
         protocol.save(path,record)
         reservation.unlink()
         return 'installed'
+
+
+def run(journal,operation,bundle, *, authority,adapter):
+    """Serialize signed pin/tree publication against every H8 invocation.
+
+    The administrator enrolls the permanent root-owned lock before bootstrap;
+    lock creation is not an authorization and grants no execution permission.
+    Never replace/unlink that inode, including on bounded rollback.
+    """
+    if (delegation.SEAL_DOCUMENT not in bundle.get('files',{})
+            and not Path(delegation.SEAL_DOCUMENT).exists()):
+        return _run(journal,operation,bundle,authority=authority,adapter=adapter)
+    seal=module('scellement-runtime')
+    with seal.locked(exclusive=True):
+        return _run(journal,operation,bundle,authority=authority,adapter=adapter)

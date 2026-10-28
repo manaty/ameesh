@@ -222,6 +222,11 @@ class BootstrapHostAdapter:
                 self.approved(request)
             return self.files.perform(step,request)
         elif step=='validate':
+            seal_info=bundle['files'].get(bootstrap.delegation.SEAL_DOCUMENT)
+            if seal_info is not None:
+                seal=module('scellement-runtime')
+                seal.verify(json.loads(seal_info['content']),
+                            self.root/'opt/ameesh-release')
             if self.system.validate_configuration(bundle) is not True or self.system.ready(bundle) is not True:
                 raise InstallError('independent release adapter not ready')
         self.approved(request)
