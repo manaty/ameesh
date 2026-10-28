@@ -236,8 +236,13 @@ OK_RE = re.compile(r"^OK(?: \(skipped=(\d+)\))?", re.MULTILINE)
 FAILED_SUMMARY_RE = re.compile(r"^FAILED \((.*?)\)", re.MULTILINE)
 FAIL_HEADER_RE = re.compile(r"^FAIL: ", re.MULTILINE)
 ERROR_HEADER_RE = re.compile(r"^ERROR: .*$", re.MULTILINE)
+#: une ligne d'exception effective, en colonne 0 : nom simple (`ValueError`)
+#: ou pointé (`psycopg.errors.QueryCanceled`), le dernier segment commençant
+#: par une majuscule. Les en-têtes unittest `FAIL:`/`ERROR:` et les lignes
+#: source (indentées) ne sont pas des exceptions.
 EXCEPTION_LINE_RE = re.compile(
-    r"^([\w.]+(?:Error|Exception)):\s*(.*)$", re.MULTILINE)
+    r"^(?!FAIL:|ERROR:)((?:[a-z_][\w]*\.)+_?[A-Z][\w]*|_?[A-Z][\w]*):\s*(.*)$",
+    re.MULTILINE)
 BLOCK_END_RE = re.compile(r"^=+$", re.MULTILINE)
 #: le seuil de preuve forte de #3801, le même que `paquet_horaire.classify`
 STRONG_EVIDENCE = 4
@@ -380,28 +385,30 @@ class TestRun:
 
     @staticmethod
     def _error_is_environment(block: str) -> bool:
-        """La dernière exception du bloc est-elle une panne d'environnement ?
+        """La dernière exception effective du bloc est-elle une panne ?
 
         Le **nom du type** ne suffit pas : `AssertionError: expected
-        OperationalError` est un rouge réel. On lit le message de la dernière
-        exception, et `AssertionError` est toujours réelle. Sans ligne
+        OperationalError` est un rouge réel. On ne lit que la **dernière**
+        exception du bloc, en colonne 0 : une exception réelle chaînée après
+        une annulation de requête reste réelle, et une ligne source n'est
+        jamais une exception (#4217, B de la revue). Un nom psycopg sans
+        suffixe `Error` (`QueryCanceled`) est lu comme les autres. Sans ligne
         d'exception (sortie psql), on cherche un motif d'infrastructure.
-        #4217 : un nom psycopg qui ne finit pas par `Error` (`QueryCanceled`,
-        `DeadlockDetected`…) échappe à `EXCEPTION_LINE_RE` ; le motif
-        d'infrastructure du bloc reste alors une preuve.
         """
         lines = EXCEPTION_LINE_RE.findall(block)
-        if lines:
-            kind, message = lines[-1]
-            name = kind.rsplit(".", 1)[-1]
-            if name == "AssertionError":
-                return False
-            if ENV_MESSAGE_RE.search(message):
-                return True
-            if name in ("ModuleNotFoundError", "ImportError") and "psycopg" in message:
-                return True
-            return bool(ENV_MESSAGE_RE.search(block))
-        return bool(INCONCLUSIVE_RE.search(block))
+        if not lines:
+            return bool(INCONCLUSIVE_RE.search(block))
+        kind, message = lines[-1]
+        name = kind.rsplit(".", 1)[-1]
+        if name == "AssertionError":
+            return False
+        if name == "QueryCanceled":
+            return True
+        if ENV_MESSAGE_RE.search(message):
+            return True
+        if name in ("ModuleNotFoundError", "ImportError") and "psycopg" in message:
+            return True
+        return False
 
     @property
     def real_failure(self) -> bool:

@@ -427,6 +427,75 @@ class FixtureErrorTest(unittest.TestCase):
              paquet_auto.unittest_failures(output)],
             ["tests.test_l56_role_executor.RoleExecutorTest.test_real"])
 
+    def test_querycanceled_chainee_vers_valueerror_reste_reelle(self) -> None:
+        # B de la revue #4217 : la dernière exception effective est
+        # ValueError ; l'QueryCanceled antérieur ne doit pas la classer
+        # environnement.
+        output = (
+            "======================================================================\n"
+            "ERROR: test_x (tests.test_x.T.test_x)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "psycopg.errors.QueryCanceled: canceling statement due to statement timeout\n"
+            "\n"
+            "During handling of the above exception, another exception occurred:\n"
+            "\n"
+            "Traceback (most recent call last):\n"
+            "ValueError: invalid application state\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 1 test in 0.1s\n"
+            "FAILED (errors=1)\n")
+        run = paquet_auto.TestRun("unité #1", ["tests.test_x"], 1, output, 0.1)
+        self.assertFalse(run.inconclusive)
+        self.assertTrue(run.real_failure)
+        self.assertEqual(
+            [failure["test"] for failure in
+             paquet_auto.unittest_failures(output)],
+            ["tests.test_x.T.test_x"])
+
+    def test_un_querycanceled_final_reste_non_concluant(self) -> None:
+        output = (
+            "======================================================================\n"
+            "ERROR: test_x (tests.test_x.T.test_x)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "RuntimeError: emballage\n"
+            "\n"
+            "During handling of the above exception, another exception occurred:\n"
+            "\n"
+            "Traceback (most recent call last):\n"
+            "psycopg.errors.QueryCanceled: canceling statement due to statement timeout\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 1 test in 0.1s\n"
+            "FAILED (errors=1)\n")
+        run = paquet_auto.TestRun("unité #1", ["tests.test_x"], 1, output, 0.1)
+        self.assertTrue(run.inconclusive)
+        self.assertFalse(run.real_failure)
+        self.assertEqual(paquet_auto.unittest_failures(output), [])
+
+    def test_une_ligne_source_n_est_pas_une_exception(self) -> None:
+        output = (
+            "======================================================================\n"
+            "ERROR: test_x (tests.test_x.T.test_x)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tests/test_x.py\", line 10, in test_x\n"
+            "    raise ValueError('invalid')  # QueryCanceled: statement timeout\n"
+            "ValueError: invalid application state\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 1 test in 0.1s\n"
+            "FAILED (errors=1)\n")
+        run = paquet_auto.TestRun("unité #1", ["tests.test_x"], 1, output, 0.1)
+        self.assertFalse(run.inconclusive)
+        self.assertTrue(run.real_failure)
+        self.assertEqual(
+            [failure["test"] for failure in
+             paquet_auto.unittest_failures(output)],
+            ["tests.test_x.T.test_x"])
+
     def check(self, *, own, neighbors):
         composition = paquet_auto.Composition(
             units=[paquet_auto.Unit(1, "a" * 40, "b" * 40)],
