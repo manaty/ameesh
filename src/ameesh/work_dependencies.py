@@ -49,6 +49,171 @@ def grouped(db, item_ids):
 
 
 # --------------------------------------------------------------------------
+# #4167 (manaty/ameesh#3185, volet 1) : liens typés entre lots
+# --------------------------------------------------------------------------
+
+#: `duplicates`, `supersedes`, `part_of` sont orientés (le lot édité est le
+#: doublon, le remplaçant, la part) ; `conflicts_with` est symétrique.
+LINK_KINDS = ("duplicates", "supersedes", "part_of", "conflicts_with")
+
+#: lecture inverse d'un lien orienté, vu depuis sa cible
+_INVERSE = {"duplicates": "duplicated by", "supersedes": "superseded by",
+            "part_of": "has part", "conflicts_with": "conflicts with"}
+
+_LINK_ERRORS = {"self_link": "a lot cannot be linked to itself",
+                "unknown_lot": "link endpoints must be existing lots",
+                "finished_lot": "a conflict links two open lots",
+                "link_cycle": "this link would create a cycle",
+                "no_link": "no conflicts_with link between these lots"}
+
+
+def _kind(kind):
+    if kind not in LINK_KINDS:
+        raise work.WorkError("link kind must be one of %s" % ", ".join(LINK_KINDS))
+    return kind
+
+
+def _actor(actor, what="a link edit"):
+    if not isinstance(actor, str) or not actor.strip():
+        raise work.WorkError("%s needs an identified actor" % what)
+
+
+def add_link(db, item_id, other_id, kind, *, actor):
+    """`item_id` <kind> `other_id` ; rend True si le lien est nouveau."""
+    _id(item_id)
+    _id(other_id)
+    _kind(kind)
+    _actor(actor)
+    result = storage.of(db).work_dependencies.add_link(item_id, other_id, kind, actor=actor)
+    if result.get("error"):
+        raise work.WorkError(_LINK_ERRORS[result["error"]])
+    return result["added"]
+
+
+def remove_link(db, item_id, other_id, kind, *, actor):
+    _id(item_id)
+    _id(other_id)
+    _kind(kind)
+    _actor(actor)
+    if work.get(db, item_id) is None or work.get(db, other_id) is None:
+        raise work.WorkError(_LINK_ERRORS["unknown_lot"])
+    return storage.of(db).work_dependencies.remove_link(item_id, other_id, kind, actor=actor)
+
+
+def decide_link(db, item_id, other_id, decision, *, actor):
+    """Consigne la décision prise sur un conflit : l'alerte se tait."""
+    _id(item_id)
+    _id(other_id)
+    _actor(actor, "a conflict decision")
+    decision = (decision or "").strip()
+    if not decision:
+        raise work.WorkError("a conflict decision needs its text (--decision)")
+    result = storage.of(db).work_dependencies.decide_link(
+        item_id, other_id, decision=decision, actor=actor)
+    if result.get("error"):
+        raise work.WorkError(_LINK_ERRORS[result["error"]])
+    return result["decided"]
+
+
+def links(db, item_ids):
+    """`{lot: [lien vu depuis ce lot]}` : `kind` lu depuis le lot (`duplicated
+    by` pour la cible d'un `duplicates`), `lot` l'autre extrémité, son état,
+    `open`, la décision d'un conflit."""
+    wanted = {int(i) for i in item_ids}
+    out = {}
+    for row in storage.of(db).work_dependencies.links_for(sorted(wanted)):
+        a, b, kind = int(row["work_item_id"]), int(row["other_id"]), row["kind"]
+        for lot, peer, label, state, forward in (
+                (a, b, kind.replace("_", " "), row["other_state"], True),
+                (b, a, _INVERSE[kind], row["item_state"], False)):
+            if lot not in wanted:
+                continue
+            out.setdefault(lot, []).append({
+                "kind": kind, "label": label, "forward": forward or kind == "conflicts_with",
+                "lot": peer, "state": state, "open": bool(row["open"]),
+                "created_by": row["created_by"], "created_ts": row["created_ts"],
+                "decision": row.get("decision"), "decided_by": row.get("decided_by"),
+                "decided_ts": row.get("decided_ts")})
+    return out
+
+
+def alerts(db):
+    """#4167 : deux lots ouverts liés `conflicts_with` sans décision consignée.
+
+    Une alerte par lien, adressée à l'assigné du premier lot (sinon du second) ;
+    elle se tait quand la décision est consignée (`work links --decide`), quand
+    le lien est retiré ou qu'un des deux lots se ferme."""
+    from .exploitation import _alert
+    out = []
+    for row in storage.of(db).work_dependencies.undecided_conflicts():
+        a, b = int(row["work_item_id"]), int(row["other_id"])
+        agent = (row.get("item_assignee") or row.get("other_assignee") or "").strip() or None
+        out.append(_alert(
+            "lot_conflict_undecided", agent, row["created_ts"], 1, 1,
+            "lots #%d and #%d conflict and no decision is recorded; decide, then "
+            "ameesh work links %d --decide %d --decision \"…\" (or remove the link)"
+            % (a, b, a, b),
+            lot=a, other_lot=b, title=row.get("item_title"),
+            other_title=row.get("other_title"), project=row.get("item_app"),
+            lot_state=row.get("item_state"), other_state=row.get("other_state")))
+    return out
+
+
+def add_links_parser(sub, func):
+    parser = sub.add_parser(
+        "links", help="#4167: inspect or edit typed links between lots (duplicates, "
+                      "supersedes, part_of, conflicts_with)")
+    parser.add_argument("id", type=int, help="lot")
+    edit = parser.add_mutually_exclusive_group()
+    edit.add_argument("--add", type=int, metavar="LOT",
+                      help="add the link: <id> <kind> LOT (with --kind)")
+    edit.add_argument("--remove", type=int, metavar="LOT",
+                      help="remove the link <id> <kind> LOT (with --kind)")
+    edit.add_argument("--decide", type=int, metavar="LOT",
+                      help="record the decision on the conflict with LOT (with --decision)")
+    parser.add_argument("--kind", choices=LINK_KINDS)
+    parser.add_argument("--decision", default="", help="the decision taken on the conflict")
+    parser.add_argument("--actor", default="")
+    parser.add_argument("--json", action="store_true")
+    parser.set_defaults(func=func)
+
+
+def run_links(db, args):
+    _id(args.id)
+    if work.get(db, args.id) is None:
+        raise work.WorkError("lot #%d not found" % args.id)
+    changed = None
+    if args.add is not None or args.remove is not None:
+        if not args.kind:
+            raise work.WorkError("--add and --remove need --kind (%s)" % ", ".join(LINK_KINDS))
+        if args.add is not None:
+            changed = add_link(db, args.id, args.add, args.kind, actor=args.actor)
+        else:
+            changed = remove_link(db, args.id, args.remove, args.kind, actor=args.actor)
+    elif args.decide is not None:
+        changed = decide_link(db, args.id, args.decide, args.decision, actor=args.actor)
+    elif args.kind or args.decision:
+        raise work.WorkError("--kind goes with --add/--remove, --decision with --decide")
+    rows = links(db, [args.id]).get(args.id, [])
+    if args.json:
+        print(json.dumps({"id": args.id, "changed": changed, "links": rows},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if changed is not None:
+        print("lot #%d: link %s" % (args.id, "updated" if changed else "unchanged"))
+    for row in rows:
+        line = "#%d %s #%d (%s)" % (args.id, row["label"], row["lot"], row["state"])
+        if row["kind"] == "conflicts_with":
+            line += (" — decided by %s: %s" % (row["decided_by"], row["decision"])
+                     if row.get("decision") else
+                     " — undecided" if row["open"] else "")
+        print(line)
+    if not rows:
+        print("lot #%d: no typed links" % args.id)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # #1945 : atterrissage planifié sur un véhicule de paquet
 # --------------------------------------------------------------------------
 

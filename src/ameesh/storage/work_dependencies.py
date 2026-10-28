@@ -30,6 +30,47 @@ class WorkDependencies(abc.ABC):
         """
 
     @abc.abstractmethod
+    def add_link(self, item_id: int, other_id: int, kind: str, *, actor: str) -> dict:
+        """#4167: atomically validate, add and journal a typed link.
+
+        `kind` is `duplicates`, `supersedes`, `part_of` (directed: `item_id`
+        duplicates/supersedes/is part of `other_id`) or `conflicts_with`
+        (symmetric, stored with the smaller id first). Same graph lock as the
+        dependencies. Self links (`self_link`), unknown endpoints
+        (`unknown_lot`), a conflict with a finished lot (`finished_lot`) and a
+        cycle in the directed graph of the same kind (`link_cycle`) are
+        refused without mutation. An existing link replays as `added: False`
+        without changing activity. The journal goes to `item_id`.
+        """
+
+    @abc.abstractmethod
+    def remove_link(self, item_id: int, other_id: int, kind: str, *, actor: str) -> bool:
+        """Remove and journal once; False when the link is already absent."""
+
+    @abc.abstractmethod
+    def decide_link(self, item_id: int, other_id: int, *, decision: str, actor: str) -> dict:
+        """Record the decision taken on a `conflicts_with` link, journaled on
+        both lots. Returns `decided` (False on the same decision replayed), or
+        `error` (`no_link`)."""
+
+    @abc.abstractmethod
+    def links_for(self, item_ids: Sequence[int]) -> list[dict]:
+        """Every typed link touching these lots, in either direction.
+
+        One row per link: `work_item_id`, `other_id`, `kind`, `created_by`,
+        `created_ts`, `decision`, `decided_by`, `decided_ts`, the current
+        state of both ends (`item_state`, `other_state`) and `open` (neither
+        end is merged/promoted/closed). No rendering limit.
+        """
+
+    @abc.abstractmethod
+    def undecided_conflicts(self) -> list[dict]:
+        """`conflicts_with` links between two open lots with no decision,
+        with both ends' assignee, project and title (rows of `links_for`
+        plus `item_assignee`, `other_assignee`, `item_app`, `item_title`,
+        `other_title`)."""
+
+    @abc.abstractmethod
     def set_landing(self, item_id: int, vehicle_id: int, *, until_on: str, actor: str) -> dict:
         """Declare (or renew) a planned landing, pinned to the vehicle's freeze.
 

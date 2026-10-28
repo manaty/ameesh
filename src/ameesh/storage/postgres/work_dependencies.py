@@ -170,6 +170,121 @@ class WorkDependencies(Contract):
             WHERE d.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
             " ORDER BY d.work_item_id, d.blocker_id", tuple(ids))
 
+    # ------------------------------------------------------------------
+    # #4167 : liens typés (duplicates, supersedes, part_of, conflicts_with)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _link_ends(item_id, other_id, kind):
+        """`conflicts_with` est symétrique : rangé plus petit id d'abord."""
+        if kind == "conflicts_with" and item_id > other_id:
+            return other_id, item_id
+        return item_id, other_id
+
+    def add_link(self, item_id, other_id, kind, *, actor):
+        if item_id == other_id:
+            return {"error": "self_link"}
+        with self.db.transaction() as tx:
+            # même verrou que le graphe des prérequis : une passe qui lit les
+            # deux graphes ne voit jamais une édition à moitié faite
+            tx.execute(_LOCK)
+            rows = tx.query("SELECT id, state FROM work_items WHERE id IN (%s, %s)"
+                            " ORDER BY id FOR UPDATE", (item_id, other_id))
+            states = {int(row["id"]): row["state"] for row in rows}
+            if item_id not in states or other_id not in states:
+                return {"error": "unknown_lot"}
+            a, b = self._link_ends(item_id, other_id, kind)
+            if tx.query("SELECT 1 FROM work_item_links WHERE work_item_id = %s"
+                        " AND other_id = %s AND kind = %s", (a, b, kind)):
+                return {"added": False}
+            if kind == "conflicts_with":
+                # un conflit avec un lot fini n'a plus rien à trancher
+                if states[item_id] in _DONE or states[other_id] in _DONE:
+                    return {"error": "finished_lot"}
+            elif tx.query("""
+                    WITH RECURSIVE reach(id) AS (
+                        SELECT other_id FROM work_item_links
+                         WHERE work_item_id = %s AND kind = %s
+                        UNION
+                        SELECT l.other_id FROM work_item_links l JOIN reach r
+                            ON l.work_item_id = r.id AND l.kind = %s
+                    ) SELECT 1 FROM reach WHERE id = %s LIMIT 1
+                    """, (other_id, kind, kind, item_id)):
+                return {"error": "link_cycle"}
+            tx.execute("INSERT INTO work_item_links(work_item_id, other_id, kind, created_by)"
+                       " VALUES (%s, %s, %s, %s)", (a, b, kind, actor))
+            self._landing_journal(tx, item_id, "Link added: %s lot #%d" % (kind, other_id),
+                                  actor)
+            return {"added": True}
+
+    def remove_link(self, item_id, other_id, kind, *, actor):
+        a, b = self._link_ends(item_id, other_id, kind)
+        with self.db.transaction() as tx:
+            tx.execute(_LOCK)
+            tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE", (item_id,))
+            removed = tx.query("DELETE FROM work_item_links WHERE work_item_id = %s"
+                               " AND other_id = %s AND kind = %s RETURNING kind",
+                               (a, b, kind))
+            if not removed:
+                return False
+            self._landing_journal(tx, item_id, "Link removed: %s lot #%d" % (kind, other_id),
+                                  actor)
+            return True
+
+    def decide_link(self, item_id, other_id, *, decision, actor):
+        a, b = self._link_ends(item_id, other_id, "conflicts_with")
+        with self.db.transaction() as tx:
+            tx.execute(_LOCK)
+            tx.query("SELECT id FROM work_items WHERE id IN (%s, %s) ORDER BY id FOR UPDATE",
+                     (a, b))
+            rows = tx.query("SELECT decision FROM work_item_links WHERE work_item_id = %s"
+                            " AND other_id = %s AND kind = 'conflicts_with' FOR UPDATE",
+                            (a, b))
+            if not rows:
+                return {"error": "no_link"}
+            if rows[0].get("decision") == decision:
+                return {"decided": False}
+            tx.execute("UPDATE work_item_links SET decision = %s, decided_by = %s,"
+                       " decided_at = clock_timestamp() WHERE work_item_id = %s"
+                       " AND other_id = %s AND kind = 'conflicts_with'",
+                       (decision, actor, a, b))
+            for lot, peer in ((a, b), (b, a)):
+                self._landing_journal(tx, lot, "Conflict with lot #%d decided: %s"
+                                      % (peer, decision), actor)
+            return {"decided": True}
+
+    _LINK_COLUMNS = """
+            l.work_item_id, l.other_id, l.kind, l.created_by,
+            extract(epoch FROM l.created_at)::float8 AS created_ts,
+            l.decision, l.decided_by,
+            extract(epoch FROM l.decided_at)::float8 AS decided_ts,
+            a.state AS item_state, b.state AS other_state,
+            (a.state NOT IN """ + _DONE_SQL + " AND b.state NOT IN " + _DONE_SQL + """) AS open
+            """
+
+    def links_for(self, item_ids):
+        ids = sorted({int(i) for i in item_ids})
+        if not ids:
+            return []
+        marks = ", ".join(["%s"] * len(ids))
+        return self.db.query(
+            "SELECT" + self._LINK_COLUMNS +
+            " FROM work_item_links l JOIN work_items a ON a.id = l.work_item_id"
+            " JOIN work_items b ON b.id = l.other_id"
+            " WHERE l.work_item_id IN (" + marks + ") OR l.other_id IN (" + marks + ")"
+            " ORDER BY l.work_item_id, l.other_id, l.kind", tuple(ids) * 2)
+
+    def undecided_conflicts(self):
+        return self.db.query(
+            "SELECT" + self._LINK_COLUMNS + ","
+            " a.assignee AS item_assignee, b.assignee AS other_assignee,"
+            " a.app AS item_app, a.title AS item_title, b.title AS other_title"
+            " FROM work_item_links l JOIN work_items a ON a.id = l.work_item_id"
+            " JOIN work_items b ON b.id = l.other_id"
+            " WHERE l.kind = 'conflicts_with' AND l.decision IS NULL"
+            " AND a.state NOT IN " + _DONE_SQL + " AND b.state NOT IN " + _DONE_SQL +
+            " ORDER BY l.work_item_id, l.other_id")
+
     @staticmethod
     def _landing_journal(tx, item_id, note, actor):
         tx.execute("INSERT INTO work_item_events(work_item_id, state, note, actor, created_at)"
