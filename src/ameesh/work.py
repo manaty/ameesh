@@ -3278,8 +3278,9 @@ def _landing_probe(db: Db, item: dict, reserved, slug, sha: str, repo: str | Non
     sa SOURCE, son dernier gel, puis à défaut au commit de preuve ; s'il est
     sur la cible tel quel, rien à faire (None). Sinon la cible est cherchée
     par le nom après le numéro, puis, à défaut, par l'empreinte du contenu
-    (blob). Sans fichier identifiable, une unité (commit à un parent) qui
-    ajoute un seul fichier numéroté présent sur la cible le désigne :
+    (blob). Sans fichier identifiable, une unité qui
+    ajoute un seul fichier numéroté présent sur la cible le désigne
+    (commit simple ou fusion, comparé à sa première parente) :
     - un seul candidat M → `{"landed": M, "repo": slug, "how": …}` ;
     - aucun, plusieurs, ou M déjà nommé par un autre lot →
       `{"release": N, "repo": slug, "why": …}` : l'ancien numéro est relâché,
@@ -3327,7 +3328,8 @@ def _landing_probe(db: Db, item: dict, reserved, slug, sha: str, repo: str | Non
         if any(name in present for name in ours):
             return None
         on_target = {number(name) for name in present}
-        if not ours:
+
+        def by_unit() -> dict | None:
             unit = _unit_added(repo, layout, sha)
             posed = {number(name) for name in unit if name in present}
             if len(posed) == 1 and len(unit) == 1 and reserved not in posed:
@@ -3336,6 +3338,12 @@ def _landing_probe(db: Db, item: dict, reserved, slug, sha: str, repo: str | Non
                 if holder is None or int(holder["id"]) == int(item["id"]):
                     return {"landed": landed, "repo": slug,
                             "how": "%s added by unit %s" % (unit[0], sha[:12])}
+            return None
+
+        if not ours:
+            unit = by_unit()
+            if unit is not None:
+                return unit
             if reserved in on_target:
                 return None   # le numéro porte un autre fichier : rien à dire
             return {"release": reserved, "repo": slug,
@@ -3351,6 +3359,9 @@ def _landing_probe(db: Db, item: dict, reserved, slug, sha: str, repo: str | Non
             how = "content"
             found = {number(other) for other, other_blob in present.items()
                      if other_blob == blob and number(other) != reserved}
+        unit = None if found else by_unit()
+        if unit is not None:
+            return unit
         if len(found) != 1:
             return {"release": reserved, "repo": slug,
                     "why": "%s absent from %s, %s" % (
@@ -3398,7 +3409,8 @@ def _repair_landing(db: Db, item: dict, sha: str, repo: str, *, actor: str,
 def _lot_sources(db: Db, item: dict, sha: str, repo: str) -> list[str]:
     """#4100 (revue cx3) : les commits où lire les fichiers du lot — son
     dernier gel s'il est lisible dans le clone (la source, avant toute
-    renumérotation d'un paquet), puis le commit de preuve."""
+    renumérotation d'un paquet), la branche fusionnée par une unité
+    `merge --no-ff` (seconde parente, revue dev3), puis le commit de preuve."""
     from . import migrations, plan_git
 
     sources: list[str] = []
@@ -3411,19 +3423,22 @@ def _lot_sources(db: Db, item: dict, sha: str, repo: str) -> list[str]:
     if frozen:
         frozen = migrations._git(repo, "rev-parse", "--verify", "--quiet",
                                  "%s^{commit}" % frozen).strip()
-    for candidate in (frozen, sha):
+    merged = migrations._git(repo, "rev-parse", "--verify", "--quiet",
+                             "%s^2^{commit}" % sha).strip()
+    for candidate in (frozen, merged, sha):
         if candidate and candidate not in sources:
             sources.append(candidate)
     return sources
 
 
 def _unit_added(repo: str, layout, sha: str) -> list[str]:
-    """#4100 : les fichiers numérotés qu'ajoute `sha` s'il n'a qu'un parent
-    (une unité de composition) ; vide pour un commit de fusion ou une racine."""
+    """#4100 : les fichiers numérotés qu'ajoute l'unité `sha` à la cible, par
+    rapport à sa première parente — un commit simple ou une fusion
+    `--no-ff` de `paquet-compose.py` (revue dev3) ; vide pour une racine."""
     from . import migrations
 
     parents = migrations._git(repo, "rev-list", "--parents", "-n", "1", sha).split()
-    if len(parents) != 2:
+    if len(parents) < 2:
         return []
     before = migrations.tree_files(repo, layout, parents[1])
     return sorted(name for name in migrations.tree_files(repo, layout, sha)

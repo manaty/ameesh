@@ -1486,6 +1486,83 @@ class NumeroAtterriTest(PgTestCase):
         self.assertTrue(any("378_key.sql added by unit" in n for n in self._notes(lot)),
                         self._notes(lot))
 
+    def _merge_unit(self, lot, branch, resolution):
+        """Une unité `paquet-compose.py` : `git merge --no-ff` de la branche
+        du lot, en conflit sur `seed.txt` ; la résolution, DANS le commit
+        d'unité, renumérote (`resolution` : [(ancien, nouveau, contenu)])."""
+        directory = NEXLINK.directory
+        with open(os.path.join(self.nexlink, "seed.txt"), "w") as fh:
+            fh.write("develop\n")
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "seed develop")
+        proc = subprocess.run(["git", "-C", self.nexlink, "merge", "--no-ff", "--no-commit",
+                               branch], capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0, "le conflit attendu n'a pas eu lieu")
+        with open(os.path.join(self.nexlink, "seed.txt"), "w") as fh:
+            fh.write("résolu\n")
+        for old, new, content in resolution:
+            _git(self.nexlink, "mv", "%s/%s" % (directory, old), "%s/%s" % (directory, new))
+            if content is not None:
+                self._write(new, content)
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "vehicule : #%d\n\nameesh-work: %d"
+             % (lot["id"], lot["id"]))
+        return self._head()
+
+    def _lot_branch(self, name, content):
+        _git(self.nexlink, "checkout", "-qb", "agent/m-%s" % name)
+        with open(os.path.join(self.nexlink, "seed.txt"), "w") as fh:
+            fh.write("lot\n")
+        self._write(name, content)
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", name)
+        _git(self.nexlink, "checkout", "-q", "develop")
+        return "agent/m-%s" % name
+
+    def _manifest(self, lot, unit):
+        os.makedirs(os.path.join(self.nexlink, "reviews"), exist_ok=True)
+        with open(os.path.join(self.nexlink, "reviews", "integration-paquet-9.md"),
+                  "w") as fh:
+            fh.write("# Paquet 9\n\n## Composition (1 unité)\n\n"
+                     "| unité | lot | source | commit | note |\n|---|---|---|---|---|\n"
+                     "| 1 | #%d | `%s` | `%s` | renumérotée |\n" % (lot["id"], unit, unit))
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "manifeste")
+
+    def test_sync_packets_sans_gel_unite_de_fusion_renumerotee(self):
+        """#4100 (revue dev3) : l'unité réelle est un `merge --no-ff` dont la
+        résolution de conflit renumérote 377 → 378 ; lot sans gel, fermé par
+        `sync-packets` sur ce commit à deux parents : landed=378."""
+        from ameesh import packet_close
+
+        lot = self._lot()
+        self._nx(lot)
+        branch = self._lot_branch("377_key.sql", "create table k();")
+        unit = self._merge_unit(lot, branch, [("377_key.sql", "378_key.sql", None)])
+        self._manifest(lot, unit)
+        report = packet_close.sync(self.db, self.nexlink, target="develop",
+                                   actor="packet:develop")
+        self.assertEqual([r["result"] for r in report["results"]], ["merged"], report)
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 378)
+        self.assertEqual(self._slot(lot), {"number": 378, "status": "landed"})
+
+    def test_unite_de_fusion_qui_renomme_et_reecrit(self):
+        """#4100 (revue dev3) : la résolution change nom ET contenu ; ni le
+        nom ni l'empreinte ne correspondent, l'unique fichier numéroté
+        qu'ajoute l'unité (comparée à sa première parente) est le posé."""
+        from ameesh import packet_close
+
+        lot = self._lot()
+        self._nx(lot)
+        branch = self._lot_branch("377_key.sql", "create table k();")
+        unit = self._merge_unit(lot, branch,
+                                [("377_key.sql", "378_cle.sql", "create table k2();")])
+        self._manifest(lot, unit)
+        packet_close.sync(self.db, self.nexlink, target="develop", actor="packet:develop")
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 378)
+        self.assertTrue(any("378_cle.sql added by unit" in n for n in self._notes(lot)),
+                        self._notes(lot))
+
     def test_la_reparation_d_un_lot_deja_fusionne_passe_par_le_meme_chemin(self):
         """#4100 : un lot fusionné avant le suivi (créneau atterri au numéro
         réservé) est réparé par `ameesh work merged <id> --sha S --repo R`,
