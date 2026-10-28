@@ -15,7 +15,11 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from ameesh import pilot_gesture, registry, role_handover_pg as handover_pg
@@ -222,13 +226,39 @@ class FencedAttemptTest(Base):
         self.assertIn(ph.MARK_FENCED + "composition n=2 base=- époque=291", ph.marks(item))
         self.assertFalse(any(n.startswith(ph.MARK_FAILED) for n in ph.marks(item)))
         self.assertIn("non décomptée", self.shell.mails[-1][1])
-        # tic suivant : même numéro (2), aucun --force de plus qu'avant
+        # tic suivant : même numéro (2)
         self.shell.auto_rc, self.shell.auto_out = 1, "autre panne"
         with self.assertRaises(ph.HoraireError):
             ph.tick(self.ctx)
         tried = [n for n in ph.marks(item) if n.startswith(ph.MARK_ATTEMPT)]
         self.assertIn("composition n=2", tried[-1])
         self.assertEqual(len([n for n in tried if "n=2" in n]), 2)
+
+    def test_reprise_d_un_refus_a_n1_passe_force(self):
+        # B impl-04 : l'essai refusé à `packet record` a laissé sa branche et
+        # son worktree locaux ; la reprise à n=1 doit les fermer (--force)
+        self.ctx.alive = lambda pid: False
+        item = self.unfrozen(
+            ph.MARK_ATTEMPT + "composition n=1 base=- par=%s:99" % self.ctx.host,
+            ph.MARK_FENCED + "composition n=1 base=- époque=291")
+        self.tick_ok()
+        self.assertEqual(len(self.autos()), 1)
+        self.assertIn("--force", self.autos()[0])
+        tried = [n for n in ph.marks(item) if n.startswith(ph.MARK_ATTEMPT)]
+        self.assertIn("composition n=1", tried[-1])
+
+    def test_phrase_de_refus_citee_plus_haut_reste_un_echec(self):
+        # N1 : seule la fin de la sortie (l'erreur qui arrête paquet-auto) dit
+        # un refus de garde ; une phrase citée par un test rouge n'en est pas un
+        self.ctx.alive = lambda pid: False
+        item = self.unfrozen(
+            ph.MARK_ATTEMPT + "composition n=1 base=- par=%s:99" % self.ctx.host)
+        self.shell.auto_rc = 1
+        self.shell.auto_out = "\n".join(
+            [self.REFUSAL] + ["ligne %d du rouge" % i for i in range(20)])
+        with self.assertRaises(ph.HoraireError):
+            ph.tick(self.ctx)
+        self.assertIn(ph.MARK_FAILED + "composition n=2 base=- rc=1", ph.marks(item))
 
     def test_refus_de_garde_au_dernier_numero_n_epuise_pas(self):
         self.ctx.alive = lambda pid: False
@@ -260,3 +290,39 @@ class FencedAttemptTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FencedLeftoversRepoTest(unittest.TestCase):
+    """B impl-04, vrai dépôt : la branche et le worktree `paquet-auto-*` laissés
+    par un essai refusé bloquent une reprise sans --force, pas avec."""
+
+    def git(self, *args, cwd=None):
+        return subprocess.run(["git", *args], cwd=str(cwd or self.repo), check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="t4245-", dir=os.environ.get("TMPDIR")))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        self.git("init", "-q", "-b", "main")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                 "--allow-empty", "-m", "base")
+        self.base = self.git("rev-parse", "HEAD")
+        self.branch = "integration/paquet-h-20261028-07"
+
+    def test_reliquat_d_un_essai_refuse_ferme_sous_force(self):
+        env = mock.patch.dict(os.environ, {"TMPDIR": str(self.tmp)})
+        env.start()
+        self.addCleanup(env.stop)
+        kept = ph.auto.make_worktree(self.repo, self.base, self.branch)
+        self.assertTrue(kept.name.startswith("paquet-auto-"))
+        # reprise sans --force : refusée avant toute composition
+        with self.assertRaises(ph.auto.InputError):
+            ph.auto.make_worktree(self.repo, self.base, self.branch)
+        # reprise sous --force (#4245) : le reliquat est fermé, la composition repart
+        ph.auto.clear_local_branch(self.repo, self.branch, log=lambda line: None)
+        fresh = ph.auto.make_worktree(self.repo, self.base, self.branch)
+        self.assertTrue(fresh.exists())
+        self.assertFalse(kept.exists())
+        ph.auto.remove_worktree(self.repo, fresh)

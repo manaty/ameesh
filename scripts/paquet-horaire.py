@@ -612,6 +612,9 @@ class Attempt:
     failed: bool = False
     #: #4245 : arrêtée par un refus de garde d'époque (non concluant, §3)
     fenced: bool = False
+    #: #4245 (B impl-04) : reprise d'un refus de garde : `--force` même à n=1,
+    #: la branche et le worktree locaux de l'essai refusé sont restés
+    force: bool = False
     epoch: int = 0  # époque du bail à l'entrée (0 : marque sans époque)
 
     @property
@@ -665,7 +668,7 @@ def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
     result = paquet_auto(ctx, name, carrier, exclude=this.exclude,
                          exclude_reason=(EXCLUDE_CI_FULL_REASON
                                          if this.step == RECOMPOSITION else ""),
-                         force=this.step == RECOMPOSITION or this.n > 1)
+                         force=this.step == RECOMPOSITION or this.n > 1 or this.force)
     return after_compose(ctx, carrier, name, result, this)
 
 
@@ -713,15 +716,17 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
     if running(ctx, this):
         return "#%d : %s en cours (%s:%d)" % (carrier, this.step, this.host, this.pid)
     if this.fenced:
-        # #4245 : refus de garde, non concluant : même numéro de tentative
-        # (donc pas de --force de plus), borné par MAX_FENCED
+        # #4245 : refus de garde, non concluant : même numéro de tentative,
+        # borné par MAX_FENCED ; `--force` ferme la branche et le worktree
+        # locaux laissés par l'essai refusé (le refus précède la poussée)
         fenced = sum(1 for a in attempts(item) if a.fenced and a.key == this.key)
         if fenced < MAX_FENCED:
             ctx.say("#%d : reprise de la %s après refus de garde (tentative %d "
                     "non décomptée)" % (carrier, this.step, this.n))
             return attempt(ctx, carrier, name, Attempt(this.step, this.n, this.base,
                                                        run_id=this.run_id,
-                                                       exclude=list(this.exclude)))
+                                                       exclude=list(this.exclude),
+                                                       force=True))
         if MARK_STUCK + this.key in marks(item):
             return "#%d : reprise de la %s épuisée, déjà signalée" % (carrier, this.step)
         ctx.mail(ctx.pilot, carrier,
@@ -748,7 +753,9 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
 def after_compose(ctx: Context, carrier: int, name: str, result: Result,
                   this: Attempt) -> str:
     step = this.step
-    if result.returncode != 0 and FENCE_REFUSAL_RE.search(result.text):
+    # N1 de relecture : la fin de la sortie seulement (l'erreur qui arrête
+    # paquet-auto), pas une phrase citée plus haut par un test rouge
+    if result.returncode != 0 and FENCE_REFUSAL_RE.search(auto._tail(result.text, 10)):
         # #4245 : la garde EP4 a refusé un geste (bail passé ailleurs, ou
         # lignée rompue) ; ni échec de composition ni tentative consommée
         ctx.note(carrier, "%s%s n=%d base=%s époque=%d" % (
