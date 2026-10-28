@@ -58,6 +58,74 @@ class MailTest(PgTestCase):
         self.assertEqual(history[0]["status"], "delivered")
         self.assertIsNotNone(history[0]["delivered_ts"])
 
+    def test_staging_emission_grande_boite(self):
+        """#4180 : aucun plafond historique, filtres exacts et rejeu sans doublon."""
+        from ameesh import work
+        registry.upsert(self.db, "beta", harness="codex", host="autre")
+        registry.upsert(self.db, "gamma", harness="codex", host="autre")
+        cle = "0123456789ab:beta"
+        charge = {"staging_actif": {"emission": cle}}
+        # Ces faux positifs ne prouvent pas un dépôt pour beta par le système.
+        mail.send(self.db, "alpha", "beta", "autre expéditeur", payload=charge)
+        mail.send(self.db, work.SYSTEM_SENDER, "gamma", "autre destinataire", payload=charge)
+        mail.send(self.db, work.SYSTEM_SENDER, "beta", "autre clé",
+                  payload={"staging_actif": {"emission": cle + "-autre"}})
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind)"
+            " SELECT 'alpha', 'beta', 'bruit', 'notify'"
+            " FROM generate_series(1, 20001)")
+        self.assertIsNone(mail.staging_emission(self.db, "beta", work.SYSTEM_SENDER, cle))
+        # Exerce le vrai signal et sa reprise après dépôt réussi mais échec
+        # de sauvegarde locale : ni recherche ni envoi de courrier substitués.
+        import io
+        import tempfile
+        from pathlib import Path
+        from contextlib import redirect_stdout, redirect_stderr
+        from unittest import mock
+        from . import test_1323_actif as fixture
+        actif = fixture.charger_actif()
+        with tempfile.TemporaryDirectory() as dossier:
+            racine = Path(dossier)
+            journal = racine / "journal.jsonl"
+            journal.write_text("".join(json.dumps(e) + "\n"
+                                       for e in fixture.journal_complet()))
+            argv = ["--journal", str(journal), "--sha", fixture.SHA,
+                    "--depuis", fixture.DEPUIS, "--etat-dir", str(racine),
+                    "--rapporteur", "beta"]
+            for hote in fixture.HOTES:
+                argv += ["--hote", hote + "=" + fixture.SHA]
+            ecrire = actif.ecrire_attestation
+
+            def echec_apres_envoi(chemin, attestation):
+                if attestation["notifies"]:
+                    raise OSError("sauvegarde après dépôt indisponible")
+                return ecrire(chemin, attestation)
+
+            with mock.patch.object(actif.db_mod, "connect", return_value=self.db), \
+                 mock.patch.object(self.db, "close"), \
+                 mock.patch.object(actif, "verifier_remises"), \
+                 mock.patch.object(actif, "enregistrer_attestation"), \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                with mock.patch.object(actif, "ecrire_attestation",
+                                       side_effect=echec_apres_envoi):
+                    self.assertEqual(actif.main(argv), actif.CODE_ECHEC)
+                premier = mail.staging_emission(self.db, "beta", work.SYSTEM_SENDER, cle)
+                self.assertIsNotNone(premier)
+                mail.mark_delivered(self.db, [premier])
+                self.db.execute(
+                    "INSERT INTO agent_mailbox (sender, recipient, body, kind)"
+                    " SELECT 'alpha', 'beta', 'bruit', 'notify'"
+                    " FROM generate_series(1, 20001)")
+                self.assertEqual(actif.main(argv), 0)
+                self.assertEqual(actif.main(argv), 0)
+            attestation = json.loads((racine / ("actif-" + fixture.SHA[:12] + ".json")).read_text())
+            self.assertEqual(attestation["notifies"]["beta"]["message"], premier)
+            self.assertTrue(attestation["notifies"]["beta"]["reconcilie"])
+        self.assertEqual(self.db.query(
+            "SELECT count(*) AS n FROM agent_mailbox WHERE recipient = %s"
+            " AND sender = %s AND payload -> 'staging_actif' ->> 'emission' = %s",
+            ("beta", work.SYSTEM_SENDER, cle))[0]["n"], 1)
+
     def test_remise_horodatee_par_message(self):
         """#796 : chaque message remis porte SON instant de remise (l'instant
         réel où il entre dans le contexte), pas l'horodatage de transaction

@@ -458,6 +458,19 @@ class Mailbox(interface.Mailbox):
             (recipient, int(limit)),
         )
 
+    def staging_emission(self, recipient, sender, key) -> int | None:
+        rows = self.db.query(
+            """
+            SELECT id FROM agent_mailbox
+            WHERE recipient = %s AND sender = %s
+              AND payload -> 'staging_actif' ->> 'emission' = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (recipient, sender, key),
+        )
+        return int(rows[0]["id"]) if rows else None
+
     def review_requests(self, recipient, lot) -> list[dict]:
         """#2504 : les `request` du lot, filtrés avant toute borne.
 
