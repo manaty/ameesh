@@ -241,6 +241,43 @@ class PartitionTest(unittest.TestCase):
                              ["b.py"])
 
 
+class ManifestEvidenceTest(unittest.TestCase):
+    """#3256 C (B cx1) : la preuve de disjonction relit le manifeste figé."""
+
+    TEXT = """# Paquet integration/paquet-h-1 — composition (§12), sur main `abc12345`
+
+Base : `main` **`%s`** (tête exacte d'`origin/main`).
+
+## Admissions (2 unités, 2 lots)
+
+| lot | source composée |
+|---|---|
+| #10 | `%s` |
+| #11 | `%s` |
+
+## Écartés
+
+| lot | motif |
+|---|---|
+| — | aucun |
+""" % ("b" * 40, "c" * 40, "d" * 40)
+
+    def test_base_and_admissions_are_read_from_the_frozen_manifest(self):
+        self.assertEqual(packet_parallel.manifest_base(self.TEXT), "b" * 40)
+        self.assertEqual(packet_parallel.manifest_units(self.TEXT),
+                         [{"work_item": 10, "source": "c" * 40},
+                          {"work_item": 11, "source": "d" * 40}])
+
+    def test_a_manifest_without_admissions_proves_nothing(self):
+        self.assertEqual(packet_parallel.manifest_units("## Écartés\n"),
+                         [])
+        self.assertEqual(packet_parallel.manifest_base("aucune base"), "")
+
+    def test_an_illisible_admission_row_invalidates_the_table(self):
+        broken = self.TEXT.replace("| #11 | `%s` |" % ("d" * 40), "| #11 | ? |")
+        self.assertEqual(packet_parallel.manifest_units(broken), [])
+
+
 # ---------------------------------------------------------------------------
 # Composeur : deux porteurs, deux --only disjoints
 # ---------------------------------------------------------------------------

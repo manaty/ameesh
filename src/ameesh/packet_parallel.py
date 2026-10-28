@@ -23,6 +23,7 @@ les fichiers modifiés de chaque lot). Le module ne compose ni ne fusionne.
 from __future__ import annotations
 
 import math
+import re
 import statistics
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -59,6 +60,68 @@ def _same_sha(left, right) -> bool:
     if a == b:
         return True
     return len(a) >= 7 and len(b) >= 7 and (a.startswith(b) or b.startswith(a))
+
+
+#: #3256 C (B cx1) : la base et la table d'admissions du manifeste §12, les
+#: seules preuves du contenu **effectivement testé** par un porteur.
+_MANIFEST_BASE = re.compile(
+    r"^Base\s*:\s*`[^`\n]+`\s*\*\*`([0-9a-fA-F]{7,40})`\*\*", re.MULTILINE)
+_MANIFEST_ROW = re.compile(
+    r"^\|\s*#(\d+)\s*\|\s*`([0-9a-fA-F]{7,40})`\s*\|")
+
+
+def manifest_base(text: str) -> str:
+    """La tête de base inscrite en tête d'un manifeste §12, ou ""."""
+    found = _MANIFEST_BASE.search(str(text or ""))
+    return found.group(1).lower() if found else ""
+
+
+def manifest_units(text: str) -> list[dict]:
+    """Les unités de la table `## Admissions` d'un manifeste §12.
+
+    Rend `[{work_item, source}]`, dans l'ordre du manifeste. La table est la
+    seule qui nomme le commit **composé** de chaque lot ; le manifeste est
+    figé dans la tête du porteur, donc cette lecture épingle le contenu testé.
+    Une section absente, une ligne illisible ou aucune unité rendent `[]` :
+    l'appelant ne suppose alors rien (#3256 C, avis cx1).
+    """
+    lines = str(text or "").splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip().startswith("## Admissions"):
+            start = index + 1
+            break
+    if start is None:
+        return []
+    header = None
+    for index in range(start, len(lines)):
+        stripped = lines[index].strip()
+        if not stripped.startswith("|"):
+            if header is not None:
+                break
+            continue
+        cells = [cell.strip().lower()
+                 for cell in stripped.strip("|").split("|")]
+        if any("lot" in cell for cell in cells) and any("source" in cell for cell in cells):
+            header = index + 1
+            break
+    if header is None:
+        return []
+    if header >= len(lines) or not lines[header].strip().startswith("|"):
+        return []
+    units: list[dict] = []
+    for line in lines[header + 1:]:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            break
+        if not stripped.strip("|").replace(" ", ""):
+            continue
+        found = _MANIFEST_ROW.match(stripped)
+        if not found:
+            return []
+        units.append({"work_item": int(found.group(1)),
+                      "source": found.group(2).lower()})
+    return units
 
 
 def _verdict_ok(marks, frozen_sha: str, composed_ts: float) -> float | None:

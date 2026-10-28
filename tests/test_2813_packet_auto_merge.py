@@ -38,7 +38,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from ameesh import ci, fire, packet_automerge, plan_github, work  # noqa: E402
+from ameesh import (ci, fire, packet_automerge, plan_github, work,  # noqa: E402
+                    work_dependencies)
 
 from .test_l161g_ci_gel import (BASE, DEPOT, GEL, LABEL_FULL, PR, GelTestCase,  # noqa: E402
                                 Gh as LabelGh, Github, pull)
@@ -1461,26 +1462,80 @@ class ParallelSecondTest(Journal):
                                   lambda db, lot, **kw: self.closed.append((lot, kw)))
         patch.start()
         self.addCleanup(patch.stop)
+        #: #3256 C (B cx1) : la paire relit aussi les dépendances courantes.
+        self.dependencies: dict = {}
+        patch = mock.patch.object(work_dependencies, "grouped",
+                                  lambda db, ids: self.dependencies)
+        patch.start()
+        self.addCleanup(patch.stop)
         self._note(None, LOT, "paquet-horaire: second paquet parallèle de #%d "
                               "groupe=#2834" % self.PEER)
 
-    def pair(self):
-        """Un dépôt : base, premier paquet fusionné, second paquet disjoint."""
+    def manifest(self, lot: int, source: str, base: str,
+                 extra_lots=()) -> tuple[str, str]:
+        """Le manifeste §12 minimal d'un porteur : sa base et ses admissions.
+
+        Seule la table `## Admissions` nomme le commit composé de chaque lot ;
+        c'est elle que la preuve de disjonction relit (#3256 C, B cx1).
+        """
+        branch = "integration/paquet-h-20261020-%04d" % lot
+        units = [(lot, source)] + list(extra_lots)
+        lines = [
+            "# Paquet %s — composition (§12), sur main `%s`" % (branch, base[:12]),
+            "",
+            "Base : `main` **`%s`** (tête exacte d'`origin/main`)." % base,
+            "",
+            "## Admissions (%d unités, %d lots)" % (len(units), len(units)),
+            "",
+            "| lot | source composée |",
+            "|---|---|",
+        ]
+        lines += ["| #%d | `%s` |" % (item, sha) for item, sha in units]
+        lines += ["", "## Écartés", "", "| lot | motif |", "|---|---|",
+                  "| — | aucun |", ""]
+        return "reviews/%s.md" % branch.replace("/", "-", 1), "\n".join(lines)
+
+    def pair(self, *, shared: bool = False):
+        """Un dépôt : base, premier paquet fusionné, second paquet disjoint.
+
+        Chaque porteur porte son manifeste dans sa tête gelée ; `shared=True`
+        donne aux deux lots un même fichier, de contenu identique pour que la
+        fusion reste propre alors que les manifestes ne sont plus disjoints.
+        """
         path, git, base = self.repo()
-        git("checkout", "-q", "-b", "packet1", base)
-        (Path(path) / "first.py").write_text("first = 1\n")
-        git("add", "-A")
-        git("commit", "-qm", "packet 1: first")
-        first_head = git("rev-parse", "HEAD")
+
+        def commit_lot(branch: str, files: dict[str, str]) -> str:
+            git("checkout", "-q", "-b", branch, base)
+            for name, content in files.items():
+                (Path(path) / name).write_text(content)
+            git("add", "-A")
+            git("commit", "-qm", "lot %s" % branch)
+            return git("rev-parse", "HEAD")
+
+        def commit_packet(name: str, parent: str, lot: int, source: str,
+                          extra_lots=()) -> str:
+            git("checkout", "-q", "-b", name, parent)
+            rel, text = self.manifest(lot, source, base, extra_lots)
+            target = Path(path) / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text + "\n")
+            git("add", "-A")
+            git("commit", "-qm", "packet %s: manifest" % name)
+            return git("rev-parse", "HEAD")
+
+        first_files = {"first.py": "first = 1\n"}
+        second_files = {"second.py": "second = 2\n"}
+        if shared:
+            first_files["shared.py"] = "shared = 1\n"
+            second_files["shared.py"] = "shared = 1\n"
+        first_source = commit_lot("lot1", first_files)
+        first_head = commit_packet("packet1", first_source, self.PEER, first_source)
         git("checkout", "-q", "main")
         git("merge", "-q", "--no-ff", "packet1", "-m",
             "Merge pull request #1 from manaty/integration/paquet-h-1")
         first_merge = git("rev-parse", "HEAD")
-        git("checkout", "-q", "-b", "packet2", base)
-        (Path(path) / "second.py").write_text("second = 2\n")
-        git("add", "-A")
-        git("commit", "-qm", "packet 2: second")
-        second_head = git("rev-parse", "HEAD")
+        second_source = commit_lot("lot2", second_files)
+        second_head = commit_packet("packet2", second_source, LOT, second_source)
         git("checkout", "-q", "main")
         self.heads = {LOT: second_head, self.PEER: first_head}
         self.frozen = second_head
@@ -1547,6 +1602,84 @@ class ParallelSecondTest(Journal):
         self.assertEqual(out["result"], "closed", out)
         self.assertEqual(gh.merges(), [])
         self.assertEqual([lot for lot, _kw in self.closed], [LOT])
+
+    def test_a_shared_file_across_manifests_returns_the_second_to_the_queue(self):
+        # #3256 C (B cx1) : le témoin du regel — la partition était A:f1 /
+        # B:f2, puis A a regelé f1+f2. Les deux manifestes partagent f2 ; la
+        # fusion est propre (même contenu) mais la paire n'est plus disjointe.
+        path, _git, base, first_head, first_merge, second_head = self.pair(
+            shared=True)
+        self.heads = {LOT: second_head, self.PEER: first_head}
+        self.armed(sha=second_head, composition=base)
+        gh = FakeGh(head=second_head, tests="success", base_oid=first_merge)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "closed", out)
+        self.assertIn("fichier(s) commun(s)", out["why"])
+        self.assertEqual(gh.merges(), [])
+        self.assertEqual([lot for lot, _kw in self.closed], [LOT])
+
+    def test_a_cross_dependency_returns_the_second_to_the_queue(self):
+        path, _git, base, first_head, first_merge, second_head = self.pair()
+        self.heads = {LOT: second_head, self.PEER: first_head}
+        self.dependencies = {LOT: [{"work_item_id": LOT, "blocker_id": self.PEER,
+                                    "blocking": True, "blocker_state": "qa"}]}
+        self.armed(sha=second_head, composition=base)
+        gh = FakeGh(head=second_head, tests="success", base_oid=first_merge)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "closed", out)
+        self.assertIn("dépendance(s) croisées", out["why"])
+        self.assertEqual(gh.merges(), [])
+        self.assertEqual([lot for lot, _kw in self.closed], [LOT])
+
+    def test_a_missing_manifest_neither_merges_nor_closes(self):
+        path, git, base, _first_head, first_merge, second_head = self.pair()
+        git("checkout", "-q", "packet2")
+        (Path(path) / ("reviews/integration-paquet-h-20261020-%04d.md" % LOT)).unlink()
+        git("add", "-A")
+        git("commit", "-qm", "packet 2: no manifest")
+        second_head = git("rev-parse", "HEAD")
+        git("checkout", "-q", "main")
+        self.heads = {LOT: second_head, self.PEER: _first_head}
+        self.frozen = second_head
+        self.armed(sha=second_head, composition=base)
+        gh = FakeGh(head=second_head, tests="success", base_oid=first_merge)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertIn("manifeste", out["why"])
+        self.assertEqual(gh.merges(), [])
+        self.assertEqual(self.closed, [])
+
+    def test_a_recorded_proof_does_not_bypass_the_manifest_check(self):
+        # La marque « preuve déjà consignée » ne couvre que l'arbre fusionné :
+        # un second passage (reprise) doit relire les manifestes avant de la
+        # réutiliser (#3256 C, B cx1).
+        path, _git, base, first_head, first_merge, second_head = self.pair(
+            shared=True)
+        self.heads = {LOT: second_head, self.PEER: first_head}
+        self._note(None, LOT, "parallel-second proof sha=%s target=%s merge=%s "
+                              "— preuve antérieure"
+                   % (second_head, first_merge, first_merge))
+        self.armed(sha=second_head, composition=base)
+        gh = FakeGh(head=second_head, tests="success", base_oid=first_merge)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "closed", out)
+        self.assertIn("fichier(s) commun(s)", out["why"])
+        self.assertEqual(gh.merges(), [])
+        self.assertEqual([lot for lot, _kw in self.closed], [LOT])
+
+    def test_a_recorded_proof_on_disjoint_manifests_still_merges(self):
+        path, _git, base, _first_head, first_merge, second_head = self.pair()
+        self._note(None, LOT, "parallel-second proof sha=%s target=%s merge=%s "
+                              "— preuve antérieure"
+                   % (second_head, first_merge, first_merge))
+        # Un contrôle de gel rouge ne doit pas être rejoué : la preuve existante
+        # couvre l'arbre fusionné, les manifestes sont disjoints.
+        self.freeze_ok = ("red", "should not run")
+        self.armed(sha=second_head, composition=base)
+        gh = FakeGh(head=second_head, tests="success", base_oid=first_merge)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", second_head)])
 
     def test_a_code_commit_beyond_the_first_merge_disarms(self):
         path, git, base, _first_head, first_merge, second_head = self.pair()

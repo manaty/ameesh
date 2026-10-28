@@ -71,7 +71,7 @@ import sys
 import tempfile
 from urllib.parse import quote, unquote
 
-from . import fire, land, storage, work
+from . import fire, land, packet_parallel, storage, work
 
 #: une tête de porteur de paquet (§12) ; `integration/paquet-h-…`, `…-nexlink`
 CARRIER_PREFIX = "integration/"
@@ -533,6 +533,115 @@ def _parallel_freeze_checks(repo: str, target: str, head: str,
         shutil.rmtree(base, ignore_errors=True)
 
 
+def _carrier_branch(db, lot: int) -> str:
+    """La branche portée par un lot (`integration/paquet-…`), ou ""."""
+    try:
+        row, _marks = fire._fresh(db, int(lot))
+    except Exception:  # noqa: BLE001 - une branche illisible ne prouve rien
+        return ""
+    return str((row or {}).get("branch") or "").strip()
+
+
+def _carrier_manifest(repo: str, head: str, branch: str) -> str | None:
+    """Le manifeste §12 tel qu'il est **figé** dans `head`, ou None."""
+    if not repo or not head or not branch.startswith(CARRIER_PREFIX):
+        return None
+    # `integration/paquet-<nom>` → `reviews/integration-paquet-<nom>.md`
+    # (même dérivation que `paquet-auto.manifest_rel`).
+    rel = "reviews/%s.md" % branch.replace("/", "-", 1)
+    return _git(repo, "show", "%s:%s" % (head, rel))
+
+
+def _parallel_manifests_disjoint(db, repo: str, lot: int, peer: int,
+                                 first_head: str, second_head: str) -> tuple:
+    """Les deux manifestes figés prouvent-ils encore la disjonction ?
+
+    #3256 C (B cx1) : la partition lit l'inventaire au moment du partage,
+    # mais `--only` ne transmet que des identifiants et `compose_packet` relit
+    # les gels courants. Un regel entre le partage et la composition (ou une
+    # reprise/recomposition) peut donc donner aux deux porteurs un fichier
+    # commun, alors que la note de paire et la preuve de fusion ne regardaient
+    # que la propreté du merge-tree. Ici on relit les **manifestes des deux
+    # têtes testées** : chaque lot y porte le commit réellement composé, et
+    # l'on recalcule ses fichiers depuis la base du manifeste, plus les
+    # dépendances courantes. Une dépendance croisée ou un fichier commun est
+    # un négatif déterministe (le second revient en file), même si la fusion
+    # est propre ; une lecture impossible laisse la preuve manquante.
+    """
+    first_branch = _carrier_branch(db, peer)
+    second_branch = _carrier_branch(db, lot)
+    if not first_branch or not second_branch:
+        return "inconclusive", "branche de la paire illisible"
+    first_text = _carrier_manifest(repo, first_head, first_branch)
+    second_text = _carrier_manifest(repo, second_head, second_branch)
+    if first_text is None or second_text is None:
+        return "inconclusive", "manifeste de la paire illisible dans la tête testée"
+    first_units = packet_parallel.manifest_units(first_text)
+    second_units = packet_parallel.manifest_units(second_text)
+    if not first_units or not second_units:
+        return "inconclusive", ("manifeste de la paire sans table d'admissions "
+                                "lisible")
+    first_lots = [unit["work_item"] for unit in first_units]
+    second_lots = [unit["work_item"] for unit in second_units]
+    if len(set(first_lots)) != len(first_lots) \
+            or len(set(second_lots)) != len(second_lots):
+        return "conflict", "manifeste de la paire : un lot y figure deux fois"
+    overlap = sorted(set(first_lots) & set(second_lots))
+    if overlap:
+        return "conflict", ("lot(s) %s présents dans les deux manifestes"
+                            % ", ".join("#%d" % item for item in overlap))
+    first_base = packet_parallel.manifest_base(first_text)
+    second_base = packet_parallel.manifest_base(second_text)
+    if not first_base or not second_base:
+        return "inconclusive", "base du manifeste de la paire illisible"
+    from . import packet_candidates
+    files: dict[int, set[str]] = {}
+    for units, base in ((first_units, first_base), (second_units, second_base)):
+        for unit in units:
+            try:
+                files[unit["work_item"]] = set(packet_candidates.changed_files(
+                    repo, base, unit["source"]))
+            except Exception as exc:  # noqa: BLE001 - une lecture impossible ne conclut pas
+                return "inconclusive", ("fichiers du lot #%d illisibles: %s"
+                                        % (unit["work_item"], exc))
+    first_files: set[str] = set()
+    second_files: set[str] = set()
+    for item in first_lots:
+        first_files |= files[item]
+    for item in second_lots:
+        second_files |= files[item]
+    shared = sorted(first_files & second_files)
+    if shared:
+        return "conflict", ("fichier(s) commun(s) aux deux manifestes testés : %s"
+                            % ", ".join(shared))
+    from . import work_dependencies
+    try:
+        edges = work_dependencies.grouped(
+            db, sorted(set(first_lots) | set(second_lots)))
+    except Exception as exc:  # noqa: BLE001 - une lecture impossible ne conclut pas
+        return "inconclusive", "dépendances de la paire illisibles: %s" % exc
+    first_set, second_set = set(first_lots), set(second_lots)
+    cross = []
+    for work_item, rows in (edges or {}).items():
+        try:
+            work_item = int(work_item)
+        except (TypeError, ValueError):
+            continue
+        for edge in rows or ():
+            try:
+                blocker = int(edge.get("blocker_id"))
+            except (TypeError, ValueError):
+                continue
+            if (work_item in first_set and blocker in second_set) \
+                    or (work_item in second_set and blocker in first_set):
+                cross.append((work_item, blocker))
+    if cross:
+        return "conflict", ("dépendance(s) croisées entre les deux manifestes "
+                            "testés : %s" % ", ".join(
+                                "#%d→#%d" % pair for pair in cross))
+    return "ok", ""
+
+
 def _parallel_proof(db, repo: str, lot: int, *, composition: str, target: str,
                     sha: str, dry_run: bool) -> dict:
     """Le second peut-il fusionner malgré la cible avancée ?
@@ -540,12 +649,13 @@ def _parallel_proof(db, repo: str, lot: int, *, composition: str, target: str,
     Rend `{state: none|wait|conflict|inconclusive|ok, why, merge, marker}`.
     `none` : le porteur n'est pas un second, la garde ordinaire s'applique.
     `wait` : le premier n'a pas encore fusionné. `conflict` : la fusion du
-    second dans la cible avancée est un négatif déterministe (conflit ou
-    contrôle de gel rouge) — le second revient en file. `inconclusive` : la
-    preuve manque (délai, worktree, OSError), le porteur n'est ni clos ni
-    fusionné (§3). `ok` : la fusion est propre et les contrôles verts ; la
-    marque est écrite par l'appelant sous le bail renouvelé, puis la fusion
-    peut suivre sans relancer la suite complète.
+    second dans la cible avancée est un négatif déterministe (conflit,
+    manifestes plus disjoints, contrôle de gel rouge) — le second revient en
+    file. `inconclusive` : la preuve manque (manifeste, délai, worktree,
+    OSError), le porteur n'est ni clos ni fusionné (§3). `ok` : les deux
+    manifestes testés restent disjoints, la fusion est propre et les contrôles
+    verts ; la marque est écrite par l'appelant sous le bail renouvelé, puis
+    la fusion peut suivre sans relancer la suite complète.
     """
     peer = _parallel_peer(db, lot)
     if peer is None:
@@ -561,6 +671,18 @@ def _parallel_proof(db, repo: str, lot: int, *, composition: str, target: str,
                     "why": "second paquet : le premier #%d n'est pas encore fusionné"
                            % peer}
         return {"state": "none"}    # la cible a avancé par un autre commit de code
+    if dry_run:
+        return {"state": "none"}
+    # #3256 C (B cx1) : l'exemption de suite complète n'est due qu'à la
+    # disjonction **réellement testée**. Elle se relit sur les deux manifestes
+    # figés à chaque passage, reprises comprises — avant toute preuve déjà
+    # consignée, qui ne couvre que la propreté de l'arbre fusionné.
+    disjoint, why = _parallel_manifests_disjoint(db, repo, lot, peer,
+                                                 first_head, sha)
+    if disjoint == "conflict":
+        return {"state": "conflict", "why": why}
+    if disjoint != "ok":
+        return {"state": "inconclusive", "why": why}
     # Preuve déjà consignée pour cette tête et cette cible : ne pas rejouer.
     try:
         notes = work.events_noted(db, int(lot), PARALLEL_PROOF, 0.0) or ()
@@ -571,8 +693,6 @@ def _parallel_proof(db, repo: str, lot: int, *, composition: str, target: str,
         if marker in str(event.get("note") or ""):
             return {"state": "ok", "merge": merge, "marker": marker,
                     "why": "preuve déjà consignée"}
-    if dry_run:
-        return {"state": "none"}
     from . import packet_candidates
     try:
         merged = packet_candidates.merge_tree(repo, target, sha)
