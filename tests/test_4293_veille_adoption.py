@@ -105,6 +105,19 @@ class ReportRuleTest(unittest.TestCase):
         decision = veille.decide(veille.Report(data), prices=cost.DEFAULT_PRICES)
         self.assertEqual(decision.action, "owner")
         self.assertEqual(decision.price, "unknown")
+        # avis auditeur e7a7 : le barème ignore le modèle cible, le rapport
+        # donne des tarifs COMPLETS et égaux — ce n'est pas « égal » pour
+        # autant : le barème du poste fait foi.
+        rates = {"input": 0.30, "cached_input": 0.006, "output": 1.20}
+        half_known = report(
+            object="model", from_version="deepseek-flash",
+            to_version="modele-absent-du-bareme",
+            price={"kind": "equal", "projected_7d_usd": 1.0,
+                   "from": dict(rates), "to": dict(rates)})
+        decision = veille.decide(veille.Report(half_known),
+                                 prices=cost.DEFAULT_PRICES)
+        self.assertEqual(decision.action, "owner")
+        self.assertEqual(decision.price, "unknown")
 
     def test_disjoint_rates_are_not_equal(self):
         data = report(price={"kind": "equal", "projected_7d_usd": 1.0,

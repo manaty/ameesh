@@ -250,19 +250,16 @@ class Report:
         for key in ("input", "output", "cached_input"):
             if key in frm and key in to and to[key] > frm[key]:
                 return "higher"
-        schedule = cost.load_prices() if prices is None else prices
-        from_known = (cost.known_price(schedule, from_model)
-                      if from_model else None)
-        to_known = cost.known_price(schedule, to_model) if to_model else None
         if from_known is not None and to_known is not None:
             for index in (0, 2, 1):  # entrée, sortie, cache
                 if to_known[index] > from_known[index]:
                     return "higher"
-        elif report_known:
-            for key in ("input", "output", "cached_input"):
-                if to[key] > frm[key]:
-                    return "higher"
-        else:
+        elif self.object == "model":
+            # un objet modèle sans les DEUX prix au barème n'est jamais
+            # « égal », même si le rapport fournit des tarifs complets : le
+            # barème du poste fait foi (#4293, avis auditeur e7a7).
+            return "unknown"
+        elif not report_known:
             return "unknown"
         if self.price_kind != "equal":
             return self.price_kind
