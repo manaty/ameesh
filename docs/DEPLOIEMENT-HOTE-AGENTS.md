@@ -16,6 +16,14 @@ venv après une bascule. Le contrôle lit l'`argv[0]` concret du MainPID dans
 rend le contrôle rouge. Sans cela, un hôte dont seul le CLI avait changé de
 venv passait pour sain (staging du 24/10/2026, #3311).
 
+La liste du registre ne suffit pas : un rôle élu (§11) a un exécuteur sur
+chaque hôte candidat, mais le registre ne porte que l'hôte du bail. `agents
+redemarrer` et `agents controler` mènent donc aussi toute unité
+`ameesh-runner-agent@` **active** sur l'hôte hors de cette liste : arrêt prouvé
+puis démarrage, venv prouvé, sans drain ni bail exigé. Sans cela, le candidat
+`mesh-design` d'agents-2 est resté 13 h sur l'ancien code, puis a repris le
+bail sur ce code (staging du 28/10/2026, #4248).
+
 Dans le fichier privé `$BASCULE_ENV` (par défaut
 `~/.config/ameesh/bascule.env`), renseigner la cible SSH **root** et le nom
 exact de l’hôte dans le registre :

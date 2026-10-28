@@ -358,16 +358,29 @@ from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 args = sys.argv[1:]
 assert args[0] == '--user', args
-unit = args[-1]
-name = unit.split('@')[1].removesuffix('.service')
 with (state / 'units.log').open('a') as f: f.write(' '.join(args) + '\n')
 scenario = (state / 'scenario').read_text()
+if 'list-units' in args:
+    # #4248 : unités actives réelles de l'hôte (candidats d'un rôle élu
+    # compris) ; sans fichier, celles des agents actifs du registre.
+    assert args[1:] == ['list-units', 'ameesh-runner-agent@*.service',
+                        '--state=active', '--plain', '--no-legend'], args
+    if scenario == 'list-units-error': sys.exit(1)
+    path = state / 'units-actives'
+    if path.exists():
+        for n in path.read_text().split():
+            if not (state / ('stopped-' + n)).exists():
+                print('ameesh-runner-agent@%s.service loaded active running runner' % n)
+    sys.exit(0)
+unit = args[-1]
+name = unit.split('@')[1].removesuffix('.service')
 def stopped():
     return (state / ('stopped-' + name)).exists()
 if 'stop' in args:
     with (state / 'sequence.log').open('a') as f:
         f.write('stop %s\n' % name)
-    if scenario == 'stop-error' or (scenario == 'drain-puis-stop-error' and name == 'dev9'):
+    if scenario == 'stop-error' or (scenario == 'drain-puis-stop-error' and name == 'dev9') \
+            or (scenario == 'stop-error-candidat' and name == 'mesh-design'):
         sys.exit(1)
     if scenario != 'stop-unproven': (state / ('stopped-' + name)).touch()
     if scenario == 'stop-failed': (state / ('failed-' + name)).touch()
@@ -628,6 +641,11 @@ class AgentHostTest(unittest.TestCase):
         return [l for l in self.units().splitlines()
                 if l.startswith('--user start ameesh-runner-agent@')]
 
+    def gestes(self):
+        """#4248 : gestes sur les unités, hors la lecture `list-units`."""
+        return [l for l in self.units().splitlines()
+                if not l.startswith('--user list-units ')]
+
     def stops(self):
         return [l for l in self.units().splitlines()
                 if l.startswith('--user stop ameesh-runner-agent@')]
@@ -637,7 +655,7 @@ class AgentHostTest(unittest.TestCase):
         p = self.run_vm()
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('runner environment file unreadable', p.stderr)
-        self.assertEqual(self.units(), '')
+        self.assertEqual(self.gestes(), [])
         self.assertFalse((self.state / 'systemd-run.log').exists())
 
     @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
@@ -853,7 +871,7 @@ class AgentHostTest(unittest.TestCase):
             self.fail('drain call outlived its deadline with a live SSH client')
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn('appel de drain expiré', stderr)
-        self.assertEqual(self.units(), '')
+        self.assertEqual(self.gestes(), [])
 
     def test_the_local_deadline_leaves_a_margin_to_the_remote_one(self):
         """#2198/N2 : la borne locale vaut DRAIN_APPEL_DELAI plus une marge,
@@ -1333,6 +1351,67 @@ class AgentHostTest(unittest.TestCase):
         for n in ('dev7', 'dev8', 'dev9'):
             self.assertIn('--user start ameesh-runner-agent@%s.service' % n, starts)
 
+    def _candidat_elu_ailleurs(self):
+        """#4248 (agents-2, 28/10) : mesh-design a son bail sur un autre hôte ;
+        son exécuteur candidat tourne ici, absent de la liste du registre."""
+        agents = self.agents + [dict(name='mesh-design', host='other-host',
+                                     mode='execute', status='idle')]
+        (self.state / 'units-actives').write_text('dev8 dev9 mesh-design\n')
+        return agents
+
+    def test_restart_reaches_an_elected_candidate_outside_the_registry(self):
+        agents = self._candidat_elu_ailleurs()
+        p = self.run_vm(agents=agents)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        log = self.units().splitlines()
+        unite = 'ameesh-runner-agent@mesh-design.service'
+        self.assertLess(log.index('--user stop ' + unite),
+                        log.index('--user start ' + unite))
+        self.assertNotIn('--user restart ' + unite, log)
+        self.assertIn('mesh-design : unité active hors registre de host-agents'
+                      ' (candidat d\'un rôle élu)', p.stdout)
+        # Ni drain (la pause viserait la persona sur l'hôte du bail) ni bail.
+        self.assertNotIn('mesh-design', self.operateur())
+        self.assertNotIn('WARNING mesh-design', p.stdout)
+        # L'agent d'un autre hôte sans unité active ici reste ignoré.
+        self.assertNotIn('ameesh-runner-agent@elsewhere.service', self.units())
+
+    def test_restart_fails_when_the_active_units_are_unreadable(self):
+        p = self.run_vm(scenario='list-units-error', agents=self._candidat_elu_ailleurs())
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('unités ameesh-runner-agent@ actives illisibles', p.stderr)
+        self.assertIn('hors registre non redémarrée(s) : (liste illisible)', p.stdout)
+        self.assertIn('dev8 : redémarré', p.stdout)
+        self.assertIn('dev9 : redémarré', p.stdout)
+
+    def test_restart_fails_when_only_the_candidate_does_not_restart(self):
+        p = self.run_vm(scenario='stop-error-candidat', agents=self._candidat_elu_ailleurs())
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('mesh-design : unité active hors registre : arrêt non prouvé', p.stderr)
+        self.assertIn('hors registre non redémarrée(s) : mesh-design', p.stdout)
+        self.assertIn('dev9 : redémarré', p.stdout)
+
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
+    def test_controler_refuse_un_candidat_elu_sur_l_ancien_venv(self):
+        """#4248 : l'hôte n'est pas sain si le candidat vit sur l'ancien venv."""
+        agents = self._candidat_elu_ailleurs()
+        self._processus_venv(self.venv_current)
+        self._processus_venv(self.venv_old, 'mainpid-mesh-design')
+        p = self.run_vm('controler', agents=agents)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("mesh-design : le MainPID vivant n'exécute pas le venv installé",
+                      p.stderr)
+        self.assertNotIn('mesh-design : bail', p.stderr)
+        self.assertNotIn('contrôles verts', p.stdout)
+
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
+    def test_controler_vert_avec_un_candidat_elu_sur_le_venv_courant(self):
+        p = self.run_vm('controler', agents=self._candidat_elu_ailleurs())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('mesh-design (unité active hors registre', p.stdout)
+        self.assertEqual(p.stdout.count('MainPID vivant sur le venv courant'), 3)
+        self.assertIn('contrôles verts', p.stdout)
+
     def test_restart_without_prior_lease_reports_warning(self):
         p = self.run_vm(scenario='no-lease')
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -1487,7 +1566,7 @@ class AgentHostTest(unittest.TestCase):
     def test_moved_agent_is_skipped_before_restart(self):
         p = self.run_vm(scenario='moved-before')
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(self.units(), '')
+        self.assertEqual(self.gestes(), [])
         self.assertIn('dev9 : déplacé ou mode non execute (hôte=elsewhere), ignoré', p.stdout)
 
     def test_host_change_after_restart_is_not_a_valid_proof(self):
@@ -1516,19 +1595,19 @@ class AgentHostTest(unittest.TestCase):
             with self.subTest(scenario=scenario):
                 p = self.run_vm(scenario=scenario)
                 self.assertNotEqual(p.returncode, 0)
-                self.assertEqual(self.units(), '')
+                self.assertEqual(self.gestes(), [])
 
     def test_empty_host_is_not_green(self):
         p = self.run_vm(agents=[])
         self.assertNotEqual(p.returncode, 0)
-        self.assertEqual(self.units(), '')
+        self.assertEqual(self.gestes(), [])
         self.assertIn('aucun agent', p.stderr)
 
     def test_registry_name_is_validated_before_shell_interpolation(self):
         p = self.run_vm(agents=[dict(name='dev9;touch injected', host='host-agents',
                                      mode='execute', status='idle')])
         self.assertNotEqual(p.returncode, 0)
-        self.assertEqual(self.units(), '')
+        self.assertEqual(self.gestes(), [])
         self.assertIn('invalide', p.stderr)
 
     def test_all_valid_registry_names_restart(self):
