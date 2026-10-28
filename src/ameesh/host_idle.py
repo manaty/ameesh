@@ -138,17 +138,8 @@ def snapshot(cfg, db, canons, readings, *, now=None):
         agents = storage.of(db).operations.listing()
         # Bounded per-agent read includes closed lots: closing work also
         # resets the quiet interval. Truncation cannot prove an idle host.
-        # Lots only matter where the reading itself could still prove idle:
-        # a host with turns, or without readable limits, stays busy whatever
-        # its lots say (one read per agent there costs seconds per view).
-        candidates = {host for host, r in readings.items()
-                      if (r or {}).get('turns_in_progress') == 0
-                      and ((r or {}).get('cgroup') or {}).get('limits_readable') is True}
         lots = {}
         for agent in agents:
-            if agent.get('host') not in candidates:
-                lots[agent['name']] = []
-                continue
             rows = storage.of(db).work.items(state=None, assignee=agent['name'], limit=1000)
             lots[agent['name']] = rows if len(rows) < 1000 else None
         by_id = {int(lot['id']): lot for rows in lots.values() if rows is not None

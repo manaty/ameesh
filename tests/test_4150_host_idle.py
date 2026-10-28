@@ -123,22 +123,6 @@ class HostIdleTest(unittest.TestCase):
             self.assertTrue(out['unknown'])
         self.assertFalse(store.host_lifecycle.mock_calls)
 
-    def test_snapshot_skips_lot_reads_where_the_reading_is_busy(self):
-        store = mock.MagicMock()
-        store.operations.listing.return_value = [self.agent(), self.agent(name='other', host='busy')]
-        store.work.items.return_value = []
-        store.hosts.since.return_value = [self.reading(sampled_ts=t)
-                                           for t in range(7600, NOW + 1, 60)]
-        cfg = config.Config(resource_interval=60)
-        with mock.patch.object(storage, 'of', return_value=store), \
-                mock.patch('ameesh.host_lifecycle.critical_names', return_value=set()):
-            out = host_idle.snapshot(cfg, 'db', [], {'vm': self.reading(),
-                                                     'busy': self.reading(turns_in_progress=2)},
-                                     now=NOW)
-        self.assertEqual(out['vm']['state'], 'idle')
-        self.assertEqual(out['busy']['state'], 'busy')
-        self.assertEqual([c.kwargs['assignee'] for c in store.work.items.call_args_list], ['worker'])
-
 
 class CgroupReadabilityTest(unittest.TestCase):
     def test_unlimited_is_readable_but_missing_limits_are_not(self):
