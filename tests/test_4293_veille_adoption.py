@@ -530,6 +530,57 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(self._bins(), {"canary": None, "impl": None,
                                         "other": None})
 
+    def test_rollback_reads_the_state_under_the_lock(self):
+        """Avis B cx2 17:16 : un tick concurrent peut basculer un hôte entre
+        la lecture et le verrou ; rollback relit SOUS le verrou et n'écrase ni
+        la bascule ni son inverse."""
+        veille.adopt(self.cfg, self.db, self.lot, self._report(), bins=self.bins,
+                     now=1000.0, rules=self.rules)
+        for _ in range(10):
+            self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
+        veille.tick(self.cfg, self.db, now=1000.0 + 5000, rules=Rules(30 * 60))
+        out = veille.tick(self.cfg, self.db, now=1000.0 + 5100,
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "rollout")
+        self.assertEqual(self._bins()["impl"], self.bins["h1"])
+        self.assertIsNone(self._bins()["other"])
+
+        def switch_h2_as_a_tick(db):
+            row = veille.load(db, self.lot)
+            row["_db"] = db
+            veille._advance_rollout(
+                self.cfg, db, row, row["state"], veille.Report(row["report"]),
+                now=1000.0 + 5200, actor="tick", rules=Rules(30 * 60),
+                dry_run=False)
+
+        real_lock = veille._lock
+
+        def lock_after_the_concurrent_tick(db):
+            if not real_lock(db):
+                return False
+            switch_h2_as_a_tick(db)
+            return True
+
+        with mock.patch.object(veille, "_lock",
+                               side_effect=lock_after_the_concurrent_tick):
+            result = veille.rollback(self.cfg, self.db, self.lot,
+                                     reason="régression constatée",
+                                     now=1000.0 + 5300)
+        self.assertEqual(result["result"], "rolled_back")
+        self.assertEqual(self._bins(), {"canary": None, "impl": None,
+                                        "other": None})
+        state = veille.load(self.db, self.lot)["state"]
+        restored = {item["agent"] for item in state["inverse"]["restore"]}
+        self.assertEqual(restored, {"canary", "impl", "other"})
+
+    def test_rollback_releases_the_lock_when_the_lot_is_absent(self):
+        with mock.patch.object(veille, "_lock", return_value=True), \
+             mock.patch.object(veille, "_unlock") as unlock:
+            with self.assertRaises(veille.VeilleError):
+                veille.rollback(self.cfg, self.db, 999999,
+                                reason="lot absent", now=1000.0)
+        unlock.assert_called_once()
+
     def test_owner_approval_without_a_valid_proof_is_refused(self):
         higher = self._report(price={
             "kind": "higher", "projected_7d_usd": 12.5,

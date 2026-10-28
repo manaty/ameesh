@@ -1585,14 +1585,17 @@ def rollback(cfg, db, lot: int, *, reason: str, actor: str = "",
              now: float | None = None) -> dict:
     """Remet la version précédente, consignée dans le lot ; idempotent."""
     now = time.time() if now is None else float(now)
-    row = load(db, int(lot))
-    if row is None:
-        raise VeilleError("lot #%s: no adoption" % lot)
-    row["_db"] = db
-    state = row["state"]
     if not _lock(db):
         raise VeilleError("another veille gesture holds the lock")
     try:
+        # #4293 (avis B cx2 du 17:16) : l'état est relu SOUS le verrou. Un
+        # tick concurrent a pu basculer un hôte entre-temps ; restaurer la
+        # copie lue avant le verrou perdrait cette bascule et son inverse.
+        row = load(db, int(lot))
+        if row is None:
+            raise VeilleError("lot #%s: no adoption" % lot)
+        row["_db"] = db
+        state = row["state"]
         report = Report(row["report"])
         applied = state.get("applied") or []
         state.update({
