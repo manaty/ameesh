@@ -376,8 +376,10 @@ ameesh_local_drain() {
 # #4358 : `show --json` d'une persona, relu tant qu'il n'est pas un objet JSON,
 # au plus LECTURE_ESSAIS fois. Rc 3 (non concluant, que l'appelant traite sans
 # échec d'étape) seulement si la dernière lecture a rendu code 0 avec une
-# sortie vide ou tronquée, ou a été coupée par sa borne (124, 137) : la relève
-# d'un rôle élu. Une erreur explicite du CLI reste un échec (rc 1, #3114).
+# sortie vide ou tronquée, a été coupée par sa borne (124, 137) ou a perdu son
+# transport SSH (255, déjà incertain pour poser_drain) : la relève d'un rôle
+# élu, un lien passager. Une erreur explicite du CLI reste un échec (rc 1,
+# #3114)
 # $2… : la commande de lecture du mode.
 lire_show() {  # persona commande… → objet JSON sur une ligne ; rc 3 si illisible
   local p=$1 sortie essai rc
@@ -393,8 +395,8 @@ print(json.dumps(r))' <<<"$sortie" 2>/dev/null; then
     if ((essai < LECTURE_ESSAIS)); then sleep "$LECTURE_ECART"; fi
   done
   case $rc in
-    0|124|137)
-      echo "$p : lecture du registre vide, tronquée ou coupée ($LECTURE_ESSAIS essais)" >&2
+    0|124|137|255)
+      echo "$p : lecture du registre vide, tronquée, coupée ou sans transport (code $rc, $LECTURE_ESSAIS essais)" >&2
       return 3 ;;
   esac
   echo "$p : lecture du registre en erreur (code $rc, $LECTURE_ESSAIS essais)" >&2

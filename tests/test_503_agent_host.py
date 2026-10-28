@@ -56,6 +56,11 @@ if '-n' not in argv and not sys.stdin.isatty():
     stdin = sys.stdin.read()
 with (state / 'ssh.log').open('a') as f:
     f.write(command + '\n')
+# #4358 (B mty-amh-impl-03) : transport SSH perdu (255) sur la lecture d'une
+# persona ; le fichier nomme la persona.
+coupe = state / 'ssh-255'
+if coupe.exists() and (' show %s ' % coupe.read_text().strip()) in command:
+    sys.exit(255)
 command = command.replace('/home/ameesh/.local/share/ameesh/venv/bin/ameesh', os.environ['FAKE_AMEESH'])
 command = command.replace('/home/ameesh/.local/share/ameesh/venv/bin/python', os.environ['FAKE_DB_PYTHON'])
 # #3311 : le helper de preuve reçoit le venv stable de la VM en argument ; le
@@ -1393,6 +1398,21 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotIn('JSONDecodeError', p.stderr)
         self.assertIn('WARNING dev8: registre toujours illisible en fin de'
                       ' balayage', p.stdout)
+        self.assertIn('WARNING: 1 persona(s) au registre illisible, laissée(s)'
+                      ' en l\'état (non concluant) : dev8', p.stdout)
+        self.assertIn('dev7 : redémarré', p.stdout)
+        self.assertIn('dev9 : redémarré', p.stdout)
+        self.assertNotIn('ameesh-runner-agent@dev8', self.units())
+
+    def test_restart_ssh_transport_loss_on_a_read_is_not_conclusive(self):
+        """#4358 (B mty-amh-impl-03) : un transport SSH perdu (255) sur la
+        lecture d'une persona est non concluant, comme une sortie vide : le
+        balayage continue et l'étape reste verte. L'erreur explicite du CLI
+        (rc 1) reste un échec (test_3114)."""
+        (self.state / 'ssh-255').write_text('dev8')
+        p = self.run_vm('redemarrer', 'lease', agents=self._trois_agents())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('code 255', p.stderr)
         self.assertIn('WARNING: 1 persona(s) au registre illisible, laissée(s)'
                       ' en l\'état (non concluant) : dev8', p.stdout)
         self.assertIn('dev7 : redémarré', p.stdout)
