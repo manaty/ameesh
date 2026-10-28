@@ -491,7 +491,9 @@ class AgentHostTest(unittest.TestCase):
         for name, source in [('ssh', SSH), ('runuser', RUNUSER), ('ameesh', AMEESH),
                              ('systemctl', SYSTEMCTL), ('systemd-run', SYSTEMD_RUN), ('db-python', DB_PYTHON), ('sleep', SLEEP),
                              ('date', DATE), ('id', '#!/bin/sh\necho 1001\n'),
-                             ('journalctl', '#!/bin/sh\nexit 0\n')]:
+                             ('journalctl', '#!/bin/sh\n'
+                              '[ -f "$FAKE_STATE/journal" ] && cat "$FAKE_STATE/journal"\n'
+                              'exit 0\n')]:
             path = self.bin / name; path.write_text(source); path.chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), BASCULE_ENV=str(self.config),
                         FAKE_STATE=str(self.state), FAKE_AMEESH=str(self.bin / 'ameesh'),
@@ -1269,6 +1271,29 @@ class AgentHostTest(unittest.TestCase):
         starts = self.starts()
         for n in ('dev7', 'dev8', 'dev9'):
             self.assertIn('--user start ameesh-runner-agent@%s.service' % n, starts)
+
+    def test_restart_reserved_role_taken_by_other_host_fails(self):
+        """#4112 : l'exécuteur arrêté avait réservé le rôle à cet hôte (#4086) ;
+        une reprise ailleurs n'est plus l'issue normale, c'est un échec."""
+        agents = [dict(name=n, host='host-agents', mode='execute', status='idle')
+                  for n in ('dev7', 'dev8', 'dev9')]
+        (self.state / 'role-dev8.json').write_text(json.dumps({
+            'name': 'dev8', 'elected': True, 'holder': 'other-host',
+            'lease_owner': 'runner-dev8@other-host', 'epoch': 9,
+            'candidates': [{'host': 'other-host', 'ready': True},
+                           {'host': 'host-agents', 'ready': True}]}))
+        (self.state / 'journal').write_text(
+            '01:02:03 [dev8] elected role reserved to host-agents for 90s'
+            ' (executor restart)\n')
+        p = self.run_vm('redemarrer', 'elu-ailleurs', agents=agents)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('dev8 : rôle élu réservé à host-agents, mais bail du rôle'
+                      ' élu repris par other-host (époque 9 > 7) — journalctl',
+                      p.stderr)
+        self.assertIn('ERREUR: 1 agent(s) sans bail repris : dev8', p.stdout)
+        self.assertNotIn('WARNING dev8', p.stdout)
+        self.assertIn('dev7 : redémarré', p.stdout)
+        self.assertIn('dev9 : redémarré', p.stdout)
 
     def test_restart_lease_failure_continues_the_sweep(self):
         """#3412 : un vrai échec de bail ne stoppe que cet agent."""
