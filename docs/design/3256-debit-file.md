@@ -169,7 +169,12 @@ attend l'ouverture de son paquet (`qa_merge`, du verdict OK à la composition).
   revient en file.
 - Le seuil (`paquet.attente_mediane_s = 3600`) vient du bloc mécanique du
   canon. Le § 11 bis du canon passe de « une seule CI de paquet à la fois » à
-  « au plus deux ».
+  « au plus deux ». Le § 12 suit : la cible n'est plus réservée au premier
+  paquet contre le second, et une cible bougée par le premier paquet, sans
+  conflit, ne relance pas la CI du second (contrôles de gel seuls). La suite
+  complète de `main` après chaque fusion reste le filet d'un conflit
+  sémantique entre fichiers disjoints : rouge, on corrige en avant ou on
+  revient en arrière (§ 11 bis).
 
 ### 4.1 Acceptation de C
 
