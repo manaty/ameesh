@@ -93,8 +93,8 @@ PROCESS_PROJECTION_END = "<!-- projection courte : fin -->"
 #: #3867 : bornes du brief, PARTAGÉES par `reprise` (qui les reprend) et par
 #: `canon check` (qui mesure le bloc de règles avec le même calcul). Plafond du
 #: brief (octets UTF-8) ; part qu'un texte accompagné de règles garde au plus.
-BRIEF_MAX_BYTES = 19000
-BRIEF_TEXT_MIN_BYTES = 4000
+BRIEF_MAX_BYTES = 23500
+BRIEF_TEXT_MIN_BYTES = 6000
 #: #538 : en-tête et pied du bloc de règles d'un brief.
 PROCESS_RULES_HEADER = "## Working rules (canon Process cards)"
 PROCESS_RULES_FOOTER = "<!-- end of the canon Process rules -->"
@@ -103,7 +103,7 @@ PROCESS_RULES_FOOTER = "<!-- end of the canon Process rules -->"
 #: `reprise.with_process_rules` (2 octets pour le `\n\n` qui recolle le texte).
 RULES_BLOC_LIMIT = BRIEF_MAX_BYTES - 2 - BRIEF_TEXT_MIN_BYTES
 #: #3867 : place des règles elles-mêmes dans ce bloc, sans en-tête ni pied
-#: (14 919 octets) : toutes les cartes Process servies, titres et métadonnées
+#: (17 419 octets) : toutes les cartes Process servies, titres et métadonnées
 #: compris, doivent y tenir — `canon check` le vérifie (`process-rules-block-*`).
 RULES_BLOC_ROOM = (RULES_BLOC_LIMIT - len((PROCESS_RULES_HEADER + "\n").encode("utf-8"))
                    - len(("\n" + PROCESS_RULES_FOOTER).encode("utf-8")))

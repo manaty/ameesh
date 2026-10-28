@@ -38,7 +38,7 @@ BAVARD = "- une règle très bavarde et répétée\n"
 
 def corps_long(fin: str = "") -> str:
     """Un corps du genre de la carte home : long, §12 et §14 à la FIN."""
-    return ("# Règles\n\n" + BAVARD * 500
+    return ("# Règles\n\n" + BAVARD * (canon.BRIEF_MAX_BYTES // len(BAVARD.encode()) + 1)
             + "\n## 12. Paquets\n\n- PAQUETS : intégration groupée des lots\n"
             + "\n## 14. Staging et prod\n\n- STAGING : pas de go owner\n" + fin)
 
@@ -158,7 +158,7 @@ class ProjectionLectureTest(_TmpMixin, unittest.TestCase):
         self.assertEqual(canon.blocking(findings).global_errors, [])
 
     def test_une_projection_trop_longue_est_signalee(self):
-        longue = "- une règle de projection\n" * 600   # ≈ 15 600 octets
+        longue = "a" * (canon.PROCESS_PROJECTION_MAX + 1)
         self.assertGreater(len(longue.encode()), canon.PROCESS_PROJECTION_MAX)
         loaded = self.charge(carte_longue(longue))
         self.assertGreater(len(loaded.processes[0].projection.encode()),
@@ -214,8 +214,8 @@ class ProjectionLectureTest(_TmpMixin, unittest.TestCase):
         # #3867 (témoin) : chaque carte est sous son budget, leur somme dépasse
         # la place du bloc ; avant, `canon check` restait muet et le brief
         # coupait la fin des règles (home d8131b3 : 16 813 octets pour 14 919).
-        moitie = "- règle de la première carte\n" * 280      # ≈ 8 700 octets
-        autre = "- règle de la seconde carte\n" * 280
+        moitie = "- règle de la première carte\n" * 320      # ≈ 9 900 octets
+        autre = "- règle de la seconde carte\n" * 320
         self.assertLess(len(moitie.encode()), canon.PROCESS_BODY_MAX * 2)
         root = self.example_copy()
         write(root, RACINE, carte_longue(moitie))
@@ -319,7 +319,7 @@ class ProjectionBriefTest(_TmpMixin, PgTestCase):
         self.assertLessEqual(len(texte.encode()), reprise.BRIEF_MAX_BYTES)
 
     def test_une_projection_trop_longue_est_dite_et_bornee(self):
-        write(self.clone, RACINE, carte_longue("- une règle de projection\n" * 600))
+        write(self.clone, RACINE, carte_longue("a" * (canon.PROCESS_PROJECTION_MAX + 1)))
         commit_all(self.clone, "projection trop longue")
         texte = self._brief()
         self.assertIn(reprise.RULES_DIAG_PREFIX, texte)
@@ -410,38 +410,40 @@ class ProjectionBriefTest(_TmpMixin, PgTestCase):
         bloc.encode("utf-8").decode("utf-8")
 
     def test_les_budgets_gardent_la_meme_reserve_texte(self):
+        # #4159 : budgets 23 500 / 6 000 demandés par mesh-design
+        # (courrier #154906 du 28/10/2026). Précédent :
         # #3126 : hausse de budget décidée par mesh-design (courrier #127249
         # du 23/10/2026), compétence mesh-design/bureau confirmée par l'avis
         # auditeur #127227 — pas une décision owner.
-        self.assertEqual(reprise.BRIEF_MAX_BYTES, 19000)
-        self.assertEqual(reprise.BRIEF_TEXT_MIN_BYTES, 4000)
+        self.assertEqual(reprise.BRIEF_MAX_BYTES, 23500)
+        self.assertEqual(reprise.BRIEF_TEXT_MIN_BYTES, 6000)
         # #3867 : place du bloc et plafond d'une projection dérivés de ces
         # bornes partagées (plus de marge fixe de 320 octets)
         self.assertIs(reprise.BRIEF_MAX_BYTES, canon.BRIEF_MAX_BYTES)
-        self.assertEqual(canon.RULES_BLOC_LIMIT, 14998)
-        self.assertEqual(canon.RULES_BLOC_ROOM, 14919)
+        self.assertEqual(canon.RULES_BLOC_LIMIT, 17498)
+        self.assertEqual(canon.RULES_BLOC_ROOM, 17419)
         self.assertEqual(canon.PROCESS_PROJECTION_MAX, canon.RULES_BLOC_ROOM)
 
     def test_le_plafond_nominal_de_consigne_et_le_pire_cas_sont_documentes(self):
         # #3137 : un brief plein (BRIEF_MAX_BYTES) et son cadre de reprise
         # dépassent déjà le plafond nominal AMEESH_PROMPT_MAIL_MAX (20 000 o) ;
         # PROMPT_MIN_BYTES garantit alors au courrier de quoi porter un message.
-        # docs/EXPLOITATION.md documente le pire cas (~22 045 o) : une hausse
+        # docs/EXPLOITATION.md documente le pire cas (~26 545 o) : une hausse
         # d'un budget ou du cadre rouvre ce calcul, jamais une coupe silencieuse.
         cadre = mail.octets(adapters.resume_prompt(""))
         pire = reprise.BRIEF_MAX_BYTES + cadre + mail.PROMPT_MIN_BYTES
         self.assertEqual(mail.PROMPT_MAX_BYTES, 20000)
         self.assertEqual(config_mod.Config().prompt_mail_max, 20000)
         self.assertEqual(cadre, 1045)
-        self.assertEqual(pire, 22045)
+        self.assertEqual(pire, 26545)
         self.assertGreater(pire, mail.PROMPT_MAX_BYTES)
 
-    def test_la_projection_de_13352_octets_garde_le_paragraphe_15(self):
+    def test_la_projection_de_15000_octets_garde_le_paragraphe_15_et_6000_octets_de_resume(self):
         fin = "\n### §15 Staging et prod de Nexlink\n- prod = release + go owner."
-        taille = 13352
+        taille = 15000
         proj = "a" * (taille - len(fin.encode("utf-8"))) + fin
         write(self.clone, RACINE, carte_longue(proj))
-        commit_all(self.clone, "projection de 13 352 octets avec fin de §15")
+        commit_all(self.clone, "projection de 15 000 octets avec fin de §15")
         texte = reprise.with_process_rules(
             self.cfg, "b" * reprise.BRIEF_TEXT_MIN_BYTES,
             agent="ouvrier", host=self.cfg.host)
