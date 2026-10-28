@@ -31,7 +31,7 @@ from .test_l538_process_inject import RACINE, TITRE, _canon_approuve, carte
 DEBUT = canon.PROCESS_PROJECTION_START
 FIN = canon.PROCESS_PROJECTION_END
 
-#: une règle bavarde : le corps dépasse la part de règles d'un brief (≈ 14 900
+#: une règle bavarde : le corps dépasse la part de règles d'un brief (≈ 17 400
 #: octets), comme la carte home — sans projection, §12 et §14 tombent.
 BAVARD = "- une règle très bavarde et répétée\n"
 

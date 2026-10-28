@@ -64,8 +64,8 @@ LOTS_MAX = 40
 #: tronqué ensuite — jamais l'inverse, sinon un résumé plein fait disparaître
 #: les règles (verdict codex #510 r3, P2) ; mais les règles ne l'effacent pas
 #: pour autant : le texte plus court que cette part reste entier.
-#: #3126 : réserve fixe de 4 000 octets ; relever le plafond du brief donne
-#: toute la place supplémentaire aux règles, sans agrandir cette réserve.
+#: #3126, #4159 : réserve fixe de 6 000 octets ; relever le plafond du brief
+#: donne toute la place supplémentaire aux règles, sans agrandir cette réserve.
 BRIEF_TEXT_MIN_BYTES = canon_mod.BRIEF_TEXT_MIN_BYTES
 
 #: #538 : les règles de travail des fiches Process du canon ouvrent le brief
@@ -380,7 +380,7 @@ def _process_fragment(process) -> tuple[str, str]:
         corps = proj
     elif _octets(corps) > canon_mod.PROCESS_BODY_MAX:
         # #1624 (N2) : la carte peut tenir entière dans le bloc (jusqu'à
-        # ~14 900 o) ; ce diagnostic annonce donc une coupe POSSIBLE, pas une
+        # ~17 400 o) ; ce diagnostic annonce donc une coupe POSSIBLE, pas une
         # coupe acquise — seul le constat de coupe du bloc est exact.
         diag = ('the card "%s" has no short projection (%d bytes of rules): '
                 "the brief may keep only what fits"
