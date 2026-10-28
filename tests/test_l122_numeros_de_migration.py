@@ -1582,14 +1582,31 @@ class NumeroAtterriTest(PgTestCase):
                           source="branch", repo=self.nexlink)
         self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 378)
         self.assertEqual(self._slot(lot), {"number": 378, "status": "landed"})
+        # revue dev3 (b) : le fichier vient d'un commit ANTÉRIEUR de la
+        # branche (S1) et la tête gelée S2 le porte seulement
+        later = self._lot(n=3)
+        self.assertEqual(self._nx(later)["migration"], 379)
+        self._write("379_early.sql", "create table e();")
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "S1")
+        _commit(self.nexlink, "docs", "s2.md")
+        frozen = self._head()
+        work.milestone(self.db, later["id"], "frozen", sha=frozen, actor="ouvrier")
+        _git(self.nexlink, "mv", NEXLINK.directory + "/379_early.sql",
+             NEXLINK.directory + "/380_early.sql")
+        _git(self.nexlink, "commit", "-qm", "R")
+        work.close_merged(self.db, later["id"], sha=frozen, actor="git:develop",
+                          source="branch", repo=self.nexlink)
+        self.assertEqual(work.get(self.db, later["id"])["migration_landed"], 380)
+        self.assertEqual(self._slot(later), {"number": 380, "status": "landed"})
         # le même chemin sans renumérotation : posé tel quel, rien à dire
         other = self._lot(n=2)
-        self.assertEqual(self._nx(other)["migration"], 379)
-        _commit(self.nexlink, NEXLINK.directory, "379_plain.sql")
+        self.assertEqual(self._nx(other)["migration"], 381)
+        _commit(self.nexlink, NEXLINK.directory, "381_plain.sql")
         work.close_merged(self.db, other["id"], sha=self._head(), actor="git:develop",
                           source="branch", repo=self.nexlink)
         self.assertIsNone(work.get(self.db, other["id"])["migration_landed"])
-        self.assertEqual(self._slot(other), {"number": 379, "status": "landed"})
+        self.assertEqual(self._slot(other), {"number": 381, "status": "landed"})
 
     def test_la_reparation_d_un_lot_deja_fusionne_passe_par_le_meme_chemin(self):
         """#4100 : un lot fusionné avant le suivi (créneau atterri au numéro
