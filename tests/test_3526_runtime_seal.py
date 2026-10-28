@@ -36,6 +36,11 @@ class SealTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name) / 'bundle'
         self.base.mkdir(mode=0o755)
+        # The offload guest's job tmp is setgid (group ameesh-jobs): mkdir
+        # inherits it, and seal.verify refuses a 02755 tree root as unsafe
+        # (#4340). The measured root carries the exact reviewed mode, whatever
+        # the guest's parent and umask impose.
+        self.base.chmod(0o755)
         (self.base / 'runtime/bin').mkdir(parents=True)
         (self.base / 'lib').mkdir()
         (self.base / 'store').mkdir(mode=0o711)
