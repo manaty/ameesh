@@ -4545,11 +4545,13 @@ class LotSessions(Domain):
         puis ancienneté : assignés à lui, en `intake`/`build`, ni prévus après
         `today`, ni en attente d'une décision (demande non lue, jalon de
         décision ouvert), d'un lot bloquant ouvert ou d'une note `hold:`
-        (la dernière note du lot). Une note `wake:` (#2466 : pose ou
-        déclenchement d'un réveil programmé) ne lève pas la retenue, ni une
-        note de l'outillage (#3992 : composition de paquet, runner, git…) :
-        seules comptent les notes d'un agent du registre ou d'un humain
-        (`human:…`). Chaque
+        (la dernière posée par un agent du registre ou un humain). La retenue
+        tient jusqu'à une note de l'assigné ou d'un humain (`human:…`), une
+        levée explicite (`unhold:`, `hold lifted:`…) ou un changement d'état ;
+        ne la lèvent pas une note `wake:` (#2466 : pose ou déclenchement d'un
+        réveil programmé), une note de l'outillage (#3992 : composition de
+        paquet, runner, git…) ni la note ordinaire d'un autre agent (#4162,
+        comme `planned_waits.active_holds`). Chaque
         ligne : `id`, `title`, `state`, `priority`, `activity_ts` (dernier
         signe de vie du lot : lot, journal, pointe de branche, courrier sur
         le lot), `wakes`, `last_wake_ts`, `wake_activity_ts`."""

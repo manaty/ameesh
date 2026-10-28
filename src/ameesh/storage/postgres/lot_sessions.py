@@ -7,6 +7,7 @@ import datetime as _dt
 import time
 
 from .. import interface
+from ..interface import HOLD_NOTE_WHITESPACE
 from .work import has_wake_at
 from .work_dependencies import freeze_due
 
@@ -113,7 +114,9 @@ class LotSessions(interface.LotSessions):
         return self.db.query(sql + " ORDER BY l.agent, l.work_item_id", params)
 
     def actionable(self, name, *, today=None):
+        from ...planned_waits import HOLD_NOTE_PATTERNS   # tardif : pas de cycle
         today = today or _dt.date.today().isoformat()
+        lift = HOLD_NOTE_PATTERNS[1]
         return self.db.query(
             """
             SELECT w.id, w.title, w.state, w.priority,
@@ -144,19 +147,30 @@ class LotSessions(interface.LotSessions):
                AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d
                                  JOIN work_items b ON b.id = d.blocker_id
                                 WHERE d.work_item_id = w.id AND b.state NOT IN """ + _CLOSED + """)
-               AND NOT coalesce((SELECT starts_with(lower(btrim(e.note)), %s)
-                                   FROM work_item_events e
-                                  WHERE e.work_item_id = w.id
-                                    AND coalesce(btrim(e.note), '') <> ''
-                                    AND NOT starts_with(lower(btrim(e.note)), %s)
-                                    AND (starts_with(e.actor, 'human:')
-                                         OR EXISTS (SELECT 1 FROM agent_registry r
-                                                     WHERE r.name = e.actor
-                                                        OR 'agent:' || r.name = e.actor))
-                                  ORDER BY e.created_at DESC, e.id DESC LIMIT 1), false)
+               AND NOT EXISTS (
+                   SELECT 1 FROM (
+                       SELECT e.id, e.created_at, e.state FROM work_item_events e
+                        WHERE e.work_item_id = w.id
+                          AND starts_with(lower(btrim(e.note)), %s)
+                          AND (starts_with(e.actor, 'human:')
+                               OR EXISTS (SELECT 1 FROM agent_registry r
+                                           WHERE r.name = e.actor
+                                              OR 'agent:' || r.name = e.actor))
+                        ORDER BY e.created_at DESC, e.id DESC LIMIT 1) h
+                    WHERE NOT EXISTS (
+                          SELECT 1 FROM work_item_events e
+                           WHERE e.work_item_id = w.id
+                             AND (e.created_at, e.id) > (h.created_at, h.id)
+                             AND (e.state IS DISTINCT FROM h.state
+                                  OR (coalesce(btrim(e.note), '') <> ''
+                                      AND NOT starts_with(lower(btrim(e.note)), %s)
+                                      AND (e.actor IN (w.assignee, 'agent:' || w.assignee)
+                                           OR starts_with(e.actor, 'human:')))
+                                  OR btrim(e.note, %s) ~* %s)))
              ORDER BY w.priority ASC NULLS LAST, w.created_at ASC, w.id ASC
             """,
-            (name, today, self.HOLD_PREFIX, self.WAKE_PREFIX))
+            (name, today, self.HOLD_PREFIX, self.WAKE_PREFIX,
+             HOLD_NOTE_WHITESPACE, lift))
 
     def note_wake(self, name, lot, activity_ts):
         rows = self.db.query(
