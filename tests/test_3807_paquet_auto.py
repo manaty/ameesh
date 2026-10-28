@@ -325,6 +325,114 @@ class PaquetAutoBanc(unittest.TestCase):
             self.assertEqual(paquet_auto.compose_packet(args), 0)
         self.assertEqual(set(calls), {"push", "pr", "freeze", "mail"})
 
+    def test_only_keeps_the_parallel_group_and_explains_the_other(self) -> None:
+        # #3256 C : un paquet parallèle ne compose que son groupe ; l'autre
+        # lot prêt est écrit aux écartés avec le motif du paquet parallèle.
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, "a" * 40, "b" * 40)],
+            discarded=[], head="c" * 40)
+        worktree = pathlib.Path(self.tmp.name) / "wt-only"
+        (worktree / "scripts").mkdir(parents=True)
+        (worktree / "scripts" / "paquet-compose.py").write_text(
+            "", encoding="utf-8")
+        args = argparse.Namespace(
+            repo=str(self.repo), name="banc", target="main", carrier=99,
+            base=None, local=True, no_packet_record=True, keep_worktree=False,
+            keep_failed_hours=24.0, force=False, tests_timeout=10,
+            pilot="pilote", only=[1], exclude=[], exclude_reason=[])
+        seen: dict = {}
+
+        def compose_side_effect(_worktree, candidates, *_args, **_kwargs):
+            seen["lots"] = [candidate.lot for candidate in candidates]
+            return composition
+
+        with mock.patch.object(paquet_auto, "fresh_base",
+                               return_value="a" * 40), \
+                mock.patch.object(paquet_auto, "prune_stale_worktrees",
+                                  return_value=[]), \
+                mock.patch.object(paquet_auto, "make_worktree",
+                                  return_value=worktree), \
+                mock.patch.object(paquet_auto, "compute_candidates",
+                                  return_value=(
+                                      [paquet_auto.Candidate(1, "a" * 40),
+                                       paquet_auto.Candidate(2, "b" * 40)],
+                                      {"ready": [1, 2], "waiting": []})), \
+                mock.patch.object(paquet_auto, "compose_candidates",
+                                  side_effect=compose_side_effect), \
+                mock.patch.object(paquet_auto, "run_freeze_checks",
+                                  return_value=(0, "ok", 0.1)), \
+                mock.patch.object(paquet_auto, "check_local_tests",
+                                  return_value=([], [], [])), \
+                mock.patch.object(paquet_auto, "composition_table",
+                                  return_value="## Composition (1 unité, 1 lot)\n"), \
+                mock.patch.object(paquet_auto, "write_manifest",
+                                  return_value="d" * 40), \
+                mock.patch.object(paquet_auto, "run_inclusion",
+                                  return_value=(0, "inclusion ok")), \
+                mock.patch.object(paquet_auto, "remove_worktree"):
+            self.assertEqual(paquet_auto.compose_packet(args), 0)
+        self.assertEqual(seen["lots"], [1])
+        self.assertEqual([(item.lot, item.reason) for item in composition.discarded],
+                         [(2, paquet_auto.PARALLEL_EXCLUDE_REASON)])
+
+    def test_only_discards_a_group_lot_that_is_no_longer_ready(self) -> None:
+        # B2 (auditeur #4275) : `resume`/`recompose` repassent le même groupe ;
+        # un lot devenu non prêt est écarté avec son motif, pas une erreur qui
+        # garde la cible réservée.
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, "a" * 40, "b" * 40)],
+            discarded=[], head="c" * 40)
+        worktree = pathlib.Path(self.tmp.name) / "wt-only-missing"
+        (worktree / "scripts").mkdir(parents=True)
+        (worktree / "scripts" / "paquet-compose.py").write_text(
+            "", encoding="utf-8")
+        args = argparse.Namespace(
+            repo=str(self.repo), name="banc", target="main", carrier=99,
+            base=None, local=True, no_packet_record=True, keep_worktree=False,
+            keep_failed_hours=24.0, force=False, tests_timeout=10,
+            pilot="pilote", only=[1, 2], exclude=[], exclude_reason=[])
+        seen: dict = {}
+
+        def compose_side_effect(_worktree, candidates, *_args, **_kwargs):
+            seen["lots"] = [candidate.lot for candidate in candidates]
+            return composition
+
+        payload = {
+            "ready": [1], "waiting": [2],
+            "candidates": [
+                {"work_item": 1, "ready": True, "causes": [], "error": ""},
+                {"work_item": 2, "ready": False, "error": "",
+                 "causes": [{"code": "verdicts-missing"}]}]}
+        with mock.patch.object(paquet_auto, "fresh_base",
+                               return_value="a" * 40), \
+                mock.patch.object(paquet_auto, "prune_stale_worktrees",
+                                  return_value=[]), \
+                mock.patch.object(paquet_auto, "make_worktree",
+                                  return_value=worktree), \
+                mock.patch.object(paquet_auto, "compute_candidates",
+                                  return_value=(
+                                      [paquet_auto.Candidate(1, "a" * 40)],
+                                      payload)), \
+                mock.patch.object(paquet_auto, "compose_candidates",
+                                  side_effect=compose_side_effect), \
+                mock.patch.object(paquet_auto, "run_freeze_checks",
+                                  return_value=(0, "ok", 0.1)), \
+                mock.patch.object(paquet_auto, "check_local_tests",
+                                  return_value=([], [], [])), \
+                mock.patch.object(paquet_auto, "composition_table",
+                                  return_value="## Composition (1 unité, 1 lot)\n"), \
+                mock.patch.object(paquet_auto, "write_manifest",
+                                  return_value="d" * 40), \
+                mock.patch.object(paquet_auto, "run_inclusion",
+                                  return_value=(0, "inclusion ok")), \
+                mock.patch.object(paquet_auto, "remove_worktree"):
+            self.assertEqual(paquet_auto.compose_packet(args), 0)
+        self.assertEqual(seen["lots"], [1])
+        self.assertEqual(
+            [(item.lot, item.reason) for item in composition.discarded],
+            [(2, paquet_auto.PARALLEL_GROUP_NOT_READY)])
+        self.assertIn("verdicts-missing", composition.discarded[0].detail)
+
     def test_exclude_reason_s_apparie_par_ordre(self) -> None:
         # #4201 : la i-ème raison décrit le i-ème --exclude.
         discards = paquet_auto.exclude_discards(

@@ -64,16 +64,29 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
+import sys
+import tempfile
 from urllib.parse import quote, unquote
 
-from . import fire, land, storage, work
+from . import fire, land, packet_parallel, storage, work
 
 #: une tête de porteur de paquet (§12) ; `integration/paquet-h-…`, `…-nexlink`
 CARRIER_PREFIX = "integration/"
 #: décision owner : un commit de fusion, comme les fusions manuelles des paquets
 METHOD = "merge"
+#: #3256 C : la note du composeur qui fait d'un porteur le second d'une paire
+#: parallèle ; le premier est nommé par son numéro de lot.
+PARALLEL_SECOND = re.compile(
+    r"^paquet-horaire: second paquet parallèle de #(\d+)\b")
+#: la preuve (une fois par tête et par cible) que le second peut fusionner
+PARALLEL_PROOF = "parallel-second proof "
+PARALLEL_CONFLICT = "parallel-second conflict "
+#: le délai des contrôles de gel sur l'arbre fusionné (#3256 C) ; borné sous le
+#: bail `auto-merge` (300 s) pour qu'un passage ne le laisse pas expirer.
+PARALLEL_FREEZE_TIMEOUT = 120.0
 #: états d'un porteur que `watch` relit
 OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
 #: durée du bail `auto-merge:<lot>` qui sérialise la publication et le passage ;
@@ -389,6 +402,336 @@ def _target_tested(repo: str, target: str, head: str, composition: str = "") -> 
     if included == target:
         return True
     return _cutoff_landing_only(repo, included, target)
+
+
+# --------------------------------------------------------------------------
+# #3256 C : le second paquet d'une paire parallèle fusionne après le premier
+# --------------------------------------------------------------------------
+
+def _parallel_peer(db, lot: int) -> int | None:
+    """Le porteur du premier paquet, si `lot` est le second d'une paire.
+
+    La note est celle du composeur (`paquet-horaire: second paquet parallèle
+    de #<premier> groupe=…`), écrite avant la publication de la CI. Aucune
+    autre source ne fait un second paquet : un porteur ordinaire reste
+    désarmé quand la cible avance.
+    """
+    try:
+        events = work.events_noted(db, int(lot), "paquet-horaire: second paquet ",
+                                   0.0)
+    except Exception:  # noqa: BLE001 - un journal illisible ne suppose rien
+        return None
+    for event in reversed(events or ()):
+        match = PARALLEL_SECOND.match(str(event.get("note") or "").strip())
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _first_head(db, peer: int) -> str:
+    """La tête gelée du premier porteur (la tête qu'il a fusionnée)."""
+    try:
+        row, marks = fire._fresh(db, int(peer))
+    except Exception:  # noqa: BLE001 - lecture du premier impossible
+        return ""
+    if row is None:
+        return ""
+    freeze = fire.freeze_of(marks) or {}
+    return str(freeze.get("sha") or "").strip().lower()
+
+
+def _first_state(db, peer: int) -> str:
+    """L'état courant du premier porteur, ou "" si illisible."""
+    try:
+        row, _marks = fire._fresh(db, int(peer))
+    except Exception:  # noqa: BLE001 - un état illisible ne suppose rien
+        return ""
+    return str((row or {}).get("state") or "")
+
+
+def _first_merge(repo: str, composition: str, target: str,
+                 first_head: str) -> str:
+    """Le commit de fusion du premier paquet dans la cible, ou "".
+
+    Seule une avance `composition..target` composée du commit de fusion du
+    premier paquet (second parent = sa tête gelée) et d'atterrissages de
+    coupure est acceptée : un autre commit de code rend "" et le second est
+    désarmé comme un paquet ordinaire.
+    """
+    if not repo or not composition or not target or not first_head:
+        return ""
+    if _git(repo, "merge-base", "--is-ancestor", first_head, target) is None:
+        return ""
+    commits = _git(repo, "rev-list", "--first-parent",
+                   "%s..%s" % (composition, target))
+    if commits is None:
+        return ""
+    merged = ""
+    for commit in commits.split():
+        parents = (_git(repo, "rev-list", "--parents", "-n", "1", commit)
+                   or "").split()
+        if len(parents) >= 3 and parents[2] == first_head:
+            if merged:
+                return ""       # deux fusions de la même tête : ambigu
+            merged = commit
+            continue
+        if not _cutoff_commit(repo, commit):
+            return ""
+    return merged
+
+
+def _parallel_freeze_checks(repo: str, target: str, head: str,
+                            timeout: float = PARALLEL_FREEZE_TIMEOUT) -> tuple:
+    """Les contrôles de gel (#2542) sur l'arbre `target + head`, fusion propre.
+
+    Le second n'est pas rebasé par un force-push (sa tête testée resterait
+    celle de la CI) : la fusion de sa tête dans la cible avancée est essayée
+    dans un worktree jetable, puis `scripts/freeze-checks.py` y tourne.
+
+    Rend `(état, motif)` : `ok`, `red` (la fusion ou un contrôle échoue — le
+    second revient en file) ou `inconclusive` (worktree, délai, OSError : la
+    preuve manque, le porteur n'est ni clos ni fusionné, §3).
+    """
+    if not repo:
+        return "inconclusive", "no clone to run the freeze checks"
+    try:
+        base = tempfile.mkdtemp(prefix="ameesh-parallel-",
+                                dir=os.environ.get("TMPDIR") or None)
+        os.rmdir(base)
+    except OSError as exc:
+        return "inconclusive", "worktree could not be prepared: %s" % exc
+    added = _git(repo, "worktree", "add", "--detach", base, target)
+    if added is None:
+        return "inconclusive", "worktree could not be created"
+    try:
+        try:
+            merge = subprocess.run(
+                ["git", "-C", base, "merge", "--no-commit", "--no-ff", head],
+                capture_output=True, text=True, timeout=120.0)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "inconclusive", "merge could not run: %s" % exc
+        if merge.returncode != 0:
+            return "red", ("merge-tree conflict: %s"
+                           % (merge.stderr or merge.stdout or "").strip()[:300])
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [os.path.join(base, "src")] + ([env["PYTHONPATH"]]
+                                           if env.get("PYTHONPATH") else []))
+        try:
+            checks = subprocess.run(
+                [sys.executable, os.path.join(base, "scripts", "freeze-checks.py")],
+                cwd=base, capture_output=True, text=True, timeout=timeout, env=env)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "inconclusive", "freeze checks could not run: %s" % exc
+        if checks.returncode != 0:
+            tail = (checks.stdout or "") + (checks.stderr or "")
+            return "red", ("freeze-checks rc %d: %s"
+                           % (checks.returncode, " ".join(tail.split())[-500:]))
+        return "ok", ""
+    finally:
+        _git(repo, "worktree", "remove", "--force", base)
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def _carrier_branch(db, lot: int) -> str:
+    """La branche portée par un lot (`integration/paquet-…`), ou ""."""
+    try:
+        row, _marks = fire._fresh(db, int(lot))
+    except Exception:  # noqa: BLE001 - une branche illisible ne prouve rien
+        return ""
+    return str((row or {}).get("branch") or "").strip()
+
+
+def _carrier_manifest(repo: str, head: str, branch: str) -> str | None:
+    """Le manifeste §12 tel qu'il est **figé** dans `head`, ou None."""
+    if not repo or not head or not branch.startswith(CARRIER_PREFIX):
+        return None
+    # `integration/paquet-<nom>` → `reviews/integration-paquet-<nom>.md`
+    # (même dérivation que `paquet-auto.manifest_rel`).
+    rel = "reviews/%s.md" % branch.replace("/", "-", 1)
+    return _git(repo, "show", "%s:%s" % (head, rel))
+
+
+def _parallel_manifests_disjoint(db, repo: str, lot: int, peer: int,
+                                 first_head: str, second_head: str) -> tuple:
+    """Les deux manifestes figés prouvent-ils encore la disjonction ?
+
+    #3256 C (B cx1) : la partition lit l'inventaire au moment du partage,
+    # mais `--only` ne transmet que des identifiants et `compose_packet` relit
+    # les gels courants. Un regel entre le partage et la composition (ou une
+    # reprise/recomposition) peut donc donner aux deux porteurs un fichier
+    # commun, alors que la note de paire et la preuve de fusion ne regardaient
+    # que la propreté du merge-tree. Ici on relit les **manifestes des deux
+    # têtes testées** : chaque lot y porte le commit réellement composé, et
+    # l'on recalcule ses fichiers depuis la base du manifeste, plus les
+    # dépendances courantes. Une dépendance croisée ou un fichier commun est
+    # un négatif déterministe (le second revient en file), même si la fusion
+    # est propre ; une lecture impossible laisse la preuve manquante.
+    """
+    first_branch = _carrier_branch(db, peer)
+    second_branch = _carrier_branch(db, lot)
+    if not first_branch or not second_branch:
+        return "inconclusive", "branche de la paire illisible"
+    first_text = _carrier_manifest(repo, first_head, first_branch)
+    second_text = _carrier_manifest(repo, second_head, second_branch)
+    if first_text is None or second_text is None:
+        return "inconclusive", "manifeste de la paire illisible dans la tête testée"
+    first_units = packet_parallel.manifest_units(first_text)
+    second_units = packet_parallel.manifest_units(second_text)
+    if not first_units or not second_units:
+        return "inconclusive", ("manifeste de la paire sans table d'admissions "
+                                "lisible")
+    first_lots = [unit["work_item"] for unit in first_units]
+    second_lots = [unit["work_item"] for unit in second_units]
+    if len(set(first_lots)) != len(first_lots) \
+            or len(set(second_lots)) != len(second_lots):
+        return "conflict", "manifeste de la paire : un lot y figure deux fois"
+    overlap = sorted(set(first_lots) & set(second_lots))
+    if overlap:
+        return "conflict", ("lot(s) %s présents dans les deux manifestes"
+                            % ", ".join("#%d" % item for item in overlap))
+    first_base = packet_parallel.manifest_base(first_text)
+    second_base = packet_parallel.manifest_base(second_text)
+    if not first_base or not second_base:
+        return "inconclusive", "base du manifeste de la paire illisible"
+    from . import packet_candidates
+    files: dict[int, set[str]] = {}
+    for units, base in ((first_units, first_base), (second_units, second_base)):
+        for unit in units:
+            try:
+                files[unit["work_item"]] = set(packet_candidates.changed_files(
+                    repo, base, unit["source"]))
+            except Exception as exc:  # noqa: BLE001 - une lecture impossible ne conclut pas
+                return "inconclusive", ("fichiers du lot #%d illisibles: %s"
+                                        % (unit["work_item"], exc))
+    first_files: set[str] = set()
+    second_files: set[str] = set()
+    for item in first_lots:
+        first_files |= files[item]
+    for item in second_lots:
+        second_files |= files[item]
+    shared = sorted(first_files & second_files)
+    if shared:
+        return "conflict", ("fichier(s) commun(s) aux deux manifestes testés : %s"
+                            % ", ".join(shared))
+    from . import work_dependencies
+    try:
+        edges = work_dependencies.grouped(
+            db, sorted(set(first_lots) | set(second_lots)))
+    except Exception as exc:  # noqa: BLE001 - une lecture impossible ne conclut pas
+        return "inconclusive", "dépendances de la paire illisibles: %s" % exc
+    first_set, second_set = set(first_lots), set(second_lots)
+    cross = []
+    for work_item, rows in (edges or {}).items():
+        try:
+            work_item = int(work_item)
+        except (TypeError, ValueError):
+            continue
+        for edge in rows or ():
+            try:
+                blocker = int(edge.get("blocker_id"))
+            except (TypeError, ValueError):
+                continue
+            if (work_item in first_set and blocker in second_set) \
+                    or (work_item in second_set and blocker in first_set):
+                cross.append((work_item, blocker))
+    if cross:
+        return "conflict", ("dépendance(s) croisées entre les deux manifestes "
+                            "testés : %s" % ", ".join(
+                                "#%d→#%d" % pair for pair in cross))
+    return "ok", ""
+
+
+def _parallel_proof(db, repo: str, lot: int, *, composition: str, target: str,
+                    sha: str, dry_run: bool) -> dict:
+    """Le second peut-il fusionner malgré la cible avancée ?
+
+    Rend `{state: none|wait|conflict|inconclusive|ok, why, merge, marker}`.
+    `none` : le porteur n'est pas un second, la garde ordinaire s'applique.
+    `wait` : le premier n'a pas encore fusionné. `conflict` : la fusion du
+    second dans la cible avancée est un négatif déterministe (conflit,
+    manifestes plus disjoints, contrôle de gel rouge) — le second revient en
+    file. `inconclusive` : la preuve manque (manifeste, délai, worktree,
+    OSError), le porteur n'est ni clos ni fusionné (§3). `ok` : les deux
+    manifestes testés restent disjoints, la fusion est propre et les contrôles
+    verts ; la marque est écrite par l'appelant sous le bail renouvelé, puis
+    la fusion peut suivre sans relancer la suite complète.
+    """
+    peer = _parallel_peer(db, lot)
+    if peer is None:
+        return {"state": "none"}
+    first_head = _first_head(db, peer)
+    if not first_head:
+        return {"state": "wait", "why": "premier paquet #%d sans tête gelée lisible"
+                                         % peer}
+    merge = _first_merge(repo, composition, target, first_head)
+    if not merge:
+        if _git(repo, "merge-base", "--is-ancestor", first_head, target) is None:
+            return {"state": "wait",
+                    "why": "second paquet : le premier #%d n'est pas encore fusionné"
+                           % peer}
+        return {"state": "none"}    # la cible a avancé par un autre commit de code
+    if dry_run:
+        return {"state": "none"}
+    # #3256 C (B cx1) : l'exemption de suite complète n'est due qu'à la
+    # disjonction **réellement testée**. Elle se relit sur les deux manifestes
+    # figés à chaque passage, reprises comprises — avant toute preuve déjà
+    # consignée, qui ne couvre que la propreté de l'arbre fusionné.
+    disjoint, why = _parallel_manifests_disjoint(db, repo, lot, peer,
+                                                 first_head, sha)
+    if disjoint == "conflict":
+        return {"state": "conflict", "why": why}
+    if disjoint != "ok":
+        return {"state": "inconclusive", "why": why}
+    # Preuve déjà consignée pour cette tête et cette cible : ne pas rejouer.
+    try:
+        notes = work.events_noted(db, int(lot), PARALLEL_PROOF, 0.0) or ()
+    except Exception:  # noqa: BLE001 - un journal illisible rejoue la preuve
+        notes = ()
+    marker = "sha=%s target=%s merge=%s" % (sha, target, merge)
+    for event in notes:
+        if marker in str(event.get("note") or ""):
+            return {"state": "ok", "merge": merge, "marker": marker,
+                    "why": "preuve déjà consignée"}
+    from . import packet_candidates
+    try:
+        merged = packet_candidates.merge_tree(repo, target, sha)
+    except Exception as exc:  # noqa: BLE001 - une lecture impossible ne conclut pas
+        return {"state": "inconclusive", "why": "merge-tree illisible: %s" % exc}
+    if merged.get("state") == "error":
+        return {"state": "inconclusive",
+                "why": "merge-tree illisible: %s" % (merged.get("detail") or "?")}
+    if merged.get("state") != "clean":
+        return {"state": "conflict",
+                "why": "fusion du second dans la cible avancée non propre: %s"
+                       % (merged.get("detail") or ", ".join(merged.get("files") or ())
+                          or merged.get("state"))}
+    state, why = _parallel_freeze_checks(repo, target, sha)
+    if state == "red":
+        return {"state": "conflict", "why": why}
+    if state != "ok":
+        return {"state": "inconclusive", "why": why}
+    return {"state": "ok", "merge": merge, "marker": marker,
+            "why": "merge-tree clean, freeze-checks green"}
+
+
+def _parallel_return_to_queue(db, lot: int, row: dict, why: str, actor: str) -> None:
+    """Le second en conflit revient en file : son porteur est clos abandonné.
+
+    Les unités restent en `qa` avec leurs verdicts ; le prochain paquet les
+    reprend. La clôture n'est pas fatale au passage : le courrier et la note
+    disent le motif même si elle échoue.
+    """
+    note = ("second paquet parallèle : %s ; lots rendus à la file, prochain "
+            "paquet" % why)
+    try:
+        work.note(db, int(lot), PARALLEL_CONFLICT + why, actor=actor)
+    except Exception:  # noqa: BLE001 - la trace ne change pas la clôture
+        pass
+    try:
+        work.close(db, int(lot), abandoned=True, note=note, actor=actor)
+    except Exception:  # noqa: BLE001 - un agent lira la note du porteur
+        pass
 
 
 def _gate_repo(cfg, db, row, slug: str, checkout: str = "") -> str:
@@ -1276,19 +1619,90 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     # #3534 (B3) : le clone se résout comme pour la porte des avis, avant la
     # garde du delta ; `checkout` est vide dans `ci run`/`arm`.
     repo = _gate_repo(cfg, db, row, slug, checkout)
+    # #3534 : le fetch précède les gardes git (tête de la PR et cible). Il est
+    # aussi nécessaire à la garde d'ordre #3256 C, qui compare la tête du
+    # premier paquet à la cible fraîche.
+    if repo and base_oid:
+        _fetch_into(repo, (view.get("branch") or "", base))
+    # #3256 C : l'ordre de la paire est une garde, même quand la cible n'a pas
+    # encore bougé. Le second ne fusionne jamais avant le premier ; un premier
+    # clos sans fusion rend le second à la file.
+    peer = _parallel_peer(db, lot)
+    if peer is not None and not dry_run:
+        first_head = _first_head(db, peer)
+        if not first_head or _git(repo, "merge-base", "--is-ancestor",
+                                  first_head, base_oid) is None:
+            first_state = _first_state(db, peer)
+            if first_state == "closed":
+                why = ("premier paquet #%d clos sans fusion : le second revient "
+                       "en file" % peer)
+                if not _renew(handle):
+                    return dict(out, result="busy")
+                if not _fenced_hold(db, fence, margin_s=AUTOMERGE_CALL_MARGIN_S):
+                    return dict(out, result="error",
+                                error="the elected pilot lease was lost before "
+                                      "closing the second packet: nothing closed")
+                _parallel_return_to_queue(db, lot, row, why, actor)
+                return dict(out, result="closed", state="closed", why=why)
+            return dict(out, result="pending",
+                        why="second paquet : le premier #%d n'est pas encore "
+                            "fusionné" % peer)
     moved = []
     # #3534 : la cible doit être couverte par la tête testée, soit directement
     # (H2 = merge(H, C)), soit par une avance limitée aux atterrissages de
     # coupure depuis le dernier commit de la cible déjà dans la tête (B2,
     # #173). Sinon la CI du paquet n'a pas testé cet arbre : on désarme.
     target_moved = ""
+    parallel = None
     if base_oid and composition and base_oid != composition:
-        if repo:
-            _fetch_into(repo, (view.get("branch") or "", base))
         if not _target_tested(repo, base_oid, sha, composition):
             target_moved = ("target advanced since composition %s → %s"
                             % (composition[:12], base_oid[:12]))
-            moved.append(target_moved)
+            if not dry_run:
+                # #3256 C : le second d'une paire parallèle fusionne après le
+                # premier, sans refaire la suite complète quand la fusion de sa
+                # tête dans la cible avancée est propre et les contrôles de gel
+                # verts. Un conflit le rend à la file.
+                proof = _parallel_proof(db, repo, lot, composition=composition,
+                                        target=base_oid, sha=sha, dry_run=dry_run)
+                if proof.get("state") == "wait":
+                    return dict(out, result="pending", why=proof.get("why") or
+                                "second paquet : le premier n'est pas encore fusionné")
+                if proof.get("state") == "inconclusive":
+                    # §3 : une preuve manquante (délai, worktree, OSError) n'est
+                    # ni un conflit ni une fusion ; le porteur reste ouvert et
+                    # le passage suivant rejoue la preuve.
+                    return dict(out, result="pending",
+                                why="preuve du second paquet non concluante: %s"
+                                    % (proof.get("why") or "?"))
+                if proof.get("state") == "conflict":
+                    if not _renew(handle):
+                        return dict(out, result="busy")
+                    if not _fenced_hold(db, fence, margin_s=AUTOMERGE_CALL_MARGIN_S):
+                        return dict(out, result="error",
+                                    error="the elected pilot lease was lost before "
+                                          "closing the second packet: nothing closed")
+                    _parallel_return_to_queue(db, lot, row, proof.get("why") or "conflit",
+                                              actor)
+                    return dict(out, result="closed", state="closed",
+                                why=proof.get("why") or "conflit")
+                if proof.get("state") == "ok":
+                    # La marque de preuve est une mutation : elle suit le
+                    # renouvellement du bail, jamais avant (avis auditeur B3).
+                    if not _renew(handle):
+                        return dict(out, result="busy")
+                    try:
+                        work.note(db, int(lot),
+                                  "%s%s — merge-tree clean, freeze-checks green, "
+                                  "tête testée inchangée (#3256 C)"
+                                  % (PARALLEL_PROOF, proof.get("marker") or ""),
+                                  actor=actor)
+                    except Exception:  # noqa: BLE001 - la preuve sera rejouée
+                        pass
+                    parallel = proof
+                    target_moved = ""
+            if target_moved:
+                moved.append(target_moved)
     if view["head"] != sha:
         moved.append("head=%s" % (view["head"] or "?"))
     if view["base"] != base:
@@ -1443,6 +1857,10 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     verdict = "gates green" if not inherited else "gates green apart from inherited red"
     note = ("base=%s commit=%s — merged by ameesh into %s at its published head, %s"
             % (base, commit or "already-contained", base, verdict))
+    if parallel:
+        note += ("; second paquet parallèle : fusion de la cible avancée propre, "
+                 "contrôles de gel verts, tête testée %s inchangée (#3256 C)"
+                 % sha[:12])
     if inherited:
         note += "; " + _inherited_text(inherited)
     if consigned:

@@ -54,6 +54,7 @@ def reader_keys() -> set[str]:
             ("backlog", mechanics._BACKLOG_KEYS),
             ("staging", mechanics._STAGING_KEYS),
             ("accounts", mechanics._ACCOUNTS_KEYS),
+            ("paquet", mechanics._PAQUET_KEYS),
             ("packet_tests", mechanics._PACKET_TESTS_KEYS),
             # #3022 : `production.branch` est un bloc **par projet**, pas un
             # bloc du document global ; la garde doit le voir comme les autres.
@@ -74,7 +75,8 @@ class SchemaCoverageTest(unittest.TestCase):
         self.assertEqual(set(mechanics._DOCUMENT_KEYS),
                          {"schema", "timezone", "cutoffs", "packets", "build",
                           "ci", "reviews", "merge", "prevalidation", "backlog",
-                          "staging", "accounts", "packet_tests", "projects"})
+                          "staging", "accounts", "paquet", "packet_tests",
+                          "projects"})
         # #3022 : les surcharges par projet peuvent porter un bloc qui n'est
         # pas un bloc du document global (`production`) ; il reste couvert par
         # `production.branch` ci-dessus, jamais ajouté au schéma du document.
@@ -127,6 +129,8 @@ POSITIVE = {
     "staging.before_packet_seconds": "BEFORE_PACKET_SECONDS = 600\n",
     "accounts.pace_multipliers": 'PACE_MULTIPLIERS = {"codex": {"primaire": 2}}\n',
     "accounts.underused_loss": "UNDERUSED_LOSS = 0.5\n",
+    "paquet.attente_mediane_s": "ATTENTE_MEDIANE_S = 3600\n",
+    "paquet.max_paquets": "MAX_PAQUETS = 2\n",
     "packet_tests.unit_timeout_seconds": "UNIT_TIMEOUT_SECONDS = 900\n",
     "packet_tests.parallel": "UNIT_TESTS_PARALLEL = 4\n",
     "projects": 'PROJECT_OVERRIDES = {"ameesh": {"build": {"max_in_build": 3}}}\n',

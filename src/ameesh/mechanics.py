@@ -30,6 +30,10 @@ mécanique, ce que l'outillage exécute sans agent :
 - `staging.waiting_lots_min`, `before_cutoff_seconds`, `before_packet_seconds`
   (#3291, bloc optionnel) : le seuil de lots retenus et les marges d'un
   déploiement staging hors créneau (canon §11 bis) ; bloc absent : `None`.
+- `paquet.attente_mediane_s` et `paquet.max_paquets` (#3256 C, bloc optionnel,
+  canon §11 bis) : la médiane d'attente `qa_merge` de la veille au-delà de
+  laquelle deux paquets disjoints partent en parallèle, et le nombre maximal
+  de CI de paquet simultanées ; bloc absent : `None`, aucun second paquet.
 - `packet_tests.unit_timeout_seconds`, `packet_tests.parallel` (#4271, bloc
   optionnel) : le plafond d'une série de tests ciblés d'unité du paquet
   horaire (au-delà, non concluant, canon §3) et le nombre de séries jouées en
@@ -94,7 +98,7 @@ _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
                   "merge", "prevalidation", "backlog", "staging", "accounts",
-                  "packet_tests", "projects")
+                  "paquet", "packet_tests", "projects")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production")
 _PRODUCTION_KEYS = ("branch",)
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
@@ -116,6 +120,8 @@ _STAGING_KEYS = ("waiting_lots_min", "before_cutoff_seconds",
                  "before_packet_seconds")
 #: #3647 : clés du bloc optionnel `accounts` (rythme des comptes de forfait)
 _ACCOUNTS_KEYS = ("pace_multipliers", "underused_loss")
+#: #3256 C : clés du bloc optionnel `paquet` (paquets en parallèle, §11 bis)
+_PAQUET_KEYS = ("attente_mediane_s", "max_paquets")
 #: #4271 : clés du bloc optionnel `packet_tests` (tests ciblés du paquet)
 _PACKET_TESTS_KEYS = ("unit_timeout_seconds", "parallel")
 #: bornes du score de valeur d'un élément de backlog (`backlog.add`)
@@ -192,6 +198,23 @@ class Staging:
 
 
 @dataclass(frozen=True)
+class PaquetParallel:
+    """#3256 C : the compiled rule for parallel packets (canon §11 bis).
+
+    `attente_mediane_s` is the previous day's median `qa_merge` wait above
+    which the composer opens a second disjoint packet; `max_paquets` is the
+    number of packet CIs allowed at once. Absent block: `None`, no parallel
+    packet — never a local default."""
+
+    attente_mediane_s: float
+    max_paquets: int
+
+    def to_dict(self) -> dict:
+        return {"attente_mediane_s": self.attente_mediane_s,
+                "max_paquets": self.max_paquets}
+
+
+@dataclass(frozen=True)
 class PacketTests:
     """#4271: optional canon rule for the targeted tests of an hourly packet."""
 
@@ -261,6 +284,8 @@ class Document:
     staging: Staging | None = None
     #: #3647 : rythme des comptes de forfait ; None = bloc absent
     accounts: AccountsPace | None = None
+    #: #3256 C : paquets en parallèle ; None = bloc absent (aucun second paquet)
+    paquet: PaquetParallel | None = None
     #: #4271 : tests ciblés du paquet horaire ; None = bloc absent
     packet_tests: PacketTests | None = None
 
@@ -311,6 +336,8 @@ class Document:
             payload["staging"] = self.staging.to_dict()
         if self.accounts is not None:
             payload["accounts"] = self.accounts.to_dict()
+        if self.paquet is not None:
+            payload["paquet"] = self.paquet.to_dict()
         if self.packet_tests is not None:
             payload["packet_tests"] = self.packet_tests.to_dict()
         return payload
@@ -363,6 +390,8 @@ class Mechanics:
     #: #2584 : seuil de lot d'un défaut non bloquant ; None = bloc absent
     backlog_lot_min_value: int | None = None
     staging: Staging | None = None
+    #: #3256 C : paquets en parallèle ; None = bloc absent
+    paquet: PaquetParallel | None = None
 
     # -- coupures -----------------------------------------------------------
 
@@ -533,6 +562,8 @@ class Mechanics:
             payload["backlog"] = {"lot_min_value": self.backlog_lot_min_value}
         if self.staging is not None:
             payload["staging"] = self.staging.to_dict()
+        if self.paquet is not None:
+            payload["paquet"] = self.paquet.to_dict()
         if self.source:
             payload["source"] = self.source
         return payload
@@ -807,6 +838,21 @@ def _staging(value, where: str) -> Staging:
                      for key in _STAGING_KEYS))
 
 
+def _paquet(value, where: str) -> PaquetParallel:
+    """#3256 C : le bloc `paquet` (seuil d'attente et plafond de paquets).
+
+    `attente_mediane_s` est une durée en secondes strictement positive (le
+    seuil du canon est `3600`, jamais recopié) ; `max_paquets` un entier au
+    moins 2 (un second paquet n'a de sens qu'à deux)."""
+    data = _mapping(value, where, _PAQUET_KEYS)
+    attente = _positive_int(data.get("attente_mediane_s"),
+                            where + ".attente_mediane_s")
+    maximum = _positive_int(data.get("max_paquets"), where + ".max_paquets")
+    if maximum < 2:
+        raise MechanicsError("%s.max_paquets: 2 or more expected" % where)
+    return PaquetParallel(attente_mediane_s=float(attente), max_paquets=maximum)
+
+
 def _packet_tests(value, where: str) -> PacketTests:
     data = _mapping(value, where, _PACKET_TESTS_KEYS)
     return PacketTests(*(_positive_int(data.get(key), where + "." + key)
@@ -924,6 +970,8 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                  if "staging" in parsed else None),
         accounts=(_accounts(parsed["accounts"], source + ".accounts")
                   if "accounts" in parsed else None),
+        paquet=(_paquet(parsed["paquet"], source + ".paquet")
+                if "paquet" in parsed else None),
         packet_tests=(_packet_tests(parsed["packet_tests"], source + ".packet_tests")
                       if "packet_tests" in parsed else None),
     )
@@ -1221,4 +1269,5 @@ def load(repo: str, commit: str, project: str, *,
         source="%s@%s:%s" % (repo, commit, PATH),
         backlog_lot_min_value=document.backlog_lot_min_value,
         staging=document.staging,
+        paquet=document.paquet,
     )
