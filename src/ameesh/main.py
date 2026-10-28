@@ -77,9 +77,6 @@
   ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
         reserved host move at a lot boundary, durable journal (L232a);
   ameesh harness list|show|check|versions  harnesses (L16, L120);
-  ameesh veille scan [--dry-run] [--json] [--no-probe] [--harness ID]
-        #3264 A: daily watch of harness/model versions; one evaluation lot per
-        harness, priority 1 on a vendor recommendation (config `veille.sources`);
   ameesh heavy [--nice N] -- <command> | --status [--json]
         heavy suite (tests, build) in one of the host's capped slots (L131);
   ameesh host drain HOST [--for 8h] | undrain HOST | reconcile HOST | status [HOST]
@@ -190,6 +187,9 @@
         turn_grace_seconds=20m|0
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
+  ameesh veille scan [--dry-run] [--json] [--no-probe] [--harness ID]
+        #3264 A: daily watch of harness/model versions; one evaluation lot per
+        harness, priority 1 on a vendor recommendation (config `veille.sources`);
   ameesh verify               verify a signed approval;
   ameesh version | --version  version of the installed package;
   ameesh watch enable --agent A [--every 30m] | disable --agent A | show [--json]
