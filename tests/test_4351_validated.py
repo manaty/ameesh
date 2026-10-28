@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Stored validation is derived from the exact-head review gate."""
+import datetime
+import types
 from unittest import mock
 
-from ameesh import progress, storage, work, work_lifecycle
+from ameesh import planned_waits, progress, storage, work, work_dependencies, work_lifecycle
 from .support import PgTestCase
 
 HEAD = "a" * 40
@@ -81,6 +83,26 @@ class ValidatedTest(PgTestCase):
         self.read.side_effect = freeze_during_gate
         self.mark()
         self.assertEqual(self.current_state(), "qa")
+
+    def test_validated_lot_can_declare_a_landing(self):
+        self.read.return_value = {"ok": True}
+        self.mark()
+        self.assertEqual(self.current_state(), "validated")
+        vehicle = work.add(self.db, title="vehicle", app="demo")["id"]
+        self.ops.add_milestone(vehicle, "frozen", sha=NEXT, actor="pilot", verdict=None, note="")
+        until = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        work_dependencies.land(self.db, self.lot, vehicle, until_on=until, actor="pilot")
+        self.assertEqual(self.current_state(), "validated")
+
+    def test_validated_packet_member_keeps_recorded_membership(self):
+        carrier = dict(id=90, state="validated", branch="integration/paquet-test", branch_head=NEXT)
+        unit = dict(id=1, state="validated", branch_head=HEAD)
+        store = types.SimpleNamespace(work=mock.Mock(), progress=mock.Mock())
+        store.work.packet_members.return_value = [dict(package_id=90, work_item_id=1,
+                                                       head_sha=NEXT, source_sha=HEAD)]
+        store.progress.lot_milestones.return_value = []
+        self.assertEqual(planned_waits.recorded_packet_attachments(store, [carrier], [unit]),
+                         {90: {1}})
 
     def test_stored_validation_is_approved_and_not_delivered(self):
         self.assertIn("validated", work_lifecycle.TO_VALIDATE)

@@ -7,7 +7,7 @@ import json
 import os
 import time
 
-from . import storage, work
+from . import storage, work, work_lifecycle as lifecycle
 
 
 def _id(value):
@@ -254,7 +254,7 @@ def _require_frozen_with_verdict(db, item_id):
     item = work.get(db, item_id)
     if item is None:
         return
-    if item.get("state") != "qa":
+    if item.get("state") not in lifecycle.TO_VALIDATE:
         raise work.WorkError("the landing lot must be in review (qa) before it "
                              "can be parked")
     st = storage.of(db)
