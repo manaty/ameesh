@@ -61,6 +61,13 @@ if [ "$(basename "$0")" = vm.sh ]; then
   fi
 fi
 action=${1:-}
+# #4416 : un nouveau timer du canon manque jusqu'a l'installation explicite.
+if grep -qx 'nouveau-timer' "$state/scenario" 2>/dev/null && [ "$host" != manaty-mesh-1 ]; then
+  case "$action" in
+    timers) touch "$state/timer-$host" ;;
+    controler) [ -f "$state/timer-$host" ] || exit 1 ;;
+  esac
+fi
 if [ "$host" = pc-smichea ]; then
   case "$action" in
     redemarrer|retour)
@@ -432,8 +439,29 @@ class StagingTest(unittest.TestCase):
         for host in ('ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3', 'manaty-mesh-1', 'pc-smichea'):
             self.assertIn(host, p.stdout)
         self.assertEqual(self.calls(), [])
-        self.assertIn('par hote installer, redemarrer, controler, sante', p.stdout)
+        self.assertIn('par hote installer, redemarrer, timers (agents et poste), controler, sante', p.stdout)
         self.assertIn('attestation « staging actif »', p.stdout)
+
+    def test_new_role_timer_is_installed_before_each_vm_check(self):
+        (self.state / 'scenario').write_text('nouveau-timer\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        actions = self.actions()
+        for host in ('ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3', 'pc-smichea'):
+            self.assertTrue((self.state / ('timer-' + host)).exists())
+            self.assertLess(actions.index((host, 'redemarrer')), actions.index((host, 'timers')))
+            self.assertLess(actions.index((host, 'timers')), actions.index((host, 'controler')))
+            self.assertTrue(any(t['hote'] == host and t['etape'] == 'timers'
+                                and t['verdict'] == 'ok' for t in self.traces()))
+
+    def test_timer_install_failure_rolls_back_and_stops_staging(self):
+        (self.state / 'scenario').write_text('ko=ameesh-agents-1:timers\n')
+        p = self.run_staging()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn(('ameesh-agents-1', 'retour'), self.actions())
+        self.assertNotIn(('ameesh-agents-2', 'installer'), self.actions())
+        self.assertTrue(any(t['etape'] == 'timers' and t['verdict'] == 'ko'
+                            for t in self.traces()))
 
     def test_full_sequence_order_and_trace(self):
         p = self.run_staging()
@@ -448,12 +476,15 @@ class StagingTest(unittest.TestCase):
             ('pc-smichea', 'migrer'),
             ('ameesh-agents-1', 'installer'),
             ('ameesh-agents-1', 'redemarrer'),
+            ('ameesh-agents-1', 'timers'),
             ('ameesh-agents-1', 'controler'),
             ('ameesh-agents-2', 'installer'),
             ('ameesh-agents-2', 'redemarrer'),
+            ('ameesh-agents-2', 'timers'),
             ('ameesh-agents-2', 'controler'),
             ('ameesh-agents-3', 'installer'),
             ('ameesh-agents-3', 'redemarrer'),
+            ('ameesh-agents-3', 'timers'),
             ('ameesh-agents-3', 'controler'),
             ('manaty-mesh-1', 'installer'),
             ('manaty-mesh-1', 'redemarrer'),
@@ -461,6 +492,7 @@ class StagingTest(unittest.TestCase):
             ('pc-smichea', 'installer'),
             ('pc-smichea', 'role'),
             ('pc-smichea', 'redemarrer'),
+            ('pc-smichea', 'timers'),
             ('pc-smichea', 'controler'),
         ])
         self.assertIn('venv-ameesh doctor --harness', self.calls())
