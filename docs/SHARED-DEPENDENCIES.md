@@ -157,7 +157,7 @@ keep typing npm:
 | `npm install -g …`, `npm test`, `npm run …`, anything else | passed through | passed through |
 
 `AMEESH_DEPS=off` passes everything through. `AMEESH_DEPS=allow-review`
-allows installs in a review worktree. With `policy.housekeeping.deps: false`,
+allows installs in a review worktree. With `policy.workspaces.housekeeping.deps: false`,
 no wrapper is installed.
 
 In a review worktree there is no parsing to get wrong: ANY argument that

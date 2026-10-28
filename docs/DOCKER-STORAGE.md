@@ -43,8 +43,8 @@ the undeclared ones with their command. The periodic housekeeping pass
 persists the same summary. `ameesh alerts` reads these persisted samples,
 without launching Docker. No migration is required.
 
-The default thresholds and retention in the Host card's `policy.housekeeping`
-are:
+The default thresholds and retention in the Host card's
+`policy.workspaces.housekeeping` are:
 
 ```yaml
 docker_orphan_volumes_alert: 100
