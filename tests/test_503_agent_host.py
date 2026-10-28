@@ -105,7 +105,11 @@ if sys.argv[1:] == ['list', '--json']:
     print((state / 'agents.json').read_text())
 elif sys.argv[1] == 'show':
     name = sys.argv[2]
-    # #4358 : sortie VIDE, code 0 (staging h-07, relève du rôle mesh-design) ;
+    # #2198/N4 : lecture lente ; la borne de lecture doit la couper avant la
+    # borne (plus longue) des gestes de drain.
+    if scenario == 'show-lent':
+        time.sleep(5)
+    # #4358 (après l'ancre #2198/N4 que test_3114 remplace) : sortie VIDE, code 0 (staging h-07, relève du rôle mesh-design) ;
     # le fichier compte les lectures vides restantes, « toujours » ne
     # s'épuise jamais.
     vide = state / ('vide-' + name)
@@ -117,10 +121,6 @@ elif sys.argv[1] == 'show':
             else:
                 vide.write_text(str(int(reste) - 1))
         sys.exit(0)
-    # #2198/N4 : lecture lente ; la borne de lecture doit la couper avant la
-    # borne (plus longue) des gestes de drain.
-    if scenario == 'show-lent':
-        time.sleep(5)
     row = next(a for a in json.loads((state / 'agents.json').read_text()) if a['name'] == name)
     row = dict(row, lease_owner='runner-' + name + '@host-agents', lease_epoch=7, lease_expires_ts=time.time()+300)
     pause = state / ('pause-' + name)

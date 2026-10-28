@@ -373,15 +373,18 @@ ameesh_agents_lecture() {
 ameesh_local_drain() {
   appel_drain "$DRAIN_APPEL_DELAI" "$AMEESH" "$@"
 }
-# #4358 : `show --json` d'une persona, relu tant qu'il n'est pas un objet JSON
-# (sortie vide ou tronquée, code non nul), au plus LECTURE_ESSAIS fois ; rc 3
-# quand la lecture reste illisible — un non-concluant que l'appelant traite,
-# jamais un échec de l'étape. $2… : la commande de lecture du mode.
+# #4358 : `show --json` d'une persona, relu tant qu'il n'est pas un objet JSON,
+# au plus LECTURE_ESSAIS fois. Rc 3 (non concluant, que l'appelant traite sans
+# échec d'étape) seulement si la dernière lecture a rendu code 0 avec une
+# sortie vide ou tronquée, ou a été coupée par sa borne (124, 137) : la relève
+# d'un rôle élu. Une erreur explicite du CLI reste un échec (rc 1, #3114).
+# $2… : la commande de lecture du mode.
 lire_show() {  # persona commande… → objet JSON sur une ligne ; rc 3 si illisible
-  local p=$1 sortie essai
+  local p=$1 sortie essai rc
   shift
   for ((essai = 1; essai <= LECTURE_ESSAIS; essai++)); do
-    if sortie=$("$@" show "$p" --json) && python3 -c 'import json,sys
+    rc=0; sortie=$("$@" show "$p" --json) || rc=$?
+    if [ "$rc" = 0 ] && python3 -c 'import json,sys
 r = json.loads(sys.stdin.read())
 if not isinstance(r, dict): sys.exit(1)
 print(json.dumps(r))' <<<"$sortie" 2>/dev/null; then
@@ -389,8 +392,13 @@ print(json.dumps(r))' <<<"$sortie" 2>/dev/null; then
     fi
     if ((essai < LECTURE_ESSAIS)); then sleep "$LECTURE_ECART"; fi
   done
-  echo "$p : lecture du registre vide ou illisible ($LECTURE_ESSAIS essais)" >&2
-  return 3
+  case $rc in
+    0|124|137)
+      echo "$p : lecture du registre vide, tronquée ou coupée ($LECTURE_ESSAIS essais)" >&2
+      return 3 ;;
+  esac
+  echo "$p : lecture du registre en erreur (code $rc, $LECTURE_ESSAIS essais)" >&2
+  return 1
 }
 lire_bail() {  # rc 3 : registre illisible (#4358), rc 1 : placement modifié
   local ligne
