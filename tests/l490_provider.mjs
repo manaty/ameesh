@@ -19,7 +19,7 @@ if (process.argv[3].startsWith('boot-')) {
 } else {
   const { LocalSubprocessRuntime } = await import('@deepseek-ai/dsh-subprocess-local');
   const ctx = new Context();
-  ctx.logger = { warn: message => console.error(message) };
+  ctx.logger = { warn: message => console.error(message), debug: () => {} };
   runtime = new LocalSubprocessRuntime(ctx);
 }
 const parent = readFileSync('/proc/self/cgroup', 'utf8').trim();
