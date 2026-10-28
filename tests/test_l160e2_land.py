@@ -252,12 +252,18 @@ class PassLeaseTest(_Land):
 
         self.fake.land_lock = tracked_lock
 
+        # #4115: with a 0.3 s pass TTL, one beat delayed by a loaded bench
+        # outlived the lease (same shape as the red of #4084). A beat every
+        # 1/3 s leaves room for a 0.6 s delay; the wait stays above the TTL
+        # so a missing heartbeat fails the assertion instead of hanging.
+        ttl = 1.0
+
         def gate(project, path, **kw):
-            self.assertTrue(renewed.wait(2.0),
+            self.assertTrue(renewed.wait(3 * ttl),
                             "the pass heartbeat did not renew the lease during the gate")
             return {"ok": True, "gate": None, "output": ""}
 
-        with mock.patch.object(land, "LAND_PASS_TTL_S", 0.3), \
+        with mock.patch.object(land, "LAND_PASS_TTL_S", ttl), \
                 mock.patch.object(land, "gates", side_effect=gate):
             out = self.land(4)
         self.assertEqual(out["result"], "landed", out)
