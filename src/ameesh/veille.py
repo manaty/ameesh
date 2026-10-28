@@ -1016,6 +1016,10 @@ def scan(cfg, db, *, sources=None, dry_run: bool = False, probe: bool = True,
                 continue
             if not models.get("complete") or not models.get("served"):
                 continue
+            if models.get("previous_error"):
+                # le relevé précédent n'a pas pu être lu : ne pas l'écraser,
+                # le prochain passage doit pouvoir comparer
+                continue
             provider = models.get("source") or ""
             try:
                 storage.of(db).catalog.upsert_models([
