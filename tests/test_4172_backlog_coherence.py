@@ -125,6 +125,41 @@ class CoherenceTest(PgTestCase):
         self.assertIn("Supprimer le mode Y", body)
         self.assertIn("Corriger la ligne deux (code)", body)
 
+    def test_restoration_after_deletion_is_a_digest_not_a_closure(self):
+        # B1 cx2 (#4172): a path already gone when the lot is filed may be a
+        # restoration request; its absence is a probable obsolescence, never a
+        # deterministic closure.
+        self.db.execute("TRUNCATE work_items CASCADE")
+        self.repo = tempfile.mkdtemp(prefix="coh-4172-restore-", dir=self.tmp)
+        _git(self.repo, "init", "-q", "-b", "main")
+        _git(self.repo, "config", "user.email", "test@example.invalid")
+        _git(self.repo, "config", "user.name", "test")
+        os.makedirs(os.path.join(self.repo, "src"), exist_ok=True)
+        self._write("src/gone.py", "deleted before the lot\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "base")
+        os.unlink(os.path.join(self.repo, "src/gone.py"))
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "remove before the lot")
+        lot = self.lot("Restaurer src/gone.py supprimé par erreur",
+                       body="src/gone.py:1")
+        report = backlog_coherence.scan(self.db, "p", cfg=self.test_cfg,
+                                        repo=self.repo)
+        finding = next(row for row in report["findings"]
+                       if row["lot"] == lot["id"])
+        self.assertEqual(finding["kind"], "probably_obsolete")
+        self.assertFalse(finding["deterministic"])
+        applied = backlog_coherence.apply_report(self.db, report,
+                                                 cfg=self.test_cfg)
+        self.assertFalse(any(row["lot"] == lot["id"]
+                             for row in applied["closures"]))
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+        sent = self.db.query(
+            "SELECT body FROM agent_mailbox WHERE recipient = 'human:po'")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Obsolètes probables", sent[0]["body"])
+        self.assertIn("Restaurer src/gone.py", sent[0]["body"])
+
     def test_second_pass_sends_no_second_digest(self):
         first = backlog_coherence.scan(self.db, "p", cfg=self.test_cfg, repo=self.repo)
         backlog_coherence.apply_report(self.db, first, cfg=self.test_cfg)

@@ -10,22 +10,27 @@ project, periodically:
 * **probably done** — a merged change touches the code the lot cites (same
   file and line, or the whole file when no line is given): a touch is not a
   proof that the lot's ask was met, so it goes to the digest, never closed;
-* **obsolete** — every path the lot cites is absent from the base ref, and at
-  least one of them was removed by a merged change (a same-basename file
-  elsewhere is a move, not an obsolescence: the lot is left open);
+* **obsolete** — every path the lot cites is absent from the base ref, at
+  least one of them was removed by a merged change **after** the lot was filed,
+  and the lot's title carries no action verb from either list (a same-basename
+  file elsewhere is a move, not an obsolescence: the lot is left open);
+* **probably obsolete** — the cited paths are gone but the deletion predates the
+  lot, or the lot asks to add/restore/remove the component: an absence is not
+  a proof that the request is obsolete, so it goes to the digest;
 * **duplicate** — two open lots of the project carry the same normalised title
   (or the same non-empty issue reference and at least two significant title
   words in common: one issue can legitimately be split into several lots);
 * **contradiction** — two open lots cite the same path and their titles start
   with opposite verbs (add/enable/keep versus remove/disable/delete).
 
-Only `already done` and `obsolete` are **deterministic**: the pass closes them itself
-(`closed`, reason `done` for an already-done lot, `abandoned` for an obsolete
-one), with the proof written in the lot's journal. Duplicates and
-contradictions (and probably-done lots) are **never** closed here: they go into **one digest per
-project** addressed to the project's PO (`notify.default_human` when the canon
-has no responsible package), so the PO can answer with a typed link
-(`duplicates`, `conflicts_with`) or a justified closure.
+Only `already done` and `obsolete` (the narrow form above) are
+**deterministic**: the pass closes them itself (`closed`, reason `done` for an
+already-done lot, `abandoned` for an obsolete one), with the proof written in
+the lot's journal. Duplicates, contradictions and probably-done/obsolete lots
+are **never** closed here: they go into **one digest per project** addressed to
+the project's PO (`notify.default_human` when the canon has no responsible
+package), so the PO can answer with a typed link (`duplicates`,
+`conflicts_with`) or a justified closure.
 
 Command::
 
@@ -78,9 +83,10 @@ CLOSABLE_STATES = ("intake", "blocked")
 #: and another whose title starts with the opposite verb contradict each other)
 POSITIVE_VERBS = frozenset("""
 add ajoute ajouter create cree creer implement implemente implementer
-introduce introduis introduire enable active activer activer allow autorise
-autoriser support supporte supporter keep garde garder restore restaure
-restaurer
+introduce introduis introduire enable active activer allow autorise
+autoriser support supporte supporter keep garde garder conserver preserver
+restore restaure restaurer retablir remettre recreer rajouter reintegrer
+maintenir
 """.split())
 #: verbs that ask for an absence
 NEGATIVE_VERBS = frozenset("""
@@ -274,7 +280,12 @@ def _code_hit(lot: dict, repo: str, target: str, since: float,
 def _obsolete(lot: dict, repo: str, target: str,
               trees: dict, listings: dict,
               deleted_cache: Optional[dict] = None) -> Optional[dict]:
-    """Every cited path is gone from `target` and at least one was deleted."""
+    """Every cited path is gone from `target` and at least one was deleted.
+
+    The caller decides whether the deletion proves obsolescence: a deletion
+    before the lot, or a lot asking to add/restore/remove the component, is a
+    probable obsolescence for the PO, never a deterministic closure (#4172 B1).
+    """
     text = " ".join([str(lot.get("title") or ""), str(lot.get("body") or "")])
     refs = intake_neighbors.cited_paths(text)
     if not refs:
@@ -546,15 +557,39 @@ def scan(db, project: str, *, cfg=None, repo: Optional[str] = None,
             obsolete = _obsolete(lot, clone, target, trees, listings,
                                  deleted_cache)
             if obsolete:
-                finding = {
-                    "kind": "obsolete", "deterministic": True,
-                    "lot": lot_id, "title": lot.get("title") or "",
-                    "sha": obsolete["sha"], "subject": obsolete["subject"],
-                    "path": obsolete["path"], "paths": obsolete["paths"],
-                    "evidence": ("%s is absent at %s and was removed by %s %r"
-                                 % (obsolete["path"], target,
-                                    obsolete["sha"][:12], obsolete["subject"])),
-                }
+                # #4172 (B1 cx2): an absence is not a proof by itself. The
+                # deletion closes an obsolete lot only when it is posterior to
+                # the lot and the lot's title carries no action verb (add,
+                # restore, keep, remove…): a restoration request filed after
+                # the deletion is exactly the case that must stay open.
+                # Everything else is a probable obsolescence for the PO.
+                created = float(lot.get("created_ts") or 0)
+                deleted = float(obsolete.get("ts") or 0)
+                intent, _verb = _polarity(str(lot.get("title") or ""))
+                if deleted < created or intent != 0:
+                    why = ("before the lot was filed" if deleted < created
+                           else "while the lot asks to add, restore or remove it")
+                    finding = {
+                        "kind": "probably_obsolete", "deterministic": False,
+                        "lot": lot_id, "title": lot.get("title") or "",
+                        "sha": obsolete["sha"], "subject": obsolete["subject"],
+                        "path": obsolete["path"], "paths": obsolete["paths"],
+                        "evidence": ("%s is absent at %s; removed by %s %r %s"
+                                     % (obsolete["path"], target,
+                                        obsolete["sha"][:12],
+                                        obsolete["subject"], why)),
+                    }
+                else:
+                    finding = {
+                        "kind": "obsolete", "deterministic": True,
+                        "lot": lot_id, "title": lot.get("title") or "",
+                        "sha": obsolete["sha"], "subject": obsolete["subject"],
+                        "path": obsolete["path"], "paths": obsolete["paths"],
+                        "evidence": ("%s is absent at %s and was removed by %s %r"
+                                     % (obsolete["path"], target,
+                                        obsolete["sha"][:12],
+                                        obsolete["subject"])),
+                    }
             else:
                 hit = _code_hit(lot, clone, target, moment, trees)
                 if hit:
@@ -747,6 +782,16 @@ def format_digest(project: str, findings: list[dict], report: dict) -> str:
     if probable:
         lines.append("Déjà faits probables à confirmer (%d) :" % len(probable))
         for row in probable:
+            lines.append("- #%d « %s » — %s."
+                         % (int(row["lot"]), row.get("title") or "",
+                            row.get("evidence") or ""))
+        lines.append("")
+    probable_obsolete = [row for row in findings
+                         if row.get("kind") == "probably_obsolete"]
+    if probable_obsolete:
+        lines.append("Obsolètes probables à confirmer (%d) :"
+                     % len(probable_obsolete))
+        for row in probable_obsolete:
             lines.append("- #%d « %s » — %s."
                          % (int(row["lot"]), row.get("title") or "",
                             row.get("evidence") or ""))
