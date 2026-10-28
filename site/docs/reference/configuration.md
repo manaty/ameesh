@@ -71,6 +71,7 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_SESSION_POLICY` | `session_policy` | `par-lot` | default session policy (`par-lot`, `taille`, `jamais`) |
 | `AMEESH_BALANCE_INTERVAL` | `balance_interval` | 900 s | provider balance reading by the runner (0 = never; only with a key) |
 | `AMEESH_DEEPSEEK_API_BASE` | — | the provider's API | base URL of the balance reading |
+| `AMEESH_IDLE_AFTER_S`, `AMEESH_BASELINE_HOSTS` | `idle_after_s`, `baseline_hosts` | 1800 s, 2 | read-only host inactivity window and baseline size; fresh uninterrupted samples and no agent work are required; critical elected leaders and reserves remain baseline when cards do not declare enough baseline hosts |
 | `AMEESH_RESOURCE_INTERVAL` | `resource_interval` | 60 s | host resource reading by the runner (0 = none; see `ameesh hosts`) |
 | `AMEESH_BRANCH_SWEEP_INTERVAL` | `branch_sweep_interval` | 300 s | runner check of lot branches: a lot whose branch is merged into its target is closed (L118; 0 = none) |
 | `AMEESH_RELOCATE` | `relocate` | off | move an agent of a host under pressure to another admitted host, between two turns |
@@ -277,3 +278,11 @@ Operator procedure and exact relay values: `docs/EXECUTEUR-MEDIEE.md`.
 |---|---|---|
 | `AMEESH_DEPS` | — | `ameesh deps` behaviour (L231): default shares one `node_modules` per lockfile; `allow-review` allows installs in a review worktree; `off` passes npm through |
 | `AMEESH_FILL_FROM` | — | package set a cache fill starts from |
+
+Host resource views include a `footprint` projection (also in the JSON `measure`).
+Host cards may declare `capacity: baseline` or `capacity: burst` and
+`tarif_eur_h`. Missing prices and reservations remain unknown. The projection
+requires fresh, uninterrupted samples with readable cgroup limits; older
+publishers without the readability marker cannot prove inactivity. Declared
+runs are zero with source “aucune interface de déclaration” until a run
+registry is available. This projection does not drain hosts.

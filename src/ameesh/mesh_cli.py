@@ -534,6 +534,8 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
 
     holds = host_holds.live(db)
     latest_by_host = {row["host"]: row for row in res.current(db)}
+    from . import host_idle
+    footprints = host_idle.snapshot(cfg, db, canons, latest_by_host)
     # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
     # worktrees suivis)
     hk = storage.of(db).housekeeping
@@ -559,6 +561,7 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
         stale, age = _host_reading_staleness(cfg, latest)
         parts.append({
             "name": name, "fiches": fiches, "physical": physical, "latest": latest,
+            "footprint": footprints.get(name),
             "host": fiches[0][1] if fiches else None,
             "admissions": {canon.id: _host_admissions(canon, name)
                            for canon, _fiche in fiches},
@@ -579,6 +582,9 @@ def _host_json(part: dict) -> dict:
     from . import resources as res
     host, physical, latest = part["host"], part["physical"], part["latest"]
     limits = physical["limits"]
+    measurement = res.measure(latest, limits.get("lend")) if latest is not None else None
+    if measurement is not None:
+        measurement.update(part.get("footprint") or {})
     return {
         "schema": "ameesh-host/1",
         "host": part["name"],
@@ -595,6 +601,7 @@ def _host_json(part: dict) -> dict:
                     "admissions": part["admissions"].get(canon.id, 0)}
                    for canon, fiche in part["fiches"]],
         "latest": latest,
+        "footprint": part.get("footprint"),
         # #3452 : l'âge du relevé et sa péremption, à côté de la mesure
         # qu'ils qualifient (un relevé périmé ne porte pas de pression)
         "sampled_age_s": part.get("sampled_age_s"),
@@ -604,8 +611,7 @@ def _host_json(part: dict) -> dict:
         # L159d: the offer, and the common measure (study §1.4)
         # whose lendable capacity it caps
         "offer": limits.get("lend"),
-        "measure": (res.measure(latest, limits.get("lend"))
-                    if latest is not None else None),
+        "measure": measurement,
         "pressure": part["verdict"],
         # L64: what the last reading could not measure
         "unmeasured": res.unmeasured(latest),
@@ -686,6 +692,9 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 continue
             age = _fmt_age(now - float(latest.get("sampled_ts") or now))
             print("%s — %s; measured %s" % (name, resp, age))
+            if part.get("footprint"):
+                from . import host_idle
+                print("  " + host_idle.line(part["footprint"]))
             _print_hold(part["hold"])
             _print_host_fiches(fiches, physical, admissions, many=many)
 
@@ -1190,6 +1199,10 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         if row is None:
             print(USAGE_HINT % ("unknown agent: %s" % args.agent), file=sys.stderr)
             return 1
+        from . import host_idle, resources, canon as canon_mod
+        readings = {r["host"]: r for r in resources.current(db, row.get("host"))}
+        row["footprint"] = host_idle.snapshot(
+            cfg, db, canon_mod.load_configured(cfg), readings).get(row.get("host"))
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2))
             return 0
@@ -1200,6 +1213,8 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         status = row.get("status")
         if pause and status not in ("stopped", "dead", "blocked"):
             status = "pause-next" if pause.get("after_turn") else "op-paused"
+        if row.get("footprint"):
+            print(host_idle.line(row["footprint"]))
         print("agent    : %s" % row["name"])
         print("workspace: %s" % (row.get("chantier") or "—"))
         print("harness  : %-9s host: %-12s status: %s%s" % (

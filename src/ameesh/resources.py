@@ -862,6 +862,8 @@ class CgroupMeter:
             # #2825: what the publisher itself observed, so another host can
             # read this host's default scope without asking its own process
             "container": False, "bounded": False,
+            # #4150: max and unreadable must not both prove idle.
+            "limits_readable": False,
             "cpu_some": None, "mem_some": None, "mem_full": None,
             "cpu_quota": None,
             "mem_current_bytes": None, "mem_max_bytes": None,
@@ -883,6 +885,14 @@ class CgroupMeter:
         stat = platform.cgroup_cpu_stat(base)
         current = platform.cgroup_memory_bytes(base)
         ceiling = platform.cgroup_memory_max(base)
+        try:
+            with open(os.path.join(base, "memory.max"), encoding="ascii") as stream:
+                raw_ceiling = stream.read(128).strip()
+            valid_ceiling = (raw_ceiling == "max" or
+                             (raw_ceiling.isdigit() and int(raw_ceiling) >= 0))
+        except (OSError, UnicodeError):
+            valid_ceiling = False
+        out["limits_readable"] = period is not None and valid_ceiling
         out["mem_current_bytes"] = current
         out["mem_max_bytes"] = ceiling
         if current is not None and ceiling:
