@@ -26,7 +26,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 72 opérations et la liste des 464 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des opérations admises et la liste des refusées ; ses comptes se lisent par `contract.load()` |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -69,14 +69,16 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Comptes : 72 opérations, dont 29 lectures et 43 écritures. 62 passent par
-`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Neuf
-lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2, 1.3, 1.5 et
-1.6) : elles sont servies aussi par `session/op`. Le test
-vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (536
-opérations) est classée, admise ou refusée. Toute opération ajoutée à
-l'interface fait donc échouer le test tant qu'elle n'est pas classée.
+Les comptes ne sont pas figés dans ce document : la table fait foi, et
+`contract.load()` les donne — `len(operations)` pour les opérations admises,
+la somme des méthodes de `refused` pour les refusées, et `interface_total`
+pour l'interface entière. Des lignes de `op` sont marquées
+`session: true` (contrats 1.1, 1.2, 1.3, 1.5 et 1.6) : elles sont servies
+aussi par `session/op`. Le test vérifie que chaque ligne existe dans
+`storage.interface` avec la même signature et les mêmes types. Il vérifie
+aussi que l'interface entière est classée, admise ou refusée. Toute
+opération ajoutée à l'interface fait donc échouer le test tant qu'elle n'est
+pas classée.
 
 `turn_resources.running_started_before` est une lecture de portée H :
 l'hôte est forcé et une règle dédiée limite les lignes aux agents admis de
@@ -683,7 +685,7 @@ Le client vit dans `src/ameesh/storage/remote/` :
 
 | Fichier | Rôle |
 |---|---|
-| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 72 opérations), `LeaseBook` (carnet des baux) |
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les opérations admises de la table), `LeaseBook` (carnet des baux) |
 | `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
 | `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
 | `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |
