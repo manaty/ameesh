@@ -144,7 +144,7 @@ def _can_prove_idle(reading, *, now, fresh_within):
             and footprint['reserved_mem_bytes'] is not None)
 
 
-def snapshot(cfg, db, canons, readings, *, now=None):
+def snapshot(cfg, db, canons, readings, *, now=None, listing=None):
     """Read all common sources once, then project each host. No mutations."""
     from . import canon as canon_mod
     from . import planned_waits
@@ -158,7 +158,7 @@ def snapshot(cfg, db, canons, readings, *, now=None):
     candidates = {host for host, reading in readings.items()
                   if _can_prove_idle(reading, now=now, fresh_within=fresh)}
     try:
-        agents = storage.of(db).operations.listing()
+        agents = storage.of(db).operations.listing() if listing is None else listing
         # Bounded per-agent read includes closed lots: closing work also
         # resets the quiet interval. Truncation cannot prove an idle host.
         # A host whose own reading already excludes rest only needs the
@@ -241,6 +241,7 @@ def snapshot(cfg, db, canons, readings, *, now=None):
         out[host] = project(reading, history, members, host_lots, now=now,
                             idle_after_s=idle_s, fresh_within=fresh,
                             capacity=capacity[host], cost_eur_h=costs[host], holds=holds)
+        out[host]["baseline_guard"] = host in protected
     return out
 
 

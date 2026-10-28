@@ -44,7 +44,7 @@ import time
 from . import sous_utilisation
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
-BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
+BRIEFED_TYPES = ("host_idle_reserved", "baseline_oversized", "idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
                  "waiting_without_question", "module_deviation",
                  "critical_budget_pause", "idle_actionable_lot", "slo_breach",
                  # #1466 : une pause qui dure est un plafond périmé, un compte
@@ -1083,6 +1083,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             text = _operator_pause(alert)
             teams = ({p for n in alert.get("agents") or () for p in _projects(by_name, n)}
                      if kind == "operator_pause_host" else _projects(by_name, alert.get("agent")))
+        elif kind in ("host_idle_reserved", "baseline_oversized"):
+            text = alert["detail"]
+            teams = set()
         elif kind == "notify_undeliverable":
             # #3007 : aucun notificateur vivant ne couvre l'humain ; tous les
             # orchestrateurs de l'alerte et l'auditeur la reçoivent.
