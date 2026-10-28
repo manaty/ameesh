@@ -226,6 +226,23 @@ def toplevel(path: str) -> str:
     return _git(path, "rev-parse", "--show-toplevel").strip()
 
 
+def _trunk_refs(checkout: str, refs: list[str]) -> set[str]:
+    """#4097 : les refs de tronc du clone, locales ou `origin/`."""
+    trunks = trunk_branches(checkout)
+    return {ref for ref in refs for prefix in ("refs/heads/", "refs/remotes/origin/")
+            if ref.startswith(prefix) and ref[len(prefix):] in trunks}
+
+
+def _landed_refs(checkout: str, refs: list[str], trunk_refs: set[str]) -> set[str]:
+    """#4097 : les refs (hors tronc) déjà contenues dans une ref de tronc.
+    Une lecture illisible ne retire rien."""
+    landed: set[str] = set()
+    for trunk in sorted(trunk_refs):
+        landed.update(_git(checkout, "for-each-ref", "--format=%(refname)", "--merged",
+                           trunk, "refs/heads", "refs/remotes").split())
+    return landed - trunk_refs
+
+
 def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = None,
                  also_skip: tuple[str, ...] = (), package: str = MIGRATIONS_DIR,
                  worktree: bool = True) -> dict[int, list[str]]:
@@ -237,6 +254,11 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
     composition, #1603) ne comptent pas, ni l'arbre de travail s'il est sur
     l'une d'elles. `worktree=False` ignore l'arbre de travail entier : le train
     y compose un membre dont la migration n'est pas encore réservée (#2400).
+    #4097 : une branche déjà entrée dans un tronc (ancêtre de `develop`,
+    `main`…) ne compte pas : ses migrations ont atterri sur le tronc, peut-être
+    sous un autre numéro (un paquet renumérote 602 → 599), et la branche
+    d'agent restée sur la forge tenait encore l'ancien. Le tronc, lui, est
+    toujours lu.
     Rien n'est récupéré (pas de fetch)."""
     found: dict[int, list[str]] = {}
 
@@ -253,9 +275,19 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
     skip = {"refs/heads/" + name for name in names}
     head = _git(checkout, "symbolic-ref", "-q", "HEAD").strip()
     directory = os.path.join(checkout, layout.directory)
-    if worktree and os.path.isdir(directory) and head not in skip:
-        add(os.listdir(directory), "worktree")
     refs = _git(checkout, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
+    trunk_refs = _trunk_refs(checkout, refs.split())
+    if worktree and os.path.isdir(directory) and head not in skip:
+        local = os.listdir(directory)
+        if trunk_refs and _git(checkout, "for-each-ref", "--contains", "HEAD",
+                               "--format=%(refname)", *sorted(trunk_refs)).strip():
+            # #4097 : HEAD déjà entré dans un tronc — ses fichiers commités y
+            # sont (peut-être renumérotés) ; seuls les ajouts locaux comptent
+            committed = {os.path.basename(name) for name in _git(
+                checkout, "ls-tree", "--name-only", "HEAD", layout.directory + "/").split()}
+            local = [name for name in local if name not in committed]
+        add(local, "worktree")
+    skip |= _landed_refs(checkout, refs.split(), trunk_refs)
     for ref in refs.split():
         if ref.endswith("/HEAD") or ref in skip or (
                 names and ref.startswith("refs/remotes/")
