@@ -909,6 +909,11 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
         ctx.mail(ctx.pilot, carrier, "#%d %s : %s, porteur clos.\n\n%s"
                  % (carrier, name, reason, auto._tail(result.stdout, 15)))
         return "%s : %s" % (name, reason)
+    if re.search(r"^%s" % re.escape(auto.MERGED_LINE), result.stdout, re.MULTILINE):
+        # #4322 : fusionné au vert pendant les tests par unité (§11 bis) ;
+        # paquet-auto a noté le porteur et prévenu le pilote d'un rouge
+        return "#%d %s : fusionné pendant les tests par unité, rien à publier" % (
+            carrier, name)
     item = show(ctx, carrier)
     return publish(ctx, item)
 
@@ -919,6 +924,11 @@ def publish(ctx: Context, item: dict) -> str:
     sha = frozen_sha(item)
     if not sha:
         return "#%d sans tête gelée : rien à publier" % carrier
+    if merged_seen(item) or str(item.get("state") or "") == "closed":
+        # #4322 : la ci-full précoce (#4304) a pu fusionner le porteur avant
+        # le retour de paquet-auto ; ni verdict ni ci-full sur un porteur clos
+        return "#%d déjà %s : rien à publier" % (
+            carrier, "fusionné" if merged_seen(item) else "clos")
     units = composition_units(manifest_at(ctx, item, sha))
     resolutions = [unit for unit in units if unit.resolution]
     lines = ["#%d %s : tête gelée %s, %d unité(s)."

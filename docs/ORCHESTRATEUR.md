@@ -564,22 +564,30 @@ La composition est **scriptée** (`scripts/paquet-auto.py`, #3807) : le
 composeur n'enchaîne plus les outils à la main. Le script part d'un worktree
 jetable à la tête exacte d'`origin/<cible>`, y exécute `paquet-candidats.py`
 (le code de la cible), compose les candidats dans l'ordre rendu, écarte un
-conflit sans le résoudre, passe les contrôles locaux, écrit le manifeste,
-`packet record` et le contrôle d'inclusion, puis pousse la branche, ouvre la
-PR, gèle la tête et couronne le pilote. « Verdict non requis », la CI complète
-et le feu restent au pilote. Un lot rendu en **erreur** par `paquet-candidats`
-n'est jamais composé : il est écarté au manifeste avec son motif (rc 3 et
-`errors_by_lot`, #3813). Un run local **non concluant** (délai, base absente,
-psql/psycopg indisponible) est consigné au manifeste, à la PR et au courrier,
-sans retirer d'unité ni arrêter le paquet : seul un test négatif bloque
-(canon §3), la ci-full tranche.
+conflit sans le résoudre, passe `freeze-checks`, écrit le manifeste,
+`packet record` et le contrôle d'inclusion, puis **dès ce point** (canon §6,
+#4304) pousse la branche, ouvre la PR, gèle la tête et demande la CI complète
+(`ameesh ci run --full`) ; les tests par unité tournent ensuite, en parallèle
+de la CI. Un rouge d'unité retire l'unité et la tête recomposée remplace la
+poussée (regel, nouvelle ci-full) ; leur résultat va à la PR, au journal du
+porteur et au courrier du pilote. « Verdict non requis » et le feu restent au
+pilote. La ci-full arme la fusion automatique et un porteur sans delta propre
+n'attend aucun verdict : le paquet peut fusionner au vert **avant la fin des
+tests par unité** (canon §11 bis). Le script ne recompose alors rien, un rouge
+d'unité part au pilote (corriger en avant ou revert), et `paquet-horaire.py`
+ne publie rien sur un porteur déjà fusionné (#4322). Un lot rendu en
+**erreur** par `paquet-candidats` n'est jamais composé : il est écarté au
+manifeste avec son motif (rc 3 et `errors_by_lot`, #3813). Un run local **non
+concluant** (délai, base absente, psql/psycopg indisponible) est consigné à la
+PR, au porteur et au courrier, sans retirer d'unité ni arrêter le paquet :
+seul un test négatif bloque (canon §3), la ci-full tranche.
 
 ```sh
 scripts/paquet-auto.py --target main --name h-20261027-01 --carrier 3808
 ```
 
-`--local` s'arrête après le manifeste et `packet record` (contrôle sans
-poussée ni gel) ; `--replay <réf>` rejoue la table `## Composition` d'un
+`--local` joue le manifeste, `packet record` et les tests par unité, sans
+poussée, PR, gel, ci-full ni courrier (composition de contrôle) ; `--replay <réf>` rejoue la table `## Composition` d'un
 manifeste gelé et compare l'arbre produit à celui de `<réf>` (témoin de
 fidélité, sans poussée ni écriture en base). Avec
 `--candidates-json <sortie paquet-candidats --json>`, le rejeu refuse une
