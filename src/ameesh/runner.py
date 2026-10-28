@@ -63,6 +63,7 @@ from . import rate_limit as rate_limit_mod
 from . import account_window
 from . import persona_memory as memory_mod
 from . import train_events
+from . import events as events_mod, turn_stages
 from . import venv_guard
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, NAME_RE, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
@@ -4250,10 +4251,13 @@ class AgentWorker(threading.Thread):
             raison = account_budget.reason(self.db, self._account)
         self._budget_paused = bool(raison)
         if not raison:
+            self._retenue_fin()  # #3218
             self._budget_reason = ""
             self._budget_nature = ""
             self._leve_pause_budget()
             return True
+        self._retenue_debut("short_window" if account_window.is_short_window(raison)
+                            else "budget")
         maintenant = time.monotonic()
         if maintenant >= self._budget_next_check:
             self._budget_next_check = maintenant + self.runner.budget_check_interval
@@ -5166,6 +5170,7 @@ class AgentWorker(threading.Thread):
         """Le prochain tour à faire, ou None. Consomme la consigne en attente.
 
         Le tour porte son lot (`lot`, L26) quand il est déductible."""
+        self._due_at = None  # #3218 : l'échéance se relit à chaque passe
         if self._attach_pending():
             self._servir(())  # #2810 : aucun tour ne part
             return None
@@ -5661,6 +5666,7 @@ class AgentWorker(threading.Thread):
         """
         passive = [m for m in messages if mail.passive_reason(m)]
         active = [m for m in messages if not mail.passive_reason(m)]
+        self._marque_vu(active)
         events = [m for m in active if mail.is_event(m)]
         others = [m for m in active if not mail.is_event(m)]
         mail_due = bool(others) and self._mail_due(others)
@@ -5683,8 +5689,11 @@ class AgentWorker(threading.Thread):
         # Seul un urgent d'un expéditeur habilité perce la fenêtre : un urgent
         # non habilité reste soumis au regroupement (même règle que la
         # préemption, 0018).
-        return (any(mail.is_urgent(m) and self.interrupt_allowed(m) for m in events)
-                or fenetre <= 0 or (time.time() - dernier) >= fenetre)
+        if (any(mail.is_urgent(m) and self.interrupt_allowed(m) for m in events)
+                or fenetre <= 0 or (time.time() - dernier) >= fenetre):
+            return True
+        self.note_due_at(dernier + fenetre)  # #3218 : réveil à la fin de la fenêtre
+        return False
 
     def mail_batch(self) -> float:
         """L125 : fenêtre de regroupement du courrier, en secondes — réglage de
@@ -5741,6 +5750,9 @@ class AgentWorker(threading.Thread):
             waited = min(waited, mono - fin_tour)
         if waited >= window:
             return True
+        # #3218 : le worker se réveille à la fin de la fenêtre, pas au sondage
+        # qui la suit (jusqu'à `poll` de plus)
+        self.note_due_at(now + (window - waited))
         oldest = min(kept)
         if getattr(self, "_batch_logged", None) != oldest:
             self._batch_logged = oldest
@@ -5748,6 +5760,84 @@ class AgentWorker(threading.Thread):
                       "(window %gs)" % (self.name, len(rows), int(window - waited) + 1,
                                          window))
         return False
+
+    # -- #3218 : échéance de réveil et reçu d'étapes ------------------------
+    def note_due_at(self, ts: float) -> None:
+        """Retient l'instant (epoch) où une attente de cette passe se lève
+        d'elle-même (fin de fenêtre de regroupement, écart de début du
+        compte) : l'attente au repos s'arrête là, pas au sondage suivant."""
+        actuel = getattr(self, "_due_at", None)
+        if actuel is None or ts < actuel:
+            self._due_at = float(ts)
+
+    def _until_due(self, cap: float) -> float:
+        """`cap`, raccourci jusqu'à l'échéance retenue (consommée) ; une marge
+        de 50 ms laisse l'échéance passée au moment de la relecture."""
+        due, self._due_at = getattr(self, "_due_at", None), None
+        if due is None:
+            return cap
+        return max(0.05, min(cap, due - time.time() + 0.05))
+
+    def _marque_vu(self, messages) -> None:
+        """L'instant (horloge de l'hôte) où cet exécuteur a lu chaque message
+        actif pour la première fois ; les messages remis sont oubliés."""
+        now = time.time()
+        vus = getattr(self, "_mail_vu", {})
+        self._mail_vu = {int(m["id"]): vus.get(int(m["id"]), now)
+                         for m in messages if m.get("id") is not None}
+
+    def _retenue_debut(self, nature: str) -> None:
+        """Un tour dû est retenu avant l'admission (budget, fenêtre courte)."""
+        if getattr(self, "_retenue", None) is None:
+            self._retenue = (time.time(), nature)
+
+    def _retenue_fin(self) -> None:
+        retenue, self._retenue = getattr(self, "_retenue", None), None
+        if retenue is not None:
+            passees = getattr(self, "_retenues", [])[-7:]
+            self._retenues = passees + [(retenue[0], time.time(), retenue[1])]
+
+    def _etapes_initiales(self, rows) -> dict:
+        """Les premiers jalons du reçu d'un tour de courrier : arrivée du plus
+        ancien message servi (horloge de la base), première lecture par cet
+        exécuteur, instant où le tour est dû (horloge de l'hôte)."""
+        now = time.time()
+        vus = getattr(self, "_mail_vu", {})
+        crees, lus, ids = [], [], []
+        for row in rows:
+            if row.get("id") is None:
+                continue
+            ident = int(row["id"])
+            ids.append(ident)
+            lus.append(vus.setdefault(ident, now))
+            if row.get("created_ts") is not None:
+                crees.append(float(row["created_ts"]))
+        self._mail_vu = vus
+        fin = getattr(self, "_turn_end_mono", None)
+        return {"ids": ids, "mail_ts": min(crees) if crees else None,
+                "seen_ts": min(lus) if lus else now, "due_ts": now,
+                "prev_turn_end_ts": (now - (time.monotonic() - fin))
+                if fin is not None else None}
+
+    def _recu_etapes(self, spec: dict) -> None:
+        """#3218 : le reçu d'étapes d'un tour de courrier, une fois par tour, à
+        la fin du flux du harnais (jamais pendant : le flux n'attend pas la
+        base, L78) : événement `turn.stages` de l'agent (`ameesh events`,
+        `GET /api/v1/events`). Jamais fatal : un reçu manqué ne retient aucun
+        tour."""
+        etapes = spec.get("_etapes")
+        if etapes is None or etapes.get("sent"):
+            return
+        etapes["sent"] = True
+        try:
+            data = turn_stages.receipt(etapes, getattr(self, "_retenues", []))
+            data.update(agent=self.name, host=self.cfg.host, kind=spec.get("kind"),
+                        harness=self.turn_harness())
+            events_mod.record(self.db, turn_stages.EVENT, "agent:" + self.name,
+                              project=(self.agent or {}).get("team")
+                              or (self.agent or {}).get("chantier") or None, **data)
+        except Exception as exc:  # noqa: BLE001 - reçu facultatif
+            log_async("[%s] turn stages receipt not written (%s)" % (self.name, exc))
 
     # -- un tour -----------------------------------------------------------
     def _adapter(self) -> adapters.HarnessAdapter:
@@ -5880,6 +5970,7 @@ class AgentWorker(threading.Thread):
             "rows": retenus,
             "candidats": list(messages),
             "remaining": reste,
+            "_etapes": self._etapes_initiales(retenus),
         }
 
     def _envelope_token(self) -> str:
@@ -5928,6 +6019,7 @@ class AgentWorker(threading.Thread):
             "remaining": reste,
             "envelopes": envelopes,
             "human": True,
+            "_etapes": self._etapes_initiales(retenus),
         }
 
     def _release_session_lock(self) -> None:
@@ -6285,6 +6377,9 @@ class AgentWorker(threading.Thread):
         if not spec.get("jeton"):
             return
         self._courrier_lance = True
+        etapes = spec.get("_etapes")
+        if etapes is not None:
+            etapes["spawned_ts"] = time.time()  # #3218 : harnais lancé
         if spec.get("human"):
             # L77 : un message humain n'est soldé qu'à la FIN du tour
             # (`_solde_humains`), jamais au lancement. Un plantage en cours de
@@ -6298,6 +6393,8 @@ class AgentWorker(threading.Thread):
         except db_mod.DbError as exc:
             livres = []
             log("[%s] mail delivery not settled (%s)" % (self.name, exc))
+        if etapes is not None and livres:
+            etapes["delivered_ts"] = time.time()
         self._remise_incertaine(ids, livres)
 
     def _remise_incertaine(self, ids, livres) -> None:
@@ -7245,6 +7342,10 @@ class AgentWorker(threading.Thread):
                     % self.name)
                 return False
             log("[%s] turn postponed: %s" % (self.name, admission.reason))
+            self._admission_reportee = True
+            self._retenue_debut("short_window")
+            if admission.retry_at is not None:
+                self.note_due_at(admission.retry_at)
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             registry.set_status(self.db, self.name, "blocked",
                                 status_text=admission.reason)
@@ -7259,6 +7360,8 @@ class AgentWorker(threading.Thread):
                 log("[%s] lease lost, agent stopped or operator paused before the turn"
                     % self.name)
                 return False
+        if spec.get("_etapes") is not None:
+            spec["_etapes"]["admitted_ts"] = time.time()  # #3218
         lot = spec.get("lot")
         if lot and not spec.get("lot_finished") \
                 and str(lot) != str(self.agent.get("session_work_item") or ""):
@@ -7728,6 +7831,10 @@ class AgentWorker(threading.Thread):
                     if not line:
                         continue
                     lignes += 1
+                    if lignes == 1 and spec.get("_etapes") is not None:
+                        # #3218 : un horodatage seulement — le flux n'attend
+                        # jamais la base (L78), le reçu s'écrit après lui
+                        spec["_etapes"]["first_output_ts"] = time.time()
                     # #2096 : la ligne brute est écrite telle quelle (`raw` finit
                     # par son saut de ligne) — `line + "\n"` en faisait une copie
                     # du même ordre que le pic du tour.
@@ -7815,6 +7922,7 @@ class AgentWorker(threading.Thread):
                         error = "lease lost during the turn"
                         self.stop_group_now("lease lost during the turn", grace=0, hard=True)
                         break
+            self._recu_etapes(spec)  # #3218
             # #2096 : les tampons du dernier événement (ligne brute, dictionnaire
             # parsé) ne vivent pas plus que le flux — la suite du tour (attente du
             # harnais, compta, conversation) ne doit pas garder le pic.
@@ -8681,8 +8789,8 @@ class AgentWorker(threading.Thread):
                 if spec is None:
                     self._deferral_over()  # #1914 : plus rien à prendre
                     self._resident_between_turns()  # L76 : mort, sommeil
-                    self.wake.wait(timeout=self.wait_timeout(
-                        min(self.runner.poll, max(1.0, self.runner.lease_ttl / 3.0))))
+                    self.wake.wait(timeout=self.wait_timeout(self._until_due(
+                        min(self.runner.poll, max(1.0, self.runner.lease_ttl / 3.0)))))
                     self.wake.clear()
                     continue
                 try:
@@ -8733,7 +8841,14 @@ class AgentWorker(threading.Thread):
                 # bail au lieu de dormir jusqu'à l'échéance, sinon `renew()`
                 # refusait au réveil (B1 cx3) — #1270 : la reprise cadencée peut
                 # dépasser le bail.
-                self._attendre_apres_echec(self.failure_wait())
+                attente = self.failure_wait()
+                if getattr(self, "_admission_reportee", False):
+                    # #3218 : un tour refusé à l'admission (fenêtre courte) n'a
+                    # pas échoué — il repart à la levée datée, au plus au
+                    # sondage suivant, jamais après l'attente d'échec.
+                    self._admission_reportee = False
+                    attente = self._until_due(min(attente, self.runner.poll))
+                self._attendre_apres_echec(attente)
         finally:
             # #1914 : le worker qui s'arrête ne laisse pas derrière lui un
             # blocage « session lock held » périmé (levé sous bail : si un

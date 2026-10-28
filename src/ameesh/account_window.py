@@ -252,6 +252,30 @@ def is_short_window(text: str) -> bool:
     return bool(_SHORT_WINDOW.match(str(text or "").strip()))
 
 
+def lift_at(st: dict, now: float) -> float | None:
+    """#3218 : l'instant (epoch) où la garde déduite de `st` se lève d'elle-même,
+    ou None (aucune garde, ou plafond de tours : il se lève à la fin d'un
+    autre tour, que rien ne date d'avance)."""
+    for key in ("cooldown_until", "next_start_at"):
+        if st.get(key) and float(st[key]) > now:
+            return float(st[key])
+    return None
+
+
+def reason_and_lift(db, harness: str, account: str, now: float | None = None,
+                    exclude_agent: str | None = None, profile=None
+                    ) -> tuple[str, float | None]:
+    """`reason`, et l'instant où elle se lève (`lift_at`) : l'exécuteur se
+    réveille à cet instant plutôt qu'au sondage suivant (#3218)."""
+    now = time.time() if now is None else float(now)
+    if not enabled(harness) or not account:
+        return "", None
+    st = state(db, harness, account, now=now, exclude_agent=exclude_agent,
+               profile=profile)
+    why = _reason_from_state(st, now)
+    return why, (lift_at(st, now) if why else None)
+
+
 def reason(db, harness: str, account: str, now: float | None = None,
            exclude_agent: str | None = None, profile=None) -> str:
     """La raison de pause de fenêtre courte, ou '' (aucune garde).
@@ -259,12 +283,8 @@ def reason(db, harness: str, account: str, now: float | None = None,
     Le cooldown et l'écart de début RETARDENT le prochain tour ; ils ne
     coupent jamais un tour en cours (`reason` n'est lu qu'avant `begin_turn`).
     """
-    now = time.time() if now is None else float(now)
-    if not enabled(harness) or not account:
-        return ""
-    st = state(db, harness, account, now=now, exclude_agent=exclude_agent,
-               profile=profile)
-    return _reason_from_state(st, now)
+    return reason_and_lift(db, harness, account, now=now,
+                           exclude_agent=exclude_agent, profile=profile)[0]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -276,12 +296,14 @@ class Admission:
     d'admission (donc la place est visible des autres runners dès le commit).
     `begun=False` avec `ok=True` : aucune garde n'a pu être posée (harnais non
     suivi, base indisponible) — l'appelant ouvre le tour par le chemin normal.
+    `retry_at` (#3218) : l'instant où le refus se lève (`lift_at`), s'il est daté.
     """
 
     ok: bool = True
     reason: str = ""
     begun: bool = False
     begin_failed: bool = False
+    retry_at: float | None = None
 
 
 def claim_start(db, harness: str, account: str | None, host: str, agent: str,
@@ -327,9 +349,10 @@ def claim_start(db, harness: str, account: str | None, host: str, agent: str,
             tx.query("select pg_advisory_xact_lock(hashtext(%s))",
                      ("ameesh-account:%s:%s" % (harness, account),))
             st = state(tx, harness, account, exclude_agent=agent, profile=profile)
-            why = _reason_from_state(st, time.time())
+            now = time.time()
+            why = _reason_from_state(st, now)
             if why:
-                return Admission(False, why)
+                return Admission(False, why, retry_at=lift_at(st, now))
             begun = False
             if begin is not None:
                 if not begin(tx):
