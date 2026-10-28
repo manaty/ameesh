@@ -31,12 +31,21 @@ concurrent changes to vocabulary do not require updating an exact baseline.
 The scanners and their unit tests remain useful for inspecting the transition.
 
 Only direct imports of module implementations are blocking, including relative
-and aliased imports. The test lists two legacy storage adapter exceptions in
+and aliased imports. The registry (`ameesh.modules.registry`, L98) is the
+core's interface to modules and is not a module implementation: importing it
+never counts. The test lists two legacy storage adapter exceptions in
 `mesh_cli.py` and `work.py` until those interfaces use the registry. New imports
 fail, and removing an adapter requires removing its exception from the test.
 The blocking vocabulary boundary will be introduced with L98 through module
 imports and the registry, rather than word counts. Architectural review remains
 necessary.
+
+L98 tranche 1 adds the `Module` interface (name, version, capabilities, CLI
+and storage entry points) and `registry.discover()`, which reads the built-in
+modules and the `ameesh.modules` entry points; `ameesh modules [--json]` lists
+them read-only and exits 1 when an entry point is refused. The bare profile
+(`discover(builtin=False)` with no entry point) is an empty registry without
+error, pinned by `tests/test_l98_modules_registry.py`.
 
 The boundary check preserves the current runtime behavior. Module activation,
 renamed persisted states, validation as a stored state, extraction of development

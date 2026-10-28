@@ -1,0 +1,154 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""L98 tranche 1 (#4308): the Module interface and the registry of modules.
+
+The core reads modules through this registry, never by importing a module
+implementation (L97 boundary, ``tests/test_generic_core.py``). A module is
+discovered either built in (``it``) or through an ``ameesh.modules`` entry
+point (#2847); each one is described by a read-only `Module`: name, version,
+declared capabilities, CLI entry point and storage entry point.
+
+Discovery is read-only and fails closed per entry: a refused entry point is
+reported with its error and never becomes a `Module`. The bare profile (no
+built-in, no entry point) yields an empty registry without error.
+"""
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass, field
+
+from . import (_builtin, _check_types, _digest, _distribution, _entry_points,
+               _external, _validate_descriptor)
+
+#: Capabilities a module may declare in ``CAPABILITIES``.
+CAPABILITIES = ("lifecycle", "cli", "audit")
+
+
+@dataclass(frozen=True)
+class Module:
+    """Descriptor of one discovered module (no behaviour, only facts)."""
+    name: str
+    version: str | None
+    source: str                      # "builtin" or "external"
+    capabilities: tuple[str, ...]
+    cli: str | None                  # command line served, or None
+    storage: tuple[str, ...]         # work item types stored for the module
+    distribution: str | None = None
+    entry_point: str | None = None
+    descriptor_sha256: str = ""
+
+    def as_dict(self):
+        return {"name": self.name, "version": self.version, "source": self.source,
+                "capabilities": list(self.capabilities), "cli": self.cli,
+                "storage": {"types": list(self.storage)},
+                "distribution": self.distribution, "entry_point": self.entry_point,
+                "descriptor_sha256": self.descriptor_sha256}
+
+
+@dataclass(frozen=True)
+class Registry:
+    modules: tuple[Module, ...] = ()
+    refused: tuple[dict, ...] = field(default_factory=tuple)
+
+    def names(self):
+        return [module.name for module in self.modules]
+
+    def get(self, name):
+        return next((module for module in self.modules if module.name == name), None)
+
+
+def _capabilities(name, module):
+    """Declared ``CAPABILITIES``, else the ones the module's attributes provide."""
+    provided = ["lifecycle"]
+    if callable(getattr(module, "main", None)):
+        provided.append("cli")
+    if callable(getattr(module, "audit", None)):
+        provided.append("audit")
+    declared = getattr(module, "CAPABILITIES", None)
+    if declared is None:
+        return tuple(provided)
+    if (not isinstance(declared, (list, tuple))
+            or any(item not in CAPABILITIES for item in declared)
+            or len(set(declared)) != len(declared)):
+        raise ValueError("installed module %r: CAPABILITIES must be unique names among %s"
+                         % (name, ", ".join(CAPABILITIES)))
+    missing = set(declared) - set(provided)
+    if missing:
+        raise ValueError("installed module %r declares %s without providing it"
+                         % (name, ", ".join(sorted(missing))))
+    return tuple(item for item in CAPABILITIES if item in declared)
+
+
+def _describe(name, module, compiled, *, source, version, distribution=None,
+              entry_point=None):
+    capabilities = _capabilities(name, module)
+    return Module(name=name, version=version, source=source,
+                  capabilities=capabilities,
+                  cli=("ameesh module %s" % name) if "cli" in capabilities else None,
+                  storage=tuple(compiled["types"]), distribution=distribution,
+                  entry_point=entry_point, descriptor_sha256=_digest(compiled))
+
+
+def _core_version():
+    from .. import version
+    return version()
+
+
+def discover(*, builtin=True):
+    """All discovered modules, by name; ``builtin=False`` is the bare profile.
+
+    Same refusals as `ameesh.modules.installed()`, but per entry: a refused
+    entry point is listed in `Registry.refused` instead of raising."""
+    modules, refused = [], []
+    builtins = _builtin() if builtin else {}
+    for name, module in sorted(builtins.items()):
+        compiled = _validate_descriptor(name, module.descriptor({}))
+        _check_types(name, module, compiled)
+        modules.append(_describe(name, module, compiled, source="builtin",
+                                 version=_core_version()))
+    entries = sorted(_entry_points(), key=lambda point: getattr(point, "name", ""))
+    counts = Counter(getattr(entry, "name", None) for entry in entries)
+    for entry in entries:
+        name = getattr(entry, "name", None)
+        dist, version = _distribution(entry)
+        row = {"name": name, "distribution": dist, "version": version,
+               "entry_point": getattr(entry, "value", None)}
+        if name in builtins or counts[name] > 1:
+            refused.append(dict(row, error="duplicate installed module: %r" % (name,)))
+            continue
+        try:
+            module, compiled = _external(entry)
+            modules.append(_describe(name, module, compiled, source="external",
+                                     version=version, distribution=dist,
+                                     entry_point=row["entry_point"]))
+        except ValueError as exc:
+            refused.append(dict(row, error=str(exc)))
+    return Registry(tuple(modules), tuple(refused))
+
+
+def main(argv):
+    """`ameesh modules [--json]`: read-only list of the discovered modules."""
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(
+        prog="ameesh modules",
+        description="Discovered modules (built in and ameesh.modules entry points), "
+                    "with version and capabilities; read only.")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    args = parser.parse_args(argv)
+    registry = discover()
+    if args.json:
+        print(json.dumps({"modules": [module.as_dict() for module in registry.modules],
+                          "refused": list(registry.refused)},
+                         ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        if not registry.modules and not registry.refused:
+            print("no module")
+        for module in registry.modules:
+            print("%-16s %-12s %-8s %s" % (module.name, module.version or "-",
+                                           module.source,
+                                           ",".join(module.capabilities)))
+        for row in registry.refused:
+            print("%-16s refused: %s" % (row["name"], row["error"]))
+    return 1 if registry.refused else 0
+

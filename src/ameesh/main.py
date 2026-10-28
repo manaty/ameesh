@@ -110,6 +110,8 @@
   ameesh models list|show|discover      model catalog and discovery;
   ameesh module <name> …              installed project module commands, --list
                                       for installation evidence;
+  ameesh modules [--json]             discovered modules (built in and ameesh.modules
+                                      entry points): version, capabilities (L98);
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
         alerts PUSHED to the responsible human (desktop, ntfy, Slack;
         `notify` key of the host configuration; L38);
@@ -308,6 +310,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "module":
         from . import modules
         return modules.main(rest)
+    if command == "modules":
+        # L98 (#4308) : lecture du registre, sans import d'implémentation.
+        from .modules import registry
+        return registry.main(rest)
     if command in ("--version", "version"):
         from . import version
         print("ameesh %s" % version())
