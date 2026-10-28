@@ -2286,14 +2286,36 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
     return "\n".join(lines)
 
 
+def report_recipients(cfg, db, project: ProjectRelease) -> list[str]:
+    """#4219 : the configured recipient, plus the project's pilot.
+
+    The default recipient is the first human, whose mail no agent reads: the
+    1.27.0 cutoff report (staging never run) sat undelivered until the pilot
+    happened to look. The pilot comes from the shared rule
+    (`alert_briefs.project_pilots`, the one base failures use); an unreadable
+    role keeps the configured recipient alone."""
+    recipients = [project.report]
+    try:
+        from . import alert_briefs, registry
+        pilots = alert_briefs.project_pilots(project.name, list(registry.overview(db)),
+                                             cfg=cfg, db=db)
+    except Exception:  # noqa: BLE001 - no readable pilot: the configured recipient
+        pilots = []
+    if pilots and pilots[0] not in recipients:
+        recipients.append(pilots[0])
+    return recipients
+
+
 def send_report(cfg, db, project: ProjectRelease, body: str, payload: dict,
                 *, urgent: bool = False) -> None:
-    try:
-        mail.send(db, work.SYSTEM_SENDER, project.report, body, kind="event",
-                  payload={**(payload or {}), **({"urgent": True} if urgent else {})})
-    except Exception as exc:  # a report failure never undoes a release
-        print("release: report not delivered to %s: %s" % (project.report, exc),
-              file=sys.stderr)
+    payload = {**(payload or {}), **({"urgent": True} if urgent else {})}
+    for recipient in report_recipients(cfg, db, project):
+        try:
+            mail.send(db, work.SYSTEM_SENDER, recipient, body, kind="event",
+                      payload=payload)
+        except Exception as exc:  # a report failure never undoes a release
+            print("release: report not delivered to %s: %s" % (recipient, exc),
+                  file=sys.stderr)
 
 
 def write_report(cfg, project: ProjectRelease, report: dict) -> str:
@@ -2660,7 +2682,12 @@ def finish(cfg, db, project: ProjectRelease, report: dict, state: dict,
            plan: Plan | None, staging: dict | None, no_staging: bool) -> dict:
     """Write the durable report, mail the owner, record the cutoff."""
     result = report.get("result")
-    report["staging_ok"] = bool(no_staging or (staging and staging.get("exit") == 0))
+    # #4219 : a skipped staging is not a successful one. A release is tagged
+    # AND deployed to staging (canon §11 bis), and not deployed is not done
+    # (§5): `--no-staging` is written down and the report goes out urgent.
+    report["staging_ok"] = bool(staging and staging.get("exit") == 0)
+    if no_staging:
+        report["staging_skipped"] = "--no-staging"
     report["completed_at"] = time.time()
     if isinstance(report.get("started_at"), (int, float)):
         report["duration_s"] = round(report["completed_at"] - report["started_at"], 1)
@@ -2686,6 +2713,10 @@ def finish(cfg, db, project: ProjectRelease, report: dict, state: dict,
                             staging=staging, deviations=report.get("deviations") or [],
                             previous=previous, cutoff_at=at, cutoff_label=label,
                             rules=rules, landing_sha=report.get("landing_sha", ""))
+        if no_staging:
+            body += ("\n\nStaging: non lancé (--no-staging). La release n'est pas "
+                     "active en staging (§5, §14) : lancer la séquence staging de %s."
+                     % str(report.get("release_sha") or "?")[:12])
         body += "\n\nRapport JSON: %s\nJournal de staging: %s" % (
             path, (staging or {}).get("log", "—"))
         send_report(cfg, db, project, body, report,
