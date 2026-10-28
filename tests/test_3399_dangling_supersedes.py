@@ -337,6 +337,66 @@ class DanglingSupersedeWithRemoteTest(_DanglingSupersededFreezeFixture):
         self.assertIn("remote ref", text)
         self.assertNotIn("cannot", text)
 
+    def test_a_partial_clone_still_proves_absence(self):
+        # #4242 : le clone `blob:none` d'un agent garde toute l'histoire des
+        # commits ; la preuve d'absence reste possible et le gel fantôme
+        # redevient remplaçable.
+        self.add_remote()
+        self.repo.git("config", "remote.origin.promisor", "true")
+        self.repo.git("config", "remote.origin.partialclonefilter", "blob:none")
+        self.assertTrue(plan_git._history_complete(self.repo.root))
+        self.assertFalse(plan_git.remote_reachable(self.repo.root, self.op))
+        row = self.supersede()
+        self.assertIn("ameesh-freeze-supersedes: %d" % int(self.op_freeze["id"]),
+                      row["note"])
+
+    def test_the_partial_presence_probe_stays_local(self):
+        # #4242 : sans `NO_LAZY_FETCH`, `cat-file --batch-check` réveille le
+        # promisor pour chaque pointe absente (60 s de délai mesuré sur un
+        # clone blob:none, un objet à la fois). La sonde locale ne fetche pas ;
+        # seules les pointes manquantes sont rapatriées, en un fetch borné.
+        bare = self.add_remote()
+        tree = self.repo.git("rev-parse", self.base + "^{tree}")
+        elsewhere = self.bare_git(bare, "commit-tree", tree, "-p", self.base,
+                                  "-m", "ailleurs", env=self.env("impl"))
+        self.bare_git(bare, "update-ref", "refs/heads/keep/other", elsewhere)
+        self.repo.git("config", "remote.origin.promisor", "true")
+        self.repo.git("config", "remote.origin.partialclonefilter", "blob:none")
+        seen: dict = {}
+        real = plan_git._git
+
+        def spy(repo, *args, **kwargs):
+            if args and args[0] == "cat-file":
+                seen.update(kwargs.get("env_extra") or {})
+            return real(repo, *args, **kwargs)
+
+        with mock.patch.object(plan_git, "_git", side_effect=spy):
+            self.assertFalse(plan_git.remote_reachable(self.repo.root, self.op))
+        self.assertEqual(seen.get("GIT_NO_LAZY_FETCH"), "1")
+
+    def test_a_shallow_clone_is_still_a_doubt(self):
+        # #4242 : un clone superficiel coupe réellement l'histoire ;
+        # l'acceptation d'un clone partiel ne relâche pas ce doute.
+        bare = self.add_remote()
+        # #4318 : le dépôt nu garde la tête de `init.defaultBranch` (`main` en
+        # CI) alors qu'`add_remote` pousse `master` : le clone --depth 1
+        # annoncerait un dépôt vide, sans marqueur superficiel, et le témoin
+        # serait rouge sans rien dire du produit. On fixe la tête, puis on
+        # vérifie la précondition : un clone non marqué superficiel (git,
+        # forge) est sauté explicitement, jamais rouge.
+        self.bare_git(bare, "symbolic-ref", "HEAD", "refs/heads/master")
+        shallow = os.path.join(self.tmp, "shallow")
+        subprocess.run(["git", "clone", "-q", "--depth", "1",
+                        "file://" + bare, shallow], check=True,
+                       capture_output=True, env=self.env("impl"))
+        marque = subprocess.run(
+            ["git", "-C", shallow, "rev-parse", "--is-shallow-repository"],
+            capture_output=True, text=True, env=self.env("impl")).stdout.strip()
+        if marque != "true":
+            self.skipTest("clone --depth 1 non marqué superficiel (git %s)"
+                          % self.repo.git("--version").replace("git version ", ""))
+        self.assertFalse(plan_git._history_complete(shallow))
+
 
 class ForcePushSupersedesKeepsCorrectorTest(_RewriteFixture):
     """#3399 (auditeur) : le correcteur connu du gel pendant reste auteur.
