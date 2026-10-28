@@ -33,7 +33,7 @@ class FileError(ValueError):
 
 
 class BootstrapFiles:
-    def __init__(self,journal, *, authority,root='/',readiness=None):
+    def __init__(self,journal, *, authority,root='/',readiness=None,renderer=None,keys=(KEY,)):
         # root is only an administrator/test fixture mapping. There is no CLI
         # or SSH route accepting it, and the default is the fixed host root.
         self.journal=Path(journal)
@@ -41,6 +41,10 @@ class BootstrapFiles:
         self.readiness=readiness
         self.root=Path(root).absolute()
         runtime.trusted(self.root)
+        # Fixed by the administrator backend for one signed bundle kind: the
+        # canonical renderer and the access keys enabled last (never a request).
+        self.renderer=renderer or delegation
+        self.keys=frozenset(keys)
 
     def path(self,logical):
         return self.root/logical.lstrip('/')
@@ -108,7 +112,7 @@ class BootstrapFiles:
             raise FileError('typed bootstrap file request required')
         # Validate the complete canonical inventory and scope before mapping any
         # path. No caller content or path outside the renderer is accepted.
-        delegation.question(request['bundle'])
+        self.renderer.question(request['bundle'])
         expected_scope=protocol.identity(dict(operation=request['operation'],bundle_digest=request['bundle']['digest'],step=step))
         if request['scope_digest']!=expected_scope:
             raise FileError('bootstrap file scope mismatch')
@@ -118,7 +122,7 @@ class BootstrapFiles:
         self.checked(step,request)
         if step=='revoke':
             return self.revoke(request)
-        files={path:info for path,info in request['bundle']['files'].items() if (path==KEY)==(step=='enable')}
+        files={path:info for path,info in request['bundle']['files'].items() if (path in self.keys)==(step=='enable')}
         # Directory creation/layout is a preceding bootstrap effect, never an
         # implicit repair using account-owned or unknown destination ancestors.
         for logical in files:
@@ -189,7 +193,7 @@ class BootstrapFiles:
                 source=protocol.load(source_path)
                 expected=dict(request,step=step,action_id=request['operation']+':'+step,
                     scope_digest=protocol.identity(dict(operation=request['operation'],bundle_digest=request['bundle']['digest'],step=step)))
-                expected_paths={logical for logical in files if (logical==KEY)==(step=='enable')}
+                expected_paths={logical for logical in files if (logical in self.keys)==(step=='enable')}
                 if (set(source)!={'request','before','done','receipt'}
                         or set(source['before'])!=expected_paths
                         or protocol.identity(source.get('request'))!=protocol.identity(expected)):
@@ -205,7 +209,7 @@ class BootstrapFiles:
                     snapshots[logical]=before
             # Revoke access first; keep runtime, account, credentials, journals
             # and live fences untouched even after failed/partial bootstrap.
-            for logical in sorted(snapshots,key=lambda name:(name!=KEY,name)):
+            for logical in sorted(snapshots,key=lambda name:(name not in self.keys,name)):
                 before=snapshots[logical]; target=self.path(logical)
                 actual=self.snapshot(target)
                 self.approved(request)
