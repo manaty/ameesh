@@ -237,6 +237,12 @@ FERMEES = {
     # #4164 (0500) : crédits du compte fournisseur ; l'état est accordé au rôle
     # superviseur (alertes), le texte d'erreur libre du fournisseur reste fermé
     "provider_account_credits": {"detail"},
+    # #4293 : état interne d'une adoption de version (rapport de rejeu, séquence
+    # canari/bascule, valeurs inverses), tenu et lu par `ameesh veille`, pas par
+    # le rôle superviseur ; fermé aux deux rôles, aucun GRANT modifié.
+    "harness_adoptions": {"lot_id", "project", "harness", "object",
+                          "from_version", "to_version", "stage", "report",
+                          "report_digest", "state", "created_at", "updated_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
