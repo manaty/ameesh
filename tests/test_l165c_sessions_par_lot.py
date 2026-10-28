@@ -299,8 +299,9 @@ class StockageTest(_Base):
 
     def test_note_de_l_outillage_ne_leve_pas_la_retenue(self):
         """#3992 : une note écrite par l'outillage après un `hold:` (composition
-        de paquet, runner, git…) ne lève pas la retenue ; celle de l'assigné,
-        d'un autre agent du registre ou d'un humain la lève, comme avant."""
+        de paquet, runner, git…) ne lève pas la retenue ; celle de l'assigné
+        ou d'un humain la lève, comme avant. #4162 : la note ordinaire d'un
+        autre agent ne la lève plus (voir le test suivant)."""
         self.bail("a7")
         def lot(title):
             return work.add(self.db, title=title, assignee="a7", force=_FORCE)["id"]
@@ -319,12 +320,44 @@ class StockageTest(_Base):
         work.note(self.db, par_l_assigne, "reprise", actor="a7")
         self.register("pilote7", "claude")
         par_un_agent = tenu("levé par un agent")
-        work.note(self.db, par_un_agent, "à toi", actor="agent:pilote7")
+        with mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": "pilote7"}):
+            work.note(self.db, par_un_agent, "unhold: à toi", actor="pilote7")
         par_l_owner = tenu("levé par l'owner")
         work.note(self.db, par_l_owner, "go", actor="human:owner")
         ids = {r["id"] for r in self.st.actionable("a7")}
         self.assertFalse(ids & set(mecaniques), "note mécanique : retenue gardée")
         self.assertEqual(ids, {par_l_assigne, par_un_agent, par_l_owner})
+
+    def test_note_d_un_autre_agent_ne_leve_pas_la_retenue(self):
+        """#4162 : la note ordinaire d'un autre agent après un `hold:` ne
+        réveille pas l'assigné (même lecture que `planned_waits.active_holds`) ;
+        une levée explicite, un changement d'état (même aller-retour) ou une
+        note de l'assigné lèvent la retenue."""
+        self.bail("a8")
+        self.register("pilote8", "claude")
+        def tenu(title):
+            item = work.add(self.db, title=title, assignee="a8", force=_FORCE)["id"]
+            work.move(self.db, item, "build")
+            work.note(self.db, item, "hold: attente owner", actor="a8")
+            return item
+        info = tenu("note d'information d'un tiers")
+        work.note(self.db, info, "pour info : paquet composé", actor="agent:pilote8")
+        reposé = tenu("hold d'un tiers après une levée")
+        work.note(self.db, reposé, "reprise", actor="a8")
+        work.note(self.db, reposé, "hold: attente bureau", actor="pilote8")
+        work.note(self.db, reposé, "relevé", actor="pilote8")
+        levé = tenu("levée explicite d'un tiers")
+        work.note(self.db, levé, "pour info", actor="pilote8")
+        with mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": "pilote8"}):
+            work.note(self.db, levé, "hold lifted: go", actor="pilote8")
+        aller_retour = tenu("aller-retour d'état")
+        work.move(self.db, aller_retour, "qa")
+        work.move(self.db, aller_retour, "build")
+        repris = tenu("note de l'assigné après un tiers")
+        work.note(self.db, repris, "pour info", actor="pilote8")
+        work.note(self.db, repris, "je reprends", actor="agent:a8")
+        ids = {r["id"] for r in self.st.actionable("a8")}
+        self.assertEqual(ids, {levé, aller_retour, repris})
 
     def test_reveil_programme_tenu_est_du_et_consomme_une_fois(self):
         """#2466 : une note hold: portant une échéance réveille à l'échéance,
