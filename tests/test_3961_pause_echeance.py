@@ -175,7 +175,9 @@ class EcheanceTest(PgTestCase):
         self.assertEqual(len(alertes), 1)
         alerte = alertes[0]
         self.assertEqual(alerte["agent"], "worker")
-        self.assertGreaterEqual(alerte["value"], 31 * 60)
+        # `age` recule l'horloge de Postgres, `alerts` mesure avec celle du
+        # runner (tronquée) : quelques secondes de jeu (#4176, 1859 < 1860 en CI).
+        self.assertGreaterEqual(alerte["value"], 31 * 60 - 5)
         self.assertEqual(alerte["threshold"], exploitation.DEFAULT_LONG_OPERATOR_PAUSE_S)
         self.assertIn("no deadline", alerte["detail"])
         self.assertIn("human:alice", alerte["detail"])
