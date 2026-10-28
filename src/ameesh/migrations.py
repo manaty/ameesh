@@ -226,6 +226,20 @@ def toplevel(path: str) -> str:
     return _git(path, "rev-parse", "--show-toplevel").strip()
 
 
+def _landed_refs(checkout: str, refs: list[str]) -> set[str]:
+    """#4097 : les refs (hors tronc) déjà contenues dans une ref de tronc du
+    clone, locale ou `origin/`. Une lecture illisible ne retire rien."""
+    trunks = trunk_branches(checkout)
+    trunk_refs = {ref for ref in refs
+                  if ref.split("/", 3)[-1] in trunks
+                  and (ref.startswith("refs/heads/") or ref.startswith("refs/remotes/origin/"))}
+    landed: set[str] = set()
+    for trunk in sorted(trunk_refs):
+        landed.update(_git(checkout, "for-each-ref", "--format=%(refname)", "--merged",
+                           trunk, "refs/heads", "refs/remotes").split())
+    return landed - trunk_refs
+
+
 def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = None,
                  also_skip: tuple[str, ...] = (), package: str = MIGRATIONS_DIR,
                  worktree: bool = True) -> dict[int, list[str]]:
@@ -237,6 +251,11 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
     composition, #1603) ne comptent pas, ni l'arbre de travail s'il est sur
     l'une d'elles. `worktree=False` ignore l'arbre de travail entier : le train
     y compose un membre dont la migration n'est pas encore réservée (#2400).
+    #4097 : une branche déjà entrée dans un tronc (ancêtre de `develop`,
+    `main`…) ne compte pas : ses migrations ont atterri sur le tronc, peut-être
+    sous un autre numéro (un paquet renumérote 602 → 599), et la branche
+    d'agent restée sur la forge tenait encore l'ancien. Le tronc, lui, est
+    toujours lu.
     Rien n'est récupéré (pas de fetch)."""
     found: dict[int, list[str]] = {}
 
@@ -256,6 +275,7 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
     if worktree and os.path.isdir(directory) and head not in skip:
         add(os.listdir(directory), "worktree")
     refs = _git(checkout, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
+    skip |= _landed_refs(checkout, refs.split())
     for ref in refs.split():
         if ref.endswith("/HEAD") or ref in skip or (
                 names and ref.startswith("refs/remotes/")

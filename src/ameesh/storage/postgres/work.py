@@ -429,6 +429,23 @@ _DELAYS_SELECT = """
 """.replace("__MERGED_EFFECTIVE__", _effective_merged("m"))
 
 
+def _land_default_slot(tx, item_id, number, repo) -> None:
+    """#4097 : le créneau `default` atterri suit le numéro réellement posé.
+
+    Le déclencheur 0467 lande le créneau au numéro RÉSERVÉ quand le lot passe
+    `merged` ; un paquet qui renumérote (602 → 599) laissait donc `landed` à
+    602, numéro jamais posé sur la cible. Le numéro déclaré (`migration_landed`,
+    #1567) le remplace, dans la transaction qui l'écrit. Seul l'index des
+    créneaux `reserved` est unique : aucune course d'allocation ici."""
+    if not has_migration_slots(tx):
+        return
+    tx.execute(
+        "UPDATE work_migration_reservations SET number = %s, updated_at = now()"
+        " WHERE work_item_id = %s AND slot = 'default' AND status = 'landed'"
+        "   AND target_repo = %s AND number <> %s",
+        (int(number), int(item_id), "github.com/" + repo, int(number)))
+
+
 class _Refrozen(Exception):
     """Annule la fermeture : un nouveau gel a été validé pendant l'attente."""
 
@@ -2418,6 +2435,7 @@ class WorkItems(interface.WorkItems):
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            _land_default_slot(tx, item_id, number, repo)
             return rows[0]
 
     def migration_landed_holder(self, number, repo) -> dict | None:
@@ -3270,6 +3288,8 @@ class WorkItems(interface.WorkItems):
                     return None
                 WorkItems(tx)._event(int(item_id), "merged", note, actor)
                 self._release_migration(tx, item_id, rows[0], why="fusion", actor=actor)
+                if number is not None:
+                    _land_default_slot(tx, item_id, number, repo)
                 tx.query(
                     "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
                     " WHERE id = (SELECT id FROM work_item_milestones"

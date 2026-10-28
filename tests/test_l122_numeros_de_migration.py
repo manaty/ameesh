@@ -115,6 +115,34 @@ class NumerosDuDepotTest(unittest.TestCase):
                                               also_skip=("integration/paquet-5",))
             self.assertEqual(sorted(skipped), [375])
 
+    def test_une_branche_entree_dans_le_tronc_ne_compte_pas(self):
+        """#4097 : un paquet renumérote 602 → 599 ; la branche d'agent restée
+        sur la forge (ancêtre de `develop`) porte encore 602 et ne doit pas
+        tenir ce numéro. Une branche non fusionnée compte toujours, le tronc
+        aussi, même en retard sur `origin/`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _depot(os.path.join(tmp, "nexlink"), "manaty/nexlink", NEXLINK.directory,
+                          ["598_a.sql"], {"agent/x-4079": ["602_key.sql"],
+                                          "agent/y-4078": ["603_open.sql"]})
+            _git(repo, "update-ref", "refs/remotes/origin/develop", "refs/heads/develop")
+            self.assertEqual(sorted(migrations.repo_numbers(repo, NEXLINK)), [598, 602, 603])
+            # le paquet fusionne la branche puis renumérote sur le tronc
+            _git(repo, "merge", "-q", "--no-ff", "-m", "paquet 212", "agent/x-4079")
+            _git(repo, "mv", NEXLINK.directory + "/602_key.sql",
+                 NEXLINK.directory + "/599_key.sql")
+            _git(repo, "commit", "-qm", "602 -> 599")
+            _git(repo, "update-ref", "refs/remotes/origin/agent/x-4079",
+                 "refs/heads/agent/x-4079")
+            _git(repo, "update-ref", "refs/remotes/origin/develop", "refs/heads/develop")
+            _git(repo, "update-ref", "refs/heads/develop", "HEAD~1")
+            found = migrations.repo_numbers(repo, NEXLINK, worktree=False)
+            self.assertEqual(sorted(found), [598, 599, 602, 603])
+            self.assertEqual(found[602], ["develop:602_key.sql"])
+            _git(repo, "update-ref", "refs/heads/develop", "refs/remotes/origin/develop")
+            found = migrations.repo_numbers(repo, NEXLINK, worktree=False)
+            self.assertEqual(sorted(found), [598, 599, 603])
+            self.assertNotIn("origin/agent/x-4079:602_key.sql", sum(found.values(), []))
+
     def test_la_cible_seule_est_lue(self):
         """#2620 : un numéro exact ne lit que la branche cible — ni l'arbre de
         travail, ni le paquet, ni les branches non fusionnées ; `origin/`
@@ -1248,6 +1276,26 @@ class NumeroAtterriTest(PgTestCase):
                       " — landed number not recorded", proc.stdout)
         self.assertNotIn("377 landed", proc.stdout)
         self.assertNotIn("supabase/migrations/377", proc.stdout)
+
+    def _slot(self, lot):
+        return self.db.query(
+            "SELECT number, status FROM work_migration_reservations"
+            " WHERE work_item_id = %s AND slot = 'default'", (lot["id"],))[0]
+
+    def test_le_creneau_atterri_suit_le_numero_pose(self):
+        """#4097 : la fusion déclarée avec le numéro réellement posé lande le
+        créneau `default` à ce numéro, plus au numéro réservé ; la
+        déclaration après coup (paquet fermé par le balayage) le corrige."""
+        lot = self._lot()
+        self.assertEqual(self._nx(lot)["migration"], 377)
+        self._merged(lot, actor="dev1", migration_landed=376)
+        self.assertEqual(self._slot(lot), {"number": 376, "status": "landed"})
+        later = self._lot(n=2)
+        self.assertEqual(self._nx(later)["migration"], 377)
+        self._merged(later, actor="sweeper")
+        self.assertEqual(self._slot(later), {"number": 377, "status": "landed"})
+        self._merged(later, actor="pilote", migration_landed=375)
+        self.assertEqual(self._slot(later), {"number": 375, "status": "landed"})
 
     def test_rattrapage_et_correction_d_un_lot_deja_fusionne(self):
         lot = self._lot()
