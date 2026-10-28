@@ -8837,8 +8837,12 @@ class Runner:
         #: L165 (EP2) : publication périodique des scores de candidats de cet
         #: hôte (rôles `releve: election`), élagage de leur historique, et
         #: instant (monotone) du premier bail libre vu par rôle pour le délai
-        #: par rang. Aucune écriture hors de `role_evaluation_once`.
+        #: par rang. Aucune écriture hors de `role_evaluation_once` (et de
+        #: `_republish_reserved`, #4112).
         self._role_eval_next = 0.0
+        #: #4112 : prochain instant (monotone) de republication, par rôle, du
+        #: relevé d'un rôle réservé à cet hôte et lu « non prêt »
+        self._reserved_republish_next: dict[str, float] = {}
         self._role_prune_next = 0.0
         self._role_error: str | None = None
         self._election_free_since: dict[str, float] = {}
@@ -9494,13 +9498,44 @@ class Runner:
                         None)
         since = self._election_free_since.setdefault(name, now)
         try:
-            return election.claim_wait(self.db, agent, self.host, since, now=now)
+            verdict = election.claim_wait(self.db, agent, self.host, since, now=now)
+            if (not verdict[0] and verdict[1].startswith("not ready")
+                    and self._republish_reserved(name, now)):
+                verdict = election.claim_wait(self.db, agent, self.host, since,
+                                              now=now)
+            return verdict
         except Exception as exc:  # idem : fail closed, jamais un tour sans rang
             message = "role standings unreadable (%s)" % db_mod.brief(exc)
             if message != self._role_error:
                 log_async(message)
             self._role_error = message
             return False, "not ready: " + message, None
+
+    #: #4112 : au plus une republication forcée par rôle réservé et par 5 s
+    RESERVED_REPUBLISH_S = 5.0
+
+    def _republish_reserved(self, name: str, now: float) -> bool:
+        """#4112 : republie tout de suite le relevé de cet hôte pour un rôle
+        qui lui est réservé (`@restart`, #4086) mais lu « non prêt ».
+
+        Le relevé lu est souvent celui d'avant le redémarrage : pause du drain
+        de `vm.sh` encore posée, ou publié par l'ancien processus il y a moins
+        d'une minute (`publish_self` ne republie pas avant `interval_s`).
+        Attendre le relevé suivant (60 s) mangeait la réservation (90 s) et
+        le rang 0 d'un autre hôte reprenait le rôle. La readiness reste la
+        garde : on ne fait que la relire à jour, bornée à `RESERVED_REPUBLISH_S`.
+        Rend vrai quand un relevé neuf a été écrit."""
+        # doublure de test partielle (sans l'état de l'exécuteur) : rien
+        pending = getattr(self, "_reserved_republish_next", None)
+        if pending is None or now < pending.get(name, 0.0):
+            return False
+        pending[name] = now + self.RESERVED_REPUBLISH_S
+        from . import election, role_handover_pg as handover_pg
+        reserved = handover_pg.restart_reservation(self.db, name)
+        if reserved is None or reserved["host"] != self.host:
+            return False
+        return bool(election.publish_self(self.cfg, self.db, self.host,
+                                          force=True, names=[name]))
 
     def _start_host_gate(self) -> None:
         with self._host_gate_lock:
