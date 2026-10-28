@@ -45,6 +45,11 @@ Le banc suit la spécification `docs/design/3264-veille-versions.md` §3 :
   meilleure), équivalente (écarts dans le bruit : ±10 % coût et durée, ±1
   point de note) ou régression ; un rejeu qui échoue aux tests du vrai lot
   n'est jamais une adoption.
+* **travail et reprise** : chaque évaluation crée son propre sous-dossier sous
+  `--work-root` et n'efface que ce qu'elle a créé ; `--resume` compare
+  l'identité complète du plan (binaires, modèles, effort, banc, relecteur,
+  plafonds) et refuse un rapport produit dans d'autres conditions plutôt que
+  de relabelliser ses mesures.
 
 Le banc n'écrit aucune note ni aucun jalon : le rapport est un fichier, et
 l'agent d'évaluation le cite dans la note du lot d'évaluation. Aucun nom de
@@ -83,6 +88,10 @@ from .config import Config
 
 #: schéma du rapport de rejeu (stable, consommé par les rapports et les tests)
 REPORT_SCHEMA = "ameesh-replay-report/1"
+#: schéma de l'identité du plan : ce qui doit être identique pour qu'un
+#: rapport puisse être repris (`--resume`) sans relabelliser d'anciennes
+#: mesures (relecture B/P2 de #4292).
+PLAN_SCHEMA = "ameesh-replay-plan/1"
 #: taille du banc et classes admises (spec §3.1)
 BENCH_SIZE = 3
 BENCH_CLASSES = ("light", "normal", "sensitive")
@@ -1315,6 +1324,9 @@ class Plan:
     max_reviews: int = MAX_REVIEWS
     budget_usd: float = DEFAULT_BUDGET_USD
     keep: bool = False
+    #: vrai si `build_plan` a créé `work_root` lui-même : seul ce dossier,
+    #: privé à l'évaluation, peut être retiré en fin d'exécution.
+    created_root: bool = False
     resume: dict | None = None
 
 
@@ -1400,11 +1412,13 @@ def build_plan(cfg: Config, db, *, project: str, new_binary: str = "",
             raise ReplayError(str(exc)) from None
         reviewer_version = probe_version(reviewer_adapter) or "?"
     eval_id = time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
-    root = _expand(work_root) if work_root else os.path.join(
-        tempfile.gettempdir(), "ameesh-replay-%s" % eval_id)
-    os.makedirs(root, exist_ok=True)
+    # `--work-root` est un parent : chaque évaluation reçoit son propre
+    # sous-dossier, créé exclusivement ici. Un dossier déjà peuplé n'est donc
+    # jamais adopté, et le nettoyage ne peut pas l'effacer (relecture B/P1).
+    parent = _expand(work_root) if work_root else tempfile.gettempdir()
+    root = os.path.join(parent, "ameesh-replay-%s" % eval_id)
     report = _expand(report_path) if report_path else os.path.join(root, "report.json")
-    return Plan(
+    plan = Plan(
         project=project, harness=harness, model=model, effort=effort,
         evaluated=evaluated, old_model=old_model, new_model=new_model,
         old_binary=old_adapter.binary, old_version=old_version,
@@ -1422,6 +1436,138 @@ def build_plan(cfg: Config, db, *, project: str, new_binary: str = "",
         prices=cost_mod.load_prices(os.environ.get("AMEESH_PRICES")),
         max_runs=max_runs, max_reviews=max_reviews,
         budget_usd=budget_usd, keep=keep, resume=resume)
+    # Une reprise ne relabellise jamais des mesures d'un autre plan : le
+    # rapport porte l'identité complète, vérifiée avant toute réutilisation
+    # (relecture B/P2 de #4292). La vérification précède la création du
+    # dossier privé pour ne pas en laisser un vide sur un refus.
+    if resume:
+        _validate_resume(plan, resume)
+    try:
+        os.makedirs(parent, exist_ok=True)
+        os.makedirs(root)
+    except FileExistsError:
+        raise ReplayError("dossier de travail déjà présent: %s" % root) from None
+    except OSError as exc:
+        raise ReplayError("dossier de travail impossible: %s" % exc) from None
+    plan.created_root = True
+    return plan
+
+
+def _digest_file(path: str | None) -> str | None:
+    """Empreinte d'un fichier du plan ; illisible, son chemin (pour refuser)."""
+    if not path:
+        return None
+    target = _expand(path)
+    try:
+        digest = hashlib.sha256()
+        with open(target, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return "illisible:%s" % target
+
+
+def _digest_json(value) -> str:
+    return _sha256_text(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                   default=str))
+
+
+def plan_identity(plan: Plan) -> dict:
+    """L'identité mesurable d'un plan, telle qu'elle est figée dans le rapport.
+
+    Tout ce qui, changé, rendrait une ancienne mesure non comparable sous les
+    nouveaux libellés : versions et binaires, modèle, effort, plafonds,
+    commande de test, carte d'impact, barème, relecteur et banc (base et tête
+    gelées, tests). Les gardes de dépense (`budget_usd`, `max_runs`,
+    `max_reviews`) n'en font pas partie : les changer ne relabellise rien."""
+    identity = {
+        "schema": PLAN_SCHEMA,
+        "project": plan.project,
+        "harness": plan.harness,
+        "evaluated": plan.evaluated,
+        "model": plan.model,
+        "effort": plan.effort,
+        "old_binary": plan.old_binary,
+        "old_version": plan.old_version,
+        "old_model": plan.old_model,
+        "new_binary": plan.new_binary,
+        "new_version": plan.new_version,
+        "new_model": plan.new_model,
+        "turn_cap_s": plan.turn_cap_s,
+        "test_cap_s": plan.test_cap_s,
+        "review_cap_s": plan.review_cap_s,
+        "test_command": plan.test_command,
+        "map_sha256": _digest_file(plan.map_path),
+        "prices_sha256": _digest_json(plan.prices),
+        "dsh_home": plan.dsh_home if plan.harness == "deepseek" else None,
+        "lots": [{"lot": lot.lot, "class": lot.klass, "app": lot.app,
+                  "target": lot.target, "base": lot.base, "frozen": lot.frozen,
+                  "tests": list(lot.tests), "files": list(lot.files)}
+                 for lot in plan.lots],
+    }
+    identity["reviewer"] = (
+        {"harness": plan.reviewer, "version": plan.reviewer_version,
+         "model": plan.reviewer_model, "effort": plan.reviewer_effort}
+        if plan.reviewer else None)
+    return identity
+
+
+def _identity_value(value) -> str:
+    text = repr(value)
+    return text if len(text) <= 80 else text[:77] + "…"
+
+
+def _identity_differences(previous, current, prefix: str = "") -> list[str]:
+    """Les chemins qui diffèrent entre deux identités, pour un refus lisible."""
+    if isinstance(previous, dict) and isinstance(current, dict):
+        differences = []
+        for key in sorted(set(previous) | set(current)):
+            name = "%s.%s" % (prefix, key) if prefix else key
+            if key not in previous:
+                differences.append("%s: absent → %s"
+                                   % (name, _identity_value(current[key])))
+            elif key not in current:
+                differences.append("%s: %s → absent"
+                                   % (name, _identity_value(previous[key])))
+            else:
+                differences.extend(_identity_differences(
+                    previous[key], current[key], name))
+        return differences
+    if isinstance(previous, list) and isinstance(current, list):
+        differences = []
+        if len(previous) != len(current):
+            differences.append("%s: %d → %d élément(s)"
+                               % (prefix, len(previous), len(current)))
+        for index, (one, two) in enumerate(zip(previous, current)):
+            differences.extend(_identity_differences(
+                one, two, "%s[%d]" % (prefix, index)))
+        return differences
+    if previous != current:
+        return ["%s: %s → %s" % (prefix, _identity_value(previous),
+                                 _identity_value(current))]
+    return []
+
+
+def _validate_resume(plan: Plan, previous: dict | None) -> None:
+    """Refuse une reprise dont le plan a changé (relecture B/P2 de #4292).
+
+    L'identité stockée dans le rapport est comparée en entier ; un rapport
+    antérieur au schéma d'identité est refusé plutôt que repris à l'aveugle."""
+    stored = (previous or {}).get("plan") if isinstance(previous, dict) else None
+    if not isinstance(stored, dict) or stored.get("schema") != PLAN_SCHEMA:
+        raise ReplayError(
+            "reprise refusée: le rapport %s n'a pas d'identité de plan (%s); "
+            "rejouer sans --resume"
+            % ((previous or {}).get("eval_id") if isinstance(previous, dict) else "?",
+               stored.get("schema") if isinstance(stored, dict) else "absente"))
+    differences = _identity_differences(stored, plan_identity(plan))
+    if differences:
+        shown = "; ".join(differences[:6])
+        if len(differences) > 6:
+            shown += "; … (%d différence(s))" % len(differences)
+        raise ReplayError("reprise refusée: le plan du rapport diffère (%s); "
+                          "rejouer sans --resume" % shown)
 
 
 def impact_modules(repo: str, base: str, frozen: str, map_path: str,
@@ -1533,26 +1679,71 @@ def _review_one(plan: Plan, lot: BenchLot, result: dict, blind: str,
                           prices=plan.prices)
     review["reviewer"] = plan.reviewer
     review["reviewer_version"] = plan.reviewer_version
+    review["reviewer_model"] = plan.reviewer_model
+    review["reviewer_effort"] = plan.reviewer_effort
     return review
 
 
-def _reuse_run(report: dict | None, lot: int, version: str) -> dict | None:
+def _expected_measure(plan: Plan, version: str) -> tuple[str, str]:
+    """Le `(libellé, modèle)` qu'un rejeu de cette version doit porter."""
+    if plan.evaluated == "model":
+        model = plan.old_model if version == "old" else plan.new_model
+        return model, model
+    label = plan.old_version if version == "old" else plan.new_version
+    return label, plan.model
+
+
+def _reuse_run(report: dict | None, plan: Plan, lot: BenchLot,
+               version: str) -> dict | None:
+    """Un rejeu reprenable, seulement s'il porte l'identité de *ce* plan.
+
+    Le lot et la version ne suffisent pas : un binaire, un modèle, un effort
+    ou une base changés rendraient l'ancienne mesure non comparable sous les
+    nouveaux libellés (relecture B/P2 de #4292). Le champ aveugle est exclu :
+    il est retiré à chaque exécution."""
+    label, model = _expected_measure(plan, version)
     for entry in (report or {}).get("lots") or []:
-        if int(entry.get("lot") or 0) != int(lot):
+        if int(entry.get("lot") or 0) != int(lot.lot):
             continue
         run = (entry.get("runs") or {}).get(version)
-        if run and run.get("exit") is not None and not run.get("pending"):
-            return run
+        if not run or run.get("exit") is None or run.get("pending"):
+            continue
+        if run.get("version") != version or run.get("label") != label:
+            continue
+        if run.get("model") != model:
+            continue
+        settings = run.get("settings") or {}
+        if settings and (settings.get("model") != model
+                         or settings.get("effort") != plan.effort):
+            continue
+        if (run.get("isolation") or {}).get("base") != lot.base:
+            continue
+        return run
     return None
 
 
-def _reuse_review(report: dict | None, lot: int, version: str) -> dict | None:
+def _reuse_review(report: dict | None, plan: Plan, lot: BenchLot,
+                  version: str) -> dict | None:
+    """Une relecture reprenable, seulement sous le même relecteur et la même
+    version de relecteur ; une relecture d'une autre famille ne se relabellise
+    pas."""
     for entry in (report or {}).get("lots") or []:
-        if int(entry.get("lot") or 0) != int(lot):
+        if int(entry.get("lot") or 0) != int(lot.lot):
             continue
         review = (entry.get("reviews") or {}).get(version)
-        if review and review.get("score") is not None:
-            return review
+        if not review or review.get("score") is None:
+            continue
+        if review.get("reviewer") != plan.reviewer:
+            continue
+        if review.get("reviewer_version") != plan.reviewer_version:
+            continue
+        if ("reviewer_model" in review
+                and review.get("reviewer_model") != plan.reviewer_model):
+            continue
+        if ("reviewer_effort" in review
+                and review.get("reviewer_effort") != plan.reviewer_effort):
+            continue
+        return review
     return None
 
 
@@ -1566,6 +1757,10 @@ def execute(plan: Plan, *, run_agent=run_harness, test_runner=run_tests,
     est écrit et dit ce qui manque."""
     say = progress or (lambda message: None)
     previous = plan.resume or None
+    # Aucune reprise ne relabellise les mesures d'un autre plan : l'identité
+    # complète est vérifiée avant de réutiliser quoi que ce soit (B/P2).
+    if previous is not None:
+        _validate_resume(plan, previous)
     # Le paramètre évalué et les paramètres tenus constants sont nommés par
     # le rapport, jamais déduits d'un `model` supposé partagé (spec §3.1,
     # point cx3) : on peut évaluer un harnais à modèle égal, ou un modèle à
@@ -1600,6 +1795,12 @@ def execute(plan: Plan, *, run_agent=run_harness, test_runner=run_tests,
         "reviewer": ({"harness": plan.reviewer, "version": plan.reviewer_version,
                       "model": plan.reviewer_model, "effort": plan.reviewer_effort}
                      if plan.reviewer else None),
+        # Identité figée du plan : la reprise la compare en entier avant de
+        # réutiliser un rejeu ou une relecture (B/P2 de #4292).
+        "plan": plan_identity(plan),
+        "resume": ({"from_eval_id": previous.get("eval_id"),
+                    "from_generated": previous.get("generated")}
+                   if previous is not None else None),
         "lots": [], "conclusion": "incomplete",
         "controls": {
             "evaluated": plan.evaluated,
@@ -1619,6 +1820,20 @@ def execute(plan: Plan, *, run_agent=run_harness, test_runner=run_tests,
     runs = 0
     reviews = 0
     spent = 0.0
+    if previous is not None:
+        # Reprendre une évaluation, c'est continuer la même dépense : les
+        # gardes (plafonds, budget) portent sur le total et non sur la seule
+        # invocation. Le rapport tient déjà ces compteurs.
+        prior = previous.get("budget") or {}
+        try:
+            runs = int(prior.get("runs") or 0)
+            reviews = int(prior.get("reviews") or 0)
+            spent = float(prior.get("spent_usd") or 0.0)
+        except (TypeError, ValueError):
+            runs, reviews, spent = 0, 0, 0.0
+    #: seuls les dossiers créés ici sont retirés : un dossier préexistant
+    #: n'est jamais adopté ni effacé (relecture B/P1 de #4292).
+    created: list[str] = []
 
     def stop(reason: str) -> None:
         report["budget"]["stopped"] = reason
@@ -1663,8 +1878,8 @@ def execute(plan: Plan, *, run_agent=run_harness, test_runner=run_tests,
         replayed: dict[str, dict] = {}
         for version in ("old", "new"):
             blind = entry["blind"][version]
-            reused = _reuse_run(previous, lot.lot, version)
-            if reused is not None and not reused.get("pending"):
+            reused = _reuse_run(previous, plan, lot, version)
+            if reused is not None:
                 reused = dict(reused)
                 reused["blind"] = blind
                 entry["runs"][version] = reused
@@ -1679,6 +1894,7 @@ def execute(plan: Plan, *, run_agent=run_harness, test_runner=run_tests,
                 break
             say("#%s %s: arbre isolé et tour (%s)…" % (lot.lot, version, blind))
             run_dir = os.path.join(plan.work_root, "lot-%s-%s" % (lot.lot, blind))
+            _create_eval_dir(run_dir, created)
             try:
                 result = _run_one(plan, lot, version, blind, run_dir,
                                   run_agent=run_agent, test_runner=test_runner)
@@ -1703,7 +1919,7 @@ def execute(plan: Plan, *, run_agent=run_harness, test_runner=run_tests,
             if not plan.reviewer_adapter:
                 entry["reviews"]["missing"] = "aucun relecteur déclaré"
                 break
-            reused = _reuse_review(previous, lot.lot, version)
+            reused = _reuse_review(previous, plan, lot, version)
             if reused is not None:
                 entry["reviews"][version] = dict(reused)
                 replayed[version]["review"] = dict(reused)
@@ -1712,6 +1928,7 @@ def execute(plan: Plan, *, run_agent=run_harness, test_runner=run_tests,
             blind = entry["blind"][version]
             say("#%s %s: relecture aveugle (%s)…" % (lot.lot, version, blind))
             run_dir = os.path.join(plan.work_root, "lot-%s-%s-review" % (lot.lot, blind))
+            _create_eval_dir(run_dir, created)
             try:
                 review = _review_one(plan, lot, replayed[version], blind, run_dir,
                                      review_agent=review_agent)
@@ -1739,31 +1956,62 @@ def execute(plan: Plan, *, run_agent=run_harness, test_runner=run_tests,
         write()
     write()
     if not plan.keep:
-        _cleanup(plan.work_root, report, keep=(plan.report_path,))
+        _cleanup(plan, created, report, keep=(plan.report_path,))
     write()
     return report
 
 
-def _cleanup(root: str, report: dict, *, keep=()) -> None:
-    """Retire les arbres de rejeu (sauf demande explicite) : les résultats et
-    les journaux de mesure restent dans le rapport. Le rapport lui-même n'est
-    jamais retiré, même quand il vit sous la racine de travail."""
-    kept = {os.path.abspath(path) for path in keep if path}
+def _create_eval_dir(path: str, created: list[str]) -> None:
+    """Crée un dossier de rejeu neuf et l'inscrit au manifeste de nettoyage.
+
+    Un dossier existant est refusé, jamais adopté : le nettoyage ne peut
+    effacer que ce que cette évaluation a créé (relecture B/P1 de #4292)."""
     try:
-        for name in os.listdir(root):
-            path = os.path.join(root, name)
-            if os.path.abspath(path) in kept:
-                continue
-            if os.path.isdir(path) and not os.path.islink(path):
-                shutil.rmtree(path, ignore_errors=True)
+        os.makedirs(path)
+    except FileExistsError:
+        raise ReplayError("dossier de rejeu déjà présent: %s" % path) from None
+    except OSError as exc:
+        raise ReplayError("dossier de rejeu impossible: %s" % exc) from None
+    created.append(path)
+
+
+def _is_under(path: str, child: str) -> bool:
+    try:
+        return os.path.commonpath([path, child]) == path
+    except ValueError:
+        return False
+
+
+def _cleanup(plan: Plan, created: list[str], report: dict, *, keep=()) -> None:
+    """Retire uniquement les dossiers de rejeu créés par cette évaluation.
+
+    Aucun `os.listdir` de la racine : un manifeste strict des chemins créés
+    (relecture B/P1 de #4292). Le rapport et tout fichier préexistant sont
+    intacts ; la racine privée n'est retirée que si elle est vide et que
+    `build_plan` l'a créée."""
+    root = os.path.abspath(plan.work_root)
+    kept = [os.path.abspath(path) for path in keep if path]
+    for path in sorted(set(created), key=len, reverse=True):
+        target = os.path.abspath(path)
+        if target == root or not _is_under(root, target):
+            continue
+        if any(kept_path == target or _is_under(target, kept_path)
+               for kept_path in kept):
+            continue
+        try:
+            if os.path.isdir(target) and not os.path.islink(target):
+                shutil.rmtree(target, ignore_errors=True)
             else:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-    except OSError:
-        return
-    report.setdefault("notes", []).append("arbres de rejeu retirés (--keep pour les garder)")
+                os.unlink(target)
+        except OSError:
+            continue
+    if plan.created_root:
+        try:
+            os.rmdir(root)
+        except OSError:
+            pass
+    report.setdefault("notes", []).append(
+        "arbres de rejeu retirés (--keep pour les garder)")
 
 
 # --------------------------------------------------------------------------
@@ -1940,7 +2188,9 @@ def _add_run_parser(sub) -> None:
                         help="harnais relecteur, d'une autre famille")
     parser.add_argument("--reviewer-model", default="")
     parser.add_argument("--reviewer-effort", default="")
-    parser.add_argument("--work-root", default="")
+    parser.add_argument("--work-root", default="",
+                        help="dossier parent du dossier privé de l'évaluation "
+                             "(défaut : dossier temporaire)")
     parser.add_argument("--report", default="")
     parser.add_argument("--dsh-home", default="", help="foyer dsh source (copié sans hooks)")
     parser.add_argument("--env-file", default=ENV_FILE,
@@ -1949,7 +2199,8 @@ def _add_run_parser(sub) -> None:
     parser.add_argument("--max-reviews", type=int, default=MAX_REVIEWS)
     parser.add_argument("--budget-usd", type=float, default=DEFAULT_BUDGET_USD)
     parser.add_argument("--resume", action="store_true",
-                        help="reprendre le rapport existant (rejeux et relectures faits)")
+                        help="reprendre le rapport existant (rejeux et relectures "
+                             "faits) si le plan est identique ; sinon refus")
     parser.add_argument("--keep", action="store_true", help="garder les arbres de rejeu")
     parser.add_argument("--json", action="store_true")
     parser.set_defaults(func=_cmd_run)

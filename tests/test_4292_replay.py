@@ -3,6 +3,7 @@
 relecture à l'aveugle et conclusion."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 from ameesh import cost
 from ameesh import replay
@@ -502,13 +504,17 @@ def _plan(tmp: str, lot, **overrides):
     return replay.Plan(**values)
 
 
+def _bench_lot(root, base):
+    return replay.BenchLot(
+        lot=7, title="un lot", klass="light", app="p", repo=root,
+        target="main", base=base, frozen=base, body="corps du lot",
+        files=("tests/test_ref.py",), tests=("tests/test_ref.py",),
+        base_source="test")
+
+
 class ExecuteTest(unittest.TestCase):
     def _lot(self, root, base):
-        return replay.BenchLot(
-            lot=7, title="un lot", klass="light", app="p", repo=root,
-            target="main", base=base, frozen=base, body="corps du lot",
-            files=("tests/test_ref.py",), tests=("tests/test_ref.py",),
-            base_source="test")
+        return _bench_lot(root, base)
 
     def test_two_versions_then_two_blind_reviews(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -617,6 +623,217 @@ class ExecuteTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(plan.report_path))
             self.assertFalse(os.path.exists(os.path.join(
                 plan.work_root, "lot-7-%s" % report["lots"][0]["blind"]["old"])))
+
+
+class WorkRootSafetyTest(unittest.TestCase):
+    """B/P1 : le nettoyage ne touche jamais un fichier préexistant."""
+
+    def test_cleanup_preserves_preexisting_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, base = _repo(tmp)
+            work = os.path.join(tmp, "work")
+            precious = os.path.join(work, "precious")
+            os.makedirs(precious)
+            sentinel = os.path.join(work, "sentinel.txt")
+            with open(sentinel, "w", encoding="utf-8") as fh:
+                fh.write("garde-moi\n")
+            with open(os.path.join(precious, "data.txt"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("intact\n")
+            plan = _plan(tmp, _bench_lot(root, base), work_root=work,
+                         report_path=os.path.join(work, "report.json"),
+                         keep=False)
+            report = replay.execute(plan, run_agent=_fake_agent,
+                                    test_runner=_fake_tests,
+                                    review_agent=_fake_review)
+            self.assertTrue(os.path.isfile(plan.report_path))
+            with open(sentinel, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "garde-moi\n")
+            self.assertTrue(os.path.isfile(os.path.join(precious, "data.txt")))
+            self.assertFalse([name for name in os.listdir(work)
+                              if name.startswith("lot-")])
+            self.assertIn("arbres de rejeu retirés", " ".join(report["notes"]))
+
+    def test_an_existing_run_directory_is_refused_not_adopted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lot-7-A")
+            os.makedirs(path)
+            sentinel = os.path.join(path, "sentinel.txt")
+            with open(sentinel, "w", encoding="utf-8") as fh:
+                fh.write("garde-moi\n")
+            with self.assertRaises(replay.ReplayError):
+                replay._create_eval_dir(path, [])
+            with open(sentinel, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "garde-moi\n")
+
+
+class BuildPlanWorkRootTest(unittest.TestCase):
+    """B/P1 : `--work-root` est un parent, jamais le dossier de l'évaluation."""
+
+    def test_a_private_subdirectory_is_created_under_the_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, base = _repo(tmp)
+            lot = _bench_lot(root, base)
+            parent = os.path.join(tmp, "work")
+            os.makedirs(parent)
+            sentinel = os.path.join(parent, "sentinel.txt")
+            with open(sentinel, "w", encoding="utf-8") as fh:
+                fh.write("garde-moi\n")
+
+            class _Adapter:
+                def __init__(self, binary):
+                    self.binary = binary
+
+                def env(self):
+                    return {}
+
+            with mock.patch.object(
+                    replay.adapters, "adapter_for",
+                    new=lambda harness, binary=None:
+                        _Adapter(binary or "/installed")), \
+                    mock.patch.object(
+                        replay, "probe_version",
+                        new=lambda adapter: "0.1"
+                        if adapter.binary == "/old" else "0.2"), \
+                    mock.patch.object(replay.work, "get",
+                                      return_value={"id": 7}), \
+                    mock.patch.object(replay, "build_lot",
+                                      return_value=lot), \
+                    mock.patch.object(replay.cost_mod, "load_prices",
+                                      return_value={}):
+                plan = replay.build_plan(
+                    None, None, project="p", harness="claude",
+                    new_binary="/new", old_binary="/old", lots=(7,),
+                    work_root=parent)
+            self.assertTrue(plan.created_root)
+            self.assertEqual(os.path.dirname(plan.work_root), parent)
+            self.assertTrue(os.path.basename(plan.work_root)
+                            .startswith("ameesh-replay-"))
+            self.assertTrue(os.path.isdir(plan.work_root))
+            self.assertEqual(plan.report_path,
+                             os.path.join(plan.work_root, "report.json"))
+            with open(sentinel, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "garde-moi\n")
+            self.assertEqual(sorted(os.listdir(parent)),
+                             sorted(["sentinel.txt",
+                                     os.path.basename(plan.work_root)]))
+
+
+class ResumeIdentityTest(unittest.TestCase):
+    """B/P2 : `--resume` ne réutilise que les mesures du même plan complet."""
+
+    def _executed(self, tmp, **overrides):
+        root, base = _repo(tmp)
+        plan = _plan(tmp, _bench_lot(root, base), keep=True, **overrides)
+        report = replay.execute(plan, run_agent=_fake_agent,
+                                test_runner=_fake_tests,
+                                review_agent=_fake_review)
+        return plan, report
+
+    @staticmethod
+    def _forbidden(calls):
+        def refuse(*args, **kwargs):
+            calls.append(1)
+            raise AssertionError("un rejeu a été relancé")
+        return refuse
+
+    def test_identical_plan_reuses_every_measure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan, report = self._executed(tmp)
+            calls = []
+            refuse = self._forbidden(calls)
+            again = replay.execute(
+                dataclasses.replace(plan, resume=report),
+                run_agent=refuse, test_runner=refuse, review_agent=refuse)
+            self.assertEqual(calls, [])
+            self.assertEqual(again["resume"]["from_eval_id"], plan.eval_id)
+            self.assertEqual(again["lots"][0]["runs"]["old"]["cost_usd"], 0.1)
+            self.assertEqual(again["conclusion"], "equal")
+            # la reprise continue la même dépense, elle ne la remet pas à zéro
+            self.assertEqual(again["budget"]["runs"], 2)
+            self.assertEqual(again["budget"]["reviews"], 2)
+            self.assertAlmostEqual(again["budget"]["spent_usd"], 0.22)
+
+    def test_changed_plan_is_refused_before_any_reuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan, report = self._executed(tmp)
+            other = dataclasses.replace(plan.lots[0], base="f" * 40)
+            cases = {
+                "new_binary": {"new_binary": "/other"},
+                "model": {"model": "other-model"},
+                "effort": {"effort": "low"},
+                "lots": {"lots": [other]},
+                "reviewer": {"reviewer": "other", "reviewer_version": "9"},
+                "turn_cap_s": {"turn_cap_s": 20.0},
+            }
+            for name, changes in cases.items():
+                with self.subTest(name=name):
+                    calls = []
+                    refuse = self._forbidden(calls)
+                    changed = dataclasses.replace(plan, resume=report, **changes)
+                    with self.assertRaises(replay.ReplayError) as caught:
+                        replay.execute(changed, run_agent=refuse,
+                                       test_runner=refuse, review_agent=refuse)
+                    self.assertIn("reprise refusée", str(caught.exception))
+                    self.assertIn(name, str(caught.exception))
+                    self.assertEqual(calls, [])
+
+    def test_a_report_without_plan_identity_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan, _report = self._executed(tmp)
+            legacy = {"schema": replay.REPORT_SCHEMA, "eval_id": "ancien",
+                      "lots": []}
+            with self.assertRaises(replay.ReplayError) as caught:
+                replay.execute(dataclasses.replace(plan, resume=legacy))
+            self.assertIn("identité de plan", str(caught.exception))
+
+
+class ReuseIdentityTest(unittest.TestCase):
+    def test_run_reuse_checks_label_model_and_base(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, base = _repo(tmp)
+            lot = _bench_lot(root, base)
+            plan = _plan(tmp, lot)
+            good = {"version": "old", "label": "0.1",
+                    "model": "claude-sonnet-5", "exit": 0,
+                    "isolation": {"base": base}}
+            self.assertIs(replay._reuse_run(
+                {"lots": [{"lot": 7, "runs": {"old": good}}]},
+                plan, lot, "old"), good)
+            for key, value in (("label", "0.9"), ("model", "autre"),
+                               ("version", "new")):
+                bad = dict(good)
+                bad[key] = value
+                self.assertIsNone(replay._reuse_run(
+                    {"lots": [{"lot": 7, "runs": {"old": bad}}]},
+                    plan, lot, "old"))
+            bad = dict(good)
+            bad["isolation"] = {"base": "f" * 40}
+            self.assertIsNone(replay._reuse_run(
+                {"lots": [{"lot": 7, "runs": {"old": bad}}]},
+                plan, lot, "old"))
+
+    def test_review_reuse_checks_the_reviewer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, base = _repo(tmp)
+            lot = _bench_lot(root, base)
+            plan = _plan(tmp, lot)
+            good = {"score": 8.0, "reviewer": plan.reviewer,
+                    "reviewer_version": plan.reviewer_version,
+                    "reviewer_model": plan.reviewer_model,
+                    "reviewer_effort": plan.reviewer_effort}
+            self.assertIs(replay._reuse_review(
+                {"lots": [{"lot": 7, "reviews": {"old": good}}]},
+                plan, lot, "old"), good)
+            for key, value in (("reviewer", "claude"),
+                               ("reviewer_version", "9"),
+                               ("reviewer_model", "autre"),
+                               ("reviewer_effort", "low")):
+                bad = dict(good)
+                bad[key] = value
+                self.assertIsNone(replay._reuse_review(
+                    {"lots": [{"lot": 7, "reviews": {"old": bad}}]},
+                    plan, lot, "old"))
 
 
 class ReportTest(unittest.TestCase):
