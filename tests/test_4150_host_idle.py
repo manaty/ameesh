@@ -115,6 +115,9 @@ class CgroupReadabilityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             write_cgroup(root, quota='max', maximum=None)
             self.assertTrue(resources.CgroupMeter(root).read()['limits_readable'])
+            with open(os.path.join(root, 'cpu.max'), 'w') as stream:
+                stream.write('garbage 100000')
+            self.assertFalse(resources.CgroupMeter(root).read()['limits_readable'])
             os.unlink(os.path.join(root, 'memory.max'))
             self.assertFalse(resources.CgroupMeter(root).read()['limits_readable'])
 

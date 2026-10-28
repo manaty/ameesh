@@ -890,9 +890,14 @@ class CgroupMeter:
                 raw_ceiling = stream.read(128).strip()
             valid_ceiling = (raw_ceiling == "max" or
                              (raw_ceiling.isdigit() and int(raw_ceiling) >= 0))
+            with open(os.path.join(base, "cpu.max"), encoding="ascii") as stream:
+                raw_cpu = stream.read(128).split()
+            valid_cpu = (len(raw_cpu) == 2 and
+                         (raw_cpu[0] == "max" or
+                          (raw_cpu[0].isdigit() and int(raw_cpu[0]) > 0)))
         except (OSError, UnicodeError):
-            valid_ceiling = False
-        out["limits_readable"] = period is not None and valid_ceiling
+            valid_ceiling = valid_cpu = False
+        out["limits_readable"] = period is not None and valid_cpu and valid_ceiling
         out["mem_current_bytes"] = current
         out["mem_max_bytes"] = ceiling
         if current is not None and ceiling:
