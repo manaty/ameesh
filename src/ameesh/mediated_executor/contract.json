@@ -4506,7 +4506,8 @@
    "github_watch": "GitHub intake cursors and deduplication: notifier host only",
    "notify_liveness": "notifier liveness and off-notifier brief claims (#3007): mesh server only",
    "fingerprints": "failure fingerprints watch (#3885): mesh server only, read by the elected role",
-   "provider_credits": "crédits du compte fournisseur (#4164) : état partagé du compte, tenu par les runners du mesh ; l'exécuteur médié passe par le relais"
+   "provider_credits": "crédits du compte fournisseur (#4164) : état partagé du compte, tenu par les runners du mesh ; l'exécuteur médié passe par le relais",
+   "veille": "relevé propre à la veille (#4291) : serveur seulement, l'appareil ne lit ni n'écrit le relevé"
   },
   "operations": {
    "account_windows": [
@@ -5076,6 +5077,10 @@
     "listing",
     "mark_exhausted",
     "mark_ok"
+   ],
+   "veille": [
+    "readings",
+    "record_readings"
    ]
   }
  },
