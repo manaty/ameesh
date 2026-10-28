@@ -10,6 +10,9 @@ an ``ameesh.modules`` entry point whose name is the module name and whose target
 is a module (or object) with ``NAME`` and ``descriptor(options)``. External
 descriptors are installed code: the canon still selects them by name, and the
 SQL module guard and per-project canon admission are unchanged.
+
+The core reads modules through ``registry`` (L98), never by importing a module
+implementation.
 """
 from __future__ import annotations
 

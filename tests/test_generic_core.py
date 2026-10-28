@@ -38,9 +38,18 @@ PATTERNS = {
     "fusion": re.compile(r"fusion", re.I),
 }
 LEGACY_STATES = {"intake", "build", "qa", "merged", "promoted"}
+#: L98 (#4308): the registry is the core's interface to modules, not one of them.
+INTERFACES = {"registry"}
 MODULE_PACKAGES = {p.stem for p in (SOURCE / "modules").iterdir()
-                   if (p.is_dir() and p.name != "__pycache__")
-                   or (p.suffix == ".py" and p.stem != "__init__")}
+                   if ((p.is_dir() and p.name != "__pycache__")
+                       or (p.suffix == ".py" and p.stem != "__init__"))
+                   and p.stem not in INTERFACES}
+
+
+def _module_implementation(module: str) -> bool:
+    if not module.startswith("ameesh.modules."):
+        return False
+    return module.split(".")[2] not in INTERFACES
 
 
 def motifs(text: str) -> Counter:
@@ -77,7 +86,7 @@ def scan_python(source: str, filename: str = "reader.py") -> Counter:
                 counts.update(motifs(alias.name))
                 if alias.asname:
                     counts.update(motifs(alias.asname))
-                if alias.name.startswith("ameesh.modules."):
+                if _module_implementation(alias.name):
                     counts["module-import"] += 1
         elif isinstance(node, ast.ImportFrom):
             module = importlib.util.resolve_name("." * node.level + (node.module or ""),
@@ -86,7 +95,7 @@ def scan_python(source: str, filename: str = "reader.py") -> Counter:
                 counts.update(motifs(alias.name))
                 if alias.asname:
                     counts.update(motifs(alias.asname))
-                if module.startswith("ameesh.modules.") or (
+                if _module_implementation(module) or (
                         module == "ameesh.modules" and alias.name in MODULE_PACKAGES):
                     counts["module-import"] += 1
     return counts
@@ -150,6 +159,12 @@ class GenericCoreTest(unittest.TestCase):
                 self.assertEqual(scan_python(source, filename)["module-import"], 1)
         self.assertEqual(scan_python("from . import modules")["module-import"], 0)
         self.assertEqual(scan_python("from .modules import installed")["module-import"], 0)
+        # L98: the registry is the sanctioned way in, in every import form.
+        for source in ("from .modules import registry",
+                       "from .modules.registry import discover",
+                       "import ameesh.modules.registry"):
+            with self.subTest(source=source):
+                self.assertEqual(scan_python(source)["module-import"], 0)
 
     def test_template_includes_javascript_state_literals(self):
         self.assertEqual(scan_template("const state = 'qa'; const merged = true;"),
