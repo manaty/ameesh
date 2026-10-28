@@ -97,6 +97,8 @@ SCHEMA_KEYS = (
     "staging.before_packet_seconds",
     "accounts.pace_multipliers",
     "accounts.underused_loss",
+    "packet_tests.unit_timeout_seconds",
+    "packet_tests.parallel",
     "production.branch",
     "projects",
 )
@@ -146,6 +148,8 @@ BINDINGS = {
     "before_packet_seconds": "staging.before_packet_seconds",
     "pace_multipliers": "accounts.pace_multipliers",
     "underused_loss": "accounts.underused_loss",
+    "unit_timeout_seconds": "packet_tests.unit_timeout_seconds",
+    "unit_tests_parallel": "packet_tests.parallel",
     "production_branch": "production.branch",
 }
 
@@ -190,6 +194,7 @@ DICT_BINDINGS = {
     "before_packet_seconds": "staging.before_packet_seconds",
     "pace_multipliers": "accounts.pace_multipliers",
     "underused_loss": "accounts.underused_loss",
+    "unit_timeout_seconds": "packet_tests.unit_timeout_seconds",
 }
 #: clés du bloc `prevalidation` dans un mapping, seulement dans un fichier
 #: qui parle de prévalidation
@@ -474,7 +479,7 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "backlog.lot_min_value":
         # #2584 : un score de valeur (1 à 100), le seuil d'un lot du canon §2
         return type(value) is int and 1 <= value <= 100
-    if key.startswith("staging."):
+    if key.startswith("staging.") or key.startswith("packet_tests."):
         # #3291 : un seuil de lots ou une marge en secondes, entiers positifs
         return type(value) is int and value > 0
     if key == "accounts.underused_loss":
@@ -519,6 +524,10 @@ def _binding_key(name: str, value, train_context: bool,
         key = "accounts.underused_loss"
     if key is None and lower.endswith("pace_multipliers"):
         key = "accounts.pace_multipliers"
+    if key is None and lower.endswith("unit_timeout_seconds"):
+        key = "packet_tests.unit_timeout_seconds"
+    if key is None and lower.endswith("unit_tests_parallel"):
+        key = "packet_tests.parallel"
     if key is None:
         return None
     if key == "timezone" and not train_context:
