@@ -1049,17 +1049,41 @@ def _dedupe_modules(worktree: Path, modules) -> list[str]:
     return out
 
 
-def save_test_log(run: TestRun) -> TestRun:
-    """Preuve locale privée, hors arbre jetable ; 48 h et 100 séries au plus."""
-    from ameesh.config import load
+def _state_dir() -> str:
+    """Le script n'a que la bibliothèque standard (voir `project_python`) :
+    sans le paquet `ameesh` importable, le défaut de `ameesh.config`."""
+    try:
+        from ameesh.config import load
+        return load().state_dir
+    except (ImportError, SystemExit):
+        return os.path.expanduser("~/.local/state/ameesh")
 
-    root = Path(load().state_dir) / "roles" / "mesh-design" / "test-logs"
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def save_test_log(run: TestRun) -> TestRun:
+    """Preuve locale privée, hors arbre jetable ; 48 h et 100 séries au plus.
+
+    Au mieux : un journal impossible à écrire ne change rien à la série."""
+    try:
+        return _save_test_log(run)
+    except Exception as exc:  # noqa: BLE001 — la preuve ne retient pas la série
+        print("journal de série non conservé : %s" % exc, file=sys.stderr)
+        return run
+
+
+def _save_test_log(run: TestRun) -> TestRun:
+    root = Path(_state_dir()) / "roles" / "mesh-design" / "test-logs"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    files = sorted(root.glob("series-*.log"), key=lambda p: p.stat().st_mtime,
-                   reverse=True)
+    files = sorted(root.glob("series-*.log"), key=_mtime, reverse=True)
     cutoff = time.time() - 48 * 3600
     for index, path in enumerate(files):
-        if index >= 99 or path.stat().st_mtime < cutoff:
+        if index >= 99 or _mtime(path) < cutoff:
             path.unlink(missing_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="series-",
                                      suffix=".log", dir=root, delete=False) as log:

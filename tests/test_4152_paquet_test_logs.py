@@ -41,3 +41,16 @@ class SeriesLogsTest(unittest.TestCase):
             self.assertFalse(old.exists())
             self.assertTrue(recent.exists())
             self.assertTrue(pathlib.Path(run.log_path).exists())
+
+    def test_log_failure_never_breaks_series(self):
+        with mock.patch.object(paquet_auto, '_state_dir', side_effect=ImportError('ameesh')), \
+                mock.patch.object(paquet_auto, 'project_python', return_value='python'), \
+                mock.patch.object(paquet_auto, 'run_command', return_value=subprocess.CompletedProcess([], 0, b'', b'OK')):
+            run = paquet_auto.run_tests(pathlib.Path('.'), 'contrats', ['tests.x'], timeout=30)
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(run.log_path, '')
+        self.assertNotIn('journal local', '\n'.join(paquet_auto._inconclusive_lines([run])))
+
+    def test_state_dir_without_ameesh_package(self):
+        with mock.patch.dict('sys.modules', {'ameesh.config': None}):
+            self.assertEqual(paquet_auto._state_dir(), os.path.expanduser('~/.local/state/ameesh'))
