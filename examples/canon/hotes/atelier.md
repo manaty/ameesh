@@ -7,7 +7,8 @@ policy:
   harnesses: [claude, codex, deepseek]   # absent = tous
   providers: [anthropic, openai, deepseek]
   credential_modes: [api-key, subscription]
-  work_roots: {acme-web: ~/acme/acme-web}
+  workspaces:
+    roots: {acme-web: ~/acme/acme-web}
   max_agents: 4
 ---
 

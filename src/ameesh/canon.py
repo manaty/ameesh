@@ -1031,6 +1031,13 @@ def work_template_problem(path: str) -> str | None:
 WORK_FROM_HOST = ("work_dirs", "work_roots", "work_root")
 WORK_FROM_PLACEMENT = "placement"
 
+#: L101 : clés de la forme canonique `policy.workspaces` et les anciennes clés
+#: qu'elles remplacent, lues comme alias sans date de retrait. `HostPolicy`
+#: garde ses champs historiques : la normalisation est faite au parse.
+WORKSPACES_FIELDS = ("dirs", "roots", "root", "housekeeping")
+LEGACY_WORKSPACES = {"dirs": "work_dirs", "roots": "work_roots",
+                     "root": "work_root", "housekeeping": "housekeeping"}
+
 
 def work_dir_for(host: "Host | None", agent: "Agent", admission: "Placement | None"
                  ) -> tuple[str | None, str | None]:
@@ -3669,19 +3676,6 @@ class _Loader:
             # seuil, qui retombe alors sur sa valeur par défaut prudente).
             if raw.get("resources") is not None:
                 policy.resources = self._host_resources(raw["resources"], where, subject)
-            # Ménage (L73) : dossiers gérés, quotas, alerte tmpfs ; une clé
-            # illisible est une erreur et prend sa valeur par défaut.
-            if raw.get("housekeeping") is not None:
-                from . import menage as menage_mod  # import tardif : pas de cycle
-                parsed, problems, unknown = menage_mod.parse_policy(raw["housekeeping"])
-                for problem in problems:
-                    self.add("host-policy-invalid", ERROR,
-                             "`policy.housekeeping`: %s" % problem, **where, **subject)
-                for key in unknown:
-                    self.add("host-housekeeping-unknown", WARNING,
-                             "`policy.housekeeping.%s`: unknown key (ignored)" % key,
-                             **where, **subject)
-                policy.housekeeping = parsed or None
             # L159a: the offer of a lending host; unreadable, it is dropped
             # whole (fail closed: the host lends nothing)
             if raw.get("lend") is not None:
@@ -3702,39 +3696,9 @@ class _Loader:
                              "`policy.lend.%s`: unknown key (ignored)" % key,
                              **where, **subject)
                 policy.lend = offer
-            # Racines de travail (L31, 0029) : le dossier de travail d'une
-            # session est un réglage de l'hôte, plus du placement.
-            # L35 : `work_dirs` (par agent) et le gabarit `{agent}` ; tout
-            # chemin déclaré doit être un texte non vide au gabarit connu (un
-            # chemin refusé n'est pas retenu : fail closed, pas de dossier).
-            if raw.get("work_root") is not None:
-                problem = work_template_problem(raw.get("work_root"))
-                if problem:
-                    self.add("host-policy-invalid", ERROR,
-                             "`policy.work_root`: %s" % problem, **where, **subject)
-                else:
-                    policy.work_root = str(raw["work_root"]).strip()
-            for key, label in (("work_roots", "project"), ("work_dirs", "agent")):
-                mapping = raw.get(key)
-                if mapping is None:
-                    continue
-                if not isinstance(mapping, dict) or not mapping:
-                    self.add("host-policy-invalid", ERROR,
-                             "`policy.%s`: mapping {%s: path} expected" % (key, label),
-                             **where, **subject)
-                    continue
-                kept: dict = {}
-                for k, v in mapping.items():
-                    problem = ("empty key" if not isinstance(k, str) or not k.strip()
-                               else work_template_problem(v))
-                    if problem:
-                        self.add("host-policy-invalid", ERROR,
-                                 "`policy.%s.%s`: %s" % (key, k, problem),
-                                 **where, **subject)
-                        continue
-                    kept[k.strip()] = v.strip()
-                if kept:
-                    setattr(policy, key, kept)
+            # L101 : espace de travail et ménage, forme canonique
+            # `policy.workspaces` ; les anciennes clés restent lues en alias.
+            self._host_workspaces(raw, policy, where, subject)
         tags = self._list(fiche, "tags", where, "host-tags-invalid", **subject)
         admins = self._list(fiche, "admins", where, "host-admins-invalid", **subject)
         occupants = self._list(fiche, "occupants", where, "host-occupants-invalid", **subject)
@@ -3881,6 +3845,97 @@ class _Loader:
                      "`policy.resources.%s`: unknown key (ignored)" % unknown,
                      **where, **subject)
         return parsed or None
+
+    def _host_workspaces(self, raw: dict, policy: HostPolicy, where: dict,
+                         subject: dict) -> None:
+        """L101 : `policy.workspaces`, les anciennes clés en alias.
+
+        Forme canonique : `workspaces: {dirs, roots, root, housekeeping}`.
+        Les clés historiques `work_dirs`, `work_roots`, `work_root` et
+        `housekeeping` restent lues (avertissement `host-policy-legacy-key`,
+        sans date de retrait). Donner les deux formes pour la même clé est
+        ambigu : erreur `host-policy-invalid`, et la clé n'est pas retenue.
+        `HostPolicy` garde ses champs historiques : la normalisation est ici.
+        """
+        workspaces = raw.get("workspaces")
+        if workspaces is not None and not isinstance(workspaces, dict):
+            self.add("host-policy-invalid", ERROR,
+                     "`policy.workspaces`: mapping expected", **where, **subject)
+            workspaces = None
+        if isinstance(workspaces, dict):
+            for key in sorted(set(map(str, workspaces)) - set(WORKSPACES_FIELDS)):
+                self.add("host-workspaces-unknown", WARNING,
+                         "`policy.workspaces.%s`: unknown key (ignored)" % key,
+                         **where, **subject)
+
+        def value(field: str) -> tuple[Any, str | None]:
+            """(valeur, chemin YAML) de la forme neuve ou de son ancien alias."""
+            legacy = LEGACY_WORKSPACES[field]
+            new_value = workspaces.get(field) if isinstance(workspaces, dict) else None
+            old_value = raw.get(legacy)
+            if new_value is not None and old_value is not None:
+                self.add("host-policy-invalid", ERROR,
+                         "`policy.workspaces.%s` and the legacy `policy.%s` both "
+                         "declare the same setting: keep one form" % (field, legacy),
+                         **where, **subject)
+                return None, None
+            if old_value is not None:
+                self.add("host-policy-legacy-key", WARNING,
+                         "`policy.%s` is a legacy key: write `policy.workspaces.%s`"
+                         % (legacy, field), **where, **subject)
+                return old_value, "policy.%s" % legacy
+            if new_value is not None:
+                return new_value, "policy.workspaces.%s" % field
+            return None, None
+
+        # Racines de travail (L31, 0029) : le dossier de travail d'une session
+        # est un réglage de l'hôte, plus du placement. L35 : `dirs` (par agent)
+        # et le gabarit `{agent}` ; tout chemin déclaré doit être un texte non
+        # vide au gabarit connu (un chemin refusé n'est pas retenu : fail
+        # closed, pas de dossier).
+        root, path = value("root")
+        if root is not None:
+            problem = work_template_problem(root)
+            if problem:
+                self.add("host-policy-invalid", ERROR,
+                         "`%s`: %s" % (path, problem), **where, **subject)
+            else:
+                policy.work_root = str(root).strip()
+        for field, label in (("roots", "project"), ("dirs", "agent")):
+            mapping, path = value(field)
+            if mapping is None:
+                continue
+            if not isinstance(mapping, dict) or not mapping:
+                self.add("host-policy-invalid", ERROR,
+                         "`%s`: mapping {%s: path} expected" % (path, label),
+                         **where, **subject)
+                continue
+            kept: dict = {}
+            for k, v in mapping.items():
+                problem = ("empty key" if not isinstance(k, str) or not k.strip()
+                           else work_template_problem(v))
+                if problem:
+                    self.add("host-policy-invalid", ERROR,
+                             "`%s.%s`: %s" % (path, k, problem),
+                             **where, **subject)
+                    continue
+                kept[k.strip()] = v.strip()
+            if kept:
+                setattr(policy, LEGACY_WORKSPACES[field], kept)
+        # Ménage (L73) : dossiers gérés, quotas, alerte tmpfs ; une clé
+        # illisible est une erreur et prend sa valeur par défaut.
+        housekeeping, path = value("housekeeping")
+        if housekeeping is not None:
+            from . import menage as menage_mod  # import tardif : pas de cycle
+            parsed, problems, unknown = menage_mod.parse_policy(housekeeping)
+            for problem in problems:
+                self.add("host-policy-invalid", ERROR,
+                         "`%s`: %s" % (path, problem), **where, **subject)
+            for key in unknown:
+                self.add("host-housekeeping-unknown", WARNING,
+                         "`%s.%s`: unknown key (ignored)" % (path, key),
+                         **where, **subject)
+            policy.housekeeping = parsed or None
 
     def _build_placement(self, fiche: Fiche, where: dict) -> None:
         subject = {"agent": _text(fiche.data.get("agent")) or fiche.title}
@@ -4620,7 +4675,7 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
         for name in sorted(host.policy.work_dirs or {}):
             if name not in agent_names:
                 add("host-work-dir-agent-unknown", WARNING,
-                    "policy of host %s: `work_dirs.%s` names no agent of the canon"
+                    "policy of host %s: `workspaces.dirs.%s` names no agent of the canon"
                     % (host.title, name), host.fiche, host=host.title)
     # #3101 : une admission épinglée prend une place sur chaque hôte couvert ;
     # un rôle élu n'en prend qu'une, sur l'un de ses candidats (seul l'hôte
@@ -4701,13 +4756,14 @@ def _check_work_dir(add, agent: Agent, host: Host, placement: Placement) -> None
     elif placement.cwd:
         add("admission-cwd-inherited", WARNING,
             "%s on %s: cwd inherited from the Placement card (%s), transitional fallback — "
-            "migrate to the host's `policy.work_dirs` / `work_roots` (fallback removed "
-            "in v1.5.0 at the latest)" % (agent.title, host.title, placement.cwd), where,
+            "migrate to the host's `policy.workspaces.dirs` / `roots` (legacy `work_dirs` / "
+            "`work_roots` still read; fallback removed in v1.5.0 at the latest)"
+            % (agent.title, host.title, placement.cwd), where,
             agent=agent.title)
     elif not found:
         add("host-work-dir-missing", WARNING,
-            "%s on %s: no working directory — declare `policy.work_dirs`, "
-            "`work_roots` or `work_root` in the host card" % (agent.title, host.title),
+            "%s on %s: no working directory — declare `policy.workspaces.dirs`, "
+            "`roots` or `root` in the host card" % (agent.title, host.title),
             host.fiche, agent=agent.title, host=host.title)
 
 

@@ -1787,17 +1787,18 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             verdict.ok = False
             verdict.diagnostic = _card_error_text(card_errors) + (
                 "; " + verdict.diagnostic if verdict.diagnostic else "")
-        # Dossier de travail (L31, 0029 ; L35) : politique de l'hôte d'abord
-        # (`work_dirs[agent]`, `work_roots[projet]`, `work_root`), repli
+        # Dossier de travail (L31, 0029 ; L35 ; L101) : politique de l'hôte
+        # d'abord (`workspaces.dirs[agent]`, `roots[projet]`, `root`), repli
         # transitoire sur le `cwd` d'une ancienne fiche Placement, noté ici.
         cwd, cwd_source = canon_mod.work_dir_for(canon.host(host), agent, admission)
         notes: list[str] = []
         if cwd_source == canon_mod.WORK_FROM_PLACEMENT:
             notes.append("cwd inherited from the Placement card (%s), to migrate to "
-                         "the host's policy.work_dirs / work_roots" % cwd)
+                         "the host's policy.workspaces.dirs / roots (legacy work_dirs / "
+                         "work_roots still read)" % cwd)
         elif cwd is None:
-            notes.append("no working directory: declare policy.work_dirs / "
-                         "work_roots / work_root in the host card")
+            notes.append("no working directory: declare policy.workspaces.dirs / "
+                         "roots / root in the host card")
         values = {
             "harness": agent.harness or "other",
             "host": host,

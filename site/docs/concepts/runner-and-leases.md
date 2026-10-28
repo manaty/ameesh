@@ -128,17 +128,22 @@ The directory where the runner starts an agent's harness is a setting of the
 **host**, not of the placement (since v1.3.0). `canon sync` copies it into the
 registry's `cwd` column. The first path found wins:
 
-1. `policy.work_dirs[<agent>]` (v1.3.1);
-2. `policy.work_roots[<team>]`;
-3. `policy.work_root/<team>`.
+1. `policy.workspaces.dirs[<agent>]` (v1.3.1);
+2. `policy.workspaces.roots[<team>]`;
+3. `policy.workspaces.root/<team>`.
 
 All three accept the `{agent}` template (v1.3.1), for one worktree per agent:
 
 ```yaml
 policy:
-  work_roots: {acme-web: "~/src/acme-web-{agent}"}   # one worktree per agent
-  work_dirs: {docs-writer: ~/src/acme-docs}          # a named exception
+  workspaces:
+    roots: {acme-web: "~/src/acme-web-{agent}"}   # one worktree per agent
+    dirs: {docs-writer: ~/src/acme-docs}          # a named exception
 ```
+
+The legacy keys `work_dirs`, `work_roots` and `work_root` are still read, with
+a `host-policy-legacy-key` warning and no removal date; the same key in both
+forms is a `host-policy-invalid` error.
 
 - **Transitional fallback.** If the policy gives nothing for an agent, the
   `cwd` of its old `Placement` card is used; `canon check` warns
@@ -298,8 +303,8 @@ ameesh run stop <name>        # no new lease; the current turn finishes
 
 An agent with several declared `projects` keeps its registry `cwd` for the
 primary project. A lot of another project uses that project's Host
-`work_roots` or `work_root`, expanding `{agent}`; the agent's `work_dirs`
-override applies to the primary project. Prepare that directory before
+`workspaces.roots` or `workspaces.root`, expanding `{agent}`; the agent's
+`workspaces.dirs` override applies to the primary project. Prepare that directory before
 automatic pick-up: the runner does not clone a repository or create an empty
 directory. A missing or ambiguous secondary directory leaves the lot
 unassigned; an explicitly assigned lot waits until its directory is ready —

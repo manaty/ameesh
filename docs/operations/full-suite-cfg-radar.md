@@ -137,9 +137,9 @@ branche de release et les refs de la cible, et être **fetché** avant un contr�
 
 Sur `pc-smichea`, il n'y a **pas de clone partagé unique** : la fiche Host
 (`canon/hotes/pc-smichea.md`) donne des dossiers **par agent** —
-`policy.work_roots` : `ameesh: ~/development/manaty/{agent}`,
+`policy.workspaces.roots` : `ameesh: ~/development/manaty/{agent}`,
 `nexlink: ~/development/manaty/nexlink-{agent}` — avec les exceptions
-`work_dirs` : `mesh-design` → `~/development/manaty/ameesh-claude3`,
+`workspaces.dirs` : `mesh-design` → `~/development/manaty/ameesh-claude3`,
 `orchestrateur` → `~/development/manaty`, `auditeur` →
 `~/development/manaty/auditeur`, `bureau` → `~/Work`. Avant d'écrire, relever le
 clone **réellement lu** par l'acteur qui lance les contrôles de release

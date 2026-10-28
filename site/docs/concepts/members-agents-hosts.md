@@ -105,15 +105,16 @@ policy:
     stop_battery_percent: 10            # on battery: clean stop below
     max_cpu_pressure: 20%               # CPU pressure (PSI some, 60 s): no new turn above
     max_mem_pressure: 10%               # memory pressure (PSI some, 60 s); default 10 % (#2296)
-  work_roots: {example-web: /srv/example-org/example-web}   # working directory per team (v1.3.0)
-  work_root: /srv                               # default: work_root/<team>
-  work_dirs: {ouvrier: /srv/example-org/ouvrier}       # per agent, wins over the above (v1.3.1)
+  workspaces:
+    roots: {example-web: /srv/example-org/example-web}   # working directory per team (v1.3.0)
+    root: /srv                                           # default: root/<team>
+    dirs: {ouvrier: /srv/example-org/ouvrier}            # per agent, wins over the above (v1.3.1)
 ```
 
 The host's responsible human sets the rules of their machine, for example "only
 DeepSeek and Codex agents, billed by API key". The host also decides **where**
-agents work: the working directory is `policy.work_dirs[<agent>]`, else
-`policy.work_roots[<team>]`, else `policy.work_root/<team>`, and each accepts
+agents work: the working directory is `policy.workspaces.dirs[<agent>]`, else
+`policy.workspaces.roots[<team>]`, else `policy.workspaces.root/<team>`, and each accepts
 the `{agent}` template (`/srv/example-org/example-web-{agent}`: one worktree per agent).
 See [Runner and leases](runner-and-leases.md#working-directory) for the
 transitional fallback and what the runner does when the directory is missing,
@@ -144,8 +145,8 @@ Older cards (a single `host:`, a `cwd:`) are still read: `host` is a single
 admitted host. Their `cwd` is ignored when the host's policy gives a directory
 (`admission-cwd-ignored`); when it does not, it is used as a **transitional
 fallback** with the warning `admission-cwd-inherited`. That fallback is removed
-in v1.5.0 at the latest: move working directories to `policy.work_dirs` /
-`work_roots`.
+in v1.5.0 at the latest: move working directories to `policy.workspaces.dirs` /
+`roots`.
 
 **Governed placement.** The project's responsible human decides where an agent
 runs, within the policy of the host's responsible human. For every canon agent
