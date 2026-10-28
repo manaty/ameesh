@@ -150,8 +150,8 @@ repris par un autre hôte candidat à une époque supérieure : c’est la relè
 normale du §11, consignée en WARNING (reprise locale non concluante) sans
 retour arrière. Une réservation `@restart` écrite par l’exécuteur arrêté
 n’y change rien : un hôte encore sur l’ancien code l’ignore et elle expire
-en 90 s. L’échec ne tient que si le rôle reste sans titulaire au-delà du
-délai de relève. En cas d’échec, la commande indique l’unité et la commande
+en 90 s. L’échec tient si aucun autre hôte candidat ne détient un bail
+vivant au moment du contrôle. En cas d’échec, la commande indique l’unité et la commande
 `journalctl --user` à lancer sous `ameesh` sur la VM.
 
 ## Installer une révision gelée, revenir en arrière
