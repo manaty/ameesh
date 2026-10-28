@@ -980,15 +980,21 @@ def roadmap_waiting(db: Db, project: str, *, now: float | None = None) -> list:
     hors file d'amélioration (`unassigned_lots`, dépendances fusionnées),
     prenable (`lot_takeable` : ni décision, ni production, équipe connue, début
     prévu échu), sans attente planifiée (`waiting_project_lots`), qui n'est ni
-    une relecture après fusion ni une suite d'avis."""
+    une relecture après fusion ni une suite d'avis.
+
+    #4250 : la portée réelle est celle de `unassigned_lots` — la file des lots
+    non assignés de TOUS les projets, dans la limite que fixe l'appelant — puis
+    le filtre du projet ; seuls les holds des candidats du projet sont lus
+    (#3565)."""
     from . import review_lot, sous_utilisation
     project = str(project or "").strip()
     if not project:
         return []
     stamp = time.time() if now is None else float(now)
     today = time.strftime("%Y-%m-%d", time.localtime(stamp))
-    # #3565 : le projet filtre AVANT la lecture des holds — seuls les candidats
-    # du projet sont lus, au lieu des 200 lots de tous les projets.
+    # #3565 : le projet filtre AVANT la lecture des holds — seuls les holds des
+    # candidats du projet sont lus. La file elle-même (`unassigned_lots`) couvre
+    # tous les projets : c'est le coût réel de ce passage, revu au panier #4250.
     candidates = [item for item in storage.of(db).work.unassigned_lots(200)
                   if _lot_project(item) == project]
     holds = _take_holds(db, candidates)

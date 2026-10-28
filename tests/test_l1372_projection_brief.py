@@ -185,16 +185,45 @@ class ProjectionLectureTest(_TmpMixin, unittest.TestCase):
         self.assertIn("process-rules-block-too-long", codes(findings))
         self.assertEqual(loaded.processes[0].projection_error, "")
 
+    def test_un_bloc_valide_pour_l_hote_recent_echoue_pour_l_hote_en_retard(self):
+        # #4250 : pendant un staging, un hôte encore en 1.26.0 coupe les briefs
+        # à 14 998 octets de règles alors que l'hôte local (1.27.0) en accepte
+        # 17 498. Un bloc entre les deux doit échouer : `canon check` mesure
+        # avec la limite de la plus ancienne version servie, pas la locale.
+        entre = (canon.RULES_BLOC_ROOM_COMPAT + canon.RULES_BLOC_ROOM) // 2
+        self.assertGreater(entre, canon.RULES_BLOC_ROOM_COMPAT)
+        self.assertLess(entre, canon.RULES_BLOC_ROOM)
+        loaded = self.charge(carte_longue("a" * entre))
+        findings = canon.validate(loaded)
+        self.assertNotIn("process-projection-too-long", codes(findings))
+        trop = [f for f in findings if f.code == "process-rules-block-too-long"]
+        self.assertEqual(len(trop), 1, sorted(codes(findings)))
+        self.assertEqual(trop[0].severity, canon.ERROR)
+        self.assertIn(str(canon.RULES_BLOC_LIMIT_COMPAT), trop[0].message)
+        self.assertNotIn(str(canon.RULES_BLOC_LIMIT), trop[0].message)
+        self.assertTrue(canon.errors(findings))
+        # sujet Process : le constat fait échouer `canon check` sans bloquer
+        # la réclamation d'un agent.
+        self.assertEqual(canon.blocking(findings).global_errors, [])
+        # le même bloc tenait dans la limite locale d'avant #4250.
+        rules, diags = _regles(loaded)
+        self.assertIn(rules, reprise._rules_bloc(
+            rules, canon.RULES_BLOC_LIMIT, diags))
+        self.assertNotIn(rules, reprise._rules_bloc(
+            rules, canon.RULES_BLOC_LIMIT_COMPAT, diags))
+
     def _fixe(self) -> int:
         """Octets du bloc hors projection (en-tête, pied, autres cartes)."""
         loaded = self.charge(carte_longue("a"))
         rules, _ = _regles(loaded)
-        return len(reprise._rules_bloc(rules, canon.RULES_BLOC_LIMIT).encode()) - 1
+        return len(reprise._rules_bloc(
+            rules, canon.RULES_BLOC_LIMIT_COMPAT).encode()) - 1
 
     def test_le_preavis_a_90_pourcent_mesure_le_bloc_en_octets_utf8(self):
-        # #3137, #3867 : le prédicat est `bloc * 10 >= LIMIT * 9`, soit
-        # `bloc >= ⌈9·LIMIT/10⌉`, sur le bloc ENTIER (pas la projection seule).
-        seuil = (canon.RULES_BLOC_LIMIT * 9 + 9) // 10 - self._fixe()
+        # #3137, #3867, #4250 : le prédicat est `bloc * 10 >= LIMIT * 9`, soit
+        # `bloc >= ⌈9·LIMIT/10⌉`, sur le bloc ENTIER (pas la projection seule),
+        # avec la limite de la plus ancienne version servie.
+        seuil = (canon.RULES_BLOC_LIMIT_COMPAT * 9 + 9) // 10 - self._fixe()
         for taille in (seuil - 1, seuil, seuil + 1):
             with self.subTest(octets=taille):
                 texte = "é" * (taille // 2) + "a" * (taille % 2)
@@ -207,7 +236,8 @@ class ProjectionLectureTest(_TmpMixin, unittest.TestCase):
                 if preavis:
                     self.assertEqual(preavis[0].severity, canon.WARNING)
                     self.assertIn(TITRE, preavis[0].message)
-                    self.assertIn(str(canon.RULES_BLOC_LIMIT), preavis[0].message)
+                    self.assertIn(str(canon.RULES_BLOC_LIMIT_COMPAT),
+                                  preavis[0].message)
                 self.assertEqual(canon.blocking(findings).global_errors, [])
 
     def test_deux_cartes_sous_budget_debordent_ensemble(self):
@@ -423,6 +453,14 @@ class ProjectionBriefTest(_TmpMixin, PgTestCase):
         self.assertEqual(canon.RULES_BLOC_LIMIT, 17498)
         self.assertEqual(canon.RULES_BLOC_ROOM, 17419)
         self.assertEqual(canon.PROCESS_PROJECTION_MAX, canon.RULES_BLOC_ROOM)
+        # #4250 : le contrôle du bloc se fait à la limite de la plus ancienne
+        # version servie (1.26.0) tant qu'un hôte peut y rester — jamais à la
+        # seule limite de l'hôte local, sinon la PR de canon casse son brief.
+        self.assertEqual(canon.BRIEF_MAX_BYTES_COMPAT, 19000)
+        self.assertEqual(canon.BRIEF_TEXT_MIN_BYTES_COMPAT, 4000)
+        self.assertEqual(canon.RULES_BLOC_LIMIT_COMPAT, 14998)
+        self.assertEqual(canon.RULES_BLOC_ROOM_COMPAT, 14919)
+        self.assertLessEqual(canon.RULES_BLOC_LIMIT_COMPAT, canon.RULES_BLOC_LIMIT)
 
     def test_le_plafond_nominal_de_consigne_et_le_pire_cas_sont_documentes(self):
         # #3137 : un brief plein (BRIEF_MAX_BYTES) et son cadre de reprise
