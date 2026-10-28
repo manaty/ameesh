@@ -16,6 +16,10 @@
 # The tick is a no-op while no adoption is open. It refuses to switch a host
 # when the next release cutoff is less than 20 minutes away, or while a turn
 # of the harness is running on that host (spec §4).
+#
+# The installed-binary map is read from ~/.config/ameesh/harness-adoption.json
+# (or AMEESH_HARNESS_ADOPTION_BINS): explicit per harness/version/host paths.
+# The report's new_binary covers the canary host only.
 [Unit]
 Description=ameesh harness adoption (harness/model versions, #4293)
 After=network-online.target

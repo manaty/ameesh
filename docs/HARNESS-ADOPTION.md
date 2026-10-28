@@ -81,8 +81,8 @@ reste accepté pour un rapport fourni à la main ; il porte les champs ci-dessou
 - `quality.regression` : `true` suffit à refuser.
 - `price.kind` : `equal`, `higher`, `new_provider` ou `plan_change`.
 - `bounds` : au moins `cost_usd` ou `duration_s` ; sans borne mesurable, pas
-  de canari concluant. `new_binary` est le binaire que le timer utilisera par
-  défaut sur chaque hôte quand aucun `--bin` n'est donné.
+  de canari concluant. `new_binary` ne sert que de binaire de canari (exécutable
+  sur l'hôte du tick) ; les autres hôtes passent par la carte explicite.
 - Un rapport est **figé** sur son lot avec son empreinte ; un second rapport
   différent sur le même lot est refusé (une nouvelle évaluation est un lot).
 
@@ -126,9 +126,19 @@ ameesh harness rollback-adoption 4278 --reason "régression observée sur agents
 `--agent NOM` force l'agent du canari (il doit être sur la version évaluée) ;
 par défaut, le premier agent au repos de cette version (un agent qui tourne
 n'est jamais candidat). `--requester NOM` désigne l'agent qui dépose la
-décision owner (par défaut l'assigné du lot). `--bin` est facultatif : sans
-lui, le `new_binary` du rapport B sert de chemin par défaut sur chaque hôte ;
-un `--bin HOTE=CHEMIN` le surcharge. La décision owner est **signée**
+décision owner (par défaut l'assigné du lot). `--bin` est facultatif pour le
+canari : `new_binary` du rapport B y sert de chemin (il doit être exécutable
+sur l'hôte du tick). Pour les **autres** hôtes, aucune valeur par défaut : il
+faut la carte explicite `AMEESH_HARNESS_ADOPTION_BINS` (ou
+`~/.config/ameesh/harness-adoption.json`) :
+
+```json
+{"bins": {"deepseek": {"0.2.1-rc.4": {
+  "ameesh-agents-1": "/opt/harness/0.2.1-rc.4/bin/dsh",
+  "ameesh-agents-2": "/opt/harness/0.2.1-rc.4/bin/dsh"}}}}
+```
+
+Un `--bin HOTE=CHEMIN` surcharge la carte. La décision owner est **signée**
 (`needs_signature`) et sa preuve est revérifiée avant chaque geste.
 
 Le tick **découvre** aussi les lots d'évaluation ouverts dont le titre
@@ -144,7 +154,9 @@ l'hôte du tick (même hôte, ou chemin partagé).
 ## Canari et bascule
 
 1. **Canari** : un agent de la version évaluée passe sur la nouvelle version
-   (ou le nouveau modèle). Il dure **24 h ou 10 tours** ; les tours sont lus
+   (ou le nouveau modèle). Il dure **24 h ou 10 tours** ; son démarrage est
+   soumis à la même fenêtre de 20 minutes qu'une bascule (calendrier
+   illisible = pas de canari). Les tours sont lus
    dans `turn_costs` (médiane du coût et de la durée). Si une médiane sort des
    bornes du rejeu, ou si aucun tour n'a été mesuré, l'agent est remis sur la
    version précédente et l'adoption est refusée.
@@ -197,6 +209,10 @@ systemctl --user daemon-reload
 systemctl --user enable --now ameesh-harness-adoption.timer
 journalctl --user -u ameesh-harness-adoption -f
 ```
+
+La carte des binaires installés (voir plus haut) est lue automatiquement par
+le tick ; `new_binary` ne couvre que l'hôte du canari, et un binaire absent ou
+non exécutable sur l'hôte du tick est refusé avant tout geste.
 
 Le tick est sans effet tant qu'aucune adoption n'est ouverte. Un seul tick
 tourne à la fois (verrou consultatif en base) ; plusieurs hôtes peuvent porter

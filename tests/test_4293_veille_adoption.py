@@ -142,6 +142,11 @@ class ReportRuleTest(unittest.TestCase):
         self.assertAlmostEqual(report.bounds["cost_usd"][0], 0.009)
         self.assertAlmostEqual(report.bounds["cost_usd"][1], 0.011)
         self.assertEqual(report.bounds["duration_s"], [9.0, 11.0])
+        # la projection 7 jours est dérivée : elle ne change pas l'identité
+        self.assertEqual(veille.from_b_replay(b_report(), 7,
+                                              projected_7d_usd=1.0).digest,
+                         veille.from_b_replay(b_report(), 7,
+                                              projected_7d_usd=2.0).digest)
 
     def test_a_more_expensive_model_from_the_schedule_is_not_equal(self):
         """deepseek-flash -> deepseek-pro : le barème de cost.py tranche,
@@ -237,21 +242,28 @@ class AdoptionTest(PgTestCase):
                 self.db, name, chantier="ameesh", harness="deepseek", host=host,
                 cwd=self.tmp, session_id=None, status="idle", status_text="",
                 model="deepseek-flash", budget_usd=None)
+        self.old_bin = os.path.join(self.tmp, "old-dsh")
+        self.new_bin = os.path.join(self.tmp, "new-dsh")
+        for path in (self.old_bin, self.new_bin):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\n")
+            os.chmod(path, 0o755)
         self.db.execute(
             "INSERT INTO harness_versions (host, harness, path, version) VALUES"
-            " ('h1', 'deepseek', '/opt/old/dsh', '0.2.0-rc.2'),"
-            " ('h2', 'deepseek', '/opt/old/dsh', '0.2.0-rc.2')")
+            " ('h1', 'deepseek', %s, '0.2.0-rc.2'),"
+            " ('h2', 'deepseek', %s, '0.2.0-rc.2')",
+            (self.old_bin, self.old_bin))
+        self.rules = Rules(30 * 60)
         self.item = work.add(self.db, title="Évaluer dsh 0.2.1-rc.4", app="ameesh",
                              assignee="canary")
         self.lot = int(self.item["id"])
-        self.bins = {"h1": "/opt/harness/0.2.1-rc.4/bin/dsh",
-                     "h2": "/opt/harness/0.2.1-rc.4/bin/dsh"}
+        self.bins = {"h1": self.new_bin, "h2": self.new_bin}
 
     def _report(self, **over):
         data = report(**over)
         data["evaluation_lot"] = self.lot
-        data.setdefault("old_binary", "/opt/old/dsh")
-        data.setdefault("new_binary", self.bins["h1"])
+        data.setdefault("old_binary", self.old_bin)
+        data.setdefault("new_binary", self.new_bin)
         return veille.Report(data)
 
     def _turn(self, agent, usd, duration, at):
@@ -268,7 +280,7 @@ class AdoptionTest(PgTestCase):
 
     def test_automatic_adoption_goes_canary_then_host_by_host(self):
         result = veille.adopt(self.cfg, self.db, self.lot, self._report(),
-                              bins=self.bins, now=1000.0)
+                              bins=self.bins, now=1000.0, rules=self.rules)
         self.assertEqual(result["result"], "canary")
         self.assertEqual(self._bins(), {
             "canary": self.bins["h1"], "impl": None, "other": None})
@@ -310,7 +322,7 @@ class AdoptionTest(PgTestCase):
 
     def test_a_running_turn_holds_the_host_switch(self):
         veille.adopt(self.cfg, self.db, self.lot, self._report(), bins=self.bins,
-                     now=1000.0)
+                     now=1000.0, rules=self.rules)
         for _ in range(10):
             self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
         veille.tick(self.cfg, self.db, now=1000.0 + 5000, rules=Rules(30 * 60))
@@ -321,9 +333,34 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(out["adoptions"][0]["result"], "waiting_turn")
         self.assertIsNone(self._bins()["impl"])
 
+    def test_canary_waits_for_a_cutoff_and_resumes(self):
+        """La garde des 20 minutes couvre le démarrage du canari aussi."""
+        blocked = veille.adopt(self.cfg, self.db, self.lot, self._report(),
+                               bins=self.bins, now=1000.0,
+                               rules=Rules(5 * 60))
+        self.assertEqual(blocked["result"], "blocked")
+        self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
+        out = veille.tick(self.cfg, self.db, now=1000.0 + 60, bins=self.bins,
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "canary")
+        self.assertEqual(self._bins()["canary"], self.bins["h1"])
+
+    def test_inherited_model_must_match_the_evaluated_model(self):
+        """model NULL vaut le défaut du descripteur, jamais from_version par
+        hypothèse : pro → pro2 ne doit pas emmener les agents flash."""
+        self.db.execute("UPDATE agent_registry SET model = NULL "
+                        "WHERE name IN ('canary', 'impl', 'other')")
+        old = self._report(object="model", from_version="model-old",
+                           to_version="model-new")
+        self.assertEqual(veille._target_agents(self.db, old), [])
+        flash = self._report(object="model", from_version="deepseek-flash",
+                             to_version="model-new")
+        self.assertEqual({row["name"] for row in veille._target_agents(self.db, flash)},
+                         {"canary", "impl", "other"})
+
     def test_canary_regression_restores_the_previous_version(self):
         veille.adopt(self.cfg, self.db, self.lot, self._report(), bins=self.bins,
-                     now=1000.0)
+                     now=1000.0, rules=self.rules)
         for _ in range(10):
             self._turn("canary", 0.5, 10.0, 1000.0 + 4000)
         out = veille.tick(self.cfg, self.db, now=1000.0 + 5000,
@@ -338,7 +375,7 @@ class AdoptionTest(PgTestCase):
     def test_report_regression_changes_no_host(self):
         result = veille.adopt(self.cfg, self.db, self.lot,
                               self._report(conclusion="regression"),
-                              bins=self.bins, now=1000.0)
+                              bins=self.bins, now=1000.0, rules=self.rules)
         self.assertEqual(result["result"], "refused")
         self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
         self.assertEqual(self.db.query(
@@ -346,11 +383,11 @@ class AdoptionTest(PgTestCase):
 
     def test_a_second_report_on_the_same_lot_is_refused(self):
         veille.adopt(self.cfg, self.db, self.lot, self._report(), bins=self.bins,
-                     now=1000.0)
+                     now=1000.0, rules=self.rules)
         second = self._report(to_version="0.2.2-rc.1")
         with self.assertRaises(veille.VeilleError):
             veille.adopt(self.cfg, self.db, self.lot, second, bins=self.bins,
-                         now=1000.0)
+                         now=1000.0, rules=self.rules)
 
     def test_higher_price_opens_the_owner_decision_without_a_gesture(self):
         higher = self._report(price={
@@ -360,7 +397,7 @@ class AdoptionTest(PgTestCase):
         with mock.patch.object(veille.decisions, "ask",
                                return_value={"id": 91, "state": "pending"}) as ask:
             result = veille.adopt(self.cfg, self.db, self.lot, higher,
-                                  bins=self.bins, now=1000.0)
+                                  bins=self.bins, now=1000.0, rules=self.rules)
         self.assertEqual(result["result"], "waiting_owner")
         self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
         question = ask.call_args.kwargs["question"]
@@ -377,7 +414,7 @@ class AdoptionTest(PgTestCase):
         with mock.patch.object(veille.decisions, "ask",
                                return_value={"id": 91, "state": "pending"}):
             veille.adopt(self.cfg, self.db, self.lot, higher, bins=self.bins,
-                         now=1000.0)
+                         now=1000.0, rules=self.rules)
         with mock.patch.object(veille.decisions, "get",
                                return_value={"state": "answered",
                                              "answer": {"option": "refuse"}}):
@@ -392,7 +429,7 @@ class AdoptionTest(PgTestCase):
         with mock.patch.object(veille.decisions, "ask",
                                return_value={"id": 91, "state": "pending"}):
             veille.adopt(self.cfg, self.db, self.lot, higher, bins=self.bins,
-                         now=1000.0)
+                         now=1000.0, rules=self.rules)
         with mock.patch.object(veille.decisions, "get",
                                return_value={"state": "answered",
                                              "answer": {"option": "adopt"}}), \
@@ -409,7 +446,7 @@ class AdoptionTest(PgTestCase):
         with mock.patch.object(veille.decisions, "ask",
                                return_value={"id": 91, "state": "pending"}):
             veille.adopt(self.cfg, self.db, self.lot, higher, bins=self.bins,
-                         now=1000.0)
+                         now=1000.0, rules=self.rules)
         with mock.patch.object(veille.decisions, "get",
                                return_value={"state": "answered",
                                              "answer": {"option": "adopt"}}), \
@@ -428,7 +465,7 @@ class AdoptionTest(PgTestCase):
         model_report = self._report(object="model", from_version="model-old",
                                     to_version="model-new")
         result = veille.adopt(self.cfg, self.db, self.lot, model_report,
-                              prices=prices, now=1000.0)
+                              prices=prices, now=1000.0, rules=self.rules)
         self.assertEqual(result["result"], "canary")
         self.assertEqual(registry.get(self.db, "canary")["model"], "model-new")
         self.assertIsNone(registry.get(self.db, "impl")["harness_bin"])
@@ -450,7 +487,7 @@ class AdoptionTest(PgTestCase):
             veille._pick_canary(self.db, model_report, bins=None,
                                 agent="expensive")
         result = veille.adopt(self.cfg, self.db, self.lot, model_report,
-                              prices=prices, now=1000.0)
+                              prices=prices, now=1000.0, rules=self.rules)
         self.assertEqual(result["result"], "canary")
         self.assertEqual(veille.load(self.db, self.lot)["state"]["target_agent"],
                          "canary")
@@ -464,10 +501,10 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(registry.get(self.db, "canary")["model"], "model-new")
 
     def test_rollback_restores_the_previous_values(self):
-        self.db.execute("UPDATE agent_registry SET harness_bin = '/opt/old/dsh' "
-                        "WHERE name = 'impl'")
+        self.db.execute("UPDATE agent_registry SET harness_bin = %s "
+                        "WHERE name = 'impl'", (self.old_bin,))
         veille.adopt(self.cfg, self.db, self.lot, self._report(), bins=self.bins,
-                     now=1000.0)
+                     now=1000.0, rules=self.rules)
         for _ in range(10):
             self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
         veille.tick(self.cfg, self.db, now=1000.0 + 5000, rules=Rules(30 * 60))
@@ -477,7 +514,7 @@ class AdoptionTest(PgTestCase):
                               reason="regression observed on the host",
                               now=1000.0 + 5200)
         self.assertEqual(out["result"], "rolled_back")
-        self.assertEqual(self._bins(), {"canary": None, "impl": "/opt/old/dsh",
+        self.assertEqual(self._bins(), {"canary": None, "impl": self.old_bin,
                                         "other": None})
         state = veille.load(self.db, self.lot)["state"]
         self.assertEqual(state["stage"], "rolled_back")
@@ -485,9 +522,9 @@ class AdoptionTest(PgTestCase):
 
     def test_adopt_is_idempotent_for_the_same_report(self):
         first = veille.adopt(self.cfg, self.db, self.lot, self._report(),
-                             bins=self.bins, now=1000.0)
+                             bins=self.bins, now=1000.0, rules=self.rules)
         second = veille.adopt(self.cfg, self.db, self.lot, self._report(),
-                              bins=self.bins, now=2000.0)
+                              bins=self.bins, now=2000.0, rules=self.rules)
         self.assertEqual(second["result"], "unchanged")
         self.assertEqual(first["state"]["stage"], second["state"]["stage"])
 
@@ -519,8 +556,11 @@ class AdoptionTest(PgTestCase):
         """La sortie réelle de B (#4292) : une note de trois lignes et un
         fichier JSON ; le timer n'a pas de --bin, le binaire du rapport sert."""
         path = os.path.join(self.tmp, "b-report.json")
+        raw = b_report()
+        raw["evaluated"]["old"]["binary"] = self.old_bin
+        raw["evaluated"]["new"]["binary"] = self.new_bin
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump(b_report(), fh)
+            json.dump(raw, fh)
         note = ("Rejeu comparatif deepseek 0.2.0-rc.2 -> 0.2.1-rc.4 : meilleure.\n"
                 "Banc : #1 (light) ; coût, durée, tests du lot et note aveugle "
                 "dans le rapport.\n"
@@ -531,8 +571,74 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(out["discovered"][0]["result"], "canary")
         state = veille.load(self.db, self.lot)["state"]
         self.assertEqual(state["stage"], "canary")
-        self.assertEqual(state["canary_bin"], "/opt/new/dsh")
-        self.assertEqual(self._bins()["canary"], "/opt/new/dsh")
+        self.assertEqual(state["canary_bin"], self.new_bin)
+        self.assertEqual(self._bins()["canary"], self.new_bin)
+
+    def test_no_bin_default_for_another_host_without_a_map(self):
+        """new_binary ne vaut que pour le canari : la bascule d'un autre hôte
+        exige une carte explicite, jamais un chemin local supposé."""
+        path = os.path.join(self.tmp, "b-report.json")
+        raw = b_report()
+        raw["evaluated"]["old"]["binary"] = self.old_bin
+        raw["evaluated"]["new"]["binary"] = self.new_bin
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        work.note(self.db, self.lot,
+                  "Rejeu comparatif deepseek : meilleure.\n"
+                  "Banc : #1 (light).\nRapport : %s" % path, actor="canary")
+        veille.tick(self.cfg, self.db, now=1000.0, bins={},
+                    rules=Rules(30 * 60))
+        for _ in range(10):
+            self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
+        veille.tick(self.cfg, self.db, now=1000.0 + 5000, bins={},
+                    rules=Rules(30 * 60))
+        out = veille.tick(self.cfg, self.db, now=1000.0 + 5100, bins={},
+                          rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "blocked")
+        state = veille.load(self.db, self.lot)["state"]
+        self.assertEqual(state["stage"], "blocked")
+        self.assertIn("no --bin", state["reason"])
+        self.assertIsNone(self._bins()["impl"])
+        self.assertIsNone(self._bins()["other"])
+
+    def test_explicit_bins_map_from_the_timer_switches_every_host(self):
+        path = os.path.join(self.tmp, "b-report.json")
+        raw = b_report()
+        raw["evaluated"]["old"]["binary"] = self.old_bin
+        raw["evaluated"]["new"]["binary"] = self.new_bin
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        work.note(self.db, self.lot,
+                  "Rejeu comparatif deepseek : meilleure.\n"
+                  "Banc : #1 (light).\nRapport : %s" % path, actor="canary")
+        bins_path = os.path.join(self.tmp, "bins.json")
+        with open(bins_path, "w", encoding="utf-8") as fh:
+            json.dump({"bins": {"deepseek": {"0.2.1-rc.4": {
+                "h1": self.new_bin, "h2": self.new_bin}}}}, fh)
+        with mock.patch.dict(os.environ, {veille.BINS_ENV: bins_path}):
+            veille.tick(self.cfg, self.db, now=1000.0, bins={},
+                        rules=Rules(30 * 60))
+            for _ in range(10):
+                self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
+            veille.tick(self.cfg, self.db, now=1000.0 + 5000, bins={},
+                        rules=Rules(30 * 60))
+            veille.tick(self.cfg, self.db, now=1000.0 + 5100, bins={},
+                        rules=Rules(30 * 60))
+            veille.tick(self.cfg, self.db, now=1000.0 + 5200, bins={},
+                        rules=Rules(30 * 60))
+            veille.tick(self.cfg, self.db, now=1000.0 + 5300, bins={},
+                        rules=Rules(30 * 60))
+        self.assertEqual(veille.load(self.db, self.lot)["state"]["stage"], "done")
+        self.assertEqual(self._bins(), {"canary": self.new_bin,
+                                        "impl": self.new_bin,
+                                        "other": self.new_bin})
+
+    def test_a_nonexistent_bin_is_refused_before_any_gesture(self):
+        result = veille.adopt(self.cfg, self.db, self.lot, self._report(),
+                              bins={"h1": "/nonexistent/dsh", "h2": self.new_bin},
+                              now=1000.0, rules=self.rules)
+        self.assertEqual(result["result"], "blocked")
+        self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
 
     def test_discovery_ignores_a_report_written_by_another_agent(self):
         work.note(self.db, self.lot, "veille-report: " + json.dumps(
@@ -552,19 +658,18 @@ class AdoptionTest(PgTestCase):
     def test_cli_adopt_and_show(self):
         path = os.path.join(self.tmp, "report-4293.json")
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump(dict(report(), evaluation_lot=self.lot), fh)
+            json.dump(dict(report(), evaluation_lot=self.lot,
+                           conclusion="regression"), fh)
         done = self.mesh("harness", "adopt", str(self.lot), "--report", path,
-                         "--bin", "h1=" + self.bins["h1"],
-                         "--bin", "h2=" + self.bins["h2"], "--json")
+                         "--json")
         self.assertEqual(done.returncode, 0, done.stderr)
         payload = json.loads(done.stdout)
-        self.assertEqual(payload["result"], "canary", payload)
+        self.assertEqual(payload["result"], "refused", payload)
         show = self.mesh("harness", "show-adoption", str(self.lot), "--json")
         self.assertEqual(show.returncode, 0, show.stderr)
         payload = json.loads(show.stdout)
-        self.assertEqual(payload["state"]["stage"], "canary")
-        self.assertEqual(registry.get(self.db, "canary")["harness_bin"],
-                         self.bins["h1"])
+        self.assertEqual(payload["state"]["stage"], "refused")
+        self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
 
     def test_runner_adapter_uses_the_agent_harness_bin(self):
         from ameesh.runner import AgentWorker

@@ -51,7 +51,7 @@ import time
 
 from . import cost
 from . import db as db_mod
-from . import decisions, registry, storage, work
+from . import decisions, harnesses, registry, storage, work
 
 #: schéma du rapport produit par le lot B
 REPORT_SCHEMA = "ameesh-veille-report/1"
@@ -72,6 +72,10 @@ CANARY_SECONDS = 24 * 3600
 CANARY_TURNS = 10
 #: marge avant une coupure de release (spec §4, canon §7) : 20 minutes
 CUTOFF_MARGIN_S = 20 * 60
+#: carte des binaires installés, lue par le timer (#4293, avis auditeur dc0d) :
+#: fichier JSON ou variable d'environnement, explicite par harnais/version/hôte.
+BINS_ENV = "AMEESH_HARNESS_ADOPTION_BINS"
+BINS_FILE = "~/.config/ameesh/harness-adoption.json"
 #: objets adoptables
 OBJECTS = ("harness", "model")
 #: conclusions du rapport de rejeu (`incomplete` : B n'a pas conclu, jamais
@@ -225,7 +229,14 @@ class Report:
     # -- dérivés ---------------------------------------------------------
     @property
     def digest(self) -> str:
-        payload = json.dumps(self.raw, ensure_ascii=False, sort_keys=True,
+        # la projection 7 jours est DÉRIVÉE (dépense des 7 derniers jours) :
+        # elle ne fait pas partie de l'identité du rapport de B, sinon un
+        # second tick avec une dépense différente croirait à un autre rapport.
+        raw = dict(self.raw)
+        price = dict(raw.get("price") or {})
+        price.pop("projected_7d_usd", None)
+        raw["price"] = price
+        payload = json.dumps(raw, ensure_ascii=False, sort_keys=True,
                              separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -773,7 +784,14 @@ def _target_agents(db, report: Report, *, host: str | None = None,
                 out.append(row)
         else:
             current = row.get("model")
-            if current is None or current == report.from_version:
+            if current is None:
+                # NULL = valeur héritée : celle du descripteur du harnais, ou
+                # inconnue. Elle n'est acceptée que si elle vaut exactement la
+                # version évaluée (avis auditeur dc0d, argent).
+                descriptor = harnesses.get(report.harness)
+                current = (descriptor.model.default
+                           if descriptor is not None and descriptor.model else None)
+            if current == report.from_version:
                 out.append(row)
     return out
 
@@ -902,24 +920,76 @@ def _merge_bins(state: dict, bins: dict | None) -> dict:
     return merged
 
 
-def _check_bin(path: str | None) -> str:
+def _check_bin(path: str | None, *, executable: bool = False) -> str:
     if not path:
         raise VeilleError("a --bin path is required for a harness adoption")
     if "\x00" in path or "\n" in path or not os.path.isabs(path):
         raise VeilleError("invalid bin path %r: an absolute path is required" % path)
+    if executable and not os.access(path, os.X_OK):
+        raise VeilleError("binary not executable on this host: %s (give an "
+                          "existing --bin, or install it there)" % path)
     return path
 
 
-def start_canary(db, row: dict, state: dict, report: Report, *,
-                 agent: str | None = None, now: float) -> dict:
-    """Démarre le canari : un seul agent passe sur la nouvelle version."""
+def load_bins(report: Report) -> dict:
+    """La carte explicite des binaires installés, par hôte.
+
+    Fichier `AMEESH_HARNESS_ADOPTION_BINS` ou
+    `~/.config/ameesh/harness-adoption.json` :
+    `{"bins": {"<harnais>": {"<version>": {"<hôte>": "/chemin"}}}}`.
+    Aucun défaut implicite : un hôte absent reste sans chemin (fail-closed).
+    """
+    path = os.environ.get(BINS_ENV) or os.path.expanduser(BINS_FILE)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError:
+        return {}
+    except ValueError as exc:
+        raise VeilleError("harness-adoption bins %s unreadable: %s" % (path, exc)) from exc
+    if not isinstance(data, dict):
+        raise VeilleError("harness-adoption bins: an object is required")
+    table = data.get("bins", data)
+    if not isinstance(table, dict):
+        raise VeilleError("harness-adoption bins: `bins` must be an object")
+    for_version = table.get(report.harness) or {}
+    if not isinstance(for_version, dict):
+        raise VeilleError("harness-adoption bins: harness %r must map versions"
+                          % report.harness)
+    hosts = for_version.get(report.to_version) or {}
+    if not isinstance(hosts, dict):
+        raise VeilleError("harness-adoption bins: version %r must map hosts"
+                          % report.to_version)
+    out = {}
+    for host, value in hosts.items():
+        if isinstance(value, str) and os.path.isabs(value):
+            out[str(host)] = value
+    return out
+
+
+def start_canary(cfg, db, row: dict, state: dict, report: Report, *,
+                 agent: str | None = None, now: float,
+                 rules=None) -> dict:
+    """Démarre le canari : un seul agent passe sur la nouvelle version.
+
+    Le démarrage est soumis à la même fenêtre que la bascule : jamais dans les
+    20 minutes qui précèdent une coupure, et pas de calendrier lisible = pas
+    de canari (fail-closed)."""
+    try:
+        remaining = _cutoff_seconds(cfg, state.get("project")
+                                    or row.get("project") or "", now, rules)
+    except Exception as exc:  # noqa: BLE001 — pas de calendrier, pas de canari
+        raise VeilleError("cutoff calendar unreadable: %s" % exc) from exc
+    if remaining < CUTOFF_MARGIN_S:
+        raise VeilleError("cutoff in %.0f s (< %d): canary waits"
+                          % (remaining, CUTOFF_MARGIN_S))
     target = _pick_canary(db, report, bins=_bins_from_state(state), agent=agent)
     host = target.get("host") or ""
     value: str | None = None
     bin_path = None
     if report.object == "harness":
         bin_path = _check_bin(_bins_from_state(state).get(host)
-                              or report.new_binary)
+                              or report.new_binary, executable=True)
         value = bin_path
     else:
         value = report.to_version
@@ -1038,7 +1108,7 @@ def _adopt_locked(cfg, db, lot: int, report: Report, *, bins: dict | None = None
         _journal(row, state, "adoption blocked: %s" % decision.reason, actor=actor)
         return {"lot": int(lot), "result": "blocked", "state": state,
                 "report": report.raw}
-    state["bins"] = dict(bins or {})
+    state["bins"] = {**load_bins(report), **(bins or {})}
     if decision.action == "owner":
         requester = requester or item.get("assignee") or actor
         if not requester or registry.get(db, requester) is None:
@@ -1054,7 +1124,8 @@ def _adopt_locked(cfg, db, lot: int, report: Report, *, bins: dict | None = None
                 "state": state, "report": report.raw}
     # automatique : canari
     try:
-        state = start_canary(db, row, state, report, agent=agent, now=now)
+        state = start_canary(cfg, db, row, state, report, agent=agent,
+                             now=now, rules=rules)
     except VeilleError as exc:
         _block(row, state, str(exc), from_stage="canary", actor=actor)
         return {"lot": int(lot), "result": "blocked", "state": state,
@@ -1099,14 +1170,15 @@ def advance(cfg, db, row: dict, *, now: float, bins: dict | None = None,
         origin = state.get("blocked_from")
         if origin == "waiting_owner_approved":
             return _start_from_owner(cfg, db, row, state, report, now=now,
-                                     actor=actor, dry_run=dry_run)
+                                     actor=actor, dry_run=dry_run, rules=rules)
         if origin == "canary":
             # le canari a pu être refusé faute d'agent au repos : on retente
             if dry_run:
                 return {"lot": row["lot_id"], "result": "blocked",
                         "reason": state.get("reason")}
             try:
-                state = start_canary(db, row, state, report, now=now)
+                state = start_canary(cfg, db, row, state, report, now=now,
+                             rules=rules)
             except VeilleError as exc:
                 _block(row, state, str(exc), from_stage="canary", actor=actor)
                 return {"lot": row["lot_id"], "result": "blocked",
@@ -1122,7 +1194,7 @@ def advance(cfg, db, row: dict, *, now: float, bins: dict | None = None,
                     "reason": state.get("reason")}
     if stage == "waiting_owner":
         return _advance_owner(cfg, db, row, state, report, now=now,
-                              actor=actor, dry_run=dry_run)
+                              actor=actor, dry_run=dry_run, rules=rules)
     if stage == "canary":
         return _advance_canary(db, row, state, report, now=now, actor=actor,
                                dry_run=dry_run)
@@ -1132,7 +1204,8 @@ def advance(cfg, db, row: dict, *, now: float, bins: dict | None = None,
     return {"lot": row["lot_id"], "result": stage}
 
 
-def _advance_owner(cfg, db, row, state, report, *, now, actor, dry_run) -> dict:
+def _advance_owner(cfg, db, row, state, report, *, now, actor, dry_run,
+                   rules=None) -> dict:
     decision_id = state.get("decision_id")
     if not decision_id:
         return {"lot": row["lot_id"], "result": "blocked",
@@ -1172,10 +1245,11 @@ def _advance_owner(cfg, db, row, state, report, *, now, actor, dry_run) -> dict:
         return {"lot": row["lot_id"], "result": "refused",
                 "reason": state["reason"]}
     return _start_from_owner(cfg, db, row, state, report, now=now,
-                             actor=actor, dry_run=dry_run)
+                             actor=actor, dry_run=dry_run, rules=rules)
 
 
-def _start_from_owner(cfg, db, row, state, report, *, now, actor, dry_run) -> dict:
+def _start_from_owner(cfg, db, row, state, report, *, now, actor, dry_run,
+                      rules=None) -> dict:
     # la preuve est revérifiée à CHAQUE tentative de geste, y compris quand un
     # canari avait été bloqué puis repris (une approbation consommée ou une clé
     # révoquée depuis ne doit plus servir).
@@ -1204,7 +1278,8 @@ def _start_from_owner(cfg, db, row, state, report, *, now, actor, dry_run) -> di
         return {"lot": row["lot_id"], "result": "would-start-canary"}
     state.update({"stage": "canary", "reason": "", "blocked_from": None})
     try:
-        state = start_canary(db, row, state, report, now=now)
+        state = start_canary(cfg, db, row, state, report, now=now,
+                             rules=rules)
     except VeilleError as exc:
         _block(row, state, str(exc), from_stage="waiting_owner_approved",
                actor=actor)
@@ -1307,7 +1382,7 @@ def _advance_rollout(cfg, db, row, state, report, *, now, actor, rules,
     host = hosts[index]
     path = None
     if report.object == "harness":
-        path = _bins_from_state(state).get(host) or report.new_binary
+        path = _bins_from_state(state).get(host)
         if not path:
             if not dry_run:
                 _block(row, state, "no --bin path for host %s" % host,
@@ -1376,20 +1451,21 @@ def tick(cfg, db, *, now: float | None = None, project: str | None = None,
                 "adoptions": []}
     try:
         discovered = discover(cfg, db, now=now, project=project, bins=bins,
-                              actor=actor, dry_run=dry_run)
+                              actor=actor, dry_run=dry_run, rules=rules)
         results = []
         for row in open_adoptions(db, project=project):
             row["_db"] = db
             state = row["state"]
-            hosts = sorted({agent.get("host") or ""
-                            for agent in _agents(db, row["harness"])
-                            if agent.get("host")}
-                           | {host for host in (state.get("hosts") or [])
-                              if host}
-                           | ({state.get("canary_host")}
-                              if state.get("canary_host") else set()))
-            row_bins = _expand_bins(bins or {}, hosts)
             try:
+                hosts = sorted({agent.get("host") or ""
+                                for agent in _agents(db, row["harness"])
+                                if agent.get("host")}
+                               | {host for host in (state.get("hosts") or [])
+                                  if host}
+                               | ({state.get("canary_host")}
+                                  if state.get("canary_host") else set()))
+                row_bins = load_bins(Report(row["report"]))
+                row_bins.update(_expand_bins(bins or {}, hosts))
                 results.append(advance(cfg, db, row, now=now, bins=row_bins,
                                        actor=actor, rules=rules, dry_run=dry_run))
             except VeilleError as exc:
@@ -1406,7 +1482,7 @@ def tick(cfg, db, *, now: float | None = None, project: str | None = None,
 
 def discover(cfg, db, *, now: float, project: str | None = None,
              bins: dict | None = None, actor: str = "ameesh",
-             dry_run: bool = False) -> list[dict]:
+             dry_run: bool = False, rules=None) -> list[dict]:
     """Démarre les adoptions dont le rapport est déjà noté.
 
     A (détection) ouvre un lot « Évaluer <harnais> <version> » ; B y écrit son
@@ -1438,14 +1514,10 @@ def discover(cfg, db, *, now: float, project: str | None = None,
             hosts = sorted({agent.get("host") or ""
                             for agent in _agents(db, report.harness)
                             if agent.get("host")})
-            expanded = _expand_bins(bins or {}, hosts)
-            if report.object == "harness" and report.new_binary:
-                # le timer n'a pas de --bin : le binaire du rapport B est la
-                # carte par défaut (surchargée par un --bin hôte=… explicite)
-                for host in hosts:
-                    expanded.setdefault(host, report.new_binary)
+            expanded = load_bins(report)
+            expanded.update(_expand_bins(bins or {}, hosts))
             result = adopt(cfg, db, lot, report, bins=expanded, actor=actor,
-                           dry_run=dry_run, now=now)
+                           dry_run=dry_run, now=now, rules=rules)
             out.append({"lot": lot, "result": result.get("result")})
         except VeilleError as exc:
             out.append({"lot": lot, "result": "ignored", "reason": str(exc)})
@@ -1578,13 +1650,10 @@ def run(cfg, args) -> int:
             report = _report_text(args)
             if report is None:
                 report = report_from_lot(db, int(args.id))
-            bins = _parse_bins(args.bin)
+            bins = load_bins(report)
             hosts = sorted({row["host"] for row in _agents(db, report.harness)
                             if row.get("host")})
-            bins = _expand_bins(bins, hosts)
-            if report.object == "harness" and report.new_binary:
-                for host in hosts:
-                    bins.setdefault(host, report.new_binary)
+            bins.update(_expand_bins(_parse_bins(args.bin), hosts))
             result = adopt(cfg, db, int(args.id), report, bins=bins,
                            agent=args.agent, requester=args.requester,
                            actor=args.actor or "ameesh", dry_run=args.dry_run,
