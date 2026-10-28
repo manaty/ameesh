@@ -20,7 +20,12 @@ l'ordre, sans agent :
    le lot est écarté avec le motif « conflit, coupure suivante » et le script
    passe au suivant. Aucune résolution : résoudre est un jugement, il reste à
    un agent ;
-4. les contrôles locaux : `scripts/freeze-checks.py`, puis
+4. `scripts/doc-compteurs.py --write` sur la tête composée : le bloc de
+   compteurs de `docs/EXECUTEUR-MEDIEE.md` est réengendré depuis le
+   `contract.json` composé et commité mécaniquement (#4094 : deux lots qui
+   ajoutent chacun une opération au contrat portent le même compteur, la
+   fusion est propre mais l'arbre composé en compte une de plus) ;
+5. les contrôles locaux : `scripts/freeze-checks.py`, puis
    `tests/parts/toujours.txt`, `tests.test_l161f_plan`, `tests.test_cluster`
    et les modules de test apportés par chaque unité. Un test ciblé **rouge**
    est attribué par la même lecture que #3801 (`packet_red`) : l'unité
@@ -32,12 +37,12 @@ l'ordre, sans agent :
    indisponible, rc inattendu) est consigné au manifeste, à la PR et au
    courrier, sans retirer d'unité ni arrêter le paquet : le canon §3 le veut,
    la ci-full tranche ;
-5. le manifeste `reviews/integration-paquet-<nom>.md` : base et SHA de la
+6. le manifeste `reviews/integration-paquet-<nom>.md` : base et SHA de la
    cible, table `## Composition` produite par `paquet-compose.py --units`
    (gabarit #3629), admissions, écartés et leur motif, contrôles locaux ;
-6. `scripts/paquet-inclusion.py` sur la tête finale, puis `ameesh work packet
+7. `scripts/paquet-inclusion.py` sur la tête finale, puis `ameesh work packet
    record` (liaison des unités au porteur) ;
-7. poussée de `integration/paquet-<nom>`, PR ouverte ou mise à jour, gel
+8. poussée de `integration/paquet-<nom>`, PR ouverte ou mise à jour, gel
    `ameesh work milestone <porteur> frozen --sha <tête>`, courrier au pilote.
 
 Ce qui reste au pilote, hors de ce script : « verdict non requis », la CI
@@ -88,6 +93,10 @@ CONTRACT_MODULES = ("tests.test_l161f_plan", "tests.test_cluster")
 COMPOSE_SCRIPT = "scripts/paquet-compose.py"
 CANDIDATES_SCRIPT = "scripts/paquet-candidats.py"
 INCLUSION_SCRIPT = "scripts/paquet-inclusion.py"
+#: #4094 : le bloc de compteurs de la doc, engendré depuis le contrat composé
+COUNTERS_SCRIPT = "scripts/doc-compteurs.py"
+COUNTERS_COMMIT = ("paquet : compteurs de docs/EXECUTEUR-MEDIEE.md "
+                   "régénérés (#4094)")
 #: #3916 : les remises (`ameesh.resolutions.REF_PREFIX`) et leur copie locale
 REMISE_PREFIX = "refs/ameesh/resolutions/"
 REMISE_LOCAL = "refs/ameesh/paquet-auto/remise/"
@@ -1077,6 +1086,52 @@ def run_freeze_checks(worktree: Path, *, timeout: int) -> tuple[int, str, float]
     return proc.returncode, _output(proc), time.monotonic() - start
 
 
+def regenerate_doc_counters(worktree: Path, *, required: bool = True,
+                            log=print) -> str | None:
+    """#4094 : réengendre le bloc de compteurs de la doc, puis le commite.
+
+    Deux lots qui ajoutent chacun une opération au contrat portent la même
+    modification du bloc de `docs/EXECUTEUR-MEDIEE.md` : la fusion est propre,
+    mais l'arbre composé compte une opération de plus que chaque branche et
+    `test_l107_executor_contract` rougirait (h-46, #3981 + #4046 : un tour de
+    ci-full perdu). Le bloc est donc réengendré depuis le `contract.json`
+    composé avant les tests, et le commit mécanique ne porte que la doc.
+
+    `required=False` sert au rejeu d'un paquet antérieur à #4094 : le script
+    n'existe pas dans sa base et l'arbre de référence n'a pas de bloc."""
+    script = worktree / COUNTERS_SCRIPT
+    if not script.is_file():
+        if required:
+            raise PaquetAutoError("%s absent de l'arbre composé" % COUNTERS_SCRIPT)
+        log("compteurs de doc : %s absent de la base, rien à régénérer"
+            % COUNTERS_SCRIPT)
+        return None
+    proc = run_command(
+        [project_python(worktree), str(script), "--repo", str(worktree),
+         "--write"],
+        cwd=worktree, timeout=FREEZE_TIMEOUT, env=python_env(worktree))
+    if proc.returncode != 0:
+        raise PaquetAutoError(
+            "compteurs de doc : %s a refusé (rc %d) : %s"
+            % (COUNTERS_SCRIPT, proc.returncode, _tail(_output(proc))))
+    status = out(worktree, "status", "--porcelain", "--",
+                 "docs/EXECUTEUR-MEDIEE.md")
+    if not status:
+        return None
+    git(worktree, "add", "--", "docs/EXECUTEUR-MEDIEE.md")
+    commit = git(worktree, "commit", "-m", COUNTERS_COMMIT, "--",
+                 "docs/EXECUTEUR-MEDIEE.md", check=False)
+    if commit.returncode != 0:
+        raise PaquetAutoError(
+            "compteurs de doc : commit : %s"
+            % (_decode(commit.stderr).strip() or "code %d" % commit.returncode))
+    head = rev(worktree, "HEAD")
+    if head is None:
+        raise PaquetAutoError("compteurs de doc : commit sans tête")
+    log("compteurs de doc : bloc réengendré → %s" % head[:12])
+    return head
+
+
 def unittest_failures(output: str) -> list[dict]:
     """Les échecs d'une sortie unittest, au format des échecs de CI (#3801).
 
@@ -1958,6 +2013,7 @@ def replay(repo: Path, reference: str, name: str, base: str, *,
             log("rejeu : %s ← %s" % ("/".join("#%d" % lot for lot in lots),
                                      candidate.source[:12]))
         path = worktree / manifest_path
+        regenerate_doc_counters(worktree, required=False, log=log)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(manifest_text, encoding="utf-8")
         git(worktree, "add", "--", manifest_path)
@@ -2078,6 +2134,7 @@ def compose_packet(args: argparse.Namespace) -> int:
         freeze_seconds = 0.0
         recomp = 0
         while True:
+            regenerate_doc_counters(worktree, log=lambda line: print(line, flush=True))
             freeze_rc, freeze_output, freeze_seconds = run_freeze_checks(
                 worktree, timeout=FREEZE_TIMEOUT)
             if freeze_rc != 0:

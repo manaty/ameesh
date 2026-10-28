@@ -7,7 +7,9 @@ interfaces figées entre L108, L109, L110 et L112 à leur liste de méthodes.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
+import importlib.util
 import inspect
 import json
 import os
@@ -28,7 +30,22 @@ from ameesh.storage import interface as SI
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GOLDEN_DIR = os.path.join(REPO, "tests", "golden", "mediated_executor")
 CONTRACT_FILE = os.path.join(REPO, "src", "ameesh", "mediated_executor", "contract.json")
+DOC_FILE = os.path.join(REPO, "docs", "EXECUTEUR-MEDIEE.md")
+COUNTERS_SCRIPT = os.path.join(REPO, "scripts", "doc-compteurs.py")
 HINTS = typing.get_type_hints(SI.Storage)
+
+
+def _load_counters():
+    """#4094 : le générateur du bloc de compteurs, chargé comme un script."""
+    spec = importlib.util.spec_from_file_location(
+        "test_l107_doc_compteurs", COUNTERS_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["test_l107_doc_compteurs"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+counters = _load_counters()
 
 
 def _domains() -> dict:
@@ -174,18 +191,81 @@ class TableTest(unittest.TestCase):
             self.assertNotIn("interface_total", json.load(fh)["refused"])
         self.assertEqual(set(self.c.refused_reasons), set(self.c.refused))
 
-    def test_les_compteurs_du_doc_suivent_le_contrat(self):
-        """#1019 : les compteurs cités par docs/EXECUTEUR-MEDIEE.md viennent de
-        contract.json ; ils doivent suivre chaque ajout à l'interface, sans
-        quoi les agents lisent des chiffres périmés."""
-        with open(os.path.join(REPO, "docs", "EXECUTEUR-MEDIEE.md"), encoding="utf-8") as fh:
-            doc = re.sub(r"\s+", " ", fh.read())
-        refuses = sum(len(methodes) for methodes in self.c.refused.values())
-        for attendu in ("la table fermée des %d opérations et la liste des %d refusées"
-                        % (len(self.c.operations), refuses),
-                        "l'interface entière (%d opérations)" % self.c.interface_total):
-            with self.subTest(fragment=attendu):
-                self.assertIn(attendu, doc)
+    def _contract_data(self) -> dict:
+        with open(CONTRACT_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_les_compteurs_du_doc_sont_engendres(self):
+        """#4094 : le bloc de docs/EXECUTEUR-MEDIEE.md est la sortie du
+        générateur, jamais un compteur recopié à la main qu'une fusion
+        résoudrait de travers (h-46 : 463/535 dans l'arbre au lieu de
+        464/536)."""
+        with open(DOC_FILE, encoding="utf-8") as fh:
+            doc = fh.read()
+        self.assertEqual(counters.block(doc), counters.render(self.c))
+        self.assertEqual(counters.check(doc, self.c), [])
+
+    def test_un_bloc_perime_ou_absent_est_refuse(self):
+        """#4094 : le contrôle rougit sur un bloc périmé ou sans marques ; le
+        script le réécrit et le contrôle repasse."""
+        data = self._contract_data()
+        with open(DOC_FILE, encoding="utf-8") as fh:
+            doc = fh.read()
+        stale = counters.replace_block(doc, "- interface entière : 0")
+        self.assertTrue(counters.check(stale, self.c))
+        self.assertEqual(counters.check(
+            counters.replace_block(stale, counters.render(self.c)), self.c), [])
+        self.assertTrue(counters.check("aucun bloc ici", self.c))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "doc.md")
+            contract = os.path.join(tmp, "contract.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("# doc\n<!-- compteurs:debut -->\n- périmé\n"
+                         "<!-- compteurs:fin -->\n")
+            with open(contract, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            self.assertEqual(counters.main(
+                ["--doc", path, "--contract", contract, "--check"]), 1)
+            self.assertEqual(counters.main(
+                ["--doc", path, "--contract", contract, "--write"]), 0)
+            self.assertEqual(counters.main(
+                ["--doc", path, "--contract", contract, "--check"]), 0)
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(counters.block(fh.read()),
+                                 counters.render(C.parse(data)))
+            # des marques absentes ne se réécrivent pas d'office : rc 1, pas
+            # de traceback (une unité qui casse le bloc doit être lue).
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("# doc sans bloc\n")
+            self.assertEqual(counters.main(
+                ["--doc", path, "--contract", contract, "--write"]), 1)
+
+    def test_deux_lots_qui_ajoutent_une_operation_refusee_ne_se_disputent_plus_le_bloc(self):
+        """#4094 (h-46, #3981 + #4046) : deux lots ajoutent chacun une
+        opération refusée. Leurs blocs sont identiques, donc la fusion ne
+        conflicte pas ; le bloc fusionné vaut une addition de trop, et le
+        commit mécanique de paquet-auto le régénère sans geste manuel."""
+        base = self._contract_data()
+        with open(DOC_FILE, encoding="utf-8") as fh:
+            doc = fh.read()
+        first = copy.deepcopy(base)
+        first["refused"]["operations"]["work"].append("premier_ajout")
+        second = copy.deepcopy(base)
+        second["refused"]["operations"]["work"].append("second_ajout")
+        merged = copy.deepcopy(base)
+        merged["refused"]["operations"]["work"].extend(
+            ["premier_ajout", "second_ajout"])
+        first_block = counters.render(C.parse(first))
+        second_block = counters.render(C.parse(second))
+        # Même delta dans les deux branches : git fusionne sans conflit.
+        self.assertEqual(first_block, second_block)
+        self.assertNotEqual(first_block, counters.render(C.parse(base)))
+        fused = counters.replace_block(doc, first_block)
+        # L'arbre fusionné compte une opération de plus que chaque branche :
+        # sans régénération, test_l107 rougit (le tour perdu de h-46).
+        self.assertTrue(counters.check(fused, C.parse(merged)))
+        fixed = counters.replace_block(fused, counters.render(C.parse(merged)))
+        self.assertEqual(counters.check(fixed, C.parse(merged)), [])
 
     def test_jamais_d_autorite(self):
         for d in ("approvals", "nonces", "grants", "authenticators", "canon", "packages",

@@ -56,6 +56,9 @@ class PaquetAutoBanc(unittest.TestCase):
         self.git("config", "commit.gpgsign", "false", cwd=self.repo)
         self.write("base.txt", "base\n")
         self.write("shared.txt", "base\n")
+        # #4094 : la composition exige le générateur de compteurs ; ce banc
+        # n'a pas de doc, le faux script ne réécrit rien.
+        self.write("scripts/doc-compteurs.py", "import sys\nsys.exit(0)\n")
         self.git("add", "-A", cwd=self.repo)
         self.git("commit", "-qm", "base", cwd=self.repo)
         self.base = self.rev("HEAD")
@@ -299,6 +302,8 @@ class PaquetAutoBanc(unittest.TestCase):
                                                 {"ready": [1], "waiting": []})), \
                 mock.patch.object(paquet_auto, "compose_candidates",
                                   return_value=composition), \
+                mock.patch.object(paquet_auto, "regenerate_doc_counters",
+                                  return_value=None), \
                 mock.patch.object(paquet_auto, "run_freeze_checks",
                                   return_value=(0, "ok", 0.1)), \
                 mock.patch.object(paquet_auto, "check_local_tests",
@@ -412,6 +417,51 @@ class PaquetAutoBanc(unittest.TestCase):
             self.git("rev-parse", "--verify", "--quiet", "MERGE_HEAD",
                      cwd=worktree, check=False).returncode, 0)
         self.assertEqual(self.rev("HEAD", cwd=worktree), composition.head)
+
+    def test_compteurs_de_doc_reengendres_et_commites(self) -> None:
+        """#4094 : après composition, le bloc de compteurs de la doc est
+        réécrit depuis le contrat composé et commité mécaniquement avant les
+        tests ; un bloc inchangé ne crée aucun commit."""
+        first = self.lot(21, "vingt-et-un.txt", "vingt et un\n")
+        worktree = self.worktree("compteurs")
+        paquet_auto.compose_candidates(
+            worktree, [paquet_auto.Candidate(21, first)], 99,
+            compose_script=COMPOSE, record_package=False,
+            log=lambda _line: None)
+        self.write("docs/EXECUTEUR-MEDIEE.md", "bloc périmé\n", cwd=worktree)
+        self.write("scripts/doc-compteurs.py",
+                   "import pathlib\n"
+                   "pathlib.Path('docs/EXECUTEUR-MEDIEE.md').write_text("
+                   "'bloc engendré\\n', encoding='utf-8')\n", cwd=worktree)
+        self.commit("faux générateur de compteurs", cwd=worktree)
+        before = self.rev("HEAD", cwd=worktree)
+        head = paquet_auto.regenerate_doc_counters(
+            worktree, log=lambda _line: None)
+        self.assertIsNotNone(head)
+        self.assertNotEqual(head, before)
+        self.assertEqual(
+            (worktree / "docs" / "EXECUTEUR-MEDIEE.md").read_text(
+                encoding="utf-8"), "bloc engendré\n")
+        self.assertEqual(
+            self.git("status", "--porcelain", cwd=worktree).stdout, "")
+        self.assertIn("#4094", self.git(
+            "log", "-1", "--format=%s", cwd=worktree).stdout)
+        self.assertEqual(self.rev("HEAD", cwd=worktree), head)
+        # Deuxième passage : le bloc est à jour, aucun nouveau commit.
+        self.assertIsNone(paquet_auto.regenerate_doc_counters(
+            worktree, log=lambda _line: None))
+        self.assertEqual(self.rev("HEAD", cwd=worktree), head)
+
+    def test_compteurs_de_doc_absents_dans_une_base_ancienne(self) -> None:
+        """#4094 : le rejeu d'un paquet antérieur au lot n'a pas le script ;
+        il le constate sans échouer, alors que la composition l'exige."""
+        worktree = self.worktree("sans-compteurs")
+        (worktree / "scripts" / "doc-compteurs.py").unlink()
+        self.assertIsNone(paquet_auto.regenerate_doc_counters(
+            worktree, required=False, log=lambda _line: None))
+        with self.assertRaises(paquet_auto.PaquetAutoError):
+            paquet_auto.regenerate_doc_counters(worktree,
+                                                log=lambda _line: None)
 
     def _fake_candidates(self, payload: dict, code: int) -> str:
         data = pathlib.Path(self.tmp.name) / "candidats.json"
