@@ -199,6 +199,14 @@ HOST_PASS_REFRESH_S = 3600.0
 #: réserve ; sans elle, un hôte à 298 worktrees refaisait les mêmes premiers
 #: à chaque passage et les phases suivantes ne tournaient plus jamais.
 HOST_PASS_RESERVE_S = 300.0
+#: #4234 : plafond de la SEULE phase worktrees. Mesuré sur ameesh-agents-1
+#: (484 worktrees suivis, 28/10/2026) : 394 s, soit 81 % d'une passe de 488 s ;
+#: avec un passage toutes les 10 min, le verrou host-pass restait tenu presque
+#: en permanence et une passe manuelle était presque toujours sautée. La phase
+#: s'arrête à ce plafond et le curseur (#3802 B1) reprend les arbres suivants
+#: au passage d'après ; le verrou est rendu au plus tard après ~3 min de
+#: worktrees.
+HOST_PASS_WORKTREES_BUDGET_S = 180.0
 #: #3802 (B1) : clé réservée de l'état du verrou qui garde le curseur de
 #: reprise des worktrees (dernier `(created_ts, id)` examiné), par mesh.
 WORKTREES_CURSOR_KEY = "_worktrees_cursor"
@@ -257,6 +265,11 @@ class PassBudget:
         kept for the following phases (#3802 B1, cx2)."""
         return _BudgetWindow(self, reserve)
 
+    def slice(self, seconds: float) -> "_BudgetSlice":
+        """#4234 : une phase s'arrête à `seconds` au plus, sans consommer le
+        budget des phases suivantes ; le passage garde son échéance."""
+        return _BudgetSlice(self, seconds)
+
     def check(self, name: str) -> None:
         """Start phase `name`; raise when the budget is already spent, naming
         the phase it was spent in (the one that just ended)."""
@@ -291,7 +304,7 @@ class _BudgetWindow:
     `expired`, `timeout`), used to bound the external calls of a removal or an
     archive (#3802 B1, cx2)."""
 
-    def __init__(self, budget: PassBudget, reserve: float = 0.0):
+    def __init__(self, budget, reserve: float = 0.0):
         self.budget = budget
         self.reserve = max(0.0, float(reserve))
 
@@ -303,6 +316,36 @@ class _BudgetWindow:
 
     def timeout(self, cap: float) -> float:
         return max(0.0, min(float(cap), self.remaining()))
+
+
+class _BudgetSlice:
+    """#4234 : la part du passage qu'une phase s'autorise (les worktrees).
+
+    Le verrou `host-pass` était tenu ~8 min sur un hôte à ~480 worktrees : une
+    passe toutes les 10 min, donc un traitement manuel presque toujours
+    « skipped ». La boucle des worktrees s'arrête à sa propre échéance et le
+    curseur reprend au passage suivant ; les appels externes de la phase sont
+    bornés par le temps qui lui reste, jamais au-delà du passage (#3802)."""
+
+    def __init__(self, budget: "PassBudget", seconds: float):
+        self.budget = budget
+        self.deadline = budget.clock() + max(0.0, float(seconds))
+
+    def remaining(self) -> float:
+        return max(0.0, min(self.budget.remaining(),
+                            self.deadline - self.budget.clock()))
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0.0
+
+    def reserved(self, seconds: float) -> bool:
+        return self.remaining() <= max(0.0, float(seconds))
+
+    def timeout(self, cap: float) -> float:
+        return max(0.0, min(float(cap), self.remaining()))
+
+    def window(self, reserve: float = 0.0) -> _BudgetWindow:
+        return _BudgetWindow(self, reserve)
 
 
 def _phase_budget(budget: PassBudget | None, reserve_s: float = 0.0):
@@ -2937,11 +2980,62 @@ def branch_agent(branch: str, agents=()) -> str:
     return ""
 
 
+def _numeric_runs(rest: str, *, skip_padded: bool) -> list[list[int]]:
+    """#4234 : les suites CONTIGUËS de segments purement numériques.
+
+    Un nom de branche mêle l'identité du lot et son contexte (`am10-16`,
+    `suite-1176`, `offload-agents-3`) : ces nombres de contexte ne sont pas
+    des lots. Un segment mixte (`am10`, `w5`, `r2`, `pass2`, `t3`) coupe la
+    suite et n'apporte aucun numéro ; `skip_padded` écarte en plus les
+    groupes complétés d'un zéro (#2182)."""
+    runs: list[list[int]] = []
+    current: list[int] = []
+    for part in rest.split("-"):
+        if part.isdigit() and not (
+                skip_padded and len(part) > 1 and part.startswith("0")):
+            current.append(int(part))
+        elif current:
+            runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+    return runs
+
+
+#: #4234 : en dessous de ce numéro, une suite numérique qui n'est pas la
+#: première du nom de branche est un repère interne (`am10-16`, `w5`,
+#: `offload-agents-3`), pas un lot lié. Les lots d'un numéro inférieur
+#: existent (les premiers du registre), mais jamais comme second groupe d'un
+#: nom de branche : ils sont toujours écrits en tête (`lot/67-…`).
+RELATED_LOT_MIN = 100
+
+
+def _date_run(run: list[int]) -> bool:
+    """#4234 : une suite `2026-10-24` est une date, pas trois lots (une
+    branche `review/ep7-3024-preuves-2026-10-24` existe)."""
+    return (len(run) == 3 and 1900 <= run[0] <= 2100
+            and 1 <= run[1] <= 12 and 1 <= run[2] <= 31)
+
+
 def cited_lots(branch: str, agent: str = "") -> list[int]:
-    """#1694: every lot id a branch name cites, in trial order — first to last
-    under `lot/`/`work/`, last to first under `agent/`/`review/` (the agent
-    name may itself carry a digit, the lot id is the last group there). Empty
-    when the branch cites no number.
+    """#1694 : les lots qu'un nom de branche cite, dans l'ordre d'essai.
+
+    La PREMIÈRE suite numérique est le lot de la branche (`lot/`, `work/`,
+    `agent/`) ; les suites suivantes dont le plus grand numéro atteint
+    `RELATED_LOT_MIN` sont des lots liés à vérifier aussi (une branche
+    `lot/431-432` sert deux lots). Les petits nombres de contexte
+    (`am10-16`, `offload-agents-3`) ne sont plus lus comme des lots : ils
+    bloquaient à jamais le retrait de worktrees de lots pourtant livrés
+    (#4234, 11 arbres et 5,7 Gio sur ameesh-agents-1).
+
+    Sous `review/`, ce sont les lots relus qui comptent : toutes les suites
+    dont un numéro atteint `RELATED_LOT_MIN`, du dernier au premier numéro
+    (#1694) ; sans une telle suite, toutes les suites (lots anciens < 100).
+
+    Une suite de trois nombres qui forme une date (`2026-10-24`) est un
+    repère, pas des lots ; dans une suite liée, seuls les numéros de lot
+    (>= `RELATED_LOT_MIN`) sont vérifiés, jamais le petit numéro d'étiquette
+    qui les suit.
 
     #2182: the number an agent name carries is not a lot. `agent` — the
     branch's agent, see `branch_agent` — is dropped from the groups first;
@@ -2951,17 +3045,31 @@ def cited_lots(branch: str, agent: str = "") -> list[int]:
     found = CITED_LOT.match(branch or "")
     if not found:
         return []
-    rest = found.group(2)
-    if agent and found.group(1) in ("agent", "review") and rest.startswith(agent + "-"):
+    kind, rest = found.group(1), found.group(2)
+    if agent and kind in ("agent", "review") and rest.startswith(agent + "-"):
         rest = rest[len(agent) + 1:]
-    groupes = []
-    for part in rest.split("-"):
-        if not part.isdigit():
-            continue
-        if found.group(1) in ("agent", "review") and len(part) > 1 and part.startswith("0"):
-            continue
-        groupes.append(int(part))
-    return groupes if found.group(1) in ("lot", "work") else list(reversed(groupes))
+    # #2182 : un lot s'écrit en décimal, jamais complété d'un zéro — vrai
+    # sous tous les préfixes, pas seulement quand le nom d'agent en porte un.
+    runs = [run for run in _numeric_runs(rest, skip_padded=True)
+            if not _date_run(run)]
+    if not runs:
+        return []
+    related = [run for run in runs if max(run) >= RELATED_LOT_MIN]
+    if kind == "review":
+        # aucune suite « grande » : un nom de revue d'un lot ancien (numéro
+        # < 100) garde toutes ses suites, comme avant #4234
+        chosen = related or runs
+        return list(reversed([ident for run in chosen for ident in run]))
+    # aucune suite grande : mêmes lots anciens, on les garde tous (le nom ne
+    # contient que des numéros de lot, pas de repère interne). Sinon la
+    # première suite est le lot, et les suivantes ne gardent que leurs numéros
+    # de lot (un `4` de contexte ne devient pas un lot).
+    if related:
+        chosen = [runs[0]] + [[ident for ident in run if ident >= RELATED_LOT_MIN]
+                              for run in related if run is not runs[0]]
+    else:
+        chosen = runs
+    return [ident for run in chosen for ident in run]
 
 
 def cited_lot(branch: str, agent: str = "") -> int | None:
@@ -4734,7 +4842,8 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
              busy: bool = False, agents_in_turn: set | None = None,
              now: float | None = None,
              runtime=None, artifact_scan: bool = True, min_interval_s: float = 0.0,
-             free_target: int = 0, budget_s: float | None = None) -> dict:
+             free_target: int = 0, budget_s: float | None = None,
+             progress=None) -> dict:
     """One host pass across all runners and the CLI, without waiting.
 
     Periodic callers share the last completed pass's timestamp, under the
@@ -4811,6 +4920,17 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
         cursors = {}
     state[WORKTREES_CURSOR_KEY] = cursors
 
+    def notify(message: str) -> None:
+        # #4234 : une passe qui dure (jusqu'à 15 min) ne doit plus être muette.
+        # Le rapport final reste sur stdout ; cette progression est un
+        # diagnostic, elle ne fait jamais échouer la passe.
+        if progress is None:
+            return
+        try:
+            progress(message)
+        except Exception:  # noqa: BLE001 - un affichage cassé n'arrête pas la passe
+            pass
+
     def on_phase(name: str) -> None:
         # the lock names the phase its holder is in: what a skipped pass —
         # and its alert — can say beyond the pid (#3802)
@@ -4818,6 +4938,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
         holder["phase_since"] = time.time()
         state[session_lock.HOLDER_KEY] = holder
         session_lock.write_content(lock, state)
+        notify("phase:%s" % name)
 
     def on_cursor(value) -> None:
         # #3802 (B1) : le curseur de reprise des worktrees vit dans l'état du
@@ -4844,6 +4965,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                 return skipped("housekeeping already ran on this host less than %gs ago"
                                % min_interval_s)
         budget = PassBudget(budget_s, on_phase=on_phase)
+        notify("started")
         try:
             report = _run_pass(cfg, db, policy, host=host, actor=actor, dry_run=dry_run,
                                busy=busy, agents_in_turn=agents_in_turn, now=now,
@@ -4851,6 +4973,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                free_target=free_target, budget=budget,
                                cursor=cursors.get(key), on_cursor=on_cursor)
         except _PassExpired as expired:
+            notify("timed_out:%s" % expired.phase)
             report = _timed_out_report(host, dry_run, budget, expired.phase)
             report["entries"] = list(report["entries"])
             if not dry_run:
@@ -5334,6 +5457,11 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         else:
             entries.append(line)
     budget.check("worktrees")
+    # #4234 : la phase worktrees a son propre plafond, pour que le verrou
+    # host-pass ne reste pas tenu ~8 min sur un hôte à ~480 arbres (mesuré
+    # sur ameesh-agents-1) ; le curseur reprend au passage suivant.
+    worktrees_budget = budget.slice(min(
+        HOST_PASS_WORKTREES_BUDGET_S, max(0.0, budget.remaining() - reserve)))
     # 3. worktrees
     if policy.worktrees and registered is None:
         # sans registre, ni dossiers d'agents ni tours en cours connus
@@ -5345,7 +5473,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                      if row.get("host") == host and row.get("cwd")}
             found = housekeeping_discovery.discover(
                 db, host, local, policy.worktree_roots, dry_run=dry_run,
-                budget=budget)
+                budget=worktrees_budget)
             entries += found["entries"]
             plan += found["plan"]
             skipped += found["skipped"]
@@ -5358,8 +5486,9 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                              + _shared_roots(),
                                              known_agents=registered or (),
                                              blocked=wt_blocked, archive=archive,
-                                             budget=budget,
-                                             reserve_s=reserve,
+                                             budget=worktrees_budget,
+                                             # la tranche porte déjà la réserve
+                                             reserve_s=0.0,
                                              cursor=cursor, on_cursor=on_cursor)
         entries += wt_entries
         plan += wt_plan
@@ -5658,6 +5787,68 @@ def print_report(report: dict) -> None:
             print("    %s  %s  (%s%s)  →  %s" % (
                 _fmt(e.get("bytes")), e["path"], e.get("owner") or "?", sort,
                 e.get("command") or ""))
+    # #4234 : le volume des arbres de lots livrés gardés pour des fichiers
+    # modifiés/non suivis, les plus gros en tête. Le relevé est borné ; il ne
+    # supprime rien et ne remplace pas la politique d'archivage du Host.
+    sizes = report.get("worktree_sizes") or {}
+    if sizes.get("dirty"):
+        print("  kept dirty worktrees by volume (biggest first; %d of %d measured "
+              "in %ss):" % (sizes.get("measured") or 0, sizes["dirty"],
+                            sizes.get("seconds") or 0))
+        for row in sizes.get("top") or ():
+            print("    %s%s  %s — %s" % (
+                "≥ " if row.get("complete") is False else "",
+                _fmt(row.get("bytes")), row.get("path"), row.get("detail") or ""))
+        if sizes.get("unmeasured"):
+            print("    … %d not measured this pass" % sizes["unmeasured"])
+        print("    total measured %s; %s" % (
+            _fmt(sizes.get("total_bytes")),
+            "archive policy declared: kept until the archive grace"
+            if sizes.get("archive_declared") else
+            "archive policy NOT declared (Host card dirty_worktree_after / "
+            "dirty_archive_retention): these trees stay"))
+
+
+#: #4234 : temps maximal du relevé de volume des arbres gardés pour du travail
+#: non commité (81 arbres, 7,2 Gio mesurés en 3,4 s sur agents-1) ; le relevé
+#: est un affichage borné, jamais une condition de suppression.
+WORKTREE_SIZE_BUDGET_S = 20.0
+WORKTREE_SIZE_TOP = 10
+
+
+def kept_worktree_sizes(plan, *, seconds: float = WORKTREE_SIZE_BUDGET_S) -> dict:
+    """#4234 : tailles des worktrees gardés pour des fichiers modifiés, non
+    suivis ou ignorés, les plus grosses d'abord.
+
+    `plan` est le plan d'une passe en essai (les lignes `garde`/`attend` du
+    kind `worktree`) ; chaque parcours est borné par le temps restant du
+    relevé (20 s au total) et par 5 s pour un seul arbre. Rien n'est supprimé
+    ni écrit : un arbre non mesuré est dit, jamais compté à zéro."""
+    wanted = []
+    for row in plan or ():
+        detail = row.get("detail") or ""
+        if (row.get("kind") == "worktree" and row.get("action") in ("garde", "attend")
+                and ("modified or untracked" in detail
+                     or "ignored file(s) outside build artifacts" in detail)):
+            wanted.append(row)
+    started = time.monotonic()
+    deadline = started + max(0.0, float(seconds))
+    measured = []
+    for row in wanted:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        size, complete = build_artifacts.size_of(
+            row["path"], budget=build_artifacts.Budget(min(left, 5.0)))
+        measured.append({"path": row.get("path"), "bytes": size,
+                         "complete": complete, "detail": row.get("detail") or "",
+                         "lot": row.get("lot")})
+    top = sorted(measured, key=lambda item: item["bytes"], reverse=True)[:WORKTREE_SIZE_TOP]
+    return {"dirty": len(wanted), "measured": len(measured),
+            "unmeasured": len(wanted) - len(measured),
+            "total_bytes": sum(item["bytes"] for item in measured),
+            "seconds": round(time.monotonic() - started, 1),
+            "top": top}
 
 
 def cmd_housekeeping(cfg, args) -> int:
@@ -5671,11 +5862,33 @@ def cmd_housekeeping(cfg, args) -> int:
     import sys
 
     apply = bool(getattr(args, "apply", False)) and not getattr(args, "dry_run", False)
+    json_mode = bool(getattr(args, "json", False))
     if apply:
         refusal = caller_refusal()
         if refusal:
             print("ameesh menage: refused — %s" % refusal, file=sys.stderr)
             return 1
+
+    def progress(message: str) -> None:
+        # #4234 : le rapport n'est imprimé qu'à la fin d'une passe qui dure
+        # jusqu'à 15 min. En texte, une ligne de vie va sur stdout tout de
+        # suite (une sortie capturée n'est plus vide) ; la progression des
+        # phases va sur stderr pour ne jamais polluer le JSON.
+        mode = "apply" if apply else "dry run"
+        if message == "started":
+            print("housekeeping of %s — started (%s)" % (cfg.host or "?", mode),
+                  file=sys.stderr, flush=True)
+            if not json_mode:
+                print("housekeeping of %s — running (%s; budget up to %s)…"
+                      % (cfg.host or "?", mode, fmt_idle(HOST_PASS_BUDGET_S)),
+                      flush=True)
+        elif message.startswith("phase:"):
+            print("  housekeeping: phase %s" % message.split(":", 1)[1],
+                  file=sys.stderr, flush=True)
+        elif message.startswith("timed_out:"):
+            print("  housekeeping: pass budget reached in phase %s"
+                  % message.split(":", 1)[1], file=sys.stderr, flush=True)
+
     db = db_mod.connect(cfg)
     try:
         db_mod.require_schema(db)
@@ -5702,8 +5915,15 @@ def cmd_housekeeping(cfg, args) -> int:
                           # #3293 : le seuil de pause disque de l'hôte
                           # déclenche l'éviction des caches sous pression.
                           free_target=int(limits.get("min_disk_free") or 0),
-                          runtime=containers_mod.Runtime.from_config(cfg))
-        if getattr(args, "json", False):
+                          runtime=containers_mod.Runtime.from_config(cfg),
+                          progress=progress)
+        if report.get("dry_run") and not report.get("status") == "skipped":
+            # #4234 : le volume des arbres gardés est enfin visible, les plus
+            # gros en tête ; le relevé ne supprime rien et reste borné.
+            report["worktree_sizes"] = kept_worktree_sizes(report.get("plan") or ())
+            report["worktree_sizes"]["archive_declared"] = bool(
+                policy.dirty_worktree_after and policy.dirty_archive_retention)
+        if json_mode:
             print(json.dumps(dict(report, schema="ameesh-menage/1"), ensure_ascii=False,
                              sort_keys=True, default=str))
         else:
