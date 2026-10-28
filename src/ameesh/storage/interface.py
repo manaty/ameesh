@@ -628,6 +628,24 @@ class Catalog(Domain):
         """Les lignes qui portent ce modèle, tous fournisseurs confondus."""
 
 
+class Veille(Domain):
+    """Le relevé précédent de la veille des versions (#4291, migration 0504).
+
+    La présence au catalogue partagé n'en est pas un : `models discover` y
+    écrit avant la veille. Ce domaine est la référence durable propre à la
+    veille, par harnais et fournisseur.
+    """
+
+    @abc.abstractmethod
+    def readings(self, harness: str, provider: str) -> list[str]:
+        """Les modèles déjà vus par la veille pour ce harnais et fournisseur."""
+
+    @abc.abstractmethod
+    def record_readings(self, harness: str, provider: str,
+                        model_ids: Sequence[str]) -> int:
+        """Enregistre le relevé courant : une ligne par modèle, `last_seen` avance."""
+
+
 class PendingSpend(Domain):
     """Marqueur comptable d'un tour (`spend_pending`) : une ligne par agent.
 
@@ -5154,6 +5172,7 @@ class Storage(abc.ABC):
     """Les domaines du stockage, liés à une connexion ou une transaction."""
 
     catalog: Catalog
+    veille: Veille
 
     #: nom du pilote de stockage (`postgres`)
     driver: str

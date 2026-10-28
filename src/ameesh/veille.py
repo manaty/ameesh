@@ -982,10 +982,13 @@ def scan(cfg, db, *, sources=None, dry_run: bool = False, probe: bool = True,
             models["previous"] = []
             if models.get("complete") and models.get("served"):
                 try:
-                    rows = storage.of(db).catalog.listing()
-                    previous = {str(row["model_id"]) for row in rows
-                                if row.get("provider") == source.provider
-                                and row.get("model_id")}
+                    # Le relevé précédent est celui de la VEILLE, par harnais
+                    # (migration 0504) : le catalogue partagé ne peut pas servir
+                    # de référence, `models discover` y écrit avant elle et le
+                    # modèle nouveau serait déjà « connu » (B de l'auditeur,
+                    # #4291).
+                    previous = set(storage.of(db).veille.readings(
+                        source.harness, source.provider))
                 except Exception as exc:  # noqa: BLE001 - le modèle reste inconnu
                     previous = set()
                     models["previous_error"] = "%s: %s" % (
@@ -1053,6 +1056,18 @@ def scan(cfg, db, *, sources=None, dry_run: bool = False, probe: bool = True,
                     allowed.add(obj.get("name"))
             to_upsert = [name for name in models["served"] if name in allowed]
             if not to_upsert:
+                continue
+            # La référence de la veille avance AVANT le catalogue : c'est elle
+            # qui décide du « nouveau » au passage suivant (B de l'auditeur,
+            # #4291). Le catalogue reste écrit pour `models list`, mais il ne
+            # sert plus de relevé précédent.
+            try:
+                storage.of(db).veille.record_readings(
+                    entry["harness"], provider, to_upsert)
+            except Exception as exc:  # noqa: BLE001 - un relevé ne juge pas
+                report["errors"].append("%s: veille readings: %s: %s" % (
+                    entry["harness"], type(exc).__name__,
+                    " ".join(str(exc).split())[:160]))
                 continue
             try:
                 storage.of(db).catalog.upsert_models([

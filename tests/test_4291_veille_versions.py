@@ -215,6 +215,7 @@ class VeilleDbTest(PgTestCase):
         self.db.execute("DELETE FROM turn_costs")
         self.db.execute("DELETE FROM model_catalog")
         self.db.execute("DELETE FROM model_harness")
+        self.db.execute("DELETE FROM veille_readings")
 
     # -- helpers ---------------------------------------------------------
     def configure(self, *, provider="", changelog=CHANGELOG, host="vm-a",
@@ -238,6 +239,10 @@ class VeilleDbTest(PgTestCase):
         storage.of(self.db).catalog.upsert_models([
             {"provider": "deepseek", "model_id": name, "source": "deepseek"}
             for name in models])
+
+    def readings(self, *models):
+        storage.of(self.db).veille.record_readings(
+            "deepseek", "deepseek", list(models))
 
     def fetch(self, versions, *, tags=None, changelog=""):
         doc = npm_doc(versions, tags)
@@ -355,7 +360,7 @@ class VeilleDbTest(PgTestCase):
 
     def test_model_served_and_never_billed_opens_a_model_lot(self):
         self.record("vm-a", "0.2.1-rc.4")
-        self.catalog("deepseek-old")
+        self.readings("deepseek-old")
         storage.of(self.db).turn_costs.insert(
             agent="a", harness="deepseek", turn="t1", model="deepseek-old",
             session="s", usd=0.0, input_tokens=1, cached_input_tokens=0,
@@ -377,7 +382,7 @@ class VeilleDbTest(PgTestCase):
 
     def test_known_model_never_billed_does_not_open_a_lot(self):
         self.record("vm-a", "0.2.1-rc.4")
-        self.catalog("deepseek-old")
+        self.readings("deepseek-old")
         listing = lambda: SourceResult(
             source="deepseek", complete=True,
             models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),))
@@ -388,7 +393,7 @@ class VeilleDbTest(PgTestCase):
 
     def test_harness_lot_does_not_catalogue_an_unevaluated_model(self):
         self.record("vm-a", "0.2.0-rc.2")
-        self.catalog("deepseek-old")
+        self.readings("deepseek-old")
         listing = lambda: SourceResult(
             source="deepseek", complete=True,
             models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),
@@ -413,7 +418,7 @@ class VeilleDbTest(PgTestCase):
 
     def test_two_new_models_keep_one_pending(self):
         self.record("vm-a", "1.0")
-        self.catalog("deepseek-old")
+        self.readings("deepseek-old")
         listing = lambda: SourceResult(
             source="deepseek", complete=True,
             models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),
@@ -444,7 +449,7 @@ class VeilleDbTest(PgTestCase):
 
     def test_open_model_lot_is_not_rewritten_by_a_new_rc(self):
         self.record("vm-a", "1.0")
-        self.catalog("deepseek-old")
+        self.readings("deepseek-old")
         listing = lambda: SourceResult(
             source="deepseek", complete=True,
             models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),
@@ -464,6 +469,56 @@ class VeilleDbTest(PgTestCase):
         known = {row["model_id"] for row in storage.of(self.db).catalog.listing()}
         self.assertIn("deepseek-model", known)
 
+    def test_discover_before_scan_does_not_hide_a_new_model(self):
+        # `models discover` écrit au catalogue avant la veille : la présence au
+        # catalogue n'est pas un relevé de la veille (B de l'auditeur, #4291)
+        self.record("vm-a", "1.0")
+        self.readings("deepseek-old")
+        self.catalog("deepseek-old", "deepseek-new")
+        listing = lambda: SourceResult(
+            source="deepseek", complete=True,
+            models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),
+                    ModelSeen(provider="deepseek", model_id="deepseek-new")))
+        first = self.scan(["1.0"], tags={"latest": "1.0"},
+                          provider="deepseek", listing=listing)
+        self.assertEqual(first["actions"][0]["action"], "created", first)
+        lot = work.get(self.db, first["actions"][0]["lot"])
+        self.assertIn("Évaluer le modèle deepseek-new", lot["title"])
+        # le relevé de la veille a avancé : pas de doublon au passage suivant
+        second = self.scan(["1.0"], tags={"latest": "1.0"},
+                           provider="deepseek", listing=listing)
+        self.assertNotEqual(second["actions"][0]["action"], "created", second)
+
+    def test_two_harnesses_same_provider_keep_their_own_reading(self):
+        # deux harnais du même fournisseur : le relevé de l'un ne peut pas
+        # absorber le modèle nouveau de l'autre (B de l'auditeur, #4291)
+        self.record("vm-a", "1.0")
+        storage.of(self.db).hosts.record_harness_version(
+            "vm-a", "deepseek-b", path="/opt/dsh", version="1.0", raw="1.0")
+        storage.of(self.db).veille.record_readings(
+            "deepseek", "deepseek", ["deepseek-old"])
+        storage.of(self.db).veille.record_readings(
+            "deepseek-b", "deepseek", ["deepseek-old"])
+        source = {"harness": "deepseek", "npm": "@org/dsh",
+                  "changelog": CHANGELOG, "provider": "deepseek"}
+        other = dict(source, harness="deepseek-b")
+        cfg = dataclasses.replace(
+            self.cfg, host="vm-a",
+            veille={"sources": [source, other], "app": "ameesh"})
+        listing = lambda: SourceResult(
+            source="deepseek", complete=True,
+            models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),
+                    ModelSeen(provider="deepseek", model_id="deepseek-new")))
+        report = veille.scan(
+            cfg, self.db, probe=False,
+            http_get=self.fetch(["1.0"], tags={"latest": "1.0"}),
+            listing=listing)
+        actions = {action["harness"]: action for action in report["actions"]}
+        self.assertEqual(actions["deepseek"]["action"], "created", report)
+        self.assertEqual(actions["deepseek-b"]["action"], "created", report)
+        self.assertNotEqual(actions["deepseek"]["lot"],
+                            actions["deepseek-b"]["lot"])
+
     def test_canary_keeps_the_harness_lot_object(self):
         self.record("vm-a", "0.2.0-rc.2")
         first = self.scan(["0.2.0-rc.2", "0.2.1-rc.4"],
@@ -472,7 +527,7 @@ class VeilleDbTest(PgTestCase):
         # the canary moves the host to the evaluated version; candidate is then
         # None, and a new model must not overwrite the open harness lot (B1)
         self.record("vm-a", "0.2.1-rc.4")
-        self.catalog("deepseek-old")
+        self.readings("deepseek-old")
         listing = lambda: SourceResult(
             source="deepseek", complete=True,
             models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),
