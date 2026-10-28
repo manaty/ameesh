@@ -75,6 +75,18 @@ posée d'abord, si bien qu'un tic du détenteur courant reprend une recompositio
 perdue à la relève du bail comme les siennes. Elle ne compte pas dans le
 retrait automatique unique du point 4.
 
+#3256 C : quand la médiane d'attente `qa_merge` de la veille dépasse
+`paquet.attente_mediane_s` (bloc du canon compilé, lu avec `ameesh debit
+--json --no-jobs`), le tic ouvre **deux** porteurs dans la même heure. Les
+lots prêts sont partagés par `ameesh.packet_parallel` : aucun fichier modifié
+commun, et deux lots dont l'un dépend de l'autre dans le même groupe. Chaque
+porteur compose avec `paquet-auto.py --only <son groupe>` ; les deux CI
+partent ensemble et `packet_automerge` fusionne le second après le premier,
+sans refaire la suite complète quand la fusion de sa tête dans la cible
+avancée est propre et les contrôles de gel verts. Un conflit le rend à la
+file. Sous le seuil, ou si les lots ne sont pas disjoints, un seul paquet
+part.
+
 Ce script ne fusionne jamais : la fusion reste celle de `packet_automerge`
 sur la tête gelée, CI requise verte. Les marques d'idempotence sont des notes
 `paquet-horaire: …` au journal du porteur.
@@ -236,6 +248,11 @@ class Context:
     pid: int = field(default_factory=os.getpid)
     #: époque du bail du tic (`AMEESH_LEASE_EPOCH`, `ameesh role run`) ; 0 : inconnue
     epoch: int = 0
+    #: #3256 C : le bloc `paquet` du canon compilé (`attente_mediane_s`,
+    #: `max_paquets`) ; None = aucun second paquet (bloc absent).
+    parallel: object | None = None
+    #: l'inventaire calculé du tic, gardé pour ne pas relire la cible
+    candidates_cache: dict = field(default_factory=dict)
     log: list[str] = field(default_factory=list)
 
     def alive(self, pid: int) -> bool:
@@ -447,7 +464,8 @@ def manifest_at(ctx: Context, item: dict, sha: str) -> str:
 
 def paquet_auto(ctx: Context, name: str, carrier: int, *,
                 exclude: list[int] = (), exclude_reasons: list[str] = (),
-                force: bool = False, publish: str = "") -> Result:
+                only: list[int] = (), force: bool = False,
+                publish: str = "") -> Result:
     """`publish` : « réf@sha » de la tête testée (#4237), publiée sans retester."""
     cmd = [ctx.python, str(SCRIPT_DIR / "paquet-auto.py"), "--repo", str(ctx.repo),
            "--target", ctx.target, "--name", name, "--carrier", str(carrier),
@@ -463,6 +481,8 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
     else:
         ctx.say("packet_tests absent du canon compilé : tests ciblés en série, "
                 "borne par défaut de paquet-auto (#4271)")
+    for lot in only:
+        cmd += ["--only", str(lot)]
     for lot in exclude:
         cmd += ["--exclude", str(lot)]
     for reason in exclude_reasons:
@@ -473,8 +493,15 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
     return ctx.shell.run(cmd, cwd=ctx.repo, timeout=COMPOSE_TIMEOUT)
 
 
-def ready_lots(ctx: Context) -> list[int]:
-    """La liste calculée, lue depuis un worktree à la tête exacte de la cible."""
+def candidates(ctx: Context) -> dict:
+    """L'inventaire calculé, lu depuis un worktree à la tête exacte de la cible.
+
+    Le résultat est gardé sur le contexte (`candidates_cache`) : la
+    composition et le partage #3256 C lisent la même liste, sans refaire un
+    worktree ni relire la cible.
+    """
+    if ctx.candidates_cache:
+        return ctx.candidates_cache
     fetched = ctx.git("fetch", "--no-tags", "origin", ctx.target, timeout=300)
     if fetched.returncode != 0:
         raise HoraireError("fetch %s : %s" % (ctx.target, auto._tail(fetched.text, 5)))
@@ -497,12 +524,20 @@ def ready_lots(ctx: Context) -> list[int]:
             raise HoraireError("paquet-candidats rc %d : %s"
                                % (result.returncode, auto._tail(result.text, 10)))
         payload = _json(result, "paquet-candidats")
-        errored = {int(item.get("work_item") or item.get("lot") or 0)
-                   for item in payload.get("errors_by_lot") or []}
-        return [int(lot) for lot in payload.get("ready") or [] if int(lot) not in errored]
+        payload["base"] = base
+        ctx.candidates_cache = payload
+        return payload
     finally:
         ctx.git("worktree", "remove", "--force", str(path))
         shutil.rmtree(path, ignore_errors=True)
+
+
+def ready_lots(ctx: Context) -> list[int]:
+    """Les identifiants prêts de l'inventaire calculé (jamais un courrier)."""
+    payload = candidates(ctx)
+    errored = {int(item.get("work_item") or item.get("lot") or 0)
+               for item in payload.get("errors_by_lot") or []}
+    return [int(lot) for lot in payload.get("ready") or [] if int(lot) not in errored]
 
 
 # ---------------------------------------------------------------------------
@@ -586,20 +621,92 @@ def replay_locally(ctx: Context, sha: str, tests: list[str]) -> str:
 # Étapes
 # ---------------------------------------------------------------------------
 
+#: #3256 C : la trace qui fait d'un porteur le second d'une paire parallèle.
+SECOND_PREFIX = "paquet-horaire: second paquet parallèle de #"
+#: le groupe de lots composé dans ce porteur (les paires et les reprises)
+GROUP_RE = re.compile(r"groupe=(\d+(?:,\d+)*)")
+SECOND_RE = re.compile(r"^paquet-horaire: second paquet parallèle de #(\d+)\b")
 
-def compose(ctx: Context, rows: list[dict]) -> str:
-    if slot_served(rows, ctx.now, ctx.zone, ctx.project, ctx.target):
-        return "porteur horaire déjà créé dans l'heure, non fusionné : rien à faire"
-    ready = ready_lots(ctx)
-    if not ready:
-        return "aucun lot prêt sur %s : rien à faire" % ctx.target
-    name = next_name(ctx)
+
+def carrier_group(item: dict) -> list[int]:
+    """Les lots que ce porteur doit composer (`groupe=…` de sa note)."""
+    for event in reversed(_events(item)):
+        match = GROUP_RE.search(str(event.get("note") or ""))
+        if match:
+            return [int(lot) for lot in match.group(1).split(",") if lot]
+    return []
+
+
+def second_peer(item: dict) -> int | None:
+    """Le porteur du premier paquet, si ce porteur est le second d'une paire."""
+    for event in reversed(_events(item)):
+        match = SECOND_RE.match(str(event.get("note") or ""))
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def yesterday_measure(ctx: Context) -> dict | None:
+    """La section `qa_merge` du débit (#3256 C), lue sans jobs GitHub.
+
+    Une lecture impossible n'ouvre rien : le tic continue avec un seul paquet,
+    et le dit. Le débit est la seule source de la mesure ; le seuil, lui,
+    vient du canon compilé (`paquet.attente_mediane_s`).
+    """
+    if ctx.parallel is None:
+        return None
+    try:
+        result = ctx.ameesh("debit", "--json", "--no-jobs", timeout=COMMAND_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001 - une mesure absente ne bloque pas
+        ctx.say("paquet parallèle : débit illisible (%s), un seul paquet" % exc)
+        return None
+    if result.returncode != 0:
+        ctx.say("paquet parallèle : débit rc %d (%s), un seul paquet"
+                % (result.returncode, auto._tail(result.text, 5)))
+        return None
+    try:
+        return _json(result, "debit").get("qa_merge") or {}
+    except HoraireError as exc:
+        ctx.say("paquet parallèle : débit illisible (%s), un seul paquet" % exc)
+        return None
+
+
+def parallel_decision(ctx: Context) -> dict | None:
+    """Le second paquet est-il ouvert par la médiane de la veille ?"""
+    if ctx.parallel is None:
+        return None
+    from ameesh import packet_parallel
+    decision = packet_parallel.trigger(
+        yesterday_measure(ctx), getattr(ctx.parallel, "attente_mediane_s", None),
+        now=ctx.now, zone=ctx.zone)
+    if not decision.get("enabled"):
+        ctx.say("paquet : un seul paquet (%s)" % decision.get("why"))
+        return None
+    return decision
+
+
+def parallel_partition(ctx: Context, ready: list[int]) -> dict | None:
+    """Partage les lots prêts en deux groupes disjoints, ou None."""
+    try:
+        payload = candidates(ctx)
+    except HoraireError as exc:
+        ctx.say("paquet parallèle : inventaire illisible (%s), un seul paquet" % exc)
+        return None
+    by_lot = {int(entry.get("work_item") or 0): entry
+              for entry in payload.get("candidates") or []}
+    entries = [by_lot[lot] for lot in ready if lot in by_lot]
+    from ameesh import packet_parallel
+    return packet_parallel.partition(entries, ready)
+
+
+def _create_carrier(ctx: Context, name: str, group: list[int], *,
+                    parallel: int) -> int:
     branch = auto.package_branch(name)
     title = "%s%s — composition automatique (§11 bis, §12)" % (TITLE_PREFIX, name)
-    if ctx.dry_run:
-        ctx.say("[essai] porteur « %s », %d lot(s) prêt(s) : %s"
-                % (title, len(ready), ", ".join("#%d" % lot for lot in ready)))
-        return "essai : composition de %s" % name
+    detail = ""
+    if parallel:
+        detail = (" Paquet parallèle #3256 C (%d/%d) : groupe disjoint %s."
+                  % (parallel, 2, ", ".join("#%d" % lot for lot in group)))
     created = ctx.must(
         "work", "add", "--title", title, "--type", "evolution",
         "--app", ctx.project, "--assignee", ctx.pilot, "--priority", "1",
@@ -608,8 +715,8 @@ def compose(ctx: Context, rows: list[dict]) -> str:
         "--estimate-source", CARRIER_ESTIMATE_SOURCE,
         "--source", "paquet-horaire (#3845), minuterie",
         "--body", "Paquet horaire composé sans agent par scripts/paquet-horaire.py "
-                  "(#3845) : %d lot(s) prêt(s) à la lecture (%s)."
-                  % (len(ready), ", ".join("#%d" % lot for lot in ready)),
+                  "(#3845) : %d lot(s) prêt(s) à la lecture (%s).%s"
+                  % (len(group), ", ".join("#%d" % lot for lot in group), detail),
         "--actor", ctx.actor, what="création du porteur")
     found = CREATED_RE.search(created.stdout)
     if not found:
@@ -617,7 +724,53 @@ def compose(ctx: Context, rows: list[dict]) -> str:
                            % auto._tail(created.text, 5))
     carrier = int(found.group(1))
     ctx.say("porteur #%d : %s" % (carrier, title))
-    return attempt(ctx, carrier, name, Attempt(COMPOSITION, 1, ""))
+    return carrier
+
+
+def compose(ctx: Context, rows: list[dict]) -> str:
+    if slot_served(rows, ctx.now, ctx.zone, ctx.project, ctx.target):
+        return "porteur horaire déjà créé dans l'heure, non fusionné : rien à faire"
+    ready = ready_lots(ctx)
+    if not ready:
+        return "aucun lot prêt sur %s : rien à faire" % ctx.target
+    groups = [ready]
+    parallel = parallel_decision(ctx)
+    if parallel is not None:
+        plan = parallel_partition(ctx, ready)
+        if plan and plan.get("second"):
+            groups = [plan["first"], plan["second"]]
+            ctx.say("paquets parallèles #3256 C : %s | %s (médiane %s s > seuil %s s)"
+                    % (", ".join("#%d" % lot for lot in groups[0]),
+                       ", ".join("#%d" % lot for lot in groups[1]),
+                       parallel.get("median_s"), parallel.get("threshold_s")))
+        else:
+            ctx.say("paquet parallèle impossible : les lots ne sont pas disjoints, "
+                    "un seul paquet")
+    if ctx.dry_run:
+        for index, group in enumerate(groups, start=1):
+            ctx.say("[essai] paquet %d/%d, %d lot(s) prêt(s) : %s"
+                    % (index, len(groups), len(group),
+                       ", ".join("#%d" % lot for lot in group)))
+        return "essai : %d paquet(s)" % len(groups)
+    first: int | None = None
+    results: list[str] = []
+    for index, group in enumerate(groups):
+        name = next_name(ctx)
+        carrier = _create_carrier(ctx, name, group,
+                                  parallel=(index + 1 if len(groups) == 2 else 0))
+        if len(groups) == 2:
+            if index == 0:
+                first = carrier
+                ctx.note(carrier, "paquet-horaire: parallèle premier groupe=%s"
+                         % ",".join(str(lot) for lot in group))
+            elif first is not None:
+                ctx.note(carrier, "%s%d groupe=%s"
+                         % (SECOND_PREFIX, first,
+                            ",".join(str(lot) for lot in group)))
+        results.append(attempt(ctx, carrier, name,
+                               Attempt(COMPOSITION, 1, "",
+                                       only=(list(group) if len(groups) == 2 else []))))
+    return "\n".join(results)
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +787,8 @@ class Attempt:
     pid: int = 0
     run_id: str = ""
     exclude: list[int] = field(default_factory=list)
+    #: #3256 C : le groupe que ce porteur compose (vide = toute la liste prête)
+    only: list[int] = field(default_factory=list)
     ts: float = 0.0
     failed: bool = False
     #: #4245 : arrêtée par un refus de garde d'époque (non concluant, §3)
@@ -674,7 +829,7 @@ def attempts(item: dict) -> list[Attempt]:
             found.append(Attempt(
                 step, int(n), "" if base == "-" else base, host, int(pid), run_id or "",
                 [int(lot) for lot in (without or "").split(",") if lot],
-                float(ev.get("created_ts") or 0), epoch=int(epoch or 0),
+                ts=float(ev.get("created_ts") or 0), epoch=int(epoch or 0),
                 publish=ref or "", reasons=reasons))
             continue
         fenced = FENCED_RE.match(note)
@@ -715,6 +870,7 @@ def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
     # une reprise (n > 1) réécrit une branche peut-être déjà poussée
     result = paquet_auto(ctx, name, carrier, exclude=this.exclude,
                          exclude_reasons=reasons,
+                         only=this.only,
                          force=this.step == RECOMPOSITION or this.n > 1 or this.force)
     return after_compose(ctx, carrier, name, result, this)
 
@@ -812,7 +968,7 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
             kept = tested_since(item, this.ts)
             return attempt(ctx, carrier, name, Attempt(
                 this.step, this.n, this.base, run_id=this.run_id,
-                exclude=list(this.exclude), force=True,
+                exclude=list(this.exclude), only=carrier_group(item), force=True,
                 publish=("%s@%s" % (kept[2], kept[1]) if kept else this.publish),
                 reasons=list(this.reasons)))
         if MARK_STUCK + this.key in marks(item):
@@ -841,6 +997,7 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
     return attempt(ctx, carrier, name, Attempt(this.step, this.n + 1, this.base,
                                                run_id=this.run_id,
                                                exclude=list(this.exclude),
+                                               only=carrier_group(item),
                                                publish=("%s@%s" % (kept[2], kept[1])
                                                         if kept else ""),
                                                reasons=list(this.reasons)))
@@ -1021,7 +1178,9 @@ def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
              "#%d %s : ci-full rouge (run %s), retrait de %s (%s) ; recomposition."
              % (carrier, name, run_id, removed, ", ".join(verdict.tests)))
     return attempt(ctx, carrier, name, Attempt(RECOMPOSITION, 1, frozen_sha(item),
-                                               run_id=run_id, exclude=list(verdict.lots)))
+                                               run_id=run_id,
+                                               exclude=list(verdict.lots),
+                                               only=carrier_group(item)))
 
 
 def exclude(ctx: Context, lot: int, carrier: int, name: str, run_id: str,
@@ -1188,6 +1347,18 @@ def tick(ctx: Context) -> str:
     if carriers:
         own = [row for row in carriers if is_hourly(row)
                and "paquet-horaire" in str(row.get("source") or "")]
+        # #3256 C : une paire parallèle (premier + second) se suit sur place ;
+        # le second ne fusionne qu'après le premier (packet_automerge).
+        limit = int(getattr(ctx.parallel, "max_paquets", 1) or 1) \
+            if ctx.parallel is not None else 1
+        if len(own) == len(carriers) == 2 and limit >= 2:
+            items = [show(ctx, int(row["id"])) for row in own]
+            pair = all(carrier_group(item) or second_peer(item) is not None
+                       for item in items)
+            if pair:
+                items.sort(key=lambda item: (float(item.get("created_ts") or 0),
+                                             int(item["id"])))
+                return "\n".join(follow(ctx, item) for item in items)
         if len(own) == 1 and len(carriers) == 1:
             return follow(ctx, show(ctx, int(own[0]["id"])))
         return "%s réservée par %s : rien à faire" % (
@@ -1252,6 +1423,7 @@ def pilot_recompose(ctx: Context, carrier: int, exclude: list[int],
         carrier, ", ".join("#%d" % lot for lot in exclude) or "aucun lot"))
     return attempt(ctx, carrier, name, Attempt(RECOMPOSITION, 1, sha, run_id=PILOT_RUN,
                                                exclude=list(exclude),
+                                               only=carrier_group(item),
                                                reasons=list(reasons)))
 
 
@@ -1304,8 +1476,10 @@ def main(argv: list[str] | None = None) -> int:
     pose_git_identity(args.pilot)
     try:
         from ameesh import config as config_mod, mechanics
-        rules = mechanics.configured(config_mod.load())
-        zone = ZoneInfo(rules.timezone)
+        document = mechanics.configured(config_mod.load())
+        zone = ZoneInfo(document.timezone)
+        unit_tests = getattr(document, "packet_tests", None)
+        parallel = getattr(document, "paquet", None)
     except Exception as error:  # noqa: BLE001 - sans canon, aucune heure sûre
         print("paquet-horaire : fuseau du canon compilé illisible (%s)" % error,
               file=sys.stderr)
@@ -1314,7 +1488,7 @@ def main(argv: list[str] | None = None) -> int:
                   pilot=args.pilot, actor=actor, shell=Shell(),
                   python=args.python or auto.project_python(repo),
                   dry_run=args.dry_run, zone=zone, epoch=lease_epoch(),
-                  unit_tests=getattr(rules, "packet_tests", None))
+                  unit_tests=unit_tests, parallel=parallel)
     try:
         check_fresh(ctx)
         align_schema(ctx)

@@ -1401,5 +1401,145 @@ class ArmPacketTest(unittest.TestCase):
         self.assertIn("  auto-merge now: merged", lines)
 
 
+class ParallelSecondTest(Journal):
+    """#3256 C : le second paquet d'une paire fusionne après le premier.
+
+    La cible avance par la fusion du premier porteur (commit de fusion dont le
+    second parent est sa tête gelée) ; la fusion de la tête du second dans
+    cette cible avancée est propre. Le second n'est ni rebasé ni retesté : ses
+    contrôles de gel tournent sur l'arbre fusionné, puis ameesh fusionne sa
+    tête publiée inchangée.
+    """
+
+    PEER = 5000
+
+    def check(self, gh, **kw):
+        return packet_automerge.check(None, None, LOT, gh=gh, **kw)
+
+    def repo(self):
+        """Un dépôt jetable : une base, puis les commits du banc."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = directory.name
+
+        def git(*args):
+            proc = subprocess.run(["git", "-C", path, *args], capture_output=True,
+                                  text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return (proc.stdout or "").strip()
+
+        git("init", "-q")
+        git("config", "user.email", "test@ameesh.invalid")
+        git("config", "user.name", "test")
+        (Path(path) / "pyproject.toml").write_text('[project]\nversion = "1.0.0"\n')
+        git("add", "-A")
+        git("commit", "-qm", "base")
+        git("branch", "-M", "main")
+        return path, git, git("rev-parse", "HEAD")
+
+    def setUp(self):
+        super().setUp()
+        self.heads = {LOT: HEAD, self.PEER: HEAD}
+        self.closed: list[tuple] = []
+
+        def fresh(db, lot):
+            lot = int(lot)
+            return ({"id": lot, "app": "ameesh", "assignee": "composeur",
+                     "state": "qa",
+                     "branch": "integration/paquet-h-20261020-%04d" % lot},
+                    [{"id": 1, "kind": "frozen",
+                      "sha": self.heads.get(lot, HEAD), "at_ts": 1.0}])
+        patch = mock.patch.object(fire, "_fresh", fresh)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.freeze_ok = (True, "")
+        patch = mock.patch.object(packet_automerge, "_parallel_freeze_checks",
+                                  lambda *a, **k: self.freeze_ok)
+        patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch.object(work, "close",
+                                  lambda db, lot, **kw: self.closed.append((lot, kw)))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self._note(None, LOT, "paquet-horaire: second paquet parallèle de #%d "
+                              "groupe=#2834" % self.PEER)
+
+    def pair(self):
+        """Un dépôt : base, premier paquet fusionné, second paquet disjoint."""
+        path, git, base = self.repo()
+        git("checkout", "-q", "-b", "packet1", base)
+        (Path(path) / "first.py").write_text("first = 1\n")
+        git("add", "-A")
+        git("commit", "-qm", "packet 1: first")
+        first_head = git("rev-parse", "HEAD")
+        git("checkout", "-q", "main")
+        git("merge", "-q", "--no-ff", "packet1", "-m",
+            "Merge pull request #1 from manaty/integration/paquet-h-1")
+        first_merge = git("rev-parse", "HEAD")
+        git("checkout", "-q", "-b", "packet2", base)
+        (Path(path) / "second.py").write_text("second = 2\n")
+        git("add", "-A")
+        git("commit", "-qm", "packet 2: second")
+        second_head = git("rev-parse", "HEAD")
+        git("checkout", "-q", "main")
+        self.heads = {LOT: second_head, self.PEER: first_head}
+        self.frozen = second_head
+        return path, git, base, first_head, first_merge, second_head
+
+    def test_the_second_waits_while_the_first_is_not_merged(self):
+        path, _git, base, first_head, _first_merge, second_head = self.pair()
+        self.heads = {LOT: second_head, self.PEER: first_head}
+        self.armed(sha=second_head, composition=base)
+        gh = FakeGh(head=second_head, tests="success", base_oid=base)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertIn("premier #%d n'est pas encore fusionné" % self.PEER, out["why"])
+        self.assertEqual(gh.merges(), [])
+
+    def test_the_second_merges_after_the_first_on_a_clean_rebase(self):
+        path, _git, base, _first_head, first_merge, second_head = self.pair()
+        self.armed(sha=second_head, composition=base)
+        gh = FakeGh(head=second_head, tests="success", base_oid=first_merge)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", second_head)])
+        proof = [note for note in self.notes()
+                 if note.startswith("parallel-second proof ")]
+        self.assertTrue(proof)
+        self.assertIn("freeze-checks green", proof[0])
+
+    def test_a_conflict_returns_the_second_to_the_queue(self):
+        path, git, base, _first_head, first_merge, second_head = self.pair()
+        # le second touche le fichier du premier : la fusion n'est pas propre
+        git("checkout", "-q", "packet2")
+        (Path(path) / "first.py").write_text("first = 2\n")
+        git("add", "-A")
+        git("commit", "-qm", "packet 2: same file")
+        second_head = git("rev-parse", "HEAD")
+        git("checkout", "-q", "main")
+        self.heads = {LOT: second_head, self.PEER: _first_head}
+        self.frozen = second_head
+        self.armed(sha=second_head, composition=base)
+        gh = FakeGh(head=second_head, tests="success", base_oid=first_merge)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "closed", out)
+        self.assertEqual(gh.merges(), [])
+        self.assertEqual([lot for lot, _kw in self.closed], [LOT])
+        self.assertIn("lots rendus à la file", self.closed[0][1]["note"])
+
+    def test_a_code_commit_beyond_the_first_merge_disarms(self):
+        path, git, base, _first_head, first_merge, second_head = self.pair()
+        (Path(path) / "later.py").write_text("later = 1\n")
+        git("add", "-A")
+        git("commit", "-qm", "later code")
+        moved = git("rev-parse", "HEAD")
+        self.armed(sha=second_head, composition=base)
+        gh = FakeGh(head=second_head, tests="success", base_oid=moved)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "disarmed", out)
+        self.assertEqual(gh.merges(), [])
+        self.assertIn("target advanced since composition", self.notes()[-1])
+
+
 if __name__ == "__main__":
     unittest.main()
