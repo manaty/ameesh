@@ -144,6 +144,9 @@
         le hook `post-commit` constate l'objet né puis écrit la preuve ;
   ameesh receipt verify       approval receipts (spec §8);
   ameesh release open|check|reason <lot>   release perimeter and validation;
+  ameesh replay bench|run|report   banc de rejeu comparatif (#3264 B, L15) :
+        trois lots livrés sur leur base gelée, version installée et version
+        évaluée, relecture croisée à l'aveugle ;
   ameesh restart <agent> --brief FILE|-   fresh session on a brief;
   ameesh resume <agent> [--brief FILE|-] [--fresh]
         restarts a stopped, dead or idle agent: same session if the next
@@ -428,6 +431,11 @@ def _dispatch(argv: list[str] | None) -> int:
         # L123 : l'agent de conversation du propriétaire
         from . import chat
         return chat.main(rest)
+    if command == "replay":
+        # #3264 B (L15) : le banc de rejeu comparatif, isolé et sans effet de
+        # bord ; la sélection lit les lots, le rapport est un fichier.
+        from . import replay
+        return replay.main(rest)
     if command in EXPLOITATION_COMMANDS:
         from . import exploitation
         return exploitation.main(argv)
