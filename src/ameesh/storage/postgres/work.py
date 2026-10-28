@@ -20,6 +20,9 @@ import time
 from ...db import DbError, in_transaction, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
+from .work_footprints import (occupying_sql as footprint_occupying_sql,
+                              overlap_exists_sql as footprint_overlap_sql,
+                              overlap_rows_sql as footprint_overlap_rows_sql)
 from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK,
                                 _UNPINNED)
 from .work_dependencies import current_verdict as _current_verdict
@@ -1131,8 +1134,19 @@ class WorkItems(interface.WorkItems):
                              " LIMIT 1", (int(item_id),)):
                 return None
             ready_state = item["state"]
+            if ready_state == "intake" and self._footprint_overlaps(item_id):
+                return None
         else:
             ready_state = None
+            if assignee is not None and current is None:
+                # #4173 : l'attribution d'un lot libre (`work assign`) prend
+                # le même verrou que la prise, AVANT toute ligne : deux
+                # attributions concurrentes de lots chevauchants décident
+                # l'une après l'autre.
+                self.db.execute(_DEPENDENCIES_LOCK)
+                overlaps = self._footprint_overlaps(item_id, free_only=True)
+                if overlaps:
+                    raise interface.FootprintOverlap(overlaps)
         behind = None
         if (queued_note is not None or take) and assignee:
             lot = self.db.query("SELECT started_at IS NULL AS fresh FROM work_items"
@@ -1148,6 +1162,17 @@ class WorkItems(interface.WorkItems):
         if row is not None and behind is not None:
             row["forced_behind" if forced_note else "queued_behind"] = behind
         return row
+
+    def _footprint_overlaps(self, item_id, *, free_only=False) -> list[dict]:
+        """#4173, sous le verrou du graphe : les chevauchements de l'empreinte
+        du lot avec celle d'un lot occupant de son dépôt (requête POSTÉRIEURE
+        au verrou, comme le contrôle des dépendances). `free_only` : vide si
+        le lot occupe déjà son empreinte (réattribution d'un lot démarré)."""
+        guard = (" AND NOT " + footprint_occupying_sql("c")) if free_only else ""
+        return self.db.query(
+            "SELECT DISTINCT x.* FROM work_items c, LATERAL ("
+            + footprint_overlap_rows_sql("c") + ") x WHERE c.id = %s" + guard +
+            " ORDER BY x.id, x.path", (int(item_id),))
 
     def _pending(self, assignee, item_id) -> int | None:
         """#540, dans la transaction ouverte et sous le verrou de l'agent : son
@@ -3590,7 +3615,13 @@ class WorkItems(interface.WorkItems):
                "           AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
                "                             JOIN work_items b ON b.id = d.blocker_id"
                "                            WHERE d.work_item_id = work_items.id"
-               "                              AND NOT " + _not_blocking("b") + ")) w"
+               "                              AND NOT " + _not_blocking("b") + ")"
+               # #4173 : un lot `intake` dont l'empreinte chevauche celle d'un
+               # lot occupant du même dépôt attend sa fusion (un lot `build`
+               # rendu à la file occupe déjà la sienne) ; même prédicat que la
+               # garde de `_assign_locked`, avant le LIMIT.
+               "           AND (state <> 'intake' OR NOT "
+               + footprint_overlap_sql("work_items") + ")) w"
                "  LEFT JOIN work_packages k ON k.id = w.package_id"
                "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
                " ORDER BY coalesce(w.priority, 2), (w.state = 'build') DESC,"

@@ -162,6 +162,7 @@ from __future__ import annotations
 from .conversations import Conversations
 from .provenance import Provenance
 from .work_dependencies import WorkDependencies
+from .work_footprints import WorkFootprints
 from .migration_reservations import MigrationReservations
 
 import abc
@@ -1656,6 +1657,17 @@ class PendingLot(RuntimeError):
     def __init__(self, lot: int):
         super().__init__("lot #%d not started" % lot)
         self.lot = lot
+
+
+class FootprintOverlap(RuntimeError):
+    """#4173 : l'attribution d'un lot qui n'occupait pas encore son empreinte
+    est refusée — elle chevauche celle d'un lot occupant du même dépôt
+    (`overlaps` : lignes de `work_footprints.overlapping`) ; rien n'est écrit."""
+
+    def __init__(self, overlaps: list):
+        self.overlaps = list(overlaps)
+        super().__init__("footprint overlaps lot(s) %s" % ", ".join(
+            "#%d" % int(i) for i in sorted({int(r["id"]) for r in self.overlaps})))
 
 
 class BasketEstimateRequired(RuntimeError):
@@ -5084,6 +5096,7 @@ class Storage(abc.ABC):
     nonces: Nonces
     work: WorkItems
     work_dependencies: WorkDependencies
+    work_footprints: WorkFootprints
     provenance: Provenance
     migration_reservations: MigrationReservations
     lot_sessions: LotSessions

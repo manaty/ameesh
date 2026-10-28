@@ -2144,20 +2144,26 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     from . import pilot_gesture
     fence = pilot_gesture.gate(cfg, db, "assign", "#%d" % item_id,
                                project=(item.get("app") or None))
-    if fence is None:
-        row = storage.of(db).work.assign(item_id, check["assignee"],
-                                         current=(None if claim and not previous else previous),
-                                         note=note, actor=actor, queued_note=queued,
-                                         forced_note=queued and _forced_note(check, note, force,
-                                                                             actor))
-    else:
-        with db.transaction() as tx:
-            fence.hold(tx)
-            row = storage.of(tx).work.assign(
+    try:
+        if fence is None:
+            row = storage.of(db).work.assign(
                 item_id, check["assignee"],
                 current=(None if claim and not previous else previous),
                 note=note, actor=actor, queued_note=queued,
                 forced_note=queued and _forced_note(check, note, force, actor))
+        else:
+            with db.transaction() as tx:
+                fence.hold(tx)
+                row = storage.of(tx).work.assign(
+                    item_id, check["assignee"],
+                    current=(None if claim and not previous else previous),
+                    note=note, actor=actor, queued_note=queued,
+                    forced_note=queued and _forced_note(check, note, force, actor))
+    except storage.FootprintOverlap as exc:
+        # #4173 : l'empreinte du lot chevauche celle d'un lot en cours du
+        # même dépôt — rien n'est écrit, le lot attend sa fusion.
+        from . import work_footprints
+        raise WorkError(work_footprints.refusal(item_id, exc.overlaps)) from None
     if row is None:
         if claim:
             holder = (get(db, item_id) or {}).get("assignee")

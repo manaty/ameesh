@@ -903,4 +903,12 @@ def milestone(
                 db, item_id, sha.strip(), actor=actor or "")
         except Exception:  # noqa: BLE001 - le gel est écrit ; l'avis se répare
             pass
+        # #4173 : l'empreinte du lot est raffinée par le diff réel de la tête
+        # gelée. Jamais d'échec du gel pour elle (`work footprint --refresh`).
+        try:
+            from . import work_footprints
+            work_footprints.refresh(db, getattr(db, "cfg", None), item_id,
+                                    actor=actor or "ameesh", head=sha.strip())
+        except Exception:  # noqa: BLE001 - le gel est écrit ; l'empreinte se refait
+            pass
     return row
