@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -129,7 +130,7 @@ class OperatorEntryTest(unittest.TestCase):
         from unittest import mock
         from tests.test_3526_runtime_seal import seal, empty_tree
         config=self.trees['runtime']/'pyvenv.cfg'
-        config.write_text('home = /usr/bin\ninclude-system-site-packages = false\n'); config.chmod(0o600)
+        config.write_text(f'home = {Path(sys._base_executable).resolve().parent}\ninclude-system-site-packages = false\n'); config.chmod(0o600)
         trees={name:installer.runtime.inventory(path) for name,path in self.trees.items()}
         self.plan=dict(self.plan,runtime_tree_sha256=trees['runtime']['digest'],source_tree_sha256=trees['sources']['digest'])
         document=dict(version=1,sha='a'*40,machine_id=self.plan['machine_id'],

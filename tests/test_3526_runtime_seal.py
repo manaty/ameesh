@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import unittest
@@ -39,7 +40,7 @@ class SealTest(unittest.TestCase):
         (self.base / 'lib').mkdir()
         (self.base / 'store').mkdir(mode=0o711)
         (self.base / 'runtime/bin/python').write_bytes(b'concrete interpreter')
-        (self.base / 'runtime/pyvenv.cfg').write_text('home = /usr/bin\ninclude-system-site-packages = false\n')
+        (self.base / 'runtime/pyvenv.cfg').write_text(f'home = {Path(sys._base_executable).resolve().parent}\ninclude-system-site-packages = false\n')
         (self.base / 'lib/dispatch-local-handoff.py').write_bytes(b'raise RuntimeError("MUST NOT IMPORT")')
         for path in self.base.rglob('*'):
             path.chmod(0o755 if path.is_dir() else 0o644)
@@ -136,7 +137,7 @@ class SealTest(unittest.TestCase):
 
     def test_even_a_measured_venv_cannot_expand_the_system_trust_boundary(self):
         config=self.base/'runtime/pyvenv.cfg'
-        for text in ('home = /usr/bin\ninclude-system-site-packages = true\n',
+        for text in (f'home = {Path(sys._base_executable).resolve().parent}\ninclude-system-site-packages = true\n',
                      'home = /outside/manifest\ninclude-system-site-packages = false\n'):
             config.chmod(0o644); config.write_text(text); config.chmod(0o444)
             doc=copy.deepcopy(self.document)
