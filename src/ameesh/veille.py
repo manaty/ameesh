@@ -763,6 +763,24 @@ def _marker(body: str) -> dict | None:
             "name": match.group(3), "version": match.group(4)}
 
 
+def _keeps_open(marker: dict | None, obj: dict) -> bool:
+    """Un lot ouvert garde-t-il son objet face à `obj` ?
+
+    Un objet modèle ne remplace jamais un autre objet (harnais ou modèle
+    différent) : le signal reste en attente. Un harnais ne remplace qu'un
+    harnais **plus récent** (ou de même version, pour rafraîchir le corps) ;
+    une version plus ancienne ne rétrograde pas le lot ouvert."""
+    if not marker:
+        return False
+    if obj.get("kind") == "model":
+        return not (marker.get("kind") == "model"
+                    and marker.get("name") == obj.get("name"))
+    if marker.get("kind") != "harness":
+        return True
+    return harness_versions.version_key(marker.get("version")) > \
+        harness_versions.version_key(obj.get("version"))
+
+
 def _already_evaluated(db, source: Source, obj: dict) -> bool:
     """Un lot terminé porte-t-il déjà cet objet (ou une version plus récente) ?"""
     for row in work.with_source(db, SOURCE_PREFIX + source.harness, limit=100):
@@ -820,13 +838,11 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
             open_lot = work.open_with_source(db, key)
             if open_lot is not None:
                 marker = _marker(open_lot.get("body") or "")
-                if obj.get("kind") == "model" and marker and (
-                        marker.get("kind") != "model"
-                        or marker.get("name") != obj.get("name")):
+                if _keeps_open(marker, obj):
                     actions.append({"harness": source.harness,
-                                    "action": "kept-model",
+                                    "action": "kept-object",
                                     "lot": int(open_lot["id"]),
-                                    "reason": "another evaluation lot is open"})
+                                    "reason": "the open lot keeps its object"})
                     continue
                 actions.append({"harness": source.harness, "action": "would-update",
                                 "lot": int(open_lot["id"]),
@@ -844,18 +860,16 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
                 open_lot = work.open_with_source(tx, key)
                 if open_lot is not None:
                     marker = _marker(open_lot.get("body") or "")
-                    if obj.get("kind") == "model" and marker and (
-                            marker.get("kind") != "model"
-                            or marker.get("name") != obj.get("name")):
+                    if _keeps_open(marker, obj):
                         # Un lot ouvert garde son objet : un modèle différent
-                        # ne le remplace jamais (B de l'auditeur, #4291). Le
-                        # relevé précédent n'avance pas pour ce modèle, qui
-                        # sera repris quand le lot sera clos.
+                        # ne le remplace jamais et un harnais plus ancien ne
+                        # rétrograde pas un harnais plus récent (B de
+                        # l'auditeur, #4291). Le signal reste en attente.
                         actions.append({"harness": source.harness,
-                                        "action": "kept-model",
+                                        "action": "kept-object",
                                         "lot": int(open_lot["id"]),
-                                        "reason": "another evaluation lot is open; "
-                                                  "model signal deferred"})
+                                        "reason": "the open lot keeps its object; "
+                                                  "signal deferred"})
                         continue
                     current_priority = open_lot.get("priority")
                     if (open_lot.get("title") == decision["title"]
@@ -1014,7 +1028,7 @@ def scan(cfg, db, *, sources=None, dry_run: bool = False, probe: bool = True,
         for entry in report["sources"]:
             models = entry.get("models") or {}
             action = actions.get(entry["harness"]) or {}
-            if action.get("action") in ("kept-model", "error"):
+            if action.get("action") in ("kept-object", "error"):
                 continue
             if not models.get("complete") or not models.get("served"):
                 continue

@@ -430,7 +430,7 @@ class VeilleDbTest(PgTestCase):
         # model lot
         second = self.scan(["1.0"], tags={"latest": "1.0"},
                            provider="deepseek", listing=listing)
-        self.assertEqual(second["actions"][0]["action"], "kept-model", second)
+        self.assertEqual(second["actions"][0]["action"], "kept-object", second)
         known = {row["model_id"] for row in storage.of(self.db).catalog.listing()}
         self.assertNotIn("deepseek-new1", known)
         self.db.execute("UPDATE work_items SET state = 'closed',"
@@ -441,6 +441,28 @@ class VeilleDbTest(PgTestCase):
         self.assertEqual(third["actions"][0]["action"], "created", third)
         lot = work.get(self.db, third["actions"][0]["lot"])
         self.assertIn("deepseek-new1", lot["title"])
+
+    def test_open_model_lot_is_not_rewritten_by_a_new_rc(self):
+        self.record("vm-a", "1.0")
+        self.catalog("deepseek-old")
+        listing = lambda: SourceResult(
+            source="deepseek", complete=True,
+            models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),
+                    ModelSeen(provider="deepseek", model_id="deepseek-model")))
+        first = self.scan(["1.0"], tags={"latest": "1.0"},
+                          provider="deepseek", listing=listing)
+        self.assertEqual(first["actions"][0]["action"], "created", first)
+        lot_id = first["actions"][0]["lot"]
+        # an rc is published while the model lot is open: the harness
+        # candidate is recomputed every pass, the model object is not lost
+        second = self.scan(["1.0", "1.1"], tags={"latest": "1.1"},
+                           provider="deepseek", listing=listing)
+        self.assertEqual(second["actions"][0]["action"], "kept-object", second)
+        lot = work.get(self.db, lot_id)
+        self.assertIn("Évaluer le modèle deepseek-model", lot["title"])
+        self.assertIn("object=model:deepseek-model", lot["body"])
+        known = {row["model_id"] for row in storage.of(self.db).catalog.listing()}
+        self.assertIn("deepseek-model", known)
 
     def test_canary_keeps_the_harness_lot_object(self):
         self.record("vm-a", "0.2.0-rc.2")
@@ -458,7 +480,7 @@ class VeilleDbTest(PgTestCase):
         report = self.scan(["0.2.0-rc.2", "0.2.1-rc.4"],
                            tags={"rc": "0.2.1-rc.4"}, provider="deepseek",
                            listing=listing)
-        self.assertEqual(report["actions"][0]["action"], "kept-model", report)
+        self.assertEqual(report["actions"][0]["action"], "kept-object", report)
         lot = work.get(self.db, lot_id)
         self.assertEqual(lot["title"], "Évaluer deepseek 0.2.1-rc.4")
         self.assertIn("version=0.2.1-rc.4", lot["body"])
