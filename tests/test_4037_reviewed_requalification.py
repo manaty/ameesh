@@ -53,7 +53,8 @@ class ReviewedMoveTest(unittest.TestCase):
             return_value=dict(actor='author', harness='deepseek')))
         self.historical_authors = self.stack.enter_context(mock.patch.object(
             review.review_authors, '_unreceived_authors', return_value=([], ['unknown'])))
-        store = types.SimpleNamespace(provenance=types.SimpleNamespace(
+        store = types.SimpleNamespace(work=types.SimpleNamespace(
+            verdicts_for_commit=lambda commit: self.marks), provenance=types.SimpleNamespace(
             get=lambda reference: dict(work_item_id=4011)))
         self.stack.enter_context(mock.patch.object(review.storage, 'of', return_value=store))
         self.stack.enter_context(mock.patch.object(review.work, 'milestones',
@@ -181,6 +182,36 @@ class ReviewedMoveTest(unittest.TestCase):
                     self.execute()
                 self.assert_unchanged()
                 self.marks.pop()
+
+    def test_block_on_uncited_lot_still_refuses_without_writing(self):
+        block = dict(self.marks[0], id=3, work_item_id=9999,
+                     actor='human:smichea', verdict='blocked', at_ts=3)
+        self.marks.append(block)
+        # The old per-cited-lot read cannot see the opposition on lot 9999.
+        with mock.patch.object(review.work, 'milestones',
+                               return_value=self.marks[:2]):
+            with self.assertRaisesRegex(TrainError, 'blocking opinion'):
+                self.execute()
+        self.assert_unchanged()
+        self.note.assert_not_called()
+
+    def test_contradictory_receipt_is_named_and_never_writes(self):
+        for number in (1, 3):
+            with self.subTest(number=number):
+                if number == 3:
+                    self.marks.append(dict(self.marks[0], id=3, at_ts=3))
+                def receipt(db, ident):
+                    if ident == number:
+                        raise review.review_provenance.ProvenanceError(
+                            'milestone:%s: proof actor differs' % ident)
+                    return self.receipts.get(ident)
+                with mock.patch.object(review.review_provenance,
+                                       'receipt_for_milestone', side_effect=receipt):
+                    with self.assertRaisesRegex(
+                            TrainError, 'provenance refused: milestone:%s' % number):
+                        self.execute()
+                self.assert_unchanged()
+                self.note.assert_not_called()
 
     def test_superseded_pilot_opinion_cannot_be_cited_as_current(self):
         self.marks.append(dict(self.marks[0], id=3, at_ts=3))

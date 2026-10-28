@@ -34,6 +34,13 @@ def actor(cfg, db):
     return binding.name
 
 
+def _milestone_receipt(db, number):
+    try:
+        return review_provenance.receipt_for_milestone(db, number)
+    except review_provenance.ProvenanceError as exc:
+        raise TrainError("reviewed requalification provenance refused: %s" % exc) from exc
+
+
 def qualify(cfg, db, spec, pin, gate, changed, references):
     """Read exact provenance and current verdicts before any configuration write."""
     if not references:
@@ -47,7 +54,7 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
             raise TrainError("unsupported review reference %r: milestone:<id> required"
                              % reference)
         number = int(match[1])
-        receipt = review_provenance.receipt_for_milestone(db, number)
+        receipt = _milestone_receipt(db, number)
         origin = storage.of(db).provenance.get(reference)
         if not receipt or not origin or not origin.get("work_item_id"):
             raise TrainError("%s: exact review provenance missing" % reference)
@@ -57,9 +64,8 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
                              % reference)
         selected[number] = receipt
         lots.add(int(origin["work_item_id"]))
-    # Read complete histories, including newer blocks that were not cited.
-    marks = [mark for lot in lots for mark in work.milestones(db, lot, limit=None)
-             if mark.get("kind") == "verdict" and mark.get("sha") == gate]
+    # Opposition belongs to the canon commit, even on an uncited source lot.
+    marks = storage.of(db).work.verdicts_for_commit(gate)
     # Ask the common gate for opposition on the complete history. Its result
     # is not an authorization here: pilot assent and diff qualification are
     # checked below. This avoids maintaining a second definition of a block.
@@ -70,7 +76,7 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
         raise TrainError("reviewed requalification has a current blocking opinion")
     latest = {}
     for mark in sorted(marks, key=lambda m: (m["at_ts"], m["id"])):
-        receipt = selected.get(mark["id"]) or review_provenance.receipt_for_milestone(
+        receipt = selected.get(mark["id"]) or _milestone_receipt(
             db, mark["id"])
         if (receipt and receipt["commit"] == gate and receipt["actor"] == mark["actor"]
                 and (receipt.get("milestone") or {}).get("verdict") == mark["verdict"]):

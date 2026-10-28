@@ -29,6 +29,8 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
   pilot.gesture        an elected pilot's gesture (merge, queue, assign,
                        packet, decision, or the drill's no-op canary), in the
                        transaction of its lease check
+  staging.attested     a complete staging sequence, its active hosts and its
+                       commit (no table: written by `actif.py`, #3981)
 
 `data` holds identifiers and states, never free text: the client rereads the
 object through the API.
@@ -77,7 +79,7 @@ CHANNEL = "ameesh_events"
 TYPES = ("lot.updated", "turn.started", "turn.ended", "agent.updated", "agent.moved",
          "cost.recorded", "thread.entry", "decision.created", "decision.closed",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
-         "alert.resolved", "pilot.gesture")
+         "alert.resolved", "pilot.gesture", "staging.attested")
 RETENTION_ENV = "AMEESH_EVENTS_RETENTION_DAYS"
 RETENTION_DAYS = 365
 #: the table refuses to delete an event younger than this (migration 0396)

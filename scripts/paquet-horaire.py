@@ -12,6 +12,11 @@ recomposer (h-32 : bisect à la main pour #3779). Ce script fait ces gestes, un
 (lots, journal du porteur) et de la forge, si bien qu'un tic perdu, un hôte
 arrêté ou un bail repris par un autre candidat ne laisse rien en suspens.
 
+Avant tout geste, le tic pose les migrations **additives** de la tête que la
+base partagée n'a pas encore (#4075) : sinon le code de la tête lit des
+colonnes absentes. Une migration non additive en attente, ou une pose refusée
+(droit DDL) : aucun geste, un lot d'empreinte, le pilote et le bureau prévenus.
+
 Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
 `ameesh role run`, ne le lance que sur l'hôte qui détient le bail) :
 
@@ -832,6 +837,112 @@ def check_fresh(ctx: Context) -> None:
         raise HoraireError("clone modifié : aucun geste\n%s" % auto._tail(dirty.text, 5))
 
 
+#: `agent-mail migrate` chargé depuis `src` du clone (argv[1]), pas depuis le
+#: paquet installé : ce sont les migrations de la tête qu'il faut poser.
+MIGRATE_CODE = ("import sys; sys.path.insert(0, sys.argv[1]); from ameesh import cli; "
+                "sys.exit(cli.main(['migrate', sys.argv[2]]))")
+
+
+#: le bureau reçoit, avec le pilote, l'échec de pose (#4075)
+BUREAU = "bureau"
+MISSING_RE = re.compile(r"^(\d{4}_[A-Za-z0-9._-]+): (additive|NOT additive)", re.MULTILINE)
+DENIED_RE = re.compile(r"permission denied|must be owner|insufficient.privilege|42501",
+                       re.IGNORECASE)
+
+
+def _migrate(ctx: Context, flag: str) -> Result:
+    return ctx.shell.run([ctx.python, "-c", MIGRATE_CODE, str(ctx.repo / "src"), flag],
+                         cwd=ctx.repo, timeout=COMMAND_TIMEOUT)
+
+
+def align_schema(ctx: Context) -> None:
+    """#4075 : la base partagée porte-t-elle les migrations de la tête ?
+
+    Le tic et `paquet-candidats` exécutent le code de la tête exacte de la
+    cible (#3782, `check_fresh`) contre la base partagée. Un paquet qui vient
+    de fusionner une migration rend ce code incompatible avec la base tant que
+    personne ne l'a posée (h-45 : « column operator_pause_until does not
+    exist » à chaque tic, jusqu'à la pose manuelle de 0499). Le tic lit donc
+    d'abord les migrations manquantes de la tête (`--dry-run`, lecture seule)
+    et pose les **additives** (§11 bis : l'ancien code des exécuteurs reste
+    compatible). Une migration non additive n'est jamais posée ici, et un
+    refus de la base (droit DDL absent du rôle du tic) n'est pas contourné :
+    aucun geste, l'échec nomme les migrations et la cause, et `alert_schema`
+    prévient le pilote et le bureau. En essai, seule la lecture a lieu.
+
+    Pas d'instantané avant pose : `migrations.migrate` pose toute la passe
+    dans une seule transaction (verrou consultatif, `lock_timeout` 5 s) et
+    refuse en bloc dès qu'une manquante n'est pas additive ; un échec ne
+    laisse rien de posé, une passe réussie n'ajoute que des objets.
+    """
+    read = _migrate(ctx, "--dry-run")
+    missing = MISSING_RE.findall(read.stdout)
+    if read.returncode != 0:
+        fail_schema(ctx, "lecture", [], read)
+    if not missing:
+        return
+    labels = [label for label, _ in missing]
+    refused = [label for label, kind in missing if kind != "additive"]
+    if refused:
+        fail_schema(ctx, "non-additive", labels, read)
+    if ctx.dry_run:
+        ctx.say("[essai] migrations à poser : %s" % ", ".join(labels))
+        return
+    result = _migrate(ctx, "--additive-only")
+    if result.returncode != 0:
+        kind = "droit-ddl" if DENIED_RE.search(result.text) else (
+            "non-additive" if result.returncode == 3 else "pose")
+        fail_schema(ctx, kind, labels, result)
+    ctx.say("schéma : %s posée(s) sur la base partagée" % ", ".join(labels))
+
+
+SCHEMA_WHY = {
+    "lecture": "lecture des migrations impossible",
+    "non-additive": "migration non additive en attente : jamais posée par le tic (§11 bis)",
+    "droit-ddl": "le rôle DB du tic n'a pas le droit DDL",
+    "pose": "pose refusée par la base",
+}
+
+
+def fail_schema(ctx: Context, kind: str, labels: list[str], result: Result) -> None:
+    """Aucun geste ; pilote et bureau prévenus une fois par empreinte."""
+    what = ", ".join(labels) or "?"
+    message = ("schéma de la tête de %s non aligné (%s) : %s, %s : aucun geste\n%s"
+               % (ctx.target, kind, what, SCHEMA_WHY[kind], auto._tail(result.text, 10)))
+    alert_schema(ctx, kind, what, message)
+    raise HoraireError(message)
+
+
+def alert_schema(ctx: Context, kind: str, what: str, message: str) -> None:
+    """Un lot par empreinte (`work fingerprint open`, #3885) : le tic suivant,
+    même échec, note ce lot au lieu d'écrire de nouveau ; un nouvel échec ou
+    une récidive après clôture ouvre un lot et écrit au pilote et au bureau.
+    Sans lot lisible, le courrier part quand même : se taire est pire."""
+    if ctx.dry_run:
+        ctx.say("[essai] alerte schéma %s : %s" % (kind, what))
+        return
+    opened = ctx.ameesh(
+        "work", "fingerprint", "open", "--app", ctx.project,
+        "--key", "paquet-horaire:schema:%s:%s" % (kind, what),
+        "--title", "Tic horaire bloqué : migrations %s non posées (%s)" % (what, kind),
+        "--code", kind, "--actor", ctx.actor, "--json")
+    lot = 0
+    try:
+        payload = json.loads(opened.stdout) if opened.returncode == 0 else {}
+        if payload.get("created") is False:
+            return
+        lot = int(payload.get("lot") or 0)
+    except (ValueError, TypeError, AttributeError):
+        lot = 0
+    for to in dict.fromkeys((ctx.pilot, BUREAU)):
+        cmd = ["agent-mail", "send", to, "-", "--from", ctx.actor]
+        if lot:
+            cmd += ["--lot", str(lot)]
+        sent = ctx.shell.run(cmd, input_text=message, timeout=120)
+        if sent.returncode != 0:
+            ctx.say("courrier à %s non envoyé : %s" % (to, auto._tail(sent.text, 5)))
+
+
 def tick(ctx: Context) -> str:
     rows = open_lots(ctx)
     carriers = [row for row in rows if is_carrier(row, ctx.project, ctx.target)]
@@ -896,6 +1007,7 @@ def main(argv: list[str] | None = None) -> int:
                   dry_run=args.dry_run, zone=zone)
     try:
         check_fresh(ctx)
+        align_schema(ctx)
         print(tick(ctx), flush=True)
         return 0
     except InputError as error:

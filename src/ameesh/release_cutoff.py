@@ -18,9 +18,11 @@ document is refused (never a fallback), like every connected consumer of
 
 State is local (`<state_dir>/release/state.json`) and the durable facts are the
 tag and the staging attestation: a retry after a crash reconciles them instead
-of publishing a second version. The target merge lease (`land.lock_key`) is
-held during the whole gesture, so a packet cannot move the target while the
-release commit and the staging run are in progress.
+of publishing a second version. The attestation is also mirrored as a compact
+`ameesh_events` event (#3981), so a sequence run from a VM — where `actif.py`
+runs on `HOTE_OUTILS` — is read by the poste without ssh. The target merge
+lease (`land.lock_key`) is held during the whole gesture, so a packet cannot
+move the target while the release commit and the staging run are in progress.
 """
 from __future__ import annotations
 
@@ -80,6 +82,13 @@ VERSION_FILE = "pyproject.toml"
 NOTES_DIR = "docs/versions"
 #: staging attestation of the installed source
 ATTESTATION_DIR = "mise-a-jour"
+#: #3981 : the shared form of the attestation, in the append-only event log.
+#: `actif.py` may run on HOTE_OUTILS (a VM) when the launcher has no venv/DB;
+#: the event is what the poste reads without ssh. The window is the durability
+#: the proof needs: an older attestation no longer proves the active content.
+STAGING_EVENT = "staging.attested"
+STAGING_EVENT_DAYS = 60
+STAGING_EVENT_LIMIT = 1000
 #: staging hosts (canon §14): the agent VMs are always proved; the server and
 #: the poste may be reported absent (#3848, #3965: same lists as actif.py)
 STAGING_AGENTS = ("ameesh-agents-1", "ameesh-agents-2", "ameesh-agents-3")
@@ -1482,7 +1491,7 @@ def tree_proof_text(head: str, proof: dict) -> str:
 
 
 def build_plan(cfg, project: ProjectRelease, *, now: float,
-               version: str | None = None) -> Plan:
+               version: str | None = None, db=None) -> Plan:
     if project.model == "nexlink":
         from . import nexlink_release
         return nexlink_release.plan(cfg, project, now=now, version=version)
@@ -1512,7 +1521,7 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
         green_commit = head
     base = green_commit or head
     from . import staging_pending
-    active = staging_pending.regressions(project, base)
+    active = staging_pending.regressions(project, base, db=db)
     if active:
         current = version_at(project.repo, next(iter(active.values())))
         return Plan(project=project, rules=rules, canon_commit=source.commit,
@@ -1887,42 +1896,128 @@ def attestation_path(sha: str) -> str:
                         ATTESTATION_DIR, "actif-%s.json" % sha[:12])
 
 
-def read_attestation(sha: str) -> dict | None:
+def read_attestation(sha: str, db=None) -> dict | None:
     """The durable attestation of `sha`, if present and complete.
 
-    Complete = the agent VMs and the server proved (the server may be reported); the poste either proved itself or is
-    explicitly reported absent (`reportes`, #3848). A reported poste does not
-    make the VMs inactive; `maybe_staging` reruns the sequence only on the
-    poste, so it catches up when it is back.
+    Two sources, the same proof: the local file (the complete one `actif.py`
+    writes, with the emission ledger) and the shared `ameesh_events` event
+    (#3981, compact), which makes a sequence run from a VM visible to the
+    poste. The most complete one wins and is written back locally, so
+    `attestation_path` and the local readers (`staging_pending`) keep their
+    file. `db=None` keeps the local-only behaviour (dry runs, tests).
+
+    Complete = the agent VMs and the server proved (the server may be
+    reported); the poste either proved itself or is explicitly reported absent
+    (`reportes`, #3848). A reported poste does not make the VMs inactive;
+    `maybe_staging` reruns the sequence only on the poste, so it catches up
+    when it is back.
     """
+    local = _read_attestation_file(sha)
+    # le fichier local est la preuve COMPLETE : il porte aussi l'etat
+    # d'emission (cle de courrier). S'il couvre tous les hotes, il prime et
+    # aucune lecture de base n'est utile.
+    if local is not None and len(local.get("hotes") or {}) == len(STAGING_HOSTS):
+        return local
+    best = local
+    for data in stored_attestations(db, sha):
+        if not _attestation_valid(data, sha):
+            continue
+        if best is None or len(data.get("hotes") or {}) > len(best.get("hotes") or {}):
+            best = data
+    if best is None:
+        return None
+    if best is not local:
+        try:
+            _write_attestation_file(best)
+        except OSError:
+            # the proof is still returned; only the local cache is missing
+            pass
+    return best
+
+
+def _attestation_valid(data, sha: str) -> bool:
+    """The shape and the commit checks of an attestation (file or event)."""
+    if not isinstance(data, dict):
+        return False
+    stored_sha = data.get("sha")
+    if not isinstance(stored_sha, str) or stored_sha[:len(sha)] != sha[:len(sha)]:
+        return False
+    hosts = data.get("hotes")
+    reportes = data.get("reportes") or {}
+    if not isinstance(hosts, dict) or not isinstance(reportes, dict):
+        return False
+    if set(reportes) - {STAGING_SERVEUR, STAGING_POSTE}:
+        return False
+    requis = (set(STAGING_AGENTS) | ({STAGING_SERVEUR} - set(reportes))
+              | ({STAGING_POSTE} - set(reportes)))
+    if set(hosts) != requis:
+        return False
+    for host, detail in hosts.items():
+        if not isinstance(detail, dict):
+            return False
+        actif = str(detail.get("actif") or "").lower()
+        if not actif or not (sha.startswith(actif) or actif.startswith(sha)):
+            return False
+    for host, detail in reportes.items():
+        if not isinstance(detail, dict) or not str(detail.get("raison") or "").strip():
+            return False
+    return True
+
+
+def _read_attestation_file(sha: str) -> dict | None:
     path = attestation_path(sha)
     try:
         with open(path, encoding="utf-8") as stream:
             data = json.load(stream)
     except (FileNotFoundError, OSError, ValueError):
         return None
-    if not isinstance(data, dict) or data.get("sha", "")[:len(sha)] != sha[:len(sha)]:
-        return None
-    hosts = data.get("hotes")
-    reportes = data.get("reportes") or {}
-    if not isinstance(hosts, dict) or not isinstance(reportes, dict):
-        return None
-    if set(reportes) - {STAGING_SERVEUR, STAGING_POSTE}:
-        return None
-    requis = (set(STAGING_AGENTS) | ({STAGING_SERVEUR} - set(reportes))
-              | ({STAGING_POSTE} - set(reportes)))
-    if set(hosts) != requis:
-        return None
-    for host, detail in hosts.items():
-        if not isinstance(detail, dict):
-            return None
-        actif = str(detail.get("actif") or "").lower()
-        if not actif or not (sha.startswith(actif) or actif.startswith(sha)):
-            return None
-    for host, detail in reportes.items():
-        if not isinstance(detail, dict) or not str(detail.get("raison") or "").strip():
-            return None
-    return data
+    return data if _attestation_valid(data, sha) else None
+
+
+def _write_attestation_file(data: dict) -> str:
+    """Materialise a shared attestation under the local state (0600, atomic)."""
+    path = attestation_path(str(data["sha"]))
+    folder = os.path.dirname(path)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".actif-", suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def stored_attestations(db, sha: str | None = None) -> list[dict]:
+    """The shared staging proofs of `ameesh_events`, newest first (#3981).
+
+    A read failure never removes the local proof: the caller falls back to the
+    file. `object` is the exact commit key `actif.py` writes; without `sha`,
+    every recent staging proof is returned (the active-content view).
+    """
+    if db is None:
+        return []
+    key = "staging:%s" % sha if sha and len(sha) == 40 else None
+    try:
+        rows = storage.of(db).events.recent_type(
+            STAGING_EVENT, STAGING_EVENT_DAYS, STAGING_EVENT_LIMIT, object=key)
+    except Exception:  # noqa: BLE001 — a shared-proof read never blocks the local one
+        return []
+    out = []
+    for row in rows or ():
+        data = row.get("data") if isinstance(row, dict) else None
+        if isinstance(data, dict):
+            out.append(data)
+    return out
 
 
 def staging_journal(day: str | None = None) -> str:
@@ -2054,7 +2149,8 @@ def _settle_poste_units(pid: int, wait, grace_s: float | None = None) -> tuple[s
 
 
 def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
-                *, state_dir: str, timeout_s: float | None = None) -> dict:
+                *, state_dir: str, timeout_s: float | None = None,
+                db=None) -> dict:
     """Run `staging.sh` from a worktree of the release commit, under its lock."""
     relative = project.staging
     if os.path.isabs(relative):
@@ -2127,7 +2223,7 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 "log": log_path,
                 "output_tail": "\n".join((output or "").splitlines()[-20:]),
                 "summary": staging_summary(read_journal(since_iso), release_sha),
-                "attestation": read_attestation(release_sha)}
+                "attestation": read_attestation(release_sha, db)}
     finally:
         if drop:
             _drop_worktree(project.repo, folder, worktree)
@@ -2297,7 +2393,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
     if recent:
         release_sha, version_out = recent["commit"], recent["version"]
         from . import staging_pending
-        active = staging_pending.regressions(project, release_sha)
+        active = staging_pending.regressions(project, release_sha, db=db)
         if active:
             return _kept_active(cfg, db, project, state, state_slot, at, label,
                                 release_sha, active, source.commit)
@@ -2322,7 +2418,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                 version_bump=project.version_bump)
         ensure_github_release(project, recent["tag"], version_out, notes)
         staging = (None if no_staging else
-                   _staging_step(project, release_sha, included, cfg.state_dir))
+                   _staging_step(project, release_sha, included, cfg.state_dir, db=db))
         report = {"schema": SCHEMA, "result": "reconciled", "project": project.name,
                   "version": version_out, "tag": recent["tag"],
                   "release_sha": release_sha, "target_head": target_head,
@@ -2333,7 +2429,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
         return finish(cfg, db, project, report, state, state_slot, at, label, rules,
                       previous, None, staging, no_staging)
 
-    plan = build_plan(cfg, project, now=now, version=version)
+    plan = build_plan(cfg, project, now=now, version=version, db=db)
     # #3186 : un run de la tête jamais conclu n'est pas une preuve ; il est
     # relancé une fois, la release suit le dernier vert.
     reruns = rerun_head(project, plan)
@@ -2463,7 +2559,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
     # Staging deploys the tag's commit V (the green content), never the main
     # head; `origin/main` now contains the landing merge M when main was red.
     staging = (None if no_staging else
-               _staging_step(project, version_sha, plan.included, cfg.state_dir))
+               _staging_step(project, version_sha, plan.included, cfg.state_dir, db=db))
     if plan.floor != "patch":
         deviations.append("version level %s: %s" % (plan.floor, plan.floor_reason[:300]))
     report = {"schema": SCHEMA, "result": "released", "project": project.name,
@@ -2504,13 +2600,13 @@ def _kept_active(cfg, db, project, state, slot, at, label, candidate, active,
 
 
 def _staging_step(project: ProjectRelease, release_sha: str, included: list[int],
-                  state_dir: str) -> dict:
+                  state_dir: str, db=None) -> dict:
     """Run staging; a lock conflict retries, a timeout is reported as a gap."""
     from . import staging_pending
-    if staging_pending.regressions(project, release_sha):
+    if staging_pending.regressions(project, release_sha, db=db):
         raise ReleaseError("staging candidate would roll back active content (#3291)")
     try:
-        result = maybe_staging(project, release_sha, included, state_dir)
+        result = maybe_staging(project, release_sha, included, state_dir, db=db)
     except ReleaseBusy:
         raise
     except TransientReleaseError as exc:
@@ -2544,8 +2640,8 @@ def staging_local_host() -> str:
 
 
 def maybe_staging(project: ProjectRelease, release_sha: str, included: list[int],
-                  state_dir: str) -> dict:
-    attestation = read_attestation(release_sha)
+                  state_dir: str, db=None) -> dict:
+    attestation = read_attestation(release_sha, db)
     # Un poste reporte ne prouve pas le staging complet : relancer le met a jour
     # au commit actif a son retour, jamais en dessous (#3848). Lancee ailleurs
     # que sur le poste, la sequence le reporterait encore : relancer referait
@@ -2556,7 +2652,7 @@ def maybe_staging(project: ProjectRelease, release_sha: str, included: list[int]
                         or staging_local_host() != STAGING_POSTE):
         return {"exit": 0, "duration_s": 0.0, "log": "", "summary": [],
                 "attestation": attestation, "skipped": "already attested"}
-    return run_staging(project, release_sha, included, state_dir=state_dir)
+    return run_staging(project, release_sha, included, state_dir=state_dir, db=db)
 
 
 def finish(cfg, db, project: ProjectRelease, report: dict, state: dict,

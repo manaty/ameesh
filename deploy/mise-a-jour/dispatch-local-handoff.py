@@ -127,12 +127,28 @@ def serve(channel, rules, execute):
     channel.sendall(output)
 
 
+def outcome(exc, module, executed):
+    """Fixed journal category: a refusal after execute may follow an effect."""
+    if module is not None and isinstance(exc, module.Uncertain):
+        return 'uncertain'
+    if isinstance(exc, (handoff_contract.ContractError, Refused)):
+        return 'uncertain' if executed else 'refused'
+    return 'unavailable'
+
+
 def main(argv=None):
     def expired(signum, frame):
         raise module.Uncertain('deadline')
     channel = None
     module = None
     pid = uid = -1
+    executed = False
+
+    def effect(request):
+        nonlocal executed
+        executed = True
+        return module.execute(request)
+
     try:
         if (sys.argv[1:] if argv is None else argv) or os.geteuid() != 0:
             raise Refused('authority')
@@ -148,13 +164,11 @@ def main(argv=None):
             raise Refused('channel')
         pid, uid, _ = struct.unpack('3i', channel.getsockopt(
             socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
-        serve(channel, rules, module.execute)
+        serve(channel, rules, effect)
         return 0
     except Exception as exc:
         # May follow an effect. No forged negative receipt: client reconciles.
-        category = ('uncertain' if module is not None
-                    and isinstance(exc, module.Uncertain) else
-                    'refused' if isinstance(exc, (Refused, handoff_contract.ContractError)) else 'unavailable')
+        category = outcome(exc, module, executed)
         print(f'local_handoff_{category} pid={pid} uid={uid}', file=sys.stderr)
         return 1
     finally:

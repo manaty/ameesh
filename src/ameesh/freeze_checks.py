@@ -26,9 +26,10 @@ jalon.
 Contrat du script, pour tout projet : lancé par l'interpréteur d'ameesh, cwd =
 racine de l'arbre de S, environnement de l'appelant ; sortie 0 = vert, toute
 autre = rouge ; il ne dure pas plus de [`TIMEOUT`] secondes (au-delà, son
-groupe de processus est tué et le gel refusé). Le script choisit ses
-contrôles : seulement ce que la suite exige déjà, statique et rapide — le gel
-n'est pas une CI.
+groupe de processus est tué et le gel refusé), ni plus que le temps qui reste
+de l'échéance du gel entier quand `before_freeze` en reçoit une (#4073). Le
+script choisit ses contrôles : seulement ce que la suite exige déjà, statique
+et rapide — le gel n'est pas une CI.
 
 #3687 : le script reçoit aussi, dans [`GATE_ENV`], les chemins du lot que la
 politique range avec la porte de fusion (JSON, liste de chemins dépôt) : la
@@ -51,6 +52,7 @@ import time
 
 from . import work
 from .canon import GitError, _git, git_range_paths, git_toplevel
+from .deadline import Deadline
 
 #: le script de contrôles du projet, chemin dépôt lu au commit gelé
 SCRIPT = "scripts/freeze-checks.py"
@@ -241,13 +243,18 @@ def run(repo: str, commit: str, *, timeout: float = TIMEOUT,
 
 
 def before_freeze(cfg, db, lot: int, sha: str, *, repo: str | None = None,
-                  skip: str | None = None, note: str = "", say=print,
+                  skip: str | None = None, note: str = "",
+                  deadline: Deadline | None = None, say=print,
                   warn=None) -> str:
     """Le garde du gel en CLI : passe les contrôles ou lève [`Refused`].
 
     Rend la note du jalon, complétée de la raison quand `skip` passe outre.
     `say` reçoit le compte rendu, `warn` (stderr par défaut) ce qui n'a pas
-    été contrôlé."""
+    été contrôlé.
+
+    Avec `deadline` (#4073), l'échéance du geste de gel entier, les contrôles
+    ne prennent que le temps qui reste : une échéance épuisée refuse le gel
+    (`checks-incomplete`) au lieu de dépasser le compositeur."""
     if warn is None:
         def warn(text):
             print(text, file=sys.stderr)
@@ -265,6 +272,9 @@ def before_freeze(cfg, db, lot: int, sha: str, *, repo: str | None = None,
     if not sha:
         warn("static checks not run: no --sha to check")
         return note
+    if deadline is not None and deadline.expired():
+        raise Refused("checks-incomplete",
+                      "freeze budget exhausted before the static checks")
     from . import lot_class
     where, commit = resolve(sha, repo=repo, project_repo=lot_class.repository(cfg, item))
     if commit is None:
@@ -272,7 +282,13 @@ def before_freeze(cfg, db, lot: int, sha: str, *, repo: str | None = None,
              "of the lot's project repository (freeze from the lot's worktree, or --repo)"
              % sha[:12])
         return note
-    result = run(where, commit, gate=gate_paths(cfg, item, where, commit))
+    gate = gate_paths(cfg, item, where, commit)
+    timeout = TIMEOUT if deadline is None else deadline.timeout(TIMEOUT)
+    if timeout <= 0.0:
+        raise Refused("checks-incomplete",
+                      "freeze budget exhausted before the static checks of %s"
+                      % commit[:12])
+    result = run(where, commit, gate=gate, timeout=timeout)
     if result["result"] == "none":
         say("static checks: none declared at %s (%s)" % (commit[:12], SCRIPT))
     else:

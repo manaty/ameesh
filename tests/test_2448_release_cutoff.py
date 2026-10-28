@@ -310,6 +310,72 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         stage.assert_not_called()
         self.assertEqual(out["skipped"], "already attested")
 
+    def test_shared_attestation_is_read_and_materialised(self):
+        """#3981 : une sequence lancee d'une VM ecrit sa preuve dans le journal
+        du mesh ; le poste la relit sans ssh et la materialise pour ses
+        lecteurs locaux (`staging_pending`, chemin du rapport)."""
+        sha = self.git(self.clone, "rev-parse", "origin/main")
+        data = {"sha": sha, "date": "2026-10-18T09:00:00Z",
+                "hotes": {hote: {"actif": sha} for hote in release_cutoff.STAGING_VMS},
+                "reportes": {"pc-smichea": {"raison": "poste absent",
+                                            "mise_a_jour": "a son retour"}}}
+
+        class FakeDb:
+            def __init__(self, rows):
+                self.rows = rows
+                self.sql = ""
+                self.params = ()
+
+            def query(self, sql, params):
+                self.sql, self.params = sql, params
+                return self.rows
+
+        db = FakeDb([{"data": data}])
+        path = Path(release_cutoff.attestation_path(sha))
+        self.assertFalse(path.exists())
+        self.assertEqual(release_cutoff.read_attestation(sha, db)["reportes"],
+                         data["reportes"])
+        self.assertIn("ameesh_events", db.sql)
+        self.assertEqual(db.params[0], release_cutoff.STAGING_EVENT)
+        self.assertEqual(db.params[2], "staging:%s" % sha)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["sha"], sha)
+        # sur une VM, la preuve partagee suffit : le poste serait encore
+        # reporte, aucune relance a vide
+        path.unlink()
+        with mock.patch.dict(os.environ, {"HOTE_LOCAL": "ameesh-agents-1"}), \
+                mock.patch.object(release_cutoff, "run_staging") as stage:
+            out = release_cutoff.maybe_staging(self.project, sha, [],
+                                               self.cfg.state_dir, db=db)
+        stage.assert_not_called()
+        self.assertEqual(out["skipped"], "already attested")
+        # sur le poste, la sequence rattrape le poste au meme commit
+        path.unlink()
+        with mock.patch.dict(os.environ, {"HOTE_LOCAL": "pc-smichea"}), \
+                mock.patch.object(release_cutoff, "run_staging",
+                                  return_value={"exit": 0}) as stage:
+            out = release_cutoff.maybe_staging(self.project, sha, [],
+                                               self.cfg.state_dir, db=db)
+        stage.assert_called_once()
+        self.assertEqual(out["exit"], 0)
+
+    def test_shared_attestation_invalid_or_older_never_wins(self):
+        """#3981 : la preuve locale complete prime sur une preuve partagee
+        moins complete ; une preuve partagee invalide est ignoree."""
+        sha = self.git(self.clone, "rev-parse", "origin/main")
+        folder = Path(release_cutoff.attestation_path(sha)).parent
+        folder.mkdir(parents=True, exist_ok=True)
+        local = {"sha": sha, "date": "2026-10-18T10:00:00Z",
+                 "hotes": {hote: {"actif": sha} for hote in release_cutoff.STAGING_HOSTS}}
+        Path(release_cutoff.attestation_path(sha)).write_text(json.dumps(local))
+        shared = {"sha": sha, "date": "2026-10-18T11:00:00Z",
+                  "hotes": {hote: {"actif": sha} for hote in release_cutoff.STAGING_VMS},
+                  "reportes": {"pc-smichea": {"raison": "poste absent"}}}
+        with mock.patch.object(release_cutoff, "stored_attestations",
+                               return_value=[shared, {"sha": "b" * 40}]):
+            attestation = release_cutoff.read_attestation(sha, db=object())
+        self.assertNotIn("reportes", attestation)
+        self.assertEqual(set(attestation["hotes"]), set(release_cutoff.STAGING_HOSTS))
+
     def test_reported_server_attestation_is_complete(self):
         """#147558 : sans acces root, le serveur peut etre reporte ; les deux
         VM d'agents restent requises et le poste prouve fait sauter la relance."""
