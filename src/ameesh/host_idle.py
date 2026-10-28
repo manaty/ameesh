@@ -145,8 +145,6 @@ def snapshot(cfg, db, canons, readings, *, now=None):
         by_id = {int(lot['id']): lot for rows in lots.values() if rows is not None
                  for lot in rows}
         for agent in agents:
-            if agent.get('host') not in candidates:
-                continue
             ident = str(agent.get('session_work_item') or '')
             if ident.isdigit() and int(ident) not in by_id:
                 row = storage.of(db).work.get(int(ident))
