@@ -144,6 +144,25 @@ def _can_prove_idle(reading, *, now, fresh_within):
             and footprint['reserved_mem_bytes'] is not None)
 
 
+def _complete_canons(cfg, canons):
+    """`canons` when it holds every configured canon, once each; else None.
+
+    `load_configured` skips an unreadable canon and a duplicate id, where
+    `from_config_all` refuses both: only an equal count proves the same list.
+    """
+    from . import canon as canon_mod
+    try:
+        entries = canon_mod.configured(cfg)
+    except Exception:  # noqa: BLE001 - unreadable configuration: own read
+        return None
+    canons = list(canons or ())
+    if not entries or len(canons) != len(entries):
+        return None
+    if len({getattr(c, 'id', None) for c in canons}) != len(canons):
+        return None
+    return canons
+
+
 def snapshot(cfg, db, canons, readings, *, now=None, listing=None):
     """Read all common sources once, then project each host. No mutations."""
     from . import canon as canon_mod
@@ -175,6 +194,11 @@ def snapshot(cfg, db, canons, readings, *, now=None, listing=None):
         by_id = {int(lot['id']): lot for rows in lots.values() if rows is not None
                  for lot in rows}
         for agent in agents:
+            # Only the hosts of `readings` are projected: the session lot of
+            # an agent elsewhere feeds neither a lease count nor a hold filter
+            # of this view (one read per agent of the mesh, #4377).
+            if agent.get('host') not in readings:
+                continue
             ident = str(agent.get('session_work_item') or '')
             if ident.isdigit() and int(ident) not in by_id:
                 row = storage.of(db).work.get(int(ident))
@@ -201,7 +225,12 @@ def snapshot(cfg, db, canons, readings, *, now=None, listing=None):
                               < cfg.baseline_hosts):
         from . import election, host_lifecycle
         try:
-            for name in host_lifecycle.critical_names(cfg, db):
+            # #4377: the canons of this view, when every configured canon is
+            # among them, are the list `critical_names` would load again
+            # (`from_config_all`, 1 to 2.4 s); a partial list keeps its own
+            # all-or-nothing read.
+            complete = _complete_canons(cfg, canons)
+            for name in host_lifecycle.critical_names(cfg, db, canons=complete):
                 role = election.status(db, name)
                 if role.get('holder'):
                     protected.add(role['holder'])
