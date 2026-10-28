@@ -37,8 +37,14 @@ ESTIMATE_SOURCES = ("intake", "manual")
 
 def normalize(path: str) -> Optional[str]:
     """Le chemin relatif à la racine, sans `./`, ni `/` en tête ou en queue ;
-    None s'il est vide ou sort du dépôt (`..`)."""
+    None s'il est vide, absolu (racine, `~`, lettre de lecteur) ou sort du
+    dépôt (`..`). Un chemin absolu n'est jamais rabattu en relatif : il
+    désignerait un fichier hors du dépôt sous un nom qui existe peut-être."""
     value = str(path or "").strip().replace("\\", "/")
+    if (not value or value == "~" or value.startswith("~/")
+            or value.startswith("/")
+            or (len(value) >= 2 and value[0].isalpha() and value[1] == ":")):
+        return None
     while value.startswith("./"):
         value = value[2:]
     value = value.strip("/")
@@ -137,9 +143,16 @@ def paths_of(db, item_id: int) -> list[str]:
 
 def set_paths(db, item_id: int, paths: Iterable[str], *, actor: str) -> dict:
     """`--set` : l'empreinte estimée devient `paths` (source `manual`, qui
-    remplace l'estimation d'intake) ; les lignes du diff restent."""
-    clean = _clean(paths)
-    if not clean and list(paths):
+    remplace l'estimation d'intake) ; les lignes du diff restent. Un chemin
+    absolu (ou vide) est refusé nommément, jamais rabattu en relatif."""
+    raw = [str(path) for path in paths]
+    invalid = [path for path in raw if path.strip() and normalize(path) is None]
+    if invalid:
+        raise work.WorkError(
+            "invalid path(s), relative to the repository root: %s"
+            % ", ".join(invalid))
+    clean = _clean(raw)
+    if not clean and raw:
         raise work.WorkError("no usable path: paths are relative to the repository root")
     result = storage.of(db).work_footprints.replace(
         item_id, "manual", clean, actor=actor, replaces=ESTIMATE_SOURCES)
@@ -156,9 +169,34 @@ def estimate_lot(cfg, item: dict, repo: Optional[str] = None) -> list[str]:
                     clone, _ref(clone, target) if clone and target else "")
 
 
+def estimate_for_creation(cfg, *, app: str = "", title: str = "", body: str = "",
+                          branch_target: str = "", repo: Optional[str] = None) -> list[str]:
+    """L'estimation d'intake d'un lot à créer — le geste commun de tous les
+    chemins de création (`work.add`, file d'amélioration). Un texte qui ne cite
+    aucun chemin ne paie pas la résolution du clone ; un échec de la recherche
+    git laisse l'empreinte inconnue et ne défait jamais la création."""
+    if cfg is None:
+        return []
+    from . import intake_neighbors
+    text = "%s\n%s" % (title or "", body or "")
+    if not intake_neighbors.cited_paths(text):
+        return []
+    try:
+        return estimate_lot(cfg, {"app": app or "", "title": title or "",
+                                  "body": body or "",
+                                  "branch_target": branch_target or ""}, repo)
+    except Exception:  # noqa: BLE001 - la création n'attend pas l'estimation
+        return []
+
+
 def record_estimate(db, cfg, item: dict, *, actor: str, repo: Optional[str] = None) -> dict | None:
     """`--estimate` : l'estimation d'intake du lot, réécrite si elle trouve un
-    chemin."""
+    chemin. Le manuel remplace l'estimation : s'il existe, `--estimate` ne
+    ré-ajoute pas de lignes `intake` (l'union serait plus large que les deux) ;
+    `--clear` puis `--estimate` réestime."""
+    rows = storage.of(db).work_footprints.for_items([int(item["id"])])
+    if any(str(row.get("source")) == "manual" for row in rows):
+        return None
     paths = estimate_lot(cfg, item, repo)
     if not paths:
         return None
@@ -257,7 +295,14 @@ def run(cfg, db, args) -> int:
                                                replaces=ESTIMATE_SOURCES)
     elif args.estimate:
         item = work.get(db, args.id)
-        if record_estimate(db, cfg, item, actor=actor, repo=args.repo) is None:
+        manual = any(row["source"] == "manual"
+                     for row in storage.of(db).work_footprints.for_items([args.id]))
+        if manual:
+            # le manuel remplace l'estimation : --estimate ne ré-ajoute pas
+            # des lignes `intake` sous une correction de pilote.
+            print("lot #%d: manual footprint set (--set), estimate not written — "
+                  "change it with --set PATH…, or --clear then --estimate" % args.id)
+        elif record_estimate(db, cfg, item, actor=actor, repo=args.repo) is None:
             print("lot #%d: no path cited by its title or body" % args.id)
     elif args.refresh:
         refresh(db, cfg, args.id, actor=actor, repo=args.repo)

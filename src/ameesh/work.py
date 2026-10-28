@@ -615,13 +615,26 @@ def add(
     unchanged.
 
     #3744 : le corps « - » est refusé quel que soit l'appelant (comme la
-    note, #3683) : c'est le marqueur de l'entrée standard, jamais un énoncé."""
+    note, #3683) : c'est le marqueur de l'entrée standard, jamais un énoncé.
+
+    #4186 : sans `footprint`, l'estimation d'intake est calculée ici, pour
+    tous les chemins de création qui passent par `add` (`agent-mail
+    --new-lot`, incident, empreinte §16, lot de relecture, porteur de paquet,
+    `add_or_note`) et pas seulement le CLI. Sans `cfg` (aucun projet connu),
+    rien n'est deviné : l'empreinte reste inconnue. `_decision_lot` appelle
+    `_create` directement et n'en porte pas : une question n'occupe pas de
+    fichiers."""
     if (body or "").strip() == "-":
         raise WorkError("body refused: `-` alone is not a statement; write the text, "
                         "or pass `--body -` to ameesh work add to read it on standard "
                         "input")
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.add")
+    if footprint is None:
+        from . import work_footprints
+        footprint = work_footprints.estimate_for_creation(
+            cfg if cfg is not None else getattr(db, "cfg", None),
+            app=app, title=title, body=body, branch_target=branch_target or "")
     return _create(db, title=title, type=type, source=source, app=app, body=body,
                    issue_ref=issue_ref, workstream=workstream, assignee=assignee,
                    budget_usd=budget_usd, actor=actor, package=package, externe=externe,

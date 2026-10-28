@@ -23,8 +23,13 @@ from .test_l165_prise_lots import _Lots
 class RegleTest(unittest.TestCase):
     def test_normalisation(self):
         self.assertEqual(fp.normalize("./src/ameesh/"), "src/ameesh")
-        self.assertEqual(fp.normalize("/src//a/../b.py"), "src/b.py")
-        for bad in ("", "  ", "/", "..", "../x", "a/../../x"):
+        self.assertEqual(fp.normalize("src//a/../b.py"), "src/b.py")
+        # #4186 : un chemin absolu n'est plus rabattu en relatif — il
+        # désignerait un fichier hors du dépôt sous un nom qui existe peut-être.
+        for absolute in ("/src//a/../b.py", "/", "~", "~/x", "C:/repo/x.py",
+                         "c:x.py", "//server/share/x.py"):
+            self.assertIsNone(fp.normalize(absolute), absolute)
+        for bad in ("", "  ", "..", "../x", "a/../../x"):
             self.assertIsNone(fp.normalize(bad), bad)
 
     def test_chevauchement_fichier_dossier_et_prefixe_trompeur(self):
