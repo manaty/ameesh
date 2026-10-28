@@ -4505,7 +4505,8 @@
    "host_lifecycle": "host withdrawal and loss recovery: mesh server only",
    "github_watch": "GitHub intake cursors and deduplication: notifier host only",
    "notify_liveness": "notifier liveness and off-notifier brief claims (#3007): mesh server only",
-   "fingerprints": "failure fingerprints watch (#3885): mesh server only, read by the elected role"
+   "fingerprints": "failure fingerprints watch (#3885): mesh server only, read by the elected role",
+   "provider_credits": "crédits du compte fournisseur (#4164) : état partagé du compte, tenu par les runners du mesh ; l'exécuteur médié passe par le relais"
   },
   "operations": {
    "account_windows": [
@@ -5066,6 +5067,13 @@
     "advance",
     "fail",
     "state"
+   ],
+   "provider_credits": [
+    "claim_probe",
+    "get",
+    "listing",
+    "mark_exhausted",
+    "mark_ok"
    ]
   }
  },

@@ -156,6 +156,8 @@ SKIPPABLE_PASSES = ("issues", "github-watch", "ci", "alerts")
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
+                 # #4164 : un compte fournisseur sans crédit — aucun tour accordé
+                 "provider_credits_exhausted",
                  # L226b/#1883 : un compte de forfait facturé au-delà du plan —
                  # l'owner le sait tout de suite, la règle est « jamais de dépassement »
                  "account_overage",
@@ -306,6 +308,7 @@ TYPE_LABELS = {
     "orchestrator_held": "orchestrator held by a session",
     "host_underused": "host underused",
     "balance_low": "low balance",
+    "provider_credits_exhausted": "provider credits exhausted",
     "host_not_ready": "host not ready",
     "auth_blocked": "authentication failing",
     "credential_failing": "credential failing",
@@ -376,6 +379,8 @@ TYPE_LABELS = {
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
+                # #4164 : plus aucun tour sur le compte tant qu'il n'est pas rechargé
+                "provider_credits_exhausted",
                 # #3536 : « jamais de dépassement » — l'owner le sait tout de suite
                 "account_overage",
                 "credential_failing", "critical_budget_pause", "critical_turn_failures",

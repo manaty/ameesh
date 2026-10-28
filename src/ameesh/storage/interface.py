@@ -1171,6 +1171,51 @@ class Accounts(Domain):
 
 
 # --------------------------------------------------------------------------
+# crédits du compte fournisseur, par compte logique (#4164)
+# --------------------------------------------------------------------------
+
+class ProviderCredits(Domain):
+    """État réel des crédits d'un compte fournisseur (`ok|low|exhausted`).
+
+    Clé : le compte **logique** (`harness`, `account`), le même sur tous les
+    hôtes — le solde prépayé est celui du fournisseur. Les lignes ne portent
+    que des noms, une raison courte et le texte d'erreur borné du
+    fournisseur : jamais de secret ni d'invite. Instants de la base (`now()`).
+    """
+
+    @abc.abstractmethod
+    def get(self, harness: str, account: str) -> dict | None:
+        """La ligne du compte (`state`, `since_ts`, `checked_ts`,
+        `next_probe_ts`, `reason`, `detail`, `source`, `agent`, `host`),
+        None si le compte n'a jamais été vu."""
+
+    @abc.abstractmethod
+    def listing(self) -> list[dict]:
+        """Toutes les lignes, par harnais puis compte."""
+
+    @abc.abstractmethod
+    def mark_exhausted(self, harness: str, account: str, *, reason: str,
+                       detail: str | None, source: str, agent: str | None,
+                       host: str | None, probe_after_s: float) -> bool:
+        """Pose `exhausted` (prochaine sonde dans `probe_after_s`). Vrai si
+        c'est une **transition** (le compte n'était pas déjà épuisé) ; sinon
+        seuls l'heure du contrôle et le détail sont actualisés — l'échéance de
+        sonde n'avance que par `claim_probe`."""
+
+    @abc.abstractmethod
+    def mark_ok(self, harness: str, account: str, *, source: str,
+                agent: str | None = None, host: str | None = None) -> bool:
+        """Pose `ok`. Vrai si c'est une transition depuis `low`/`exhausted`
+        (une seule des écritures concurrentes l'obtient)."""
+
+    @abc.abstractmethod
+    def claim_probe(self, harness: str, account: str, interval_s: float) -> bool:
+        """Réserve atomiquement la sonde d'un compte épuisé dont l'échéance
+        est passée, et repousse la suivante de `interval_s`. Vrai pour un
+        seul appelant par échéance."""
+
+
+# --------------------------------------------------------------------------
 # fenêtre courte du fournisseur, par compte logique (#3779)
 # --------------------------------------------------------------------------
 
@@ -5092,6 +5137,7 @@ class Storage(abc.ABC):
     turn_costs: TurnCosts
     accounts: Accounts
     account_windows: AccountWindows
+    provider_credits: ProviderCredits
     credentials: Credentials
     budgets: Budgets
     api_requests: ApiRequests
