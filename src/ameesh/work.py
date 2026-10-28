@@ -3318,11 +3318,22 @@ def _landing_probe(db: Db, item: dict, reserved, slug, sha: str, repo: str | Non
 
         ours: dict[str, str] = {}
         for source in _lot_sources(db, item, sha, repo):
+            numbered = {name: blob for name, blob
+                        in migrations.tree_files(repo, layout, source).items()
+                        if number(name) == reserved}
             base = _merge_base_before(repo, source, resolved[1])
-            before = migrations.tree_files(repo, layout, base) if base else {}
-            ours = {name: blob for name, blob
-                    in migrations.tree_files(repo, layout, source).items()
-                    if number(name) == reserved and name not in before}
+            if base and base == source:
+                # revue cx2 : la source est sur la ligne de premier parent de
+                # la cible (avance rapide) — aucune base ne sépare le lot ; un
+                # fichier N encore sur la cible est posé tel quel, celui que la
+                # cible n'a plus a été renuméroté depuis
+                if any(name in present for name in numbered):
+                    return None
+                ours = numbered
+            else:
+                before = migrations.tree_files(repo, layout, base) if base else {}
+                ours = {name: blob for name, blob in numbered.items()
+                        if name not in before}
             if ours:
                 break
         if any(name in present for name in ours):

@@ -1563,6 +1563,34 @@ class NumeroAtterriTest(PgTestCase):
         self.assertTrue(any("378_cle.sql added by unit" in n for n in self._notes(lot)),
                         self._notes(lot))
 
+    def test_avance_rapide_puis_renumerotation(self):
+        """#4100 (revue cx2) : la source S est sur la ligne de premier parent
+        de la cible (avance rapide), puis R renomme 377 → 378 ; gel et preuve
+        = S. La base calculée égale S : le fichier du lot est celui que la
+        cible n'a plus, suivi par son nom (landed=378, pas de relâchement)."""
+        lot = self._lot()
+        self._nx(lot)
+        self._write("377_key.sql", "create table k();")
+        _git(self.nexlink, "add", ".")
+        _git(self.nexlink, "commit", "-qm", "S")
+        source = self._head()
+        work.milestone(self.db, lot["id"], "frozen", sha=source, actor="ouvrier")
+        _git(self.nexlink, "mv", NEXLINK.directory + "/377_key.sql",
+             NEXLINK.directory + "/378_key.sql")
+        _git(self.nexlink, "commit", "-qm", "R")
+        work.close_merged(self.db, lot["id"], sha=source, actor="git:develop",
+                          source="branch", repo=self.nexlink)
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 378)
+        self.assertEqual(self._slot(lot), {"number": 378, "status": "landed"})
+        # le même chemin sans renumérotation : posé tel quel, rien à dire
+        other = self._lot(n=2)
+        self.assertEqual(self._nx(other)["migration"], 379)
+        _commit(self.nexlink, NEXLINK.directory, "379_plain.sql")
+        work.close_merged(self.db, other["id"], sha=self._head(), actor="git:develop",
+                          source="branch", repo=self.nexlink)
+        self.assertIsNone(work.get(self.db, other["id"])["migration_landed"])
+        self.assertEqual(self._slot(other), {"number": 379, "status": "landed"})
+
     def test_la_reparation_d_un_lot_deja_fusionne_passe_par_le_meme_chemin(self):
         """#4100 : un lot fusionné avant le suivi (créneau atterri au numéro
         réservé) est réparé par `ameesh work merged <id> --sha S --repo R`,
