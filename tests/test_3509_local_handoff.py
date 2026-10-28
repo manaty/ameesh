@@ -22,6 +22,11 @@ def load(name):
 dispatch = load('dispatch-local-handoff')
 bridge = load('pont-handoff')
 
+# #4294: the handoff boundary authenticates its peer with the Linux kernel's
+# SO_PEERCRED (VM agents, systemd); elsewhere (macOS) there is nothing to prove.
+peercred = unittest.skipUnless(
+    hasattr(socket, 'SO_PEERCRED'), 'SO_PEERCRED : frontière du handoff Linux seulement')
+
 
 def request():
     return {'step': 'stop_source', 'host': 'source', 'operation': 'a' * 32,
@@ -29,6 +34,7 @@ def request():
             'agent': 'dev', 'owner': 'runner', 'lease_epoch': 7}
 
 
+@peercred
 class LocalAuthorityTest(unittest.TestCase):
     def setUp(self):
         self.rules = {'uid': os.getuid(), 'host': 'source', 'agents': ['dev']}
@@ -117,6 +123,7 @@ class LocalAuthorityTest(unittest.TestCase):
             server.close()
 
 
+@peercred
 class AlarmOutcomeTest(unittest.TestCase):
     def test_dispatcher_alarm_preserves_intent_then_reconciliation_quiesces(self):
         import io
@@ -177,6 +184,7 @@ class AlarmOutcomeTest(unittest.TestCase):
                          'revoked_epoch')
 
 
+@peercred
 class ContractOutcomeTest(unittest.TestCase):
     def main(self, error, *, executed):
         import io
@@ -225,6 +233,7 @@ class ContractOutcomeTest(unittest.TestCase):
                          'local_handoff_refused pid=42 uid=1001\n')
 
 
+@peercred
 class ClientBoundaryTest(unittest.TestCase):
     def channel(self, uid=0, output=b'{}'):
         import struct

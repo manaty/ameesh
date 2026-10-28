@@ -7,7 +7,7 @@ import subprocess
 import sys
 import unittest
 
-from .test_3509_local_handoff import request
+from .test_3509_local_handoff import peercred, request
 
 
 WORKER = r'''
@@ -41,6 +41,7 @@ else:
 '''
 
 
+@peercred
 class ChildStdinTest(unittest.TestCase):
     def test_each_boundary_prevents_child_receipt_injection(self):
         for boundary in ('dispatcher', 'bounded_run'):
