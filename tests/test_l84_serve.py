@@ -392,14 +392,27 @@ class ServePgTest(ServerMixin, PgTestCase):
                                (host_idle, "snapshot")):
             with self.subTest(source=method), mock.patch.object(
                     module, method, side_effect=OSError("unreadable")):
-                row = mesh_cli.agent_detail(self.db, "a1", cfg=self.cfg)
+                row = mesh_cli.agent_detail(self.db, "a1", cfg=self.cfg, footprint=True)
                 self.assertEqual(row["name"], "a1")
                 self.assertIsNone(row["footprint"])
                 self.assertEqual(row["footprint_unavailable"], "unreadable")
                 status, data = self.get_json("/api/v1/agents/a1")
                 self.assertEqual(status, 200, data)
-                self.assertEqual(data["agent"]["footprint_unavailable"], "unreadable")
                 self.assertIsNone(data["agent"]["footprint"])
+
+    def test_show_does_not_compute_the_host_footprint(self):
+        # #4375 : host_idle.snapshot (~15 s sur un hôte réel) hors de `show`
+        # et de l'API agent ; vm.sh lit `show --json` sous une borne de 30 s.
+        from ameesh import host_idle, mesh_cli
+        with mock.patch.object(host_idle, "snapshot",
+                               side_effect=AssertionError("snapshot in show")):
+            row = mesh_cli.agent_detail(self.db, "a1", cfg=self.cfg)
+            self.assertEqual(row["name"], "a1")
+            self.assertIsNone(row["footprint"])
+            self.assertIsNone(row["footprint_unavailable"])
+            status, data = self.get_json("/api/v1/agents/a1")
+            self.assertEqual(status, 200, data)
+            self.assertIsNone(data["agent"]["footprint"])
 
     def test_unknown_objects_are_404(self):
         for path in ("/api/v1/agents/nobody", "/api/v1/lots/999999", "/api/v1/hosts/nowhere",
