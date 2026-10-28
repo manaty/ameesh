@@ -49,6 +49,8 @@ def project(footprints, listing, *, now, idle_after_s=1800, baseline_hosts=2,
                       len(idle), now - since, baseline_hosts, ', '.join(sorted(idle)),
                       ', '.join(candidates) or 'none until critical guards can be regrouped',
                       ', '.join(agents) or 'none'))
+        detail += ' Footprints: ' + '; '.join(h + ': ' + host_idle.line(idle[h])
+                                                for h in sorted(idle))
         out.append(_alert('baseline_oversized', None, since, len(idle), baseline_hosts,
                           detail, hosts=sorted(idle), burst_candidates=candidates,
                           agents=agents, footprints=idle,

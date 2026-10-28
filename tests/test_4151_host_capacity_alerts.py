@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Read-only reserved-capacity warnings: fresh evidence, agents and quiet holds."""
+import time
 import unittest
 from unittest import mock
 
 from ameesh import (alert_briefs, config, exploitation, host_capacity_alerts as subject,
                     host_idle, notify, sous_utilisation, storage)
+
+from .support import PgTestCase
 
 NOW = 10000
 
@@ -54,6 +57,7 @@ class CapacityAlertsTest(unittest.TestCase):
         self.assertEqual(alert['value'], 3)
         self.assertEqual(alert['threshold'], 2)
         self.assertIn('Regroup', alert['detail'])
+        self.assertIn('0.08 EUR/h', alert['detail'])
         self.assertEqual(self.alerts(fps, baseline_hosts=3), [])
         self.assertEqual(self.alerts(fps, held_hosts={'extra'}), [])
         self.assertEqual(self.alerts(fps, draining_hosts={'extra'}), [])
@@ -116,3 +120,30 @@ class CapacityAlertsTest(unittest.TestCase):
                                                 readings={'burst': reading}), [])
                 of.assert_not_called()
                 snap.assert_not_called()
+
+
+class CapacityNotifierTest(PgTestCase):
+    def test_agents_receive_once_but_configured_owner_channel_stays_silent(self):
+        from ameesh import registry
+        for name in ('orch', 'auditeur'):
+            registry.upsert(self.db, name, harness='claude', host=self.cfg.host)
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name, "
+                        "lease_expires_at = now() + interval '1 hour'")
+        ncfg = notify.parse_config(dict(default_human='human:owner', default=['desktop']))
+        sender = mock.Mock()
+        notifier = notify.Notifier(self.cfg, ncfg, sender=sender, log=lambda text: None,
+                                   clock=time.time)
+        alerts = [dict(type=kind, host='burst', hosts=['a', 'b', 'c'],
+                       since=time.time() - 1800, value=1800, threshold=1800,
+                       detail='reserved idle capacity', orchestrators=['orch'])
+                  for kind in subject.TYPES]
+        notifier.run_pass(self.db, current=alerts)
+        for alert in alerts:
+            alert['since'] += 60  # rolling evidence does not wake the agents twice
+        notifier.run_pass(self.db, current=alerts)
+        sender.send.assert_not_called()
+        self.assertEqual(notifier.state['active'], {})
+        for name in ('orch', 'auditeur'):
+            rows = self.db.query("SELECT body FROM agent_mailbox WHERE recipient = %s", (name,))
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all('reserved idle capacity' in row['body'] for row in rows))
