@@ -1058,9 +1058,17 @@ def run_tests(tree: str, modules: list[str], *, files=(), command: str = "",
         # `tests/<module>.py` qui élimine les fichiers JS/TS.
         shown = present or ["tests/%s.py" % name.replace(".", "/")
                             for name in existing]
-        argv = [part.format(modules=" ".join(existing),
-                            files=" ".join(shown))
-                for part in shlex.split(command)]
+        argv = []
+        for part in shlex.split(command):
+            # Un emplacement de liste fournit un argument par élément,
+            # même quand un chemin contient des espaces.
+            if part == "{files}":
+                argv.extend(str(path) for path in shown)
+            elif part == "{modules}":
+                argv.extend(existing)
+            else:
+                argv.append(part.format(modules=" ".join(existing),
+                                        files=" ".join(shown)))
     else:
         argv = [sys.executable, "-m", "unittest"] + ["tests.%s" % name
                                                     for name in existing]

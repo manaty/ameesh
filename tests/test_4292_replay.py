@@ -367,27 +367,40 @@ class RunTestsTest(unittest.TestCase):
         # reconstruction `tests/<module>.py` qui les éliminerait.
         with tempfile.TemporaryDirectory() as tmp:
             tree = os.path.join(tmp, "tree")
-            for rel in ("web/a.test.ts", "web/b.spec.ts", "tests/test_x.py"):
+            for rel in ("web/a.test.ts", "web/b space.spec.ts", "tests/test_x.py"):
                 path = os.path.join(tree, rel)
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write("// %s\n" % rel)
             helper = os.path.join(tree, "print_files.py")
             with open(helper, "w", encoding="utf-8") as fh:
-                fh.write("import sys\nprint(' | '.join(sys.argv[1:]))\n")
+                fh.write("import json, sys\nprint(json.dumps(sys.argv[1:]))\n")
             command = "%s print_files.py {files}" % sys.executable
             result = replay.run_tests(
-                tree, ["test_x"],
-                files=["web/a.test.ts", "web/b.spec.ts", "tests/test_x.py"],
+                tree, [],
+                files=["web/a.test.ts", "web/b space.spec.ts", "tests/test_x.py"],
                 command=command)
             self.assertEqual(result["status"], "ran", result)
             self.assertTrue(result["passed"], result)
-            self.assertIn("web/a.test.ts", result["output_tail"])
-            self.assertIn("web/b.spec.ts", result["output_tail"])
-            self.assertIn("tests/test_x.py", result["output_tail"])
+            self.assertEqual(json.loads(result["output_tail"]),
+                             ["web/a.test.ts", "web/b space.spec.ts", "tests/test_x.py"])
             self.assertEqual(result["files"],
-                             ["web/a.test.ts", "web/b.spec.ts", "tests/test_x.py"])
+                             ["web/a.test.ts", "web/b space.spec.ts", "tests/test_x.py"])
             self.assertNotIn("tests/a.test.ts", result["command"])
+
+    def test_module_placeholder_supplies_separate_arguments(self):
+        with tempfile.TemporaryDirectory() as tree:
+            os.makedirs(os.path.join(tree, "tests"))
+            for name in ("test_a", "test_b"):
+                with open(os.path.join(tree, "tests", name + ".py"), "w"):
+                    pass
+            with mock.patch.object(replay, "_run_capture", return_value={
+                    "output": "", "timed_out": False, "exit": 0,
+                    "duration_s": 0}) as capture:
+                replay.run_tests(tree, ["test_a", "test_b"],
+                                 command="runner {modules}")
+            self.assertEqual(capture.call_args.args[0],
+                             ["runner", "test_a", "test_b"])
 
     def test_a_declared_command_without_any_usable_file_is_not_conclusive(self):
         # Une commande déclarée n'est pas une preuve : sans fichier ni module
