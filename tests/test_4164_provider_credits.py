@@ -261,6 +261,34 @@ class AcceptanceTest(_CreditsBase):
         finally:
             worker.watchdog_stop.set()
 
+    def test_a_probe_lost_keeps_the_suite_and_runs_it_after_recovery(self):
+        # B2 cx2: a resume consumed by `_pick` (suite after a cap, attach
+        # resume) is given back when the probe is lost, and runs once `ok`
+        _r, worker = self._worker("suite", "codex", {})
+        try:
+            provider_credits.mark_exhausted(self.db, "codex", "", reason="insufficient_quota")
+            self._probe_due()
+            worker.suite = "cap"
+            worker._reprise_attach = True
+            vrai = provider_credits.claim_probe
+
+            def course(db, harness, account, *a, **kw):
+                vrai(db, harness, account)                 # the other runner wins
+                return vrai(db, harness, account, *a, **kw)
+
+            with mock.patch.object(provider_credits, "claim_probe", side_effect=course):
+                self.assertIsNone(self._turn(worker))
+            self.assertEqual(self.turns(), [])
+            self.assertEqual((worker.suite, worker._reprise_attach), ("cap", True))
+            # topped up: the kept suite is the turn that leaves
+            provider_credits.mark_ok(self.db, "codex", "", source="test")
+            spec = self._turn(worker)
+            self.assertEqual(spec["kind"], "suite")
+            self.assertIsNone(worker.suite)
+            self.assertEqual(len(self.turns()), 1)
+        finally:
+            worker.watchdog_stop.set()
+
     def test_a_plan_usage_limit_is_not_an_exhaustion(self):
         _r, worker = self._worker("plan", "codex", {})
         try:

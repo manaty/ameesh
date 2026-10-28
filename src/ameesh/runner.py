@@ -5329,6 +5329,11 @@ class AgentWorker(threading.Thread):
         # urgents, donc hors de ce que le tour choisi sert — ne doit pas être
         # effacée au début du tour : elle l'arrête.
         frontiere = _preemption_generation(self)
+        # #4164 (B2 cx2) : les reprises que `_pick` consomme en choisissant
+        # (suite après plafond, reprise d'attach, relance), rendues si la
+        # sonde du compte épuisé est perdue et que le tour ne part pas
+        reprises = (getattr(self, "suite", None), getattr(self, "_reprise_attach", False),
+                    getattr(self, "nudged", False))
         spec = self._pick()
         if spec is None:
             self._credits_candidate = None  # aucun tour : la sonde reste libre
@@ -5356,6 +5361,7 @@ class AgentWorker(threading.Thread):
                 if spec.get("kind") == "prompt":
                     registry.restore_prompt(self.db, self.name, self.runner.runner_id,
                                             self.epoch)
+                self.suite, self._reprise_attach, self.nudged = reprises
                 self._servir(())
                 return None
             # transportée par le spec : `rotate_for_lot` et les copies de
