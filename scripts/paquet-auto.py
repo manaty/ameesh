@@ -1521,6 +1521,13 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             shared[module] = shared.get(module, 0) + 1
     if composition.selection:
         log("tests voisins : %s" % composition.selection)
+    # #4298 : sans `ameesh` dans le PATH, ni créneau ni schéma isolé : des
+    # séries simultanées partageraient la base ; repli en série, dit au journal
+    if parallel > 1 and shutil.which("ameesh") is None:
+        log("tests ciblés : `ameesh` absent du PATH, pas de créneau `ameesh "
+            "heavy` : séries jouées l'une après l'autre (au lieu de %d à la "
+            "fois)" % parallel)
+        parallel = 1
     # le créneau de l'hôte n'est demandé qu'en parallèle : la série reste le
     # geste antérieur, à l'identique
     slots = {"heavy": True} if parallel > 1 else {}
