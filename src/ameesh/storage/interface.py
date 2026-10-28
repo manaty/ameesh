@@ -90,6 +90,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    revoke get
    placements      recorded
    progress        lots lot_events lot_transitions lot_event_last lot_hold_events
+                   packet_exits
                    lot_milestones lot_actions actions agents costs packages
                    package_items lot_messages
    projects        board
@@ -3529,6 +3530,15 @@ class Progress(Domain):
             if ts is not None:
                 last[lot] = max(last.get(lot, float("-inf")), float(ts))
         return [{"work_item_id": lot, "last_ts": last[lot]} for lot in sorted(last)]
+
+    def packet_exits(self, *, since_ts: float) -> list[dict]:
+        """#4369 : notes de composition de porteur (tout état) qui nomment
+        des unités retirées (`slo.VEHICLE_EXIT_MARK`), écrites depuis
+        `since_ts` (id, work_item_id, note, created_ts). La sortie d'une unité
+        doit survivre à la fusion ou à la clôture de son porteur. Repli : aucune
+        sortie connue — l'horloge part alors du GO, le sens qui n'éteint
+        aucune alerte."""
+        return []
 
     def lot_hold_events(self, item_ids: Sequence[int],
                         patterns: Sequence[str]) -> list[dict]:

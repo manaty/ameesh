@@ -592,7 +592,12 @@ class PaquetTest(_Base):
             self._backdate_exit(self.now)
             self.now += 10 * 60
             self.assertEqual([a for a in self.slo() if a["lot"] == self.lot["id"]], [])
-            self.now += 35 * 60
+            # Avis cx2 (B/P2) : le porteur fusionne ou se ferme sans l'unité ;
+            # sa sortie reste lue, l'horloge ne recule pas au GO.
+            work.close(self.db, carrier["id"], abandoned=True, actor="orch")
+            self.now += 10 * 60
+            self.assertEqual([a for a in self.slo() if a["lot"] == self.lot["id"]], [])
+            self.now += 25 * 60
             alerts = [a for a in self.slo() if a["lot"] == self.lot["id"]]
         self.assertEqual([(a["step"], a["level"]) for a in alerts],
                          [("verdict_merge", 1)], alerts)
