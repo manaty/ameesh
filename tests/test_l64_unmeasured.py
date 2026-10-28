@@ -127,6 +127,15 @@ class CommandsTest(PgTestCase):
         with mock.patch.object(canon, "load_configured", side_effect=OSError("canon")):
             _code, text = self._doctor(self.cfg, return_value=FULL)
         self.assertIn("[default policy: canon unreadable]", text)
+        self.assertIn("footprint  : not checked (canon)", text)
+
+    def test_unavailable_footprint_does_not_change_doctor_verdict(self):
+        from ameesh import host_idle
+        code, _ = self._doctor(self.cfg, return_value=FULL)
+        with mock.patch.object(host_idle, "snapshot", side_effect=OSError("reading")):
+            failed_code, text = self._doctor(self.cfg, return_value=FULL)
+        self.assertEqual(failed_code, code)
+        self.assertIn("footprint  : not checked (reading)", text)
 
     def test_hosts_text_and_json(self):
         self.db.execute("DELETE FROM host_resources")

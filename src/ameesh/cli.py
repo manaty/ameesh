@@ -2283,10 +2283,13 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     print("unread     : %d" % unread)
     print(host_measures_line(cfg))
     from . import host_idle, resources, canon as canon_mod
-    footprints = host_idle.snapshot(cfg, db, canon_mod.load_configured(cfg),
-                                    {r["host"]: r for r in resources.current(db, cfg.host)})
-    if cfg.host in footprints:
-        print(host_idle.line(footprints[cfg.host]))
+    try:
+        footprints = host_idle.snapshot(cfg, db, canon_mod.load_configured(cfg),
+                                        {r["host"]: r for r in resources.current(db, cfg.host)})
+        if cfg.host in footprints:
+            print(host_idle.line(footprints[cfg.host]))
+    except Exception as exc:  # an unavailable footprint never breaks the doctor
+        print("footprint  : not checked (%s)" % (" ".join(str(exc).split())[:120],))
     # #3503 : le JIT de Postgres. db.connect le coupe dans chaque session
     # (`-c jit=off`) ; ici, on signale en plus si le rôle ou la base ne le
     # couperaient pas pour une session qui ne passe pas par ameesh (psql,
