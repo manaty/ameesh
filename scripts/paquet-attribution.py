@@ -27,7 +27,8 @@ et le reste est `unattributable`. Aucune donnée de la base n'est lue.
 que paquet-auto joue en plus des modules propres de l'unité :
 
     {"schema": "ameesh-paquet-selection-request/1", "base": "<sha>",
-     "budget": 180, "units": [{"lot": 1, "unit_sha": "<sha>"}]}
+     "budget": 180, "driver": "psycopg",
+     "units": [{"lot": 1, "unit_sha": "<sha>"}]}
 
 * `support` : les `tests/test_*.py` qui importent un module `tests/*.py`
   modifié par l'unité (un niveau, même lecture que `imported_test_files`) ;
@@ -36,10 +37,17 @@ que paquet-auto joue en plus des modules propres de l'unité :
   `src/` que l'unité change (empreintes de `scripts/map.py`, un bloc nouveau
   lu à son bloc englobant) ; ceux qui couvrent une fonction ou une classe
   passent avant ceux qui ne couvrent que `<module>`, puis le moins cher
-  d'abord (durée psycopg de la carte), jusqu'à `budget` secondes par unité ;
-  le reste est compté (`dropped`).
+  d'abord, jusqu'à `budget` secondes par unité ; le reste est compté
+  (`dropped`).
 
 Une carte absente ou antérieure à `base` est dite dans `card`, sans bloquer.
+
+#4271 — la durée d'un module est celle de `tests/parts/durees.json` de l'arbre
+lu, **pour le pilote** (`driver`, `psycopg` par défaut) avec lequel paquet-auto
+joue les tests : la carte ne mesure que psycopg, et sous psql la suite est
+environ six fois plus lente (h-07 du 28/10 : 1134 s de carte pour 13 unités,
+20 à 30 min réelles chacune). La durée de la carte ne sert qu'à défaut, et
+seulement pour psycopg avec une carte à la base ; sinon `UNKNOWN_DURATION_S`.
 
 Codes de retour : 0 relevé produit (même sans carte), 2 entrée invalide,
 1 lecture impossible (le relevé n'est pas une attribution).
@@ -69,6 +77,9 @@ TEST_FILE_RE = re.compile(r"tests/(test_[A-Za-z0-9_]+)\.py")
 #: la durée prêtée à un module que la carte ne mesure pas
 UNKNOWN_DURATION_S = 60.0
 MAP_SCRIPT = "scripts/map.py"
+#: #4271 : les durées mesurées de la suite, par pilote (`test-parts.py durations`)
+DURATIONS_REL = "tests/parts/durees.json"
+DRIVERS = ("psycopg", "psql")
 SLUG_RE = re.compile(r"(?:github\.com|gitlab\.com)[:/]([^/]+/[^/]+?)(?:\.git)?/?$")
 DEFAULT_STATE = Path.home() / ".local" / "state" / "ameesh"
 
@@ -241,7 +252,28 @@ def changed_blocks(repo: Path, sha: str, path: str, blocks) -> set | None:
             != (after.get(name) or {}).get("empreinte")}
 
 
-def _module_seconds(card, module: str) -> float:
+def read_durations(repo: Path, driver: str) -> dict[str, float]:
+    """{module: secondes} de `tests/parts/durees.json` pour `driver`, ou {}."""
+    try:
+        data = json.loads((repo / DURATIONS_REL).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    table = data.get(driver) if isinstance(data, dict) else None
+    if not isinstance(table, dict):
+        return {}
+    return {str(module): float(value) for module, value in table.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and value >= 0}
+
+
+def _module_seconds(card, module: str, durations: dict | None = None,
+                    card_durations: bool = True) -> float:
+    """#4271 : la durée mesurée pour le pilote, puis celle de la carte si elle
+    vaut pour ce pilote et cette base, sinon `UNKNOWN_DURATION_S`."""
+    if durations and module in durations:
+        return durations[module]
+    if not card_durations:
+        return UNKNOWN_DURATION_S
     entry = ((card or {}).get("modules") or {}).get(module) or {}
     durations = entry.get("durations") or entry.get("durees") or {}
     try:
@@ -290,7 +322,7 @@ def card_candidates(repo: Path, card, sha: str, files) -> dict:
 
 
 def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
-           slug: str, state_dir: Path) -> dict:
+           slug: str, state_dir: Path, driver: str = "psycopg") -> dict:
     """Les modules voisins de chaque unité (support, carte), avec leur raison."""
     units = packet_red.unit_files(unit_rows, checkout=str(repo))
     tests_dir = repo / "tests"
@@ -303,6 +335,11 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
         imports[path.stem] = packet_red.imported_test_files(text)
     card, card_prov = read_card(repo, slug, state_dir)
     card_prov = _card_against_base(repo, card_prov, base)
+    durations = read_durations(repo, driver)
+    # la carte mesure psycopg, à son commit : ni psql, ni une base plus récente
+    card_durations = driver == "psycopg" and card_prov.get("base") == "à jour"
+    priced = {"driver": driver, "table": DURATIONS_REL if durations else "",
+              "measured": len(durations), "card": card_durations}
     out_units = []
     for unit in units:
         files = set(unit.get("files") or ())
@@ -327,7 +364,7 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
             if module in taken or not re.fullmatch(r"test_[A-Za-z0-9_]+", module) \
                     or not (tests_dir / (module + ".py")).is_file():
                 continue
-            seconds = _module_seconds(card, module)
+            seconds = _module_seconds(card, module, durations, card_durations)
             ranked.append((not specific, seconds, module, hit))
         ranked.sort()
         spent, dropped = 0.0, 0
@@ -344,7 +381,7 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
                           "seconds": round(spent, 1)})
     return {"schema": SELECTION_SCHEMA, "status": "ok", "repo": str(repo),
             "slug": slug, "budget": budget, "card": card_prov,
-            "units": out_units, "why": ""}
+            "durations": priced, "units": out_units, "why": ""}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -381,8 +418,11 @@ def main(argv: list[str] | None = None) -> int:
             except (TypeError, ValueError) as exc:
                 raise InputError("budget illisible : %r"
                                  % payload.get("budget")) from exc
+            driver = _text(payload.get("driver")) or "psycopg"
+            if driver not in DRIVERS:
+                raise InputError("pilote inconnu : %r" % driver)
             out = select(repo, unit_rows, budget, _text(payload.get("base")),
-                         slug, Path(args.state_dir))
+                         slug, Path(args.state_dir), driver=driver)
         else:
             rows = failures(payload)
             out = attribute(repo, unit_rows, rows, slug, Path(args.state_dir))

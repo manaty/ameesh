@@ -54,6 +54,14 @@ est relue avant la composition, entre unités, avant chaque série de tests et
 avant publication. Une perte de bail arrête avant l’opération suivante ;
 une opération déjà lancée peut finir. Aucun résultat de test n’est réutilisé.
 
+#4271 : `--tests-parallel N` joue les séries des unités et celle des contrats
+en même temps (au plus N), chacune dans un créneau `ameesh heavy` de l'hôte et
+bornée par `--tests-timeout` (au-delà : non concluant, canon §3) ;
+paquet-horaire les lit dans `packet_tests` du canon compilé. Les voisins de la
+carte sont pesés par `tests/parts/durees.json` pour le pilote des tests
+(`test_driver`), que le manifeste nomme : sous psql, la suite est ~6 fois plus
+lente que la mesure psycopg de la carte.
+
 Modes :
 
 * normal : composition réelle, poussée, PR, gel et courrier ;
@@ -83,7 +91,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -103,6 +113,10 @@ REMISE_PREFIX = "refs/ameesh/resolutions/"
 REMISE_LOCAL = "refs/ameesh/paquet-auto/remise/"
 FREEZE_CHECKS_SCRIPT = "scripts/freeze-checks.py"
 DEFAULT_TIMEOUT = 1800
+#: #4271 : séries jouées en même temps, quand l'appelant ne dit rien (série)
+DEFAULT_PARALLEL = 1
+#: #4271 : code de sortie d'`ameesh heavy` arrêté par sa borne (`heavy.CAPPED_EXIT`)
+HEAVY_CAPPED_EXIT = 124
 FREEZE_TIMEOUT = 600
 GIT_TIMEOUT = 300
 #: #4245 : `RESTART_RESERVE_S` (90 s) de l'élection, plus la lecture
@@ -1039,9 +1053,10 @@ def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
         return {}, ""
     if not script.is_file():
         return {}, "modules voisins non sélectionnés : %s absent" % ATTRIBUTION_SCRIPT
+    driver = test_driver(worktree)
     payload = {
         "schema": "ameesh-paquet-selection-request/1",
-        "base": base_sha, "budget": budget,
+        "base": base_sha, "budget": budget, "driver": driver,
         "units": [{"lot": unit.lot, "unit_sha": unit.commit}
                   for unit in composition.units],
     }
@@ -1085,6 +1100,12 @@ def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
     else:
         note = "carte d'impact absente (%s) : seuls les modules `support` " \
             "sont ajoutés" % (card.get("why") or card.get("status") or "?")
+    priced = report.get("durations") or {}
+    if priced.get("table"):
+        note += " ; durées `%s` (pilote %s)" % (priced["table"], driver)
+    elif priced:
+        note += " ; durées %s (pilote %s)" % (
+            "de la carte" if priced.get("card") else "forfaitaires", driver)
     note += " ; budget de carte %d s par unité, %.0f s pris" % (budget, spent)
     if dropped:
         note += ", %d module(s) au-delà du budget non joué(s)" % dropped
@@ -1180,19 +1201,50 @@ def _save_test_log(run: TestRun) -> TestRun:
     return run
 
 
+def test_driver(worktree: Path) -> str:
+    """#4271 : le pilote Postgres des tests joués par ce script.
+
+    Celui que l'environnement impose (`AMEESH_DRIVER`, comme
+    `ameesh.config`), sinon psycopg si l'interpréteur des tests le porte,
+    sinon psql : la durée d'un module en dépend d'un facteur ~6."""
+    for name in ("AMEESH_DRIVER", "AGENT_MESH_DRIVER"):
+        wanted = (os.environ.get(name) or "").strip()
+        if wanted in ("psycopg", "psql"):
+            return wanted
+        if wanted:
+            break
+    return "psycopg" if _supports_psycopg(project_python(worktree)) else "psql"
+
+
+_SERIES = iter(range(1, 1 << 30))
+
+
 def run_tests(worktree: Path, label: str, modules: list[str], *,
-              timeout: int) -> TestRun:
+              timeout: int, heavy: bool = False) -> TestRun:
+    """Une série unittest bornée par `timeout` (au-delà : non concluant).
+
+    #4271 : avec `heavy`, la série prend un créneau de l'hôte
+    (`ameesh heavy --max-duration`) et son propre schéma par défaut : la borne
+    est tenue par `heavy`, qui arrête tout le groupe de la série ; l'attente
+    d'un créneau a la même borne en plus."""
     if not modules:
         return TestRun(label=label, modules=[], returncode=0, output="",
                        seconds=0.0)
     start = time.monotonic()
+    cmd = [project_python(worktree), "-m", "unittest", "-q", *modules]
+    env = python_env(worktree)
+    wait = 0
+    wrapper = shutil.which("ameesh") if heavy else None
+    if wrapper:
+        cmd = [wrapper, "heavy", "--max-duration", "%ds" % timeout, "--", *cmd]
+        env["AMEESH_SCHEMA"] = "t_paq_%d_%d" % (os.getpid(), next(_SERIES))
+        wait = timeout + 60
     try:
-        proc = run_command(
-            [project_python(worktree), "-m", "unittest", "-q", *modules],
-            cwd=worktree, timeout=timeout, env=python_env(worktree))
+        proc = run_command(cmd, cwd=worktree, timeout=timeout + wait, env=env)
         result = TestRun(label=label, modules=list(modules),
                        returncode=proc.returncode, output=_output(proc),
-                       seconds=time.monotonic() - start)
+                       seconds=time.monotonic() - start,
+                       timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT)
     except PaquetAutoError as exc:
         result = TestRun(label=label, modules=list(modules), returncode=None,
                        output=str(exc), seconds=time.monotonic() - start,
@@ -1328,10 +1380,57 @@ def designated_removals(attribution: dict, failures: list[dict], *,
     return list(by_lot.values()), ""
 
 
+def _run_series(jobs: list, *, parallel: int, guard=None) -> list[TestRun]:
+    """#4271 : les séries `jobs` (sans argument), leurs résultats dans l'ordre.
+
+    En série (`parallel` <= 1), `guard` passe avant chaque série et une garde
+    refusée arrête la suite. En parallèle, `guard` passe au départ de chaque
+    série ; un refus (ou toute erreur d'une série) annule celles qui ne sont
+    pas parties et remonte une fois les séries en cours terminées."""
+    if parallel <= 1 or len(jobs) <= 1:
+        out = []
+        for job in jobs:
+            if guard is not None:
+                guard()
+            out.append(job())
+        return out
+    stop = threading.Event()
+    lock = threading.Lock()
+
+    def start(job):
+        if stop.is_set():
+            return None
+        try:
+            if guard is not None:
+                with lock:
+                    guard()
+            return job()
+        except BaseException:
+            stop.set()
+            raise
+
+    pool = ThreadPoolExecutor(max_workers=min(parallel, len(jobs)),
+                              thread_name_prefix="paquet-series")
+    try:
+        futures = [pool.submit(start, job) for job in jobs]
+        results, error = [], None
+        for future in futures:
+            try:
+                results.append(future.result())
+            except BaseException as exc:  # noqa: BLE001 - remonté après les autres
+                error = error or exc
+        if error is not None:
+            raise error
+        return results
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
 def check_local_tests(worktree: Path, composition: Composition, *,
                       timeout: int, log=print,
                       attribute=None, base_sha: str = "",
-                      select=None, on_base=None, guard=None) -> tuple[list[TestRun], list[int],
+                      select=None, on_base=None, guard=None,
+                      parallel: int = DEFAULT_PARALLEL) -> tuple[list[TestRun], list[int],
                                                           list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
@@ -1353,6 +1452,11 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     l'a sélectionné ; un rouge partagé reste à l'attribution et à la ci-full.
     Un rouge de module voisin aussi rouge sur la base (`base_failures`,
     injectable par `on_base`) ne compte pas : environnement ou préexistant.
+
+    #4271 : avec `parallel` > 1, les séries des unités et celle des contrats
+    sont indépendantes et jouées en même temps (au plus `parallel`), chacune
+    dans un créneau `ameesh heavy` de l'hôte ; leurs résultats sont lus dans
+    l'ordre des unités, comme en série. `guard` est relu avant chaque série.
     """
     runs: list[TestRun] = []
     red: list[tuple[TestRun, list[dict]]] = []
@@ -1365,10 +1469,11 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             shared[module] = shared.get(module, 0) + 1
     if composition.selection:
         log("tests voisins : %s" % composition.selection)
-    pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str]]] = []
+    # le créneau de l'hôte n'est demandé qu'en parallèle : la série reste le
+    # geste antérieur, à l'identique
+    slots = {"heavy": True} if parallel > 1 else {}
+    planned: list[tuple[Unit, list[str], list[dict], list[str]]] = []
     for unit in composition.units:
-        if guard is not None:
-            guard()
         proper = unit_test_modules(worktree, unit)
         added = []
         for row in neighbors.get(unit.lot, []):
@@ -1384,7 +1489,25 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                 % (unit.lot, len(added),
                    ", ".join("%s (%s)" % (row["module"], row["reason"])
                              for row in added)))
-        run = run_tests(worktree, "unité #%d" % unit.lot, modules, timeout=timeout)
+        planned.append((unit, proper, added, modules))
+
+    def unit_job(label: str, modules: list[str]):
+        return lambda: run_tests(worktree, label, modules, timeout=timeout,
+                                 **slots)
+
+    def contract_job():
+        modules = contract_modules(worktree)
+        return run_tests(worktree, "contrats", modules, timeout=timeout, **slots)
+
+    jobs = [unit_job("unité #%d" % unit.lot, modules)
+            for unit, _proper, _added, modules in planned] + [contract_job]
+    if slots:
+        log("tests ciblés : %d série(s), %d à la fois, créneaux `ameesh heavy`, "
+            "borne %d s par série" % (len(jobs), min(parallel, len(jobs)), timeout))
+    results = _run_series(jobs, parallel=parallel, guard=guard)
+    contract = results.pop()
+    pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str]]] = []
+    for (unit, proper, added, modules), run in zip(planned, results):
         run.added = added
         runs.append(run)
         if run.inconclusive:
@@ -1433,10 +1556,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             run.ignored_red = True
             log("tests unité #%d : rouge des seuls voisins, aussi rouges sur la "
                 "base ou non rejoués — sans effet" % unit.lot)
-    if guard is not None:
-        guard()
-    modules = contract_modules(worktree)
-    contract = run_tests(worktree, "contrats", modules, timeout=timeout)
+    modules = contract.modules
     runs.append(contract)
     contract_red = False
     if contract.inconclusive:
@@ -2238,7 +2358,8 @@ def compose_packet(args: argparse.Namespace) -> int:
             print("freeze-checks : vert (%.1f s)" % freeze_seconds, flush=True)
             runs, faulty, removals = check_local_tests(
                 worktree, composition, timeout=args.tests_timeout,
-                base_sha=base_sha, guard=guard)
+                base_sha=base_sha, guard=guard,
+                parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
             if not faulty:
                 break
             if recomp >= MAX_RECOMPOSITIONS:
@@ -2421,6 +2542,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tests-timeout", type=int, default=DEFAULT_TIMEOUT,
                         help="borne d'une exécution unittest (défaut : %d s)"
                         % DEFAULT_TIMEOUT)
+    parser.add_argument("--tests-parallel", type=int, default=DEFAULT_PARALLEL,
+                        help="#4271 : séries d'unités jouées en même temps, "
+                             "dans les créneaux `ameesh heavy` (défaut : %d, "
+                             "en série)" % DEFAULT_PARALLEL)
     parser.add_argument("--keep-worktree", action="store_true",
                         help="conserver le worktree jetable (diagnostic)")
     parser.add_argument("--keep-failed-hours", type=float, default=24.0,

@@ -214,6 +214,9 @@ class Context:
     dry_run: bool = False
     #: fuseau des coupures, lu au canon compilé (`mechanics.timezone`, #2449)
     zone: ZoneInfo = ZoneInfo("UTC")
+    #: #4271 : `packet_tests` du canon compilé (borne d'une série d'unité,
+    #: séries simultanées) ; None : bloc absent, les défauts de paquet-auto
+    unit_tests: object = None
     now: float = field(default_factory=time.time)
     host: str = field(default_factory=socket.gethostname)
     pid: int = field(default_factory=os.getpid)
@@ -436,6 +439,12 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
            "--pilot", ctx.pilot, "--from", ctx.actor]
     if force:
         cmd.append("--force")
+    if ctx.unit_tests is not None:
+        cmd += ["--tests-timeout", str(ctx.unit_tests.unit_timeout_seconds),
+                "--tests-parallel", str(ctx.unit_tests.parallel)]
+    else:
+        ctx.say("packet_tests absent du canon compilé : tests ciblés en série, "
+                "borne par défaut de paquet-auto (#4271)")
     for lot in exclude:
         cmd += ["--exclude", str(lot)]
     if exclude_reason:
@@ -1098,7 +1107,8 @@ def main(argv: list[str] | None = None) -> int:
     pose_git_identity(args.pilot)
     try:
         from ameesh import config as config_mod, mechanics
-        zone = ZoneInfo(mechanics.configured(config_mod.load()).timezone)
+        rules = mechanics.configured(config_mod.load())
+        zone = ZoneInfo(rules.timezone)
     except Exception as error:  # noqa: BLE001 - sans canon, aucune heure sûre
         print("paquet-horaire : fuseau du canon compilé illisible (%s)" % error,
               file=sys.stderr)
@@ -1106,7 +1116,8 @@ def main(argv: list[str] | None = None) -> int:
     ctx = Context(repo=repo, target=args.target, project=args.project,
                   pilot=args.pilot, actor=actor, shell=Shell(),
                   python=args.python or auto.project_python(repo),
-                  dry_run=args.dry_run, zone=zone, epoch=lease_epoch())
+                  dry_run=args.dry_run, zone=zone, epoch=lease_epoch(),
+                  unit_tests=getattr(rules, "packet_tests", None))
     try:
         check_fresh(ctx)
         align_schema(ctx)
