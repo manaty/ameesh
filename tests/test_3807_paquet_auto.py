@@ -315,6 +315,10 @@ class PaquetAutoBanc(unittest.TestCase):
                                   side_effect=record("pr", (1, "http://pr"))), \
                 mock.patch.object(paquet_auto, "freeze_carrier",
                                   side_effect=record("freeze", "gel")), \
+                mock.patch.multiple(paquet_auto,
+                                    request_full_ci=mock.Mock(return_value="ci-full"),
+                                    note_carrier=mock.Mock(return_value="note"),
+                                    pull_request_state=mock.Mock(return_value="OPEN")), \
                 mock.patch.object(paquet_auto, "send_mail",
                                   side_effect=record("mail", "sent")), \
                 mock.patch.object(paquet_auto, "remove_worktree"):

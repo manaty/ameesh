@@ -691,6 +691,10 @@ class ComposePacketTest(unittest.TestCase):
                                   return_value=(2987, "http://pr")), \
                 mock.patch.object(paquet_auto, "freeze_carrier",
                                   return_value="gel"), \
+                mock.patch.multiple(paquet_auto,
+                                    request_full_ci=mock.Mock(return_value="ci-full"),
+                                    note_carrier=mock.Mock(return_value="note"),
+                                    pull_request_state=mock.Mock(return_value="OPEN")), \
                 mock.patch.object(paquet_auto, "send_mail",
                                   return_value="envoyé"), \
                 mock.patch.object(paquet_auto, "remove_worktree"):
