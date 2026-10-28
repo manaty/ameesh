@@ -71,7 +71,13 @@ def alerts(cfg, db, listing, now, *, canons, readings, held_hosts=(), orchestrat
                 and 0 <= now - float(r['sampled_ts']) <= fresh}
     if not readings:
         return []
-    controls = storage.of(db).host_lifecycle.listing()
+    try:
+        controls = storage.of(db).host_lifecycle.listing()
+    except Exception:
+        # The alert pass already holds its other evidence: a lifecycle read
+        # failure must not discard under-use alerts (same rule as
+        # host_verdicts in sous_utilisation.alerts).
+        controls = []
     excluded = {row['host'] for row in controls if row.get('mode') != 'active'}
     readings = {h: r for h, r in readings.items()
                 if h not in excluded and h not in held_hosts}
