@@ -63,8 +63,12 @@ MODEL_SOURCES = ("anthropic", "openai", "deepseek")
 NPM_REGISTRY = "https://registry.npmjs.org"
 #: délai d'une lecture HTTP (npm, changelog)
 HTTP_TIMEOUT_S = 10.0
-#: taille maximale d'une réponse lue (un changelog, un document npm)
+#: taille maximale d'une réponse lue (un changelog)
 HTTP_MAX_BYTES = 8_000_000
+#: taille maximale du document npm complet : celui de `@openai/codex` faisait
+#: 18,3 Mo le 28/10/2026, sous le plafond générique de 8 Mo qui le rendait
+#: invisible (avis B2 de l'auditeur sur #4291). La lecture reste bornée.
+NPM_MAX_BYTES = 64_000_000
 #: lots terminaux : un objet qui y figure a déjà été évalué
 COMPLETED = tuple(work.COMPLETED)
 
@@ -350,13 +354,15 @@ def parse_releases(payload) -> tuple[list[Release], list[str]]:
             sorted(ignored, key=harness_versions.version_key))
 
 
-def _http_get_text(url: str, headers: dict | None = None) -> str:
+def _http_get_text(url: str, headers: dict | None = None, *,
+                   max_bytes: int | None = None) -> str:
+    limit = HTTP_MAX_BYTES if max_bytes is None else int(max_bytes)
     request = urllib.request.Request(
         url, headers={"User-Agent": "ameesh-veille", **(headers or {})})
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:  # noqa: S310
-        body = response.read(HTTP_MAX_BYTES + 1)
-    if len(body) > HTTP_MAX_BYTES:
-        raise VeilleError("response too large (over %d bytes)" % HTTP_MAX_BYTES)
+        body = response.read(limit + 1)
+    if len(body) > limit:
+        raise VeilleError("response too large (over %d bytes)" % limit)
     return body.decode("utf-8", "replace")
 
 
@@ -391,8 +397,11 @@ def published(source: Source, *, http_get=None, github_api=None) -> dict:
             url = "%s/%s" % (NPM_REGISTRY,
                              urllib.parse.quote(source.npm, safe="@/"))
             out["url"] = url
-            body = (http_get or _http_get_text)(
-                url, {"Accept": "application/json"})
+            if http_get is not None:
+                body = http_get(url, {"Accept": "application/json"})
+            else:
+                body = _http_get_text(url, {"Accept": "application/json"},
+                                      max_bytes=NPM_MAX_BYTES)
             releases, ignored = parse_npm(json.loads(body))
         else:
             path = "/repos/%s/releases?per_page=100" % source.releases
@@ -414,26 +423,39 @@ def published(source: Source, *, http_get=None, github_api=None) -> dict:
 # recommandation du fournisseur
 # --------------------------------------------------------------------------
 
-def parse_recommendation(text: str, models=()) -> dict:
+def parse_recommendation(text: str, *, models=(), names=()) -> dict:
     """Relève une recommandation explicite dans un changelog.
 
     Rend `{version, model, text}` : `version` d'une formule « X or later » /
     « X ou ultérieure » (ou d'un verbe recommander/exiger), `model` d'un
     modèle servi cité près d'un de ces verbes. Aucune recommandation n'est
-    inventée : les motifs sont explicites."""
+    inventée : les motifs sont explicites.
+
+    `names` (harnais, libellé) et le vocabulaire « harness »/« cli » départagent
+    plusieurs formules : un changelog qui exige « Node.js 20.0 or later » **et**
+    « DeepSeek Harness 0.2.1-rc.1 or later » recommande le second, pas Node."""
     plain = re.sub(r"<[^>]+>", " ", str(text or ""))
     plain = " ".join(plain.split())
-    version = None
+    lowered = plain.lower()
+    wanted = tuple(str(name).lower() for name in names if str(name or "").strip())
+    candidates: list[tuple[int, int, str]] = []
     for pattern in (_OR_LATER_RE, _RECOMMEND_RE):
         for match in pattern.finditer(plain):
             candidate = clean_version(match.group(1))
-            if candidate and watched(candidate):
-                version = candidate
-                break
-        if version:
-            break
+            if candidate is None or not watched(candidate):
+                continue
+            window = lowered[max(0, match.start() - 120):match.start() + 40]
+            score = 0
+            if wanted and any(name in window for name in wanted):
+                score += 4
+            if "harness" in window or "harnais" in window or "cli" in window:
+                score += 2
+            if "node" in window or "python" in window or "node.js" in window:
+                score -= 2
+            candidates.append((score, -match.start(), candidate))
+    version = max(candidates, key=lambda item: (item[0], item[1]))[2] \
+        if candidates else None
     model = None
-    lowered = plain.lower()
     for name in models or ():
         if not name:
             continue
@@ -448,14 +470,15 @@ def parse_recommendation(text: str, models=()) -> dict:
             "text": (plain[:400] if version or model else "")}
 
 
-def recommendation(source: Source, *, http_get=None, models=()) -> dict:
+def recommendation(source: Source, *, http_get=None, models=(), names=()) -> dict:
     """La recommandation déclarée par le changelog, ou `{error: …}`."""
     out = {"version": None, "model": None, "text": "", "error": ""}
     if not source.changelog:
         return out
     try:
         text = (http_get or _http_get_text)(source.changelog)
-        out.update(parse_recommendation(text, models=models))
+        out.update(parse_recommendation(
+            text, models=models, names=names or (source.harness, source.label)))
     except Exception as exc:  # noqa: BLE001 - une lecture ne juge pas le lot
         out["error"] = "%s: %s" % (type(exc).__name__,
                                    " ".join(str(exc).split())[:200])
@@ -625,6 +648,14 @@ def _body(source: Source, installed: dict, published_row: dict, rec: dict,
     if never:
         lines.append("- Servis et jamais facturés : %s"
                      % ", ".join("`%s`" % name for name in never))
+    if models.get("previous_error"):
+        lines.append("- Relevé précédent illisible (%s)"
+                     % models["previous_error"])
+    elif models.get("new"):
+        lines.append("- Nouveaux depuis le relevé précédent : %s"
+                     % ", ".join("`%s`" % name for name in models["new"]))
+    elif models.get("complete") and models.get("served"):
+        lines.append("- Aucun modèle nouveau depuis le relevé précédent")
     lines.append("")
 
     ignored = _top_ignored(published_row.get("ignored") or ())
@@ -678,9 +709,8 @@ def evaluate(source: Source, installed: dict, published_row: dict, rec: dict,
                 and harness_versions.version_key(rec_version) <=
                 harness_versions.version_key(installed["newest"]))):
         rec = dict(rec, version=None)
-    billed_set = set(billed)
     served = list(models.get("served") or ())
-    new_models = [name for name in served if name not in billed_set]
+    new_models = list(models.get("new") or ())
     rec_model = rec.get("model")
     rec_new_model = rec_model if rec_model in new_models else None
     rec_applies = bool(rec_new_model)
@@ -752,19 +782,17 @@ def _already_evaluated(db, source: Source, obj: dict) -> bool:
 
 
 @contextlib.contextmanager
-def _lock(db, key: str):
-    """Verrou consultatif de la réconciliation d'un harnais, tenu par la
-    connexion : deux hôtes ne créent pas deux lots pour le même événement."""
-    db.query("SELECT pg_advisory_lock(hashtextextended(current_schema() || %s, 0))",
-             (key,))
-    try:
-        yield
-    finally:
-        try:
-            db.query("SELECT pg_advisory_unlock("
-                     "hashtextextended(current_schema() || %s, 0))", (key,))
-        except Exception:  # noqa: BLE001 - un déverrouillage ne juge pas
-            pass
+def _locked(db, key: str):
+    """Verrou transactionnel de la réconciliation d'un harnais.
+
+    `pg_advisory_xact_lock` vit dans la transaction ouverte : il tient pour
+    les pilotes psql ET psycopg, contrairement au verrou de session qui se
+    perd entre deux requêtes psql (N de l'auditeur sur #4291). Les lectures et
+    l'écriture du lot passent par la même transaction."""
+    with db.transaction() as tx:
+        tx.query("SELECT pg_advisory_xact_lock("
+                 "hashtextextended(current_schema() || %s, 0))", (key,))
+        yield tx
 
 
 def _update_note(old: dict, new: dict) -> str:
@@ -791,6 +819,14 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
         if dry_run:
             open_lot = work.open_with_source(db, key)
             if open_lot is not None:
+                marker = _marker(open_lot.get("body") or "")
+                if marker and marker.get("kind") == "harness" \
+                        and obj.get("kind") == "model":
+                    actions.append({"harness": source.harness,
+                                    "action": "kept-model",
+                                    "lot": int(open_lot["id"]),
+                                    "reason": "harness evaluation lot open"})
+                    continue
                 actions.append({"harness": source.harness, "action": "would-update",
                                 "lot": int(open_lot["id"]),
                                 "reason": decision["reason"]})
@@ -803,9 +839,22 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
                                 "lot": None, "reason": decision["reason"]})
             continue
         try:
-            with _lock(db, "veille:%s:%s" % (app, source.harness)):
-                open_lot = work.open_with_source(db, key)
+            with _locked(db, key) as tx:
+                open_lot = work.open_with_source(tx, key)
                 if open_lot is not None:
+                    marker = _marker(open_lot.get("body") or "")
+                    if marker and marker.get("kind") == "harness" \
+                            and obj.get("kind") == "model":
+                        # Un lot harnais ouvert garde son objet : un modèle
+                        # nouveau ne le remplace jamais (B1 #4291). Le relevé
+                        # précédent n'avance pas pour ce modèle, qui sera
+                        # repris quand le lot harnais sera clos.
+                        actions.append({"harness": source.harness,
+                                        "action": "kept-model",
+                                        "lot": int(open_lot["id"]),
+                                        "reason": "harness evaluation lot open; "
+                                                  "model signal deferred"})
+                        continue
                     current_priority = open_lot.get("priority")
                     if (open_lot.get("title") == decision["title"]
                             and open_lot.get("body") == decision["body"]
@@ -816,7 +865,7 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
                                         "reason": decision["reason"]})
                         continue
                     updated = work.update_generated(
-                        db, int(open_lot["id"]), title=decision["title"],
+                        tx, int(open_lot["id"]), title=decision["title"],
                         body=decision["body"], priority=int(decision["priority"]),
                         note=_update_note(open_lot, decision), actor=work.SYSTEM_SENDER)
                     if updated is None:
@@ -828,13 +877,13 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
                                     "lot": int(open_lot["id"]),
                                     "reason": decision["reason"]})
                     continue
-                if _already_evaluated(db, source, obj):
+                if _already_evaluated(tx, source, obj):
                     actions.append({"harness": source.harness,
                                     "action": "already-evaluated", "lot": None,
                                     "reason": decision["reason"]})
                     continue
                 item = work.add(
-                    db, title=decision["title"], type="evolution", app=app,
+                    tx, title=decision["title"], type="evolution", app=app,
                     source=key, body=decision["body"],
                     priority=int(decision["priority"]), estimate=config.estimate,
                     estimate_source="veille des versions (#3264 A)",
@@ -913,6 +962,25 @@ def scan(cfg, db, *, sources=None, dry_run: bool = False, probe: bool = True,
             billed = billed_models(db, source.harness, config.model_days, now=now)
             models = discover_models(source, listing=listing)
             models["days"] = config.model_days
+            models["new"] = []
+            models["previous"] = []
+            if models.get("complete") and models.get("served"):
+                try:
+                    rows = storage.of(db).catalog.listing()
+                    previous = {str(row["model_id"]) for row in rows
+                                if row.get("provider") == source.provider
+                                and row.get("model_id")}
+                except Exception as exc:  # noqa: BLE001 - le modèle reste inconnu
+                    previous = set()
+                    models["previous_error"] = "%s: %s" % (
+                        type(exc).__name__, " ".join(str(exc).split())[:160])
+                models["previous"] = sorted(previous)
+                if previous:
+                    models["new"] = sorted(set(models["served"]) - previous)
+                else:
+                    # aucun relevé précédent : pas de « nouveau » inventé,
+                    # ce passage pose la ligne de base
+                    models["baseline"] = True
             rec = recommendation(source, http_get=http_get,
                                  models=models.get("served") or ())
             decision = evaluate(source, installed, published_row, rec, models,
@@ -936,4 +1004,25 @@ def scan(cfg, db, *, sources=None, dry_run: bool = False, probe: bool = True,
             report["errors"].append("%s: %s" % (source.harness, entry["error"]))
         report["sources"].append(entry)
     report["actions"] = apply(db, cfg, config, decisions, dry_run=dry_run)
+    if not dry_run:
+        # Le catalogue des modèles (L14) est le relevé précédent : on ne
+        # l'avance pas quand un modèle nouveau est mis en attente derrière un
+        # lot harnais ouvert, sinon le signal serait perdu (avis B1 #4291).
+        actions = {action.get("harness"): action for action in report["actions"]}
+        for entry in report["sources"]:
+            models = entry.get("models") or {}
+            action = actions.get(entry["harness"]) or {}
+            if action.get("action") in ("kept-model", "error"):
+                continue
+            if not models.get("complete") or not models.get("served"):
+                continue
+            provider = models.get("source") or ""
+            try:
+                storage.of(db).catalog.upsert_models([
+                    {"provider": provider, "model_id": name, "source": provider}
+                    for name in models["served"]])
+            except Exception as exc:  # noqa: BLE001 - un catalogue ne juge pas
+                report["errors"].append("%s: catalog: %s: %s" % (
+                    entry["harness"], type(exc).__name__,
+                    " ".join(str(exc).split())[:160]))
     return report

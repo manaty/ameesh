@@ -78,7 +78,7 @@ def cmd_veille(cfg, args) -> int:
         db.close()
     if getattr(args, "json", False):
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
-        return 0
+        return 1 if report.get("errors") else 0
     if not report.get("enabled"):
         print("veille: off (no `veille.sources` in the configuration of this host)")
         return 0
@@ -94,7 +94,10 @@ def cmd_veille(cfg, args) -> int:
         if not any(entry.get("error") and entry["error"] in error
                    for entry in report.get("sources") or ()):
             print("veille: %s" % error, file=sys.stderr)
-    return 0
+    # une erreur persistante (document npm trop gros, source illisible) ne
+    # doit pas rester invisible : la minuterie sort en échec et le journal dit
+    # pourquoi ; le prochain passage réessaie (N de l'auditeur sur #4291).
+    return 1 if report.get("errors") else 0
 
 
 def add_parsers(sub) -> None:

@@ -13,8 +13,9 @@ import dataclasses
 import json
 import types
 import unittest
+from unittest import mock
 
-from ameesh import hostcheck, storage, veille, work
+from ameesh import hostcheck, storage, veille, veille_cli, work
 from ameesh.discovery.base import ModelSeen, SourceResult
 
 from .support import PgTestCase
@@ -112,6 +113,36 @@ class VersionsTest(unittest.TestCase):
         # an alpha is never a recommended release
         self.assertIsNone(veille.parse_recommendation(
             "version 0.2.2-alpha.2 or later")["version"])
+        # a dependency requirement does not win over the harness recommendation
+        found = veille.parse_recommendation(
+            "Node.js 20.0.0 or later is required. DeepSeek Harness "
+            "0.2.1-rc.1 or later is recommended.", names=("deepseek",))
+        self.assertEqual(found["version"], "0.2.1-rc.1")
+
+    def test_npm_document_cap_accepts_a_large_packument(self):
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, size):
+                return self.body[:size]
+
+        body = b"x" * 9_000_000
+        with mock.patch("ameesh.veille.urllib.request.urlopen",
+                        return_value=Response(body)):
+            with self.assertRaises(veille.VeilleError):
+                veille._http_get_text("https://example.invalid/npm")
+            self.assertEqual(
+                len(veille._http_get_text("https://example.invalid/npm",
+                                          max_bytes=10_000_000)), 9_000_000)
+        # the codex packument measured 18.3 MB on 28/10/2026 (B2 #4291)
+        self.assertGreater(veille.NPM_MAX_BYTES, 18_300_000)
 
     def test_settings_are_strict_and_generic(self):
         good = types.SimpleNamespace(veille={
@@ -200,6 +231,11 @@ class VeilleDbTest(PgTestCase):
     def record(self, host, version):
         storage.of(self.db).hosts.record_harness_version(
             host, "deepseek", path="/opt/dsh", version=version, raw=version)
+
+    def catalog(self, *models):
+        storage.of(self.db).catalog.upsert_models([
+            {"provider": "deepseek", "model_id": name, "source": "deepseek"}
+            for name in models])
 
     def fetch(self, versions, *, tags=None, changelog=""):
         doc = npm_doc(versions, tags)
@@ -317,6 +353,7 @@ class VeilleDbTest(PgTestCase):
 
     def test_model_served_and_never_billed_opens_a_model_lot(self):
         self.record("vm-a", "0.2.1-rc.4")
+        self.catalog("deepseek-old")
         storage.of(self.db).turn_costs.insert(
             agent="a", harness="deepseek", turn="t1", model="deepseek-old",
             session="s", usd=0.0, input_tokens=1, cached_input_tokens=0,
@@ -333,7 +370,44 @@ class VeilleDbTest(PgTestCase):
         self.assertIn("Évaluer le modèle deepseek-new", lot["title"])
         self.assertIn("deepseek-old", lot["body"])
         self.assertIn("deepseek-new", lot["body"])
+        self.assertIn("Nouveaux depuis le relevé précédent", lot["body"])
         self.assertEqual(lot["priority"], 2)
+
+    def test_known_model_never_billed_does_not_open_a_lot(self):
+        self.record("vm-a", "0.2.1-rc.4")
+        self.catalog("deepseek-old")
+        listing = lambda: SourceResult(
+            source="deepseek", complete=True,
+            models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),))
+        report = self.scan(["0.2.1-rc.4"], tags={"latest": "0.2.1-rc.4"},
+                           provider="deepseek", listing=listing)
+        self.assertEqual(report["actions"][0]["action"], "none", report)
+        self.assertEqual(self.lots(), [])
+
+    def test_canary_keeps_the_harness_lot_object(self):
+        self.record("vm-a", "0.2.0-rc.2")
+        first = self.scan(["0.2.0-rc.2", "0.2.1-rc.4"],
+                          tags={"rc": "0.2.1-rc.4"})
+        lot_id = first["actions"][0]["lot"]
+        # the canary moves the host to the evaluated version; candidate is then
+        # None, and a new model must not overwrite the open harness lot (B1)
+        self.record("vm-a", "0.2.1-rc.4")
+        self.catalog("deepseek-old")
+        listing = lambda: SourceResult(
+            source="deepseek", complete=True,
+            models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),
+                    ModelSeen(provider="deepseek", model_id="deepseek-reasoner")))
+        report = self.scan(["0.2.0-rc.2", "0.2.1-rc.4"],
+                           tags={"rc": "0.2.1-rc.4"}, provider="deepseek",
+                           listing=listing)
+        self.assertEqual(report["actions"][0]["action"], "kept-model", report)
+        lot = work.get(self.db, lot_id)
+        self.assertEqual(lot["title"], "Évaluer deepseek 0.2.1-rc.4")
+        self.assertIn("version=0.2.1-rc.4", lot["body"])
+        # the deferred model was not catalogued as a previous reading, so its
+        # signal survives until the harness lot closes
+        known = {row["model_id"] for row in storage.of(self.db).catalog.listing()}
+        self.assertNotIn("deepseek-reasoner", known)
 
     def test_dry_run_writes_nothing(self):
         self.record("vm-a", "0.2.0-rc.2")
@@ -366,6 +440,22 @@ class VeilleDbTest(PgTestCase):
         proc = self.mesh("veille", "scan", env=self.env(AMEESH_CONFIG=path))
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("npm", proc.stderr)
+
+
+    def test_cli_returns_nonzero_on_a_persistent_error(self):
+        cfg = self.cfg
+        args = types.SimpleNamespace(veille_command="scan", json=True,
+                                     dry_run=False, no_probe=True, harness=None)
+
+        class FakeDb:
+            def close(self):
+                pass
+
+        report = {"enabled": True, "reconciled": True, "sources": [],
+                  "actions": [], "errors": ["boom"]}
+        with mock.patch("ameesh.mesh_cli._open", return_value=FakeDb()), \
+                mock.patch("ameesh.veille.scan", return_value=report):
+            self.assertEqual(veille_cli.cmd_veille(cfg, args), 1)
 
 
 class HostcheckTest(unittest.TestCase):
