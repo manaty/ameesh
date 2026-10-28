@@ -1635,15 +1635,22 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if not auditor_mod.may_take(agent, canons):
                 continue
             auditors = auditor_mod.cards([agent], canons)
-            # Read-only predicate: also used while the assignment row is locked.
-            def plan_can_take(item):
+            candidate_ids = {int(item["id"]) for item in lots}
+
+            # Assignment rechecks stay read-only. During selection, record
+            # directory refusals for this pass's candidates before the plan
+            # filters them out; otherwise the reporting loop never sees them.
+            def plan_can_take(item, *, note=False):
                 return (lot_fits(item, agent, auditor=row["name"] in auditors,
                                  card=auditors.get(row["name"]), others=listing, db=db)
                         and _directory_ready(cfg, db, agent, item, _lot_project(item),
-                                             canons=canons, dry_run=True, notes=dir_notes))
+                                             canons=canons,
+                                             dry_run=(dry_run if note and int(item["id"]) in candidate_ids
+                                                      else True), notes=dir_notes))
 
             agent_lots = project_plan.eligible(db, lots, cfg=cfg, now=now,
-                                               can_take=plan_can_take, snapshots=plan_snapshots)
+                                               can_take=lambda item: plan_can_take(item, note=True),
+                                               snapshots=plan_snapshots)
             for item in agent_lots:
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
                                 card=auditors.get(row["name"]), others=listing, db=db):
