@@ -235,6 +235,10 @@ def _recorded_line(host: str, recorded: dict | None) -> str:
         line += (" — %s\n  → canon agents not claimable on %s until an "
                  "\"ameesh canon sync\" reads a valid canon" % (st.get("diagnostic") or "?",
                                                                     host))
+    elif st.get("diagnostic"):
+        # #4264 : un état `ok` porte au diagnostic les erreurs propres aux
+        # agents ou au plan (`canon_sync.assess`) : elles sont dites, jamais tues
+        line += " — %s" % st["diagnostic"]
     if st.get("auth_status"):
         line += "\nauthenticators : %s%s (checked %s)%s" % (
             "IN ERROR — " if st["auth_status"] == canon_sync.AUTH_STATE_ERROR else "",
@@ -269,12 +273,14 @@ def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
     errors = canon_mod.errors(findings)
     status, diagnostic = canon_sync.assess(canon, host, findings)
     placements = placement_mod.verdicts(canon) if canon.readable else []
+    unseen = _registry_errors_unseen(canon, recorded, errors)
     if args.json:
         data = {
-            "ok": not errors, "root": canon.root, "untrusted": canon.untrusted,
+            "ok": not errors and not unseen, "root": canon.root, "untrusted": canon.untrusted,
             "readable": canon.readable, "host": host,
             "canon_status": status, "diagnostic": diagnostic,
             "registry_state": recorded["state"] if recorded else None,
+            "registry_errors_unseen": unseen,
             # C4 : verdicts écrits au registre pour l'hôte, confrontés au
             # profil courant (placement_profile_ok faux : profil divergé)
             "registry_placements": [
@@ -292,19 +298,42 @@ def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
             sink.append(data)
         else:
             print(json.dumps(data, ensure_ascii=False, indent=2))
-        return 1 if errors else 0
+        return 1 if errors or unseen else 0
     print("canon : %s" % canon.root)
     print("source : %s%s" % (UNTRUSTED_TAG if canon.untrusted else "", canon.source_label()))
     _print_findings(findings)
-    print(("canon valid — " if not errors
+    print(("canon valid — " if not errors and not unseen
+           else "canon valid here, ERRORS in the registry — " if not errors
            else "canon UNREADABLE — " if not canon.readable
            else "canon INVALID — ") + _summary(findings))
     print(_status_line(host, status, diagnostic, recorded=False))
     print(_recorded_line(host, recorded))
+    if unseen:
+        print(unseen)
     if canon.readable:
         _print_placements(host, [v for v in placements if v.host == host])
     _print_recorded_placements(recorded)
-    return 1 if errors else 0
+    return 1 if errors or unseen else 0
+
+
+def _registry_errors_unseen(canon: canon_mod.Canon, recorded: dict | None,
+                            errors: list) -> str:
+    """#4264 : le registre porte des erreurs pour CE commit que ce check ne voit pas.
+
+    Le registre est écrit par `canon sync` de l'ameesh installé sur l'hôte, et
+    c'est lui que suivent les briefs et la réclamation ; un check lancé depuis
+    une autre version (une branche, `main` non déployé) peut ne pas les voir.
+    Rend la ligne qui le dit (le check échoue alors), ou "" ."""
+    st = (recorded or {}).get("state")
+    if errors or not st or st.get("status") != canon_sync.CANON_OK:
+        return ""
+    commit = canon.sources[0].commit if canon.sources else ""
+    if not st.get("diagnostic") or not commit or st.get("last_good_commit") != commit:
+        return ""
+    return ("registry  : ERRORS recorded for %s that this check does not find — "
+            "the registry is written by \"ameesh canon sync\" of the host's installed "
+            "ameesh (another version than this one?), and briefs and claims follow "
+            "it: canon not valid until both agree" % commit[:12])
 
 
 def _print_placements(host: str, verdicts: list[placement_mod.Verdict]) -> None:
