@@ -11,7 +11,7 @@ n'était ni composé ni « écarté » au manifeste.
 Ce module rend la liste **calculée** que la composition doit lire avant tout
 courrier :
 
-* état `qa` (aucun filtre d'assigné : un lot assigné est un candidat comme un
+* état `qa` ou `validated` (aucun filtre d'assigné : un lot assigné est un candidat comme un
   autre) ;
 * aucun prérequis explicite encore bloquant (`work_dependencies`, #4144),
   même si le parent est hors `qa` ; un parent fusionné ne bloque plus ;
@@ -491,13 +491,14 @@ def default_app(repo: str) -> str:
 
 
 def _items(db, app: str) -> list[dict]:
-    """Tous les lots `qa` du projet, sans filtre d'assigné ni borne de page.
+    """Tous les lots `qa` et `validated` du projet, sans filtre d'assigné ni borne de page.
 
     Un filtre `assignee` ou une limite d'interface cacherait précisément les
     lots assignés que #2404 a vus omis (le composeur doit voir tous les
     candidats, pas ceux qui restent à prendre).
     """
-    rows = storage.of(db).work.items(state="qa", assignee=None, limit=None)
+    rows = [row for state in ("qa", "validated")
+            for row in storage.of(db).work.items(state=state, assignee=None, limit=None)]
     return [row for row in rows if (row.get("app") or "") == app]
 
 

@@ -73,7 +73,8 @@ MAX_QA_LOOPS = 2
 FORWARD = {
     "intake": ("build",),
     "build": ("qa",),
-    "qa": ("merged", "build"),
+    "qa": ("validated", "merged", "build"),
+    "validated": ("merged", "build"),
     "merged": ("promoted",),
     "promoted": (),
     "closed": (),
@@ -83,7 +84,8 @@ FORWARD = {
 TRANSITIONS = {
     "intake": {"build", "blocked", "waiting_human"},
     "build": {"qa", "blocked", "waiting_human"},
-    "qa": {"merged", "build", "blocked", "waiting_human"},
+    "qa": {"validated", "merged", "build", "blocked", "waiting_human"},
+    "validated": {"qa", "merged", "build", "blocked", "waiting_human"},
     "merged": {"promoted", "blocked", "waiting_human"},
     "promoted": set(),
     "closed": set(),
@@ -4036,7 +4038,7 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     (`corrector`).
 
     `state` accepte l'orthographe v1 et le nom générique du cycle de vie
-    (#4349 : `in_progress` pour `build`, `validated` pour `merged`…)."""
+    (#4349 : `in_progress` pour `build`, `to_validate` pour `qa`…)."""
     state = _canonical_state(state)
     if package_exclusion and correct is not None:
         raise WorkError("--package-exclusion and --correct are distinct gestures")
@@ -4114,11 +4116,11 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
                % (item_id, state) if (current, state) in CORRECTIONS else ""))
     if state == "waiting_human" and not storage.of(db).decisions.pending_for_lot(str(item_id)):
         raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
-    if package_exclusion and current != "qa":
+    if package_exclusion and current not in TO_VALIDATE:
         raise WorkError("--package-exclusion: lot %s is in %s, not in qa: only a "
                         "frozen lot under review is in a package" % (item_id, current))
     # #4043 : un retrait de paquet n'est pas une boucle d'auteur
-    returning_loop = current == "qa" and state == "build" and not package_exclusion
+    returning_loop = current in TO_VALIDATE and state == "build" and not package_exclusion
     if returning_loop and int(item["loops"]) >= MAX_QA_LOOPS:
         raise WorkError(
             "qa → build loop exhausted (%d): move the lot to blocked, or ask the "

@@ -265,7 +265,7 @@ _CLOSED_PRIORITY = ("merged", "promoted", "closed")
 #: L165b : un lot qui attend un autre que son agent (`qa`, `waiting_human`,
 #: `blocked`) ne l'occupe pas — même liste que `operations.listing` et
 #: `sous_utilisation.LOTS_WAITING_ON_OTHERS`
-_WAITING_ON_OTHERS = "('qa', 'waiting_human', 'blocked')"
+_WAITING_ON_OTHERS = "('qa', 'validated', 'waiting_human', 'blocked')"
 #: #443, #478 : réservation automatique du prochain numéro libre — un budget
 #: de temps (et non plus un nombre d'essais) et une attente plein jitter
 #: (`uniform(0, min(plafond, base·2^n))`) bornée au budget restant, pour que
@@ -978,15 +978,30 @@ class WorkItems(interface.WorkItems):
         # lot qui quitte qa (reprise, correction) la perd — sa prochaine revue
         # est due.
         waiver = has_reviewer(self.db)
-        sql = sql.replace("__WAIVER__", ", reviewer = CASE WHEN reviewer = %s AND %s <> 'qa'"
+        sql = sql.replace("__WAIVER__", ", reviewer = CASE WHEN reviewer = %s AND %s NOT IN ('qa', 'validated')"
                                         " THEN '' ELSE reviewer END" if waiver else "")
         params = ((state, loops, state, state)
                   + ((REVIEWER_NONE, state) if waiver else ())
                   + (int(item_id), current)
                   + ((str(int(item_id)),) if held else ()))
+        validation_item = self.get(item_id) if state == "validated" else None
+        validation_marks = self.milestones(item_id, None) if state == "validated" else None
+        validation_gate = (self._validation_gate(item_id, validation_marks, item=validation_item)
+                           if state == "validated" else None)
         with self.db.transaction() as tx:
             if not _lock_migration_writer(tx, item_id):
                 return None
+            if state == "validated":
+                # The same lock serializes freezes, verdicts and manual entry.
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                         (int(item_id),))
+                gate = validation_gate
+                if (WorkItems(tx).milestones(item_id, None) != validation_marks
+                        or WorkItems(tx).get(item_id) != validation_item):
+                    gate = None
+                if not gate or not gate.get("ok"):
+                    from ...work import WorkError
+                    raise WorkError("validated requires the review quorum on the frozen head")
             rows = tx.query(sql, params)
             if not rows:
                 return None
@@ -1966,9 +1981,15 @@ class WorkItems(interface.WorkItems):
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
             milestone = rows[0]
+            if (kind == "verdict" and items and items[0]["state"] == "validated"
+                    and not items[0].get("workflow_ref")):
+                tx.execute("UPDATE work_items SET state = 'qa', updated_at = now()"
+                           " WHERE id = %s", (int(item_id),))
+                WorkItems(tx)._event(int(item_id), "qa",
+                                    "validated → qa — review quorum changed (#4351)", actor)
             if (kind == "frozen" and items
                     and not items[0].get("workflow_ref")
-                    and items[0]["state"] in ("intake", "build")):
+                    and items[0]["state"] in ("intake", "build", "validated")):
                 # #3467: freezing enters review before the designation hook.
                 # #3489: pinned lots keep their Process state; work.move
                 # rejects them. The milestone and designation still apply.
@@ -1980,7 +2001,9 @@ class WorkItems(interface.WorkItems):
                     work.move(tx, item_id, "build", actor=actor,
                               note="intake → build — frozen (#3467)")
                 work.move(tx, item_id, "qa", actor=actor,
-                          note="build → qa — frozen (#3467)")
+                          note=("validated → qa — frozen (#4351)"
+                                if items[0]["state"] == "validated"
+                                else "build → qa — frozen (#3467)"))
             if kind == "verdict" and items:
                 from ... import merge_queue, train_events
                 item = items[0]
@@ -2004,7 +2027,53 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._lapse_waiver(int(item_id), milestone, actor)
             if on_frozen is not None:
                 on_frozen(tx, milestone, threads)
+        if kind in ("verdict", "frozen"):
+            # Git/classification reads run after the writer commits. Nested
+            # designation hooks are reconciled by the outer freeze writer.
+            from ...freeze_gate import _in_transaction
+            if not _in_transaction(self.db):
+                self._sync_validation(item_id, actor)
         return milestone
+
+    def _validation_gate(self, item_id, marks=None, *, item=None):
+        from ... import merge_queue
+        item = self.get(item_id) if item is None else item
+        marks = self.milestones(item_id, None) if marks is None else marks
+        gate = merge_queue.review_gate_for_item(
+            self.db, getattr(self.db, "cfg", None), item, marks)
+        return gate
+
+    def _sync_validation(self, item_id, actor):
+        """Compute the gate outside locks, then compare the immutable ledger.
+
+        Any concurrent freeze/verdict invalidates this observation. The next
+        writer reconciles its own snapshot; no stale quorum can promote a lot.
+        """
+        item = self.get(item_id)
+        if item["state"] != "qa" or item.get("workflow_ref"):
+            return
+        marks = self.milestones(item_id, None)
+        from ... import plan_git
+        freeze = plan_git.latest_freeze(marks)
+        # Refreezing alone resets validation, including on the same SHA.
+        if not freeze or not any(mark.get("kind") == "verdict"
+                                 and mark["id"] > freeze["id"] for mark in marks):
+            return
+        gate = self._validation_gate(item_id, marks, item=item)
+        if not gate or not gate.get("ok"):
+            return
+        with self.db.transaction() as tx:
+            tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                     (int(item_id),))
+            if (WorkItems(tx).milestones(item_id, None) != marks
+                    or WorkItems(tx).get(item_id) != item):
+                return
+            rows = tx.query("UPDATE work_items SET state = 'validated', updated_at = now()"
+                            " WHERE id = %s AND state = 'qa' AND " + _UNPINNED + " RETURNING id",
+                            (int(item_id),))
+            if rows:
+                WorkItems(tx)._event(int(item_id), "validated",
+                                    "qa → validated — review quorum (#4351)", actor)
 
     def _lapse_waiver(self, item_id, milestone, actor) -> None:
         """#1979 : un gel d'une AUTRE tête lève la dispense de re-verdict
@@ -2611,7 +2680,7 @@ class WorkItems(interface.WorkItems):
                 return None
             if packet is not None:
                 fields = ("app", "branch", "branch_target", "type")
-                if frozen_id is None or lot[0]["state"] != "qa" \
+                if frozen_id is None or lot[0]["state"] not in ("qa", "validated") \
                         or set(packet) != set(fields) | {"resolved_target"} \
                         or packet["resolved_target"] != target \
                         or any(lot[0][key] != packet[key] for key in fields):

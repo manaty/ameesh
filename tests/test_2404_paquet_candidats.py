@@ -69,9 +69,9 @@ class FakeWork:
         self.rows = rows
 
     def items(self, *, state, assignee, limit):
-        assert (state, assignee, limit) == ("qa", None, None), \
+        assert state in ("qa", "validated") and (assignee, limit) == (None, None), \
             "the inventory must read every qa lot, without assignee filter or page limit"
-        return [dict(row) for row in self.rows]
+        return [dict(row) for row in self.rows if row["state"] == state]
 
     def get(self, lot: int):
         return next((row for row in self.rows if row["id"] == lot), None)
@@ -266,6 +266,13 @@ class InventoryTest(unittest.TestCase):
 
     def by_id(self, payload):
         return {entry["work_item"]: entry for entry in payload["candidates"]}
+
+    def test_validated_lot_is_a_candidate_with_the_same_review_gate(self):
+        row = next(row for row in self.rows if row["id"] == 1)
+        row["state"] = "validated"
+        self.assertIn(1, self.inventory()["ready"])
+        self.marks[1] = [m for m in self.marks[1] if m["kind"] != "verdict"]
+        self.assertNotIn(1, self.inventory()["ready"])
 
     def test_ready_lot_is_assigned_and_listed(self):
         payload = self.inventory()

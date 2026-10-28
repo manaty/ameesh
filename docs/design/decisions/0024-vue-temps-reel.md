@@ -34,3 +34,11 @@ readable on a phone:
   the orchestrator on its own data): it serves as a mock-up.
 - Lot L24: JSON export of the events and the state (`ameesh progress --json`),
   timeline data model, and a reference view.
+
+# L99 T3 — persisted approval (#4351)
+
+`validated` is a distinct stored state after `qa`: the review gate's quorum
+on the frozen head promotes the lot automatically. A new freeze returns it
+to `qa`; a current blocking verdict removes validation. `merged` continues
+to mean a recorded merge. Package readers accept both `validated` and legacy
+`qa` lots with a quorum, and recheck the review gate before admission.

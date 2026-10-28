@@ -26,7 +26,7 @@ from .work_dependencies import current_verdict as _current_verdict, freeze_due
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = "('merged', 'promoted', 'closed')"   # closed : abandonné ou remplacé (L29)
 #: L165b : un lot dans ces états attend quelqu'un d'autre que son assigné
-_WAITING_ON_OTHERS = "('qa', 'waiting_human', 'blocked')"
+_WAITING_ON_OTHERS = "('qa', 'validated', 'waiting_human', 'blocked')"
 #: L125 : un message passif de la boîte `mb`
 _PASSIVE = PASSIVE_SQL.format(t="mb")
 

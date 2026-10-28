@@ -101,12 +101,12 @@ LOT_HEAD_RE = re.compile(r"^lot/([1-9][0-9]{0,17})(?:-|$)")
 _MARKER_RE = re.compile(r"<!-- ameesh:package=([A-Za-z0-9][A-Za-z0-9._-]*)(?: d=([0-9a-f.]*))? -->")
 
 #: labels d'état d'une issue de lot
-STATE_LABELS = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, lifecycle.TO_VALIDATE,
+STATE_LABELS = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, *lifecycle.TO_VALIDATE,
                 lifecycle.DELIVERY_RECORDED, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN)
 BASE_LABEL = "ameesh"
 EPIC_LABEL = "ameesh:epic"
 LABEL_COLORS = {lifecycle.REQUESTED: "c5def5", lifecycle.IN_PROGRESS: "1d76db",
-                lifecycle.TO_VALIDATE: "fbca04", lifecycle.DELIVERY_RECORDED: "0e8a16",
+                lifecycle.QA: "fbca04", lifecycle.VALIDATED: "0e8a16", lifecycle.DELIVERY_RECORDED: "0e8a16",
                 lifecycle.BLOCKED: "b60205", lifecycle.WAITING_HUMAN: "d93f0b",
                 "epic": "5319e7", "": "ededed",
                 # L126 : étiquettes des issues de lot (état, type, priorité)
@@ -114,7 +114,7 @@ LABEL_COLORS = {lifecycle.REQUESTED: "c5def5", lifecycle.IN_PROGRESS: "1d76db",
                 "evolution": "a2eeef", "improvement": "7057ff", "p1": "b60205",
                 "p2": "fbca04", "p3": "c2e0c6"}
 #: priorité d'attention quand une fiche a plusieurs lots ouverts
-_ATTENTION = (lifecycle.WAITING_HUMAN, lifecycle.BLOCKED, lifecycle.TO_VALIDATE,
+_ATTENTION = (lifecycle.WAITING_HUMAN, lifecycle.BLOCKED, *lifecycle.TO_VALIDATE,
               lifecycle.IN_PROGRESS, lifecycle.REQUESTED)
 
 
@@ -1753,7 +1753,7 @@ PRIORITY_LABELS = {1: "p1", 2: "p2", 3: "p3"}
 _TYPE_FR = {"bug": "bug", "evolution": "evolution", "improvement": "improvement"}
 _PRIORITY_FR = {1: "high priority", 2: "normal priority", 3: "low priority"}
 _STATE_FR = {lifecycle.REQUESTED: "to do", lifecycle.IN_PROGRESS: "in progress",
-             lifecycle.TO_VALIDATE: "in review",
+             lifecycle.QA: "in review", lifecycle.VALIDATED: "approved",
              lifecycle.DELIVERY_RECORDED: "merged", lifecycle.PROMOTED: "delivered", lifecycle.BLOCKED: "blocked",
              lifecycle.WAITING_HUMAN: "waiting for a human", lifecycle.CLOSED: "closed"}
 _LOT_FIELD_FR = {"title": "title", "body": "body", "labels": "ameesh labels",

@@ -868,6 +868,17 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
         for to in [row.get("assignee")] + [e["actor"] for e in carried]:
             if to:
                 _passive(db, to, lot, text, data)
+    if carried:
+        from .freeze_gate import _in_transaction
+        # Nested carries are reconciled by the outer freeze writer. Ordinary
+        # carries use the same guarded entry as a manual validation, after
+        # committing their copied verdicts and provenance.
+        if not _in_transaction(db) and (work.get(db, lot) or {}).get("state") == "qa":
+            try:
+                work.move(db, lot, "validated", actor=work.SYSTEM_SENDER,
+                          note="qa → validated — carried review quorum (#4351)")
+            except work.WorkError:
+                pass  # incomplete/stale quorum keeps legacy qa eligibility
     return out
 
 
