@@ -3350,29 +3350,43 @@ class WorkItems(interface.WorkItems):
     # -- file d'amélioration (L119, décision 0037) ------------------------------
     def backlog_add(self, *, title, body, source, expected_value, value_score, priority,
                     team, required_capabilities, package_id, package_parent, note,
-                    actor, app="") -> dict:
+                    actor, app="", estimate_minutes=None, estimate_source=None,
+                    estimate_by=None, change_size=None) -> dict:
         with self.db.transaction() as tx:
+            # #4117 : l'estimation (et sa ligne d'historique) est posée avec la
+            # création, comme `work.add` (L157) ; jamais après.
+            by = (estimate_by or actor or "") if estimate_minutes else None
             rows = tx.query(
                 """
                 INSERT INTO work_items
                     (type, source, title, body, state, expected_value, value_score,
                      priority, team, required_capabilities, package_id, package_parent,
-                     app)
+                     app, estimate_minutes, estimate_source, estimate_by, estimate_at,
+                     change_size)
                 VALUES ('improvement', %s, %s, %s, 'intake', %s, %s, %s, %s, %s::text[],
-                        %s, %s, %s)
+                        %s, %s, %s, %s, %s, %s, CASE WHEN %s THEN now() END, %s)
                 RETURNING __COLUMNS__
                 """.replace("__COLUMNS__", item_columns(self.db)),
                 (source, title, body, expected_value, int(value_score), int(priority), team,
                  _catalog._text_array(required_capabilities) if required_capabilities else None,
-                 package_id, package_parent, app or ""))
+                 package_id, package_parent, app or "", estimate_minutes,
+                 estimate_source if estimate_minutes else None, by,
+                 bool(estimate_minutes), change_size or None))
             item = rows[0]
+            if estimate_minutes:
+                WorkItems(tx)._estimate_row(int(item["id"]), estimate_minutes,
+                                            estimate_source, estimate_by or actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             return item
 
     def backlog_basket_add(self, *, key, title, expected_value, line, value_score, priority,
                            team, required_capabilities, package_id, package_parent, note,
-                           actor, app="") -> dict:
+                           actor, app="", estimate_minutes=None, estimate_source=None,
+                           estimate_by=None, change_size=None) -> dict:
         caps = _catalog._text_array(required_capabilities) if required_capabilities else None
+        # #4117 : l'estimation ne s'applique qu'au panier OUVERT par cet ajout ;
+        # une ligne ajoutée à un panier existant ne le réestime pas.
+        by = (estimate_by or actor or "") if estimate_minutes else None
         with self.db.transaction() as tx:
             # #2584 : un seul écrivain par clé de panier — deux ajouts
             # simultanés n'ouvrent jamais deux paniers du même chantier.
@@ -3393,12 +3407,16 @@ class WorkItems(interface.WorkItems):
                     "INSERT INTO work_items"
                     "    (type, source, title, body, state, expected_value, value_score,"
                     "     priority, team, required_capabilities, package_id, package_parent,"
-                    "     app)"
+                    "     app, estimate_minutes, estimate_source, estimate_by, estimate_at,"
+                    "     change_size)"
                     " VALUES ('improvement', %s, %s, %s, 'intake', %s, %s, %s, %s,"
-                    "         %s::text[], %s, %s, %s)"
+                    "         %s::text[], %s, %s, %s, %s, %s, %s,"
+                    "         CASE WHEN %s THEN now() END, %s)"
                     " RETURNING id",
                     (key, title, line, expected_value, int(value_score), int(priority),
-                     team, caps, package_id, package_parent, app or ""))
+                     team, caps, package_id, package_parent, app or "", estimate_minutes,
+                     estimate_source if estimate_minutes else None, by,
+                     bool(estimate_minutes), change_size or None))
             else:
                 tx.query(
                     "UPDATE work_items"
@@ -3415,6 +3433,9 @@ class WorkItems(interface.WorkItems):
                     (line, "\n" + line, int(value_score), int(priority), int(priority),
                      caps, team, int(rows[0]["id"])))
             item_id = int(rows[0]["id"])
+            if opened and estimate_minutes:
+                WorkItems(tx)._estimate_row(item_id, estimate_minutes, estimate_source,
+                                            estimate_by or actor)
             WorkItems(tx)._event(item_id, "intake", note, actor)
             rows = tx.query(
                 "SELECT " + item_columns(self.db) + ","

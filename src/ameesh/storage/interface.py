@@ -2596,18 +2596,26 @@ class WorkItems(Domain):
                     value_score: int, priority: int, team: str | None,
                     required_capabilities: list | None, package_id: str | None,
                     package_parent: str | None, note: str, actor: str,
-                    app: str = "") -> dict:
+                    app: str = "", estimate_minutes: int | None = None,
+                    estimate_source: str | None = None, estimate_by: str | None = None,
+                    change_size: str | None = None) -> dict:
         """Crée un élément de la file : un lot `improvement` en `intake`, sans
         assigné, et sa première ligne de journal ; rend le lot.
 
-        `app`: its project (L118c), empty when unknown."""
+        `app`: its project (L118c), empty when unknown. #4117 : `estimate_minutes`
+        (avec sa source et son auteur) et `change_size` sont posés en même temps
+        que le lot et sa ligne d'historique (`work_item_estimates`), comme
+        `work.add` (L157) ; `estimate_by` vaut `actor` quand il est omis."""
 
     @abc.abstractmethod
     def backlog_basket_add(self, *, key: str, title: str, expected_value: str, line: str,
                            value_score: int, priority: int, team: str | None,
                            required_capabilities: list | None, package_id: str | None,
                            package_parent: str | None, note: str, actor: str,
-                           app: str = "") -> dict:
+                           app: str = "", estimate_minutes: int | None = None,
+                           estimate_source: str | None = None,
+                           estimate_by: str | None = None,
+                           change_size: str | None = None) -> dict:
         """#2584 (canon §2 l.129) : ajoute une ligne au panier ouvert `key`
         d'un chantier, ou ouvre ce panier ; rend le panier.
 
@@ -2623,7 +2631,11 @@ class WorkItems(Domain):
         suivante ouvre un nouveau panier. Deux ajouts simultanés sur la même
         clé n'ouvrent jamais deux paniers (un écrivain par clé). Le lot rendu
         porte `basket_lines` (lignes au journal du panier) et `basket_opened`
-        (vrai si cet ajout l'a ouvert)."""
+        (vrai si cet ajout l'a ouvert).
+
+        #4117 : l'estimation et la taille ne s'appliquent qu'au panier OUVERT
+        par cet ajout ; une ligne ajoutée à un panier existant ne le réestime
+        pas (aucun rétro-remplissage)."""
 
     @abc.abstractmethod
     def backlog(self, *, open_only: bool, limit: int,
