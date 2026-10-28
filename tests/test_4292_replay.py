@@ -361,6 +361,46 @@ class RunTestsTest(unittest.TestCase):
             self.assertEqual(result["status"], "no-tests")
             self.assertIsNone(result["passed"])
 
+    def test_a_non_python_lot_runs_the_declared_command_with_real_files(self):
+        # #4292 B/P2 : un lot JS/TS n'a pas de module unittest. La commande
+        # déclarée reçoit les vrais chemins injectés (`web/a.test.ts`), pas une
+        # reconstruction `tests/<module>.py` qui les éliminerait.
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = os.path.join(tmp, "tree")
+            for rel in ("web/a.test.ts", "web/b.spec.ts", "tests/test_x.py"):
+                path = os.path.join(tree, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("// %s\n" % rel)
+            helper = os.path.join(tree, "print_files.py")
+            with open(helper, "w", encoding="utf-8") as fh:
+                fh.write("import sys\nprint(' | '.join(sys.argv[1:]))\n")
+            command = "%s print_files.py {files}" % sys.executable
+            result = replay.run_tests(
+                tree, ["test_x"],
+                files=["web/a.test.ts", "web/b.spec.ts", "tests/test_x.py"],
+                command=command)
+            self.assertEqual(result["status"], "ran", result)
+            self.assertTrue(result["passed"], result)
+            self.assertIn("web/a.test.ts", result["output_tail"])
+            self.assertIn("web/b.spec.ts", result["output_tail"])
+            self.assertIn("tests/test_x.py", result["output_tail"])
+            self.assertEqual(result["files"],
+                             ["web/a.test.ts", "web/b.spec.ts", "tests/test_x.py"])
+            self.assertNotIn("tests/a.test.ts", result["command"])
+
+    def test_a_declared_command_without_any_usable_file_is_not_conclusive(self):
+        # Une commande déclarée n'est pas une preuve : sans fichier ni module
+        # présent dans l'arbre, le résultat reste non concluant.
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = os.path.join(tmp, "tree")
+            os.makedirs(tree)
+            result = replay.run_tests(tree, [], files=["web/a.test.ts"],
+                                      command="true {files}")
+            self.assertEqual(result["status"], "no-tests")
+            self.assertIsNone(result["passed"])
+            self.assertEqual(result["files"], [])
+
 
 class ReviewTest(unittest.TestCase):
     def _lot(self):
@@ -465,10 +505,10 @@ def _fake_agent(adapter, prompt, *, run_dir, cwd, env, harness, model, effort,
             "settings": {"model": model, "effort": effort}}
 
 
-def _fake_tests(tree, modules, *, command="", timeout=0, env=None):
+def _fake_tests(tree, modules, *, files=(), command="", timeout=0, env=None):
     return {"status": "ran", "passed": True, "exit": 0, "duration_s": 1.0,
-            "modules": modules, "counts": {"ran": 1, "failures": 0, "errors": 0,
-                                           "skipped": 0},
+            "modules": modules, "files": list(files),
+            "counts": {"ran": 1, "failures": 0, "errors": 0, "skipped": 0},
             "timed_out": False, "output_tail": "", "command": "fake"}
 
 
@@ -517,6 +557,34 @@ class ExecuteTest(unittest.TestCase):
     def _lot(self, root, base):
         return _bench_lot(root, base)
 
+    def test_javascript_tests_are_injected_and_handed_to_the_runner(self):
+        # #4292 B/P2 : les tests JS/TS du lot sont injectés et transmis entiers
+        # au lanceur ; ils n'ont pas de module unittest.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "repo")
+            _init_repo(root)
+            base = _commit(root, {"README.md": "base\n",
+                                  "web/a.test.ts": "// test\n"}, "base")
+            lot = replay.BenchLot(
+                lot=7, title="un lot JS", klass="light", app="p", repo=root,
+                target="main", base=base, frozen=base, body="corps du lot",
+                files=("web/a.test.ts",), tests=("web/a.test.ts",),
+                base_source="test")
+            plan = _plan(tmp, lot, test_command="node --test {files}")
+            seen = {}
+
+            def tests(tree, modules, *, files=(), command="", timeout=0, env=None):
+                seen.update(files=list(files), modules=list(modules),
+                            command=command)
+                return _fake_tests(tree, modules, files=files, command=command,
+                                   timeout=timeout, env=env)
+
+            replay.execute(plan, run_agent=_fake_agent, test_runner=tests,
+                           review_agent=_fake_review)
+            self.assertEqual(seen["files"], ["web/a.test.ts"])
+            self.assertEqual(seen["modules"], [])
+            self.assertEqual(seen["command"], "node --test {files}")
+
     def test_two_versions_then_two_blind_reviews(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, base = _repo(tmp)
@@ -549,13 +617,13 @@ class ExecuteTest(unittest.TestCase):
             plan = _plan(tmp, self._lot(root, base))
             seen = {}
 
-            def tests(tree, modules, *, command="", timeout=0, env=None):
+            def tests(tree, modules, *, files=(), command="", timeout=0, env=None):
                 with open(os.path.join(tree, "tests", "test_ref.py"),
                           encoding="utf-8") as fh:
                     seen["test"] = fh.read()
                 seen["solution"] = os.path.exists(os.path.join(tree, "solution.py"))
                 seen["env"] = env or {}
-                return _fake_tests(tree, modules, command=command,
+                return _fake_tests(tree, modules, files=files, command=command,
                                    timeout=timeout, env=env)
 
             replay.execute(plan, run_agent=_fake_agent, test_runner=tests,
@@ -569,9 +637,9 @@ class ExecuteTest(unittest.TestCase):
             plan = _plan(tmp, self._lot(root, base))
             seen = {}
 
-            def tests(tree, modules, *, command="", timeout=0, env=None):
+            def tests(tree, modules, *, files=(), command="", timeout=0, env=None):
                 seen.update(env or {})
-                return _fake_tests(tree, modules, command=command,
+                return _fake_tests(tree, modules, files=files, command=command,
                                    timeout=timeout, env=env)
 
             sentinels = {

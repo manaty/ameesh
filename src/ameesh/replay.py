@@ -1026,19 +1026,27 @@ def parse_unittest_summary(output: str) -> dict:
     return counts
 
 
-def run_tests(tree: str, modules: list[str], *, command: str = "",
+def run_tests(tree: str, modules: list[str], *, files=(), command: str = "",
               timeout: float = TEST_CAP_S, env: dict | None = None) -> dict:
     """Exécute les tests du vrai lot dans l'arbre rejoué.
 
-    Sans commande déclarée, la convention Python/unittest du dépôt est
-    utilisée (`tests.<module>` sur `PYTHONPATH=src`). Une commande déclarée
-    reçoit `{modules}` et `{files}` déjà substitués."""
+    `modules` : les noms de modules unittest (Python) retenus par la
+    sélection. `files` : les chemins **réels** des tests injectés, Python et
+    non Python (`web/a.test.ts`, `e2e/**`), tels qu'écrits dans l'arbre ; une
+    commande déclarée reçoit `{modules}` et `{files}` déjà substitués. Sans
+    commande, la convention Python/unittest du dépôt est utilisée
+    (`tests.<module>` sur `PYTHONPATH=src`) ; un lot sans module Python mais
+    avec une commande explicite et des fichiers (JS/TS) est exécuté, pas
+    déclaré `no-tests`. Sans commande utilisable, le résultat reste non
+    concluant (`no-tests`, `passed=None`)."""
     existing = [name for name in modules
                 if os.path.isfile(os.path.join(tree, "tests",
                                                name.replace(".", "/") + ".py"))]
-    if not existing:
+    present = [rel for rel in files
+               if os.path.isfile(os.path.join(tree, str(rel)))]
+    if not existing and not (command and present):
         return {"status": "no-tests", "passed": None, "exit": None,
-                "duration_s": 0.0, "modules": [], "counts": {},
+                "duration_s": 0.0, "modules": [], "files": [], "counts": {},
                 "output_tail": "", "command": command or "python -m unittest"}
     run_env = dict(env or os.environ)
     source = os.path.join(tree, "src")
@@ -1046,9 +1054,12 @@ def run_tests(tree: str, modules: list[str], *, command: str = "",
         [source, tree] + ([run_env["PYTHONPATH"]] if run_env.get("PYTHONPATH") else []))
     run_env["PYTHONDONTWRITEBYTECODE"] = "1"
     if command:
+        # #4292 B/P2 : les chemins injectés, jamais une reconstruction
+        # `tests/<module>.py` qui élimine les fichiers JS/TS.
+        shown = present or ["tests/%s.py" % name.replace(".", "/")
+                            for name in existing]
         argv = [part.format(modules=" ".join(existing),
-                            files=" ".join("tests/%s.py" % name.replace(".", "/")
-                                           for name in existing))
+                            files=" ".join(shown))
                 for part in shlex.split(command)]
     else:
         argv = [sys.executable, "-m", "unittest"] + ["tests.%s" % name
@@ -1058,7 +1069,8 @@ def run_tests(tree: str, modules: list[str], *, command: str = "",
     counts = parse_unittest_summary(output)
     passed = None if result["timed_out"] else (result["exit"] == 0)
     return {"status": "ran", "passed": passed, "exit": result["exit"],
-            "duration_s": result["duration_s"], "modules": existing, "counts": counts,
+            "duration_s": result["duration_s"], "modules": existing,
+            "files": present, "counts": counts,
             "timed_out": result["timed_out"],
             "output_tail": _clip(output[-OUTPUT_TAIL_CHARS:], OUTPUT_TAIL_CHARS),
             "command": " ".join(argv)}
@@ -1702,9 +1714,13 @@ def _run_one(plan: Plan, lot: BenchLot, version: str, blind: str, run_dir: str,
     modules += [name for name in extra if name not in modules]
     result["neighbors"] = {"modules": extra, "detail": why}
     # Les tests du vrai lot remplacent ceux de l'agent avant l'exécution : le
-    # rejeu est jugé par la référence, pas par ses propres témoins.
-    result["tests"] = {"injected": inject_tests(lot.repo, lot.frozen, tree, lot.tests)}
-    result["tests"].update(test_runner(tree, modules, command=plan.test_command,
+    # rejeu est jugé par la référence, pas par ses propres témoins. Les
+    # chemins injectés sont transmis entiers (#4292 B/P2) : un lot JS/TS n'a
+    # pas de module unittest, et `{files}` doit nommer ses vrais fichiers.
+    injected = inject_tests(lot.repo, lot.frozen, tree, lot.tests)
+    result["tests"] = {"injected": injected}
+    result["tests"].update(test_runner(tree, modules, files=injected,
+                                       command=plan.test_command,
                                        timeout=plan.test_cap_s, env=test_env))
     return result
 
