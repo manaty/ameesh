@@ -7,15 +7,16 @@ looks for the four families the owner described in manaty/ameesh#3185:
 
 | Family | What is detected | Outcome |
 |---|---|---|
-| already done | a merged change of the base ref references the lot, or touches the code the lot cites | **closed** (reason `done`) with the proof in the lot journal |
+| already done | a merged change of the base ref references the lot (`ameesh-work: <id>`, `lot/<id>-…` merge) | **closed** (reason `done`) with the proof in the lot journal |
+| probably done | a merged change touches the code the lot cites (same line, or the whole file when no line is cited) | **digest** to the project's PO: a touch is not a proof |
 | obsolete | every cited path is absent from the base ref and at least one was removed by a merged change | **closed** (reason `abandoned`) with the proof in the lot journal |
 | duplicate | two open lots have the same normalised title, or the same non-empty issue reference and at least two significant title words in common | **digest** to the project's PO |
 | contradiction | two open lots cite the same path and their titles start with opposite verbs (`add`/`remove`, `ajouter`/`supprimer`, …) | **digest** to the project's PO |
 
-Only the first two families are deterministic. A closure is a normal
+Only `already done` and `obsolete` are deterministic. A closure is a normal
 `work.close` gesture: it takes the same locks and releases the same
-dependents. The duplicate and the contradiction are **never** closed by the
-pass; the PO answers with a typed link (`ameesh work links <lot> --add <other>
+dependents. The probably-done lot, the duplicate and the contradiction are **never**
+closed by the pass; the PO answers with a typed link (`ameesh work links <lot> --add <other>
 --kind duplicates|conflicts_with`, #4167) or with a justified closure.
 
 ## Command
@@ -60,8 +61,9 @@ The JSON output is one object:
   is compared with the lot's creation timestamp; a same-second commit (for
   example the base commit that added the cited file) is not a fix for a lot
   filed after it. A commit that references the lot is looked for in the base
-  ref's history since the oldest open lot, which is enough: an id cannot be
-  cited before the lot exists.
+  ref's history since the oldest open lot; a commit older than the lot itself
+  (beyond a five-minute slack) is ignored: a `#<id>` cited before the lot
+  existed names something else.
 * **Only `intake` and `blocked` lots are closed.** A lot in `build`, `qa` or
   `waiting_human`, or one carrying a branch or a PR, is left to the PO; a
   refused closure appears in the digest with its reason.
@@ -70,8 +72,8 @@ The JSON output is one object:
   closed: the move is not a proof that the component disappeared.
 * **A line is a precise claim.** When a lot cites both a bare path (in its
   title) and a `path:line` (in its body), only the line is used for the code
-  check; otherwise a commit touching another line of the same file would close
-  the lot.
+  check; otherwise a commit touching another line of the same file would
+  flag the lot.
 * **One digest per project.** The digest is idempotent: its body is stable
   while findings do not change, and `mail.send` deduplicates it on its
   `idempotency_key`; a periodic timer does not repeat the same message every
@@ -98,7 +100,7 @@ elected host is enough, and the digest is idempotent across ticks.
 ## Reference fixture
 
 `tests/test_4172_backlog_coherence.py` plants a duplicate, an already-done lot
-(reference and code-touch), an obsolete path and a contradiction. It checks
-that only the deterministic findings are closed, that the duplicate and the
-contradiction stay open, that exactly one digest is sent to the PO, and that a
+(reference), a probably-done lot (code touch), an obsolete path and a
+contradiction. It checks that only the deterministic findings are closed, that
+the probably-done lot, the duplicate and the contradiction stay open, that exactly one digest is sent to the PO, and that a
 second pass sends no second digest.

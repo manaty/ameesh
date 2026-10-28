@@ -84,7 +84,8 @@ class CoherenceTest(PgTestCase):
         self.assertEqual(report["open_lots"], 8)
         findings = self._findings(report)
         self.assertIn(("already_done", self.already_ref["id"], 0), findings)
-        self.assertIn(("already_done", self.already_code["id"], 0), findings)
+        # a touch of the cited line is a hint for the PO, never a closure
+        self.assertIn(("probably_done", self.already_code["id"], 0), findings)
         self.assertIn(("obsolete", self.obsolete["id"], 0), findings)
         self.assertIn(("obsolete", self.obsolete_basename["id"], 0), findings)
         self.assertIn(("duplicate", self.dup_b["id"], self.dup_a["id"]), findings)
@@ -95,7 +96,6 @@ class CoherenceTest(PgTestCase):
         closed = {(row["kind"], row["lot"]) for row in applied["closures"]
                   if row["result"] == "closed"}
         self.assertEqual(closed, {("already_done", self.already_ref["id"]),
-                                  ("already_done", self.already_code["id"]),
                                   ("obsolete", self.obsolete["id"]),
                                   ("obsolete", self.obsolete_basename["id"])})
         for row in applied["closures"]:
@@ -107,7 +107,7 @@ class CoherenceTest(PgTestCase):
         self.assertEqual(work.get(self.db, self.obsolete_basename["id"])["close_reason"],
                          "abandoned")
         for lot_id in (self.dup_a["id"], self.dup_b["id"], self.add["id"],
-                       self.remove["id"]):
+                       self.remove["id"], self.already_code["id"]):
             self.assertNotEqual(work.get(self.db, lot_id)["state"], "closed")
         notes = [event["note"] for event in
                  work.events(self.db, self.already_ref["id"])]
@@ -123,6 +123,7 @@ class CoherenceTest(PgTestCase):
         self.assertIn("Corriger le mode X", body)
         self.assertIn("Ajouter le mode Y", body)
         self.assertIn("Supprimer le mode Y", body)
+        self.assertIn("Corriger la ligne deux (code)", body)
 
     def test_second_pass_sends_no_second_digest(self):
         first = backlog_coherence.scan(self.db, "p", cfg=self.test_cfg, repo=self.repo)
@@ -168,6 +169,7 @@ class CoherenceTest(PgTestCase):
         result = self.mesh("work", "coherence", "--project", "p", "--repo", self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("already done", result.stdout)
+        self.assertIn("probably done", result.stdout)
         self.assertEqual(work.get(self.db, self.already_ref["id"])["state"], "intake")
 
 
