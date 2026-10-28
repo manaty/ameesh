@@ -392,6 +392,17 @@ if epoque <= avant or holder not in candidats:
 print("bail du rôle élu repris par %s (époque %d > %d) — reprise normale"
       % (holder, epoque, avant))' "$avant" "$HOTE_AGENTS" <<<"$rapport"
 }
+# #4112 : l'exécuteur arrêté a-t-il réservé le rôle élu à cet hôte (#4086) ?
+# Son journal depuis le début du redémarrage le dit (`elected role reserved
+# to <hôte>`). Avec la réservation, une reprise ailleurs n'est plus l'issue
+# normale du §11 mais un échec ; sans elle (ancien code à l'arrêt, journal
+# illisible), elle reste un avertissement (#3412).
+reservation_ecrite() {  # persona epoch-depuis
+  local journal
+  journal=$(utilisateur_agents journalctl --user -u "$(unite_agents "$1")" \
+    --since "@$2" --no-pager -o cat) || return 1
+  grep -qF "] elected role reserved to $HOTE_AGENTS for " <<<"$journal"
+}
 statut() { lire_bail "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status") or "")'; }
 heure_base() {
   if [ "$MODE" = agents ]; then
@@ -1128,6 +1139,12 @@ redemarrer_agents() {
         # normale ; un vrai échec ne stoppe que cet agent, le balayage continue
         # (#2184/N2) et la sortie nomme les échecs à la fin.
         if detail=$(role_elu_repris_ailleurs "$p" "$avant"); then
+          # #4112 : sauf si l'exécuteur arrêté l'avait réservé à cet hôte.
+          if reservation_ecrite "$p" "$(( ${heure%.*} - 5 ))"; then
+            echec_agent "$p" "rôle élu réservé à $HOTE_AGENTS, mais ${detail% — reprise normale}"
+            echecs+=("$p")
+            continue
+          fi
           echo "WARNING $p: $detail"
         else
           echec_agent "$p" "active, mais bail non repris"

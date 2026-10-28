@@ -429,6 +429,23 @@ _DELAYS_SELECT = """
 """.replace("__MERGED_EFFECTIVE__", _effective_merged("m"))
 
 
+def _land_default_slot(tx, item_id, number, repo) -> None:
+    """#4097 : le créneau `default` atterri suit le numéro réellement posé.
+
+    Le déclencheur 0467 lande le créneau au numéro RÉSERVÉ quand le lot passe
+    `merged` ; un paquet qui renumérote (602 → 599) laissait donc `landed` à
+    602, numéro jamais posé sur la cible. Le numéro déclaré (`migration_landed`,
+    #1567) le remplace, dans la transaction qui l'écrit. Seul l'index des
+    créneaux `reserved` est unique : aucune course d'allocation ici."""
+    if not has_migration_slots(tx):
+        return
+    tx.execute(
+        "UPDATE work_migration_reservations SET number = %s, updated_at = now()"
+        " WHERE work_item_id = %s AND slot = 'default' AND status = 'landed'"
+        "   AND target_repo = %s AND number <> %s",
+        (int(number), int(item_id), "github.com/" + repo, int(number)))
+
+
 class _Refrozen(Exception):
     """Annule la fermeture : un nouveau gel a été validé pendant l'attente."""
 
@@ -2407,7 +2424,8 @@ class WorkItems(interface.WorkItems):
         """#1567 : enregistre (ou corrige) le numéro atterri d'un lot **déjà**
         fusionné ou promu, dans une transaction avec sa ligne de journal ; None
         si le lot n'est pas terminal. La réservation (`migration`,
-        `migration_repo`) n'est pas touchée : elle peut déjà être libérée."""
+        `migration_repo`) n'est pas touchée : elle peut déjà être libérée ;
+        le créneau `default` atterri, lui, suit le numéro posé (#4097)."""
         with self.db.transaction() as tx:
             rows = tx.query(
                 "UPDATE work_items SET migration_landed = %s, migration_landed_repo = %s,"
@@ -2418,6 +2436,7 @@ class WorkItems(interface.WorkItems):
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            _land_default_slot(tx, item_id, number, repo)
             return rows[0]
 
     def migration_landed_holder(self, number, repo) -> dict | None:
@@ -3270,6 +3289,8 @@ class WorkItems(interface.WorkItems):
                     return None
                 WorkItems(tx)._event(int(item_id), "merged", note, actor)
                 self._release_migration(tx, item_id, rows[0], why="fusion", actor=actor)
+                if number is not None:
+                    _land_default_slot(tx, item_id, number, repo)
                 tx.query(
                     "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
                     " WHERE id = (SELECT id FROM work_item_milestones"
@@ -3350,29 +3371,44 @@ class WorkItems(interface.WorkItems):
     # -- file d'amélioration (L119, décision 0037) ------------------------------
     def backlog_add(self, *, title, body, source, expected_value, value_score, priority,
                     team, required_capabilities, package_id, package_parent, note,
-                    actor, app="") -> dict:
+                    actor, app="", estimate_minutes=None, estimate_source=None,
+                    estimate_by=None, change_size=None) -> dict:
         with self.db.transaction() as tx:
+            # #4117 : l'estimation (et sa ligne d'historique) est posée avec la
+            # création, comme `work.add` (L157) ; jamais après.
+            by = (estimate_by or actor or "") if estimate_minutes else None
             rows = tx.query(
                 """
                 INSERT INTO work_items
                     (type, source, title, body, state, expected_value, value_score,
                      priority, team, required_capabilities, package_id, package_parent,
-                     app)
+                     app, estimate_minutes, estimate_source, estimate_by, estimate_at,
+                     change_size)
                 VALUES ('improvement', %s, %s, %s, 'intake', %s, %s, %s, %s, %s::text[],
-                        %s, %s, %s)
+                        %s, %s, %s, %s, %s, %s, CASE WHEN %s THEN now() END, %s)
                 RETURNING __COLUMNS__
                 """.replace("__COLUMNS__", item_columns(self.db)),
                 (source, title, body, expected_value, int(value_score), int(priority), team,
                  _catalog._text_array(required_capabilities) if required_capabilities else None,
-                 package_id, package_parent, app or ""))
+                 package_id, package_parent, app or "", estimate_minutes,
+                 estimate_source if estimate_minutes else None, by,
+                 bool(estimate_minutes), change_size or None))
             item = rows[0]
+            if estimate_minutes:
+                WorkItems(tx)._estimate_row(int(item["id"]), estimate_minutes,
+                                            estimate_source, estimate_by or actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             return item
 
     def backlog_basket_add(self, *, key, title, expected_value, line, value_score, priority,
                            team, required_capabilities, package_id, package_parent, note,
-                           actor, app="") -> dict:
+                           actor, app="", estimate_minutes=None, estimate_source=None,
+                           estimate_by=None, change_size=None,
+                           estimate_required=False) -> dict:
         caps = _catalog._text_array(required_capabilities) if required_capabilities else None
+        # #4117 : l'estimation ne s'applique qu'au panier OUVERT par cet ajout ;
+        # une ligne ajoutée à un panier existant ne le réestime pas.
+        by = (estimate_by or actor or "") if estimate_minutes else None
         with self.db.transaction() as tx:
             # #2584 : un seul écrivain par clé de panier — deux ajouts
             # simultanés n'ouvrent jamais deux paniers du même chantier.
@@ -3388,17 +3424,27 @@ class WorkItems(interface.WorkItems):
                 "   AND assignee IS NULL"
                 " ORDER BY id LIMIT 1 FOR NO KEY UPDATE", (key,))
             opened = not rows
+            # #4117 : la garde d'estimation est lue ICI, sous le verrou du
+            # panier : une ligne ajoutée à un panier déjà ouvert ne crée aucun
+            # lot et n'a pas à porter d'estimation (P2 de la relecture cx2).
+            if opened and estimate_required and not estimate_minutes:
+                raise interface.BasketEstimateRequired(
+                    "opening a basket requires an estimate or a published reference")
             if opened:
                 rows = tx.query(
                     "INSERT INTO work_items"
                     "    (type, source, title, body, state, expected_value, value_score,"
                     "     priority, team, required_capabilities, package_id, package_parent,"
-                    "     app)"
+                    "     app, estimate_minutes, estimate_source, estimate_by, estimate_at,"
+                    "     change_size)"
                     " VALUES ('improvement', %s, %s, %s, 'intake', %s, %s, %s, %s,"
-                    "         %s::text[], %s, %s, %s)"
+                    "         %s::text[], %s, %s, %s, %s, %s, %s,"
+                    "         CASE WHEN %s THEN now() END, %s)"
                     " RETURNING id",
                     (key, title, line, expected_value, int(value_score), int(priority),
-                     team, caps, package_id, package_parent, app or ""))
+                     team, caps, package_id, package_parent, app or "", estimate_minutes,
+                     estimate_source if estimate_minutes else None, by,
+                     bool(estimate_minutes), change_size or None))
             else:
                 tx.query(
                     "UPDATE work_items"
@@ -3415,6 +3461,9 @@ class WorkItems(interface.WorkItems):
                     (line, "\n" + line, int(value_score), int(priority), int(priority),
                      caps, team, int(rows[0]["id"])))
             item_id = int(rows[0]["id"])
+            if opened and estimate_minutes:
+                WorkItems(tx)._estimate_row(item_id, estimate_minutes, estimate_source,
+                                            estimate_by or actor)
             WorkItems(tx)._event(item_id, "intake", note, actor)
             rows = tx.query(
                 "SELECT " + item_columns(self.db) + ","

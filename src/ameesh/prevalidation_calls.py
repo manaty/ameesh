@@ -23,6 +23,12 @@ classes, contrats, hôtes, délai, lanceur de part) :
   la preuve finale ; son passage entier est borné sous ``land.LOCK_TTL_S``
   (#2665).
 
+#4136 : un véhicule composé par ``scripts/paquet-auto.py`` porte à sa tête un
+manifeste qui consigne ses tests locaux (unités, voisins, contrats) ; ni le
+gel ni ``ci run --full`` ne le prévalident une seconde fois
+(``composer_tested``). Un lot ordinaire, ou un véhicule composé à la main sans
+ce manifeste, garde sa prévalidation.
+
 Les hôtes viennent du bloc canon ; un hôte **local déclaré au canon** est
 admis (décision pilote 19/10 06:03, pour que les accroches tournent depuis
 `ameesh-agents-1`), un poste local non déclaré reste refusé.
@@ -44,6 +50,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1012,6 +1019,54 @@ def _run_hosts(prepared: Prepared, params: Parameters, *, lot: int, head: str,
 # (a) la porte du paquet, avant l'étiquette ci-full-<sha>
 # --------------------------------------------------------------------------
 
+#: #4136 : le manifeste d'un véhicule composé par paquet-auto (sans agent)
+COMPOSER_MARK = "Composeur : `scripts/paquet-auto.py`"
+#: #4136 : la ligne de ses tests locaux (`_tests_summary` de paquet-auto)
+COMPOSER_TESTS_RE = re.compile(
+    r"^- Tests locaux : .*?(\d+) tests exécutés, (\d+) échec\(s\)", re.MULTILINE)
+
+
+def composer_tested(cfg, db, item, head: str, *, repo: str = "") -> dict | None:
+    """#4136 : le véhicule a-t-il été testé en local par son composeur ?
+
+    Rend ``{"manifest": chemin, "sha": tête, "tests": n}`` quand le lot porte
+    une branche ``integration/**`` et que sa tête publie le manifeste de
+    paquet-auto avec des tests locaux exécutés, sans échec, et que la tête est
+    le commit de ce manifeste ; sinon ``None``.
+    Un doute (arbre absent, manifeste illisible, autre composeur, aucun test,
+    un échec) ne dispense de rien : la prévalidation reste due.
+    """
+    from . import packet_red
+    head = str(head or "").strip().lower()
+    if not head or not packet_red.is_carrier(item):
+        return None
+    where = repository(cfg, db, item, head, explicit=repo)
+    if not where:
+        return None
+    path = packet_red.manifest_name(str((item or {}).get("branch") or ""))
+    try:
+        text = plan_git._out(where, "show", "%s:%s" % (head, path)) or ""
+        # paquet-auto gèle le commit de son manifeste : un commit posé
+        # ensuite (correctif à la main) n'a pas été testé par le composeur.
+        last = plan_git._out(where, "log", "-1", "--format=%H", head, "--", path) or ""
+    except Exception:  # noqa: BLE001 - arbre illisible : rien n'est dispensé
+        return None
+    if last.strip().lower() != head:
+        return None
+    if COMPOSER_MARK not in text:
+        return None
+    found = COMPOSER_TESTS_RE.search(text)
+    if not found or int(found.group(1)) <= 0 or int(found.group(2)) != 0:
+        return None
+    return {"manifest": path, "sha": head, "tests": int(found.group(1))}
+
+
+def skipped_text(tested: dict) -> str:
+    """#4136 : la ligne de journal d'un véhicule dispensé (ni rouge ni indisponible)."""
+    return "%s skipped: vehicle tested by the composer (manifest %s)" % (
+        JOURNAL_PREFIX, str(tested.get("sha") or "")[:12])
+
+
 def gate_packet(cfg, db, item, decision: dict, *, repo: str = "",
                 map_path: str = "", say=None, warn=None,
                 deadline: Deadline | None = None) -> dict:
@@ -1026,7 +1081,9 @@ def gate_packet(cfg, db, item, decision: dict, *, repo: str = "",
     * ``{"state": "green", "report": …}`` : la sélection a tourné et est verte ;
     * ``{"state": "red", "report": …}`` : un test a échoué, l'appelant refuse ;
     * ``{"state": "unavailable", "cause"/"why", "report"?}`` : rien de prouvé,
-      l'appelant continue et cite le motif.
+      l'appelant continue et cite le motif ;
+    * ``{"state": "skipped", "manifest", "sha", "why"}`` (#4136) : véhicule
+      testé en local par paquet-auto, aucun offload lancé.
 
     L'exception déclarée au journal du paquet n'est pas lue ici : elle
     appartient à l'appelant (packet_guard), qui choisit de ne pas bloquer.
@@ -1035,10 +1092,13 @@ def gate_packet(cfg, db, item, decision: dict, *, repo: str = "",
     ``CALLER_BUDGET_S``) pour que ``ci run`` rende la main sous le délai du
     compositeur ; une échéance épuisée est ``unavailable`` (« timeout »).
     """
-    if deadline is None:
-        deadline = caller_deadline()
     head = str(decision.get("sha") or "").strip().lower()
     item = item or {}
+    tested = composer_tested(cfg, db, item, head, repo=repo)
+    if tested:
+        return {"state": "skipped", **tested, "why": skipped_text(tested)}
+    if deadline is None:
+        deadline = caller_deadline()
     lot = int(item.get("id") or decision.get("work_item") or 0)
     where = repository(cfg, db, item, head, explicit=repo)
     if not where:
@@ -1128,6 +1188,10 @@ def _after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
     if not head:
         _journal(db, lot, "%s unavailable: gel sans --sha" % JOURNAL_PREFIX)
         return {"state": "unavailable", "why": "gel sans --sha"}
+    tested = composer_tested(cfg, db, item, head, repo=repo)
+    if tested:
+        _journal(db, lot, skipped_text(tested))
+        return {"state": "skipped", **tested, "why": skipped_text(tested)}
     where = repository(cfg, db, item, head, explicit=repo)
     if not where:
         _journal(db, lot, "%s unavailable: aucun arbre ne porte %s"

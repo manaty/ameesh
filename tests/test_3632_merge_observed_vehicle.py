@@ -99,7 +99,9 @@ class VehicleMergedTest(_Base):
 
     # -- witness ----------------------------------------------------------
     def test_merged_vehicle_suppresses_the_member_alert_without_sync_merges(self):
-        self.assertEqual([alert["level"] for alert in self.verdict_merge()], [3])
+        # #4111: the recorded open packet already plans the member's wait,
+        # even before the branch sweep observes the carrier head.
+        self.assertEqual(self.verdict_merge(), [])
         self.merge_vehicle()
         # No sync-merges: the member is still open in qa.
         self.assertEqual(self.member()["state"], "qa")
@@ -107,8 +109,15 @@ class VehicleMergedTest(_Base):
         self.assertTrue(slo_delivery.merge_observed(self.cfg, self.db, self.member()))
 
     def test_a_stale_snapshot_sends_no_mail_once_the_vehicle_is_merged(self):
+        # Capture an alert while the observed carrier head invalidates its
+        # record; the matching head is then restored and merged. This keeps
+        # a real stale snapshot despite #4111 suppressing valid open packets.
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        ("e" * 40, self.vehicle["id"]))
         snapshot = self.slo()
         self.assertEqual([alert["step"] for alert in snapshot], ["verdict_merge"])
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (self.HEAD, self.vehicle["id"]))
         self.merge_vehicle()
         send, thread = self.deliver(snapshot)
         send.assert_not_called()
@@ -116,8 +125,8 @@ class VehicleMergedTest(_Base):
         self.assertEqual(self.notifier.state["briefs"], {})
 
     # -- negative witnesses ----------------------------------------------
-    def test_open_vehicle_keeps_the_alert(self):
-        self.assertEqual([alert["level"] for alert in self.verdict_merge()], [3])
+    def test_open_vehicle_plans_the_wait_but_is_not_delivery_evidence(self):
+        self.assertEqual(self.verdict_merge(), [])
         self.assertFalse(slo_delivery.merge_observed(self.cfg, self.db, self.member()))
 
     def test_a_new_freeze_after_composition_is_not_delivered(self):
