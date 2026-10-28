@@ -313,8 +313,11 @@ The source is the IMA-owned record: issue
 `thepackengers/issue-manager-agent#704`, its comments and state. IMA remains
 the decision authority; this bridge only *reads* the records and normalises
 them. `source=api` is never an authority (it is refused by
-`require_approval(..., source="api")`), and a projection whose `authority` is
-not `ima` is invalid. No IMA database, API or private content is copied into
+`require_approval(..., source="api")`). The authority's name is not a code
+constant (#4259): it is `approvals.authority` in the configuration, mandatory
+and without default (`ima` for the TPK mesh); the reader writes it into the
+projection, and a projection whose `authority` differs from the host's
+configured one is refused (`projection-source`). No IMA database, API or private content is copied into
 this repository.
 
 An owner approval is a comment that:
@@ -377,11 +380,11 @@ consumer's `max_age_s`. `owner_uid` can pin the expected owner of the file
 and its directory (0 for a root-synchronised copy).
 
 **The file does not prove its provenance.** The local configuration therefore
-carries the expected identity in `approvals.source`: `repo`, `issue`,
-`approvers` and, when the approvals cover another artifact repository,
-`artifact_repos`. `load_projection` compares the projection's `source.repo`,
-`source.issue`, `approvers` and every approval/revocation artifact with that
-identity; a mismatch, or an absent identity, is `projection-source` and the
+carries the expected identity in `approvals.authority` and
+`approvals.source`: `repo`, `issue`, `approvers` and, when the approvals cover
+another artifact repository, `artifact_repos`. `load_projection` compares the
+projection's `authority`, `source.repo`, `source.issue`, `approvers` and every
+approval/revocation artifact with that identity; a mismatch, or an absent identity, is `projection-source` and the
 approvals source is omitted from `read_sources` (fail-closed). The bureau and
 each host must declare the same identity; only the bureau also needs
 `token_file`. A valid 0644 projection produced from another repository, issue
@@ -392,6 +395,7 @@ or approver therefore cannot be substituted for the expected one.
 ```json
 {
   "approvals": {
+    "authority": "ima",
     "projection": "/var/lib/ameesh/approvals/ima-704.json",
     "max_age_s": 300,
     "owner_uid": 0,
@@ -411,8 +415,10 @@ or approver therefore cannot be substituted for the expected one.
 }
 ```
 
-`token_file` names a 0600 file; a token *value* in the configuration is
-refused. `api_base` must be https outside the loopback. The bureau runs:
+`authority` is mandatory, without default (#4259): absent or malformed,
+`refresh` refuses `reader-config` and the local read refuses
+`projection-source`. `token_file` names a 0600 file; a token *value* in the
+configuration is refused. `api_base` must be https outside the loopback. The bureau runs:
 
 ```
 ameesh process-approvals refresh     # reads #704, writes the projection
@@ -422,9 +428,9 @@ ameesh process-approvals show --repo R --revision <full-sha> --path P
 ```
 
 A host only uses `check` / `show`; it performs no network access. Its
-`approvals` section must keep the **identity** fields (`source.repo`,
-`source.issue`, `source.approvers`, optional `source.artifact_repos`) and the
-projection path; it may keep `source.token_file` (never read by `check` /
+`approvals` section must keep the **identity** fields (`authority`,
+`source.repo`, `source.issue`, `source.approvers`, optional
+`source.artifact_repos`) and the projection path; it may keep `source.token_file` (never read by `check` /
 `show`) or omit it. Omitting the identity is a refusal (`projection-source`),
 not a default.
 
@@ -439,7 +445,7 @@ exactly like `observations`. The
 `github` is accepted); it is not the command's authority source
 (`runner`/`explicit`/`session`), which B checks separately. The value is
 `{"projection": {generated_at, expires_at, digest, source_digest, repo,
-issue}, "records": [...]}`. `process_verifiers.SOURCE_COLLECTIONS` and
+issue, approvers, authority}, "records": [...]}`. `process_verifiers.SOURCE_COLLECTIONS` and
 `Snapshot.approvals` carry it; `approval_records(snapshot)` returns the
 normalised records. A C verifier applies the exact rules without reading a
 file or trusting a client: `process_approvals.projection_from_source(...)` /
@@ -502,7 +508,8 @@ client.
   `owner/repo@<40-hex sha>:<path>`; a branch, a tag, a short sha or any other
   form binds to no exact approval and is refused.
 * **Proof source**: the `approvals` projection (IMA #704, `source=github`,
-  authority `ima`). The approval source and the contract version are module
+  authority read from the projection, i.e. the configured
+  `approvals.authority`, #4259). The approval source and the contract version are module
   constants (`TRANSFER_APPROVAL_SOURCE`, `TRANSFER_CONTRACT`): no caller, test
   included, chooses another source or clock (`verify`, `server_verifier` and
   `install_verifiers` take neither `source` nor `now`).
@@ -552,10 +559,12 @@ message).
 `installation_receipt(registry)` (schema `process-verifier-install/1`) says
 what is **really** installed: `installed` is true only when the callable under
 `revision_transfer` is C's own; it carries the contract, the approval source,
-the authority, the required references and source, the ameesh version and the
+the required references and source, the ameesh version and the
 SHA-256 of the two deciding sources (`process_verifiers`,
 `process_approvals`). A foreign callable under the name reads
-`installed: false`.
+`installed: false`. It no longer carries the authority (#4259): the authority
+is configuration, not code, and is recorded in each accepted proof
+(`verification.facts.proof.authority`).
 
 ### Named limit
 
