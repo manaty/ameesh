@@ -23,8 +23,10 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
 1. **Réservation (§12).** Un porteur de paquet ouvert sur la cible (branche
    `integration/paquet-*` ou titre « Paquet horaire h-… ») la réserve : le tic
    suit ce porteur s'il est à lui (étapes 3-4), sinon ne fait rien.
-2. **Composition, une fois par heure.** Cible libre et aucun porteur horaire
-   créé dans l'heure locale (fuseau du canon compilé) : la liste calculée est lue
+2. **Composition, au moins une fois par heure.** Cible libre et aucun porteur
+   horaire créé dans l'heure locale (fuseau du canon compilé) dont la fusion
+   ne soit pas vue (#4171 : un porteur fusionné libère le créneau, un porteur
+   clos sans fusion le garde) : la liste calculée est lue
    (`paquet-candidats.py` depuis un worktree à la tête exacte de la cible) ;
    sans lot prêt, rien n'est créé. Sinon le lot porteur « Paquet horaire
    h-AAAAMMJJ-NN » est créé et `paquet-auto.py` compose, pousse et gèle.
@@ -91,6 +93,10 @@ TITLE_PREFIX = "Paquet horaire "
 HOURLY_RE = re.compile(r"^Paquet horaire (h-(\d{8})-(\d+))\b")
 CARRIER_BRANCH_PREFIX = "integration/paquet"
 OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
+#: #4171 : fusion vue d'un porteur (miroir de `work_lifecycle.DELIVERED` et
+#: des raisons de clôture livrée de `work.CLOSE_REASONS`).
+MERGED_STATES = ("merged", "promoted")
+MERGED_CLOSE_REASONS = ("delivered", "done")
 MARK = "paquet-horaire: "
 MARK_CI = MARK + "ci demandée "
 MARK_RED = MARK + "rouge consigné "
@@ -296,12 +302,26 @@ def hour_start(now: float, zone: ZoneInfo) -> float:
     return local.replace(minute=0, second=0, microsecond=0).timestamp()
 
 
+def merged_seen(row: dict) -> bool:
+    """#4171 : la fusion du porteur est-elle vue (état livré, ou clos livré) ?"""
+    state = str(row.get("state") or "")
+    return state in MERGED_STATES or (
+        state == "closed" and str(row.get("close_reason") or "") in MERGED_CLOSE_REASONS)
+
+
 def slot_served(rows: list[dict], now: float, zone: ZoneInfo, project: str,
                 target: str) -> bool:
-    """Un porteur horaire a-t-il été créé dans l'heure locale courante ?"""
+    """Un porteur horaire créé dans l'heure locale courante consomme-t-il le créneau ?
+
+    #4171 (décision #154026 a) : un porteur dont la fusion est vue ne le
+    consomme plus, le suivant se compose au tic suivant ; un porteur clos sans
+    fusion (abandonné, rien composé) le garde, pour ne pas recomposer à
+    chaque tic. L'heure reste le rythme minimum.
+    """
     start = hour_start(now, zone)
     return any(is_hourly(row) and is_carrier(row, project, target)
-               and float(row.get("created_ts") or 0) >= start for row in rows)
+               and float(row.get("created_ts") or 0) >= start
+               and not merged_seen(row) for row in rows)
 
 
 def next_name(ctx: Context) -> str:
@@ -525,7 +545,7 @@ def replay_locally(ctx: Context, sha: str, tests: list[str]) -> str:
 
 def compose(ctx: Context, rows: list[dict]) -> str:
     if slot_served(rows, ctx.now, ctx.zone, ctx.project, ctx.target):
-        return "porteur horaire déjà créé dans l'heure : rien à faire"
+        return "porteur horaire déjà créé dans l'heure, non fusionné : rien à faire"
     ready = ready_lots(ctx)
     if not ready:
         return "aucun lot prêt sur %s : rien à faire" % ctx.target
