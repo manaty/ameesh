@@ -50,10 +50,15 @@ l'ordre, sans agent :
 9. le résultat des tests au corps de la PR et au journal du porteur,
    courrier au pilote.
 
-Ce qui reste au pilote, hors de ce script : « verdict non requis » (sans lui,
-aucune fusion automatique : les tests par unité finissent avant), le feu et
+Ce qui reste au pilote, hors de ce script : « verdict non requis », le feu et
 toute fusion sur la cible. Le script ne fusionne jamais la cible et ne déclare
-aucun verdict.
+aucun verdict. La ci-full demandée dès la poussée arme pourtant la fusion
+automatique (#2813), et un porteur sans delta propre n'attend aucun verdict :
+le paquet peut fusionner au vert **avant la fin des tests par unité** (canon
+§11 bis, panier #4322). La ci-full tranche ; si la PR est fusionnée pendant les
+tests, le script ne recompose plus rien : un rouge d'unité va au porteur et au
+pilote (corriger en avant ou revert), et la ligne `MERGED_LINE` dit à
+`paquet-horaire.py` de ne rien publier.
 
 Un lot prêt peut être retiré de la composition par `--exclude LOT` (répétable,
 #3845) ; `--exclude-reason TEXTE` (répétable, apparié par ordre) écrit son vrai
@@ -139,6 +144,9 @@ MAX_RECOMPOSITIONS = 1
 TESTS_PARALLEL_LINE = ("- Tests locaux : joués par le composeur après la poussée, "
                        "en parallèle de la CI complète (#4304) ; résultat à la PR, "
                        "au porteur et au courrier du pilote.")
+#: #4322 : début de ligne quand la PR a fusionné pendant les tests par unité ;
+#: `paquet-horaire.py` (after_compose) n'appelle alors pas publish.
+MERGED_LINE = "porteur fusionné pendant les tests par unité"
 #: #4201 : motif neutre d'un `--exclude` sans `--exclude-reason`. Le vrai motif
 #: (B de relecture, regel, rouge local) est celui que le pilote écrit.
 EXCLUDE_DEFAULT_REASON = "exclu par le pilote"
@@ -2010,6 +2018,41 @@ def withdraw_packet(worktree: Path, carrier: int, pr_number: int | None,
     return failed
 
 
+def merged_during_tests(args: argparse.Namespace, worktree: Path, head: str,
+                        runs: list[TestRun], faulty: list[int], branch: str,
+                        rel: str) -> int:
+    """#4322 : la PR a fusionné au vert pendant les tests par unité (§11 bis).
+
+    Rien n'est recomposé ni retiré : les unités sont sur la cible. Le résultat
+    va au journal du porteur ; un rouge part au pilote (corriger en avant ou
+    revert). La dernière ligne (`MERGED_LINE`) dit à `paquet-horaire.py` de ne
+    pas publier sur un porteur déjà fusionné.
+    """
+    red = ", ".join("#%d" % lot for lot in faulty)
+    summary = ("rouges pour %s (%s)" % (red, _tests_summary(runs)) if faulty
+               else "verts (%s)" % _tests_summary(runs))
+    print(note_carrier(
+        worktree, args.carrier,
+        "paquet %s : PR fusionnée au vert pendant les tests par unité ; tests "
+        "par unité %s sur la tête %s ; manifeste %s (#4322)"
+        % (args.name, summary, head[:12], rel)), flush=True)
+    if faulty:
+        body = ("Paquet %s (%s, tête %s) : la ci-full verte a fusionné la PR "
+                "pendant les tests par unité, puis ceux-ci ont rougi pour %s "
+                "(%s). Rien n'est retiré ni recomposé : les unités sont sur la "
+                "cible. Rouge après fusion : corriger en avant ou revert "
+                "(canon §11 bis) ; un rouge local seul reste non bloquant.\n"
+                % (args.name, branch, head[:12], red, _tests_summary(runs)))
+        try:
+            send_mail(args.pilot, args.carrier, body, getattr(args, "sender", None))
+        except PaquetAutoError as error:
+            print("courrier non envoyé : %s\n\n%s" % (error, body),
+                  file=sys.stderr, flush=True)
+    print("%s : %s, tête %s, tests par unité %s" % (
+        MERGED_LINE, branch, head[:12], summary), flush=True)
+    return 0
+
+
 def send_mail(recipient: str, lot: int, body: str,
               sender: str | None = None) -> str:
     cmd = ["agent-mail", "send", recipient, "-", "--lot", str(lot)]
@@ -2519,6 +2562,18 @@ def compose_packet(args: argparse.Namespace) -> int:
                 parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
             if not faulty:
                 break
+            if pushed:
+                # #4322 : la ci-full verte a pu fusionner la tête pendant les
+                # tests ; ses unités sont sur la cible, rien à retirer
+                state = pull_request_state(worktree, branch)
+                if state == "MERGED":
+                    success = True
+                    return merged_during_tests(
+                        args, worktree, head, runs, faulty, branch, rel)
+                if state and state != "OPEN":
+                    raise PaquetAutoError(
+                        "PR de %s %s pendant les tests par unité : rien n'est "
+                        "recomposé, un agent lit" % (branch, state.lower()))
             if recomp >= MAX_RECOMPOSITIONS:
                 raise PaquetAutoError(
                     "tests locaux encore rouges après recomposition : %s ; "
@@ -2591,6 +2646,9 @@ def compose_packet(args: argparse.Namespace) -> int:
         tests_note = ("verts" if not inconclusive
                       else "verts + %d non concluant(s) consigné(s)" % inconclusive)
         state = pull_request_state(worktree, branch)
+        if state == "MERGED":
+            success = True
+            return merged_during_tests(args, worktree, head, runs, [], branch, rel)
         if state and state != "OPEN":
             print("PR %s pendant les tests par unité : corps non mis à jour"
                   % state.lower(), flush=True)
@@ -2642,7 +2700,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="expéditeur du courrier (défaut : AMEESH_ROLE, sinon "
                              "l'identité liée)")
     parser.add_argument("--local", action="store_true",
-                        help="s'arrêter après le manifeste et packet record")
+                        help="composition de contrôle : manifeste, packet "
+                             "record et tests par unité, sans poussée, PR, gel, "
+                             "ci-full ni courrier")
     parser.add_argument("--force", action="store_true",
                         help="recomposer un paquet existant : réécrit la "
                              "branche distante sous --force-with-lease (retirer "

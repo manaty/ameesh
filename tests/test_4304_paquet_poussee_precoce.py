@@ -195,14 +195,17 @@ class PousseePrecoceTest(unittest.TestCase):
         self.assertEqual(names[second_push - 1], "state")
         self.assertEqual(flux.manifests, [None, None])
 
-    def test_pr_fusionnee_pendant_les_tests_la_recomposition_n_est_pas_poussee(self) -> None:
+    def test_pr_close_pendant_les_tests_rien_n_est_recompose(self) -> None:
+        # #4322 : l'état de la PR est lu avant toute recomposition (la fusion
+        # au vert pendant les tests est couverte par test_4322)
         removal = paquet_auto.Removal(2, tests=["t"], attributed=True)
         red = paquet_auto.TestRun("unité #2", ["tests.test_x"], 1, "FAIL: t\n", 0.1)
         flux = Flux(self, tests=[([red], [2], [removal])],
-                    compositions=[self.two, self.one], states=("MERGED",))
-        with self.assertRaisesRegex(paquet_auto.PaquetAutoError, "merged"):
+                    compositions=[self.two, self.one], states=("CLOSED",))
+        with self.assertRaisesRegex(paquet_auto.PaquetAutoError, "closed"):
             flux.run()
         self.assertEqual(len(flux.calls("push")), 1)
+        self.assertEqual(len(flux.calls("manifest")), 1)
 
     def test_plus_aucune_unite_apres_poussee_retire_le_paquet(self) -> None:
         removal = paquet_auto.Removal(1, tests=["t"], attributed=True)
