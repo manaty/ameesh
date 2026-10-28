@@ -132,7 +132,7 @@ class SignedBootstrapRevokeAuthority(SignedBootstrapAuthority):
         return revoke_question(operation,self.bundle,expires_at=expires_at)
 
 
-def _run(journal,operation,bundle, *, authority,adapter):
+def _run(journal,operation,bundle, *, authority,adapter,steps=STEPS,scopes_of=None):
     """Resume exact bootstrap intents; no automatic destructive rollback.
 
     adapter validates the real host/runtime closure before copying, preserves
@@ -142,7 +142,9 @@ def _run(journal,operation,bundle, *, authority,adapter):
     authority preserve journals, accounts, runtime and existing live fences.
     """
     bundle=json.loads(json.dumps(bundle))
-    action_scopes=scopes(operation,bundle)
+    # Another signed bundle kind (delegation-canaux) supplies its own ordered
+    # steps and scope function; the journal, reservation and lock are shared.
+    action_scopes=(scopes_of or scopes)(operation,bundle)
     def approved(step):
         try:
             valid=authority.validate(operation,action_scopes[step],step) is True
@@ -170,22 +172,22 @@ def _run(journal,operation,bundle, *, authority,adapter):
             record=dict(bundle=bundle,intent=None,receipts={},complete=False)
             protocol.save(path,record)
         if (not isinstance(record['receipts'],dict) or type(record['complete']) is not bool
-                or record['intent'] not in (*STEPS,None)):
+                or record['intent'] not in (*steps,None)):
             raise BootstrapError('bootstrap journal state mismatch')
         def request_for(step):
             return dict(operation=operation,step=step,action_id=operation+':'+step,
                         scope_digest=action_scopes[step],bundle=bundle)
         for step,receipt in record['receipts'].items():
-            if (step not in STEPS or not isinstance(receipt,dict)
+            if (step not in steps or not isinstance(receipt,dict)
                     or protocol.identity(receipt)!=protocol.identity(dict(request_for(step),ok=True))):
                 raise BootstrapError('bootstrap recorded receipt mismatch')
-        if record['complete'] and (set(record['receipts'])!=set(STEPS) or record['intent'] is not None):
+        if record['complete'] and (set(record['receipts'])!=set(steps) or record['intent'] is not None):
             raise BootstrapError('bootstrap completion journal mismatch')
         if record['complete'] is True:
             # Do not reprovision/re-enable on replay after a revocation.
             reservation.unlink(missing_ok=True)
             return 'installed'
-        for step in STEPS:
+        for step in steps:
             if step in record['receipts']:
                 continue
             approved(step)

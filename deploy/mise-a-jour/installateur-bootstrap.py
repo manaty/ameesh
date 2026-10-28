@@ -60,7 +60,12 @@ class LinuxHost(account.LinuxAccounts):
         return True
 
     def layout(self,bundle):
-        for logical,mode in DIRECTORIES.items():
+        return self.create_layout(DIRECTORIES,('/etc/ameesh-release','/var/lib/ameesh-release',
+                                               '/opt/ameesh-release/store'))
+
+    def create_layout(self,directories,private):
+        """Create the reviewed directories; `private` roots keep their exact mode."""
+        for logical,mode in directories.items():
             path=Path(logical)
             # Trusted fixed system ancestors only. Never repair ownership or
             # permissions of an existing unrelated directory as a side effect.
@@ -82,9 +87,7 @@ class LinuxHost(account.LinuxAccounts):
                 raise InstallError('bootstrap directory not root-owned')
             # Existing generic system directories may be more restrictive; the
             # private roots below keep their reviewed mode exactly.
-            if (logical.startswith(('/etc/ameesh-release','/var/lib/ameesh-release',
-                                    '/opt/ameesh-release/store'))
-                    and stat.S_IMODE(info.st_mode)!=mode):
+            if logical.startswith(tuple(private)) and stat.S_IMODE(info.st_mode)!=mode:
                 raise InstallError('bootstrap private layout mismatch')
         return True
 

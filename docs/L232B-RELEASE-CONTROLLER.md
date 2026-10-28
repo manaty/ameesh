@@ -507,6 +507,42 @@ use a disposable root and simulated accounts/services, and the real signed
 authority on disposable PostgreSQL; the qualification on a real host starts
 with `plan` on agents-1.
 
+### Channel accounts bundle (#4327)
+
+The release bundle enrolls only `ameesh-release`. The canary pair (#3392)
+also needs the dedicated `ameesh-handoff` (H2) and `ameesh-secrets` (L232c)
+accounts: a second, separately signed bundle, `delegation-canaux.py`, renders
+both together (both are required, with distinct uid/gid and one distinct
+controller key and source per channel):
+
+| Object | Exact value |
+| --- | --- |
+| Accounts | `ameesh-handoff`, `ameesh-secrets`: system, `/bin/sh`, password `*`, no supplementary group; home = the channel's root-owned `/etc` root (never writable by the account) |
+| Roots | `/etc/ameesh-handoff`, `/etc/ameesh-secrets` root 0755 (key lookup by sshd); `/var/lib/ameesh-handoff`, `/var/lib/ameesh-secrets` root 0700; an existing root must already have this mode |
+| Handoff channel | `/usr/local/libexec/ameesh-handoff-ssh`, `/etc/sudoers.d/ameesh-handoff`, `/etc/ameesh-handoff/authorized_keys`, `/etc/ssh/sshd_config.d/62-ameesh-handoff.conf`, dispatcher `/opt/ameesh-release/lib/hote-handoff.py` |
+| Secret channel | the exact files of `delegation-secrets.py` (61-ameesh-secrets, dispatcher `hote-secrets.py`) |
+
+No tree is published and no enrollment document (`execution.json`,
+`policy.json`, `helper.json`, transports) is part of it: the dispatchers run
+from the release runtime and sources, which must already be installed at the
+plan's pinned digests, and each refuses until its documents are enrolled by
+their own decision. `bootstrap-canaux.py` orders `preflight` (machine-id,
+host key, installed release trees read-only, dispatchers present), `layout`,
+`account_handoff`, `account_secrets`, `configuration`, `validate` (`visudo`
+and `sshd -T` for each account with its own source), `enable` (reload,
+revalidate, both keys last) with the release engine, journal and host
+reservation; its question prefix, options and rollback decision
+(`SignedChannelRevokeAuthority`) are its own, so a release decision never
+authorizes a channel step and conversely. `installateur-canaux.py` holds the
+`LinuxChannels` commands and the `ChannelHostAdapter`.
+
+The administrator stages only `plan.json` with `"delegation": "canaux"`,
+`plan` (`host`, `machine_id`, `host_key_sha256`, `runtime_tree_sha256`,
+`source_tree_sha256`, `channels.{handoff,secrets}.{controller_source,
+controller_key}`), `account_ids.{handoff,secrets}.{uid,gid}` and
+`expires_at` (`probe_turn` and `runtime_seal` refused); the same backend
+commands then apply, `plan` reports `"delegation": "canaux"`.
+
 ## Independent service coordinator
 
 `service-release.py` coordinates protected operation files from the fixed
