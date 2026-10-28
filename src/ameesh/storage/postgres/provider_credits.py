@@ -11,11 +11,15 @@ from __future__ import annotations
 
 from .. import interface
 
-_ROW = ("select harness, account, state, reason, detail, source, agent, host,"
-        " extract(epoch from since)::float8 as since_ts,"
-        " extract(epoch from checked_at)::float8 as checked_ts,"
-        " extract(epoch from next_probe_at)::float8 as next_probe_ts"
-        " from provider_account_credits")
+#: les colonnes accordées au rôle superviseur (role-superviseur.sql) : pas
+#: `detail`, texte libre du fournisseur — `listing` nourrit les alertes
+_COLUMNS = ("select harness, account, state, reason, source, agent, host,"
+            " extract(epoch from since)::float8 as since_ts,"
+            " extract(epoch from checked_at)::float8 as checked_ts,"
+            " extract(epoch from next_probe_at)::float8 as next_probe_ts")
+_LISTING = _COLUMNS + " from provider_account_credits"
+#: et le détail, pour l'exécuteur et la lecture d'un compte (rôle complet)
+_ROW = _COLUMNS + ", detail from provider_account_credits"
 
 
 class ProviderCredits(interface.ProviderCredits):
@@ -26,7 +30,7 @@ class ProviderCredits(interface.ProviderCredits):
         return rows[0] if rows else None
 
     def listing(self) -> list[dict]:
-        return self.db.query(_ROW + " order by harness, account")
+        return self.db.query(_LISTING + " order by harness, account")
 
     def mark_exhausted(self, harness, account, *, reason, detail, source, agent,
                        host, probe_after_s) -> bool:

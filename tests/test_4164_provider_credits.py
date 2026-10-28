@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import unittest
 from unittest import mock
 
 from ameesh import balance, budget, exploitation, provider_credits, registry, storage
 
-from .support import FAKEBIN
+from .support import FAKEBIN, REPO
 from .test_l30_accounts import _Base
 
 #: the OpenAI error of the incident, as the Codex CLI reports a failed turn
@@ -98,6 +99,26 @@ class StorageTest(_CreditsBase):
                          ("ok", None, None))
         self.assertFalse(store.claim_probe("codex", "", 600))   # ok: nothing to probe
         self.assertFalse(store.mark_ok("deepseek", "", source="balance"))  # unseen
+
+    def test_listing_reads_only_what_the_supervisor_is_granted(self):
+        # the alerts read `listing()` under the supervisor role: a column it is
+        # not granted (`detail`, free provider text) would empty the alerts
+        from ameesh.storage.postgres import provider_credits as pg
+        with open(os.path.join(REPO, "deploy", "sql", "role-superviseur.sql"),
+                  encoding="utf-8") as fh:
+            grants = re.search(r"\('provider_account_credits', ARRAY\[(.*?)\]",
+                               fh.read(), re.S)
+        granted = set(re.findall(r"'([a-z_]+)'", grants.group(1)))
+        columns = {row["column_name"] for row in self.db.query(
+            "select column_name from information_schema.columns"
+            " where table_name = 'provider_account_credits'"
+            " and table_schema = current_schema()")}
+        self.assertEqual(columns - granted, {"detail"})
+        read = set(re.findall(r"[a-z_]+", pg._LISTING)) & columns
+        self.assertEqual(read - granted, set())
+        provider_credits.mark_exhausted(self.db, "codex", "", reason="r", detail="d")
+        self.assertNotIn("detail", storage.of(self.db).provider_credits.listing()[0])
+        self.assertEqual(self._row()["detail"], "d")
 
     def test_balance_reading_sets_and_clears_exhaustion(self):
         lu = lambda total, available: [balance.BalanceReading(  # noqa: E731
