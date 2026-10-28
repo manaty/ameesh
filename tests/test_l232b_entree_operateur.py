@@ -65,7 +65,11 @@ class Host(account_fixture.Accounts):
 
     def layout(self,bundle):
         for logical,mode in installer.DIRECTORIES.items():
-            (self.root/logical.lstrip('/')).mkdir(parents=True,mode=mode,exist_ok=True)
+            target=self.root/logical.lstrip('/')
+            target.mkdir(parents=True,mode=mode,exist_ok=True)
+            # Exact reviewed mode: neither the umask nor a setgid parent
+            # (offload guest job directory) may leak into the layout.
+            target.chmod(mode)
         return True
 
     def validate_configuration(self,bundle): return True
@@ -88,6 +92,10 @@ class OperatorEntryTest(unittest.TestCase):
         program.write_bytes(b'synthetic executable, never launched'); program.chmod(0o700)
         (stage/'sources').mkdir(mode=0o700)
         (stage/'sources/hote-release.py').write_text('# synthetic pinned source\n')
+        # A setgid parent (offload guest job directory) is inherited by mkdir;
+        # the staged trees must not carry it (runtime.inventory refuses 07000).
+        for directory in (stage.parent,stage,stage/'runtime',stage/'runtime/bin',stage/'sources'):
+            directory.chmod(0o700)
         self.trees={'runtime':stage/'runtime','sources':stage/'sources'}
         self.plan=dict(base.bundle['plan'],
             runtime_tree_sha256=installer.runtime.inventory(self.trees['runtime'])['digest'],

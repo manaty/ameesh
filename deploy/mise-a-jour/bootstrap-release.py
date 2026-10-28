@@ -28,6 +28,11 @@ ACTIONS=STEPS+('revoke',)
 OPTIONS=[dict(key='install',label='Install this exact host bootstrap and bounded delegation'),
          dict(key='leave',label='Leave this host unchanged')]
 PREFIX='Approve the exact host bootstrap and delegation below:\n'
+#: Rollback is its own signed decision (#4323): an install answer never
+#: authorizes revoke, and a revoke answer never authorizes an install step.
+REVOKE_OPTIONS=[dict(key='revoke',label='Revoke this exact host bootstrap delegation'),
+                dict(key='leave',label='Leave this host unchanged')]
+REVOKE_PREFIX='Approve the exact host bootstrap revocation below:\n'
 
 
 class BootstrapError(ValueError):
@@ -71,6 +76,17 @@ def question(operation,bundle, *, expires_at):
     return PREFIX+json.dumps(value,sort_keys=True,separators=(',',':'))
 
 
+def revoke_question(operation,bundle, *, expires_at):
+    if type(expires_at) is not int or expires_at<=0:
+        raise BootstrapError('signed revoke deadline required')
+    value=dict(version=1,operation=operation,host=bundle['host'],machine_id=bundle['machine_id'],
+        bundle_digest=bundle['digest'],revoke_digest=protocol.identity(bundle['revoke']),
+        file_sha256={path:info['sha256'] for path,info in bundle['files'].items()},
+        previous_files=bundle['previous_files'],scope=scopes(operation,bundle)['revoke'],
+        step='revoke',expires_at=expires_at)
+    return REVOKE_PREFIX+json.dumps(value,sort_keys=True,separators=(',',':'))
+
+
 class SignedBootstrapAuthority(signed.SignedDecisionAuthority):
     def __init__(self,db,decision_id,operation,bundle, *, clock=time.time):
         if type(decision_id) is not int or decision_id<=0:
@@ -79,27 +95,41 @@ class SignedBootstrapAuthority(signed.SignedDecisionAuthority):
         self.bundle=json.loads(json.dumps(bundle))
         self.scopes=scopes(operation,self.bundle)
 
+    #: Steps, answer option, options, prefix and question of this decision.
+    steps,option,options,prefix=STEPS,'install',OPTIONS,PREFIX
+
+    def render(self,operation,expires_at):
+        return question(operation,self.bundle,expires_at=expires_at)
+
     def validate(self,operation,digest,step):
-        if operation!=self.operation or step not in ACTIONS or self.scopes[step]!=digest:
+        if operation!=self.operation or step not in self.steps or self.scopes[step]!=digest:
             return False
         view=signed.decisions.get(self.db,self.decision_id)
         if not view or view.get('state')!='answered' or view.get('needs_signature') is not True:
             return False
         answer=view.get('answer') or {}
-        if (answer.get('option')!='install' or answer.get('text')!='install'
-                or answer.get('channel')!='signed' or view.get('options')!=OPTIONS):
+        if (answer.get('option')!=self.option or answer.get('text')!=self.option
+                or answer.get('channel')!='signed' or view.get('options')!=self.options):
             return False
         text=view.get('question') or ''
-        if not text.startswith(PREFIX):
+        if not text.startswith(self.prefix):
             return False
         try:
-            expires=json.loads(text[len(PREFIX):])['expires_at']
-            if type(expires) is not int or text!=question(operation,self.bundle,expires_at=expires):
+            expires=json.loads(text[len(self.prefix):])['expires_at']
+            if type(expires) is not int or text!=self.render(operation,expires):
                 return False
         except (KeyError,ValueError,TypeError):
             return False
         now=self.clock()
         return now<expires and self._proof_live(view,now,expires)
+
+
+class SignedBootstrapRevokeAuthority(SignedBootstrapAuthority):
+    """The separately signed rollback of one exact bootstrap bundle."""
+    steps,option,options,prefix=('revoke',),'revoke',REVOKE_OPTIONS,REVOKE_PREFIX
+
+    def render(self,operation,expires_at):
+        return revoke_question(operation,self.bundle,expires_at=expires_at)
 
 
 def _run(journal,operation,bundle, *, authority,adapter):
@@ -108,7 +138,7 @@ def _run(journal,operation,bundle, *, authority,adapter):
     adapter validates the real host/runtime closure before copying, preserves
     operation-specific config snapshots, validates effective SSH/sudo settings,
     proves independent controller readiness and enables the key last. Revoke
-    remains the separately reviewed administrator artifact; failures/expired
+    remains the separately signed administrator artifact; failures/expired
     authority preserve journals, accounts, runtime and existing live fences.
     """
     bundle=json.loads(json.dumps(bundle))
