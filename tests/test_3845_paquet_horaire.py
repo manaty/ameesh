@@ -124,16 +124,23 @@ class Base(unittest.TestCase):
                               pilot="mesh-design", actor="mesh-design",
                               shell=self.shell, python="python3", now=NOW,
                               zone=ZONE)
-        self._saved = (ph.ready_lots, ph.manifest_at, ph.replay_locally)
+        self._saved = (ph.ready_lots, ph.manifest_at, ph.replay_locally,
+                       ph.auto.composition_holder)
         self.ready = [3801, 3807]
         self.manifest = MANIFEST
         self.replay = ""
         ph.ready_lots = lambda ctx: list(self.ready)
         ph.manifest_at = lambda ctx, item, sha: self.manifest
         ph.replay_locally = lambda ctx, sha, tests: self.replay
+        # #4329 : le verrou de composition est lu dans le `.git` du checkout ;
+        # les témoins du tic le remplacent pour ne pas dépendre du dépôt réel
+        # (guest de prévalidation sans histoire, safe.directory, etc.). Les
+        # témoins du verrou le patchent explicitement dans leur with.
+        ph.auto.composition_holder = lambda repo, name: None
 
     def tearDown(self):
-        ph.ready_lots, ph.manifest_at, ph.replay_locally = self._saved
+        (ph.ready_lots, ph.manifest_at, ph.replay_locally,
+         ph.auto.composition_holder) = self._saved
 
 
 class ComposeTest(Base):
