@@ -409,11 +409,11 @@ root-private readiness receipt bound to host/enrollment, current boot/systemd
 invocation and verified read-only runtime/source trees. The service coordinator,
 fixed unit, pinned host factory and its two pinned companions are now prepared
 as described below; the recovery-set and health companions refuse admission
-until their enrolled documents and private state exist. There is no installed
-bootstrap CLI, automatic
+until their enrolled documents and private state exist. There is no automatic
 root executor or runtime/credential enrollment. The operator entry below
-assembles the reviewed bundle and the probe enrollment; execution still belongs
-to the enrolled administrator backend. No real root/account/SSH/systemd
+assembles the reviewed bundle and the probe enrollment; execution belongs to
+the enrolled administrator backend (`backend-administrateur.py`, below), run
+by the administrator as root. No real root/account/SSH/systemd
 effect is executed by this work. Tests combine disposable filesystem copies with
 simulated accounts/services and synthetic real signatures on disposable PostgreSQL
 through both drivers. Authenticated host pilot and external toolchain admission
@@ -457,6 +457,47 @@ Assembly and enrollment remain source only: no host is contacted, no root,
 SSH, systemd, migration or production effect is executed and no signed request
 is sent. A real-host pilot still needs the enrolled administrator backend, the
 administrator-staged trees and the owner's signed `install` decision.
+
+## Enrolled administrator backend
+
+`backend-administrateur.py` is the one root entry of the signed bootstrap
+(#4323). It adds no effect of its own: it wires `SignedBootstrapAuthority`,
+`installateur-bootstrap.LinuxHost`/`BootstrapHostAdapter` and `bootstrap.run`
+(through `entree-operateur.install`) to fixed paths. Its arguments are a
+command, an operation name and, for signed commands, a decision id; no
+program, root, destination, journal or credential is selectable.
+
+| Command | Effect |
+| --- | --- |
+| `inventory OPERATION` | none: host inventory of the reviewed destinations of the staged plan, machine-id, host-key digest |
+| `prepare OPERATION` | measures the staged trees, observes the inventory itself, writes `bundle.json` and `question.txt` (0600) beside the stage; an existing different bundle refuses |
+| `plan OPERATION --decision N` | none (dry run): ordered steps, scope digests, per-step authority, observed state and revoke preview; exit 3 while any step is unauthorized |
+| `install OPERATION --decision N` | the signed bootstrap, resumable from its journal |
+| `revoke OPERATION --decision N` | signed rollback under the bootstrap host lock: key first, approved snapshots restored, exact new files removed; runtime, account and journals kept |
+
+The administrator stages `runtime/`, `sources/` and `plan.json` (exactly
+`plan`, `account_ids`, `expires_at`, optional `probe_turn`, `runtime_seal`,
+root 0600) under `/var/lib/ameesh-release-bootstrap/OPERATION/`. The question
+is then asked with `ameesh decide ask --needs-signature`; the owner signs
+`install`. Private state lives under `/var/lib/ameesh-release-bootstrap/.admin`
+(no operation name starts with a dot): the controller and effect journals and
+`gestes.jsonl`, an append-only journal hash-chained line by line (`seq`,
+`prev`, `sha`) carrying the backend code digest, bundle digest, step, intent,
+receipt digest or a fixed failure category, never a document body, secret or
+provider text. A removed, reordered or edited line refuses every later gesture.
+
+Enrollment, by the administrator before the first gesture:
+`/etc/ameesh-admin` root 0700 holds `backend.json` (`version: 1`, `host`,
+`machine_id`, root 0600) and `config.json`, an ameesh configuration naming the
+separately enrolled controller database connection (root 0600), never the
+runners' settings. The backend runs from the reviewed wheel of the pinned SHA
+installed in a root-owned environment, `PYTHON -I -B
+…/share/ameesh/mise-a-jour/backend-administrateur.py`; a staged plan or
+bundle of another host, a non-root caller, an altered question, an absent,
+unsigned, expired or revoked mandate all refuse before any host effect. Tests
+use a disposable root and simulated accounts/services, and the real signed
+authority on disposable PostgreSQL; the qualification on a real host starts
+with `plan` on agents-1.
 
 ## Independent service coordinator
 
