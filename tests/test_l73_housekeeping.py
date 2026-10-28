@@ -474,6 +474,63 @@ class WorktreeEtatTest(_Tmp):
             menage.cited_lots("review/claude2-t3-unit-459-460-r2", agent="claude2"),
             [460, 459])
 
+    def test_4234_les_numeros_de_contexte_ne_sont_pas_des_lots(self):
+        """#4234 : les nombres de contexte d'un nom de branche (`am10-16`,
+        `am12-3`, `offload-agents-3`) ne sont pas des lots — lus comme tels,
+        ils nommaient un lot inexistant qui interdisait à jamais le retrait
+        d'un worktree de lot livré (11 arbres, 5,7 Gio sur agents-1). La
+        première suite numérique reste le lot ; une suite suivante n'en est
+        un que si son plus grand numéro atteint `RELATED_LOT_MIN` (#3266 :
+        `lot/431-432` sert bien deux lots)."""
+        # les branches réelles qui bloquaient les plus gros arbres
+        self.assertEqual(
+            menage.cited_lots("agent/claude2-4101-am10-16-notification-level",
+                              agent="claude2"), [4101])
+        self.assertEqual(
+            menage.cited_lots("agent/deepseek3-4129-am12-3-webhook-endpoint",
+                              agent="deepseek3"), [4129])
+        self.assertEqual(
+            menage.cited_lots("lot/4011-offload-agents-3"), [4011])
+        self.assertEqual(
+            menage.cited_lots("agent/ameesh-dev1-3719-rt-w5",
+                              agent="ameesh-dev1"), [3719])
+        self.assertEqual(
+            menage.cited_lots("agent/claude1-3703-dh-key-2",
+                              agent="claude1"), [3703])
+        # une suite liée réelle est toujours vérifiée (#3266)
+        self.assertEqual(menage.cited_lots("lot/431-432"), [431, 432])
+        self.assertEqual(
+            menage.cited_lots("agent/codex3-compute-298-299",
+                              agent="codex3"), [298, 299])
+        self.assertEqual(
+            menage.cited_lots("agent/deepseek1-3284-dossier-3155-g2-pass2",
+                              agent="deepseek1"), [3284, 3155])
+        # un groupe complété d'un zéro n'est jamais un lot, sous aucun préfixe
+        self.assertEqual(
+            menage.cited_lots("lot/1305-sauvegardes-0600"), [1305])
+        # review : la dernière suite utile, sans lire `t3` ni `r2`
+        self.assertEqual(
+            menage.cited_lots("review/codex1-4129-webhook-ingress"), [4129])
+        self.assertEqual(
+            menage.cited_lots("review/claude2-t3-unit-459-460-r2"),
+            [460, 459])
+        # sans aucune suite « grande », un nom de lots anciens (< 100) garde
+        # toutes ses suites, comme avant #4234
+        self.assertEqual(menage.cited_lots("lot/67-fix-89"), [67, 89])
+        self.assertEqual(menage.cited_lots("review/a2-42-fix-56",
+                                          agent="a2"), [56, 42])
+        # un premier lot ancien reste vérifié à côté d'une suite liée grande
+        self.assertEqual(menage.cited_lots("agent/a2-16-fix-431",
+                                          agent="a2"), [16, 431])
+        # une date n'est pas une suite de lots ; le petit numéro d'étiquette
+        # qui suit un lot lié n'en est pas un
+        self.assertEqual(
+            menage.cited_lots("review/ep7-3024-preuves-2026-10-24",
+                              agent="ep7"), [3024])
+        self.assertEqual(
+            menage.cited_lots("agent/claude2-3285-dossier-3155-4-4",
+                              agent="claude2"), [3285, 3155])
+
     def test_the_agent_number_is_not_a_lot_to_attach_to(self):
         """#2182 N2: `lot_of_worktree` must not attach a review copy to the
         lot numbered like its agent (`review/reviewer-02-999` is not #2), even
@@ -2175,6 +2232,11 @@ class MenageDbTest(PgTestCase):
         proc = self.mesh("menage")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("DRY RUN", proc.stdout)
+        # #4234 : une passe qui dure ne rend plus une sortie vide — la ligne
+        # de vie est sur stdout, la progression des phases sur stderr
+        self.assertIn("running (dry run", proc.stdout)
+        self.assertIn("started (dry run)", proc.stderr)
+        self.assertIn("housekeeping: phase", proc.stderr)
         self.assertTrue(os.path.exists(menage.agent_tmp(cfg_state, pol, "parti")))
         proc = self.mesh("menage", "--apply", env=self.env(AGENT_MAIL_NAME="a1"))
         self.assertEqual(proc.returncode, 1)
