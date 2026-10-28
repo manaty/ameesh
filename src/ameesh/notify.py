@@ -171,6 +171,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "account_shared",
                  "host_not_ready", "host_power_low",
                  "host_unavailable", "host_drain_overdue", "lease_not_taken", "backlog_empty", "mail_undeliverable",
+                 # #3256 A : feuille de route épuisée (une alerte à l'owner)
+                 "roadmap_exhausted",
                  # #2341 : un hôte dont l'échantillonneur s'est tu n'alimente plus
                  # les autres alertes ; son propriétaire l'apprend
                  "host_unsampled",
@@ -317,6 +319,7 @@ TYPE_LABELS = {
     "credential_expiring": "credential expiring soon",
     "host_power_low": "host battery low",
     "backlog_empty": "improvement backlog empty",
+    "roadmap_exhausted": "roadmap exhausted",
     "mail_undeliverable": "undeliverable mail",
     # #3007: cet hôte n'a aucune route pour l'humain — rien ne lui est poussé
     "notify_undeliverable": "human not reachable by the notifier",
@@ -2621,6 +2624,7 @@ class Notifier:
                 self._budget_handoff(db, now)
             if self.take:
                 self._auto_take(db, current, now)
+                self._queue_fill(db, now)
             if self.wip:
                 self._wip_sweep(db, now)
         if "issues" in selected:
@@ -2919,6 +2923,25 @@ class Notifier:
                                 "correction": "correction proposée"}.get(
                                     take.get("kind"), "file d'amélioration")}
             self._record("auto_take", entry, "a_blanc" if self.dry_run else "prise", {})
+
+    def _queue_fill(self, db, now: float) -> None:
+        """#3256 A : le lot de découpage d'un projet dont la file est vide alors
+        que la capacité est là ; repli de l'auditeur, sommeil et réveil."""
+        from . import file_decoupage
+        try:
+            gestures = file_decoupage.run(self.cfg, db, now=now, state=self.state,
+                                          dry_run=self.dry_run)
+        except db_mod.DbError:
+            raise
+        except Exception as exc:     # le découpage ne fait jamais tomber les alertes
+            self.log("queue fill failed: %s" % _clean(exc, 200))
+            return
+        for gesture in gestures:
+            entry = {"alert": {"type": "queue_fill_" + gesture["kind"],
+                               "lot": gesture.get("lot"),
+                               "project": gesture.get("project")},
+                     "human": None, "source": "file remplie (#3256 A)"}
+            self._record("queue_fill", entry, "a_blanc" if self.dry_run else "geste", {})
 
     # -- §4 (owner 14/10/2026) : limite d'en-cours -----------------------------
     def _wip_sweep(self, db, now: float) -> None:
