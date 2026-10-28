@@ -176,7 +176,8 @@ l'hôte du tick (même hôte, ou chemin partagé).
 Le retour est consigné dans le lot et dans l'état de l'adoption
 (`inverse.version`, `inverse.restore`). Il est appliqué :
 
-- automatiquement quand le canari sort des bornes ;
+- automatiquement quand le canari sort des bornes, ou quand la preuve de la
+  décision owner n'est plus valide avant un hôte ;
 - par `ameesh harness rollback-adoption <lot> --reason …`, à tout moment, y compris
   après `done` : chaque agent retrouve exactement son `harness_bin` ou son
   `model` d'avant la bascule (y compris `NULL`).

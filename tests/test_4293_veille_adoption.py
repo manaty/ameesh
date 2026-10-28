@@ -279,6 +279,17 @@ class AdoptionTest(PgTestCase):
         return {name: registry.get(self.db, name)["harness_bin"]
                 for name in ("canary", "impl", "other")}
 
+    def _owner_adoption(self, bins=None):
+        """Une adoption plus chère : décision owner #91 en attente, canari."""
+        higher = self._report(price={
+            "kind": "higher", "projected_7d_usd": 12.5,
+            "from": {"output": 1.20}, "to": {"output": 1.60}})
+        with mock.patch.object(veille.decisions, "ask",
+                               return_value={"id": 91, "state": "pending"}):
+            veille.adopt(self.cfg, self.db, self.lot, higher,
+                         bins=self.bins if bins is None else bins,
+                         now=1000.0, rules=self.rules)
+
     def test_automatic_adoption_goes_canary_then_host_by_host(self):
         result = veille.adopt(self.cfg, self.db, self.lot, self._report(),
                               bins=self.bins, now=1000.0, rules=self.rules)
@@ -439,6 +450,85 @@ class AdoptionTest(PgTestCase):
             out = veille.tick(self.cfg, self.db, now=1001.0, rules=Rules(1800))
         self.assertEqual(out["adoptions"][0]["result"], "canary")
         self.assertEqual(self._bins()["canary"], self.bins["h1"])
+
+    def test_owner_proof_revoked_after_canary_refuses_before_any_host(self):
+        """Avis B cx1 17:05 : la preuve est revérifiée à chaque hôte. Révoquée
+        après le canari, elle arrête la bascule sans toucher un autre agent."""
+        self._owner_adoption()
+        answered = {"state": "answered", "answer": {"option": "adopt"}}
+        with mock.patch.object(veille.decisions, "get", return_value=answered), \
+             mock.patch.object(veille.decisions, "verify_proof",
+                               return_value=(True, "signed owner key")) as proof:
+            out = veille.tick(self.cfg, self.db, now=1001.0, rules=Rules(1800))
+            self.assertEqual(out["adoptions"][0]["result"], "canary")
+            for _ in range(10):
+                self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
+            out = veille.tick(self.cfg, self.db, now=1000.0 + 5000,
+                              rules=Rules(30 * 60))
+            self.assertEqual(out["adoptions"][0]["result"], "rollout")
+            proof.return_value = (False, "key of owner revoked since")
+            out = veille.tick(self.cfg, self.db, now=1000.0 + 5100,
+                              rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "refused")
+        self.assertIn("proof", out["adoptions"][0]["reason"])
+        self.assertEqual(self._bins(), {"canary": None, "impl": None,
+                                        "other": None})
+        self.assertEqual(veille.load(self.db, self.lot)["state"]["stage"],
+                         "refused")
+
+    def test_owner_proof_revoked_between_hosts_restores_the_first_host(self):
+        """Avis B cx1 17:05 : révoquée entre deux hôtes, la preuve arrête la
+        suite et rend aux agents déjà basculés leur valeur d'avant."""
+        self._owner_adoption()
+        answered = {"state": "answered", "answer": {"option": "adopt"}}
+        with mock.patch.object(veille.decisions, "get", return_value=answered), \
+             mock.patch.object(veille.decisions, "verify_proof",
+                               return_value=(True, "signed owner key")) as proof:
+            veille.tick(self.cfg, self.db, now=1001.0, rules=Rules(1800))
+            for _ in range(10):
+                self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
+            veille.tick(self.cfg, self.db, now=1000.0 + 5000,
+                        rules=Rules(30 * 60))
+            out = veille.tick(self.cfg, self.db, now=1000.0 + 5100,
+                              rules=Rules(30 * 60))
+            self.assertEqual(out["adoptions"][0]["result"], "rollout")
+            self.assertEqual(self._bins()["impl"], self.bins["h1"])
+            self.assertIsNone(self._bins()["other"])
+            proof.return_value = (False, "approval expired")
+            out = veille.tick(self.cfg, self.db, now=1000.0 + 5200,
+                              rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "refused")
+        self.assertIn("proof", out["adoptions"][0]["reason"])
+        self.assertEqual(self._bins(), {"canary": None, "impl": None,
+                                        "other": None})
+
+    def test_blocked_rollout_resume_rechecks_the_owner_proof(self):
+        """Avis B cx1 17:05 : la reprise d'une bascule bloquée repasse par la
+        preuve ; sans elle, elle refuse et restaure l'hôte déjà fait."""
+        self._owner_adoption(bins={"h1": self.new_bin})
+        answered = {"state": "answered", "answer": {"option": "adopt"}}
+        with mock.patch.object(veille.decisions, "get", return_value=answered), \
+             mock.patch.object(veille.decisions, "verify_proof",
+                               return_value=(True, "signed owner key")) as proof:
+            veille.tick(self.cfg, self.db, now=1001.0, rules=Rules(1800))
+            for _ in range(10):
+                self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
+            veille.tick(self.cfg, self.db, now=1000.0 + 5000,
+                        rules=Rules(30 * 60))
+            veille.tick(self.cfg, self.db, now=1000.0 + 5100,
+                        rules=Rules(30 * 60))
+            out = veille.tick(self.cfg, self.db, now=1000.0 + 5200,
+                              rules=Rules(30 * 60))
+            self.assertEqual(out["adoptions"][0]["result"], "blocked")
+            state = veille.load(self.db, self.lot)["state"]
+            self.assertEqual(state["blocked_from"], "rollout")
+            proof.return_value = (False, "key of owner revoked since")
+            out = veille.tick(self.cfg, self.db, now=1000.0 + 5300,
+                              rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "refused")
+        self.assertIn("proof", out["adoptions"][0]["reason"])
+        self.assertEqual(self._bins(), {"canary": None, "impl": None,
+                                        "other": None})
 
     def test_owner_approval_without_a_valid_proof_is_refused(self):
         higher = self._report(price={

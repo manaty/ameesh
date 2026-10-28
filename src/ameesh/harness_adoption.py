@@ -1271,32 +1271,38 @@ def _advance_owner(cfg, db, row, state, report, *, now, actor, dry_run,
                              actor=actor, dry_run=dry_run, rules=rules)
 
 
+def _owner_proof_still_valid(db, state: dict) -> tuple[bool, str]:
+    """La décision owner d'une adoption est toujours une approbation prouvée.
+
+    Revérifiée avant CHAQUE geste (démarrage du canari, puis chaque hôte) :
+    une approbation consommée, une clé révoquée ou une preuve expirée depuis
+    ne laisse pas la bascule continuer. Une adoption automatique n'a pas de
+    décision : rien à vérifier."""
+    decision_id = state.get("decision_id")
+    if not decision_id:
+        return True, ""
+    view = decisions.get(db, int(decision_id))
+    if view is None or view.get("state") != "answered" \
+            or (view.get("answer") or {}).get("option") != "adopt":
+        return False, "owner decision is no longer an approval"
+    ok, why = decisions.verify_proof(db, view)
+    if not ok:
+        return False, "owner approval without a valid proof: %s" % why
+    return True, ""
+
+
 def _start_from_owner(cfg, db, row, state, report, *, now, actor, dry_run,
                       rules=None) -> dict:
     # la preuve est revérifiée à CHAQUE tentative de geste, y compris quand un
     # canari avait été bloqué puis repris (une approbation consommée ou une clé
     # révoquée depuis ne doit plus servir).
-    decision_id = state.get("decision_id")
-    if decision_id:
-        view = decisions.get(db, int(decision_id))
-        if view is None or view.get("state") != "answered" \
-                or (view.get("answer") or {}).get("option") != "adopt":
-            state.update({"stage": "refused",
-                          "reason": "owner decision is no longer an approval"})
-            if not dry_run:
-                save(db, row, state)
-                _journal(row, state, state["reason"], actor=actor)
-            return {"lot": row["lot_id"], "result": "refused",
-                    "reason": state["reason"]}
-        ok, why = decisions.verify_proof(db, view)
-        if not ok:
-            state.update({"stage": "refused",
-                          "reason": "owner approval without a valid proof: %s" % why})
-            if not dry_run:
-                save(db, row, state)
-                _journal(row, state, state["reason"], actor=actor)
-            return {"lot": row["lot_id"], "result": "refused",
-                    "reason": state["reason"]}
+    ok, why = _owner_proof_still_valid(db, state)
+    if not ok:
+        state.update({"stage": "refused", "reason": why})
+        if not dry_run:
+            save(db, row, state)
+            _journal(row, state, why, actor=actor)
+        return {"lot": row["lot_id"], "result": "refused", "reason": why}
     if dry_run:
         return {"lot": row["lot_id"], "result": "would-start-canary"}
     state.update({"stage": "canary", "reason": "", "blocked_from": None})
@@ -1386,6 +1392,31 @@ def _advance_canary(db, row, state, report, *, now, actor, dry_run) -> dict:
 
 def _advance_rollout(cfg, db, row, state, report, *, now, actor, rules,
                      dry_run) -> dict:
+    # #4293 (avis B cx1 du 17:05) : la preuve owner est vivante avant CHAQUE
+    # hôte, y compris quand la bascule reprend après un blocage. Sinon on
+    # s'arrête et on rend aux agents leurs valeurs d'avant : aucune nouvelle
+    # bascule sans approbation encore valable.
+    ok, why = _owner_proof_still_valid(db, state)
+    if not ok:
+        if dry_run:
+            return {"lot": row["lot_id"], "result": "would-refuse",
+                    "reason": why}
+        state.update({
+            "stage": "refused",
+            "reason": why,
+            "inverse": {"version": report.from_version,
+                        "restore": [{"agent": item["name"],
+                                     "value": item["before"]}
+                                    for entry in state.get("applied") or []
+                                    for item in entry.get("agents") or []]},
+        })
+        with db.transaction() as tx:
+            _restore(tx, state.get("applied") or [], report.object)
+            save(tx, row, state)
+        _journal(row, state, "rollout refused (%s); previous values restored"
+                 % why, actor=actor)
+        return {"lot": row["lot_id"], "result": "refused", "reason": why,
+                "state": state}
     hosts = list(state.get("hosts") or [])
     # un hôte apparu pendant la bascule (agent déplacé) rejoint la file : il
     # ne doit pas rester sur l'ancienne version sans être vu.
