@@ -80,7 +80,7 @@ def project(reading, history, agents, lots, *, now, idle_after_s=1800,
         if updated is not None:
             since = max(since, updated)
         wake = resources.finite_float(lot.get('wake_ts'))
-        if lot.get('state') not in DONE and wake is not None and wake <= now + idle_after_s:
+        if lot.get('state') not in DONE and wake is not None and wake < now + idle_after_s:
             busy = True
     if busy or unknown:
         return out

@@ -191,7 +191,7 @@ def agent_rows(cfg: Config, db) -> list:
     return _annotate_agents(cfg, db, rows)
 
 
-def agent_detail(db, name: str) -> dict | None:
+def agent_detail(db, name: str, *, cfg=None) -> dict | None:
     """The object of `ameesh show --json` (also `GET /api/v1/agents/{a}`)."""
     # L61 : la ligne et la clé en un seul aller-retour (db.batched)
     row, info = db_mod.batched(db, lambda db: (
@@ -208,6 +208,12 @@ def agent_detail(db, name: str) -> dict | None:
     row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
     row["key_updated_ts"] = (info or {}).get("key_updated_ts")
     row["key_revoked_ts"] = (info or {}).get("key_revoked_ts")
+    row["footprint"] = None
+    if cfg is not None and row.get("host"):
+        from . import host_idle, resources, canon as canon_mod
+        readings = {r["host"]: r for r in resources.current(db, row["host"])}
+        row["footprint"] = host_idle.snapshot(
+            cfg, db, canon_mod.load_configured(cfg), readings).get(row["host"])
     return row
 
 
@@ -1195,14 +1201,11 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     from . import progress
     db = _open(cfg)
     try:
-        row = agent_detail(db, args.agent)
+        row = agent_detail(db, args.agent, cfg=cfg)
         if row is None:
             print(USAGE_HINT % ("unknown agent: %s" % args.agent), file=sys.stderr)
             return 1
-        from . import host_idle, resources, canon as canon_mod
-        readings = {r["host"]: r for r in resources.current(db, row.get("host"))}
-        row["footprint"] = host_idle.snapshot(
-            cfg, db, canon_mod.load_configured(cfg), readings).get(row.get("host"))
+        from . import host_idle
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2))
             return 0

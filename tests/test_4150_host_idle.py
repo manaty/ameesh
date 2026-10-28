@@ -47,6 +47,7 @@ class HostIdleTest(unittest.TestCase):
         self.assertEqual(self.project(reading=self.reading(turns_in_progress=1))['state'], 'busy')
         for wake in (NOW - 1, NOW, NOW + 1799):
             self.assertEqual(self.project(lots=[dict(state='blocked', wake_ts=wake)])['state'], 'busy')
+        self.assertEqual(self.project(lots=[dict(state='blocked', wake_ts=NOW + 1800)])['state'], 'idle')
         self.assertEqual(self.project(lots=[dict(state='blocked', wake_ts=NOW + 1801)])['state'], 'idle')
         self.assertEqual(self.project(lots=[dict(state='closed', wake_ts=NOW - 1)])['state'], 'idle')
 
@@ -145,7 +146,8 @@ class CgroupReadabilityTest(unittest.TestCase):
         import tempfile
         from ameesh import resources
         from tests.test_2814_pressure_cgroup_capacity import write_cgroup
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(resources.platform.host, 'in_container', return_value=True):
             write_cgroup(root, quota='max', maximum=None)
             self.assertTrue(resources.CgroupMeter(root).read()['limits_readable'])
             with open(os.path.join(root, 'cpu.max'), 'w') as stream:
@@ -158,3 +160,30 @@ class CgroupReadabilityTest(unittest.TestCase):
         for value in ('nan', 'inf', '-1', '0', 'garbage'):
             self.assertEqual(config._as_bounded_positive(value, 1800), 1800)
         self.assertEqual(config._as_bounded_positive('900', 1800), 900)
+
+
+    def test_vm_without_cpu_controller_reserves_the_machine(self):
+        import os
+        import tempfile
+        from ameesh import resources
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(resources.platform.host, 'in_container', return_value=False):
+            with open(os.path.join(root, 'memory.max'), 'w') as stream:
+                stream.write('max')
+            cg = resources.CgroupMeter(root).read()
+            self.assertTrue(cg['limits_readable'])
+            self.assertFalse(cg['container'])
+            reading = dict(sampled_ts=NOW, cpu_count=8, mem_total_bytes=16000,
+                           turns_in_progress=0, cgroup=cg)
+            history = [dict(reading, sampled_ts=t) for t in range(7600, NOW + 1, 60)]
+            out = host_idle.project(reading, history, [], [], now=NOW)
+            self.assertEqual(out['state'], 'idle')
+            self.assertEqual(out['reserved_cpu'], 8)
+            self.assertEqual(out['reserved_mem_bytes'], 16000)
+
+    def test_real_vm_meter_does_not_require_delegated_cpu(self):
+        from ameesh import resources
+        cg = resources.CgroupMeter().read()
+        if cg['container']:
+            self.skipTest('real VM witness requires a VM')
+        self.assertTrue(cg['limits_readable'])
