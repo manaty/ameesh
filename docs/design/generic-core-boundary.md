@@ -47,6 +47,16 @@ them read-only and exits 1 when an entry point is refused. The bare profile
 (`discover(builtin=False)` with no entry point) is an empty registry without
 error, pinned by `tests/test_l98_modules_registry.py`.
 
+L99 tranche 1 adds the generic lifecycle names as accepted aliases:
+`requested` (intake), `in_progress` (build), `to_validate` (qa), `validated`
+(merged) and `delivered` (promoted); `blocked`, `waiting_human` and `closed`
+keep the same spelling. `work_lifecycle.ALIASES` names every accepted spelling,
+`canonical()` returns the persisted v1 one and `lifecycle_name()` the generic
+one. `work move`, `work list --state` and the lots API filter accept either
+spelling, and `work show` and `--json` carry a derived `lifecycle` field
+beside `state`. Storage does not change: the v1 spellings stay persisted
+until the storage switch.
+
 The boundary check preserves the current runtime behavior. Module activation,
 renamed persisted states, validation as a stored state, extraction of development
 and forge tooling, vocabulary selection and declarative pipelines are subsequent
