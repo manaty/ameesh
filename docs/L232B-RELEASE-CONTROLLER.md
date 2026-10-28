@@ -470,10 +470,15 @@ program, root, destination, journal or credential is selectable.
 | Command | Effect |
 | --- | --- |
 | `inventory OPERATION` | none: host inventory of the reviewed destinations of the staged plan, machine-id, host-key digest |
-| `prepare OPERATION` | measures the staged trees, observes the inventory itself, writes `bundle.json` and `question.txt` (0600) beside the stage; an existing different bundle refuses |
-| `plan OPERATION --decision N` | none (dry run): ordered steps, scope digests, per-step authority, observed state and revoke preview; exit 3 while any step is unauthorized |
+| `prepare OPERATION` | no host installation effect: measures the staged trees, observes the inventory itself, writes `question.txt` then `bundle.json` (0600) beside the stage; an existing different bundle refuses |
+| `plan OPERATION --decision N` | none (dry run, no `adapter.perform` nor `bootstrap.run`): ordered steps, scope digests, per-step authority, observed state, revoke preview and whether N authorizes the revoke; exit 3 when N authorizes neither |
 | `install OPERATION --decision N` | the signed bootstrap, resumable from its journal |
-| `revoke OPERATION --decision N` | signed rollback under the bootstrap host lock: key first, approved snapshots restored, exact new files removed; runtime, account and journals kept |
+| `revoke-question OPERATION --expires T` | none: prints the separate rollback question (options `revoke`/`leave`) |
+| `revoke OPERATION --decision N` | rollback under its **own** signed decision (`SignedBootstrapRevokeAuthority`), under the bootstrap host lock: key first, approved snapshots restored, exact new files removed; runtime, account and journals kept |
+
+An `install` answer never authorizes `revoke`, and a `revoke` answer never
+authorizes an install step: a root rollback is not implied by the decision
+that installed.
 
 The administrator stages `runtime/`, `sources/` and `plan.json` (exactly
 `plan`, `account_ids`, `expires_at`, optional `probe_turn`, `runtime_seal`,
@@ -488,12 +493,15 @@ provider text. A removed, reordered or edited line refuses every later gesture.
 
 Enrollment, by the administrator before the first gesture:
 `/etc/ameesh-admin` root 0700 holds `backend.json` (`version: 1`, `host`,
-`machine_id`, root 0600) and `config.json`, an ameesh configuration naming the
+`machine_id`, `code_sha256` of the installed backend and companion files,
+root 0600; a different digest refuses) and `config.json`, an ameesh configuration naming the
 separately enrolled controller database connection (root 0600), never the
 runners' settings. The backend runs from the reviewed wheel of the pinned SHA
-installed in a root-owned environment, `PYTHON -I -B
+installed in a root-owned environment outside any agent checkout (a
+non-root-owned code directory refuses), `PYTHON -I -B
 …/share/ameesh/mise-a-jour/backend-administrateur.py`; a staged plan or
-bundle of another host, a non-root caller, an altered question, an absent,
+bundle of another host, an invalid operation name (refused before any path
+is built), a non-root caller, an altered question, an absent,
 unsigned, expired or revoked mandate all refuse before any host effect. Tests
 use a disposable root and simulated accounts/services, and the real signed
 authority on disposable PostgreSQL; the qualification on a real host starts

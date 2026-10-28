@@ -16,8 +16,12 @@ journal or credential:
   plan OPERATION --decision N      dry run: the exact ordered plan, per-step
                                    authority and observed state, no effect;
   install OPERATION --decision N   executes the signed bootstrap;
-  revoke OPERATION --decision N    signed rollback: key first, approved
-                                   snapshots restored, exact new files removed.
+  revoke-question OPERATION --expires T
+                                   prints the separate rollback question to
+                                   sign (option `revoke`); writes nothing;
+  revoke OPERATION --decision N    signed rollback under its own decision:
+                                   key first, approved snapshots restored,
+                                   exact new files removed.
 
 Every effect gesture is appended to a private hash-chained journal
 (`gestes.jsonl`): code digest, bundle digest, step, intent, receipt digest or
@@ -25,8 +29,10 @@ a fixed failure category, never a document body, secret or provider text.
 The administrator stages `runtime/`, `sources/` and `plan.json` under the
 fixed `/var/lib/ameesh-release-bootstrap/OPERATION/`. The database used to
 revalidate the signed decision is the separately enrolled controller
-connection named by `/etc/ameesh-admin/backend.json`, never runner
-credentials. Tests map a disposable root and simulated accounts/services;
+connection named by `/etc/ameesh-admin/config.json`, never runner
+credentials; `/etc/ameesh-admin/backend.json` pins the host, machine-id and
+the digest of the installed backend code, which must live outside any agent
+checkout (root-owned, not writable by group or others). Tests map a disposable root and simulated accounts/services;
 no real root, account, SSH or systemd effect is executed by them.
 """
 import base64
@@ -65,7 +71,7 @@ CONFIG='/etc/ameesh-admin/config.json'
 HOST_KEY='/etc/ssh/ssh_host_ed25519_key.pub'
 PLAN_FIELDS={'plan','account_ids','expires_at'}
 PLAN_OPTIONAL={'probe_turn','runtime_seal'}
-COMMANDS=('inventory','prepare','plan','install','revoke')
+COMMANDS=('inventory','prepare','plan','install','revoke-question','revoke')
 SIGNED=('plan','install','revoke')
 GENESIS='0'*64
 
@@ -164,16 +170,20 @@ class Backend:
         # the fixed host root and `LinuxHost`, and no argument selects them.
         self.system,self.db=system,db
         self.root=Path(root).absolute(); runtime.trusted(self.root)
-        if (not isinstance(enrollment,dict) or set(enrollment)!={'version','host','machine_id'}
+        self.gestes=Gestes(self.path(ADMIN)/'gestes.jsonl',code or code_digest())
+        if (not isinstance(enrollment,dict) or set(enrollment)!={'version','host','machine_id','code_sha256'}
                 or enrollment['version']!=1 or not isinstance(enrollment['host'],str)
                 or not isinstance(enrollment['machine_id'],str)
                 or re.fullmatch(r'[0-9a-f]{32}',enrollment['machine_id']) is None):
             raise BackendError('enrolled administrator backend required')
+        if enrollment['code_sha256']!=self.gestes.code:
+            # Only the enrolled bytes run as root: a changed backend or
+            # companion refuses before any host access.
+            raise BackendError('backend code differs from its enrollment')
         self.enrollment=enrollment
         self.admin=self.path(ADMIN)
         # Read-only observer: the constructor stores, never creates.
         self.files=files_mod.BootstrapFiles(self.admin/'effects/files',authority=None,root=self.root)
-        self.gestes=Gestes(self.admin/'gestes.jsonl',code or code_digest())
 
     def path(self,logical):
         return self.root/logical.lstrip('/')
@@ -293,12 +303,13 @@ class Backend:
             raise BackendError('prepared question does not match its bundle')
         return entry.Prepared(operation,bundle,question)
 
-    def authority(self,decision,operation,bundle):
+    def authority(self,decision,operation,bundle,revoke=False):
         if type(decision) is not int or decision<=0:
             raise BackendError('signed decision required')
         if self.db is None:
             raise BackendError('enrolled decision registry required')
-        return bootstrap.SignedBootstrapAuthority(self.db,decision,operation,bundle)
+        kind=bootstrap.SignedBootstrapRevokeAuthority if revoke else bootstrap.SignedBootstrapAuthority
+        return kind(self.db,decision,operation,bundle)
 
     def adapter(self,authority):
         return installer.BootstrapHostAdapter(self.admin/'effects',authority=authority,
@@ -307,7 +318,7 @@ class Backend:
     def journal(self):
         return self.admin/'controller'
 
-    def plan(self,operation,decision,authority=None):
+    def plan(self,operation,decision,authority=None,revoke_authority=None):
         """Dry run: the exact plan this decision would execute; no effect.
 
         Nothing is created, locked, journaled or reloaded: only reads of the
@@ -326,8 +337,9 @@ class Backend:
                 allowed=False
             steps.append(dict(step=step,scope_digest=scopes[step],authorized=allowed,
                               done=step in record.get('receipts',{}),effects=self.effects(step,operation,bundle)))
+        revoke_authority=revoke_authority or self.authority(decision,operation,bundle,revoke=True)
         try:
-            revocable=authority.validate(operation,scopes['revoke'],'revoke') is True
+            revocable=revoke_authority.validate(operation,scopes['revoke'],'revoke') is True
         except Exception:
             revocable=False
         return dict(dry_run=True,operation=operation,host=bundle['host'],machine_id=bundle['machine_id'],
@@ -434,6 +446,14 @@ class Backend:
                 result[logical]='refuse changed'
         return result
 
+    def revoke_question(self,operation,expires_at):
+        bundle=self.prepared(operation).bundle
+        question=bootstrap.revoke_question(operation,bundle,expires_at=expires_at)
+        if len(question.encode())>entry.MAX_QUESTION:
+            raise BackendError('revoke question exceeds the signed limit')
+        return dict(operation=operation,bundle_digest=bundle['digest'],question=question,
+                    options=bootstrap.REVOKE_OPTIONS)
+
     def install(self,operation,decision,authority=None):
         prepared=self.prepared(operation)
         authority=authority or self.authority(decision,operation,prepared.bundle)
@@ -456,7 +476,7 @@ class Backend:
         files; runtime, account, journals and fences are kept.
         """
         prepared=self.prepared(operation); bundle=prepared.bundle
-        authority=authority or self.authority(decision,operation,bundle)
+        authority=authority or self.authority(decision,operation,bundle,revoke=True)
         scopes=bootstrap.scopes(operation,bundle)
         request=dict(operation=operation,step='revoke',action_id=operation+':revoke',
                      scope_digest=scopes['revoke'],bundle=bundle)
@@ -486,8 +506,15 @@ def parse(argv):
     if len(argv)<2 or argv[0] not in COMMANDS:
         raise BackendError('usage: '+'|'.join(COMMANDS)+' OPERATION [--decision N]')
     command,operation,rest=argv[0],argv[1],argv[2:]
+    if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}',operation) is None:
+        # Refused before any path is built from it.
+        raise BackendError('bootstrap operation required')
     decision=None
-    if command in SIGNED:
+    if command=='revoke-question':
+        if len(rest)!=2 or rest[0]!='--expires' or not rest[1].isdigit() or int(rest[1])<=0:
+            raise BackendError(command+' requires --expires EPOCH')
+        decision=int(rest[1])
+    elif command in SIGNED:
         if len(rest)!=2 or rest[0]!='--decision' or not rest[1].isdigit() or int(rest[1])<=0:
             raise BackendError(command+' requires --decision N')
         decision=int(rest[1])
@@ -499,6 +526,8 @@ def parse(argv):
 def dispatch(backend,command,operation,decision):
     if command in ('inventory','prepare'):
         return getattr(backend,command)(operation)
+    if command=='revoke-question':
+        return backend.revoke_question(operation,decision)
     return getattr(backend,command)(operation,decision)
 
 
@@ -509,6 +538,11 @@ def main(argv=None):
         if os.geteuid()!=0:
             raise BackendError('administrator backend runs as root')
         os.umask(0o077)
+        try:
+            # Installed code only: an agent checkout is not root-owned.
+            runtime.trusted(Path(__file__).resolve().parent)
+        except Exception:
+            raise BackendError('backend code must be installed root-owned') from None
         enrollment=json.loads(Backend.private(runtime.trusted(ENROLLMENT),4096))
         db=connect() if command!='inventory' else None
         backend=Backend(system=installer.LinuxHost(),enrollment=enrollment,db=db)
@@ -521,7 +555,7 @@ def main(argv=None):
         print(json.dumps(dict(ok=False,error='uncertain',category=type(error).__name__)),file=sys.stderr)
         return 1
     print(json.dumps(result,sort_keys=True,indent=1))
-    if command=='plan' and not result['authorized']:
+    if command=='plan' and not result['authorized'] and not result['revoke']['authorized']:
         return 3
     return 0
 

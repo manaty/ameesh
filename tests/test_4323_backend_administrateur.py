@@ -45,7 +45,8 @@ class Fixture:
         self.root.joinpath('var/lib/ameesh-release-bootstrap').chmod(0o700)
         self.question=bootstrap.question(self.operation,self.bundle,expires_at=2000000000)
         self.stage_bundle(self.bundle,self.question)
-        self.enrollment=dict(version=1,host=self.bundle['host'],machine_id=self.bundle['machine_id'])
+        self.enrollment=dict(version=1,host=self.bundle['host'],machine_id=self.bundle['machine_id'],
+                             code_sha256='e'*64)
         self.backend=backend_mod.Backend(system=self.system,enrollment=self.enrollment,
                                          root=self.root,code='e'*64)
 
@@ -61,7 +62,7 @@ class Fixture:
 class BackendTest(Fixture,unittest.TestCase):
     def test_dry_run_renders_the_exact_plan_without_any_effect(self):
         before=tree_state(self.root)
-        plan=self.backend.plan(self.operation,7,authority=self.authority)
+        plan=self.backend.plan(self.operation,7,authority=self.authority,revoke_authority=self.authority)
         self.assertEqual(tree_state(self.root),before)
         self.assertFalse((self.root/'var/lib/ameesh-release-bootstrap/.admin').exists())
         self.assertTrue(plan['dry_run']); self.assertTrue(plan['authorized'])
@@ -86,7 +87,7 @@ class BackendTest(Fixture,unittest.TestCase):
 
     def test_dry_run_reports_missing_authority_per_step(self):
         self.authority.denied={'enable'}
-        plan=self.backend.plan(self.operation,7,authority=self.authority)
+        plan=self.backend.plan(self.operation,7,authority=self.authority,revoke_authority=self.authority)
         self.assertFalse(plan['authorized'])
         self.assertEqual([item['step'] for item in plan['steps'] if not item['authorized']],['enable'])
 
@@ -105,7 +106,7 @@ class BackendTest(Fixture,unittest.TestCase):
         for info in self.bundle['files'].values(): self.assertNotIn(info['content'],journal.read_text())
         self.assertEqual(self.backend.install(self.operation,7,authority=self.authority)['outcome'],'installed')
         self.assertEqual(self.system.calls,['group','user']); self.assertEqual(self.system.reloads,1)
-        plan=self.backend.plan(self.operation,7,authority=self.authority)
+        plan=self.backend.plan(self.operation,7,authority=self.authority,revoke_authority=self.authority)
         self.assertTrue(plan['complete']); self.assertTrue(all(item['done'] for item in plan['steps']))
         self.assertEqual(plan['revoke']['files'][KEY],'remove')
 
@@ -132,7 +133,7 @@ class BackendTest(Fixture,unittest.TestCase):
         self.assertIsNotNone(self.system.account_value)
         phases=[(item['command'],item['phase']) for item in self.gestes()]
         self.assertEqual(phases[-2:],[('revoke','intent'),('revoke','receipt')])
-        plan=self.backend.plan(self.operation,7,authority=self.authority)
+        plan=self.backend.plan(self.operation,7,authority=self.authority,revoke_authority=self.authority)
         self.assertTrue(all(value=='unchanged' for value in plan['revoke']['files'].values()))
 
     def test_revoke_without_authority_changes_nothing_and_is_journaled(self):
@@ -154,7 +155,7 @@ class BackendTest(Fixture,unittest.TestCase):
     def test_bundle_of_another_host_or_altered_question_refuses(self):
         self.stage_bundle(self.bundle,self.question.replace('"uid":987','"uid":988'))
         with self.assertRaisesRegex(backend_mod.BackendError,'question'):
-            self.backend.plan(self.operation,7,authority=self.authority)
+            self.backend.plan(self.operation,7,authority=self.authority,revoke_authority=self.authority)
         other=backend_mod.Backend(system=self.system,root=self.root,code='e'*64,
                                   enrollment=dict(self.enrollment,host='other-host'))
         self.stage_bundle(self.bundle,self.question)
@@ -162,7 +163,14 @@ class BackendTest(Fixture,unittest.TestCase):
             other.install(self.operation,7,authority=self.authority)
         self.system.machine_id='f'*32
         with self.assertRaisesRegex(backend_mod.BackendError,'another host'):
-            self.backend.plan(self.operation,7,authority=self.authority)
+            self.backend.plan(self.operation,7,authority=self.authority,revoke_authority=self.authority)
+
+    def test_backend_code_must_match_its_enrollment(self):
+        for enrollment in (dict(self.enrollment,code_sha256='f'*64),
+                           {k:v for k,v in self.enrollment.items() if k!='code_sha256'}):
+            with self.subTest(),self.assertRaisesRegex(backend_mod.BackendError,'enrollment|enrolled'):
+                backend_mod.Backend(system=self.system,enrollment=enrollment,root=self.root,code='e'*64)
+        self.assertEqual(len(backend_mod.code_digest()),64)
 
     def test_no_enrolled_registry_or_decision_refuses_before_any_effect(self):
         with self.assertRaisesRegex(backend_mod.BackendError,'registry'):
@@ -183,6 +191,14 @@ class BackendTest(Fixture,unittest.TestCase):
         for operation in ('../etc','.admin','/etc/x','a b'):
             with self.subTest(operation=operation),self.assertRaisesRegex(backend_mod.BackendError,'operation'):
                 self.backend.stage(operation)
+            with self.subTest(operation=operation),self.assertRaisesRegex(backend_mod.BackendError,'operation'):
+                backend_mod.parse(['plan',operation,'--decision','7'])
+        self.assertEqual(backend_mod.parse(['revoke-question','op-1','--expires','2000000000']),
+                         ('revoke-question','op-1',2000000000))
+        with self.assertRaises(backend_mod.BackendError): backend_mod.parse(['revoke-question','op-1','--decision','7'])
+        question=self.backend.revoke_question(self.operation,2000000000)['question']
+        self.assertTrue(question.startswith(bootstrap.REVOKE_PREFIX))
+        self.assertIn(bootstrap.scopes(self.operation,self.bundle)['revoke'],question)
         with mock.patch.object(backend_mod.os,'geteuid',return_value=1001), \
                 mock.patch('sys.stderr'),mock.patch('sys.stdout'):
             self.assertEqual(backend_mod.main(['plan','op-1','--decision','7']),2)
@@ -210,7 +226,7 @@ class BackendTest(Fixture,unittest.TestCase):
 
 
 class SignedRefusalTest(Fixture,support.PgTestCase):
-    """Mandate absent, unsigned or expired: the real authority refuses."""
+    """Mandate absent, unsigned, expired or of the other kind: real authority refuses."""
 
     def setUp(self):
         support.PgTestCase.setUp(self)
@@ -219,25 +235,32 @@ class SignedRefusalTest(Fixture,support.PgTestCase):
         registry.upsert(self.db,'fixture-owner',harness='other',host=self.cfg.host)
         authority.register_key(self.db,'fixture-owner',signing.public_from_seed(self.seed),role='owner')
         registry.upsert(self.db,'fixture-controller',harness='other',host=self.cfg.host)
-        lot=work.add(self.db,title='Synthetic admin backend signature',assignee='fixture-controller')
+        self.lot=work.add(self.db,title='Synthetic admin backend signature',assignee='fixture-controller')
         self.question=bootstrap.question(self.operation,self.bundle,expires_at=int(self.now)+600)
         self.stage_bundle(self.bundle,self.question)
-        self.view=decisions.ask(self.cfg,self.db,requester='fixture-controller',lot=str(lot['id']),
-            question=self.question,options=['%s=%s'%(item['key'],item['label']) for item in bootstrap.OPTIONS],
-            needs_signature=True)
+        self.view=self.ask(self.question,bootstrap.OPTIONS)
         self.backend.db=self.db
 
-    def sign(self,signed=True):
-        text='install'
+    def ask(self,question,options):
+        return decisions.ask(self.cfg,self.db,requester='fixture-controller',lot=str(self.lot['id']),
+            question=question,options=['%s=%s'%(item['key'],item['label']) for item in options],
+            needs_signature=True)
+
+    def sign(self,view=None,text='install',signed=True):
+        view=view or self.view
         if signed:
-            digest=decisions.answer_digest(self.view,text,text,'human:fixture-owner')
+            digest=decisions.answer_digest(view,text,text,'human:fixture-owner')
             authority.create_approval(self.db,self.seed,approver='fixture-owner',action=decisions.APPROVAL_ACTION,
                 artifact_kind=decisions.APPROVAL_KIND,artifact_hash=digest,ttl=(self.now+900)-time.time())
-        decisions.answer(self.cfg,self.db,self.view['id'],text,human='human:fixture-owner',channel='cli',signed=signed)
+        decisions.answer(self.cfg,self.db,view['id'],text,human='human:fixture-owner',channel='cli',signed=signed)
 
-    def signed(self,clock=None):
-        return bootstrap.SignedBootstrapAuthority(self.db,self.view['id'],self.operation,self.bundle,
-                                                  clock=clock or (lambda:self.now))
+    def signed(self,clock=None,view=None,revoke=False):
+        kind=bootstrap.SignedBootstrapRevokeAuthority if revoke else bootstrap.SignedBootstrapAuthority
+        return kind(self.db,(view or self.view)['id'],self.operation,self.bundle,clock=clock or (lambda:self.now))
+
+    def revoke_view(self):
+        text=self.backend.revoke_question(self.operation,int(self.now)+600)['question']
+        return self.ask(text,bootstrap.REVOKE_OPTIONS)
 
     def assert_refused(self,decision,authority=None):
         with self.assertRaises(bootstrap.BootstrapError):
@@ -250,7 +273,8 @@ class SignedRefusalTest(Fixture,support.PgTestCase):
     def test_absent_mandate_refuses(self):
         self.assert_refused(self.view['id']+1000)
         self.assert_refused(self.view['id'])
-        self.assertFalse(self.backend.plan(self.operation,self.view['id'])['authorized'])
+        plan=self.backend.plan(self.operation,self.view['id'])
+        self.assertFalse(plan['authorized']); self.assertFalse(plan['revoke']['authorized'])
 
     def test_unsigned_mandate_refuses(self):
         with mock.patch.object(decisions,'verify_proof',return_value=(False,'unsigned')):
@@ -268,9 +292,35 @@ class SignedRefusalTest(Fixture,support.PgTestCase):
         self.assertTrue(self.backend.plan(self.operation,self.view['id'],authority=self.signed())['authorized'])
         self.assertEqual(self.backend.install(self.operation,self.view['id'],authority=self.signed())['outcome'],
                          'installed')
-        authority.revoke_key(self.db,'fixture-owner')
+
+    def test_install_decision_never_authorizes_revoke_and_conversely(self):
+        self.sign()
+        self.backend.install(self.operation,self.view['id'],authority=self.signed())
+        install=self.signed(); scopes=bootstrap.scopes(self.operation,self.bundle)
+        self.assertFalse(install.validate(self.operation,scopes['revoke'],'revoke'))
+        self.assertFalse(self.backend.plan(self.operation,self.view['id'])['revoke']['authorized'])
+        with self.assertRaises(Exception): self.backend.revoke(self.operation,self.view['id'])
+        self.assertTrue((self.root/KEY.lstrip('/')).exists())
+        view=self.revoke_view()
+        with self.assertRaises(Exception): self.backend.revoke(self.operation,view['id'])
+        self.sign(view,'revoke')
+        revoke=self.signed(view=view,revoke=True)
+        for step in bootstrap.STEPS:
+            self.assertFalse(revoke.validate(self.operation,scopes[step],step),step)
+        plan=self.backend.plan(self.operation,view['id'])
+        self.assertFalse(plan['authorized']); self.assertTrue(plan['revoke']['authorized'])
+        self.assertEqual(self.backend.revoke(self.operation,view['id'])['outcome'],'revoked')
+        self.assertFalse((self.root/KEY.lstrip('/')).exists())
+        self.assertTrue((self.root/'opt/ameesh-release/runtime/bin/python').exists())
+
+    def test_revoked_owner_key_or_expired_revoke_decision_refuses_rollback(self):
+        self.sign(); self.backend.install(self.operation,self.view['id'],authority=self.signed())
+        view=self.revoke_view(); self.sign(view,'revoke')
         with self.assertRaises(Exception):
-            self.backend.revoke(self.operation,self.view['id'],authority=self.signed())
+            self.backend.revoke(self.operation,view['id'],
+                                authority=self.signed(view=view,revoke=True,clock=lambda:self.now+601))
+        authority.revoke_key(self.db,'fixture-owner')
+        with self.assertRaises(Exception): self.backend.revoke(self.operation,view['id'])
         self.assertTrue((self.root/KEY.lstrip('/')).exists())
 
 
