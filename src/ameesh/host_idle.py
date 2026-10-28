@@ -144,7 +144,7 @@ def _can_prove_idle(reading, *, now, fresh_within):
             and footprint['reserved_mem_bytes'] is not None)
 
 
-def snapshot(cfg, db, canons, readings, *, now=None):
+def snapshot(cfg, db, canons, readings, *, now=None, listing=None):
     """Read all common sources once, then project each host. No mutations."""
     from . import canon as canon_mod
     from . import planned_waits
@@ -158,7 +158,7 @@ def snapshot(cfg, db, canons, readings, *, now=None):
     candidates = {host for host, reading in readings.items()
                   if _can_prove_idle(reading, now=now, fresh_within=fresh)}
     try:
-        agents = storage.of(db).operations.listing()
+        agents = storage.of(db).operations.listing() if listing is None else listing
         # Bounded per-agent read includes closed lots: closing work also
         # resets the quiet interval. Truncation cannot prove an idle host.
         # A host whose own reading already excludes rest only needs the
@@ -193,11 +193,12 @@ def snapshot(cfg, db, canons, readings, *, now=None):
         agents = None
     capacity, costs = capacities(canons, names, protected=protected,
                                  baseline_hosts=cfg.baseline_hosts)
-    # The leader/reserve guard can only change the capacity when the canon
-    # declares fewer than the baseline hosts; computing the election for it
-    # costs seconds per view and would be discarded (#4178).
-    if agents is not None and (sum(v == 'baseline' for v in capacity.values())
-                               < cfg.baseline_hosts):
+    # Ordinary views need elections only for an underspecified baseline
+    # (#4178). A supplied listing also serves the A3 alert projection: its
+    # reclassification proposals must retain guards even with a full baseline.
+    if agents is not None and (listing is not None or
+                              sum(v == 'baseline' for v in capacity.values())
+                              < cfg.baseline_hosts):
         from . import election, host_lifecycle
         try:
             for name in host_lifecycle.critical_names(cfg, db):
@@ -241,6 +242,7 @@ def snapshot(cfg, db, canons, readings, *, now=None):
         out[host] = project(reading, history, members, host_lots, now=now,
                             idle_after_s=idle_s, fresh_within=fresh,
                             capacity=capacity[host], cost_eur_h=costs[host], holds=holds)
+        out[host]["baseline_guard"] = host in protected
     return out
 
 

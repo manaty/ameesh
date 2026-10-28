@@ -307,6 +307,8 @@ TYPE_LABELS = {
     "idle_capacity": "idle capacity",
     "orchestrator_held": "orchestrator held by a session",
     "host_underused": "host underused",
+    "host_idle_reserved": "idle reserved host capacity",
+    "baseline_oversized": "oversized baseline",
     "balance_low": "low balance",
     "provider_credits_exhausted": "provider credits exhausted",
     "host_not_ready": "host not ready",
