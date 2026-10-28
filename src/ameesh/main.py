@@ -142,15 +142,15 @@
         le hook `post-commit` constate l'objet né puis écrit la preuve ;
   ameesh receipt verify       approval receipts (spec §8);
   ameesh release open|check|reason <lot>   release perimeter and validation;
+  ameesh replay bench|run|report   banc de rejeu comparatif (#3264 B, L15) :
+        trois lots livrés sur leur base gelée, version installée et version
+        évaluée, relecture croisée à l'aveugle ;
   ameesh restart <agent> --brief FILE|-   fresh session on a brief;
   ameesh resume <agent> [--brief FILE|-] [--fresh]
         restarts a stopped, dead or idle agent: same session if the next
         turn's account can resume it, otherwise a deterministic resume brief;
   ameesh review-class [--project P] [--diff REF | FILE ...]
         review class of the changed files from the project's policy;
-  ameesh replay bench|run|report   banc de rejeu comparatif (#3264 B, L15) :
-        trois lots livrés sur leur base gelée, version installée et version
-        évaluée, relecture croisée à l'aveugle ;
   ameesh role canary [--json]   L165 (EP7 P3) : geste sans effet gardé par
         l'époque du bail de l'environnement (AMEESH_ROLE + AMEESH_LEASE_EPOCH,
         ou session liée) ; 0 accepté (un `pilot.gesture` canary), 1 refusé
