@@ -797,7 +797,7 @@ def format_digest(project: str, findings: list[dict], report: dict) -> str:
                          % (int(row["lot"]), row.get("kind") or "?",
                             row.get("reason") or "?"))
         lines.append("")
-    lines.append("Les fermetures déterministes éventuelles (déjà fait, obsolète) "
+    lines.append("Les fermetures déterministes éventuelles (déjà fait) "
                  "sont justifiées dans le journal de chaque lot.")
     lines.append("Ces constats ne sont pas fermés d'office : répondez par un lien "
                  "typé (`ameesh work links <lot> --add <autre> --kind "
