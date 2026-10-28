@@ -62,7 +62,18 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    dépassé ailleurs) est relancée sur le même porteur avec
    `--force`, au plus 3 fois, puis le pilote est prévenu une fois. Un porteur
    créé sans tentative (arrêt entre `work add` et la marque) est repris de même.
+   #4237 : si la tentative morte a laissé une **tête testée** (refus de geste
+   après des tests verts, `paquet-auto: tête testée …` au journal), la reprise
+   la publie (`paquet-auto.py --publish`) sans recomposer ; une chaîne refusée
+   (cible bougée) recompose dans le même tic.
 6. Un courrier au pilote à chaque étape (tête, unités, écartés, CI).
+
+**Recomposition du pilote** (#4237) : `paquet-horaire.py recompose --carrier N
+--exclude LOT [--exclude-reason TEXTE]` au lieu de `paquet-auto.py --force` à
+la main : la marque « tentative » (hôte, pid, époque de la session, motifs) est
+posée d'abord, si bien qu'un tic du détenteur courant reprend une recomposition
+perdue à la relève du bail comme les siennes. Elle ne compte pas dans le
+retrait automatique unique du point 4.
 
 Ce script ne fusionne jamais : la fusion reste celle de `packet_automerge`
 sur la tête gelée, CI requise verte. Les marques d'idempotence sont des notes
@@ -112,7 +123,10 @@ COMPOSITION = "composition"
 RECOMPOSITION = "recomposition"
 ATTEMPT_RE = re.compile(
     r"^paquet-horaire: tentative (composition|recomposition) n=(\d+) base=(\S+) "
-    r"par=(\S+):(\d+)(?: run=(\S+) sans=([\d,]+))?(?: epoque=(\d+))?")
+    r"par=(\S+):(\d+)(?: run=(\S+) sans=([\d,]*))?(?: epoque=(\d+))?"
+    r"(?: publie=(\S+))?(?: motifs=(\[.*\]))?$")
+#: #4237 : le `run=` d'une recomposition demandée par le pilote (sous-commande)
+PILOT_RUN = "pilote"
 FAILED_RE = re.compile(r"^paquet-horaire: échec (composition|recomposition) n=(\d+) base=(\S+)")
 FENCED_RE = re.compile(
     r"^paquet-horaire: non concluant (composition|recomposition) n=(\d+) base=(\S+)")
@@ -432,11 +446,15 @@ def manifest_at(ctx: Context, item: dict, sha: str) -> str:
 
 
 def paquet_auto(ctx: Context, name: str, carrier: int, *,
-                exclude: list[int] = (), exclude_reason: str = "",
-                force: bool = False) -> Result:
+                exclude: list[int] = (), exclude_reasons: list[str] = (),
+                force: bool = False, publish: str = "") -> Result:
+    """`publish` : « réf@sha » de la tête testée (#4237), publiée sans retester."""
     cmd = [ctx.python, str(SCRIPT_DIR / "paquet-auto.py"), "--repo", str(ctx.repo),
            "--target", ctx.target, "--name", name, "--carrier", str(carrier),
            "--pilot", ctx.pilot, "--from", ctx.actor]
+    if publish:
+        ref, _, sha = publish.rpartition("@")
+        cmd += ["--publish", ref, "--publish-sha", sha]
     if force:
         cmd.append("--force")
     if ctx.unit_tests is not None:
@@ -447,9 +465,8 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
                 "borne par défaut de paquet-auto (#4271)")
     for lot in exclude:
         cmd += ["--exclude", str(lot)]
-    if exclude_reason:
-        for _lot in exclude:
-            cmd += ["--exclude-reason", exclude_reason]
+    for reason in exclude_reasons:
+        cmd += ["--exclude-reason", reason]
     if ctx.dry_run:
         ctx.say("[essai] %s" % " ".join(cmd))
         return Result(0, "aucun lot prêt : rien à composer (essai)\n", "")
@@ -625,6 +642,10 @@ class Attempt:
     #: la branche et le worktree locaux de l'essai refusé sont restés
     force: bool = False
     epoch: int = 0  # époque du bail à l'entrée (0 : marque sans époque)
+    #: #4237 : « réf@sha » de la tête testée publiée par cette tentative ("" : composer)
+    publish: str = ""
+    #: #4237 : motifs d'exclusion du pilote, appariés à `exclude`
+    reasons: list[str] = field(default_factory=list)
 
     @property
     def key(self) -> str:
@@ -645,11 +666,16 @@ def attempts(item: dict) -> list[Attempt]:
         note = str(ev.get("note") or "")
         match = ATTEMPT_RE.match(note)
         if match:
-            step, n, base, host, pid, run_id, without, epoch = match.groups()
+            step, n, base, host, pid, run_id, without, epoch, ref, why = match.groups()
+            try:
+                reasons = [str(text) for text in json.loads(why)] if why else []
+            except ValueError:
+                reasons = []
             found.append(Attempt(
                 step, int(n), "" if base == "-" else base, host, int(pid), run_id or "",
                 [int(lot) for lot in (without or "").split(",") if lot],
-                float(ev.get("created_ts") or 0), epoch=int(epoch or 0)))
+                float(ev.get("created_ts") or 0), epoch=int(epoch or 0),
+                publish=ref or "", reasons=reasons))
             continue
         fenced = FENCED_RE.match(note)
         match = fenced or FAILED_RE.match(note)
@@ -672,11 +698,23 @@ def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
         mark += " run=%s sans=%s" % (this.run_id, ",".join(str(lot) for lot in this.exclude))
     if ctx.epoch:
         mark += " epoque=%d" % ctx.epoch
+    if this.publish:
+        mark += " publie=%s" % this.publish
+    if this.reasons:
+        mark += " motifs=%s" % json.dumps(this.reasons, ensure_ascii=False)
     ctx.note(carrier, mark)
+    if this.publish:
+        result = paquet_auto(ctx, name, carrier, publish=this.publish)
+        return after_compose(ctx, carrier, name, result, this)
+    if this.reasons:
+        reasons = list(this.reasons)
+    elif this.step == RECOMPOSITION and this.run_id != PILOT_RUN:
+        reasons = [EXCLUDE_CI_FULL_REASON] * len(this.exclude)
+    else:
+        reasons = []
     # une reprise (n > 1) réécrit une branche peut-être déjà poussée
     result = paquet_auto(ctx, name, carrier, exclude=this.exclude,
-                         exclude_reason=(EXCLUDE_CI_FULL_REASON
-                                         if this.step == RECOMPOSITION else ""),
+                         exclude_reasons=reasons,
                          force=this.step == RECOMPOSITION or this.n > 1 or this.force)
     return after_compose(ctx, carrier, name, result, this)
 
@@ -732,10 +770,13 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
         if fenced < MAX_FENCED:
             ctx.say("#%d : reprise de la %s après refus de garde (tentative %d "
                     "non décomptée)" % (carrier, this.step, this.n))
-            return attempt(ctx, carrier, name, Attempt(this.step, this.n, this.base,
-                                                       run_id=this.run_id,
-                                                       exclude=list(this.exclude),
-                                                       force=True))
+            # #4237 : une tête testée gardée depuis se publie sans recomposer
+            kept = tested_since(item, this.ts)
+            return attempt(ctx, carrier, name, Attempt(
+                this.step, this.n, this.base, run_id=this.run_id,
+                exclude=list(this.exclude), force=True,
+                publish=("%s@%s" % (kept[2], kept[1]) if kept else this.publish),
+                reasons=list(this.reasons)))
         if MARK_STUCK + this.key in marks(item):
             return "#%d : reprise de la %s épuisée, déjà signalée" % (carrier, this.step)
         ctx.mail(ctx.pilot, carrier,
@@ -753,10 +794,36 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
                  % (carrier, name, this.step, this.n, (this.base or "aucune")[:12]))
         ctx.note(carrier, MARK_STUCK + this.key)
         return "#%d : reprise de la %s épuisée" % (carrier, this.step)
-    ctx.say("#%d : reprise de la %s (tentative %d morte)" % (carrier, this.step, this.n))
+    kept = tested_since(item, this.ts)
+    if kept:
+        ctx.say("#%d : reprise de la %s (tentative %d morte) par la tête testée %s"
+                % (carrier, this.step, this.n, kept[1][:12]))
+    else:
+        ctx.say("#%d : reprise de la %s (tentative %d morte)" % (carrier, this.step, this.n))
     return attempt(ctx, carrier, name, Attempt(this.step, this.n + 1, this.base,
                                                run_id=this.run_id,
-                                               exclude=list(this.exclude)))
+                                               exclude=list(this.exclude),
+                                               publish=("%s@%s" % (kept[2], kept[1])
+                                                        if kept else ""),
+                                               reasons=list(this.reasons)))
+
+
+def tested_since(item: dict, since: float) -> tuple[str, str, str] | None:
+    """#4237 : la dernière tête testée gardée depuis `since` : (base, tête, réf).
+
+    Écrite par `paquet-auto.keep_tested` sur un refus de geste après des tests
+    verts ; une réf « - » (poussée échouée) n'est pas publiable. Une tentative
+    de publication ne réécrit jamais cette marque : une publication morte se
+    reprend en recomposant.
+    """
+    found = None
+    for ev in _events(item):
+        if float(ev.get("created_ts") or 0) < since:
+            continue
+        match = auto.TESTED_RE.match(str(ev.get("note") or ""))
+        if match:
+            found = match.groups() if match.group(3) != "-" else None
+    return found
 
 
 def after_compose(ctx: Context, carrier: int, name: str, result: Result,
@@ -775,6 +842,17 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
                  % (carrier, name, step, ctx.epoch, this.n, MAX_ATTEMPTS,
                     auto._tail(result.text, 10)))
         return "#%d : %s non concluante (refus de garde d'époque)" % (carrier, step)
+    if this.publish and result.returncode == auto.PUBLISH_REFUSED \
+            and this.n < MAX_ATTEMPTS:
+        # tête testée non publiable (cible bougée, chaîne) : recomposer tout de suite
+        ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (
+            MARK_FAILED, step, this.n, this.base or "-", result.returncode))
+        ctx.say("#%d : tête testée refusée (%s), recomposition"
+                % (carrier, auto._tail(result.text, 3)))
+        return attempt(ctx, carrier, name, Attempt(step, this.n + 1, this.base,
+                                                   run_id=this.run_id,
+                                                   exclude=list(this.exclude),
+                                                   reasons=list(this.reasons)))
     if result.returncode != 0:
         ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (
             MARK_FAILED, step, this.n, this.base or "-", result.returncode))
@@ -854,7 +932,9 @@ def follow(ctx: Context, item: dict) -> str:
         why = replay_locally(ctx, sha, verdict.tests)
         if why:
             verdict = Verdict(False, verdict.lots, verdict.tests, why)
-    recomposed = len({a.run_id for a in attempts(item) if a.step == RECOMPOSITION})
+    # #4237 : une recomposition du pilote n'use pas le retrait automatique
+    recomposed = len({a.run_id for a in attempts(item)
+                      if a.step == RECOMPOSITION and a.run_id != PILOT_RUN})
     if verdict.deterministic and recomposed < MAX_RECOMPOSITIONS:
         return recompose(ctx, item, run, verdict)
     reason = verdict.why if not verdict.deterministic else \
@@ -1067,6 +1147,66 @@ def tick(ctx: Context) -> str:
     return compose(ctx, recent_lots(ctx))
 
 
+def session_epoch(ctx: Context) -> int:
+    """#4237 : l'époque du bail de la session qui lance une recomposition.
+
+    `AMEESH_LEASE_EPOCH` sous `ameesh role run` ; sinon la garde `packet` de
+    `pilot_gesture`, lue par le Python du projet : une session de pilote liée
+    par son runner rend son époque, une session qui ne détient plus le bail
+    est refusée ici, avant toute marque. Un humain ou le bureau (aucune garde)
+    rend 0 : la marque n'a pas d'époque et le délai de composition s'applique.
+    """
+    if ctx.epoch:
+        return ctx.epoch
+    code = (
+        "import sys\n"
+        "sys.path.insert(0, sys.argv[2])\n"
+        "from ameesh import config, db, pilot_gesture\n"
+        "conn = db.connect(config.load())\n"
+        "try:\n"
+        "    gate = pilot_gesture.gate(None, conn, 'packet', sys.argv[1])\n"
+        "finally:\n"
+        "    if conn is not None:\n"
+        "        conn.close()\n"
+        "print(gate.epoch if gate is not None else 0)\n")
+    result = ctx.shell.run([ctx.python, "-c", code, "paquet-horaire recompose",
+                            str(ctx.repo / "src")],
+                           cwd=ctx.repo, timeout=60)
+    if result.returncode != 0:
+        raise HoraireError("recomposition refusée, bail non vérifié : %s"
+                           % auto._tail(result.text, 5))
+    try:
+        return max(int(result.stdout.strip().splitlines()[-1]), 0)
+    except (ValueError, IndexError):
+        raise HoraireError("époque illisible : %r" % result.stdout[-200:]) from None
+
+
+def pilot_recompose(ctx: Context, carrier: int, exclude: list[int],
+                    reasons: list[str]) -> str:
+    """#4237 : la recomposition du pilote, marquée comme celles du tic."""
+    if reasons and len(reasons) != len(exclude):
+        raise InputError("--exclude-reason : %d motif(s) pour %d --exclude"
+                         % (len(reasons), len(exclude)))
+    item = show(ctx, carrier)
+    if not (item.get("state") in OPEN_STATES
+            and is_carrier(item, ctx.project, ctx.target) and is_hourly(item)
+            and "paquet-horaire" in str(item.get("source") or "")):
+        raise InputError("#%d n'est pas un porteur horaire ouvert sur %s : aucun tic "
+                         "ne reprendrait sa recomposition" % (carrier, ctx.target))
+    sha = frozen_sha(item)
+    left = pending(ctx, item, sha)
+    if left is not None and running(ctx, left):
+        raise InputError("#%d : %s en cours (%s:%d), attendre sa fin"
+                         % (carrier, left.step, left.host, left.pid))
+    ctx.epoch = session_epoch(ctx)
+    name = str(item.get("branch") or "")[len(auto.PACKAGE_PREFIX):]
+    ctx.say("#%d : recomposition du pilote sans %s" % (
+        carrier, ", ".join("#%d" % lot for lot in exclude) or "aucun lot"))
+    return attempt(ctx, carrier, name, Attempt(RECOMPOSITION, 1, sha, run_id=PILOT_RUN,
+                                               exclude=list(exclude),
+                                               reasons=list(reasons)))
+
+
 def pose_git_identity(pilot: str) -> dict:
     """#3916 : la minuterie compose sous l'identité de son rôle pilote.
 
@@ -1087,17 +1227,26 @@ def main(argv: list[str] | None = None) -> int:
         description="Paquet horaire déclenché par minuterie, sans agent (#3845).")
     sub = parser.add_subparsers(dest="command", required=True)
     one = sub.add_parser("tick", help="un tic : composer, publier ou suivre")
-    one.add_argument("--repo", default=".", help="clone du projet (défaut : .)")
-    one.add_argument("--target", default="main")
-    one.add_argument("--project", default="ameesh")
-    one.add_argument("--pilot", default="mesh-design",
-                     help="destinataire des courriers et assigné du porteur")
-    one.add_argument("--actor", default=None,
-                     help="auteur des gestes (défaut : AMEESH_ROLE, sinon --pilot)")
-    one.add_argument("--python", default=None,
-                     help="interpréteur des scripts enfants (défaut : celui-ci)")
-    one.add_argument("--dry-run", action="store_true",
-                     help="lire et dire, sans créer, pousser, noter ni écrire")
+    again = sub.add_parser(
+        "recompose", help="#4237 : recomposition du pilote, marquée « tentative » "
+                          "et reprise par le tic du détenteur courant")
+    again.add_argument("--carrier", type=int, required=True, help="porteur horaire")
+    again.add_argument("--exclude", type=int, action="append", default=[],
+                       metavar="LOT", help="lot retiré (répétable)")
+    again.add_argument("--exclude-reason", action="append", default=[], metavar="TEXTE",
+                       help="motif au manifeste, apparié par ordre aux --exclude")
+    for each in (one, again):
+        each.add_argument("--repo", default=".", help="clone du projet (défaut : .)")
+        each.add_argument("--target", default="main")
+        each.add_argument("--project", default="ameesh")
+        each.add_argument("--pilot", default="mesh-design",
+                          help="destinataire des courriers et assigné du porteur")
+        each.add_argument("--actor", default=None,
+                          help="auteur des gestes (défaut : AMEESH_ROLE, sinon --pilot)")
+        each.add_argument("--python", default=None,
+                          help="interpréteur des scripts enfants (défaut : celui-ci)")
+        each.add_argument("--dry-run", action="store_true",
+                          help="lire et dire, sans créer, pousser, noter ni écrire")
     args = parser.parse_args(argv)
     repo = Path(args.repo).resolve()
     if not (repo / ".git").exists():
@@ -1121,7 +1270,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         check_fresh(ctx)
         align_schema(ctx)
-        print(tick(ctx), flush=True)
+        if args.command == "recompose":
+            print(pilot_recompose(ctx, args.carrier, args.exclude, args.exclude_reason),
+                  flush=True)
+        else:
+            print(tick(ctx), flush=True)
         return 0
     except InputError as error:
         print("paquet-horaire : %s" % error, file=sys.stderr)
