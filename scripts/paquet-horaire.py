@@ -52,10 +52,12 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    vert en local) ne retire rien : il est consigné au journal du porteur et le
    pilote est prévenu, une fois.
 5. **Reprise.** Chaque lancement de `paquet-auto.py` laisse d'abord une
-   marque « tentative » (étape, tête de départ, hôte:pid) ; son achèvement se
-   lit à la tête gelée qui a bougé, son échec à une marque « échec ». Une
-   tentative morte (échec, processus disparu sur cet hôte, ou délai de
-   composition dépassé ailleurs) est relancée sur le même porteur avec
+   marque « tentative » (étape, tête de départ, hôte:pid, époque du bail) ;
+   son achèvement se lit à la tête gelée qui a bougé, son échec à une marque
+   « échec ». Une tentative morte (échec, processus disparu sur cet hôte,
+   époque d'un autre hôte différente de celle du tic — son `packet record`
+   est clôturé par l'époque, #4087 —, ou, sans époque, délai de composition
+   dépassé ailleurs) est relancée sur le même porteur avec
    `--force`, au plus 3 fois, puis le pilote est prévenu une fois. Un porteur
    créé sans tentative (arrêt entre `work add` et la marque) est repris de même.
 6. Un courrier au pilote à chaque étape (tête, unités, écartés, CI).
@@ -101,7 +103,7 @@ COMPOSITION = "composition"
 RECOMPOSITION = "recomposition"
 ATTEMPT_RE = re.compile(
     r"^paquet-horaire: tentative (composition|recomposition) n=(\d+) base=(\S+) "
-    r"par=(\S+):(\d+)(?: run=(\S+) sans=([\d,]+))?")
+    r"par=(\S+):(\d+)(?: run=(\S+) sans=([\d,]+))?(?: epoque=(\d+))?")
 FAILED_RE = re.compile(r"^paquet-horaire: échec (composition|recomposition) n=(\d+) base=(\S+)")
 MAX_RECOMPOSITIONS = 1
 #: lancements de paquet-auto pour une même étape (même tête de départ)
@@ -115,7 +117,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 LIST_LIMIT = 300
 COMMAND_TIMEOUT = 600
 COMPOSE_TIMEOUT = 3 * 3600
-#: au-delà, une tentative lancée sur un autre hôte est réputée morte
+#: au-delà, une tentative lancée sur un autre hôte sans époque est réputée morte
 ATTEMPT_STALE = COMPOSE_TIMEOUT + 900
 REPLAY_TIMEOUT = 900
 #: poids #3801 d'une preuve forte (fichier du test, liste, migration) :
@@ -194,6 +196,8 @@ class Context:
     now: float = field(default_factory=time.time)
     host: str = field(default_factory=socket.gethostname)
     pid: int = field(default_factory=os.getpid)
+    #: époque du bail du tic (`AMEESH_LEASE_EPOCH`, `ameesh role run`) ; 0 : inconnue
+    epoch: int = 0
     log: list[str] = field(default_factory=list)
 
     def alive(self, pid: int) -> bool:
@@ -567,6 +571,7 @@ class Attempt:
     exclude: list[int] = field(default_factory=list)
     ts: float = 0.0
     failed: bool = False
+    epoch: int = 0  # époque du bail à l'entrée (0 : marque sans époque)
 
     @property
     def key(self) -> str:
@@ -587,11 +592,11 @@ def attempts(item: dict) -> list[Attempt]:
         note = str(ev.get("note") or "")
         match = ATTEMPT_RE.match(note)
         if match:
-            step, n, base, host, pid, run_id, without = match.groups()
+            step, n, base, host, pid, run_id, without, epoch = match.groups()
             found.append(Attempt(
                 step, int(n), "" if base == "-" else base, host, int(pid), run_id or "",
                 [int(lot) for lot in (without or "").split(",") if lot],
-                float(ev.get("created_ts") or 0)))
+                float(ev.get("created_ts") or 0), epoch=int(epoch or 0)))
             continue
         match = FAILED_RE.match(note)
         if match:
@@ -610,6 +615,8 @@ def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
                                             this.base or "-", ctx.host, ctx.pid)
     if this.step == RECOMPOSITION:
         mark += " run=%s sans=%s" % (this.run_id, ",".join(str(lot) for lot in this.exclude))
+    if ctx.epoch:
+        mark += " epoque=%d" % ctx.epoch
     ctx.note(carrier, mark)
     # une reprise (n > 1) réécrit une branche peut-être déjà poussée
     result = paquet_auto(ctx, name, carrier, exclude=this.exclude,
@@ -631,11 +638,25 @@ def pending(ctx: Context, item: dict, sha: str) -> Attempt | None:
     return None
 
 
+def lease_epoch() -> int:
+    """L'époque passée par `ameesh role run` ; 0 si absente ou illisible."""
+    text = (os.environ.get("AMEESH_LEASE_EPOCH")
+            or os.environ.get("AGENT_MESH_LEASE_EPOCH") or "").strip()
+    try:
+        return max(int(text), 0)
+    except ValueError:
+        return 0
+
+
 def running(ctx: Context, this: Attempt) -> bool:
     if this.failed:
         return False
     if this.host == ctx.host:
         return this.pid == ctx.pid or ctx.alive(this.pid)
+    if this.epoch and ctx.epoch:
+        # le bail a changé de main : le `packet record` de l'ancienne époque
+        # est refusé (EP4) avant la poussée, elle ne publie plus rien (#4087)
+        return this.epoch == ctx.epoch
     return ctx.now - this.ts < ATTEMPT_STALE
 
 
@@ -1004,7 +1025,7 @@ def main(argv: list[str] | None = None) -> int:
     ctx = Context(repo=repo, target=args.target, project=args.project,
                   pilot=args.pilot, actor=actor, shell=Shell(),
                   python=args.python or auto.project_python(repo),
-                  dry_run=args.dry_run, zone=zone)
+                  dry_run=args.dry_run, zone=zone, epoch=lease_epoch())
     try:
         check_fresh(ctx)
         align_schema(ctx)
