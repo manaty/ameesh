@@ -185,6 +185,10 @@ EXCLUDE_DEFAULT_REASON = "exclu par le pilote"
 #: #3256 C : motif écrit pour un lot prêt que `--only` laisse à l'autre paquet
 #: parallèle ; il n'est ni perdu ni composé deux fois.
 PARALLEL_EXCLUDE_REASON = "paquet parallèle : autre groupe disjoint"
+#: #3256 C : un lot du groupe qui n'est plus prêt (gel, avis, conflit) est
+#: écarté avec ce motif, jamais une erreur qui garde la cible réservée.
+PARALLEL_GROUP_NOT_READY = "paquet parallèle : lot du groupe non prêt"
+PARALLEL_GROUP_GONE = "paquet parallèle : lot du groupe introuvable"
 #: sorties qui ne prouvent pas un rouge du lot (environnement, base absente)
 INCONCLUSIVE_RE = re.compile(
     r"(OperationalError|could not connect|connection refused|"
@@ -2704,12 +2708,24 @@ def compose_packet(args: argparse.Namespace) -> int:
         only = {int(lot) for lot in (getattr(args, "only", None) or [])}
         if only:
             present = {candidate.lot for candidate in candidates}
-            missing = sorted(only - present - set(excluded))
-            if missing:
-                raise InputError(
-                    "--only : lot(s) %s absents de la liste prête (écartés ou "
-                    "en erreur) : un paquet parallèle ne compose que des lots "
-                    "prêts" % ", ".join("#%d" % lot for lot in missing))
+            # #3256 C : un lot du groupe qui n'est plus prêt (gel, avis,
+            # conflit) est **écarté avec son motif**, pas une erreur d'entrée :
+            # `resume` et `recompose` repassent le même groupe, et un refus
+            # garderait la cible réservée avec MARK_STUCK (avis auditeur B2).
+            by_lot = {int(entry.get("work_item") or 0): entry
+                      for entry in payload.get("candidates") or []}
+            missing = sorted(only - present - set(excluded) - error_lots)
+            for lot in missing:
+                entry = by_lot.get(lot) or {}
+                causes = ", ".join(str(cause.get("code") or "")
+                                   for cause in entry.get("causes") or ()
+                                   if cause.get("code"))
+                detail = (str(entry.get("error") or "").strip()
+                          or causes or "lot absent de la liste calculée")
+                errors.append(Discarded(
+                    lot,
+                    (PARALLEL_GROUP_NOT_READY if entry else PARALLEL_GROUP_GONE),
+                    detail))
             outside = [candidate for candidate in candidates
                        if candidate.lot not in only]
             if outside:

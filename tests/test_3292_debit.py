@@ -670,6 +670,35 @@ class WitnessTest(PgTestCase):
         self.assertEqual(report["ci"]["slow_runs"][0]["run_id"], 42)
         self.assertEqual(report["unreadable"], [])
 
+    def test_qa_merge_mesure_les_lots_fusionnes_hors_items(self):
+        # B1 (auditeur #4275) : `_ITEMS_SQL` écarte un lot fusionné ; la mesure
+        # qa_merge doit néanmoins le compter, sinon 1 lot mesuré contre 134
+        # relus composés sur la vraie base du 27/10.
+        self._item(6001, "ameesh-dev5")
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = 6001")
+        self._milestone(6001, 6101, "frozen", T - 13 * H, sha="e" * 40)
+        self._milestone(6001, 6102, "verdict", T - 12 * H, sha="e" * 40,
+                        actor="ameesh-cx1", verdict="ok")
+        self._milestone(6001, 6103, "merged", T - 2 * H, sha="e" * 40)
+        self.db.execute(
+            "INSERT INTO work_items (id, type, source, title, app, state, "
+            "assignee, created_at) VALUES "
+            "(6000, 'evolution', 'test', 'paquet h-test', 'ameesh', 'merged', "
+            "'mesh-design', to_timestamp(%s))", (T - 10 * H,))
+        self.db.execute(
+            "INSERT INTO work_packet_members (package_id, work_item_id, "
+            "package_branch, base_sha, head_sha, unit_sha, source_sha, "
+            "frozen_sha, recorded_by, recorded_at) VALUES "
+            "(6000, 6001, 'integration/paquet-h-test', %s, %s, %s, %s, %s, "
+            "'test', to_timestamp(%s))",
+            ("a" * 40, "b" * 40, "c" * 40, "d" * 40, "e" * 40, T - 10 * H))
+        report = debit.read(self.db, cfg=self.cfg, now=T, hours=6,
+                            wait_s=2 * H, canons=[], installed="1.20.0",
+                            jobs=False)
+        yesterday = report["qa_merge"]["yesterday"]
+        self.assertEqual(yesterday["count"], 1, report["qa_merge"])
+        self.assertEqual(yesterday["median_s"], 2 * H)
+
     def test_read_garde_un_hold_apres_la_fusion(self):
         # B2 (cx1) : frozen@10, merged@20, hold@30 « correctif non déployé ».
         # `build` lisait ce hold, mais `read` écartait le lot par son jalon

@@ -84,9 +84,9 @@ PARALLEL_SECOND = re.compile(
 #: la preuve (une fois par tête et par cible) que le second peut fusionner
 PARALLEL_PROOF = "parallel-second proof "
 PARALLEL_CONFLICT = "parallel-second conflict "
-#: le délai des contrôles de gel sur l'arbre fusionné (#3256 C) ; borné, il ne
-#: retient pas le passage au-delà du délai de son bail.
-PARALLEL_FREEZE_TIMEOUT = 600.0
+#: le délai des contrôles de gel sur l'arbre fusionné (#3256 C) ; borné sous le
+#: bail `auto-merge` (300 s) pour qu'un passage ne le laisse pas expirer.
+PARALLEL_FREEZE_TIMEOUT = 120.0
 #: états d'un porteur que `watch` relit
 OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
 #: durée du bail `auto-merge:<lot>` qui sérialise la publication et le passage ;
@@ -486,38 +486,48 @@ def _parallel_freeze_checks(repo: str, target: str, head: str,
 
     Le second n'est pas rebasé par un force-push (sa tête testée resterait
     celle de la CI) : la fusion de sa tête dans la cible avancée est essayée
-    dans un worktree jetable, puis `scripts/freeze-checks.py` y tourne. Un
-    conflit, un script absent ou un rouge rendent `(False, motif)`.
+    dans un worktree jetable, puis `scripts/freeze-checks.py` y tourne.
+
+    Rend `(état, motif)` : `ok`, `red` (la fusion ou un contrôle échoue — le
+    second revient en file) ou `inconclusive` (worktree, délai, OSError : la
+    preuve manque, le porteur n'est ni clos ni fusionné, §3).
     """
     if not repo:
-        return False, "no clone to run the freeze checks"
-    base = tempfile.mkdtemp(prefix="ameesh-parallel-",
-                            dir=os.environ.get("TMPDIR") or None)
-    os.rmdir(base)
+        return "inconclusive", "no clone to run the freeze checks"
+    try:
+        base = tempfile.mkdtemp(prefix="ameesh-parallel-",
+                                dir=os.environ.get("TMPDIR") or None)
+        os.rmdir(base)
+    except OSError as exc:
+        return "inconclusive", "worktree could not be prepared: %s" % exc
     added = _git(repo, "worktree", "add", "--detach", base, target)
     if added is None:
-        return False, "worktree could not be created"
+        return "inconclusive", "worktree could not be created"
     try:
-        merge = subprocess.run(
-            ["git", "-C", base, "merge", "--no-commit", "--no-ff", head],
-            capture_output=True, text=True, timeout=120.0)
+        try:
+            merge = subprocess.run(
+                ["git", "-C", base, "merge", "--no-commit", "--no-ff", head],
+                capture_output=True, text=True, timeout=120.0)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "inconclusive", "merge could not run: %s" % exc
         if merge.returncode != 0:
-            return False, ("merge-tree conflict: %s"
+            return "red", ("merge-tree conflict: %s"
                            % (merge.stderr or merge.stdout or "").strip()[:300])
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join(
             [os.path.join(base, "src")] + ([env["PYTHONPATH"]]
                                            if env.get("PYTHONPATH") else []))
-        checks = subprocess.run(
-            [sys.executable, os.path.join(base, "scripts", "freeze-checks.py")],
-            cwd=base, capture_output=True, text=True, timeout=timeout, env=env)
+        try:
+            checks = subprocess.run(
+                [sys.executable, os.path.join(base, "scripts", "freeze-checks.py")],
+                cwd=base, capture_output=True, text=True, timeout=timeout, env=env)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "inconclusive", "freeze checks could not run: %s" % exc
         if checks.returncode != 0:
             tail = (checks.stdout or "") + (checks.stderr or "")
-            return False, ("freeze-checks rc %d: %s"
+            return "red", ("freeze-checks rc %d: %s"
                            % (checks.returncode, " ".join(tail.split())[-500:]))
-        return True, ""
-    except (OSError, subprocess.SubprocessError) as exc:
-        return False, "freeze checks could not run: %s" % exc
+        return "ok", ""
     finally:
         _git(repo, "worktree", "remove", "--force", base)
         shutil.rmtree(base, ignore_errors=True)
@@ -527,12 +537,15 @@ def _parallel_proof(db, repo: str, lot: int, *, composition: str, target: str,
                     sha: str, dry_run: bool) -> dict:
     """Le second peut-il fusionner malgré la cible avancée ?
 
-    Rend `{state: none|wait|conflict|ok, why, merge}`. `none` : le porteur
-    n'est pas un second, la garde ordinaire s'applique. `wait` : le premier
-    n'a pas encore fusionné. `conflict` : la fusion du second dans la cible
-    avancée n'est pas propre, ou les contrôles de gel échouent — le second
-    revient en file. `ok` : la preuve est consignée (une fois par tête et par
-    cible) et la fusion peut suivre sans relancer la suite complète.
+    Rend `{state: none|wait|conflict|inconclusive|ok, why, merge, marker}`.
+    `none` : le porteur n'est pas un second, la garde ordinaire s'applique.
+    `wait` : le premier n'a pas encore fusionné. `conflict` : la fusion du
+    second dans la cible avancée est un négatif déterministe (conflit ou
+    contrôle de gel rouge) — le second revient en file. `inconclusive` : la
+    preuve manque (délai, worktree, OSError), le porteur n'est ni clos ni
+    fusionné (§3). `ok` : la fusion est propre et les contrôles verts ; la
+    marque est écrite par l'appelant sous le bail renouvelé, puis la fusion
+    peut suivre sans relancer la suite complète.
     """
     peer = _parallel_peer(db, lot)
     if peer is None:
@@ -556,30 +569,30 @@ def _parallel_proof(db, repo: str, lot: int, *, composition: str, target: str,
     marker = "sha=%s target=%s merge=%s" % (sha, target, merge)
     for event in notes:
         if marker in str(event.get("note") or ""):
-            return {"state": "ok", "merge": merge, "why": "preuve déjà consignée"}
+            return {"state": "ok", "merge": merge, "marker": marker,
+                    "why": "preuve déjà consignée"}
     if dry_run:
         return {"state": "none"}
     from . import packet_candidates
     try:
         merged = packet_candidates.merge_tree(repo, target, sha)
-    except Exception as exc:  # noqa: BLE001 - une lecture impossible ne fusionne pas
-        return {"state": "none", "why": "merge-tree illisible: %s" % exc}
+    except Exception as exc:  # noqa: BLE001 - une lecture impossible ne conclut pas
+        return {"state": "inconclusive", "why": "merge-tree illisible: %s" % exc}
+    if merged.get("state") == "error":
+        return {"state": "inconclusive",
+                "why": "merge-tree illisible: %s" % (merged.get("detail") or "?")}
     if merged.get("state") != "clean":
         return {"state": "conflict",
                 "why": "fusion du second dans la cible avancée non propre: %s"
                        % (merged.get("detail") or ", ".join(merged.get("files") or ())
                           or merged.get("state"))}
-    ok, why = _parallel_freeze_checks(repo, target, sha)
-    if not ok:
+    state, why = _parallel_freeze_checks(repo, target, sha)
+    if state == "red":
         return {"state": "conflict", "why": why}
-    try:
-        work.note(db, int(lot),
-                  "%s%s — merge-tree clean, freeze-checks green, tête testée "
-                  "inchangée (#3256 C)" % (PARALLEL_PROOF, marker),
-                  actor=work.SYSTEM_SENDER)
-    except Exception:  # noqa: BLE001 - la preuve est relue, la fusion sûre
-        pass
-    return {"state": "ok", "merge": merge, "why": "merge-tree clean, freeze-checks green"}
+    if state != "ok":
+        return {"state": "inconclusive", "why": why}
+    return {"state": "ok", "merge": merge, "marker": marker,
+            "why": "merge-tree clean, freeze-checks green"}
 
 
 def _parallel_return_to_queue(db, lot: int, row: dict, why: str, actor: str) -> None:
@@ -1503,6 +1516,12 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
             if first_state == "closed":
                 why = ("premier paquet #%d clos sans fusion : le second revient "
                        "en file" % peer)
+                if not _renew(handle):
+                    return dict(out, result="busy")
+                if not _fenced_hold(db, fence, margin_s=AUTOMERGE_CALL_MARGIN_S):
+                    return dict(out, result="error",
+                                error="the elected pilot lease was lost before "
+                                      "closing the second packet: nothing closed")
                 _parallel_return_to_queue(db, lot, row, why, actor)
                 return dict(out, result="closed", state="closed", why=why)
             return dict(out, result="pending",
@@ -1529,12 +1548,37 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
                 if proof.get("state") == "wait":
                     return dict(out, result="pending", why=proof.get("why") or
                                 "second paquet : le premier n'est pas encore fusionné")
+                if proof.get("state") == "inconclusive":
+                    # §3 : une preuve manquante (délai, worktree, OSError) n'est
+                    # ni un conflit ni une fusion ; le porteur reste ouvert et
+                    # le passage suivant rejoue la preuve.
+                    return dict(out, result="pending",
+                                why="preuve du second paquet non concluante: %s"
+                                    % (proof.get("why") or "?"))
                 if proof.get("state") == "conflict":
+                    if not _renew(handle):
+                        return dict(out, result="busy")
+                    if not _fenced_hold(db, fence, margin_s=AUTOMERGE_CALL_MARGIN_S):
+                        return dict(out, result="error",
+                                    error="the elected pilot lease was lost before "
+                                          "closing the second packet: nothing closed")
                     _parallel_return_to_queue(db, lot, row, proof.get("why") or "conflit",
                                               actor)
                     return dict(out, result="closed", state="closed",
                                 why=proof.get("why") or "conflit")
                 if proof.get("state") == "ok":
+                    # La marque de preuve est une mutation : elle suit le
+                    # renouvellement du bail, jamais avant (avis auditeur B3).
+                    if not _renew(handle):
+                        return dict(out, result="busy")
+                    try:
+                        work.note(db, int(lot),
+                                  "%s%s — merge-tree clean, freeze-checks green, "
+                                  "tête testée inchangée (#3256 C)"
+                                  % (PARALLEL_PROOF, proof.get("marker") or ""),
+                                  actor=actor)
+                    except Exception:  # noqa: BLE001 - la preuve sera rejouée
+                        pass
                     parallel = proof
                     target_moved = ""
             if target_moved:

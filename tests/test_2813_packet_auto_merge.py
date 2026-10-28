@@ -1452,7 +1452,7 @@ class ParallelSecondTest(Journal):
         patch = mock.patch.object(fire, "_fresh", fresh)
         patch.start()
         self.addCleanup(patch.stop)
-        self.freeze_ok = (True, "")
+        self.freeze_ok = ("ok", "")
         patch = mock.patch.object(packet_automerge, "_parallel_freeze_checks",
                                   lambda *a, **k: self.freeze_ok)
         patch.start()
@@ -1526,6 +1526,27 @@ class ParallelSecondTest(Journal):
         self.assertEqual(gh.merges(), [])
         self.assertEqual([lot for lot, _kw in self.closed], [LOT])
         self.assertIn("lots rendus à la file", self.closed[0][1]["note"])
+
+    def test_an_inconclusive_freeze_check_neither_merges_nor_closes(self):
+        path, _git, base, _first_head, first_merge, second_head = self.pair()
+        self.freeze_ok = ("inconclusive", "freeze checks timed out")
+        self.armed(sha=second_head, composition=base)
+        gh = FakeGh(head=second_head, tests="success", base_oid=first_merge)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertIn("non concluante", out["why"])
+        self.assertEqual(gh.merges(), [])
+        self.assertEqual(self.closed, [])
+
+    def test_a_red_freeze_check_returns_the_second_to_the_queue(self):
+        path, _git, base, _first_head, first_merge, second_head = self.pair()
+        self.freeze_ok = ("red", "freeze-checks rc 1: FAIL test_x")
+        self.armed(sha=second_head, composition=base)
+        gh = FakeGh(head=second_head, tests="success", base_oid=first_merge)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "closed", out)
+        self.assertEqual(gh.merges(), [])
+        self.assertEqual([lot for lot, _kw in self.closed], [LOT])
 
     def test_a_code_commit_beyond_the_first_merge_disarms(self):
         path, git, base, _first_head, first_merge, second_head = self.pair()
