@@ -826,6 +826,20 @@ def rotate(worker, harness: str, old, new, session: str, *, new_label: str | Non
             possible = False
             _log("[%s] no summary under %s/%s: %s" % (worker.name, harness, nom_ancien,
                                                       raison))
+    if possible and not getattr(getattr(worker, "runner", None), "mediated", False):
+        # #4164 (B mty-amh-docs-01) : pas de résumé sur un ancien compte sans
+        # crédit chez le fournisseur — brief déterministe
+        from . import provider_credits
+        try:
+            epuise = provider_credits.exhausted(
+                worker.db, harness, auth_failure.account_name(old))
+        except Exception as exc:  # dans le doute, pas d'appel de modèle
+            epuise = {"reason": "credit state unreadable (%s)" % exc}
+        if epuise:
+            possible = False
+            _log("[%s] no summary under %s/%s: %s (%s)" % (
+                worker.name, harness, nom_ancien, provider_credits.REASON,
+                epuise.get("reason") or "?"))
 
     if possible:
         # le résumé se fait sous l'ANCIEN compte (et l'ancien harnais), qui

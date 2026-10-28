@@ -1199,7 +1199,8 @@ class ProviderCredits(Domain):
                        host: str | None, probe_after_s: float) -> bool:
         """Pose `exhausted` (prochaine sonde dans `probe_after_s`). Vrai si
         c'est une **transition** (le compte n'était pas déjà épuisé) ; sinon
-        seuls l'heure du contrôle, le détail et la sonde sont actualisés."""
+        seuls l'heure du contrôle et le détail sont actualisés — l'échéance de
+        sonde n'avance que par `claim_probe`."""
 
     @abc.abstractmethod
     def mark_ok(self, harness: str, account: str, *, source: str,

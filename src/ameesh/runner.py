@@ -2553,6 +2553,10 @@ class AgentWorker(threading.Thread):
             return False
         if not self.budget_ok() or not self.auth_ready():
             return False
+        if self._credits_exhausted():
+            # #4164 (B mty-amh-docs-01) : aucun appel de modèle sur un compte
+            # sans crédit, résumé compris ; la rotation attend son retour à ok
+            return False
         if self.turn_harness() != account_turn.session_harness(self):
             # #389 r1 : le tour partirait sous un autre harnais que celui de
             # la session (repli L242b, ou retour) — c'est `continuity` qui
@@ -5165,6 +5169,21 @@ class AgentWorker(threading.Thread):
             return True
         self._credits_block(harness, account, row.get("reason") or "")
         return False
+
+    def _credits_exhausted(self) -> bool:
+        """#4164 : le compte du prochain tour est-il épuisé ? Lecture seule
+        (ni sonde ni blocage), pour les appels de modèle hors `pick` (résumé
+        de rotation). Ouvert sur panne de lecture, comme `credits_ready`."""
+        if self.runner.dry_run or self.runner.mediated:
+            return False
+        compte = account_turn.for_turn(self)
+        if compte is account_turn.INVALID:
+            return False
+        try:
+            return bool(provider_credits.exhausted(
+                self.db, self.turn_harness(), auth_failure.account_name(compte)))
+        except db_mod.DbError:
+            return False
 
     def _credits_claim(self) -> bool:
         """#4164 (B1 cx2) : un tour est choisi alors que le compte est épuisé

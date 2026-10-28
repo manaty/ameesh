@@ -54,13 +54,14 @@ class ProviderCredits(interface.ProviderCredits):
             params + (harness, account or ""))
         if flipped:
             return True
-        # déjà épuisé : contrôle actualisé, `since` (clé d'alerte) inchangé
+        # déjà épuisé : contrôle actualisé, `since` (clé d'alerte) et échéance
+        # de sonde inchangés — seule `claim_probe` avance l'échéance ; un échec
+        # hors sonde ne doit pas la repousser sans fin (B mty-amh-docs-01)
         self.db.execute(
             "update provider_account_credits set checked_at = now(), reason = %s,"
-            " detail = %s, source = %s, agent = %s, host = %s,"
-            " next_probe_at = greatest(next_probe_at, now() + make_interval(secs => %s))"
+            " detail = %s, source = %s, agent = %s, host = %s"
             " where harness = %s and account = %s",
-            params + (harness, account or ""))
+            params[:5] + (harness, account or ""))
         return False
 
     def mark_ok(self, harness, account, *, source, agent=None, host=None) -> bool:

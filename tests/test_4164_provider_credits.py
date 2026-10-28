@@ -289,6 +289,50 @@ class AcceptanceTest(_CreditsBase):
         finally:
             worker.watchdog_stop.set()
 
+    def test_no_rotation_summary_on_an_exhausted_account(self):
+        # B mty-amh-docs-01: a rotation summary is a model call too — it waits
+        # while the account is exhausted, without pushing the probe back
+        _r, worker = self._worker("rot", "codex", {})
+        try:
+            provider_credits.mark_exhausted(self.db, "codex", "", reason="insufficient_quota")
+            echeance = self._row()["next_probe_ts"]
+            worker.rotation_forcee = "context cap"
+            with mock.patch.object(worker, "current_session", return_value="sess-1"), \
+                    mock.patch.object(worker, "run_turn", return_value=False) as tour:
+                self.assertFalse(worker.maybe_rotate())
+                self.assertFalse(worker.maybe_rotate())
+                tour.assert_not_called()
+                self.assertEqual(worker.rotation_forcee, "context cap")  # kept
+                self.assertEqual(self._row()["next_probe_ts"], echeance)
+                provider_credits.mark_ok(self.db, "codex", "", source="test")
+                worker.maybe_rotate()
+                tour.assert_called_once()
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_no_account_switch_summary_on_an_exhausted_old_account(self):
+        from ameesh import account_turn
+        _r, worker = self._worker("bascule", "codex", {})
+        try:
+            provider_credits.mark_exhausted(self.db, "codex", "", reason="insufficient_quota")
+            with mock.patch.object(worker, "run_turn", return_value=True) as tour:
+                account_turn.rotate(worker, "codex", None, None, "sess-1",
+                                    new_label="claude/(default)", undeclared=True)
+                tour.assert_not_called()
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_a_failure_outside_the_probe_does_not_push_the_probe_back(self):
+        store = storage.of(self.db).provider_credits
+        kw = dict(reason="insufficient_quota", detail="x", source="turn", agent="a",
+                  host="h", probe_after_s=600)
+        store.mark_exhausted("codex", "", **kw)
+        self._probe_due()
+        echeance = self._row()["next_probe_ts"]
+        self.assertFalse(store.mark_exhausted("codex", "", **kw))
+        self.assertEqual(self._row()["next_probe_ts"], echeance)
+        self.assertTrue(store.claim_probe("codex", "", 600))   # still due
+
     def test_a_plan_usage_limit_is_not_an_exhaustion(self):
         _r, worker = self._worker("plan", "codex", {})
         try:
