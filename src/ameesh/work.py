@@ -1677,7 +1677,8 @@ def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str, *,
     return row
 
 
-def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
+def _reviewer_request(db: Db, item: dict, reviewer: str, who: str, *,
+                      cfg=None) -> dict:
     """The request mail that wakes a manually designated reviewer (#2478).
 
     A designation writes the reviewer column and the journal; without a mail
@@ -1691,6 +1692,11 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
     caller can surface it without losing the designation. A human reviewer has
     no runner to wake and gets no mailbox request. An earlier request that
     already covers this reviewer and head is reused, not sent again (#2495).
+
+    On a frozen head, the mail reads the reviewer's room as a corrector first
+    (`review_correction.check`, the `--if-corrector` preview): too tight, it
+    opens with "do not push" (#4325). An unreadable preview keeps the rule
+    text, never delays the request.
     """
     from . import mail, plan_git
     from .review_designation import (REQUEST_KIND, covering_request,
@@ -1722,7 +1728,18 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
                                   "manual": True}}
     if freeze:
         payload["review_request"]["freeze"] = freeze
-    body = manual_reviewer_message(item, freeze=freeze, actor=who)
+    correction = None
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    if freeze and cfg is not None:
+        from . import review_correction
+
+        try:
+            correction = review_correction.check(cfg, db, int(item["id"]), name,
+                                                 fetch=True)
+        except Exception:  # noqa: BLE001 - un aperçu ne retient pas la demande
+            correction = None
+    body = manual_reviewer_message(item, freeze=freeze, actor=who,
+                                   correction=correction)
     try:
         message_id = mail.send(
             db, who or SYSTEM_SENDER, name, body, kind=REQUEST_KIND,
@@ -1759,7 +1776,7 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
     if warning:
         row["reviewer_warning"] = warning
     if not remove:
-        row.update(_reviewer_request(db, item, name, who))
+        row.update(_reviewer_request(db, item, name, who, cfg=cfg))
     return row
 
 

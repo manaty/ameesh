@@ -810,10 +810,41 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
 # the mails: the exact head, or the missing capacity
 # --------------------------------------------------------------------------
 
+def _correction_room(required: int, eligible_families: Optional[int],
+                     correction: Optional[Mapping]) -> Optional[int]:
+    """The independent families a correction by the recipient would leave.
+
+    The exact preview (`review_correction.outlook`, #3416) wins when it is
+    conclusive (`ok` or `short`); otherwise the family count of the head minus
+    the recipient's own family. None: nothing is known, the mail states the
+    rule alone (doubt never says "push").
+    """
+    room = dict(correction or {})
+    if room.get("state") in ("ok", "short") and int(room.get("required") or 0) > 0:
+        return max(int(room.get("remaining") or 0), 0)
+    if eligible_families is not None:
+        return max(int(eligible_families) - 1, 0)
+    return None
+
+
+def _do_not_push_line(remaining: int, required: int, lot, sha: str = "") -> str:
+    """The first instruction when a reviewer correction would be too tight (#4325)."""
+    return (
+        "- **do not push this correction: return the fix to the author, verdict "
+        "blocked** (`ameesh work milestone %s verdict blocked --sha %s`, with the "
+        "defect). A correction of yours would make you an author of the new head "
+        "and leave %d independent famil%s for %d required opinion(s): the merge "
+        "gate could not be satisfied. The author fixes it and freezes a new head "
+        "(canon §2, #2670/#2888);"
+        % (lot, sha or "<frozen sha>", remaining,
+           "y" if remaining == 1 else "ies", required))
+
+
 def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
                      reviewer: Mapping, authors: Iterable = (), base: str = "",
                      risk: str = "", policy_ref: str = "",
-                     eligible_families: Optional[int] = None) -> str:
+                     eligible_families: Optional[int] = None,
+                     correction: Optional[Mapping] = None) -> str:
     """The mail that hands the reviewer the exact head and its place.
 
     The SHA is written in full, with its `frozen` milestone: the verdict will
@@ -828,6 +859,12 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
     the rule alone. The `~50 lines` threshold only says whether a correction is
     a first-round fix or goes back to the author; it never keeps a family
     eligible.
+
+    `correction` is the room computed for this very reviewer as a corrector
+    (`review_correction.outlook`, the `--if-corrector` preview, #3416): when it
+    reads `ok` or `short` it overrides the family count. A correction that
+    would leave too few families opens the instructions with "do not push"
+    (#4325): the mail no longer starts with "fix it yourself".
     """
     sha = str((freeze or {}).get("sha") or "")
     fid = (freeze or {}).get("id")
@@ -854,6 +891,23 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
         "outside those of the authors." % ((reviewer or {}).get("family") or "?"),
         "",
         "To do:",
+    ]
+    remaining = _correction_room(required, eligible_families, correction)
+    if remaining is not None and remaining < required:
+        lines += [
+            _do_not_push_line(remaining, required, row.get("id"), sha),
+            "- read the diff **of this exact head** and check the edge cases;",
+            "- render the verdict: `ameesh work milestone %s verdict ok|blocked "
+            "--sha %s`;" % (row.get("id"), sha),
+            "- a non-blocking defect goes to the backlog, it does not block the merge;",
+            "- do not rerun the suites: targeted tests are the author's job, CI "
+            "runs on the frozen head once the required opinions are acquired.",
+            "",
+            "This mail comes from the freeze: if the branch moves, a new freeze "
+            "cancels this designation and a new head will be handed to you.",
+        ]
+        return "\n".join(lines)
+    lines += [
         "- read the diff **of this exact head** and check the edge cases;",
         "- render the verdict: `ameesh work milestone %s verdict ok|blocked --sha %s`;"
         % (row.get("id"), sha),
@@ -868,20 +922,11 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
         "<sha>`): the next designation reads it to establish who authored the "
         "head;",
     ]
-    if eligible_families is not None:
-        available = max(int(eligible_families), 0)
-        remaining = max(available - 1, 0)
-        if remaining < required:
-            lines.append(
-                "- **do not push this correction**: it would leave %d "
-                "independent famil%s for %d required opinion(s), and the merge "
-                "gate could not be satisfied — return the defect to the author, "
-                "who fixes it and freezes a new head (canon §2, #2670/#2888);" % (remaining, "y" if remaining == 1 else "ies", required))
-        else:
-            lines.append(
-                "- this correction is receivable: it leaves %d independent "
-                "famil%s for %d required opinion(s) (canon §2, #2670/#2888);"
-                % (remaining, "y" if remaining == 1 else "ies", required))
+    if remaining is not None:
+        lines.append(
+            "- this correction is receivable: it leaves %d independent "
+            "famil%s for %d required opinion(s) (canon §2, #2670/#2888);"
+            % (remaining, "y" if remaining == 1 else "ies", required))
     else:
         lines.append(
             "- any correction makes you an author of the new head: do not push "
@@ -900,13 +945,19 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
 
 
 def manual_reviewer_message(lot: Mapping, *, freeze: Optional[Mapping] = None,
-                            actor: str = "") -> str:
+                            actor: str = "",
+                            correction: Optional[Mapping] = None) -> str:
     """The request mail of a manual designation (#705, #2478).
 
     Unlike the automatic mail, this designation can happen as soon as the lot
     enters `qa`: the head may not be frozen yet. The mail names the latest
     frozen head when one exists and says what to watch otherwise. It is sent as
     a `request` linked to the lot, so the reviewer's runner opens a turn (#2478).
+
+    `correction` is the `--if-corrector` preview of the recipient on the frozen
+    head (`review_correction.check`, #3416): when it reads `short`, the
+    instructions open with "do not push" instead of "fix it yourself" (#4325).
+    Any other reading keeps the text that states the rule.
     """
     row = dict(lot or {})
     freeze = dict(freeze or {})
@@ -939,16 +990,28 @@ def manual_reviewer_message(lot: Mapping, *, freeze: Optional[Mapping] = None,
                  % row.get("id"))
     if actor:
         lines.append("- Designated by: %s." % actor)
+    room = dict(correction or {})
+    if room.get("state") == "short" and int(room.get("required") or 0) > 0:
+        lines += [
+            "",
+            "To do:",
+            _do_not_push_line(max(int(room.get("remaining") or 0), 0),
+                              int(room["required"]), row.get("id"), sha),
+            "- read the diff of the frozen head and check the edge cases;",
+        ]
+    else:
+        lines += [
+            "",
+            "To do:",
+            "- read the diff of the frozen head and check the edge cases;",
+            "- a blocking defect: fix it yourself and push to the lot branch "
+            "(canon §2). Any correction makes you an author of the new head: your "
+            "own opinion no longer counts and your family is no longer eligible; "
+            "a fix longer than ~50 lines, a design change, or a correction that "
+            "would leave fewer independent families than required opinions goes "
+            "back to the author (canon §2, #2670/#2888);",
+        ]
     lines += [
-        "",
-        "To do:",
-        "- read the diff of the frozen head and check the edge cases;",
-        "- a blocking defect: fix it yourself and push to the lot branch "
-        "(canon §2). Any correction makes you an author of the new head: your "
-        "own opinion no longer counts and your family is no longer eligible; "
-        "a fix longer than ~50 lines, a design change, or a correction that "
-        "would leave fewer independent families than required opinions goes "
-        "back to the author (canon §2, #2670/#2888);",
         "- a non-blocking defect goes to the backlog, it does not block the merge;",
         "- do not rerun the suites: targeted tests are the author's job, CI runs "
         "on the frozen head once the required opinions are acquired.",
@@ -1255,10 +1318,18 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     # opinions (canon §2, #2670/#2888).
     eligible_families = (len(selection.get("manual") or ())
                          + len(selection.get("families") or ()))
+    from . import review_correction
+
     for index, reviewer in enumerate(selection.get("reviewers") or ()):
         if str(reviewer.get("name") or "") in previous_names:
             # #3596: an automatic seat of this freeze already holds its request.
             continue
+        # #4325: the room this very reviewer would leave as a corrector, read
+        # before the mail so it opens with "do not push" when it is too tight.
+        correction = (None if unknown else review_correction.outlook(
+            required=required, reviewer=reviewer, authors=authors,
+            candidates=candidates, families=families, seats=already,
+            earlier=fixers))
         messages.append({
             "to": reviewer["name"],
             "family": reviewer["family"],
@@ -1267,7 +1338,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                                      rank=first_rank + index, reviewer=reviewer,
                                      authors=authors, base=base, risk=risk,
                                      policy_ref=policy_ref,
-                                     eligible_families=eligible_families),
+                                     eligible_families=eligible_families,
+                                     correction=correction),
         })
     try:
         return port.commit(lot, freeze=freeze, required=required, state=state,
