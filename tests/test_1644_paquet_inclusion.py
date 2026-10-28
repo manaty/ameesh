@@ -126,7 +126,8 @@ class PaquetInclusionTest(unittest.TestCase):
         return head
 
     def merge(self, lot: str) -> str:
-        self.git("merge", "-q", "--no-ff", "-m", f"#{lot}: compose sur le paquet",
+        self.git("merge", "-q", "--no-ff", "-m",
+                 f"#{lot}: compose sur le paquet\n\nameesh-work: {lot}",
                  f"lot/{lot}")
         return self.rev("HEAD")
 
@@ -247,6 +248,44 @@ class PaquetInclusionTest(unittest.TestCase):
         self.assertTrue(any(entry["verdict"] == "commit_inconnu"
                             for entry in payload["entries"]))
 
+    def test_trailer_absent_stoppe_avant_la_ci(self) -> None:
+        # #4240 : un merge de lot sans trailer `ameesh-work:` est un défaut
+        # bloquant du contrôle d'inclusion, avant la CI complète (constat du
+        # paquet Nexlink 229 : détecté au gel, après une CI annulée).
+        self.git("switch", "-q", "-c", "lot/601", "main")
+        self.write("sixcentun.txt", "six cent un\n")
+        source = self.commit("#601 : six cent un")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m",
+                 "#601: compose sans trailer", "lot/601")
+        head = self.rev("HEAD")
+        manifest = self.manifest_simple(601, source, head)
+        code, payload = inclusion.run(
+            self.namespace(expected=[601], head=head, manifest=manifest)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            [(item["lot"], item["commit"][:12])
+             for item in payload["trailers_missing"]],
+            [(601, head[:12])],
+        )
+        self.assertTrue(any("sans trailer" in error
+                            for error in payload["errors"]))
+        texte = inclusion.render(payload)
+        self.assertIn("TRAILERS DE COMPOSITION MANQUANTS", texte)
+        self.assertIn("`ameesh-work: 601`", texte)
+        # Le message corrigé, à arbre identique, lève le défaut : c'est le
+        # geste que le composeur doit faire avant de demander la CI.
+        self.git("commit", "--amend", "-q", "-m",
+                 "#601: compose\n\nameesh-work: 601")
+        fixed = self.rev("HEAD")
+        manifest = self.manifest_simple(601, source, fixed)
+        code, payload = inclusion.run(
+            self.namespace(expected=[601], head=fixed, manifest=manifest)
+        )
+        self.assertEqual(code, 0, payload["errors"])
+        self.assertEqual(payload["trailers_missing"], [])
+
     def test_json_et_sortie_texte(self) -> None:
         proc = subprocess.run(
             [sys.executable, str(REPO / "scripts" / "paquet-inclusion.py"),
@@ -268,7 +307,8 @@ class PaquetInclusionTest(unittest.TestCase):
         self.write("base.txt", "ligne1\n")
         source = self.commit("#600 : retire une ligne")
         self.git("switch", "-q", "main")
-        self.git("merge", "-q", "--no-ff", "-m", "#600: compose", "lot/600")
+        self.git("merge", "-q", "--no-ff", "-m",
+                 "#600: compose\n\nameesh-work: 600", "lot/600")
         head = self.rev("HEAD")
         manifest = self.manifest_simple(600, source, head)
         code, payload = inclusion.run(
@@ -543,7 +583,8 @@ class PaquetInclusionTest(unittest.TestCase):
                  "-m", "#700 : remise fraîche sans delta")
         source = self.rev("HEAD")
         self.git("switch", "-q", "main")
-        self.git("merge", "-q", "--no-ff", "-m", "#700: compose", "lot/700")
+        self.git("merge", "-q", "--no-ff", "-m",
+                 "#700: compose\n\nameesh-work: 700", "lot/700")
         head = self.rev("HEAD")
         manifest = self.manifest_simple(700, source, source)
         code, payload = inclusion.run(
@@ -571,7 +612,8 @@ class PaquetInclusionTest(unittest.TestCase):
         (self.repo / "neuf.sh").chmod(0o755)
         source = self.commit("#900 : rend le script exécutable")
         self.git("switch", "-q", "main")
-        self.git("merge", "-q", "--no-ff", "-m", "#900: compose", "lot/900")
+        self.git("merge", "-q", "--no-ff", "-m",
+                 "#900: compose\n\nameesh-work: 900", "lot/900")
         head = self.rev("HEAD")
         manifest = self.manifest_simple(900, source, source)
         code, payload = inclusion.run(
@@ -594,7 +636,8 @@ class PaquetInclusionTest(unittest.TestCase):
         (self.repo / "vide.txt").write_text("", encoding="utf-8")
         source = self.commit("#970 : ajoute un fichier vide")
         self.git("switch", "-q", "main")
-        self.git("merge", "-q", "--no-ff", "-m", "#970: compose", "lot/970")
+        self.git("merge", "-q", "--no-ff", "-m",
+                 "#970: compose\n\nameesh-work: 970", "lot/970")
         head = self.rev("HEAD")
         manifest = self.manifest_simple(970, source, source)
         code, payload = inclusion.run(
@@ -615,7 +658,8 @@ class PaquetInclusionTest(unittest.TestCase):
         (self.repo / "vide.txt").write_text("", encoding="utf-8")
         source = self.commit("#971 : ajoute un fichier vide")
         self.git("switch", "-q", "main")
-        self.git("merge", "-q", "--no-ff", "-m", "#971: compose", "lot/971")
+        self.git("merge", "-q", "--no-ff", "-m",
+                 "#971: compose\n\nameesh-work: 971", "lot/971")
         self.git("rm", "-q", "vide.txt")
         head = self.commit("retrait du fichier vide")
         manifest = self.manifest_simple(971, source, source)
@@ -638,7 +682,8 @@ class PaquetInclusionTest(unittest.TestCase):
         self.write("mix.dat", "desormais du texte\n")
         source = self.commit("#960 : remplace le binaire par du texte")
         self.git("switch", "-q", "main")
-        self.git("merge", "-q", "--no-ff", "-m", "#960: compose", "lot/960")
+        self.git("merge", "-q", "--no-ff", "-m",
+                 "#960: compose\n\nameesh-work: 960", "lot/960")
         head = self.rev("HEAD")
         manifest = self.manifest_simple(960, source, source)
         code, payload = inclusion.run(
@@ -657,7 +702,8 @@ class PaquetInclusionTest(unittest.TestCase):
         self.write("huit.txt", "++ entete en apparence\nsimple\n")
         source = self.commit("#800 : ajoute une ligne ++")
         self.git("switch", "-q", "main")
-        self.git("merge", "-q", "--no-ff", "-m", "#800: compose", "lot/800")
+        self.git("merge", "-q", "--no-ff", "-m",
+                 "#800: compose\n\nameesh-work: 800", "lot/800")
         # la ligne « ++ » est retirée à la tête : elle doit être vue manquante
         self.write("huit.txt", "simple\n")
         head = self.commit("retrait de la ligne ++")
