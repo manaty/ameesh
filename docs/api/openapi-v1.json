@@ -1040,6 +1040,19 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "#4378: 1 also reads the host footprint (slow)",
+            "in": "query",
+            "name": "footprint",
+            "required": false,
+            "schema": {
+              "enum": [
+                "0",
+                "1"
+              ],
+              "type": "string"
+            }
           }
         ],
         "responses": {

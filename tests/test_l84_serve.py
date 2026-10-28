@@ -392,11 +392,13 @@ class ServePgTest(ServerMixin, PgTestCase):
                                (host_idle, "snapshot")):
             with self.subTest(source=method), mock.patch.object(
                     module, method, side_effect=OSError("unreadable")):
-                row = mesh_cli.agent_detail(self.db, "a1", cfg=self.cfg)
+                # #4378 : le footprint se lit sur demande seulement
+                row = mesh_cli.agent_detail(self.db, "a1", cfg=self.cfg,
+                                            footprint=True)
                 self.assertEqual(row["name"], "a1")
                 self.assertIsNone(row["footprint"])
                 self.assertEqual(row["footprint_unavailable"], "unreadable")
-                status, data = self.get_json("/api/v1/agents/a1")
+                status, data = self.get_json("/api/v1/agents/a1?footprint=1")
                 self.assertEqual(status, 200, data)
                 self.assertEqual(data["agent"]["footprint_unavailable"], "unreadable")
                 self.assertIsNone(data["agent"]["footprint"])
@@ -432,7 +434,7 @@ class BuildersTest(unittest.TestCase):
                      "budget.status", "exploitation.alerts"):
             self.assertIn(name + "(", source)
         cli = (ROOT / "src" / "ameesh" / "mesh_cli.py").read_text(encoding="utf-8")
-        for name in ("agent_detail(db, args.agent, cfg=cfg)", "work_rows(db,",
+        for name in ("agent_detail(db, args.agent, cfg=cfg", "work_rows(db,",
                      # #1905 : `work show` passe aussi repo= et target= (arguments nommés à défaut)
                      "work_detail(cfg, db, args.id", "_host_json(part)"):
             self.assertIn(name, cli)

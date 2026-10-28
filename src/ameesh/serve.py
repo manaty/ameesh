@@ -264,7 +264,9 @@ def _agents(ctx: Context, db, params, query) -> dict:
 
 def _agent(ctx: Context, db, params, query) -> dict:
     from . import mesh_cli
-    row = mesh_cli.agent_detail(db, params["agent"], cfg=ctx.cfg)
+    # #4378 : le footprint de l'hôte sur demande seulement (?footprint=1).
+    row = mesh_cli.agent_detail(db, params["agent"], cfg=ctx.cfg,
+                                footprint=_one(query, "footprint") == "1")
     if row is None:
         raise ApiError(404, "not_found", "unknown agent")
     return {"schema": "ameesh-agent-detail/1", "agent": row}
@@ -415,7 +417,8 @@ ROUTES = (
           query=(("since", {"type": "string"}, "window: 90m, 24h, 2d or an ISO date"),)),
     Route(API + "/agents", "ameesh-agents/1", "Agents (`ameesh list --json`)", _agents),
     Route(API + "/agents/{agent}", "ameesh-agent-detail/1", "One agent (`ameesh show --json`)",
-          _agent),
+          _agent, query=(("footprint", {"type": "string", "enum": ["0", "1"]},
+                          "#4378: 1 also reads the host footprint (slow)"),)),
     Route(API + "/agents/{agent}/peek", "ameesh-agent-peek/1",
           "Responsible human's agent summary (`ameesh agent peek`)", _agent_peek,
           query=(("limit", {"type": "integer", "minimum": 1, "maximum": 50},

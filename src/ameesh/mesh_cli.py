@@ -191,8 +191,15 @@ def agent_rows(cfg: Config, db) -> list:
     return _annotate_agents(cfg, db, rows)
 
 
-def agent_detail(db, name: str, *, cfg=None) -> dict | None:
-    """The object of `ameesh show --json` (also `GET /api/v1/agents/{a}`)."""
+def agent_detail(db, name: str, *, cfg=None, footprint: bool = False) -> dict | None:
+    """The object of `ameesh show --json` (also `GET /api/v1/agents/{a}`).
+
+    #4378 : le footprint de l'hôte (`host_idle.snapshot`, #4150) n'est lu que
+    sur demande (`footprint=True`, `show --footprint`, `?footprint=1`). Par
+    défaut, il coûtait 12 à 48 s par lecture (120 à 145 requêtes), et la
+    lecture `show --json` du déploiement (vm.sh) expirait. Les clés restent
+    présentes, à null ; la vue par hôte reste dans `ameesh hosts`.
+    """
     # L61 : la ligne et la clé en un seul aller-retour (db.batched)
     row, info = db_mod.batched(db, lambda db: (
         registry.get(db, name), authority.key_info(db, name)))
@@ -210,7 +217,7 @@ def agent_detail(db, name: str, *, cfg=None) -> dict | None:
     row["key_revoked_ts"] = (info or {}).get("key_revoked_ts")
     row["footprint"] = None
     row["footprint_unavailable"] = None
-    if cfg is not None and row.get("host"):
+    if footprint and cfg is not None and row.get("host"):
         from . import host_idle, resources, canon as canon_mod
         try:
             readings = {r["host"]: r for r in resources.current(db, row["host"])}
@@ -1205,7 +1212,8 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     from . import progress
     db = _open(cfg)
     try:
-        row = agent_detail(db, args.agent, cfg=cfg)
+        row = agent_detail(db, args.agent, cfg=cfg,
+                           footprint=bool(getattr(args, "footprint", False)))
         if row is None:
             print(USAGE_HINT % ("unknown agent: %s" % args.agent), file=sys.stderr)
             return 1
@@ -3131,7 +3139,8 @@ def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
     return cli.cmd_doctor(cfg, notify_test=args.notify_test, probe=args.probe,
                           harness=getattr(args, "harness", False),
-                          profiles=getattr(args, "profiles", False))
+                          profiles=getattr(args, "profiles", False),
+                          footprint=getattr(args, "footprint", False))
 
 
 # --------------------------------------------------------------------------
@@ -3570,6 +3579,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = sub.add_parser("show", help="details of an agent")
     p_show.add_argument("agent")
     p_show.add_argument("--json", action="store_true")
+    p_show.add_argument("--footprint", action="store_true",
+                        help="#4378: also read the host footprint (#4150, slow: "
+                             "every lot of the host's agents)")
     p_show.set_defaults(func=cmd_show)
 
     p_hosts = sub.add_parser("hosts", help="host resources (L31)")
@@ -4481,6 +4493,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="#3345: runner profiles against the host config.json; "
                             "non-zero on a divergence of train, github or release "
                             "(database-free, for deployment checks)")
+    p_doc.add_argument("--footprint", action="store_true",
+                       help="#4378: also read this host's footprint (#4150, slow)")
     p_doc.set_defaults(func=cmd_doctor)
 
     from . import canon_cli

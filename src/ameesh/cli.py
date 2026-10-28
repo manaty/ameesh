@@ -2123,7 +2123,8 @@ def _print_profile_audit(audit) -> bool:
 
 
 def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
-               harness: bool = False, profiles: bool = False) -> int:
+               harness: bool = False, profiles: bool = False,
+               footprint: bool = False) -> int:
     if probe:
         return cmd_probe(cfg)
     if profiles:
@@ -2282,14 +2283,19 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     print("agents     : %d" % agents)
     print("unread     : %d" % unread)
     print(host_measures_line(cfg))
-    from . import host_idle, resources, canon as canon_mod
-    try:
-        footprints = host_idle.snapshot(cfg, db, canon_mod.load_configured(cfg),
-                                        {r["host"]: r for r in resources.current(db, cfg.host)})
-        if cfg.host in footprints:
-            print(host_idle.line(footprints[cfg.host]))
-    except Exception as exc:  # an unavailable footprint never breaks the doctor
-        print("footprint  : not checked (%s)" % (" ".join(str(exc).split())[:120],))
+    # #4378 : le footprint (#4150) seulement sur demande. doctor fait partie
+    # du contrôle « hôte sain » du déploiement, et cette lecture lui ajoutait
+    # 10 à 20 s.
+    if footprint:
+        from . import host_idle, resources, canon as canon_mod
+        try:
+            footprints = host_idle.snapshot(
+                cfg, db, canon_mod.load_configured(cfg),
+                {r["host"]: r for r in resources.current(db, cfg.host)})
+            if cfg.host in footprints:
+                print(host_idle.line(footprints[cfg.host]))
+        except Exception as exc:  # an unavailable footprint never breaks the doctor
+            print("footprint  : not checked (%s)" % (" ".join(str(exc).split())[:120],))
     # #3503 : le JIT de Postgres. db.connect le coupe dans chaque session
     # (`-c jit=off`) ; ici, on signale en plus si le rôle ou la base ne le
     # couperaient pas pour une session qui ne passe pas par ameesh (psql,
@@ -2427,7 +2433,8 @@ def main(argv: list[str] | None = None) -> int:
         if command == "doctor":
             return cmd_doctor(cfg, notify_test="--notify-test" in rest,
                               probe="--probe" in rest, harness="--harness" in rest,
-                              profiles="--profiles" in rest)
+                              profiles="--profiles" in rest,
+                              footprint="--footprint" in rest)
         if command == "statusline":
             return cmd_statusline(cfg)
         if command == "alias":

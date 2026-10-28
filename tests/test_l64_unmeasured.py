@@ -85,11 +85,11 @@ class DoctorLineTest(unittest.TestCase):
 class CommandsTest(PgTestCase):
     """Review #392 r1: the doctor line and the hosts output, at command level."""
 
-    def _doctor(self, cfg, **patch) -> tuple[int, str]:
+    def _doctor(self, cfg, footprint=False, **patch) -> tuple[int, str]:
         out = io.StringIO()
         with mock.patch.object(resources, "sample", **patch) as sample, \
                 contextlib.redirect_stdout(out):
-            code = cli.cmd_doctor(cfg, notify_test=False)
+            code = cli.cmd_doctor(cfg, notify_test=False, footprint=footprint)
         self.calls = sample.call_args_list
         return code, out.getvalue()
 
@@ -127,13 +127,17 @@ class CommandsTest(PgTestCase):
         with mock.patch.object(canon, "load_configured", side_effect=OSError("canon")):
             _code, text = self._doctor(self.cfg, return_value=FULL)
         self.assertIn("[default policy: canon unreadable]", text)
+        # #4378 : le footprint n'est lu que sur demande
+        self.assertNotIn("footprint  :", text)
+        with mock.patch.object(canon, "load_configured", side_effect=OSError("canon")):
+            _code, text = self._doctor(self.cfg, footprint=True, return_value=FULL)
         self.assertIn("footprint  : not checked (canon)", text)
 
     def test_unavailable_footprint_does_not_change_doctor_verdict(self):
         from ameesh import host_idle
-        code, _ = self._doctor(self.cfg, return_value=FULL)
+        code, _ = self._doctor(self.cfg, footprint=True, return_value=FULL)
         with mock.patch.object(host_idle, "snapshot", side_effect=OSError("reading")):
-            failed_code, text = self._doctor(self.cfg, return_value=FULL)
+            failed_code, text = self._doctor(self.cfg, footprint=True, return_value=FULL)
         self.assertEqual(failed_code, code)
         self.assertIn("footprint  : not checked (reading)", text)
 
