@@ -1686,6 +1686,35 @@ class SanteCourrierTest(unittest.TestCase):
         self.assertIsNone(out['delai_s'])
         self.assertEqual(out['tour'], "remis, sans reponse de l'outil")
 
+    def test_probe_waits_through_a_budget_start_gap_then_ok(self):
+        """#4089 : l'ecart de demarrage (« budget : ») n'est pas un tour en
+        echec ; la sonde attend le vrai tour, repondu et termine."""
+        attente = {'last_turn_ts': 101.0, 'status': 'blocked',
+                   'status_text': 'budget : account primaire: next turn in 17s '
+                                  '(start gap 30s between turns, #3779)',
+                   'last_error': 'account primaire: next turn in 17s'}
+        lectures = iter([attente, {'last_turn_ts': 120.0, 'status': 'idle'}])
+        out = self.sonde(lambda db, nom: next(lectures), repond=True, attente=60.0)
+        self.assertEqual(out['tour'], 'ok')
+        self.assertTrue(out['concluant'])
+
+    def test_probe_budget_wait_until_the_bound_is_inconclusive(self):
+        out = self.sonde({'last_turn_ts': 101.0, 'status': 'blocked',
+                          'last_error': 'budget : account primaire: next turn in 17s'})
+        self.assertIsNone(out['delai_s'])
+        self.assertFalse(out['concluant'])
+        self.assertIn('attente budget : account primaire', out['tour'])
+
+    def test_probe_real_blocked_error_stays_a_failed_turn(self):
+        out = self.sonde({'last_turn_ts': 101.0, 'status': 'blocked',
+                          'status_text': 'harness crashed', 'last_error': 'boom'})
+        self.assertIn('tour en echec : boom', out['tour'])
+        self.assertTrue(out['concluant'])
+
+    def test_probe_answer_without_finished_turn_is_inconclusive(self):
+        out = self.sonde({'last_turn_ts': 99.0, 'status': 'running'}, repond=True)
+        self.assertFalse(out['concluant'])
+
     def test_probe_ok_when_the_ack_was_already_delivered(self):
         out = self.sonde({'last_turn_ts': 103.0, 'status': 'idle'},
                          repond=True, accuse_remis=True)
@@ -2002,6 +2031,35 @@ class SanteCourrierTest(unittest.TestCase):
         self.assertIsNone(rapport['sonde']['delai_s'])
         self.assertIsNone(rapport['sonde']['remise_s'])
         self.assertEqual(rapport['sonde']['statut_cible'], 'idle')
+
+    def test_main_sonde_non_concluante_sort_en_code_3_sans_ko(self):
+        """#4089 : une attente budget jusqu'a la borne n'est pas un hote
+        malsain : verdict non-concluant, code 3 (aucun retour arriere)."""
+        maintenant = 1000.0
+        rows = [{'name': 'cx1', 'host': 'ameesh-agents-2', 'status': 'idle',
+                 'lease_expires_ts': maintenant + 60}]
+        resultat = {'message': 7, 'destinataire': 'cx1', 'delai_s': None,
+                    'remise_s': 2.6, 'hote_destinataire': 'ameesh-agents-2',
+                    'statut_cible': 'idle', 'concluant': False,
+                    'tour': "remis, sans reponse de l'outil (attente budget : x)"}
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+             mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
+             mock.patch.object(self.mod.registry, 'get', return_value=rows[0]), \
+             mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'sans_executeur', return_value=[]), \
+             mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod, 'canal_humain', return_value=[]), \
+             mock.patch.object(self.mod, 'choose', return_value=(rows[0], None)), \
+             mock.patch.object(self.mod, 'driven', return_value=True), \
+             mock.patch.object(self.mod, 'libre', return_value=True), \
+             mock.patch.object(self.mod, 'probe', return_value=resultat), \
+             mock.patch.object(self.mod.time, 'time', return_value=maintenant), \
+             redirect_stdout(sortie):
+            code = self.mod.main(['--hote', 'ameesh-agents-2', '--json'])
+        self.assertEqual(code, 3, sortie.getvalue())
+        self.assertEqual(json.loads(sortie.getvalue())['verdict'], 'non-concluant')
 
     def test_main_base_injoignable_sort_en_rapport_non_concluant(self):
         """#2190 : une erreur de base sort en rapport JSON, pas en trace vide ;

@@ -768,7 +768,7 @@ sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
     ${args_hote[@]+"${args_hote[@]}"}) || rc=$?
   printf '%s\n' "$sortie"
   SANTE_DETAIL=$sortie
-  # 3 : la sonde n'a pas pu tourner (non concluant), jamais un hote malsain
+  # 3 : la sonde n'a pas pu tourner ou conclure (non concluant), jamais un hote malsain
   case "$(verdict_sonde "$rc" "$sortie")" in
     ok) return 0 ;;
     ko) return 1 ;;
@@ -825,16 +825,17 @@ echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
   exit 1
 }
 
-# #3976 : la sonde n'a pas pu tourner (outil absent, ssh, base injoignable) :
+# #3976 : la sonde n'a pas pu tourner (outil absent, ssh, base injoignable)
+# ou n'a pas conclu (#4089 : remise sans tour termine, attente budget) :
 # non concluant (canon §3), jamais « malsain ». Aucun retour de l'hote, qui a
 # passe installer, redemarrer et controler ; la sequence s'arrete et le dit.
 sonde_non_concluante() {  # nom
   local nom=$1 detail
-  detail="sonde de courrier non concluante (code ${SANTE_RC:-?}) : l'outil n'a pas pu tourner, aucun retour"
+  detail="sonde de courrier non concluante (code ${SANTE_RC:-?}) : outil empeche ou tour non conclu, aucun retour"
   trace "$nom" sante non-concluant "$detail" "$SANTE_DETAIL"
   echo "!! $nom : $detail ; $nom reste sur $SHA_TRAVE, sequence arretee avant les hotes suivants" >&2
   notifier "staging : sonde de $nom non concluante, sequence arretee sans retour" \
-    "Le staging $SHA_TRAVE a installe, redemarre et controle $nom, mais sa sonde de courrier n'a pas pu tourner ($detail). Non concluant (canon §3) : $nom n'est PAS remis en arriere ; sequence arretee avant les hotes suivants, aucune attestation. Corriger l'outil puis relancer (un hote deja au commit n'est pas reinstalle). Sortie de la sonde : ${SANTE_DETAIL:-vide}. Trace : $JOURNAL"
+    "Le staging $SHA_TRAVE a installe, redemarre et controle $nom, mais sa sonde de courrier n'a pas conclu ($detail). Non concluant (canon §3) : $nom n'est PAS remis en arriere ; sequence arretee avant les hotes suivants, aucune attestation. Corriger l'outil ou attendre la fin de l'attente nommee, puis relancer (un hote deja au commit n'est pas reinstalle). Sortie de la sonde : ${SANTE_DETAIL:-vide}. Trace : $JOURNAL"
   exit 3
 }
 

@@ -28,6 +28,7 @@ from ameesh.storage import interface as SI
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GOLDEN_DIR = os.path.join(REPO, "tests", "golden", "mediated_executor")
 CONTRACT_FILE = os.path.join(REPO, "src", "ameesh", "mediated_executor", "contract.json")
+DOC_FILE = os.path.join(REPO, "docs", "EXECUTEUR-MEDIEE.md")
 HINTS = typing.get_type_hints(SI.Storage)
 
 
@@ -174,18 +175,38 @@ class TableTest(unittest.TestCase):
             self.assertNotIn("interface_total", json.load(fh)["refused"])
         self.assertEqual(set(self.c.refused_reasons), set(self.c.refused))
 
-    def test_les_compteurs_du_doc_suivent_le_contrat(self):
-        """#1019 : les compteurs cités par docs/EXECUTEUR-MEDIEE.md viennent de
-        contract.json ; ils doivent suivre chaque ajout à l'interface, sans
-        quoi les agents lisent des chiffres périmés."""
-        with open(os.path.join(REPO, "docs", "EXECUTEUR-MEDIEE.md"), encoding="utf-8") as fh:
-            doc = re.sub(r"\s+", " ", fh.read())
-        refuses = sum(len(methodes) for methodes in self.c.refused.values())
-        for attendu in ("la table fermée des %d opérations et la liste des %d refusées"
-                        % (len(self.c.operations), refuses),
-                        "l'interface entière (%d opérations)" % self.c.interface_total):
-            with self.subTest(fragment=attendu):
-                self.assertIn(attendu, doc)
+    def test_les_compteurs_du_doc_ne_sont_pas_figes(self):
+        """#4094 : la doc ne cite aucun compte figé ; elle renvoie à la table
+        et à `contract.load()` (`len(operations)`, la somme des méthodes de
+        `refused`, `interface_total`). Deux lots qui ajoutent chacun une
+        opération refusée ne modifient donc plus la même ligne du doc (h-46) :
+        l'arbre composé reste vert sans geste manuel."""
+        with open(DOC_FILE, encoding="utf-8") as fh:
+            doc = fh.read()
+        plat = re.sub(r"\s+", " ", doc)
+        for attendu in ("`contract.load()`", "`len(operations)`",
+                        "la somme des méthodes de `refused`",
+                        "`interface_total`"):
+            self.assertIn(attendu, plat)
+        # les phrases qui portent les comptes n'ont plus de nombre figé
+        for ancre in ("la table fermée des", "l'interface entière",
+                      "`RemoteStorage`"):
+            lignes = [line for line in doc.splitlines() if ancre in line]
+            self.assertTrue(lignes, ancre)
+            for ligne in lignes:
+                with self.subTest(ancre=ancre, ligne=ligne):
+                    self.assertIsNone(re.search(r"\d", ligne), ligne)
+        # les anciennes formes (compteurs recopiés) ne sont plus là
+        for absent in (
+            r"la table fermée des \d+ opérations",
+            r"l'interface entière \(\d+ opérations?\)",
+            r"\d+ opérations, dont \d+ lectures",
+            r"\d+ passent par `op`, \d+ par `session/op`",
+            r"Neuf lignes de `op`",
+            r"`RemoteStorage` \(les \d+ opérations?\)",
+        ):
+            with self.subTest(absent=absent):
+                self.assertNotRegex(plat, absent)
 
     def test_jamais_d_autorite(self):
         for d in ("approvals", "nonces", "grants", "authenticators", "canon", "packages",
