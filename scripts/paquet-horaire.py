@@ -56,8 +56,9 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    de son assigné jusqu'à un nouveau gel, et l'alerte SLO vise l'auteur, pas
    le pilote. Un rouge non concluant (§3 : run annulé ou
    hors délai, échec de job sans test, échec non attribuable ou ambigu, test
-   vert en local) ne retire rien : il est consigné au journal du porteur et le
-   pilote est prévenu, une fois.
+   vert en local, erreur de fixture DB en QueryCanceled/timeout) ne retire
+   rien : il est consigné au journal du porteur et le pilote est prévenu, une
+   fois.
 5. **Reprise.** Chaque lancement de `paquet-auto.py` laisse d'abord une
    marque « tentative » (étape, tête de départ, hôte:pid, époque du bail) ;
    son achèvement se lit à la tête gelée qui a bougé, son échec à une marque

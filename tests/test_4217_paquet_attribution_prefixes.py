@@ -4,7 +4,9 @@
 Témoins : un empilement synthétique A, B, C où le test casse dès A et ne
 sort que dans l'unité C (module voisin) ; le retrait attendu est A, pas B,
 même quand l'attribution par fichiers désigne B. Un rejeu non concluant ne
-retire personne : `AttributionUnreadable` et courrier au pilote. Aucune base,
+retire personne : `AttributionUnreadable` et courrier au pilote. Une erreur
+de fixture DB en `QueryCanceled` (statement timeout) est non concluante et
+jamais attribuée, dans un module propre comme dans un voisin. Aucune base,
 aucun réseau.
 """
 from __future__ import annotations
@@ -347,6 +349,120 @@ class ComposePacketPilotMailTest(unittest.TestCase):
         recipient, lot, body, sender = send.call_args.args
         self.assertEqual((recipient, lot, sender), ("pilote", 99, "mesh-design"))
         self.assertIn("Aucun retrait automatique", body)
+
+
+class FixtureErrorTest(unittest.TestCase):
+    """#4217 (2e cas) : une erreur de fixture DB n'est jamais attribuée.
+
+    Un `tearDownClass`/`setUpClass` en `psycopg.errors.QueryCanceled`
+    (statement timeout, base de test chargée) est une panne d'infrastructure,
+    qu'il sorte dans un module propre ou voisin : la série est non concluante,
+    consignée, et aucun retrait n'est décidé.
+    """
+
+    TEARDOWN = (
+        "======================================================================\n"
+        "ERROR: tearDownClass (tests.test_l56_role_executor.RoleExecutorTest)\n"
+        "----------------------------------------------------------------------\n"
+        "Traceback (most recent call last):\n"
+        "psycopg.errors.QueryCanceled: canceling statement due to statement timeout\n"
+        "\n"
+        "----------------------------------------------------------------------\n"
+        "Ran 33 tests in 42.0s\n"
+        "FAILED (errors=1)\n")
+
+    def run_of(self) -> "paquet_auto.TestRun":
+        return paquet_auto.TestRun(
+            "unité #1", ["tests.test_l56_role_executor"], 1,
+            self.TEARDOWN, 42.0)
+
+    def test_l_erreur_de_fixture_est_non_concluante(self) -> None:
+        run = self.run_of()
+        self.assertTrue(run.inconclusive)
+        self.assertFalse(run.real_failure)
+        self.assertEqual(paquet_auto.unittest_failures(self.TEARDOWN), [])
+        self.assertIn("QueryCanceled", run.motive())
+
+    def test_une_assertion_qui_cite_querycanceled_reste_reelle(self) -> None:
+        output = (
+            "======================================================================\n"
+            "ERROR: test_x (tests.test_x.T.test_x)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "AssertionError: expected QueryCanceled: statement timeout\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 1 test in 0.1s\n"
+            "FAILED (errors=1)\n")
+        run = paquet_auto.TestRun("unité #1", ["tests.test_x"], 1, output, 0.1)
+        self.assertFalse(run.inconclusive)
+        self.assertTrue(run.real_failure)
+        self.assertEqual(
+            [failure["test"] for failure in
+             paquet_auto.unittest_failures(output)],
+            ["tests.test_x.T.test_x"])
+
+    def test_un_vrai_rouge_reste_reel_a_cote_de_la_fixture(self) -> None:
+        output = (
+            "======================================================================\n"
+            "FAIL: test_real (tests.test_l56_role_executor.RoleExecutorTest.test_real)\n"
+            "----------------------------------------------------------------------\n"
+            "AssertionError: vrai rouge\n"
+            "\n"
+            "======================================================================\n"
+            "ERROR: tearDownClass (tests.test_l56_role_executor.RoleExecutorTest)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "psycopg.errors.QueryCanceled: canceling statement due to statement timeout\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 33 tests in 42.0s\n"
+            "FAILED (failures=1, errors=1)\n")
+        run = paquet_auto.TestRun(
+            "unité #1", ["tests.test_l56_role_executor"], 1, output, 42.0)
+        self.assertFalse(run.inconclusive)
+        self.assertTrue(run.real_failure)
+        self.assertEqual(
+            [failure["test"] for failure in
+             paquet_auto.unittest_failures(output)],
+            ["tests.test_l56_role_executor.RoleExecutorTest.test_real"])
+
+    def check(self, *, own, neighbors):
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, "a" * 40, "b" * 40)],
+            discarded=[], head="b" * 40)
+        green = paquet_auto.TestRun(
+            "contrats", ["tests.test_contrat"], 0,
+            "Ran 1 test in 0.1s\n\nOK", 0.1)
+        with mock.patch.object(paquet_auto, "unit_test_modules",
+                               return_value=list(own)), \
+                mock.patch.object(paquet_auto, "contract_modules",
+                                  return_value=["tests.test_contrat"]), \
+                mock.patch.object(paquet_auto, "run_tests",
+                                  side_effect=[self.run_of(), green]):
+            return paquet_auto.check_local_tests(
+                pathlib.Path("."), composition, timeout=1,
+                log=lambda _line: None,
+                select=lambda *_a: (neighbors, ""),
+                attribute=lambda *_a: self.fail(
+                    "une erreur de fixture ne doit jamais être attribuée"))
+
+    def test_module_propre_en_fixture_ne_retire_rien(self) -> None:
+        runs, faulty, removals = self.check(
+            own=["tests.test_l56_role_executor"], neighbors={})
+        self.assertEqual((faulty, removals), ([], []))
+        self.assertTrue(runs[0].inconclusive)
+        self.assertIn("1 non concluant(s)",
+                      paquet_auto._tests_summary(runs))
+
+    def test_module_voisin_en_fixture_ne_retire_rien(self) -> None:
+        neighbor = {"module": "tests.test_l56_role_executor",
+                    "reason": "carte",
+                    "files": ["src/ameesh/cli.py"]}
+        runs, faulty, removals = self.check(
+            own=["tests.test_own"], neighbors={1: [neighbor]})
+        self.assertEqual((faulty, removals), ([], []))
+        self.assertTrue(runs[0].inconclusive)
 
 
 if __name__ == "__main__":

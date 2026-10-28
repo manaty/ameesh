@@ -45,9 +45,10 @@ l'ordre, sans agent :
    pilote est prévenu et le paquet s'arrête. Un rouge non attribuable garde
    le geste antérieur : une unité dont le module propre a rougi est retirée,
    un contrat rouge arrête (l'attribution demande un agent). Un run **non
-   concluant** (délai, base absente, psql/psycopg indisponible, rc inattendu)
-   est consigné à la PR, au porteur et au courrier, sans retirer d'unité ni
-   arrêter le paquet : le canon §3 le veut, la ci-full tranche ;
+   concluant** (délai, base absente, psql/psycopg indisponible, erreur de
+   fixture DB en QueryCanceled/timeout, rc inattendu) est consigné à la PR,
+   au porteur et au courrier, sans retirer d'unité ni arrêter le paquet : le
+   canon §3 le veut, la ci-full tranche ;
 9. le résultat des tests au corps de la PR et au journal du porteur,
    courrier au pilote.
 
@@ -206,11 +207,15 @@ PARALLEL_EXCLUDE_REASON = "paquet parallèle : autre groupe disjoint"
 PARALLEL_GROUP_NOT_READY = "paquet parallèle : lot du groupe non prêt"
 PARALLEL_GROUP_GONE = "paquet parallèle : lot du groupe introuvable"
 #: sorties qui ne prouvent pas un rouge du lot (environnement, base absente)
+#: #4217 : un `tearDownClass`/`setUpClass` en `QueryCanceled` (statement
+#: timeout, base de test chargée) est une panne d'infrastructure, jamais un
+#: rouge du lot, qu'il sorte dans un module propre ou voisin.
 INCONCLUSIVE_RE = re.compile(
     r"(OperationalError|could not connect|connection refused|"
     r"server closed the connection|database system is starting up|"
     r"psql: error|No such file or directory: 'psql'|"
     r"could not translate host name|Temporary failure in name resolution|"
+    r"QueryCanceled|canceling statement|statement timeout|timeout expired|"
     r"ModuleNotFoundError: No module named 'psycopg)",
     re.IGNORECASE,
 )
@@ -221,6 +226,7 @@ ENV_MESSAGE_RE = re.compile(
     r"database system is starting up|psql: error|"
     r"No such file or directory: 'psql'|"
     r"could not translate host name|Temporary failure in name resolution|"
+    r"QueryCanceled|canceling statement|statement timeout|timeout expired|"
     r"No module named 'psycopg'",
     re.IGNORECASE,
 )
@@ -380,6 +386,9 @@ class TestRun:
         OperationalError` est un rouge réel. On lit le message de la dernière
         exception, et `AssertionError` est toujours réelle. Sans ligne
         d'exception (sortie psql), on cherche un motif d'infrastructure.
+        #4217 : un nom psycopg qui ne finit pas par `Error` (`QueryCanceled`,
+        `DeadlockDetected`…) échappe à `EXCEPTION_LINE_RE` ; le motif
+        d'infrastructure du bloc reste alors une preuve.
         """
         lines = EXCEPTION_LINE_RE.findall(block)
         if lines:
@@ -391,7 +400,7 @@ class TestRun:
                 return True
             if name in ("ModuleNotFoundError", "ImportError") and "psycopg" in message:
                 return True
-            return False
+            return bool(ENV_MESSAGE_RE.search(block))
         return bool(INCONCLUSIVE_RE.search(block))
 
     @property
