@@ -689,8 +689,12 @@ def _title(source: Source, obj: dict) -> str:
 
 
 def evaluate(source: Source, installed: dict, published_row: dict, rec: dict,
-             models: dict, billed: list[str]) -> dict:
-    """Décide de l'objet du lot (ou de son absence) et de sa priorité."""
+             models: dict, billed: list[str], evaluated=None) -> dict:
+    """Décide de l'objet du lot (ou de son absence) et de sa priorité.
+
+    `evaluated(obj)` écarte les objets déjà évalués (lot terminé) **avant**
+    la sélection : une rc rejetée ne doit pas masquer un modèle nouveau
+    (B de cx2, #4291)."""
     releases = [Release(version=row["version"], date=row.get("date", ""),
                         source=row.get("source", ""), url=row.get("url", ""),
                         tag=row.get("tag", ""))
@@ -720,26 +724,39 @@ def evaluate(source: Source, installed: dict, published_row: dict, rec: dict,
         if candidate is not None and harness_versions.version_key(candidate.version) >= \
                 harness_versions.version_key(rec_version):
             rec_applies = True
+    def done(obj) -> bool:
+        return bool(evaluated and obj is not None and evaluated(obj))
+
     priority = 1 if rec_applies else 2
     obj = None
     reason = ""
-    if candidate is not None:
+    if candidate is not None and not done(
+            {"kind": "harness", "name": source.harness,
+             "version": candidate.version}):
         obj = {"kind": "harness", "name": source.harness,
                "version": candidate.version}
         reason = "version publiée %s > installée %s" % (
             candidate.version, installed.get("newest") or "?")
-    elif rec_new_model is not None:
+    elif rec_new_model is not None and not done(
+            {"kind": "model", "name": rec_new_model, "version": rec_new_model}):
         obj = {"kind": "model", "name": rec_new_model, "version": rec_new_model}
         reason = "modèle recommandé et jamais facturé : %s" % rec_new_model
     elif new_models:
-        chosen = new_models[-1]
-        obj = {"kind": "model", "name": chosen, "version": chosen}
-        reason = "modèle servi et jamais facturé : %s" % chosen
-    else:
+        chosen = next((name for name in reversed(new_models)
+                       if not done({"kind": "model", "name": name, "version": name})),
+                      None)
+        if chosen is not None:
+            obj = {"kind": "model", "name": chosen, "version": chosen}
+            reason = "modèle servi et jamais facturé : %s" % chosen
+    if obj is None:
         if installed.get("newest") is None:
             reason = "aucune version installée connue : rien à comparer"
         elif published_row.get("error"):
             reason = "source publiée illisible : %s" % published_row["error"]
+        elif candidate is not None:
+            reason = "version %s déjà évaluée" % candidate.version
+        elif new_models:
+            reason = "modèles nouveaux déjà évalués"
         else:
             reason = "à jour (installée %s)" % installed["newest"]
     title = _title(source, obj) if obj else ""
@@ -1002,8 +1019,9 @@ def scan(cfg, db, *, sources=None, dry_run: bool = False, probe: bool = True,
                     models["baseline"] = True
             rec = recommendation(source, http_get=http_get,
                                  models=models.get("served") or ())
-            decision = evaluate(source, installed, published_row, rec, models,
-                                billed)
+            decision = evaluate(
+                source, installed, published_row, rec, models, billed,
+                evaluated=lambda obj: _already_evaluated(db, source, obj))
             entry.update({"published": published_row, "installed": installed,
                           "recommendation": rec, "models": models,
                           "billed": billed,

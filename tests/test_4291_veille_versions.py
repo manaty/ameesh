@@ -350,7 +350,10 @@ class VeilleDbTest(PgTestCase):
         self.db.execute("UPDATE work_items SET state = 'closed',"
                         " close_reason = 'done' WHERE id = %s", (lot_id,))
         again = self.scan(["0.2.0-rc.2", "0.2.1-rc.4"], tags={"rc": "0.2.1-rc.4"})
-        self.assertEqual(again["actions"][0]["action"], "already-evaluated")
+        # l'objet déjà évalué est écarté avant la sélection : plus d'objet,
+        # donc aucun lot rouvert (B de cx2, #4291)
+        self.assertEqual(again["actions"][0]["action"], "none")
+        self.assertIn("déjà évaluée", again["actions"][0]["reason"])
         self.assertEqual(len(self.lots()), 1)
         # a NEWER version is compared, and opens a new lot
         newer = self.scan(["0.2.0-rc.2", "0.2.1-rc.4", "0.2.1-rc.5"],
@@ -488,6 +491,36 @@ class VeilleDbTest(PgTestCase):
         second = self.scan(["1.0"], tags={"latest": "1.0"},
                            provider="deepseek", listing=listing)
         self.assertNotEqual(second["actions"][0]["action"], "created", second)
+
+    def test_evaluated_rc_does_not_hide_a_new_model(self):
+        # B de cx2 (#4291) : la rc 0.2.1-rc.4 a été évaluée puis close sans
+        # adoption (le parc reste en 0.2.0-rc.2). Elle ne doit pas être
+        # rechoisie au passage suivant et masquer le modèle nouveau : le lot
+        # modèle s'ouvre, puis aucun doublon.
+        self.record("vm-a", "0.2.0-rc.2")
+        first = self.scan(["0.2.0-rc.2", "0.2.1-rc.4"],
+                          tags={"rc": "0.2.1-rc.4"})
+        self.assertEqual(first["actions"][0]["action"], "created", first)
+        self.db.execute("UPDATE work_items SET state = 'closed',"
+                        " close_reason = 'abandoned' WHERE id = %s",
+                        (first["actions"][0]["lot"],))
+        self.readings("deepseek-old")
+        listing = lambda: SourceResult(
+            source="deepseek", complete=True,
+            models=(ModelSeen(provider="deepseek", model_id="deepseek-old"),
+                    ModelSeen(provider="deepseek", model_id="deepseek-new")))
+        second = self.scan(["0.2.0-rc.2", "0.2.1-rc.4"],
+                           tags={"rc": "0.2.1-rc.4"}, provider="deepseek",
+                           listing=listing)
+        self.assertEqual(second["actions"][0]["action"], "created", second)
+        lot = work.get(self.db, second["actions"][0]["lot"])
+        self.assertIn("Évaluer le modèle deepseek-new", lot["title"])
+        # la rc close n'est pas rouverte et le modèle n'est pas dupliqué
+        third = self.scan(["0.2.0-rc.2", "0.2.1-rc.4"],
+                          tags={"rc": "0.2.1-rc.4"}, provider="deepseek",
+                          listing=listing)
+        self.assertEqual(third["actions"][0]["action"], "none", third)
+        self.assertEqual(len(self.lots()), 2)
 
     def test_two_harnesses_same_provider_keep_their_own_reading(self):
         # deux harnais du même fournisseur : le relevé de l'un ne peut pas
