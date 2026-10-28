@@ -247,6 +247,30 @@ class RealBalanceTest(_LowBase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(self._row("deepseek", "")["state"], "low")
 
+    def test_a_zero_or_unavailable_currency_does_not_hide_a_usable_one(self):
+        """B1 cx3 : un USD à zéro marqué disponible n'épuise pas un compte qui
+        porte encore un solde en CNY ; le poll et la réévaluation choisissent
+        la même devise positive, sans conversion implicite."""
+        self._declare(100.0, harness="deepseek", account="")
+        self._reading(0.0, currency="USD")
+        self._reading(100.0, currency="CNY")
+        usd = balance.BalanceReading("deepseek", "USD", 0.0, available=True)
+        cny = balance.BalanceReading("deepseek", "CNY", 100.0, available=True)
+        unavailable_usd = balance.BalanceReading(
+            "deepseek", "USD", 0.0, available=False)
+        for readings in ([usd, cny], [cny, usd], [cny], [unavailable_usd, cny]):
+            with self.subTest(currencies=[r.currency for r in readings]):
+                self.assertIsNot(
+                    balance.credit_state(self.db, "deepseek", "", readings), True)
+        # la réévaluation depuis la série (alerts -> assess) fait le même choix
+        self._assess()
+        row = self._row("deepseek", "")
+        self.assertEqual(row["state"], "ok")
+        self.assertAlmostEqual(row["balance_usd"], 100.0, places=3)
+        self.assertAlmostEqual(row["ratio"], 1.0, places=3)
+        self.assertEqual(self._alerts("provider_credits_exhausted"), [])
+        self.assertEqual(self._alerts("provider_credits_low"), [])
+
 
 class ChooseFallbackTest(_LowBase):
 

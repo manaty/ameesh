@@ -369,6 +369,40 @@ def _spendable(reading) -> bool:
     return float(reading.total) > 0.0
 
 
+def _reading_field(reading, key):
+    """Un champ d'un relevé (`BalanceReading`) ou d'une ligne de série (dict)."""
+    if isinstance(reading, dict):
+        return reading.get(key)
+    return getattr(reading, key, None)
+
+
+def _fresh_usable(reading) -> bool:
+    """La devise est utilisable et porte un solde strictement positif.
+
+    Un relevé à zéro marqué disponible (le fournisseur publie la
+    disponibilité par compte, pas par devise) ne prouve pas l'épuisement
+    quand une autre devise porte un solde : il ne sert donc pas à choisir.
+    """
+    available = _reading_field(reading, "available")
+    if available is not None and not bool(available):
+        return False
+    try:
+        return float(_reading_field(reading, "total")) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _choose_currency(items: dict) -> str | None:
+    """La devise qui décide : USD positif s'il existe, sinon la première
+    positive par ordre alphabétique. Le même choix au poll et à la
+    réévaluation ; aucune conversion implicite entre devises."""
+    positive = sorted(str(cur or "").upper() for cur, reading in items.items()
+                      if _fresh_usable(reading))
+    if not positive:
+        return None
+    return "USD" if "USD" in positive else positive[0]
+
+
 def _history(db, harness: str, account: str | None) -> dict:
     """Les soldes lus du fournisseur, par devise, récents d'abord bornés."""
     rows = storage.of(db).operations.balances(
@@ -388,11 +422,13 @@ def from_readings(db, harness: str, account: str | None, readings, *,
                   host: str | None = None, now: float | None = None) -> bool | None:
     """#4166 : un relevé de solde réel décide `exhausted`, `low` ou `ok`.
 
-    Aucune devise utilisable → `exhausted` ; sinon la devise de référence
-    (USD d'abord, sinon la première) est comparée au prépayé déclaré — ou au
-    sommet de la série — et son rythme donne l'échéance projetée. Rend True
-    sur la transition vers `exhausted`, False sur un retour à `ok`, None
-    sinon (les transitions `low` ne changent pas la garde)."""
+    Aucune devise utilisable → `exhausted` ; sinon la devise positive (USD
+    s'il est positif, sinon la première par ordre alphabétique) est comparée
+    au prépayé déclaré (USD seulement) — ou au sommet de sa propre série — et
+    son rythme donne l'échéance projetée. Aucune conversion implicite entre
+    devises : une devise à zéro ne cache pas une autre devise utilisable.
+    Rend True sur la transition vers `exhausted`, False sur un retour à `ok`,
+    None sinon (les transitions `low` ne changent pas la garde)."""
     now = time.time() if now is None else float(now)
     rows = list(readings or ())
     if not rows:
@@ -406,8 +442,23 @@ def from_readings(db, harness: str, account: str | None, readings, *,
             reason="balance %.2f %s" % (total, currency), source="balance",
             host=host)
         return True if transition else None
-    ref = usable[0]
-    currency = str(getattr(ref, "currency", "") or "").upper()
+    by_currency: dict = {}
+    for reading in usable:
+        currency = str(getattr(reading, "currency", "") or "").upper()
+        by_currency[currency] = reading
+    chosen = _choose_currency(by_currency)
+    if chosen is None:
+        # utilisables mais toutes à zéro : rien ne reste sur le compte
+        worst = min(rows, key=lambda r: float(r.total))
+        total = float(worst.total)
+        currency = str(getattr(worst, "currency", "") or "")
+        transition = mark_exhausted(
+            db, harness, account,
+            reason="balance %.2f %s" % (total, currency), source="balance",
+            host=host)
+        return True if transition else None
+    ref = by_currency[chosen]
+    currency = chosen
     try:
         series = _history(db, harness, account)
     except db_mod.Unavailable:
@@ -416,7 +467,7 @@ def from_readings(db, harness: str, account: str | None, readings, *,
         return None
     points = series.get(currency) or []
     row = get(db, harness, account)
-    reference = _peak(points, prepaid_of(row))
+    reference = _peak(points, prepaid_of(row) if currency == "USD" else None)
     measured = None
     if points:
         from .sous_utilisation import balance_rate
@@ -440,16 +491,27 @@ def from_balance(db, harness: str, account: str | None, total: float, currency: 
 
 
 def _real_verdict(db, row: dict, now: float) -> tuple | None:
-    """Le verdict d'un compte dont le fournisseur publie un solde."""
+    """Le verdict d'un compte dont le fournisseur publie un solde.
+
+    La devise est choisie comme au poll (`from_readings`) : une devise
+    positive, USD d'abord, sinon la première par ordre alphabétique. Aucune
+    devise positive → épuisé. Le prépayé déclaré n'est une référence que pour
+    USD ; les autres devises se comparent à leur propre sommet."""
     series = _history(db, row["harness"], row.get("account"))
     if not series:
         return None
-    currency = "USD" if "USD" in series else sorted(series)[0]
+    latest = {currency: points[-1] for currency, points in series.items() if points}
+    if not latest:
+        return None
+    currency = _choose_currency(latest)
+    if currency is None:
+        # aucune devise positive : le compte est à zéro (ou indisponible)
+        currency = "USD" if "USD" in series else sorted(series)[0]
     points = series[currency]
     if not points:
         return None
     total = float(points[-1]["total"])
-    reference = _peak(points, prepaid_of(row))
+    reference = _peak(points, prepaid_of(row) if currency == "USD" else None)
     measured = None
     if points:
         from .sous_utilisation import balance_rate
