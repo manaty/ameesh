@@ -19,6 +19,10 @@ expected (`hold: attente bureau : <geste>`, `hold: attente owner : <geste>`,
 optionally dated `(due 2026-10-25 12:00 UTC)` or `[réveil programmé: …]`).
 `external_hold` reads that declaration; the debit keeps the lot out of the
 agent waits and reports the reminder to the bureau or owner.
+
+#4235: a pilot hold may declare an **observation window** — a wanted, dated
+wait (`hold: fenêtre : <motif>`, with its deadline armed by `--wake-at`) —
+read by `observation_hold`; the debit lists it apart until the deadline.
 """
 from __future__ import annotations
 
@@ -167,6 +171,43 @@ def external_hold(text) -> dict | None:
     due = _EXTERNAL_DUE.search(note) or _EXTERNAL_WAKE.search(note)
     return {"executor": who, "gesture": gesture,
             "due": due.group("date").strip() if due else None}
+
+
+#: #4235 : une **fenêtre d'observation** est une attente voulue et **datée**,
+#: déclarée dans le hold du pilote : `hold: fenêtre : <motif>` (ou `hold:
+#: fenêtre d'observation : …`, `hold: observation : …`), avec le préambule du
+#: journal (`hold: (pilote …) Fenêtre d'observation voulue : …`). Son échéance
+#: est celle que `--wake-at` écrit (`[réveil programmé: …]`), ou une date
+#: déclarée `(due …)`/`(échéance …)`. Sans échéance écrite, ce n'est pas une
+#: fenêtre : le débit ne devine pas quand l'attente finit, et le hold reste
+#: une attente ordinaire.
+_OBSERVATION_HOLD = re.compile(
+    r"^hold:\s*(?:\([^)\n]*\)\s*)?"
+    r"(?P<head>fen[êe]tre(?:\s+d['’]observation)?|observation)\b"
+    r"(?P<tail>.*)$", re.I | re.S)
+
+
+def observation_hold(text) -> dict | None:
+    """#4235 : la déclaration d'une fenêtre d'observation, ou None.
+
+    Rend `{motif, due}` : `motif` est ce qui est attendu à l'échéance (le
+    texte déclaré, sans la date), `due` la date écrite (texte brut, pour
+    `debit.parse_wake_due`). Une note sans motif ou sans échéance ne déclare
+    rien (le sens sûr : elle reste une attente d'agent), et une graphie de
+    hold (`hold :`) n'est pas un hold."""
+    note = str(text or "").strip()
+    match = _OBSERVATION_HOLD.match(note)
+    if not match:
+        return None
+    found = _EXTERNAL_DUE.search(note) or _EXTERNAL_WAKE.search(note)
+    if not found:
+        return None
+    motif = _EXTERNAL_DUE.sub("", match.group("tail"))
+    motif = _EXTERNAL_WAKE.sub("", motif)
+    motif = _EXTERNAL_TOKEN.sub("", motif).strip(" \t:;,.—–-")
+    if not motif:
+        return None
+    return {"motif": motif, "due": found.group("date").strip()}
 
 
 def explicit_holds(events, *, allowed=None) -> dict[int, dict]:

@@ -4194,7 +4194,10 @@ def build_parser() -> argparse.ArgumentParser:
                "\"hold: attente bureau : <geste>\" (or owner), with an optional "
                "\"(due 2026-10-25 12:00 UTC)\"; ameesh debit lists it as an "
                "external wait, not an agent wait. #3773: it may also declare "
-               "a third party — \"hold: attente externe : revue Apple\".")
+               "a third party — \"hold: attente externe : revue Apple\". #4235: "
+               "a pilot hold may declare an observation window — \"hold: fenêtre "
+               ": <motif>\" with --wake-at; ameesh debit lists it apart until "
+               "the deadline, outside --check.")
     pw_note.add_argument("id", type=int)
     pw_note.add_argument("text", help="the note, or - to read it on standard input "
                                       "(heredoc <<'EOF': nothing is expanded)")
