@@ -8757,7 +8757,8 @@ RELOADABLE_FIELDS = frozenset({
     "config_path", "config_base", "config_shadowed",
     # comptes, plafonds et rôles : la décision de pause budget
     "accounts", "budget_usd_per_hour", "budget_usd_per_day", "budget_explicit",
-    "critical_agents", "noncritical_hourly_share", "critical_fallback_harnesses",
+    "critical_agents", "idle_after_s", "baseline_hosts",
+    "noncritical_hourly_share", "critical_fallback_harnesses",
     # #2571 (suite de #313/#2580) : le partage des comptes est relu au tour
     # suivant et à la passe de revendications suivante ; un passage `report` →
     # `refuse`/`strict` (ou un registre déplacé) ne demande pas de redémarrage.

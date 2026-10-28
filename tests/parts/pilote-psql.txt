@@ -120,3 +120,5 @@ test_registry_lease  # verrous et baux : comportement différent entre psql et p
 test_undeliverable  # courrier en souffrance : renvoi en une transaction (psql persistant), lecture jointe à la vue par projet (une requête)
 test_3752_gabarit  # #3752 : le schéma cloné du gabarit vaut migrate(), rejoué par le pilote psql comme psycopg
 test_4147_host_footprint  # projection des relevés cgroup persistés, deux pilotes
+
+test_4150_host_idle  # état inactif conservateur et empreinte des vues

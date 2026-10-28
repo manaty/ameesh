@@ -861,16 +861,20 @@ class CgroupMeter:
             "path": base,
             # #2825: what the publisher itself observed, so another host can
             # read this host's default scope without asking its own process
-            "container": False, "bounded": False,
+            "container": platform.host.in_container(), "bounded": False,
+            # #4150: max and unreadable must not both prove idle.
+            "limits_readable": False,
             "cpu_some": None, "mem_some": None, "mem_full": None,
             "cpu_quota": None,
             "mem_current_bytes": None, "mem_max_bytes": None,
             "mem_used": None, "throttled": None, "cpu_used": None,
         }
+        # VM reservation comes from machine CPU/MemTotal. Its runner may
+        # have no delegated cpu controller, or no cgroup at all (macOS).
+        out["limits_readable"] = not out["container"]
         if not base or not os.path.isdir(base):
             self._prev, self._prev_path = None, None
             return out
-        out["container"] = platform.host.in_container()
         out["bounded"] = platform.host.own_cgroup_bounded(base)
         cpu = platform.cgroup_pressure("cpu", base)
         mem = platform.cgroup_pressure("memory", base)
@@ -883,6 +887,20 @@ class CgroupMeter:
         stat = platform.cgroup_cpu_stat(base)
         current = platform.cgroup_memory_bytes(base)
         ceiling = platform.cgroup_memory_max(base)
+        try:
+            with open(os.path.join(base, "memory.max"), encoding="ascii") as stream:
+                raw_ceiling = stream.read(128).strip()
+            valid_ceiling = (raw_ceiling == "max" or
+                             (raw_ceiling.isdigit() and int(raw_ceiling) >= 0))
+            with open(os.path.join(base, "cpu.max"), encoding="ascii") as stream:
+                raw_cpu = stream.read(128).split()
+            valid_cpu = (len(raw_cpu) == 2 and
+                         (raw_cpu[0] == "max" or
+                          (raw_cpu[0].isdigit() and int(raw_cpu[0]) > 0)))
+        except (OSError, UnicodeError):
+            valid_ceiling = valid_cpu = False
+        out["limits_readable"] = (not out["container"] or
+                                  (period is not None and valid_cpu and valid_ceiling))
         out["mem_current_bytes"] = current
         out["mem_max_bytes"] = ceiling
         if current is not None and ceiling:
