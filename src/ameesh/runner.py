@@ -9319,7 +9319,8 @@ class Runner:
         from . import role_standings_pg as pg
         try:
             published = 0 if _admits_nobody(self) else election.publish_self(
-                self.cfg, self.db, self.host, names=self.agents_filter)
+                self.cfg, self.db, self.host, names=self.agents_filter,
+                pressure=self.host_pressure())
             self._role_error = None
         except Exception as exc:  # un score de rôle ne fait jamais tomber l'exécuteur
             message = "role standings not published (%s)" % db_mod.brief(exc)
@@ -9535,7 +9536,8 @@ class Runner:
         if reserved is None or reserved["host"] != self.host:
             return False
         return bool(election.publish_self(self.cfg, self.db, self.host,
-                                          force=True, names=[name]))
+                                          force=True, names=[name],
+                                          pressure=self.host_pressure()))
 
     def _start_host_gate(self) -> None:
         with self._host_gate_lock:
