@@ -13,6 +13,8 @@ courrier :
 
 * état `qa` (aucun filtre d'assigné : un lot assigné est un candidat comme un
   autre) ;
+* aucun prérequis explicite encore bloquant (`work_dependencies`, #4144),
+  même si le parent est hors `qa` ; un parent fusionné ne bloque plus ;
 * gel effectif (`plan_git.freeze_candidate`, #1756) sans refus, résolu en
   commit **égal à la tête publiée** de la branche (`origin`, lecture fraîche :
   une tête locale n'est pas la forge) ;
@@ -62,7 +64,8 @@ import re
 import subprocess
 import time
 
-from . import lot_class, merge_queue, packet_guard, plan_git, resolutions, storage, work
+from . import (lot_class, merge_queue, packet_guard, plan_git, resolutions,
+               storage, work, work_dependencies)
 from .canon import FETCH_TIMEOUT
 
 SCHEMA = "ameesh-packet-candidates/1"
@@ -589,6 +592,12 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     marks = _marks(db, ids)
     overrides = _hold_overrides(hold_overrides)
     holds = _pilot_holds(db, ids, cfg=cfg)
+    # #4144 : même vérité que `work show`, y compris les prérequis hors qa.
+    # Une panne de lecture ne doit jamais transformer un lot bloqué en prêt.
+    try:
+        dependencies = work_dependencies.grouped(db, ids)
+    except Exception as exc:  # noqa: BLE001 - inventaire incomplet
+        raise CandidateError("cannot read blocking dependencies: %s" % exc) from exc
     unknown = sorted(set(overrides) - set(ids))
     if unknown:
         raise HoldOverrideError(
@@ -644,6 +653,16 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
                    remises, remise_error, where=where, package_base=package_base,
                    cfg=cfg, canons=canons)
     for entry in candidates:
+        # Après les remises : ni une résolution de conflit ni une surcharge
+        # de hold ne peuvent lever un prérequis encore bloquant.
+        for edge in dependencies.get(entry["work_item"], []):
+            if edge["blocking"]:
+                entry["causes"].append(_cause(
+                    "dependency-blocking", "#%d %s" % (
+                        edge["blocker_id"], edge["blocker_state"]),
+                    blocker_id=edge["blocker_id"],
+                    blocker_state=edge["blocker_state"]))
+                entry["ready"] = False
         if entry["ready"] and not entry["source"]:
             entry["source"] = entry["published_head"]
         if entry["error"]:
