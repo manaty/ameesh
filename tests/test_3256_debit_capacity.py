@@ -276,5 +276,37 @@ class ReadCapacityTest(unittest.TestCase):
         self.assertTrue(any("open lots" in line for line in unreadable))
 
 
+    def test_the_split_lot_is_read_from_the_real_row_shape(self):
+        # B6 (impl-04 sur ac79c550) : `open_lots_activity` ne rend pas
+        # `source` ; un lot de découpage de 20 min doit pourtant retenir
+        # `--check`, et le débit le nommer.
+        from types import SimpleNamespace
+        row = {"id": 90, "title": "Découper la feuille de route de ameesh : des lots "
+               "démarrables pour 2 agent(s)", "state": "intake", "assignee": "pilote",
+               "app": "ameesh", "type": "evolution", "created_ts": T - 20 * 60}
+        store = SimpleNamespace(operations=SimpleNamespace(
+            listing=lambda: team(2, 8), open_lots_activity=lambda limit: [row]))
+        rule = SimpleNamespace(queue_fill=SimpleNamespace(repos_part=PART, repos_s=REPOS))
+
+        def query(sql, params=()):
+            if "file-decoupage:%%'" in sql and "SELECT id, source" in sql:
+                return [{"id": 90, "source": SPLIT}]
+            return []
+        db = mock.Mock()
+        db.query.side_effect = query
+        with mock.patch("ameesh.storage.of", return_value=store), \
+                mock.patch("ameesh.mechanics.configured", return_value=rule), \
+                mock.patch("ameesh.sous_utilisation._budget_held", return_value={}), \
+                mock.patch("ameesh.sous_utilisation.waiting_project_lots", return_value=[]), \
+                mock.patch("ameesh.sous_utilisation.critical_verdict",
+                           return_value=(False, False)), \
+                mock.patch("ameesh.sous_utilisation.latest_account_gauges", return_value={}):
+            cap = debit.read_capacity(db, cfg=object(), now=T, hours=6, turns=[],
+                                      canons=[], unreadable=[])
+        project = [p for p in cap["projects"] if p["project"] == "ameesh"][0]
+        self.assertEqual(project["decoupage"]["lot"], 90)
+        self.assertEqual(cap["alerts"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

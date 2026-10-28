@@ -1861,6 +1861,16 @@ _ROADMAP_SQL = """
      ORDER BY e.created_at
 """
 
+#: #3256 : la `source` des lots ouverts de découpage. `open_lots_activity`
+#: ne la rend pas (B6 d'impl-04 sur ac79c550) : elle est lue ici pour les
+#: seuls lots ouverts qu'elle a rendus, sans élargir l'interface partagée.
+_SPLIT_SOURCES_SQL = """
+    SELECT id, source
+      FROM work_items
+     WHERE id = ANY(string_to_array(%s, ',')::bigint[])
+       AND source LIKE 'file-decoupage:%%'
+"""
+
 #: #3256 : par projet, la création du dernier lot **arrivé démarrable** :
 #: créé sans assigné ni exécutant externe, puis pris dans la file (le
 #: journal porte `assigned to … (before: nobody)`). Un lot créé déjà
@@ -2094,6 +2104,12 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
     horizon = now - EVENT_DAYS * 86400
     listing = attempt("agents", store.operations.listing, [])
     lots = attempt("open lots", lambda: store.operations.open_lots_activity(None), [])
+    if lots:
+        sources = attempt("split lot sources", lambda: {
+            int(row["id"]): row["source"] for row in _rows(
+                db, _SPLIT_SOURCES_SQL, (",".join(str(int(l["id"])) for l in lots),))}, {})
+        lots = [dict(lot, source=sources.get(int(lot["id"]), lot.get("source")))
+                for lot in lots]
     startable = attempt("startable lots", lambda: sous_utilisation.waiting_project_lots(
         lots, db=db, now=now), []) if lots else []
     # la tenue de budget ne se lit que pour les agents au repos (comme
