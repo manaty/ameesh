@@ -117,11 +117,104 @@ class HostIdleTest(unittest.TestCase):
         with mock.patch.object(storage, 'of', return_value=store), \
                 mock.patch('ameesh.host_lifecycle.critical_names', return_value=set()):
             self.assertEqual(host_idle.snapshot(cfg, 'db', [], {'vm': self.reading()}, now=NOW)['vm']['state'], 'idle')
+            # A reading that can still prove idle keeps the full lot read and
+            # the quiet history: both can shorten the interval (VM witness).
+            store.work.items.assert_called_once_with(state=None, assignee='worker', limit=1000)
+            self.assertEqual([call.args[0] for call in store.hosts.since.call_args_list], ['vm'])
             store.operations.listing.side_effect = RuntimeError('unavailable')
             out = host_idle.snapshot(cfg, 'db', [], {'vm': self.reading()}, now=NOW)['vm']
             self.assertEqual(out['state'], 'busy')
             self.assertTrue(out['unknown'])
         self.assertFalse(store.host_lifecycle.mock_calls)
+
+    def test_snapshot_skips_lot_reads_where_the_reading_is_busy(self):
+        store = mock.MagicMock()
+        store.operations.listing.return_value = [self.agent(), self.agent(name='other', host='busy')]
+        store.work.items.return_value = []
+        store.hosts.since.return_value = [self.reading(sampled_ts=t)
+                                           for t in range(7600, NOW + 1, 60)]
+        cfg = config.Config(resource_interval=60)
+        with mock.patch.object(storage, 'of', return_value=store), \
+                mock.patch('ameesh.host_lifecycle.critical_names', return_value=set()):
+            out = host_idle.snapshot(cfg, 'db', [], {'vm': self.reading(),
+                                                     'busy': self.reading(turns_in_progress=2)},
+                                     now=NOW)
+        self.assertEqual(out['vm']['state'], 'idle')
+        self.assertEqual(out['busy']['state'], 'busy')
+        self.assertEqual([call.kwargs['assignee'] for call in store.work.items.call_args_list],
+                         ['worker'])
+        # The busy host cannot be idle whatever its history says: no read.
+        self.assertEqual([call.args[0] for call in store.hosts.since.call_args_list], ['vm'])
+
+    def test_busy_host_keeps_hold_aware_leases_without_full_lot_reads(self):
+        """The hold/lease witness must survive the fast path (#4178)."""
+        store = mock.MagicMock()
+        store.operations.listing.return_value = [
+            self.agent(name='worker', host='busy', session_work_item='42',
+                       session_lot_state='build', actionable_lots=1)]
+        store.work.get.return_value = dict(id=42, state='build', assignee='worker',
+                                           updated_ts=7000)
+        store.progress.lot_hold_events.return_value = [
+            dict(id=1, work_item_id=42, state='build', actor='human:smichea',
+                 note='hold: attente owner', created_ts=7000)]
+        store.hosts.since.return_value = []
+        cfg = config.Config(resource_interval=60)
+        with mock.patch.object(storage, 'of', return_value=store), \
+                mock.patch('ameesh.host_lifecycle.critical_names', return_value=set()):
+            out = host_idle.snapshot(cfg, 'db', [], {'busy': self.reading(turns_in_progress=2)},
+                                     now=NOW)['busy']
+        # The reading is busy, but the session lot still feeds the lease count:
+        # the held lot is not a lot lease, exactly as with a full read.
+        self.assertEqual(out['state'], 'busy')
+        self.assertEqual(out['leases'], 0)
+        self.assertNotIn('agent/lot activity unreadable', out['unknown'])
+        store.work.items.assert_not_called()
+        store.work.get.assert_called_once_with(42)
+        store.progress.lot_hold_events.assert_called_once()
+
+    def test_snapshot_seeds_the_canon_window_for_hold_authority(self):
+        """#4178: the canons already read for the view are not read per author."""
+        from ameesh import canon as canon_mod
+
+        store = mock.MagicMock()
+        store.operations.listing.return_value = [
+            self.agent(name='worker', host='busy', session_work_item='42',
+                       session_lot_state='build')]
+        store.work.get.return_value = dict(id=42, state='build', assignee='worker')
+        store.progress.lot_hold_events.return_value = [
+            dict(id=1, work_item_id=42, state='build', actor='ameesh-cx3',
+                 note='hold: attente owner', created_ts=7000)]
+        store.hosts.since.return_value = []
+        cfg = config.Config(resource_interval=60)
+
+        def orchestrator(*args, **kwargs):
+            # Same delegation as the real check, without a registry read.
+            canon_mod.load_configured(cfg)
+            return True
+
+        with mock.patch.object(storage, 'of', return_value=store), \
+                mock.patch('ameesh.host_lifecycle.critical_names', return_value=set()), \
+                mock.patch.object(canon_mod, 'load') as load, \
+                mock.patch('ameesh.assignments.is_orchestrator', side_effect=orchestrator):
+            out = host_idle.snapshot(
+                cfg, 'db', [], {'busy': self.reading(turns_in_progress=2)}, now=NOW)['busy']
+        load.assert_not_called()
+        self.assertEqual(out['leases'], 0)
+
+    def test_unknown_reading_skips_lots_but_keeps_the_unknown_witness(self):
+        store = mock.MagicMock()
+        store.operations.listing.return_value = [self.agent()]
+        store.work.items.return_value = []
+        store.hosts.since.return_value = []
+        cfg = config.Config(resource_interval=60)
+        with mock.patch.object(storage, 'of', return_value=store), \
+                mock.patch('ameesh.host_lifecycle.critical_names', return_value=set()):
+            out = host_idle.snapshot(cfg, 'db', [], {'vm': self.reading(cgroup={})},
+                                     now=NOW)['vm']
+        self.assertEqual(out['state'], 'busy')
+        self.assertIn('executor cgroup unreadable', out['unknown'])
+        store.work.items.assert_not_called()
+        store.hosts.since.assert_not_called()
 
 
 class CgroupReadabilityTest(unittest.TestCase):

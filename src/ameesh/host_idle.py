@@ -124,9 +124,30 @@ def capacities(canons, names, *, protected=(), baseline_hosts=2):
     return out, costs
 
 
+def _can_prove_idle(reading, *, now, fresh_within):
+    """The reading alone still leaves room for an idle verdict (#4178).
+
+    Mirrors the unknown conditions of `project`: a sample that is stale,
+    turns that are running or unreadable, limits that are unreadable, or a
+    reservation that cannot be read already rules idleness out. Those hosts
+    do not need their agents' full lot lists."""
+    reading = reading or {}
+    ts = resources.finite_float(reading.get('sampled_ts'))
+    if ts is None or not 0 <= now - ts <= fresh_within:
+        return False
+    if reading.get('turns_in_progress') != 0:
+        return False
+    if (reading.get('cgroup') or {}).get('limits_readable') is not True:
+        return False
+    footprint = resources.footprint(reading)
+    return (footprint['reserved_cpu'] is not None
+            and footprint['reserved_mem_bytes'] is not None)
+
+
 def snapshot(cfg, db, canons, readings, *, now=None):
     """Read all common sources once, then project each host. No mutations."""
-    from . import election, host_lifecycle, planned_waits
+    from . import canon as canon_mod
+    from . import planned_waits
     now = time.time() if now is None else now
     idle_s = max(1.0, float(cfg.idle_after_s))
     fresh = staleness_s(cfg.resource_interval)
@@ -134,12 +155,21 @@ def snapshot(cfg, db, canons, readings, *, now=None):
     protected = set()
     agents = lots = None
     holds = {}
+    candidates = {host for host, reading in readings.items()
+                  if _can_prove_idle(reading, now=now, fresh_within=fresh)}
     try:
         agents = storage.of(db).operations.listing()
         # Bounded per-agent read includes closed lots: closing work also
         # resets the quiet interval. Truncation cannot prove an idle host.
+        # A host whose own reading already excludes rest only needs the
+        # session lot, for the lease count and the hold filter: its full
+        # per-agent lists cost seconds per view and cannot change the verdict
+        # (#4178, taking back 9b11d526b after its revert b207dbce5).
         lots = {}
         for agent in agents:
+            if agent.get('host') not in candidates:
+                lots[agent['name']] = []
+                continue
             rows = storage.of(db).work.items(state=None, assignee=agent['name'], limit=1000)
             lots[agent['name']] = rows if len(rows) < 1000 else None
         by_id = {int(lot['id']): lot for rows in lots.values() if rows is not None
@@ -154,19 +184,34 @@ def snapshot(cfg, db, canons, readings, *, now=None):
         if ids:
             events = storage.of(db).progress.lot_hold_events(
                 sorted(ids), planned_waits.HOLD_NOTE_PATTERNS)
-            holds = planned_waits.pilot_holds(db, events, cfg=cfg, strict=True)
-        for name in host_lifecycle.critical_names(cfg, db):
-            role = election.status(db, name)
-            if role.get('holder'):
-                protected.add(role['holder'])
-            reserve = next((c['host'] for c in role['candidates']
-                            if c.get('ready') and c['host'] != role.get('holder')), None)
-            if reserve:
-                protected.add(reserve)
+            # The canons were already read for this view: without seeding the
+            # cache, `pilot_holds` reloads them once per hold author (14 reads,
+            # ~6 s on the live mesh), which dominated the same projection.
+            with canon_mod.configured_cache(cfg, canons):
+                holds = planned_waits.pilot_holds(db, events, cfg=cfg, strict=True)
     except Exception:  # unavailable inputs must prevent an idle verdict
         agents = None
     capacity, costs = capacities(canons, names, protected=protected,
                                  baseline_hosts=cfg.baseline_hosts)
+    # The leader/reserve guard can only change the capacity when the canon
+    # declares fewer than the baseline hosts; computing the election for it
+    # costs seconds per view and would be discarded (#4178).
+    if agents is not None and (sum(v == 'baseline' for v in capacity.values())
+                               < cfg.baseline_hosts):
+        from . import election, host_lifecycle
+        try:
+            for name in host_lifecycle.critical_names(cfg, db):
+                role = election.status(db, name)
+                if role.get('holder'):
+                    protected.add(role['holder'])
+                reserve = next((c['host'] for c in role['candidates']
+                                if c.get('ready') and c['host'] != role.get('holder')), None)
+                if reserve:
+                    protected.add(reserve)
+        except Exception:  # unavailable inputs must prevent an idle verdict
+            agents = None
+        capacity, costs = capacities(canons, names, protected=protected,
+                                     baseline_hosts=cfg.baseline_hosts)
     out = {}
     for host, reading in readings.items():
         members = ([a for a in agents if a.get('host') == host]
@@ -185,10 +230,14 @@ def snapshot(cfg, db, canons, readings, *, now=None):
                 if ident.isdigit() and int(ident) in by_id and int(ident) not in present:
                     host_lots.append(by_id[int(ident)])
                     present.add(int(ident))
-        try:
-            history = storage.of(db).hosts.since(host, idle_s + fresh)
-        except Exception:
-            history = None
+        # History can only shorten a quiet interval: a reading that already
+        # excludes rest does not need the samples read (#4178).
+        history = None
+        if host in candidates:
+            try:
+                history = storage.of(db).hosts.since(host, idle_s + fresh)
+            except Exception:
+                history = None
         out[host] = project(reading, history, members, host_lots, now=now,
                             idle_after_s=idle_s, fresh_within=fresh,
                             capacity=capacity[host], cost_eur_h=costs[host], holds=holds)

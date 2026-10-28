@@ -4186,13 +4186,19 @@ _CANONS = threading.local()
 
 
 @contextlib.contextmanager
-def configured_cache():
+def configured_cache(cfg=None, canons=None):
     """Read the configured canons once inside the block.
 
     The cache never outlives the block: a long-lived process (`alerts
-    --follow`, the runner) must see canon changes at its next read."""
+    --follow`, the runner) must see canon changes at its next read.
+
+    ``cfg``/``canons`` seed the window with a list the caller has already
+    read (#4178): a projection that received its canons does not read them
+    again for each delegated authority check."""
     previous = getattr(_CANONS, "loaded", None)
     _CANONS.loaded = {}
+    if cfg is not None and canons is not None:
+        _CANONS.loaded[_configured_key(cfg, False)] = list(canons)
     try:
         yield
     finally:
