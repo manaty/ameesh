@@ -221,7 +221,8 @@ def record(db, source: BalanceSource, account: str | None = None,
             provider=source.provider, account=account, within_s=min_interval_s):
         return []
     rows = []
-    for reading in source.fetch():
+    readings = list(source.fetch())
+    for reading in readings:
         extra: dict = {}
         if account is not None:
             extra["account"] = account
@@ -233,7 +234,35 @@ def record(db, source: BalanceSource, account: str | None = None,
             available=reading.available, **extra)
         if row is not None:
             rows.append(row)
+    credit_state(db, source.provider, account, readings)
     return rows
+
+
+def _spendable(reading: BalanceReading) -> bool:
+    if reading.available is not None:
+        return bool(reading.available)
+    return float(reading.total) > 0.0
+
+
+def credit_state(db, provider: str, account: str | None,
+                 readings: list[BalanceReading]) -> bool | None:
+    """#4164 : un relevé de solde dit aussi l'état des crédits du compte —
+    aucune devise utilisable → `exhausted`, une utilisable → `ok` (s'il était
+    épuisé). La clé du compte fournisseur est (harnais = fournisseur, compte).
+    Une base sans migration 0500 n'empêche pas le relevé."""
+    from . import db as db_mod, provider_credits
+    if not readings:
+        return None
+    usable = [r for r in readings if _spendable(r)]
+    ref = usable[0] if usable else readings[0]
+    try:
+        return provider_credits.from_balance(
+            db, provider, account or "", ref.total if usable else min(0.0, ref.total),
+            ref.currency)
+    except db_mod.Unavailable:
+        raise
+    except db_mod.DbError:
+        return None
 
 
 def _bucket(ts: float, size: str) -> float:

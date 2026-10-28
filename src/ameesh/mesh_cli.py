@@ -1201,6 +1201,17 @@ def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: 
         "at a time" % cap if total > cap else ""))
 
 
+def _agent_credits(db, row: dict) -> tuple[str, list]:
+    """#4164 : (harnais, lignes de crédit à montrer) d'un agent — le compte
+    de sa session s'il est suivi, sinon les comptes non `ok` du harnais."""
+    from . import provider_credits
+    harness = registry.live_harness(row) or row.get("harness") or ""
+    credits = [r for r in provider_credits.listing(db) if r["harness"] == harness]
+    own = [r for r in credits
+           if (r.get("account") or "") == (row.get("session_account") or "")]
+    return harness, own or [r for r in credits if r.get("state") != provider_credits.OK]
+
+
 def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     from . import progress
     db = _open(cfg)
@@ -1211,6 +1222,7 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
             return 1
         from . import host_idle
         if args.json:
+            row = dict(row, provider_credits=_agent_credits(db, row)[1])
             print(json.dumps(row, ensure_ascii=False, indent=2))
             return 0
         # #2200 : la pause opérateur se lit dans le résumé texte, pas seulement
@@ -1272,6 +1284,15 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
                                    " (account %s)" % row["session_account"]
                                    if row.get("session_id") and row.get("session_account")
                                    else ""))
+        # #4164 : l'état réel des crédits du compte fournisseur de l'agent
+        from . import provider_credits
+        credit_harness, shown = _agent_credits(db, row)
+        if shown:
+            for r in shown:
+                print("credits  : %s %s" % (provider_credits.who(r["harness"], r.get("account")),
+                                           provider_credits.describe(r)))
+        elif credit_harness:
+            print("credits  : %s ok (no credit exhaustion seen)" % credit_harness)
         print("lease    : %s" % _lease(row))
         print("model    : %-9s budget: %s" % (row.get("model") or "—", _budget(row)))
         print("responsible: %s   team: %s%s" % (

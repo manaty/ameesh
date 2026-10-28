@@ -535,6 +535,7 @@ class TourDeRepriseTest(unittest.TestCase):
         with mock.patch.multiple(w, _marque_base=non, maybe_relocate=non, budget_ok=oui,
                                  _held_by_pressure=non, _host_pressure_release=mock.Mock(),
                                  host_ready=oui, workdir_ready=oui, auth_ready=oui,
+                                 credits_ready=oui,
                                  _lot_wake_spec=mock.Mock(return_value=None),
                                  _scheduled_wake_spec=mock.Mock(return_value=None)), \
                 mock.patch("ameesh.runner.registry.get", return_value={"status": "blocked"}), \
