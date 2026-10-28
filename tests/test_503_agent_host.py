@@ -641,6 +641,11 @@ class AgentHostTest(unittest.TestCase):
         return [l for l in self.units().splitlines()
                 if l.startswith('--user start ameesh-runner-agent@')]
 
+    def gestes(self):
+        """#4248 : gestes sur les unités, hors la lecture `list-units`."""
+        return [l for l in self.units().splitlines()
+                if not l.startswith('--user list-units ')]
+
     def stops(self):
         return [l for l in self.units().splitlines()
                 if l.startswith('--user stop ameesh-runner-agent@')]
@@ -650,7 +655,7 @@ class AgentHostTest(unittest.TestCase):
         p = self.run_vm()
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('runner environment file unreadable', p.stderr)
-        self.assertEqual(self.units(), '')
+        self.assertEqual(self.gestes(), [])
         self.assertFalse((self.state / 'systemd-run.log').exists())
 
     @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
@@ -866,7 +871,7 @@ class AgentHostTest(unittest.TestCase):
             self.fail('drain call outlived its deadline with a live SSH client')
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn('appel de drain expiré', stderr)
-        self.assertEqual(self.units(), '')
+        self.assertEqual(self.gestes(), [])
 
     def test_the_local_deadline_leaves_a_margin_to_the_remote_one(self):
         """#2198/N2 : la borne locale vaut DRAIN_APPEL_DELAI plus une marge,
@@ -1561,7 +1566,7 @@ class AgentHostTest(unittest.TestCase):
     def test_moved_agent_is_skipped_before_restart(self):
         p = self.run_vm(scenario='moved-before')
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(self.units(), '')
+        self.assertEqual(self.gestes(), [])
         self.assertIn('dev9 : déplacé ou mode non execute (hôte=elsewhere), ignoré', p.stdout)
 
     def test_host_change_after_restart_is_not_a_valid_proof(self):
@@ -1590,19 +1595,19 @@ class AgentHostTest(unittest.TestCase):
             with self.subTest(scenario=scenario):
                 p = self.run_vm(scenario=scenario)
                 self.assertNotEqual(p.returncode, 0)
-                self.assertEqual(self.units(), '')
+                self.assertEqual(self.gestes(), [])
 
     def test_empty_host_is_not_green(self):
         p = self.run_vm(agents=[])
         self.assertNotEqual(p.returncode, 0)
-        self.assertEqual(self.units(), '')
+        self.assertEqual(self.gestes(), [])
         self.assertIn('aucun agent', p.stderr)
 
     def test_registry_name_is_validated_before_shell_interpolation(self):
         p = self.run_vm(agents=[dict(name='dev9;touch injected', host='host-agents',
                                      mode='execute', status='idle')])
         self.assertNotEqual(p.returncode, 0)
-        self.assertEqual(self.units(), '')
+        self.assertEqual(self.gestes(), [])
         self.assertIn('invalide', p.stderr)
 
     def test_all_valid_registry_names_restart(self):
