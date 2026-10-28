@@ -125,10 +125,6 @@ class PreuveManquante(Exception):
     """Une preuve d'activation manque : aucun signal de reussite."""
 
 
-class RechercheNonExhaustive(Exception):
-    """L'absence d'un envoi n'a pas pu etre prouvee : ne rien renvoyer."""
-
-
 def prefixe_du_commit(sha: str, vu: str) -> bool:
     """`vu` est un prefixe non vide de `sha` (le poste publie un nom court)."""
     sha, vu = (sha or "").lower(), (vu or "").lower()
@@ -752,13 +748,6 @@ def main(argv: list[str] | None = None) -> int:
                 continue
         try:
             deja = deja_emis(nom, cle)
-        except RechercheNonExhaustive as exc:
-            # absence non prouvee : renvoyer risquerait un doublon ; la marque
-            # reste ambigue et le relais operateur verifie le depot.
-            ambigus.append(nom)
-            print("emission ambigue pour %s, aucun renvoi (relais operateur) : %s"
-                  % (nom, exc), file=sys.stderr)
-            continue
         except Exception as exc:  # noqa: BLE001 — sans relecture, absence non prouvee
             # la relecture a echoue (base injoignable, erreur de lecture), donc
             # l'absence du depot n'est pas prouvee. La marque durable reste ambigue et le
