@@ -142,6 +142,25 @@ class NumerosDuDepotTest(unittest.TestCase):
             found = migrations.repo_numbers(repo, NEXLINK, worktree=False)
             self.assertEqual(sorted(found), [598, 599, 603])
             self.assertNotIn("origin/agent/x-4079:602_key.sql", sum(found.values(), []))
+            # le clone de lecture est resté sur la branche fusionnée : son
+            # fichier commité ne compte pas, un ajout local si (revue cx3)
+            _git(repo, "checkout", "-q", "agent/x-4079")
+            with open(os.path.join(repo, NEXLINK.directory, "604_local.sql"), "w") as fh:
+                fh.write("--")
+            found = migrations.repo_numbers(repo, NEXLINK)
+            self.assertEqual(sorted(found), [598, 599, 603, 604])
+            self.assertEqual(found[604], ["worktree:604_local.sql"])
+            # HEAD détaché sur un commit déjà contenu dans le tronc : idem
+            _git(repo, "checkout", "-q", "--detach", "agent/x-4079")
+            self.assertEqual(sorted(migrations.repo_numbers(repo, NEXLINK)),
+                             [598, 599, 603, 604])
+            # `agent/main` n'est pas un tronc : fusionnée, elle ne compte pas
+            _git(repo, "update-ref", "refs/heads/agent/main", "refs/heads/agent/x-4079")
+            self.assertNotIn(602, migrations.repo_numbers(repo, NEXLINK))
+            # une branche non fusionnée garde son arbre de travail entier
+            _git(repo, "checkout", "-q", "agent/y-4078")
+            self.assertIn("worktree:603_open.sql",
+                          migrations.repo_numbers(repo, NEXLINK)[603])
 
     def test_la_cible_seule_est_lue(self):
         """#2620 : un numéro exact ne lit que la branche cible — ni l'arbre de

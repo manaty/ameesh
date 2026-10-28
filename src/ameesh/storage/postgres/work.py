@@ -2424,7 +2424,8 @@ class WorkItems(interface.WorkItems):
         """#1567 : enregistre (ou corrige) le numéro atterri d'un lot **déjà**
         fusionné ou promu, dans une transaction avec sa ligne de journal ; None
         si le lot n'est pas terminal. La réservation (`migration`,
-        `migration_repo`) n'est pas touchée : elle peut déjà être libérée."""
+        `migration_repo`) n'est pas touchée : elle peut déjà être libérée ;
+        le créneau `default` atterri, lui, suit le numéro posé (#4097)."""
         with self.db.transaction() as tx:
             rows = tx.query(
                 "UPDATE work_items SET migration_landed = %s, migration_landed_repo = %s,"
