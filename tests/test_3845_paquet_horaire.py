@@ -163,6 +163,40 @@ class ComposeTest(Base):
         self.assertIn("ci-full demandée", ph.tick(self.ctx))
         self.assertEqual(len(self.shell.ran("work", "add")), 1)
 
+    def test_sans_fusion_vue_le_creneau_reste_consomme(self):
+        # #4171 (b) : l'heure reste le rythme minimum ; seul un porteur dont la
+        # fusion est vue libère le créneau, tout autre état le garde.
+        for state, reason in (("intake", ""), ("build", ""), ("qa", ""), ("blocked", ""),
+                              ("waiting_human", ""), ("closed", "abandoned"),
+                              ("closed", "superseded"), ("closed", "")):
+            row = dict(carrier(lot=3990), state=state, close_reason=reason,
+                       created_ts=NOW - 60)
+            self.assertTrue(ph.slot_served([row], NOW, ZONE, "ameesh", "main"),
+                            (state, reason))
+        # un porteur de l'heure précédente ne consomme pas le créneau courant
+        old = dict(carrier(lot=3990), state="closed", close_reason="abandoned",
+                   created_ts=ph.hour_start(NOW, ZONE) - 1)
+        self.assertFalse(ph.slot_served([old], NOW, ZONE, "ameesh", "main"))
+
+    def test_enchainement_epoque_perimee_ne_compose_pas(self):
+        # #4171 (a) : le créneau libéré par une fusion vue ne lève pas la
+        # garde d'époque de #4113 (paquet-auto.check_epoch) : bail périmé →
+        # rien de poussé, ni gel ni ci-full, échec signalé au pilote.
+        self.shell.lists[""] = [dict(carrier(lot=3990), state="merged", created_ts=NOW - 60)]
+        self.ctx.epoch = 279
+        self.shell.auto_rc = 1
+        self.shell.auto_out = ("paquet-auto : composition interrompue avant la prochaine "
+                               "opération : époque du bail 279 périmée\n")
+        with self.assertRaises(ph.HoraireError):
+            ph.tick(self.ctx)
+        self.assertEqual(self.shell.ran("ci", "run"), [])
+        self.assertEqual(self.shell.ran("work", "reviewer"), [])
+        notes = [c[c.index("note") + 2] for c in self.shell.ran("work", "note")]
+        self.assertTrue(any(n.startswith(ph.MARK_ATTEMPT) and "epoque=279" in n
+                            for n in notes), notes)
+        self.assertTrue(any(n.startswith(ph.MARK_FAILED) for n in notes), notes)
+        self.assertIn("époque", self.shell.mails[-1][1])
+
     def test_porteur_ouvert_dans_l_heure_reserve_la_cible(self):
         self.shell.lists["qa"] = [carrier(lot=3990, created=NOW - 60)]
         self.shell.lists[""] = [carrier(lot=3990, created=NOW - 60)]
