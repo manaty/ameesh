@@ -3,7 +3,7 @@
 
 Témoin du lot : la même lecture deux fois, la seconde sans processus
 `git grep` (le cache en mémoire de #3753 est vidé entre les deux, comme entre
-deux exécutions). Un autre arbre ou d'autres motifs relancent le balayage ; un
+deux exécutions). Un autre arbre relance le balayage, mais pas d'autres motifs ; un
 échec n'est jamais gardé. Une échéance épuisée refuse en nommant le lot et
 l'étape, même quand une couche intermédiaire l'a lue comme un doute.
 """
@@ -102,20 +102,27 @@ class GrepCacheTest(unittest.TestCase):
         self.assertEqual(value, set())
         self.assertEqual(launched, 0)
 
-    def test_another_tree_or_other_patterns_grep_again(self):
+    def test_another_tree_greps_again_but_other_patterns_share_the_tree(self):
         self.counted(review_authors._tree_lines, self.repo, self.first, ["un = 1"])
         self.write("b.py", "un = 1\n")
         second = self.commit()
         value, launched = self.counted(review_authors._tree_lines, self.repo,
                                        second, ["un = 1"])
         self.assertEqual((value, launched), ({"un = 1"}, 1))
-        _value, launched = self.counted(review_authors._tree_lines, self.repo,
-                                        self.first, ["un = 1", "trois = 3"])
-        self.assertEqual(launched, 1)
+        value, launched = self.counted(review_authors._tree_lines, self.repo,
+                                       self.first, ["trois = 3", "absente"])
+        self.assertEqual((value, launched), ({"trois = 3"}, 0))
         # le mode binaire (-a) n'est pas le mode texte (-I)
         _value, launched = self.counted(review_authors._tree_lines, self.repo,
                                         self.first, ["un = 1"], binary=True)
         self.assertEqual(launched, 1)
+
+    def test_old_pattern_limited_entries_do_not_hide_other_lines(self):
+        grep_cache.cached(self.repo, self.first, "lines-I", ["un = 1"],
+                          lambda: ["un = 1"])
+        value, launched = self.counted(review_authors._tree_lines, self.repo,
+                                       self.first, ["trois = 3"])
+        self.assertEqual((value, launched), ({"trois = 3"}, 1))
 
     def test_the_same_tree_in_another_commit_shares_the_entry(self):
         self.counted(review_authors._tree_lines, self.repo, self.first, ["un = 1"])
@@ -310,7 +317,7 @@ class SweepDeadlineTest(unittest.TestCase):
                 with self.assertRaises(review_authors.SweepDeadline) as caught:
                     review_authors._tree_lines(self.tmp, self.head, ["un = 1"])
         self.assertIn("lot #42", str(caught.exception))
-        self.assertIn("git grep -h -I -F -f - %s" % self.head, str(caught.exception))
+        self.assertIn("git grep -h -I -G -f - %s" % self.head, str(caught.exception))
         self.assertTrue(sweep.tripped.startswith("git grep"))
         self.assertEqual(_greps(run), 0)
 
@@ -335,7 +342,7 @@ class SweepDeadlineTest(unittest.TestCase):
                 merge_queue.readiness(None, 3974, self.tmp)
         text = str(caught.exception)
         self.assertIn("lot #3974", text)
-        self.assertIn("git grep -h -I -F -f -", text)
+        self.assertIn("git grep -h -I -G -f -", text)
 
     def test_a_deadline_read_as_doubt_still_refuses(self):
         def swallowed(*_args, **_kwargs):
