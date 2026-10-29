@@ -610,15 +610,17 @@ class Agents(interface.Agents):
         )
 
     def reachability(self) -> list[dict]:
-        # #3631 : la passe de redésignation n'a besoin que de ces six
+        # #3631 : la passe de redésignation n'a besoin que de ces sept
         # colonnes ; `overview()` y ajoutait le canon, les baux, les jauges et
         # des colonnes larges (`pending_prompt`, `last_error`), et expirait
         # sous la pression de la base commune. `retired_ts` est la forme que
-        # lit `review_designation.is_retired`.
+        # lit `review_designation.is_retired` ; `status_text` porte le préfixe
+        # `auth_blocked` (#4491), court et nécessaire pour que le siège bloqué
+        # ne soit pas laissé en place.
         return self.db.query(
             "SELECT name, aliases,"
             "       extract(epoch from retired_at)::float8 AS retired_ts,"
-            "       mode, status, host"
+            "       mode, status, status_text, host"
             "  FROM agent_registry"
             " ORDER BY name")
 

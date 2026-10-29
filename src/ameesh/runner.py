@@ -11240,8 +11240,8 @@ class Runner:
         readable) can lift the cause after the freeze; the freeze is kept, so
         the same head is replayed, never a newer one. #3328: the same pass
         reattributes a seat whose designated reviewer became unreachable (host
-        closed, stopped/dead). Bounded and never fatal: the canon sync must not
-        fail because a designation retry did."""
+        closed, stopped/dead, blocked/auth_blocked #4491). Bounded and never
+        fatal: the canon sync must not fail because a designation retry did."""
         if getattr(self, "mediated", False):
             return
         if not getattr(self, "_designation_retry_ready", False):
