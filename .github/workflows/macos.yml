@@ -138,6 +138,9 @@ jobs:
           && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: macos-26-intel
     strategy:
+      # #4557 : deux parts longues au plus par run, même la nuit : le job
+      # court requis platform-macos doit pouvoir accéder aux runners hébergés.
+      max-parallel: 2
       # N1 de la revue #393 : toutes les parts tournent avant l'échec ; une
       # part rouge n'annule pas les autres.
       fail-fast: false

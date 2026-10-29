@@ -165,6 +165,20 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
         self.assertIn("part: ${{ fromJSON(needs.plan.outputs.psycopg) }}", self.suite)
         self.assertIn("--part ${{ matrix.part }} --driver psycopg", self.suite)
 
+    def test_long_suite_leaves_hosted_capacity_for_the_required_short_job(self):
+        # #4557 : huit parts longues en file affamaient platform-macos.
+        # Lire la stratégie YAML effective : un commentaire ou un plafond
+        # posé sur un autre job ne protège pas le paquet.
+        import yaml
+
+        with open(MACOS, encoding="utf-8") as fh:
+            workflow = yaml.safe_load(fh)
+        strategy = workflow["jobs"]["suite"]["strategy"]
+        ceiling = strategy.get("max-parallel")
+        self.assertIs(type(ceiling), int, "plafond constant requis")
+        self.assertGreaterEqual(ceiling, 1)
+        self.assertLessEqual(ceiling, 2, "laisser de la capacité au job court")
+
     def test_each_part_reads_the_plan_of_the_plan_job(self):
         # #1256 B4 : le plan téléchargé est vérifié par l'empreinte que le job
         # plan publie en sortie ; une part au plan différent n'exécute rien.
