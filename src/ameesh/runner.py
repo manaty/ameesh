@@ -58,7 +58,7 @@ import threading
 import time
 import uuid
 
-from . import account_budget, account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
+from . import account_budget, account_turn, adapters, admission_lock, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import rate_limit as rate_limit_mod
@@ -571,6 +571,9 @@ class AgentWorker(threading.Thread):
         self.epoch = int(lease["lease_epoch"])
         self.agent = agent
         self.wake = threading.Event()
+        #: #4602 : un signal de travail (courrier) a réveillé ce worker ; sa
+        #: prochaine passe d'admission base passe avant les sondages au repos.
+        self._priority_wake = False
         self.stopping = threading.Event()
         self.lease_lost = threading.Event()
         self.proc: subprocess.Popen | None = None
@@ -8901,6 +8904,7 @@ class AgentWorker(threading.Thread):
 
     def process_once(self, wait_seconds: float) -> bool:
         """Mode banc : au plus un tour, en attendant `wait_seconds` du travail."""
+        admission_lock.reset()  # #4602 : le fil appelant est ordinaire
         self.ensure_watchdog()
         self.ensure_peek()
         deadline = time.monotonic() + max(0.0, wait_seconds)
@@ -8929,12 +8933,27 @@ class AgentWorker(threading.Thread):
             self.wake.wait(timeout=min(0.25, max(0.02, deadline - time.monotonic())))
             self.wake.clear()
 
+    def _admission_priority(self) -> None:
+        """#4602 : applique au fil la classe de la passe qui commence.
+
+        Un réveil de travail est consommé par cette passe : la passe suivante
+        repart NORMAL, sauf nouvelle notification. Sans cela un worker réveillé
+        une fois garderait la priorité pour toutes ses passes au repos."""
+        prioritaire, self._priority_wake = self._priority_wake, False
+        admission_lock.set_priority(
+            admission_lock.CONTROL if prioritaire else admission_lock.NORMAL)
+
     def run(self) -> None:
         """Mode service : boucle jusqu'à l'arrêt, réveillée par NOTIFY."""
         self.ensure_watchdog()
         self.ensure_peek()
         try:
             while not self.stopping.is_set() and not self.runner.stop.is_set():
+                # #4602 : la passe qui suit un réveil de travail passe avant
+                # les passes de sondage des autres agents ; la classe est
+                # consommée par cette passe (une nouvelle notification la
+                # repose). Sans réveil, la passe reste NORMAL.
+                self._admission_priority()
                 self._apply_pending_config()  # une pause budget doit voir les comptes relus
                 if self.runner.draining.is_set():
                     break  # drainage : le tour d'avant est fini, aucun autre ne part
@@ -9006,6 +9025,10 @@ class AgentWorker(threading.Thread):
                     if attente_reprise > 0:
                         self._attendre_reprise(attente_reprise)
                         continue
+                    # #4602 : une notification a pu arriver pendant les
+                    # lectures de cette passe ; le choix du tour passe alors
+                    # en CONTROL sans attendre la passe suivante.
+                    self._admission_priority()
                     spec = self._pick_for_turn()
                     if spec is not None and self._moved_before_turn(spec):
                         break
@@ -9077,6 +9100,9 @@ class AgentWorker(threading.Thread):
                     attente = self._until_due(min(attente, self.runner.poll))
                 self._attendre_apres_echec(attente)
         finally:
+            # #4602 : un worker qui sort ne laisse pas sa classe d'admission
+            # derrière lui (le fil meurt, mais le nettoyage reste explicite).
+            admission_lock.reset()
             # #1914 : le worker qui s'arrête ne laisse pas derrière lui un
             # blocage « session lock held » périmé (levé sous bail : si un
             # remplaçant a déjà repris la main, la marque n'est plus la nôtre
@@ -9159,6 +9185,11 @@ class Runner:
         #: #1466 : empreinte des fichiers lus au dernier chargement
         self._config_stamp = self.config_stamp()
         self.db = db
+        #: #4602 : signale une attente longue sur la connexion partagée, pour
+        #: rendre visible l'étage qui retarde le grant d'un tour réveillé.
+        self._db_wait_seen: dict[str, float] = {}
+        self._db_wait_lock = threading.Lock()
+        admission_lock.set_wait_observer(self._db_wait_notice)
         self.host = cfg.host
         self.runner_id = cfg.runner
         from .agent_names import resolve
@@ -10754,6 +10785,25 @@ class Runner:
         return True
 
     # -- écoute ------------------------------------------------------------
+    #: #4602 : au plus une ligne par agent et par fenêtre pour une attente
+    #: d'admission base longue (le seuil du verrou est `admission_lock.WARN_S`).
+    DB_WAIT_NOTICE_S = 30.0
+
+    def _db_wait_notice(self, name: str, waited: float) -> None:
+        """Journalise une attente longue sur la connexion partagée (#4594).
+
+        Le verrou prioritaire appelle ceci hors de sa condition ; on ne écrit
+        qu'une ligne par agent et par fenêtre, et jamais depuis un chemin qui
+        pourrait bloquer l'admission (file de journal bornée)."""
+        now = time.monotonic()
+        with self._db_wait_lock:
+            last = self._db_wait_seen.get(name, 0.0)
+            if now - last < self.DB_WAIT_NOTICE_S:
+                return
+            self._db_wait_seen[name] = now
+        log_async("[%s] deferred: shared database admission (queued %.1fs)"
+                  % (name, waited))
+
     def dispatch(self, item: dict) -> None:
         """Réveille (ou préempte) le worker visé, **signal avant journal**.
 
@@ -10798,12 +10848,15 @@ class Runner:
                 # des dizaines de passes au repos ; le réveil ne doit pas
                 # dépendre de cette file. Le contrôle d'urgence vient ensuite,
                 # et #2810 couvre la course avec un tour qui a déjà commencé.
+                # #4602 : cette passe d'admission du worker passe en tête.
+                worker._priority_wake = True
                 worker.wake.set()
             if payload.get("restart"):
                 # `ameesh restart` (L26) : le NOTIFY n'est qu'un réveil ; la
                 # demande est relue en base avant d'arrêter quoi que ce soit.
                 if worker is not None:
-                    agent = registry.get(self.db, target) or {}
+                    with admission_lock.priority_for(admission_lock.CONTROL):
+                        agent = registry.get(self.db, target) or {}
                     if agent.get("restart_requested_ts"):
                         worker.request_restart()  # le signal d'abord
                         log_async("restart requested for %s: stopping the turn" % target)
@@ -10812,7 +10865,8 @@ class Runner:
             prioritaire = False
             row = None
             if worker is not None and payload.get("id"):
-                row = mail.get(self.db, int(payload["id"]))
+                with admission_lock.priority_for(admission_lock.CONTROL):
+                    row = mail.get(self.db, int(payload["id"]))
                 if row and mail.is_urgent(row):
                     prioritaire = worker.interrupt_allowed(row)
                     if not prioritaire:
@@ -10838,6 +10892,7 @@ class Runner:
                 log_async("message for %s: waking the turn" % target)
             else:
                 for autre in self.workers.values():
+                    autre._priority_wake = True
                     autre.wake.set()
         self.wake_all.set()
 
@@ -10845,6 +10900,10 @@ class Runner:
         """Écoute LISTEN/NOTIFY, reconnectée après une coupure (L72) : attente
         croissante tant que la base ne répond pas (le sondage `poll` des
         workers et de la passe prend le relais), journal borné."""
+        #: #4602 : le listener est un fil de contrôle ; ses lectures (`mail.get`
+        #: du dispatch, `registry.get` d'un restart) passent avant les passes
+        #: au repos pour que le réveil ne soit pas retenu par la file.
+        admission_lock.set_priority(admission_lock.CONTROL)
         reprise = Reprise(self.db_retry_max, minimum=1.0)
         annonce = False
         while not self.stop.is_set():
@@ -13150,6 +13209,9 @@ class Runner:
         return list(running.get(row["turn_id"], []))
 
     def run(self) -> int:
+        # #4602 : le fil principal de l'exécuteur est ordinaire ; une classe
+        # posée par un test ou un appelant ne doit pas survivre à l'entrée.
+        admission_lock.reset()
         log("starting: host %s, runner %s, driver %s, schema %s, mail "
             "batch %ds (L125); config %s" % (self.host, self.runner_id, self.db.name,
                                              self.cfg.schema, int(self.mail_batch),
