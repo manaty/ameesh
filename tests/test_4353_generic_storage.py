@@ -95,6 +95,18 @@ class GenericDeliveryTest(PgTestCase):
                              " AND kind = 'merged'", (lot,))
         self.assertEqual(len(rows), 1)
 
+    def test_sql_reviewer_audit_preserves_phase_and_merge_annulment(self):
+        lot = self.lot()
+        self.db.execute("UPDATE work_items SET state = 'merged', reviewer = 'reviewer',"
+                        " reviewers = ARRAY['reviewer'] WHERE id = %s", (lot,))
+        self.db.execute("UPDATE work_items SET assignee = 'reviewer' WHERE id = %s", (lot,))
+        events = work.events(self.db, lot)
+        self.assertEqual(events[0]['actor'], 'db:reviewers_sync')
+        self.assertEqual(events[0]['state'], 'merged')
+        work.move(self.db, lot, 'build', correct='wrong merge')
+        marks = [m for m in work.milestones(self.db, lot) if m['kind'] == 'merged']
+        self.assertTrue(marks[0]['annulled'])
+
     def test_fingerprint_can_recur_after_generic_delivery(self):
         first = self.lot()
         self.db.execute("UPDATE work_items SET source = 'empreinte:4353', state = 'merged'"

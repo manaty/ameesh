@@ -206,7 +206,11 @@ class _Witness(PgTestCase):
         _git(self.repo, "checkout", "-q", "-b", branch, "develop")
         self.commit(name)
         sha = _git(self.repo, "rev-parse", "HEAD")
-        work.milestone(self.db, lot, "frozen", sha=sha, actor="claude1")
+        # Repository discovery is not this witness: unassigned imported lots
+        # otherwise search the real host's neighbouring worktrees for the SHA.
+        from ameesh import review_designation_activation
+        with mock.patch.object(review_designation_activation, "_repository", return_value=self.repo):
+            work.milestone(self.db, lot, "frozen", sha=sha, actor="claude1", repo=self.repo)
         return sha
 
     def review_lots(self, lot):

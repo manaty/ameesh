@@ -95,6 +95,39 @@ begin
     return NEW;
 end $$;
 
+create or replace function work_item_reviewers_audit() returns trigger
+language plpgsql as $$
+declare
+    name text;
+    previous text[];
+    remaining text[];
+begin
+    -- Les chemins Python journalisent déjà le retrait avec leur acteur ; ils
+    -- posent ce drapeau pour ne pas doubler la ligne.
+    if current_setting('ameesh.reviewer_audit', true) = 'python' then
+        return null;
+    end if;
+    previous := coalesce(old.reviewers, '{}');
+    if coalesce(old.reviewer, '') <> ''
+       and not old.reviewer = any(previous) then
+        previous := array_append(previous, old.reviewer);
+    end if;
+    remaining := coalesce(new.reviewers, '{}');
+    foreach name in array previous loop
+        if coalesce(name, '') <> '' and name <> '-none'
+           and name = new.assignee
+           and not name = any(remaining) then
+            insert into work_item_events (work_item_id, state, note, actor)
+            values (new.id, new.state,
+                    'reviewer ' || name || ' cleared (they now hold the lot)',
+                    'db:reviewers_sync');
+        end if;
+    end loop;
+    return null;
+end;
+$$;
+
+
 DROP INDEX IF EXISTS work_items_fingerprint_open_uniq;
 CREATE UNIQUE INDEX work_items_fingerprint_open_uniq ON work_items (lower(source))
  WHERE source LIKE 'empreinte:%' AND state NOT IN ('merged', 'promoted', 'closed');

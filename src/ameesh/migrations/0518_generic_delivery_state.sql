@@ -142,6 +142,39 @@ BEGIN
     RETURN NEW;
 END $$;
 
+create or replace function work_item_reviewers_audit() returns trigger
+language plpgsql as $$
+declare
+    name text;
+    previous text[];
+    remaining text[];
+begin
+    -- Les chemins Python journalisent déjà le retrait avec leur acteur ; ils
+    -- posent ce drapeau pour ne pas doubler la ligne.
+    if current_setting('ameesh.reviewer_audit', true) = 'python' then
+        return null;
+    end if;
+    previous := coalesce(old.reviewers, '{}');
+    if coalesce(old.reviewer, '') <> ''
+       and not old.reviewer = any(previous) then
+        previous := array_append(previous, old.reviewer);
+    end if;
+    remaining := coalesce(new.reviewers, '{}');
+    foreach name in array previous loop
+        if coalesce(name, '') <> '' and name <> '-none'
+           and name = new.assignee
+           and not name = any(remaining) then
+            insert into work_item_events (work_item_id, state, note, actor)
+            values (new.id, case when new.state = 'delivered' then new.legacy_state else new.state end,
+                    'reviewer ' || name || ' cleared (they now hold the lot)',
+                    'db:reviewers_sync');
+        end if;
+    end loop;
+    return null;
+end;
+$$;
+
+
 -- No event is appended for this representation change. Existing steps of
 -- pinned Process lots are preserved, including custom names.
 UPDATE work_items SET state = state WHERE legacy_state IS NULL;
