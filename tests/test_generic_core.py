@@ -173,6 +173,12 @@ class GenericCoreTest(unittest.TestCase):
         self.assertEqual(scan_template("const state = 'qa'; const merged = true;"),
                          {"state:qa": 1})
 
+    def test_the_workspaces_facade_is_read_through_the_registry(self):
+        """L101 T4: the core asks the registry for `dev`, never imports it."""
+        source = (SOURCE / "workspaces.py").read_text()
+        self.assertIn('registry.get("dev")', source)
+        self.assertEqual(scan_python(source, "workspaces.py")["module-import"], 0)
+
     def test_legacy_terminal_and_completed_semantics_remain_distinct(self):
         self.assertEqual(work.STATES, ("intake", "build", "qa", "validated", "merged", "promoted",
                                        "blocked", "waiting_human", "closed"))

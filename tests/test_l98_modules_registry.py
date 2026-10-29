@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 
 from tests import support  # isolate host config before product imports
-from ameesh import main as ameesh_main, modules, version
+from ameesh import main as ameesh_main, modules, version, workspaces
 from ameesh.modules import registry
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +81,7 @@ class BareProfileTest(unittest.TestCase):
         self.assertEqual(found.modules, ())
         self.assertEqual(found.refused, ())
         with bare():
+            self.assertIsNone(registry.get("dev"))
             code, out = run(["modules", "--json"])
             self.assertEqual((code, json.loads(out)), (0, {"modules": [], "refused": []}))
             code, out = run(["modules"])
@@ -106,7 +107,7 @@ class RegistryTest(unittest.TestCase):
             found = registry.discover()
             installed = modules.installed()
         it = found.get("it")
-        self.assertEqual(found.names(), ["it"])
+        self.assertEqual(found.names(), ["dev", "it"])
         self.assertEqual((it.source, it.version, it.cli),
                          ("builtin", version(), "ameesh module it"))
         self.assertEqual(it.capabilities, ("lifecycle", "cli", "audit"))
@@ -116,6 +117,77 @@ class RegistryTest(unittest.TestCase):
         with points():
             proof = {row["name"]: row for row in modules.evidence()}
         self.assertEqual(proof["it"]["descriptor_sha256"], it.descriptor_sha256)
+
+    def test_dev_is_listed_as_builtin_tooling_through_the_registry(self):
+        """L101 T4: `dev` joins the Module interface, without a work type."""
+        with points():
+            found = registry.discover()
+            installed = modules.installed()
+        dev = found.get("dev")
+        self.assertIsNotNone(dev)
+        self.assertEqual((dev.source, dev.version, dev.cli, dev.entry_point),
+                         ("builtin", version(), None, None))
+        self.assertEqual(dev.capabilities, ("audit", "workspaces"))
+        self.assertEqual(dev.storage, ())
+        self.assertEqual(len(dev.descriptor_sha256), 64)
+        # The façade the core obtains is the workspaces module, through `dev`.
+        self.assertIs(registry.get("dev"), installed["dev"])
+        self.assertIs(installed["dev"].workspaces(), workspaces)
+        self.assertIn("workspaces", registry.CAPABILITIES)
+        self.assertEqual(installed["dev"].descriptor({}), {
+            "types": [], "schemas": {}, "rules": []})
+
+    def test_dev_descriptor_takes_no_option_and_declares_no_type(self):
+        with points():
+            dev = modules.installed()["dev"]
+        with self.assertRaisesRegex(ValueError, "unknown dev module option"):
+            dev.descriptor({"require_qa": ["promoted"]})
+
+    def test_an_external_empty_type_descriptor_is_still_refused(self):
+        """The empty-type tolerance is for trusted built-ins only (L101 T4)."""
+        empty = sample(descriptor=lambda options=None: {
+            "types": [], "schemas": {}, "rules": []})
+        with points(FakeEntryPoint(empty)):
+            found = registry.discover()
+        self.assertIsNone(found.get("sample"))
+        self.assertIn("types must be unique non-empty names",
+                      found.refused[0]["error"])
+
+    def test_dev_audit_delegates_the_canon_workspaces_checks(self):
+        """L101 T4: `audit` is a thin, read-only Module view of `canon check`."""
+        from ameesh import canon
+        from ameesh.modules import dev
+        missing = canon.Finding("host-work-dir-missing", canon.WARNING,
+                                "agent a on host h: no working directory",
+                                host="h", agent="a", member="m", path="p")
+        unknown = canon.Finding("host-workspaces-unknown", canon.WARNING,
+                                "`policy.workspaces.dir`: unknown key", host="h")
+        other = canon.Finding("agent-unplaced", canon.WARNING, "not a workspace")
+        with mock.patch("ameesh.config.load", return_value=object()), \
+                mock.patch("ameesh.canon.load_configured", return_value=[object()]), \
+                mock.patch("ameesh.canon.validate",
+                           return_value=[missing, unknown, other]):
+            findings = dev.audit(mock.Mock(), "acme")
+        self.assertEqual([f["rule"] for f in findings],
+                         ["host-work-dir-missing", "host-workspaces-unknown"])
+        self.assertEqual((findings[0]["type"], findings[0]["module"],
+                          findings[0]["project"], findings[0]["agent"]),
+                         ("module_deviation", "dev", "acme", "a"))
+        self.assertIn("no working directory", findings[0]["detail"])
+
+    def test_dev_audit_is_empty_without_a_readable_canon(self):
+        from ameesh.modules import dev
+        with mock.patch("ameesh.config.load", return_value=object()), \
+                mock.patch("ameesh.canon.load_configured", return_value=[]):
+            self.assertEqual(dev.audit(mock.Mock(), "acme"), [])
+
+    def test_the_bare_profile_audits_no_module(self):
+        """No built-in module (bare profile): an active name runs no hook."""
+        from ameesh.modules.storage import ModuleStore
+        with mock.patch("ameesh.modules._builtin", return_value={}), \
+                mock.patch.object(ModuleStore, "active",
+                                  return_value=[{"project": "acme", "module": "dev"}]):
+            self.assertEqual(modules.audit(mock.Mock()), [])
 
     def test_an_external_entry_point_is_described(self):
         with points(FakeEntryPoint(sample())):
@@ -145,7 +217,8 @@ class RegistryTest(unittest.TestCase):
             code, out = run(["modules", "--json"])
         self.assertEqual(code, 1)
         payload = json.loads(out)
-        self.assertEqual([row["name"] for row in payload["modules"]], ["it", "sample"])
+        self.assertEqual([row["name"] for row in payload["modules"]],
+                         ["dev", "it", "sample"])
         errors = {row["name"]: row["error"] for row in payload["refused"]}
         self.assertIn("cannot be loaded: boom", errors["broken"])
         self.assertEqual(errors["it"], "duplicate installed module: 'it'")

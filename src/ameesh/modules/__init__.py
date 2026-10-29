@@ -4,7 +4,9 @@
 The canon selects installed names, never executable import paths. Module
 descriptors supply types, milestone schemas and generic lifecycle requirements.
 
-The built-in registry holds ameesh's own modules (``it``). An operator may also
+The built-in registry holds ameesh's own modules (``dev``, ``it``). ``dev`` is
+development tooling: it declares no work item type and is always active, while
+``it`` is a lifecycle module the canon selects per project. An operator may also
 install an external descriptor distribution in the same environment; it exposes
 an ``ameesh.modules`` entry point whose name is the module name and whose target
 is a module (or object) with ``NAME`` and ``descriptor(options)``. External
@@ -32,8 +34,8 @@ DESCRIPTOR_KEYS = ("types", "schemas", "rules")
 
 
 def _builtin():
-    from . import it
-    return {it.NAME: it}
+    from . import dev, it
+    return {dev.NAME: dev, it.NAME: it}
 
 
 def _entry_points():
@@ -57,8 +59,12 @@ def _distribution(entry):
     return name, version
 
 
-def _validate_descriptor(name, descriptor):
-    """Refuse a descriptor that cannot become a project policy row."""
+def _validate_descriptor(name, descriptor, *, allow_empty=False):
+    """Refuse a descriptor that cannot become a project policy row.
+
+    A built-in tooling module may declare no work item type (``dev``, L101 T4):
+    ``allow_empty`` is for the trusted built-ins only. An installed external
+    descriptor is a lifecycle extension and must declare at least one type."""
     if not isinstance(descriptor, dict):
         raise ValueError("installed module %r: descriptor must be a mapping" % name)
     extra = set(descriptor) - set(DESCRIPTOR_KEYS)
@@ -67,7 +73,7 @@ def _validate_descriptor(name, descriptor):
         raise ValueError("installed module %r: descriptor keys must be %s"
                          % (name, ", ".join(DESCRIPTOR_KEYS)))
     types = descriptor["types"]
-    if (not isinstance(types, list) or not types
+    if (not isinstance(types, list) or (not types and not allow_empty)
             or any(not isinstance(kind, str) or not NAME.fullmatch(kind)
                    for kind in types)
             or len(set(types)) != len(types)):
