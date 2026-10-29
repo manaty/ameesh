@@ -68,11 +68,16 @@ except Exception:  # pragma: no cover - dépend de l'environnement
 
 #: `Persona` (L51, 0029/0032) replaces `Agent`; both card types remain
 #: readable during the transition. `Process` (#538) carries the working rules
-#: (`processus/*.md`), read to open every agent's brief.
+#: (`processus/*.md`), read to open every agent's brief. `Pipeline` (L103,
+#: #4395) declares a pipeline (`pipelines/*.md`), a module without code.
 PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage",
-                 "Process")
+                 "Process", "Pipeline")
 #: #538 : une fiche Process (`processus/*.md`) porte les règles de travail.
 PROCESS_TYPE = "Process"
+#: L103 (#4395) : une carte Pipeline (`pipelines/*.md`) porte un bloc
+#: `pipeline:` (alias transitoire `workflow:`), compilé par `canon check`.
+PIPELINE_TYPE = "Pipeline"
+PIPELINE_DIR = "pipelines"
 #: #3070 (canon §12) : clés d'une fiche Host déclarant l'appareil indisponible
 UNAVAILABLE_UNTIL_KEY = "indisponible_jusqu_au"
 UNAVAILABLE_REASON_KEY = "indisponible_motif"
@@ -812,6 +817,7 @@ class Finding:
     untrusted: bool = False  # lu hors source approuvée
     package: str = ""       # fiche WorkPackage concernée (ne bloque aucun agent)
     process: str = ""       # fiche Process concernée (ne bloque aucun agent)
+    pipeline: str = ""      # carte Pipeline concernée (ne bloque aucun agent)
 
     def to_dict(self) -> dict:
         out = {"code": self.code, "severity": self.severity, "member": self.member,
@@ -826,6 +832,8 @@ class Finding:
             out["package"] = self.package
         if self.process:
             out["process"] = self.process
+        if self.pipeline:
+            out["pipeline"] = self.pipeline
         if self.untrusted:
             out["untrusted"] = True
         return out
@@ -1225,6 +1233,47 @@ class Process:
 
 
 @dataclass
+class Pipeline:
+    """L103 (#4395) : une carte `Pipeline` du canon (`pipelines/*.md`) — un
+    pipeline déclaré, compilé par `canon check` en `process-workflow/1`.
+
+    `name` est le nom du module (clé `name`, défaut : nom du fichier sans
+    `.md`). `artifact` est l'artefact compilé (`CompiledWorkflow`), None quand
+    le bloc est refusé ; `error` dit pourquoi. `valid` est faux sur toute
+    erreur de la carte : elle reste listée (`canon show`), sans bloquer aucun
+    agent."""
+
+    fiche: Fiche
+    name: str = ""
+    description: str = ""
+    responsible: str = ""
+    updated: str = ""
+    artifact: Any = None
+    error: str = ""
+    valid: bool = True
+
+    @property
+    def title(self) -> str:
+        return self.fiche.title
+
+    def to_dict(self) -> dict:
+        out = {"title": self.title, "name": self.name, "member": self.fiche.member,
+               "path": self.fiche.path, "ref": self.fiche.ref,
+               "description": self.description, "responsible": self.responsible,
+               "updated": self.updated, "valid": self.valid}
+        if self.artifact is not None:
+            out.update({"initial": self.artifact.initial,
+                        "types": list(self.artifact.types),
+                        "stages": [s.status for s in self.artifact.stages],
+                        "transitions": len(self.artifact.transitions)})
+        if self.error:
+            out["error"] = self.error
+        if self.fiche.untrusted:
+            out["untrusted"] = True
+        return out
+
+
+@dataclass
 class Canon:
     root: str
     sources: list[Source] = field(default_factory=list)
@@ -1237,6 +1286,9 @@ class Canon:
     decisions: list[DecisionNote] = field(default_factory=list)
     #: #538 : fiches Process (règles de travail), injectées dans les briefs
     processes: list[Process] = field(default_factory=list)
+    #: L103 (#4395) : cartes Pipeline (modules déclaratifs), validées par
+    #: `canon check`
+    pipelines: list[Pipeline] = field(default_factory=list)
     federation: dict | None = None
     #: constats de lecture (source, fédération, frontmatter, champs)
     load_findings: list[Finding] = field(default_factory=list)
@@ -1353,6 +1405,12 @@ class Canon:
                 return process
         return None
 
+    def pipeline(self, name: str) -> Pipeline | None:
+        for pipeline in self.pipelines:
+            if pipeline.name == name:
+                return pipeline
+        return None
+
     def placements_of(self, agent: str) -> list[Placement]:
         from .agent_names import resolve
         try:
@@ -1428,6 +1486,7 @@ class Canon:
                               status=w.status, **fiche(w.fiche))
                          for w in self.packages],
             "processes": [p.to_dict() for p in self.processes],
+            "pipelines": [p.to_dict() for p in self.pipelines],
             "federation": {"id": (self.federation or {}).get("id"),
                            "roles": self.roles, "review_policies": self.review_policies,
                            "naming": self.naming.to_dict() if self.naming else None},
@@ -2647,21 +2706,23 @@ def parse_scope(value: Any) -> tuple[list[str] | None, str | None]:
     return out, None
 
 
-def process_path_ok(relpath: str, scope: Iterable[str] | None = None) -> bool:
+def process_path_ok(relpath: str, scope: Iterable[str] | None = None,
+                    directory: str = PROCESS_DIR) -> bool:
     """#538, #2973 : le chemin (relatif au bundle) d'une fiche Process est-il
     celui d'une règle ? `processus/…` à la racine du bundle, ou
     `<dossier>/processus/…` quand `<dossier>` est un dossier déclaré du
     périmètre ameesh du membre (la fédération roote le membre à `.` et lit le
-    périmètre comme un filtre) ; jamais un autre dossier."""
+    périmètre comme un filtre) ; jamais un autre dossier. L103 (#4395) : même
+    contrôle pour une carte Pipeline avec `directory=PIPELINE_DIR`."""
     chemin = relpath.replace("\\", "/").split("/")
-    if len(chemin) >= 2 and chemin[0] == PROCESS_DIR:
+    if len(chemin) >= 2 and chemin[0] == directory:
         return True
     for dossier in scope or ():
         if not dossier:
             continue                # `.` : la racine, déjà jugée
         parts = dossier.split("/")
         reste = chemin[len(parts):]
-        if chemin[:len(parts)] == parts and len(reste) >= 2 and reste[0] == PROCESS_DIR:
+        if chemin[:len(parts)] == parts and len(reste) >= 2 and reste[0] == directory:
             return True
     return False
 
@@ -3444,6 +3505,9 @@ class _Loader:
             # une fiche du plan illisible ne bloque aucun agent (L29)
             subject = ({"package": _package_stem(path)}
                        if typed and typed.group(1) == "WorkPackage" else {})
+            if typed and typed.group(1) == PIPELINE_TYPE:
+                # L103 (#4395) : une carte Pipeline illisible ne bloque aucun agent
+                subject = {"pipeline": path}
             self.add("frontmatter-invalid", ERROR if typed else WARNING,
                      "unreadable frontmatter: %s%s" % (
                          exc, "" if typed else " (unknown type: card ignored)"),
@@ -3467,6 +3531,8 @@ class _Loader:
                 # a Process card error blocks no agent (#538): without a title,
                 # the card is named by its path
                 subject = {"process": path}
+            elif kind == PIPELINE_TYPE:
+                subject = {"pipeline": path}
             self.add("fiche-title-missing", ERROR, "%s card without `title`" % kind, **where,
                      **subject)
             return
@@ -4058,22 +4124,82 @@ class _Loader:
             body=contenu, projection=projection, projection_error=projection_error,
             valid=valid))
 
+    def _build_pipeline(self, fiche: Fiche, where: dict) -> None:
+        """L103 (#4395) : une carte Pipeline (`pipelines/*.md`) — `title`,
+        `responsible` et `updated` obligatoires, `name` facultatif (défaut :
+        nom du fichier, grammaire des noms de module), bloc `pipeline:` (alias
+        transitoire `workflow:`, jamais les deux) compilé par l'encodeur de
+        `process_card`. Chemin contraint comme une carte Process (bundle
+        imbriqué et périmètre déclaré compris). Toute erreur rend la carte
+        invalide et porte `pipeline` : `canon check` échoue, aucun agent n'est
+        bloqué. Le responsable est résolu dans `_validate_pipelines`."""
+        from . import modules as modules_mod
+        from . import process_card
+        from .process_workflow import WorkflowRefusal
+
+        stem = posixpath.splitext(posixpath.basename(fiche.path))[0]
+        name = _text(fiche.data.get("name"))
+        name = name if name is not None else stem
+        subject = {"pipeline": name or stem}
+        valid = True
+        if not process_path_ok(fiche.bundle_path or fiche.path,
+                               self.canon.scopes.get(fiche.member), PIPELINE_DIR):
+            scope = [d for d in self.canon.scopes.get(fiche.member) or () if d]
+            dossiers = "`, `".join([PIPELINE_DIR + "/"]
+                                   + ["%s/%s/" % (d, PIPELINE_DIR) for d in scope])
+            self.add("pipeline-path", ERROR,
+                     "Pipeline card outside `%s`: %s" % (dossiers, fiche.path),
+                     **where, **subject)
+            valid = False
+        if not isinstance(fiche.data.get("name") or "", str) \
+                or not modules_mod.NAME.fullmatch(name or ""):
+            self.add("pipeline-name-invalid", ERROR,
+                     "Pipeline card: name %r is not a module name (letters, digits, "
+                     "`.`, `_`, `-`; 64 characters at most)" % fiche.data.get("name", name),
+                     **where, **subject)
+            valid = False
+        responsible = _text(fiche.data.get("responsible"))
+        if not responsible:
+            self.add("pipeline-responsible-missing", ERROR,
+                     "Pipeline card without `responsible` (the human who answers "
+                     "for the pipeline)", **where, **subject)
+            valid = False
+        updated = self._process_day(fiche, "updated", where, required=True,
+                                    prefix="pipeline", label="Pipeline", **subject)
+        valid = valid and updated is not None
+        artifact, error = None, ""
+        try:
+            block = process_card.pipeline_block(fiche.data)
+            artifact, _encoding = process_card.compile_block(block, ref=fiche.ref)
+        except WorkflowRefusal as exc:
+            error = str(exc)
+            self.add("pipeline-invalid", ERROR,
+                     "Pipeline card %s: %s" % (name or stem, error), **where, **subject)
+            valid = False
+        self.canon.pipelines.append(Pipeline(
+            fiche=fiche, name=name or "",
+            description=_text(fiche.data.get("description")) or "",
+            responsible=responsible or "", updated=updated or "",
+            artifact=artifact, error=error, valid=valid))
+
     def _process_day(self, fiche: Fiche, key: str, where: dict, *, required: bool,
+                     prefix: str = "process", label: str = "Process",
                      **subject) -> str | None:
         """#538 : un jour ISO d'une fiche Process (`AAAA-MM-JJ`). Vide : erreur
-        si la clé est obligatoire, silence sinon ; illisible : erreur."""
+        si la clé est obligatoire, silence sinon ; illisible : erreur. L103 :
+        `prefix`/`label` nomment le constat d'une carte Pipeline."""
         value = fiche.data.get(key)
         if value is None or value == "":
             if required:
-                self.add("process-%s-missing" % key, ERROR,
-                         "Process card without `%s` (expected YYYY-MM-DD)" % key,
+                self.add("%s-%s-missing" % (prefix, key), ERROR,
+                         "%s card without `%s` (expected YYYY-MM-DD)" % (label, key),
                          **where, **subject)
             return None
         text = str(value).strip()[:10]
         try:
             return _dt.date.fromisoformat(text).isoformat()
         except ValueError:
-            self.add("process-%s-invalid" % key, ERROR,
+            self.add("%s-%s-invalid" % (prefix, key), ERROR,
                      "`%s`: unreadable date %r (expected YYYY-MM-DD)" % (key, value),
                      **where, **subject)
             return None
@@ -4745,6 +4871,9 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
     # -- règles de travail (#538) -------------------------------------------------------
     _validate_processes(canon, add)
 
+    # -- pipelines déclarés (L103, #4395) -----------------------------------------------
+    _validate_pipelines(canon, add)
+
     # -- avertissements -----------------------------------------------------------------
     for agent in canon.agents:
         if agent.title not in by_agent:
@@ -4901,6 +5030,33 @@ def _validate_processes(canon: Canon, add) -> None:
     _validate_process_block(canon, add)
 
 
+def _validate_pipelines(canon: Canon, add) -> None:
+    """L103 (#4395) : cartes Pipeline — nom unique dans le canon, responsable
+    résolu en Member humain. Les constats portent `pipeline` : ils font
+    échouer `canon check` sans bloquer aucun agent (voir `blocking`). La forme
+    de la carte et son bloc sont vérifiés à la lecture (`_build_pipeline`)."""
+    by_name: dict[str, list[Pipeline]] = defaultdict(list)
+    for pipeline in canon.pipelines:
+        if pipeline.name:
+            by_name[pipeline.name].append(pipeline)
+    for name, group in by_name.items():
+        if len(group) > 1:
+            for pipeline in group:
+                add("pipeline-duplicate", ERROR,
+                    "pipeline %s declared %d times (%s)" % (
+                        name, len(group),
+                        ", ".join("%s:%s" % (p.fiche.member, p.fiche.path) for p in group)),
+                    pipeline.fiche, pipeline=name)
+                pipeline.valid = False
+    for pipeline in canon.pipelines:
+        if pipeline.responsible and canon.resolve_human(pipeline.responsible) is None:
+            add("pipeline-responsible-unresolved", ERROR,
+                "Pipeline card %s: responsible %s is not a human Member of the canon "
+                "(expected human:<id>)" % (pipeline.name, pipeline.responsible),
+                pipeline.fiche, pipeline=pipeline.name)
+            pipeline.valid = False
+
+
 def _validate_process_block(canon: Canon, add) -> None:
     """#3867 : le bloc de règles RÉELLEMENT injecté tient-il dans sa place ?
 
@@ -4976,11 +5132,11 @@ class Blocking:
 def blocking(findings: Iterable[Finding]) -> Blocking:
     """Une erreur liée à un agent bloque cet agent ; à un hôte, les agents qui y
     sont placés ; à une fiche du plan (WorkPackage, L29) ou à une règle de
-    travail (Process, #538), aucun agent ; sinon (fédération, frontmatter d'une
-    fiche du profil, …) tous."""
+    travail (Process, #538) ou à une carte Pipeline (L103), aucun agent ; sinon
+    (fédération, frontmatter d'une fiche du profil, …) tous."""
     result = Blocking([], defaultdict(list), defaultdict(list), defaultdict(list))
     for finding in errors(findings):
-        if finding.package or finding.process:
+        if finding.package or finding.process or finding.pipeline:
             continue
         if finding.candidate and finding.host:
             result.by_candidate[(finding.candidate, finding.host)].append(finding)

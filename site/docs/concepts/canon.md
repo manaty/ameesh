@@ -16,6 +16,17 @@ injected into every agent's brief. A card may also carry an executable
 admitted by an exact revision pin. The prose and the workflow live in the same
 card; see [Write a Process card](../guides/write-a-process.md).
 
+**Pipeline cards** (`pipelines/*.md`, `type: Pipeline`) declare a pipeline
+without code: a `pipeline:` block of the same canon form as a Process card's
+`workflow:` block (`workflow:` is still read as a transitional alias; both at
+once are refused). `title`, `responsible` (a human `Member`) and `updated` are
+required; `name` is optional (default: the file name) and follows the module
+name grammar. `ameesh canon check` compiles the block and reports
+`pipeline-*` findings: an error fails the check but blocks no agent;
+`ameesh canon show --json` lists the cards under `pipelines`. The path rule is
+the one of `processus/`: `pipelines/` at the root of the bundle, or under a
+folder of the declared ameesh scope.
+
 ## Where ameesh reads it
 
 `AMEESH_CANON` (or `canon` in the configuration file) points to the root of an
