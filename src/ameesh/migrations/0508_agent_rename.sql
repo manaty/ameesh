@@ -65,10 +65,12 @@ end $$;
 -- holds FOR UPDATE on it, so a concurrent writer either waits for the commit
 -- and then reads the new primary (rechecked on the updated row), or holds the
 -- row first and the rename, waiting for it, rewrites what it wrote.
--- FOR KEY SHARE requires UPDATE on the registry: the lookup runs as the
--- schema owner (as 0427), and only returns a name the resolver already gives.
+-- FOR KEY SHARE requires UPDATE on the registry, which every writer of these
+-- tables holds (schema owner, ameesh_executor, ameesh_canon_sync): the lookup
+-- runs with the caller's rights. SECURITY DEFINER would hand any role the
+-- registry lock, and the role contracts refuse an executable one (h-12, #4477).
 create or replace function ameesh_agent_primary_locked(spelling text)
-returns text language plpgsql security definer set search_path from current as $$
+returns text language plpgsql security invoker set search_path from current as $$
 declare primary_name text;
 begin
     select r.name into primary_name from agent_registry r

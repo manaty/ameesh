@@ -84,6 +84,18 @@ class AgentRenameTest(PgTestCase):
                          sorted(agent_rename.CASCADED))
         self.assertEqual({r['confupdtype'] for r in children}, {'c'})
 
+    def test_spelling_lookup_runs_with_the_writer_rights(self):
+        # h-12 (#4477): a SECURITY DEFINER lookup, executable by PUBLIC, broke
+        # the role contracts; every writer of the rewritten tables already
+        # holds UPDATE on the registry, which FOR KEY SHARE needs.
+        rows = self.db.query(
+            "SELECT p.proname, p.prosecdef FROM pg_proc p"
+            " WHERE p.pronamespace = current_schema()::regnamespace"
+            "   AND p.proname IN ('ameesh_agent_primary_locked', 'ameesh_agent_spelling',"
+            "                     'ameesh_rename_agent_column')")
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([r['proname'] for r in rows if r['prosecdef']], [])
+
     def test_rename_moves_the_same_identity_and_keeps_old_as_alias(self):
         claimed = registry.claim(self.db, 'worker', 'runner-test', 120)
         registry.release(self.db, 'worker', 'runner-test', claimed['lease_epoch'])
