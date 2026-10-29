@@ -94,7 +94,7 @@ identity (`agent_rename.REWRITTEN`: lots, reviewers, delegations, mail
 sender/recipient, sessions, worktrees, costs, quotas, journals of lots and
 housekeeping) are rewritten where equal to `OLD`. The children of
 `agent_registry(name)` and `conversation_heads(agent)` follow by
-`ON UPDATE CASCADE` (migration 0508). Evidence is never rewritten
+`ON UPDATE CASCADE` (migration 0516). Evidence is never rewritten
 (`agent_rename.KEPT`): approvals and nonces, keys and key events, receipts,
 executor audit and tokens, alias resolutions and the rename journal. Signed
 bytes are untouched; stored identities resolve through the alias. A test

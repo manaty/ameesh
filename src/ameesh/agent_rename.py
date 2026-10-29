@@ -7,7 +7,7 @@ One transaction moves the registry row's primary from OLD to NEW, keeps OLD as
 an alias (with every other alias), and rewrites the columns that designate the
 identity (`REWRITTEN`), so per-agent reads under the new primary see the same
 lots, mail, sessions, costs and standings. Foreign keys follow by ON UPDATE
-CASCADE (0508). The key, lease epoch, session and worktree stay on the same
+CASCADE (0516). The key, lease epoch, session and worktree stay on the same
 row: no second row is created and nothing is copied.
 
 Evidence is never rewritten (`KEPT`): approvals, nonces, keys and key events,
@@ -47,6 +47,7 @@ REWRITTEN = (
     "alert_acknowledgements.actor", "budget_events.actor", "budget_limits.set_by",
     "commitments.created_by", "commitments.owner", "conversation_heads.agent",
     "estimate_references.published_by", "host_lifecycle.actor",
+    "host_lifecycle.return_requested_by", "host_lifecycle_transitions.actor",
     "housekeeping_log.actor", "housekeeping_log.agent", "integration_train_fires.changed_by",
     "integration_train_fires.owner", "managed_worktrees.agent", "merge_locks.owner",
     "merge_queue.queued_by", "notify_briefs.recipient", "notify_state.owner",
@@ -67,9 +68,10 @@ REWRITTEN = (
 )
 
 # Children of agent_registry(name) and conversation_heads(agent): moved by the
-# cascade (0508), counted only.
+# cascade (0516), counted only.
 CASCADED = (
-    "agent_candidates.name", "agent_peek.agent", "conversation_log.agent", "host_handoffs.agent",
+    "agent_candidates.name", "agent_peek.agent", "alerts_delegations.role",
+    "conversation_log.agent", "host_handoffs.agent",
     "host_lifecycle_agents.agent", "operator_pause_events.agent", "role_handover.name",
     "role_standings.name",
 )
@@ -113,7 +115,7 @@ def _uses(tx, column: str, name: str) -> int:
 
 def _rewrite(tx, column: str, old: str, new: str) -> int:
     table, col, is_array = _split(column)
-    # Counted in SQL (0508): the psql driver's execute() reports no row count.
+    # Counted in SQL (0516): the psql driver's execute() reports no row count.
     rows = tx.query("SELECT ameesh_rename_agent_column(%s, %s, %s, %s, %s) AS n",
                     (table, col, is_array, old, new))
     return int(rows[0]["n"])

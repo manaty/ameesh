@@ -104,7 +104,7 @@ CONTENUS = {
     # #4148 : sortie du crochet de libération et journal des transitions
     "host_lifecycle": {"release_error"},
     "host_lifecycle_transitions": {"detail"},
-    # L243b étape 3 (0508, #4299) : motif libre d'un renommage d'agent
+    # L243b étape 3 (0516, #4299) : motif libre d'un renommage d'agent
     "agent_renames": {"reason"},
 }
 #: colonnes refusées au rôle de base. Une colonne nouvelle, ni accordée ni

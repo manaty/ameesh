@@ -123,7 +123,7 @@ class Mailbox(interface.Mailbox):
                       (__RECIPIENT_PROJECT__) AS recipient_project
             """.replace("__SENDER_PROJECT__", PROJECT_SQL % "agent_mailbox.sender")
                .replace("__RECIPIENT_PROJECT__", PROJECT_SQL % "agent_mailbox.recipient"),
-            # #4299: the stored names, which 0508 maps from an alias.
+            # #4299: the stored names, which 0516 maps from an alias.
             (recipient, recipient, sender, recipient, body, host, kind,
              json.dumps(payload or {}, ensure_ascii=False), work_item_id,
              signature, signature_key, signed_payload, nonce,

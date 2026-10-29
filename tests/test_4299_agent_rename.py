@@ -225,7 +225,7 @@ class AgentRenameTest(PgTestCase):
         self.assertEqual((stored['sender'], stored['recipient']), ('new-worker', 'new-worker'))
         self.assertEqual([m['body'] for m in mail.unread(self.db, 'new-worker')],
                          ['Written under the old spelling'])
-        # A row written without the trigger (before 0508) is left to the sweep.
+        # A row written without the trigger (before 0516) is left to the sweep.
         self.db.execute("ALTER TABLE agent_mailbox DISABLE TRIGGER ameesh_agent_spelling")
         try:
             self.db.execute("INSERT INTO agent_mailbox (sender, recipient, body)"
@@ -336,7 +336,11 @@ class LocalStateTest(unittest.TestCase):
 
 
 # Generic columns matched by IDENTITY_COLUMNS that never hold agent names.
-IGNORED: set = set()
+IGNORED = {
+    # #4148 (0507): a scanner lock token "<actor>:<host>", not an agent name;
+    # it expires within the scan, a rename never needs to move it.
+    "host_release_locks.owner",
+}
 
 
 if __name__ == '__main__':

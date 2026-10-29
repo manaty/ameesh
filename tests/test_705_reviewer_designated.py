@@ -858,7 +858,7 @@ class ReviewerDesignationTest(PgTestCase):
         self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_sync ON work_items")
         # 0462 : le trigger d'audit dépend aussi de la colonne `reviewer`.
         self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_audit ON work_items")
-        # 0508 : le trigger d'orthographe des noms d'agents aussi.
+        # 0516 : le trigger d'orthographe des noms d'agents aussi.
         self.db.execute("DROP TRIGGER IF EXISTS ameesh_agent_spelling ON work_items")
         self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
         self.addCleanup(self._restore_reviewer_column)
@@ -904,7 +904,7 @@ class ReviewerDesignationTest(PgTestCase):
         # DROP COLUMN also drops its UPDATE OF triggers. Restore the schema
         # used by subsequent tests, including compatibility for old writers.
         for migration in ("0456_work_item_reviewers.sql", "0462_reviewer_audit.sql",
-                          "0508_agent_rename.sql"):
+                          "0516_agent_rename.sql"):
             with open(os.path.join(REPO, "src/ameesh/migrations", migration),
                       encoding="utf-8") as fh:
                 self.db.execute(fh.read())
@@ -918,7 +918,7 @@ class ReviewerDesignationTest(PgTestCase):
         self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_sync ON work_items")
         # 0462 : le trigger d'audit dépend aussi de la colonne `reviewer`.
         self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_audit ON work_items")
-        # 0508 : le trigger d'orthographe des noms d'agents aussi.
+        # 0516 : le trigger d'orthographe des noms d'agents aussi.
         self.db.execute("DROP TRIGGER IF EXISTS ameesh_agent_spelling ON work_items")
         self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
         self.addCleanup(self._restore_reviewer_column)
@@ -956,7 +956,7 @@ class ReviewerDesignationTest(PgTestCase):
         self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_sync ON work_items")
         # 0462 : le trigger d'audit dépend aussi de la colonne `reviewer`.
         self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_audit ON work_items")
-        # 0508 : le trigger d'orthographe des noms d'agents aussi.
+        # 0516 : le trigger d'orthographe des noms d'agents aussi.
         self.db.execute("DROP TRIGGER IF EXISTS ameesh_agent_spelling ON work_items")
         self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
         self.addCleanup(self._restore_reviewer_column)
