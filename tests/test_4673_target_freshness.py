@@ -166,3 +166,26 @@ class FireOnStaleCloneTest(FreshTargetFixture):
         self.assertFalse(ok)
         self.assertNotIn("provenance unknown", why)
         self.assertNotIn("complete authors", why)
+
+    def test_a_vehicle_gate_receives_the_published_commit(self):
+        # B/P1 dev1 (gel #26365) : `packet_reviews.need` résout sa base par
+        # `plan_git._commit` ; lui passer « main » lirait la branche LOCALE du
+        # checkout (ici volontairement divergente). La porte doit recevoir le
+        # commit exact publié, pas le nom nu.
+        self.reader.git("update-ref", "refs/heads/main", self.base)
+        row = dict(self.item_row(), branch="integration/paquet",
+                   assignee="composeur", branch_target="main")
+        seen = {}
+
+        def gate(_db, _marks, _frozen, **kwargs):
+            seen.update(kwargs)
+            return {"ok": True}
+
+        with mock.patch.object(merge_queue, "required_verdicts",
+                               return_value=0), \
+                mock.patch.object(merge_queue, "review_gate", side_effect=gate):
+            ok, why, _klass = fire.ready_verdicts(
+                self.cfg, self.db, row, self.marks, repo=self.reader.root,
+                project=None, target="main")
+        self.assertTrue(ok, why)
+        self.assertEqual(seen["target"], self.delivered)

@@ -2734,7 +2734,7 @@ def _readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
             # le seul assigné (#1515).
             try:
                 authors, families = _complete_authors(
-                    db, row, tip, where, target, target_repo=repo,
+                    db, row, tip, where, fresh_target or target, target_repo=repo,
                     queue=(where != repo), klass=klass, marks=marks, cfg=cfg)
             except _ProvenanceError as exc:
                 raise QueueError(

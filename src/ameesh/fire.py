@@ -783,6 +783,18 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     if class_sha and repo:
         class_sha = merge_queue.pinned(repo, class_sha) or class_sha
     resolved = class_sha or (merge_queue.pinned(repo, base) if (repo and base) else None)
+    # #4673 : la ref `origin/<cible>` du checkout n'est fraîche que de son
+    # dernier fetch ; la branche **locale** peut même avoir divergé. La porte
+    # (et `packet_reviews.need`, qui reçoit cette cible comme base) ne doit
+    # jamais recevoir le nom nu : la pointe publiée est lue une fois ici et
+    # passée en commit exact. Une forge muette retombe sur la ref locale.
+    fresh_target = None
+    if repo and target:
+        try:
+            from . import review_authors
+            fresh_target = review_authors.refreshed_target(repo, target) or None
+        except Exception:  # noqa: BLE001 - rafraîchissement au mieux
+            fresh_target = None
     klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo or None,
                              base=target, base_sha=resolved or base, head=head)
     if str(klass.get("class") or "") == lot_class.RELEASE:
@@ -807,8 +819,8 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
             # sur le seul assigné.
             try:
                 authors, families = merge_queue._complete_authors(
-                    db, row, frozen, repo, target, klass=klass, marks=marks,
-                    cfg=cfg)
+                    db, row, frozen, repo, fresh_target or target, klass=klass,
+                    marks=marks, cfg=cfg)
             except merge_queue._ProvenanceError as exc:
                 return False, (
                     "no review verdict ok on the freeze %s (class: %s): the complete "
@@ -819,10 +831,11 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
                             "authors_complete": True}
     # #3091 : la base de composition du véhicule est prouvée sur cette cible
     # résolue, jamais sur la ref du checkout. #4673 : sans base déjà résolue
-    # par l'appelant, la porte reçoit la **branche** cible et relit sa pointe
-    # publiée ; un clone partagé non rafraîchi ne fait alors plus passer des
-    # commits déjà dans la cible pour des tiers.
-    gate_target = resolved if class_sha else (target or resolved or base)
+    # par l'appelant, la porte reçoit la **pointe publiée** en commit exact
+    # (pas le nom de branche, que `packet_reviews.need` résoudrait sur la
+    # branche locale) ; un clone partagé non rafraîchi ne fait alors plus
+    # passer des commits déjà dans la cible pour des tiers.
+    gate_target = resolved if class_sha else (fresh_target or resolved or base)
     gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass,
                                    item=row, cfg=cfg, target=gate_target,
                                    **gate_authors)
