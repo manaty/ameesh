@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The turn-context document handed to a harness (TPK #2167, lot #2894).
+"""The turn-context document handed to a harness (#2167, lot #2894).
 
 The runner allocates one turn id before the first side effect of a turn and
 uses it unchanged for the mail reservation, the accounting marker, the account

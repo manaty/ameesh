@@ -6298,7 +6298,7 @@ class AgentWorker(threading.Thread):
 
     @staticmethod
     def _with_turn_id(spec: dict) -> dict:
-        """The one turn id of this turn (TPK #2167 / L2894).
+        """The one turn id of this turn (#2167 / L2894).
 
         It is allocated before the first side effect — mail reservation,
         accounting marker, account reservation — and travels in `spec` so
