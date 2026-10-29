@@ -613,66 +613,20 @@ _PYTHON_OVERRIDE: str | None = None
 
 
 def _supports_psycopg(python: str) -> bool:
-    try:
-        proc = subprocess.run([python, "-c", "import psycopg"],
-                              stdin=subprocess.DEVNULL, capture_output=True,
-                              timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return proc.returncode == 0
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from ameesh.project_python import _supports_psycopg as supports
+    return supports(python)
 
 
 def project_python(worktree: Path) -> str:
-    """Un interpréteur qui porte psycopg, pour les outils de l'arbre.
-
-    Le script lui-même n'a que la bibliothèque standard ; ses enfants
-    (`paquet-candidats`, `paquet-compose`, les tests) importent le projet.
-    Un agent qui lance `python3 scripts/paquet-auto.py` avec le Python du
-    système n'a pas psycopg : on prend le `.venv` de l'arbre, celui du
-    worktree principal, ou le Python du venv d'`ameesh` (le wrapper de la
-    session). À défaut, `sys.executable` : `paquet-candidats` rendra son
-    refus, sans le maquiller.
-    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from ameesh.project_python import project_python as select
     global _PYTHON_INTERPRETER
     if _PYTHON_OVERRIDE:
         return _PYTHON_OVERRIDE
-    if _PYTHON_INTERPRETER:
-        return _PYTHON_INTERPRETER
-    candidates: list[str] = []
-    env = os.environ.get("AMEESH_PYTHON")
-    if env:
-        candidates.append(env)
-    candidates.append(sys.executable)
-    candidates.append(str(worktree / ".venv" / "bin" / "python"))
-    listed = git(worktree, "worktree", "list", "--porcelain", check=False)
-    for line in _decode(listed.stdout).splitlines():
-        if line.startswith("worktree "):
-            candidates.append(str(Path(line[len("worktree "):]) /
-                                 ".venv" / "bin" / "python"))
-    wrapper = shutil.which("ameesh")
-    if wrapper:
-        try:
-            text = Path(wrapper).read_text(encoding="utf-8")
-        except OSError:
-            text = ""
-        match = re.search(r"exec\s+(\S+)/ameesh\b", text)
-        if match:
-            candidates.append(match.group(1) + "/python")
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        if Path(candidate).is_file() and _supports_psycopg(candidate):
-            _PYTHON_INTERPRETER = candidate
-            return candidate
-    _PYTHON_INTERPRETER = sys.executable
+    if not _PYTHON_INTERPRETER:
+        _PYTHON_INTERPRETER = select(worktree)
     return _PYTHON_INTERPRETER
-
-
-# ---------------------------------------------------------------------------
-# Entrées
-# ---------------------------------------------------------------------------
 
 
 def package_branch(name: str) -> str:
@@ -2230,7 +2184,11 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
     un objet (`#N`) serait relu par le contrôle d'inclusion comme un lot
     attendu. Les objets et les classes restent à la PR et au courrier.
     """
-    lots = len({unit.lot for unit in composition.units})
+    try:
+        admissions = parse_composition_table(table)
+    except InputError:
+        admissions = [([unit.lot], unit.source) for unit in composition.units]
+    lots = len({lot for members, _source in admissions for lot in members})
     lines = [
         "# Paquet %s — composition (§12), sur %s `%s`"
         % (package_branch(name), target, base_sha[:12]),
@@ -2245,8 +2203,9 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
         "| lot | source composée |",
         "|---|---|",
     ]
-    for unit in composition.units:
-        lines.append("| #%d | `%s` |" % (unit.lot, unit.source))
+    for members, source in admissions:
+        for lot in members:
+            lines.append("| #%d | `%s` |" % (lot, source))
     lines += ["", table.rstrip(), ""]
     lines += [
         "## Écartés",
