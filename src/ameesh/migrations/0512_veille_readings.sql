@@ -1,4 +1,4 @@
--- 0504 — le relevé précédent de la veille, par harnais (#4291).
+-- 0512 — le relevé précédent de la veille, par harnais (#4291).
 --
 -- La présence au catalogue partagé n'est pas un relevé de la veille :
 -- `models discover` y écrit avant elle (`catalog.record`), et le modèle

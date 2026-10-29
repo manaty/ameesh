@@ -629,7 +629,7 @@ class Catalog(Domain):
 
 
 class Veille(Domain):
-    """Le relevé précédent de la veille des versions (#4291, migration 0504).
+    """Le relevé précédent de la veille des versions (#4291, migration 0512).
 
     La présence au catalogue partagé n'en est pas un : `models discover` y
     écrit avant la veille. Ce domaine est la référence durable propre à la

@@ -1054,7 +1054,7 @@ def scan(cfg, db, *, sources=None, dry_run: bool = False, probe: bool = True,
             if models.get("complete") and models.get("served"):
                 try:
                     # Le relevé précédent est celui de la VEILLE, par harnais
-                    # (migration 0504) : le catalogue partagé ne peut pas servir
+                    # (migration 0512) : le catalogue partagé ne peut pas servir
                     # de référence, `models discover` y écrit avant elle et le
                     # modèle nouveau serait déjà « connu » (B de l'auditeur,
                     # #4291).

@@ -237,7 +237,7 @@ FERMEES = {
     # #4164 (0500) : crédits du compte fournisseur ; l'état est accordé au rôle
     # superviseur (alertes), le texte d'erreur libre du fournisseur reste fermé
     "provider_account_credits": {"detail"},
-    # #4291 (0504) : relevé propre à la veille (ce qu'elle a réellement vu,
+    # #4291 (0512) : relevé propre à la veille (ce qu'elle a réellement vu,
     # par harnais et fournisseur), tenu et lu par `ameesh veille`, pas par le
     # rôle superviseur ; fermé aux deux rôles, aucun GRANT modifié.
     "veille_readings": {"harness", "provider", "model_id", "first_seen",

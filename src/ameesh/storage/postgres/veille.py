@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Pilote Postgres : le relevé précédent de la veille (migration 0504).
+"""Pilote Postgres : le relevé précédent de la veille (migration 0512).
 
 Deux opérations seulement : ce que la veille a déjà vu pour un harnais, et
 l'enregistrement du relevé courant. Le catalogue partagé n'est pas lu ici :
