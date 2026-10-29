@@ -124,12 +124,10 @@ class SnapshotStaysReadable(PgTestCase):
         calls: list = []
 
         def read(dsn):
-            # 30 s : bien plus long que la borne de la sonde. Si le relevé
-            # attendait la console, la lecture finirait par rendre un relevé
-            # vide, donc pas de ligne « console illisible » ci-dessous : le
-            # témoin ne dépend pas du temps mural (#4446, canon §3).
+            # La console reste muette jusqu'au nettoyage du test : même un
+            # relevé PostgreSQL lent ne peut pas la libérer (#4446).
             calls.append(dsn)
-            self.release.wait(30)
+            self.release.wait()
             return {}
 
         with mock.patch.object(pgbouncer_local, "admin_dsn", return_value="admin"), \
