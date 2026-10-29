@@ -15,6 +15,7 @@ la nouvelle tête) prouve que l'auteur l'a réécrit. Aucune note n'est lue.
 """
 from __future__ import annotations
 
+import time
 from unittest import mock
 
 from ameesh import (merge_queue, registry, review_authors,
@@ -191,6 +192,47 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
         self.later_receipts(10)
         with self.assertRaises(review_authors.SweepDeadline):
             with review_authors.sweep_deadline(0):
+                review_authors._rewritten_after_freeze(
+                    self.db, work.get(self.db, self.lot),
+                    {"id": 999999, "sha": head_b}, self.repo.root,
+                    head=head_b, fetch=True)
+
+    def _only_absent_receipt(self):
+        """Une tête B et un seul reçu, absent : le fetch est le dernier."""
+        _head_a, fix, head_b = self._prepare_rewrite()
+        self.db.execute("DELETE FROM provenance_receipts WHERE subject = %s",
+                        ("commit:" + fix,))
+        self.later_receipts(1)
+        return head_b
+
+    def test_a_slow_fetch_cannot_exceed_the_remaining_time(self):
+        # B/P2 cx3 : le temps restant est transmis au fetch ; une récupération
+        # lente sur le dernier reçu ne conclut pas sans propager l'expiration.
+        head_b = self._only_absent_receipt()
+
+        def slow(repo, sha, *, timeout=None):
+            self.assertIsNotNone(timeout)
+            time.sleep(0.25)
+            return False
+
+        with mock.patch.object(review_authors, "_forge_fetch", side_effect=slow):
+            with self.assertRaises(review_authors.SweepDeadline):
+                with review_authors.sweep_deadline(0.2):
+                    review_authors._rewritten_after_freeze(
+                        self.db, work.get(self.db, self.lot),
+                        {"id": 999999, "sha": head_b}, self.repo.root,
+                        head=head_b, fetch=True)
+
+    def test_a_slow_fetch_cannot_exceed_the_local_budget(self):
+        head_b = self._only_absent_receipt()
+
+        def slow(repo, sha, *, timeout=None):
+            time.sleep(0.25)
+            return False
+
+        with mock.patch.object(review_authors, "REWRITTEN_SCAN_BUDGET_S", 0.2), \
+                mock.patch.object(review_authors, "_forge_fetch", side_effect=slow):
+            with self.assertRaises(review_authors.review_provenance.ProvenanceError):
                 review_authors._rewritten_after_freeze(
                     self.db, work.get(self.db, self.lot),
                     {"id": 999999, "sha": head_b}, self.repo.root,

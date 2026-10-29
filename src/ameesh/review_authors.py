@@ -3394,7 +3394,7 @@ def unknown_refusal(unknown: Sequence[str], *, head_sha: str = "") -> str:
     return out
 
 
-def _forge_fetch(repo: str, sha: str) -> bool:
+def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None) -> bool:
     """Rapatrie le commit exact `sha` depuis la forge du clone (`origin`).
 
     #3147 : la forge sert encore par SHA un commit devenu inaccessible après un
@@ -3408,6 +3408,10 @@ def _forge_fetch(repo: str, sha: str) -> bool:
     #3648 : le dépôt scratch de `merge-pr` (`git init`, sans `origin`) porte
     sa forge dans `ameesh.forge` (`plan_git.forge_remote`) ; sans elle, un
     gel antérieur écrasé par push forcé n'y était jamais rapatrié.
+
+    #4457 (B/P2 cx3) : `timeout` est le temps qui reste à l'appelant ; le
+    fetch ne peut pas dépasser son échéance ni `FETCH_TIMEOUT`. Un temps nul
+    ne lance aucun fetch.
     """
     text = plan_git.full_commit_id(sha)
     if not text:
@@ -3417,13 +3421,17 @@ def _forge_fetch(repo: str, sha: str) -> bool:
             return True
     except Exception:  # noqa: BLE001 - dépôt illisible : aucune récupération
         return False
+    bound = plan_git.FETCH_TIMEOUT if timeout is None else min(
+        float(timeout), plan_git.FETCH_TIMEOUT)
+    if bound <= 0:
+        return False
     try:
         forge = plan_git.forge_remote(repo)
         if forge is None:
             return False
         proc = plan_git._git(
             repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-            "--", forge, text, timeout=plan_git.FETCH_TIMEOUT)
+            "--", forge, text, timeout=bound)
     except Exception:  # noqa: BLE001 - forge injoignable : absence
         return False
     if proc.returncode != 0:
@@ -4158,6 +4166,14 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 "the rewritten-corrector scan exceeded its %d s budget"
                 % int(REWRITTEN_SCAN_BUDGET_S))
 
+    def remaining() -> Optional[float]:
+        """Le temps qui reste, transmis aux opérations bloquantes (#4457)."""
+        if sweep is not None:
+            return sweep.deadline.remaining()
+        if local is not None:
+            return local.remaining()
+        return None
+
     check()
     try:
         if not plan_git.local_commit(repo, head_sha):
@@ -4168,6 +4184,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         rows = storage.of(db).work.milestones(lot, None) or []
     except Exception:  # noqa: BLE001 - frise illisible : comportement historique
         return {}
+    check()
     freezes = sorted((row for row in rows if row.get("kind") == "frozen"),
                      key=lambda value: (float(value.get("at_ts") or 0.0),
                                         int(value.get("id") or 0)))
@@ -4197,6 +4214,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 continue
             stamp = float(verdict.get("at_ts") or freeze.get("at_ts") or 0.0)
             wanted.setdefault(key, []).append((freeze_id, sha, stamp, actor))
+    check()
     if not wanted:
         return {}
     out: dict[str, dict] = {}
@@ -4217,6 +4235,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     raise review_provenance.ProvenanceError(
                         "the provenance of prior reviewer corrections cannot be read"
                         " (%s)" % exc) from exc
+                check()
                 return out
             for receipt in receipts or ():
                 check()
@@ -4233,7 +4252,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                         check()
                         attempted = True
                         try:
-                            recover(sha)
+                            recover(sha, timeout=remaining())
                         except Exception:  # noqa: BLE001 - source en échec
                             pass
                         try:
@@ -4244,7 +4263,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                         check()
                         attempted = True
                         try:
-                            _forge_fetch(repo, sha)
+                            _forge_fetch(repo, sha, timeout=remaining())
                         except Exception:  # noqa: BLE001 - forge injoignable
                             pass
                         try:
@@ -4253,6 +4272,9 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                             full = None
                     if not full and attempted:
                         fetch_cache.note(repo, sha)
+                    # L'appel bloquant a pu consommer toute l'échéance : le
+                    # constat d'absence ne doit pas l'absorber (#4457 B/P2).
+                    check()
                 if not full:
                     continue
                 check()
@@ -4269,6 +4291,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 break
             if key in out:
                 break
+    check()
     return out
 
 

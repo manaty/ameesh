@@ -1810,8 +1810,12 @@ def _object_recoverer(where: str, sources):
     l'agent ou à l'origine du projet, puis on vérifie que l'objet est bien
     lisible localement. Aucun ref n'est déplacé et aucune tête n'est changée :
     seule la preuve manquante est réparée. Rend False (jamais une exception)
-    quand la récupération échoue, pour que l'appelant strict refuse fermé."""
-    def recover(sha: str) -> bool:
+    quand la récupération échoue, pour que l'appelant strict refuse fermé.
+
+    #4457 (B/P2 cx3) : `timeout` est le temps qui reste à l'appelant ; il
+    borne l'ensemble des sources, pas chacune. Sans lui, le plafond par source
+    reste `FETCH_TIMEOUT` (comportement historique)."""
+    def recover(sha: str, *, timeout=None) -> bool:
         text = str(sha or "").strip().lower()
         if not _HEX.fullmatch(text):
             return False
@@ -1824,17 +1828,25 @@ def _object_recoverer(where: str, sources):
         # localement s'il était lisible.
         if len(text) not in (40, 64):
             return False
+        remaining = None if timeout is None else max(float(timeout), 0.0)
         for source in sources or ():
             source = str(source or "").strip()
             if not source:
                 continue
+            if remaining is not None and remaining <= 0:
+                break
+            bound = (FETCH_TIMEOUT if remaining is None
+                     else min(remaining, FETCH_TIMEOUT))
+            started = time.monotonic()
             try:
                 proc = plan_git._git(where, "fetch", "--quiet", "--no-tags",
                                      "--no-write-fetch-head", "--", source, text,
-                                     timeout=FETCH_TIMEOUT)
+                                     timeout=bound)
             except Exception:  # noqa: BLE001 - source injoignable : suivante
-                continue
-            if proc.returncode != 0:
+                proc = None
+            if remaining is not None:
+                remaining -= time.monotonic() - started
+            if proc is None or proc.returncode != 0:
                 continue
             try:
                 if plan_git.local_commit(where, text):
