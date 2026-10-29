@@ -27,7 +27,7 @@ import dataclasses
 import re
 from typing import Callable
 
-from . import fil
+from . import fil, vocab
 
 #: a request body, at most (JSON)
 MAX_BODY = 16 * 1024
@@ -137,13 +137,15 @@ def _lot_label(db, value) -> int | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ActionError(400, "bad_body", "lot: a lot number is required")
+        raise ActionError(400, "bad_body", f"lot: identifiant {vocab.active().of} requis")
     try:
         item = assignments.resolve_lot(db, str(value))
     except assignments.AssignmentError:
         item = None
     if item is None:
-        raise ActionError(404, "not_found", "unknown or closed lot")
+        words = vocab.active()
+        raise ActionError(404, "not_found",
+                          f"{words.title} introuvable ou {words.agree('fermé')}")
     return int(item["id"])
 
 
@@ -231,12 +233,13 @@ def _publish(ctx, db, params, body) -> dict:
     else:
         from . import work
         if not re.match(r"^[0-9]{1,9}$", lot):
-            raise ActionError(400, "bad_path", "lot: a lot number is required")
+            raise ActionError(400, "bad_path", f"lot: identifiant {vocab.active().of} requis")
         item = work.get(db, int(lot))
         if item is None:
-            raise ActionError(404, "not_found", "unknown lot")
+            raise ActionError(404, "not_found", f"{vocab.active().title} introuvable")
         if fil.lot_project(db, int(lot)) != project:
-            raise ActionError(404, "not_found", "lot %s is not in project %s" % (lot, project))
+            raise ActionError(404, "not_found",
+                              f"{vocab.active().label(lot, capital=True)} hors du projet {project}")
     entry = fil.record(ctx.cfg, db, sender=ctx.human, recipients=(), text=text,
                        project=project, lot=lot, meta={"by": actor(ctx)}
                        if actor(ctx) != ctx.human else None)
@@ -393,6 +396,19 @@ def _ack_alert(ctx, db, params, body) -> dict:
     except alert_ack.AckRefused as exc:
         status = {"not_found": 404, "forbidden": 403, "native_only": 403}.get(exc.code, 400)
         raise ActionError(status, exc.code, str(exc)) from exc
+
+
+def summary(action: Action) -> str:
+    """L102 T4: render labels at request time, without changing action IDs."""
+    words = vocab.active()
+    # serve prefixes the same action table with /api/v1.
+    path = action.path.removeprefix("/api/v1")
+    if path == "/threads/{project}/{lot}":
+        return f"Publier dans le fil {words.of}"
+    if path == "/lots/{id}/assign":
+        return (f"Réaffecter {words.definite} (`ameesh work assign`, 0030 §2 ; "
+                "jamais à un agent externe)")
+    return action.summary
 
 
 _TEXT = ({"type": "string", "minLength": 1, "maxLength": MAX_TEXT}, True)

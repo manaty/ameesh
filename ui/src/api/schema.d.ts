@@ -367,7 +367,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One lot (`ameesh work show --json`) */
+        /** Détail du lot (`ameesh work show --json`) */
         get: operations["lots_id"];
         put?: never;
         post?: never;
@@ -386,7 +386,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Reassign a lot (`ameesh work assign`, 0030 §2; never to an external agent) */
+        /** Réaffecter le lot (`ameesh work assign`, 0030 §2 ; jamais à un agent externe) */
         post: operations["post_lots_id_assign"];
         delete?: never;
         options?: never;
@@ -469,7 +469,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Timeline of a project: its lots, window and rendering cut (#3395, #3401) */
+        /** Chronologie du projet : lots, fenêtre et rendu (#3395, #3401) */
         get: operations["projects_project_timeline"];
         put?: never;
         post?: never;
@@ -504,10 +504,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Lot thread (`ameesh fil show PROJECT LOT`) */
+        /** Fil du lot (`ameesh fil show PROJECT LOT`) */
         get: operations["threads_project_lot"];
         put?: never;
-        /** Publish in a lot's thread */
+        /** Publier dans le fil du lot */
         post: operations["post_threads_project_lot"];
         delete?: never;
         options?: never;
@@ -613,6 +613,22 @@ export interface components {
             schema: "ameesh-discovery/1";
             version: string;
             versions: string[];
+            vocabulary?: {
+                definite?: string;
+                definite_plural?: string;
+                elides?: boolean;
+                gender?: string;
+                indefinite?: string;
+                indefinite_plural?: string;
+                of?: string;
+                of_plural?: string;
+                plural?: string;
+                singular?: string;
+                title?: string;
+                title_plural?: string;
+                to?: string;
+                to_plural?: string;
+            };
         };
         "ameesh-error-1": {
             error: string;
@@ -2403,11 +2419,11 @@ export interface operations {
     lots: {
         parameters: {
             query?: {
-                /** @description assignee of the lots */
+                /** @description Responsable des lots */
                 assignee?: string;
-                /** @description lots listed at most (default 100) */
+                /** @description Nombre maximal de lots (défaut 100) */
                 limit?: number;
-                /** @description state of the lots */
+                /** @description État des lots */
                 state?: string;
             };
             header?: never;
@@ -2465,7 +2481,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description One lot (`ameesh work show --json`) */
+            /** @description Détail du lot (`ameesh work show --json`) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -2532,7 +2548,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Reassign a lot (`ameesh work assign`, 0030 §2; never to an external agent) */
+            /** @description Réaffecter le lot (`ameesh work assign`, 0030 §2 ; jamais à un agent externe) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -2816,7 +2832,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Timeline of a project: its lots, window and rendering cut (#3395, #3401) */
+            /** @description Chronologie du projet : lots, fenêtre et rendu (#3395, #3401) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -3051,7 +3067,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Lot thread (`ameesh fil show PROJECT LOT`) */
+            /** @description Fil du lot (`ameesh fil show PROJECT LOT`) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -3119,7 +3135,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Publish in a lot's thread */
+            /** @description Publier dans le fil du lot */
             200: {
                 headers: {
                     [name: string]: unknown;
