@@ -37,12 +37,15 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    propres, §2 : aucun avis) — avec une résolution le geste reste au pilote
    (#1979) et le courrier le dit ; puis `ameesh ci run <porteur> --full`, qui
    arme la fusion automatique (`packet_automerge`, tic de release).
-4. **Rouge.** À la composition, un test ciblé rouge est attribué par la même
-   lecture que #3801 (`packet_red`) : l'unité désignée par une preuve forte
-   est retirée, son auteur prévenu, et `paquet-auto.py` recompose sans elle
-   dans le même lancement (#3931) — la tentative n'est pas perdue. Sans
-   attribution sûre, `paquet-auto.py` garde son échec antérieur (contrat rouge
-   ou reprise bornée) et le pilote est prévenu. Sur la ci-full rouge de la tête
+4. **Rouge.** À la composition, un test ciblé rouge **d'un module voisin**
+   est situé en le rejouant sur les préfixes de l'empilement (#4217) : la
+   première unité où il apparaît est retirée, son auteur prévenu, et
+   `paquet-auto.py` recompose sans elle dans le même lancement — la tentative
+   n'est pas perdue. Les rouges propres et les contrats gardent la lecture
+   #3801 (`packet_red`) : l'unité désignée par une preuve forte est retirée
+   (#3931). Sans attribution sûre (rejeu des préfixes illisible, contrat
+   rouge), `paquet-auto.py` ne retire rien, prévient le pilote et garde son
+   échec antérieur. Sur la ci-full rouge de la tête
    gelée : un rouge **déterministe** (chaque échec de test propre au paquet
    attribué par #3801 à une seule unité probable, rejoué rouge en local sur la
    tête) retire ces unités ; le paquet est recomposé sans elles
@@ -53,8 +56,9 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    de son assigné jusqu'à un nouveau gel, et l'alerte SLO vise l'auteur, pas
    le pilote. Un rouge non concluant (§3 : run annulé ou
    hors délai, échec de job sans test, échec non attribuable ou ambigu, test
-   vert en local) ne retire rien : il est consigné au journal du porteur et le
-   pilote est prévenu, une fois.
+   vert en local, erreur de fixture DB en QueryCanceled/timeout) ne retire
+   rien : il est consigné au journal du porteur et le pilote est prévenu, une
+   fois.
 5. **Reprise.** Chaque lancement de `paquet-auto.py` laisse d'abord une
    marque « tentative » (étape, tête de départ, hôte:pid, époque du bail) ;
    son achèvement se lit à la tête gelée qui a bougé, son échec à une marque
