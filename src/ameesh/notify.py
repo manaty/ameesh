@@ -2406,9 +2406,12 @@ class Notifier:
                 gate_cache = self.state["gates"] = {}
             from . import canon as canon_mod
             with canon_mod.configured_cache():
+                # #4579 : la passe de livraison, sous bail, date seule les
+                # épisodes d'attente d'empreinte ; une passe à blanc n'écrit rien.
                 current = exploitation.alerts(
                     self.cfg, db, now=now, local_pool=False,
-                    unreadable=unreadable, gate_cache=gate_cache, **thresholds)
+                    unreadable=unreadable, gate_cache=gate_cache,
+                    record_footprint=not self.dry_run, **thresholds)
         # #3913 B1 : la lecture/le calcul a pu durer plus que le bail. Avant
         # la première écriture (les accusés) et la première poussée, on
         # reprend le verdict : un détenteur périmé se tait, même si son
