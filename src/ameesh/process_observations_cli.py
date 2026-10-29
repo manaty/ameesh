@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Commandes du journal d'observations IMA (#4425).
+"""Commandes du journal d'observations du mesh client (#4425).
 
 * ``ameesh process-observations refresh`` : sur bureau-goal, collecte les
   attestations de staging et les acceptations de la projection #4006, ecrit
@@ -190,7 +190,7 @@ def _cmd_revoke(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ameesh process-observations",
-        description="Journal d'observations IMA (#4425)")
+        description="Journal d'observations du mesh client (#4425)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     refresh = sub.add_parser(

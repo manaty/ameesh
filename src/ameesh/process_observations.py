@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Journal d'observations IMA (#4425, B de #2846).
+"""Journal d'observations du mesh client (#4425, B de #2846).
 
-La decision du proprietaire (#155437, option a) confie a IMA le role de
-collecteur de confiance : les deploiements, les resultats QA et les
+La decision du proprietaire (#155437, option a) confie au mesh client le role
+de collecteur de confiance : les deploiements, les resultats QA et les
 acceptations humaines sont des **observations** natives, ecrites par une API
 de journal locale, puis projetees en lecture seule vers les hotes.
 
@@ -31,11 +31,11 @@ Sources collectees sur ``bureau-goal`` :
   (``ameesh-approvals/1``), avec sa revocation et son echeance -> ``pass``
   d'environnement ``acceptance``. Aucun seuil propre n'est ajoute a celui de
   #4006 ;
-* les resultats QA d'IMA : **aucune enveloppe n'est inventee**. Le contrat de
-  ce format est le ticket externe IMA #796 ; tant qu'il n'est pas la, une
-  configuration ``qa`` est refusee (``reader-config``) et aucun ``pass`` /
-  ``fail`` QA n'est collecte. Le lecteur et le temoin sont prets pour ce
-  contrat.
+* les resultats QA du mesh client : **aucune enveloppe n'est inventee**. Le
+  contrat de ce format est le ticket externe du client #796 ; tant qu'il n'est
+  pas la, une configuration ``qa`` est refusee (``reader-config``) et aucun
+  ``pass`` / ``fail`` QA n'est collecte. Le lecteur et le temoin sont prets
+  pour ce contrat.
 
 Mapping des genres du relais : ``merged_and_staging_deployed`` et
 ``preprod_deployed`` -> ``deployed`` ; ``*_pass`` -> ``pass`` ;
