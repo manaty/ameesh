@@ -153,11 +153,20 @@ class EngineTest(unittest.TestCase):
         first = slo.lot_steps(_item(), {"requested": T0}, events,
                               now=T0 + 10000, footprint=wait)
         self.assertEqual({row["elapsed_s"] for row in first}, {9000})
-        # deux passes plus tard, la même date : pas de dérive
-        self.assertEqual(slo.footprint_wait(events, [], satisfied={}), wait)
+        # P1 de cx2 sur 1b7e58d00 : la fusion POSTÉRIEURE du bloqueur (sorti
+        # de l'empreinte avant) n'écrase pas la clôture de l'épisode.
+        self.assertEqual(slo.footprint_wait(events, [], satisfied={1: T0 + 19900}),
+                         wait)
         later = slo.lot_steps(_item(), {"requested": T0}, events,
                               now=T0 + 20000, footprint=wait)
         self.assertEqual({row["elapsed_s"] for row in later}, {19000})
+
+    def test_une_fusion_avant_la_cloture_reste_la_date_exacte(self):
+        # Le cas normal : le bloqueur a fusionné avant la passe de clôture ;
+        # la fusion (la plus tôt) date la levée, pas l'instant de la note.
+        events = [_note(T0, ids=(1,)), _release(T0 + 1300, ids=(1,))]
+        wait = slo.footprint_wait(events, [], satisfied={1: T0 + 1000})
+        self.assertEqual(wait["released_ts"], T0 + 1000)
 
     def test_sans_bloqueur_ni_note_rien_ne_change(self):
         rows = slo.lot_steps(_item(), {"requested": T0}, [], now=T0 + 3 * 3600,

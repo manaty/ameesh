@@ -580,9 +580,10 @@ def footprint_wait(events: Iterable[dict], blockers: Iterable[dict], *,
     (`footprint_blockers`) — l'attente est en cours, aucun pas SLO ne court.
     Sans bloqueur courant, l'épisode (`footprint_episode`) nomme ceux qui
     l'ont retenu ; sa clôture date le redémarrage de l'horloge. Elle est lue
-    des jalons `merged`/`closed` des bloqueurs quand TOUS en ont un ; sinon
-    de la note de clôture, écrite une fois et stable même si un bloqueur
-    encore ouvert bouge ensuite (P1 de cx1 sur b8d7a9901).
+    des jalons `merged`/`closed` des bloqueurs quand TOUS en ont un, mais
+    jamais au-delà de la clôture déjà écrite : un bloqueur sorti de
+    l'empreinte puis fusionné plus tard ne déplace pas la levée (P1 de cx2
+    sur 1b7e58d00).
 
     Si la clôture n'est pas encore datable, la levée est **inconnue**
     (`undated`) : l'attente reste suspendue, sans durée inventée (#1982) et
@@ -599,7 +600,15 @@ def footprint_wait(events: Iterable[dict], blockers: Iterable[dict], *,
         return None
     exact = _footprint_exact_release(named, satisfied)
     if not episode["open"]:
-        release = exact if exact is not None else episode["released_ts"]
+        # La clôture déjà écrite est la borne : un bloqueur sorti de
+        # l'empreinte PUIS fusionné plus tard ne déplace plus la levée. La
+        # fusion, quand elle précède la passe de clôture, reste la date
+        # exacte (la plus tôt) : min(clôture, jalons).
+        release = episode["released_ts"]
+        if release is None:
+            release = exact
+        elif exact is not None:
+            release = min(float(release), exact)
         if release is None:
             return {"lots": [], "released_ts": None, "named": named,
                     "undated": True, "open": False}
