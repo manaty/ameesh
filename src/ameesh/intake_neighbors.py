@@ -819,7 +819,7 @@ def _candidate_rows(db, app: str, since_days: int) -> list[dict]:
     if not app:
         return []
     return db.query(
-        "SELECT id, title, body, state, close_reason, branch_target, branch_head,"
+        "SELECT id, title, body, state, legacy_state, workflow_stage, close_reason, branch_target, branch_head,"
         "       issue_ref,"
         "       extract(epoch from closed_at)::float8 AS closed_ts,"
         "       extract(epoch from updated_at)::float8 AS updated_ts"
