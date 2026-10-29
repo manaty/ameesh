@@ -152,6 +152,11 @@ def _host_footprint(cfg, db, canons, host, reading, listing, controls, now):
         return None
 
 
+def _attempt_bound(cfg):
+    """How long an external adapter call is presumed alive (same as begin)."""
+    return float(cfg.lifecycle_hook_timeout) + 120.0
+
+
 def _fresh_reading(cfg, db, host, *, now, after=None):
     """The host's latest reading when it is fresh (and not before `after`)."""
     try:
@@ -289,7 +294,7 @@ def _run_transition(cfg, api, canons, row, state, *, actor, runner=None,
     previous = row.get("hook_state")
     attempt = api.begin_transition(
         host, generation, state, release_epoch=epoch, actor=actor,
-        stale_after=float(cfg.lifecycle_hook_timeout) + 120.0,
+        stale_after=_attempt_bound(cfg),
         retry_after=float(cfg.host_release_retry))
     if attempt is None:
         return None
@@ -312,33 +317,38 @@ def _run_transition(cfg, api, canons, row, state, *, actor, runner=None,
 def _busy_sample_ok(cfg, api, db, row, *, now):
     """After a `busy` acknowledgement, which reading allows claims to reopen?
 
-    A host that was actually released (`idle-drained`) is a machine that was
-    off: only a reading *after* the acknowledgement proves it booted. A host
-    that was merely draining stayed on: a fresh reading sampled after the
-    withdrawal is enough."""
+    The `busy` journal must be newer than *every* `idle-drained` entry of the
+    host, whatever its generation or epoch: a stale hook that released the
+    host after a busy acknowledgement still counts. A host that was actually
+    released also needs a reading after that `busy` acknowledgement (the VM
+    booted); a merely draining host requires a fresh post-ack reading too.
+    A migrated `busy` (never released, no journal) is its own proof."""
     requested = resources.finite_float(row.get("requested_ts"))
+    released_ts = resources.finite_float(row.get("released_ts"))
     journal = api.transition_journal(row["host"])
-    generation = row.get("generation")
-    busy = [item for item in journal
-            if item.get("state") == "busy" and item.get("generation") == generation]
-    released = [item for item in journal
-                if item.get("state") == "idle-drained"
-                and item.get("generation") == generation]
-    # A migrated `busy` (hook_state busy, never released) is proof enough. A
-    # released host needs a `busy` journal entry newer than its latest release:
-    # an acknowledgement from before that release proves nothing.
-    legacy = (row.get("hook_state") == "busy"
-              and resources.finite_float(row.get("released_ts")) is None)
-    newer_than_release = bool(
-        busy and (not released
-                  or float(busy[-1].get("created_ts") or 0)
-                  > float(released[-1].get("created_ts") or 0)))
-    if not newer_than_release and not legacy:
+    busy = [item for item in journal if item.get("state") == "busy"]
+    released = [item for item in journal if item.get("state") == "idle-drained"]
+    latest_busy_ts = max((float(item.get("created_ts") or 0) for item in busy),
+                         default=None)
+    latest_release_ts = max((float(item.get("created_ts") or 0) for item in released),
+                            default=None)
+    legacy = (row.get("hook_state") == "busy" and released_ts is None
+              and latest_busy_ts is None and latest_release_ts is None)
+    if latest_release_ts is not None:
+        if latest_busy_ts is None or latest_busy_ts <= latest_release_ts:
+            return None
+        after = latest_busy_ts
+    elif released_ts is not None:
+        # released but no journal (edge): the busy must postdate the release
+        if latest_busy_ts is None or latest_busy_ts < released_ts:
+            return None
+        after = max(latest_busy_ts, released_ts)
+    elif latest_busy_ts is not None:
+        after = latest_busy_ts
+    elif legacy:
+        after = requested
+    else:
         return None
-    released_before = bool(busy and (busy[-1].get("detail") or {}).get(
-        "previous_hook_state") == "idle-drained")
-    after = (busy[-1].get("created_ts") if released_before
-             else (busy[-1].get("created_ts") if busy else requested))
     return _fresh_reading(cfg, db, row["host"], now=now, after=after)
 
 
@@ -355,7 +365,8 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, holds, known,
             # No adapter: a first drain (or a migrated row) has hook_state
             # NULL; there is no `busy` answer to wait for.
             api.open_claims(host, row["generation"], require_busy=False,
-                            release_epoch=row.get("release_epoch"))
+                            release_epoch=row.get("release_epoch"),
+                            attempt_stale_after=_attempt_bound(cfg))
         return "no hook"
     if mode == "returning":
         if row.get("claims_open"):
@@ -363,7 +374,8 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, holds, known,
         if row.get("hook_state") == "busy":
             if _busy_sample_ok(cfg, api, db, row, now=now):
                 api.open_claims(host, row["generation"],
-                                release_epoch=row.get("release_epoch"))
+                                release_epoch=row.get("release_epoch"),
+                                attempt_stale_after=_attempt_bound(cfg))
                 return "claims open"
             return "waiting for a fresh reading"
         _run_transition(cfg, api, canons, row, "busy", actor=actor,
@@ -404,7 +416,8 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, holds, known,
             # proves the host is back.
             if _busy_sample_ok(cfg, api, db, row, now=now):
                 api.reopen_return(host, generation=row["generation"],
-                                  release_epoch=row["release_epoch"], actor=actor)
+                                  release_epoch=row["release_epoch"], actor=actor,
+                                  attempt_stale_after=_attempt_bound(cfg))
                 return "returning"
             return "waiting for a fresh reading"
         # A new withdrawal: busy is where we start, draining is the next step.
@@ -527,11 +540,13 @@ def request_return(cfg, db, host, *, actor, runner=None, now=None, clock=time.ti
     if not hook:
         if row.get("mode") == "returning" and not row.get("claims_open"):
             api.open_claims(host, row["generation"], require_busy=False,
-                            release_epoch=row.get("release_epoch"))
+                            release_epoch=row.get("release_epoch"),
+                            attempt_stale_after=_attempt_bound(cfg))
         else:
             api.undrain(host, actor=actor, claims_open=True,
                         generation=row["generation"],
-                        release_epoch=row.get("release_epoch"))
+                        release_epoch=row.get("release_epoch"),
+                        attempt_stale_after=_attempt_bound(cfg))
         return api.get(host)
     if row.get("mode") == "returning" and row.get("claims_open"):
         return row
@@ -547,7 +562,8 @@ def request_return(cfg, db, host, *, actor, runner=None, now=None, clock=time.ti
     if not _busy_sample_ok(cfg, api, db, row, now=now):
         return row
     api.reopen_return(host, generation=row["generation"],
-                      release_epoch=row["release_epoch"], actor=actor)
+                      release_epoch=row["release_epoch"], actor=actor,
+                      attempt_stale_after=_attempt_bound(cfg))
     return api.get(host)
 
 

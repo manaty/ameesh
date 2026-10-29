@@ -4264,7 +4264,8 @@ class HostLifecycle(Domain):
     @abc.abstractmethod
     def undrain(self, host: str, *, actor: str, claims_open: bool = True,
                 generation: int | None = None,
-                release_epoch: int | None = None) -> dict | None:
+                release_epoch: int | None = None,
+                attempt_stale_after: float | None = None) -> dict | None:
         """Request agents' return; retained origin rows survive this request.
 
         #4148: `claims_open=False` leaves the claim gate closed for the
@@ -4272,6 +4273,8 @@ class HostLifecycle(Domain):
         it. `release_state` returns to `busy` only when claims are opened.
         `generation`/`release_epoch` are the CAS of a return decided from a
         snapshot: a new withdrawal or another return makes it stale.
+        `attempt_stale_after` refuses to reopen while an external adapter call
+        is still in flight (younger than the bound), even from an older wave.
         """
 
     @abc.abstractmethod
@@ -4308,25 +4311,29 @@ class HostLifecycle(Domain):
     @abc.abstractmethod
     def open_claims(self, host: str, generation: int, *,
                     require_busy: bool = True,
-                    release_epoch: int | None = None) -> bool:
+                    release_epoch: int | None = None,
+                    attempt_stale_after: float | None = None) -> bool:
         """Reopen claims after a `busy` acknowledgement and a fresh reading.
 
         Only a host whose acknowledged hook state is `busy` can reopen; a
         replay, a stale generation or a moved `release_epoch` opens nothing.
         `require_busy=False` is the explicit operator path of a host whose
-        adapter was removed.
+        adapter was removed. `attempt_stale_after` also refuses while an
+        adapter call is in flight.
         """
 
     @abc.abstractmethod
     def reopen_return(self, host: str, *, generation: int, release_epoch: int,
-                      actor: str) -> dict | None:
+                      actor: str,
+                      attempt_stale_after: float | None = None) -> dict | None:
         """Atomically reopen a return after a valid `busy` proof.
 
         The CAS is the generation and the release epoch of the snapshot, and
         the row must still carry `hook_state='busy'`; a released host also
-        needs a `busy` journal entry newer than its last `idle-drained`. A
-        new withdrawal, another return, or an in-flight release transition
-        leaves the claims closed. Returns the updated row, or None.
+        needs a `busy` journal entry newer than its last `idle-drained`
+        (across generations and epochs). A new withdrawal, another return, or
+        any in-flight adapter call younger than `attempt_stale_after` leaves
+        the claims closed. Returns the updated row, or None.
         """
 
     @abc.abstractmethod

@@ -308,6 +308,66 @@ class HostReleaseTest(PgTestCase):
             actor="runner", older_than=180, released_grace=60)
         self.assertEqual([row["mode"] for row in changed], ["lost"])
 
+    def test_new_drain_does_not_erase_an_in_flight_release(self):
+        self.add_agent()
+        self.quiet_history()
+        self.once(local_host="vm", now=time.time())
+        control = self.control()
+        gen1, epoch1 = control["generation"], control["release_epoch"]
+        self.assertIsNotNone(self.api.host_lifecycle.begin_transition(
+            "vm", gen1, "idle-drained", release_epoch=epoch1, actor="runner",
+            stale_after=300, retry_after=0))
+        # The external release hook is still running; a planned return then a
+        # new drain must keep its marker.
+        self.db.execute("UPDATE host_lifecycle SET hook_state='busy' WHERE host='vm'")
+        self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
+                        "WHERE host='vm'")
+        self.api.host_lifecycle.expire_returns(open_claims=False)
+        self.api.host_lifecycle.drain("vm", actor="human:op")
+        control = self.control()
+        self.assertEqual(control["hook_attempt_state"], "idle-drained")
+        self.assertEqual(control["hook_attempt_generation"], gen1)
+        self.assertEqual(control["hook_attempt_epoch"], epoch1)
+        # No reopening while the old hook is in flight.
+        self.assertIsNone(self.api.host_lifecycle.reopen_return(
+            "vm", generation=control["generation"],
+            release_epoch=control["release_epoch"], actor="runner",
+            attempt_stale_after=420))
+        # The old hook ends: its external release is journalled as stale and
+        # the current hook state becomes idle-drained (last effect wins).
+        self.assertIsNone(self.api.host_lifecycle.finish_transition(
+            "vm", gen1, "idle-drained", release_epoch=epoch1, actor="runner",
+            detail={}))
+        control = self.control()
+        self.assertIsNone(control["hook_attempt_state"])
+        self.assertEqual(control["hook_state"], "idle-drained")
+        journal = self.api.host_lifecycle.transition_journal("vm")
+        stale = [row for row in journal
+                 if row["state"] == "idle-drained" and row["generation"] == gen1]
+        self.assertEqual(len(stale), 1)
+        self.assertTrue(stale[0]["detail"].get("stale"))
+        # The stale release is newer than every busy acknowledgement: still no
+        # reopening until a fresh busy hook.
+        self.assertIsNone(self.api.host_lifecycle.reopen_return(
+            "vm", generation=control["generation"],
+            release_epoch=control["release_epoch"], actor="runner",
+            attempt_stale_after=420))
+        busy = self.api.host_lifecycle.begin_transition(
+            "vm", control["generation"], "busy",
+            release_epoch=control["release_epoch"], actor="runner",
+            stale_after=300, retry_after=0)
+        self.assertIsNotNone(busy)
+        self.api.host_lifecycle.finish_transition(
+            "vm", control["generation"], "busy",
+            release_epoch=control["release_epoch"], actor="runner",
+            detail={"previous_hook_state": "idle-drained"})
+        opened = self.api.host_lifecycle.reopen_return(
+            "vm", generation=control["generation"],
+            release_epoch=control["release_epoch"], actor="runner",
+            attempt_stale_after=420)
+        self.assertIsNotNone(opened)
+        self.assertTrue(opened["claims_open"])
+
     def test_release_decision_is_refused_after_a_return(self):
         self.add_agent()
         self.quiet_history()

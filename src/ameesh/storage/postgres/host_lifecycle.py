@@ -209,9 +209,13 @@ class HostLifecycle(interface.HostLifecycle):
                 "release_generation=host_lifecycle.generation+1, "
                 "automatic=excluded.automatic,released_at=NULL, "
                 "release_error=NULL,release_error_state=NULL,release_error_at=NULL, "
-                "release_error_since=NULL,hook_attempt_at=NULL,"
-                "hook_attempt_state=NULL,hook_attempt_generation=NULL,"
-                "hook_attempt_epoch=NULL, "
+                "release_error_since=NULL, "
+                # #4148: NEVER clear an in-flight adapter attempt here. A new
+                # drain from `returning` can start while an idle-drained hook
+                # of the previous wave is still running; erasing its marker
+                # would let a fresh `busy` reopen claims before that external
+                # release finishes. The stale attempt is cleared by its own
+                # finish (stale branch) or by the stale_after bound.
                 "updated_at=clock_timestamp() RETURNING " + _ROW,
                 (host, actor, duration, duration, automatic))
             row = rows[0]
@@ -225,7 +229,7 @@ class HostLifecycle(interface.HostLifecycle):
             return row
 
     def undrain(self, host, *, actor, claims_open=True, generation=None,
-                release_epoch=None):
+                release_epoch=None, attempt_stale_after=None):
         if not isinstance(claims_open, bool):
             raise ValueError("claims_open: a boolean expected")
         for value, name in ((generation, "generation"),
@@ -233,6 +237,9 @@ class HostLifecycle(interface.HostLifecycle):
             if value is not None and (isinstance(value, bool)
                                       or not isinstance(value, int) or value < 1):
                 raise ValueError("%s: a positive integer expected" % name)
+        if attempt_stale_after is not None:
+            attempt_stale_after = _positive_seconds(attempt_stale_after,
+                                                    "attempt_stale_after")
         with self.db.transaction() as tx:
             Hosts._lock_gate(tx, host)
             tx.query("SELECT name FROM agent_registry WHERE host=%s ORDER BY name FOR UPDATE", (host,))
@@ -250,9 +257,13 @@ class HostLifecycle(interface.HostLifecycle):
                 "AND mode='draining' "
                 "AND (%s::bigint IS NULL OR generation=%s) "
                 "AND (%s::bigint IS NULL OR release_epoch=%s) "
+                # No reopen while an external adapter call is still in flight.
+                "AND (%s::float8 IS NULL OR hook_attempt_at IS NULL "
+                "     OR hook_attempt_at <= clock_timestamp()-make_interval(secs=>%s)) "
                 "RETURNING " + _ROW,
                 (actor, claims_open, claims_open, host, generation, generation,
-                 release_epoch, release_epoch))
+                 release_epoch, release_epoch, attempt_stale_after,
+                 attempt_stale_after))
             return rows[0] if rows else HostLifecycle(tx).get(host)
 
     def agents(self, host, generation):
@@ -397,6 +408,32 @@ class HostLifecycle(interface.HostLifecycle):
             control = HostLifecycle(tx).get(host)
             if (not control or control["generation"] != generation
                     or control["release_epoch"] != release_epoch):
+                # #4148 cx3: the external call happened, but a newer decision
+                # owns the row. Keep the evidence (a stale idle-drained journal
+                # makes a later `busy` mandatory before any reopen), then clear
+                # only OUR attempt so the next transition can proceed.
+                if error is None:
+                    tx.execute(
+                        "INSERT INTO host_lifecycle_transitions(host,generation,"
+                        "release_epoch,state,actor,detail) "
+                        "VALUES (%s,%s,%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING",
+                        (host, generation, release_epoch, state, actor,
+                         json.dumps(dict(detail, stale=True), sort_keys=True)))
+                    # cx3: the external effect happened after a newer decision.
+                    # The last completed acknowledgement wins: stamp it so the
+                    # scanner calls `busy` again after a stale release and does
+                    # not trust a `busy` from before it.
+                    tx.execute(
+                        "UPDATE host_lifecycle SET hook_state=%s,"
+                        "updated_at=clock_timestamp() WHERE host=%s",
+                        (state, host))
+                tx.execute(
+                    "UPDATE host_lifecycle SET hook_attempt_at=NULL,"
+                    "hook_attempt_state=NULL,hook_attempt_generation=NULL,"
+                    "hook_attempt_epoch=NULL,updated_at=clock_timestamp() "
+                    "WHERE host=%s AND hook_attempt_generation=%s "
+                    "AND hook_attempt_epoch=%s AND hook_attempt_state=%s",
+                    (host, generation, release_epoch, state))
                 return None
             if error is not None:
                 text = " ".join(str(error).split())[:500]
@@ -439,20 +476,27 @@ class HostLifecycle(interface.HostLifecycle):
             return HostLifecycle(tx).get(host)
 
     def open_claims(self, host, generation, *, require_busy=True,
-                    release_epoch=None):
+                    release_epoch=None, attempt_stale_after=None):
         if release_epoch is not None and (isinstance(release_epoch, bool)
                                          or not isinstance(release_epoch, int)
                                          or release_epoch < 1):
             raise ValueError("release_epoch: a positive integer expected")
+        if attempt_stale_after is not None:
+            attempt_stale_after = _positive_seconds(attempt_stale_after,
+                                                    "attempt_stale_after")
         rows = self.db.query(
             "UPDATE host_lifecycle SET claims_open=true,updated_at=clock_timestamp() "
             "WHERE host=%s AND generation=%s AND (NOT %s OR hook_state='busy') "
             "AND (%s::bigint IS NULL OR release_epoch=%s) "
+            "AND (%s::float8 IS NULL OR hook_attempt_at IS NULL "
+            "     OR hook_attempt_at <= clock_timestamp()-make_interval(secs=>%s)) "
             "AND NOT claims_open RETURNING host",
-            (host, generation, bool(require_busy), release_epoch, release_epoch))
+            (host, generation, bool(require_busy), release_epoch, release_epoch,
+             attempt_stale_after, attempt_stale_after))
         return bool(rows)
 
-    def reopen_return(self, host, *, generation, release_epoch, actor):
+    def reopen_return(self, host, *, generation, release_epoch, actor,
+                      attempt_stale_after=None):
         """Atomic CAS of a return after a valid `busy` proof (see interface)."""
         for value, name in ((generation, "generation"),
                             (release_epoch, "release_epoch")):
@@ -461,6 +505,9 @@ class HostLifecycle(interface.HostLifecycle):
         if not isinstance(actor, str) or not actor.strip() \
                 or any(ord(c) < 32 for c in actor):
             raise ValueError("return actor required")
+        if attempt_stale_after is not None:
+            attempt_stale_after = _positive_seconds(attempt_stale_after,
+                                                    "attempt_stale_after")
         with self.db.transaction() as tx:
             Hosts._lock_gate(tx, host)
             rows = tx.query(
@@ -470,18 +517,27 @@ class HostLifecycle(interface.HostLifecycle):
                 "WHERE c.host=%s AND c.generation=%s AND c.release_epoch=%s "
                 "AND c.mode IN ('draining','returning') "
                 "AND c.hook_state='busy' AND NOT c.claims_open "
-                # A released host needs a busy acknowledgement after its last
-                # release; a never-released legacy row is its own proof.
-                "AND (c.released_at IS NULL OR EXISTS ("
-                "  SELECT 1 FROM host_lifecycle_transitions t "
-                "   WHERE t.host=c.host AND t.generation=c.generation "
-                "     AND t.state='busy' "
-                "     AND NOT EXISTS (SELECT 1 FROM host_lifecycle_transitions r "
-                "                      WHERE r.host=c.host AND r.generation=c.generation "
-                "                        AND r.state='idle-drained' "
-                "                        AND r.created_at > t.created_at))) "
+                # No reopen while an external adapter call is in flight, even
+                # from an older wave: it may still release the host.
+                "AND (%s::float8 IS NULL OR c.hook_attempt_at IS NULL "
+                "     OR c.hook_attempt_at <= clock_timestamp()-make_interval(secs=>%s)) "
+                # A host with ANY release evidence (including a stale
+                # idle-drained hook of an older wave) needs a `busy`
+                # acknowledgement after its LAST release, across generations
+                # and epochs. A never-released legacy row is its own proof.
+                "AND (NOT EXISTS ("
+                "       SELECT 1 FROM host_lifecycle_transitions r "
+                "        WHERE r.host=c.host AND r.state='idle-drained') "
+                "     OR EXISTS ("
+                "       SELECT 1 FROM host_lifecycle_transitions t "
+                "        WHERE t.host=c.host AND t.state='busy' "
+                "          AND t.created_at > ("
+                "              SELECT max(r.created_at) "
+                "                FROM host_lifecycle_transitions r "
+                "               WHERE r.host=c.host AND r.state='idle-drained'))) "
                 "RETURNING " + _ROW,
-                (actor, host, generation, release_epoch))
+                (actor, host, generation, release_epoch, attempt_stale_after,
+                 attempt_stale_after))
             return rows[0] if rows else None
 
     def transition_journal(self, host):
