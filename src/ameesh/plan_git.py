@@ -2183,6 +2183,11 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
     if found["merged"] and found["how"] != "message":
         # la citation par une fusion de la cible ne dépend pas de la pointe
         return _remote_moved(repo, branch, target, out, found)
+    if found.pop("check_remote", False):
+        # #4508 : la tête vue a été refusée faute de travail propre, mais la
+        # forge peut avoir avancé depuis (branche recréée ou poussée, #2654) :
+        # la pointe publiée, si elle diffère, est rendue en avance.
+        return _remote_moved(repo, branch, target, out, found)
     return found
 
 
@@ -2287,10 +2292,20 @@ def _branch_probe(repo: str, branch: str, target: str, head: str, tip: str | Non
                 return dict(cited, how="ancestor", ref=tip,
                             detail="%s (%s) entered %s through a merge commit "
                                    "that cites it" % (branch, tip[:12], target))
+            if own_refusal():
+                # #4508 : refus local (base de création, pointe d'une autre
+                # branche) ; la forge peut avoir avancé, `branch_probe` le
+                # vérifie sur la tête publiée (#2654).
+                cited["check_remote"] = True
             return cited
-        return seen() or mention(
+        why = own_refusal()
+        cited = seen() or mention(
             refusal() or "%s has no work of its own: its tip %s is on the line of %s"
                        % (branch, tip[:12], target))
+        if why and not cited["merged"]:
+            # #4508 : même refus local ; la forge peut avoir avancé (#2654).
+            cited["check_remote"] = True
+        return cited
     out["ahead"] = True
     found = probe(repo, tip, target, lot=branch_lot(branch))
     if found["merged"]:
