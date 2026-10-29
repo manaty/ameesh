@@ -560,7 +560,9 @@ def manual_seats(already: Iterable, *, authors: Iterable = (), fixers: Iterable 
     correction (#2739). They are authors of the head (#2888): their family is
     forbidden exactly like any author's, and the agent itself cannot count a
     seat — it would be reviewing its own fix. The name list is kept as a
-    safety net when the caller's `authors` list is partial.
+    safety net when the caller's `authors` list is partial. A row with no
+    proven family (`test_only`, #3518, or a corrector whose commit the author
+    rewrote, #4457) excludes only the name; its family stays eligible.
     """
     names, forbidden = families_of(authors)
     fixer_names = names_of(fixers)
@@ -733,7 +735,9 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     - `fixers` names the designated reviewers whose small first-round
       correction is an authored commit of the head (#2739/#2888). Their family
       is forbidden like any author's family; their exact name is excluded too,
-      as a safety net: they would review their own fix.
+      as a safety net: they would review their own fix. A fixer row with an
+      empty family is a **personal** exclusion only (`test_only`, #3518, or a
+      rewritten correction, #4457): its family remains eligible.
 
     Returns `{state, required, reviewers, missing, manual, why, forbidden,
     families, fixers}`: `waiting` when independent families are missing or an author
@@ -1263,6 +1267,9 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     `fixers` names the designated reviewers whose small first-round correction
     is an authored commit of the head (#2739/#2888): their family is forbidden
     like any author's family, and the exact agent is never designated again.
+    A fixer row with an empty family is a **personal** exclusion only
+    (`test_only`, #3518, or a rewritten correction, #4457): its family remains
+    eligible and another agent of it may be designated.
 
     `advances` maps a family to its advance over the plan pace, in points
     (`review_pace`, #2668), or to a `{scope: advance}` mapping whose scoped
