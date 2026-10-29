@@ -2243,8 +2243,23 @@ def _reasons(entry: dict) -> str:
     return (" (" + ", ".join(parts) + ")") if parts else ""
 
 
+def report_sha256(path: str | None) -> str:
+    """L'empreinte du fichier de rapport, telle que la note de B la porte."""
+    if not path:
+        return ""
+    try:
+        with open(_expand(path), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
 def note_text(report: dict) -> str:
-    """La note de trois lignes à poser sur le lot d'évaluation."""
+    """La note de rejeu à poser sur le lot d'évaluation.
+
+    Elle nomme le fichier ET son empreinte (#4312) : C lit le fichier après
+    la note, et une empreinte absente ou différente refuse le rapport (le
+    fichier a changé entre la note et la lecture)."""
     evaluated = report.get("evaluated") or {}
     kind = evaluated.get("kind") or "harness"
     old = evaluated.get("old") or {}
@@ -2257,12 +2272,17 @@ def note_text(report: dict) -> str:
             "%s %s → %s" % (report.get("harness") or "?", old_label, new_label))
     bench = ", ".join("#%s (%s)" % (entry.get("lot"), entry.get("class"))
                       for entry in report.get("lots") or [])
-    return "\n".join([
+    path = report.get("report_path") or report.get("work_root") or "?"
+    lines = [
         "Rejeu comparatif %s : %s." % (
             what, CONCLUSION_LABELS.get(report.get("conclusion") or "", "?")),
         "Banc : %s ; coût, durée, tests du lot et note aveugle dans le rapport." % bench,
-        "Rapport : %s" % (report.get("report_path") or report.get("work_root") or "?"),
-    ])
+        "Rapport : %s" % path,
+    ]
+    digest = report_sha256(path)
+    if digest:
+        lines.append("Empreinte : %s" % digest)
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -2329,7 +2349,7 @@ def _add_report_parser(sub) -> None:
     parser = sub.add_parser("report", help="relire un rapport de rejeu")
     parser.add_argument("file")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--note", action="store_true", help="la note de trois lignes")
+    parser.add_argument("--note", action="store_true", help="la note de rejeu (chemin et empreinte du rapport)")
     parser.set_defaults(func=_cmd_report)
 
 
@@ -2409,6 +2429,8 @@ def _cmd_run(cfg: Config, args) -> int:
 
 def _cmd_report(cfg: Config, args) -> int:
     report = _load_report(args.file)
+    # le fichier est la source de l'empreinte de la note (#4312)
+    report["report_path"] = _expand(args.file)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=1))
     elif args.note:
