@@ -160,6 +160,31 @@ class PrefixReplayTest(unittest.TestCase):
         self.assertEqual((found, flaky), ({}, []))
         self.assertIn("non concluant", why)
 
+    def test_un_rouge_situe_survit_a_un_instable(self) -> None:
+        # B1 cx2 : un test rouge situé sur un préfixe et un test instable dans
+        # le même rejeu ; le premier doit rester retirable.
+        real = {"test": "tests.test_target.T.test_real", "module": "test_target"}
+        flaky = {"test": "tests.test_target.T.test_flaky",
+                 "module": "test_target"}
+
+        def replay(_worktree, label, modules, *, timeout):
+            if label == "préfixe 1 (#1)":
+                return paquet_auto.TestRun(
+                    label, list(modules), 1,
+                    "FAIL: test_real (tests.test_target.T.test_real)\n"
+                    "AssertionError: real\n", 0.1)
+            return _green(label, modules)
+
+        found, why, remaining = paquet_auto.prefix_failures(
+            self.repo, self.composition, [real, flaky], timeout=1,
+            replay=replay, log=lambda _line: None)
+        self.assertEqual(why, "")
+        self.assertEqual({lot: [failure["test"] for failure in failures]
+                          for lot, failures in found.items()},
+                         {1: [real["test"]]})
+        self.assertEqual([failure["test"] for failure in remaining],
+                         [flaky["test"]])
+
     def test_rouge_de_la_tete_mais_vert_sur_les_prefixes_est_instable(self) -> None:
         # #4221 : vert sur tous les préfixes = instable, consigné non
         # concluant, le paquet continue ; ce n'est plus une lecture illisible.

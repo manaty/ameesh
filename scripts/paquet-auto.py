@@ -1833,8 +1833,9 @@ def prefix_failures(worktree: Path, composition: Composition,
                 break
         if unresolved:
             # #4221 : verts au rejeu sur tous les préfixes : instables,
-            # l'appelant les consigne non concluants sans arrêter le paquet.
-            return {}, "", unresolved
+            # l'appelant les consigne non concluants sans arrêter le paquet ;
+            # les tests déjà situés (`found`, B1 cx2) restent retirables.
+            return found, "", unresolved
         return found, "", []
     finally:
         remove_worktree(worktree, path)

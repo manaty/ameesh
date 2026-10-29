@@ -203,18 +203,20 @@ class FlakyLocalTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="paquet-4221-check-")
         self.addCleanup(self.tmp.cleanup)
 
-    def check(self, *, prefix, own=None, attribute=None, own_failure=True):
+    def check(self, *, prefix, own=None, attribute=None, own_failure=True,
+              output=None):
         composition = paquet_auto.Composition(
             units=[paquet_auto.Unit(1, "a" * 40, "b" * 40)],
             discarded=[], head="b" * 40)
         own = list(own or ["tests.test_own"])
         neighbor = {"module": "tests.test_target", "reason": "carte",
                     "files": ["src/pkg/value.py"]}
-        output = ("FAIL: test_value (%s)\nAssertionError: 2 != 1\n"
-                  % TARGET)
-        if own_failure:
-            output = ("FAIL: test_own (tests.test_own.T.test_own)\n"
-                      "AssertionError: own\n" + output)
+        if output is None:
+            output = ("FAIL: test_value (%s)\nAssertionError: 2 != 1\n"
+                      % TARGET)
+            if own_failure:
+                output = ("FAIL: test_own (tests.test_own.T.test_own)\n"
+                          "AssertionError: own\n" + output)
         neighbor_run = _run(
             "unité #1", own + ["tests.test_target"], 1, output)
         green = _run("contrats", ["tests.test_contrat"], 0,
@@ -247,6 +249,25 @@ class FlakyLocalTest(unittest.TestCase):
         self.assertIn("instable", runs[0].motive())
         self.assertIn("1 non concluant(s)",
                       paquet_auto._tests_summary(runs))
+
+    def test_un_voisin_situe_reste_retire_a_cote_de_l_instable(self) -> None:
+        # B1 cx2 : deux rouges voisins, l'un situé sur un préfixe, l'autre
+        # instable ; le premier doit être retiré, le second consigné.
+        real = "tests.test_target.T.test_real"
+        flaky = "tests.test_target.T.test_flaky"
+        output = ("FAIL: test_real (%s)\nAssertionError: real\n"
+                  "FAIL: test_flaky (%s)\nAssertionError: flaky\n"
+                  % (real, flaky))
+        runs, faulty, removals = self.check(
+            own_failure=False, output=output,
+            prefix=lambda *_a, **_k: (
+                {1: [{"test": real, "module": "test_target"}]}, "",
+                [{"test": flaky, "module": "test_target"}]))
+        self.assertEqual(faulty, [1])
+        self.assertEqual([removal.lot for removal in removals], [1])
+        self.assertEqual(removals[0].proof, "prefixes")
+        self.assertEqual(removals[0].tests, [real])
+        self.assertTrue(any(run.flaky_tests == [flaky] for run in runs))
 
     def test_un_rouge_propre_reste_retire_a_cote_de_l_instable(self) -> None:
         failure = {"test": TARGET, "module": "test_target"}
