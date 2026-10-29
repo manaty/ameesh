@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -360,6 +362,143 @@ class RealTreeTest(unittest.TestCase):
         spec.loader.exec_module(freeze)
         commands = [args for _name, args in freeze.CHECKS]
         self.assertIn(["scripts/garde-alias-classe.py", "--root", "."], commands)
+
+
+class BranchementCITest(unittest.TestCase):
+    """#4521 B/P2 (cx2) : la garde est requise en CI, pas seulement au gel.
+
+    Le gel local et le composeur ne couvrent pas une CI verte : la garde doit
+    tourner dans un job dont l'échec rougit l'agrégat requis `tests`, sur
+    l'arbre testé, et refuser sans canon lisible.
+    """
+
+    WORKFLOW = REPO / ".github" / "workflows" / "tests.yml"
+
+    def job_block(self, name):
+        text = self.WORKFLOW.read_text(encoding="utf-8")
+        start = text.index("\n  %s:" % name)
+        end = len(text)
+        for marker in ("\n  psycopg:", "\n  psql:", "\n  platform-macos:",
+                       "\n  doc-readers:", "\n  fs-class:", "\n  version:",
+                       "\n  tests:"):
+            position = text.find(marker, start + 1)
+            if position != -1:
+                end = min(end, position)
+        return text[start:end]
+
+    def test_la_garde_tourne_dans_le_job_plan_requis(self):
+        plan = self.job_block("plan")
+        self.assertIn(
+            "run: python3 scripts/garde-alias-classe.py --root . --project ameesh",
+            plan)
+        # `plan` est une dépendance de l'agrégat requis `tests` : son échec
+        # rougit le check requis (`scripts/ci-agregat.py`, plan != success).
+        self.assertIn("needs: [plan,", self.job_block("tests"))
+
+
+#: un git de banc, sans la configuration de l'hôte
+GIT_ENV = {
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_AUTHOR_NAME": "banc",
+    "GIT_AUTHOR_EMAIL": "banc@example.invalid",
+    "GIT_COMMITTER_NAME": "banc",
+    "GIT_COMMITTER_EMAIL": "banc@example.invalid",
+}
+
+
+class CanonReelTest(unittest.TestCase):
+    """#4521 B cx2 : la garde sous un canon git réel, pas une politique simulée.
+
+    La commande est celle de la CI (`--root . --project ameesh`, même
+    interpréteur), lancée sur l'arbre réel du dépôt ; le canon est un dépôt git
+    jetable. Une implémentation plus légère est refusée, un canon absent ou
+    illisible aussi.
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="ameesh-4521-canon-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.canon = os.path.join(self.root, "canon")
+        os.makedirs(self.canon)
+
+    def git(self, *args):
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("GIT_")}
+        env.update(GIT_ENV)
+        proc = subprocess.run(["git", *args], cwd=self.canon, env=env,
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise AssertionError("git %s: %s" % (" ".join(args), proc.stderr))
+
+    def write_canon(self, rules):
+        """Un canon git minimal : les chemins de ``rules`` sont sensibles."""
+        text = (
+            'federation: "0.1"\n'
+            "id: test\n"
+            "members: []\n"
+            "review_policies:\n"
+            "  risk_classes:\n"
+            "    default: normal\n"
+            "    projects:\n"
+            "      ameesh:\n"
+            "        default: light\n"
+            "        rules:\n")
+        for paths in rules:
+            text += "          - paths:\n"
+            for path in paths:
+                text += '              - "%s"\n' % path
+            text += "            class: sensitive\n"
+        with open(os.path.join(self.canon, "federation.yaml"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(text)
+        self.git("init", "-q", "-b", "main")
+        self.git("add", "federation.yaml")
+        self.git("commit", "-qm", "canon")
+
+    def config(self, *, canon=None):
+        path = os.path.join(self.root, "config.json")
+        payload = {}
+        if canon is not None:
+            payload["canons"] = [{"path": canon, "ref": "main"}]
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        return path
+
+    def run_guard(self, config):
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(("AMEESH_CANON", "AMEESH_CANONS",
+                                       "AGENT_MESH_CONFIG", "AGENT_MESH_CANON"))}
+        env["AMEESH_CONFIG"] = config
+        env["PYTHONPATH"] = str(REPO / "src")
+        env["HOME"] = os.path.join(self.root, "home")
+        os.makedirs(env["HOME"], exist_ok=True)
+        return subprocess.run(
+            [sys.executable, str(REPO / "scripts" / "garde-alias-classe.py"),
+             "--root", str(REPO), "--project", "ameesh"],
+            env=env, capture_output=True, text=True)
+
+    def test_refuse_une_implementation_light_sous_un_canon_reel(self):
+        self.write_canon([["src/ameesh/merge_pr.py"]])
+        proc = self.run_guard(self.config(canon=self.canon))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("src/ameesh/modules/dev/merge_pr.py", proc.stdout)
+
+    def test_couvre_les_deux_chemins_sous_un_canon_reel(self):
+        self.write_canon([["src/ameesh/merge_pr.py",
+                           "src/ameesh/modules/dev/merge_pr.py"]])
+        proc = self.run_guard(self.config(canon=self.canon))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_sans_canon_refuse(self):
+        proc = self.run_guard(self.config())
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("aucun canon", proc.stderr)
+
+    def test_politique_illisible_refuse(self):
+        missing = os.path.join(self.root, "absent")
+        proc = self.run_guard(self.config(canon=missing))
+        self.assertEqual(proc.returncode, 2, proc.stdout)
 
 
 if __name__ == "__main__":

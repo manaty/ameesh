@@ -513,6 +513,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # #4521 (revue cx2, B/P2) : la garde des alias `sys.modules` tourne aussi
+      # en CI, sur l'arbre testé, dans `plan` dont l'échec rougit l'agrégat
+      # requis `tests`. Elle lit le canon configuré de l'hôte, comme
+      # `ameesh review-class` : sans canon ou politique illisible, elle refuse
+      # (code 2) ; un alias dont l'implémentation est plus légère que son ancien
+      # chemin refuse la CI (code 1). Jamais de vert muet.
+      - name: garde alias/classe (#4521)
+        run: python3 scripts/garde-alias-classe.py --root . --project ameesh
       - name: lancement à la main sur la tête d'une PR ouverte (#1635)
         if: github.event_name == 'workflow_dispatch'
         env:
