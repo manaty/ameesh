@@ -17,7 +17,7 @@ from .support import PgTestCase
 IDENTITY_COLUMNS = re.compile(
     r"^(agent|persona|assignee|reviewers?|recipient|sender|delegate|owner|approver|actor|"
     r"holder|external_executor|name|primary_name|supplied_name|old_name|new_name|"
-    r"[a-z_]+_by)$")
+    r"agents_allowlist|[a-z_]+_by)$")
 NOT_AGENTS = {
     # Identity-like names that never hold an agent spelling.
     "agent_registry.name",
@@ -55,7 +55,7 @@ class AgentRenameTest(PgTestCase):
             "  FROM information_schema.columns c JOIN information_schema.tables t"
             "    USING (table_schema, table_name)"
             " WHERE c.table_schema = current_schema() AND t.table_type = 'BASE TABLE'"
-            "   AND c.data_type IN ('text', 'ARRAY', 'character varying')")
+            "   AND c.data_type IN ('text', 'ARRAY', 'character varying', 'jsonb')")
         columns = {r['col']: r['data_type'] for r in rows}
         known = {c.rstrip('[]') for c in agent_rename.REWRITTEN + agent_rename.CASCADED
                  + agent_rename.KEPT}
@@ -96,6 +96,22 @@ class AgentRenameTest(PgTestCase):
             "                     'ameesh_rename_agent_column')")
         self.assertEqual(len(rows), 3)
         self.assertEqual([r['proname'] for r in rows if r['prosecdef']], [])
+
+    def test_executor_allowlist_reads_the_old_spelling_as_the_new_identity(self):
+        # B1 (mty-amh-docs-01): the invitation's allowlist is kept as signed;
+        # the session token admits the renamed agent through its alias.
+        from ameesh.mediated_executor import contract as C
+        from ameesh.mediated_executor import identity
+        from ameesh.mediated_executor import interfaces as I
+        self.rename('worker', 'new-worker')
+        provider = identity.DbIdentityProvider(self.db)
+        fence = C.Fence('new-worker', C.owner_for('0' * 16, self.cfg.host, 1), 1)
+        for allowlist, refused in ((('worker',), I.AuthError), (('reviewer',), I.ScopeError)):
+            principal = I.Principal(kind='executor', executor_id='0' * 16, mesh='m',
+                                    host=self.cfg.host, agents_allowlist=allowlist)
+            # past the allowlist, the unknown executor is refused as revoked
+            with self.assertRaises(refused):
+                provider.issue_session_token(principal, fence)
 
     def test_rename_moves_the_same_identity_and_keeps_old_as_alias(self):
         claimed = registry.claim(self.db, 'worker', 'runner-test', 120)

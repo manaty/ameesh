@@ -11,8 +11,8 @@ CASCADE (0516). The key, lease epoch, session and worktree stay on the same
 row: no second row is created and nothing is copied.
 
 Evidence is never rewritten (`KEPT`): approvals, nonces, keys and key events,
-receipts, executor audit and tokens, alias resolutions and renames. Signed
-bytes stay as signed; their spellings resolve through the alias.
+receipts, executor audit, tokens and allowlists, alias resolutions and renames.
+Signed bytes stay as signed; their spellings resolve through the alias.
 
 Refused while the agent holds a live lease or is running (stop its runner
 first, between two turns), when NEW already designates another identity or
@@ -56,17 +56,17 @@ REWRITTEN = (
     "merge_queue.queued_by", "notify_briefs.recipient", "notify_state.owner",
     "operator_pause_events.actor", "persona_sessions.persona", "provider_account_credits.agent",
     "provider_account_credits.prepaid_by",
-    "quota_gauge_readings.source", "review_catch_up.actor", "session_bindings.agent",
+    "review_catch_up.actor", "session_bindings.agent",
     "session_bindings.created_by", "spend_pending.agent", "standing_reservations.reserved_by",
     "turn_costs.agent", "turn_resources.agent", "visibility_checks.persona",
     "work_item_delegations.delegate", "work_item_delegations.delegated_by",
     "work_item_delegations.resolved_by", "work_item_dependencies.created_by",
-    "work_item_estimates.estimated_by", "work_item_estimates.source", "work_item_events.actor",
+    "work_item_estimates.estimated_by", "work_item_events.actor",
     "work_item_footprints.created_by", "work_item_links.created_by",
     "work_item_links.decided_by", "work_item_milestones.actor", "work_items.assignee",
-    "work_items.delegated_by", "work_items.estimate_by", "work_items.estimate_source",
+    "work_items.delegated_by", "work_items.estimate_by",
     "work_items.external_executor", "work_items.planned_by", "work_items.reviewer",
-    "work_items.reviewers[]", "work_items.source", "work_landings.created_by",
+    "work_items.reviewers[]", "work_landings.created_by",
     "work_packages.planned_by", "work_packet_members.recorded_by", "work_resolutions.created_by",
 )
 
@@ -79,7 +79,8 @@ CASCADED = (
     "role_standings.name",
 )
 
-# Evidence, authority and unrelated names: never rewritten.
+# Evidence, authority and unrelated names: never rewritten. Executor
+# allowlists (jsonb) are granted authority, read through the alias.
 KEPT = (
     "action_attempts.approver", "action_attempts.launched_by", "action_attempts.settled_by",
     "action_events.actor", "actions.auth_by", "actions.proposed_by", "actions.replaced_by",
@@ -87,7 +88,8 @@ KEPT = (
     "agent_registry.name", "agent_registry.roles", "agent_renames.actor",
     "agent_renames.new_name", "agent_renames.old_name", "authenticator_syncs.applied_by",
     "authenticators.approver", "ci_runner_state.name", "ci_runs.superseded_by",
-    "exec_audit.agent", "executor_events.actor", "executor_invitations.created_by",
+    "exec_audit.agent", "executor_events.actor", "executor_invitations.agents_allowlist",
+    "executor_invitations.created_by", "executors.agents_allowlist",
     "executor_tokens.agent", "executors.enrolled_by", "executors.revoked_by",
     "key_events.holder", "key_events.name", "key_holders.name", "mesh_approvals.approver",
     "mesh_approvals.consumed_by", "mesh_consumed_nonces.approver",
