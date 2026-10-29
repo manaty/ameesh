@@ -749,6 +749,33 @@ def mediated_hosts(db) -> list:
     return [r["host"] for r in rows]
 
 
+#: #4435: a mediated host has no runner with a database, so the server is its
+#: release scanner. Transitions and planned returns are checked every minute;
+#: the costly idle scan stays spaced by `host_release_interval` in the DB.
+RELEASE_INTERVAL_S = 60.0
+
+
+def release_once(cfg, db) -> list:
+    """#4435: one bounded release pass over the mediated hosts.
+
+    Returns the hosts whose return was completed. Only hosts with an enrolled
+    executor are scanned: a native host keeps its own runner's scanner (and
+    this server may not hold its adapter configuration), so it must never be
+    decided from here.
+    """
+    from .. import host_lifecycle, host_release, storage
+    hosts = set(mediated_hosts(db))
+    if not hosts:
+        return []
+    # No runner pass will expire the planned returns of a mediated host:
+    # convert the due withdrawals here, with claims kept closed so the `busy`
+    # hook still answers before any claim reopens.
+    storage.of(db).host_lifecycle.expire_returns(open_claims=False, hosts=hosts)
+    host_release.once(cfg, db, local_host=None, actor="mediated-server",
+                      hosts=hosts)
+    return host_lifecycle.complete_returns(db, hosts=hosts)
+
+
 #: L790 : un serveur médié périmé ne doit pas répéter le même avertissement à
 #: chaque passe (le runner, lui, ne le dit qu'une fois). Clé = (hôte, raison) ;
 #: l'entrée est oubliée dès qu'une passe réussit, pour qu'une nouvelle
@@ -825,6 +852,18 @@ def _purge_loop(app: ExecApp) -> None:
             log.warning("élagage impossible : %s", str(exc)[:200])
 
 
+def _release_loop(app: ExecApp, cfg, interval: float = RELEASE_INTERVAL_S) -> None:
+    """#4435: the release scanner of the mediated hosts, every minute."""
+    while True:
+        try:
+            with app.pool.connection() as conn:
+                release_once(cfg, conn)
+        except Exception as exc:
+            log.warning("libération des hôtes médiés : %s", str(exc)[:200])
+        if app.closing.wait(interval):
+            return
+
+
 def main(argv=None) -> int:
     from .. import config as config_mod
     from .. import db as db_mod
@@ -894,6 +933,11 @@ def main(argv=None) -> int:
                          daemon=True, name="canon-hotes-medies").start()
     server = ExecHTTPServer(app, (host, int(port)), tls=tls)
     threading.Thread(target=_purge_loop, args=(app,), daemon=True).start()
+    if isinstance(auth, LockedIdentity):
+        # #4435: a fixed-token bench is not an executor server; never run a
+        # mediated host's release adapter from it.
+        threading.Thread(target=_release_loop, args=(app, cfg), daemon=True,
+                         name="liberation-hotes-medies").start()
     log.info("API d'exécuteur médiée sur %s:%s%s (contrat %s, identité %s, relais %s,"
              " dépôt de travail %s)",
              host, port, contract.PREFIX, app.contract.version,

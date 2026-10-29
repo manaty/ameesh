@@ -1207,11 +1207,16 @@ def ensure_source(worktree: Path, candidate: Candidate) -> None:
 
 
 def _compose(worktree: Path, candidate: Candidate, carrier: int,
-             compose_script: Path, record_package: bool) -> subprocess.CompletedProcess:
+             compose_script: Path, record_package: bool,
+             expect_pushed: str = "") -> subprocess.CompletedProcess:
     cmd = [project_python(worktree), str(compose_script), "--repo", str(worktree),
            "--lot", str(candidate.lot), "--source", candidate.source]
     if record_package:
         cmd += ["--record-package", str(carrier)]
+        if expect_pushed:
+            # #4501 : la tête poussée dont ce composeur détient le bail ; le
+            # `packet record` refuse une autre tête gelée.
+            cmd += ["--expect-pushed", expect_pushed]
     return run_command(cmd, cwd=worktree, timeout=DEFAULT_TIMEOUT,
                        env=python_env(worktree))
 
@@ -1269,6 +1274,7 @@ finally:
 
 def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int,
                        *, compose_script: Path, record_package: bool,
+                       expect_pushed: str = "",
                        log=print, guard=None) -> Composition:
     """Compose les candidats dans l'ordre ; un conflit est écarté, jamais résolu."""
     units: list[Unit] = []
@@ -1289,7 +1295,8 @@ def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int
             log("écarté #%d : source déjà portée par une unité précédente"
                 % candidate.lot)
             continue
-        proc = _compose(worktree, candidate, carrier, compose_script, record_package)
+        proc = _compose(worktree, candidate, carrier, compose_script, record_package,
+                        expect_pushed=expect_pushed)
         if proc.returncode == 0:
             commit = rev(worktree, "HEAD")
             if commit is None or commit == before:
@@ -1330,6 +1337,7 @@ def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int
 
 def recompose(worktree: Path, base_sha: str, candidates: list[Candidate],
               carrier: int, *, compose_script: Path, record_package: bool,
+              expect_pushed: str = "",
               log=print, guard=None) -> Composition:
     """Repart de la base exacte et recompose, sans les unités fautives."""
     if guard is not None:
@@ -1338,7 +1346,9 @@ def recompose(worktree: Path, base_sha: str, candidates: list[Candidate],
     git(worktree, "clean", "-fd")
     return compose_candidates(worktree, candidates, carrier,
                               compose_script=compose_script,
-                              record_package=record_package, log=log, guard=guard)
+                              record_package=record_package,
+                              expect_pushed=expect_pushed,
+                              log=log, guard=guard)
 
 
 # ---------------------------------------------------------------------------
@@ -2381,10 +2391,14 @@ def run_inclusion(worktree: Path, manifest: Path, head: str,
 
 
 def record_packet(worktree: Path, carrier: int, base_sha: str, head: str,
-                  branch: str, target: str) -> str:
+                  branch: str, target: str, expect_pushed: str = "") -> str:
     cmd = ["ameesh", "work", "packet", "record", str(carrier),
            "--repo", str(worktree), "--base", base_sha, "--head", head,
            "--branch", branch, "--target", target]
+    if expect_pushed:
+        # #4501 : la tête poussée que cette composition remplace (bail du
+        # composeur) ; le refus d'une tête gelée étrangère vient de packet_link.
+        cmd += ["--expect-pushed", expect_pushed]
     proc = run_command(cmd, cwd=worktree, timeout=DEFAULT_TIMEOUT)
     if proc.returncode != 0:
         error = EpochLost if REFUSAL_RE.search(_output(proc)) else PaquetAutoError
@@ -3279,7 +3293,8 @@ def compose_packet(args: argparse.Namespace) -> int:
         composition = compose_candidates(
             worktree, candidates, args.carrier,
             compose_script=compose_script,
-            record_package=not args.no_packet_record, guard=guard)
+            record_package=not args.no_packet_record,
+            expect_pushed=remote_sha or "", guard=guard)
         if not composition.units:
             print("aucune unité composée : %s"
                   % ", ".join("#%d (%s)" % (item.lot, item.reason)
@@ -3340,7 +3355,8 @@ def compose_packet(args: argparse.Namespace) -> int:
             print("manifeste %s : tête %s" % (rel, head), flush=True)
             if not args.no_packet_record:
                 print(record_packet(worktree, args.carrier, base_sha, head,
-                                    branch, args.target), flush=True)
+                                    branch, args.target,
+                                    expect_pushed=lease or ""), flush=True)
             _write_id_file(expected_file, [unit.lot for unit in composition.units])
             inclusion_rc, inclusion_output = run_inclusion(
                 worktree, worktree / rel, head, ready_out, expected_file)
@@ -3442,7 +3458,8 @@ def compose_packet(args: argparse.Namespace) -> int:
             composition = recompose(
                 worktree, base_sha, candidates, args.carrier,
                 compose_script=compose_script,
-                record_package=not args.no_packet_record, guard=guard)
+                record_package=not args.no_packet_record,
+                expect_pushed=lease or "", guard=guard)
             composition.discarded = errors + composition.discarded + reasons
             # `--local` est une composition de contrôle : aucun courrier.
             failed: list[str] = []

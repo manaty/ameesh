@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 import unittest
+from unittest import mock
 
-from ameesh import packet_link, plan_git, storage, work
+from ameesh import db as db_mod, packet_head, packet_link, plan_git, storage, work
 
 from .support import PgTestCase
 from .test_canon import _TmpMixin, git
@@ -140,6 +143,205 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("packet composition recorded", out.stdout)
         self.assertEqual(self.membership(item["id"])[0]["package_id"], porteur["id"])
+
+    def test_record_refuses_a_second_composer_on_a_foreign_pushed_head(self):
+        """#4501 : le manifeste d'une tête poussée (gelée) n'est pas écrasé.
+
+        Témoin h-12 du 29/10 : le tic a recomposé un porteur dont la ci-full
+        tournait et ses 9 unités locales ont remplacé les 27 de la tête
+        poussée. Un enregistrement d'une autre tête est refusé tant que le
+        composeur qui la détient ne le dit pas (`--expect-pushed`).
+        """
+        sha = self.unit_branch("lot/vingt", "src/vingt.py", "vingt\n", "vingt")
+        item = self.lot("vingt")
+        self.freeze(item, sha)
+        head = self.compose("integration/paquet-1", [(item["id"], sha)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo,
+                           base=self.base, head=head, actor="pilote", cfg=self.cfg)
+        work.milestone(self.db, porteur["id"], "frozen", sha=head, actor="pilote")
+        # la même tête poussée se réenregistre sans cérémonie (pilote, rejeu)
+        again = packet_link.record(self.db, porteur["id"], repo=self.repo,
+                                   base=self.base, head=head, actor="pilote",
+                                   cfg=self.cfg)
+        self.assertTrue(again["recorded"])
+        # un second composeur repart de la base et fabrique sa propre tête
+        git(self.repo, "checkout", "-q", "-B", "integration/paquet-1", self.base)
+        git(self.repo, "merge", "-q", "--no-ff", "-m",
+            "vehicule : #%d %s\n\nameesh-work: %d"
+            % (item["id"], sha[:12], item["id"]), sha)
+        other = self.commit("manifeste.md", "# second\n", "manifeste du second")
+        with self.assertRaises(packet_link.PacketLinkError) as caught:
+            packet_link.record(self.db, porteur["id"], repo=self.repo,
+                               base=self.base, head=other, actor="second",
+                               cfg=self.cfg)
+        self.assertIn("already has the pushed head", str(caught.exception))
+        self.assertEqual(
+            {m["head_sha"] for m in
+             packet_link.memberships(self.db, package_ids=[porteur["id"]])},
+            {head})
+        # un second composeur qui croit encore la tête distante ancienne ne
+        # passe pas non plus : `expect_pushed` ne vaut pas la tête gelée.
+        with self.assertRaises(packet_link.PacketLinkError) as stale:
+            packet_link.record(self.db, porteur["id"], repo=self.repo,
+                               base=self.base, head=other,
+                               expect_pushed=self.base, actor="second",
+                               cfg=self.cfg)
+        self.assertIn("already has the pushed head", str(stale.exception))
+        # le composeur qui détient la tête poussée peut la remplacer
+        report = packet_link.record(self.db, porteur["id"], repo=self.repo,
+                                    base=self.base, head=other,
+                                    expect_pushed=head, actor="premier",
+                                    cfg=self.cfg)
+        self.assertTrue(report["recorded"])
+        self.assertEqual(
+            {m["head_sha"] for m in
+             packet_link.memberships(self.db, package_ids=[porteur["id"]])},
+            {other})
+
+    def test_record_refuses_a_newer_observed_push_before_its_freeze(self):
+        """#4501 : une poussée vue après le gel protège aussi le manifeste.
+
+        Entre la poussée et son gel (quelques secondes), le gel déclaré est
+        encore l'ancien : `branch_head`, relevé de la forge, est la trace
+        partagée de la nouvelle poussée. Un second composeur dont la lecture
+        distante est antérieure ne l'écrase pas.
+        """
+        sha = self.unit_branch("lot/vingt-et-un", "src/vingt-et-un.py", "x\n", "x")
+        item = self.lot("vingt-et-un")
+        self.freeze(item, sha)
+        head = self.compose("integration/paquet-1", [(item["id"], sha)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo,
+                           base=self.base, head=head, actor="pilote", cfg=self.cfg)
+        work.milestone(self.db, porteur["id"], "frozen", sha=head, actor="pilote")
+        # une poussée plus récente est vue par le veilleur, pas encore gelée
+        pushed = self.commit("pousse.md", "# poussée\n", "poussée du premier")
+        self.assertTrue(storage.of(self.db).work.set_branch_head(
+            porteur["id"], porteur["branch"], pushed))
+        # un second composeur repart de la base et fabrique sa propre tête
+        git(self.repo, "checkout", "-q", "-B", "integration/paquet-1", self.base)
+        git(self.repo, "merge", "-q", "--no-ff", "-m",
+            "vehicule : #%d %s\n\nameesh-work: %d"
+            % (item["id"], sha[:12], item["id"]), sha)
+        other = self.commit("manifeste.md", "# second\n", "manifeste du second")
+        with self.assertRaises(packet_link.PacketLinkError) as caught:
+            packet_link.record(self.db, porteur["id"], repo=self.repo,
+                               base=self.base, head=other,
+                               expect_pushed=head, actor="second", cfg=self.cfg)
+        self.assertIn("already has the pushed head %s" % pushed[:12],
+                      str(caught.exception))
+        self.assertEqual(
+            {m["head_sha"] for m in
+             packet_link.memberships(self.db, package_ids=[porteur["id"]])},
+            {head})
+
+    def test_record_rechecks_the_pushed_head_under_the_carrier_lock(self):
+        """#4501 (B cx3) : un gel qui avance entre la lecture et l'écriture.
+
+        La lecture initiale de `packet_link.record` voit F1 et accepte
+        `expect_pushed=F1` ; un premier composeur gèle F2 avant la transaction
+        d'écriture. `record_packet` relit la tête sous le verrou du porteur et
+        refuse : les membres de F1 restent intacts.
+        """
+        sha = self.unit_branch("lot/vingt-deux", "src/vingt-deux.py", "y\n", "y")
+        item = self.lot("vingt-deux")
+        self.freeze(item, sha)
+        head = self.compose("integration/paquet-1", [(item["id"], sha)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo,
+                           base=self.base, head=head, actor="pilote", cfg=self.cfg)
+        work.milestone(self.db, porteur["id"], "frozen", sha=head, actor="pilote")
+        # la tête poussée/gelée pendant la course
+        raced = self.commit("course.md", "# course\n", "gel concurrent")
+        # un second composeur repart de la base et fabrique sa propre tête
+        git(self.repo, "checkout", "-q", "-B", "integration/paquet-1", self.base)
+        git(self.repo, "merge", "-q", "--no-ff", "-m",
+            "vehicule : #%d %s\n\nameesh-work: %d"
+            % (item["id"], sha[:12], item["id"]), sha)
+        other = self.commit("manifeste.md", "# second\n", "manifeste du second")
+        real = packet_link._protected_pushed_head
+
+        def racing(db_arg, package, repo):
+            protected = real(db_arg, package, repo)
+            # le premier composeur gèle F2 juste après la lecture initiale
+            work.milestone(self.db, porteur["id"], "frozen", sha=raced,
+                           actor="premier")
+            return protected
+
+        with mock.patch.object(packet_link, "_protected_pushed_head",
+                               side_effect=racing):
+            with self.assertRaises(packet_link.PacketLinkError) as caught:
+                packet_link.record(self.db, porteur["id"], repo=self.repo,
+                                   base=self.base, head=other,
+                                   expect_pushed=head, actor="second", cfg=self.cfg)
+        self.assertIn("already has the pushed head %s" % raced[:12],
+                      str(caught.exception))
+        self.assertEqual(
+            {m["head_sha"] for m in
+             packet_link.memberships(self.db, package_ids=[porteur["id"]])},
+            {head})
+
+    def test_concurrent_records_serialize_on_the_carrier_lock(self):
+        """#4501 (B cx3/auditeur) : deux enregistrements concurrents ne se mélangent pas.
+
+        Deux connexions appellent `record_packet` sur le même porteur avec le
+        même `expect_pushed` (la tête gelée), des têtes et des unités
+        différentes. Le verrou `FOR NO KEY UPDATE` du porteur sérialise : le
+        second attend le premier avant de relire la tête, puis écrit son
+        ensemble complet. Avec deux `FOR SHARE` compatibles, il passerait
+        pendant que le premier dort et les membres pourraient se mélanger.
+        """
+        head = self.base
+        carrier = self.carrier()
+        work.milestone(self.db, carrier["id"], "frozen", sha=head, actor="pilote")
+        unit_a = self.lot("unit A")
+        unit_b = self.lot("unit B")
+        conn_a, conn_b = db_mod.connect(self.cfg), db_mod.connect(self.cfg)
+        self.addCleanup(conn_a.close)
+        self.addCleanup(conn_b.close)
+        locked = threading.Event()
+        real = packet_head.protected_head
+
+        def slow_a(*args):
+            if threading.current_thread().name == "record-a":
+                locked.set()
+                time.sleep(0.6)
+            return real(*args)
+
+        def record(conn, head_sha, unit):
+            storage.of(conn).work.record_packet(
+                int(carrier["id"]), branch="integration/paquet-1",
+                base_sha=self.base, head_sha=head_sha,
+                units=[{"work_item_id": int(unit["id"]), "unit_sha": "d" * 40,
+                        "source_sha": self.base, "frozen_sha": self.base}],
+                note="concurrence", actor="test", expect_pushed=head)
+
+        done: dict = {}
+
+        def run_a():
+            try:
+                record(conn_a, "2" * 40, unit_a)
+                done["a"] = True
+            except Exception as exc:  # noqa: BLE001 - remonté par le témoin
+                done["a_error"] = exc
+
+        with mock.patch.object(packet_head, "protected_head", side_effect=slow_a):
+            thread = threading.Thread(target=run_a, name="record-a", daemon=True)
+            thread.start()
+            self.assertTrue(locked.wait(5), "le premier n'a pas pris le verrou")
+            started = time.monotonic()
+            record(conn_b, "3" * 40, unit_b)
+            elapsed = time.monotonic() - started
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("a_error", done)
+        self.assertGreaterEqual(elapsed, 0.4,
+                                "le second n'a pas attendu le verrou du porteur")
+        self.assertEqual(
+            {m["work_item_id"] for m in
+             packet_link.memberships(self.db, package_ids=[carrier["id"]])},
+            {unit_b["id"]})
 
     def test_record_reuses_the_recorded_base_after_a_target_update(self):
         """Une mise à jour de la cible dans le paquet ne perd pas les unités."""

@@ -50,13 +50,15 @@ def green(label="unité #1"):
 class Flux:
     """Le flux de `compose_packet`, chaque geste extérieur consigné dans l'ordre."""
 
-    def __init__(self, test, *, tests, compositions, states=("OPEN",), local=False):
+    def __init__(self, test, *, tests, compositions, states=("OPEN",), local=False,
+                 record=False):
         self.test = test
         self.events: list[tuple] = []
         self.tests = list(tests)
         self.compositions = list(compositions)
         self.states = list(states)
         self.local = local
+        self.record = record
         self.heads = iter("%x" % n * 40 for n in range(1, 10))
         self.manifests: list = []
 
@@ -74,10 +76,14 @@ class Flux:
         (worktree / "scripts" / "paquet-compose.py").write_text("")
         args = argparse.Namespace(
             repo=tmp, name=NAME, target="main", carrier=4304, base=None,
-            local=self.local, no_packet_record=True, keep_worktree=False,
+            local=self.local, no_packet_record=not self.record, keep_worktree=False,
             keep_failed_hours=24.0, force=False, tests_timeout=10,
             pilot="mesh-design", sender="mesh-design")
         first, *rest = self.compositions
+
+        def recompose(*args, **kwargs):
+            self.events.append(("recompose", args, kwargs))
+            return rest.pop(0)
 
         def manifest(**kwargs):
             self.manifests.append(kwargs["tests"])
@@ -97,6 +103,7 @@ class Flux:
             return self.states.pop(0) if len(self.states) > 1 else self.states[0]
 
         patches = [
+            mock.patch.object(paquet_auto, "check_epoch"),
             mock.patch.object(paquet_auto, "fresh_base", return_value="a" * 40),
             mock.patch.object(paquet_auto, "prune_stale_worktrees", return_value=[]),
             mock.patch.object(paquet_auto, "make_worktree", return_value=worktree),
@@ -104,7 +111,13 @@ class Flux:
                 [paquet_auto.Candidate(1, "a" * 40), paquet_auto.Candidate(2, "c" * 40)],
                 {"ready": [1, 2], "waiting": []})),
             mock.patch.object(paquet_auto, "compose_candidates", return_value=first),
-            mock.patch.object(paquet_auto, "recompose", side_effect=rest),
+            mock.patch.object(paquet_auto, "recompose", side_effect=recompose),
+            # #4501 : la liaison en base est mockée, mais ses arguments sont
+            # consignés (tête poussée attendue).
+            mock.patch.object(paquet_auto, "remote_branch", return_value=None),
+            mock.patch.object(paquet_auto, "ensure_carrier_branch"),
+            mock.patch.object(paquet_auto, "record_packet",
+                              side_effect=self.log("record", "record")),
             mock.patch.object(paquet_auto, "notify_removals", return_value=[]),
             mock.patch.object(paquet_auto, "run_freeze_checks",
                               side_effect=self.log("freeze-checks", (0, "ok", 0.1))),
@@ -197,6 +210,25 @@ class PousseePrecoceTest(unittest.TestCase):
         second_push = [i for i, name in enumerate(names) if name == "push"][1]
         self.assertEqual(names[second_push - 1], "state")
         self.assertEqual(flux.manifests, [None, None])
+
+    def test_recomposition_du_meme_composeur_dit_la_tete_poussee(self) -> None:
+        """#4501 : la liaison d'une recomposition nomme la tête qu'elle remplace.
+
+        Le composeur qui a poussé la tête détient son bail (`lease`) : la
+        première liaison ne remplace rien (`expect_pushed` vide), la seconde
+        dit la tête poussée du même lancement, que `packet record` reconnaît.
+        """
+        removal = paquet_auto.Removal(2, tests=["tests.test_x.T.test_y"], attributed=True)
+        red = paquet_auto.TestRun("unité #2", ["tests.test_x"], 1,
+                                  "FAIL: test_y (tests.test_x.T.test_y)\n", 0.1)
+        flux = Flux(self, tests=[([red], [2], [removal]), ([green()], [], [])],
+                    compositions=[self.two, self.one], record=True)
+        self.assertEqual(flux.run(), 0)
+        first, second = [event[1][0] for event in flux.calls("manifest")]
+        self.assertEqual([event[2].get("expect_pushed") for event in flux.calls("record")],
+                         ["", first])
+        self.assertEqual(flux.calls("recompose")[0][2]["expect_pushed"], first)
+        self.assertNotEqual(second, first)
 
     def test_pr_close_pendant_les_tests_rien_n_est_recompose(self) -> None:
         # #4322 : l'état de la PR est lu avant toute recomposition (la fusion

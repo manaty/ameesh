@@ -11240,8 +11240,8 @@ class Runner:
         readable) can lift the cause after the freeze; the freeze is kept, so
         the same head is replayed, never a newer one. #3328: the same pass
         reattributes a seat whose designated reviewer became unreachable (host
-        closed, stopped/dead). Bounded and never fatal: the canon sync must not
-        fail because a designation retry did."""
+        closed, stopped/dead, blocked/auth_blocked #4491). Bounded and never
+        fatal: the canon sync must not fail because a designation retry did."""
         if getattr(self, "mediated", False):
             return
         if not getattr(self, "_designation_retry_ready", False):
@@ -11472,15 +11472,30 @@ class Runner:
         except (db_mod.DbError, handoffs.HandoffError, ValueError):
             log_async("host lifecycle: request remains pending; helper or prerequisites unavailable")
 
-    def host_release_once(self) -> None:
-        """#4148: one release-scanner pass (adapter transitions, auto drain)."""
+    def host_release_once(self, *, scan_local=True, complete=False) -> None:
+        """#4148: one release-scanner pass (adapter transitions, auto drain).
+
+        #4435: `scan_local=False` is the bounded one-shot pass: it advances
+        the durable requests but never starts an automatic withdrawal of the
+        calling host. `complete=True` then closes the returns whose claims the
+        pass just reopened, since no later resource pass may come.
+        """
         from . import host_release
         db = None
         try:
             from .scoped_db import ScopedDb
             db = ScopedDb(self.cfg)
-            host_release.once(self.cfg, db, local_host=self.host,
+            if complete:
+                from . import host_lifecycle
+                # No resource pass will call `host_lifecycle_once` after this
+                # one: expire the planned returns here, claims kept closed so
+                # the `busy` hook still answers first.
+                storage.of(db).host_lifecycle.expire_returns(open_claims=False)
+            host_release.once(self.cfg, db,
+                              local_host=self.host if scan_local else None,
                               actor=self.runner_id)
+            if complete:
+                host_lifecycle.complete_returns(db)
         except Exception as exc:  # a scanner pass never stops the runner
             log_async("host release: pass failed (%s: %s)"
                       % (type(exc).__name__, str(exc)[:160]))
@@ -11492,8 +11507,16 @@ class Runner:
                     pass
 
     def start_host_release_poll(self) -> None:
-        """#4148: transitions every minute; the idle scan is spaced in the DB."""
-        if self.once or getattr(self, "mediated", False):
+        """#4148: transitions every minute; the idle scan is spaced in the DB.
+
+        #4435: a one-shot executor is the only scanner of its host; it makes
+        one explicit bounded pass (no automatic withdrawal) and closes the
+        returns it reopened, then hands back.
+        """
+        if getattr(self, "mediated", False):
+            return
+        if self.once:
+            self.host_release_once(scan_local=False, complete=True)
             return
 
         def boucle() -> None:

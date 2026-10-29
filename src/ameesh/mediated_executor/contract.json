@@ -4994,6 +4994,7 @@
     "unassign_surplus",
     "unassigned_lots",
     "update_generated",
+    "project_plan_rows",
     "waiting_episodes",
     "wip_exceptions",
     "without_project",
