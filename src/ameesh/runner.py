@@ -451,46 +451,10 @@ def _expanduser_in(path: str, env: dict) -> str:
     return os.path.expanduser(path)
 
 
-def worktree_marker(cwd: str | None) -> dict:
-    """Identité git d'un dossier de travail (0018 : suivre un renommage).
-
-    `git_common_dir` est le dépôt commun (le même pour tous les worktrees) ;
-    la branche distingue les worktrees d'un même dépôt. Best-effort : renvoie
-    `{}` si le dossier n'est pas un dépôt ou si git manque.
-    """
-    if not cwd or not os.path.isdir(cwd):
-        return {}
-    try:
-        common = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
-            capture_output=True, text=True, timeout=5)
-        branche = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    if common.returncode != 0 or not common.stdout.strip():
-        return {}
-    return {
-        "cwd": os.path.abspath(cwd),
-        "git_common_dir": os.path.abspath(os.path.join(cwd, common.stdout.strip())),
-        "branch": branche.stdout.strip() if branche.returncode == 0 else "",
-    }
-
-
-def write_worktree_marker(cfg: Config, name: str, cwd: str) -> dict:
-    """Écrit le marqueur du dossier de travail dans l'état de l'agent."""
-    marker = worktree_marker(cwd)
-    if not marker:
-        return {}
-    directory = cfg.agent_dir(name)
-    try:
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        with open(os.path.join(directory, "worktree.json"), "w", encoding="utf-8") as fh:
-            json.dump(marker, fh, ensure_ascii=False)
-    except OSError:
-        return {}
-    return marker
+#: 0018 : l'identité git d'un dossier de travail et son marqueur vivent dans
+#: la façade (L101 T3) ; ces noms restent importables depuis `runner`.
+worktree_marker = workspaces.worktree_marker
+write_worktree_marker = workspaces.write_worktree_marker
 
 
 def _preemption_generation(worker) -> int:
@@ -3344,77 +3308,19 @@ class AgentWorker(threading.Thread):
             return None
 
     # -- dossier de travail déplacé (0018) ---------------------------------
-    #: profondeur maximale de recherche d'un dossier de travail déplacé :
-    #: `~/development/manaty/ameesh/.claude/worktrees/<nom>` est à cinq niveaux.
-    WORKTREE_DEPTH = 6
-    #: dossiers cachés qu'on traverse quand même (worktrees imbriqués)
-    WORKTREE_HIDDEN = (".claude", ".worktrees")
-    #: répertoires jamais traversés (dépendances, caches, sorties de build)
-    WORKTREE_SKIP = ("node_modules", ".git", "venv", ".venv", "target", "build",
-                     "dist", "__pycache__", ".cache", ".local")
-
-    def _worktree_dirs(self, racine: str, ancien: str | None):
-        """Dossiers candidats sous une racine, profondeur bornée (0018 B4).
-
-        On ne descend pas dans les grands répertoires de dépendances ni dans
-        `.git`, mais on traverse `.claude` / `.worktrees` : les worktrees
-        imbriqués (ex. `~/development/manaty/ameesh/.claude/worktrees/<nom>`)
-        doivent être trouvés, ou l'adoption refuse proprement.
-        """
-        base = racine.rstrip(os.sep).count(os.sep)
-        for dossier, sous_dirs, _ in os.walk(racine):
-            sous_dirs[:] = [d for d in sous_dirs
-                            if d not in self.WORKTREE_SKIP
-                            and (not d.startswith(".") or d in self.WORKTREE_HIDDEN)]
-            if dossier.count(os.sep) - base >= self.WORKTREE_DEPTH:
-                sous_dirs[:] = []
-            if dossier != ancien and os.path.exists(os.path.join(dossier, ".git")):
-                yield dossier
-
     def adopt_moved_worktree(self) -> str | None:
         """Retrouve un dossier de travail déplacé, borné aux racines (0018).
 
-        Le marqueur git (common dir + branche) est écrit à l'inscription ; si le
-        cwd a disparu, on cherche un candidat **unique** sous les racines
-        configurées, en profondeur bornée, et on refuse un dossier déjà utilisé
-        par un autre agent.
-        """
-        marqueur: dict = {}
-        try:
-            with open(self._path("worktree.json"), encoding="utf-8") as fh:
-                marqueur = json.load(fh) or {}
-        except (OSError, ValueError):
-            return None
-        common = marqueur.get("git_common_dir")
-        if not common:
-            return None
-        branche = marqueur.get("branch") or ""
-        ancien = self.agent.get("cwd")
-        candidats = []
-        for racine in self.runner.worktree_roots:
-            if not os.path.isdir(racine):
-                continue
-            for chemin in self._worktree_dirs(racine, ancien):
-                ident = worktree_marker(chemin)
-                if not ident or ident.get("git_common_dir") != common:
-                    continue
-                if branche and ident.get("branch") != branche:
-                    continue
-                candidats.append(chemin)
-        if len(candidats) != 1:
-            if len(candidats) > 1:
-                log("[%s] moved directory ambiguous: %s" % (self.name, ", ".join(candidats)))
-            return None
-        candidat = candidats[0]
-        if registry.cwd_used(self.db, candidat, self.name):
-            log("[%s] moved directory %s already used by another agent"
-                % (self.name, candidat))
-            return None
-        registry.upsert(self.db, self.name, cwd=candidat)
-        self.agent["cwd"] = candidat
-        log("[%s] moved working directory adopted: %s" % (self.name, candidat))
-        self._fil_note("Moved working directory adopted: %s" % candidat,
-                       meta={"action": "deplacement", "cwd": candidat})
+        La recherche (marqueur git, candidat unique, dossier libre) et la mise
+        à jour du registre vivent dans `workspaces` (L101 T3) ; ce point garde
+        le journal de l'agent et la trace d'audit."""
+        candidat = workspaces.adopt_moved_worktree(
+            self.db, self.agent, marker_path=self._path("worktree.json"),
+            roots=self.runner.worktree_roots,
+            report=lambda texte: log("[%s] %s" % (self.name, texte)))
+        if candidat:
+            self._fil_note("Moved working directory adopted: %s" % candidat,
+                           meta={"action": "deplacement", "cwd": candidat})
         return candidat
 
     # -- panne de base (L72) -------------------------------------------------
@@ -3822,59 +3728,35 @@ class AgentWorker(threading.Thread):
     #: déplacé comprise) : 5 s, 10 s, 20 s… bornée à 5 min, par agent
     WORKDIR_BACKOFF_MIN = 5.0
     WORKDIR_BACKOFF_MAX = 300.0
-    #: #811 (B1) : dossier d'un lot secondaire absent — délai par lot (borné),
-    #: l'agent gardant ses autres tours
-    LOT_WORKDIR_BACKOFF_MIN = 30.0
-    LOT_WORKDIR_BACKOFF_MAX = 600.0
 
     def _resolve_workdir(self, adopt: bool = True, *, lot=None) -> str | None:
         """Le dossier de travail utilisable, ou None.
 
-        Le primaire garde le `cwd` du registre relu par `pick()` et l'adoption
-        bornée d'un worktree déplacé (0018). Un lot SECONDaire DÉCLARÉ (projet
-        de l'agent autre que le primaire) utilise le dossier de son projet au
-        Host, sans modifier le registre ; quand ce dossier manque, `None` ne
-        concerne que ce lot (`_lot_workdir_secondary`), jamais le blocage
-        global « dossier absent » (L35) réservé au cwd primaire. Un lot d'un
-        projet NON déclaré par l'agent, ou un lot inconnu, tourne dans le cwd
-        primaire comme avant L243-4 (#811 B1)."""
-        from . import canon as canon_mod, lot_workdir, projects as projects_mod
+        La règle (primaire, lot secondaire déclaré, projet inconnu) vit dans
+        `workspaces.resolve` (L101 T3) ; ce point garde l'appel et recopie le
+        diagnostic lu par la garde L35 (`_workdir_missing`, #811 B1)."""
         lot = lot or getattr(self, "_workdir_lot", None) or self.agent.get("session_work_item")
-        names = projects_mod.agent_projects(self.agent)
         self._lot_workdir_secondary = False
         self._lot_workdir_path = None
-        project = ""
-        if len(names) > 1:  # N3 : aucun accès base pour un agent mono-projet
-            try:
-                project = lot_workdir.project(self.db, lot)
-            except (lot_workdir.WorkdirError, canon_mod.CanonError):
-                project = ""  # lot inconnu : cwd primaire, comme avant L243-4
-        if project and project != names[0] and project in names[1:]:
-            self._lot_workdir_secondary = True
-            if getattr(self.runner, "mediated", False):
-                self._lot_workdir_error = "mediated executor has no per-project depot"
-                return None
-            try:
-                cwd = lot_workdir.destination(self.cfg, self.agent, project)
-            except (lot_workdir.WorkdirError, canon_mod.CanonError) as exc:
-                self._lot_workdir_error = "project %s: %s" % (project, exc)
-                return None
-            self._lot_workdir_path = cwd
-            self._lot_workdir_error = "project %s: %r" % (project, cwd)
-            return cwd if cwd and os.path.isdir(cwd) else None
         self._lot_workdir_error = ""
-        return self._primary_workdir(adopt=adopt)
+        issue = workspaces.resolve(
+            self.cfg, self.db, self.agent, lot,
+            mediated=getattr(self.runner, "mediated", False),
+            mediated_workdir=self._mediated_workdir,
+            adopt_worktree=(self.adopt_moved_worktree if adopt else None))
+        self._lot_workdir_secondary = issue.secondary
+        self._lot_workdir_path = issue.path
+        self._lot_workdir_error = issue.error
+        return issue.cwd
 
     def _primary_workdir(self, adopt: bool = True) -> str | None:
         """Le dossier primaire (cwd du registre, adoption bornée ; dépôt de
         l'exécuteur médié) — jamais un projet secondaire : la garde L35 ne se
         lève que sur le dossier qu'elle a vu manquer (#811 B1)."""
-        if getattr(self.runner, "mediated", False):
-            return self._mediated_workdir()  # L113 : dépôt de travail
-        cwd = self.agent.get("cwd")
-        if cwd and os.path.isdir(cwd):
-            return cwd
-        return self.adopt_moved_worktree() if adopt else None
+        return workspaces.primary_workdir(
+            self.agent, mediated=getattr(self.runner, "mediated", False),
+            mediated_workdir=self._mediated_workdir,
+            adopt_worktree=(self.adopt_moved_worktree if adopt else None))
 
     # -- dépôt de travail de l'exécuteur médié (L113) -------------------------
     def _depot_dir(self) -> str:
@@ -4026,15 +3908,16 @@ class AgentWorker(threading.Thread):
     def _lot_workdir_deferred(self, lot) -> None:
         """#811 (B1) : diffère CE lot secondaire (dossier absent), échéance
         croissante et dernier chemin connu — le dossier revenu le débloque au
-        sondage suivant, sans attendre l'échéance."""
+        sondage suivant, sans attendre l'échéance.
+
+        Le délai (30 s, 60 s… borné) et son échéance sont calculés par
+        `workspaces.lot_deferral` (L101 T3) ; l'état reste ici."""
         lot = str(lot or "")
         if not lot:
             return
-        delay = self._lot_wd_delay.get(lot)
-        delay = (self.LOT_WORKDIR_BACKOFF_MIN if delay is None
-                 else min(self.LOT_WORKDIR_BACKOFF_MAX, delay * 2))
+        delay, until = workspaces.lot_deferral(self._lot_wd_delay.get(lot))
         self._lot_wd_delay[lot] = delay
-        self._lot_wd_until[lot] = time.monotonic() + delay
+        self._lot_wd_until[lot] = until
         if self._lot_workdir_path:
             self._lot_wd_path[lot] = self._lot_workdir_path
         log("[%s] lot #%s: %s — lot deferred for %ds, the agent keeps its other "
@@ -4045,30 +3928,31 @@ class AgentWorker(threading.Thread):
         """#811 (B1) : ce lot secondaire attend-il encore son dossier ?
 
         Le dernier chemin connu est revérifié à chaque appel : un dossier
-        recréé lève le différé tout de suite (pas d'attente de l'échéance)."""
+        recréé lève le différé tout de suite (pas d'attente de l'échéance).
+        La règle vit dans `workspaces.lot_wait` (L101 T3) ; l'état reste ici."""
         lot = str(lot or "")
         if not lot or lot not in self._lot_wd_until:
             return False
-        path = self._lot_wd_path.get(lot)
-        if path and os.path.isdir(path):
+        etat = workspaces.lot_wait(self._lot_wd_path.get(lot),
+                                   self._lot_wd_until[lot])
+        if etat.back:
             self._lot_wd_until.pop(lot, None)
             self._lot_wd_delay.pop(lot, None)
             self._lot_wd_path.pop(lot, None)
-            return False
-        return self._lot_wd_until[lot] > time.monotonic()
+        return etat.waiting
 
     def _lot_workdir_blocked(self, lot) -> bool:
         """#811 (B1/B2) : ce lot ne peut pas ouvrir de tour faute de dossier.
 
         L'état de différé (mémoire de ce worker) d'abord ; sinon la règle
-        partagée avec le hook (`lot_workdir.mail_hold`), pour ne pas livrer de
-        courrier dans la session d'un autre lot ni consommer un réveil pour un
-        lot dont le dossier manque. Une lecture en échec ne bloque rien."""
+        partagée avec le hook (`workspaces.mail_hold`, L101 T3), pour ne pas
+        livrer de courrier dans la session d'un autre lot ni consommer un
+        réveil pour un lot dont le dossier manque. Une lecture en échec ne
+        bloque rien."""
         if self._lot_deferred(lot):
             return True
         try:
-            from . import lot_workdir
-            return lot_workdir.mail_hold(self.cfg, self.db, self.agent, lot)
+            return workspaces.mail_hold(self.cfg, self.db, self.agent, lot)
         except db_mod.DbError as exc:
             log_async("[%s] lot workdir unreadable (%s)" % (self.name, exc))
             return False
