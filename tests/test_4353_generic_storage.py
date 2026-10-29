@@ -179,10 +179,12 @@ class GenericDeliveryTest(PgTestCase):
             self.db.execute('UPDATE work_items SET state = %s WHERE id = %s', (stage, lot))
         marks = self.db.query('SELECT * FROM work_item_milestones ORDER BY id')
         with self.db.transaction() as tx:
+            self.assertEqual(tx.query('SELECT version FROM schema_migrations WHERE version = 518'), [{'version': 518}])
             tx.execute((MIGRATIONS / 'rollback/0518_generic_delivery_state.sql').read_text())
             rows = tx.query('SELECT state, workflow_stage FROM work_items WHERE id IN (%s,%s) ORDER BY id', tuple(ids))
             self.assertEqual(rows, [dict(state='merged', workflow_stage=None), dict(state='promoted', workflow_stage=None)])
             self.assertEqual(tx.query('SELECT * FROM work_item_milestones ORDER BY id'), marks)
+            self.assertEqual(tx.query('SELECT version FROM schema_migrations WHERE version = 518'), [])
             tx.execute(MIGRATION)
             rows = tx.query('SELECT state, legacy_state FROM work_items WHERE id IN (%s,%s) ORDER BY id', tuple(ids))
             self.assertEqual(rows, [dict(state='delivered', legacy_state='merged'), dict(state='delivered', legacy_state='promoted')])
@@ -190,8 +192,6 @@ class GenericDeliveryTest(PgTestCase):
     def test_migration_round_trip_preserves_rows_and_milestones(self):
         lot = self.lot()
         self.db.execute("UPDATE work_items SET state = 'promoted' WHERE id = %s", (lot,))
-        class Rollback(Exception):
-            pass
         with self.db.transaction() as tx:
             # Reconstruct the actual pre-switch constraints/functions in the
             # disposable test schema. The outer rollback restores the fixture.
@@ -210,15 +210,16 @@ class GenericDeliveryTest(PgTestCase):
                        "'promoted','blocked','waiting_human','closed'))")
             before = tx.query('SELECT id, state, workflow_ref, workflow_stage FROM work_items ORDER BY id')
             marks = tx.query('SELECT * FROM work_item_milestones ORDER BY id')
+            # Explicit SQL savepoints work with both psql and psycopg drivers.
+            tx.execute('SAVEPOINT delivery_migration')
             try:
-                with tx.transaction() as inner:
-                    inner.execute(MIGRATION)
-                    row = inner.query('SELECT state, legacy_state, workflow_stage FROM work_items WHERE id = %s', (lot,))[0]
-                    self.assertEqual(row, {'state': 'delivered', 'legacy_state': 'promoted', 'workflow_stage': 'promoted'})
-                    self.assertEqual(inner.query('SELECT * FROM work_item_milestones ORDER BY id'), marks)
-                    raise Rollback()
-            except Rollback:
-                pass
+                tx.execute(MIGRATION)
+                row = tx.query('SELECT state, legacy_state, workflow_stage FROM work_items WHERE id = %s', (lot,))[0]
+                self.assertEqual(row, {'state': 'delivered', 'legacy_state': 'promoted', 'workflow_stage': 'promoted'})
+                self.assertEqual(tx.query('SELECT * FROM work_item_milestones ORDER BY id'), marks)
+            finally:
+                tx.execute('ROLLBACK TO SAVEPOINT delivery_migration')
+                tx.execute('RELEASE SAVEPOINT delivery_migration')
             self.assertEqual(tx.query('SELECT id, state, workflow_ref, workflow_stage FROM work_items ORDER BY id'), before)
             tx.execute(MIGRATION)
             self.assertEqual(tx.query('SELECT state FROM work_items WHERE id = %s', (lot,))[0]['state'], 'delivered')
