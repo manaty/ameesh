@@ -189,6 +189,26 @@ class SleepWorkMailTest(PgTestCase):
         self.assertEqual(self.lift_event("dev1")["reason"],
                          "automatic sleep lifted: unread mail from orchestrateur")
 
+    def test_a_review_designated_after_the_sleep_wakes_the_agent(self):
+        # Cas du pilote (#164353) : codex2, relecteur désigné de #4577, remis
+        # en pause après une levée. Une relecture due est du travail actionnable
+        # (#1726) : le dormeur doit être réveillé, même sans lot à lui.
+        self.sleep_all()
+        lot = work.add(self.db, title="gel en attente", app="ameesh",
+                       assignee="dev2", actor="pilote")
+        lot_id = int(lot["id"])
+        work.move(self.db, lot_id, "build", actor="dev2")
+        work.milestone(self.db, lot_id, "frozen", sha="a" * 40, actor="dev2")
+        self.db.execute("UPDATE work_items SET reviewers = ARRAY['dev1']"
+                        " WHERE id = %s", (lot_id,))
+        out = self.run_pass(2000)
+        woken = [g for g in out if g["kind"] == "wake"]
+        self.assertEqual(len(woken), 1)
+        self.assertEqual(woken[0]["agents"], ["dev1"])
+        self.assertFalse(registry.get(self.db, "dev1")["operator_paused"])
+        self.assertEqual(self.lift_event("dev1")["reason"],
+                         "automatic sleep lifted: actionable work due")
+
     def test_mail_from_an_ordinary_agent_does_not_wake(self):
         self.sleep_all()
         mail.send(self.db, "dev2", "dev1", "Coucou, rien d'urgent.")
