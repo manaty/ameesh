@@ -15,7 +15,10 @@ la nouvelle tête) prouve que l'auteur l'a réécrit. Aucune note n'est lue.
 """
 from __future__ import annotations
 
-from ameesh import merge_queue, registry, review_designation as rd, work
+from unittest import mock
+
+from ameesh import (merge_queue, registry, review_authors,
+                    review_designation as rd, work)
 
 from .support import PgTestCase
 from .test_2447_review_designation_activation import _ActivationFixture
@@ -51,14 +54,19 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
             ("milestone:%d" % int(mark["id"]), self.frozen, mark["actor"],
              "s-" + harness, "t", harness, self.lot))
 
-    def _rewrite_after_the_freeze(self):
-        """F1, correctif de cx3 sur F1, réécriture par l'auteur, F2."""
+    def _prepare_rewrite(self):
+        """F1, correctif de cx3 sur F1, réécriture par l'auteur : la tête B."""
         head_a = self.frozen
         self.freeze()                       # F1 désigne r1 (claude) et r2 (codex)
         # Le correctif du relecteur est poussé APRÈS le gel, sur sa tête.
         self.repo.write("src/ameesh/mail.py", "lot\ncx3 petit correctif\n")
         fix = self.repo.commit("cx3: correctif de relecture", agent="cx3")
         self.commit_receipt("cx3", "codex", fix)
+        # Le reçu est daté avant le verdict : la fenêtre de recherche couvre
+        # le tour de relecture, et les reçus de test peuvent se placer après.
+        self.db.execute(
+            "UPDATE provenance_receipts SET at = now() - interval '10 minutes'"
+            " WHERE subject = %s", ("commit:" + fix,))
         work.milestone(self.db, self.lot, "verdict", sha=head_a, actor="cx3",
                        verdict="blocked")
         # L'auteur le réécrit depuis le B : le commit du relecteur n'est plus
@@ -69,8 +77,26 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
         head_b = self.repo.commit("author: reprise du correctif", agent="author")
         self.receipts(commits=[head_b])
         self.frozen = head_b
+        return head_a, fix, head_b
+
+    def _rewrite_after_the_freeze(self):
+        head_a, fix, head_b = self._prepare_rewrite()
         _mark, out = self.freeze()          # F2
         return head_a, fix, head_b, out
+
+    def later_receipts(self, count, *, actor="cx3", harness="codex"):
+        """`count` reçus de commits absents, après le correctif, avant F2."""
+        for index in range(count):
+            sha = "%040x" % (0x44570000 + index)
+            self.db.execute(
+                "INSERT INTO provenance_receipts"
+                " (subject, sha, actor, session, turn, harness, work_item_id, at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, NULL,"
+                "         now() - interval '9 minutes'"
+                "         + (%s * interval '1 second'))"
+                " ON CONFLICT (subject) DO NOTHING",
+                ("commit:" + sha, sha, actor, "s-" + harness, "t", harness,
+                 index + 1))
 
     def test_a_rewritten_corrector_is_not_redesignated_and_its_family_stays(self):
         _head_a, _fix, _head_b, out = self._rewrite_after_the_freeze()
@@ -104,3 +130,68 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
         self.assertNotIn("cx3", [entry["actor"] for entry in out["accepted"]])
         self.assertEqual([entry["actor"] for entry in out["accepted"]],
                          ["r1", "r2"])
+
+    def test_more_than_500_later_receipts_do_not_hide_the_corrector(self):
+        # B/P2 cx3 : une lecture tronquée à 500 reçus (tri DESC, tous lots)
+        # perdait le correctif sous l'activité ultérieure de l'agent.
+        _head_a, _fix, head_b = self._prepare_rewrite()
+        self.later_receipts(501)
+        _mark, out = self.freeze()          # F2
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        names = [row["name"] for row in out["reviewers"]]
+        self.assertNotIn("cx3", names)
+        self.assertIn("r2", names)
+        # La porte suit la même lecture, malgré les 501 reçus absents.
+        harnesses = {"r1": "claude", "r2": "codex", "cx3": "codex"}
+        for actor, harness in harnesses.items():
+            mark = work.milestone(self.db, self.lot, "verdict", sha=head_b,
+                                  actor=actor, verdict="ok")
+            self.verdict_receipt(mark, harness)
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/mail.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/*"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        with mock.patch.object(review_authors, "_forge_fetch",
+                               return_value=False):
+            gate = merge_queue.review_gate(
+                self.db, work.milestones(self.db, self.lot), head_b,
+                repo=self.repo.root, klass=klass, item=work.get(self.db, self.lot),
+                required=2, families=FAMILIES)
+        self.assertFalse(gate.get("error"), gate)
+        self.assertIn("cx3", gate["corrections"])
+        self.assertNotIn("cx3", [entry["actor"] for entry in gate["accepted"]])
+
+    def test_absent_receipts_are_fetched_once_per_host(self):
+        # B/P2 auditeur : un SHA absent du clone ne doit pas être redemandé à
+        # la forge à chaque lecture ; la deuxième lecture ne fait aucun fetch.
+        _head_a, _fix, head_b = self._prepare_rewrite()
+        self.later_receipts(10)
+        item = work.get(self.db, self.lot)
+        freeze = {"id": 999999, "sha": head_b}
+        with mock.patch.object(review_authors, "_forge_fetch",
+                               return_value=False) as forge:
+            first = review_authors._rewritten_after_freeze(
+                self.db, item, freeze, self.repo.root, head=head_b, fetch=True)
+            self.assertIn("cx3", first)
+            calls = forge.call_count
+            self.assertGreater(calls, 0)
+            self.assertLessEqual(calls, 10)
+            again = review_authors._rewritten_after_freeze(
+                self.db, item, freeze, self.repo.root, head=head_b, fetch=True)
+            self.assertIn("cx3", again)
+            self.assertEqual(forge.call_count, calls)
+
+    def test_the_scan_honours_the_sweep_deadline(self):
+        # B/P2 auditeur : l'échéance des balayages d'auctorialité s'applique à
+        # cette boucle ; épuisée, elle refuse la lecture, elle ne la continue
+        # pas.
+        _head_a, _fix, head_b = self._prepare_rewrite()
+        self.later_receipts(10)
+        with self.assertRaises(review_authors.SweepDeadline):
+            with review_authors.sweep_deadline(0):
+                review_authors._rewritten_after_freeze(
+                    self.db, work.get(self.db, self.lot),
+                    {"id": 999999, "sha": head_b}, self.repo.root,
+                    head=head_b, fetch=True)

@@ -97,7 +97,7 @@ import re
 
 from typing import Mapping, Optional, Sequence
 
-from . import (canon, grep_cache, plan_git, registry, review_lot,
+from . import (canon, fetch_cache, grep_cache, plan_git, registry, review_lot,
                review_provenance, storage)
 from .deadline import Deadline
 
@@ -4088,6 +4088,17 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     return authors, unknown, [correctors[name] for name in sorted(correctors)]
 
 
+#: #4457 : fenêtre de recherche du correctif autour du verdict de relecture.
+#: Le relecteur corrige dans son tour : 6 h avant l'avis couvrent un tour
+#: long, 2 h après couvrent la poussée qui suit l'avis. La fenêtre est lue
+#: exhaustivement (B/P2 cx3), jamais tronquée à 500 reçus.
+REWRITTEN_BEFORE_S = 6 * 3600
+REWRITTEN_WINDOW_S = 2 * 3600
+#: budget local de la lecture quand l'appelant n'a pas posé de `sweep_deadline`
+#: (le gel et la désignation) : au-delà, la lecture est incomplète et lève.
+REWRITTEN_SCAN_BUDGET_S = 60.0
+
+
 def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                             repo: str, *, head: str = "", strict: bool = False,
                             fetch: bool = True, recover=None) -> dict[str, dict]:
@@ -4110,6 +4121,15 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     plus ancêtre de la tête lue est le correctif réécrit : son acteur reste
     exclu par son nom, sans famille.
 
+    La fenêtre lue est bornée autour du verdict (6 h avant, 2 h après, sans
+    dépasser le gel courant) et **exhaustive** : une troncature silencieuse
+    ferait disparaître le correctif sous des reçus plus récents (B/P2 cx3).
+    L'échéance `_SWEEP` de l'appelant (ou un budget local de 60 s hors de ces
+    appels) est vérifiée avant chaque lecture et chaque fetch ; une lecture
+    incomplète lève, la porte refuse et la désignation attend. Un objet absent
+    n'est demandé qu'une fois par hôte (`fetch_cache`) : un refus n'est pas
+    redemandé à la lecture suivante.
+
     Un dépôt ou une tête illisible rend `{}` (la lecture garde son
     comportement historique) ; `strict` (la porte, le train) refuse au
     contraire une lecture des reçus qui échoue, comme le reste de la
@@ -4126,6 +4146,19 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     head_sha = str(head or (milestone or {}).get("sha") or "").strip().lower()
     if not head_sha:
         return {}
+    sweep = _SWEEP.get()
+    local = Deadline(REWRITTEN_SCAN_BUDGET_S) if sweep is None else None
+
+    def check() -> None:
+        """Borne la lecture : échéance de l'appelant, sinon budget local."""
+        if sweep is not None:
+            sweep.check("rewritten correctors")
+        elif local is not None and local.expired():
+            raise review_provenance.ProvenanceError(
+                "the rewritten-corrector scan exceeded its %d s budget"
+                % int(REWRITTEN_SCAN_BUDGET_S))
+
+    check()
     try:
         if not plan_git.local_commit(repo, head_sha):
             return {}
@@ -4141,11 +4174,12 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     if not freezes:
         return {}
     current_id = int((milestone or {}).get("id") or 0)
+    current_at = float((milestone or {}).get("at_ts") or 0.0)
     verdicts = [row for row in rows
                 if row.get("kind") == "verdict"
                 and str(row.get("sha") or "").strip()]
     author = str(item.get("assignee") or "").strip().casefold()
-    # nominalement : acteur -> [(gel, tête, instant)] des têtes qu'il a relues
+    # nominalement : acteur -> [(gel, tête, instant du verdict)] des têtes lues
     wanted: dict[str, list] = {}
     for freeze in freezes:
         freeze_id = int(freeze.get("id") or 0)
@@ -4161,54 +4195,69 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             key = actor.casefold()
             if not actor or key == author:
                 continue
-            wanted.setdefault(key, []).append(
-                (freeze_id, sha, float(freeze.get("at_ts") or 0.0), actor))
+            stamp = float(verdict.get("at_ts") or freeze.get("at_ts") or 0.0)
+            wanted.setdefault(key, []).append((freeze_id, sha, stamp, actor))
     if not wanted:
         return {}
     out: dict[str, dict] = {}
     for key in sorted(wanted):
-        entries = wanted[key]
-        actor = entries[0][3]
-        since = min(value[2] for value in entries)
-        try:
-            receipts = storage.of(db).provenance.commits(actor, since_ts=since)
-        except Exception as exc:  # noqa: BLE001 - lecture des reçus impossible
-            if strict:
-                raise review_provenance.ProvenanceError(
-                    "the provenance of prior reviewer corrections cannot be read"
-                    " (%s)" % exc) from exc
-            return out
-        for receipt in receipts or ():
-            sha = str((receipt or {}).get("sha") or "").strip().lower()
-            if not sha:
+        for freeze_id, freeze_sha, verdict_at, actor in wanted[key]:
+            since = max(0.0, verdict_at - REWRITTEN_BEFORE_S)
+            until = verdict_at + REWRITTEN_WINDOW_S
+            if current_at and current_at >= verdict_at:
+                until = min(until, current_at)
+            if until <= since:
                 continue
+            check()
             try:
-                full = plan_git.local_commit(repo, sha)
-            except Exception:  # noqa: BLE001 - objet illisible : ignoré
-                full = None
-            if not full and recover is not None:
-                try:
-                    recover(sha)
-                except Exception:  # noqa: BLE001 - source en échec
-                    pass
-                try:
-                    full = plan_git.local_commit(repo, sha)
-                except Exception:  # noqa: BLE001 - objet illisible : ignoré
-                    full = None
-            if not full and fetch:
-                try:
-                    _forge_fetch(repo, sha)
-                except Exception:  # noqa: BLE001 - forge injoignable
-                    pass
+                receipts = storage.of(db).provenance.commits(
+                    actor, since_ts=since, until_ts=until)
+            except Exception as exc:  # noqa: BLE001 - lecture des reçus impossible
+                if strict:
+                    raise review_provenance.ProvenanceError(
+                        "the provenance of prior reviewer corrections cannot be read"
+                        " (%s)" % exc) from exc
+                return out
+            for receipt in receipts or ():
+                check()
+                sha = str((receipt or {}).get("sha") or "").strip().lower()
+                if not sha:
+                    continue
                 try:
                     full = plan_git.local_commit(repo, sha)
                 except Exception:  # noqa: BLE001 - objet illisible : ignoré
                     full = None
-            if not full:
-                continue
-            if _is_ancestor(repo, full, head_sha) is True:
-                continue                # encore dans la tête : lu par la plage
-            for freeze_id, freeze_sha, _at, _name in entries:
+                if not full and not fetch_cache.refused(repo, sha):
+                    attempted = False
+                    if recover is not None:
+                        check()
+                        attempted = True
+                        try:
+                            recover(sha)
+                        except Exception:  # noqa: BLE001 - source en échec
+                            pass
+                        try:
+                            full = plan_git.local_commit(repo, sha)
+                        except Exception:  # noqa: BLE001 - objet illisible : ignoré
+                            full = None
+                    if not full and fetch:
+                        check()
+                        attempted = True
+                        try:
+                            _forge_fetch(repo, sha)
+                        except Exception:  # noqa: BLE001 - forge injoignable
+                            pass
+                        try:
+                            full = plan_git.local_commit(repo, sha)
+                        except Exception:  # noqa: BLE001 - objet illisible : ignoré
+                            full = None
+                    if not full and attempted:
+                        fetch_cache.note(repo, sha)
+                if not full:
+                    continue
+                check()
+                if _is_ancestor(repo, full, head_sha) is True:
+                    continue                # encore dans la tête : lu par la plage
                 if _is_ancestor(repo, freeze_sha, full) is not True:
                     continue
                 # Un seul nom par acteur ; la première tête gelée qui porte
