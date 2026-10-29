@@ -79,3 +79,17 @@ the next pass.
 Footprint writes take the same lock, so a footprint never changes between
 a check and the attribution it guards. Footprints set or refreshed on lots
 that are *already* in progress are not retroactive: `ameesh work footprint` shows the overlap, and the pilot decides.
+
+## SLO and dispatch (#4561)
+
+A held `intake` lot is not late: while an occupying lot overlaps its
+footprint, the SLO steps "reported → assigned" and "ready → started" are
+suspended, because `ameesh work assign` could not take it. The wait is dated
+on the lot by a journal note, `en attente d'empreinte : #12, #34`; after the
+last blocker merges (or closes), both clocks restart from that merge, never
+from the lot's creation.
+
+`ameesh debit` never lists such a lot as startable. It reports it apart, in
+`footprint_lots`, with the blocking lot and its state. When the blocker has
+not moved for 2 h, the due gesture is on it — its verdict or its package —
+not on an assignment.

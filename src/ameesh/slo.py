@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from ameesh import work_lifecycle as lifecycle
 
+import re
 import time
 from typing import Iterable, NamedTuple
 
@@ -430,6 +431,128 @@ def current_hold_start(events: Iterable[dict], state: str | None) -> float | Non
     return started
 
 
+#: #4561 : la note qui date l'attente de la garde d'empreinte (#3185) sur le
+#: lot retenu. Elle nomme les lots occupants qui chevauchent le sien ; sa
+#: dernière ligne est la mémoire de l'attente après leur fusion (le lot, lui,
+#: n'est plus « occupant » et ne se lit plus dans la garde).
+FOOTPRINT_WAIT_NOTE = "en attente d'empreinte : "
+_LOT_REF_RE = re.compile(r"#(\d+)")
+
+
+def footprint_wait_note(blockers: Iterable[dict]) -> str:
+    """La note d'attente d'empreinte : « en attente d'empreinte : #12, #34 »."""
+    ids = sorted({int(lot["id"]) for lot in blockers or ()
+                  if lot.get("id") is not None})
+    return FOOTPRINT_WAIT_NOTE + ", ".join("#%d" % ident for ident in ids)
+
+
+def footprint_note(events: Iterable[dict]) -> tuple[list[int], float] | None:
+    """Les bloqueurs nommés par la dernière note d'attente d'empreinte, et
+    l'instant où elle a été écrite (`None` sans note). Une note plus récente
+    remplace la précédente : c'est l'ensemble des bloqueurs d'alors qui fait
+    foi, pas l'union de toutes les attentes passées."""
+    found = None
+    for event in events or ():
+        note = str(event.get("note") or "")
+        at = event.get("created_ts")
+        if not note.startswith(FOOTPRINT_WAIT_NOTE) or at is None:
+            continue
+        ids = sorted({int(match) for match in _LOT_REF_RE.findall(note)})
+        if not ids:
+            continue
+        key = (float(at), int(event.get("id") or 0))
+        if found is None or key >= found[0]:
+            found = (key, ids)
+    return (found[1], found[0][0]) if found else None
+
+
+def footprint_blockers(item: dict, lots: Iterable[dict],
+                       paths_by_lot: dict) -> list[dict]:
+    """Les lots qui retiennent `item` par la garde d'empreinte (#3185, #4561).
+
+    Même règle que la garde d'attribution : un lot du même dépôt (`app`), qui
+    OCCUPE son empreinte (confié ou démarré, non fusionné) et dont un chemin
+    chevauche celui du lot retenu. Seul un lot `intake` SANS porteur est
+    retenu : la garde ne refuse pas la réassignation d'un lot en cours. Rend
+    `[{id, state, assignee, updated_ts, last_activity_ts}]`, triés par id."""
+    if str(item.get("state") or "") != lifecycle.REQUESTED:
+        return []
+    if str(item.get("assignee") or "").strip():
+        return []
+    mine = paths_by_lot.get(int(item["id"])) or ()
+    app = str(item.get("app") or "").strip()
+    if not mine or not app:
+        return []
+    from . import work_footprints
+
+    out = []
+    for other in lots or ():
+        other_id = int(other["id"])
+        if other_id == int(item["id"]):
+            continue
+        if str(other.get("app") or "").strip() != app:
+            continue
+        state = str(other.get("state") or "")
+        if not state or state in lifecycle.COMPLETED:
+            continue
+        if not (str(other.get("assignee") or "").strip()
+                or state != lifecycle.REQUESTED):
+            continue
+        theirs = paths_by_lot.get(other_id) or ()
+        if not theirs:
+            continue
+        if any(work_footprints.overlaps(a, b)
+               for a in mine for b in theirs):
+            out.append({"id": other_id, "state": state,
+                        "assignee": other.get("assignee") or None,
+                        "updated_ts": other.get("updated_ts"),
+                        "last_activity_ts": other.get("last_activity_ts")})
+    return sorted(out, key=lambda blocker: blocker["id"])
+
+
+def footprint_wait(item: dict, events: Iterable[dict],
+                   blockers: Iterable[dict], *, lots: Iterable[dict] = (),
+                   satisfied: dict | None = None,
+                   now: float | None = None) -> dict | None:
+    """L'attente d'empreinte d'un lot, pour `lot_steps` (#4561).
+
+    `blockers` : les lots occupants qui le retiennent maintenant
+    (`footprint_blockers`) — l'attente est en cours, aucun pas SLO ne court.
+    Sans bloqueur courant, la dernière note (`footprint_note`) nomme ceux qui
+    l'ont retenu ; leur levée date le redémarrage de l'horloge : jalon
+    `merged`/`closed` du bloqueur (`satisfied`, lu par l'appelant), ou sa
+    dernière activité quand il est encore ouvert mais ne chevauche plus
+    (empreinte corrigée). Sans aucune date, le redémarrage est l'instant de
+    la passe : une durée d'attente n'est jamais inventée (#1982).
+
+    Rend `{lots, released_ts, named}` ; `None` sans attente connue."""
+    blockers = list(blockers or ())
+    if blockers:
+        return {"lots": blockers, "released_ts": None,
+                "named": sorted({int(b["id"]) for b in blockers})}
+    found = footprint_note(events)
+    if found is None:
+        return None
+    named, _noted_ts = found
+    open_by_id = {int(lot["id"]): lot for lot in lots or ()}
+    satisfied = satisfied or {}
+    stamps = []
+    for ident in named:
+        stamp = satisfied.get(ident, satisfied.get(str(ident)))
+        if stamp is not None:
+            stamps.append(float(stamp))
+            continue
+        row = open_by_id.get(ident)
+        if row is not None:
+            stamp = row.get("updated_ts") or row.get("last_activity_ts")
+            if stamp is not None:
+                stamps.append(float(stamp))
+    if not stamps:
+        fallback = time.time() if now is None else float(now)
+        return {"lots": [], "released_ts": fallback, "named": named}
+    return {"lots": [], "released_ts": max(stamps), "named": named}
+
+
 def intake_ready_ts(assigned: float | None, requested: float | None,
                     dependencies: Iterable[dict] = (), *,
                     started: float | None = None) -> float | None:
@@ -517,7 +640,8 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               reviews: Iterable[dict] = (),
               fixes: Iterable[dict] = (),
               vehicle_exit_ts: float | None = None,
-              packet_pause: dict | None = None) -> list:
+              packet_pause: dict | None = None,
+              footprint: dict | None = None) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -645,6 +769,14 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     compte pas. À la levée, l'horloge repart de la levée ; un lot sans
     retenue garde son alerte. Une étape déjà terminée garde sa durée réelle,
     moins la retenue qui a suivi son départ.
+
+    #4561 : `footprint` (`footprint_wait`) est l'attente de la garde
+    d'empreinte (#3185) d'un lot `intake` sans porteur. Tant qu'un lot
+    occupant chevauche le sien, aucun pas « signalé → assigné » ni « prêt →
+    démarré » ne court : `work assign` le refuserait. Après la levée, les deux
+    horloges repartent de la fusion (ou clôture) du dernier bloqueur, jamais de
+    la création : le temps où le lot n'était pas attribuable n'est pas un
+    retard de son porteur. `footprint["named"]` nomme les bloqueurs retenus.
     """
     events = list(events)
     fixes = list(fixes or ())
@@ -653,21 +785,41 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     state = item.get("state")
     out = []
 
+    # #4561 : l'attente de la garde d'empreinte suspend les deux pas d'avant
+    # le départ ; leur horloge repart de la levée, jamais de la création.
+    footprint = dict(footprint or {})
+    blocked = bool(footprint.get("lots"))
+    fp_released = footprint.get("released_ts")
+    fp_named = [int(i) for i in (footprint.get("named") or ())]
+
+    def _fp_start(start: float, end: float | None = None) -> tuple[float, dict]:
+        if fp_released is None:
+            return start, {}
+        value = float(fp_released)
+        if value <= start or (end is not None and value > end):
+            return start, {}
+        extra = {"footprint_released_ts": round(value, 3)}
+        if fp_named:
+            extra["footprint_lots"] = fp_named
+        return value, extra
+
     requested = jalons.get("requested") or item.get("created_ts")
     assigned = assigned_ts(item, events)
     if requested is not None:
         step = step_of("signal_assigned")
         if assigned is not None:
-            out.append(_row(step, requested, now=now, critical=critical,
+            start, extra = _fp_start(float(requested), assigned)
+            out.append(_row(step, start, now=now, critical=critical,
                             done_ts=round(assigned, 3),
-                            elapsed_s=int(max(0.0, assigned - float(requested)))))
-        else:
-            out.append(_row(step, requested, now=now, critical=critical))
+                            elapsed_s=int(max(0.0, assigned - start)), **extra))
+        elif not blocked:
+            start, extra = _fp_start(float(requested))
+            out.append(_row(step, start, now=now, critical=critical, **extra))
 
     # #3162 : le début mesuré conclut l'étape comme le passage en build, même
     # quand le lot est resté en intake.
     started = start_ts(events)
-    if requested is not None and state not in lifecycle.COMPLETED:
+    if requested is not None and state not in lifecycle.COMPLETED and not blocked:
         step = step_of("intake_started")
         ready = intake_ready_ts(assigned, requested, dependencies, started=started)
         # #2916 : le temps passé sous retenue n'est pas un retard intake ; au
@@ -688,6 +840,11 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
         planned = day_start_ts(item.get("planned_start"))
         if ready is not None and planned is not None:
             ready = max(float(ready), planned)
+        # #4561 : l'empreinte libérée repousse aussi le « prêt » de l'intake.
+        if ready is not None:
+            ready, fp_extra = _fp_start(float(ready), started)
+        else:
+            fp_extra = {}
         if ready is None:
             # #2551 : dépendance bloquante ouverte — le lot n'est pas prêt,
             # aucun délai ne court : son porteur ne peut rien faire avant la
@@ -696,7 +853,8 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
         elif started is not None:
             out.append(_row(step, ready, now=now, critical=critical,
                             done_ts=round(started, 3),
-                            elapsed_s=int(max(0.0, started - float(ready)))))
+                            elapsed_s=int(max(0.0, started - float(ready))),
+                            **fp_extra))
         elif begun(events, jalons):
             # #3162 : branche associée ou gel — le lot est commencé, mais son
             # début n'est pas daté : ni retard ni durée inventés (#1982).
@@ -706,7 +864,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             # prêt. Passé intake sans événement `build` (#1982), la phase est
             # franchie mais non mesurable : aucune ligne, donc aucun retard
             # inventé — seules l'origine réelle et les durées mesurées restent.
-            out.append(_row(step, ready, now=now, critical=critical))
+            out.append(_row(step, ready, now=now, critical=critical, **fp_extra))
 
     verdict, kind = jalons.get("verdict"), jalons.get("verdict_kind")
     merged = jalons.get("merged")
