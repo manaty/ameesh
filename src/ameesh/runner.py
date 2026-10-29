@@ -12239,7 +12239,11 @@ class Runner:
         `blocked` : au moins un seuil est franchi — aucun nouveau tour ne
         démarre, les tours en cours finissent. `critical` : un franchissement
         est grave — les agents de plus faible priorité sont mis en pause, jamais
-        au milieu d'un tour. Sans relevé, aucune pression (on ne devine pas)."""
+        au milieu d'un tour. Sans relevé, aucune pression (on ne devine pas).
+
+        #4433 : une brèche mémoire de l'hôte imputée à un cgroup de runner ne
+        retient que ce runner (`own_path`, ou à défaut les agents servis) ; les
+        autres exécuteurs de l'hôte restent ouverts."""
         from . import resources as resources_mod
         now = time.monotonic() if now is None else float(now)
         with self._pressure_lock:
@@ -12270,6 +12274,7 @@ class Runner:
         if reading is None and not measured \
                 and power.get("on_ac") is None and power.get("battery_percent") is None:
             verdict: dict = {"blocked": False, "critical": False, "breaches": [],
+                             "attributed": [],
                              "limits": limits,
                              "scope": limits.get("pressure_scope", "host"),
                              "cgroup": {},
@@ -12281,7 +12286,11 @@ class Runner:
             # `host_resources.cgroup`); the pressure reader wants the flat
             # `cgroup_*` form for the live reading.
             merged.update({"cgroup_" + key: value for key, value in cgroup.items()})
-            verdict = resources_mod.pressure(merged, limits=limits)
+            # #4433 : un franchissement mémoire imputé au cgroup d'un runner ne
+            # retient que ce runner ; le chemin de SON cgroup fait foi.
+            verdict = resources_mod.pressure(
+                merged, limits=limits, own_path=cgroup.get("path") or None,
+                own_agents=getattr(self, "agents_filter", None) or ())
             if reading is not None:
                 verdict["since"] = reading.get("sampled_ts")
                 verdict["reading"] = reading
