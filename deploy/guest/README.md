@@ -114,7 +114,8 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   stops, including after a killed job, and counts against the job's memory
   cap. Both the profile's `down` hook and the launcher's `close` remove the
   container with its volumes. At job open/close, the dedicated job user also
-  prunes anonymous unused Podman volumes created more than an hour ago;
+  reads Podman's volume inventory and removes anonymous unused volumes
+  created more than an hour ago, using `volume rm` without force;
   volumes referenced by any container and named volumes are preserved.
   Cleanup failures are reported and do not prevent releasing runtime caps.
   `ameesh doctor` warns from 80% inode use on the host's watched filesystems.

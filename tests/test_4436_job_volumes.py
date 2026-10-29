@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Job cleanup and inode exhaustion regressions; no host containers touched."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -27,15 +28,14 @@ class JobVolumesTest(unittest.TestCase):
         def run(argv, **kwargs):
             commands.append(argv)
             self.assertEqual(kwargs["timeout"], 30)
-            return subprocess.CompletedProcess(argv, 0, "", "")
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
         with mock.patch.object(self.launcher.subprocess, "run", side_effect=run), \
                 mock.patch.object(self.launcher, "systemctl") as ctl:
             self.assertEqual(self.launcher.cmd_close(
                 ["--job", "20261029-010000-abcdef"]), 0)
         self.assertEqual(commands[0], ["/usr/bin/podman", "rm", "-f", "-v",
                                      "-t", "2", "ameesh-job-20261029-010000-abcdef-pg"])
-        self.assertEqual(commands[1], ["/usr/bin/podman", "volume", "prune", "--force",
-                                     "--filter", "anonymous=true", "--filter", "until=1h"])
+        self.assertEqual(commands[1], ["/usr/bin/podman", "volume", "inspect", "--all"])
         self.assertEqual(ctl.call_args_list[-1].args[0], "revert")
 
     def test_stuck_or_absent_container_does_not_skip_prune_or_caps(self):
@@ -55,6 +55,32 @@ class JobVolumesTest(unittest.TestCase):
             self.assertEqual(self.launcher.cmd_open(
                 ["--job", "20261029-010000-abcdef"]), 0)
             prune.assert_called_once_with()
+
+    def test_only_old_explicitly_anonymous_volumes_are_removed_without_force(self):
+        inventory = [
+            {"Name": "orphan", "Anonymous": True, "CreatedAt": "2020-01-01T00:00:00Z"},
+            {"Name": "live", "Anonymous": True, "CreatedAt": "2020-01-01T00:00:00Z"},
+            {"Name": "named", "Anonymous": False, "CreatedAt": "2020-01-01T00:00:00Z"},
+            {"Name": "unknown", "CreatedAt": "2020-01-01T00:00:00Z"},
+            {"Name": "recent", "Anonymous": True, "CreatedAt": "2030-01-01T00:00:00Z"},
+            {"Name": "bad-date", "Anonymous": True, "CreatedAt": "unreadable"},
+            {"Name": "naive", "Anonymous": True, "CreatedAt": "2020-01-01T00:00:00"},
+        ]
+        # A live volume can appear in inspect; the remove must leave Podman's
+        # reference check enabled, including for attachments after inventory.
+        with mock.patch.object(self.launcher, "podman_cleanup", return_value=json.dumps(inventory)) as run, \
+                mock.patch.object(self.launcher.time, "time", return_value=1800000000):
+            self.launcher.prune_job_volumes()
+        self.assertEqual(run.call_args_list, [
+            mock.call("volume", "inspect", "--all"),
+            mock.call("volume", "rm", "orphan", "live")])
+
+    def test_unreadable_inventory_never_removes_a_volume(self):
+        for raw in (None, "not json", "{}", "[]"):
+            with self.subTest(raw=raw), \
+                    mock.patch.object(self.launcher, "podman_cleanup", return_value=raw) as run:
+                self.launcher.prune_job_volumes()
+                self.assertEqual(run.call_count, 1)
 
     def test_postgres_hooks_pass_tmpfs_and_remove_volumes_even_if_absent(self):
         # Execute both actual hooks with a recording Podman, including down

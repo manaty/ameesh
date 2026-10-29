@@ -44,12 +44,14 @@ manager) and keep it; they never receive the client's `--env` and the
 launcher strips the loader variables from what they do receive.
 """
 import errno
+from datetime import datetime
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 
 #: root-owned, written by install.sh (the launcher takes no --config)
 CONFIG = "/etc/ameesh-guest/offload.json"
@@ -468,24 +470,50 @@ def cmd_close(args: list[str]) -> int:
     return 0
 
 
-def podman_cleanup(*args: str) -> None:
+def podman_cleanup(*args: str) -> str | None:
     """Best effort, bounded cleanup as the dedicated job user, never root."""
     try:
         result = subprocess.run(["/usr/bin/podman", *args], capture_output=True,
                                 text=True, check=False, timeout=30)
         if result.returncode:
             die("podman cleanup failed: %s" % result.stderr.strip())
+            return None
+        return result.stdout
     except (OSError, subprocess.TimeoutExpired) as exc:
         die("podman cleanup unavailable: %s" % exc)
 
 
 def prune_job_volumes() -> None:
-    # Podman itself checks references at deletion: a volume of any container
-    # (running or stopped) is protected, including during concurrent jobs.
-    # Explicit anonymous=true also fails closed on older unsupported Podman.
-    # The one-hour creation grace leaves newly allocated volumes alone.
-    podman_cleanup("volume", "prune", "--force", "--filter", "anonymous=true",
-                   "--filter", "until=1h")
+    # Older Podman prune has no anonymous filter and defaults to ALL unused
+    # volumes. Inspect explicit metadata instead; missing metadata is spared.
+    raw = podman_cleanup("volume", "inspect", "--all")
+    if raw is None:
+        return
+    try:
+        volumes = json.loads(raw)
+        if not isinstance(volumes, list):
+            raise ValueError("volume inventory is not a list")
+        stale = []
+        cutoff = time.time() - 3600
+        for volume in volumes:
+            if not isinstance(volume, dict) or volume.get("Anonymous") is not True:
+                continue
+            name = volume.get("Name", "")
+            if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name):
+                continue
+            try:
+                created = datetime.fromisoformat(volume["CreatedAt"].replace("Z", "+00:00"))
+                if created.tzinfo is not None and created.timestamp() < cutoff:
+                    stale.append(name)
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        if stale:
+            # Never force: Podman checks references at deletion, including a
+            # container created since inspect. Even stopped containers retain
+            # their volumes; a concurrent live job cannot lose its data.
+            podman_cleanup("volume", "rm", *stale)
+    except (ValueError, TypeError) as exc:
+        die("podman volume inventory unreadable: %s" % exc)
 
 
 def cmd_clean(args: list[str]) -> int:
