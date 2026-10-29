@@ -9,7 +9,8 @@ The plan and automatic dispatch use the same readiness checks: a lot must be
 unassigned in intake (or returned to the queue from build), have an accepted
 spec, no unfinished prerequisite, no open `conflicts_with` peer, no pending
 decision, no active pilot hold, no future planned start and no reservation for
-an external executor or human/production capability. A conflict decision alone
+an external executor or human/production capability. Intake lots whose footprint
+overlaps an occupying lot also wait (#4173). A conflict decision alone
 does not close the peer or remove the conflict link.
 
 A dispatchable bug puts its project in the bug phase. Enhancements wait until

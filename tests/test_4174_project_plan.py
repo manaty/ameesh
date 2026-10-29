@@ -205,6 +205,24 @@ class DispatchTest(_Lots):
             self.assertEqual([t["item"]["id"] for t in self.take()], [evo["id"]])
         self.assertIsNone(work.get(self.db, bug["id"])["assignee"])
 
+    def test_footprint_blocked_bug_keeps_evolution_dispatchable(self):
+        from ameesh import work_footprints
+        self.agent("claude1", team="nexlink")
+        occupant = self.lot("occupant")
+        evolution = self.lot("enhancement")
+        bug = self.lot("overlapping bug", type="bug")
+        footprints = storage.of(self.db).work_footprints
+        for item in (occupant, bug):
+            footprints.replace(item["id"], "manual",
+                               [work_footprints.normalize("a.py")], actor="test")
+        self.db.execute("UPDATE work_items SET assignee = 'human:proprio' WHERE id = %s",
+                        (occupant["id"],))
+        report = plan.report(self.db, "nexlink")
+        blocked = next(row for row in report["lots"] if row["id"] == bug["id"])
+        self.assertIn("footprint overlaps an occupying lot", blocked["waiting"])
+        self.assertEqual([taken["item"]["id"] for taken in self.take()], [evolution["id"]])
+        self.assertIsNone(work.get(self.db, bug["id"])["assignee"])
+
     def test_new_untakeable_bug_does_not_rollback_enhancement(self):
         self.agent("claude1", team="nexlink")
         evo = self.lot("enhancement")

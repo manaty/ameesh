@@ -3699,6 +3699,9 @@ class WorkItems(interface.WorkItems):
             "               AND l.kind = 'conflicts_with' AND b.state NOT IN " + _CLOSED +
             "             ORDER BY b.id) AS open_conflicts,"
             "       (pd.lot IS NOT NULL) AS pending_decision,"
+            # Match the intake footprint guard used by dispatch (#4173).
+            "       (w.state = 'intake' AND " + footprint_overlap_sql("w") + ")"
+            "         AS footprint_overlap,"
             "       EXISTS (SELECT 1 FROM commitments c WHERE c.work_item_id = w.id"
             "               AND c.kind = 'decision' AND c.status IN ('proposed', 'open'))"
             "         AS decision_milestone"

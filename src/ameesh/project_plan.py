@@ -66,6 +66,8 @@ def evaluate(rows, *, project, rule=None, holds=None, now=None, can_take=None, p
             reasons.append("planned start: %s" % start)
         if row.get("pending_decision") or row.get("decision_milestone"):
             reasons.append("decision pending")
+        if row.get("footprint_overlap"):
+            reasons.append("footprint overlaps an occupying lot")
         if set(row.get("required_capabilities") or ()) & set(backlog.RESERVED_CAPABILITIES):
             reasons.append("human/production capability required")
         reason = spec_reason(row, rule)
