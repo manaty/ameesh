@@ -27,11 +27,14 @@ class SetupTokenTest(unittest.TestCase):
         target = setup_token.path(self.profile)
         self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o600)
         env = {"CLAUDE_CONFIG_DIR": "ambient", "ANTHROPIC_API_KEY": "billed",
-               "CLAUDE_CODE_OAUTH_TOKEN": "ambient", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "other"}
+               "CLAUDE_CODE_OAUTH_TOKEN": "ambient", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "other",
+               "ANTHROPIC_AUTH_TOKEN": "ambient", "CODEX_API_KEY": "ambient"}
         accounts.launch_env(env, {"claude": [self.profile]}, self.profile, {})
         self.assertEqual(env[setup_token.VARIABLE], TOKEN)
         self.assertNotIn("CLAUDE_CONFIG_DIR", env)
         self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+        self.assertNotIn("CODEX_API_KEY", env)
         self.assertNotIn("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", env)
         self.assertEqual(accounts.check(self.profile, {}), [])
         verdict = sentinel.probe_claude(self.profile, NOW, environ={})
@@ -85,9 +88,12 @@ class SetupTokenTest(unittest.TestCase):
         with open(os.path.join(other_home, "auth.json"), "w") as handle:
             handle.write("{}")
         other = accounts.Profile("codex", "other", path=other_home, declared=True)
-        env = {"CLAUDE_CODE_OAUTH_TOKEN": TOKEN}
+        env = {"CLAUDE_CODE_OAUTH_TOKEN": TOKEN,
+               "ANTHROPIC_AUTH_TOKEN": "ambient", "CODEX_API_KEY": "ambient"}
         accounts.launch_env(env, {"claude": [self.profile], "codex": [other]}, other, {})
         self.assertNotIn(setup_token.VARIABLE, env)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+        self.assertNotIn("CODEX_API_KEY", env)
         self.assertEqual(env["CODEX_HOME"], other_home)
 
     def test_opaque_expiry_unknown_and_expired_failing(self):

@@ -976,6 +976,7 @@ def auth_variables(declared: dict[str, list[Profile]], *, selected: bool) -> set
             if selected and profile.env:
                 out.add(profile.env)
     if selected:
+        out.update({"ANTHROPIC_AUTH_TOKEN", "CODEX_API_KEY"})
         out.add("CLAUDE_CODE_OAUTH_TOKEN")
         out.add("CLAUDE_CODE_OAUTH_REFRESH_TOKEN")
         out.add("CLAUDE_CODE_OAUTH_SCOPES")
