@@ -303,13 +303,16 @@ class HostLifecycle(interface.HostLifecycle):
             (operation, json.dumps(list(missing)), host, generation, agent))
         return bool(rows)
 
-    def expire_returns(self, *, open_claims=True):
+    def expire_returns(self, *, open_claims=True, hosts=None):
         if not isinstance(open_claims, bool):
             raise ValueError("open_claims: a boolean expected")
+        wanted = None if hosts is None else set(hosts)
         rows = self.db.query("SELECT host,generation FROM host_lifecycle "
                              "WHERE mode='draining' AND return_at<=clock_timestamp()", ())
         changed = []
         for row in rows:
+            if wanted is not None and row["host"] not in wanted:
+                continue
             with self.db.transaction() as tx:
                 Hosts._lock_gate(tx, row["host"])
                 updated = tx.query(

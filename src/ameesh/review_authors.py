@@ -56,6 +56,13 @@ auteurs, avec les mêmes exceptions du canon §2 :
   un commit hérité d'un parent empilé puis retiré (revert, annulation) n'est
   pas un contenu de cette tête et sa famille redevient éligible ; une ligne
   qui survit, ou une lecture impossible, garde l'exclusion ;
+* un lot empilé sur la tête gelée d'un parent — prérequis déclaré ou membre
+  du même paquet — lit `parent..tête` (#4343/#4478) : les commits du parent,
+  relus sur sa propre tête, ne sont ni auteurs ni inconnus de l'enfant. La
+  porte de fusion ne retire cette tête que si la **propre porte du parent**
+  est satisfaite sur elle (`merge_queue._admitted_stacked_parents`) ; un
+  parent jamais relu ou bloqué reste dans le périmètre de l'enfant. Le doute
+  (parent, gel ou objet illisible) conserve l'auteur ;
 * un ancien commit sans reçu et sans attribution ne bloque plus quand son
   contenu a disparu, ou quand le même auteur l'a réémis avec reçu exact et
   patch-id verbatim identique dans la plage courante (#3301, constat
@@ -97,7 +104,7 @@ import re
 
 from typing import Mapping, Optional, Sequence
 
-from . import (canon, grep_cache, plan_git, registry, review_lot,
+from . import (canon, fetch_cache, grep_cache, plan_git, registry, review_lot,
                review_provenance, storage)
 from .deadline import Deadline
 
@@ -928,6 +935,44 @@ def _is_ancestor(repo: str, before: str, after: str) -> Optional[bool]:
     return None
 
 
+def _present_commits(repo: str, shas: Sequence[str], *,
+                     timeout: Optional[float] = None) -> Optional[dict[str, str]]:
+    """Les SHA de commits présents **localement**, en une seule commande git.
+
+    #4457 (gel #25249) : `plan_git.local_commit` lançait un processus git par
+    reçu ; 500 reçus prenaient ~40 s, au-delà du budget de 60 s du balayage en
+    CI. `cat-file --batch-check` lit la présence des objets en un passage, sans
+    fetch paresseux (`GIT_NO_LAZY_FETCH`), et rend `{sha: sha complet}`.
+    `None` quand la lecture échoue : l'appelant retombe sur la sonde par SHA.
+    """
+    wanted = [value for value in
+              (plan_git.full_commit_id(sha) for sha in shas or ()) if value]
+    if not wanted:
+        return {}
+    if timeout is not None and timeout <= 0:
+        return None
+    try:
+        proc = plan_git._git(
+            repo, "cat-file", "--batch-check=%(objectname) %(objecttype)",
+            stdin=("\n".join(wanted) + "\n").encode("utf-8"),
+            timeout=(plan_git.GIT_TIMEOUT if timeout is None
+                     else min(float(timeout), plan_git.GIT_TIMEOUT)),
+            env_extra=dict(plan_git.NO_LAZY_FETCH))
+    except Exception:  # noqa: BLE001 - lecture impossible : repli par SHA
+        return None
+    if proc.returncode != 0:
+        return None
+    present = {}
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split()
+        if len(fields) < 2 or fields[1] != "commit":
+            continue
+        sha = fields[0].strip().lower()
+        if sha:
+            present[sha] = sha
+    return present
+
+
 def target_commit(repo: str, target: str) -> str:
     """Le commit qu'une cible nomme dans `repo`, ou "" (#3116).
 
@@ -968,6 +1013,79 @@ def target_commit(repo: str, target: str) -> str:
         if found:
             return found
     return ""
+
+
+def stacked_parents(db, item: Mapping, repo: str, head: str) -> list[dict]:
+    """Les parents d'empilement dont une tête gelée précède `head` (#4478).
+
+    Un lot empilé sur la tête gelée d'un parent — prérequis déclaré
+    (`work dependencies`) ou membre du même paquet (#3589) — porte dans sa
+    plage, lue depuis la cible, les commits du parent. Ces commits ont été
+    relus sur la tête du parent : ils ne sont ni auteurs ni périmètre de
+    relecture de l'enfant. La lecture d'auteurs (`reading`, `admitted_heads`)
+    part donc de ces têtes.
+
+    Rend `[{lot, frozen, source, target}]`, réduits aux têtes les plus proches
+    (`freeze_stack.parent_heads`). On ne rend que ce qui est **prouvé** : un
+    parent ouvert, un gel lisible dans ce dépôt et l'ascendance de cette tête
+    sur la tête lue. Une lecture impossible (graphe, frise du parent, objet
+    git) ne retire rien : le doute conserve les auteurs.
+
+    Comme #3513 pour les têtes des membres admis, une tête absente de
+    l'historique de `head` ne retire aucun commit. La porte de fusion ne
+    retire en plus que les parents dont la **propre porte** est satisfaite
+    (`merge_queue._admitted_stacked_parents`) : un parent jamais relu ou
+    bloqué reste dans le périmètre de l'enfant.
+    """
+    lot = int((item or {}).get("id") or 0)
+    if not lot:
+        return []
+    from . import freeze_stack
+
+    store = storage.of(db).work
+    try:
+        candidates = freeze_stack.candidates(db, lot)
+    except Exception:  # noqa: BLE001 - graphe illisible : aucun parent retiré
+        return []
+    # #4478 : sans parent candidat, aucune sonde git n'est nécessaire. La
+    # résolution locale de `head` ouvre un dépôt d'objets temporaire
+    # (`plan_git.local_commit`) : la faire pour tout lot changeait le compte
+    # des temporaires d'un post sans radar (#1761, test_l160e) sans rien
+    # prouver de plus.
+    if not candidates:
+        return []
+    head_full = plan_git.local_commit(repo, str(head or ""))
+    if not head_full:
+        return []
+    parents: list[dict] = []
+    for candidate in candidates or ():
+        parent = int((candidate or {}).get("lot") or 0)
+        if not parent:
+            continue
+        try:
+            row = store.get(parent)
+            if row is None or str(row.get("state") or "") in freeze_stack.DONE_STATES:
+                continue
+            rows = store.milestones(parent, None) or ()
+        except Exception:  # noqa: BLE001 - parent illisible : aucun retrait
+            continue
+        for freeze in rows:
+            if str((freeze or {}).get("kind") or "") != "frozen":
+                continue
+            frozen = plan_git.local_commit(repo, str((freeze or {}).get("sha") or ""))
+            if not frozen or frozen == head_full:
+                continue
+            if canon.git_contains(repo, frozen, head_full):
+                parents.append({"lot": parent, "frozen": frozen,
+                                "source": str((candidate or {}).get("source") or ""),
+                                "target": str(row.get("branch_target") or "")})
+    return freeze_stack.parent_heads(repo, parents)
+
+
+def stacked_parent_heads(db, item: Mapping, repo: str, head: str) -> tuple[str, ...]:
+    """Les SHA des têtes gelées des parents d'empilement (#4478)."""
+    return tuple(entry["frozen"] for entry in
+                 stacked_parents(db, item, repo, head))
 
 
 def _applied_in(repo: str, target: str, sha: str) -> bool:
@@ -3400,7 +3518,7 @@ def unknown_refusal(unknown: Sequence[str], *, head_sha: str = "") -> str:
     return out
 
 
-def _forge_fetch(repo: str, sha: str) -> bool:
+def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None):
     """Rapatrie le commit exact `sha` depuis la forge du clone (`origin`).
 
     #3147 : la forge sert encore par SHA un commit devenu inaccessible après un
@@ -3414,30 +3532,71 @@ def _forge_fetch(repo: str, sha: str) -> bool:
     #3648 : le dépôt scratch de `merge-pr` (`git init`, sans `origin`) porte
     sa forge dans `ameesh.forge` (`plan_git.forge_remote`) ; sans elle, un
     gel antérieur écrasé par push forcé n'y était jamais rapatrié.
+
+    #4457 (B/P2 cx3) : `timeout` est le temps qui reste à l'appelant ; le
+    fetch ne peut pas dépasser son échéance ni `FETCH_TIMEOUT`. Un temps nul
+    ne lance aucun fetch.
+
+    Rend `True` (objet lisible), `False` (refus **explicite de l'objet** :
+    seul cas mémorisable par `fetch_cache`) ou `None` (non lancé, coupé par
+    l'échéance, panne DNS/connexion/authentification/serveur : un doute qui
+    se relit). #4457 B/P2 auditeur : une coupure notée « refusée » pour 6 h
+    effacerait le correcteur de toutes les lectures suivantes ; B/P2 cx2 : un
+    code 128 de transport n'est pas un refus de l'objet, et le cache ne doit
+    pas court-circuiter `recover` après rétablissement de la forge.
     """
     text = plan_git.full_commit_id(sha)
     if not text:
-        return False
+        return None
     try:
         if plan_git.local_commit(repo, text):
             return True
     except Exception:  # noqa: BLE001 - dépôt illisible : aucune récupération
-        return False
+        return None
+    bound = plan_git.FETCH_TIMEOUT if timeout is None else min(
+        float(timeout), plan_git.FETCH_TIMEOUT)
+    if bound <= 0:
+        return None
     try:
         forge = plan_git.forge_remote(repo)
         if forge is None:
-            return False
+            return None
         proc = plan_git._git(
             repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-            "--", forge, text, timeout=plan_git.FETCH_TIMEOUT)
-    except Exception:  # noqa: BLE001 - forge injoignable : absence
-        return False
+            "--", forge, text, timeout=bound)
+    except Exception:  # noqa: BLE001 - forge injoignable ou coupée : doute
+        return None
     if proc.returncode != 0:
-        return False
+        return False if _fetch_refused(proc.stderr) else None
     try:
         return bool(plan_git.local_commit(repo, text))
-    except Exception:  # noqa: BLE001 - lecture impossible : absence
-        return False
+    except Exception:  # noqa: BLE001 - lecture impossible : doute
+        return None
+
+
+#: stderr d'un `git fetch` qui refuse **explicitement** l'objet demandé (#4457)
+_FETCH_REFUSAL_MARKERS = (
+    "not our ref",
+    "couldn't find remote ref",
+    "remote ref does not exist",
+    "no such ref",
+    "unadvertised object",
+    "not allowed to request",
+)
+
+
+def _fetch_refused(stderr) -> bool:
+    """Le `git fetch` a-t-il explicitement refusé **cet objet** ? (#4457)
+
+    Un code non nul ne suffit pas : DNS, connexion, authentification et 5xx
+    rendent aussi 128. Seuls les messages qui nomment l'objet absent/non servi
+    autorisent le cache négatif ; une panne reste un doute qui se relit (B/P2
+    cx2 sur la tête 8298ee2e9).
+    """
+    text = (stderr.decode("utf-8", "replace")
+            if isinstance(stderr, (bytes, bytearray)) else str(stderr or ""))
+    low = text.lower()
+    return any(marker in low for marker in _FETCH_REFUSAL_MARKERS)
 
 
 def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list[str]:
@@ -4094,6 +4253,220 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     return authors, unknown, [correctors[name] for name in sorted(correctors)]
 
 
+#: #4457 : fenêtre de recherche du correctif autour du verdict de relecture.
+#: Le relecteur corrige dans son tour : 6 h avant l'avis couvrent un tour
+#: long, 2 h après couvrent la poussée qui suit l'avis. La fenêtre est lue
+#: exhaustivement (B/P2 cx3), jamais tronquée à 500 reçus.
+REWRITTEN_BEFORE_S = 6 * 3600
+REWRITTEN_WINDOW_S = 2 * 3600
+#: budget local de la lecture quand l'appelant n'a pas posé de `sweep_deadline`
+#: (le gel et la désignation) : au-delà, la lecture est incomplète et lève.
+REWRITTEN_SCAN_BUDGET_S = 60.0
+
+
+def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
+                            repo: str, *, head: str = "", strict: bool = False,
+                            fetch: bool = True, recover=None) -> dict[str, dict]:
+    """Les correctifs de relecteur **retirés** après leur gel (#4457).
+
+    Un relecteur désigné corrige lui-même au premier tour (canon §2) : son
+    commit est poussé **après** la tête gelée, pas dedans. Quand l'auteur le
+    réécrit depuis le B, le commit d'origine n'est plus ancêtre de la nouvelle
+    tête : la lecture de la plage n'en voit rien, et `_carried_from_previous`
+    ne le connaît pas non plus (il n'a jamais été une tête gelée). Le relecteur
+    réapparaissait donc comme un candidat indépendant, alors que le §2
+    l'exclut **par son nom** — sa famille, elle, redevient éligible (« un
+    autre agent relit »).
+
+    La preuve ne vient pas d'une note : le reçu exact du commit
+    (`provenance_receipts`, #1465) nomme l'acteur et le SHA, et la topologie
+    Git prouve le geste. Pour chaque gel antérieur du lot et chaque verdict
+    rendu par un relecteur sur sa tête, on lit les commits que ce relecteur a
+    créés après le gel. Un commit qui descend de la tête gelée et qui n'est
+    plus ancêtre de la tête lue est le correctif réécrit : son acteur reste
+    exclu par son nom, sans famille.
+
+    La fenêtre lue est bornée autour du verdict (6 h avant, 2 h après, sans
+    dépasser le gel courant) et **exhaustive** : une troncature silencieuse
+    ferait disparaître le correctif sous des reçus plus récents (B/P2 cx3).
+    L'échéance `_SWEEP` de l'appelant (ou un budget local de 60 s hors de ces
+    appels) est vérifiée avant chaque lecture et chaque fetch ; une lecture
+    incomplète lève, la porte refuse et la désignation attend. Un objet absent
+    n'est demandé qu'une fois par hôte (`fetch_cache`) : un refus n'est pas
+    redemandé à la lecture suivante.
+
+    Un dépôt ou une tête illisible rend `{}` (la lecture garde son
+    comportement historique) ; `strict` (la porte, le train) refuse au
+    contraire une lecture des reçus qui échoue, comme le reste de la
+    provenance. `recover`/`fetch` rapatrient l'objet du commit retiré quand
+    le clone de lecture ne l'a pas (clone scratch de `merge-pr`) ; un objet
+    irrécupérable est ignoré, faute de topologie prouvable.
+    """
+    item = dict(item or {})
+    if db is None or not repo or packet_composer(item):
+        return {}
+    state_dir = str(getattr(getattr(db, "cfg", None), "state_dir", "") or "")
+    lot = int(item.get("id") or 0)
+    if not lot:
+        return {}
+    head_sha = str(head or (milestone or {}).get("sha") or "").strip().lower()
+    if not head_sha:
+        return {}
+    sweep = _SWEEP.get()
+    local = Deadline(REWRITTEN_SCAN_BUDGET_S) if sweep is None else None
+
+    def check() -> None:
+        """Borne la lecture : échéance de l'appelant, sinon budget local."""
+        if sweep is not None:
+            sweep.check("rewritten correctors")
+        elif local is not None and local.expired():
+            raise review_provenance.ProvenanceError(
+                "the rewritten-corrector scan exceeded its %d s budget"
+                % int(REWRITTEN_SCAN_BUDGET_S))
+
+    def remaining() -> Optional[float]:
+        """Le temps qui reste, transmis aux opérations bloquantes (#4457)."""
+        if sweep is not None:
+            return sweep.deadline.remaining()
+        if local is not None:
+            return local.remaining()
+        return None
+
+    check()
+    try:
+        if not plan_git.local_commit(repo, head_sha):
+            return {}
+    except Exception:  # noqa: BLE001 - tête illisible : comportement historique
+        return {}
+    try:
+        rows = storage.of(db).work.milestones(lot, None) or []
+    except Exception:  # noqa: BLE001 - frise illisible : comportement historique
+        return {}
+    check()
+    freezes = sorted((row for row in rows if row.get("kind") == "frozen"),
+                     key=lambda value: (float(value.get("at_ts") or 0.0),
+                                        int(value.get("id") or 0)))
+    if not freezes:
+        return {}
+    current_id = int((milestone or {}).get("id") or 0)
+    current_at = float((milestone or {}).get("at_ts") or 0.0)
+    verdicts = [row for row in rows
+                if row.get("kind") == "verdict"
+                and str(row.get("sha") or "").strip()]
+    author = str(item.get("assignee") or "").strip().casefold()
+    # nominalement : acteur -> [(gel, tête, instant du verdict)] des têtes lues
+    wanted: dict[str, list] = {}
+    for freeze in freezes:
+        freeze_id = int(freeze.get("id") or 0)
+        if current_id and freeze_id >= current_id:
+            continue
+        sha = str(freeze.get("sha") or "").strip().lower()
+        if not sha or plan_git.same_commit(sha, head_sha):
+            continue
+        for verdict in verdicts:
+            if not plan_git.same_commit(verdict.get("sha"), sha):
+                continue
+            actor = str(verdict.get("actor") or "").strip()
+            key = actor.casefold()
+            if not actor or key == author:
+                continue
+            stamp = float(verdict.get("at_ts") or freeze.get("at_ts") or 0.0)
+            wanted.setdefault(key, []).append((freeze_id, sha, stamp, actor))
+    check()
+    if not wanted:
+        return {}
+    out: dict[str, dict] = {}
+    for key in sorted(wanted):
+        for freeze_id, freeze_sha, verdict_at, actor in wanted[key]:
+            since = max(0.0, verdict_at - REWRITTEN_BEFORE_S)
+            until = verdict_at + REWRITTEN_WINDOW_S
+            if current_at and current_at >= verdict_at:
+                until = min(until, current_at)
+            if until <= since:
+                continue
+            check()
+            try:
+                receipts = storage.of(db).provenance.commits(
+                    actor, since_ts=since, until_ts=until)
+            except Exception as exc:  # noqa: BLE001 - lecture des reçus impossible
+                if strict:
+                    raise review_provenance.ProvenanceError(
+                        "the provenance of prior reviewer corrections cannot be read"
+                        " (%s)" % exc) from exc
+                check()
+                return out
+            # #4457 (gel #25249) : une seule sonde `cat-file --batch-check`
+            # pour tous les reçus, au lieu d'un processus git par SHA ; les
+            # 500 reçus du témoin passent de ~40 s à moins d'une seconde.
+            present = _present_commits(
+                repo, [str((row or {}).get("sha") or "").strip()
+                       for row in receipts or ()], timeout=remaining())
+            check()
+            for receipt in receipts or ():
+                check()
+                sha = str((receipt or {}).get("sha") or "").strip().lower()
+                if not sha:
+                    continue
+                if present is None:
+                    # Lecture groupée impossible : repli par SHA, jamais une
+                    # absence supposée.
+                    try:
+                        full = plan_git.local_commit(repo, sha)
+                    except Exception:  # noqa: BLE001 - objet illisible : ignoré
+                        full = None
+                else:
+                    full = present.get(sha)
+                if not full and not fetch_cache.refused(
+                        repo, sha, state_dir=state_dir):
+                    refused = False
+                    if recover is not None:
+                        check()
+                        try:
+                            if recover(sha, timeout=remaining()):
+                                full = sha
+                        except Exception:  # noqa: BLE001 - source en échec
+                            pass
+                    if not full and fetch:
+                        check()
+                        try:
+                            outcome = _forge_fetch(repo, sha, timeout=remaining())
+                        except Exception:  # noqa: BLE001 - forge injoignable
+                            outcome = None
+                        # `_forge_fetch` rend l'objet trouvé (True), un refus
+                        # net (False) ou un doute (None) : une seule sonde, pas
+                        # de `local_commit` par SHA après un échec (#25249).
+                        if outcome is True:
+                            full = sha
+                        # Seul un refus **net** de git fetch se mémorise ; une
+                        # coupure par l'échéance ou une exception reste un
+                        # doute qui se relit (#4457 B/P2 auditeur).
+                        refused = outcome is False
+                    # L'appel bloquant a pu consommer toute l'échéance : le
+                    # constat d'absence ne doit pas l'absorber, et on ne note
+                    # rien sous une lecture expirée (#4457 B/P2 cx3/auditeur).
+                    check()
+                    if refused and not full:
+                        fetch_cache.note(repo, sha, state_dir=state_dir)
+                if not full:
+                    continue
+                check()
+                if _is_ancestor(repo, full, head_sha) is True:
+                    continue                # encore dans la tête : lu par la plage
+                if _is_ancestor(repo, freeze_sha, full) is not True:
+                    continue
+                # Un seul nom par acteur ; la première tête gelée qui porte
+                # le correctif suffit à la trace.
+                out.setdefault(key, {"name": actor, "family": "",
+                                     "families": [],
+                                     "rewritten": full,
+                                     "freeze": freeze_id})
+                break
+            if key in out:
+                break
+    check()
+    return out
+
+
 def reading(db, item: Mapping, milestone: Optional[Mapping],
             commits: Sequence[str], repo: str = "", families=(),
             *, reference: Optional[Mapping] = None,
@@ -4155,7 +4528,12 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     produit. La désignation ignore sa famille et exclut toujours son nom. Le
     report des gels antérieurs garde cette distinction. Un correctif au-delà
     du seuil ou de conception est aussi un auteur, mais n'est pas un
-    « correcteur » de premier tour.
+    « correcteur » de premier tour. #4457 : un correctif de relecteur poussé
+    **après** un gel et réécrit par l'auteur n'est ni dans la tête ni dans un
+    gel ; le reçu exact du commit retiré et la topologie le retrouvent, et son
+    acteur reste dans `correctors` avec une famille vide (`rewritten` nomme le
+    commit). Exclu par son nom seulement, il laisse sa famille éligible : un
+    autre agent relit (canon §2).
     #3335 : cette promotion et la trace « correcteur » suivent la survie du
     contenu (#3220). Un correctif de relecteur dont aucune ligne significative
     ne subsiste plus dans la tête n'exclut plus sa famille ; une ligne qui
@@ -4210,7 +4588,9 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     #3513 : `admitted_heads` sont les gels des membres déjà admis par la
     porte du même véhicule. Leurs commits sont écartés de la plage courante
     et des gels antérieurs, comme ceux de la cible ; aucun autre tiers
-    ne bénéficie de cette exclusion. Une lecture Git impossible ne retire rien.
+    ne bénéficie de cette exclusion. #4478 : les têtes gelées des parents
+    d'empilement (`stacked_parent_heads`) sont la même borne pour un lot
+    empilé. Une lecture Git impossible ne retire rien.
     Une portée est un gel (texte) ou la portée de `provenance_scope` (dict,
     #3533). #3544 : `exclusions_out` reçoit les commits écartés du report des
     gels antérieurs (`carried_from` = le gel reporté) ; la plage courante est
@@ -4486,9 +4866,31 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                          str(row.get("family") or ""),
                          row.get("families") or (),
                          test_only=bool(row.get("test_only")))
-    correctors = [dict({"name": row["name"], "family": row["family"]},
-                       **({"test_only": True} if row["test_only"] else {}))
-                  for row in corrector_rows.values()]
+    # #4457 : un correctif de relecteur poussé **après** la tête gelée puis
+    # réécrit par l'auteur n'est dans aucune plage ni aucun gel : son acteur
+    # reste exclu par son nom, sans famille (le §2 laisse un autre agent de la
+    # même famille relire). Une trace de correcteur survivante garde, elle, sa
+    # famille : ne jamais l'effacer.
+    for row in _rewritten_after_freeze(
+            db, item, milestone, repo, head=head, strict=strict,
+            fetch=fetch, recover=recover).values():
+        key = str(row.get("name") or "").strip().lower()
+        if not key or key in corrector_rows:
+            continue
+        corrector_rows[key] = {"name": row["name"], "family": "",
+                               "proven": set(), "test_only": False,
+                               "rewritten": str(row.get("rewritten") or ""),
+                               "freeze": int(row.get("freeze") or 0)}
+    correctors = []
+    for row in corrector_rows.values():
+        entry = {"name": row["name"], "family": row["family"]}
+        if row["test_only"]:
+            entry["test_only"] = True
+        if row.get("rewritten"):
+            entry["rewritten"] = row["rewritten"]
+            if row.get("freeze"):
+                entry["freeze"] = int(row["freeze"])
+        correctors.append(entry)
     return out, unknown, correctors
 
 

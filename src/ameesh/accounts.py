@@ -1035,9 +1035,8 @@ def apply_env(env: dict, profile: Profile, environ=None) -> None:
     from . import setup_token
     if setup_token.present(profile, environ):
         token, _ = setup_token.read(profile, environ)
-        env.pop("CLAUDE_CONFIG_DIR", None)
+        # Authentication must preserve the selected session directory (#4546).
         env[setup_token.VARIABLE] = token
-        return
     variable = config_env_of(profile.harness)
     if profile.kind == "config_dir":
         if not profile.default and variable:
@@ -2532,12 +2531,13 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     # #1883 (R2 auditeur, B1) : la décision est une fonction du jeu d'écartés
     # (retenues d'overage, identités en conflit) ; `choose` la rejoue sur un
     # jeu FRAIS avant de rendre un compte (voir la reprise après l'appel).
-    def decide(retenus: set[str], conflits: set[str]) -> Choice:
+    def decide(retenus: set[str], conflits: set[str], sick: dict) -> Choice:
         """La décision de placement pour un jeu d'écartés donné.
 
         Un compte retenu ou d'identité contredite ne reçoit aucun tour : ces
         écartés priment sur le forçage, la continuité et le classement.
-        Les jeux sont relus à l'instant du placement (R2 auditeur, B1)."""
+        Les jeux sont relus à l'instant du placement (R2 auditeur, B1), comme
+        les échecs d'authentification `sick` (#4489)."""
         nonlocal row, cache
         candidates = [p for p in healthy(items, sick) if p.name not in epuises]
         ecartes = retenus | conflits
@@ -2795,13 +2795,19 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     # publiée pendant son classement ; chaque reprise repasse donc par la même
     # relecture, et une borne franchie refuse le tour (`VALIDATION_ESSAIS`) —
     # jamais un compte peut-être retenu rendu.
-    choice = decide(retenus, conflits)
+    # #4489 : l'échec d'authentification est relu avec elles — un échec
+    # publié par un autre runner de l'hôte entre la lecture de `sick` et la
+    # bascule ne fait pas partir un tour sur ce compte (la reprise saute au
+    # suivant sain, ou rend `auth_blocked`).
+    choice = decide(retenus, conflits, sick)
     for _ in range(VALIDATION_ESSAIS):
         if choice.profile is None or choice.auth_blocked:
             return choice
         frais, conflits_frais = _etat_placement(store, host, harness, items, now)
+        sick = auth_failure.failing(db, host, harness)
         if (choice.profile.name not in frais
-                and choice.profile.name not in conflits_frais):
+                and choice.profile.name not in conflits_frais
+                and choice.profile.name not in sick):
             return choice
         # reprise : la décision est rejouée sur l'état frais — forçage levé
         # pour un compte libre, continuité rompue, compte écarté du classement.
@@ -2810,10 +2816,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         row = store.active(host, harness) or row
         active_name = row.get("account")
         active = by_name(items, active_name) or active
-        choice = decide(frais, conflits_frais)
+        choice = decide(frais, conflits_frais, sick)
     return Choice(None, active, reason=(
         "no %s account to place: the placement state changed on every re-read "
-        "(a hold or an identity conflict was published while deciding); "
+        "(a hold, an identity conflict or an authentication failure was "
+        "published while deciding); "
         "retrying next turn" % harness))
 
 

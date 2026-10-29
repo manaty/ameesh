@@ -644,6 +644,54 @@ def _exact_verdict_receipt(db, mark) -> dict | None:
         return None
 
 
+def _admitted_stacked_parents(db, cfg, item, repo, frozen) -> tuple[str, ...]:
+    """Les têtes parentes d'empilement dont la propre porte est satisfaite.
+
+    #4478 : un lot empilé ne relit pas les commits de son parent **relu**.
+    Encore faut-il que le parent ait passé sa propre porte sur cette tête
+    exacte : les dépendances ne bornent que la prise, pas la fusion, et rien
+    n'empêche l'enfant de fusionner avant son parent. Un parent jamais relu,
+    ou bloqué, reste donc dans le périmètre de l'enfant : ses auteurs comptent
+    (le §2 interdit à leur famille de relire l'enfant), comme pour une tête qui
+    n'est pas `admitted_heads` du même véhicule (#3513).
+
+    La porte du parent se lit comme celle des membres d'un paquet : sa classe
+    sur sa propre cible, ses avis sur sa tête, et une provenance effectivement
+    lue (`attribution_read`, #3513). Une lecture impossible ne l'admet pas :
+    le doute conserve les auteurs. Rend les SHA admis, les plus proches
+    d'abord (l'ordre de `review_authors.stacked_parents`)."""
+    if db is None or cfg is None or not repo or not item:
+        return ()
+    from . import lot_class, review_authors
+
+    admitted: list[str] = []
+    for parent in review_authors.stacked_parents(db, item, repo, frozen):
+        lot = int((parent or {}).get("lot") or 0)
+        sha = str((parent or {}).get("frozen") or "").strip()
+        if not lot or not sha:
+            continue
+        try:
+            row = work.get(db, lot)
+            if row is None:
+                continue
+            marks = storage.of(db).work.milestones(lot, None)
+            target = lot_class.default_base(cfg, row, repo)
+            base = _class_base(repo, target) if target else None
+            base_sha = plan_git._commit(repo, base) if base else None
+            klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo,
+                                     head=sha, milestones=marks,
+                                     base=target, base_sha=base_sha)
+            if not klass or (klass.get("doubt") and not klass.get("files")):
+                continue
+            gate = review_gate(db, marks, sha, repo=repo, klass=klass,
+                               item=row, cfg=cfg, target=base_sha or target)
+        except Exception:  # noqa: BLE001 - porte du parent illisible : non admis
+            continue
+        if gate.get("ok") and gate.get("attribution_read"):
+            admitted.append(sha)
+    return tuple(admitted)
+
+
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None, families=None, required=None, family_of=None,
                 authors=None, authors_complete=False, cfg=None, project=None,
@@ -1082,9 +1130,19 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if publication_error:
             out["production_scope_error"] = publication_error
         inherited = tuple((vehicle or {}).get("admitted_heads") or ())
-        scopes = tuple(admitted_heads) + inherited + ((production,) if production else ())
+        from . import review_authors
+        # #4478 : une tête de parent d'empilement n'est hors du périmètre de
+        # relecture de l'enfant que si sa **propre** porte est satisfaite sur
+        # cette tête exacte, comme les `admitted_heads` des membres d'un même
+        # véhicule (#3513). Un parent jamais relu ou bloqué reste compté :
+        # l'enfant ne peut pas le faire atterrir sans une relecture
+        # indépendante de sa famille d'auteur.
+        stacked = tuple(
+            {"head": sha, "reason": "stacked-parent", "ref": "parent"}
+            for sha in _admitted_stacked_parents(db, cfg, item, repo, frozen))
+        scopes = (tuple(admitted_heads) + inherited + stacked
+                  + ((production,) if production else ()))
         if scopes and repo:
-            from . import review_authors
             boundary = (review_authors.target_commit(repo, target or (klass or {}).get("target") or "")
                         or (klass or {}).get("base_sha"))
             if boundary:
@@ -1433,10 +1491,29 @@ GATE_CACHE_MAX_ENTRIES = 2000
 #: numéro de paquet (qui ne bouge qu'aux releases).
 _GATE_CODE_FILES = (
     "merge_queue.py", "review_authors.py", "review_designation_activation.py",
-    "lot_class.py", "plan_git.py", "canon.py", "review_lot.py", "review.py",
-    "provenance_scope.py", "packet_reviews.py",
+    "lot_class.py", "plan_git.py", "modules/dev/plan_git.py", "canon.py",
+    "review_lot.py", "review.py", "provenance_scope.py", "packet_reviews.py",
 )
 _GATE_CODE_FINGERPRINT: str | None = None
+
+
+def _gate_code_digest(root: str) -> str:
+    """L'empreinte du code de la porte sous `root` (le dossier `ameesh`).
+
+    Les chemins déplacés par une tranche de module (L100) comptent par leur
+    nouveau fichier, pas seulement par l'alias constant laissé derrière :
+    `plan_git.py` n'est qu'un alias depuis #4383, le vrai code est dans
+    `modules/dev/plan_git.py`. Un chemin absent est haché comme
+    `unreadable` : son apparition change l'empreinte."""
+    digest = hashlib.sha256()
+    for name in _GATE_CODE_FILES:
+        digest.update(name.encode("utf-8"))
+        try:
+            with open(os.path.join(root, name), "rb") as fh:
+                digest.update(fh.read())
+        except OSError:
+            digest.update(b"unreadable")
+    return digest.hexdigest()[:16]
 
 
 def _gate_code_version() -> str:
@@ -1447,21 +1524,13 @@ def _gate_code_version() -> str:
     global _GATE_CODE_FINGERPRINT
     if _GATE_CODE_FINGERPRINT is not None:
         return _GATE_CODE_FINGERPRINT
-    digest = hashlib.sha256()
     root = os.path.dirname(os.path.abspath(__file__))
-    for name in _GATE_CODE_FILES:
-        digest.update(name.encode("utf-8"))
-        try:
-            with open(os.path.join(root, name), "rb") as fh:
-                digest.update(fh.read())
-        except OSError:
-            digest.update(b"unreadable")
     try:
         from . import version as ameesh_version
         label = ameesh_version()
     except Exception:  # noqa: BLE001 - version illisible : l'empreinte suffit
         label = "unknown"
-    _GATE_CODE_FINGERPRINT = "%s+%s" % (label, digest.hexdigest()[:16])
+    _GATE_CODE_FINGERPRINT = "%s+%s" % (label, _gate_code_digest(root))
     return _GATE_CODE_FINGERPRINT
 
 
@@ -1724,16 +1793,18 @@ def _delta_head(repo, frozen, *, target_repo: str | None = None) -> tuple[str, s
 def _delta_log(repo, row, frozen, *, base: str | None = None,
                base_repo: str | None = None, target: str | None = None,
                target_repo: str | None = None, queue: bool = False,
-               args=()) -> list[str]:
+               args=(), exclude=()) -> list[str]:
     """Les lignes de `git log <args> base..head` (#1515 N1/B3).
 
     Le delta est lu depuis la **base effective** (`_delta_base`, refs privées
     de la file comprises). `args` choisit la lecture : noms Git des auteurs,
     commits de contenu (`--no-merges`) ou auteurs des fusions (`--merges`).
     Une fusion peut ajouter du contenu : son auteur est un auteur du lot et ne
-    peut plus compter comme relecteur indépendant. Lève `_ProvenanceError`
-    quand le gel, la base ou `git log` ne peut pas être lu : la porte refuse,
-    elle n'invente pas une liste partielle."""
+    peut plus compter comme relecteur indépendant. `exclude` nomme des têtes
+    déjà relues ailleurs (parents d'empilement, #4478) : leur histoire sort du
+    delta, fusions comprises. Lève `_ProvenanceError` quand le gel, la base ou
+    `git log` ne peut pas être lu : la porte refuse, elle n'invente pas une
+    liste partielle."""
     if not repo or not frozen:
         return []
     head, head_repo = _delta_head(repo, frozen, target_repo=target_repo)
@@ -1743,6 +1814,9 @@ def _delta_log(repo, row, frozen, *, base: str | None = None,
     if base == head:
         return []
     argv = list(args) + ["%s..%s" % (base, head)]
+    excluded = [str(sha).strip() for sha in exclude or () if str(sha).strip()]
+    if excluded:
+        argv += ["--not", *excluded]
     proc = plan_git._git(head_repo, "log", *argv)
     if proc.returncode != 0 and base_repo != head_repo:
         # Objets non partagés (banc, clone incomplet) : la tête peut aussi
@@ -1775,7 +1849,8 @@ def _unique_names(names) -> list[str]:
 
 def _delta_commits(repo, row, frozen, *, base: str | None = None,
                    base_repo: str | None = None, target: str | None = None,
-                   target_repo: str | None = None, queue: bool = False) -> list[str]:
+                   target_repo: str | None = None, queue: bool = False,
+                   exclude=()) -> list[str]:
     """Les commits de contenu du delta gelé (#1515), fusions exclues.
 
     C'est la plage que lit le lecteur partagé (`review_authors.reading`) et la
@@ -1783,17 +1858,19 @@ def _delta_commits(repo, row, frozen, *, base: str | None = None,
     à part (`_merge_authors`) pour ne pas perdre une résolution."""
     return _unique_names(_delta_log(
         repo, row, frozen, base=base, base_repo=base_repo, target=target,
-        target_repo=target_repo, queue=queue,
+        target_repo=target_repo, queue=queue, exclude=exclude,
         args=("--no-merges", "--format=%H")))
 
 
 def _merge_authors(repo, row, frozen, *, base: str | None = None,
                    base_repo: str | None = None, target: str | None = None,
-                   target_repo: str | None = None, queue: bool = False) -> list[str]:
+                   target_repo: str | None = None, queue: bool = False,
+                   exclude=()) -> list[str]:
     """Les auteurs Git des fusions du delta gelé (#1515 N1/B3)."""
     return _unique_names(_delta_log(
         repo, row, frozen, base=base, base_repo=base_repo, target=target,
-        target_repo=target_repo, queue=queue, args=("--merges", "--format=%an")))
+        target_repo=target_repo, queue=queue, exclude=exclude,
+        args=("--merges", "--format=%an")))
 
 
 def _commit_author(places, sha: str) -> str:
@@ -1817,8 +1894,12 @@ def _object_recoverer(where: str, sources):
     l'agent ou à l'origine du projet, puis on vérifie que l'objet est bien
     lisible localement. Aucun ref n'est déplacé et aucune tête n'est changée :
     seule la preuve manquante est réparée. Rend False (jamais une exception)
-    quand la récupération échoue, pour que l'appelant strict refuse fermé."""
-    def recover(sha: str) -> bool:
+    quand la récupération échoue, pour que l'appelant strict refuse fermé.
+
+    #4457 (B/P2 cx3) : `timeout` est le temps qui reste à l'appelant ; il
+    borne l'ensemble des sources, pas chacune. Sans lui, le plafond par source
+    reste `FETCH_TIMEOUT` (comportement historique)."""
+    def recover(sha: str, *, timeout=None) -> bool:
         text = str(sha or "").strip().lower()
         if not _HEX.fullmatch(text):
             return False
@@ -1831,17 +1912,25 @@ def _object_recoverer(where: str, sources):
         # localement s'il était lisible.
         if len(text) not in (40, 64):
             return False
+        remaining = None if timeout is None else max(float(timeout), 0.0)
         for source in sources or ():
             source = str(source or "").strip()
             if not source:
                 continue
+            if remaining is not None and remaining <= 0:
+                break
+            bound = (FETCH_TIMEOUT if remaining is None
+                     else min(remaining, FETCH_TIMEOUT))
+            started = time.monotonic()
             try:
                 proc = plan_git._git(where, "fetch", "--quiet", "--no-tags",
                                      "--no-write-fetch-head", "--", source, text,
-                                     timeout=FETCH_TIMEOUT)
+                                     timeout=bound)
             except Exception:  # noqa: BLE001 - source injoignable : suivante
-                continue
-            if proc.returncode != 0:
+                proc = None
+            if remaining is not None:
+                remaining -= time.monotonic() - started
+            if proc is None or proc.returncode != 0:
                 continue
             try:
                 if plan_git.local_commit(where, text):
@@ -1869,8 +1958,12 @@ def _freeze_milestone(marks, frozen, repo: str | None = None):
 
 def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
                       *, target_repo: str | None = None, queue: bool = False,
-                      klass=None, marks=None):
+                      klass=None, marks=None, cfg=None):
     """(auteurs `{name, family}`, familles) pour la porte des avis (#1515 N1).
+
+    `cfg` est nécessaire pour admettre les têtes d'un parent d'empilement
+    (#4478) : seule une tête dont la propre porte est satisfaite sort de la
+    lecture ; sans `cfg`, aucune ne l'est (le doute garde les auteurs).
 
     Les auteurs de **contenu** sont ceux du lecteur partagé (#2681,
     `review_authors.reading`) : reçus exacts, familles **historiques** du
@@ -1961,6 +2054,7 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
             if value:
                 row["families"].add(value)
 
+    parent_heads: tuple = ()
     if db is None:
         # Sans magasin (banc, dry-run), la provenance n'est pas lisible : on
         # garde la lecture Git historique, comme `_corrections_on_freeze`
@@ -1970,8 +2064,16 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
                 target_repo=target_repo, queue=queue, args=("--format=%an",))):
             add(name)
     else:
+        # #4478 : un lot empilé sur la tête gelée d'un parent (prérequis
+        # déclaré ou membre du paquet) ne relit pas les commits de ce parent
+        # **s'il a passé sa propre porte**. Un parent jamais relu ou bloqué
+        # reste dans le delta : sa famille d'auteur compte, et la porte ne peut
+        # pas lui opposer un avis de cette famille. La borne s'applique aussi
+        # aux fusions du parent.
+        parent_heads = _admitted_stacked_parents(db, cfg, item, repo, frozen)
         commits = _delta_commits(repo, item, frozen, base=base, base_repo=base_repo,
-                                 target=target, target_repo=target_repo, queue=queue)
+                                 target=target, target_repo=target_repo, queue=queue,
+                                 exclude=parent_heads)
         milestone = _freeze_milestone(marks, frozen, repo)
         reference_families: dict = {}
         try:
@@ -1995,7 +2097,8 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
                 db, item, milestone, commits, repo,
                 families=families, strict=True, families_out=proven_families,
                 reference=reference, reference_families=reference_families,
-                base=base, head=frozen, target=base, recover=recover)
+                base=base, head=frozen, target=base, recover=recover,
+                admitted_heads=parent_heads)
         except Exception as exc:  # noqa: BLE001 - une lecture illisible ne conclut pas
             raise _ProvenanceError(
                 "the authors of the frozen range cannot be read (%s)" % exc) from exc
@@ -2021,7 +2124,8 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
                     "historical author unreadable for the unknown %s" % sha)
             add(fallback)
     for name in _merge_authors(repo, item, frozen, base=base, base_repo=base_repo,
-                               target=target, target_repo=target_repo, queue=queue):
+                               target=target, target_repo=target_repo, queue=queue,
+                               exclude=parent_heads):
         add(name)
     authors: list[dict] = []
     for key, entry in found.items():
@@ -2616,7 +2720,7 @@ def _readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
             try:
                 authors, families = _complete_authors(
                     db, row, tip, where, target, target_repo=repo,
-                    queue=(where != repo), klass=klass, marks=marks)
+                    queue=(where != repo), klass=klass, marks=marks, cfg=cfg)
             except _ProvenanceError as exc:
                 raise QueueError(
                     "lot #%d: the complete authors of the lot cannot be established "

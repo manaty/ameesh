@@ -38,6 +38,22 @@ class Provenance(abc.ABC):
         les faits recopiés du jalon — et les champs de la preuve."""
 
     @abc.abstractmethod
+    def commits(self, actor: str, *, since_ts: Optional[float] = None,
+                until_ts: Optional[float] = None,
+                limit: Optional[int] = None) -> list[dict]:
+        """Les preuves de commits écrites par `actor`, les plus récentes d'abord.
+
+        Un reçu de commit ne porte pas toujours le lot (`work_item_id` est
+        NULL quand le hook post-commit ne le connaît pas). Cette lecture rend
+        les SHA que l'acteur a réellement créés, pour que la désignation
+        retrouve un correctif de relecteur **retiré** de la tête (#4457) sans
+        se fier à une note. `since_ts`/`until_ts` bornent par l'instant
+        d'écriture du reçu (epoch). **Sans `limit`**, la fenêtre est lue
+        exhaustivement : une troncature silencieuse ferait disparaître le
+        correctif sous des reçus plus récents (B/P2 cx3). Une ligne par
+        `subject`, sans `recorded`."""
+
+    @abc.abstractmethod
     def origins(self, commits: Sequence[str]) -> list[int]:
         """Les lots que des jalons de gel/verdict rattachent à ces commits.
 

@@ -290,7 +290,8 @@ def compose(args: argparse.Namespace) -> int:
         print("unité composée : %s" % sha)
         print("lots portés : %s" % ", ".join("#%d" % lot for lot in lots))
         if args.record_package:
-            record_package(repo, args.record_package)
+            record_package(repo, args.record_package,
+                           getattr(args, "expect_pushed", None))
         return 0
 
     if rev(repo, "MERGE_HEAD"):
@@ -311,14 +312,20 @@ def compose(args: argparse.Namespace) -> int:
                    % proc.stderr.decode("utf-8", "replace").strip())
 
 
-def record_package(repo: Path, package: int) -> None:
+def record_package(repo: Path, package: int, expect_pushed: str | None = None) -> None:
     """#2443 : après le commit, lier le paquet en base (jamais le manifeste).
 
     Le commit de composition est déjà écrit : un refus de la liaison le dit
     et donne la commande à relancer, sans défaire la composition.
+
+    #4501 : `expect_pushed` nomme la tête poussée que cette composition
+    remplace (bail du composeur) ; `packet record` refuse d'écraser le
+    manifeste d'une autre tête gelée.
     """
     command = ["ameesh", "work", "packet", "record", str(int(package)),
                "--repo", str(repo)]
+    if expect_pushed:
+        command += ["--expect-pushed", expect_pushed]
     try:
         proc = subprocess.run(command, capture_output=True, text=True)
     except OSError as error:
@@ -361,6 +368,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--record-package", type=int, default=None, metavar="LOT",
                         help="après le commit, enregistrer la liaison au lot "
                              "porteur en base (#2443 : ameesh work packet record LOT)")
+    parser.add_argument("--expect-pushed", default=None, metavar="SHA",
+                        help="#4501 : la tête poussée que cette composition remplace "
+                             "(bail du composeur), refusée à un autre composeur")
     args = parser.parse_args(argv)
 
     try:

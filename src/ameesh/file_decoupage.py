@@ -20,12 +20,15 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   et crée les lots au niveau 1 ;
 * **feuille de route épuisée** : une note `roadmap: épuisée <projet>` sur le
   lot de découpage ouvert met en sommeil les agents d'exécution au repos du
-  projet (pause opérateur au nom de l'humain responsable, raison
-  `SLEEP_REASON`, levée conditionnelle), jamais un relecteur ni un agent
-  critique ; l'alerte `roadmap_exhausted` (une par lot, dédoublonnée par le
-  notifieur) prévient l'owner ; les hôtes burst sont rendus par le drainage
-  de #3167 B (#4148), hors de ce module. Le premier lot démarrable du projet
-  réveille les dormeurs.
+  projet (pause opérateur posée par `ameesh:file-decoupage`, l'humain
+  responsable n'étant que le principal, raison `SLEEP_REASON`, levée
+  conditionnelle), jamais un relecteur ni un agent critique ; l'alerte
+  `roadmap_exhausted` (une par lot, dédoublonnée par le notifieur) prévient
+  l'owner ; les hôtes burst sont rendus par le drainage de #3167 B (#4148),
+  hors de ce module. Le premier lot démarrable du projet réveille les
+  dormeurs. #4525 : une relecture désignée ouverte, ou le dernier relecteur
+  disponible d'une famille pendant qu'un gel attend un avis, n'est jamais
+  endormi ; le motif d'exemption est journalisé sur le lot de découpage.
 
 « Au repos » se lit comme `idle_capacity` (#1677 : sans lot actionnable) ;
 la durée de 30 min porte sur la condition du projet, suivie dans l'état du
@@ -41,6 +44,7 @@ from dataclasses import dataclass, field
 from . import planned_waits, storage
 from . import sous_utilisation as su
 from . import work
+from .agent_pause import FILE_DECOUPAGE_ACTOR as SLEEP_ACTOR
 
 #: identité du lot de découpage d'un projet (un seul ouvert)
 SOURCE_PREFIX = "file-decoupage:"
@@ -53,8 +57,23 @@ EXHAUSTED_PREFIX = "roadmap: épuisée"
 EXHAUSTED_RE = re.compile(r"^\s*roadmap\s*:\s*épuisée\s+(\S+)", re.IGNORECASE)
 #: raison de la pause opérateur posée par le sommeil, levée par elle seule
 SLEEP_REASON = "roadmap: épuisée %s (#3256 §2.3)"
+#: #4525 : reconnaissance de CETTE pause, pour l'alerte (une raison humaine qui
+#: ressemblerait au texte ne doit pas être prise pour le sommeil automatique)
+SLEEP_REASON_RE = re.compile(r"^roadmap\s*:\s*épuisée\s+\S+\s+\(#3256\s+§2\.3\)$")
+#: préfixe de la note d'exemption écrite sur le lot de découpage
+SLEEP_EXEMPT_PREFIX = "sleep exempted:"
 #: état du notifieur : `{projet: début de la condition}`
 STATE_KEY = "queue_fill"
+
+
+def is_sleep_reason(reason) -> bool:
+    """#4525 : la raison est-elle exactement celle du sommeil automatique ?
+
+    L'alerte de pause opérateur s'en sert pour ne pas demander à l'owner de
+    mettre fin à une maintenance qui n'a jamais eu lieu, et pour dire que le
+    premier lot démarrable lève le sommeil.
+    """
+    return bool(SLEEP_REASON_RE.match(str(reason or "").strip()))
 
 
 def source_of(project: str) -> str:
@@ -318,19 +337,200 @@ def _owner_of(rows: list) -> str | None:
     return owner
 
 
-def _sleep(db, project: str, item: Measure, by_name: dict, now: float) -> list:
-    """Met en sommeil les agents d'exécution au repos du projet (§2.3)."""
+def _reviewer_spares(db, project: str, lots: list, listing: list, *,
+                     cfg=None, canons=None) -> tuple:
+    """#4525 : qui le sommeil doit-il épargner, et pourquoi ?
+
+    Rend `(pending, keep, error)` :
+
+    * `pending` : `{nom minuscule: [ligne de pending_reviews]}`. Une ligne est
+      une relecture **désignée ouverte** sur le dernier gel d'un lot ouvert
+      (le calcul partagé #3033 : le gel, la désignation et l'absence de
+      verdict de ce relecteur sur cette tête) ;
+    * `keep` : `{nom: (famille, lot)}` pour le **dernier relecteur
+      disponible** d'une famille qui peut encore relire **un gel en attente**.
+      Le calcul est fait gel par gel : deux gels peuvent exclure des noms
+      différents de la même famille et avoir besoin de relecteurs différents.
+      Les lots ouverts en `qa` portent un gel ; les auteurs de ce gel (lus à
+      la marque de désignation, `frozen_authors`) et leur famille sont
+      inéligibles. Un agent d'une famille dont il ne reste que lui est
+      épargné, sinon le sommeil retirerait la famille entière et le gel
+      n'aurait plus de relecteur possible (constat #4507 / #4496) ;
+    * `error` : la lecture des relectures désignées a échoué. Le sommeil ne
+      retire alors personne : le doute ne supprime pas un relecteur.
+
+    Le calcul reste prudent : sans marque de désignation complète, les
+    familles d'auteurs sont inconnues et toutes les familles restent
+    éligibles ; une lecture de gel en échec ne fait qu'épargner davantage.
+
+    « Dernier relecteur disponible » se lit sur les agents **disponibles** du
+    projet (`review_designation.is_available`), pas sur les seuls agents au
+    repos : un agent occupé par un lot reste un relecteur possible.
+    """
+    from . import alert_briefs
+    from . import plan_git
+    from . import projects as projects_mod
+    from . import registry
+    from . import review_designation as rd
+    from . import review_designation_activation as activation
+
+    try:
+        rows = activation.pending_reviews(db)
+    except Exception as exc:  # noqa: BLE001 - le doute ne retire pas un relecteur
+        return {}, {}, "%s: %s" % (type(exc).__name__, str(exc)[:160])
+    pending: dict = {}
+    for row in rows or ():
+        name = str((row or {}).get("name") or "").strip()
+        if name:
+            pending.setdefault(name.lower(), []).append(row)
+
+    # Les familles réelles du registre : la politique du canon n'est pas
+    # relue ici, un harnais hors politique est simplement épargné en trop.
+    families = set()
+    for row in listing or ():
+        try:
+            family = str(registry.live_harness(dict(row)) or "").strip().lower()
+        except Exception:  # noqa: BLE001 - une ligne illisible n'est pas une famille
+            family = ""
+        if family:
+            families.add(family)
+    try:
+        closed = alert_briefs.claims_closed_hosts(db)
+    except Exception:  # noqa: BLE001 - hôte inconnu : ne ferme rien
+        closed = set()
+    try:
+        candidates = [c for c in rd.candidates_from_registry(
+            listing or (), project=project, families=families, closed_hosts=closed)
+            if c.available and c.family]
+    except Exception:  # noqa: BLE001 - pas de vivier : rien à épargner en plus
+        candidates = []
+    by_name = {c.name: c for c in candidates}
+    # Le pilote du projet reçoit l'alerte de capacité, il n'est pas un siège de
+    # relecture : la désignation l'exclut (`_candidates`), le sommeil doit donc
+    # l'exclure aussi du choix du représentant de famille. Sinon un pilote au
+    # nom « max » serait épargné et le vrai relecteur de la famille endormi
+    # (B/P2 de la relecture cx2, #4525).
+    try:
+        pilots = alert_briefs.project_pilots(
+            project, listing or (), cfg=cfg, db=db, canons=canons)
+    except Exception:  # noqa: BLE001 - rôle illisible : ne retire personne
+        pilots = []
+    if pilots:
+        by_name.pop(pilots[0], None)
+
+    waiting = [lot for lot in lots or ()
+               if str((lot or {}).get("state") or "") == "qa"
+               and projects_mod.lot_project(lot or {}) == project]
+    # Un représentant par (gel, famille), pas un représentant global : deux
+    # gels peuvent exclure des noms différents de la même famille (auteurs,
+    # correcteurs) et avoir besoin de relecteurs différents. Agréger les noms
+    # puis garder le max global laisserait l'un des gels sans relecteur
+    # (B/P2 de la relecture cx2, second tour #4525).
+    keep: dict = {}
+    for lot in waiting:
+        lot = lot or {}
+        try:
+            lot_id = int(lot.get("id"))
+        except (TypeError, ValueError):
+            continue
+        # Une dispense `-none` ou une marque `review-designation-none` dit que
+        # ce gel n'attend aucun avis avant fusion (lot léger, #2561/#1979) :
+        # le sommeil n'a alors pas de relecteur à épargner pour lui.
+        if any(str(name).strip() == "-none" for name in lot.get("reviewers") or ()):
+            continue
+        try:
+            freeze = plan_git.latest_freeze(work.milestones(db, lot_id, None) or ())
+            if freeze is None:
+                continue
+            if work.events_noted(
+                    db, lot_id, "review-designation-none:%d:%d:"
+                                % (lot_id, int(freeze.get("id") or 0))):
+                continue
+        except Exception:  # noqa: BLE001 - lecture illisible : le doute épargne
+            pass
+        try:
+            authors = activation.frozen_authors(db, {"id": lot_id})
+        except Exception:  # noqa: BLE001 - marque illisible : toutes éligibles
+            authors = None
+        forbidden_names = {str(lot.get("assignee") or "").strip()} - {""}
+        forbidden_families = set()
+        for author in authors or ():
+            name = str((author or {}).get("name") or "").strip()
+            if name:
+                forbidden_names.add(name)
+            forbidden_families.update(rd.proven_families(author))
+        by_family: dict = {}  # famille -> noms éligibles sur CE gel
+        for name, candidate in by_name.items():
+            if name in forbidden_names or candidate.family in forbidden_families:
+                continue
+            by_family.setdefault(candidate.family, set()).add(name)
+        for family, names in by_family.items():
+            # Le nom le plus grand est le représentant stable de la famille
+            # pour ce gel : les autres membres peuvent dormir.
+            name = max(names)
+            keep.setdefault(name, (family, lot_id))
+    return pending, keep, None
+
+
+def _journal_exemption(db, split_id, name: str, why: str) -> None:
+    """Écrit une fois le motif d'exemption sur le lot de découpage (#4525).
+
+    Une note par agent (ou par cause globale), pas une par passage : le motif
+    est une trace, pas un journal de boucle. Une trace en échec ne défait pas
+    le sommeil.
+    """
+    if split_id is None:
+        return
+    prefix = "%s %s:" % (SLEEP_EXEMPT_PREFIX, name)
+    try:
+        if work.events_noted(db, int(split_id), prefix):
+            return
+        work.note(db, int(split_id), "%s %s" % (prefix, why), actor=SLEEP_ACTOR)
+    except Exception:  # noqa: BLE001 - une trace ne bloque jamais le geste
+        pass
+
+
+def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
+           split_id=None, lots=(), listing=(), cfg=None, canons=None) -> list:
+    """Met en sommeil les agents d'exécution au repos du projet (§2.3).
+
+    #4525 : une relecture désignée ouverte n'est jamais endormie, et le dernier
+    relecteur disponible d'une famille ne l'est non plus tant qu'un gel du
+    projet attend un avis. Le motif est journalisé sur le lot de découpage.
+    """
     from . import agent_pause
     out = []
     reason = SLEEP_REASON % project
+    pending, keep, unreadable = _reviewer_spares(
+        db, project, lots, listing, cfg=cfg, canons=canons)
+    if unreadable:
+        why = "review exemptions unreadable: %s" % unreadable
+        _journal_exemption(db, split_id, "*", why)
+        for name in item.idle:
+            out.append({"agent": name, "slept": False, "why": why})
+        return out
     for name in item.idle:
-        owner = _owner_of([by_name[name]])
+        owner = _owner_of([by_name.get(name) or {}])
         if not owner:
             out.append({"agent": name, "slept": False, "why": "no human responsible"})
             continue
+        pending_rows = pending.get(name.lower()) or []
+        if pending_rows:
+            why = ("designated review pending on #%s"
+                   % (pending_rows[0].get("lot") or "?"))
+            out.append({"agent": name, "slept": False, "why": why})
+            _journal_exemption(db, split_id, name, why)
+            continue
+        kept = keep.get(name)
+        if kept is not None:
+            why = ("only eligible reviewer of family %s for pending freeze #%s"
+                   % (kept[0], kept[1]))
+            out.append({"agent": name, "slept": False, "why": why})
+            _journal_exemption(db, split_id, name, why)
+            continue
         try:
-            done = agent_pause.change(db, name, paused=True, reason=reason, actor=owner,
-                                      principal=owner, now=now)
+            done = agent_pause.change(db, name, paused=True, reason=reason,
+                                      actor=SLEEP_ACTOR, principal=owner, now=now)
         except Exception as exc:  # noqa: BLE001 - un agent refusé n'arrête pas les autres
             out.append({"agent": name, "slept": False,
                         "why": "%s: %s" % (type(exc).__name__, str(exc)[:120])})
@@ -342,7 +542,11 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float) -> list:
 
 def _wake(db, project: str, listing: list) -> list:
     """Le premier lot démarrable réveille les dormeurs du projet : seule la
-    pause posée par le sommeil est levée (`expect_reason`)."""
+    pause posée par le sommeil est levée (`expect_reason`).
+
+    #4525 : le geste de levée est automatique comme la pose ; l'acteur est
+    `ameesh:file-decoupage`, le principal reste l'humain qui portait la pause.
+    """
     from . import agent_pause
     from . import projects as projects_mod
     reason = SLEEP_REASON % project
@@ -352,10 +556,14 @@ def _wake(db, project: str, listing: list) -> list:
             continue
         if project not in projects_mod.agent_projects(row):
             continue
-        owner = row.get("operator_pause_by") or _owner_of([row])
+        owner = (row.get("operator_pause_for") or row.get("operator_pause_by")
+                 or _owner_of([row]))
+        if not owner:
+            continue
         try:
             done = agent_pause.change(db, row["name"], paused=False, reason=reason,
-                                      actor=owner, principal=owner, expect_reason=reason)
+                                      actor=SLEEP_ACTOR, principal=owner,
+                                      expect_reason=reason)
         except Exception:  # noqa: BLE001 - la pause expire d'elle-même (#3961)
             continue
         if done.get("changed"):
@@ -416,7 +624,9 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
         notes = work.events_noted(db, int(split["id"]), EXHAUSTED_PREFIX)
         if exhausted(notes, project):
             if not item.startable and item.idle and not dry_run:
-                slept = _sleep(db, project, item, by_name, now)
+                slept = _sleep(db, project, item, by_name, now,
+                               split_id=int(split["id"]), lots=lots, listing=listing,
+                               cfg=cfg, canons=canons)
                 if slept:
                     out.append({"kind": "sleep", "project": project,
                                 "lot": int(split["id"]), "agents": slept})

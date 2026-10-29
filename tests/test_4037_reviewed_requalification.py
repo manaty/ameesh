@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import types
 import unittest
 from unittest import mock
@@ -291,13 +292,47 @@ class ReviewedMoveTest(unittest.TestCase):
             None if sha == self.gate else dict(actor='author', harness='deepseek'))
         self.assertEqual(self.execute()['state'], 'requalified')
 
-    def test_merge_adding_content_requires_its_own_author_provenance(self):
-        head = self.gate
-        self.repo.git('checkout', '-qb', 'content-merge', self.pin)
-        self.repo.write('extra.md', 'extra content\n')
-        self.repo.commit('other branch')
-        self.repo.git('merge', '--no-ff', '-qm', 'combined content', head)
+    def test_clean_merge_from_an_older_base_needs_no_fictitious_author(self):
+        main = self.repo.git('rev-parse', '--abbrev-ref', 'HEAD')
+        self.repo.git('checkout', '-qb', 'clean-pr', self.pin)
+        self.repo.write('extra.md', 'reviewed content\n')
+        self.repo.commit('reviewed branch')
+        self.repo.git('checkout', '-q', main)
+        self.repo.git('merge', '--no-ff', '-qm', 'Merge pull request #217', 'clean-pr')
         self.set_gate(self.repo.git('rev-parse', 'HEAD'))
+        # The merge tree differs from both parents (the PR left from the pin,
+        # main advanced): only git merge-tree proves it added no content.
+        self.commit_proof.side_effect = lambda db, sha: (
+            None if sha == self.gate else dict(actor='author', harness='deepseek'))
+        self.assertEqual(self.execute()['state'], 'requalified')
+
+    def test_conflict_resolution_merge_requires_its_own_author_provenance(self):
+        main = self.repo.git('rev-parse', '--abbrev-ref', 'HEAD')
+        self.repo.git('checkout', '-qb', 'conflicting-pr', self.pin)
+        self.repo.write('processus/mecanique.yaml', 'schema: reviewed branch\n')
+        self.repo.commit('conflicting branch')
+        self.repo.git('checkout', '-q', main)
+        conflict = subprocess.run(
+            ['git', '-C', self.repo.root, 'merge', '--no-ff', '--no-commit',
+             'conflicting-pr'], capture_output=True, text=True, env=self.repo.env)
+        self.assertEqual(conflict.returncode, 1, conflict.stderr)
+        self.repo.write('processus/mecanique.yaml', 'schema: resolved by hand\n')
+        self.set_gate(self.repo.commit('resolve conflict'))
+        self.commit_proof.side_effect = lambda db, sha: (
+            None if sha == self.gate else dict(actor='author', harness='deepseek'))
+        with self.assertRaisesRegex(TrainError, 'author provenance missing'):
+            self.execute()
+        self.assert_unchanged()
+
+    def test_edited_clean_merge_still_needs_its_own_author_provenance(self):
+        main = self.repo.git('rev-parse', '--abbrev-ref', 'HEAD')
+        self.repo.git('checkout', '-qb', 'edited-pr', self.pin)
+        self.repo.write('extra.md', 'reviewed content\n')
+        self.repo.commit('reviewed branch')
+        self.repo.git('checkout', '-q', main)
+        self.repo.git('merge', '--no-ff', '--no-commit', 'edited-pr')
+        self.repo.write('extra.md', 'content added during the merge\n')
+        self.set_gate(self.repo.commit('edited merge'))
         self.commit_proof.side_effect = lambda db, sha: (
             None if sha == self.gate else dict(actor='author', harness='deepseek'))
         with self.assertRaisesRegex(TrainError, 'author provenance missing'):

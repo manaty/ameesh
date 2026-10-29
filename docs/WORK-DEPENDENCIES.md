@@ -137,3 +137,8 @@ The backlog coherence pass (#4172, `docs/WORK-COHERENCE.md`) is the periodic
 consumer of these links: it proposes `duplicates` and finds textual
 contradictions, and its digest asks the PO to record the typed link or a
 justified closure. It never creates a typed link on its own.
+
+The [project dispatch plan](PROJECT-PLAN.md) also checks open conflicts before
+automatic assignment: a `conflicts_with` peer must finish or the link must be
+removed. Recording a decision clears the alert, but does not by itself make
+the lot ready. `ameesh work plan --project acme` shows that waiting reason.

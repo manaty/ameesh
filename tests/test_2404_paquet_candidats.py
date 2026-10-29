@@ -208,6 +208,7 @@ class InventoryTest(unittest.TestCase):
         self.store = mock.Mock(work=FakeWork(rows),
                                progress=FakeProgress(self.marks, self.holds))
         self.store.work_dependencies.for_items.return_value = []
+        self.store.work_dependencies.links_for.return_value = []
         self.classes = {
             1: "normal", 2: "normal", 3: "sensitive", 4: "normal", 5: "light",
             6: "light", 7: "normal", 8: "normal", 9: "light", 12: "sensitive",
@@ -226,6 +227,17 @@ class InventoryTest(unittest.TestCase):
         # #2664 : le banc n'a pas de canon Git ; les familles lues par la
         # porte sont épinglées, les familles d'acteurs restent simulées.
         patch_families(self)
+
+    def test_inventory_exports_explicit_conflicts_for_parallel_partition(self):
+        self.store.work_dependencies.links_for.return_value = [{
+            "work_item_id": 1, "other_id": 5, "kind": "conflicts_with",
+            "item_state": "qa", "other_state": "qa", "open": True,
+            "created_by": "author", "created_ts": 1.0}]
+        report = self.inventory()
+        entries = {row["work_item"]: row for row in report["candidates"]}
+        self.assertEqual(entries[1]["conflicts_with"], [5])
+        self.assertEqual(entries[5]["conflicts_with"], [1])
+        self.assertEqual(entries[1]["migration_files"], [])
 
     def inventory(self, *, family=None, **kwargs):
         def fake_class(db, lot, **rest):

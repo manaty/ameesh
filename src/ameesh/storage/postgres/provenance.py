@@ -59,6 +59,23 @@ class Provenance(Contract):
             " WHERE p.subject = %s", (subject,))
         return rows[0] if rows else None
 
+    def commits(self, actor, *, since_ts=None, until_ts=None, limit=None):
+        sql = ("SELECT " + _COLUMNS +
+               "  FROM provenance_receipts"
+               " WHERE actor = %s AND subject LIKE 'commit:%%'")
+        params = [str(actor)]
+        if since_ts is not None:
+            sql += " AND extract(epoch FROM at) >= %s"
+            params.append(float(since_ts))
+        if until_ts is not None:
+            sql += " AND extract(epoch FROM at) <= %s"
+            params.append(float(until_ts))
+        sql += " ORDER BY at DESC, subject DESC"
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(max(int(limit), 1))
+        return [dict(row) for row in self.db.query(sql, tuple(params))]
+
     def origins(self, commits):
         values = sorted({str(sha).strip().lower() for sha in commits or ()
                          if str(sha or "").strip()})

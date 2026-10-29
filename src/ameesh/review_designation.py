@@ -62,15 +62,44 @@ PLACEHOLDER_FAMILIES = frozenset(("", "none", "other", "unknown", "inconnu"))
 #: automatic designation (#3415) and by the reassignment scan of
 #: `review_designation_activation` (#3328), so the two never disagree.
 NON_LIVE_STATUS = frozenset(("stopped", "dead"))
-#: the registry states that forbid designation: the non-live ones, plus the
+#: #4491: the runner's marked pause (`status` `blocked`) — a failing
+#: credential (`auth_blocked`, L226b), exhausted provider credits, a host that
+#: is not ready, a missing account. No turn is taken until the cause is fixed,
+#: so a request deposited there would hold the seat. The runner writes the
+#: **same** status at the end of every failed turn (`last turn: … (failed)`,
+#: or a `429` episode retried in a minute): those stay candidates, like the
+#: account's short-window pause (#3876). `is_blocked_pause` is the single
+#: reading that tells the named long causes from the short ones.
+BLOCKED_STATUS = frozenset(("blocked",))
+#: the registry states that forbid designation: the non-live ones and the
 #: legacy `paused` state. An operator pause is a **column**, read by
-#: `is_available` (#3415), not a status: the row keeps `idle`.
+#: `is_available` (#3415), not a status: the row keeps `idle`. A `blocked`
+#: status is read by `is_blocked_pause` (#4491), because it covers both a lost
+#: seat and the short-window pause that must stay a candidate.
 UNAVAILABLE_STATUS = NON_LIVE_STATUS | frozenset(("paused",))
+#: #4491: the `status_text` prefix the runner writes when the credential is
+#: failing (`auth_failure.STATUS_PREFIX`, L226b). The status is `blocked`; the
+#: text is checked too, so a row whose status was not refreshed still does not
+#: take a request.
+AUTH_BLOCKED_PREFIX = "auth_blocked"
 #: the `status_text` prefixes of an operations or budget pause, and (#3973)
 #: of an account configuration block (`accounts.CONFIG_BLOCK_PREFIX`, #3969):
 #: an agent with no valid account on its host takes no turn until the host is
-#: fixed, so a request deposited there would hold the seat
-PAUSE_PREFIXES = ("paused", "budget : ", "accounts : ")
+#: fixed, so a request deposited there would hold the seat. #4491 adds the
+#: authentication block (`auth_failure.STATUS_PREFIX`, L226b).
+PAUSE_PREFIXES = ("paused", "budget : ", "accounts : ", AUTH_BLOCKED_PREFIX)
+#: #4491 B1: the **named long causes** written under `blocked`. Only these
+#: make a lost seat: the end-of-turn failure marker (#1268, "failures x1
+#: since …: last turn: … (failed)") and the transient rate episode (#1270,
+#: "[rate_limited x1 …, retry in 60s, retry at …]", or "quota") are not here —
+#: their pause lasts a minute and the reviewer resumes on its own (#3876).
+#: `provider_credits.STATUS_PREFIX` and `runner.AgentWorker.HOST_STATUS` are
+#: named here rather than imported (the runner is a heavy, higher layer);
+#: `PAUSE_PREFIXES` already carries the account, auth and budget blocks.
+BLOCKED_LONG_PREFIXES = (
+    "provider_credits_exhausted",
+    "hôte non prêt",
+) + PAUSE_PREFIXES
 #: a commit SHA (full or abbreviated): a branch name is not a freeze
 _SHA = re.compile(r"[0-9a-f]{7,64}")
 
@@ -236,17 +265,21 @@ def live_family(row: Mapping, *, families) -> str:
 
 
 def is_available(row: Mapping, *, closed_hosts: Iterable[str] = ()) -> bool:
-    """Availability in the registry: neither stopped, nor dead, nor paused, nor
-    under an operator pause, nor a human session, nor on a host whose claims
-    are closed (#3328, #3415).
+    """Availability in the registry: neither stopped, nor dead, nor in a lost
+    `blocked` pause, nor paused, nor under an operator pause, nor a human
+    session, nor on a host whose claims are closed (#3328, #3415, #4491).
 
     An agent in a turn remains available: the mail waits for it and opens its
     next turn. Unavailable are a `stopped`/`dead`/`paused` agent (#3415: a
-    reaped lease writes `dead`), an `external` session (never run by the
-    executor, L46), an operations or budget pause (`status_text` "paused…" or
-    "budget : …", except the short-window pause of the account, #3876), an
-    account configuration block (#3973: "accounts : …", no valid account on
-    the host, #3969), an operator pause (`operator_paused`, a column: the row keeps
+    reaped lease writes `dead`), a `blocked` agent with a **named long cause**
+    (#4491: the runner marks a failing credential, exhausted provider credits,
+    a host that is not ready, a missing account; `is_blocked_pause`), an
+    `external` session (never run by the executor, L46), an operations or
+    budget pause (`status_text` "paused…" or "budget : …", except the
+    short-window pause of the account, #3876), an account configuration block
+    (#3973: "accounts : …", no valid account on the host, #3969), an
+    authentication block (#4491: "auth_blocked…", the credential is failing,
+    L226b), an operator pause (`operator_paused`, a column: the row keeps
     `status` `idle` and its text "last turn: …", so the status and the prefixes
     never see it), and — #3328 — an agent whose host is `draining`/`lost`
     (claims closed): the request deposited there is not read until the host
@@ -254,7 +287,10 @@ def is_available(row: Mapping, *, closed_hosts: Iterable[str] = ()) -> bool:
     evidence is the one agent-mail uses (`alert_briefs.claims_closed_hosts`,
     #3036); an unreadable host state closes nothing, and a missing lease is not
     read: an idle reviewer is woken by the request mail, so it is still a
-    candidate. A row with no readable mode or status is refused: doubt
+    candidate. The end-of-turn failure marker (#1268) and the transient
+    `429`/`quota` episode (#1270) are minute-scale pauses, not lost seats:
+    they stay candidates like the short window (#3876), as the auditeur's B1
+    on #4491 required. A row with no readable mode or status is refused: doubt
     designates nobody.
     """
     row = dict(row or {})
@@ -266,6 +302,11 @@ def is_available(row: Mapping, *, closed_hosts: Iterable[str] = ()) -> bool:
         return False
     status = str(row.get("status") or "").strip().lower()
     if not status or status in UNAVAILABLE_STATUS:
+        return False
+    # #4491: a `blocked` row is the runner's marked pause. Only the account's
+    # short window (#3876) may keep it a candidate; an authentication, host,
+    # database or account block takes no turn and would hold the seat.
+    if is_blocked_pause(row):
         return False
     text = str(row.get("status_text") or "").strip().lower()
     if any(text.startswith(prefix) for prefix in PAUSE_PREFIXES) \
@@ -297,6 +338,38 @@ def is_short_window_pause(text: str) -> bool:
     if rest.lower().startswith(mark):
         rest = rest[len(mark):]
     return account_window.is_short_window(rest)
+
+
+def is_blocked_pause(row: Mapping) -> bool:
+    """#4491: a `blocked` pause with a **named long cause**, not a short pause.
+
+    The runner writes **one** status, `blocked`, for very different causes:
+    a failing credential (`auth_blocked`, L226b), exhausted provider credits,
+    a host that is not ready, a missing account, a gauge pause — and, at the
+    end of **every failed turn**, a minute-scale retry (#1268 failure marker,
+    #1270 `429`/`quota` episode with its `retry at`), and the account's
+    short-window refusal (#3779). Only the named long causes take no turn
+    until a human or the next poll fixes them; the failed-turn and short-window
+    pauses stay reviewer candidates (#3876 and the auditeur's B1 on #4491).
+    Treating the failure marker as a lost seat made a reviewer who failed one
+    turn lose its seat and be replaced 60 s before resuming.
+
+    A row that is not `blocked` is never a blocked pause: the long pauses
+    written as `status_text` prefixes are read by `PAUSE_PREFIXES`. A long
+    series of real failures is not read here either: the runner itself stops
+    the agent after its fast-failure threshold (`stopped`, already a non-live
+    status), and a slow series is an incident for the alerts, not a proof
+    that the reviewer will not read its request.
+    """
+    if str((row or {}).get("status") or "").strip().lower() not in BLOCKED_STATUS:
+        return False
+    text = str((row or {}).get("status_text") or "").strip().lower()
+    if not any(text.startswith(prefix) for prefix in BLOCKED_LONG_PREFIXES):
+        return False
+    if is_short_window_pause(text):
+        return False
+    from . import account_window
+    return not account_window.is_short_window(text)
 
 
 def reviewed_projects(row: Mapping) -> list[str]:
@@ -487,7 +560,9 @@ def manual_seats(already: Iterable, *, authors: Iterable = (), fixers: Iterable 
     correction (#2739). They are authors of the head (#2888): their family is
     forbidden exactly like any author's, and the agent itself cannot count a
     seat — it would be reviewing its own fix. The name list is kept as a
-    safety net when the caller's `authors` list is partial.
+    safety net when the caller's `authors` list is partial. A row with no
+    proven family (`test_only`, #3518, or a corrector whose commit the author
+    rewrote, #4457) excludes only the name; its family stays eligible.
     """
     names, forbidden = families_of(authors)
     fixer_names = names_of(fixers)
@@ -660,7 +735,9 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     - `fixers` names the designated reviewers whose small first-round
       correction is an authored commit of the head (#2739/#2888). Their family
       is forbidden like any author's family; their exact name is excluded too,
-      as a safety net: they would review their own fix.
+      as a safety net: they would review their own fix. A fixer row with an
+      empty family is a **personal** exclusion only (`test_only`, #3518, or a
+      rewritten correction, #4457): its family remains eligible.
 
     Returns `{state, required, reviewers, missing, manual, why, forbidden,
     families, fixers}`: `waiting` when independent families are missing or an author
@@ -1190,6 +1267,9 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     `fixers` names the designated reviewers whose small first-round correction
     is an authored commit of the head (#2739/#2888): their family is forbidden
     like any author's family, and the exact agent is never designated again.
+    A fixer row with an empty family is a **personal** exclusion only
+    (`test_only`, #3518, or a rewritten correction, #4457): its family remains
+    eligible and another agent of it may be designated.
 
     `advances` maps a family to its advance over the plan pace, in points
     (`review_pace`, #2668), or to a `{scope: advance}` mapping whose scoped

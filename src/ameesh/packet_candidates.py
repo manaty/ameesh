@@ -831,6 +831,7 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     # Une panne de lecture ne doit jamais transformer un lot bloqué en prêt.
     try:
         dependencies = work_dependencies.grouped(db, ids)
+        links = work_dependencies.links(db, ids)
     except Exception as exc:  # noqa: BLE001 - inventaire incomplet
         raise CandidateError("cannot read blocking dependencies: %s" % exc) from exc
     unknown = sorted(set(overrides) - set(ids))
@@ -887,7 +888,13 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     _apply_remises(db, candidates, {int(row["id"]): row for row in rows}, marks,
                    remises, remise_error, where=where, package_base=package_base,
                    cfg=cfg, canons=canons)
+    from . import migrations
+    slug = migrations.origin_repo(repo)
+    layout = migrations.layout_for(slug, cfg) if slug else None
     for entry in candidates:
+        entry["conflicts_with"] = sorted({
+            int(link["lot"]) for link in links.get(entry["work_item"], ())
+            if link.get("kind") == "conflicts_with"})
         # Après les remises : ni une résolution de conflit ni une surcharge
         # de hold ne peuvent lever un prérequis encore bloquant.
         entry["dependencies"] = sorted({
@@ -910,6 +917,10 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
         if entry["ready"]:
             try:
                 entry["files"] = changed_files(where, package_base, entry["source"])
+                entry["migration_files"] = [
+                    path for path in entry["files"] if (layout is not None
+                         and path.startswith(layout.directory.rstrip("/") + "/"))
+                    or (path.startswith("deploy/sql/") and path.endswith(".sql"))]
                 _check_migration_coverage(db, entry, repo=where, origin_repo=repo,
                                           base=package_base, target=target_branch, cfg=cfg)
             except CandidateError as exc:
