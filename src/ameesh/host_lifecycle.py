@@ -213,7 +213,9 @@ class _ReadyAdapter:
 def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
     """One critical-first controller pass; no host effect without the enrolled helper."""
     api = storage.of(db)
-    api.host_lifecycle.expire_returns()
+    # #4148: never open claims here; the runner already expired with
+    # closed claims, and a due planned return must wait for `busy`.
+    api.host_lifecycle.expire_returns(open_claims=False)
     control = api.host_lifecycle.get(host)
     if not control or control["mode"] not in ("draining", "returning", "lost"):
         return []

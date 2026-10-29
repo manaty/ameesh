@@ -384,8 +384,9 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, holds, known,
 
     # mode == draining
     released = row.get("release_state") == "idle-drained"
-    need_return = return_targets(row, listing, controls, known_hosts=known,
-                                 holds=holds)
+    need_return = (return_targets(row, listing, controls, known_hosts=known,
+                                  holds=holds)
+                   or row.get("return_requested_ts") is not None)
     reading = _fresh_reading(cfg, db, host, now=now,
                              after=row.get("requested_ts"))
     footprint = _host_footprint(cfg, db, canons, host, reading, listing,
@@ -530,6 +531,11 @@ def request_return(cfg, db, host, *, actor, runner=None, now=None, clock=time.ti
                          "(`ameesh host reconcile`); a heartbeat does not reopen it")
     if row.get("mode") == "available":
         return row
+    # Persist the explicit intent BEFORE any busy attempt: an idle-drained
+    # hook in flight may refuse the busy call, but the return must survive it.
+    requested = api.note_return_request(host, actor=actor)
+    if requested is not None:
+        row = requested
     from . import canon as canon_mod
     try:
         canons = canon_mod.load_configured(cfg)

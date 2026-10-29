@@ -388,6 +388,64 @@ class HostReleaseTest(PgTestCase):
         states = [row["state"] for row in self.api.host_lifecycle.transition_journal("vm")]
         self.assertEqual(states, ["draining"])
 
+    def test_explicit_undrain_survives_an_inflight_release_without_work(self):
+        self.add_agent()
+        self.quiet_history()
+        self.once(local_host="vm", now=time.time())
+        self.reading()
+        barrier = os.path.join(self.tmpdir, "barrier2")
+        os.environ["HOOK_BARRIER"] = barrier
+        self.addCleanup(lambda: os.environ.pop("HOOK_BARRIER", None))
+        errors = []
+
+        def scan():
+            other = db_mod.connect(self.cfg)
+            try:
+                host_release.once(self.cfg, other, local_host=None,
+                                  actor="runner-thread", now=time.time())
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+            finally:
+                other.close()
+
+        thread = threading.Thread(target=scan, daemon=True)
+        thread.start()
+        marker = barrier + ".started"
+        deadline = time.time() + 15
+        while not os.path.exists(marker) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(marker), "hook did not start: %r" % (errors,))
+        # Explicit undrain, no work at all: the intent must survive the hook.
+        host_lifecycle.undrain(self.cfg, self.db, "vm", actor="human:op")
+        control = self.control()
+        self.assertIsNotNone(control["return_requested_ts"])
+        self.assertFalse(control["claims_open"])
+        open(barrier + ".release", "w").close()
+        thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.control()["release_state"], "idle-drained")
+        self.assertIsNotNone(self.control()["return_requested_ts"])
+        # The scanner answers `busy` because of the intent, not because of work.
+        self.once(now=time.time())
+        self.assertIn("busy", self.states())
+        self.assertFalse(self.control()["claims_open"])
+        self.reading()
+        self.once(now=time.time())
+        self.assertTrue(self.control()["claims_open"])
+        self.assertEqual(self.control()["mode"], "returning")
+
+    def test_advance_host_does_not_open_a_due_planned_return(self):
+        self.add_agent()
+        self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
+        self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
+                        "WHERE host='vm'")
+        host_lifecycle.advance_host(self.db, "vm", limits_for=lambda host: {"max": 1})
+        control = self.control()
+        self.assertEqual(control["mode"], "returning")
+        self.assertFalse(control["claims_open"])
+        self.assertNotEqual(control["release_state"], "busy")
+
     def test_return_waits_for_an_in_flight_idle_drained_hook(self):
         worker = self.add_agent()
         self.quiet_history()

@@ -12,6 +12,8 @@ _ROW = ("host, mode, generation, actor, "
         "release_state, hook_state, claims_open, release_epoch, "
         "release_generation, automatic, "
         "extract(epoch from released_at)::float8 AS released_ts, "
+        "extract(epoch from return_requested_at)::float8 AS return_requested_ts, "
+        "return_requested_by, "
         "release_error, release_error_state, "
         "extract(epoch from release_error_at)::float8 AS release_error_ts, "
         "extract(epoch from release_error_since)::float8 AS release_error_since_ts, "
@@ -211,6 +213,7 @@ class HostLifecycle(interface.HostLifecycle):
                 "release_state='draining',claims_open=excluded.claims_open, "
                 "release_generation=host_lifecycle.generation+1, "
                 "automatic=excluded.automatic,released_at=NULL, "
+                "return_requested_at=NULL,return_requested_by=NULL, "
                 "release_error=NULL,release_error_state=NULL,release_error_at=NULL, "
                 "release_error_since=NULL, "
                 # #4148: NEVER clear an in-flight adapter attempt here. A new
@@ -253,6 +256,7 @@ class HostLifecycle(interface.HostLifecycle):
             rows = tx.query(
                 "UPDATE host_lifecycle SET mode='returning',actor=%s,return_at=NULL, "
                 "release_epoch=release_epoch+1, claims_open=%s, "
+                "return_requested_at=NULL,return_requested_by=NULL, "
                 # the release state follows the opened gate; a closed return
                 # keeps saying `draining` until the busy hook answers.
                 "release_state=CASE WHEN %s THEN 'busy' ELSE release_state END, "
@@ -328,7 +332,9 @@ class HostLifecycle(interface.HostLifecycle):
                      "ON a.agent=r.name WHERE a.host=%s AND a.generation=%s ORDER BY r.name "
                      "FOR UPDATE OF r", (host, generation))
             rows = tx.query(
-                "UPDATE host_lifecycle c SET mode='available',updated_at=clock_timestamp() "
+                "UPDATE host_lifecycle c SET mode='available',"
+                "return_requested_at=NULL,return_requested_by=NULL,"
+                "updated_at=clock_timestamp() "
                 "WHERE c.host=%s AND c.generation=%s AND c.mode='returning' "
                 # #4148: a return is complete only once the busy hook has
                 # reopened claims; otherwise the host would be `available`
@@ -488,7 +494,9 @@ class HostLifecycle(interface.HostLifecycle):
             attempt_stale_after = _positive_seconds(attempt_stale_after,
                                                     "attempt_stale_after")
         rows = self.db.query(
-            "UPDATE host_lifecycle SET claims_open=true,updated_at=clock_timestamp() "
+            "UPDATE host_lifecycle SET claims_open=true,"
+            "return_requested_at=NULL,return_requested_by=NULL,"
+            "updated_at=clock_timestamp() "
             "WHERE host=%s AND generation=%s AND (NOT %s OR hook_state='busy') "
             "AND (%s::bigint IS NULL OR release_epoch=%s) "
             "AND (%s::float8 IS NULL OR hook_attempt_at IS NULL "
@@ -497,6 +505,20 @@ class HostLifecycle(interface.HostLifecycle):
             (host, generation, bool(require_busy), release_epoch, release_epoch,
              attempt_stale_after, attempt_stale_after))
         return bool(rows)
+
+    def note_return_request(self, host, *, actor):
+        """Persist an explicit return intent without opening any claim."""
+        if not isinstance(actor, str) or not actor.strip() \
+                or any(ord(c) < 32 for c in actor):
+            raise ValueError("return actor required")
+        rows = self.db.query(
+            "UPDATE host_lifecycle SET "
+            "return_requested_at=coalesce(return_requested_at,clock_timestamp()),"
+            "return_requested_by=coalesce(return_requested_by,%s),"
+            "updated_at=clock_timestamp() "
+            "WHERE host=%s AND mode IN ('draining','returning') RETURNING " + _ROW,
+            (actor, host))
+        return rows[0] if rows else None
 
     def reopen_return(self, host, *, generation, release_epoch, actor,
                       attempt_stale_after=None):
@@ -516,6 +538,7 @@ class HostLifecycle(interface.HostLifecycle):
             rows = tx.query(
                 "UPDATE host_lifecycle c SET mode='returning',actor=%s,"
                 "return_at=NULL,claims_open=true,release_state='busy',"
+                "return_requested_at=NULL,return_requested_by=NULL,"
                 "release_epoch=c.release_epoch+1,updated_at=clock_timestamp() "
                 "WHERE c.host=%s AND c.generation=%s AND c.release_epoch=%s "
                 "AND c.mode IN ('draining','returning') "

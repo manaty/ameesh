@@ -34,6 +34,10 @@ ALTER TABLE host_lifecycle
     -- true: ameesh drained the host itself (burst idle), false: an operator did
     ADD COLUMN automatic boolean NOT NULL DEFAULT false,
     ADD COLUMN released_at timestamptz,
+    -- #4148: an explicit `undrain` survives an idle-drained hook in flight;
+    -- the scanner answers `busy` as soon as that hook ends, even without work.
+    ADD COLUMN return_requested_at timestamptz,
+    ADD COLUMN return_requested_by text,
     ADD COLUMN release_error text,
     ADD COLUMN release_error_state text,
     ADD COLUMN release_error_at timestamptz,

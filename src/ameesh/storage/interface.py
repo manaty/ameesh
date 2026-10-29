@@ -4327,6 +4327,15 @@ class HostLifecycle(Domain):
         """
 
     @abc.abstractmethod
+    def note_return_request(self, host: str, *, actor: str) -> dict | None:
+        """Persist an explicit return intent without opening any claim.
+
+        #4148: an `undrain` issued while an `idle-drained` hook is in flight
+        must survive the hook's completion; the scanner then calls `busy` even
+        if no work arrived.
+        """
+
+    @abc.abstractmethod
     def reopen_return(self, host: str, *, generation: int, release_epoch: int,
                       actor: str,
                       attempt_stale_after: float | None = None) -> dict | None:
