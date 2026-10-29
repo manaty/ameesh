@@ -11791,7 +11791,12 @@ class Runner:
                 from .scoped_db import ScopedDb
                 db = ScopedDb(self.cfg)
             from . import notify_gap, validation_deadlines
-            validation_deadlines.sweep(self.cfg, db, now=now)
+            try:
+                validation_deadlines.sweep(self.cfg, db, now=now)
+            except Exception as exc:
+                # Deadline failures never suppress the notifier safety brief.
+                # Do not log private routing or audit data from an exception.
+                log_async("validation deadlines: sweep failed (%s)" % type(exc).__name__)
             report = notify_gap.brief_once(self.cfg, db, now=now)
         except Exception as exc:      # jamais fatal pour l'exécuteur
             log_async("notify gap: pass failed (%s: %s)" % (type(exc).__name__, exc))

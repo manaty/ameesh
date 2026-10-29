@@ -233,3 +233,44 @@ class ValidationTest(PgTestCase):
         view = self.ask(due_ts=self.now + 60)
         self.assertEqual(vd.sweep(self.cfg, self.db, now=self.now + 61),
                          [{"id": view["id"], "status": "escalated"}])
+
+    def test_bad_decision_does_not_suppress_the_next_escalation(self):
+        first = self.ask(due_ts=self.now + 60)
+        second = self.ask(due_ts=self.now + 60)
+        self.db.execute(
+            "UPDATE decision_validations SET routing = jsonb_set("
+            "routing, '{nodes,1,timezone}', %s::jsonb) WHERE decision_id = %s",
+            (json.dumps("Invalid/PrivateTimezone"), first["id"]))
+        with self.assertLogs(vd.LOGGER, level="WARNING") as logs:
+            changed = vd.sweep(self.cfg, self.db, now=self.now + 61)
+        self.assertEqual(changed, [{"id": second["id"], "status": "escalated"}])
+        self.assertEqual(decisions.get(self.db, first["id"])["owner"], "human:tpm")
+        self.assertEqual(decisions.get(self.db, second["id"])["owner"], "human:po")
+        self.assertIn("#%s" % first["id"], logs.output[0])
+        self.assertNotIn("Invalid/PrivateTimezone", " ".join(logs.output))
+        self.assertIsNone(storage.of(self.db).decisions.validation_route(first["id"]).get("escalated_to"))
+
+    def test_runner_notifier_safety_brief_survives_sweep_failure(self):
+        from types import SimpleNamespace
+        from ameesh import notify_gap, runner
+        fake = SimpleNamespace(cfg=self.cfg, dry_run=False, mediated=False)
+        report = {"sent": [], "failed": []}
+        with mock.patch.object(vd, "sweep", side_effect=RuntimeError("private payload")), \
+                mock.patch.object(notify_gap, "brief_once", return_value=report) as brief, \
+                mock.patch.object(runner, "log_async") as log:
+            result = runner.Runner.notify_health_once(fake, db=self.db, now=self.now)
+        self.assertIs(result, report)
+        brief.assert_called_once_with(self.cfg, self.db, now=self.now)
+        log.assert_called_once_with("validation deadlines: sweep failed (RuntimeError)")
+
+    def test_malformed_deadline_is_isolated_before_query_cast(self):
+        first = self.ask(due_ts=self.now + 60)
+        second = self.ask(due_ts=self.now + 60)
+        self.db.execute(
+            "UPDATE agent_mailbox SET payload = jsonb_set("
+            "payload, '{decision,due_ts}', %s::jsonb) WHERE id = %s",
+            (json.dumps("invalid private deadline"), first["id"]))
+        with self.assertLogs(vd.LOGGER, level="WARNING") as logs:
+            changed = vd.sweep(self.cfg, self.db, now=self.now + 61)
+        self.assertEqual(changed, [{"id": second["id"], "status": "escalated"}])
+        self.assertNotIn("invalid private deadline", " ".join(logs.output))

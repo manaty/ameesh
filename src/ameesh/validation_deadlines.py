@@ -10,10 +10,13 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import logging
 import time
 from zoneinfo import ZoneInfo
 
 from . import storage
+
+LOGGER = logging.getLogger(__name__)
 
 
 def business_due(now, timezone):
@@ -95,37 +98,43 @@ def sweep(cfg, db, *, now=None):
         return []
     changed = []
     for view in storage.of(db).decisions.validation_due(now=now):
-        with db.transaction() as tx:
-            store = storage.of(tx).decisions
-            row = store.validation_lock(view["id"])
-            if not row or row.get("closed_ts") is not None:
-                continue
-            decision = decisions._payload(row)
-            if float(decision["due_ts"]) > now:
-                continue
-            route = store.validation_route(view["id"])
-            if not route or route.get("escalated_to"):
-                continue
-            initial = route["nodes"][0]
-            substitute = (route["nodes"][1] if len(route["nodes"]) > 1 else
-                          {"human": route["owner"], "timezone": route["owner_timezone"]})
-            needs_substitute = len(route["nodes"]) < 2
-            decision["validation"]["timezone"] = substitute["timezone"]
-            decision["validation"]["due_local"] = stamp(decision["due_ts"], substitute["timezone"])
-            decision["validation"]["status"] = "escalated"
-            if needs_substitute:
-                decision["question"] += "\nPlease name an authorized substitute."
-            body = decisions.request_text(decision, requester=row["sender"],
-                                          owner=substitute["human"], decision_id=view["id"])
-            store.validation_escalate(view["id"], recipient=substitute["human"],
-                                       decision=decision, body=body, now=now)
-            store.validation_event(view["id"], person=initial["human"], kind="missed",
-                                   now=now, event_key="missed",
-                                   facts={"requested_ts": row["created_ts"],
-                                          "due_ts": decision["due_ts"],
-                                          "escalated_to": substitute["human"],
-                                          "needs_substitute": needs_substitute})
-            changed.append({"id": view["id"], "status": "escalated"})
+        try:
+            with db.transaction() as tx:
+                store = storage.of(tx).decisions
+                row = store.validation_lock(view["id"])
+                if not row or row.get("closed_ts") is not None:
+                    continue
+                decision = decisions._payload(row)
+                if float(decision["due_ts"]) > now:
+                    continue
+                route = store.validation_route(view["id"])
+                if not route or route.get("escalated_to"):
+                    continue
+                initial = route["nodes"][0]
+                substitute = (route["nodes"][1] if len(route["nodes"]) > 1 else
+                              {"human": route["owner"], "timezone": route["owner_timezone"]})
+                needs_substitute = len(route["nodes"]) < 2
+                decision["validation"]["timezone"] = substitute["timezone"]
+                decision["validation"]["due_local"] = stamp(decision["due_ts"], substitute["timezone"])
+                decision["validation"]["status"] = "escalated"
+                if needs_substitute:
+                    decision["question"] += "\nPlease name an authorized substitute."
+                body = decisions.request_text(decision, requester=row["sender"],
+                                              owner=substitute["human"], decision_id=view["id"])
+                store.validation_escalate(view["id"], recipient=substitute["human"],
+                                           decision=decision, body=body, now=now)
+                store.validation_event(view["id"], person=initial["human"], kind="missed",
+                                       now=now, event_key="missed",
+                                       facts={"requested_ts": row["created_ts"],
+                                              "due_ts": decision["due_ts"],
+                                              "escalated_to": substitute["human"],
+                                              "needs_substitute": needs_substitute})
+                changed.append({"id": view["id"], "status": "escalated"})
+        except Exception as exc:
+            # Keep this decision retryable; isolate its rollback and continue.
+            # Exception strings can contain private payload/routing details.
+            LOGGER.warning("validation decision #%s could not escalate (%s)",
+                           view["id"], type(exc).__name__)
     return changed
 
 
