@@ -1170,10 +1170,11 @@ jobs:
   # needs (CONTRIBUTING.md, "Numérotation des versions"): scripts/version-level.py
   # compares it with the content since the last tag. Any other PR: nothing to check.
   # #1343 : chaque PR de tests est une demande de gel (étiquette ci-lot/ci-full) ;
-  # le numéro est vérifié sur la base du merge-ref (HEAD^1, exactement la base du
-  # payload — la porte de gel du job plan vérifie ses deux parents), sans quoi un
+  # le numéro est vérifié sur la base du merge-ref (HEAD^1, la base réellement
+  # composée — la porte de gel du job plan vérifie ses deux parents), sans quoi un
   # lot qui change la version obtiendrait un `tests` vert sans que le numéro soit
-  # regardé.
+  # regardé. #4533 : cette base est la pointe demandée, ou une pointe qui n'en
+  # diffère que par des atterrissages de coupure ; c'est bien le contenu testé.
   version:
     name: version number
     if: github.event_name == 'pull_request' && github.event.label.name != 'ci-macos'
@@ -1185,9 +1186,10 @@ jobs:
           fetch-depth: 0  # the tags, and the range since the last one
       - name: number against content
         # #1343 : la porte `gel` du job plan vérifie que HEAD est le merge-ref
-        # composé de la base demandée (HEAD^1) et de la tête étiquetée (HEAD^2),
-        # et refuse sinon ; `HEAD^1` est donc la base exacte, et la commande garde
-        # la forme du contrat L158 (tests/test_l158_version_level.py).
+        # de la tête étiquetée (HEAD^2) ; `HEAD^1` est la base réellement
+        # composée (#4533 : la pointe demandée, ou une pointe qui n'en diffère
+        # que par des atterrissages de coupure), et la commande garde la forme
+        # du contrat L158 (tests/test_l158_version_level.py).
         run: python3 scripts/version-level.py pr HEAD^1 HEAD
 
   # nom de vérification stable : vert seulement si toutes les parts le sont
