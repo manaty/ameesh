@@ -615,6 +615,45 @@ class VeilleDbTest(PgTestCase):
         self.assertEqual(report["actions"][0]["action"], "would-create")
         self.assertEqual(self.lots(), [])
 
+    def test_dry_run_probes_without_recording(self):
+        """L'appel normal de la veille (`probe=True`, sans `--no-probe`) ne
+        persiste pas la sonde en dry-run : « write nothing » vaut aussi pour
+        `harness_versions` (#4438). Le dry-run juge sur l'état frais."""
+        cfg = self.configure()
+        probe = {"harness": "deepseek", "path": "/opt/dsh",
+                 "version": "0.2.0-rc.2", "raw": "dsh 0.2.0-rc.2",
+                 "error": None}
+        before = storage.of(self.db).hosts.harness_versions()
+        with mock.patch("ameesh.harness_versions.probe", return_value=probe):
+            report = veille.scan(
+                cfg, self.db, probe=True, dry_run=True,
+                http_get=self.fetch(["0.2.0-rc.2", "0.2.1-rc.4"],
+                                    tags={"rc": "0.2.1-rc.4"}))
+        self.assertEqual(report["probed"], [probe])
+        self.assertEqual(
+            report["sources"][0]["installed"]["hosts"],
+            {"vm-a": {"version": "0.2.0-rc.2", "path": "/opt/dsh"}})
+        self.assertEqual(report["actions"][0]["action"], "would-create")
+        self.assertEqual(storage.of(self.db).hosts.harness_versions(), before)
+        self.assertEqual(self.lots(), [])
+
+    def test_scan_records_the_probe_outside_dry_run(self):
+        """Le même passage hors dry-run enregistre bien la sonde."""
+        cfg = self.configure()
+        probe = {"harness": "deepseek", "path": "/opt/dsh",
+                 "version": "0.2.0-rc.2", "raw": "dsh 0.2.0-rc.2",
+                 "error": None}
+        with mock.patch("ameesh.harness_versions.probe", return_value=probe):
+            report = veille.scan(
+                cfg, self.db, probe=True, dry_run=False,
+                http_get=self.fetch(["0.2.0-rc.2", "0.2.1-rc.4"],
+                                    tags={"rc": "0.2.1-rc.4"}))
+        rows = storage.of(self.db).hosts.harness_versions()
+        self.assertEqual(
+            [(row["host"], row["harness"], row["version"]) for row in rows],
+            [("vm-a", "deepseek", "0.2.0-rc.2")])
+        self.assertEqual(report["actions"][0]["action"], "created")
+
     def test_designated_host_does_not_reconcile(self):
         self.record("vm-a", "0.2.0-rc.2")
         cfg = self.configure(host="vm-b", designated="vm-a")
