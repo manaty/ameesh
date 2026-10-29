@@ -21,6 +21,8 @@ class InventoryTest(unittest.TestCase):
         self.item = dict(id=2005, app="nexlink", state="qa", branch="agent/member",
                          branch_target="origin/develop", type="improvement", title="member")
         self.ops.items.return_value = [self.item]
+        self.ops.items.side_effect = lambda **kw: [
+            row for row in self.ops.items.return_value if row["state"] == kw["state"]]
         self.marks = [dict(id=1, kind="frozen", sha="a" * 40)]
         self.ops.milestones.return_value = self.marks
         self.result = dict(sha="a" * 40, origin="frozen", declared=self.marks[0],
@@ -41,8 +43,10 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(result["candidates"][0]["candidate"], self.result)
         self.assertEqual(result["candidates"][0]["target"], "develop")
         self.assertEqual(result["candidates"][0]["causes"], [])
-        self.assertEqual([call[0] for call in self.ops.mock_calls], ["items", "milestones"])
-        self.ops.items.assert_called_once_with(state="qa", assignee=None, limit=None)
+        self.assertEqual([call[0] for call in self.ops.mock_calls], ["items", "milestones", "items"])
+        self.assertEqual(self.ops.items.call_args_list, [
+            mock.call(state="qa", assignee=None, limit=None),
+            mock.call(state="validated", assignee=None, limit=None)])
         self.ops.milestones.assert_called_once_with(2005, None)
         self.reader.assert_called_once_with(self.marks, waived=False)
         self.assertEqual((self.item, self.marks, self.result), before)

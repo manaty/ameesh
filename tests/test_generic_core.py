@@ -172,14 +172,14 @@ class GenericCoreTest(unittest.TestCase):
                          {"state:qa": 1})
 
     def test_legacy_terminal_and_completed_semantics_remain_distinct(self):
-        self.assertEqual(work.STATES, ("intake", "build", "qa", "merged", "promoted",
+        self.assertEqual(work.STATES, ("intake", "build", "qa", "validated", "merged", "promoted",
                                        "blocked", "waiting_human", "closed"))
         self.assertEqual(work.TERMINAL, ("promoted", "closed"))
         self.assertEqual(work.COMPLETED, ("merged", "promoted", "closed"))
         self.assertEqual(work.DELIVERED, work.MERGED_STATES)
         self.assertEqual(work.ACTIVE, ("intake", "build"))
         self.assertEqual(work.WAITING, {"blocked", "waiting_human"})
-        self.assertEqual(work.TO_VALIDATE, "qa")
+        self.assertEqual(work.TO_VALIDATE, ("qa", "validated"))
         self.assertEqual(registry.merge_connector(), "git-merge")
         for state in work.TERMINAL:
             self.assertFalse(work.TRANSITIONS[state])

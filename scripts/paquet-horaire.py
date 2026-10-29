@@ -120,7 +120,7 @@ from zoneinfo import ZoneInfo
 TITLE_PREFIX = "Paquet horaire "
 HOURLY_RE = re.compile(r"^Paquet horaire (h-(\d{8})-(\d+))\b")
 CARRIER_BRANCH_PREFIX = "integration/paquet"
-OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
+OPEN_STATES = ("intake", "build", "qa", "validated", "blocked", "waiting_human")
 #: #4171 : fusion vue d'un porteur (miroir de `work_lifecycle.DELIVERED` et
 #: des raisons de clôture livrée de `work.CLOSE_REASONS`).
 MERGED_STATES = ("merged", "promoted")

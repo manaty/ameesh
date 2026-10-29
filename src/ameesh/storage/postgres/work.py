@@ -265,7 +265,7 @@ _CLOSED_PRIORITY = ("merged", "promoted", "closed")
 #: L165b : un lot qui attend un autre que son agent (`qa`, `waiting_human`,
 #: `blocked`) ne l'occupe pas — même liste que `operations.listing` et
 #: `sous_utilisation.LOTS_WAITING_ON_OTHERS`
-_WAITING_ON_OTHERS = "('qa', 'waiting_human', 'blocked')"
+_WAITING_ON_OTHERS = "('qa', 'validated', 'waiting_human', 'blocked')"
 #: #443, #478 : réservation automatique du prochain numéro libre — un budget
 #: de temps (et non plus un nombre d'essais) et une attente plein jitter
 #: (`uniform(0, min(plafond, base·2^n))`) bornée au budget restant, pour que
@@ -978,7 +978,7 @@ class WorkItems(interface.WorkItems):
         # lot qui quitte qa (reprise, correction) la perd — sa prochaine revue
         # est due.
         waiver = has_reviewer(self.db)
-        sql = sql.replace("__WAIVER__", ", reviewer = CASE WHEN reviewer = %s AND %s <> 'qa'"
+        sql = sql.replace("__WAIVER__", ", reviewer = CASE WHEN reviewer = %s AND %s NOT IN ('qa', 'validated')"
                                         " THEN '' ELSE reviewer END" if waiver else "")
         params = ((state, loops, state, state)
                   + ((REVIEWER_NONE, state) if waiver else ())
@@ -1998,9 +1998,15 @@ class WorkItems(interface.WorkItems):
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
             milestone = rows[0]
+            if (kind == "verdict" and items and items[0]["state"] == "validated"
+                    and not items[0].get("workflow_ref")):
+                tx.execute("UPDATE work_items SET state = 'qa', updated_at = now()"
+                           " WHERE id = %s", (int(item_id),))
+                WorkItems(tx)._event(int(item_id), "qa",
+                                    "validated → qa — review quorum changed (#4351)", actor)
             if (kind == "frozen" and items
                     and not items[0].get("workflow_ref")
-                    and items[0]["state"] in ("intake", "build")):
+                    and items[0]["state"] in ("intake", "build", "validated")):
                 # #3467: freezing enters review before the designation hook.
                 # #3489: pinned lots keep their Process state; work.move
                 # rejects them. The milestone and designation still apply.
@@ -2012,7 +2018,9 @@ class WorkItems(interface.WorkItems):
                     work.move(tx, item_id, "build", actor=actor,
                               note="intake → build — frozen (#3467)")
                 work.move(tx, item_id, "qa", actor=actor,
-                          note="build → qa — frozen (#3467)")
+                          note=("validated → qa — frozen (#4351)"
+                                if items[0]["state"] == "validated"
+                                else "build → qa — frozen (#3467)"))
             if kind == "verdict" and items:
                 from ... import merge_queue, train_events
                 item = items[0]
@@ -2651,7 +2659,7 @@ class WorkItems(interface.WorkItems):
                 return None
             if packet is not None:
                 fields = ("app", "branch", "branch_target", "type")
-                if frozen_id is None or lot[0]["state"] != "qa" \
+                if frozen_id is None or lot[0]["state"] not in ("qa", "validated") \
                         or set(packet) != set(fields) | {"resolved_target"} \
                         or packet["resolved_target"] != target \
                         or any(lot[0][key] != packet[key] for key in fields):

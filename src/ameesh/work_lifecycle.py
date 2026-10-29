@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Shared lifecycle vocabulary during the generic-core transition (#114).
 
-Values remain the persisted v1 spellings. L99 T1 (#4349) adds the generic
+L99 T3 (#4351) recognizes validated separately from a recorded merge;
+its writer follows the reader compatibility release (#4426).
+L99 T1 (#4349) adds the generic
 names as aliases: `canonical` returns the persisted spelling and
 `lifecycle_name` the generic one. TERMINAL means no further normal
 transition is allowed; COMPLETED means the task no longer needs production
@@ -12,30 +14,32 @@ from __future__ import annotations
 
 REQUESTED = "intake"
 IN_PROGRESS = "build"
-TO_VALIDATE = "qa"
+QA = "qa"
+VALIDATED = "validated"
+TO_VALIDATE = (QA, VALIDATED)
 DELIVERY_RECORDED = "merged"
 PROMOTED = "promoted"
 BLOCKED = "blocked"
 WAITING_HUMAN = "waiting_human"
 CLOSED = "closed"
 
-STATES = (REQUESTED, IN_PROGRESS, TO_VALIDATE, DELIVERY_RECORDED, PROMOTED,
+STATES = (REQUESTED, IN_PROGRESS, *TO_VALIDATE, DELIVERY_RECORDED, PROMOTED,
           BLOCKED, WAITING_HUMAN, CLOSED)
 ACTIVE = (REQUESTED, IN_PROGRESS)
 DELIVERED = (DELIVERY_RECORDED, PROMOTED)
 COMPLETED = (*DELIVERED, CLOSED)
 TERMINAL = (PROMOTED, CLOSED)
 WAITING = {BLOCKED, WAITING_HUMAN}
-WAITING_ON_OTHERS = (TO_VALIDATE, WAITING_HUMAN, BLOCKED)
+WAITING_ON_OTHERS = (*TO_VALIDATE, WAITING_HUMAN, BLOCKED)
 
 #: L99 T1 (#4349) : le vocabulaire générique du cycle de vie, par orthographe
-#: persistée v1. La valeur stockée reste la v1 jusqu'à la bascule du stockage
-#: (T5) : `canonical` ramène les deux orthographes sur celle-ci.
+#: persistée. T3 distingue désormais validated de merged.
 GENERIC_NAMES = {
     REQUESTED: "requested",
     IN_PROGRESS: "in_progress",
-    TO_VALIDATE: "to_validate",
-    DELIVERY_RECORDED: "validated",
+    QA: "to_validate",
+    VALIDATED: "validated",
+    DELIVERY_RECORDED: "merged",
     PROMOTED: "delivered",
     BLOCKED: "blocked",
     WAITING_HUMAN: "waiting_human",

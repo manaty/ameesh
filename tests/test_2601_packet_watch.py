@@ -180,7 +180,7 @@ class Carriers(unittest.TestCase):
 
 class CompositionBeforePush(unittest.TestCase):
     def test_unpublished_composition_silences_alert_in_each_open_state(self):
-        for phase in ("intake", "build", "qa"):
+        for phase in ("intake", "build", "qa", "validated"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
                 row = {"id": 3404, "title": "Paquet horaire h-11 — composition",
                        "branch": None, "app": "ameesh", "assignee": "impl-05",

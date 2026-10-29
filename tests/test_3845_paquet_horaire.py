@@ -277,6 +277,15 @@ class FollowTest(Base):
         self.shell.lists["qa"] = [item]
         return item
 
+    def test_validated_carrier_with_ci_running_prevents_another_composition(self):
+        item = self.open_carrier()
+        item["state"] = "validated"
+        self.shell.lists["qa"] = []
+        self.shell.lists["validated"] = [item]
+        self.shell.ci[4000] = {"runs": [dict(red_run(), status="running")]}
+        self.assertIn("en cours", ph.tick(self.ctx))
+        self.assertFalse(self.shell.ran("work", "add"))
+
     def test_ci_en_cours_rien(self):
         self.open_carrier()
         self.shell.ci[4000] = {"runs": [dict(red_run(), status="running")]}

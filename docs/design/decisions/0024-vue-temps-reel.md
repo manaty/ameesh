@@ -34,3 +34,16 @@ readable on a phone:
   the orchestrator on its own data): it serves as a mock-up.
 - Lot L24: JSON export of the events and the state (`ameesh progress --json`),
   timeline data model, and a reference view.
+
+# L99 T3 — reader compatibility for approval (#4351)
+
+`validated` is a distinct stored state after `qa`, separate from `merged`.
+This compatibility release understands it in transitions, progress, package
+and train candidates, carriers and planned landings. A new freeze or verdict
+returns an existing validated lot to `qa`.
+
+It does not create validated lots: review verdicts keep writing `qa`, and
+manual `qa → validated` is unavailable. The writer follows in a subsequent release,
+after staging has established a compatible reader and rollback baseline.
+During that transition, package readers still qualify legacy `qa` lots with
+the full exact-head review gate.

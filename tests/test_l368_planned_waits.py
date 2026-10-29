@@ -379,6 +379,8 @@ class UnitTest(unittest.TestCase):
                         "head": "b" * 40, "until": "2026-10-13"}}
         self.assertEqual(self.resolve(rows=[{"id": 1, "state": "qa"}],
                                       landings=[self.landing()]), expected)
+        self.assertEqual(self.resolve(rows=[{"id": 1, "state": "validated"}],
+                                      landings=[self.landing()]), expected)
         for state in ("intake", "build", "blocked", "waiting_human"):
             self.assertEqual(self.resolve(rows=[{"id": 1, "state": state}],
                                           landings=[self.landing()]), {})

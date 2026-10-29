@@ -88,7 +88,7 @@ PARALLEL_CONFLICT = "parallel-second conflict "
 #: bail `auto-merge` (300 s) pour qu'un passage ne le laisse pas expirer.
 PARALLEL_FREEZE_TIMEOUT = 120.0
 #: états d'un porteur que `watch` relit
-OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
+OPEN_STATES = ("intake", "build", "qa", "validated", "blocked", "waiting_human")
 #: durée du bail `auto-merge:<lot>` qui sérialise la publication et le passage ;
 #: il est renouvelé avant chaque geste (B4 : plusieurs appels `gh` de 60 à 120 s)
 LOCK_TTL_S = 300.0

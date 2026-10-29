@@ -30,7 +30,7 @@ import datetime
 import re
 import time
 
-from . import plan, storage
+from . import plan, storage, work_lifecycle as lifecycle
 from .storage.interface import HOLD_NOTE_WHITESPACE, LotSessions
 
 _LOT = re.compile(r"^(?:(?:task|lot)\s*#?\s*|#)?([0-9]{1,18})$", re.I)
@@ -694,7 +694,7 @@ def recorded_packet_attachments(st, open_items, rows):
     for member in members:
         cid, uid = int(member["package_id"]), int(member["work_item_id"])
         carrier, unit = carriers.get(cid), units.get(uid)
-        if carrier is None or unit is None or unit.get("state") != "qa":
+        if carrier is None or unit is None or unit.get("state") not in lifecycle.TO_VALIDATE:
             continue
         # #4111: composition precedes the branch sweep. Until a head is
         # observed, use the last freeze, then the recorded composition itself.
@@ -904,7 +904,7 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         # remplace que l'attente de fusion ; sorti de qa (build, blocked,
         # waiting_human), le signal revient.
         landing = landing_by_item.get(ident)
-        if (not landing or row.get("state") != "qa"
+        if (not landing or row.get("state") not in lifecycle.TO_VALIDATE
                 or landing.get("admitted") is False):
             continue
         vehicle = int(landing["vehicle_id"])
