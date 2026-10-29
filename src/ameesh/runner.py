@@ -11189,7 +11189,10 @@ class Runner:
             for canon in loaded:
                 try:
                     interval = getattr(self, "canon_sync_interval", 0.0)
-                    report = (canon_sync.periodic_sync(db, canon, self.host, interval)
+                    report = (canon_sync.periodic_sync(
+                        db, canon, self.host, interval,
+                        on_incomplete=lambda why: log_async(
+                            "host gate: canon sync incomplete: %s" % why))
                               if interval > 0 else canon_sync.sync(db, canon, self.host))
                     if report is None:
                         # Another executor is syncing, or this snapshot differs

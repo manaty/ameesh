@@ -1536,7 +1536,8 @@ def _same(row: dict, values: dict) -> bool:
     return True
 
 
-def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float) -> SyncReport | None:
+def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
+                  on_incomplete=None) -> SyncReport | None:
     """#3963: one complete sync per host/canon/interval, without a long lock.
 
     Other executors reuse only a completed result for the same immutable
@@ -1557,6 +1558,16 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float) -> SyncRep
     if not store.claim_sync(host, key, token, interval_s):
         shared = store.shared_sync(host, key)
         if shared is None or shared["sync_signature"] != signature:
+            if on_incomplete is not None:
+                reason = ("shared sync pending or failed (no completed token)"
+                          if shared is None else
+                          "snapshot mismatch: local signature %s, shared signature %s"
+                          % (signature, shared["sync_signature"]))
+                sources = ", ".join("%s=%s@%s (%s)" % (
+                    s.member, s.repo, s.commit, s.mode) for s in canon.sources)
+                on_incomplete("canon %s at %s: %s; sources [%s]; "
+                              "claim interval %.1fs" % (
+                                  canon.id, canon.root, reason, sources, interval_s))
             return None
         return SyncReport(host, str(canon.root), False, [], [],
                           status=shared["status"], diagnostic=shared["diagnostic"], shared=True)
