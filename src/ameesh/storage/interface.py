@@ -2866,7 +2866,9 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def project_plan_rows(self, project: str, *, assignment_id: int | None = None) -> list[dict]:
-        """#4174: open project readiness; assignment_id limits to target and unassigned bugs."""
+        """#4174: open dispatch readiness (bugs and evolutions, not the L119
+        improvement queue), with `footprint_overlap` (#4173); assignment_id
+        limits to target and unassigned bugs."""
         raise NotImplementedError
 
     @abc.abstractmethod

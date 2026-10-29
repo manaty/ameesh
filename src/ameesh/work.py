@@ -78,7 +78,7 @@ MAX_QA_LOOPS = 2
 FORWARD = {
     lifecycle.REQUESTED: (lifecycle.IN_PROGRESS,),
     lifecycle.IN_PROGRESS: (lifecycle.QA,),
-    lifecycle.QA: (lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
+    lifecycle.QA: (lifecycle.VALIDATED, lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
     lifecycle.VALIDATED: (lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
     lifecycle.DELIVERY_RECORDED: (lifecycle.PROMOTED,),
     lifecycle.PROMOTED: (),
@@ -90,6 +90,7 @@ TRANSITIONS = {
     lifecycle.REQUESTED: {lifecycle.IN_PROGRESS, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
     lifecycle.IN_PROGRESS: {lifecycle.QA, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
     lifecycle.QA: {
+        lifecycle.VALIDATED,
         lifecycle.DELIVERY_RECORDED,
         lifecycle.IN_PROGRESS,
         lifecycle.BLOCKED,

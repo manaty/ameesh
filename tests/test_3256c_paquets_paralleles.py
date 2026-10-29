@@ -72,7 +72,8 @@ prevalidation:
         self.assertEqual(document.paquet.max_paquets, 2)
         self.assertEqual(document.to_dict()["paquet"],
                          {"attente_mediane_s": 3600.0, "max_paquets": 2})
-        for body in ("paquet:\n  attente_mediane_s: 0\n  max_paquets: 2\n",
+        for body in ("paquet:\n  attente_mediane_s: 3600\n  max_paquets: 3\n",
+                     "paquet:\n  attente_mediane_s: 0\n  max_paquets: 2\n",
                      "paquet:\n  attente_mediane_s: 3600\n  max_paquets: 1\n",
                      "paquet:\n  attente_mediane_s: 3600\n",
                      "paquet:\n  attente_mediane_s: 3600\n  max_paquets: 2\n"
@@ -192,6 +193,17 @@ class PartitionTest(unittest.TestCase):
             [self.entry(1, ["a.py"]), self.entry(2, ["a.py"])], [1, 2])
         self.assertEqual(plan["first"], [1, 2])
         self.assertEqual(plan["second"], [])
+
+    def test_conflicts_and_distinct_migrations_stay_together(self):
+        for metadata in ({"conflicts_with": [2]}, {"migration_files": ["schema/001.sql"]}):
+            first = dict(self.entry(1, ["a.py"]), **metadata)
+            second = self.entry(2, ["b.py"])
+            if "migration_files" in metadata:
+                second["migration_files"] = ["schema/002.sql"]
+            with self.subTest(metadata=metadata):
+                plan = packet_parallel.partition([first, second], [1, 2])
+                self.assertEqual(plan["first"], [1, 2])
+                self.assertEqual(plan["second"], [])
 
     def test_a_dependency_keeps_the_lots_in_one_packet(self):
         plan = packet_parallel.partition(
@@ -377,6 +389,34 @@ class ComposerParallelTest(unittest.TestCase):
         self.assertFalse(set(self.only(self.autos()[0]))
                          & set(self.only(self.autos()[1])))
 
+    def test_first_carrier_error_does_not_prevent_the_second(self):
+        from unittest import mock
+        original = ph.attempt
+        def attempt(ctx, carrier, name, this):
+            if this.only == [101]:
+                raise ph.HoraireError("first failed")
+            return original(ctx, carrier, name, this)
+        with mock.patch.object(ph, "attempt", side_effect=attempt):
+            result = ph.compose(self.ctx, [])
+        self.assertIn("first failed", result)
+        self.assertEqual(len(self.shell.items), 2)
+        self.assertEqual(self.only(self.autos()[0]), [102])
+
+    def test_missing_parallel_proof_recomposes_same_carrier_and_group(self):
+        from unittest import mock
+        item = carrier(lot=4002, sha=HEAD)
+        item["events"] += [
+            {"note": "paquet-horaire: second paquet parallèle de #4001 groupe=102"},
+            {"note": "auto-merge parallel-recompose repo=manaty/ameesh pr=1 sha=%s missing clone" % HEAD}]
+        with mock.patch.object(ph, "pending", return_value=None), \
+                mock.patch.object(ph, "attempt", return_value="recomposed") as attempt:
+            self.assertEqual(ph.follow(self.ctx, item), "recomposed")
+        this = attempt.call_args.args[-1]
+        self.assertEqual(this.only, [102])
+        self.assertEqual(this.base, HEAD)
+        self.assertEqual(this.step, ph.RECOMPOSITION)
+        self.assertTrue(this.force)
+
     def test_below_the_threshold_one_packet(self):
         self.shell.debit["qa_merge"]["yesterday"]["median_s"] = 3599.0
         ph.compose(self.ctx, [])
@@ -423,3 +463,23 @@ class ComposerParallelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProjectPythonTest(unittest.TestCase):
+    def test_explicit_interpreter_is_shared_with_freeze_checks(self):
+        from unittest import mock
+        from ameesh import project_python, packet_automerge
+        import os
+        with mock.patch.dict(os.environ, {"AMEESH_PYTHON": "/project/python"}), \
+                mock.patch.object(project_python, "_PYTHON_INTERPRETER", None), \
+                mock.patch.object(project_python.Path, "is_file", return_value=True), \
+                mock.patch.object(project_python, "_supports_psycopg", return_value=True), \
+                mock.patch.object(project_python.subprocess, "run", return_value=SimpleNamespace(stdout="")):
+            self.assertEqual(project_python.project_python(Path("/repo")), "/project/python")
+        with tempfile.TemporaryDirectory() as repo, \
+                mock.patch.object(project_python, "project_python", return_value="/project/python"), \
+                mock.patch.object(packet_automerge, "_git", return_value="ok"), \
+                mock.patch.object(packet_automerge.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+            state, _why = packet_automerge._parallel_freeze_checks(repo, "a" * 40, "b" * 40)
+            self.assertEqual(state, "ok")
+            self.assertEqual(run.call_args.args[0][0], "/project/python")

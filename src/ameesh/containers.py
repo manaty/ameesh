@@ -8,12 +8,20 @@ l'exécuteur demande en **lecture seule** au moteur de conteneurs ceux qui
 portent encore son étiquette — des ressources orphelines, signalées, jamais
 supprimées ici.
 
+#4560 : le script d'étiquetage force `rm -v`, pour que le volume anonyme d'un
+conteneur qu'une suite supprime elle-même ne survive pas sans provenance ; il
+pose aussi `ameesh.lifetime=test` sur les images construites sans tag
+dans un tour. Ce
+sont les deux seules ressources qu'un test peut laisser derrière lui : le
+ménage les récolte après absence continue, jamais un volume de base nommé.
+
 Aucun moteur n'est requis : sans binaire (ou sans droit, ou sans démon), la
 liste est vide et le rattachement par groupe de processus reste la garantie.
 """
 from __future__ import annotations
 
 import datetime
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -41,6 +49,35 @@ BENCH_LABEL = "ameesh.bench"
 #: de lot que son appelant a DÉCLARÉ jetable, dont les données se recréent.
 #: Toute autre valeur (ou l'absence d'étiquette) est conservée et signalée.
 BENCH_DISPOSABLE = "disposable"
+
+#: #4560 : étiquette de DURÉE DE VIE d'une ressource de test — le volume nommé
+#: d'un banc de lot (`scripts/pg-up.sh`) ou l'image construite par une suite.
+#: Sa valeur [`LIFETIME_TEST`] déclare la ressource jetable : housekeeping la
+#: récolte après `docker_volume_idle` d'absence continue, et seulement elle.
+#: Une ressource sans étiquette (ou avec une autre valeur) est conservée ; un
+#: volume de base nommé (`*-pg-data`) n'est jamais récolté, même étiqueté.
+LIFETIME_LABEL = "ameesh.lifetime"
+
+#: #4560 : seule valeur de [`LIFETIME_LABEL`] reconnue pour l'instant — une
+#: ressource créée pour un test, sans valeur hors de la suite qui l'a créée.
+LIFETIME_TEST = "test"
+
+#: #4560 : suffixe d'un volume de BASE nommé (`ameesh-pg-data`,
+#: `agent-mesh-pg-data`, `<agent>-pg-data`). Ses données survivent aux
+#: conteneurs et aux suites : housekeeping ne le récolte JAMAIS, même si une
+#: étiquette jetable y a été posée par erreur.
+BASE_VOLUME_SUFFIX = "-pg-data"
+
+
+def is_base_volume(name: str) -> bool:
+    """#4560 : ce nom est-il celui d'un volume de base nommé (`*-pg-data`) ?
+
+    Un volume de base porte les données du banc partagé (ou d'un agent) : il
+    est conservé quel que soit son âge ou son étiquette. Un banc de lot nommé
+    `...-data` (par exemple `ameesh-pg-1333-data`) ne porte PAS ce suffixe :
+    lui seul peut être déclaré jetable."""
+    return str(name or "").endswith(BASE_VOLUME_SUFFIX)
+
 
 #: marque que Docker pose sur un volume créé implicitement pour un conteneur
 ANONYMOUS_LABEL = "com.docker.volume.anonymous"
@@ -316,13 +353,136 @@ class Runtime:
             return False, (getattr(proc, "stderr", "") or "refused").strip()[:300]
         return True, ""
 
+    def images(self) -> list[dict] | None:
+        """Les images de l'hôte (L73/#4560, lecture seule) : `id`, `created`,
+        `labels`, `tags` ; None si le moteur ne répond pas, refuse, ou rend une
+        ligne illisible — une liste partielle ne décide jamais d'une
+        suppression.
+
+        Toutes les images sont listées, pas seulement les `dangling` : une
+        image étiquetée test qui vient d'être RETAGUÉE est en service, et son
+        épisode d'absence doit être refermé (comme la reprise d'un volume) ;
+        seules celles dont `tags` est vide sont candidates à la récolte."""
+        argv = self._argv("image", "ls", "--no-trunc", "--format", "{{.ID}}")
+        try:
+            proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if getattr(proc, "returncode", 1) != 0:
+            return None
+        # une image à plusieurs tags apparaît une fois PAR TAG : un même Id
+        # ne doit être inspecté et récolté qu'une fois.
+        ids = list(dict.fromkeys(
+            line.strip() for line in (proc.stdout or "").splitlines() if line.strip()))
+        out: list[dict] = []
+        import json
+        for start in range(0, len(ids), INSPECT_BATCH):
+            chunk = ids[start:start + INSPECT_BATCH]
+            argv = self._argv("image", "inspect", "--format", "{{json .}}", *chunk)
+            try:
+                proc = self.run(argv, capture_output=True, text=True,
+                                timeout=self.timeout * 6)
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if getattr(proc, "returncode", 1) != 0:
+                return None
+            for line in (proc.stdout or "").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    return None
+                if not isinstance(row, dict):
+                    return None
+                ident = str(row.get("Id") or "")
+                stamp = parse_created(row.get("Created"))
+                if not ident or stamp is None:
+                    return None
+                config = row.get("Config") if isinstance(row.get("Config"), dict) else {}
+                tags = [str(tag) for tag in row.get("RepoTags") or ()]
+                out.append({"id": ident, "created": stamp,
+                            "labels": parse_labels(config.get("Labels")),
+                            "tags": tags})
+        return out
+
+    def remove_image(self, ident: str, *, tag: str | None = None) -> tuple[bool, str]:
+        """Retire une image DÉCLARÉE jetable et SANS tag (L73/#4560).
+
+        `docker image rm <id>` ne sait pas distinguer « toujours sans tag » de
+        « retaguée depuis le relevé » : un `docker tag` concurrent verrait son
+        unique tag retiré avec l'image. L'image reçoit donc d'abord un tag
+        TEMPORAIRE à nous (`docker tag`, atomique), puis seul ce tag est
+        retiré avec `--no-prune` : si un autre tag est apparu entre-temps,
+        Docker ne retire que le nôtre et l'image reste ; `--no-prune` interdit
+        en outre de supprimer les images parentes non taguées. Docker refuse
+        encore une image utilisée par un conteneur, même arrêté. En cas de
+        refus, le tag temporaire peut rester (l'image est alors conservée,
+        jamais supprimée) : le message le nomme pour le nettoyage manuel."""
+        import json
+        import secrets
+        argv = self._argv("image", "inspect", "--format", "{{json .RepoTags}}", ident)
+        try:
+            proc = self.run(argv, capture_output=True, text=True,
+                            timeout=self.timeout * 6)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, str(exc)
+        if getattr(proc, "returncode", 1) != 0:
+            return False, (getattr(proc, "stderr", "") or "refused").strip()[:300]
+        try:
+            tags = json.loads(proc.stdout or "null")
+        except ValueError:
+            return False, "tags unreadable"
+        if tags:
+            return False, "image is tagged again"
+        temp = tag or "ameesh-reap:%s" % secrets.token_hex(16)
+        argv = self._argv("tag", ident, temp)
+        try:
+            proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, str(exc)
+        if getattr(proc, "returncode", 1) != 0:
+            return False, (getattr(proc, "stderr", "") or "tag refused").strip()[:300]
+        argv = self._argv("image", "rm", "--no-prune", temp)
+        try:
+            proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout * 6)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, "%s (temporary tag %s may remain)" % (exc, temp)
+        if getattr(proc, "returncode", 1) != 0:
+            return False, "%s (temporary tag %s may remain)" % (
+                (getattr(proc, "stderr", "") or "refused").strip()[:300], temp)
+        # L'image est partie, ou un autre tag l'a retenue : le dire.
+        argv = self._argv("image", "inspect", "--format", "{{json .RepoTags}}", ident)
+        try:
+            proc = self.run(argv, capture_output=True, text=True,
+                            timeout=self.timeout * 6)
+        except (OSError, subprocess.SubprocessError):
+            return True, ""                 # image disparue
+        if getattr(proc, "returncode", 1) != 0:
+            return True, ""
+        try:
+            tags = json.loads(proc.stdout or "null")
+        except ValueError:
+            return False, "image still present; tags unreadable after reap"
+        if tags:
+            return False, "image is tagged again (temporary reap tag %s removed)" % temp
+        return False, "image still referenced (temporary reap tag %s removed)" % temp
+
+
+#: #4560 : plus de 6 chiffres après la virgule ne sont lus par
+#: `datetime.fromisoformat` ni par Python 3.10 : la fraction est ramenée à la
+#: microseconde, largement suffisante pour l'identité d'une image.
+_ISO_FRACTION = re.compile(r"(\.[0-9]{6})[0-9]+")
+
 
 def parse_created(value) -> float | None:
-    """`CreatedAt` d'un volume (RFC 3339, `Z` ou décalage), en secondes epoch ;
-    None si illisible. Python 3.9/3.10 ne lit pas le `Z` de `fromisoformat`."""
+    """`CreatedAt`/`Created` d'un volume ou d'une image (RFC 3339, `Z` ou
+    décalage), en secondes epoch ; None si illisible. Python 3.9/3.10 ne lit
+    pas le `Z` de `fromisoformat` ; Docker date les images à la nanoseconde."""
     text = str(value or "").strip()
     if not text:
         return None
+    text = _ISO_FRACTION.sub(r"\1", text)
     if text[-1:] in ("Z", "z"):
         text = text[:-1] + "+00:00"
     try:
@@ -420,11 +580,15 @@ def running_for_turn(cfg, turn_id: str) -> list[str]:
 
 #: script posé devant le vrai binaire dans le PATH d'un tour : il ajoute les
 #: étiquettes du tour (`AMEESH_CONTAINER_LABELS`) à `run` et `create` (et
-#: `container run|create`), et transmet tout le reste tel quel au vrai binaire
+#: `container run|create`), le label de durée de vie aux images construites, et
+#: force `rm -v` pour que les volumes anonymes d'un conteneur supprimé par une
+#: suite partent avec lui (#4560) ; tout le reste va tel quel au vrai binaire
 #: (`AMEESH_REAL_DOCKER` / `AMEESH_REAL_PODMAN`). Un conteneur lancé par
 #: l'API (bibliothèque, compose) n'est pas étiqueté : il reste signalé.
 SHIM = r"""#!/bin/sh
 # Posé par ameesh (L73) : étiquette les conteneurs lancés par un tour.
+# #4560 : `rm` reprend aussi les volumes ANONYMES du conteneur (-v) ; une
+# image construite dans un tour porte le label de durée de vie de test.
 case "${0##*/}" in
   docker) real="$AMEESH_REAL_DOCKER" ;;
   podman) real="$AMEESH_REAL_PODMAN" ;;
@@ -438,6 +602,44 @@ if [ "$1" = run ] || [ "$1" = create ]; then
   pre="$1"; shift
 elif [ "$1" = container ] && { [ "$2" = run ] || [ "$2" = create ]; }; then
   pre="$1 $2"; shift 2
+elif [ "$1" = rm ] || { [ "$1" = container ] && [ "$2" = rm ]; }; then
+  # Sans -v, Docker laisse le volume anonyme du conteneur supprimé : plus
+  # aucun conteneur ne le référence, et le ménage ne peut pas l'attribuer.
+  # Un volume NOMMÉ n'est jamais visé par -v (Docker ne retire que les
+  # anonymes) ; `--volumes=false` explicite est respecté.
+  if [ "$1" = rm ]; then pre="rm"; shift
+  else pre="$1 $2"; shift 2; fi
+  volumes=""
+  for a in "$@"; do
+    case "$a" in
+      -v|--volumes|--volumes=*|-v=*) volumes=1 ;;
+    esac
+  done
+  [ -n "$volumes" ] || set -- -v "$@"
+  exec "$real" $pre "$@"
+elif [ "$1" = build ] && [ -n "$AMEESH_CONTAINER_LABELS" ]; then
+  shift
+  tagged=""
+  for a in "$@"; do
+    case "$a" in
+      -t|--tag|--tag=*|-t?*) tagged=1 ;;
+    esac
+  done
+  # une construction TAGUÉE est un artefact voulu : pas de label jetable.
+  # Une construction SANS tag ne produit qu'une image dangling, ressource du
+  # tour : sa durée de vie est déclarée, le ménage la récolte après 24 h.
+  if [ -n "$tagged" ]; then exec "$real" build "$@"; fi
+  exec "$real" build --label "ameesh.lifetime=test" "$@"
+elif [ "$1" = image ] && [ "$2" = build ] && [ -n "$AMEESH_CONTAINER_LABELS" ]; then
+  shift 2
+  tagged=""
+  for a in "$@"; do
+    case "$a" in
+      -t|--tag|--tag=*|-t?*) tagged=1 ;;
+    esac
+  done
+  if [ -n "$tagged" ]; then exec "$real" image build "$@"; fi
+  exec "$real" image build --label "ameesh.lifetime=test" "$@"
 else
   exec "$real" "$@"
 fi

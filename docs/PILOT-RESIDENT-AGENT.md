@@ -319,7 +319,8 @@ fallback after the silent resident) is 2.292943 USD, 42% of the window; the
 - **Cost.** 5.431180 USD over the 10 window turns, B6 1.028904, B7 0.1624, the
   06:36 package turn 0.3988; total 7.021284. The B5d one-per-event fallback
   after the silent resident (2.292943) is the largest single turn and 42% of
-  the window; the B6 new session (1.028904) is the second. No overage.
+  the window; the 18:45 package-notice turn (1.030526) is the second, just
+  ahead of the B6 new session (1.028904). No overage.
 - **Session loss at B6.** The B6 turn started a new session `ef183ea7` on
   `primaire` instead of resuming `09a18e15` on `secondaire` after 11 h 50 min
   of dormancy and the staging stop/restore. The 24 h cache control is

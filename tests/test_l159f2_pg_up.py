@@ -181,7 +181,8 @@ class PgUpVolumeTest(unittest.TestCase):
         crees = [c for c in calls if c[:2] == ["volume", "create"]]
         self.assertEqual(len(crees), 1)
         self.assertEqual(crees[0], ["volume", "create", "--label",
-                                    "ameesh.bench=disposable",
+                                    "ameesh.bench=disposable", "--label",
+                                    "ameesh.lifetime=test",
                                     "ameesh-dev7-pgtest-data"])
 
     def test_the_declaration_also_accepts_the_historical_prefix(self):
@@ -192,7 +193,8 @@ class PgUpVolumeTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         crees = [c for c in calls if c[:2] == ["volume", "create"]]
         self.assertEqual(crees[0], ["volume", "create", "--label",
-                                    "ameesh.bench=disposable", "essai-pg-data"])
+                                    "ameesh.bench=disposable", "--label",
+                                    "ameesh.lifetime=test", "essai-pg-data"])
 
     def test_a_custom_volume_on_the_shared_name_follows_the_declaration(self):
         """Le volume par défaut du banc partagé seul est protégé : un volume
@@ -210,7 +212,8 @@ class PgUpVolumeTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         crees = [c for c in calls if c[:2] == ["volume", "create"]]
         self.assertEqual(crees[0], ["volume", "create", "--label",
-                                    "ameesh.bench=disposable", "pg-essai"])
+                                    "ameesh.bench=disposable", "--label",
+                                    "ameesh.lifetime=test", "pg-essai"])
 
     def test_the_shared_default_volume_ignores_the_declaration(self):
         """#2003 : le banc partagé reste persistant même si l'appelant demande

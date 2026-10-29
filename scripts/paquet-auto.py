@@ -42,7 +42,10 @@ l'ordre, sans agent :
    fichiers (`packet_red`, #3801) ne désigne plus un voisin ; elle reste la
    lecture des rouges propres et des contrats (#3931). Un rouge voisin
    impossible à situer sur les préfixes n'entraîne **aucun retrait** : le
-   pilote est prévenu et le paquet s'arrête. Un rouge non attribuable garde
+   pilote est prévenu et le paquet s'arrête. Un test rouge sur la tête mais
+   **vert sur tous les préfixes** est instable (#4221) : consigné non
+   concluant, sans retrait, le paquet continue et le pilote est prévenu. Un
+   rouge non attribuable garde
    le geste antérieur : une unité dont le module propre a rougi est retirée,
    un contrat rouge arrête (l'attribution demande un agent). Un run **non
    concluant** (délai, base absente, psql/psycopg indisponible, erreur de
@@ -235,6 +238,17 @@ INCONCLUSIVE_RE = re.compile(
     r"ModuleNotFoundError: No module named 'psycopg)",
     re.IGNORECASE,
 )
+#: #4221 : un QueryCanceled ou un lock timeout **reproduit** en rejouant seul,
+#: hors charge, est un rouge réel ; hors rejeu, il reste non concluant.
+CANCEL_MESSAGE_RE = re.compile(
+    r"canceling statement due to (?:statement|lock) timeout|timeout expired",
+    re.IGNORECASE,
+)
+#: #4221 : une erreur levée dans `setUp`/`tearDown` (comme dans
+#: `setUpClass`/`tearDownClass`) est une panne de fixture : non concluante
+#: même rejouée seule. Seul le corps de la méthode de test peut se confirmer.
+FIXTURE_FRAME_RE = re.compile(
+    r"^\s+File .*, line \d+, in (?:setUp|tearDown)\s*$", re.MULTILINE)
 #: le **message** d'une exception d'environnement (sans les noms de types :
 #: un `AssertionError: expected OperationalError` reste un rouge réel, et un
 #: `ValueError: expected QueryCanceled` aussi : le nom psycopg est reconnu par
@@ -432,6 +446,9 @@ class TestRun:
     #: Rouge écarté après rejeu des seuls voisins sur la base (#4048).
     ignored_red: bool = False
     log_path: str = ""
+    #: #4221 : tests rouges sur la tête mais verts sur tous les préfixes de
+    #: l'empilement (instables) : non concluants, ils ne retirent aucune unité.
+    flaky_tests: list[str] = field(default_factory=list)
 
     @property
     def green(self) -> bool:
@@ -472,6 +489,40 @@ class TestRun:
             return True
         return False
 
+    def body_cancel_tests(self) -> set[str]:
+        """#4221 : les tests dont un QueryCanceled/lock timeout est l'exception.
+
+        Seuls les `ERROR:` du **corps** d'un test comptent : une erreur de
+        `setUpClass`/`tearDownClass` reste une panne de fixture, non
+        concluante même rejouée seule. Sert au rejeu hors charge : un même
+        test qui redonne ce QueryCanceled reproduit une erreur déterministe,
+        alors qu'un QueryCanceled de charge ne revient pas.
+        """
+        found: set[str] = set()
+        for match in FAIL_LINE_RE.finditer(self.output or ""):
+            kind, test = match.group(1), match.group(2).strip()
+            if kind != "ERROR" or not test:
+                continue
+            header = match.group(0)
+            if header.startswith("ERROR: setUpClass") \
+                    or header.startswith("ERROR: tearDownClass"):
+                continue
+            rest = (self.output or "")[match.end():]
+            end = BLOCK_END_RE.search(rest)
+            block = rest[:end.start()] if end else rest
+            if FIXTURE_FRAME_RE.search(block):
+                continue
+            exception = last_exception(block)
+            if exception is None:
+                continue
+            name, message = exception
+            short = name.rsplit(".", 1)[-1]
+            if short == "AssertionError":
+                continue
+            if short == "QueryCanceled" or CANCEL_MESSAGE_RE.search(message):
+                found.add(test)
+        return found
+
     @property
     def real_failure(self) -> bool:
         """Un test négatif réel, même mêlé à une erreur d'environnement.
@@ -482,6 +533,8 @@ class TestRun:
         `FAIL + OperationalError` est donc rouge, jamais « non concluant ».
         """
         if self.returncode == 0:
+            return False
+        if self.flaky_tests:
             return False
         if self.timed_out or self.returncode != 1:
             return False
@@ -512,6 +565,8 @@ class TestRun:
 
     @property
     def inconclusive(self) -> bool:
+        if self.flaky_tests:
+            return True
         if self.timed_out or self.returncode not in (0, 1):
             return True
         if self.returncode == 1:
@@ -530,6 +585,10 @@ class TestRun:
 
     def motive(self) -> str:
         """Pourquoi un run est non concluant, en une ligne."""
+        if self.flaky_tests:
+            return ("test(s) rouge(s) sur la tête mais vert(s) sur tous les "
+                    "préfixes (instable) : %s"
+                    % ", ".join(self.flaky_tests[:3]))
         if self.timed_out:
             return "délai dépassé"
         if self.returncode not in (0, 1):
@@ -642,66 +701,20 @@ _PYTHON_OVERRIDE: str | None = None
 
 
 def _supports_psycopg(python: str) -> bool:
-    try:
-        proc = subprocess.run([python, "-c", "import psycopg"],
-                              stdin=subprocess.DEVNULL, capture_output=True,
-                              timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return proc.returncode == 0
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from ameesh.project_python import _supports_psycopg as supports
+    return supports(python)
 
 
 def project_python(worktree: Path) -> str:
-    """Un interpréteur qui porte psycopg, pour les outils de l'arbre.
-
-    Le script lui-même n'a que la bibliothèque standard ; ses enfants
-    (`paquet-candidats`, `paquet-compose`, les tests) importent le projet.
-    Un agent qui lance `python3 scripts/paquet-auto.py` avec le Python du
-    système n'a pas psycopg : on prend le `.venv` de l'arbre, celui du
-    worktree principal, ou le Python du venv d'`ameesh` (le wrapper de la
-    session). À défaut, `sys.executable` : `paquet-candidats` rendra son
-    refus, sans le maquiller.
-    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from ameesh.project_python import project_python as select
     global _PYTHON_INTERPRETER
     if _PYTHON_OVERRIDE:
         return _PYTHON_OVERRIDE
-    if _PYTHON_INTERPRETER:
-        return _PYTHON_INTERPRETER
-    candidates: list[str] = []
-    env = os.environ.get("AMEESH_PYTHON")
-    if env:
-        candidates.append(env)
-    candidates.append(sys.executable)
-    candidates.append(str(worktree / ".venv" / "bin" / "python"))
-    listed = git(worktree, "worktree", "list", "--porcelain", check=False)
-    for line in _decode(listed.stdout).splitlines():
-        if line.startswith("worktree "):
-            candidates.append(str(Path(line[len("worktree "):]) /
-                                 ".venv" / "bin" / "python"))
-    wrapper = shutil.which("ameesh")
-    if wrapper:
-        try:
-            text = Path(wrapper).read_text(encoding="utf-8")
-        except OSError:
-            text = ""
-        match = re.search(r"exec\s+(\S+)/ameesh\b", text)
-        if match:
-            candidates.append(match.group(1) + "/python")
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        if Path(candidate).is_file() and _supports_psycopg(candidate):
-            _PYTHON_INTERPRETER = candidate
-            return candidate
-    _PYTHON_INTERPRETER = sys.executable
+    if not _PYTHON_INTERPRETER:
+        _PYTHON_INTERPRETER = select(worktree)
     return _PYTHON_INTERPRETER
-
-
-# ---------------------------------------------------------------------------
-# Entrées
-# ---------------------------------------------------------------------------
 
 
 def package_branch(name: str) -> str:
@@ -1807,7 +1820,8 @@ def _failure_matches(observed: str, failed: set[str]) -> bool:
 def prefix_failures(worktree: Path, composition: Composition,
                     failures: list[dict], *, timeout: int,
                     replay=None, log=print, guard=None,
-                    deadline: float | None = None) -> tuple[dict[int, list[dict]], str]:
+                    deadline: float | None = None,
+                    ) -> tuple[dict[int, list[dict]], str, list[dict]]:
     """#4217 : la première unité où chaque test rouge apparaît.
 
     Rejoue les tests rouges des modules **voisins** sur les préfixes de
@@ -1817,10 +1831,12 @@ def prefix_failures(worktree: Path, composition: Composition,
     le préfixe correspondant le rend rouge ; les préfixes suivants ne le
     rejouent plus.
 
-    Rend `({lot: [échecs]}, "")`, ou `({}, pourquoi)` quand le rejeu ne
-    conclut pas (worktree impossible, run non concluant, test vert sur tous
-    les préfixes) : l'appelant ne retire alors aucune unité. Aucune décision
-    de retrait ici.
+    Rend `({lot: [échecs]}, "", [])`, ou `({}, "", [échecs])` quand des tests
+    restent rouges sur la tête mais verts sur **tous** les préfixes : ce sont
+    des instables (#4221), consignés non concluants, sans retrait. Rend
+    `({}, pourquoi, [])` quand le rejeu ne conclut pas (worktree impossible,
+    run non concluant, rouge sans nom de test) : l'appelant ne retire alors
+    aucune unité. Aucune décision de retrait ici.
 
     #4463 : `guard` est relu avant chaque préfixe après le premier (fusion du
     porteur comprise) ; sous `deadline`, chaque rejeu est borné au temps
@@ -1835,9 +1851,9 @@ def prefix_failures(worktree: Path, composition: Composition,
             seen.add(name)
             tests.append(dict(failure))
     if not tests:
-        return {}, "aucun nom de test à rejouer sur les préfixes"
+        return {}, "aucun nom de test à rejouer sur les préfixes", []
     if not composition.units:
-        return {}, "composition sans unité à rejouer"
+        return {}, "composition sans unité à rejouer", []
     replay = replay or run_tests
     parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
     path = Path(tempfile.mkdtemp(prefix="paquet-auto-prefixe-", dir=str(parent)))
@@ -1848,7 +1864,7 @@ def prefix_failures(worktree: Path, composition: Composition,
     if added.returncode != 0:
         shutil.rmtree(path, ignore_errors=True)
         return {}, ("worktree de préfixe impossible : %s"
-                    % _tail(_decode(added.stderr), 3))
+                    % _tail(_decode(added.stderr), 3)), []
     try:
         unresolved = tests
         found: dict[int, list[dict]] = {}
@@ -1864,7 +1880,7 @@ def prefix_failures(worktree: Path, composition: Composition,
                 if moved.returncode != 0:
                     return {}, ("préfixe %d (#%d) illisible : %s"
                                 % (index, unit.lot,
-                                   _tail(_decode(moved.stderr), 3)))
+                                   _tail(_decode(moved.stderr), 3))), []
                 git(path, "clean", "-fdq", check=False)
             run = replay(path, "préfixe %d (#%d)" % (index, unit.lot),
                          [_failure_name(failure) for failure in unresolved],
@@ -1877,12 +1893,12 @@ def prefix_failures(worktree: Path, composition: Composition,
                                       "%d (#%d) : %s" % (index, unit.lot,
                                                          run.motive()))
                 return {}, ("préfixe %d (#%d) non concluant : %s"
-                            % (index, unit.lot, run.motive()))
+                            % (index, unit.lot, run.motive())), []
             failed = {entry["test"]
                       for entry in unittest_failures(run.output)}
             if not run.green and not failed:
                 return {}, ("préfixe %d (#%d) rouge sans nom de test"
-                            % (index, unit.lot))
+                            % (index, unit.lot)), []
             still = []
             for failure in unresolved:
                 if _failure_matches(_failure_name(failure), failed):
@@ -1896,11 +1912,11 @@ def prefix_failures(worktree: Path, composition: Composition,
             if not unresolved:
                 break
         if unresolved:
-            return {}, ("test(s) rouge(s) sur la tête mais verts sur tous les "
-                        "préfixes : %s"
-                        % ", ".join(_failure_name(failure)
-                                    for failure in unresolved[:5]))
-        return found, ""
+            # #4221 : verts au rejeu sur tous les préfixes : instables,
+            # l'appelant les consigne non concluants sans arrêter le paquet ;
+            # les tests déjà situés (`found`, B1 cx2) restent retirables.
+            return found, "", unresolved
+        return found, "", []
     finally:
         remove_worktree(worktree, path)
 
@@ -2069,10 +2085,12 @@ def check_local_tests(worktree: Path, composition: Composition, *,
 
     Un rouge de voisin que les préfixes ne permettent pas de situer lève
     `AttributionUnreadable` : aucun retrait automatique, le pilote est
-    prévenu et un agent lit. Un résultat non concluant (délai, base absente,
-    psql/psycopg indisponible, rc inattendu) est **consigné** dans `runs` et
-    ne retire aucune unité : le canon §3 veut qu'il ne retienne ni paquet ni
-    release ; la ci-full tranche.
+    prévenu et un agent lit. Un test rouge sur la tête mais **vert sur tous
+    les préfixes** est instable (#4221) : consigné non concluant dans `runs`
+    (`flaky_tests`), sans retrait, et le paquet continue. Un résultat non
+    concluant (délai, base absente, psql/psycopg indisponible, rc inattendu)
+    est **consigné** dans `runs` et ne retire aucune unité : le canon §3 veut
+    qu'il ne retienne ni paquet ni release ; la ci-full tranche.
     `attribute` est injectable pour les témoins (`attribute_composition`).
 
     #4025 : la série d'une unité joue aussi ses modules voisins
@@ -2227,10 +2245,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     prefix_red = [neighbor_tests[name] for name in neighbor_tests
                   if name in prefix_names]
     for lot, owned in owned_by_lot.items():
-        remaining_own = [failure for failure in owned
-                         if _failure_name(failure) not in prefix_names]
-        if remaining_own or lot in unparsed_lots:
-            own[lot] = remaining_own
+        # #4221 (P3) : `prefix_names` exclut déjà `own_names`, donc aucun
+        # échec propre ne peut y figurer ; le filtre `remaining_own` était mort.
+        if owned or lot in unparsed_lots:
+            own[lot] = owned
     modules = contract.modules
     runs.append(contract)
     contract_red = False
@@ -2273,7 +2291,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         bounds = ({"guard": guard} if guard is not None else {}) | (
             {"deadline": deadline} if deadline is not None else {})
         try:
-            found_by_lot, prefix_why = (prefix or prefix_failures)(
+            found_by_lot, prefix_why, flaky = (prefix or prefix_failures)(
                 worktree, composition, prefix_red, timeout=timeout, log=log,
                 **bounds)
         except BudgetSpent as spent:
@@ -2282,7 +2300,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                 "paquet continue" % spent)
             runs.append(budget_spent("préfixes", [_failure_name(failure)
                                                   for failure in prefix_red]))
-            found_by_lot, prefix_why = {}, ""
+            found_by_lot, prefix_why, flaky = {}, "", []
         except (AttributionUnreadable, CarrierSettled, EpochLost):
             raise
         except PaquetAutoError as exc:
@@ -2293,6 +2311,48 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             raise AttributionUnreadable(
                 prefix_why,
                 tests=[_failure_name(failure) for failure in prefix_red])
+        if flaky:
+            # #4221 : rouge sur la tête mais vert sur tous les préfixes =
+            # instable. Consigné non concluant, le paquet continue (canon §3).
+            flaky_names = sorted({_failure_name(failure) for failure in flaky
+                                  if _failure_name(failure)})
+            log("tests voisins : %d test(s) rouge(s) sur la tête mais vert(s) "
+                "sur tous les préfixes (instable) : %s — consigné(s) non "
+                "concluant(s), le paquet continue"
+                % (len(flaky_names), ", ".join(flaky_names[:5])))
+            kept_red: list[tuple[TestRun, list[dict]]] = []
+            for run, found in red:
+                names_here = sorted({_failure_name(failure)
+                                     for failure in found
+                                     if _failure_name(failure) in flaky_names})
+                left = [failure for failure in found
+                        if _failure_name(failure) not in flaky_names]
+                if len(left) == len(found):
+                    kept_red.append((run, found))
+                    continue
+                if left:
+                    # des rouges réels restent dans la même série : la série
+                    # reste rouge, l'instable est consigné à part.
+                    kept_red.append((run, left))
+                    runs.append(TestRun(
+                        label="%s (instable)" % run.label,
+                        modules=sorted({"tests." + str(failure.get("module"))
+                                        for failure in found
+                                        if failure.get("module")
+                                        and _failure_name(failure)
+                                        in names_here}),
+                        returncode=1,
+                        output="tests rouges sur la tête mais verts sur tous "
+                               "les préfixes : %s" % ", ".join(names_here),
+                        seconds=0.0, flaky_tests=names_here,
+                        log_path=run.log_path))
+                else:
+                    run.flaky_tests = names_here
+            red = kept_red
+            if not red:
+                return runs, [], []
+            failures = [failure for failure in failures
+                        if _failure_name(failure) not in flaky_names]
         positions = {unit.lot: index for index, unit in enumerate(
             composition.units, start=1)}
         unknown = [lot for lot in found_by_lot if lot not in positions]
@@ -2399,7 +2459,11 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
     un objet (`#N`) serait relu par le contrôle d'inclusion comme un lot
     attendu. Les objets et les classes restent à la PR et au courrier.
     """
-    lots = len({unit.lot for unit in composition.units})
+    try:
+        admissions = parse_composition_table(table)
+    except InputError:
+        admissions = [([unit.lot], unit.source) for unit in composition.units]
+    lots = len({lot for members, _source in admissions for lot in members})
     lines = [
         "# Paquet %s — composition (§12), sur %s `%s`"
         % (package_branch(name), target, base_sha[:12]),
@@ -2414,8 +2478,9 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
         "| lot | source composée |",
         "|---|---|",
     ]
-    for unit in composition.units:
-        lines.append("| #%d | `%s` |" % (unit.lot, unit.source))
+    for members, source in admissions:
+        for lot in members:
+            lines.append("| #%d | `%s` |" % (lot, source))
     lines += ["", table.rstrip(), ""]
     lines += [
         "## Écartés",
@@ -2908,6 +2973,30 @@ def notify_unattributable(name: str, carrier: int, error,
         log("courrier au pilote non envoyé : %s" % exc)
         return str(exc)
     log("courrier au pilote envoyé (%s)" % pilot)
+    return ""
+
+
+def notify_flaky(name: str, carrier: int, tests: list[str],
+                 *, pilot: str = "mesh-design",
+                 sender: str | None = None, log=print) -> str:
+    """#4221 : un test instable est consigné non concluant, le paquet continue.
+
+    Le canon §3 veut qu'un instable ne retienne ni paquet ni release ; le
+    pilote le sait pour le corriger à part. Un courrier qui ne part pas est
+    consigné, sans arrêter la composition. Rend le motif d'échec.
+    """
+    listed = ", ".join(tests[:5]) or "test(s) non nommé(s)"
+    body = (
+        "#%d paquet %s : test(s) rouge(s) sur la tête mais vert(s) sur tous "
+        "les préfixes de l'empilement (%s) : instable(s), consigné(s) non "
+        "concluant(s) (canon §3) ; aucun retrait pour eux, le paquet "
+        "continue. À corriger à part." % (carrier, name, listed))
+    try:
+        send_mail(pilot, carrier, body, sender)
+    except PaquetAutoError as exc:
+        log("courrier d'instabilité au pilote non envoyé : %s" % exc)
+        return str(exc)
+    log("courrier d'instabilité au pilote envoyé (%s)" % pilot)
     return ""
 
 
@@ -3625,7 +3714,14 @@ def compose_packet(args: argparse.Namespace) -> int:
                         pilot=getattr(args, "pilot", "mesh-design"),
                         sender=getattr(args, "sender", None))
                 raise
-
+            flaky = sorted({name for run in runs
+                            for name in getattr(run, "flaky_tests", [])})
+            if flaky and not getattr(args, "local", False):
+                # #4221 : instable consigné non concluant, le paquet continue ;
+                # le pilote le sait même si une recomposition suit.
+                notify_flaky(args.name, args.carrier, flaky,
+                             pilot=getattr(args, "pilot", "mesh-design"),
+                             sender=getattr(args, "sender", None))
             if not faulty:
                 break
             if pushed:

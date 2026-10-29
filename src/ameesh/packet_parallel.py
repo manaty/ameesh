@@ -287,7 +287,9 @@ def _files(entry) -> set[str]:
 
 def _dependencies(entry) -> set[int]:
     out = set()
-    for value in entry.get("dependencies") or ():
+    related = list(entry.get("dependencies") or ())
+    related += list(entry.get("conflicts_with") or ())
+    for value in related:
         try:
             out.add(int(value))
         except (TypeError, ValueError):
@@ -337,6 +339,10 @@ def partition(entries, order=None) -> dict:
                 owners[path] = lot
             else:
                 union.union(other, lot)
+    # Distinct migration files still share one ordered schema history.
+    migrators = [lot for lot in ranked if by_lot[lot].get("migration_files")]
+    for lot in migrators[1:]:
+        union.union(migrators[0], lot)
     chosen = set(ranked)
     for lot in ranked:
         for blocker in _dependencies(by_lot[lot]):

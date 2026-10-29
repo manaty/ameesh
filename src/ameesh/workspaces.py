@@ -13,7 +13,14 @@ aussi. Le runner garde l'état de délai (backoff) et l'appel ; la façade porte
 la résolution (:func:`resolve`, :func:`primary_workdir`), l'adoption bornée
 d'un worktree déplacé (0018, :func:`adopt_moved_worktree`), le différé par lot
 (#811, :func:`lot_deferral`, :func:`lot_wait`) et la règle partagée avec le
-hook (:func:`mail_hold`). Le module `dev` (L101 T4) la lira par le registre.
+hook (:func:`mail_hold`).
+
+L101 T4 : la façade est portée par le module intégré `dev` (capacité
+`workspaces`) et le cœur l'obtient par le registre, jamais par un import de
+l'implémentation (L97) : :func:`dev_module`. Au profil nu (`builtin=False`),
+le module est absent : le ménage et les worktrees sont des no-ops documentés —
+un tour éteint, aucune adoption ni résolution secondaire, aucun hold, rien
+d'écrit dans le journal.
 """
 from __future__ import annotations
 
@@ -27,6 +34,16 @@ from . import canon, housekeeping, lot_workdir, projects, registry
 
 #: Politique de ménage d'un hôte : même objet que `housekeeping.Policy`.
 Policy = housekeeping.Policy
+
+
+def dev_module():
+    """Le module `dev` qui porte la capacité `workspaces` (L101 T4), ou None.
+
+    Rendu par le registre (`registry.get("dev")`), jamais importé directement
+    (L97). Au profil nu (`_builtin()` vide), il est absent : les fonctions de
+    cette façade passent alors en no-op documenté."""
+    from .modules import registry as modules_registry
+    return modules_registry.get("dev")
 
 
 def policy(canons, host: str) -> Policy:
@@ -86,8 +103,11 @@ def worktree_marker(cwd: str | None) -> dict:
 
     `git_common_dir` est le dépôt commun (le même pour tous les worktrees) ;
     la branche distingue les worktrees d'un même dépôt. Best-effort : renvoie
-    `{}` si le dossier n'est pas un dépôt ou si git manque.
+    `{}` si le dossier n'est pas un dépôt ou si git manque, et au profil nu
+    (pas de module `dev`) : les worktrees y sont un no-op.
     """
+    if dev_module() is None:
+        return {}
     if not cwd or not os.path.isdir(cwd):
         return {}
     try:
@@ -110,6 +130,8 @@ def worktree_marker(cwd: str | None) -> dict:
 
 def write_worktree_marker(cfg, name: str, cwd: str) -> dict:
     """Écrit le marqueur du dossier de travail dans l'état de l'agent."""
+    if dev_module() is None:
+        return {}
     marker = worktree_marker(cwd)
     if not marker:
         return {}
@@ -151,7 +173,9 @@ def adopt_moved_worktree(db, agent: dict, *, marker_path: str,
     configurées, en profondeur bornée, et on refuse un dossier déjà utilisé
     par un autre agent. `report` reçoit les diagnostics (l'appelant les
     journalise) ; le registre et `agent['cwd']` sont mis à jour sur succès.
-    """
+    Au profil nu (pas de module `dev`), l'adoption est un no-op."""
+    if dev_module() is None:
+        return None
     try:
         with open(marker_path, encoding="utf-8") as fh:
             marqueur = json.load(fh) or {}
@@ -197,12 +221,15 @@ def primary_workdir(agent: dict, *, mediated: bool = False,
 
     `mediated_workdir` et `adopt_worktree` sont les fournisseurs de l'appelant
     quand ce dossier n'est pas un simple `cwd` : le dépôt d'un exécuteur médié
-    (L113) et l'adoption d'un worktree déplacé (0018)."""
+    (L113) et l'adoption d'un worktree déplacé (0018). Au profil nu, le
+    dossier primaire est rendu tel quel et l'adoption est un no-op."""
     if mediated:
         return mediated_workdir() if mediated_workdir is not None else None
     cwd = agent.get("cwd")
     if cwd and os.path.isdir(cwd):
         return cwd
+    if dev_module() is None:
+        return None
     return adopt_worktree() if adopt_worktree is not None else None
 
 
@@ -217,7 +244,12 @@ def resolve(cfg, db, agent: dict, lot, *, mediated: bool = False,
     que ce lot (`secondary`), jamais le blocage global « dossier absent » (L35)
     réservé au cwd primaire. Un lot d'un projet NON déclaré par l'agent, ou un
     lot inconnu, tourne dans le cwd primaire comme avant L243-4 (#811 B1).
+    Au profil nu (pas de module `dev`), seul le primaire est résolu : aucun
+    dossier de projet secondaire, aucune adoption de worktree.
     """
+    if dev_module() is None:
+        return Workdir(primary_workdir(
+            agent, mediated=mediated, mediated_workdir=mediated_workdir))
     names = projects.agent_projects(agent)
     if len(names) > 1:  # N3 : aucun accès base pour un agent mono-projet
         try:
@@ -276,7 +308,9 @@ def mail_hold(cfg, db, agent: dict, lot, *, canons=None) -> bool:
     Faux pour le projet primaire, un projet non déclaré, un lot inconnu ou un
     dossier prêt : ces messages suivent le flux normal. Un canon illisible ne
     retient rien (flux normal), comme `problem` le fait pour son propre repli.
-    """
+    Au profil nu (pas de module `dev`), le courrier suit toujours le flux."""
+    if dev_module() is None:
+        return False
     names = projects.agent_projects(agent)
     if len(names) < 2:                # mono-projet : pas de dossier secondaire
         return False
@@ -301,7 +335,12 @@ def before_turn(cfg, policy: Policy, agent: str, cwd: str | None, *,
     tour, et il doit être conclu par :func:`after_turn`, même si le tour
     échoue. `new_session` est décidé par l'appelant — une suite de rotation,
     un travail de fond encore vivant ou un résident gardent le dossier
-    (#2610, #2619)."""
+    (#2610, #2619). Au profil nu (pas de module `dev`), le ménage est un
+    no-op : un tour éteint (`off=True`), sans dossier temporaire ni cache
+    touchés ; le tour part avec l'environnement d'origine."""
+    if dev_module() is None:
+        return housekeeping.Turn(cfg=cfg, policy=policy, agent=agent, cwd=cwd,
+                                 off=True)
     return housekeeping.Turn.begin(cfg, policy, agent, cwd,
                                    new_session=new_session, base_env=base_env)
 
@@ -312,7 +351,10 @@ def after_turn(turn, *, lot: str | None, turn_id: str, db, host: str,
 
     Quota du dossier temporaire, worktrees apparus, entrées de /tmp
     signalées, puis les conteneurs étiquetés par ce tour. Rend les entrées du
-    journal, que l'appelant écrit (`storage.of(db).housekeeping.log`)."""
+    journal, que l'appelant écrit (`storage.of(db).housekeeping.log`). Au
+    profil nu (pas de module `dev`), rien n'est conclu : aucune entrée."""
+    if dev_module() is None or turn is None:
+        return []
     entries = turn.end(lot=lot, turn_id=turn_id, db=db, host=host)
     if not turn.off:
         # conteneurs étiquetés par CE tour, sans lot : supprimés tout de
@@ -329,7 +371,10 @@ def periodic_pass(cfg, db, policy: Policy, *, host: str, actor: str,
     """Un passage d'hôte (L73), partagé par les exécuteurs et la CLI.
 
     Mêmes verrous (`host-pass`, intervalle du passage) et mêmes seuils que
-    `housekeeping.run_pass` : la façade ne fait que nommer l'entrée."""
+    `housekeeping.run_pass` : la façade ne fait que nommer l'entrée. Au profil
+    nu (pas de module `dev`), le passage est un no-op : aucune entrée."""
+    if dev_module() is None:
+        return {"status": "no-dev-module", "entries": []}
     return housekeeping.run_pass(
         cfg, db, policy, host=host, actor=actor, busy=busy,
         agents_in_turn=agents_in_turn, runtime=runtime,
@@ -350,7 +395,10 @@ def attach_env(cfg, name: str, base_env: dict, holds: list) -> dict:
     temporaire de l'agent jusqu'à la fin de la session (le verrou est ajouté
     à `holds`) et rend l'environnement à poser. Une erreur est rendue à
     l'appelant, qui journalise et garde l'environnement d'origine : la
-    préparation ne bloque jamais la session."""
+    préparation ne bloque jamais la session. Au profil nu (pas de module
+    `dev`), aucune préparation : l'environnement d'origine est rendu."""
+    if dev_module() is None:
+        return {}
     from . import canon as canon_mod
     try:
         canons = canon_mod.load_configured(cfg)

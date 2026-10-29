@@ -927,14 +927,14 @@ def _paquet(value, where: str) -> PaquetParallel:
     """#3256 C : le bloc `paquet` (seuil d'attente et plafond de paquets).
 
     `attente_mediane_s` est une durée en secondes strictement positive (le
-    seuil du canon est `3600`, jamais recopié) ; `max_paquets` un entier au
-    moins 2 (un second paquet n'a de sens qu'à deux)."""
+    seuil du canon est `3600`, jamais recopié) ; `max_paquets` vaut exactement 2
+    (seuls deux groupes sont implémentés)."""
     data = _mapping(value, where, _PAQUET_KEYS)
     attente = _positive_int(data.get("attente_mediane_s"),
                             where + ".attente_mediane_s")
     maximum = _positive_int(data.get("max_paquets"), where + ".max_paquets")
-    if maximum < 2:
-        raise MechanicsError("%s.max_paquets: 2 or more expected" % where)
+    if maximum != 2:
+        raise MechanicsError("%s.max_paquets: exactly 2 expected" % where)
     return PaquetParallel(attente_mediane_s=float(attente), max_paquets=maximum)
 
 

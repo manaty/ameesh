@@ -1,7 +1,9 @@
 # Project readiness and dispatch plan
 
 `ameesh work plan --project acme [--json]` reads the current project backlog.
-It lists every open lot, its planned dates and each reason it is waiting.
+It lists every open bug and evolution, its planned dates and each reason it is
+waiting. Improvement-backlog items are not part of this plan: they stay in
+their own queue, taken by priority, score and age (L119).
 `ameesh work plan <id> --start … --estimate …` keeps its existing meaning;
 project mode is read-only and cannot be combined with those edits.
 

@@ -987,9 +987,24 @@ class WorkItems(interface.WorkItems):
                   + ((REVIEWER_NONE, state) if waiver else ())
                   + (int(item_id), current)
                   + ((str(int(item_id)),) if held else ()))
+        validation_item = self.get(item_id) if state == "validated" else None
+        validation_marks = self.milestones(item_id, None) if state == "validated" else None
+        validation_gate = (self._validation_gate(item_id, validation_marks, item=validation_item)
+                           if state == "validated" else None)
         with self.db.transaction() as tx:
             if not _lock_migration_writer(tx, item_id):
                 return None
+            if state == "validated":
+                # The same lock serializes freezes, verdicts and manual entry.
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                         (int(item_id),))
+                gate = validation_gate
+                if (WorkItems(tx).milestones(item_id, None) != validation_marks
+                        or WorkItems(tx).get(item_id) != validation_item):
+                    gate = None
+                if not gate or not gate.get("ok"):
+                    from ...work import WorkError
+                    raise WorkError("validated requires the review quorum on the frozen head")
             rows = tx.query(sql, params)
             if not rows:
                 return None
@@ -2051,7 +2066,53 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._lapse_waiver(int(item_id), milestone, actor)
             if on_frozen is not None:
                 on_frozen(tx, milestone, threads)
+        if kind in ("verdict", "frozen"):
+            # Git/classification reads run after the writer commits. Nested
+            # designation hooks are reconciled by the outer freeze writer.
+            from ...freeze_gate import _in_transaction
+            if not _in_transaction(self.db):
+                self._sync_validation(item_id, actor)
         return milestone
+
+    def _validation_gate(self, item_id, marks=None, *, item=None):
+        from ... import merge_queue
+        item = self.get(item_id) if item is None else item
+        marks = self.milestones(item_id, None) if marks is None else marks
+        gate = merge_queue.review_gate_for_item(
+            self.db, getattr(self.db, "cfg", None), item, marks)
+        return gate
+
+    def _sync_validation(self, item_id, actor):
+        """Compute the gate outside locks, then compare the immutable ledger.
+
+        Any concurrent freeze/verdict invalidates this observation. The next
+        writer reconciles its own snapshot; no stale quorum can promote a lot.
+        """
+        item = self.get(item_id)
+        if item["state"] != "qa" or item.get("workflow_ref"):
+            return
+        marks = self.milestones(item_id, None)
+        from ... import plan_git
+        freeze = plan_git.latest_freeze(marks)
+        # Refreezing alone resets validation, including on the same SHA.
+        if not freeze or not any(mark.get("kind") == "verdict"
+                                 and mark["id"] > freeze["id"] for mark in marks):
+            return
+        gate = self._validation_gate(item_id, marks, item=item)
+        if not gate or not gate.get("ok"):
+            return
+        with self.db.transaction() as tx:
+            tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                     (int(item_id),))
+            if (WorkItems(tx).milestones(item_id, None) != marks
+                    or WorkItems(tx).get(item_id) != item):
+                return
+            rows = tx.query("UPDATE work_items SET state = 'validated', updated_at = now()"
+                            " WHERE id = %s AND state = 'qa' AND " + _UNPINNED + " RETURNING id",
+                            (int(item_id),))
+            if rows:
+                WorkItems(tx)._event(int(item_id), "validated",
+                                    "qa → validated — review quorum (#4423)", actor)
 
     def _lapse_waiver(self, item_id, milestone, actor) -> None:
         """#1979 : un gel d'une AUTRE tête lève la dispense de re-verdict

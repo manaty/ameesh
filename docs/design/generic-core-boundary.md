@@ -65,16 +65,40 @@ behind `work close --done`). `git-merge` is declared by the built-in `dev`
 tooling provider in `DELIVERY_CONNECTORS` and read through
 `registry.delivery_connectors()`; its evidence is either `{sha}`/`{pr}` (a
 declared merge, `work merged`) or `{action}` (a merge confirmed by the gate).
-`dev` is not a lifecycle module: it is absent from `discover()` and the canon
-cannot select it. Installed entry points cannot declare connectors, and a name
-declared twice or taken by the core is refused. `registry.merge_connector()`
-replaces `work_lifecycle.delivery_connector()`. The lot journal names the
-connector (`[via <connector>]`); storage is unchanged. Tranche 2b (#4366)
+L101 tranche 4 (#4357) integrates `dev` on the Module interface: `discover()`
+lists it as a built-in tooling module with the `workspaces` capability and no
+work item type. It is always active, and the canon still cannot select it (a
+descriptor without types is refused in a project policy) until L98 T2 defines
+activation by federation or host. The core obtains the workspaces façade
+through `registry.get("dev")`; its `audit` hook delegates the `canon check`
+workspace findings (`host-work-dir-*`, `host-workspaces-unknown`) under the
+Module interface. Those settings are host-scoped, so `modules.audit` runs the
+hook once, with `project=None`, after the project modules: one finding is not
+repeated per project and carries its host and agent. The bare profile has no
+`dev` module and documents housekeeping and worktrees as no-ops. Installed
+entry points cannot declare connectors, and a name declared twice or taken by
+the core is refused. `registry.merge_connector()` replaces
+`work_lifecycle.delivery_connector()`. The lot journal names the connector
+(`[via <connector>]`); storage is unchanged. Tranche 2b (#4366)
 routes the merges observed by the sweeps and the packet and merge-queue paths
 (`plan_git`, `plan_github`, `packet_close`, `merge_pr`, `fire`) through the
 same verb, with a third `git-merge` evidence `{seen: <source>, sha, pr}`; a
 test refuses any new direct call to `work.close_merged` outside the
 `git-merge` connector and `work.record_merge`.
+
+L100 tranche 1 (#4382) moves the development merge paths into the built-in
+`dev` provider. The `git-merge` action connector lives in
+`modules/dev/git_merge.py`; `connectors.get("git-merge")` reads it through
+`registry.action_connectors()`, which follows the delivery rule: the core
+keeps `shell-noop`, a name declared twice or taken by the core is refused, and
+installed entry points cannot declare action connectors. The `work merge-pr`
+gesture lives in `modules/dev/merge_pr.py`; the `ameesh work merge-pr` route is
+unchanged. The old paths `ameesh.connectors.git_merge` and `ameesh.merge_pr`
+are `sys.modules` aliases of the same module object, so importers and tests
+patching a module global by the old name keep working;
+`tests/test_l100_dev_aliases.py` pins identity and patching for both. Those two
+aliases are the only new direct module imports outside `modules/`, declared as
+exceptions in `tests/test_generic_core.py` until L104 removes them.
 
 The boundary check preserves the current runtime behavior. Module activation,
 renamed persisted states, validation as a stored state, extraction of development

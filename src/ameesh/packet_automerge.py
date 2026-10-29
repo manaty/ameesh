@@ -69,7 +69,6 @@ import re
 import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 from urllib.parse import quote, unquote
 
@@ -499,7 +498,7 @@ def _parallel_freeze_checks(repo: str, target: str, head: str,
 
     Rend `(état, motif)` : `ok`, `red` (la fusion ou un contrôle échoue — le
     second revient en file) ou `inconclusive` (worktree, délai, OSError : la
-    preuve manque, le porteur n'est ni clos ni fusionné, §3).
+    preuve manque, §3).
     """
     if not repo:
         return "inconclusive", "no clone to run the freeze checks"
@@ -527,8 +526,10 @@ def _parallel_freeze_checks(repo: str, target: str, head: str,
             [os.path.join(base, "src")] + ([env["PYTHONPATH"]]
                                            if env.get("PYTHONPATH") else []))
         try:
+            from pathlib import Path
+            from .project_python import project_python
             checks = subprocess.run(
-                [sys.executable, os.path.join(base, "scripts", "freeze-checks.py")],
+                [project_python(Path(base)), os.path.join(base, "scripts", "freeze-checks.py")],
                 cwd=base, capture_output=True, text=True, timeout=timeout, env=env)
         except (OSError, subprocess.SubprocessError) as exc:
             return "inconclusive", "freeze checks could not run: %s" % exc
@@ -661,7 +662,7 @@ def _parallel_proof(db, repo: str, lot: int, *, composition: str, target: str,
     second dans la cible avancée est un négatif déterministe (conflit,
     manifestes plus disjoints, contrôle de gel rouge) — le second revient en
     file. `inconclusive` : la preuve manque (manifeste, délai, worktree,
-    OSError), le porteur n'est ni clos ni fusionné (§3). `ok` : les deux
+    OSError), une recomposition du même porteur est demandée (§3). `ok` : les deux
     manifestes testés restent disjoints, la fusion est propre et les contrôles
     verts ; la marque est écrite par l'appelant sous le bail renouvelé, puis
     la fusion peut suivre sans relancer la suite complète.
@@ -1253,6 +1254,19 @@ def _fresh_events(slug: str, head: str, rid: int, attempt: int, *, gh) -> list[d
     return ci_mod.events_of(runs, int(rid), int(attempt))
 
 
+def _inherited_gate(pairs, rollup, provenance, *, slug: str, gh, head: str,
+                    target: str) -> tuple:
+    """#4549 (B3 de dev1, confirmé par cx2) : la porte du paquet porte les
+    mêmes preuves que le feu — workflow, tête et base de la cible — pour le
+    remplacement d'une suite échouée au plan par une suite verte sans test.
+    Sans ces preuves, `fire._supersede_testless_runs` ne remplace rien (le
+    doute ne verdit jamais) ; l'appel sans elles de la version précédente
+    laissait une suite verte d'un autre workflow ou sur une base périmée
+    masquer un rouge."""
+    return fire._required_gate(pairs, rollup, provenance, strict=False,
+                               slug=slug, gh=gh, head=head, target=target)
+
+
 def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
                    project, gh) -> dict | None:
     """#3558 : la preuve qu'une tête n'est rouge que d'échecs **hérités** de
@@ -1532,8 +1546,9 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
     masked_provenance = ([masked_run(run) for run in provenance]
                          if provenance is not None else None)
     try:
-        gaps, _consigned = fire._required_gate(pairs, masked_rollup,
-                                               masked_provenance, strict=False)
+        gaps, _consigned = _inherited_gate(pairs, masked_rollup,
+                                           masked_provenance, slug=slug,
+                                           gh=gh, head=sha, target=base)
         proof_gaps, _proof_consigned = fire._packet_proof_gate(masked_rollup)
         detail_gaps, _detail_consigned = fire._aggregate_detail_gate(masked_rollup)
     except Exception:  # noqa: BLE001 - une porte illisible ne fusionne pas
@@ -1678,11 +1693,17 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
                     return dict(out, result="pending", why=proof.get("why") or
                                 "second paquet : le premier n'est pas encore fusionné")
                 if proof.get("state") == "inconclusive":
-                    # §3 : une preuve manquante (délai, worktree, OSError) n'est
-                    # ni un conflit ni une fusion ; le porteur reste ouvert et
-                    # le passage suivant rejoue la preuve.
+                    # Preserve the carrier and its units; the composer retries
+                    # on the current target with full CI instead of waiting
+                    # forever for this host-specific exemption proof.
+                    if not _renew(handle):
+                        return dict(out, result="busy")
+                    if not _note_fenced(db, fence, lot, "parallel-recompose", slug,
+                                        number, sha, proof.get("why") or "?", actor,
+                                        margin_s=AUTOMERGE_CALL_MARGIN_S):
+                        return dict(out, result="busy")
                     return dict(out, result="pending",
-                                why="preuve du second paquet non concluante: %s"
+                                why="preuve du second paquet non concluante: %s; recomposition demandée"
                                     % (proof.get("why") or "?"))
                 if proof.get("state") == "conflict":
                     if not _renew(handle):
