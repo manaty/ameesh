@@ -36,10 +36,14 @@ The gesture, and its guards (all checked BEFORE any write):
    green CI (`radar.commit_ci`), and the project's `gates` run on the merged
    tree before the push;
 4. **the PR** is read by `gh`: open, not a draft, its base is the target, its
-   head is the given frozen SHA, its `mergeStateStatus` is `CLEAN`/`HAS_HOOKS`
-   and all its checks are concluded and green (`radar.ci_green`) — nothing is
-   weakened: a blocked PR, behind (`BEHIND`) or with a non-green check is
-   refused; the target's **required checks** (#2273) are read like the fire
+   head is the given frozen SHA, its `mergeStateStatus` is `CLEAN`,
+   `HAS_HOOKS` or `UNSTABLE` — nothing is weakened: a blocked PR or behind
+   (`BEHIND`) is refused; on `CLEAN`/`HAS_HOOKS` all its checks are concluded
+   and green (`radar.ci_green`), on `UNSTABLE` (#4549) the only tolerated
+   non-green checks are optional ones and a run superseded by a newer green
+   suite that ran no test (the packet proof and the aggregate detail still
+   gate), while every required check is proven by the same gate as the fire;
+   the target's **required checks** (#2273) are read like the fire
    does (`fire.required_checks`: branch protection completed by
    `radar.projects.<p>.required_checks`) and must be present and `SUCCESS` on
    the frozen head — an absent `tests` check is not proven by a green
@@ -211,8 +215,37 @@ def _branch_name(target: str) -> str:
     return merge_queue._remote_branch((target or "").strip())
 
 
+def _unstable_ci_ok(rollup, project=None, branch=None) -> bool:
+    """#4549 : sous `UNSTABLE`, les seuls non-verts tolérés sont les checks
+    facultatifs et un run supplanté par une suite verte sans test.
+
+    Les checks **requis** sont déjà prouvés par `_required_refusal` (même
+    règle que le feu) ; restent les portes qui ne sont pas des checks requis
+    de la forge : les statuts exigés, la preuve du portier `paquet` et le
+    détail de l'agrégat `tests` gardent leurs refus. Un négatif facultatif
+    n'arrête donc pas le geste, comme la protection GitHub ne l'exige pas."""
+    contexts = [(entry.get("context"), entry.get("state"))
+                for entry in rollup or ()
+                if isinstance(entry, dict)
+                and (entry.get("__typename") == "StatusContext"
+                     or "state" in entry and "conclusion" not in entry)]
+    if radar._status_success(contexts, radar.required_statuses(project, branch)):
+        return False
+    proof_gaps, _ = fire._packet_proof_gate(rollup)
+    if proof_gaps:
+        return False
+    detail_gaps, _ = fire._aggregate_detail_gate(rollup)
+    return not detail_gaps
+
+
 def _pr_guards(view: dict, pr: int, head: str, target: str, project=None) -> None:
-    """The guards carried by the PR view, replayed before any write."""
+    """The guards carried by the PR view, replayed before any write.
+
+    #4549 : `UNSTABLE` n'est plus refusé d'emblée. GitHub le rend quand des
+    checks facultatifs ou un run supplanté ne sont pas verts, alors que les
+    checks requis le sont ; les checks requis restent prouvés par
+    `_admission` (`_required_refusal`) et les statuts exigés ici. `BLOCKED`,
+    `BEHIND` ou `DIRTY` restent refusés."""
     state = (view.get("state") or "").upper()
     if state != "OPEN":
         raise MergePrError("PR #%d is %s, not open: nothing to merge" % (pr, state or "?"))
@@ -226,13 +259,22 @@ def _pr_guards(view: dict, pr: int, head: str, target: str, project=None) -> Non
     if base and _branch_name(base) != _branch_name(target):
         raise MergePrError("PR #%d targets %s, not %s" % (pr, base, target))
     merge_state = (view.get("mergeStateStatus") or "").upper()
-    if merge_state not in ("CLEAN", "HAS_HOOKS"):
+    if merge_state not in ("CLEAN", "HAS_HOOKS", "UNSTABLE"):
         raise MergePrError(
             "PR #%d is not mergeable now (mergeStateStatus %s): the direct path never "
             "weakens what the API checks — required checks, reviews or the base state "
             "must be settled first" % (pr, merge_state or "?"))
-    required = radar.required_statuses(project, (view.get("headRefName") or "").strip() or None)
-    if not radar.ci_green(view.get("statusCheckRollup") or [], required):
+    branch = (view.get("headRefName") or "").strip() or None
+    required = radar.required_statuses(project, branch)
+    rollup = view.get("statusCheckRollup") or []
+    if merge_state == "UNSTABLE":
+        if not _unstable_ci_ok(rollup, project, branch):
+            raise MergePrError(
+                "PR #%d: the only tolerated non-green checks under UNSTABLE are "
+                "optional ones and a run superseded by a newer green suite; the "
+                "packet proof or a required status is still missing" % pr)
+        return
+    if not radar.ci_green(rollup, required):
         raise MergePrError("PR #%d: the checks on %s are not all concluded and green"
                            % (pr, head[:12]))
 
@@ -345,7 +387,8 @@ def _required_refusal(slug: str, target: str, project, rollup, *, head: str = ""
         except land.LandError as exc:
             return ("the source of the required checks of %s cannot be proven: %s"
                     % (target, exc))
-    gaps = fire._required_gap(pairs, rollup, provenance)
+    gaps = fire._required_gap(pairs, rollup, provenance, slug=slug,
+                              gh=gh, head=head, target=target)
     if gaps:
         return "the required checks of %s are not proven: %s" % (target, ", ".join(gaps))
     return ""
@@ -378,12 +421,20 @@ def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict, *,
         raise MergePrError("PR #%s on the freeze %s: %s"
                            % (view.get("number"), head[:12] or "?", refusal))
 
+    #: #4549 : sous `UNSTABLE`, un non-vert facultatif ou un run supplanté ne
+    #: bloque plus la file ; `_required_refusal` ci-dessus a déjà prouvé les
+    #: checks requis, `_unstable_ci_ok` garde le portier et le détail.
+    unstable_ok = ((view.get("mergeStateStatus") or "").upper() == "UNSTABLE"
+                   and _unstable_ci_ok(rollup, project, branch))
+
     def ci_status(name: str):
         if not branch or name != branch:
             return None
         return {"number": view.get("number"), "url": view.get("url") or "",
                 "head": head.lower(),
-                "green": radar.ci_green(rollup, radar.required_statuses(project, branch)),
+                "green": (unstable_ok
+                          or radar.ci_green(rollup,
+                                           radar.required_statuses(project, branch))),
                 "draft": bool(view.get("isDraft"))}
 
     clone = resolutions.Replayer(repo, owner)

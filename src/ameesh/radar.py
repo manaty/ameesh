@@ -1449,11 +1449,142 @@ def _status_success(contexts, required) -> list:
     return [p for p in required if not any((c or "").startswith(p) for c in won)]
 
 
+#: #4549 : le job de planification de la suite `tests`. Son échec saute
+#: toutes les parts qui en dépendent : la suite n'exécute alors aucun test.
+PLAN_CHECK = "plan"
+#: #4549 : préfixe des checks de flux d'une part (`ci.CHECK_PREFIX`). Leur
+#: existence prouve qu'une part a démarré, donc qu'un test a pu s'exécuter.
+#: Recopié ici pour rester lisible sans import circulaire ; `ci.py` reste la
+#: source du nom.
+TEST_FLOW_PREFIX = "tests (flux)"
+
+
+def _entry_name(entry) -> str:
+    """Le nom d'une entrée de rollup : `name` d'un check run, `context` d'un
+    statut de commit."""
+    return str(entry.get("name") or entry.get("context") or "")
+
+
+def _started_stamp(entry):
+    """La date de début d'une entrée de rollup, en secondes epoch, ou None.
+
+    Un statut de commit porte sa date sous `startedAt` (export `gh`) ou
+    `createdAt` (GraphQL brut) ; un check run sous `startedAt`."""
+    from datetime import datetime
+
+    raw = entry.get("startedAt") or entry.get("createdAt")
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return stamp.timestamp() if stamp.tzinfo is not None else None
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def testless_failure(checks, name, required=()) -> bool:
+    """#4549 : la suite a-t-elle échoué au plan **sans exécuter de test** ?
+
+    La preuve est fermée par défaut : un job `plan` en `FAILURE`, aucun check
+    de flux de part (`tests (flux) …`) — une part qui démarre publie le sien —,
+    aucun autre négatif que le plan et les checks requis, et aucun check
+    encore en cours. Un test rouge, une part lancée ou une suite encore
+    active ne sont donc jamais masqués. `required` nomme les autres checks
+    requis : leur échec, dans une suite au plan rouge, ne prouve pas un test
+    exécuté (toutes les parts dépendent du plan)."""
+    rows = [entry for entry in checks or () if isinstance(entry, dict)]
+    plan = [entry for entry in rows if _entry_name(entry) == PLAN_CHECK]
+    if not plan or not any(check_result(entry) == CI_NEGATIVE_RESULT
+                           for entry in plan):
+        return False
+    required = set(required or ())
+    for entry in rows:
+        label = _entry_name(entry)
+        if label.startswith(TEST_FLOW_PREFIX):
+            return False
+        if check_result(entry) == CI_WAITING_RESULT:
+            return False
+        if label in (PLAN_CHECK, name) or label in required:
+            continue
+        if check_result(entry) == CI_NEGATIVE_RESULT:
+            return False
+    return True
+
+
+def _supersede_testless(latest, rows) -> list:
+    """#4549 : une suite plus récente conclue verte remplace, pour un même
+    workflow et un même nom de check, une suite plus ancienne dont le check a
+    échoué au plan sans exécuter de test.
+
+    Le choix se fait **par suite** et non par date de check : une suite dont
+    le plan a échoué tôt peut finir son agrégat après une suite verte plus
+    récente. Dates absentes ou ex aequo, suite inconnue, suite concurrente
+    encore en cours, plan de la suite verte non prouvé, ou ancien échec non
+    prouvé « sans test » : toutes les entrées restent (le doute ne verdit
+    jamais). Le workflow est porté par la clé de groupe (`workflowName`) :
+    deux workflows homonymes ne se masquent pas."""
+    by_suite: dict = {}
+    for entry in rows:
+        if not isinstance(entry, dict):
+            continue
+        suite = entry.get("checkSuiteId")
+        if suite is not None:
+            by_suite.setdefault(suite, []).append(entry)
+    groups: dict = {}
+    for entry in latest:
+        suite = entry.get("checkSuiteId")
+        # Sans nom de workflow (rollup construit depuis la seule provenance),
+        # deux workflows homonymes ne se distinguent pas : rien n'est masqué.
+        if suite is None or entry.get("workflowName") is None:
+            continue
+        groups.setdefault((entry.get("workflowName"), _entry_name(entry)),
+                          []).append(entry)
+    drop = set()
+    for (workflow, name), entries in groups.items():
+        if len(entries) < 2:
+            continue
+        timeline = []
+        for entry in entries:
+            suite = entry.get("checkSuiteId")
+            checks = by_suite.get(suite) or []
+            stamps = [_started_stamp(check) for check in checks]
+            if not stamps or any(stamp is None for stamp in stamps):
+                timeline = []
+                break
+            timeline.append((min(stamps), suite, entry, checks))
+        if len(timeline) < 2 or len({row[0] for row in timeline}) != len(timeline):
+            continue
+        timeline.sort(key=lambda row: row[0])
+        newest = timeline[-1]
+        if check_result(newest[2]) != CI_GREEN_RESULT:
+            continue
+        if not any(_entry_name(check) == PLAN_CHECK
+                   and check_result(check) == CI_GREEN_RESULT
+                   for check in newest[3]):
+            continue
+        failures = [row for row in timeline[:-1]
+                    if check_result(row[2]) == CI_NEGATIVE_RESULT]
+        if not failures:
+            continue
+        if any(check_result(row[2]) == CI_WAITING_RESULT for row in timeline):
+            continue
+        if any(not testless_failure(row[3], name, required=(name,))
+               for row in failures):
+            continue
+        # La suite entière est écartée : son `plan` rouge et ses parts sautées
+        # ne sont pas des preuves de test. Les autres suites de la même tête
+        # (dont la verte plus récente) restent seules juges.
+        drop.update((workflow, row[1]) for row in failures)
+    return [entry for entry in latest
+            if (entry.get("workflowName"), entry.get("checkSuiteId")) not in drop]
+
+
 def latest_rollup(rollup) -> list:
     """#2524 : les derniers checks par (workflow, nom), statuts par contexte.
     #3008 : une suite connue (`checkSuiteId`, rollup construit depuis les
     check runs de la tête) entre dans la clé : deux workflows homonymes ne se
     masquent pas.
+    #4549 : une suite plus récente conclue verte remplace la même vérification
+    d'une suite plus ancienne échouée au plan sans exécuter de test
+    (`_supersede_testless`) ; un rouge de test reste, lui, bloquant.
 
     Seule une date strictement plus récente remplace une entrée. Dates
     absentes, invalides ou ex aequo : garder les entrées ambiguës afin de ne
@@ -1461,8 +1592,9 @@ def latest_rollup(rollup) -> list:
     """
     from datetime import datetime
 
+    rows = list(rollup or ())
     groups = {}
-    for index, entry in enumerate(rollup or ()):
+    for index, entry in enumerate(rows):
         context = (entry.get("__typename") == "StatusContext"
                    or "state" in entry and "conclusion" not in entry)
         name = entry.get("context" if context else "name")
@@ -1485,7 +1617,7 @@ def latest_rollup(rollup) -> list:
         else:
             newest = max(stamp for _, stamp in entries)
             latest.extend(entry for entry, stamp in entries if stamp == newest)
-    return latest
+    return _supersede_testless(latest, rows)
 
 
 def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
