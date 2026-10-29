@@ -138,11 +138,13 @@ une tête testée n'est pas publiable (`--publish`, #4237).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -177,6 +179,9 @@ DEFAULT_TIMEOUT = 1800
 DEFAULT_PARALLEL = 1
 #: #4271 : code de sortie d'`ameesh heavy` arrêté par sa borne (`heavy.CAPPED_EXIT`)
 HEAVY_CAPPED_EXIT = 124
+#: #4463 : après SIGTERM au temps mural échu, le délai laissé à `ameesh heavy`
+#: pour arrêter le groupe de sa série (`heavy.GROUP_GRACE_S`, 10 s) et sortir
+WALL_GRACE_S = 20
 FREEZE_TIMEOUT = 600
 GIT_TIMEOUT = 300
 #: #4245 : `RESTART_RESERVE_S` (90 s) de l'élection, plus la lecture
@@ -1517,14 +1522,54 @@ def test_driver(worktree: Path) -> str:
 _SERIES = iter(range(1, 1 << 30))
 
 
+def run_walled(cmd: list[str], *, cwd: Path, env: dict,
+               wall: int) -> subprocess.CompletedProcess | None:
+    """#4463 : `cmd` borné en temps mural (attente d'un créneau comprise).
+
+    À l'échéance, SIGTERM (relayé par `ameesh heavy` au groupe de la série),
+    puis SIGKILL après `WALL_GRACE_S` ; None si la borne a été atteinte. La
+    commande a sa propre session : le SIGKILL atteint aussi ce qu'elle a lancé
+    dans son groupe, et la lecture des sorties reste bornée."""
+    proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=wall)
+        return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        pass
+    proc.terminate()
+    try:
+        proc.communicate(timeout=WALL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.kill()
+        try:
+            proc.communicate(timeout=WALL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            # un descendant hors du groupe tient les tubes : on les lâche
+            for pipe in (proc.stdout, proc.stderr):
+                with contextlib.suppress(OSError):
+                    pipe.close()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=WALL_GRACE_S)
+    return None
+
+
 def run_tests(worktree: Path, label: str, modules: list[str], *,
-              timeout: int, heavy: bool = False) -> TestRun:
+              timeout: int, heavy: bool = False,
+              wall: int | None = None) -> TestRun:
     """Une série unittest bornée par `timeout` (au-delà : non concluant).
 
     #4271 : avec `heavy`, la série prend un créneau de l'hôte
     (`ameesh heavy --max-duration`) et son propre schéma par défaut : la borne
     est tenue par `heavy`, qui arrête tout le groupe de la série ; l'attente
-    d'un créneau a la même borne en plus."""
+    d'un créneau a la même borne en plus.
+
+    #4463 : avec `wall` (le temps restant de l'échéance totale), attente du
+    créneau et exécution tiennent ensemble dans `wall` secondes (`run_walled`) ;
+    au-delà, la série est non concluante."""
     if not modules:
         return TestRun(label=label, modules=[], returncode=0, output="",
                        seconds=0.0)
@@ -1537,6 +1582,18 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
         cmd = [wrapper, "heavy", "--max-duration", "%ds" % timeout, "--", *cmd]
         env["AMEESH_SCHEMA"] = "t_paq_%d_%d" % (os.getpid(), next(_SERIES))
         wait = timeout + 60
+    if wall is not None:
+        proc = run_walled(cmd, cwd=worktree, env=env, wall=wall)
+        if proc is None:
+            return save_test_log(TestRun(
+                label=label, modules=list(modules), returncode=None,
+                output="borne totale des tests par unité atteinte après %d s "
+                       "(attente du créneau comprise) : série arrêtée (#4463)" % wall,
+                seconds=time.monotonic() - start, timed_out=True))
+        return save_test_log(TestRun(
+            label=label, modules=list(modules), returncode=proc.returncode,
+            output=_output(proc), seconds=time.monotonic() - start,
+            timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT))
     try:
         proc = run_command(cmd, cwd=worktree, timeout=timeout + wait, env=env)
         result = TestRun(label=label, modules=list(modules),
@@ -1774,8 +1831,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
 
     #4463 : `deadline` (horloge monotone) borne la durée totale : chaque série
     est bornée au temps restant ; une série qui n'est pas partie à l'échéance
-    est non concluante sans être jouée. En parallèle, l'attente d'un créneau
-    `ameesh heavy` s'y ajoute (au plus la borne de la série et 60 s).
+    est non concluante sans être jouée. L'attente d'un créneau `ameesh heavy`
+    compte dans ce temps (`run_tests(wall=…)`) : à l'échéance la série est
+    arrêtée, au plus `WALL_GRACE_S` après.
     """
     runs: list[TestRun] = []
     red: list[tuple[TestRun, list[dict]]] = []
@@ -1823,7 +1881,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             log("tests %s : borne totale atteinte, série non jouée (non "
                 "concluant)" % label)
             return budget_spent(label, modules)
-        return run_tests(worktree, label, modules, timeout=limit, **slots)
+        # sous l'échéance, attente du créneau comprise (relecture cx3)
+        walled = {"wall": limit} if deadline is not None else {}
+        return run_tests(worktree, label, modules, timeout=limit, **slots, **walled)
 
     def unit_job(label: str, modules: list[str]):
         return lambda: bounded(label, modules)
