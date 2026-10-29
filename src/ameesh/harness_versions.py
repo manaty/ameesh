@@ -113,17 +113,23 @@ def probe(harness: str, *, run=subprocess.run) -> dict:
     return out
 
 
-def probe_and_record(db, host: str, harness_ids, *, run=subprocess.run) -> list[dict]:
+def probe_and_record(db, host: str, harness_ids, *, run=subprocess.run,
+                     record: bool = True) -> list[dict]:
     """Probe each harness and record what was read; a harness that is not
-    found is not recorded (`ameesh doctor --harness` says it)."""
+    found is not recorded (`ameesh doctor --harness` says it).
+
+    `record=False` only reads (the dry run of `ameesh veille scan`, #4438):
+    the answer is returned, nothing is written to `harness_versions`."""
     found = []
     for harness in sorted(set(harness_ids)):
         item = probe(harness, run=run)
         if item["path"] is None:
             found.append(item)
             continue
-        storage.of(db).hosts.record_harness_version(
-            host, harness, path=item["path"], version=item["version"], raw=item["raw"])
+        if record:
+            storage.of(db).hosts.record_harness_version(
+                host, harness, path=item["path"], version=item["version"],
+                raw=item["raw"])
         found.append(item)
     return found
 

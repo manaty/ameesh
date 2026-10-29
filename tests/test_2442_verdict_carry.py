@@ -500,6 +500,16 @@ class CarryTest(PgTestCase):
         self.assertEqual(again["result"], "idle")
         self.assertEqual(len(self.on(frozen)), 2)
 
+    def test_carried_quorum_persists_validation(self):
+        self.verdict("rev1", self.repo.reviewed)
+        self.verdict("rev2", self.repo.reviewed)
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+        with mock.patch.object(merge_queue, "review_gate_for_item",
+                               side_effect=lambda *args, **kw: self.gate(frozen)):
+            self.assertEqual(self.carry()["result"], "carried")
+        self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+
     def test_a_block_is_carried_too(self):
         self.verdict("rev1", self.repo.reviewed, "blocked")
         self.verdict("rev2", self.repo.reviewed)

@@ -471,6 +471,35 @@ def _preemption_generation(worker) -> int:
         return worker.preempt_gen
 
 
+def declared_adoption_binaries(harness: str, host: str) -> set[str]:
+    """Les binaires installés déclarés sur CET hôte (#4488).
+
+    La carte locale est relue à chaque tour : un binaire installé puis déclaré
+    est vu sans redémarrer l'exécuteur. Une carte illisible est une erreur
+    d'hôte (fail-closed), jamais un laissez-passer."""
+    from . import harness_adoption
+    try:
+        return harness_adoption.declared_binaries(harness, host)
+    except harness_adoption.VeilleError as exc:
+        raise adapters.HarnessMissing("harness-adoption bins: %s" % exc) from exc
+
+
+def agent_adapter(harness: str, harness_bin: str | None,
+                  host: str) -> adapters.HarnessAdapter:
+    """L'adaptateur d'un agent, avec la garde de lecture de #4488.
+
+    Un `harness_bin` écrit en base n'est lancé que s'il est DÉCLARÉ sur cet
+    hôte : carte des binaires installés (`harness_adoption`), `harness_bins`
+    de la configuration, ou `AMEESH_<HARNAIS>_BIN`. Sinon c'est une erreur
+    d'hôte (`HarnessMissing`) : le tour n'est pas lancé, et le binaire nommé
+    par la base ne reçoit jamais les identifiants du compte."""
+    if harness_bin:
+        adapters.require_declared_harness_bin(
+            harness, harness_bin, host=host,
+            extra=declared_adoption_binaries(harness, host))
+    return adapters.adapter_for(harness, harness_bin)
+
+
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
     MAX_RENEW_FAILURES = 3
@@ -5973,7 +6002,15 @@ class AgentWorker(threading.Thread):
         # #4293 : binaire choisi pour CET agent (canari d'adoption) ; NULL =
         # résolution de l'hôte inchangée. Un tour déjà lancé garde son
         # adaptateur : la ligne est relue au début du tour suivant.
-        adapter = adapters.adapter_for(harness, (self.agent or {}).get("harness_bin") or None)
+        agent = self.agent or {}
+        choisi = agent.get("harness_bin") or None
+        if choisi and agent.get("harness") and harness != agent.get("harness"):
+            # #4488 : le binaire épinglé est celui du harnais de l'agent. Un
+            # tour de repli (L242b) ou le résumé d'une rotation sous l'ancien
+            # harnais ne doit ni lancer ce binaire sous un autre adaptateur,
+            # ni être bloqué par sa garde : on reprend la résolution de l'hôte.
+            choisi = None
+        adapter = agent_adapter(harness, choisi, getattr(self.cfg, "host", ""))
         # Traçabilité de chaîne d'approvisionnement (décision 0021) : chaque
         # descripteur utilisé est journalisé avec sa provenance et son empreinte,
         # une fois par changement (pas à chaque tour).
@@ -11240,8 +11277,8 @@ class Runner:
         readable) can lift the cause after the freeze; the freeze is kept, so
         the same head is replayed, never a newer one. #3328: the same pass
         reattributes a seat whose designated reviewer became unreachable (host
-        closed, stopped/dead). Bounded and never fatal: the canon sync must not
-        fail because a designation retry did."""
+        closed, stopped/dead, blocked/auth_blocked #4491). Bounded and never
+        fatal: the canon sync must not fail because a designation retry did."""
         if getattr(self, "mediated", False):
             return
         if not getattr(self, "_designation_retry_ready", False):
@@ -11472,15 +11509,30 @@ class Runner:
         except (db_mod.DbError, handoffs.HandoffError, ValueError):
             log_async("host lifecycle: request remains pending; helper or prerequisites unavailable")
 
-    def host_release_once(self) -> None:
-        """#4148: one release-scanner pass (adapter transitions, auto drain)."""
+    def host_release_once(self, *, scan_local=True, complete=False) -> None:
+        """#4148: one release-scanner pass (adapter transitions, auto drain).
+
+        #4435: `scan_local=False` is the bounded one-shot pass: it advances
+        the durable requests but never starts an automatic withdrawal of the
+        calling host. `complete=True` then closes the returns whose claims the
+        pass just reopened, since no later resource pass may come.
+        """
         from . import host_release
         db = None
         try:
             from .scoped_db import ScopedDb
             db = ScopedDb(self.cfg)
-            host_release.once(self.cfg, db, local_host=self.host,
+            if complete:
+                from . import host_lifecycle
+                # No resource pass will call `host_lifecycle_once` after this
+                # one: expire the planned returns here, claims kept closed so
+                # the `busy` hook still answers first.
+                storage.of(db).host_lifecycle.expire_returns(open_claims=False)
+            host_release.once(self.cfg, db,
+                              local_host=self.host if scan_local else None,
                               actor=self.runner_id)
+            if complete:
+                host_lifecycle.complete_returns(db)
         except Exception as exc:  # a scanner pass never stops the runner
             log_async("host release: pass failed (%s: %s)"
                       % (type(exc).__name__, str(exc)[:160]))
@@ -11492,8 +11544,16 @@ class Runner:
                     pass
 
     def start_host_release_poll(self) -> None:
-        """#4148: transitions every minute; the idle scan is spaced in the DB."""
-        if self.once or getattr(self, "mediated", False):
+        """#4148: transitions every minute; the idle scan is spaced in the DB.
+
+        #4435: a one-shot executor is the only scanner of its host; it makes
+        one explicit bounded pass (no automatic withdrawal) and closes the
+        returns it reopened, then hands back.
+        """
+        if getattr(self, "mediated", False):
+            return
+        if self.once:
+            self.host_release_once(scan_local=False, complete=True)
             return
 
         def boucle() -> None:
@@ -13658,9 +13718,10 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
               file=sys.stderr)
         return 1
     try:
-        # #4293 : le binaire du canari suit l'agent en session interactive aussi
-        adapter = adapters.adapter_for(agent.get("harness") or "other",
-                                       agent.get("harness_bin") or None)
+        # #4293 : le binaire du canari suit l'agent en session interactive
+        # aussi ; #4488 : seulement s'il est déclaré sur cet hôte.
+        adapter = agent_adapter(agent.get("harness") or "other",
+                                agent.get("harness_bin") or None, cfg.host)
         # #2706 : refus AVANT le bail. `dsh --profile agent` est headless et
         # exige une tâche : l'ancien code prenait le bail, lançait la commande
         # sans texte, puis le rendait en 4 s après « a task is required »,

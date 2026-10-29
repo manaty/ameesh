@@ -187,6 +187,29 @@ class EpochLostTest(unittest.TestCase):
                 auto.record_packet(pathlib.Path("."), 4000, "a", "b", "br", "main")
         self.assertNotIsInstance(caught.exception, auto.EpochLost)
 
+    def test_record_packet_porte_la_tete_poussee_attendue(self):
+        """#4501 : le composeur dit la tête poussée qu'il remplace."""
+        done = subprocess.CompletedProcess([], 0, b"recorded", b"")
+        with mock.patch.object(auto, "run_command", return_value=done) as run:
+            auto.record_packet(pathlib.Path("."), 4000, "a", "b", "br", "main",
+                               expect_pushed="c" * 40)
+        cmd = run.call_args.args[0]
+        self.assertIn("--expect-pushed", cmd)
+        self.assertEqual(cmd[cmd.index("--expect-pushed") + 1], "c" * 40)
+
+    def test_compose_passe_la_tete_poussee_attendue_au_record(self):
+        """#4501 : la liaison par unité reçoit le même bail que la poussée."""
+        done = subprocess.CompletedProcess([], 0, b"ok", b"")
+        with mock.patch.object(auto, "project_python", return_value="python3"), \
+                mock.patch.object(auto, "run_command", return_value=done) as run:
+            auto._compose(pathlib.Path("."), auto.Candidate(1, "a" * 40), 4000,
+                          pathlib.Path("paquet-compose.py"), True,
+                          expect_pushed="c" * 40)
+        cmd = run.call_args.args[0]
+        self.assertIn("--record-package", cmd)
+        self.assertIn("--expect-pushed", cmd)
+        self.assertEqual(cmd[cmd.index("--expect-pushed") + 1], "c" * 40)
+
     def compose(self, refuse_after_tests):
         """#4304 : poussée, gel et ci-full avant les tests par unité ; la garde
         refuse (`EpochLost`) avant les tests ou après des tests verts."""

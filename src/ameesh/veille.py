@@ -47,7 +47,7 @@ import time
 import urllib.parse
 import urllib.request
 
-from . import harness_versions, storage, work
+from . import harness_adoption, harness_versions, storage, work
 
 #: schéma du rapport de `scan` (`ameesh veille scan --json`)
 SCHEMA = "ameesh-veille/1"
@@ -524,15 +524,22 @@ def billed_models(db, harness: str, days: float, *, now: float | None = None) ->
     return [str(row["model"]) for row in rows if str(row.get("model") or "").strip()]
 
 
-def installed_versions(db, harness: str, *, overview=None) -> dict:
+def installed_versions(db, harness: str, *, overview=None, fresh=None) -> dict:
     """Les versions installées de `harness`, par hôte, et l'écart éventuel.
 
-    Les hôtes qui portent un agent de ce harnais mais n'ont aucun relevé sont
-    nommés dans `missing` : un hôte muet n'est pas un hôte à jour."""
+    `fresh` ({hôte: item}) superpose les relevés de la sonde de ce passage aux
+    lignes enregistrées : un dry-run juge ainsi sur l'état réel sans l'écrire
+    (#4438). Les hôtes qui portent un agent de ce harnais mais n'ont aucun
+    relevé sont nommés dans `missing` : un hôte muet n'est pas un hôte à jour."""
     rows = [row for row in storage.of(db).hosts.harness_versions()
             if row.get("harness") == harness]
     hosts = {str(row["host"]): {"version": row.get("version"), "path": row.get("path")}
              for row in rows}
+    for host, item in (fresh or {}).items():
+        if item.get("path") is None:
+            continue
+        hosts[str(host)] = {"version": item.get("version"),
+                            "path": item.get("path")}
     if overview is None:
         try:
             overview = storage.of(db).agents.overview()
@@ -908,6 +915,16 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
         if dry_run:
             open_lot = work.open_with_source(db, key)
             if open_lot is not None:
+                if harness_adoption.open_adoption_for(db, int(open_lot["id"])):
+                    # #4312 (A x C) : une adoption est en cours sur ce lot ;
+                    # réécrire son objet ferait diverger le titre de la version
+                    # adoptée et le rapport B suivant serait refusé.
+                    actions.append({"harness": source.harness,
+                                    "action": "kept-object",
+                                    "lot": int(open_lot["id"]),
+                                    "reason": "an adoption is in progress; "
+                                              "signal deferred"})
+                    continue
                 marker = _marker(open_lot.get("body") or "")
                 if _keeps_open(marker, obj):
                     actions.append({"harness": source.harness,
@@ -930,6 +947,13 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
             with _locked(db, key) as tx:
                 open_lot = work.open_with_source(tx, key)
                 if open_lot is not None:
+                    if harness_adoption.open_adoption_for(tx, int(open_lot["id"])):
+                        actions.append({"harness": source.harness,
+                                        "action": "kept-object",
+                                        "lot": int(open_lot["id"]),
+                                        "reason": "an adoption is in progress; "
+                                                  "signal deferred"})
+                        continue
                     marker = _marker(open_lot.get("body") or "")
                     if _keeps_open(marker, obj):
                         # Un lot ouvert garde son objet : un modèle différent
@@ -989,15 +1013,16 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
 # le passage quotidien
 # --------------------------------------------------------------------------
 
-def probe_local(cfg, db, sources) -> list[dict]:
-    """Lit la version de chaque harnais surveillé **sur cet hôte** et l'enregistre."""
+def probe_local(cfg, db, sources, *, record: bool = True) -> list[dict]:
+    """Lit la version de chaque harnais surveillé **sur cet hôte** et
+    l'enregistre, sauf `record=False` (dry-run : lecture seule, #4438)."""
     from . import adapters
     adapters.configure(cfg)
     found: list[dict] = []
     for source in sources:
         try:
             found.extend(harness_versions.probe_and_record(
-                db, cfg.host, [source.harness]))
+                db, cfg.host, [source.harness], record=record))
         except Exception as exc:  # noqa: BLE001 - une sonde ne juge pas les autres
             found.append({"harness": source.harness, "path": None, "version": None,
                           "raw": None,
@@ -1012,7 +1037,8 @@ def scan(cfg, db, *, sources=None, dry_run: bool = False, probe: bool = True,
 
     `sources` borne la lecture à ces identifiants de harnais (commande
     `--harness`) ; `probe=False` n'écrit rien dans `harness_versions` (tests,
-    lecture seule) ; `dry_run` n'écrit aucun lot."""
+    lecture seule) ; `dry_run` sonde sans enregistrer et n'écrit aucun lot
+    (write nothing)."""
     config = settings(cfg)
     report = {"schema": SCHEMA, "host": getattr(cfg, "host", ""),
               "enabled": bool(config.sources), "reconciled": False,
@@ -1026,8 +1052,10 @@ def scan(cfg, db, *, sources=None, dry_run: bool = False, probe: bool = True,
     if unknown:
         report["errors"].append("harness not declared in veille.sources: %s"
                                 % ", ".join(unknown))
+    probed = []
     if probe:
-        report["probed"] = probe_local(cfg, db, selected)
+        probed = probe_local(cfg, db, selected, record=not dry_run)
+        report["probed"] = probed
     if config.host and config.host != getattr(cfg, "host", ""):
         report["reconciled"] = False
         report["reason"] = "reconciliation is assigned to %s" % config.host
@@ -1043,7 +1071,10 @@ def scan(cfg, db, *, sources=None, dry_run: bool = False, probe: bool = True,
                  "recommendation": {}, "models": {}, "billed": [],
                  "decision": {}, "error": ""}
         try:
-            installed = installed_versions(db, source.harness, overview=overview)
+            installed = installed_versions(
+                db, source.harness, overview=overview,
+                fresh={getattr(cfg, "host", ""): item
+                       for item in probed if item.get("harness") == source.harness})
             published_row = published(source, http_get=http_get,
                                       github_api=github_api)
             billed = billed_models(db, source.harness, config.model_days, now=now)

@@ -219,6 +219,28 @@ class _ReadyAdapter:
         return self.adapter.revalidate(op)
 
 
+def complete_returns(db, *, hosts=None):
+    """#4435: close the returns whose claims the release scanner reopened.
+
+    A host without a long-running executor of its own (a one-shot `--once`
+    run, a mediated host whose scanner is the server) would otherwise stay
+    `returning` after its claims are open: the resource pass that calls
+    `advance_host` never comes. The storage guard still requires every origin
+    home and unfenced, so this only finishes a return that is truly done.
+    """
+    api = storage.of(db).host_lifecycle
+    wanted = None if hosts is None else set(hosts)
+    done = []
+    for control in api.listing():
+        if wanted is not None and control["host"] not in wanted:
+            continue
+        if control.get("mode") != "returning" or not control.get("claims_open"):
+            continue
+        if api.complete_return(control["host"], control["generation"]):
+            done.append(control["host"])
+    return done
+
+
 def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
     """One critical-first controller pass; no host effect without the enrolled helper."""
     api = storage.of(db)
