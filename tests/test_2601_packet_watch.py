@@ -164,7 +164,7 @@ class Carriers(unittest.TestCase):
                       {"id": 2600, "branch": "integration/paquet-84-nexlink", "app": "nexlink"},
                       {"id": 2601, "branch": "lot/2601-x", "app": "ameesh"}],
             "intake": [{"id": 2606, "branch": "integration/sync-main-11m", "app": "ameesh"}],
-            "merged": [{"id": 2590, "branch": "integration/paquet-h-20261019-0300",
+            "delivered": [{"id": 2590, "branch": "integration/paquet-h-20261019-0300",
                         "app": "ameesh", "updated_at": recent},
                        {"id": 2580, "branch": "integration/paquet-h-20261019-0100",
                         "app": "ameesh", "updated_at": old}],
@@ -274,7 +274,7 @@ class CompositionBeforePush(unittest.TestCase):
 
 class ServedSlot(unittest.TestCase):
     def test_early_merge_silences_whole_slot_but_not_the_next(self):
-        rows = {"merged": [{"id": 2639, "branch": "integration/paquet-h-20261019-0600",
+        rows = {"delivered": [{"id": 2639, "branch": "integration/paquet-h-20261019-0600",
                             "app": "ameesh", "updated_ts": at(6, 20)}]}
         store = types.SimpleNamespace(
             items=lambda state, assignee, limit: rows.get(state, []),
@@ -300,7 +300,7 @@ class ServedSlot(unittest.TestCase):
         for merged, expected in ((at(6), [2639]), (at(5, 59), []),
                                  (at(6, 37), []), (None, [])):
             with self.subTest(merged=merged):
-                rows = {"merged": [{"id": 2639, "branch": "integration/paquet-h-x",
+                rows = {"delivered": [{"id": 2639, "branch": "integration/paquet-h-x",
                                     "app": "ameesh", "updated_ts": at(6, 20)}]}
                 store = types.SimpleNamespace(
                     items=lambda state, assignee, limit: rows.get(state, []),

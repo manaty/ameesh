@@ -388,7 +388,8 @@ class MailProjectTests(_Base):
                                          new_lot="Follow up", source_mail=mail_id)
                     self.assertEqual(work.get(self.db, view["lot"])["app"],
                                      requester_project or "parent")
-                    self.assertEqual(work.get(self.db, parent["id"])["state"], state)
+                    self.assertEqual(work.get(self.db, parent["id"])["state"],
+                                     "delivered" if state in ("merged", "promoted") else state)
                     self.assertEqual(work.events(self.db, parent["id"]), events)
 
     def test_known_requester_project_does_not_resolve_an_unused_parent(self):
