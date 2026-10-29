@@ -762,12 +762,15 @@ def _operator_pause(alert: dict) -> str:
     #4525 : le sommeil automatique du découpage (`SLEEP_REASON`) n'est pas une
     maintenance. L'alerte le reconnaît et dit qu'il est levé au premier lot
     démarrable, sans demander à l'owner de mettre fin à une maintenance.
+    #4610 : la levée est aussi automatique sur un lot attribué ou un courrier
+    du pilote ou d'un orchestrateur.
     """
     from . import file_decoupage
     if alert.get("sleep") or file_decoupage.is_sleep_reason(alert.get("reason")):
         return ("Automatic sleep still in place: %s. This is the automatic sleep of an "
-                "exhausted roadmap, not a maintenance: it is lifted by the first startable "
-                "lot of the project, and at the latest when its deadline expires. No "
+                "exhausted roadmap, not a maintenance: it is lifted by the first "
+                "startable lot, an assigned actionable lot, or pilot/orchestrator "
+                "mail, and at the latest when its deadline expires. No "
                 "operator action is expected; the owner is not asked to end any "
                 "maintenance." % (alert.get("detail") or "?"))
     return ("Operator pause still in place: %s. Expected action: check with whoever set it "

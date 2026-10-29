@@ -137,6 +137,7 @@ POSITIVE = {
     "packet_tests.parallel": "UNIT_TESTS_PARALLEL = 4\n",
     "file.repos_part": "REPOS_PART = 0.2\n",
     "file.repos_s": "REPOS_S = 1800\n",
+    "file.wake_mail_s": "WAKE_MAIL_S = 1800\n",
     "session.max_tokens": "SESSION_MAX_TOKENS = 150000\n",
     "session.max_tokens_by_harness":
         'SESSION_MAX_TOKENS_BY_HARNESS = {"codex": 2000000}\n',

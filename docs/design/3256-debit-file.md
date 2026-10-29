@@ -99,7 +99,12 @@ Quand le pilote note la feuille de route épuisée :
 
 Les relecteurs et les agents critiques ne sont jamais mis en sommeil par ce
 geste. Le premier lot démarrable qui arrive réveille les agents en sommeil,
-dans l'ordre normal de prise.
+dans l'ordre normal de prise. #4610 : un agent à qui un lot actionnable est
+attribué, ou qui reçoit un courrier non lu de son pilote ou d'un
+orchestrateur, n'est pas endormi ; s'il l'était déjà, la pause est levée à
+l'arrivée du lot ou du courrier, avec l'acteur et la raison au journal de la
+pause. La fenêtre du courrier récent est `file.wake_mail_s` (secondes), à
+défaut `file.repos_s`.
 
 ### 2.4 Acceptation de A
 
@@ -112,7 +117,10 @@ dans l'ordre normal de prise.
 - Témoins :
   - aucun déclenchement sous 20 % ou sous 30 min ;
   - aucun déclenchement quand un lot démarrable existe ;
-  - un seul lot de découpage par projet ouvert.
+  - un seul lot de découpage par projet ouvert ;
+  - #4610 : un lot actionnable attribué ou un courrier récent du pilote ou
+    d'un orchestrateur retient l'agent, et la pause est levée à l'arrivée de
+    l'un ou de l'autre (acteur et cause au journal des pauses).
 
 ## 3. Lot B : mesure de débit de l'auditeur **[owner]**
 

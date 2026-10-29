@@ -29,6 +29,11 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   dormeurs. #4525 : une relecture désignée ouverte, ou le dernier relecteur
   disponible d'une famille pendant qu'un gel attend un avis, n'est jamais
   endormi ; le motif d'exemption est journalisé sur le lot de découpage.
+  #4610 : un agent à qui un lot actionnable est attribué, ou qui a reçu un
+  courrier non lu de son pilote ou d'un orchestrateur, n'est pas endormi (le
+  courrier compte s'il a moins de `file.wake_mail_s`, à défaut `file.repos_s`,
+  secondes) ; la pause est levée dès qu'un de ces deux événements arrive,
+  avec l'acteur et la raison au journal de la pause.
 
 « Au repos » se lit comme `idle_capacity` (#1677 : sans lot actionnable) ;
 la durée de 30 min porte sur la condition du projet, suivie dans l'état du
@@ -59,9 +64,14 @@ EXHAUSTED_RE = re.compile(r"^\s*roadmap\s*:\s*épuisée\s+(\S+)", re.IGNORECASE)
 SLEEP_REASON = "roadmap: épuisée %s (#3256 §2.3)"
 #: #4525 : reconnaissance de CETTE pause, pour l'alerte (une raison humaine qui
 #: ressemblerait au texte ne doit pas être prise pour le sommeil automatique)
-SLEEP_REASON_RE = re.compile(r"^roadmap\s*:\s*épuisée\s+\S+\s+\(#3256\s+§2\.3\)$")
+SLEEP_REASON_RE = re.compile(r"^roadmap\s*:\s*épuisée\s+(\S+)\s+\(#3256\s+§2\.3\)$")
 #: préfixe de la note d'exemption écrite sur le lot de découpage
 SLEEP_EXEMPT_PREFIX = "sleep exempted:"
+#: #4610 : préfixe de la raison de levée automatique, au journal des pauses
+SLEEP_LIFT_PREFIX = "automatic sleep lifted:"
+#: #4610 : courriers relus par agent pour retrouver le dernier envoi du pilote
+#: ou d'un orchestrateur (les plus récents d'abord, `mail.history`)
+MAIL_HISTORY_LIMIT = 200
 #: état du notifieur : `{projet: début de la condition}`
 STATE_KEY = "queue_fill"
 
@@ -74,6 +84,12 @@ def is_sleep_reason(reason) -> bool:
     premier lot démarrable lève le sommeil.
     """
     return bool(SLEEP_REASON_RE.match(str(reason or "").strip()))
+
+
+def project_of_sleep_reason(reason) -> str:
+    """#4610 : le projet que porte la raison du sommeil ("" si inconnu)."""
+    match = SLEEP_REASON_RE.match(str(reason or "").strip())
+    return match.group(1) if match else ""
 
 
 def source_of(project: str) -> str:
@@ -490,21 +506,109 @@ def _journal_exemption(db, split_id, name: str, why: str) -> None:
         pass
 
 
+def _fresh_state(db, names) -> tuple:
+    """#4610 : relit l'état des candidats au moment du geste.
+
+    Le relevé de la passe précède de peu le sommeil : un lot attribué, une
+    relecture due ou un courrier arrivé entre-temps ne doit pas être ignoré.
+    Rend `({nom: ligne}, erreur)` ; une lecture en échec ne fait endormir
+    personne (le doute épargne, comme #4525).
+    """
+    from . import db as db_mod
+    wanted = {str(name) for name in names if name}
+    if not wanted:
+        return {}, None
+    try:
+        rows = storage.of(db).operations.listing()
+    except db_mod.Unavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 - le doute ne retire personne
+        return {}, "%s: %s" % (type(exc).__name__, str(exc)[:160])
+    return {str(row.get("name")): row for row in rows or ()
+            if str(row.get("name") or "") in wanted}, None
+
+
+def _senders(cfg, db, listing, projects, *, canons=None) -> tuple:
+    """#4610 : les expéditeurs dont le courrier compte.
+
+    Les orchestrateurs déclarés du registre (`sous_utilisation.alert_orchestrators`,
+    rôle du canon ou `AMEESH_ALERT_ORCHESTRATORS`) et les pilotes des projets
+    de l'agent (`alert_briefs.project_pilots`) : rien n'est propre à un projet
+    ni à un nom en dur. Rend `(noms, erreur)` ; une erreur de lecture invite à
+    ne pas endormir, jamais à deviner.
+    """
+    from . import alert_briefs
+    try:
+        names = set(su.alert_orchestrators(cfg, db, listing, canons=canons))
+    except Exception as exc:  # noqa: BLE001 - rôle illisible : le doute épargne
+        return set(), "%s: %s" % (type(exc).__name__, str(exc)[:160])
+    for project in projects or ():
+        try:
+            names.update(alert_briefs.project_pilots(
+                project, listing, cfg=cfg, db=db, canons=canons))
+        except Exception:  # noqa: BLE001 - les orchestrateurs couvrent le rôle
+            continue
+    return names, None
+
+
+def _recent_mail(db, name: str, *, now: float, senders, window_s=None) -> tuple:
+    """#4610 : les courriers NON LUS de `senders`, les plus récents d'abord.
+
+    `window_s` borne l'âge (None : aucune borne, pour la levée). `mail.history`
+    lit les derniers courriers : un agent en sommeil peut accumuler plus de
+    `UNREAD_LIMIT` non-lus, que `mail.unread` (du plus ancien au plus récent)
+    ne montrerait pas. Un message passif (copie, accusé) ne réveille pas.
+    Rend `(messages, erreur)`.
+    """
+    from . import mail
+    try:
+        rows = mail.history(db, name, limit=MAIL_HISTORY_LIMIT)
+    except Exception as exc:  # noqa: BLE001 - une lecture en échec n'endort pas
+        return [], "%s: %s" % (type(exc).__name__, str(exc)[:160])
+    out = []
+    for row in rows or ():
+        if row.get("delivered_ts") is not None:
+            continue
+        if str(row.get("sender") or "").strip() not in senders:
+            continue
+        if mail.passive_reason(row):
+            continue
+        if window_s is not None:
+            created = row.get("created_ts")
+            if created is None or now - float(created) > float(window_s):
+                continue
+        out.append(row)
+    return out, None
+
+
 def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
-           split_id=None, lots=(), listing=(), cfg=None, canons=None) -> list:
+           split_id=None, lots=(), listing=(), cfg=None, canons=None,
+           mail_window_s=None) -> list:
     """Met en sommeil les agents d'exécution au repos du projet (§2.3).
 
     #4525 : une relecture désignée ouverte n'est jamais endormie, et le dernier
     relecteur disponible d'une famille ne l'est non plus tant qu'un gel du
     projet attend un avis. Le motif est journalisé sur le lot de découpage.
+
+    #4610 : un lot actionnable attribué, ou un courrier non lu récent du pilote
+    ou d'un orchestrateur, retient aussi l'agent. L'état est relu au moment du
+    geste : le relevé de la passe peut précéder l'attribution ou le courrier.
     """
     from . import agent_pause
+    from . import projects as projects_mod
     out = []
     reason = SLEEP_REASON % project
     pending, keep, unreadable = _reviewer_spares(
         db, project, lots, listing, cfg=cfg, canons=canons)
     if unreadable:
         why = "review exemptions unreadable: %s" % unreadable
+        _journal_exemption(db, split_id, "*", why)
+        for name in item.idle:
+            out.append({"agent": name, "slept": False, "why": why})
+        return out
+    fresh, fresh_error = _fresh_state(db, item.idle)
+    if fresh_error:
+        why = "fresh state unreadable: %s" % fresh_error
         _journal_exemption(db, split_id, "*", why)
         for name in item.idle:
             out.append({"agent": name, "slept": False, "why": why})
@@ -528,6 +632,36 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
             out.append({"agent": name, "slept": False, "why": why})
             _journal_exemption(db, split_id, name, why)
             continue
+        row = fresh.get(name) or by_name.get(name) or {}
+        if int(row.get("actionable_lots") or 0) > 0:
+            lot_id = row.get("assigned_lot_id")
+            why = ("assigned actionable lot #%s" % lot_id if lot_id
+                   else "actionable work due")
+            out.append({"agent": name, "slept": False, "why": why})
+            _journal_exemption(db, split_id, name, why)
+            continue
+        if int(row.get("unread") or 0):
+            senders, mail_error = _senders(
+                cfg, db, listing, projects_mod.agent_projects(row), canons=canons)
+            if mail_error:
+                why = "mail exemptions unreadable: %s" % mail_error
+                out.append({"agent": name, "slept": False, "why": why})
+                _journal_exemption(db, split_id, name, why)
+                continue
+            recent, mail_error = _recent_mail(
+                db, name, now=now, senders=senders, window_s=mail_window_s)
+            if mail_error:
+                why = "mail exemptions unreadable: %s" % mail_error
+                out.append({"agent": name, "slept": False, "why": why})
+                _journal_exemption(db, split_id, name, why)
+                continue
+            if recent:
+                age = now - float(recent[0].get("created_ts") or now)
+                why = "unread mail from %s (%s)" % (
+                    recent[0].get("sender"), su._duration(age))
+                out.append({"agent": name, "slept": False, "why": why})
+                _journal_exemption(db, split_id, name, why)
+                continue
         try:
             done = agent_pause.change(db, name, paused=True, reason=reason,
                                       actor=SLEEP_ACTOR, principal=owner, now=now)
@@ -571,6 +705,57 @@ def _wake(db, project: str, listing: list) -> list:
     return out
 
 
+def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None) -> list:
+    """#4610 : lève le sommeil dès qu'un lot actionnable est attribué à l'agent
+    ou qu'un courrier non lu de son pilote ou d'un orchestrateur arrive.
+
+    Le geste est journalisé dans `operator_pause_events` : acteur
+    `ameesh:file-decoupage`, principal humain, raison « automatic sleep
+    lifted: … » qui nomme la cause. Seule la pause du sommeil automatique est
+    levée (`expect_reason`), jamais une pause d'opérateur. Une lecture en
+    échec laisse la pause en place : le passage suivant réessaie.
+    """
+    from . import agent_pause
+    from . import projects as projects_mod
+    woken: dict = {}
+    for row in listing:
+        name = str(row.get("name") or "").strip()
+        reason = str(row.get("operator_pause_reason") or "")
+        if not name or not row.get("operator_paused") or not is_sleep_reason(reason):
+            continue
+        why = None
+        if int(row.get("actionable_lots") or 0) > 0:
+            lot_id = row.get("assigned_lot_id")
+            why = ("assigned actionable lot #%s" % lot_id if lot_id
+                   else "actionable work due")
+        elif int(row.get("unread") or 0):
+            senders, mail_error = _senders(
+                cfg, db, listing, projects_mod.agent_projects(row), canons=canons)
+            if mail_error:
+                continue
+            recent, mail_error = _recent_mail(db, name, now=now, senders=senders)
+            if mail_error or not recent:
+                continue
+            why = "unread mail from %s" % recent[0].get("sender")
+        if why is None:
+            continue
+        owner = (row.get("operator_pause_for") or row.get("operator_pause_by")
+                 or _owner_of([row]))
+        if not owner:
+            continue
+        try:
+            done = agent_pause.change(
+                db, name, paused=False,
+                reason="%s %s" % (SLEEP_LIFT_PREFIX, why),
+                actor=SLEEP_ACTOR, principal=owner, expect_reason=reason)
+        except Exception:  # noqa: BLE001 - la pause reste, le prochain passage réessaie
+            continue
+        if done.get("changed"):
+            woken.setdefault(project_of_sleep_reason(reason), []).append(name)
+    return [{"kind": "wake", "project": project, "agents": sorted(names)}
+            for project, names in sorted(woken.items())]
+
+
 def run(cfg, db, *, now: float | None = None, state: dict | None = None,
         dry_run: bool = False, actor: str = "ameesh:file-decoupage",
         listing: list | None = None, canons=None, settings=None) -> list:
@@ -600,6 +785,11 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
     state[STATE_KEY] = since
     by_name = {row["name"]: row for row in listing}
     out = []
+    # #4610 : la levée sur lot attribué ou courrier ne dépend pas du lot de
+    # découpage encore ouvert : elle se fait à chaque passe, pour tous les
+    # dormeurs du sommeil automatique.
+    if not dry_run:
+        out.extend(_wake_work(db, listing, now, cfg=cfg, canons=canons))
     for project, item in sorted(measures.items()):
         split = _open_split(db, project)
         if item.startable:
@@ -626,7 +816,8 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
             if not item.startable and item.idle and not dry_run:
                 slept = _sleep(db, project, item, by_name, now,
                                split_id=int(split["id"]), lots=lots, listing=listing,
-                               cfg=cfg, canons=canons)
+                               cfg=cfg, canons=canons,
+                               mail_window_s=settings.mail_window())
                 if slept:
                     out.append({"kind": "sleep", "project": project,
                                 "lot": int(split["id"]), "agents": slept})
@@ -661,7 +852,8 @@ def exhausted_alerts(db, listing: list) -> list:
         out.append(su._alert(
             "roadmap_exhausted", None, None, 1, None,
             "roadmap exhausted for %s: the pilot noted it on split lot #%d; idle "
-            "execution agents are asleep until a startable lot arrives, burst hosts are "
+            "execution agents are asleep until a startable lot, an assigned actionable "
+            "lot, or pilot/orchestrator mail arrives, burst hosts are "
             "released by the host drain (#3167 B). Action: add roadmap items or a "
             "decision (ameesh decide), or close #%d" % (
                 project, int(split["id"]), int(split["id"])),
