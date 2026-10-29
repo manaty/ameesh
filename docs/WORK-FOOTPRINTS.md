@@ -63,6 +63,8 @@ repository:
 
 - is not offered to idle agents (`unassigned_lots`, L165), and the take
   re-checks the rule under the dependency-graph lock after locking the lot;
+- is shown as waiting by the project dispatch plan (`ameesh work plan
+  --project`), the same rule as the dispatcher;
 - is refused by `ameesh work assign`, which names the overlapping lots and
   paths. Nothing is written. Reassigning a lot that already occupies its
   footprint is not affected;
