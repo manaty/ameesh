@@ -47,6 +47,27 @@ def _bounded(text, limit=DETAIL_MAX):
     return " ".join(str(text or "").split())[:limit]
 
 
+def _canon_read(cfg):
+    """(canons, unknown): `unknown` is a configured canon that did not load.
+
+    An empty canons list may mean "no canon" (no card can declare a hook) or
+    "the canon is unreadable" (its Host card may hold the only hook). The two
+    must not lead to the same decision: the second never reopens a claim.
+    """
+    from . import canon as canon_mod
+    try:
+        entries = canon_mod.configured(cfg)
+    except Exception:
+        return [], True
+    try:
+        canons = canon_mod.load_configured(cfg)
+    except Exception:
+        return [], True
+    if entries and len(canons) != len(entries):
+        return canons, True
+    return canons, False
+
+
 def hook_for(cfg, canons, host):
     """The adapter command of `host`, or None.
 
@@ -352,12 +373,19 @@ def _busy_sample_ok(cfg, api, db, row, *, now):
     return _fresh_reading(cfg, db, row["host"], now=now, after=after)
 
 
-def _advance(cfg, api, db, row, *, controls, listing, canons, holds, known,
-             actor, runner, now, clock):
+def _advance(cfg, api, db, row, *, controls, listing, canons, canon_unknown,
+             holds, known, actor, runner, now, clock):
     """One transition decision for a controlled host. Returns a short reason."""
     host = row["host"]
     mode = row.get("mode")
-    hook = hook_for(cfg, canons, host)
+    if canon_unknown:
+        # A configured canon did not load: its Host card may declare the only
+        # hook. Never open a claim or emit a release without knowing it.
+        return "canon unreadable"
+    try:
+        hook = hook_for(cfg, canons, host)
+    except ValueError:
+        return "hook configuration ambiguous"
     if not hook:
         # No adapter: keep the historical L232e behaviour. A return opened by
         # an operator still reopens claims; nothing is released.
@@ -505,12 +533,13 @@ def enter_draining(cfg, db, host, *, actor, runner=None, clock=time.time):
     row = api.get(host)
     if row is None or row.get("mode") not in ("draining", "returning"):
         return row
-    from . import canon as canon_mod
+    canons, canon_unknown = _canon_read(cfg)
+    if canon_unknown:
+        return row
     try:
-        canons = canon_mod.load_configured(cfg)
-    except Exception:
-        canons = []
-    hook = hook_for(cfg, canons, host)
+        hook = hook_for(cfg, canons, host)
+    except ValueError:
+        return row
     if not hook:
         return row
     if row.get("hook_state") == "idle-drained":
@@ -542,12 +571,16 @@ def request_return(cfg, db, host, *, actor, runner=None, now=None, clock=time.ti
     requested = api.note_return_request(host, actor=actor)
     if requested is not None:
         row = requested
-    from . import canon as canon_mod
+    canons, canon_unknown = _canon_read(cfg)
+    if canon_unknown:
+        # A configured but unreadable canon may hold the only Host-card hook:
+        # keep the claims closed and the return intent durable for the next
+        # pass, never take the "no adapter" branch.
+        return api.get(host)
     try:
-        canons = canon_mod.load_configured(cfg)
-    except Exception:
-        canons = []
-    hook = hook_for(cfg, canons, host)
+        hook = hook_for(cfg, canons, host)
+    except ValueError:
+        return api.get(host)
     now = clock() if now is None else float(now)
     if not hook:
         if row.get("mode") == "returning" and not row.get("claims_open"):
@@ -602,7 +635,8 @@ def once(cfg, db, *, local_host=None, actor="", now=None, runner=None,
     # #4148: the release scanner runs on every agent runner, every minute.
     # The expensive work views are read only when a controlled host needs them
     # or the local idle scan is due, never on a quiet pass.
-    cache = {"listing": None, "canons": None, "holds": None, "known": None}
+    cache = {"listing": None, "canons": None, "canon_unknown": False,
+             "holds": None, "known": None}
 
     def _listing():
         if cache["listing"] is None:
@@ -614,11 +648,7 @@ def once(cfg, db, *, local_host=None, actor="", now=None, runner=None,
 
     def _canons():
         if cache["canons"] is None:
-            from . import canon as canon_mod
-            try:
-                cache["canons"] = canon_mod.load_configured(cfg)
-            except Exception:
-                cache["canons"] = []
+            cache["canons"], cache["canon_unknown"] = _canon_read(cfg)
         return cache["canons"]
 
     def _holds():
@@ -649,8 +679,11 @@ def once(cfg, db, *, local_host=None, actor="", now=None, runner=None,
             if row is None or row.get("mode") not in ("draining", "returning"):
                 if host == local_host and lock.get("scan_due"):
                     try:
+                        canons = _canons()
+                        if cache["canon_unknown"]:
+                            continue
                         _auto_drain(cfg, api, db, host, owner=owner,
-                                    listing=_listing(), canons=_canons(),
+                                    listing=_listing(), canons=canons,
                                     holds=_holds(), controls=controls, actor=actor,
                                     now=now, runner=runner, clock=clock)
                     except (ValueError, OSError):
@@ -658,7 +691,8 @@ def once(cfg, db, *, local_host=None, actor="", now=None, runner=None,
                 continue
             try:
                 _advance(cfg, api, db, row, controls=controls, listing=_listing(),
-                         canons=_canons(), holds=_holds(), known=_known(),
+                         canons=_canons(), canon_unknown=cache["canon_unknown"],
+                         holds=_holds(), known=_known(),
                          actor=actor, runner=runner, now=now, clock=clock)
             except (ValueError, OSError):
                 # A conflicting or malformed adapter command must not stop the

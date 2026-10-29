@@ -283,6 +283,25 @@ class HostReleaseTest(PgTestCase):
         self.assertEqual(self.control()["mode"], "draining")
         self.assertEqual(self.states(), ["draining"])
 
+    def test_unreadable_canon_never_reopens_without_busy(self):
+        self.add_agent()
+        self.cfg = dataclasses.replace(self.cfg, lifecycle_hooks={})
+        self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
+        self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
+                        "WHERE host='vm'")
+        self.api.host_lifecycle.expire_returns(open_claims=False)
+        with mock.patch("ameesh.canon.configured", return_value=[object()]), \
+                mock.patch("ameesh.canon.load_configured",
+                           side_effect=RuntimeError("unreadable canon")):
+            host_lifecycle.undrain(self.cfg, self.db, "vm", actor="human:op")
+            control = self.control()
+            self.assertEqual(control["mode"], "returning")
+            self.assertFalse(control["claims_open"])
+            self.assertIsNotNone(control["return_requested_ts"])
+            self.once(now=time.time())
+            self.assertFalse(self.control()["claims_open"])
+            self.assertEqual(self.control()["mode"], "returning")
+
     def test_hook_added_after_a_drain_closes_claims_before_draining(self):
         self.add_agent()
         no_hook = dataclasses.replace(self.cfg, lifecycle_hooks={})
