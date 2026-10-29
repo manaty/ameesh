@@ -1505,6 +1505,23 @@ def _manual_covers(inputs: Inputs) -> bool:
     return not rd.unknown_families(inputs.authors)
 
 
+def _held_manual(inputs: Inputs, reported: Sequence[str] = ()) -> list:
+    """Les sièges manuels gardés qui doivent être relancés sur cette tête.
+
+    #4582 : ils couvrent un avis (`missing: 0`) mais n'ont pas de verdict sur
+    la tête gelée et leur avis antérieur n'est pas reporté. `reported` sont les
+    acteurs dont le verdict va être reporté (#2442), même quand le plan est
+    partiel. Les sièges qui y figurent, comme ceux qui ont déjà rendu un avis
+    sur la tête (`inputs.answered`), ne sont pas relancés."""
+    answered = {str(name or "").strip().lower()
+                for name in inputs.answered or () if str(name or "").strip()}
+    answered |= {str(name or "").strip().lower()
+                 for name in reported or () if str(name or "").strip()}
+    return [dict(seat) for seat in inputs.manual_seats or ()
+            if str((seat or {}).get("name") or "").strip().lower()
+            not in answered]
+
+
 def _verdicts_on(db, lot: int, sha: str) -> tuple:
     """Les acteurs qui ont déjà un verdict sur `sha` (tête gelée), #4582.
 
@@ -2634,12 +2651,7 @@ def _selection(inputs: Inputs, port, *, force: bool = False,
     tête. `inputs.answered` écarte de même les avis déjà rendus sur elle."""
     if force:
         port = _ForcedPort(port)
-    answered = {str(name or "").strip().lower()
-                for name in inputs.answered or () if str(name or "").strip()}
-    answered |= {str(name or "").strip().lower()
-                 for name in reported or () if str(name or "").strip()}
-    held = [dict(seat) for seat in inputs.manual_seats or ()
-            if str((seat or {}).get("name") or "").strip().lower() not in answered]
+    held = _held_manual(inputs, reported)
     return rd.apply(
         inputs.item, policy=inputs.policy.rules, paths=list(inputs.paths),
         port=port, freeze_sha=str(inputs.freeze.get("sha") or ""),
@@ -3041,7 +3053,7 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
         # #2812 : la même lecture que la désignation, réutilisée par la
         # notification des blocages levés (aucune lecture git redoublée).
         reading["excluded"] = _excluded_names(inputs)
-    if _manual_covers(inputs):
+    if _manual_covers(inputs) and not _held_manual(inputs, reported):
         return _manual_outcome(tx, item, freeze, inputs.manual)
     checkpoint = len(threads)
     _savepoint(tx)
@@ -3056,6 +3068,11 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
         else:
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads),
                              reported=reported)
+            if _manual_covers(inputs) and out.get("state") == "manual":
+                # #4582 : les demandes nommaient déjà cette tête (ou le siège
+                # est introuvable) : aucune marque, le journal de la
+                # couverture manuelle reste l'issue du gel (comme #3596).
+                out = _manual_outcome(tx, item, freeze, inputs.manual)
             if out.get("state") in (rd.DESIGNATED, rd.WAITING):
                 # #3596 : une désignation partielle reste `waiting` et nomme
                 # les sièges déjà pourvus ; la colonne les garde.
@@ -3506,7 +3523,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                     "why": inputs.why}
         # #3554 : même journal hors du hook (reprise), une fois par tête.
         _note_canon_lowering(db, item, freeze, inputs)
-        if _manual_covers(inputs):
+        if _manual_covers(inputs) and not _held_manual(inputs, reported):
             # #3596 : la couverture manuelle finale est marquée au journal
             # (`MANUAL_PREFIX`) pour que la boucle de reprise ne relise pas la
             # politique à chaque passe.
@@ -3584,6 +3601,11 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
                                                 at_freeze=False, retired=removed),
                              force=force, reported=reported)
+            if _manual_covers(inputs) and out.get("state") == "manual":
+                # #4582 : couverture manuelle complète sans nouvelle demande
+                # (les courriers nomment déjà cette tête) : le journal #3596
+                # reste l'issue du gel, comme au hook.
+                out = _manual_outcome(tx, item, freeze, inputs.manual)
             names = ([r.get("name") for r in out.get("reviewers") or ()]
                      if out.get("state") in (rd.DESIGNATED, rd.WAITING) else [])
             _sync_reviewers(tx, item, freeze, names)

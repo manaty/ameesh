@@ -86,6 +86,34 @@ class DesignationReaskTest(_ReaskFixture):
         self.assertEqual([row["recipient"] for row in self.request_mails()],
                          ["rev2"])
 
+    def test_a_full_manual_coverage_asks_its_held_seats_on_the_new_head(self):
+        # B/P2 d'ameesh-cx2 (29/10) : deux sièges manuels couvrent tous les
+        # avis requis (`_manual_covers`), aucun siège automatique ne manque.
+        # Leurs avis sur A ne sont pas reportés en B : chacun doit pourtant
+        # recevoir la demande de B, et la marque doit porter les deux `sent`.
+        _, outcome = self.freeze(self.repo.reviewed)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        self.verdict("rev1", self.repo.reviewed)
+        self.verdict("rev2", self.repo.reviewed)
+        self.redesignate("rev1")
+        self.redesignate("rev2")
+        self.db.execute("DELETE FROM agent_mailbox")
+        changed = self.repo.author_commit()
+        self.receipt(changed)
+        _, outcome = self.freeze(changed)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        self.assertEqual(outcome["required"], 2)
+        self.assertEqual(outcome["reviewers"], [])
+        mark = self.last_mark()
+        self.assertEqual(sorted(entry["to"] for entry in mark["sent"]),
+                         ["rev1", "rev2"])
+        for name in ("rev1", "rev2"):
+            sent = [row for row in self.request_mails()
+                    if row["recipient"] == name
+                    and row["payload"]["review_designation"].get("sha") == changed]
+            self.assertEqual(len(sent), 1, (name, self.request_mails()))
+            self.assertIn("--sha %s" % changed, sent[0]["body"])
+
 
 class CarriedSeatTest(_ReaskFixture):
     """Un siège reporté n'est pas relancé (la face inverse du témoin)."""

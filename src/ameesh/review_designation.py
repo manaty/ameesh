@@ -1374,11 +1374,22 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         out["replayed"] = True
         return out
     state = selection["state"]
-    if state == DESIGNATED and not selection["reviewers"]:
+    manual = [dict(row) for row in selection.get("manual") or ()]
+    by_name = {str(row.get("name") or "").strip(): row for row in manual}
+    held_seats: list = []
+    for row in held or ():
+        name = str((row or {}).get("name") if isinstance(row, Mapping)
+                   else row or "").strip()
+        seat = by_name.get(name)
+        if seat is not None and seat not in held_seats:
+            held_seats.append(dict(seat))
+    if state == DESIGNATED and not selection["reviewers"] and not held_seats:
         # The manual reviewers already cover every required seat (#2627): no
-        # automatic reviewer, no mail, no designation mark to write.
+        # automatic reviewer, no mail, no designation mark to write. A held
+        # seat whose verdict was not carried still needs its exact-head
+        # request, even when no automatic reviewer is missing (#4582).
         return {"state": "manual", "required": required, "reviewers": [],
-                "missing": 0, "manual": [dict(row) for row in selection["manual"]],
+                "missing": 0, "manual": manual,
                 "why": selection["why"], "freeze": freeze}
     messages = []
     if state == WAITING and not existing:
@@ -1393,15 +1404,6 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                                      designated=selection["reviewers"]),
             "capacity": True,
         })
-    manual = [dict(row) for row in selection.get("manual") or ()]
-    by_name = {str(row.get("name") or "").strip(): row for row in manual}
-    held_seats: list = []
-    for row in held or ():
-        name = str((row or {}).get("name") if isinstance(row, Mapping)
-                   else row or "").strip()
-        seat = by_name.get(name)
-        if seat is not None and seat not in held_seats:
-            held_seats.append(dict(seat))
     first_rank = len(manual) + 1
     # The independent families available on this head: the manual seats and
     # the automatic families, the already designated ones included. Any
