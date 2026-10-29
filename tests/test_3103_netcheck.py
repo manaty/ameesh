@@ -169,7 +169,8 @@ class HostAlertTest(unittest.TestCase):
         hk = SimpleNamespace(
             last_measure=lambda _: [{"host": "pc-smichea",
                                      "data": {"docker_network": self.DATA}}],
-            worktrees=lambda *args: [], latest_by_path=lambda *args, **kwargs: [])
+            worktrees=lambda *args, **kwargs: [],
+            latest_by_path=lambda *args, **kwargs: [])
         st = SimpleNamespace(housekeeping=hk, hosts=SimpleNamespace(current=lambda _: []))
         with mock.patch.object(exploitation.storage, "of", return_value=st), \
                 mock.patch.object(exploitation.time, "time", return_value=1100), \
