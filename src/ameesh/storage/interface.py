@@ -628,6 +628,24 @@ class Catalog(Domain):
         """Les lignes qui portent ce modèle, tous fournisseurs confondus."""
 
 
+class Veille(Domain):
+    """Le relevé précédent de la veille des versions (#4291, migration 0512).
+
+    La présence au catalogue partagé n'en est pas un : `models discover` y
+    écrit avant la veille. Ce domaine est la référence durable propre à la
+    veille, par harnais et fournisseur.
+    """
+
+    @abc.abstractmethod
+    def readings(self, harness: str, provider: str) -> list[str]:
+        """Les modèles déjà vus par la veille pour ce harnais et fournisseur."""
+
+    @abc.abstractmethod
+    def record_readings(self, harness: str, provider: str,
+                        model_ids: Sequence[str]) -> int:
+        """Enregistre le relevé courant : une ligne par modèle, `last_seen` avance."""
+
+
 class PendingSpend(Domain):
     """Marqueur comptable d'un tour (`spend_pending`) : une ligne par agent.
 
@@ -796,6 +814,13 @@ class TurnCosts(Domain):
         hors lignes écartées : `{agent, harness, account, ts, usd}`. Sert à
         rapprocher l'estimation des baisses de solde compte par compte et
         intervalle par intervalle (`CostBook.paid_spent`)."""
+
+    @abc.abstractmethod
+    def models_used(self, harness: str, from_ts: float, *, limit: int = 50) -> list[dict]:
+        """#4291 : les modèles distincts réellement facturés pour ce harnais
+        depuis `from_ts` (epoch), hors lignes écartées et hors appareils
+        médiés : `{model, turns, first_ts, last_ts}`, du plus récent au plus
+        ancien. Lecture seule, bornée par `limit`."""
 
     @abc.abstractmethod
     def unpriced(self, since_ts: float, prefix: str) -> list[dict]:
@@ -2371,6 +2396,18 @@ class WorkItems(Domain):
         """Journalise une note et rafraîchit `updated_at`.
 
         `once` sérialise sur le lot et n'insère pas un texte déjà présent.
+        """
+
+    @abc.abstractmethod
+    def update_generated(self, item_id: int, *, title: str, body: str,
+                         priority: int | None, note: str, actor: str) -> dict | None:
+        """#4291 : rafraîchit le titre et le corps **générés** d'un lot ouvert
+        (veille des versions), et ne fait que **monter** la priorité (1 est la
+        plus haute) : une priorité choisie par un humain n'est jamais
+        abaissée par une détection automatique. Écriture et ligne de journal
+        `note` dans la même transaction, sous le verrou de ligne du lot ; une
+        valeur inchangée n'écrit rien. Rend le lot relu, ou None s'il n'existe
+        pas ou n'est plus ouvert.
         """
 
     @abc.abstractmethod
@@ -5182,6 +5219,7 @@ class Storage(abc.ABC):
     """Les domaines du stockage, liés à une connexion ou une transaction."""
 
     catalog: Catalog
+    veille: Veille
 
     #: nom du pilote de stockage (`postgres`)
     driver: str

@@ -177,6 +177,17 @@ class TurnCosts(interface.TurnCosts):
             " and harness in (" + ", ".join(["%s"] * len(names)) + ")",
             tuple([float(from_ts)] + names))
 
+    def models_used(self, harness, from_ts, *, limit=50) -> list[dict]:
+        return self.db.query(
+            "SELECT coalesce(model, '') AS model, count(*) AS turns,"
+            " extract(epoch from min(recorded_at))::float8 AS first_ts,"
+            " extract(epoch from max(recorded_at))::float8 AS last_ts"
+            " FROM turn_costs WHERE harness = %s AND recorded_at >= to_timestamp(%s)"
+            " AND void_reason IS NULL AND source <> 'device'"
+            " GROUP BY coalesce(model, '')"
+            " ORDER BY max(recorded_at) DESC LIMIT %s",
+            (str(harness), float(from_ts), int(limit)))
+
     def unpriced(self, since_ts, prefix) -> list[dict]:
         return self.db.query(
             "SELECT agent, harness, coalesce(model, '') AS model, count(*) AS turns,"

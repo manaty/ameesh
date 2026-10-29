@@ -57,6 +57,8 @@ TURN_CGROUP_SUBGROUP = "runner"
 SYSTEMCTL_ENV = "AMEESH_SYSTEMCTL"
 #: #3364 : la minuterie qui porte le packet-watch (`ameesh release tick`)
 RELEASE_TIMER = "ameesh-release.timer"
+#: #3264 A / #4291 : la minuterie de la veille quotidienne des versions
+VEILLE_TIMER = "ameesh-veille.timer"
 
 
 def _systemctl(*args: str) -> str | None:
@@ -464,6 +466,35 @@ def packet_watch_lines(cfg, run=_systemctl) -> list[str]:
         "             systemctl --user enable --now %s" % RELEASE_TIMER,
         "             a single cutter elsewhere: remove this host's `release` block, "
         "never disable the timer",
+    ]
+
+
+def veille_lines(cfg, run=_systemctl) -> list[str]:
+    """#3264 A : `veille.sources` déclaré mais minuterie absente.
+
+    La veille est un passage quotidien : sans `ameesh-veille.timer`, aucun lot
+    d'évaluation n'est ouvert et personne ne le voit. Le verdict du doctor ne
+    change pas (avertissement), comme pour le packet-watch."""
+    try:
+        from . import veille
+        declared = veille.settings(cfg)
+    except Exception as exc:  # noqa: BLE001 - une lecture ne casse pas le doctor
+        return ["warning    : veille configuration unreadable: %s"
+                % (" ".join(str(exc).split())[:200],)]
+    if not declared.sources:
+        return []
+    if declared.host and declared.host != cfg.host:
+        return []
+    state = run("show", VEILLE_TIMER, "-p", "ActiveState", "--value")
+    if state is None:
+        return ["veille: systemd unavailable — %s state not checked" % VEILLE_TIMER]
+    state = (state or "").strip() or "unknown"
+    if state == "active":
+        return []
+    return [
+        "warning    : veille.sources is declared for this host but %s is not active "
+        "(%s): the daily version watch is stopped" % (VEILLE_TIMER, state),
+        "             systemctl --user enable --now %s" % VEILLE_TIMER,
     ]
 
 

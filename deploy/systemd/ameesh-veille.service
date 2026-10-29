@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# ameesh veille quotidienne des versions de harnais et de modèles (#3264 A,
+# #4291). Service UTILISATEUR, installé sur chaque hôte du mesh qui porte le
+# bloc `veille.sources` : chaque hôte relève ses versions installées ; l'hôte
+# désigné par `veille.host` (sinon le premier à passer, sous verrou consultatif)
+# entretient les lots d'évaluation.
+#
+# Aucune source propre à un client n'est ici : le paquet npm, le dépôt, le
+# changelog et le fournisseur viennent de la configuration de l'hôte.
+#
+# Install:
+#   install -m 0644 deploy/systemd/ameesh-veille.service \
+#                      deploy/systemd/ameesh-veille.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ameesh-veille.timer
+#   journalctl --user -u ameesh-veille -f
+[Unit]
+Description=ameesh daily harness and model version watch (#3264 A)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.config/ameesh/env
+ExecStart=%h/.local/share/ameesh/venv/bin/ameesh veille scan
+TimeoutStartSec=20min
+NoNewPrivileges=yes

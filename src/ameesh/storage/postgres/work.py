@@ -1720,6 +1720,38 @@ class WorkItems(interface.WorkItems):
                 "       wake_claim_at = NULL, updated_at = now() WHERE id = %s",
                 (float(wake_ts), int(item_id)))
 
+    def update_generated(self, item_id, *, title, body, priority, note,
+                         actor) -> dict | None:
+        """#4291 : titre et corps générés, priorité seulement montée."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT %s FROM work_items WHERE id = %%s AND state NOT IN %s"
+                " FOR NO KEY UPDATE" % (item_columns(self.db, "work_items"), _CLOSED),
+                (int(item_id),))
+            if not rows:
+                return None
+            row = rows[0]
+            current = row.get("priority")
+            wanted = current
+            if priority is not None and (current is None or int(priority) < int(current)):
+                wanted = int(priority)
+            if (row.get("title") == title and row.get("body") == body
+                    and wanted == current):
+                return row
+            updated = tx.query(
+                "UPDATE work_items SET title = %%s, body = %%s, priority = %%s,"
+                " updated_at = now() WHERE id = %%s RETURNING %s"
+                % item_columns(self.db, "work_items"),
+                (title, body, wanted, int(item_id)))
+            if not updated:
+                return None
+            if note:
+                tx.execute(
+                    "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+                    " VALUES (%s, %s, %s, %s)",
+                    (int(item_id), updated[0]["state"], note, actor or ""))
+            return updated[0]
+
     def schedule_wake(self, item_id, wake_ts, *, text, actor) -> dict | None:
         """#2466 : pose (ou efface) le réveil programmé et journalise, atomique."""
         if not has_wake_at(self.db):

@@ -187,6 +187,9 @@
         turn_grace_seconds=20m|0
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
+  ameesh veille scan [--dry-run] [--json] [--no-probe] [--harness ID]
+        #3264 A: daily watch of harness/model versions; one evaluation lot per
+        harness, priority 1 on a vendor recommendation (config `veille.sources`);
   ameesh verify               verify a signed approval;
   ameesh version | --version  version of the installed package;
   ameesh watch enable --agent A [--every 30m] | disable --agent A | show [--json]
@@ -232,6 +235,8 @@ MESH_COMMANDS = (
     "models",
     # L16 : descripteurs de harnais (`ameesh harness list|show|check`)
     "harness",
+    # #3264 A : veille quotidienne des versions (`ameesh veille scan`)
+    "veille",
     # L30 : comptes multiples par fournisseur (`ameesh accounts list|use|auto`)
     "accounts",
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
