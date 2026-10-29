@@ -10,13 +10,21 @@ Comme `test_2449_garde_mecanique` et `test_2457_garde_non_python`, elle est
 dans la liste « toujours », que la sélection d'un lot et la prévalidation
 (`prevalidation.contracts`) exécutent sur chaque branche de lot.
 
-Témoin : la liste lue par le sélecteur lui-même contient la garde.
+Même angle mort pour `test_l161f_plan`, qui fige le contenu de
+`tests/parts/toujours.txt` : #4256 y ajoutait un module, la sélection de son
+lot n'a pas lancé ce test, et h-06 a été recomposé une fois de plus
+(ci-full 40883252255). Il devient un contrat transverse de `tests/parts/`.
+
+Témoins : la liste lue par le sélecteur lui-même contient la garde ; un
+changement sous `tests/parts/` rend `test_l161f_plan` dû.
 """
 from __future__ import annotations
 
 import importlib.util
 import pathlib
 import unittest
+
+from ameesh import transverse_contracts
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -36,6 +44,14 @@ class GardeLitterauxContratTest(unittest.TestCase):
         connus = sorted(p.stem for p in (REPO / "tests").glob("test*.py"))
         toujours = plan.read_list(plan.ALWAYS_FILE, connus, required=True)
         self.assertIn("test_4259_client_literals", toujours)
+
+    def test_un_changement_des_listes_de_parts_rend_le_plan_du(self):
+        for path in ("tests/parts/toujours.txt", "tests/parts/pilote-psql.txt"):
+            with self.subTest(path=path):
+                dus = transverse_contracts.hits([("M", path)])
+                self.assertEqual(dus.get("test_l161f_plan"), path)
+        self.assertNotIn("test_l161f_plan",
+                         transverse_contracts.hits([("M", "tests/test_cluster.py")]))
 
 
 if __name__ == "__main__":
