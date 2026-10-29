@@ -150,7 +150,8 @@ class LandingRefreezeTest(PgTestCase):
         self.st.work.record_packet(
             int(self.vehicle["id"]), branch="integration/paquet-3641",
             base_sha=self.base, head_sha=self.mid, units=[],
-            note="composition corrigée sans U", actor="mty-amh-impl-07")
+            note="composition corrigée sans U", actor="mty-amh-impl-07",
+            expect_pushed=self.old)
 
         work.milestone(self.db, int(self.vehicle["id"]), "frozen", sha=self.new,
                        repo=str(self.repo), actor="mty-amh-impl-07")
