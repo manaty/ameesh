@@ -1,4 +1,4 @@
-# Docker storage: observation, declared-disposable volume retention (#2003) and owner cleanup (#411)
+# Docker storage: observation, declared-disposable volume retention (#2003, #4560) and owner cleanup (#411)
 
 Housekeeping samples Docker storage and counts `dangling=true` volumes
 (no container references, including stopped containers), and reads the
@@ -10,38 +10,59 @@ not measured by this feature.
 
 Since #2003 the same pass also **reaps the dangling volumes the mesh has
 declared disposable**, and only those: conservation is the default, and the
-declaration is explicit. `scripts/pg-up.sh` labels a lot bench's volume
-`ameesh.bench=disposable` only when its caller declares that bench disposable
-(`AMEESH_PG_DISPOSABLE=1`, the per-agent bench of the README); without that
-declaration it creates no label, so the volume is kept whatever its creation
-time. A shared bench (`ameesh-pg`/`agent-mesh-pg`, default volume
-`${NAME}-data`, historically `ameesh-pg-data`) is deliberately persistent and is
-**never labelled**, even if the declaration is passed: its data survives the
-container, which is that script's contract. A labelled disposable volume is
-deleted only after `docker_volume_idle` (default 24 h) of **continuous
-absence**, measured by the successive housekeeping passes: each pass journals
-the episode (`episode_since`, plus the volume's creation identity), a first
-sighting never deletes, a volume referenced again closes the episode, and a
-name recreated under the same volume opens a new one. Creation age is used as
-identity and reporting information, never as the idle delay.
+declaration is explicit. Two labels declare it: the generic lifetime label
+`ameesh.lifetime=test` (#4560), and the older `ameesh.bench=disposable`
+(#2003). `scripts/pg-up.sh` puts both on a lot bench's volume only when its
+caller declares that bench disposable (`AMEESH_PG_DISPOSABLE=1`, the per-agent
+bench of the README); without that declaration it creates no label, so the
+volume is kept whatever its creation time. A shared bench
+(`ameesh-pg`/`agent-mesh-pg`, default volume `${NAME}-data`, historically
+`ameesh-pg-data`) is deliberately persistent and is **never labelled**, even if
+the declaration is passed: its data survives the container, which is that
+script's contract. A labelled disposable volume is deleted only after
+`docker_volume_idle` (default 24 h) of **continuous absence**, measured by the
+successive housekeeping passes: each pass journals the episode
+(`episode_since`, plus the volume's creation identity), a first sighting never
+deletes, a volume referenced again closes the episode, and a name recreated
+under the same volume opens a new one. Creation age is used as identity and
+reporting information, never as the idle delay.
+
+A **named base volume** (`ameesh-pg-data`, `agent-mesh-pg-data`, any
+`*-pg-data`) is never reaped, even when it carries a disposable label by
+mistake: it is reported as kept, without a removal command.
+
+Since #4560 the turn's Docker shim also forces `rm -v` on every `docker rm` /
+`docker container rm`: a test container removed by its own script no longer
+leaves its anonymous volume behind (`-v` removes only anonymous volumes, never
+a named one), and an explicit `--volumes=false` is respected. This covers
+third-party suites and old checkouts that still call `docker rm -f` without
+`-v` — the mechanism behind the 77 orphan volumes / 5.4 GB measured on
+agents-2 on 29 October 2026. The shim labels an **untagged** image built during a turn
+`ameesh.lifetime=test` (a tagged build is a deliberate artifact and gets no
+disposable label); an image without any tag carrying that label is reaped
+after the same `docker_volume_idle` of continuous absence. A tagged image is
+never deleted, even labelled: a tag is a reference. Images without the label
+are only counted.
 
 Nothing else is ever deleted automatically: an anonymous volume
 (`com.docker.volume.anonymous`) carries no mesh provenance and is never reaped
-here — a mesh container labelled `ameesh.turn` is removed with its anonymous
-volumes (`docker rm -f -v`), which is what actually stops the leak; a named
-volume without the label, or with a non-disposable label, is listed in the
-bounded `others` section with its exact `docker volume rm` command so a human
-decides. A disposable volume whose creation identity is unreadable is flagged
-without a command, since the episode's identity cannot be established. This
-preserves the #411 rule (existing named volumes are kept). `docker volume rm`
-itself refuses a volume still mounted, so a `docker run` racing the reap wins.
-Set `docker_volumes: false` in the Host card to disable reaping on one host.
+by housekeeping — it leaves with the container that owns it (`rm -v`, forced by
+the shim and already used by the mesh's own container reaper); a named volume
+without the label, or with a non-disposable label, is listed in the bounded
+`others` section with its exact `docker volume rm` command so a human decides;
+an untagged image without the label is only counted. A disposable volume or
+image whose creation identity is unreadable is flagged without a command, since
+the episode's identity cannot be established. This preserves the #411 rule
+(existing named volumes are kept). `docker volume rm` and `docker image rm`
+themselves refuse a resource still in use, so a `docker run` racing the reap
+wins. Set `docker_volumes: false` / `docker_images: false` in the Host card to
+disable each reaping on one host.
 
-`ameesh menage --json` exposes `measure.docker_storage` and `measure.volumes`;
-the text report shows the orphan count, the volumes being reaped or kept, and
-the undeclared ones with their command. The periodic housekeeping pass
-persists the same summary. `ameesh alerts` reads these persisted samples,
-without launching Docker. No migration is required.
+`ameesh menage --json` exposes `measure.docker_storage`, `measure.volumes` and
+`measure.images`; the text report shows the orphan count, the volumes and
+images being reaped or kept, and the undeclared ones with their command. The
+periodic housekeeping pass persists the same summary. `ameesh alerts` reads
+these persisted samples, without launching Docker. No migration is required.
 
 The default thresholds and retention in the Host card's
 `policy.workspaces.housekeeping` are:
@@ -50,20 +71,21 @@ The default thresholds and retention in the Host card's
 docker_orphan_volumes_alert: 100
 docker_build_cache_alert: 20GiB
 docker_volumes: true          # reap declared-disposable dangling volumes
-docker_volume_idle: 24h       # continuous absence before such a volume is reaped
+docker_images: true           # reap declared-disposable untagged images
+docker_volume_idle: 24h       # continuous absence before either is reaped
 ```
 
 The strictest threshold across the host's canons wins; the longest
-`docker_volume_idle` wins, and one canon that sets `docker_volumes: false`
-disables reaping for that host. Alerts `docker_orphan_volumes` and
-`docker_build_cache` are pushed to the responsible human by the standard
-notification routing. Errors and samples older than 30 minutes produce
-`docker_storage_unavailable`: unknown is never reported as zero. A host needs a
-housekeeping sample before these alerts are available. The cache threshold
-counts private reclaimable records, excluding shared records and records in
-use. Reported total cache size is logical record accounting, not a promise of
-physical disk space recovered, especially with shared layers or btrfs. Other
-builders require a separate operator inventory.
+`docker_volume_idle` wins, and one canon that sets `docker_volumes: false` (or
+`docker_images: false`) disables that reaping for the host. Alerts
+`docker_orphan_volumes` and `docker_build_cache` are pushed to the responsible
+human by the standard notification routing. Errors and samples older than 30
+minutes produce `docker_storage_unavailable`: unknown is never reported as
+zero. A host needs a housekeeping sample before these alerts are available. The
+cache threshold counts private reclaimable records, excluding shared records
+and records in use. Reported total cache size is logical record accounting, not
+a promise of physical disk space recovered, especially with shared layers or
+btrfs. Other builders require a separate operator inventory.
 
 Sources: [Docker volume lifecycle](https://docs.docker.com/engine/storage/volumes/),
 [BuildKit cache accounting](https://docs.docker.com/reference/cli/docker/buildx/du/).

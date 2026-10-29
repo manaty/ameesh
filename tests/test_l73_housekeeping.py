@@ -718,7 +718,7 @@ class ConteneursTest(_Tmp):
         self.assertEqual(appels[1], ["docker", "ps", "--no-trunc",
                                      "--format", "{{json .}}"])
 
-    def test_le_script_etiquette_run_et_create_seulement(self):
+    def test_le_script_etiquette_run_create_et_reprend_les_volumes_anonymes(self):
         faux = os.path.join(self.base, "vrai-bin")
         os.makedirs(faux)
         with open(os.path.join(faux, "docker"), "w") as fh:
@@ -741,7 +741,23 @@ class ConteneursTest(_Tmp):
                          "[container][create][--label][ameesh.turn=t1][--label]"
                          "[ameesh.agent=a 1][img]")
         self.assertEqual(docker("ps", "-a"), "[ps][-a]")
-        self.assertEqual(docker("rm", "x*"), "[rm][x*]")
+        # #4560 : le volume anonyme d'un conteneur qu'une suite supprime part
+        # avec lui ; un `-v` déjà demandé n'est pas doublé.
+        self.assertEqual(docker("rm", "x*"), "[rm][-v][x*]")
+        self.assertEqual(docker("container", "rm", "-f", "x"),
+                         "[container][rm][-v][-f][x]")
+        self.assertEqual(docker("rm", "-f", "-v", "x"), "[rm][-f][-v][x]")
+        # une construction SANS tag ne produit qu'une image dangling : elle
+        # porte la durée de vie de test ; une construction taguée, artefact
+        # voulu, n'est pas déclarée jetable.
+        self.assertEqual(docker("build", "."),
+                         "[build][--label][ameesh.lifetime=test][.]")
+        self.assertEqual(docker("image", "build", "."),
+                         "[image][build][--label][ameesh.lifetime=test][.]")
+        self.assertEqual(docker("build", "-t", "img", "."),
+                         "[build][-t][img][.]")
+        self.assertEqual(docker("image", "build", "--tag=img", "."),
+                         "[image][build][--tag=img][.]")
         self.assertEqual(containers.install_shims(shims, os.path.join(self.base, "vide")), {})
 
 
