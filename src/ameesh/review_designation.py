@@ -1233,7 +1233,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           base: str = "", policy_ref: str = "", notify: str = "",
           unknown_authors: Iterable = (), families,
           already: Iterable = (), fixers: Iterable = (), required: Optional[int] = None,
-          advances: Optional[Mapping] = None) -> dict:
+          advances: Optional[Mapping] = None, held: Iterable = ()) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
     `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
@@ -1270,6 +1270,15 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     family furthest behind, the load only breaking a tie. A family without a
     current reading is neutral, and the pace never makes an eligible family
     ineligible: two required opinions still take two distinct families.
+
+    `held` carries the manual seats that already cover a required opinion but
+    must be **asked again** for this exact head (#4582): a seat kept from an
+    earlier freeze whose verdict was not carried sleeps until the 2 h SLO when
+    nothing wakes it. Only the rows that the selection counts as manual seats
+    are mailed; the caller has already excluded the seats whose verdict is on
+    the frozen head or reported onto it, and the port still skips a request
+    that already names this head (#2495). The designation names them in its
+    mark's `sent`, so the exact-head request is auditable.
 
     The freeze is re-read **once**, and the provided inputs (paths, authors,
     class) are those of this freeze: if the `Port` refuses a freeze that has
@@ -1384,15 +1393,46 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                                      designated=selection["reviewers"]),
             "capacity": True,
         })
-    first_rank = len(selection.get("manual") or ()) + 1
+    manual = [dict(row) for row in selection.get("manual") or ()]
+    by_name = {str(row.get("name") or "").strip(): row for row in manual}
+    held_seats: list = []
+    for row in held or ():
+        name = str((row or {}).get("name") if isinstance(row, Mapping)
+                   else row or "").strip()
+        seat = by_name.get(name)
+        if seat is not None and seat not in held_seats:
+            held_seats.append(dict(seat))
+    first_rank = len(manual) + 1
     # The independent families available on this head: the manual seats and
     # the automatic families, the already designated ones included. Any
     # reviewer correction authors the head and removes its own family from the
     # opinions (canon §2, #2670/#2888).
-    eligible_families = (len(selection.get("manual") or ())
-                         + len(selection.get("families") or ()))
+    eligible_families = len(manual) + len(selection.get("families") or ())
     from . import review_correction
 
+    # #4582: a held manual seat covers its opinion, but its earlier request
+    # named another head. The exact-head request is what wakes it; without it
+    # the review sleeps until the SLO. Rank follows the seat in the column.
+    positions = {str(row.get("name") or "").strip(): index + 1
+                 for index, row in enumerate(manual)}
+    for seat in held_seats:
+        correction = (None if unknown else review_correction.outlook(
+            required=required, reviewer=seat, authors=authors,
+            candidates=candidates, families=families, seats=already,
+            earlier=fixers))
+        messages.append({
+            "to": seat["name"],
+            "family": seat.get("family") or "",
+            "kind": REQUEST_KIND,
+            "manual": True,
+            "body": reviewer_message(item, freeze=freeze, required=required,
+                                     rank=positions.get(seat["name"], 1),
+                                     reviewer=seat,
+                                     authors=authors, base=base, risk=risk,
+                                     policy_ref=policy_ref,
+                                     eligible_families=eligible_families,
+                                     correction=correction),
+        })
     for index, reviewer in enumerate(selection.get("reviewers") or ()):
         if str(reviewer.get("name") or "") in previous_names:
             # #3596: an automatic seat of this freeze already holds its request.
