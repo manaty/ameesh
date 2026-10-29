@@ -755,6 +755,25 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
     names, forbidden = families_of(authors)
     fixer_names = names_of(fixers)
+    #: #4679 : un correcteur dont le commit local (avant rebase/amend) est
+    #: introuvable reste exclu par son nom ; le gel dit le doute et le SHA,
+    #: au lieu de le redésigner en silence.
+    fixer_doubts: dict[str, str] = {}
+    for row in fixers or ():
+        if isinstance(row, Mapping) and row.get("unresolved"):
+            name = str(row.get("name") or "").strip()
+            if name:
+                fixer_doubts[name] = str(row.get("unresolved") or "").strip()
+
+    def excluded_fixers_text() -> str:
+        text = ", ".join(sorted(fixer_names))
+        if fixer_doubts:
+            text += (" (unresolved correction: %s — commit not recoverable,"
+                     " excluded by doubt)" % ", ".join(
+                         "%s %s" % (name, sha[:12])
+                         for name, sha in sorted(fixer_doubts.items())))
+        return text
+
     forbidden = forbidden | families_of(fixers)[1]
     seats = manual_seats(already, authors=authors, fixers=fixers, families=families)
     kept = automatic_seats(automatic, authors=authors, fixers=fixers,
@@ -856,7 +875,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
             missing_why += (" (already designated: %s)"
                             % ", ".join(row["name"] for row in kept))
         if fixer_names:
-            missing_why += " (corrector(s) excluded: %s)" % ", ".join(sorted(fixer_names))
+            missing_why += " (corrector(s) excluded: %s)" % excluded_fixers_text()
         out.update({
             "state": WAITING,
             "missing": remaining - len(chosen),
@@ -868,7 +887,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     if kept:
         why += " (kept %d already designated for this freeze)" % len(kept)
     if fixer_names:
-        why += " (corrector(s) excluded: %s)" % ", ".join(sorted(fixer_names))
+        why += " (corrector(s) excluded: %s)" % excluded_fixers_text()
     if pace:
         reading = ["%s %+.0f pt" % (c.family.strip().lower(), _advance_of(c, pace) * 100)
                    for c in chosen if c.family.strip().lower() in pace]
