@@ -33,10 +33,15 @@
 #                manque (#3327) ; sans effet sur un hôte non candidat
 #   controler    unités actives, journal récent, venv du MainPID vivant,
 #                ameesh doctor et minuteries de rôle sur le serveur
-#   (agents)     redemarrer et controler mènent aussi toute unité
-#                ameesh-runner-agent@ active sur l'hôte hors de sa liste du
-#                registre (candidat d'un rôle élu, bail ailleurs, #4248) :
-#                redémarrée et venv prouvé, sans bail exigé
+#   (agents)     redemarrer et controler partagent un seul périmètre (#4437) :
+#                agents du registre menés (activité, bail et venv exigés) ;
+#                persona arrêtée ou unité désactivée : aucune activité ni bail
+#                exigés, mais une unité encore active est rechargée sur le
+#                nouveau code et son venv est prouvé ; une unité masquée
+#                encore active est seulement arrêtée (systemd refuse de la
+#                démarrer) ; toute autre unité ameesh-runner-agent@ active sur
+#                l'hôte (candidat d'un rôle élu, agent retiré/déplacé, #4248) :
+#                rechargée et venv prouvé, sans bail exigé
 #   retour       bascule en arrière vers le venv précédent conservé, puis
 #                redémarre
 #
@@ -448,10 +453,11 @@ reservation_ecrite() {  # persona epoch-depuis
     --since "@$2" --no-pager -o cat) || return 1
   grep -qF "] elected role reserved to $HOTE_AGENTS for " <<<"$journal"
 }
+statut_de_json() { python3 -c 'import json,sys; print(json.load(sys.stdin).get("status") or "")'; }
 statut() {  # #4358 : « illisible » plutôt qu'une trace JSONDecodeError
   local ligne
   ligne=$(lire_bail "$1") || { echo illisible; return 0; }
-  python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("status") or "")' <<<"$ligne"
+  statut_de_json <<<"$ligne"
 }
 heure_base() {
   if [ "$MODE" = agents ]; then
@@ -497,7 +503,9 @@ unite_systemctl() {  # unité commande [arguments]
 # après elle — et on ne relance jamais au-dessus d'un processus vivant.
 # Only inactive with MainPID=0 proves the safe point. Clear a preexisting
 # failure BEFORE stop (#1907), so a new failure during drainage stays visible.
-redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unité démarrée
+# #4437 : l'arrêt seul sert à une unité masquée encore active, qui ne peut pas
+# être rechargée (systemd refuse de la démarrer).
+arreter_hors_tour() {  # unité — 0 quand l'arrêt est prouvé (inactive, MainPID=0)
   local u=$1 etat pid debut
   etat=$(unite_systemctl "$u" show -p ActiveState --value) \
     || { echo "$u : lecture d'ActiveState impossible — aucun démarrage" >&2; return 1; }
@@ -516,6 +524,10 @@ redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unit�
     return 1
   fi
   etape "$u : arrêt prouvé — attente $(( $(horloge) - debut )) s"
+}
+redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unité démarrée
+  local u=$1
+  arreter_hors_tour "$u" || return 1
   unite_systemctl "$u" start || { echo "$u : le démarrage échoue" >&2; return 1; }
 }
 # #4373 : `list --json` est relu tant qu'il n'est pas un tableau JSON, au plus
@@ -555,7 +567,8 @@ print(json.dumps(rows))' <<<"$sortie" 2>/dev/null); then
 # noms invalides ; ne pas transformer un registre vide en succès.
 # `avec-arretes` inclut les personas arrêtées du registre : le redémarrage de
 # déploiement doit recharger leur unité si elle tourne encore (#1633), là où le
-# contrôleur ne les attend pas (aucun bail d'une persona arrêtée).
+# contrôleur ne les attend pas (aucun bail d'une persona arrêtée) mais prouve
+# le venv d'une unité encore active (#4437).
 agents_du_registre() {
   local arretes=${1:-} noms liste
   liste=$(lire_liste) || return $?
@@ -587,21 +600,23 @@ print("\n".join(names))' "$HOTE_AGENTS" "$arretes" <<<"$liste") || return 1
 }
 
 unite_agents() { printf 'ameesh-runner-agent@%s.service' "$1"; }
-# #4239 : une unité désactivée (résident expérimental, persona hors service)
-# n'a aucun exécuteur actif attendu. Le staging la classe hors périmètre : il
-# n'exige ni bail ni unité active et ne la relance pas. Une unité absente ou
-# illisible reste une erreur : seul l'état `disabled`/`masked` est reconnu.
-unite_hors_perimetre() {  # persona
-  local etat
-  etat=$(utilisateur_agents systemctl --user show -p UnitFileState --value \
-    "$(unite_agents "$1")" 2>/dev/null) || return 1
-  [ "$etat" = disabled ] || [ "$etat" = masked ]
+# #4239 : état systemd de l'unité d'une persona. Une unité absente ou illisible
+# rend rc 1 : l'appelant la traite comme à mener (jamais un succès silencieux).
+# Seuls `disabled` et `masked` sont reconnus « hors périmètre » : aucun
+# exécuteur actif n'est attendu, mais une unité encore active doit tout de
+# même charger le code installé (#4437).
+etat_unite_agents() {  # persona → UnitFileState
+  utilisateur_agents systemctl --user show -p UnitFileState --value \
+    "$(unite_agents "$1")" 2>/dev/null
 }
 # #4248 : un rôle élu (§11) a un exécuteur sur chaque hôte candidat, mais le
 # registre ne porte que l'hôte du bail : agents_du_registre ne voit pas ici le
 # candidat en attente, qui restait sur l'ancien code puis reprenait le bail.
 # Les unités actives de l'hôte font foi pour le code chargé. $1… : personas
 # déjà menées par le registre ; sortie : les autres unités actives.
+# #4437 : redemarrer et controler passent le même périmètre mené, pour que le
+# balayage des unités actives couvre exactement ce que l'autre commande a
+# ignoré.
 unites_hors_registre() {
   local sortie u p q connu
   sortie=$(utilisateur_agents systemctl --user list-units 'ameesh-runner-agent@*.service' \
@@ -1184,7 +1199,7 @@ preparer_drain() {  # une seule persona, juste avant son arrêt
 
 redemarrer_agents() {
   local noms p st avant ligne heure attendu tenu restantes i rc
-  local etat deja_pause detail hors
+  local etat deja_pause detail hors etat_unite
   local non_verifiees=() echecs=() echecs_hors=()
   DRAINS_INDISPONIBLES=()
   DRAINS_NON_LEVES=()
@@ -1216,16 +1231,55 @@ redemarrer_agents() {
       # Ne jamais poser le drain suivant tant que le précédent reste suivi.
       # Le trap réconcilie et rapporte toute pause restante, même sur échec.
       exiger_drain_precedent_leve "$p" || return 1
-      # #4239 : relire le placement et écarter une unité désactivée avant
-      # toute pause (résident expérimental, aucun exécuteur actif attendu).
+      # #4437 : une seule classification pour redemarrer et controler.
+      # Le statut et l'état de l'unité sont relus avant toute pause.
       etat=$(etat_agent "$p") || return 1
       IFS='|' read -r st deja_pause detail <<<"$etat"
       if [ "$st" = illisible ]; then reporter_illisible "$p"; continue; fi
       if [ "$st" = skip ]; then
         echo "$p : déplacé ou mode non execute ($detail), ignoré"; continue
       fi
-      if unite_hors_perimetre "$p"; then
-        echo "$p : unité désactivée, aucun exécuteur à relancer — hors périmètre"
+      etat_unite=$(etat_unite_agents "$p") || etat_unite=
+      # Une unité masquée ne peut pas être démarrée : si elle tourne encore,
+      # le seul geste sûr est de l'arrêter (aucun exécuteur actif attendu).
+      if [ "$etat_unite" = masked ]; then
+        if utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")"; then
+          arreter_hors_tour "$(unite_agents "$p")" \
+            || { echec_agent "$p" "unité masquée encore active : ne s'arrête pas"; return 1; }
+          echo "$p : unité masquée encore active — arrêtée, aucun exécuteur actif exigé"
+        else
+          echo "$p : unité masquée, aucun exécuteur actif exigé — hors périmètre"
+        fi
+        continue
+      fi
+      # #1131 : persona arrêtée par le propriétaire — un déploiement ne la
+      # réactive pas. #1633 : son unité encore active est seulement rechargée
+      # sur le nouveau code, sans bail ni tour ; une unité déjà arrêtée n'est
+      # pas relancée. #4437 : le statut arrêté prime sur l'unité désactivée,
+      # sinon l'unité resterait sur l'ancien code et le contrôle la rejetterait.
+      if [ "$st" = stopped ]; then
+        if utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")"; then
+          utilisateur_agents systemctl --user restart "$(unite_agents "$p")" \
+            && utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")" \
+            || { echec_agent "$p" "unité d'une persona arrêtée : ne redémarre pas"; return 1; }
+          echo "$p : arrêté dans le registre — unité redémarrée pour charger le nouveau code, aucun tour"
+        else
+          echo "$p : arrêté dans le registre — unité déjà arrêtée, rien à recharger"
+        fi
+        continue
+      fi
+      # #4239/#4437 : une unité désactivée n'exige ni activité ni bail ; si
+      # elle tourne encore, elle est rechargée sur le nouveau code (arrêt
+      # prouvé), sinon elle resterait sur l'ancien et le contrôle la rejetterait.
+      if [ "$etat_unite" = disabled ]; then
+        if utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")"; then
+          redemarrer_hors_tour "$(unite_agents "$p")" \
+            && unite_systemctl "$(unite_agents "$p")" is-active --quiet \
+            || { echec_agent "$p" "unité désactivée encore active : ne redémarre pas"; return 1; }
+          echo "$p : unité désactivée encore active — rechargée sur le nouveau code, bail non exigé"
+        else
+          echo "$p : unité désactivée, aucun exécuteur actif exigé — hors périmètre"
+        fi
         continue
       fi
       preparer_drain "$p" || return 1
@@ -1333,6 +1387,9 @@ redemarrer_agents() {
   # unités que le registre ne place plus ici) : arrêt prouvé puis démarrage,
   # sans drain (la pause viserait la persona sur l'hôte du bail) ni preuve de
   # bail (ils n'en tiennent pas) ; `controler` prouve ensuite leur venv.
+  # #4437 : le registre entier (arrêtés et désactivés compris) est exclu du
+  # balayage, car ces personas ont été traitées ci-dessus ; le contrôle, lui,
+  # ne mène que les personas actives et exige le venv pour tout le reste.
   if ! hors=$(unites_hors_registre "${restantes[@]}"); then
     echecs_hors+=("(liste illisible)")
   else
@@ -1340,7 +1397,7 @@ redemarrer_agents() {
       [ -n "$p" ] || continue
       if redemarrer_hors_tour "$(unite_agents "$p")" \
           && unite_systemctl "$(unite_agents "$p")" is-active --quiet; then
-        echo "$p : unité active hors registre de $HOTE_AGENTS (candidat d'un rôle élu) — redémarrée sur le nouveau code, bail non attendu"
+        echo "$p : unité active hors registre de $HOTE_AGENTS (candidat d'un rôle élu ou persona hors périmètre) — redémarrée sur le nouveau code, bail non exigé"
       else
         echec_agent "$p" "unité active hors registre : arrêt non prouvé ou ne redémarre pas"
         echecs_hors+=("$p")
@@ -1757,30 +1814,50 @@ preuve_venv_agents() {  # persona → 0 si le MainPID vivant exécute le venv in
 }
 
 controler_agents() {
-  local noms p ligne heure attendu detail hors connus echec=0 rc
+  local noms p ligne heure attendu detail hors echec=0 etat_unite st rc
+  local menes=()
   etape "code installé sur $HOTE_AGENTS"
   releve_agents || { echo "relevé du code impossible" >&2; echec=1; }
-  noms=$(agents_du_registre) || return 1
+  noms=$(agents_du_registre avec-arretes) || return 1
   while IFS= read -r p; do
     etape "$p"
-    # #4239 : une unité désactivée (résident expérimental) n'a pas d'exécuteur
-    # actif attendu : hors périmètre, ni unité active ni bail exigés.
-    if unite_hors_perimetre "$p"; then
-      echo "$p : unité désactivée, aucun exécuteur actif attendu — hors périmètre"
-      continue
-    fi
-    utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")" \
-      && utilisateur_agents journalctl --user -u "$(unite_agents "$p")" -n 15 --no-pager \
-      || { echec_agent "$p" "unité inactive ou journal inaccessible"; echec=1; }
-    preuve_venv_agents "$p" \
-      || { echec_agent "$p" "le MainPID vivant n'exécute pas le venv installé"; echec=1; }
-    # #4358 : un registre illisible après relectures est non concluant.
+    # #4437 : même liste que redemarrer (personas arrêtées comprises). Une
+    # persona arrêtée n'exige ni activité ni bail ; son unité encore active
+    # est contrôlée sur le venv par le balayage ci-dessous.
+    # #4358 : une lecture vide ou coupée est non concluante, jamais un échec
+    # d'étape ; on ne peut alors ni classer ni exiger le bail de la persona.
     rc=0; ligne=$(lire_bail "$p") || rc=$?
     if [ "$rc" = 3 ]; then
       echo "WARNING $p: registre illisible (lecture vide) — preuve de bail non concluante (sans retour)"
       continue
     fi
-    if ! { [ "$rc" = 0 ] && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
+    [ "$rc" = 0 ] \
+      || { echec_agent "$p" "registre, placement ou bail illisible"; echec=1; continue; }
+    st=$(statut_de_json <<<"$ligne")
+    if [ "$st" = stopped ]; then
+      echo "$p : arrêté dans le registre — ni activité ni bail exigés (une unité active est contrôlée ci-dessous)"
+      continue
+    fi
+    # #4239/#4437 : une unité désactivée ou masquée n'a pas d'exécuteur actif
+    # attendu : ni unité active ni bail exigés. Si elle tourne encore, elle
+    # n'est pas « menée » ici et le balayage des unités actives ci-dessous
+    # prouve son venv, exactement comme le redémarrage l'a rechargée.
+    etat_unite=$(etat_unite_agents "$p") || etat_unite=
+    if [ "$etat_unite" = masked ]; then
+      echo "$p : unité masquée, aucun exécuteur actif exigé — hors périmètre (une unité active est contrôlée ci-dessous)"
+      continue
+    fi
+    if [ "$etat_unite" = disabled ]; then
+      echo "$p : unité désactivée, aucun exécuteur actif exigé — hors périmètre (une unité active est contrôlée ci-dessous)"
+      continue
+    fi
+    menes+=("$p")
+    utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")" \
+      && utilisateur_agents journalctl --user -u "$(unite_agents "$p")" -n 15 --no-pager \
+      || { echec_agent "$p" "unité inactive ou journal inaccessible"; echec=1; }
+    preuve_venv_agents "$p" \
+      || { echec_agent "$p" "le MainPID vivant n'exécute pas le venv installé"; echec=1; }
+    if ! { heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
              && bail_valide 0 "$attendu" "$heure" <<<"$ligne"; }; then
       # #4239 : un rôle élu repris par un autre hôte candidat pendant le
       # contrôle est une relève normale (§11), pas une preuve locale
@@ -1796,13 +1873,16 @@ controler_agents() {
   done <<<"$noms"
   # #4248 : un candidat de rôle élu actif ici, bail ailleurs, doit lui aussi
   # vivre sur le venv installé (l'hôte n'est pas sain sinon) ; aucun bail exigé.
-  mapfile -t connus <<<"$noms"
-  if ! hors=$(unites_hors_registre "${connus[@]}"); then
+  # #4437 : tout ce que la boucle n'a pas mené (persona arrêtée, unité
+  # désactivée ou masquée encore active, agent retiré/déplacé, candidat élu)
+  # est contrôlé ici sur le seul venv — même périmètre que `redemarrer`, qui
+  # recharge ces unités sur le nouveau code.
+  if ! hors=$(unites_hors_registre ${menes[@]+"${menes[@]}"}); then
     echec=1
   else
     while IFS= read -r p; do
       [ -n "$p" ] || continue
-      etape "$p (unité active hors registre de $HOTE_AGENTS : candidat, bail non exigé)"
+      etape "$p (unité active hors registre de $HOTE_AGENTS : candidat d'un rôle élu ou persona hors périmètre, bail non exigé)"
       preuve_venv_agents "$p" \
         || { echec_agent "$p" "le MainPID vivant n'exécute pas le venv installé"; echec=1; }
     done <<<"$hors"
