@@ -53,19 +53,42 @@ def _canon_read(cfg):
     An empty canons list may mean "no canon" (no card can declare a hook) or
     "the canon is unreadable" (its Host card may hold the only hook). The two
     must not lead to the same decision: the second never reopens a claim.
+    A duplicate canon id is skipped by `load_configured` and is NOT a failure;
+    a `CanonError`, an unexpected read error or `canon.readable=False` is.
     """
     from . import canon as canon_mod
     try:
         entries = canon_mod.configured(cfg)
     except Exception:
         return [], True
+    if not entries:
+        return [], False
     try:
         canons = canon_mod.load_configured(cfg)
     except Exception:
         return [], True
-    if entries and len(canons) != len(entries):
-        return canons, True
-    return canons, False
+    if len(canons) == len(entries) and all(
+            getattr(canon, "readable", True) is not False for canon in canons):
+        return canons, False
+    # Count the real failures entry by entry: the fast path skips a duplicate
+    # id too, which is not an unreadable canon.
+    out, unknown = [], False
+    for index, entry in enumerate(entries):
+        try:
+            canon = (canon_mod.from_config(cfg) if index == 0
+                     else canon_mod.from_config(cfg, entry=entry))
+        except canon_mod.CanonError:
+            unknown = True
+            continue
+        except Exception:
+            unknown = True
+            continue
+        if getattr(canon, "readable", True) is False:
+            unknown = True
+        if any(getattr(c, "id", None) == getattr(canon, "id", None) for c in out):
+            continue
+        out.append(canon)
+    return out, unknown
 
 
 def hook_for(cfg, canons, host):
@@ -575,8 +598,11 @@ def request_return(cfg, db, host, *, actor, runner=None, now=None, clock=time.ti
     if canon_unknown:
         # A configured but unreadable canon may hold the only Host-card hook:
         # keep the claims closed and the return intent durable for the next
-        # pass, never take the "no adapter" branch.
-        return api.get(host)
+        # pass, never take the "no adapter" branch. The command fails loudly.
+        raise ValueError(
+            "return refused: a configured canon is unreadable, so the adapter "
+            "is unknown; claims stay closed and the return intent is kept "
+            "(retry after the canon loads)")
     try:
         hook = hook_for(cfg, canons, host)
     except ValueError:
@@ -709,6 +735,7 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
     from .exploitation import _alert
     api = storage.of(db).host_lifecycle
     controls = api.listing()
+    _canons, canon_unknown = _canon_read(cfg)
     if listing is None:
         try:
             listing = storage.of(db).operations.listing()
@@ -717,6 +744,24 @@ def alerts(cfg, db, now, *, listing=None, orchestrators=()):
     out = []
     for control in controls:
         host = control["host"]
+        if (canon_unknown and control.get("mode") in ("draining", "returning")
+                and not control.get("claims_open")):
+            since = (resources.finite_float(control.get("return_requested_ts"))
+                     or resources.finite_float(control.get("requested_ts"))
+                     or resources.finite_float(control.get("updated_ts"))
+                     or now)
+            detail = ("Host %s is under a host release but a configured canon is "
+                      "unreadable: its Host card may declare the lifecycle adapter, "
+                      "so ameesh keeps claims closed and cannot emit busy/idle-drained. "
+                      "Fix the canon (`ameesh canon check`); the return intent is kept "
+                      "and the scanner retries. State: mode %s, hook %s, claims %s." % (
+                          host, control.get("mode"), control.get("hook_state") or "none",
+                          "open" if control.get("claims_open") else "closed"))
+            out.append(_alert("host_release_canon_unreadable", None, since,
+                              max(0.0, now - since), 0.0, detail,
+                              host=host, mode=control.get("mode"),
+                              orchestrators=list(orchestrators)))
+            continue
         if control.get("release_error_ts"):
             since = (control.get("release_error_since_ts")
                      or control["release_error_ts"])

@@ -334,6 +334,7 @@ TYPE_LABELS = {
     "host_release_failed": "host release adapter failed",
     "host_release_overdue": "host release overdue",
     "host_release_no_runs": "host release blocked by unknown runs",
+    "host_release_canon_unreadable": "host release blocked by unreadable canon",
     # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "turn_churn": "bursts of short turns",

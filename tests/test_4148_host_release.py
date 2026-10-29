@@ -40,6 +40,24 @@ class RunsEvidenceTest(unittest.TestCase):
                 self.assertTrue(source)
 
 
+class CanonReadTest(unittest.TestCase):
+    def test_duplicate_canon_id_is_not_an_unreadable_canon(self):
+        duplicate = NS(id="same", readable=True)
+        with mock.patch("ameesh.canon.configured", return_value=[object(), object()]), \
+                mock.patch("ameesh.canon.load_configured", return_value=[duplicate]), \
+                mock.patch("ameesh.canon.from_config", return_value=duplicate):
+            canons, unknown = host_release._canon_read(config.Config())
+        self.assertEqual([canon.id for canon in canons], ["same"])
+        self.assertFalse(unknown)
+
+    def test_a_canon_read_failure_is_unknown(self):
+        with mock.patch("ameesh.canon.configured", return_value=[object()]), \
+                mock.patch("ameesh.canon.load_configured", return_value=[]), \
+                mock.patch("ameesh.canon.from_config", side_effect=RuntimeError("io")):
+            _canons, unknown = host_release._canon_read(config.Config())
+        self.assertTrue(unknown)
+
+
 class DecisionTest(unittest.TestCase):
     def footprint(self, **extra):
         return dict(dict(state="idle", capacity="burst", baseline_guard=False,
@@ -293,11 +311,15 @@ class HostReleaseTest(PgTestCase):
         with mock.patch("ameesh.canon.configured", return_value=[object()]), \
                 mock.patch("ameesh.canon.load_configured",
                            side_effect=RuntimeError("unreadable canon")):
-            host_lifecycle.undrain(self.cfg, self.db, "vm", actor="human:op")
+            with self.assertRaises(ValueError):
+                host_lifecycle.undrain(self.cfg, self.db, "vm", actor="human:op")
             control = self.control()
             self.assertEqual(control["mode"], "returning")
             self.assertFalse(control["claims_open"])
             self.assertIsNotNone(control["return_requested_ts"])
+            alerts = host_release.alerts(self.cfg, self.db, time.time())
+            self.assertIn("host_release_canon_unreadable",
+                          [alert["type"] for alert in alerts])
             self.once(now=time.time())
             self.assertFalse(self.control()["claims_open"])
             self.assertEqual(self.control()["mode"], "returning")
