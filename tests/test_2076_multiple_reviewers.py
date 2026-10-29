@@ -299,9 +299,9 @@ class MultipleReviewersTest(PgTestCase):
         self.db.execute("ALTER TABLE work_items DROP COLUMN reviewers")
         # LIFO : 0456 d'abord, puis 0462 qui rétablit le trigger d'audit,
         # puis 0516 qui rétablit celui des noms d'agents.
-        self.addCleanup(self.db.execute, spelling)
-        self.addCleanup(self.db.execute, audit)
-        self.addCleanup(self.db.execute, migration)
+        self.addCleanup(self.db.script, spelling)
+        self.addCleanup(self.db.script, audit)
+        self.addCleanup(self.db.script, migration)
         self.db.__dict__.pop("_has_reviewers", None)
         self.db.execute("UPDATE work_items SET reviewer = 'first' WHERE id = %s",
                         (self.lot["id"],))

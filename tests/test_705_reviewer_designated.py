@@ -907,7 +907,7 @@ class ReviewerDesignationTest(PgTestCase):
                           "0516_agent_rename.sql"):
             with open(os.path.join(REPO, "src/ameesh/migrations", migration),
                       encoding="utf-8") as fh:
-                self.db.execute(fh.read())
+                self.db.script(fh.read())
 
     def test_lectures_avant_la_migration_0421(self):
         """#705 (revue r1, P2-3) : la prod peut être en 0373 ; sans la colonne,
