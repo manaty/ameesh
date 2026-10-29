@@ -136,13 +136,16 @@ def _notify(waited: float) -> None:
 
 
 class _Ticket:
-    __slots__ = ("priority", "since", "ident", "granted")
+    __slots__ = ("priority", "since", "ident", "granted", "wakeup")
 
-    def __init__(self, priority: int, since: float, ident: int):
+    def __init__(self, priority: int, since: float, ident: int,
+                 wakeup: threading.Condition | None = None):
         self.priority = priority
         self.since = since
         self.ident = ident
         self.granted = False
+        #: #4515 : condition propre au ticket, sur le verrou du PriorityRLock
+        self.wakeup = wakeup
 
 
 class PriorityRLock:
@@ -156,13 +159,20 @@ class PriorityRLock:
     ensemble, laissant le verrou libre sans personne pour le notifier (#4602,
     B1 de la relecture dev1).
 
+    #4515 : la passation ne réveille que le fil choisi (une condition par
+    ticket, sur le même verrou). Un ``notify_all`` réveillait toutes les
+    attentes à chaque passation : avec vingt agents au repos, chaque fil
+    était réveillé ~200 fois/s pour se rendormir aussitôt, et se disputait
+    le GIL pour le faire.
+
     L'API est celle de ``threading.RLock`` pour les usages du pilote
     (``with``, ``acquire``, ``release``, ``locked``). ``clock`` est injectable
     par les tests de vieillissement.
     """
 
     def __init__(self, clock=None):
-        self._condition = threading.Condition()
+        self._mutex = threading.Lock()
+        self._condition = threading.Condition(self._mutex)
         self._owner: int | None = None
         self._depth = 0
         self._queues = (collections.deque(), collections.deque())
@@ -208,7 +218,7 @@ class PriorityRLock:
         self._owner = ticket.ident
         self._depth = 1
         self._burst = self._burst + 1 if ticket.priority == CONTROL else 0
-        self._condition.notify_all()
+        ticket.wakeup.notify()
 
     # -- acquisition ------------------------------------------------------
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
@@ -225,7 +235,8 @@ class PriorityRLock:
                 return True
             if not blocking:
                 return False
-            ticket = _Ticket(want, self._clock(), ident)
+            ticket = _Ticket(want, self._clock(), ident,
+                             threading.Condition(self._mutex))
             self._queues[want].append(ticket)
             if self._owner is None:
                 # ne jamais laisser un verrou libre avec des attentes : la
@@ -238,16 +249,17 @@ class PriorityRLock:
             try:
                 while not ticket.granted:
                     if deadline is None:
-                        self._condition.wait()
+                        ticket.wakeup.wait()
                         continue
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         if ticket.granted:
                             break  # la passation a gagné la course
+                        # un ticket non choisi ne change ni le propriétaire
+                        # ni le choix suivant : personne à réveiller
                         self._queues[want].remove(ticket)
-                        self._condition.notify_all()
                         return False
-                    self._condition.wait(remaining)
+                    ticket.wakeup.wait(remaining)
                 waited = self._clock() - ticket.since
             except BaseException:
                 if ticket.granted:
@@ -260,7 +272,6 @@ class PriorityRLock:
                         self._queues[want].remove(ticket)
                     except ValueError:
                         pass
-                self._condition.notify_all()
                 raise
         _notify(waited)
         return True

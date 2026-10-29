@@ -45,6 +45,7 @@ import argparse
 import dataclasses
 import getpass
 import hashlib
+import io
 import json
 import math
 import os
@@ -349,6 +350,23 @@ def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
             fcntl.fcntl(fd, fcntl.F_SETFL, flags)
     except (OSError, ImportError, ValueError):
         pass
+
+
+def dump_stacks_on_signal(signum: int | None = None, stream=None) -> bool:
+    """#4515 : `kill -USR1 <pid>` écrit la pile de chaque fil sur stderr.
+
+    Un hôte sans `CAP_SYS_PTRACE` (conteneur sans capacités) ne peut pas
+    échantillonner l'exécuteur avec py-spy ni gdb : le diagnostic d'un
+    exécuteur qui brûle du CPU au repos doit venir de lui-même. Le vidage est
+    fait par `faulthandler`, hors de l'interpréteur (aucun verrou Python),
+    même GIL disputé. Faux si le flux n'a pas de descripteur."""
+    import faulthandler
+    signum = signal.SIGUSR1 if signum is None else signum
+    try:
+        faulthandler.register(signum, file=stream or sys.stderr, all_threads=True)
+    except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+        return False
+    return True
 
 
 def _sortie_sure(code: int, fils: "list[threading.Thread] | tuple" = ()) -> int:
@@ -9045,6 +9063,13 @@ class AgentWorker(threading.Thread):
             self.wake.wait(timeout=min(0.25, max(0.02, deadline - time.monotonic())))
             self.wake.clear()
 
+    def _idle_poll(self) -> float:
+        """#4515 : le pas du sondage au repos de ce worker (voir
+        `Runner.idle_poll`) ; une doublure d'exécuteur sans budget garde
+        `poll`."""
+        idle_poll = getattr(self.runner, "idle_poll", None)
+        return idle_poll() if callable(idle_poll) else self.runner.poll
+
     def _admission_priority(self) -> None:
         """#4602 : applique au fil la classe de la passe qui commence.
 
@@ -9165,7 +9190,7 @@ class AgentWorker(threading.Thread):
                     self._resident_between_turns()  # L76 : mort, sommeil
                     admission_lock.reset()  # #4602 : la passe prioritaire est finie
                     self.wake.wait(timeout=self.wait_timeout(self._until_due(
-                        min(self.runner.poll, max(1.0, self.runner.lease_ttl / 3.0)))))
+                        min(self._idle_poll(), max(1.0, self.runner.lease_ttl / 3.0)))))
                     self.wake.clear()
                     continue
                 try:
@@ -10518,7 +10543,13 @@ class Runner:
                 getattr(gate.gate, "ack_error", "")
             self._note_gate_wait("host gate: %s%s" % (
                 gate.describe(), "; ack not written: " + error if error else ""))
+            if not getattr(self, "_gate_closed_woken", False):
+                # #4515 : le sondage au repos s'est allongé (`idle_poll`) ; à la
+                # fermeture, chaque worker au repos rend son bail sans attendre
+                self._gate_closed_woken = True
+                self._wake_workers()
             return  # host gate closed: registry diagnosis without taking a lease
+        self._gate_closed_woken = False
         # #1425 (N2) : le dessaisissement des arrêts délibérés vient APRÈS les
         # gardes (secteur, drainage, code périmé, porte) : sous l'une d'elles
         # l'exécuteur n'agit pas sur la file, et un runner périmé ne dessaisit
@@ -10910,6 +10941,47 @@ class Runner:
         return True
 
     # -- écoute ------------------------------------------------------------
+    #: #4515 : passes de sondage au repos par seconde, pour l'exécuteur
+    #: entier. Une passe d'agent au repos coûte une trentaine de requêtes sur
+    #: la connexion partagée ; à `poll` = 5 s, vingt agents en faisaient ~120/s
+    #: et un runtime de soixante-dix agents saturait la connexion en
+    #: permanence (fils en file, GIL disputé, ~1 cœur brûlé sans aucun tour).
+    IDLE_PASSES_PER_S = 1.0
+    #: #4515 : plafond du pas au repos. La relève élue d'un détenteur non
+    #: prêt (#4231) est vue à une passe du worker : 60 s de publication, 60 s
+    #: d'observation, 120 s de garde et au plus 45 s de pas restent sous les
+    #: cinq minutes du canon (§11) ; au-delà de 45 agents, le budget de passes
+    #: recroît donc doucement (70 agents : 1,6 passe/s, contre 14 avant).
+    IDLE_POLL_MAX_S = 45.0
+
+    def idle_poll(self) -> float:
+        """#4515 : le pas du sondage d'un worker au repos.
+
+        Le sondage n'est qu'un filet : courrier, redémarrage, budget, config
+        et drainage réveillent le worker par son événement (NOTIFY, `dispatch`)
+        et les échéances connues raccourcissent l'attente (`_until_due`).
+        Tant que l'écoute est établie, le pas s'allonge donc avec le nombre
+        d'agents pour que l'exécuteur entier fasse au plus
+        `IDLE_PASSES_PER_S` passes de repos par seconde, dans la limite de
+        `IDLE_POLL_MAX_S`. Le bail reste renouvelé au tiers de sa durée
+        (borne de l'appelant). Sans écoute (pilote sans
+        LISTEN, reconnexion en cours), le sondage redevient le seul réveil :
+        `poll`, comme avant."""
+        if getattr(self, "listener", None) is None:
+            return self.poll
+        with self.lock:
+            agents = len(self.workers)
+        return max(self.poll, min(self.IDLE_POLL_MAX_S, agents / self.IDLE_PASSES_PER_S))
+
+    def _wake_workers(self) -> None:
+        """#4515 : réveille chaque worker (écoute rétablie, porte fermée)."""
+        lock = getattr(self, "lock", None)
+        if lock is None:
+            return  # doublure d'exécuteur sans workers
+        with lock:
+            for worker in self.workers.values():
+                worker.wake.set()
+
     #: #4602 : au plus une ligne par agent et par fenêtre pour une attente
     #: d'admission base longue (le seuil du verrou est `admission_lock.WARN_S`).
     DB_WAIT_NOTICE_S = 30.0
@@ -11015,12 +11087,17 @@ class Runner:
             elif worker:
                 worker.wake.set()
                 log_async("message for %s: waking the turn" % target)
-            else:
+            elif not target:
                 # #4602 (N dev1) : pas de priorité pour un réveil sans cible —
                 # soixante-dix CONTROL ne seraient plus une priorité ; ces
                 # workers restent des sondeurs NORMAL.
                 for autre in self.workers.values():
                     autre.wake.set()
+            # #4515 : un courrier pour un agent que cet exécuteur ne sert pas
+            # (les NOTIFY sont émis pour toute la base, donc tout le maillage)
+            # ne concerne aucun de ses workers ; le réveiller tous lançait une
+            # passe complète par agent à chaque courrier du maillage. Seule la
+            # passe de l'exécuteur (`wake_all`, ci-dessous) peut le réclamer.
         self.wake_all.set()
 
     def _listen_loop(self) -> None:
@@ -11053,6 +11130,10 @@ class Runner:
                           % self.poll)
                 return
             self.listener = listener
+            # #4515 : un NOTIFY émis pendant la coupure est perdu, et le
+            # sondage au repos s'est allongé (`idle_poll`) : chaque worker
+            # relit une fois dès que l'écoute est (r)établie.
+            self._wake_workers()
             if service is not None:
                 # LISTEN is established first: recover hints lost before startup
                 # or during disconnection once, never on a listener timeout.
@@ -14601,6 +14682,7 @@ def main(argv: list[str] | None = None) -> int:
 
         signal.signal(signal.SIGTERM, handler)
         signal.signal(signal.SIGINT, handler)
+        dump_stacks_on_signal()
         code = runner.run()  # son `finally` rend les baux (shutdown)
     finally:
         try:
