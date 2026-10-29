@@ -74,6 +74,11 @@ an ordered authority route from the project's configuration, for example:
 
 The adapter supplies these identities from its authority directory; ameesh
 contains no customer-specific role or person. The first entry is solicited.
+A domain without an explicit route keeps the ordinary decision recipient
+resolved from the requester/lot; configuring the escalation owner does not
+redirect that request. Its timezone defaults to `validations.timezone` (UTC
+when omitted); a recipient matching `validations.owner` uses
+`owner_timezone`. Explicit domain entries may provide their own timezone.
 At expiry, the runner escalates once to the next entry, or to the configured
 owner to name a substitute if no next entry exists. It never skips an entry.
 A response before expiry cancels escalation. The initial validator can still
@@ -82,7 +87,9 @@ A contradictory late response opens a new decision linked as `contradicts`,
 without replacing the recorded winner.
 
 The factual record includes the request time, deadline, default application,
-escalation, responder and late responses. It is kept outside public work
+escalation, responder and late responses. An escalation also records a request
+under the substitute's identity, with the solicitation time and deadline,
+so the owner can query that person's history. It is kept outside public work
 notes and threads. Public decision views expose only `validation.status =
 escalated`, never the private audit or authority snapshot. History by person
 requires a non-agent human session and possession of a registered, live owner

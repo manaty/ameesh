@@ -84,6 +84,38 @@ class ValidationTest(PgTestCase):
         self.answer(current, human="human:po", now=self.now + 61)
         self.assertEqual(vd.sweep(self.cfg, self.db, now=self.now + 130), [])
 
+    def test_ordinary_decision_keeps_resolved_recipient_and_zone(self):
+        settings = self.cfg.project_planning["acme"]["validations"]
+        settings["timezone"] = "Asia/Manila"
+        settings["owner_timezone"] = "Europe/Paris"
+        self.db.execute("UPDATE agent_registry SET responsible = 'human:client'"
+                        " WHERE name = 'requester'")
+        view = decisions.ask(self.cfg, self.db, requester="requester",
+                             lot=str(self.lot["id"]), question="Ordinary decision?", now=self.now)
+        self.assertEqual(view["owner"], "human:client")
+        self.assertEqual(view["validation"]["timezone"], "Asia/Manila")
+        self.assertEqual(view["due_ts"], vd.business_due(self.now, "Asia/Manila"))
+
+    def test_owner_recipient_uses_owner_timezone(self):
+        self.cfg.project_planning["acme"]["validations"]["owner_timezone"] = "Europe/Paris"
+        view = decisions.ask(self.cfg, self.db, requester="requester",
+                             lot=str(self.lot["id"]), question="Owner decision?", now=self.now)
+        self.assertEqual(view["owner"], "human:owner")
+        self.assertEqual(view["validation"]["timezone"], "Europe/Paris")
+        self.assertEqual(view["due_ts"], vd.business_due(self.now, "Europe/Paris"))
+        self.assertIn(vd.stamp(view["due_ts"], "Europe/Paris"),
+                      storage.of(self.db).decisions.get(view["id"])["body"])
+
+    def test_escalation_records_recipient_request_once(self):
+        view = self.ask(due_ts=self.now + 60)
+        vd.sweep(self.cfg, self.db, now=self.now + 61)
+        vd.sweep(self.cfg, self.db, now=self.now + 62)
+        rows = storage.of(self.db).decisions.validation_history(person="human:po")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "requested")
+        self.assertEqual(rows[0]["facts"]["requested_ts"], self.now + 61)
+        self.assertEqual(rows[0]["facts"]["escalated_from"], "human:tpm")
+
     def test_early_response_cancels_escalation(self):
         view = self.ask(due_ts=self.now + 60)
         self.answer(view)

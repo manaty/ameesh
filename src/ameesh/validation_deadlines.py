@@ -39,6 +39,7 @@ def routing(cfg, project, domain, owner):
     if settings.get("domains") and not settings.get("owner"):
         raise ValueError("validation domain routes require an explicit mesh owner")
     ZoneInfo(settings.get("owner_timezone", settings.get("timezone", "UTC")))
+    recipient = owner
     owner = settings.get("owner") or owner
     if not owner:
         raise ValueError("validation needs an explicit owner in project_planning")
@@ -49,13 +50,17 @@ def routing(cfg, project, domain, owner):
     for node in domain_route:
         if not isinstance(node, dict) or not str(node.get("human", "")).startswith("human:"):
             raise ValueError("validation route needs human identities")
-        zone = node.get("timezone") or settings.get("timezone", "UTC")
+        zone = node.get("timezone") or (
+            settings.get("owner_timezone", settings.get("timezone", "UTC"))
+            if node["human"] == owner else settings.get("timezone", "UTC"))
         ZoneInfo(zone)
         if node["human"] in {n["human"] for n in nodes}:
             raise ValueError("duplicate validation authority")
         nodes.append({"human": node["human"], "timezone": zone})
     if not nodes:
-        nodes = [{"human": owner, "timezone": settings.get("timezone", "UTC")}]
+        zone = (settings.get("owner_timezone", settings.get("timezone", "UTC"))
+                if recipient == owner else settings.get("timezone", "UTC"))
+        nodes = [{"human": recipient, "timezone": zone}]
     ZoneInfo(nodes[0]["timezone"])
     if not str(owner).startswith("human:"):
         raise ValueError("validation owner must be a human identity")
@@ -123,6 +128,10 @@ def sweep(cfg, db, *, now=None):
                                               owner=substitute["human"], decision_id=view["id"])
                 store.validation_escalate(view["id"], recipient=substitute["human"],
                                            decision=decision, body=body, now=now)
+                store.validation_event(
+                    view["id"], person=substitute["human"], kind="requested", now=now,
+                    facts={"due_ts": decision["due_ts"], "escalated_from": initial["human"],
+                           "requested_ts": now}, event_key="escalation_requested")
                 store.validation_event(view["id"], person=initial["human"], kind="missed",
                                        now=now, event_key="missed",
                                        facts={"requested_ts": row["created_ts"],
