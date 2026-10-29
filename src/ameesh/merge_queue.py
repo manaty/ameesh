@@ -1435,6 +1435,7 @@ _GATE_CODE_FILES = (
     "merge_queue.py", "review_authors.py", "review_designation_activation.py",
     "lot_class.py", "plan_git.py", "canon.py", "review_lot.py", "review.py",
     "provenance_scope.py", "packet_reviews.py",
+    "modules/dev/lot_class.py", "modules/dev/review.py", "modules/dev/review_target.py",
 )
 _GATE_CODE_FINGERPRINT: str | None = None
 
