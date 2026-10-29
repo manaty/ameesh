@@ -314,7 +314,8 @@ def _lot(ctx: Context, db, params, query) -> dict:
     from . import mesh_cli
     item = mesh_cli.work_detail(ctx.cfg, db, int(params["id"]))
     if item is None:
-        raise ApiError(404, "not_found", "unknown lot")
+        from . import vocab
+        raise ApiError(404, "not_found", f"{vocab.active().title} introuvable")
     return {"schema": "ameesh-lot/1", "lot": item}
 
 
@@ -505,12 +506,49 @@ def fault_route(command: str, path: str) -> str:
     return "%s <unknown>" % command
 
 
+def vocabulary_metadata() -> dict:
+    """L102 T4: additive presentation metadata; wire identifiers stay stable."""
+    from . import vocab
+    words = vocab.active()
+    return {name: getattr(words, name) for name in (
+        "singular", "plural", "gender", "elides", "definite", "indefinite",
+        "of", "to", "definite_plural", "indefinite_plural", "of_plural",
+        "to_plural", "title", "title_plural")}
+
+
+def route_summary(route: Route) -> str:
+    from . import vocab
+    words = vocab.active()
+    summaries = {
+        API + "/lots": f"{words.title_plural} (`ameesh work list --json`)",
+        API + "/lots/{id}": f"Détail {words.of} (`ameesh work show --json`)",
+        API + "/threads/{project}/{lot}":
+            f"Fil {words.of} (`ameesh fil show PROJECT LOT`)",
+        API + "/projects/{project}/timeline":
+            f"Chronologie du projet : {words.plural}, fenêtre et rendu (#3395, #3401)",
+        EVENTS_PATH: f"Event stream (Server-Sent Events): {words.plural}, turns, costs, "
+                     "threads, decisions, alerts",
+    }
+    return summaries.get(route.path, route.summary)
+
+
+def query_description(route: Route, name: str, text: str) -> str:
+    from . import vocab
+    words = vocab.active()
+    if route.path == API + "/lots":
+        return {"state": f"État {words.of_plural}",
+                "assignee": f"Responsable {words.of_plural}",
+                "limit": f"Nombre maximal de {words.plural} (défaut 100)"}.get(name, text)
+    return text
+
+
 def discovery(ctx: Context) -> dict:
     """`GET /.well-known/ameesh` (study §3)."""
     return {"schema": "ameesh-discovery/1", "organisation": ctx.organisation,
             "api": API, "versions": ["v1"], "version": version(), "mode": "local",
             "oidc_issuer": None, "approve_url": getattr(ctx.cfg, "approve_url", None) or None,
-            "languages": list(LANGUAGES), "openapi": OPENAPI_PATH}
+            "languages": list(LANGUAGES), "openapi": OPENAPI_PATH,
+            "vocabulary": vocabulary_metadata()}
 
 
 # --------------------------------------------------------------------------
@@ -596,7 +634,13 @@ SCHEMAS = {
                                organisation=_STR_NULL, api=_STR,
                                versions={"type": "array", "items": _STR}, version=_STR,
                                mode=_STR, oidc_issuer=_STR_NULL, approve_url=_STR_NULL,
-                               languages={"type": "array", "items": _STR}, openapi=_STR),
+                               languages={"type": "array", "items": _STR}, openapi=_STR,
+                               vocabulary={"type": "object", "properties": {
+                                   name: {"type": "boolean" if name == "elides" else "string"}
+                                   for name in ("singular", "plural", "gender", "elides",
+                                                "definite", "indefinite", "of", "to",
+                                                "definite_plural", "indefinite_plural",
+                                                "of_plural", "to_plural", "title", "title_plural")}}),
     "ameesh-error/1": _obj("ameesh-error/1", ["error", "message"], error=_STR, message=_STR),
     "ameesh-action/1": _obj("ameesh-action/1", ["action", "by", "for", "result"],
                             action=_STR, by=_STR, result=_OBJ, **{"for": _STR}),
@@ -624,7 +668,7 @@ def openapi() -> dict:
     for route in ROUTES:
         if route.path == OPENAPI_PATH:
             paths[route.path] = {"get": {
-                "operationId": "openapi", "summary": route.summary, "security": [],
+                "operationId": "openapi", "summary": route_summary(route), "security": [],
                 "responses": {"200": {"description": "OpenAPI 3.1",
                                       "content": {"application/json": {
                                           "schema": {"type": "object"}}}}}}}
@@ -633,8 +677,9 @@ def openapi() -> dict:
                    "schema": {"type": "integer"} if name == "id" else {"type": "string"}}
                   for name in re.findall(r"\{(\w+)\}", route.path)]
         params += [{"name": name, "in": "query", "required": False, "schema": schema,
-                    "description": text} for name, schema, text in route.query]
-        responses = {"200": _response(route.summary, route.schema),
+                    "description": query_description(route, name, text)}
+                   for name, schema, text in route.query]
+        responses = {"200": _response(route_summary(route), route.schema),
                      "400": _response("bad request", "ameesh-error/1"),
                      "401": _response("token missing or refused", "ameesh-error/1"),
                      "503": _response("database unavailable", "ameesh-error/1")}
@@ -662,7 +707,7 @@ def openapi() -> dict:
                                           "new events only"})
         operation = {"operationId": re.sub(r"[^A-Za-z0-9]+", "_",
                                            route.path[len(API) + 1:]).strip("_"),
-                     "summary": route.summary, "responses": responses}
+                     "summary": route_summary(route), "responses": responses}
         if params:
             operation["parameters"] = params
         paths[route.path] = {"get": operation}
@@ -679,7 +724,7 @@ def openapi() -> dict:
                              if required],
                 "properties": {name: schema for name, (schema, _required)
                                in action.body.items()}}
-        responses = {"200": _response(action.summary, "ameesh-action/1"),
+        responses = {"200": _response(serve_actions.summary(action), "ameesh-action/1"),
                      "400": _response("bad request", "ameesh-error/1"),
                      "401": _response("token missing or refused", "ameesh-error/1"),
                      "403": _response("not allowed", "ameesh-error/1"),
@@ -693,13 +738,14 @@ def openapi() -> dict:
                      "503": _response("database unavailable", "ameesh-error/1")}
         operation = {"operationId": "post_" + re.sub(r"[^A-Za-z0-9]+", "_",
                                                      action.path[len(API) + 1:]).strip("_"),
-                     "summary": action.summary, "parameters": params,
+                     "summary": serve_actions.summary(action), "parameters": params,
                      "requestBody": {"required": True, "content": {
                          "application/json": {"schema": body}}},
                      "responses": responses}
         paths.setdefault(action.path, {})["post"] = operation
     return {
         "openapi": "3.1.0",
+        "x-ameesh-vocabulary": vocabulary_metadata(),
         "info": {"title": "ameesh API", "version": "1",
                  "description": "API of an ameesh mesh, local mode: reads (L84), each the "
                                 "serialisation of the matching `--json` output of the CLI "
