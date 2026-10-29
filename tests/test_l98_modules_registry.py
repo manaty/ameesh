@@ -203,7 +203,8 @@ class RegistryTest(unittest.TestCase):
             "name": "sample", "version": "0.1.0", "source": "external",
             "capabilities": ["lifecycle"], "cli": None, "storage": {"types": ["docs"]},
             "distribution": "ameesh-sample-module", "entry_point": "sample_module",
-            "descriptor_sha256": rows["sample"]["descriptor_sha256"]})
+            "descriptor_sha256": rows["sample"]["descriptor_sha256"],
+            "card_ref": None})
 
     def test_declared_capabilities_are_checked_against_the_module(self):
         with points(FakeEntryPoint(sample(CAPABILITIES=("lifecycle", "cli"),

@@ -47,6 +47,16 @@ them read-only and exits 1 when an entry point is refused. The bare profile
 (`discover(builtin=False)` with no entry point) is an empty registry without
 error, pinned by `tests/test_l98_modules_registry.py`.
 
+L103 tranche 2 (#4396) adds a third source to the registry: with a canon,
+`registry.discover(canon=…)` turns each valid `Pipeline` card into a `Module`
+of source `canon` (`card_ref` for the trace, capability `lifecycle`, no stored
+type). Its `PipelineModule` adapter lives in the registry and is built from
+canon data: nothing is imported. `modules.installed(canon)` and
+`modules.declarations(federation, canon)` accept the card's name as a project
+module; a declarative module is the one module without types a project may
+select (an installed one, and the always-active `dev`, still may not). A card
+never shadows an installed name.
+
 L99 tranche 1 adds the generic lifecycle names as accepted aliases:
 `requested` (intake), `in_progress` (build), `to_validate` (qa), `validated`
 (merged) and `delivered` (promoted); `blocked`, `waiting_human` and `closed`
