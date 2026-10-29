@@ -75,6 +75,13 @@ prêts — celui d'un paquet parallèle. Tout autre lot prêt est écrit aux éc
 avec le motif « paquet parallèle : autre groupe disjoint », jamais composé
 dans deux paquets.
 
+#4581 : `--keep-composition REF` reprend **les membres** de la composition du
+manifeste gelé à REF, moins les `--exclude`, chacun à sa source composée. Un
+lot prêt depuis cette composition, un membre regelé (nouvelle tête) ou disparu
+de la liste prête n'est pas admis : il est écrit aux écartés avec le motif
+« coupure suivante : … ». Après un rouge, le paquet ne grossit donc plus à
+chaque recomposition, et aucune tête neuve n'entre sans ci de paquet.
+
 #4113 : hors banc sans base, la même garde d’époque que `packet record`
 est relue avant la composition, entre unités, avant chaque série de tests et
 avant publication. Une perte de bail arrête avant l’opération suivante ;
@@ -209,6 +216,12 @@ PARALLEL_EXCLUDE_REASON = "paquet parallèle : autre groupe disjoint"
 #: écarté avec ce motif, jamais une erreur qui garde la cible réservée.
 PARALLEL_GROUP_NOT_READY = "paquet parallèle : lot du groupe non prêt"
 PARALLEL_GROUP_GONE = "paquet parallèle : lot du groupe introuvable"
+#: #4581 : motifs écrits par une recomposition qui garde la composition
+#: précédente. Les lots prêts depuis vont au paquet suivant, jamais dans
+#: celui-ci ; un membre regelé n'est pas réadmis sur une tête sans ci de paquet.
+KEEP_READY_REASON = "coupure suivante : recomposition"
+KEEP_REFROZEN_REASON = "coupure suivante : tête regelée"
+KEEP_NOT_READY_REASON = "coupure suivante : membre non prêt"
 #: sorties qui ne prouvent pas un rouge du lot (environnement, base absente)
 #: #4217 : un `tearDownClass`/`setUpClass` en `QueryCanceled` (statement
 #: timeout, base de test chargée) est une panne d'infrastructure, jamais un
@@ -1095,6 +1108,92 @@ def exclude_discards(requested: list[int], reasons: list[str],
             lot, reason or EXCLUDE_DEFAULT_REASON,
             "--exclude, recomposition sans lui"))
     return discards
+
+
+def composition_specs(repo: Path, reference: str, name: str) -> list[tuple[list[int], str]]:
+    """#4581 : la table `## Composition` du manifeste gelé à `reference`."""
+    sha = rev(repo, reference)
+    if sha is None:
+        raise InputError("--keep-composition : référence %r introuvable" % reference)
+    rel = manifest_rel(name)
+    show = git(repo, "show", "%s:%s" % (sha, rel), check=False)
+    if show.returncode != 0:
+        raise InputError(
+            "--keep-composition : manifeste %s illisible sur %s : %s"
+            % (rel, sha[:12], _tail(_decode(show.stderr))))
+    try:
+        return parse_composition_table(_decode(show.stdout))
+    except InputError as error:
+        raise InputError(
+            "--keep-composition : %s illisible sur %s : %s"
+            % (rel, sha[:12], error)) from error
+
+
+def same_source(worktree: Path, left: str, right: str) -> bool:
+    """Les deux désignent-ils le même commit ? (une abréviation est résolue.)"""
+    if left == right:
+        return True
+    if not left or not right:
+        return False
+    found_left = rev(worktree, left)
+    found_right = rev(worktree, right)
+    return bool(found_left and found_right and found_left == found_right)
+
+
+def keep_composition(candidates: list[Candidate],
+                     specs: list[tuple[list[int], str]], *,
+                     worktree: Path,
+                     already_discarded: set[int]) -> tuple[list[Candidate], list[Discarded]]:
+    """#4581 : restreint la liste prête aux membres de la composition précédente.
+
+    `specs` vient du manifeste gelé de la composition à conserver ;
+    `already_discarded` porte les lots déjà écartés (erreurs de la liste
+    calculée, `--exclude`, groupe parallèle). Un membre n'est repris que sur sa
+    source composée : une nouvelle tête, un lot sorti de la liste prête ou une
+    unité de résolution est écrit aux écartés pour la coupure suivante, jamais
+    composé ici. Tout lot prêt qui n'était pas dans la composition précédente
+    est nommé de même.
+    """
+    by_lot = {candidate.lot: candidate for candidate in candidates}
+    members: list[Candidate] = []
+    discarded: list[Discarded] = []
+    seen: set[int] = set(already_discarded)
+    for lots, source in specs:
+        if any(lot in seen for lot in lots):
+            seen.update(lots)
+            continue
+        seen.update(lots)
+        if len(lots) != 1:
+            # paquet-auto ne compose pas de résolution (jugement humain) ; une
+            # telle unité ne se reprend pas sans la relire.
+            discarded.append(Discarded(
+                lots[0], KEEP_NOT_READY_REASON,
+                "unité de résolution (%s), non reprise par une recomposition"
+                % ", ".join("#%d" % lot for lot in lots)))
+            continue
+        lot = lots[0]
+        candidate = by_lot.get(lot)
+        if candidate is None:
+            discarded.append(Discarded(
+                lot, KEEP_NOT_READY_REASON,
+                "composé %s, plus dans la liste prête" % source[:12]))
+            continue
+        if not same_source(worktree, candidate.source, source):
+            discarded.append(Discarded(
+                lot, KEEP_REFROZEN_REASON,
+                "composé %s, tête actuelle %s : pas de ci de paquet sur la "
+                "nouvelle tête" % (source[:12], candidate.source[:12])))
+            continue
+        candidate.source = source
+        members.append(candidate)
+    for candidate in candidates:
+        if candidate.lot in seen:
+            continue
+        seen.add(candidate.lot)
+        discarded.append(Discarded(
+            candidate.lot, KEEP_READY_REASON,
+            "hors de la composition conservée ; non admis, coupure suivante"))
+    return members, discarded
 
 
 def compute_candidates(worktree: Path, target: str, base_sha: str,
@@ -3364,6 +3463,17 @@ def compose_packet(args: argparse.Namespace) -> int:
                     Discarded(candidate.lot, PARALLEL_EXCLUDE_REASON,
                               "--only, second paquet parallèle (#3256 C)")
                     for candidate in outside]
+        # #4581 : une recomposition après un rouge garde les membres de la
+        # composition précédente, moins les exclus, à leur source composée.
+        # Les lots devenus prêts entre-temps vont à la coupure suivante ; ils
+        # sont nommés aux écartés (le contrôle d'inclusion lit ce motif).
+        keep = str(getattr(args, "keep_composition", None) or "")
+        if keep:
+            specs = composition_specs(repo, keep, args.name)
+            candidates, kept_discards = keep_composition(
+                candidates, specs, worktree=worktree,
+                already_discarded={item.lot for item in errors})
+            errors = errors + kept_discards
         for item in errors:
             print("écarté #%d : %s — %s"
                   % (item.lot, item.reason, item.detail), flush=True)
@@ -3682,6 +3792,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="#3256 C : ne composer que ces lots prêts (répétable) ; "
                              "les autres, prêts, sont écrits aux écartés avec le "
                              "motif du paquet parallèle, jamais composés deux fois")
+    parser.add_argument("--keep-composition", default=None, metavar="REF",
+                        help="#4581 : recomposition après un rouge : ne garder "
+                             "que les membres de la composition du manifeste gelé "
+                             "à REF, moins les --exclude, chacun à sa source "
+                             "composée ; un lot prêt depuis, regelé ou disparu va "
+                             "à la coupure suivante (écarté, non composé)")
     parser.add_argument("--replay", default=None, metavar="REF",
                         help="rejouer le manifeste d'une référence et comparer "
                              "les arbres (avec --candidates-json : refuser une "
@@ -3734,6 +3850,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.replay:
             if args.carrier or args.local:
                 raise InputError("--replay : ni --carrier ni --local")
+            if args.keep_composition:
+                raise InputError("--keep-composition ne s'applique pas à --replay")
             if not args.base:
                 raise InputError("--replay exige --base")
             if args.candidates_json:
@@ -3754,9 +3872,11 @@ def main(argv: list[str] | None = None) -> int:
             if not re.fullmatch(r"[0-9a-f]{40}", args.publish_sha or ""):
                 raise InputError("--publish exige --publish-sha : le SHA complet "
                                  "attesté par la marque de tests")
-            if args.local or args.no_packet_record or args.exclude:
+            if args.local or args.no_packet_record or args.exclude \
+                    or args.keep_composition:
                 raise InputError("--publish : ni --local, ni --no-packet-record, "
-                                 "ni --exclude (la tête testée est publiée telle quelle)")
+                                 "ni --exclude, ni --keep-composition (la tête "
+                                 "testée est publiée telle quelle)")
             return publish_tested(args)
         if args.no_packet_record and not args.local:
             raise InputError("--no-packet-record est réservé au banc avec --local")

@@ -462,6 +462,157 @@ class PaquetAutoBanc(unittest.TestCase):
         with self.assertRaises(paquet_auto.InputError):
             paquet_auto.exclude_discards([], ["motif orphelin"], set())
 
+    # -- #4581 : la recomposition garde les membres de la composition ---------
+    def test_keep_composition_garde_les_membres_a_leur_source(self) -> None:
+        # Témoin #4581 : composition A = {1, 2, 3}, lot 4 prêt, --exclude 2 :
+        # on recompose {1, 3} ; 4 est nommé pour la coupure suivante.
+        candidates = [paquet_auto.Candidate(1, "a" * 40),
+                      paquet_auto.Candidate(2, "b" * 40),
+                      paquet_auto.Candidate(3, "c" * 40),
+                      paquet_auto.Candidate(4, "d" * 40)]
+        specs = [([1], "a" * 40), ([2], "b" * 40), ([3], "c" * 40)]
+        members, discarded = paquet_auto.keep_composition(
+            candidates, specs, worktree=self.repo, already_discarded={2})
+        self.assertEqual([member.lot for member in members], [1, 3])
+        self.assertEqual([item.lot for item in discarded], [4])
+        self.assertEqual(discarded[0].reason, paquet_auto.KEEP_READY_REASON)
+        self.assertEqual(discarded[0].reason, "coupure suivante : recomposition")
+
+    def test_keep_composition_ecarte_une_tete_regelee(self) -> None:
+        # #4581 : un membre gelé sur une nouvelle tête n'est jamais réadmis
+        # sans ci de paquet sur cette tête ; il va à la coupure suivante.
+        candidates = [paquet_auto.Candidate(1, "a" * 40),
+                      paquet_auto.Candidate(2, "e" * 40),
+                      paquet_auto.Candidate(3, "c" * 40)]
+        specs = [([1], "a" * 40), ([2], "b" * 40), ([3], "c" * 40)]
+        members, discarded = paquet_auto.keep_composition(
+            candidates, specs, worktree=self.repo, already_discarded=set())
+        self.assertEqual([member.lot for member in members], [1, 3])
+        self.assertEqual([item.lot for item in discarded], [2])
+        self.assertEqual(discarded[0].reason, paquet_auto.KEEP_REFROZEN_REASON)
+        self.assertIn("nouvelle tête", discarded[0].detail)
+
+    def test_keep_composition_nomme_le_membre_absent(self) -> None:
+        candidates = [paquet_auto.Candidate(1, "a" * 40),
+                      paquet_auto.Candidate(3, "c" * 40)]
+        specs = [([1], "a" * 40), ([2], "b" * 40), ([3], "c" * 40)]
+        members, discarded = paquet_auto.keep_composition(
+            candidates, specs, worktree=self.repo, already_discarded=set())
+        self.assertEqual([member.lot for member in members], [1, 3])
+        self.assertEqual([item.lot for item in discarded], [2])
+        self.assertEqual(discarded[0].reason, paquet_auto.KEEP_NOT_READY_REASON)
+
+    def test_keep_composition_ecarte_une_resolution(self) -> None:
+        # Une unité à plusieurs lots ne se reprend pas sans la relire.
+        candidates = [paquet_auto.Candidate(1, "a" * 40),
+                      paquet_auto.Candidate(2, "b" * 40)]
+        members, discarded = paquet_auto.keep_composition(
+            candidates, [([1, 2], "a" * 40)], worktree=self.repo, already_discarded=set())
+        self.assertEqual(members, [])
+        self.assertEqual([item.lot for item in discarded], [1])
+        self.assertIn("résolution", discarded[0].detail)
+
+    def test_keep_composition_lit_le_manifeste_gele(self) -> None:
+        manifest = ("# Paquet\n\n## Composition (2 unités, 2 lots)\n\n"
+                    "| unité | lot(s) | source | commit | note |\n"
+                    "|---|---|---|---|---|\n"
+                    "| 1 | #7 | `%s` | `1111111` | composition |\n"
+                    "| 2 | #8 | `%s` | `2222222` | composition |\n"
+                    % ("a" * 12, "b" * 12))
+        self.write("reviews/integration-paquet-banc.md", manifest)
+        self.git("add", "-A", cwd=self.repo)
+        self.git("commit", "-qm", "manifeste", cwd=self.repo)
+        specs = paquet_auto.composition_specs(self.repo, self.rev("HEAD"), "banc")
+        self.assertEqual(specs, [([7], "a" * 12), ([8], "b" * 12)])
+
+    def test_keep_composition_ref_inconnue_refusee(self) -> None:
+        with self.assertRaises(paquet_auto.InputError):
+            paquet_auto.composition_specs(self.repo, "0" * 40, "banc")
+
+    def test_manifeste_nomme_les_prets_non_admis(self) -> None:
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, "a" * 40, "b" * 40)],
+            discarded=[paquet_auto.Discarded(
+                4, paquet_auto.KEEP_READY_REASON, "hors composition conservée")],
+            head="c" * 40)
+        manifest = paquet_auto.build_manifest(
+            name="banc", target="main", base_sha=self.base, carrier=99,
+            composition=composition, table="", tests=[], freeze_seconds=0.0)
+        self.assertIn("| #4 | coupure suivante : recomposition — hors composition "
+                      "conservée |", manifest)
+
+    def test_recomposition_keep_composition_borne_les_candidats(self) -> None:
+        # #4581 : au niveau de la composition, --exclude 2 + la composition
+        # précédente {1, 2} ne composent que #1 ; #3, prêt depuis, est nommé aux
+        # écartés pour la coupure suivante, jamais composé.
+        manifest = ("# Paquet\n\n## Composition (2 unités, 2 lots)\n\n"
+                    "| unité | lot(s) | source | commit | note |\n"
+                    "|---|---|---|---|---|\n"
+                    "| 1 | #1 | `%s` | `1111111` | composition |\n"
+                    "| 2 | #2 | `%s` | `2222222` | composition |\n"
+                    % ("a" * 40, "b" * 40))
+        self.write("reviews/integration-paquet-banc.md", manifest)
+        self.git("add", "-A", cwd=self.repo)
+        self.git("commit", "-qm", "manifeste", cwd=self.repo)
+        keep = self.rev("HEAD")
+        worktree = pathlib.Path(self.tmp.name) / "wt-keep"
+        (worktree / "scripts").mkdir(parents=True)
+        (worktree / "scripts" / "paquet-compose.py").write_text(
+            "", encoding="utf-8")
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, "a" * 40, "d" * 40)],
+            discarded=[], head="e" * 40)
+        args = argparse.Namespace(
+            repo=str(self.repo), name="banc", target="main", carrier=99,
+            base=None, local=True, no_packet_record=True, keep_worktree=False,
+            keep_failed_hours=24.0, force=True, tests_timeout=10,
+            pilot="pilote", exclude=[2], exclude_reason=["rouge ci-full"],
+            keep_composition=keep)
+        seen: dict[str, list[int]] = {}
+        manifests: list[str] = []
+
+        def fake_compose(_worktree, candidates, *_args, **_kwargs):
+            seen["candidates"] = [candidate.lot for candidate in candidates]
+            return composition
+
+        def capture(_worktree, _rel, text, **_kwargs):
+            manifests.append(text)
+            return "d" * 40
+
+        with mock.patch.object(paquet_auto, "fresh_base",
+                               return_value="a" * 40), \
+                mock.patch.object(paquet_auto, "prune_stale_worktrees",
+                                  return_value=[]), \
+                mock.patch.object(paquet_auto, "make_worktree",
+                                  return_value=worktree), \
+                mock.patch.object(paquet_auto, "compute_candidates",
+                                  return_value=(
+                                      [paquet_auto.Candidate(1, "a" * 40),
+                                       paquet_auto.Candidate(2, "b" * 40),
+                                       paquet_auto.Candidate(3, "c" * 40)],
+                                      {"ready": [1, 2, 3], "waiting": []})), \
+                mock.patch.object(paquet_auto, "compose_candidates",
+                                  side_effect=fake_compose), \
+                mock.patch.object(paquet_auto, "run_freeze_checks",
+                                  return_value=(0, "ok", 0.1)), \
+                mock.patch.object(paquet_auto, "check_local_tests",
+                                  return_value=([], [], [])), \
+                mock.patch.object(paquet_auto, "composition_table",
+                                  return_value="## Composition (1 unité, 1 lot)\n"), \
+                mock.patch.object(paquet_auto, "write_manifest",
+                                  side_effect=capture), \
+                mock.patch.object(paquet_auto, "run_inclusion",
+                                  return_value=(0, "inclusion ok")), \
+                mock.patch.object(paquet_auto, "remove_worktree"):
+            self.assertEqual(paquet_auto.compose_packet(args), 0)
+        self.assertEqual(seen["candidates"], [1])
+        self.assertEqual(len(manifests), 1)
+        self.assertIn("| #2 | rouge ci-full — --exclude, recomposition sans lui |",
+                      manifests[0])
+        self.assertIn("| #3 | coupure suivante : recomposition — hors de la "
+                      "composition conservée ; non admis, coupure suivante |",
+                      manifests[0])
+
     def test_manifeste_porte_le_motif_exclude_reason(self) -> None:
         # Témoin #4201 : une recomposition --exclude écrit au manifeste le vrai
         # motif du pilote, pas la phrase figée « ci-full rouge attribuée ».
@@ -845,6 +996,10 @@ class PaquetAutoBanc(unittest.TestCase):
             log=lambda _line: None,
         )
         table = paquet_auto.composition_table(worktree, self.base, COMPOSE)
+        # #4581 : un lot prêt depuis la composition (jamais composé) est nommé
+        # aux écartés ; le contrôle d'inclusion l'accepte comme expliqué.
+        composition.discarded.append(paquet_auto.Discarded(
+            4, paquet_auto.KEEP_READY_REASON, "hors composition conservée"))
         manifest = paquet_auto.build_manifest(
             name="inclusion", target="main", base_sha=self.base, carrier=99,
             composition=composition, table=table, tests=[], freeze_seconds=0.0)
@@ -852,7 +1007,7 @@ class PaquetAutoBanc(unittest.TestCase):
         self.write(rel, manifest, cwd=worktree)
         head = self.commit("manifeste", cwd=worktree)
         ready = pathlib.Path(self.tmp.name) / "prets.txt"
-        ready.write_text("#1\n#2\n#3\n", encoding="utf-8")
+        ready.write_text("#1\n#2\n#3\n#4\n", encoding="utf-8")
         expected = pathlib.Path(self.tmp.name) / "attendus.txt"
         expected.write_text("#1\n#3\n", encoding="utf-8")
         proc = subprocess.run(
@@ -863,11 +1018,13 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("VERDICT : aucun défaut", proc.stdout)
         # La table d'admissions ne cite que les lots composés : #2 est écarté
-        # au manifeste, pas attendu.
+        # au manifeste, pas attendu ; #4 prêt depuis la composition non plus.
         parse = self._parse_manifest(worktree / rel)
         self.assertEqual(parse.admissions, [1, 3])
         self.assertIn(2, parse.ecartes)
         self.assertIn("conflit", parse.ecartes[2])
+        self.assertIn(4, parse.ecartes)
+        self.assertIn(paquet_auto.KEEP_READY_REASON, parse.ecartes[4])
 
     def _parse_manifest(self, path: pathlib.Path):
         spec = importlib.util.spec_from_file_location("test_paquet_inclusion_script",
@@ -951,6 +1108,36 @@ class PaquetAutoBanc(unittest.TestCase):
             paquet_auto.main(["--repo", str(REPO), "--replay", "fc59a14e",
                               "--name", "h-20261026-31", "--base", "f444955b"]),
             0)
+
+
+class KeepCompositionOptionTest(unittest.TestCase):
+    """#4581 : l'option de recomposition est transmise, et refuse le rejeu."""
+
+    def test_main_transmet_keep_composition(self) -> None:
+        parsed: list[str] = []
+        original = paquet_auto.compose_packet
+        paquet_auto.compose_packet = (
+            lambda args: parsed.append(args.keep_composition) or 0)
+        try:
+            rc = paquet_auto.main(["--name", "h-x", "--carrier", "9",
+                                   "--keep-composition", "a" * 40])
+        finally:
+            paquet_auto.compose_packet = original
+        self.assertEqual(rc, 0)
+        self.assertEqual(parsed, ["a" * 40])
+
+    def test_rejeu_refuse_keep_composition(self) -> None:
+        self.assertEqual(
+            paquet_auto.main(["--name", "h-x", "--replay", "HEAD",
+                              "--base", "HEAD", "--keep-composition", "a" * 40]),
+            2)
+
+    def test_publication_refuse_keep_composition(self) -> None:
+        self.assertEqual(
+            paquet_auto.main(["--name", "h-x", "--carrier", "9",
+                              "--publish", "refs/ameesh/paquet-auto/teste/h-x",
+                              "--publish-sha", "a" * 40,
+                              "--keep-composition", "b" * 40]), 2)
 
 
 if __name__ == "__main__":
