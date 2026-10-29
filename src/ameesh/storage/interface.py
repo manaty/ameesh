@@ -4435,12 +4435,16 @@ class HostLifecycle(Domain):
         """CAS progress against the current host generation."""
 
     @abc.abstractmethod
-    def expire_returns(self, *, open_claims: bool = True) -> list[dict]:
+    def expire_returns(self, *, open_claims: bool = True,
+                       hosts: Sequence[str] | None = None) -> list[dict]:
         """Convert elapsed planned withdrawals to durable return requests.
 
         #4148: `open_claims=False` keeps the claim gate closed so the `busy`
         hook answers first (the runner's path); the default preserves the
         historical direct call, where no adapter is involved.
+
+        #4435: `hosts` restricts the conversion to those hosts (the mediated
+        server expires only the hosts it scans); None keeps every one.
         """
 
     @abc.abstractmethod
