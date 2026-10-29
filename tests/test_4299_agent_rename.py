@@ -2,6 +2,7 @@
 """#4299 (L243b step 3): an identity renamed in place, old name kept as alias."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -160,6 +161,7 @@ class AgentRenameTest(PgTestCase):
             'milestone:%d' % stranger['id'], sha, 'reviewer', 's-2', 'u' * 32, 'claude',
             work_item_id=int(lot['id']))
 
+        self.mark_merged(lot)
         self.rename('worker', 'new-worker')
         receipt = review_provenance.receipt_for_milestone(self.db, mark['id'])
         self.assertEqual(receipt['actor'], 'worker')                 # proof unchanged
@@ -172,6 +174,78 @@ class AgentRenameTest(PgTestCase):
         receipt = review_provenance.receipt_for_milestone(self.db, mark['id'])
         self.assertEqual((receipt['actor'], receipt['milestone']['actor']),
                          ('worker', 'worker'))
+
+    def test_strict_verdict_families_survive_the_rename(self):
+        # B1 of dev3 on bf63c9d5: the train's strict reader compared the
+        # receipt's spelling with the rewritten milestone actor.
+        from ameesh import review_authors, review_provenance, storage
+        sha = 'b' * 40
+        lot = work.add(self.db, title='Strict families', app='ameesh', actor='human:owner')
+        with mock.patch('ameesh.freeze_checks.commit_in', return_value=sha):
+            mark = work.milestone(self.db, int(lot['id']), 'verdict', sha=sha[:12],
+                                  actor='worker', verdict='ok')
+        storage.of(self.db).provenance.add(
+            'milestone:%d' % mark['id'], sha, 'worker', 's-1', 't' * 32, 'codex',
+            work_item_id=int(lot['id']))
+
+        def families():
+            return review_authors.verdict_families(
+                self.db, work.milestones(self.db, int(lot['id'])),
+                ('claude', 'codex', 'deepseek'), strict=True, require_receipt=True)
+
+        self.mark_merged(lot)
+        self.rename('worker', 'new-worker')
+        self.assertEqual(families(), {'new-worker': 'codex'})
+        # Another identity's receipt still breaks the strict reader.
+        self.db.execute("UPDATE provenance_receipts SET actor = 'reviewer'"
+                        " WHERE subject = %s", ('milestone:%d' % mark['id'],))
+        with self.assertRaises(review_provenance.ProvenanceError):
+            families()
+
+    def test_signed_proofs_on_an_unmerged_lot_refuse_the_rename(self):
+        # The gate pairs kept receipts with rewritten names in many readers:
+        # the rename waits until the agent's proven lots are merged or closed.
+        from ameesh import storage
+        lot = work.add(self.db, title='Under review', app='ameesh', actor='human:owner')
+        storage.of(self.db).provenance.add(
+            'commit:' + 'c' * 40, 'c' * 40, 'worker', 's-1', 't' * 32, 'codex',
+            work_item_id=int(lot['id']))
+        with self.assertRaisesRegex(agent_rename.RenameError,
+                                    'signed proofs on unmerged lots \\(#%d\\)' % lot['id']):
+            self.rename('worker', 'new-worker')
+        self.assertEqual(registry.get(self.db, 'worker')['name'], 'worker')
+        self.mark_merged(lot)
+        self.assertEqual(self.rename('worker', 'new-worker')['new'], 'new-worker')
+
+    def mark_merged(self, lot):
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (int(lot['id']),))
+
+    def test_review_floor_survives_the_rename(self):
+        # B2 of dev3 on bf63c9d5: the floor's evidence keeps the old spelling,
+        # the event actor is rewritten; the floor must not fall to 0.
+        from ameesh import review_floor
+        lot = int(work.add(self.db, title='Floored lot', app='ameesh',
+                           actor='human:owner')['id'])
+
+        def pose(actor, evidence_actor):
+            self.db.execute(
+                "INSERT INTO work_item_events (work_item_id, state, note, actor, evidence)"
+                " VALUES (%s, 'intake', %s, %s, %s)",
+                (lot, '%s 2' % review_floor.PREFIX, actor, json.dumps(
+                    {'schema': review_floor.EVIDENCE_SCHEMA, 'floor': 2,
+                     'actor': evidence_actor})))
+
+        pose('worker', 'worker')
+        self.rename('worker', 'new-worker')
+        found = review_floor.of_lot(self.db, lot)
+        self.assertEqual((found['floor'], found['actor']), (2, 'new-worker'))
+        # Evidence naming another identity is still not authentic.
+        other = int(work.add(self.db, title='Forged floor', app='ameesh',
+                             actor='human:owner')['id'])
+        lot = other
+        pose('new-worker', 'reviewer')
+        self.assertEqual(review_floor.of_lot(self.db, other)['floor'], 0)
 
     def test_reverse_is_the_same_gesture(self):
         self.db.execute("UPDATE agent_registry SET aliases = ARRAY['legacy'] WHERE name = 'worker'")

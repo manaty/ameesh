@@ -4563,6 +4563,7 @@
     "retire",
     "restore",
     "reachability",
+    "same_identity",
     "stopped_with"
    ],
    "alert_acknowledgements": [

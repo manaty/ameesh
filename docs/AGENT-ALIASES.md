@@ -103,8 +103,12 @@ requires every agent-valued column in the schema to be classified.
 The gesture is refused, with nothing written, if the agent holds a live lease
 or is running (stop its runner between two turns first), if `NEW` designates
 another identity or a human key holder, if `NEW` already appears in a
-rewritten column (that would graft a foreign history), or if the agent holds an
-owner key. `--dry-run` runs the whole transaction and rolls it back. Each
+rewritten column (that would graft a foreign history), if the agent holds an
+owner key, or if a receipt under any of its spellings belongs to a lot not yet
+merged or closed: the review gate and the train pair kept receipts with
+rewritten names, so a lot under review keeps the spelling it was proven under
+(rename once it lands). The verdict-family and review-floor readers compare
+identities, not spellings, for lots already past that point. `--dry-run` runs the whole transaction and rolls it back. Each
 committed rename appends a row to `agent_renames` (append-only) and an
 `agent.renamed` event. After the commit, a sweep rewrites the rows a
 concurrent writer may still have spelled `OLD`. Running the same command again

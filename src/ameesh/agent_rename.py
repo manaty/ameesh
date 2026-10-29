@@ -16,7 +16,9 @@ bytes stay as signed; their spellings resolve through the alias.
 
 Refused while the agent holds a live lease or is running (stop its runner
 first, between two turns), when NEW already designates another identity or
-already appears in a rewritten column, and for an owner key holder. Reverse is
+already appears in a rewritten column, for an owner key holder, and while a
+receipt of any of its spellings belongs to a lot not yet merged or closed (the
+review gate pairs kept receipts with rewritten names). Reverse is
 the same gesture in the other direction: `rename NEW OLD` restores OLD as
 primary and keeps NEW as alias. `--dry-run` runs the whole transaction and
 rolls it back, so a refusal by any trigger shows before the real pass.
@@ -209,6 +211,21 @@ def _rename_tx(tx, old: str, new: str, who: str, reason: str) -> dict:
         raise RenameError("agent rename refused: %s is running" % old)
     if row["has_key"] and row["key_role"] == "owner":
         raise RenameError("agent rename refused: %s holds an owner key" % old)
+    # The review gate and the train read signed receipts (kept spelling)
+    # against rewritten milestones, assignees and reviewers; on a lot still
+    # under review that pairing is not proven to hold everywhere. Merged and
+    # closed lots are past the gate.
+    spellings = [old] + aliases
+    pending = tx.query(
+        "SELECT DISTINCT w.id FROM provenance_receipts p"
+        "  LEFT JOIN work_item_milestones m ON p.subject = 'milestone:' || m.id"
+        "  JOIN work_items w ON w.id = coalesce(p.work_item_id, m.work_item_id)"
+        " WHERE p.actor = ANY(%s) AND w.state = ANY(%s)"
+        " ORDER BY w.id LIMIT 6", (spellings, list(work.OPEN_STATES)))
+    if pending:
+        raise RenameError("agent rename refused: %s has signed proofs on unmerged lots "
+                          "(%s): rename once they are merged or closed"
+                          % (old, ", ".join("#%d" % r["id"] for r in pending)))
     other = tx.query("SELECT name FROM agent_registry WHERE name <> %s"
                      " AND (name = %s OR %s = ANY(aliases))", (old, new, new))
     if other:

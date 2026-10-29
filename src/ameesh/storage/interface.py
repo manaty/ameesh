@@ -329,6 +329,11 @@ class Agents(Domain):
         executors."""
 
     @abc.abstractmethod
+    def same_identity(self, first: str, second: str) -> bool:
+        """#4299 : vrai si les deux graphies désignent la même fiche du
+        registre (nom ou alias). Lecture seule : rien n'est audité."""
+
+    @abc.abstractmethod
     def harnesses(self) -> dict[str, str]:
         """L71 : `{agent: harnais}` pour tout le registre (comptabilité, jauges)."""
 
