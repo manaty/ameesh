@@ -214,6 +214,59 @@ def begun(events: Iterable[dict], jalons: dict | None = None) -> bool:
     return False
 
 
+#: #4704 : la mention de la note de création d'un lot né réservé à un
+#: exécutant externe (`work add --external-executor`), distincte de la note de
+#: déclaration tardive (`storage.interface.EXTERNAL_EXECUTOR_NOTE`).
+RESERVED_AT_CREATION = "reserved to external executor "
+
+
+def _external_executor_ts(item: dict, events: Iterable[dict]) -> float | None:
+    """#4704 : l'instant où un lot a un exécutant externe (bureau, owner), ou
+    None s'il n'en a jamais porté.
+
+    Un lot réservé n'a pas d'`assignee` : sans cette lecture,
+    `signal_assigned` (« signalé → assigné ») courait depuis sa création et
+    escaladait indéfiniment, même en build (#4696, alerte SLO #166099). La
+    date est celle de la déclaration (`work.external-executor`, note
+    `EXTERNAL_EXECUTOR_NOTE`) ; un lot né réservé porte la mention dans sa note
+    de création, donc la création le date. Une réservation lue seulement sur le
+    champ courant, sans trace datée au journal, est bornée par le passage en
+    build ou le début mesuré : un lot que son exécutant a commencé a un
+    exécutant. La création reste le dernier repli."""
+    from .storage.interface import EXTERNAL_EXECUTOR_NOTE
+
+    events = list(events)
+    reserved = None
+    created_reserved = False
+    for ev in events:
+        note = ev.get("note") or ""
+        if note.startswith(EXTERNAL_EXECUTOR_NOTE):
+            at = ev.get("created_ts")
+            stamp = None if at is None else float(at)
+            if stamp is not None and (reserved is None or stamp < reserved):
+                reserved = stamp
+        elif note.startswith("created") and RESERVED_AT_CREATION in note:
+            created_reserved = True
+    current = bool(str(item.get("external_executor") or "").strip())
+    if not (current or created_reserved or reserved is not None):
+        return None
+    started = start_ts(events)
+    if created_reserved:
+        base = item.get("created_ts")
+    elif reserved is not None:
+        base = reserved
+    else:
+        base = started if started is not None else item.get("created_ts")
+    if base is None:
+        return None
+    base = float(base)
+    # « au plus tard » : le passage en build ou le début mesuré borne une
+    # réservation déclarée après coup (l'exécutant travaillait déjà).
+    if started is not None and float(started) < base:
+        return float(started)
+    return base
+
+
 def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
     """L'instant où le lot a un exécutant.
 
@@ -225,6 +278,12 @@ def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
     s'applique qu'à un lot sans preneur. Sans elle, un lot pris par la file
     restait « jamais assigné » : `signal_assigned` courait depuis sa création
     et l'alerte demandait de le réassigner juste après sa prise (#660).
+
+    #4704 : une réservation à un exécutant externe (`external_executor`, #3447)
+    est une attribution elle aussi — le lot n'aura jamais d'`assignee`.
+    `_external_executor_ts` en donne la date (déclaration, création, à défaut
+    build/début mesuré) ; la plus ancienne preuve gagne, comme pour une
+    réassignation.
 
     #3424 : la première attribution reste acquise quand le lot est rendu à la
     file. Le retour (`work.RETURN_NOTE`, `handoff.RETURN_NOTE`) et le début
@@ -238,6 +297,7 @@ def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
     ne rouvre pas l'alerte de niveau 3 « reassign it now » (#3223)."""
     from . import backlog, estimates, handoff, work
 
+    events = list(events)
     #: notes qu'un lot sans porteur ne peut pas avoir au journal : elles
     #: prouvent qu'un exécutant a tenu le lot, sans dater sa première
     #: attribution.
@@ -274,8 +334,17 @@ def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
             first = stamp
     # #3424 : une reprise datée APRÈS un rendu (ou un début mesuré) n'est pas
     # la première attribution — le lot avait déjà un porteur à sa création.
+    stamps = []
     if first is not None and not (held_at is not None and held_at < first):
-        return first
+        stamps.append(first)
+    # #4704 : la réservation externe date l'exécutant ; si le lot a ensuite
+    # été assigné à un agent (réservation levée), la plus ancienne preuve
+    # garde la première attribution (#3424).
+    external = _external_executor_ts(item, events)
+    if external is not None:
+        stamps.append(external)
+    if stamps:
+        return min(stamps)
     if item.get("assignee") or held:
         return float(item["created_ts"]) if item.get("created_ts") is not None else None
     return None
