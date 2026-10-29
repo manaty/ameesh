@@ -134,6 +134,10 @@
         GitHub approval bridge (#4006): bureau reader on bureau-goal,
         fail-closed local projection for the hosts; source=api is never an
         authority;
+  ameesh process-observations refresh|check|show|revoke
+        observations journal (#4425): the bureau collects staging
+        attestations and approvals, the hosts read a fresh fail-closed
+        projection; deployed never expires by age, QA observations do;
   ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since 24h]
         progress: work items, agents, milestones, budget (schema ameesh-progress/1);
         --serve: the page served locally, read-only, with a Refresh button (L304);
@@ -479,6 +483,11 @@ def _dispatch(argv: list[str] | None) -> int:
         # #4006 : pont d'approbation GitHub (projection locale fail-closed)
         from . import process_approvals_cli
         return process_approvals_cli.main(rest)
+    if command == "process-observations":
+        # #4425 : journal d'observations IMA (journal append-only, projection
+        # locale fail-closed)
+        from . import process_observations_cli
+        return process_observations_cli.main(rest)
     print("ameesh: unknown subcommand %r" % command, file=sys.stderr)
     print(__doc__)
     return 2
