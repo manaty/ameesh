@@ -274,6 +274,20 @@ sleep 300
 """
 
 
+def _alive(pid: int) -> bool:
+    deadline = time.monotonic() + 3      # le temps d'être récolté
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+            stat = pathlib.Path("/proc/%d/stat" % pid).read_text()
+        except (ProcessLookupError, FileNotFoundError):
+            return False
+        if stat.rpartition(")")[2].split()[0] == "Z":
+            return False        # mort, en attente de son récolteur
+        time.sleep(0.1)
+    return True
+
+
 def _killpg(pgid: int) -> None:
     with contextlib.suppress(OSError):
         os.killpg(pgid, 9)
@@ -300,15 +314,6 @@ class ArbreHeavyTest(unittest.TestCase):
     def pid(self, name: str) -> int:
         return int((self.tmp / name).read_text())
 
-    def alive(self, pid: int) -> bool:
-        deadline = time.monotonic() + 3      # le temps d'être récolté
-        while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return False
-            time.sleep(0.1)
-        return True
 
     def test_borne_murale_arrete_l_arbre_et_rend_le_creneau(self) -> None:
         import sys
@@ -328,9 +333,50 @@ class ArbreHeavyTest(unittest.TestCase):
         leader, enfant = self.pid("leader.pid"), self.pid("enfant.pid")
         for group in (leader, enfant):   # sans le correctif : rien ne survit au test
             self.addCleanup(_killpg, group)
-        self.assertFalse(self.alive(leader), "série vivante")
-        self.assertFalse(self.alive(enfant), "enfant d'un autre groupe vivant")
+        self.assertFalse(_alive(leader), "série vivante")
+        self.assertFalse(_alive(enfant), "enfant d'un autre groupe vivant")
         self.assertEqual([row["busy"] for row in self.heavy.status(self.cfg)], [False])
+
+
+#: série directe (parallel = 1, sans heavy) : son enfant, aux sorties
+#: redirigées, reste dans son groupe ; l'un ignore SIGTERM, l'autre non
+SERIE_DIRECTE = """\
+import os, subprocess, sys
+for name, trap in (("enfant.pid", "trap '' TERM; "), ("enfant2.pid", "")):
+    child = subprocess.Popen(["sh", "-c", trap + "exec sleep 300"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    open(name, "w").write(str(child.pid))
+open("leader.pid", "w").write(str(os.getpid()))
+child.wait()
+"""
+
+
+class SerieDirecteTest(unittest.TestCase):
+    """Relecture cx3 (#161913) : sans heavy, SIGTERM au seul meneur laissait
+    ses enfants vivre après la borne."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="paquet-4463-", dir=os.environ.get("TMPDIR"))
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        self.tmp = pathlib.Path(tmp)
+        (self.tmp / "serie.py").write_text(SERIE_DIRECTE)
+        grace = mock.patch.object(paquet_auto, "WALL_GRACE_S", 2)
+        grace.start()
+        self.addCleanup(grace.stop)
+
+    def test_borne_murale_arrete_les_enfants_de_la_serie(self) -> None:
+        import sys
+        start = time.monotonic()
+        proc = paquet_auto.run_walled([sys.executable, "serie.py"], cwd=self.tmp,
+                                      env=dict(os.environ), wall=2)
+        self.assertIsNone(proc)
+        self.assertLess(time.monotonic() - start, 2 + 2 + 1)
+        pids = [int((self.tmp / name).read_text())
+                for name in ("leader.pid", "enfant.pid", "enfant2.pid")]
+        for pid in pids:
+            self.addCleanup(_killpg, pid)
+        for pid in pids:
+            self.assertFalse(_alive(pid), "pid %d vivant" % pid)
 
 
 class CanonTest(unittest.TestCase):

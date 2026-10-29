@@ -1523,14 +1523,27 @@ def test_driver(worktree: Path) -> str:
 _SERIES = iter(range(1, 1 << 30))
 
 
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def run_walled(cmd: list[str], *, cwd: Path, env: dict,
                wall: int) -> subprocess.CompletedProcess | None:
     """#4463 : `cmd` borné en temps mural (attente d'un créneau comprise).
 
-    À l'échéance, SIGTERM : `ameesh heavy` le relaie au groupe de la série,
-    l'escalade en SIGKILL et arrête ses autres descendants avant de rendre le
-    créneau. Au plus `WALL_GRACE_S` après, SIGKILL à la session du wrapper ;
-    None si la borne a été atteinte. La lecture des sorties reste bornée."""
+    La commande a sa propre session, dont elle mène le groupe. À l'échéance,
+    SIGTERM à ce groupe : une série directe et ce qu'elle a lancé le
+    reçoivent ; `ameesh heavy` le relaie au groupe de sa série, l'escalade en
+    SIGKILL et arrête ses autres descendants avant de rendre le créneau. Ce
+    qui reste du groupe reçoit SIGKILL au plus `WALL_GRACE_S` après, même si
+    le meneur est déjà sorti ; None si la borne a été atteinte. La lecture des
+    sorties reste bornée."""
     proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
@@ -1540,11 +1553,13 @@ def run_walled(cmd: list[str], *, cwd: Path, env: dict,
     except subprocess.TimeoutExpired:
         pass
     stop_by = time.monotonic() + WALL_GRACE_S      # une seule grâce en tout
-    with contextlib.suppress(ProcessLookupError):
-        proc.terminate()
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGTERM)
     try:
         proc.communicate(timeout=WALL_GRACE_S)
-        return None
+        # meneur sorti : le reste de son groupe a le reste de la grâce
+        while time.monotonic() < stop_by and _group_alive(proc.pid):
+            time.sleep(0.1)
     except subprocess.TimeoutExpired:
         pass
     with contextlib.suppress(ProcessLookupError, PermissionError):
