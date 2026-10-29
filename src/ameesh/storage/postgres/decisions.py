@@ -157,6 +157,12 @@ class Decisions(interface.Decisions):
                              (int(decision_id),))
         return rows[0]["routing"] if rows else None
 
+    def validation_due(self, *, now):
+        return self.db.query(
+            "SELECT m.id FROM agent_mailbox m JOIN decision_validations v ON v.decision_id = m.id"
+            " WHERE m.delivered_at IS NULL AND v.escalated_at IS NULL"
+            " AND (m.payload->'decision'->>'due_ts')::float8 <= %s ORDER BY m.id", (float(now),))
+
     def validation_lock(self, decision_id):
         rows = self.db.query(
             "SELECT %s FROM agent_mailbox WHERE id = %%s AND %s FOR UPDATE"

@@ -3904,6 +3904,10 @@ class Decisions(Domain):
         """Private routing snapshot, or None for a legacy request."""
         raise NotImplementedError
 
+    def validation_due(self, *, now: float):
+        """All due, pending, not-yet-escalated validations; no queue truncation."""
+        raise NotImplementedError
+
     def validation_lock(self, decision_id: int):
         """Lock the decision mailbox row before escalation or a late reply."""
         raise NotImplementedError

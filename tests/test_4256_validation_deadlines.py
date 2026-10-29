@@ -223,3 +223,13 @@ class ValidationTest(PgTestCase):
         winner = decisions.get(self.db, view["id"])["answer"]
         self.assertIn((winner["by"], winner["option"]),
                       (("human:tpm", "a"), ("human:po", "b")))
+
+    def test_legacy_queue_prefix_cannot_hide_a_due_validation(self):
+        self.db.execute(
+            "INSERT INTO agent_mailbox(sender, recipient, body, kind, payload)"
+            " SELECT 'requester', 'human:owner', 'legacy', 'request',"
+            " jsonb_build_object('decision', jsonb_build_object('due_ts', %s))"
+            " FROM generate_series(1, 501)", (self.now + 60,))
+        view = self.ask(due_ts=self.now + 60)
+        self.assertEqual(vd.sweep(self.cfg, self.db, now=self.now + 61),
+                         [{"id": view["id"], "status": "escalated"}])

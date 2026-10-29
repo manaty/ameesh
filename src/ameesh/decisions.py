@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Decision requests to the owner, received and answered in one place (work item L124).
 
+#4256: new requests carry a recipient-local business-day deadline and a
+project-owned validation route. Private audit and contradiction links live in
+migration 0515; ``decide validation-history`` requires the owner's key.
+
   ameesh decide ask (--lot <id|ref> | --new-lot "title") --question "…"
                     --option a="…" [--option b="…" …] [--recommend a [--why "…"]]
                     [--urgent] [--by 2h|18:00|"2026-10-12 09:00"] [--needs-signature] [--json]

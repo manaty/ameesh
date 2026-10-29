@@ -94,9 +94,7 @@ def sweep(cfg, db, *, now=None):
     if storage.is_remote(db):
         return []
     changed = []
-    for view in decisions.pending(db, now):
-        if not view["overdue"]:
-            continue
+    for view in storage.of(db).decisions.validation_due(now=now):
         with db.transaction() as tx:
             store = storage.of(tx).decisions
             row = store.validation_lock(view["id"])
