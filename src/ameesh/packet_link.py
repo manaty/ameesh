@@ -10,6 +10,7 @@ la retrouvait qu'en le relisant, le second ignorait une unité dont le gel
 d'origine verdict n'était pas un jalon `frozen` (#2366).
 
     ameesh work packet record <porteur> [--repo D] [--base SHA] [--head REF]
+                              [--expect-pushed SHA]
     ameesh work packet show <lot|porteur> [--json]
 
 `record` relit les commits de composition du dépôt (trailers, jamais le
@@ -19,6 +20,14 @@ la liaison dans `work_packet_members` (migration 0465). `work show` et
 second ferme une unité quand le commit de composition est entré dans la cible
 (`plan_git.probe`, revert #1825 compris) et que le gel courant de l'unité n'a
 pas bougé depuis la composition.
+
+#4501 : un enregistrement ne remplace jamais le manifeste d'une tête poussée
+différente de la sienne. La tête poussée protégée `F` est le dernier gel
+déclaré, ou la tête de branche vue en avance après ce gel (relevé partagé,
+avant son propre gel) ; une composition `H != F` n'est écrite que si
+`--expect-pushed F` le dit — le composeur qui détient la tête poussée ; un
+second composeur, dont la lecture de la branche précède la poussée du premier,
+s'abstient.
 
 `record` ne touche pas au dépôt : aucune référence, aucun commit. Il refuse
 avant d'écrire si le dépôt n'est pas celui du porteur, si l'intervalle
@@ -126,8 +135,44 @@ def _effective_freeze(db, lot: int, repo: str, target: str) -> str:
     return _commit(repo, sha) or sha
 
 
+def _declared_freeze(db, lot: int, repo: str) -> tuple[str, float]:
+    """La tête du dernier jalon `frozen` du lot et son instant ; vide sinon
+    (#4501).
+
+    C'est la tête que `paquet-auto.py` gèle juste après l'avoir poussée ; un
+    `verdict` (même favorable) n'est pas une poussée et ne protège rien.
+    """
+    freeze = plan_git.latest_freeze(work.milestones(db, lot))
+    sha = plan_git.commit_id((freeze or {}).get("sha"))
+    if not sha:
+        return "", 0.0
+    return (_commit(repo, sha) or sha), float((freeze or {}).get("at_ts") or 0)
+
+
+def _protected_pushed_head(db, package: dict, repo: str) -> str:
+    """La tête poussée qu'un enregistrement ne remplace pas sans le dire.
+
+    Le gel déclaré protège la tête poussée ; une tête de branche **vue en
+    avance après ce gel** (`branch_head`, relevé de la forge) la remplace,
+    même avant son propre gel : c'est une poussée plus récente, observation
+    que la base partage entre les clones (le composeur d'un autre clone ne lit
+    qu'une réf distante périmée).
+    """
+    frozen, frozen_ts = _declared_freeze(db, int(package["id"]), repo)
+    observed = plan_git.commit_id(package.get("branch_head"))
+    try:
+        observed_ts = float(package.get("branch_head_ts") or 0)
+    except (TypeError, ValueError):
+        observed_ts = 0.0
+    if observed and not plan_git.same_commit(observed, frozen) \
+            and observed_ts > frozen_ts:
+        return _commit(repo, observed) or observed
+    return frozen
+
+
 def record(db, package_id: int, *, repo: str | None = None, base: str | None = None,
            head: str = "HEAD", branch: str | None = None, target: str | None = None,
+           expect_pushed: str | None = None,
            actor: str = "", dry_run: bool = False, cfg=None) -> dict:
     """Enregistre la composition du paquet `package_id` ; rend le compte rendu.
 
@@ -135,6 +180,13 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
     `work._checkout`, qui lit l'`origin`) : une composition d'un autre dépôt ne
     peut pas être attachée au porteur. `base` : par défaut la base commune
     entre `head` et la cible. Aucune écriture si `dry_run`.
+
+    #4501 : un enregistrement ne remplace jamais le manifeste d'une tête
+    poussée différente de la sienne. Un porteur dont la tête poussée est `F`
+    (dernier gel, ou tête vue en avance après ce gel) n'accepte une tête
+    `H != F` que si `expect_pushed` vaut `F` — le composeur qui détient cette
+    tête le dit explicitement ; un second composeur, dont la lecture de la
+    branche précède la poussée du premier, est refusé avant toute écriture.
     """
     package = work.get(db, package_id)
     if package is None:
@@ -193,6 +245,24 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
             "head %s is not on the carrier's branch %s (tip %s): run the "
             "record from the package worktree, or pass --head/--branch"
             % (head_sha[:12], package_branch, tip[:12]))
+    # #4501 : le porteur est sur une tête poussée F (gelée, ou vue en avance
+    # après un gel). Un enregistrement de H != F est une recomposition qui
+    # remplace la composition de F ; seul le composeur qui détient F (il l'a
+    # poussée, ou il l'a lue comme tête distante au départ) le déclare par
+    # `expect_pushed`. Sans cela, on n'écrase pas le manifeste d'une tête
+    # qu'un autre composeur a poussée — témoin h-12 du 29/10 : le tic a rejoué
+    # un porteur dont la ci-full tournait, et ses 9 unités locales ont
+    # remplacé les 27 de c68edfb.
+    frozen = _protected_pushed_head(db, package, top)
+    expected = _text(expect_pushed)
+    if frozen and not plan_git.same_commit(frozen, head_sha) \
+            and not (expected and plan_git.same_commit(expected, frozen)):
+        raise PacketLinkError(
+            "packet carrier #%d already has the pushed head %s, not %s: "
+            "a composition record never replaces the manifest of another "
+            "pushed head; nothing written (the head's own composer passes "
+            "`--expect-pushed %s`)"
+            % (int(package_id), frozen[:12], head_sha[:12], frozen[:12]))
     if base is None:
         # Une recomposition garde la base de la composition précédente : si la
         # cible a été fusionnée dans le paquet entre-temps, `merge-base` aurait

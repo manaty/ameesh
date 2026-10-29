@@ -141,6 +141,98 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
         self.assertIn("packet composition recorded", out.stdout)
         self.assertEqual(self.membership(item["id"])[0]["package_id"], porteur["id"])
 
+    def test_record_refuses_a_second_composer_on_a_foreign_pushed_head(self):
+        """#4501 : le manifeste d'une tête poussée (gelée) n'est pas écrasé.
+
+        Témoin h-12 du 29/10 : le tic a recomposé un porteur dont la ci-full
+        tournait et ses 9 unités locales ont remplacé les 27 de la tête
+        poussée. Un enregistrement d'une autre tête est refusé tant que le
+        composeur qui la détient ne le dit pas (`--expect-pushed`).
+        """
+        sha = self.unit_branch("lot/vingt", "src/vingt.py", "vingt\n", "vingt")
+        item = self.lot("vingt")
+        self.freeze(item, sha)
+        head = self.compose("integration/paquet-1", [(item["id"], sha)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo,
+                           base=self.base, head=head, actor="pilote", cfg=self.cfg)
+        work.milestone(self.db, porteur["id"], "frozen", sha=head, actor="pilote")
+        # la même tête poussée se réenregistre sans cérémonie (pilote, rejeu)
+        again = packet_link.record(self.db, porteur["id"], repo=self.repo,
+                                   base=self.base, head=head, actor="pilote",
+                                   cfg=self.cfg)
+        self.assertTrue(again["recorded"])
+        # un second composeur repart de la base et fabrique sa propre tête
+        git(self.repo, "checkout", "-q", "-B", "integration/paquet-1", self.base)
+        git(self.repo, "merge", "-q", "--no-ff", "-m",
+            "vehicule : #%d %s\n\nameesh-work: %d"
+            % (item["id"], sha[:12], item["id"]), sha)
+        other = self.commit("manifeste.md", "# second\n", "manifeste du second")
+        with self.assertRaises(packet_link.PacketLinkError) as caught:
+            packet_link.record(self.db, porteur["id"], repo=self.repo,
+                               base=self.base, head=other, actor="second",
+                               cfg=self.cfg)
+        self.assertIn("already has the pushed head", str(caught.exception))
+        self.assertEqual(
+            {m["head_sha"] for m in
+             packet_link.memberships(self.db, package_ids=[porteur["id"]])},
+            {head})
+        # un second composeur qui croit encore la tête distante ancienne ne
+        # passe pas non plus : `expect_pushed` ne vaut pas la tête gelée.
+        with self.assertRaises(packet_link.PacketLinkError) as stale:
+            packet_link.record(self.db, porteur["id"], repo=self.repo,
+                               base=self.base, head=other,
+                               expect_pushed=self.base, actor="second",
+                               cfg=self.cfg)
+        self.assertIn("already has the pushed head", str(stale.exception))
+        # le composeur qui détient la tête poussée peut la remplacer
+        report = packet_link.record(self.db, porteur["id"], repo=self.repo,
+                                    base=self.base, head=other,
+                                    expect_pushed=head, actor="premier",
+                                    cfg=self.cfg)
+        self.assertTrue(report["recorded"])
+        self.assertEqual(
+            {m["head_sha"] for m in
+             packet_link.memberships(self.db, package_ids=[porteur["id"]])},
+            {other})
+
+    def test_record_refuses_a_newer_observed_push_before_its_freeze(self):
+        """#4501 : une poussée vue après le gel protège aussi le manifeste.
+
+        Entre la poussée et son gel (quelques secondes), le gel déclaré est
+        encore l'ancien : `branch_head`, relevé de la forge, est la trace
+        partagée de la nouvelle poussée. Un second composeur dont la lecture
+        distante est antérieure ne l'écrase pas.
+        """
+        sha = self.unit_branch("lot/vingt-et-un", "src/vingt-et-un.py", "x\n", "x")
+        item = self.lot("vingt-et-un")
+        self.freeze(item, sha)
+        head = self.compose("integration/paquet-1", [(item["id"], sha)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo,
+                           base=self.base, head=head, actor="pilote", cfg=self.cfg)
+        work.milestone(self.db, porteur["id"], "frozen", sha=head, actor="pilote")
+        # une poussée plus récente est vue par le veilleur, pas encore gelée
+        pushed = self.commit("pousse.md", "# poussée\n", "poussée du premier")
+        self.assertTrue(storage.of(self.db).work.set_branch_head(
+            porteur["id"], porteur["branch"], pushed))
+        # un second composeur repart de la base et fabrique sa propre tête
+        git(self.repo, "checkout", "-q", "-B", "integration/paquet-1", self.base)
+        git(self.repo, "merge", "-q", "--no-ff", "-m",
+            "vehicule : #%d %s\n\nameesh-work: %d"
+            % (item["id"], sha[:12], item["id"]), sha)
+        other = self.commit("manifeste.md", "# second\n", "manifeste du second")
+        with self.assertRaises(packet_link.PacketLinkError) as caught:
+            packet_link.record(self.db, porteur["id"], repo=self.repo,
+                               base=self.base, head=other,
+                               expect_pushed=head, actor="second", cfg=self.cfg)
+        self.assertIn("already has the pushed head %s" % pushed[:12],
+                      str(caught.exception))
+        self.assertEqual(
+            {m["head_sha"] for m in
+             packet_link.memberships(self.db, package_ids=[porteur["id"]])},
+            {head})
+
     def test_record_reuses_the_recorded_base_after_a_target_update(self):
         """Une mise à jour de la cible dans le paquet ne perd pas les unités."""
         first = self.unit_branch("lot/treize", "src/neuf.py", "neuf\n", "neuf")

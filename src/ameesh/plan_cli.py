@@ -19,7 +19,8 @@
   ameesh work plan <id|fiche> [--start J] [--end J] [--delivery J] [--source S]  (L96)
                   [--estimate 90m] [--estimate-source S]                (L157, une tâche)
   ameesh work estimates [--app P] [--json]   (L157 : écarts réel/estimé, pour l'auditeur)
-  ameesh work packet record <porteur> [--repo R] [--base SHA] [--head REF] [--dry-run]
+  ameesh work packet record <porteur> [--repo R] [--base SHA] [--head REF]
+                             [--expect-pushed SHA] [--dry-run]
   ameesh work packet show <lot|porteur> [--json]   (#2443 : paquet d'une unité)
 
 Gardées hors de `mesh_cli` (qui les branche) pour que leurs évolutions n'y
@@ -69,6 +70,9 @@ def add_parsers(work_sub, func) -> None:
                         help="package branch (default: the carrier's branch)")
     p_prec.add_argument("--target", default=None,
                         help="target branch (default: the carrier's, then the repository's)")
+    p_prec.add_argument("--expect-pushed", default=None, metavar="SHA",
+                        help="#4501: the pushed head this composition replaces; a head "
+                             "other than the carrier's frozen one is refused without it")
     p_prec.add_argument("--dry-run", action="store_true",
                         help="read and print the composition without writing")
     p_prec.add_argument("--actor", default="")
@@ -466,6 +470,7 @@ def _packet_record(db, args: argparse.Namespace, packet_link) -> int:
         report = packet_link.record(
             db, args.id, repo=args.repo, base=args.base, head=args.head,
             branch=args.branch, target=args.target, actor=args.actor,
+            expect_pushed=args.expect_pushed,
             dry_run=args.dry_run, cfg=getattr(db, "cfg", None))
     except (packet_link.PacketLinkError, work.WorkError, plan_git.MergeProbeError,
             GitError) as exc:
