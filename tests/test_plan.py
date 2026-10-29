@@ -1212,7 +1212,7 @@ class ContentMergeTest(_PlanDb):
         self.assertEqual(self.run_sync()[blocker["id"]]["result"], "merged")
         [row] = mail.unread(self.db, "dev-a")
         self.assertEqual((row["kind"], row["recipient"]), ("event", "dev-a"))
-        self.assertIn("lot #%d is merged" % blocker["id"], row["body"])
+        self.assertIn("lot #%d is delivered" % blocker["id"], row["body"])
         self.assertEqual(mail.message_payload(row)["dependency"]["dependent"],
                          waiting["id"])
 
