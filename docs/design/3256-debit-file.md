@@ -101,6 +101,16 @@ Les relecteurs et les agents critiques ne sont jamais mis en sommeil par ce
 geste. Le premier lot démarrable qui arrive réveille les agents en sommeil,
 dans l'ordre normal de prise.
 
+**La dernière note du pilote fait foi (#4623)** : une note
+`roadmap: rouverte <projet>` postérieure à la dernière `roadmap: épuisée
+<projet>` désarme le sommeil et lève les dormeurs du projet dans la même
+passe ; le geste est journalisé sur le lot de découpage (auteur de la note,
+note, agents levés). Une réouverture antérieure à la dernière note
+d'épuisement ne change rien : `épuisée` → `rouverte` → `épuisée` endort de
+nouveau. L'alerte `roadmap_exhausted` suit la même règle et disparaît dès la
+réouverture. Le sommeil s'arrête aussi au classement du lot de découpage,
+comme avant.
+
 ### 2.4 Acceptation de A
 
 - Un projet sans lot démarrable, avec 20 % d'agents au repos depuis 30 min,
@@ -112,7 +122,10 @@ dans l'ordre normal de prise.
 - Témoins :
   - aucun déclenchement sous 20 % ou sous 30 min ;
   - aucun déclenchement quand un lot démarrable existe ;
-  - un seul lot de découpage par projet ouvert.
+  - un seul lot de découpage par projet ouvert ;
+  - `épuisée` → sommeil ; `épuisée` puis `rouverte` → aucun sommeil et levée
+    des dormeurs dans la même passe ; `rouverte` puis `épuisée` → sommeil
+    (#4623) ; l'alerte suit la dernière note.
 
 ## 3. Lot B : mesure de débit de l'auditeur **[owner]**
 
