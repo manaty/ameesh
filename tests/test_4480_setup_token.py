@@ -31,7 +31,7 @@ class SetupTokenTest(unittest.TestCase):
                "ANTHROPIC_AUTH_TOKEN": "ambient", "CODEX_API_KEY": "ambient"}
         accounts.launch_env(env, {"claude": [self.profile]}, self.profile, {})
         self.assertEqual(env[setup_token.VARIABLE], TOKEN)
-        self.assertNotIn("CLAUDE_CONFIG_DIR", env)
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], self.home)
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
         self.assertNotIn("CODEX_API_KEY", env)
