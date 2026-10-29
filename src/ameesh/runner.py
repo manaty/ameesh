@@ -11133,6 +11133,7 @@ class Runner:
             return True  # L109 : le canon est synchronisé par le serveur
         self._designation_retry_ready = False
         entries = canon_mod.configured(self.cfg)
+        self._canon_sync_counts = (0, len(entries))
         # L159f : aucun canon, aucune fiche Host prêteuse : la porte est fixée
         self._canon_complete = not entries
         if not entries:
@@ -11250,6 +11251,7 @@ class Runner:
             # exercé sur un objet factice (tests d'authentificateurs).
             # L159f : la porte d'hôte n'est fixée que sur TOUS les canons
             # configurés (un hôte prêteur l'est par sa fiche Host, `policy.lend`)
+            self._canon_sync_counts = (len(synced), len(entries))
             self._canon_complete = bool(entries) and len(synced) == len(entries)
             # #2561: only a pass that actually synced a canon may replay the
             # pending designations (a mocked/test `canon_sync_once` must not).
@@ -11324,13 +11326,28 @@ class Runner:
             log_async("review designation retry failed: %s"
                       % " ".join(str(exc).split())[:200])
 
+    def _canon_sync_pass(self) -> bool:
+        """Settle the host gate before optional, potentially slow review work."""
+        initial = not self._gate_settled.is_set()
+        started = time.monotonic()
+        if initial:
+            log_async("host gate: canon sync starting")
+        ok = self.canon_sync_once()
+        settled = self._settle_gate_after_sync()
+        if initial:
+            read, configured = getattr(self, "_canon_sync_counts", (0, 0))
+            cause = "complete" if settled else ("incomplete" if ok else "failed")
+            log_async("host gate: canon sync %.3fs, canons %d/%d, %s"
+                      % (time.monotonic() - started, read, configured, cause))
+        if ok and settled:
+            # A retry may scan Git history: it must neither delay the first
+            # claim nor postpone the next sync while the gate is incomplete.
+            self.retry_review_designations()
+        return settled
+
     def _canon_sync_loop(self) -> None:
         while not self.stop.is_set():
-            if self.canon_sync_once():
-                # #2561: a designation that waited on the canon policy or on a
-                # worktree now readable is retried on the same freeze.
-                self.retry_review_designations()
-            settled = self._settle_gate_after_sync()
+            settled = self._canon_sync_pass()
             # avant la première porte fixée, on réessaie vite
             wait = (self.canon_sync_interval if settled or self.canon_sync_interval <= 0
                     else min(self.canon_sync_interval, GATE_SETTLE_RETRY_S))
@@ -11357,15 +11374,12 @@ class Runner:
             self._gate_settled.set()
             return
         if self.once:
-            if self.canon_sync_once():
-                self.retry_review_designations()
+            self._canon_sync_pass()
             return
         if self.canon_thread is not None:
             return
         if self.canon_sync_interval <= 0:
-            if self.canon_sync_once():  # seulement au démarrage…
-                self.retry_review_designations()
-            if self._settle_gate_after_sync():
+            if self._canon_sync_pass():  # seulement au démarrage…
                 return
             # … ou jusqu'à la première porte d'hôte fixée (fil ci-dessous)
         self.canon_thread = threading.Thread(
