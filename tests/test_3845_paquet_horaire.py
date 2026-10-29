@@ -58,6 +58,8 @@ class FakeShell:
         self.auto_rc = 0
         self.added: list[list[str]] = []
         self.clock = NOW
+        #: #4506 : la tête gelée est-elle un ancêtre de origin/<cible> ?
+        self.ancestor = False
 
     def run(self, cmd, *, cwd=None, input_text=None, timeout=0):
         self.calls.append(list(cmd))
@@ -67,6 +69,8 @@ class FakeShell:
         if cmd[0] == "git":
             if "ls-remote" in cmd:
                 return ph.Result(0, "%s\trefs/heads/integration/paquet-h-20261027-03\n" % HEAD)
+            if "merge-base" in cmd and "--is-ancestor" in cmd:
+                return ph.Result(0 if self.ancestor else 1)
             return ph.Result(0)
         if cmd[0] == "ameesh":
             args = cmd[1:]

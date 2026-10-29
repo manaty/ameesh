@@ -151,6 +151,12 @@ OPEN_STATES = ("intake", "build", "qa", "validated", "blocked", "waiting_human")
 #: des raisons de clôture livrée de `work.CLOSE_REASONS`).
 MERGED_STATES = ("merged", "promoted")
 MERGED_CLOSE_REASONS = ("delivered", "done")
+#: #4506 : la note de fusion automatique du porteur porte la tête publiée
+MERGED_NOTE_RE = re.compile(
+    r"^auto-merge merged repo=\S+ pr=\d+ sha=(?P<sha>[0-9a-f]{40})\b")
+#: #4506 : `paquet-auto` gèle lui-même la tête poussée dès la composition (#4304)
+EARLY_PUSH_RE = re.compile(
+    r"^paquet \S+ poussé par scripts/paquet-auto\.py dès la composition\b")
 MARK = "paquet-horaire: "
 MARK_CI = MARK + "ci demandée "
 MARK_RED = MARK + "rouge consigné "
@@ -462,6 +468,56 @@ def merged_seen(row: dict) -> bool:
     state = str(row.get("state") or "")
     return state in MERGED_STATES or (
         state == "closed" and str(row.get("close_reason") or "") in MERGED_CLOSE_REASONS)
+
+
+def merged_note(item: dict, sha: str) -> bool:
+    """#4506 : une note `auto-merge merged` porte sur la tête gelée `sha`."""
+    if not sha:
+        return False
+    for ev in item.get("events") or []:
+        match = MERGED_NOTE_RE.match(str(ev.get("note") or ""))
+        if match and match.group("sha") == sha:
+            return True
+    return False
+
+
+def merged_head(ctx: Context, item: dict, sha: str) -> bool:
+    """#4506 : le porteur est-il déjà fusionné dans la cible ?
+
+    `merged_seen` ne lit que l'état du lot ; un porteur fusionné par `ameesh`
+    reste ouvert (qa) jusqu'à sa clôture (hold du pilote, balayage de contenu).
+    La tête gelée ancêtre de `origin/<cible>` ou la note `auto-merge merged`
+    du journal disent la fusion avant l'état.
+    """
+    if merged_seen(item):
+        return True
+    if not sha:
+        return False
+    if merged_note(item, sha):
+        return True
+    result = ctx.git("merge-base", "--is-ancestor", sha, "origin/" + ctx.target)
+    return result.returncode == 0
+
+
+def freeze_foreign(item: dict, since: float) -> bool:
+    """#4506 : le gel postérieur à `since` vient-il d'une autre main ?
+
+    `paquet-auto` gèle lui-même la tête qu'il vient de pousser dès la
+    composition (#4304) ; cette note est la sienne. Un gel postérieur avec une
+    autre note (geste manuel, dépannage après échec) est la main d'un autre.
+    Sans jalon lisible (les bancs peuvent l'omettre, `work show` le porte), on
+    ne conclut pas.
+    """
+    declared = (item.get("freeze") or {}).get("declared") or {}
+    if float(declared.get("at_ts") or 0) <= since:
+        return False
+    ident = int(declared.get("id") or 0)
+    if not ident:
+        return False
+    for milestone in item.get("milestones") or []:
+        if int(milestone.get("id") or 0) == ident:
+            return not EARLY_PUSH_RE.match(str(milestone.get("note") or ""))
+    return False
 
 
 def slot_served(rows: list[dict], now: float, zone: ZoneInfo, project: str,
@@ -1049,15 +1105,25 @@ def pending(ctx: Context, item: dict, sha: str) -> Attempt | None:
     bougé vers la tête que la tentative a elle-même poussée et gelée avant ses
     tests (#4304 : gel postérieur à la marque, ou tête qu'elle publie), sans
     que cette tête soit finie (`achieved`) : refus de garde après les tests,
-    échec ou arrêt en cours de tests, ou tentative encore vivante.
+    échec ou arrêt en cours de tests, ou tentative encore vivante. Un gel
+    postérieur qu'elle n'a ni publié ni testé et qu'elle n'a pas posé
+    elle-même (#4506) la clôt : c'est la main d'un autre.
     """
     found = attempts(item)
     if found and sha:
-        kept = tested_since(item, found[-1].ts)
-        expected = (found[-1].publish.rsplit("@", 1)[-1]
-                    if found[-1].publish else kept[1] if kept else "")
+        last = found[-1]
+        kept = tested_since(item, last.ts)
+        expected = (last.publish.rsplit("@", 1)[-1]
+                    if last.publish else kept[1] if kept else "")
+        moved = frozen_ts(item) > last.ts > 0
         # Un autre gel ne donne pas à cette tentative le droit de le remplacer.
-        if expected and expected != sha and frozen_ts(item) > found[-1].ts:
+        if moved and expected and expected != sha:
+            return None
+        # #4506 : la tête a bougé après la tentative sans qu'elle l'ait publiée
+        # ni testée, et le gel vient d'une autre main (note du jalon) : il la
+        # clôt, sans la reprendre. Une tentative encore vivante garde la main.
+        if moved and not expected and sha != last.base \
+                and freeze_foreign(item, last.ts) and not running(ctx, last):
             return None
     if found and found[-1].base == sha:
         return found[-1]
@@ -1269,11 +1335,12 @@ def publish(ctx: Context, item: dict) -> str:
     sha = frozen_sha(item)
     if not sha:
         return "#%d sans tête gelée : rien à publier" % carrier
-    if merged_seen(item) or str(item.get("state") or "") == "closed":
+    landed = merged_head(ctx, item, sha)
+    if landed or str(item.get("state") or "") == "closed":
         # #4322 : la ci-full précoce (#4304) a pu fusionner le porteur avant
         # le retour de paquet-auto ; ni verdict ni ci-full sur un porteur clos
         return "#%d déjà %s : rien à publier" % (
-            carrier, "fusionné" if merged_seen(item) else "clos")
+            carrier, "fusionné" if landed else "clos")
     units = composition_units(manifest_at(ctx, item, sha))
     resolutions = [unit for unit in units if unit.resolution]
     lines = ["#%d %s : tête gelée %s, %d unité(s)."
@@ -1311,6 +1378,11 @@ def follow(ctx: Context, item: dict) -> str:
             # verrou du paquet ; ne rien publier, retirer ni recomposer avant.
             return "#%d : composition en cours (%s)" % (carrier, holder)
     sha = frozen_sha(item)
+    if merged_head(ctx, item, sha):
+        # #4506 : un porteur fusionné reste ouvert (qa) le temps de sa clôture
+        # (hold du pilote, balayage) ; le tic n'y recompose ni ne republie.
+        return "#%d : fusionné, rien à faire (tête %s dans %s)" % (
+            carrier, sha[:12] or "aucune", ctx.target)
     left = pending(ctx, item, sha)
     if left is not None:
         return resume(ctx, item, left)
