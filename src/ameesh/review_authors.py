@@ -973,7 +973,94 @@ def _present_commits(repo: str, shas: Sequence[str], *,
     return present
 
 
-def target_commit(repo: str, target: str) -> str:
+#: #4673 : borne de la lecture du SHA publié d'une cible avant une lecture de
+#: provenance. Une forge muette laisse la lecture locale : le doute garde les
+#: auteurs au lieu de rendre une famille indépendante par accident.
+TARGET_REFRESH_TIMEOUT = 30.0
+
+
+def _published_target(repo: str, target: str) -> str:
+    """Le commit **publié** d'une cible de branche, lu à la forge (#4673).
+
+    Un clone partagé n'est frais que de son dernier fetch : sa ref
+    `refs/remotes/<remote>/<branche>` peut nommer un ancêtre de la cible
+    réelle. La porte et la désignation lisaient cette ref locale et comptaient
+    donc des commits déjà entrés dans la cible comme des tiers « auteur
+    inconnu » (Nexlink #165406, ameesh #4654). Ici la pointe publiée est lue
+    par `ls-remote` (lecture seule, aucun ref écrit) puis l'objet exact est
+    demandé par SHA à la forge, comme pour un gel absent (#3147) : le clone
+    partagé reste intact et un autre agent peut le fetcher en parallèle.
+
+    Rend "" — la lecture locale fait alors foi — pour un commit exact, une
+    ref non-branche, un dépôt sans remote, une cible `HEAD`, une forge
+    injoignable ou un SHA abrégé. Jamais d'exception : la fraîcheur au mieux,
+    le doute fermé ensuite.
+    """
+    text = str(target or "").strip()
+    if not repo or not text:
+        return ""
+    if plan_git.full_commit_id(text) or re.fullmatch(r"[0-9a-f]{7,39}", text.lower()):
+        return ""                          # commit exact : rien à rafraîchir
+    if text.startswith("refs/") and not text.startswith(
+            ("refs/heads/", "refs/remotes/")):
+        return ""                          # étiquette ou ref privée : objet exact
+    try:
+        remotes = (plan_git._out(repo, "remote") or "").split()
+    except Exception:  # noqa: BLE001 - configuration illisible : lecture locale
+        return ""
+    if not remotes:
+        return ""
+    try:
+        remote = canon.remote_branch(repo, text)
+    except Exception:  # noqa: BLE001 - résolution distante impossible : locale
+        return ""
+    if not remote or "/" not in remote:
+        return ""
+    name, branch = remote.split("/", 1)
+    if name not in remotes or not branch or branch == "HEAD":
+        return ""
+    try:
+        listing = plan_git._git(
+            repo, "ls-remote", "--exit-code", "--refs", name,
+            "refs/heads/" + branch, timeout=TARGET_REFRESH_TIMEOUT)
+    except Exception:  # noqa: BLE001 - forge injoignable : lecture locale
+        return ""
+    if listing.returncode != 0:
+        return ""
+    fields = listing.stdout.decode("utf-8", "replace").split()
+    sha = plan_git.full_commit_id(fields[0]) if fields else ""
+    if not sha:
+        return ""
+    try:
+        if plan_git.local_commit(repo, sha):
+            return sha
+    except Exception:  # noqa: BLE001 - sonde locale impossible : tenter le fetch
+        pass
+    try:
+        proc = plan_git._git(
+            repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+            "--", name, sha, timeout=TARGET_REFRESH_TIMEOUT)
+    except Exception:  # noqa: BLE001 - forge coupée : lecture locale
+        return ""
+    if proc.returncode != 0:
+        return ""
+    try:
+        return sha if plan_git.local_commit(repo, sha) else ""
+    except Exception:  # noqa: BLE001 - objet non lisible : lecture locale
+        return ""
+
+
+def refreshed_target(repo: str, target: str) -> str:
+    """#4673 : le commit publié d'une cible de branche, rafraîchi, ou "".
+
+    Même lecture que `target_commit(fetch=True)` mais **sans repli local** :
+    un appelant qui a besoin de distinguer une cible prouvée fraîche d'une
+    ref de clone périmée (la base de la porte) ne reçoit que la première.
+    """
+    return _published_target(repo, target)
+
+
+def target_commit(repo: str, target: str, *, fetch: bool = False) -> str:
     """Le commit qu'une cible nomme dans `repo`, ou "" (#3116).
 
     La cible peut être un commit complet ou une ref (`origin/develop`) : c'est
@@ -989,10 +1076,21 @@ def target_commit(repo: str, target: str) -> str:
 
     #3318 (B3) : la ref distante se lit pleinement qualifiée
     (`refs/remotes/origin/main`) : le nom court peut être masqué par une
-    branche ou un tag local homonyme. Une cible `refs/...` se lit exactement."""
+    branche ou un tag local homonyme. Une cible `refs/...` se lit exactement.
+
+    #4673 : avec `fetch=True`, une cible de **branche** est d'abord lue à la
+    forge par son SHA publié (`_published_target`), puis l'objet exact est
+    rapatrié : un clone partagé non rafraîchi ne fait plus passer des commits
+    déjà entrés dans la cible pour des tiers. Une forge muette retombe sur la
+    ref locale ; `fetch=False` (transaction de gel, #3836) ne touche jamais au
+    réseau et lit la ref locale."""
     text = str(target or "").strip()
     if not repo or not text:
         return ""
+    if fetch:
+        fresh = _published_target(repo, text)
+        if fresh:
+            return fresh
     remote = None
     try:
         from . import canon as canon_mod
@@ -3767,7 +3865,8 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            None)
     if not head_sha:
         return [], [], []
-    target_sha = target_commit(repo, target) or target_commit(repo, base)
+    target_sha = target_commit(repo, target, fetch=fetch) or target_commit(
+        repo, base, fetch=fetch)
     if head_id:
         # #3948 (N dev4) : l'id de tête absent des gels est le **nouveau** gel
         # — `prepare` le prépare avant l'INSERT, au-delà des marques du lot.
@@ -4610,7 +4709,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     """
     item = dict(item or {})
     packet = bool(packet_composer(item))
-    target_sha = target_commit(repo, target) or target_commit(repo, base)
+    target_sha = target_commit(repo, target, fetch=fetch) or target_commit(
+        repo, base, fetch=fetch)
     commits = _not_in_target(repo, commits, target_sha,
                              head=str(head or (milestone or {}).get("sha") or ""))
     for admitted in admitted_heads:
