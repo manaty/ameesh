@@ -888,5 +888,54 @@ class AttributionAcquiseTest(unittest.TestCase):
                 self.assertEqual(signal["level"], 3)
 
 
+class ExecuteurExterneTest(unittest.TestCase):
+    """#4704 : un lot réservé à un exécutant externe (bureau, owner) n'a jamais
+    d'`assignee`. La réservation est sa première attribution : `signal_assigned`
+    conclut à la déclaration (ou à la création si le lot naît réservé), et au
+    plus tard au passage en build / au début mesuré par l'exécutant. Sans quoi
+    l'alerte « signalé → assigné » court indéfiniment et escalade même en build
+    (#4696)."""
+
+    def test_lot_cree_reserve_au_bureau_conclut_signal_assigned(self):
+        # Témoin demandé par le lot : né réservé au bureau, en build, P1.
+        item = _item(state="build", external_executor="bureau", priority=1)
+        events = [_ev("intake", T0,
+                      "created; estimate: 1 h; reserved to external executor bureau"),
+                  _ev("build", T0 + 600, "garde tenue par le bureau")]
+        self.assertEqual(slo.assigned_ts(item, events), T0)
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 30 * 60)
+        signal = [r for r in rows if r["step"] == "signal_assigned"][0]
+        self.assertEqual((signal["level"], signal["done_ts"]), (0, T0))
+        self.assertEqual(slo.breaches(rows), [])
+
+    def test_reservation_declaree_apres_la_creation_date_l_executeur(self):
+        # Créé sans exécutant, réservé plus tard : la déclaration date
+        # l'attribution, pas la création.
+        item = _item(state="intake", external_executor="bureau")
+        events = [_ev("intake", T0, "created; estimate: 1 h"),
+                  _ev("intake", T0 + 1200, "external executor: bureau")]
+        self.assertEqual(slo.assigned_ts(item, events), T0 + 1200)
+
+    def test_reservation_sans_trace_journalisee_est_bornee_par_le_build(self):
+        # Réservation lue seulement sur le champ courant (aucune déclaration
+        # datée au journal) : le passage en build borne la date au plus tard.
+        item = _item(state="build", external_executor="bureau")
+        events = [_ev("intake", T0, "created; estimate: 1 h"),
+                  _ev("build", T0 + 900, "the external executor starts")]
+        self.assertEqual(slo.assigned_ts(item, events), T0 + 900)
+
+    def test_reservation_levee_garde_la_premiere_attribution(self):
+        # #3424 : la réservation est la première attribution ; sa levée puis
+        # une prise par un agent ne rouvrent pas l'étape.
+        item = _item(state="intake", assignee="")
+        events = [_ev("intake", T0, "created; estimate: 1 h"),
+                  _ev("intake", T0 + 600, "external executor: bureau"),
+                  _ev("intake", T0 + 1200,
+                      "external executor cleared (was bureau)"),
+                  _ev("intake", T0 + 1800, "assigned to a (before: nobody)")]
+        self.assertEqual(slo.assigned_ts(item, events), T0 + 600)
+
+
 if __name__ == "__main__":
     unittest.main()
