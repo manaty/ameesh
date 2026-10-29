@@ -61,6 +61,29 @@ class TurnCosts(interface.TurnCosts):
             " order by recorded_at asc, id asc limit 1", (agent, float(ts)))
         return rows[0] if rows else None
 
+    def session_total(self, agent, session) -> dict | None:
+        """#4448 : la mesure de rotation d'une session, relue du grand livre.
+
+        Même somme que les compteurs en mémoire de l'exécuteur : l'entrée et
+        la sortie de chaque tour, cache compris (Codex compte déjà le cache
+        dans l'entrée). `turns` compte **tous** les tours inscrits, réussis ou
+        non : c'est la définition du compteur vivant (`session_turns`), pas les
+        seuls succès — sinon l'alerte et la rotation divergent (B cx3). Le
+        harnais et l'instant sont ceux du dernier tour de la session, pour
+        choisir la surcharge compilée du bon harnais. Aucun tour : None (pas
+        une session à zéro par défaut).
+        """
+        rows = self.db.query(
+            "select coalesce(sum(input_tokens + output_tokens), 0)::bigint as tokens,"
+            " count(*)::bigint as turns,"
+            " (array_agg(harness order by recorded_at desc, id desc))[1] as harness,"
+            " extract(epoch from max(recorded_at))::float8 as last_ts"
+            " from turn_costs where agent = %s and session = %s",
+            (agent, session))
+        if not rows or int(rows[0].get("turns") or 0) == 0:
+            return None
+        return rows[0]
+
     def insert(self, *, agent, harness, turn, model, session, usd, input_tokens,
                cached_input_tokens, output_tokens, cum_usd, cum_input_tokens,
                cum_cached_input_tokens, cum_output_tokens, account=None,

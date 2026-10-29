@@ -179,13 +179,19 @@ class GrandLivreDeepSeekTest(_Base):
         self.assertEqual(self._lignes("ds-pro")[-1]["model"], "deepseek-pro")
 
     def test_alerte_session_trop_grosse_voit_deepseek(self):
-        runner, worker = self._worker("ds-al", context_max_tokens=0.0)
+        # #4448 : l'alerte mesure la même somme de session que la rotation
+        # (entrée non cachée + sortie ; le cache DeepSeek n'entre pas dans
+        # cette somme) : 100 000 + 500 pour ce tour. Le seuil et le minimum
+        # sont abaissés pour que ce tour unique reste au-dessus.
+        runner, worker = self._worker("ds-al", context_max_tokens=0.0,
+                                      session_max_tokens=100_000.0,
+                                      session_min_turns=1)
         with self._env(GROS_TOUR):
             self.assertTrue(self._tour(worker))
-        alertes = [a for a in exploitation.alerts(self.cfg, self.db)
+        alertes = [a for a in exploitation.alerts(worker.cfg, self.db)
                    if a["type"] == "session_too_big"]
         self.assertEqual([(a["agent"], a["value"], a["session"]) for a in alertes],
-                         [("ds-al", 16_000_000, "dsh-session-1")])
+                         [("ds-al", 100_500, "dsh-session-1")])
 
     def test_taille_de_session_mesuree_pour_deepseek(self):
         runner, worker = self._worker("ds-taille", session_min_turns=1,
