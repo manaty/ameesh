@@ -366,8 +366,9 @@ jobs:
       # avant tout plan et sans exécuter un test : l'étiquette (motif exact,
       # SHA complet), l'égalité exacte avec `pull_request.head.sha`, le mode
       # imposé par les refs (`release/**`/`integration/**` → full), et que le
-      # checkout est bien le merge-ref composé de la base de l'étiquette et de
-      # cette tête (ses deux parents). Toute autre étiquette est refusée : le
+      # checkout est bien le merge-ref de cette tête, composé de la base de
+      # l'étiquette ou d'une pointe qui n'en diffère que par des atterrissages
+      # de coupure (#4533, canon §12). Toute autre étiquette est refusée : le
       # check requis rougit, rien ne tourne.
       - name: gel (étiquette ci-lot/ci-full sur la tête gelée — #1343)
         id: gel
@@ -413,13 +414,74 @@ jobs:
           fi
           p1="$(git rev-parse HEAD^1)"
           p2="$(git rev-parse HEAD^2)"
-          if [ "$p1" != "$base" ]; then
-            echo "::error::the merge-ref base is $p1, the requested base is $base: the composition moved, request CI again, nothing run"
-            exit 1
-          fi
           if [ "$p2" != "$head" ]; then
             echo "::error::the merge-ref head is $p2, the label names $head: the composition moved, refreeze the request, nothing run"
             exit 1
+          fi
+          # #4533 (canon §12, manaty/home#173) : la pointe demandée peut être en
+          # avance sur la référence de fusion (GitHub la calcule en asynchrone),
+          # ou en retard ; un delta de cible fait **seulement** d'atterrissages
+          # de coupure (message de release, ligne de version de pyproject.toml
+          # et notes docs/versions/*.md) ne change pas le contenu testé. La
+          # ci-full d'un paquet composé avant la coupure reste valide : le plan
+          # part de la base réelle du merge-ref, jamais d'une base non testée.
+          # Tout autre delta reste refusé.
+          cutoff_commit() {
+            local sha="$1" line parent names name
+            git log -1 --format=%B "$sha" | grep -q 'ameesh-release:' || return 1
+            line="$(git rev-list --parents -n 1 "$sha")" || return 1
+            set -- $line
+            [ "$#" -ge 2 ] || return 1
+            parent="$2"
+            names="$(git diff --name-only --no-renames "$parent" "$sha")" || return 1
+            [ -n "$names" ] || return 1
+            for name in $names; do
+              case "$name" in
+                docs/versions/*.md) ;;
+                pyproject.toml)
+                  git diff -U0 "$parent" "$sha" -- pyproject.toml | awk '
+                    /^(\+\+\+|---)/ { next }
+                    /^\+/ { add++; if ($0 !~ /^[+]version = "[^"]+"[[:space:]]*$/) bad = 1 }
+                    /^-/  { del++; if ($0 !~ /^-version = "[^"]+"[[:space:]]*$/) bad = 1 }
+                    END { exit !(add == 1 && del == 1 && !bad) }' || return 1
+                  ;;
+                *) return 1 ;;
+              esac
+            done
+            return 0
+          }
+          cutoff_landing_only() {
+            local old="$1" new="$2" range commits commit
+            if git merge-base --is-ancestor "$old" "$new"; then
+              range="$old..$new"
+            elif git merge-base --is-ancestor "$new" "$old"; then
+              range="$new..$old"
+            else
+              return 1
+            fi
+            commits="$(git rev-list --reverse "$range")" || return 1
+            [ -n "$commits" ] || return 1
+            for commit in $commits; do
+              cutoff_commit "$commit" || return 1
+            done
+            return 0
+          }
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            # fetch-depth: 0 couvre les branches au checkout ; une pointe vue
+            # après coup peut manquer : on la lit avant de conclure.
+            git fetch --quiet --no-tags origin "$base" || {
+              echo "::error::requested base $base is not readable in the checkout: the composition cannot be checked, nothing run"
+              exit 1
+            }
+          fi
+          plan_base="$p1"
+          if [ "$p1" != "$base" ]; then
+            if cutoff_landing_only "$p1" "$base"; then
+              echo "composition: merge-ref base $p1, requested base $base: only cutoff landing commit(s) (version and notes) separate them, the tested content is unchanged; the plan runs against $p1"
+            else
+              echo "::error::the merge-ref base is $p1, the requested base is $base: the composition moved, request CI again, nothing run"
+              exit 1
+            fi
           fi
           echo "freeze request: mode=$mode sha=$sha base=$base head=$head label=$label"
           {
@@ -430,6 +492,9 @@ jobs:
           {
             echo "AMEESH_CI_MODE=$mode"
             echo "AMEESH_CI_GEL=$sha"
+            # le plan sélectionne contre la composition réellement extraite,
+            # pas contre une pointe que le merge-ref n'a pas encore intégrée.
+            echo "AMEESH_CI_BASE=$plan_base"
           } >> "$GITHUB_ENV"
       # une poussée garde le plan automatique (L1211, L161a) : impactés +
       # contrat sur une branche de lot, suite complète sur main/release.
