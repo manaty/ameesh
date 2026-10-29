@@ -976,15 +976,14 @@ def _plan_green(checks, app_id) -> bool:
 
 
 def _suite_run(slug: str, run, *, gh, head: str = "", cache: dict | None = None):
-    """#4549 : le run Actions d'une suite — identité du workflow, date de
-    demande et tête — ou None si la preuve ne se lit pas.
+    """#4549 : le run Actions d'une suite — identité du workflow, base
+    attestée et tête — ou None si la preuve ne se lit pas.
 
     L'identité de workflow vient du run lui-même (`workflow_id`, `path`), pas
-    des noms de checks : deux workflows homonymes restent distincts. La date
-    de demande est `created_at` (celle de l'étiquette), pas le démarrage des
-    jobs : un run resté en file peut démarrer après un mouvement de la cible
-    en gardant la base demandée plus ancienne."""
-    from . import radar
+    des noms de checks : deux workflows homonymes restent distincts. La base
+    attestée est celle que le run-name de la demande porte (`ci.pr_run`) :
+    c'est la base que la porte du gel a composée, pas la tête du dépôt."""
+    from . import ci, radar
     run_id = radar.actions_run_id(slug, run)
     if run_id is None or gh is None:
         return None
@@ -1007,10 +1006,16 @@ def _suite_run(slug: str, run, *, gh, head: str = "", cache: dict | None = None)
     path = data.get("path")
     if not isinstance(path, str):
         path = None
-    created = data.get("created_at")
-    if not isinstance(created, str):
-        created = None
-    proof = {"workflow_id": identity, "path": path, "created_at": created}
+    # #4549 (B2 de cx2) : la base est lue dans le run-name de la demande ;
+    # un run sans demande lisible n'atteste aucune base (le doute refuse).
+    attested = None
+    try:
+        request = ci.pr_run(data)
+    except (AttributeError, TypeError, ValueError):
+        request = None
+    if request is not None:
+        attested = request.get("base")
+    proof = {"workflow_id": identity, "path": path, "attested_base": attested}
     if cache is not None:
         cache[run_id] = proof
     return proof
@@ -1025,34 +1030,26 @@ def _same_workflow(left, right) -> bool:
     return bool(left.get("path") and left.get("path") == right.get("path"))
 
 
-def _current_base_ok(created, *, slug: str | None, gh, target: str) -> bool:
-    """#4549 : la suite verte a été demandée alors que la cible portait déjà
-    son commit courant.
+def _current_base_ok(attested, *, slug: str | None, gh, target: str) -> bool:
+    """#4549 (B de cx2) : la suite verte atteste, par son run-name, la base
+    sur laquelle elle a été demandée ; cette base doit être la tête courante
+    de la cible, comparée par **SHA**.
 
-    Une suite demandée avant le commit courant de la cible a testé une
-    composition plus ancienne : elle ne remplace pas un rouge plus récent.
-    Sans lecteur, la preuve de base est réputée faite (les appelants de la
-    porte passent tous la lecture) ; une lecture impossible refuse, le doute
-    ne verdit jamais."""
+    La date de committer de la tête de la cible ne prouve pas quand elle est
+    devenue la tête : un commit ancien poussé en fast-forward après le run
+    garde sa date et laisserait passer une composition plus ancienne. Une
+    base attestée absente ou une lecture impossible refuse : le doute ne
+    verdit jamais. Sans lecteur (appel unitaire), la preuve de base est
+    réputée faite, comme avant."""
     if not (slug and gh and target):
         return True
-    from datetime import datetime
-
+    if not isinstance(attested, str) or not attested.strip():
+        return False
     try:
-        base = land.base_oid(slug, merge_queue._remote_branch(target), gh=gh)
-        proc = gh(["api", "repos/%s/commits/%s" % (slug, base)])
-        if getattr(proc, "returncode", 1) != 0:
-            return False
-        data = json.loads(proc.stdout or "{}")
-        commit = data.get("commit") if isinstance(data, dict) else None
-        stamp = ((commit or {}).get("committer") or {}).get("date")
-        moment = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
-        asked = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
-        if moment.tzinfo is None or asked.tzinfo is None:
-            return False
-        return asked.timestamp() >= moment.timestamp()
+        current = land.base_oid(slug, merge_queue._remote_branch(target), gh=gh)
     except (land.LandError, ValueError, TypeError, AttributeError, OSError):
         return False
+    return attested.strip().lower() == str(current or "").strip().lower()
 
 
 def _supersede_testless_runs(name, app_id, runs, provenance, *, required=(),
@@ -1103,17 +1100,54 @@ def _supersede_testless_runs(name, app_id, runs, provenance, *, required=(),
     if slug and gh:
         cache: dict = {}
         newest_run = _suite_run(slug, newest[2], gh=gh, head=head, cache=cache)
-        if newest_run is None or newest_run.get("created_at") is None:
+        if newest_run is None:
             return runs
         for _start, _suite, run, _checks in failures:
             proof = _suite_run(slug, run, gh=gh, head=head, cache=cache)
             if not _same_workflow(newest_run, proof):
                 return runs
-        if not _current_base_ok(newest_run["created_at"], slug=slug, gh=gh,
-                                target=target):
+        if not _current_base_ok(newest_run.get("attested_base"), slug=slug,
+                                gh=gh, target=target):
             return runs
     drop = {row[1] for row in failures}
     return [run for run in runs if run.get("check_suite_id") not in drop]
+
+
+def _proven_superseded_suites(name, provenance, *, required=(), slug=None, gh=None,
+                              head: str = "", target: str = "") -> set:
+    """#4549 (B2 de cx2) : les suites dont le run de `name` est supplanté,
+    prouvées application par application.
+
+    `radar.latest_rollup` ne masque plus rien sur le seul nom : la décision
+    se prend ici, avec la même preuve que la voie `app_id` (même workflow,
+    plan vert, aucun test lancé, base attestée = cible courante). Un nom
+    porté par deux applications, ou deux workflows homonymes, n'est donc
+    jamais verdit par la suite de l'autre."""
+    by_app: dict = {}
+    for run in provenance or ():
+        if not isinstance(run, dict) or _rollup_name(run) != name:
+            continue
+        app_id = run.get("app_id")
+        if isinstance(app_id, bool) or not isinstance(app_id, int):
+            continue
+        by_app.setdefault(app_id, []).append(run)
+    dropped: set = set()
+    for app_id, runs in by_app.items():
+        before = {run.get("check_suite_id") for run in runs}
+        kept = _supersede_testless_runs(name, app_id, _latest_runs(runs),
+                                        provenance, required=required,
+                                        slug=slug, gh=gh, head=head,
+                                        target=target)
+        dropped |= before - {run.get("check_suite_id") for run in kept}
+    return dropped
+
+
+def _entry_suite(entry):
+    """L'identifiant de suite d'une entrée de rollup (`checkSuiteId`) ou d'un
+    check run de provenance (`check_suite_id`), ou None."""
+    if not isinstance(entry, dict):
+        return None
+    return entry.get("checkSuiteId", entry.get("check_suite_id"))
 
 
 def _required_gate(required, rollup, provenance=None, *, strict: bool = False,
@@ -1153,11 +1187,14 @@ def _required_gate(required, rollup, provenance=None, *, strict: bool = False,
     manque), pour les lecteurs qui n'ont pas reçu la règle du 23/10 (file de
     fusion, `merge-pr`).
 
-    #4549 : sur une application imposée, une suite plus récente conclue verte
-    remplace un run échoué au plan d'une suite plus ancienne **sans aucun
-    test exécuté** (`_supersede_testless_runs`) ; un rouge de test, une suite
-    concurrente ou une base de composition non courante gardent la porte
-    fermée. `slug`/`gh`/`target` portent la preuve de la base courante."""
+    #4549 : une suite plus récente conclue verte remplace un run échoué au
+    plan d'une suite plus ancienne **sans aucun test exécuté**
+    (`_supersede_testless_runs`) ; un rouge de test, une suite concurrente ou
+    une base de composition non courante gardent la porte fermée. La preuve
+    vaut aussi pour un nom sans application imposée, application par
+    application (`_proven_superseded_suites`, B2 de cx2) : le rollup n'est
+    jamais filtré sur le seul nom. `slug`/`gh`/`target` portent la preuve de
+    la base attestée."""
     from . import radar
     rollup = radar.latest_rollup(rollup)
     gaps, consigned = [], []
@@ -1201,6 +1238,19 @@ def _required_gate(required, rollup, provenance=None, *, strict: bool = False,
             if not entries:
                 gaps.append("%s (absent)" % name)
                 continue
+            # #4549 (B2 de cx2) : le remplacement d'une suite échouée au plan
+            # par une suite verte sans test se prouve ici, sur la provenance
+            # de la tête et la base attestée ; le rollup n'est jamais filtré
+            # sur le seul nom. Sans entrée restante, on garde tout : un vert
+            # ne se déduit pas d'une absence.
+            dropped = _proven_superseded_suites(
+                name, provenance, required=required, slug=slug, gh=gh,
+                head=head, target=target)
+            if dropped:
+                kept = [entry for entry in entries
+                        if _entry_suite(entry) not in dropped]
+                if kept:
+                    entries = kept
             classify(name, entries)
             continue
         runs = _latest_runs([entry for entry in provenance or ()

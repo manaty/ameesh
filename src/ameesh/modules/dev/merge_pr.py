@@ -221,15 +221,14 @@ def _unstable_ci_ok(rollup, project=None, branch=None) -> bool:
 
     Les checks **requis** sont déjà prouvés par `_required_refusal` (même
     règle que le feu) ; restent les portes qui ne sont pas des checks requis
-    de la forge : les statuts exigés, la preuve du portier `paquet` et le
-    détail de l'agrégat `tests` gardent leurs refus. Un négatif facultatif
-    n'arrête donc pas le geste, comme la protection GitHub ne l'exige pas."""
-    contexts = [(entry.get("context"), entry.get("state"))
-                for entry in rollup or ()
-                if isinstance(entry, dict)
-                and (entry.get("__typename") == "StatusContext"
-                     or "state" in entry and "conclusion" not in entry)]
-    if radar._status_success(contexts, radar.required_statuses(project, branch)):
+    de la forge : les statuts exigés — classés par la même porte que le feu,
+    un statut en erreur se consigne et ne bloque pas (N2 de dev1) —, la
+    preuve du portier `paquet` et le détail de l'agrégat `tests` gardent
+    leurs refus. Un négatif facultatif n'arrête donc pas le geste, comme la
+    protection GitHub ne l'exige pas."""
+    status_gaps, _consigned = fire._required_status_gate(
+        rollup, radar.required_statuses(project, branch))
+    if status_gaps:
         return False
     proof_gaps, _ = fire._packet_proof_gate(rollup)
     if proof_gaps:
@@ -346,7 +345,7 @@ def _project_of(cfg, repo: str):
 
 
 def _required_refusal(slug: str, target: str, project, rollup, *, head: str = "",
-                      gh=None) -> str:
+                      gh=None, pairs_out: list | None = None) -> str:
     """Le refus opposé par les checks requis de la cible sur cette tête
     (#2273), ou "" quand ils sont tous présents et `SUCCESS`.
 
@@ -365,7 +364,11 @@ def _required_refusal(slug: str, target: str, project, rollup, *, head: str = ""
     transport local (chemin réel
     existant, celui que lie `_bind_repo_identity`) n'a pas de protection de
     branche, il n'y a donc rien à exiger ; un slug vide ou malformé n'est ni
-    l'un ni l'autre et refuse, sans s'en remettre à l'appelant (#2289)."""
+    l'un ni l'autre et refuse, sans s'en remettre à l'appelant (#2289).
+
+    #4549 (B de dev1, réécrit par l'auteur) : `pairs_out` reçoit les couples
+    requis lus, pour que `_admission` sache si un `UNSTABLE` repose sur des
+    checks requis prouvés ou sur une déclaration vide."""
     ident = _slug_identity(slug)
     if ident is None:
         return ("the required checks cannot be proven: the repository %r is neither "
@@ -380,6 +383,8 @@ def _required_refusal(slug: str, target: str, project, rollup, *, head: str = ""
         pairs = fire._required_pairs(required)
     except land.LandError as exc:
         return "the required checks of %s cannot be proven: %s" % (target, exc)
+    if pairs_out is not None:
+        pairs_out.extend(pairs)
     provenance = None
     if any(app_id is not None for _, app_id in pairs):
         try:
@@ -415,17 +420,28 @@ def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict, *,
     head = (head or (view.get("headRefOid") or "")).strip()
     # la cible de la commande fait foi ; la vue ne sert qu'à défaut (#2273 :
     # une vue sans base ne doit pas vider la lecture des checks requis)
+    pairs: list = []
     refusal = _required_refusal(slug, (target or "").strip() or base, project, rollup,
-                                head=head, gh=gh)
+                                head=head, gh=gh, pairs_out=pairs)
     if refusal:
         raise MergePrError("PR #%s on the freeze %s: %s"
                            % (view.get("number"), head[:12] or "?", refusal))
+    unstable = (view.get("mergeStateStatus") or "").upper() == "UNSTABLE"
+    if unstable and not pairs:
+        # #4549 (B de dev1, réécrit par l'auteur) : sans paire requise lue,
+        # rien ne prouve que le non-vert d'`UNSTABLE` est facultatif — la
+        # déclaration peut être vide (403 de plan #3428) ou le transport
+        # local sans protection. Le feu exige alors toute la CI verte ; le
+        # geste hors API ne fait pas moins.
+        raise MergePrError(
+            "PR #%s on the freeze %s is UNSTABLE and %s declares no required "
+            "check: all the checks must be concluded and green"
+            % (view.get("number"), head[:12] or "?", target or base or "?"))
 
     #: #4549 : sous `UNSTABLE`, un non-vert facultatif ou un run supplanté ne
     #: bloque plus la file ; `_required_refusal` ci-dessus a déjà prouvé les
     #: checks requis, `_unstable_ci_ok` garde le portier et le détail.
-    unstable_ok = ((view.get("mergeStateStatus") or "").upper() == "UNSTABLE"
-                   and _unstable_ci_ok(rollup, project, branch))
+    unstable_ok = unstable and _unstable_ci_ok(rollup, project, branch)
 
     def ci_status(name: str):
         if not branch or name != branch:
