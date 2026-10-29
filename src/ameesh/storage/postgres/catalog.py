@@ -46,7 +46,12 @@ class Catalog(interface.Catalog):
                     price_input  = coalesce(excluded.price_input,  model_catalog.price_input),
                     price_cached = coalesce(excluded.price_cached, model_catalog.price_cached),
                     price_output = coalesce(excluded.price_output, model_catalog.price_output),
-                    source       = excluded.source,
+                    -- #4312 (N de l'auditeur sur #4291) : `source` est la
+                    -- PROPRIÉTÉ de la ligne (le retrait d'un modèle ne voit que
+                    -- les lignes de sa source). Une autre source qui revoit le
+                    -- même modèle met à jour ses mesures, jamais son
+                    -- propriétaire : sinon la ligne échappe au retrait de la
+                    -- source qui l'a créée, et le catalogue change de main.
                     raw_digest   = coalesce(excluded.raw_digest, model_catalog.raw_digest),
                     last_seen    = now(),
                     retired_at   = NULL
