@@ -466,11 +466,14 @@ class PaquetAutoBanc(unittest.TestCase):
     def test_keep_composition_garde_les_membres_a_leur_source(self) -> None:
         # Témoin #4581 : composition A = {1, 2, 3}, lot 4 prêt, --exclude 2 :
         # on recompose {1, 3} ; 4 est nommé pour la coupure suivante.
-        candidates = [paquet_auto.Candidate(1, "a" * 40),
-                      paquet_auto.Candidate(2, "b" * 40),
-                      paquet_auto.Candidate(3, "c" * 40),
+        first = self.lot(1, "un.txt", "1\n")
+        second = self.lot(2, "deux.txt", "2\n")
+        third = self.lot(3, "trois.txt", "3\n")
+        candidates = [paquet_auto.Candidate(1, first),
+                      paquet_auto.Candidate(2, second),
+                      paquet_auto.Candidate(3, third),
                       paquet_auto.Candidate(4, "d" * 40)]
-        specs = [([1], "a" * 40), ([2], "b" * 40), ([3], "c" * 40)]
+        specs = [([1], first), ([2], second), ([3], third)]
         members, discarded = paquet_auto.keep_composition(
             candidates, specs, worktree=self.repo, already_discarded={2})
         self.assertEqual([member.lot for member in members], [1, 3])
@@ -478,13 +481,38 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertEqual(discarded[0].reason, paquet_auto.KEEP_READY_REASON)
         self.assertEqual(discarded[0].reason, "coupure suivante : recomposition")
 
+    def test_keep_composition_source_abregee_est_reprise(self) -> None:
+        # #4581 (auditeur) : le manifeste écrit la source en --short=12 et le
+        # candidat porte le SHA complet ; la source composée est résolue dans
+        # le worktree (second parent de la tête gelée) avant comparaison.
+        first = self.lot(1, "un.txt", "1\n")
+        members, discarded = paquet_auto.keep_composition(
+            [paquet_auto.Candidate(1, first)], [([1], first[:12])],
+            worktree=self.repo, already_discarded=set())
+        self.assertEqual([member.lot for member in members], [1])
+        self.assertEqual(discarded, [])
+
+    def test_keep_composition_source_composee_absente_est_ecartee(self) -> None:
+        first = self.lot(1, "un.txt", "1\n")
+        members, discarded = paquet_auto.keep_composition(
+            [paquet_auto.Candidate(1, first)], [([1], "0" * 12)],
+            worktree=self.repo, already_discarded=set())
+        self.assertEqual(members, [])
+        self.assertEqual([item.lot for item in discarded], [1])
+        self.assertEqual(discarded[0].reason, paquet_auto.KEEP_NOT_READY_REASON)
+        self.assertIn("introuvable", discarded[0].detail)
+
     def test_keep_composition_ecarte_une_tete_regelee(self) -> None:
         # #4581 : un membre gelé sur une nouvelle tête n'est jamais réadmis
         # sans ci de paquet sur cette tête ; il va à la coupure suivante.
-        candidates = [paquet_auto.Candidate(1, "a" * 40),
-                      paquet_auto.Candidate(2, "e" * 40),
-                      paquet_auto.Candidate(3, "c" * 40)]
-        specs = [([1], "a" * 40), ([2], "b" * 40), ([3], "c" * 40)]
+        first = self.lot(1, "un.txt", "1\n")
+        second = self.lot(2, "deux.txt", "2\n")
+        third = self.lot(3, "trois.txt", "3\n")
+        refrozen = self.lot(4, "quatre.txt", "4\n")
+        candidates = [paquet_auto.Candidate(1, first),
+                      paquet_auto.Candidate(2, refrozen),
+                      paquet_auto.Candidate(3, third)]
+        specs = [([1], first[:12]), ([2], second[:12]), ([3], third[:12])]
         members, discarded = paquet_auto.keep_composition(
             candidates, specs, worktree=self.repo, already_discarded=set())
         self.assertEqual([member.lot for member in members], [1, 3])
@@ -493,14 +521,18 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertIn("nouvelle tête", discarded[0].detail)
 
     def test_keep_composition_nomme_le_membre_absent(self) -> None:
-        candidates = [paquet_auto.Candidate(1, "a" * 40),
-                      paquet_auto.Candidate(3, "c" * 40)]
-        specs = [([1], "a" * 40), ([2], "b" * 40), ([3], "c" * 40)]
+        first = self.lot(1, "un.txt", "1\n")
+        second = self.lot(2, "deux.txt", "2\n")
+        third = self.lot(3, "trois.txt", "3\n")
+        candidates = [paquet_auto.Candidate(1, first),
+                      paquet_auto.Candidate(3, third)]
+        specs = [([1], first), ([2], second), ([3], third)]
         members, discarded = paquet_auto.keep_composition(
             candidates, specs, worktree=self.repo, already_discarded=set())
         self.assertEqual([member.lot for member in members], [1, 3])
         self.assertEqual([item.lot for item in discarded], [2])
         self.assertEqual(discarded[0].reason, paquet_auto.KEEP_NOT_READY_REASON)
+
 
     def test_keep_composition_ecarte_une_resolution(self) -> None:
         # Une unité à plusieurs lots ne se reprend pas sans la relire.
@@ -545,22 +577,25 @@ class PaquetAutoBanc(unittest.TestCase):
         # #4581 : au niveau de la composition, --exclude 2 + la composition
         # précédente {1, 2} ne composent que #1 ; #3, prêt depuis, est nommé aux
         # écartés pour la coupure suivante, jamais composé.
+        first = self.lot(1, "un.txt", "1\n")
+        second = self.lot(2, "deux.txt", "2\n")
         manifest = ("# Paquet\n\n## Composition (2 unités, 2 lots)\n\n"
                     "| unité | lot(s) | source | commit | note |\n"
                     "|---|---|---|---|---|\n"
                     "| 1 | #1 | `%s` | `1111111` | composition |\n"
                     "| 2 | #2 | `%s` | `2222222` | composition |\n"
-                    % ("a" * 40, "b" * 40))
+                    % (first[:12], second[:12]))
         self.write("reviews/integration-paquet-banc.md", manifest)
-        self.git("add", "-A", cwd=self.repo)
-        self.git("commit", "-qm", "manifeste", cwd=self.repo)
-        keep = self.rev("HEAD")
+        keep = self.commit("manifeste")
         worktree = pathlib.Path(self.tmp.name) / "wt-keep"
+        self.git("worktree", "add", "--detach", str(worktree), self.base,
+                 cwd=self.repo)
+        self.addCleanup(paquet_auto.remove_worktree, self.repo, worktree)
         (worktree / "scripts").mkdir(parents=True)
         (worktree / "scripts" / "paquet-compose.py").write_text(
             "", encoding="utf-8")
         composition = paquet_auto.Composition(
-            units=[paquet_auto.Unit(1, "a" * 40, "d" * 40)],
+            units=[paquet_auto.Unit(1, first, "d" * 40)],
             discarded=[], head="e" * 40)
         args = argparse.Namespace(
             repo=str(self.repo), name="banc", target="main", carrier=99,
@@ -580,15 +615,15 @@ class PaquetAutoBanc(unittest.TestCase):
             return "d" * 40
 
         with mock.patch.object(paquet_auto, "fresh_base",
-                               return_value="a" * 40), \
+                               return_value=self.base), \
                 mock.patch.object(paquet_auto, "prune_stale_worktrees",
                                   return_value=[]), \
                 mock.patch.object(paquet_auto, "make_worktree",
                                   return_value=worktree), \
                 mock.patch.object(paquet_auto, "compute_candidates",
                                   return_value=(
-                                      [paquet_auto.Candidate(1, "a" * 40),
-                                       paquet_auto.Candidate(2, "b" * 40),
+                                      [paquet_auto.Candidate(1, first),
+                                       paquet_auto.Candidate(2, second),
                                        paquet_auto.Candidate(3, "c" * 40)],
                                       {"ready": [1, 2, 3], "waiting": []})), \
                 mock.patch.object(paquet_auto, "compose_candidates",

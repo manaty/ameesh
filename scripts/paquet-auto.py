@@ -1129,15 +1129,22 @@ def composition_specs(repo: Path, reference: str, name: str) -> list[tuple[list[
             % (rel, sha[:12], error)) from error
 
 
-def same_source(worktree: Path, left: str, right: str) -> bool:
-    """Les deux désignent-ils le même commit ? (une abréviation est résolue.)"""
-    if left == right:
-        return True
-    if not left or not right:
+def same_source(worktree: Path, composed: str, candidate: str) -> bool:
+    """Le candidat pointe-t-il le commit de la source **composée** ?
+
+    La table `## Composition` écrit la source abrégée (#3629, `--short=12`) ;
+    on la résout donc dans le worktree avant de comparer au SHA complet du
+    candidat. Une source composée absente du clone n'est jamais reprise en
+    silence : elle va à la coupure suivante (l'invariant « second parent de la
+    tête gelée » est ainsi vérifié, pas supposé). Le SHA du candidat est résolu
+    de même quand il est présent.
+    """
+    if not composed or not candidate:
         return False
-    found_left = rev(worktree, left)
-    found_right = rev(worktree, right)
-    return bool(found_left and found_right and found_left == found_right)
+    resolved = rev(worktree, composed)
+    if resolved is None:
+        return False
+    return resolved == (rev(worktree, candidate) or candidate)
 
 
 def keep_composition(candidates: list[Candidate],
@@ -1178,7 +1185,14 @@ def keep_composition(candidates: list[Candidate],
                 lot, KEEP_NOT_READY_REASON,
                 "composé %s, plus dans la liste prête" % source[:12]))
             continue
-        if not same_source(worktree, candidate.source, source):
+        if rev(worktree, source) is None:
+            # la source composée est le second parent d'une fusion de la tête
+            # gelée : absente du clone, elle ne se reprend pas en silence.
+            discarded.append(Discarded(
+                lot, KEEP_NOT_READY_REASON,
+                "source composée %s introuvable dans le clone" % source[:12]))
+            continue
+        if not same_source(worktree, source, candidate.source):
             discarded.append(Discarded(
                 lot, KEEP_REFROZEN_REASON,
                 "composé %s, tête actuelle %s : pas de ci de paquet sur la "
