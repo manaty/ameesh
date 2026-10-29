@@ -435,6 +435,29 @@ class PrefixesBornesTest(unittest.TestCase):
         self.assertEqual(wall, timeout)
         self.assertEqual(self.worktrees(), 1)
 
+    def test_echeance_pendant_un_prefixe_non_concluant(self) -> None:
+        # relecture cx2 (#162655) : le rejeu lancé est coupé par le temps mural
+        def replay(_worktree, label, modules, *, timeout, wall):
+            time.sleep(2.0)
+            return self.auto.TestRun(label, list(modules), None,
+                                     "temps mural atteint", float(wall),
+                                     timed_out=True)
+
+        with self.assertRaises(self.auto.BudgetSpent) as caught:
+            self.prefixes(replay, deadline=time.monotonic() + 1.9)
+        self.assertIn("pendant le préfixe 1", str(caught.exception))
+        self.assertEqual(self.worktrees(), 1)
+
+    def test_delai_propre_du_prefixe_reste_illisible(self) -> None:
+        # sous l'échéance, un préfixe non concluant de lui-même ne change pas
+        def replay(_worktree, label, modules, *, timeout, wall):
+            return self.auto.TestRun(label, list(modules), None,
+                                     "did not finish", 1.0, timed_out=True)
+
+        found, why = self.prefixes(replay, deadline=time.monotonic() + 600)
+        self.assertEqual(found, {})
+        self.assertIn("préfixe 1 (#1) non concluant", why)
+
     def test_sans_borne_inchange(self) -> None:
         replay, calls = self.t4217.PrefixReplayTest.replay_at(self, {"préfixe 2 (#2)"})
         found, why = self.prefixes(replay)
@@ -487,6 +510,27 @@ class VoisinRougePrefixesTest(unittest.TestCase):
         self.assertEqual(runs[-1].label, "préfixes")
         # la base aussi est bornée en temps mural
         self.assertEqual(self.base_calls[0]["wall"], self.base_calls[0]["timeout"])
+
+    def test_prefixe_coupe_par_l_echeance_paquet_continue(self) -> None:
+        # voisin rouge → préfixe lancé → TestRun coupé → aucun retrait, sans
+        # AttributionUnreadable (relecture cx2 #162655)
+        real = self.auto.prefix_failures
+
+        def prefix(*args, **kwargs):
+            def replay(_worktree, label, modules, *, timeout, wall):
+                return self.auto.TestRun(label, list(modules), None,
+                                         "temps mural atteint", float(wall),
+                                         timed_out=True)
+
+            # 5 s restantes au lancement, plus rien au retour du rejeu
+            with mock.patch.object(self.auto, "series_timeout",
+                                   side_effect=[5, None]):
+                return real(*args, replay=replay, **kwargs)
+
+        runs, faulty, removals = self.check(prefix)
+        self.assertEqual((faulty, removals), ([], []))
+        self.assertEqual(runs[-1].label, "préfixes")
+        self.assertTrue(runs[-1].inconclusive)
 
     def test_fusion_aux_prefixes_remonte_telle_quelle(self) -> None:
         def prefix(*_args, **_kwargs):

@@ -1825,7 +1825,7 @@ def prefix_failures(worktree: Path, composition: Composition,
     #4463 : `guard` est relu avant chaque préfixe après le premier (fusion du
     porteur comprise) ; sous `deadline`, chaque rejeu est borné au temps
     restant, en temps mural, et `BudgetSpent` est levée quand il n'en reste
-    plus.
+    plus, avant un préfixe ou pendant (rejeu coupé par l'échéance).
     """
     tests: list[dict] = []
     seen: set[str] = set()
@@ -1871,6 +1871,11 @@ def prefix_failures(worktree: Path, composition: Composition,
                          timeout=limit,
                          **({"wall": limit} if deadline is not None else {}))
             if run.inconclusive:
+                if deadline is not None and series_timeout(timeout, deadline) is None:
+                    # #4463 : coupé par l'échéance totale, pas par le préfixe
+                    raise BudgetSpent("borne totale atteinte pendant le préfixe "
+                                      "%d (#%d) : %s" % (index, unit.lot,
+                                                         run.motive()))
                 return {}, ("préfixe %d (#%d) non concluant : %s"
                             % (index, unit.lot, run.motive()))
             failed = {entry["test"]
