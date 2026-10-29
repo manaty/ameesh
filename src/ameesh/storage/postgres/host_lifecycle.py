@@ -173,7 +173,7 @@ class HostLifecycle(interface.HostLifecycle):
         return self.db.query("SELECT " + _ROW + " FROM host_lifecycle ORDER BY host", ())
 
     def drain(self, host, *, actor, duration=None, critical=(), automatic=False,
-              close_claims=True):
+              close_claims=False):
         if not isinstance(automatic, bool):
             raise ValueError("automatic: a boolean expected")
         if not isinstance(close_claims, bool):
@@ -434,6 +434,10 @@ class HostLifecycle(interface.HostLifecycle):
                     # not trust a `busy` from before it.
                     tx.execute(
                         "UPDATE host_lifecycle SET hook_state=%s,"
+                        # A new epoch lets the scanner ask for a fresh `busy`
+                        # even when a `busy` journal already exists for the
+                        # current wave: the stale release is newer.
+                        "release_epoch=release_epoch+1,"
                         "updated_at=clock_timestamp() WHERE host=%s",
                         (state, host))
                 tx.execute(
@@ -504,6 +508,18 @@ class HostLifecycle(interface.HostLifecycle):
             "AND NOT claims_open RETURNING host",
             (host, generation, bool(require_busy), release_epoch, release_epoch,
              attempt_stale_after, attempt_stale_after))
+        return bool(rows)
+
+    def close_claims(self, host, generation, release_epoch):
+        for value, name in ((generation, "generation"),
+                            (release_epoch, "release_epoch")):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError("%s: a positive integer expected" % name)
+        rows = self.db.query(
+            "UPDATE host_lifecycle SET claims_open=false,updated_at=clock_timestamp() "
+            "WHERE host=%s AND generation=%s AND release_epoch=%s "
+            "AND mode='draining' AND claims_open RETURNING host",
+            (host, generation, release_epoch))
         return bool(rows)
 
     def note_return_request(self, host, *, actor):

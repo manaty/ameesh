@@ -283,6 +283,17 @@ class HostReleaseTest(PgTestCase):
         self.assertEqual(self.control()["mode"], "draining")
         self.assertEqual(self.states(), ["draining"])
 
+    def test_hook_added_after_a_drain_closes_claims_before_draining(self):
+        self.add_agent()
+        no_hook = dataclasses.replace(self.cfg, lifecycle_hooks={})
+        host_lifecycle.drain(no_hook, self.db, "vm", duration=3600,
+                             actor="human:op")
+        self.assertTrue(self.control()["claims_open"])
+        self.once(now=time.time())
+        control = self.control()
+        self.assertFalse(control["claims_open"])
+        self.assertEqual(control["hook_state"], "draining")
+
     def test_released_host_waking_is_not_lost_before_a_post_ack_reading(self):
         worker = self.add_agent()
         self.quiet_history()
@@ -323,7 +334,7 @@ class HostReleaseTest(PgTestCase):
         self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
                         "WHERE host='vm'")
         self.api.host_lifecycle.expire_returns(open_claims=False)
-        self.api.host_lifecycle.drain("vm", actor="human:op")
+        self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
         control = self.control()
         self.assertEqual(control["hook_attempt_state"], "idle-drained")
         self.assertEqual(control["hook_attempt_generation"], gen1)
@@ -517,10 +528,11 @@ class HostReleaseTest(PgTestCase):
         self.assertTrue(opened)
         self.assertTrue(self.control()["claims_open"])
 
-    def test_scheduled_return_without_an_adapter_reopens_claims(self):
+    def test_closed_scheduled_return_reopens_claims_without_a_hook(self):
         self.add_agent()
         self.cfg = dataclasses.replace(self.cfg, lifecycle_hooks={})
-        self.api.host_lifecycle.drain("vm", actor="human:op", duration=3600)
+        self.api.host_lifecycle.drain("vm", actor="human:op", duration=3600,
+                                      close_claims=True)
         self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
                         "WHERE host='vm'")
         self.api.host_lifecycle.expire_returns(open_claims=False)
@@ -545,10 +557,10 @@ class HostReleaseTest(PgTestCase):
 
     def test_reopen_return_is_refused_after_a_new_withdrawal(self):
         self.add_agent()
-        self.api.host_lifecycle.drain("vm", actor="human:op")
+        self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
         snapshot = self.control()
         self.api.host_lifecycle.undrain("vm", actor="human:op", claims_open=True)
-        self.api.host_lifecycle.drain("vm", actor="human:op")
+        self.api.host_lifecycle.drain("vm", actor="human:op", close_claims=True)
         self.assertEqual(self.control()["mode"], "draining")
         self.assertFalse(self.control()["claims_open"])
         stale = self.api.host_lifecycle.reopen_return(

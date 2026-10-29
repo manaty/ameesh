@@ -5037,6 +5037,7 @@
     "agents",
     "begin_transition",
     "claim_release_scan",
+    "close_claims",
     "complete_return",
     "demand",
     "detect_losses",

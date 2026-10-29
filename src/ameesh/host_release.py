@@ -383,6 +383,12 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, holds, known,
         return "busy"
 
     # mode == draining
+    if row.get("claims_open"):
+        # A hook configured after the drain (or a late canon read): close the
+        # durable gate before asking the adapter for `draining`.
+        if not api.close_claims(host, row["generation"], row["release_epoch"]):
+            return "claims already closed"
+        row = api.get(host) or row
     released = row.get("release_state") == "idle-drained"
     need_return = (return_targets(row, listing, controls, known_hosts=known,
                                   holds=holds)

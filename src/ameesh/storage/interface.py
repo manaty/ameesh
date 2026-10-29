@@ -4250,7 +4250,7 @@ class HostLifecycle(Domain):
     @abc.abstractmethod
     def drain(self, host: str, *, actor: str, duration: int | None = None,
               critical: Sequence[str] = (), automatic: bool = False,
-              close_claims: bool = True) -> dict:
+              close_claims: bool = False) -> dict:
         """Close claims/enable atomically and retain agents' original host.
 
         #3029: an elected role holding its lease on this host is returned in
@@ -4324,6 +4324,16 @@ class HostLifecycle(Domain):
         `require_busy=False` is the explicit operator path of a host whose
         adapter was removed. `attempt_stale_after` also refuses while an
         adapter call is in flight.
+        """
+
+    @abc.abstractmethod
+    def close_claims(self, host: str, generation: int,
+                     release_epoch: int) -> bool:
+        """Close the durable claim gate of a current withdrawal (CAS).
+
+        #4148: a hook configured after a drain (or a canon read late) must
+        close claims before `draining`; the mode already closes them, so this
+        only lets the adapter transition be accepted.
         """
 
     @abc.abstractmethod

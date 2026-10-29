@@ -41,15 +41,24 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
     # #4148: only an external adapter requires the durable claim gate; without
     # one, `draining` alone closes claims and `returning` must reopen at once
     # for an old binary's agents to come home.
+    from . import canon as canon_mod
     from . import host_release
+    try:
+        configured = bool(canon_mod.configured(cfg))
+    except Exception:  # unreadable configuration: fail closed
+        configured = True
     try:
         canons = work.configured_canons(cfg)
     except Exception:  # an unreadable canon must not reopen the gate
         canons = []
+        configured = True
     try:
-        close_claims = bool(host_release.hook_for(cfg, canons, host))
+        hook = host_release.hook_for(cfg, canons, host)
     except ValueError:
-        close_claims = True  # ambiguous adapter config: fail closed
+        hook = True  # ambiguous adapter config: fail closed
+    # A configured canon that did not load may hold the only Host card with
+    # the hook: fail closed rather than reopen the gate.
+    close_claims = bool(hook) or (configured and not canons)
     return storage.of(db).host_lifecycle.drain(
         host, actor=actor, duration=duration, critical=critical,
         automatic=bool(automatic), close_claims=close_claims)

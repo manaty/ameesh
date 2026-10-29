@@ -386,7 +386,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #4148 : states and evidence of the external release adapter; the
         -- free-text failure stays in the contents role.
         'release_state', 'hook_state', 'claims_open', 'release_epoch',
-        'release_generation', 'automatic', 'released_at', 'release_error_state',
+        'release_generation', 'automatic', 'released_at',
+        'return_requested_at', 'return_requested_by', 'release_error_state',
         'release_error_at', 'release_error_since', 'hook_attempt_at',
         'hook_attempt_state', 'hook_attempt_generation', 'hook_attempt_epoch'
     ]),
