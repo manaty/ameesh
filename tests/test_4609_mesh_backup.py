@@ -72,7 +72,7 @@ class ProjectionTest(unittest.TestCase):
         self.assertAlmostEqual(result["share"], 0.1)
 
     def test_hors_fenetre_aucune_preuve(self):
-        result = mesh_backup.project(rows(ts(2), ts(10), ts(16)), NOW)
+        result = mesh_backup.project(rows(ts(2), ts(2, 30), ts(3)), NOW)
         self.assertFalse(result["ok"])
         self.assertEqual((result["tables"], result["in_window"], result["shared"]),
                          (3, 0, 0))
@@ -122,9 +122,10 @@ class ProjectionTest(unittest.TestCase):
         self.assertAlmostEqual(result["share"], 0.89)
 
     def test_le_plancher_de_groupe_est_reglable(self):
-        """3 tables à T et 97 relues après : le plancher par défaut refuse,
-        un plancher plus bas laisse passer la couverture."""
-        instants = [ts(3, 35)] * 3 + [ts(10)] * 97
+        """3 tables à T et 97 relues après, une par seconde : le plancher par
+        défaut refuse le petit groupe, un plancher plus bas le laisse passer
+        (la couverture, elle, est de 100 %)."""
+        instants = [ts(3, 35)] * 3 + [ts(10) + i * 1000000 for i in range(97)]
         self.assertFalse(mesh_backup.project(rows(*instants), NOW)["ok"])
         self.assertTrue(mesh_backup.project(rows(*instants), NOW,
                                             min_group_share=0.01)["ok"])
@@ -134,6 +135,16 @@ class ProjectionTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["window_start"], (ts(3, 30) - DAY_US) / 1000000)
         self.assertEqual(result["window_end"], (ts(4, 30) - DAY_US) / 1000000)
+
+    def test_dump_du_jour_avant_0430_prouve_la_fenetre_de_la_veille(self):
+        """B/P2 auditeur : à 04:00, le dump du jour (03:37) a avancé toutes
+        les tables hors de la fenêtre de la veille ; il prouve au moins
+        autant et ne doit pas lever l'alerte."""
+        result = mesh_backup.project(rows(*([DUMP] * 271)), ts(4) / 1000000)
+        self.assertTrue(result["ok"])
+        self.assertEqual((result["tables"], result["in_window"]), (271, 0))
+        self.assertEqual(result["instant_us"], DUMP)
+        self.assertEqual(result["share"], 1.0)
 
     def test_la_fenetre_du_jour_est_jugee_apres_sa_fin(self):
         result = mesh_backup.project(rows(*([DUMP] * 10)), NOW)
@@ -186,7 +197,8 @@ class AlertTest(unittest.TestCase):
             self.assertEqual(mesh_backup.alerts(None, NOW), [])
 
     def test_hors_fenetre_leve_une_alerte(self):
-        with mock.patch.object(mesh_backup, "read", return_value=rows(ts(2), ts(10))):
+        with mock.patch.object(mesh_backup, "read",
+                               return_value=rows(ts(2), ts(3))):
             out = scan_alert(mesh_backup.alerts(None, NOW))
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["value"], 0.0)

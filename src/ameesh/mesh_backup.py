@@ -12,16 +12,18 @@ Deux précautions, apprises du relevé du 29/10 (#4300) :
 
 * les tables relues ensuite par l'activité normale **avancent** leur instant :
   le critère ne compte donc pas les tables encore dans la fenêtre, mais
-  demande qu'un groupe de tables partage un même instant T dans la fenêtre
-  (preuve d'une transaction) et qu'au moins 90 % des tables lisibles aient un
-  `last_seq_scan` **au moins égal** à T (elles ont pu être lues par le dump,
-  puis relues plus tard). Compter les tables relues après le dump contre la
-  sauvegarde produisait une fausse alerte chaque matin vers 04:30 (#4609 B) ;
-  un plancher de groupe écarte la petite transaction ordinaire qui, seule,
-  donnerait 100 % (faux vert) ;
+  demande qu'un groupe de tables partage un même instant T entre le début de
+  la fenêtre et `now` (preuve d'une transaction) et qu'au moins 90 % des
+  tables lisibles aient un `last_seq_scan` **au moins égal** à T (elles ont pu
+  être lues par le dump, puis relues plus tard). Compter les tables relues
+  après le dump contre la sauvegarde produisait une fausse alerte chaque
+  matin vers 04:30 (#4609 B) ; un plancher de groupe écarte la petite
+  transaction ordinaire qui, seule, donnerait 100 % (faux vert) ;
 * la fenêtre évaluée est la **dernière fenêtre close** : avant 04:30Z, c'est
   celle de la veille, pour qu'une sauvegarde manquante ne disparaisse pas à
-  minuit et ne se relève pas chaque matin.
+  minuit et ne se relève pas chaque matin. Un groupe plus récent, jusqu'à
+  `now`, est accepté : le dump du jour (vers 03:37Z) a déjà avancé toutes les
+  tables hors de la fenêtre de la veille, et il prouve au moins autant.
 
 Ce que l'alerte ne prouve pas : l'écriture du fichier de `pg_dump`, ni son
 envoi vers S3 (ligne de statut de `sauvegarder-base.sh`, #4300). Le détail de
@@ -82,27 +84,36 @@ def project(rows, now, *, window=DEFAULT_WINDOW, min_share=DEFAULT_MIN_SHARE,
     Le `pg_dump` lit toutes les tables dans une seule transaction : après lui,
     chaque table a un `last_seq_scan` **au moins égal** à l'instant T du dump ;
     une table relue plus tard n'a fait que avancer. Le critère est donc :
-    il existe T dans la fenêtre, porté par un groupe d'au moins
-    `min_group_share` des tables lisibles, tel qu'au moins `min_share` des
-    tables aient un `last_seq_scan >= T`. Les tables relues après T ne
-    diluent plus la part (l'ancien dénominateur « tables encore dans la
-    fenêtre » produisait une fausse alerte à 04:30, #4609 B de relecture) ;
-    le plancher de groupe écarte une petite transaction ordinaire, qui
-    donnerait sinon 100 % (faux vert).
+    il existe T entre le début de la fenêtre jugée et `now`, porté par un
+    groupe d'au moins `min_group_share` des tables lisibles, tel qu'au moins
+    `min_share` des tables aient un `last_seq_scan >= T`. Les tables relues
+    après T ne diluent plus la part (l'ancien dénominateur « tables encore
+    dans la fenêtre » produisait une fausse alerte à 04:30, #4609 B de
+    relecture) ; le plancher de groupe écarte une petite transaction
+    ordinaire, qui donnerait sinon 100 % (faux vert).
+
+    T peut dépasser la fin de la fenêtre jugée : avant 04:30Z, la fenêtre
+    jugée est celle de la veille, et le dump du jour (vers 03:37Z) a déjà
+    avancé toutes les tables hors de cette fenêtre. Un dump plus récent prouve
+    au moins autant ; sans cela, l'alerte se lèverait chaque matin de 03:35 à
+    04:30Z (B/P2 de l'auditeur, 29/10).
     """
     start_us, end_us = window_bounds(now, window)
+    now_us = int(float(now) * MICROSECONDS)
     instants: Counter = Counter()
     values = []
+    in_window = 0
     for row in rows or ():
         value = row.get("last_seq_scan_us")
         if value is None:
             continue
         value = int(value)
         values.append(value)
-        if start_us <= value < end_us:
+        if start_us <= value <= now_us:
             instants[value] += 1
+        if start_us <= value < end_us:
+            in_window += 1
     total = len(values)
-    in_window = sum(instants.values())
     # plancher du groupe : au moins 2 tables, et `min_group_share` des tables
     # lisibles ; jamais plus que le nombre de tables (petite base).
     floor = min(total, max(2, math.ceil(float(min_group_share) * total))) if total else 0
@@ -154,23 +165,31 @@ def alert_detail(result, min_share, min_group_share=DEFAULT_MIN_GROUP_SHARE):
     """Le texte de l'alerte : constat, commande de vérification, limites."""
     start = _stamp(result["window_start"])
     end = _stamp(result["window_end"])
-    if result["in_window"]:
-        if result["shared"] < result["min_group"]:
-            seen = (
-                "the largest group inside %s..%s is %d of the %d readable tables, "
-                "all at %s, below the %d-table floor for a full-dump transaction"
-                % (start, end, result["shared"], result["tables"],
-                   _instant(result["instant_us"]), result["min_group"]))
-        else:
-            seen = (
-                "the largest transaction inside %s..%s read %d tables at %s; only "
-                "%d of the %d readable tables have last_seq_scan at or after it "
-                "(%.0f %% against a %.0f %% floor)"
-                % (start, end, result["shared"], _instant(result["instant_us"]),
-                   result["covered"], result["tables"], 100 * result["share"],
-                   100 * float(min_share)))
+    if result["instant_us"] is None:
+        seen = ("no table still shows a sequential scan inside %s..%s "
+                "(nor after it up to now)" % (start, end))
+    elif result["instant_us"] >= result["window_end"] * MICROSECONDS:
+        seen = (
+            "the largest candidate after the judged window is at %s: %d of the "
+            "%d readable tables, covering %d of them (%.0f %% against a %.0f %% "
+            "floor; group floor %d); it does not prove the judged window"
+            % (_instant(result["instant_us"]), result["shared"],
+               result["tables"], result["covered"], 100 * result["share"],
+               100 * float(min_share), result["min_group"]))
+    elif result["shared"] < result["min_group"]:
+        seen = (
+            "the largest group inside %s..%s is %d of the %d readable tables, "
+            "all at %s, below the %d-table floor for a full-dump transaction"
+            % (start, end, result["shared"], result["tables"],
+               _instant(result["instant_us"]), result["min_group"]))
     else:
-        seen = "no table still shows a sequential scan inside %s..%s" % (start, end)
+        seen = (
+            "the largest transaction inside %s..%s read %d tables at %s; only "
+            "%d of the %d readable tables have last_seq_scan at or after it "
+            "(%.0f %% against a %.0f %% floor)"
+            % (start, end, result["shared"], _instant(result["instant_us"]),
+               result["covered"], result["tables"], 100 * result["share"],
+               100 * float(min_share)))
     return (
         "mesh database backup not seen: %s (%d readable tables in "
         "pg_stat_user_tables). The daily pg_dump reads every table in one "
