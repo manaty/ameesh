@@ -447,23 +447,32 @@ def footprint_wait_note(blockers: Iterable[dict]) -> str:
 
 
 def footprint_note(events: Iterable[dict]) -> tuple[list[int], float] | None:
-    """Les bloqueurs nommés par la dernière note d'attente d'empreinte, et
-    l'instant où elle a été écrite (`None` sans note). Une note plus récente
-    remplace la précédente : c'est l'ensemble des bloqueurs d'alors qui fait
-    foi, pas l'union de toutes les attentes passées."""
-    found = None
+    """Tous les bloqueurs nommés par les notes d'attente d'empreinte, avec
+    l'instant de la dernière note (`None` sans note).
+
+    C'est l'UNION, jamais la seule dernière note : un ensemble qui revient
+    après un autre (`{A, B}`, puis `{B}`, puis `{A, B}`) ne réécrit pas la
+    note `{A, B}` (dédoublonnage du journal) ; garder la dernière note
+    perdrait A, et la levée serait datée sur B, avant la vraie libération
+    (B1 de cx2 sur 1f182041f). L'union garde tous les bloqueurs qui ont
+    réellement retenu le lot, et la plus grande levée fait foi."""
+    found = set()
+    last = None
     for event in events or ():
         note = str(event.get("note") or "")
         at = event.get("created_ts")
         if not note.startswith(FOOTPRINT_WAIT_NOTE) or at is None:
             continue
-        ids = sorted({int(match) for match in _LOT_REF_RE.findall(note)})
+        ids = {int(match) for match in _LOT_REF_RE.findall(note)}
         if not ids:
             continue
+        found.update(ids)
         key = (float(at), int(event.get("id") or 0))
-        if found is None or key >= found[0]:
-            found = (key, ids)
-    return (found[1], found[0][0]) if found else None
+        if last is None or key >= last:
+            last = key
+    if not found:
+        return None
+    return (sorted(found), last[0])
 
 
 def footprint_blockers(item: dict, lots: Iterable[dict],
@@ -512,23 +521,26 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
 
 def footprint_wait(item: dict, events: Iterable[dict],
                    blockers: Iterable[dict], *, lots: Iterable[dict] = (),
-                   satisfied: dict | None = None,
-                   now: float | None = None) -> dict | None:
+                   satisfied: dict | None = None) -> dict | None:
     """L'attente d'empreinte d'un lot, pour `lot_steps` (#4561).
 
     `blockers` : les lots occupants qui le retiennent maintenant
     (`footprint_blockers`) — l'attente est en cours, aucun pas SLO ne court.
-    Sans bloqueur courant, la dernière note (`footprint_note`) nomme ceux qui
-    l'ont retenu ; leur levée date le redémarrage de l'horloge : jalon
+    Sans bloqueur courant, les notes (`footprint_note`) nomment ceux qui l'ont
+    retenu ; leur levée date le redémarrage de l'horloge : jalon
     `merged`/`closed` du bloqueur (`satisfied`, lu par l'appelant), ou sa
     dernière activité quand il est encore ouvert mais ne chevauche plus
-    (empreinte corrigée). Sans aucune date, le redémarrage est l'instant de
-    la passe : une durée d'attente n'est jamais inventée (#1982).
+    (empreinte corrigée).
 
-    Rend `{lots, released_ts, named}` ; `None` sans attente connue."""
+    Si un seul bloqueur nommé n'a pas de date de levée, la levée est
+    **inconnue** (`undated`) : l'attente reste suspendue, sans durée inventée
+    (#1982) et sans repartir de l'instant de chaque passe — sinon les deux
+    horloges ne vieilliraient jamais (B2 de cx2 sur 1f182041f).
+
+    Rend `{lots, released_ts, named, undated}` ; `None` sans attente connue."""
     blockers = list(blockers or ())
     if blockers:
-        return {"lots": blockers, "released_ts": None,
+        return {"lots": blockers, "released_ts": None, "undated": False,
                 "named": sorted({int(b["id"]) for b in blockers})}
     found = footprint_note(events)
     if found is None:
@@ -543,14 +555,17 @@ def footprint_wait(item: dict, events: Iterable[dict],
             stamps.append(float(stamp))
             continue
         row = open_by_id.get(ident)
-        if row is not None:
-            stamp = row.get("updated_ts") or row.get("last_activity_ts")
-            if stamp is not None:
-                stamps.append(float(stamp))
-    if not stamps:
-        fallback = time.time() if now is None else float(now)
-        return {"lots": [], "released_ts": fallback, "named": named}
-    return {"lots": [], "released_ts": max(stamps), "named": named}
+        if row is None:
+            # nommé, plus ouvert, sans jalon datable : la levée est inconnue.
+            return {"lots": [], "released_ts": None, "named": named,
+                    "undated": True}
+        stamp = row.get("updated_ts") or row.get("last_activity_ts")
+        if stamp is None:
+            return {"lots": [], "released_ts": None, "named": named,
+                    "undated": True}
+        stamps.append(float(stamp))
+    return {"lots": [], "released_ts": max(stamps), "named": named,
+            "undated": False}
 
 
 def intake_ready_ts(assigned: float | None, requested: float | None,
@@ -776,7 +791,9 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     démarré » ne court : `work assign` le refuserait. Après la levée, les deux
     horloges repartent de la fusion (ou clôture) du dernier bloqueur, jamais de
     la création : le temps où le lot n'était pas attribuable n'est pas un
-    retard de son porteur. `footprint["named"]` nomme les bloqueurs retenus.
+    retard de son porteur. Une levée qu'aucun jalon ne date laisse les deux
+    pas suspendus (`undated`), sans durée inventée. `footprint["named"]`
+    nomme les bloqueurs retenus.
     """
     events = list(events)
     fixes = list(fixes or ())
@@ -786,9 +803,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     out = []
 
     # #4561 : l'attente de la garde d'empreinte suspend les deux pas d'avant
-    # le départ ; leur horloge repart de la levée, jamais de la création.
+    # le départ ; leur horloge repart de la levée, jamais de la création. Une
+    # levée non datée reste suspendue (aucune durée inventée, #1982).
     footprint = dict(footprint or {})
-    blocked = bool(footprint.get("lots"))
+    blocked = bool(footprint.get("lots")) or bool(footprint.get("undated"))
     fp_released = footprint.get("released_ts")
     fp_named = [int(i) for i in (footprint.get("named") or ())]
 
