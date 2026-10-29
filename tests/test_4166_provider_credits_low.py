@@ -315,6 +315,27 @@ class RealBalanceTest(_LowBase):
         self.assertEqual(self._row("openai", "")["state"], "low")
         self.assertEqual(self._row("deepseek", "")["state"], "ok")
 
+    def test_a_successful_probe_is_not_undone_by_the_stale_projection(self):
+        """B1 dev4 : après une sonde réussie, la projection d'un prépayé non
+        redéclaré ne doit pas re-tenir le compte ni relancer l'alerte."""
+        self._declare(10.0, harness="codex", account="primaire")
+        self._prepaid_at(3600)
+        self._spend(15.0, seconds_ago=60)
+        self._assess()
+        self.assertEqual(self._row()["state"], "exhausted")
+        # la sonde bornée réussit : le compte a de nouveau du crédit
+        provider_credits.mark_ok(self.db, "codex", "primaire", source="probe")
+        self.assertEqual(self._row()["state"], "ok")
+        self._assess()
+        self.assertEqual(self._row()["state"], "ok")
+        self.assertEqual(self._alerts("provider_credits_exhausted"), [])
+        self.assertEqual(self._alerts("provider_credits_low"), [])
+        # une nouvelle déclaration rafraîchit la projection : elle s'applique
+        self._declare(10.0, harness="codex", account="primaire")
+        self._assess()
+        self.assertEqual(self._row()["state"], "ok")
+        self.assertAlmostEqual(self._row()["ratio"], 1.0, places=3)
+
 
 class ChooseFallbackTest(_LowBase):
 

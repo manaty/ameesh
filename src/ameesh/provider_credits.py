@@ -541,6 +541,28 @@ def _source_has_balance(harness: str) -> bool:
     return harness in balance.SOURCES
 
 
+def _probe_after_declaration(row: dict) -> bool:
+    """La dernière réouverture est une sonde réussie, postérieure à la
+    déclaration de prépayé : elle prouve l'usage mieux que la projection.
+
+    Un compte sans API de solde rouvert par une sonde (#4164) garde son
+    prépayé déclaré d'origine, non redéclaré : la projection peut être à zéro
+    ou négative alors qu'un tour réel vient de passer. La passe d'alertes ne
+    doit donc pas re-tenir le compte depuis cette projection périmée (B1
+    dev4) ; une nouvelle déclaration la rafraîchit, un nouvel échec de tour
+    repose `exhausted` par la preuve directe."""
+    if row.get("state") != OK or row.get("source") != "probe":
+        return False
+    since = row.get("since_ts")
+    declared = row.get("prepaid_ts")
+    if since is None or declared is None:
+        return False
+    try:
+        return float(since) >= float(declared)
+    except (TypeError, ValueError):
+        return False
+
+
 def assess(db, *, now: float | None = None, harness: str | None = None,
            account: str | None = None) -> list[dict]:
     """#4166 : recalcule `low`/`ok` du prépayé déclaré et des soldes réels.
@@ -559,9 +581,14 @@ def assess(db, *, now: float | None = None, harness: str | None = None,
             continue
         if account is not None and (row.get("account") or "") != (account or ""):
             continue
+        has_balance = _source_has_balance(row["harness"])
         try:
+            if not has_balance and _probe_after_declaration(row):
+                # sonde réussie après la déclaration : preuve directe d'usage,
+                # la projection du prépayé non redéclaré est périmée (B1 dev4)
+                continue
             verdict = (_real_verdict(db, row, now)
-                       if _source_has_balance(row["harness"])
+                       if has_balance
                        else _projected_verdict(db, row, now))
             if verdict is None:
                 # plus rien pour juger : aucun signe de manque ne subsiste
@@ -575,8 +602,7 @@ def assess(db, *, now: float | None = None, harness: str | None = None,
             before = row.get("state")
             _apply(db, row["harness"], row.get("account"), applied,
                    balance=balance, reference=reference, rate=rate, now=now,
-                   source=("balance" if _source_has_balance(row["harness"])
-                           else "prepaid"),
+                   source=("balance" if has_balance else "prepaid"),
                    host=None)
             after = get(db, row["harness"], row.get("account"))
             if after is not None and after.get("state") != before:
