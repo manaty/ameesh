@@ -1522,10 +1522,16 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def reserve(self, recipient: str, owner: str | None, epoch: int | None,
                 token: str, *, ids: Sequence[int] | None = None, porteur: str,
-                ttl_seconds: float, limit: int = 200) -> list[dict]:
+                ttl_seconds: float, limit: int = 200,
+                turn_id: str | None = None) -> list[dict]:
         """Réserve atomiquement des non-lus sans réservation active (le
         destinataire est verrouillé dans le registre, le bail (owner, epoch)
-        contrôlé s'il est donné) ; rend les messages réservés sous `token`."""
+        contrôlé s'il est donné) ; rend les messages réservés sous `token`.
+
+        `turn_id` (#2894) : le tour de l'exécuteur qui réserve sa consigne,
+        écrit dans `meta.consigne.turn` (additif) pour relier la remise au
+        document `ameesh-turn-context/1` ; absent pour une réservation de hook.
+        """
 
     @abc.abstractmethod
     def deliver(self, recipient: str, owner: str | None, epoch: int | None,
