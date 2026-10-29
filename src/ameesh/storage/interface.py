@@ -4249,7 +4249,8 @@ class HostLifecycle(Domain):
 
     @abc.abstractmethod
     def drain(self, host: str, *, actor: str, duration: int | None = None,
-              critical: Sequence[str] = (), automatic: bool = False) -> dict:
+              critical: Sequence[str] = (), automatic: bool = False,
+              close_claims: bool = True) -> dict:
         """Close claims/enable atomically and retain agents' original host.
 
         #3029: an elected role holding its lease on this host is returned in
@@ -4258,7 +4259,10 @@ class HostLifecycle(Domain):
         L232e handoff journal (there is no local work to publish).
 
         #4148: `automatic=True` records that ameesh drained a burst host by
-        itself; `release_state` becomes `draining` and `claims_open` false.
+        itself; `release_state` becomes `draining`. `close_claims` is true
+        only when an external adapter must answer `busy` before a return; with
+        no adapter the durable gate stays open, and the `draining` mode alone
+        closes claims (an old binary needs that to bring agents back).
         """
 
     @abc.abstractmethod

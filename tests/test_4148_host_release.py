@@ -442,6 +442,23 @@ class HostReleaseTest(PgTestCase):
         self.assertLess(self.states().index("idle-drained"),
                         self.states().index("busy"))
 
+    def test_no_adapter_drain_leaves_claims_open_for_old_returns(self):
+        self.add_agent()
+        no_hook = dataclasses.replace(self.cfg, lifecycle_hooks={})
+        host_lifecycle.drain(no_hook, self.db, "vm", duration=3600,
+                             actor="human:op")
+        control = self.control()
+        self.assertEqual(control["mode"], "draining")
+        self.assertTrue(control["claims_open"])
+        # The old binary's undrain does not touch claims_open; the SQL
+        # function must let its agents return from `returning`.
+        self.db.execute("UPDATE host_lifecycle SET mode='returning', actor='old', "
+                        "return_at=NULL, updated_at=clock_timestamp() WHERE host='vm'")
+        opened = self.db.query(
+            "SELECT ameesh_host_claims_open('vm') AS open")[0]["open"]
+        self.assertTrue(opened)
+        self.assertTrue(self.control()["claims_open"])
+
     def test_scheduled_return_without_an_adapter_reopens_claims(self):
         self.add_agent()
         self.cfg = dataclasses.replace(self.cfg, lifecycle_hooks={})

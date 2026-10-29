@@ -170,9 +170,12 @@ class HostLifecycle(interface.HostLifecycle):
     def listing(self):
         return self.db.query("SELECT " + _ROW + " FROM host_lifecycle ORDER BY host", ())
 
-    def drain(self, host, *, actor, duration=None, critical=(), automatic=False):
+    def drain(self, host, *, actor, duration=None, critical=(), automatic=False,
+              close_claims=True):
         if not isinstance(automatic, bool):
             raise ValueError("automatic: a boolean expected")
+        if not isinstance(close_claims, bool):
+            raise ValueError("close_claims: a boolean expected")
         with self.db.transaction() as tx:
             Hosts._lock_gate(tx, host)
             # A claim or turn that wins this lock finishes before withdrawal;
@@ -196,7 +199,7 @@ class HostLifecycle(interface.HostLifecycle):
                 "release_generation,claims_open,automatic,release_epoch) "
                 "VALUES (%s,'draining',%s,CASE WHEN %s::int IS NULL THEN NULL "
                 "ELSE clock_timestamp()+make_interval(secs=>%s) END,"
-                "'draining',1,false,%s,1) "
+                "'draining',1,%s,%s,1) "
                 "ON CONFLICT(host) DO UPDATE SET mode='draining',actor=excluded.actor, "
                 "generation=host_lifecycle.generation+1,requested_at=clock_timestamp(), "
                 "return_at=excluded.return_at, "
@@ -205,7 +208,7 @@ class HostLifecycle(interface.HostLifecycle):
                 # transition; the acknowledged hook state is kept (busy after a
                 # return, idle-drained if the host was released without a busy
                 # acknowledgement, which the release scanner restores first).
-                "release_state='draining',claims_open=false, "
+                "release_state='draining',claims_open=excluded.claims_open, "
                 "release_generation=host_lifecycle.generation+1, "
                 "automatic=excluded.automatic,released_at=NULL, "
                 "release_error=NULL,release_error_state=NULL,release_error_at=NULL, "
@@ -217,7 +220,7 @@ class HostLifecycle(interface.HostLifecycle):
                 # release finishes. The stale attempt is cleared by its own
                 # finish (stale branch) or by the stale_after bound.
                 "updated_at=clock_timestamp() RETURNING " + _ROW,
-                (host, actor, duration, duration, automatic))
+                (host, actor, duration, duration, not close_claims, automatic))
             row = rows[0]
             for agent in agents:
                 if agent["releve"] == "election":

@@ -480,7 +480,7 @@ def _auto_drain(cfg, api, db, host, *, owner, listing, canons, holds, controls,
         return None
     api.note_release_blocked(host, owner=owner)
     try:
-        row = api.drain(host, actor=actor, automatic=True,
+        row = api.drain(host, actor=actor, automatic=True, close_claims=True,
                         critical=host_lifecycle.critical_names(cfg, db))
     except Exception:
         return None

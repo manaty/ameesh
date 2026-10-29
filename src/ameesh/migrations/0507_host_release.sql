@@ -48,9 +48,11 @@ ALTER TABLE host_lifecycle
 UPDATE host_lifecycle
    SET release_generation = generation,
        release_state = CASE WHEN mode = 'draining' THEN 'draining' ELSE 'busy' END,
-       -- A withdrawal in progress already closes claims through `mode`; the
-       -- durable flag is false so a return cannot reopen them by accident.
-       claims_open = (mode <> 'draining'),
+       -- The durable flag only closes an ADAPTER return; `mode` already
+       -- closes claims while draining/lost. An old binary (window before the
+       -- restart, rollback) has no adapter awareness and needs claims open in
+       -- `returning` to bring its agents back.
+       claims_open = true,
        hook_state = CASE WHEN mode = 'draining' THEN NULL ELSE 'busy' END;
 
 CREATE TABLE host_lifecycle_transitions (
