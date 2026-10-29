@@ -20,7 +20,7 @@ import unittest
 from unittest import mock
 
 from ameesh import file_decoupage as fd
-from ameesh import mail, mechanics, registry, work
+from ameesh import mail, mechanics, registry, undeliverable, work
 
 from .support import PgTestCase
 
@@ -211,6 +211,10 @@ class SleepWorkMailTest(PgTestCase):
 
     def test_mail_from_an_ordinary_agent_does_not_wake(self):
         self.sleep_all()
+        # l'expéditeur est averti : son courrier ne lèvera pas le sommeil
+        warned = undeliverable.check_send(None, self.db, sender="dev2", dest="dev1")
+        self.assertEqual(len(warned), 1)
+        self.assertIn("automatic roadmap sleep", warned[0])
         mail.send(self.db, "dev2", "dev1", "Coucou, rien d'urgent.")
         out = self.run_pass(2000)
         self.assertFalse([g for g in out if g["kind"] == "wake"])

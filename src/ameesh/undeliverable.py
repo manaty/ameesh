@@ -476,6 +476,17 @@ def wake_note(cfg, db, name: str, row: dict) -> list[str]:
         return []
     ok, why, _note = registry.wake_status(db, cfg, name)
     if ok:
+        # #4610 : le sommeil automatique est réveillable pour une attribution,
+        # mais seul le courrier du pilote ou d'un orchestrateur le lève ; tout
+        # autre expéditeur doit le savoir, comme pour une pause d'opérateur.
+        from . import file_decoupage
+        if (row.get("operator_paused")
+                and file_decoupage.is_sleep_reason(row.get("operator_pause_reason"))):
+            return ["%s is under the automatic roadmap sleep: the message is stored, "
+                    "and no turn opens until a lot is assigned to it, its pilot or an "
+                    "orchestrator writes to it, a startable lot arrives or the sleep "
+                    "deadline expires; if the request cannot wait, address another "
+                    "agent" % name]
         return []
     if row.get("operator_paused"):
         # #2200 : la pause humaine a sa propre sortie ; « prochain canon sync »
