@@ -123,6 +123,18 @@ class ValidationTest(PgTestCase):
         self.assertFalse(any(r["kind"] == "missed" for r in
                              storage.of(self.db).decisions.validation_history(person="human:tpm")))
 
+    def test_timely_winner_stays_timely_after_replay_and_contradiction(self):
+        view = self.ask(due_ts=self.now + 60)
+        self.answer(view, now=self.now + 10)
+        original = decisions.get(self.db, view["id"])["answer"]
+        self.answer(view, now=self.now + 70)
+        followup = self.answer(view, text="b", now=self.now + 80)
+        self.assertEqual(followup["relation"], "contradicts")
+        self.assertEqual(decisions.get(self.db, view["id"])["answer"], original)
+        audit = storage.of(self.db).decisions.validation_history(person="human:tpm")
+        self.assertNotIn("missed", [event["kind"] for event in audit])
+        self.assertIn("late_response", [event["kind"] for event in audit])
+
     def test_no_substitute_goes_to_owner(self):
         self.cfg.project_planning["acme"]["validations"]["domains"]["ready"].pop()
         view = self.ask(due_ts=self.now + 60)

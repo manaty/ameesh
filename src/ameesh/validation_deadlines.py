@@ -154,7 +154,8 @@ def response(db, view, *, human, text, now):
         return
     late = float(now) >= float(view["due_ts"])
     kind = "late_response" if late else "response"
-    if late:
+    winning_response_ts = (view.get("answer") or {}).get("ts", now)
+    if float(winning_response_ts) >= float(view["due_ts"]):
         storage.of(db).decisions.validation_event(
             view["id"], person=route["nodes"][0]["human"], kind="missed", now=now,
             facts={"requested_ts": view["created_ts"], "due_ts": view["due_ts"],
