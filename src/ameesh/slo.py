@@ -514,7 +514,8 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               hold_releases: Iterable[float] = (),
               reviews: Iterable[dict] = (),
               fixes: Iterable[dict] = (),
-              vehicle_exit_ts: float | None = None) -> list:
+              vehicle_exit_ts: float | None = None,
+              packet_pause: dict | None = None) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -545,6 +546,9 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     #4369 : `vehicle_exit_ts` (sortie du véhicule, `vehicle_exits`) décale
     de même le départ de `verdict_merge` en cours : retiré d'un paquet, le lot
     ne paie pas le temps passé dedans.
+
+    #4444 : `packet_pause` (la pause déclarée du paquet horaire que
+    `packet_slot` a déjà franchie) est seulement nommée sur la ligne.
 
     #2217 : quand le lot vient d'être pris en charge (dernière ligne
     `assigned to … (before: …)` il y a moins de `HANDOVER_GRACE_S`), les
@@ -819,6 +823,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                     # l'horloge GO → fusion part de ce créneau, pas du GO.
                     start = float(packet_slot)
                     extra["packet_slot"] = round(start, 3)
+                    if packet_pause:
+                        # #4444 : le créneau suit une pause déclarée du
+                        # paquet horaire ; la cause est nommée sur la ligne.
+                        extra["packet_pause"] = dict(packet_pause)
                 if lifted is not None and lifted > start:
                     # #3555 : la levée de retenue suit le créneau ; l'horloge
                     # repart d'elle, le parcage n'est pas un retard.

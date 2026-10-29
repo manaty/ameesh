@@ -106,3 +106,68 @@ def describe(data: dict, zone=None) -> str:
     when = datetime.fromtimestamp(float(data["until"]), zone or timezone.utc)
     return "en pause jusqu'à %s (%s, par %s)" % (
         when.strftime("%Y-%m-%d %H:%M %Z"), data.get("reason") or "?", data.get("by") or "?")
+
+
+#: #4444: a read of the recent pauses keeps a bounded number of events
+WINDOWS_LIMIT = 200
+
+
+def windows(db, *, project: str) -> list[dict]:
+    """#4444: the recent pause windows of `project`, every target, oldest first.
+
+    Each window is ``{"start", "end", "until", "reason", "by", "target"}``:
+    it opens at the `paused` event and ends at its deadline, or earlier at the
+    next event of the same object (`resumed`, or a renewed pause that opens
+    its own window). The SLO reads them to see that a packet slot falling in
+    a pause composed nothing: the merge waits for the first slot after it.
+    An event without a date opens no window.
+    """
+    prefix = key(project, "")
+    rows = [row for row in _events(db).recent_type(EVENT, LOOKBACK_DAYS, WINDOWS_LIMIT) or ()
+            if isinstance(row, dict) and str(row.get("object") or "").startswith(prefix)]
+    rows.sort(key=lambda row: (float(row.get("ts") or 0.0), int(row.get("id") or 0)))
+    out: list[dict] = []
+    open_: dict = {}
+    for row in rows:
+        data = row.get("data") if isinstance(row.get("data"), dict) else {}
+        obj = row["object"]
+        try:
+            ts = float(row["ts"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        current = open_.pop(obj, None)
+        if current is not None and ts < current["end"]:
+            current["end"] = ts
+        if data.get("state") != "paused":
+            continue
+        try:
+            until = float(data.get("until"))
+        except (TypeError, ValueError):
+            continue
+        if until <= ts:
+            continue
+        window = {"start": ts, "end": until, "until": int(until),
+                  "reason": data.get("reason") or "", "by": data.get("by") or "",
+                  "target": data.get("target") or obj[len(prefix):]}
+        open_[obj] = window
+        out.append(window)
+    return out
+
+
+def shift_slot(slot: float, pauses, next_slot) -> tuple[float, dict | None]:
+    """#4444: the first packet slot at or after `slot` outside every pause.
+
+    A slot inside a pause composes nothing (the tick skips it); the next
+    composition is `next_slot(end)`, the first slot strictly after the pause.
+    Returns the slot and the last pause it crossed (None when none did).
+    """
+    crossed = None
+    slot = float(slot)
+    for _ in range(len(pauses) + 1):
+        hit = next((w for w in pauses if w["start"] <= slot < w["end"]), None)
+        if hit is None:
+            break
+        crossed = hit
+        after = next_slot(hit["end"])
+        slot = float(after) if after is not None and float(after) > slot else float(hit["end"])
+    return slot, crossed
