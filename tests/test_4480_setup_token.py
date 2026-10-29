@@ -194,7 +194,7 @@ from .test_l30_accounts import _Base
 
 
 class TokenRunnerTest(_Base):
-    def test_runner_turn_uses_setup_token_without_config_dir(self):
+    def test_runner_turn_uses_setup_token_with_profile_directory(self):
         import subprocess
         profiles = self._claude_comptes()
         profile = accounts.parse({"claude": profiles})["claude"][0]
@@ -207,7 +207,7 @@ class TokenRunnerTest(_Base):
             if any("fakebin/claude" in str(item) for item in argv):
                 env = kwargs.get("env") or {}
                 observed.append((env.get(setup_token.VARIABLE) == TOKEN,
-                                 "CLAUDE_CONFIG_DIR" in env,
+                                 env.get("CLAUDE_CONFIG_DIR"),
                                  "ANTHROPIC_API_KEY" in env))
             return original(argv, *args, **kwargs)
 
@@ -215,6 +215,6 @@ class TokenRunnerTest(_Base):
             with mock.patch("subprocess.Popen", side_effect=spawn):
                 result = self._tour(worker, ANTHROPIC_API_KEY="ambient-billed-key")
             self.assertIsNotNone(result)
-            self.assertEqual(observed, [(True, False, False)])
+            self.assertEqual(observed, [(True, profile.path, False)])
         finally:
             worker.watchdog_stop.set()
