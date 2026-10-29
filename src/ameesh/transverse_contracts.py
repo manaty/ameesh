@@ -46,6 +46,12 @@ CONTRACTS = {
         "src/ameesh/storage/postgres/",
         "tests/golden/mediated_executor/",
     ),
+    # #4574 : la liste « toujours » et la liste pilote sont lues comme des
+    # données (liste figée de test_always_list_sorted_and_known) ; la carte ne
+    # relie pas un fichier texte au test qui le lit (#4256 exclu de h-06).
+    "test_l161f_plan": (
+        "tests/parts/",
+    ),
 }
 
 

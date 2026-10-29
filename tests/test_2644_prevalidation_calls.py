@@ -516,7 +516,10 @@ class ContractFallbackTest(unittest.TestCase):
         plan = prepared.plan
         self.assertEqual(plan["selection"]["mode"], "contract")
         self.assertIn("contrats et tests du lot", plan["selection"]["why"])
-        self.assertEqual(fallback["transverse"], ["test_l107_executor_contract"])
+        # #4574 : le décor écrit tests/parts/toujours.txt après la base, d'où
+        # aussi le contrat de la liste figée (test_l161f_plan).
+        self.assertEqual(fallback["transverse"],
+                         ["test_l107_executor_contract", "test_l161f_plan"])
         self.assertEqual(fallback["changed_tests"], ["test_3845_paquet_horaire"])
         self.assertFalse(fallback["transverse_all"])
         self.assertEqual(fallback["diff"], "read")
@@ -529,7 +532,7 @@ class ContractFallbackTest(unittest.TestCase):
         chosen = pv.selection(plan, head=self.head, base=self.repo.base)
         self.assertTrue(chosen.ok, chosen.why)
         self.assertEqual(chosen.fallback["transverse"],
-                         ["test_l107_executor_contract"])
+                         ["test_l107_executor_contract", "test_l161f_plan"])
 
     def test_unreadable_diff_plays_all_transverse_contracts(self):
         # #3954/B de cx3 : un diff illisible ne conclut pas « aucun contrat
