@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import abc
-from typing import Optional
+from typing import Optional, Sequence
 
 
 class Provenance(abc.ABC):
@@ -36,3 +36,12 @@ class Provenance(abc.ABC):
         l'inverse) est une origine inconnue, pas une preuve partielle. La ligne
         porte `mark_actor`, `mark_sha`, `verdict`, `milestone_id`, `at_ts` —
         les faits recopiés du jalon — et les champs de la preuve."""
+
+    @abc.abstractmethod
+    def origins(self, commits: Sequence[str]) -> list[int]:
+        """Les lots que des jalons de gel/verdict rattachent à ces commits.
+
+        Lecture exacte, sans deviner : le reçu doit nommer l'un de ces commits
+        (sha complet) et son fait `work_item_milestones` doit exister ; le lot
+        rendu est celui qui a déclaré le jalon. Identifiants distincts et
+        triés ; un reçu sans fait n'est pas une origine."""

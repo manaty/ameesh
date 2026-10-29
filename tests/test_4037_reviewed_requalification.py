@@ -53,14 +53,17 @@ class ReviewedMoveTest(unittest.TestCase):
             return_value=dict(actor='author', harness='deepseek')))
         self.historical_authors = self.stack.enter_context(mock.patch.object(
             review.review_authors, '_unreceived_authors', return_value=([], ['unknown'])))
+        self.origins = mock.Mock(return_value=[])
+        self.items = {4037: {'id': 4037}, 4011: {'id': 4011}}
         store = types.SimpleNamespace(work=types.SimpleNamespace(
             verdicts_for_commit=lambda commit: self.marks), provenance=types.SimpleNamespace(
-            get=lambda reference: dict(work_item_id=4011)))
+            get=lambda reference: dict(work_item_id=4011), origins=self.origins))
         self.stack.enter_context(mock.patch.object(review.storage, 'of', return_value=store))
         self.stack.enter_context(mock.patch.object(review.work, 'milestones',
                                                    side_effect=lambda *a, **k: self.marks))
-        self.stack.enter_context(mock.patch.object(review.work, 'get',
-                                                   return_value={'id': 4037}))
+        self.stack.enter_context(mock.patch.object(
+            review.work, 'get',
+            side_effect=lambda db, lot: self.items.get(int(lot))))
         self.note = self.stack.enter_context(mock.patch.object(review.work, 'note'))
         self.stack.enter_context(mock.patch.object(
             review.assignments, 'is_orchestrator',
@@ -168,6 +171,27 @@ class ReviewedMoveTest(unittest.TestCase):
             [dict(name='author', family='deepseek', proof=True)], [])
         self.assertEqual(self.execute()['state'], 'requalified')
         self.assertFalse(self.historical_authors.call_args.kwargs['carry_receipts'])
+
+    def test_source_lots_also_come_from_the_gate_receipts(self):
+        """#4505: one gate over several PRs reads the lots of its commits.
+
+        Both cited opinions were recorded on lot 4011, but the commit of the
+        range was frozen on lot 4453, where its author is the reference. The
+        fallback must read that lot from the gate's exact receipts; reading
+        only the cited lot's origins leaves the author unknown.
+        """
+        self.commit_proof.return_value = None
+        self.origins.return_value = [4453]
+        self.items[4453] = {'id': 4453, 'assignee': 'author'}
+
+        def authors(db, item, repo, sha, **kwargs):
+            if int(item['id']) == 4453:
+                return [dict(name='author', family='deepseek', proof=True)], []
+            return [], [sha[:12]]
+        self.historical_authors.side_effect = authors
+        self.assertEqual(self.execute()['state'], 'requalified')
+        self.assertIn(self.gate, self.origins.call_args.args[0])
+        self.assertEqual(self.historical_authors.call_args.args[1]['id'], 4453)
 
     def test_uncited_newer_block_is_not_hidden(self):
         for actor in ('pilot', 'human:smichea'):

@@ -87,12 +87,23 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
     guard = set(changed).intersection(train_assembly.REQUALIFY_GUARD)
     if guard:
         authors = []
-        source_items = [work.get(db, lot) for lot in lots]
         commits = resolutions._run(spec.canon, "rev-list", "--parents", pin + ".." + gate)
         if commits.returncode:
             raise TrainError("cannot read canon authors")
-        for line in resolutions._text(commits).splitlines():
-            commit, *parents = line.split()
+        lines = [line.split() for line in resolutions._text(commits).splitlines()]
+        # #4505: a canon gate can cover several PRs. The cited opinions name
+        # the lot they were recorded on, which need not be the lot that froze
+        # each commit of the range. Read the lots that the exact freeze/verdict
+        # receipts of these commits name, so the author fallback below finds
+        # the lot where the committer is the reference. These are candidate
+        # lots only: each commit still needs its registered Git identity and
+        # its family proved by the turn journal.
+        range_commits = [fields[0] for fields in lines if fields]
+        lots.update(int(lot) for lot in
+                    storage.of(db).provenance.origins(range_commits))
+        source_items = [work.get(db, lot) for lot in sorted(lots)]
+        for fields in lines:
+            commit, *parents = fields
             if len(parents) > 1:
                 # A hosting merge whose tree is exactly a parent adds no
                 # content. A conflict resolution does, and needs provenance.
