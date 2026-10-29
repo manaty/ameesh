@@ -2708,7 +2708,8 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def record_packet(self, package_id: int, *, branch: str, base_sha: str,
                       head_sha: str, units: Sequence[dict], note: str,
-                      actor: str) -> list[dict]:
+                      actor: str,
+                      expect_pushed: str | None = None) -> list[dict]:
         """#2443 : enregistre la composition d'un paquet (lot porteur
         `package_id`, branche `branch`), en remplaçant l'ensemble de ses
         unités, en UNE transaction.
@@ -2718,6 +2719,13 @@ class WorkItems(Domain):
         (l'intégrité référentielle tranche) ; l'événement `note` est écrit au
         journal du porteur dans la même transaction. Rend les lignes relues
         par `packet_members` (ordre de `recorded_at` décroissant).
+
+        #4501 : le porteur est verrouillé (`FOR SHARE`, qui bloque le
+        `FOR NO KEY UPDATE` d'un gel ou d'un relevé de `branch_head`) avant
+        toute lecture de sa tête poussée ; le dernier gel et `branch_head` sont
+        relus **dans cette transaction**, et l'écriture est refusée si la tête
+        poussée n'est ni `head_sha` ni `expect_pushed`. Un gel ou une poussée
+        concurrente est ainsi sérialisé avec l'enregistrement.
         """
 
     @abc.abstractmethod

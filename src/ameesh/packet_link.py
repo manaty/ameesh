@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import re
 
-from . import plan_git, storage, work
+from . import packet_head, plan_git, storage, work
 from .db import DbError
 
 
@@ -156,18 +156,13 @@ def _protected_pushed_head(db, package: dict, repo: str) -> str:
     avance après ce gel** (`branch_head`, relevé de la forge) la remplace,
     même avant son propre gel : c'est une poussée plus récente, observation
     que la base partage entre les clones (le composeur d'un autre clone ne lit
-    qu'une réf distante périmée).
+    qu'une réf distante périmée). Lecture initiale : la relecture qui fait foi
+    est faite sous le verrou du porteur par `record_packet` (#4501).
     """
     frozen, frozen_ts = _declared_freeze(db, int(package["id"]), repo)
-    observed = plan_git.commit_id(package.get("branch_head"))
-    try:
-        observed_ts = float(package.get("branch_head_ts") or 0)
-    except (TypeError, ValueError):
-        observed_ts = 0.0
-    if observed and not plan_git.same_commit(observed, frozen) \
-            and observed_ts > frozen_ts:
-        return _commit(repo, observed) or observed
-    return frozen
+    return packet_head.protected_head(
+        frozen, frozen_ts, package.get("branch_head"),
+        package.get("branch_head_ts") or 0)
 
 
 def record(db, package_id: int, *, repo: str | None = None, base: str | None = None,
@@ -252,17 +247,15 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
     # `expect_pushed`. Sans cela, on n'écrase pas le manifeste d'une tête
     # qu'un autre composeur a poussée — témoin h-12 du 29/10 : le tic a rejoué
     # un porteur dont la ci-full tournait, et ses 9 unités locales ont
-    # remplacé les 27 de c68edfb.
+    # remplacé les 27 de c68edfb. Cette lecture-ci est un refus rapide : la
+    # relecture sous le verrou du porteur, dans la transaction de
+    # `record_packet`, fait foi (un gel peut avancer entre les deux).
     frozen = _protected_pushed_head(db, package, top)
     expected = _text(expect_pushed)
-    if frozen and not plan_git.same_commit(frozen, head_sha) \
-            and not (expected and plan_git.same_commit(expected, frozen)):
-        raise PacketLinkError(
-            "packet carrier #%d already has the pushed head %s, not %s: "
-            "a composition record never replaces the manifest of another "
-            "pushed head; nothing written (the head's own composer passes "
-            "`--expect-pushed %s`)"
-            % (int(package_id), frozen[:12], head_sha[:12], frozen[:12]))
+    if frozen and not packet_head.same_commit(frozen, head_sha) \
+            and not (expected and packet_head.same_commit(expected, frozen)):
+        raise PacketLinkError(packet_head.refusal(
+            int(package_id), frozen, head_sha, expected))
     if base is None:
         # Une recomposition garde la base de la composition précédente : si la
         # cible a été fusionnée dans le paquet entre-temps, `merge-base` aurait
@@ -314,13 +307,15 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
         if fence is None:
             report["members"] = storage.of(db).work.record_packet(
                 int(package_id), branch=package_branch, base_sha=base_sha,
-                head_sha=head_sha, units=known, note=note, actor=actor)
+                head_sha=head_sha, units=known, note=note, actor=actor,
+                expect_pushed=expected or None)
         else:
             with db.transaction() as tx:
                 fence.hold(tx)
                 report["members"] = storage.of(tx).work.record_packet(
                     int(package_id), branch=package_branch, base_sha=base_sha,
-                    head_sha=head_sha, units=known, note=note, actor=actor)
+                    head_sha=head_sha, units=known, note=note, actor=actor,
+                    expect_pushed=expected or None)
     except DbError as exc:
         raise PacketLinkError("packet composition not recorded: %s" % exc) from exc
     report["recorded"] = True

@@ -17,6 +17,7 @@ import json
 import random
 import time
 
+from ... import packet_head
 from ...db import DbError, in_transaction, is_unique_violation
 from ...slo import VEHICLE_EXIT_MARK
 from .. import interface
@@ -3314,13 +3315,39 @@ class WorkItems(interface.WorkItems):
     )
 
     def record_packet(self, package_id, *, branch, base_sha, head_sha, units, note,
-                      actor) -> list[dict]:
+                      actor, expect_pushed=None) -> list[dict]:
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT id, state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                "SELECT id, state, branch_head,"
+                "       extract(epoch FROM branch_head_at)::float8 AS branch_head_ts"
+                " FROM work_items WHERE id = %s FOR SHARE",
                 (int(package_id),))
             if not rows:
                 raise DbError("packet #%s: no such work item" % package_id)
+            # #4501 : sous le verrou du porteur, relire la tête poussée avant
+            # toute écriture. `FOR SHARE` bloque le `FOR NO KEY UPDATE` que
+            # prennent un gel (`add_milestone`) et un relevé de `branch_head`
+            # (`UPDATE`) : soit ils ont commité avant et cette lecture les
+            # voit, soit ils attendent et l'enregistrement porte sur la tête
+            # courante. (`FOR NO KEY UPDATE` ne suffirait pas : deux verrous de
+            # ce mode sont compatibles.) Sans cette relecture, une lecture
+            # initiale périmée de `packet_link.record` écrasait le manifeste
+            # d'une tête poussée entre-temps.
+            freeze = tx.query(
+                "SELECT sha, extract(epoch FROM at)::float8 AS at_ts"
+                " FROM work_item_milestones"
+                " WHERE work_item_id = %s AND kind = 'frozen'"
+                " ORDER BY at DESC, id DESC LIMIT 1", (int(package_id),))
+            protected = packet_head.protected_head(
+                freeze[0]["sha"] if freeze else "",
+                freeze[0]["at_ts"] if freeze else 0,
+                rows[0].get("branch_head") or "",
+                rows[0].get("branch_head_ts") or 0)
+            if protected and not packet_head.same_commit(protected, head_sha) \
+                    and not (expect_pushed
+                             and packet_head.same_commit(expect_pushed, protected)):
+                raise DbError(packet_head.refusal(
+                    int(package_id), protected, head_sha, expect_pushed))
             # #4369 : une unité que la recomposition retire sort du véhicule ;
             # la note du porteur la nomme, l'horloge « verdict → fusion »
             # repart de là (`slo.vehicle_exits`). Une seule ligne par

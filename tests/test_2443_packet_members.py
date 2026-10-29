@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from unittest import mock
 
 from ameesh import packet_link, plan_git, storage, work
 
@@ -227,6 +228,52 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
                                base=self.base, head=other,
                                expect_pushed=head, actor="second", cfg=self.cfg)
         self.assertIn("already has the pushed head %s" % pushed[:12],
+                      str(caught.exception))
+        self.assertEqual(
+            {m["head_sha"] for m in
+             packet_link.memberships(self.db, package_ids=[porteur["id"]])},
+            {head})
+
+    def test_record_rechecks_the_pushed_head_under_the_carrier_lock(self):
+        """#4501 (B cx3) : un gel qui avance entre la lecture et l'écriture.
+
+        La lecture initiale de `packet_link.record` voit F1 et accepte
+        `expect_pushed=F1` ; un premier composeur gèle F2 avant la transaction
+        d'écriture. `record_packet` relit la tête sous le verrou du porteur et
+        refuse : les membres de F1 restent intacts.
+        """
+        sha = self.unit_branch("lot/vingt-deux", "src/vingt-deux.py", "y\n", "y")
+        item = self.lot("vingt-deux")
+        self.freeze(item, sha)
+        head = self.compose("integration/paquet-1", [(item["id"], sha)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo,
+                           base=self.base, head=head, actor="pilote", cfg=self.cfg)
+        work.milestone(self.db, porteur["id"], "frozen", sha=head, actor="pilote")
+        # la tête poussée/gelée pendant la course
+        raced = self.commit("course.md", "# course\n", "gel concurrent")
+        # un second composeur repart de la base et fabrique sa propre tête
+        git(self.repo, "checkout", "-q", "-B", "integration/paquet-1", self.base)
+        git(self.repo, "merge", "-q", "--no-ff", "-m",
+            "vehicule : #%d %s\n\nameesh-work: %d"
+            % (item["id"], sha[:12], item["id"]), sha)
+        other = self.commit("manifeste.md", "# second\n", "manifeste du second")
+        real = packet_link._protected_pushed_head
+
+        def racing(db_arg, package, repo):
+            protected = real(db_arg, package, repo)
+            # le premier composeur gèle F2 juste après la lecture initiale
+            work.milestone(self.db, porteur["id"], "frozen", sha=raced,
+                           actor="premier")
+            return protected
+
+        with mock.patch.object(packet_link, "_protected_pushed_head",
+                               side_effect=racing):
+            with self.assertRaises(packet_link.PacketLinkError) as caught:
+                packet_link.record(self.db, porteur["id"], repo=self.repo,
+                                   base=self.base, head=other,
+                                   expect_pushed=head, actor="second", cfg=self.cfg)
+        self.assertIn("already has the pushed head %s" % raced[:12],
                       str(caught.exception))
         self.assertEqual(
             {m["head_sha"] for m in
