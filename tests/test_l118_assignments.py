@@ -538,6 +538,42 @@ class BranchMergeTest(_Base):
         self.assertEqual(report["results"][0]["how"], "ancestor")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
+    def test_gel_sur_le_commit_propre_ne_prouve_pas_la_base_vue(self):
+        """#4508 (B dev1) : le gel du lot sur son commit propre F ne prouve
+        pas la BASE B de la branche, qui en est un ancêtre. Le clone du
+        balayage voit encore B (F pas poussé ou pas récupéré) : B n'est pas
+        enregistrée comme tête vue, et quand elle entre par le paquet d'un
+        autre lot, le lot reste ouvert."""
+        # la base B : la pointe d'un autre lot, hors de develop
+        _git(self.repo, "checkout", "-q", "-b", "autre/lot", "develop")
+        base = self.commit("base-autre-lot")
+        _git(self.repo, "checkout", "-q", "develop")
+        # la branche du lot naît sur B, sans commit propre
+        _git(self.repo, "branch", "agent/dev1-base-gel", base)
+        lot = self.lot("agent/dev1-base-gel")
+        first = self.sync()["results"][0]
+        self.assertEqual(first["result"], "open", first)
+        self.assertIn("no work of its own", first["detail"], first)
+        self.assertIsNone(work.get(self.db, lot["id"])["branch_head"])
+        # l'auteur a un commit propre F et gèle dessus ; le clone du balayage
+        # voit encore la pointe de la branche à B
+        _git(self.repo, "checkout", "-q", "agent/dev1-base-gel")
+        propre = self.commit("propre")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "branch", "-f", "agent/dev1-base-gel", base)
+        storage.of(self.db).work.add_milestone(
+            lot["id"], "frozen", sha=propre, actor="dev1", verdict=None, note="")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertIsNone(work.get(self.db, lot["id"])["branch_head"])
+        self.assertIn("no work of its own", entry["detail"], entry)
+        # B entre dans develop par le paquet d'un autre lot : rien ne ferme
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge autre/lot", "autre/lot")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertIn("no work of its own", entry["detail"], entry)
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
     def test_tete_sans_commit_propre_enregistree_avant_le_correctif_est_refusee(self):
         """#4508 : une tête déjà enregistrée (base d'un autre lot, avant le
         correctif) est refusée par la même lecture : le reflog de la branche

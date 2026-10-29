@@ -2808,12 +2808,15 @@ def _was_ancestor_at_seen(repo: str, sha: str, target: str, when) -> bool:
 # commit d'un autre lot, ou celui d'un porteur — et le relevé la voit « en
 # avance » tant que cette base n'a pas atterri. Quand elle atterrit par un
 # autre chemin, l'ascendance semblait prouver la fusion (#4482). Deux
-# lectures, sans écriture :
+# lectures du dépôt, sans écriture :
 #   - le reflog de la branche locale : une branche qui n'a pas bougé depuis
 #     sa création n'a aucun commit propre ;
 #   - les autres refs (locales, `origin/`) : une pointe qui est déjà la
 #     pointe d'une autre branche (celle de l'autre lot, le porteur) est un
 #     commit de cette branche, pas du lot.
+# Le gel du lot est une preuve directe, mais seulement pour la tête gelée ou
+# un descendant : un ancêtre du gel — la base de la branche, n'importe quel
+# commit de `main` — n'en est pas une (B dev1).
 # Sans reflog local ni autre pointe identique (branche connue seulement par
 # `origin/`, clone partiel), rien n'est conclu : le comportement antérieur
 # est gardé, comme pour #3326.
@@ -2885,15 +2888,20 @@ def _own_commit_evidence(repo: str, branch: str, sha: str,
                          target: str | None = None,
                          frozen_sha: str | None = None) -> tuple[bool, str]:
     """#4508 : `sha` est-il un commit propre à `branch` ? Rend (vrai, "") ou
-    (faux, la raison). Le gel du lot est une preuve directe quand il porte
-    `sha` (ou un descendant) : la tête déclarée est bien un travail du lot,
-    même si la branche n'a fait que la pointer. Sinon, deux signes qu'il
-    n'est pas propre : la branche locale n'a pas bougé depuis sa création,
-    ou une autre branche porte déjà cette pointe. Sans signe contraire, le
-    comportement antérieur est gardé (un reflog absent ne prouve pas
-    l'absence de travail)."""
+    (faux, la raison). Le gel du lot est une preuve directe quand il est
+    `sha` lui-même ou un ancêtre de `sha` (la tête vue est le gel ou en
+    descend) : elle est alors sur la ligne du travail gelé, même si la
+    branche n'a fait que la pointer. Un ancêtre du gel ne prouve rien : c'est
+    la base de la branche — le commit d'un autre lot — ou n'importe quel
+    commit de `main` (B dev1). Sinon, deux signes qu'il n'est pas propre : la
+    branche locale n'a pas bougé depuis sa création, ou une autre branche
+    porte déjà cette pointe. Sans signe contraire, le comportement antérieur
+    est gardé (un reflog absent ne prouve pas l'absence de travail)."""
     frozen_sha = (frozen_sha or "").strip()
-    if frozen_sha and (sha == frozen_sha or _is_ancestor(repo, sha, frozen_sha)):
+    # B dev1 : le gel ne prouve que lui-même ou ses descendants. Accepter un
+    # ancêtre du gel rouvrirait #4482 : la base de la branche (celle d'un
+    # autre lot) et tout l'historique de main sont des ancêtres du gel.
+    if frozen_sha and (sha == frozen_sha or _is_ancestor(repo, frozen_sha, sha)):
         return True, ""
     base = _branch_creation_commit(repo, branch)
     if base and base == sha:
