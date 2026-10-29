@@ -187,6 +187,9 @@ class Operations(interface.Operations):
                    coalesce(al.n, 0)::bigint AS active_lots,
                    -- #1677 : les lots qui demandent encore un geste de l'agent
                    coalesce(ac.n, 0)::bigint AS actionable_lots,
+                   -- #4619 : le lot actionnable à citer au journal (le lot
+                   -- assigné le plus récent peut ne pas l'être)
+                   ac.lot_id AS actionable_lot_id,
                    -- L60 : Codex compte déjà le cache dans input_tokens
                    (CASE WHEN t.harness = 'codex'
                          THEN greatest(t.input_tokens, t.cached_input_tokens)
@@ -239,7 +242,12 @@ class Operations(interface.Operations):
                   -- #1726 : une relecture désignée sans verdict courant
                   -- (relecteur #705, lot en qa) compte aussi : l'agent doit
                   -- son verdict avant de prendre autre chose.
-                  SELECT count(*)""" + review_due + """ AS n FROM work_items w
+                  -- #4619 : `lot_id` nomme le lot actionnable que le journal
+                  -- peut citer ; `assigned_lot_id` reste le lot assigné le plus
+                  -- récemment touché, qui peut être prévu plus tard ou en
+                  -- attente d'un autre.
+                  SELECT count(*)""" + review_due + """ AS n, min(w.id) AS lot_id
+                    FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                      AND (w.state NOT IN """ + _WAITING_ON_OTHERS + f"""
                           OR (w.state = '{lifecycle.QA}' AND (""" + freeze_due("w") + """
