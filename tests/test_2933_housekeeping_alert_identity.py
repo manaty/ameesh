@@ -75,6 +75,10 @@ class CleanupAlertIdentityTest(PgTestCase):
                 self.assertNotIn(path, [a["path"] for a in self._alerts("tmp_orphan")])
 
     def test_kept_worktree_commit_keeps_key_and_new_registration_is_distinct(self):
+        """#4442 : le SHA de HEAD et le nombre de fichiers sont volatils — un
+        commit de plus ne change plus la raison gardée, ne réécrit pas le
+        statut (`checked_at`) et ne rouvre pas l'alerte. L'alerte est unique
+        par hôte ; un autre hôte est une autre alerte."""
         main = _repo(self.root)
         path = os.path.join(self.root, "copy")
         _git("worktree", "add", "-q", path, "-b", "unpublished", cwd=main)
@@ -88,30 +92,37 @@ class CleanupAlertIdentityTest(PgTestCase):
             with mock.patch.object(hk, "worktree_holders", return_value=(False, "")):
                 entries, _plan = hk._worktree_pass(
                     self.db, "pc", dry_run=False, protected=set(), now=time.time())
-            self.assertEqual([e["action"] for e in entries], ["kept"])
-            return self._alerts("worktree_kept")[0]
+            return entries, self._alerts("worktree_kept")[0]
 
         _write(os.path.join(path, "work"), 100)
         _git("add", "work", cwd=path)
         _git("commit", "-q", "-m", "first", cwd=path)
-        observe()
+        entries, before = observe()
+        self.assertEqual([e["action"] for e in entries], ["kept"])
         # Make the next checked_at materially different, with no wall-clock wait.
         self.db.execute("UPDATE managed_worktrees SET checked_at = now() - interval '1 day'"
                         " WHERE id = %s", (row["id"],))
-        before = self._alerts("worktree_kept")[0]
+        checked_before = self.store.worktrees("pc")[0]["checked_ts"]
         _write(os.path.join(path, "work"), 200)
         _git("add", "work", cwd=path)
         _git("commit", "-q", "-m", "second", cwd=path)
-        after = observe()
-        self.assertNotEqual(before["detail"], after["detail"])
+        entries, after = observe()
+        # only the HEAD SHA moved: same normalized reason, nothing rewritten
+        self.assertEqual(entries, [])
+        self.assertEqual(before["reasons"], after["reasons"])
         self.assertEqual(before["since"], after["since"])
         self.assertEqual(exploitation.alert_key(before), exploitation.alert_key(after))
+        self.assertEqual(after["paths"], [path])
         tracked = self.store.worktrees("pc")[0]
+        # the grace clock (`checked_at`) is not restarted by a volatile detail
+        self.assertAlmostEqual(tracked["checked_ts"], checked_before, places=3)
         self.assertGreater(tracked["checked_ts"], tracked["created_ts"] + 86400)
+        self.assertNotIn(_git("rev-parse", "HEAD", cwd=path).strip()[:12],
+                         tracked["detail"])
 
         self.store.set_worktree_status(row["id"], "gone", "old observation ended")
         self.assertEqual(self._alerts("worktree_kept"), [])
-        new = self.store.register_worktree(host="pc", path=path, repo=hk.common_dir(main),
+        new = self.store.register_worktree(host="other-pc", path=path, repo=hk.common_dir(main),
             agent="dev1", lot=None, turn_id="new", branch="unpublished", head="")
         self.store.set_worktree_status(new["id"], "kept", "new observation")
         self.assertNotEqual(exploitation.alert_key(before),

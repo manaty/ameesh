@@ -1417,8 +1417,12 @@ class MenageDbTest(PgTestCase):
         self.assertIn(("mesure", "measured"), {(r["kind"], r["action"]) for r in journal})
         alertes = [a for a in exploitation.alerts(self.cfg, self.db)
                    if a["type"] == "worktree_kept"]
-        self.assertEqual([a["path"] for a in alertes], [sale])
+        # #4442 : une alerte par hôte, qui nomme les worktrees gardés
+        self.assertEqual(len(alertes), 1)
+        self.assertEqual((alertes[0]["host"], alertes[0]["value"]), ("pc", 1))
+        self.assertEqual(alertes[0]["paths"], [sale])
         self.assertIn("untracked", alertes[0]["detail"])
+        self.assertIn("no archive policy", alertes[0]["detail"])
 
     def test_unreadable_ok_de_l_hote_est_passe_au_garde_fou_processus(self):
         """L230/#1807 : le plan des worktrees passe `policy.unreadable_ok` à
@@ -1902,7 +1906,8 @@ class MenageDbTest(PgTestCase):
         self.assertIn("commits not pushed", row["detail"])
         alertes = [a for a in exploitation.alerts(self.cfg, self.db)
                    if a["type"] == "worktree_kept"]
-        self.assertEqual([a["path"] for a in alertes], [wt])
+        self.assertEqual(len(alertes), 1)
+        self.assertEqual(alertes[0]["paths"], [wt])
         self.assertIn("commits not pushed", alertes[0]["detail"])
         journal = storage.of(self.db).housekeeping.recent("pc", 3600)
         self.assertIn(("worktree", "kept"), {(r["kind"], r["action"]) for r in journal})

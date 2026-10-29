@@ -123,7 +123,8 @@ class DockerStorageTest(unittest.TestCase):
         hk = SimpleNamespace(
             last_measure=lambda _: [{'host': 'pc', 'data': {'docker_storage': {
                 'sampled_ts': 1000, 'orphan_volumes': 101}}}],
-            worktrees=lambda *args: [], latest_by_path=lambda *args, **kwargs: [])
+            worktrees=lambda *args, **kwargs: [],
+            latest_by_path=lambda *args, **kwargs: [])
         st = SimpleNamespace(housekeeping=hk, hosts=SimpleNamespace(current=lambda _: []))
         with patch.object(exploitation.storage, 'of', return_value=st), \
              patch.object(exploitation.time, 'time', return_value=1000):

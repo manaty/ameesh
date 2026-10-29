@@ -52,7 +52,13 @@ l'humain. Chaque famille a sa règle :
   HEAD est INTÉGRÉ à la branche principale distante (ancêtre, rebase, fusion
   écrasée : `git cherry`, `git merge-tree`) ; sinon GARDÉS et signalés
   (`worktree_kept`) au responsable. L230: one kept although its lot is merged
-  is removed after 24 h if clean and pushed; its branch stays. #1665 : un
+  is removed after 24 h if clean and pushed; its branch stays. #4442 : la
+  raison gardée est NORMALISÉE (sans SHA de HEAD ni nombre de fichiers), donc
+  un détail volatil ne fait plus repartir la grâce de 24 h ; et un worktree
+  gardé pour des fichiers modifiés ou des commits absents de la forge est
+  archivé (`patchs` + `HEAD.bundle`) puis retiré une fois TOUS ses lots
+  finis depuis `policy.housekeeping.dirty_worktree_after` et inactif autant
+  (copies étrangères comprises). #1665 : un
   worktree orphelin (aucun lot nommé, ou lot fini sans intégration) est
   retiré après `ORPHAN_WORKTREE_IDLE_S` (24 h) d'inactivité s'il est propre
   et poussé et qu'aucun agent ne l'utilise (aucun tour, aucun processus
@@ -2831,8 +2837,11 @@ def worktree_state(path: str, budget: PassBudget | None = None) -> dict:
     lock`), `head`, `reason` (pourquoi il ne peut pas être retiré, vide
     sinon).
 
-    Seul `integrated` autorise un retrait : une branche poussée mais pas
-    fusionnée est du travail en cours (L73b)."""
+    Un retrait DIRECT exige `integrated` : une branche poussée mais pas
+    fusionnée est du travail en cours (L73b) ; un worktree non intégré peut
+    partir par la grâce L230 (`pushed`) ou, pour un lot fini, après archivage
+    de son travail (`policy.housekeeping.dirty_worktree_after`, #3728/#4442,
+    `HEAD.bundle` pour les commits absents de la forge)."""
     out = {"exists": os.path.isdir(path), "clean": False, "pushed": False,
            "integrated": False, "locked": False, "head": "", "branch": "", "reason": "",
            "gitdir": "", "submodules": ""}
@@ -2891,6 +2900,51 @@ def worktree_state(path: str, budget: PassBudget | None = None) -> dict:
             out["head"][:12] or "?", ref or "the remote main branch",
             "pushed but not merged" if out["pushed"] else "commits not pushed")
     return out
+
+
+#: #4442 : ce qui, dans `worktree_state()["reason"]`, bouge d'un passage à
+#: l'autre sans que la RAISON change (SHA de HEAD, nombre de fichiers) : la
+#: grâce de 24 h et le statut `kept` se fondent sur la raison normalisée, donc
+#: un détail volatil ne fait plus repartir le compteur.
+_KEPT_REASON_RULES = (
+    (re.compile(r"\bHEAD [0-9a-f]{7,40} not integrated\b"), "HEAD not integrated"),
+    (re.compile(r"\b\d+ file\(s\) modified or untracked\b"),
+     "modified or untracked files"),
+    (re.compile(r"\b\d+ ignored file\(s\) outside build artifacts \([^)]*\)"),
+     "ignored files outside build artifacts"),
+)
+
+
+def kept_reason(reason: str) -> str:
+    """#4442 : la raison d'un worktree gardé, sans son détail volatil (SHA de
+    HEAD, nombre de fichiers) : deux passages qui gardent le même travail
+    gardent la même raison, et la grâce de 24 h ne repart pas."""
+    out = reason or ""
+    for pattern, stable in _KEPT_REASON_RULES:
+        out = pattern.sub(stable, out)
+    return out
+
+
+def kept_detail(why: str, st: dict) -> str:
+    """#4442 : `<why>: kept — <raison normalisée>` ; des commits non poussés
+    restent nommés même quand des fichiers modifiés expliquent la garde."""
+    reason = kept_reason(st.get("reason") or "")
+    if not st.get("pushed") and not st.get("integrated") \
+            and "commits not pushed" not in reason:
+        reason = "commits not pushed" + ("; %s" % reason if reason else "")
+    return "%s: kept — %s" % (why, reason)
+
+
+def _unsaved_work(st: dict) -> str:
+    """#4442 : ce qu'un retrait perdrait — fichiers modifiés ou non suivis,
+    commits absents de la forge, ou les deux (texte stable pour l'archive)."""
+    dirty = not st.get("clean")
+    unpushed = bool(st.get("head")) and not st.get("pushed") and not st.get("integrated")
+    if dirty and unpushed:
+        return "modified or untracked files and commits not pushed"
+    if dirty:
+        return "modified or untracked files"
+    return "commits not pushed"
 
 
 def submodules(path: str, gitdir: str) -> str:
@@ -3557,9 +3611,10 @@ def _archive_dirty_worktree(path: str, repo: str, base: dict, *, why: str, st: d
                             budget: PassBudget | None = None,
                             reserve_s: float = 0.0) -> dict:
     """#3728 : archive puis retrait d'un worktree gardé pour des fichiers
-    modifiés ou non suivis (#3734 : ou seulement ignorés, `held`). `plan`
-    (action `archivage` en essai, `retrait`, `garde` ou `attend`), `entries`
-    du journal, `removed`."""
+    modifiés ou non suivis (#3734 : ou seulement ignorés ; #4442 : ou des
+    commits absents de la forge, alors aussi dans `HEAD.bundle`, `held`).
+    `plan` (action `archivage` en essai, `retrait`, `garde` ou `attend`),
+    `entries` du journal, `removed`."""
     from . import housekeeping_archive
     after = float(archive["after"])
     why = "%s; kept for %s, ended and idle for more than %s" % (why, held, fmt_idle(after))
@@ -3582,7 +3637,7 @@ def _archive_dirty_worktree(path: str, repo: str, base: dict, *, why: str, st: d
             made.update(housekeeping_archive.archive(
                 path, archive["root"], rules=build_artifacts.rules_of(artifacts),
                 lot=base.get("lot"), state=state or "", branch=st.get("branch") or "",
-                head=st.get("head") or "", now=now,
+                head=st.get("head") or "", repo=repo or "", now=now,
                 retention_s=float(archive["retention"]),
                 deadline=(None if budget is None
                           else budget.deadline - max(0.0, reserve_s))))
@@ -3604,14 +3659,17 @@ def _archive_dirty_worktree(path: str, repo: str, base: dict, *, why: str, st: d
             shutil.rmtree(made["archive"], ignore_errors=True)
         return {"plan": dict(base, action=outcome, detail="%s; %s" % (why, note)),
                 "entries": entries, "removed": False}
-    detail = "%s: archived to %s (%d tracked change(s), %d untracked file(s), kept until " \
-             "%s), deleted (logged trash), git worktree prune%s" % (
+    detail = "%s: archived to %s (%d tracked change(s), %d untracked file(s), " \
+             "%d unpushed commit(s), kept until %s), deleted (logged trash), " \
+             "git worktree prune%s" % (
                  why, made.get("archive"), made.get("tracked", 0), made.get("files", 0),
+                 made.get("commits", 0),
                  time.strftime("%Y-%m-%d", time.gmtime(made.get("retain_until_ts") or now)),
                  "; %s" % note if note else "")
     entries.append(dict(base, action="archived", bytes=freed, detail=detail, data={
         "archive": made.get("archive"), "archive_bytes": made.get("bytes"),
         "tracked": made.get("tracked"), "files": made.get("files"),
+        "commits": made.get("commits"), "bundle_bytes": made.get("bundle_bytes"),
         "retain_until_ts": made.get("retain_until_ts"), "outcome": outcome}))
     return {"plan": dict(base, action="retrait", bytes=freed, detail=detail),
             "entries": entries, "removed": True}
@@ -3662,12 +3720,13 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     premier `detail` (qui nomme les processus et la clé du canon) ; le relevé
     d'hôte en fait l'alerte `housekeeping_blocked` après six heures.
 
-    `archive` (#3728) : `after`, `retention` (secondes, de la fiche Host),
-    `root`. Un worktree gardé pour des fichiers modifiés ou non suivis, dont
-    TOUS les lots nommés ont fini depuis plus de `after` et sans activité
-    depuis autant, sans commit absent de la forge (HEAD poussé ou intégré),
-    ni verrou git, ni sous-module, ni processus, est archivé
-    (`housekeeping_archive`) puis retiré. Absent : il reste gardé.
+    `archive` (#3728, #4442) : `after`, `retention` (secondes, de la fiche
+    Host), `root`. Un worktree gardé pour des fichiers modifiés ou non suivis
+    OU pour des commits absents de la forge, dont TOUS les lots nommés ont
+    fini depuis plus de `after` et sans activité depuis autant, ni verrou git,
+    ni sous-module, ni processus, est archivé (`housekeeping_archive` : patchs
+    et `HEAD.bundle` des commits non poussés) puis retiré — copies étrangères
+    comprises. Absent : il reste gardé.
 
     #3802 (B1) : `reserve_s` garde aux phases suivantes cette part du budget ;
     la boucle s'arrête quand il ne reste que cela. `cursor` est le dernier
@@ -3913,20 +3972,6 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         if st["locked"]:
             plan.append(dict(base, action="garde", detail="%s; %s" % (why, st["reason"])))
             continue
-        if foreign and not st["pushed"]:
-            # #2182: never remove a foreign copy that carries unpushed work,
-            # but say it — without the `kept` status (and its `worktree_kept`
-            # alert), this work was only in the pass plan, named to nobody.
-            detail = "%s: kept — %s" % (
-                why, st["reason"] if "commits not pushed" in (st["reason"] or "")
-                else "commits not pushed" + ("; %s" % st["reason"] if st["reason"] else ""))
-            plan.append(dict(base, action="garde", detail=detail))
-            if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
-                store.set_worktree_status(row["id"], "kept", detail)
-                entries.append(dict(base, action="kept", detail=detail, data={
-                    "command": "git -C %s status ; git -C %s log --all --not --remotes"
-                               % (shlex.quote(path), shlex.quote(path))}))
-            continue
         in_use, holder_detail = worktree_holders(path, allow=allow)
         if in_use:
             if ended:
@@ -3934,7 +3979,13 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             plan.append(dict(base, action="attend",
                              detail="%s; %s" % (why, holder_detail)))
             continue
-        detail = "%s: kept — %s" % (why, st["reason"])
+        # #4442 : le statut `kept` (et son alerte) porte la raison NORMALISÉE,
+        # sans le SHA ni le nombre de fichiers : un détail qui bouge d'un
+        # passage à l'autre ne remet plus la grâce de 24 h à zéro, et
+        # #2182/#4442 : une copie étrangère non poussée n'est plus écartée du
+        # flux — elle est gardée, signalée, puis archivée/retirée comme les
+        # autres quand la politique d'archivage le permet.
+        detail = kept_detail(why, st)
         # L230: a worktree kept although its lot is merged goes once kept
         # (same reason) for more than a day, if clean and its HEAD is on the
         # remote: nothing is lost; its branch stays (not merged into main).
@@ -4020,32 +4071,41 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                                        "git worktree prune%s" % (why, "; %s" % note if note
                                                                  else "")))
             continue
-        # #3728 : gardé pour des fichiers modifiés ou non suivis, lot fini
-        # depuis plus de `after` : archivé puis retiré (en cas de doute, gardé)
+        # #3728/#4442 : gardé pour des fichiers modifiés ou non suivis, ou
+        # pour des commits absents de la forge, lot fini depuis plus de
+        # `after` : archivé (patchs + `HEAD.bundle` quand des commits ne sont
+        # sur aucun remote) puis retiré (en cas de doute, gardé). #4442 : la
+        # condition ne demande plus `pushed or integrated` — le bundle couvre
+        # précisément le travail non poussé — et les copies étrangères
+        # suivent la même fin au lieu d'être écartées avant ce bloc.
         held_by_archive = None
-        if archive and ended and not st["clean"] and not st["locked"] \
-                and not st["submodules"] and st["head"] and (st["pushed"] or st["integrated"]):
-            if _archive_due(db, idents, archive, now=now, youngest=youngest):
-                done = _archive_dirty_worktree(
-                    path, row.get("repo") or "", base, why=why, st=st, state=state,
-                    archive=archive, now=now, dry_run=dry_run, artifacts=artifacts,
-                    allow=allow, lock_path=lock_path, journal_path=journal_path,
-                    skip_roots=skip_roots, budget=budget, reserve_s=reserve_s)
-                entries += done["entries"]
-                if done["plan"]["action"] != "garde":
-                    plan.append(done["plan"])
-                    if done["removed"]:
-                        store.set_worktree_status(row["id"], "removed", done["plan"]["detail"])
-                    continue
-                held_by_archive = done["plan"]
-                # dev3 N3: the refusal is the kept reason, in the status and
-                # the `kept` line (written when it changes), not only in a plan
-                detail = held_by_archive["detail"]
+        unpushed = bool(st.get("head")) and not st["pushed"] and not st["integrated"]
+        unsaved = not st["clean"] or unpushed
+        if archive and ended and unsaved and st["head"] and not st["locked"] \
+                and not st["submodules"] \
+                and _archive_due(db, idents, archive, now=now, youngest=youngest):
+            done = _archive_dirty_worktree(
+                path, row.get("repo") or "", base, why=why, st=st, state=state,
+                archive=archive, now=now, dry_run=dry_run, artifacts=artifacts,
+                allow=allow, lock_path=lock_path, journal_path=journal_path,
+                skip_roots=skip_roots, held=_unsaved_work(st),
+                budget=budget, reserve_s=reserve_s)
+            entries += done["entries"]
+            if done["plan"]["action"] != "garde":
+                plan.append(done["plan"])
+                if done["removed"]:
+                    store.set_worktree_status(row["id"], "removed", done["plan"]["detail"])
+                continue
+            held_by_archive = done["plan"]
+            # dev3 N3: the refusal is the kept reason, in the status and
+            # the `kept` line (written when it changes), not only in a plan
+            detail = held_by_archive["detail"]
         if not st["clean"] or not st["integrated"] or st["submodules"]:
             plan.append(held_by_archive or dict(base, action="garde", detail=detail))
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
                 store.set_worktree_status(row["id"], "kept", detail)
                 entries.append(dict(base, action="kept", detail=detail, data={
+                    "reason": st["reason"],
                     "command": "git -C %s status ; git -C %s log --all --not --remotes"
                                % (shlex.quote(path), shlex.quote(path))}))
             continue
