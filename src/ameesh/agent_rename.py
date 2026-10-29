@@ -51,6 +51,7 @@ REWRITTEN = (
     "integration_train_fires.owner", "managed_worktrees.agent", "merge_locks.owner",
     "merge_queue.queued_by", "notify_briefs.recipient", "notify_state.owner",
     "operator_pause_events.actor", "persona_sessions.persona", "provider_account_credits.agent",
+    "provider_account_credits.prepaid_by",
     "quota_gauge_readings.source", "review_catch_up.actor", "session_bindings.agent",
     "session_bindings.created_by", "spend_pending.agent", "standing_reservations.reserved_by",
     "turn_costs.agent", "turn_resources.agent", "visibility_checks.persona",

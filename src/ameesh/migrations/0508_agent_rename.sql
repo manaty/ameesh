@@ -151,7 +151,7 @@ begin
         ['notify_state', 'owner'],
         ['operator_pause_events', 'actor'],
         ['persona_sessions', 'persona'],
-        ['provider_account_credits', 'agent'],
+        ['provider_account_credits', 'agent prepaid_by'],
         ['quota_gauge_readings', 'source'],
         ['review_catch_up', 'actor'],
         ['session_bindings', 'agent created_by'],
