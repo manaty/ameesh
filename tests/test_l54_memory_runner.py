@@ -43,10 +43,12 @@ class MemoryRunnerTest(PgTestCase):
         with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN,
                                          "AMEESH_TEST_LOG": self.turns_log}):
             self.assertTrue(self.worker.run_turn({"kind": "prompt", "prompt": "work", "ids": []}))
-        for thread in threading.enumerate():
-            if thread.name == "memory-a-memory":
-                thread.join(10)
-                self.assertFalse(thread.is_alive())
+            # #4692 : joindre avant de restaurer os.environ ; sinon la synchro
+            # copie l'environnement pendant sa restauration (KeyError) et ne pousse rien.
+            for thread in threading.enumerate():
+                if thread.name == "memory-a-memory":
+                    thread.join(60)
+                    self.assertFalse(thread.is_alive())
 
     def test_run_turn_designates_memory_and_automatically_syncs(self):
         original = pm.preface

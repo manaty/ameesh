@@ -23,6 +23,11 @@ class StorageError(ValueError):
     pass
 
 
+# Signé sous ce nom par SigV4. curl 7.88 (Debian 12) ne l'ajoute pas seul, et
+# Scaleway refuse alors la requête ; ces GET et DELETE n'ont jamais de corps.
+EMPTY_SHA256 = hashlib.sha256(b'').hexdigest()
+
+
 def identifier(value):
     if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', value):
         raise StorageError('invalid storage reference')
@@ -143,7 +148,9 @@ class VersionRetention:
             config.write_text('user = ' + json.dumps(self.settings['access_key'] + ':' + self.settings['secret_key']) + '\n')
             args = ['/usr/bin/curl', '--disable', '--config', str(config), '--silent',
                     '--proto', '=https', '--connect-timeout', '10', '--max-time', '120',
-                    '--max-filesize', str(self.max_bytes), '--aws-sigv4',
+                    '--max-filesize', str(self.max_bytes),
+                    '-H', 'x-amz-content-sha256: ' + EMPTY_SHA256,
+                    '--aws-sigv4',
                     'aws:amz:' + self.settings['region'] + ':s3', '--request', method,
                     '--dump-header', str(headers), '--output', str(body),
                     '--write-out', '%{http_code}', url]
