@@ -56,6 +56,11 @@ if '-n' not in argv and not sys.stdin.isatty():
     stdin = sys.stdin.read()
 with (state / 'ssh.log').open('a') as f:
     f.write(command + '\n')
+# #4358 (B mty-amh-impl-03) : transport SSH perdu (255) sur la lecture d'une
+# persona ; le fichier nomme la persona.
+coupe = state / 'ssh-255'
+if coupe.exists() and (' show %s ' % coupe.read_text().strip()) in command:
+    sys.exit(255)
 command = command.replace('/home/ameesh/.local/share/ameesh/venv/bin/ameesh', os.environ['FAKE_AMEESH'])
 command = command.replace('/home/ameesh/.local/share/ameesh/venv/bin/python', os.environ['FAKE_DB_PYTHON'])
 # #3311 : le helper de preuve reçoit le venv stable de la VM en argument ; le
@@ -119,6 +124,18 @@ elif sys.argv[1] == 'show':
     # borne (plus longue) des gestes de drain.
     if scenario == 'show-lent':
         time.sleep(5)
+    # #4358 (après l'ancre #2198/N4 que test_3114 remplace) : sortie VIDE, code 0 (staging h-07, relève du rôle mesh-design) ;
+    # le fichier compte les lectures vides restantes, « toujours » ne
+    # s'épuise jamais.
+    vide = state / ('vide-' + name)
+    if vide.exists():
+        reste = vide.read_text().strip()
+        if reste != 'toujours':
+            if int(reste) <= 1:
+                vide.unlink()
+            else:
+                vide.write_text(str(int(reste) - 1))
+        sys.exit(0)
     row = next(a for a in json.loads((state / 'agents.json').read_text()) if a['name'] == name)
     row = dict(row, lease_owner='runner-' + name + '@host-agents', lease_epoch=7, lease_expires_ts=time.time()+300)
     pause = state / ('pause-' + name)
@@ -987,12 +1004,18 @@ class AgentHostTest(unittest.TestCase):
     def test_reads_are_bounded_by_their_own_deadline(self):
         """#2198/N4 : list/show/--help ont une borne plus courte que celle des
         gestes de drain ; une lecture lente ne bloque pas le balayage."""
+        # #4358 : une lecture coupée est vide, donc non concluante : relue
+        # en fin de balayage puis laissée en l'état, sans échec de l'étape.
+        # Un seul essai et un seul agent : deux lectures coupées en tout.
         self.env.update(DRAIN_APPEL_DELAI='10', DRAIN_MARGE_LOCALE='1',
-                        DRAIN_LECTURE_DELAI='1')
+                        DRAIN_LECTURE_DELAI='1', LECTURE_ESSAIS='1')
+        agents = [dict(name='dev9', host='host-agents', mode='execute', status='idle')]
         debut = time.monotonic()
-        p = self.run_vm(scenario='show-lent')
+        p = self.run_vm(scenario='show-lent', agents=agents)
         ecoule = time.monotonic() - debut
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('laissée(s) en l\'état (non concluant) : dev9', p.stdout)
+        self.assertEqual(self.starts(), [])
         # #3832 : 8 s reste strictement sous la borne des gestes de drain
         # (10 s) et laisse la marge d'ordonnancement de --parallel.
         self.assertLess(ecoule, 8,
@@ -1157,6 +1180,9 @@ class AgentHostTest(unittest.TestCase):
     def test_lost_pause_and_reconciliation_still_attempt_conditional_cleanup(self):
         """A committed pause stays tracked when its reconciliation read fails."""
         self.env['DRAIN_ATTENTE'] = '1'
+        # #4358 : pause_reelle relit (lire_show) ; un seul essai garde la
+        # lecture de réconciliation perdue que ce témoin exige.
+        self.env['LECTURE_ESSAIS'] = '1'
         p = self.run_vm(scenario='pause-coupee-etat-perdu')
         self.assertNotEqual(p.returncode, 0)
         self.assertTrue((self.state / 'lecture-perdue').exists())
@@ -1345,6 +1371,76 @@ class AgentHostTest(unittest.TestCase):
         starts = self.starts()
         for n in ('dev7', 'dev8', 'dev9'):
             self.assertIn('--user start ameesh-runner-agent@%s.service' % n, starts)
+
+    def _trois_agents(self):
+        return [dict(name=n, host='host-agents', mode='execute', status='idle')
+                for n in ('dev7', 'dev8', 'dev9')]
+
+    def test_restart_absorbs_a_transient_empty_read(self):
+        """#4358 : deux lectures vides puis une valide — relues sur place."""
+        (self.state / 'vide-dev8').write_text('2')
+        p = self.run_vm('redemarrer', 'lease', agents=self._trois_agents())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('JSONDecodeError', p.stderr)
+        self.assertNotIn('illisible', p.stdout)
+        for n in ('dev7', 'dev8', 'dev9'):
+            self.assertIn('%s : redémarré' % n, p.stdout)
+
+    def test_restart_defers_an_unreadable_agent_to_the_end_of_the_sweep(self):
+        """#4358 : illisible après 3 essais (relève en cours), la persona est
+        relue en fin de balayage et redémarrée — jamais un échec d'étape."""
+        (self.state / 'vide-dev8').write_text('3')
+        p = self.run_vm('redemarrer', 'lease', agents=self._trois_agents())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('JSONDecodeError', p.stderr)
+        self.assertIn('WARNING dev8: registre illisible (lecture vide) — relu en'
+                      ' fin de balayage', p.stdout)
+        self.assertLess(p.stdout.index('dev9 : redémarré'),
+                        p.stdout.index('dev8 : redémarré'))
+        self.assertNotIn('laissée(s) en l\'état', p.stdout)
+        for n in ('dev7', 'dev8', 'dev9'):
+            self.assertIn('--user start ameesh-runner-agent@%s.service' % n,
+                          self.starts())
+
+    def test_restart_leaves_a_still_unreadable_agent_with_a_warning(self):
+        """#4358 : toujours illisible, la persona est laissée en l'état avec
+        un avertissement ; le balayage et l'étape restent verts."""
+        (self.state / 'vide-dev8').write_text('toujours')
+        p = self.run_vm('redemarrer', 'lease', agents=self._trois_agents())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('JSONDecodeError', p.stderr)
+        self.assertIn('WARNING dev8: registre toujours illisible en fin de'
+                      ' balayage', p.stdout)
+        self.assertIn('WARNING: 1 persona(s) au registre illisible, laissée(s)'
+                      ' en l\'état (non concluant) : dev8', p.stdout)
+        self.assertIn('dev7 : redémarré', p.stdout)
+        self.assertIn('dev9 : redémarré', p.stdout)
+        self.assertNotIn('ameesh-runner-agent@dev8', self.units())
+
+    def test_restart_ssh_transport_loss_on_a_read_is_not_conclusive(self):
+        """#4358 (B mty-amh-impl-03) : un transport SSH perdu (255) sur la
+        lecture d'une persona est non concluant, comme une sortie vide : le
+        balayage continue et l'étape reste verte. L'erreur explicite du CLI
+        (rc 1) reste un échec (test_3114)."""
+        (self.state / 'ssh-255').write_text('dev8')
+        p = self.run_vm('redemarrer', 'lease', agents=self._trois_agents())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('code 255', p.stderr)
+        self.assertIn('WARNING: 1 persona(s) au registre illisible, laissée(s)'
+                      ' en l\'état (non concluant) : dev8', p.stdout)
+        self.assertIn('dev7 : redémarré', p.stdout)
+        self.assertIn('dev9 : redémarré', p.stdout)
+        self.assertNotIn('ameesh-runner-agent@dev8', self.units())
+
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
+    def test_check_unreadable_registry_is_not_conclusive(self):
+        """#4358 : `controler` sur un registre illisible n'échoue pas."""
+        (self.state / 'vide-dev8').write_text('toujours')
+        p = self.run_vm('controler', 'lease', agents=self._trois_agents())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('WARNING dev8: registre illisible (lecture vide) — preuve'
+                      ' de bail non concluante (sans retour)', p.stdout)
+        self.assertIn('contrôles verts', p.stdout)
 
     def test_restart_lease_failure_continues_the_sweep(self):
         """#3412 : un vrai échec de bail ne stoppe que cet agent."""

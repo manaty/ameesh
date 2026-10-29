@@ -90,6 +90,19 @@ if action == 'pause' and sys.argv[2:] == ['--help']:
         print('usage: ameesh pause AGENT --reason R [--human H] '
               '[--not-after EPOCH] [--json]')
     sys.exit(0)
+if action == 'show' and (state / ('vide-' + name)).exists():
+    sys.exit(0)  # #4358 : sortie vide, code 0 (relève d'un rôle élu)
+vide_reprise = state / 'vide-apres-reprise'
+if action == 'show' and vide_reprise.exists() \
+        and (state / ('reprise-faite-' + name)).exists():
+    # #4358 (dev3) : registre vide juste après notre reprise ; le fichier
+    # compte les lectures vides restantes.
+    reste = int(vide_reprise.read_text().strip())
+    if reste <= 1:
+        vide_reprise.unlink()
+    else:
+        vide_reprise.write_text(str(reste - 1))
+    sys.exit(0)
 if action == 'show':
     paused = pause.exists()
     # #2152 : l'agent enchaîne les tours tant qu'il n'est pas drainé ; drainé,
@@ -128,6 +141,7 @@ elif action == 'resume':
     if pause.exists() and attendu is not None and raison == attendu:
         pause.unlink()
         motif.unlink(missing_ok=True)
+        (state / ('reprise-faite-' + name)).touch()
         print(json.dumps({'agent': name, 'mode': 'execute', 'operator_paused': False,
                           'changed': True, 'event_id': 2}))
     else:
@@ -197,6 +211,48 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         self.assertIn('systemctl start ameesh-runner@dev9', journal_ssh)
         self.assertNotIn('systemctl restart ameesh-runner@dev9', journal_ssh)
         self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_unreadable_registry_leaves_the_agent_with_a_warning(self):
+        """#4358 : une lecture `show --json` vide n'arrête plus le script par
+        JSONDecodeError ; la persona est relue en fin de balayage, puis
+        laissée en l'état avec un avertissement, sans drain posé."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'vide-dev9').touch()
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('JSONDecodeError', p.stderr)
+        self.assertIn('WARNING dev9: registre illisible (lecture vide) — relu en'
+                      ' fin de balayage', p.stdout)
+        self.assertIn('WARNING: 1 persona(s) au registre illisible', p.stdout)
+        self.assertNotIn('pause dev9', self.poste())
+        journal_ssh = (self.state / 'ssh.log').read_text()
+        self.assertNotIn('ameesh-runner@dev9', journal_ssh)
+
+    def test_transient_empty_read_after_resume_is_reread(self):
+        """#4358 (dev3) : la relecture de la pause après notre reprise passe
+        par lire_show. Une lecture vide passagère est relue, et la levée est
+        prouvée, au lieu d'un « relecture impossible » avec geste de secours.
+        Une lecture vide n'a jamais prouvé la levée : pause_etat reçoit
+        « \\n » (here-string), json.loads échoue et pause_reelle rend 1."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'vide-apres-reprise').write_text('2')
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('dev9 : drain levé (redémarrage hors tour) — reprise prouvée'
+                      ' (operator_paused=false)', p.stdout)
+        self.assertNotIn('relecture de la pause impossible', p.stderr)
+        self.assertNotIn('pause à lever à la main', p.stderr)
+
+    def test_unreadable_read_after_resume_is_not_a_proven_lift(self):
+        """#4358 (dev3) : un registre qui reste vide après notre reprise ne
+        prouve pas la levée : non confirmée, geste de secours donné."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'vide-apres-reprise').write_text('1000')
+        p = self.run_vm()
+        self.assertNotIn('reprise prouvée', p.stdout)
+        self.assertIn('dev9 : drain levé, mais relecture de la pause impossible',
+                      p.stderr)
+        self.assertIn('pause à lever à la main : ameesh resume dev9', p.stderr)
 
     def test_unsupported_cli_never_poses_a_pause(self):
         """N5 B1 : CLI antérieur à --expect-reason — aucune pause posée ;

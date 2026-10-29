@@ -150,11 +150,21 @@ persona_de() {
   systemctl --user show -p ExecStart --value "$1" \
     | grep -o -- '--agents [^ ;]*' | head -1 | awk '{print $2}'
 }
+# #4358 : une lecture vide ou illisible (relève d'un rôle élu, timeout) est
+# relue 3 fois, puis rendue « illisible » : un non-concluant, jamais une
+# JSONDecodeError qui arrête le script sous `set -e`.
 statut() {  # statut de la persona $2 vue par la configuration $1 (« mesh » ou « ancienne »)
-  local sortie
-  if [ "$1" = ancienne ]; then sortie=$(ameesh_ancienne show "$2" --json)
-  else sortie=$("$AMEESH" show "$2" --json); fi
-  python3 -c 'import json,sys; print(json.load(sys.stdin).get("status") or "")' <<<"$sortie"
+  local sortie essai
+  for essai in 1 2 3; do
+    if [ "$1" = ancienne ]; then sortie=$(ameesh_ancienne show "$2" --json) || sortie=
+    else sortie=$("$AMEESH" show "$2" --json) || sortie=; fi
+    python3 -c 'import json,sys
+r = json.loads(sys.stdin.read())
+if not isinstance(r, dict): sys.exit(1)
+print(r.get("status") or "")' <<<"$sortie" 2>/dev/null && return 0
+    [ "$essai" = 3 ] || sleep 3
+  done
+  echo illisible
 }
 
 verifier() {
@@ -534,8 +544,17 @@ role() {
 }
 
 lire_bail() {  # base persona → its registry row (`ameesh show --json`)
-  if [ "$1" = ancienne ]; then ameesh_ancienne show "$2" --json
-  else "$AMEESH" show "$2" --json; fi
+  local sortie essai
+  for essai in 1 2 3; do
+    if [ "$1" = ancienne ]; then sortie=$(ameesh_ancienne show "$2" --json) || sortie=
+    else sortie=$("$AMEESH" show "$2" --json) || sortie=; fi
+    python3 -c 'import json,sys
+r = json.loads(sys.stdin.read())
+if not isinstance(r, dict): sys.exit(1)
+print(json.dumps(r))' <<<"$sortie" 2>/dev/null && return 0
+    [ "$essai" = 3 ] || sleep 3
+  done
+  return 3  # #4358 : lecture non concluante, aucun redémarrage
 }
 # base … → the clock of that base's database, epoch seconds, read through
 # ameesh's own connection, as `ameesh show` is: no DSN nor password in argv
@@ -594,11 +613,15 @@ redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unit�
 # sans bail ni tour.
 redemarrer_liste() {
   local base=$1; shift
-  local u p st avant ligne heure tenu attendu
+  local u p st avant ligne heure tenu attendu rc
   for u in "$@"; do
     p=$(persona_de "$u")
     [ -n "$p" ] || { echo "$u : persona introuvable dans ExecStart" >&2; exit 1; }
     st=$(statut "$base" "$p")
+    if [ "$st" = illisible ]; then
+      echo "WARNING $p: registre illisible (lecture vide) — unité $u laissée en l'état (non concluant, sans retour)"
+      continue
+    fi
     # #1131 : le propriétaire a arrêté cette persona ; un déploiement ne la
     # réactive pas (incident du 14/10 : unités dev1/dev2/dev4/dev7 restées
     # actives malgré le registre `stopped`).
@@ -619,7 +642,12 @@ redemarrer_liste() {
       continue
     fi
     # #502: only a runner that held its lease must take it again (bail.sh)
-    ligne=$(lire_bail "$base" "$p") && heure=$(heure_base "$base") \
+    rc=0; ligne=$(lire_bail "$base" "$p") || rc=$?
+    if [ "$rc" = 3 ]; then
+      echo "WARNING $p: bail illisible — unité $u laissée en l'état (non concluant, sans retour)"
+      continue
+    fi
+    [ "$rc" = 0 ] && heure=$(heure_base "$base") \
       && attendu=$(proprietaire_de "$u") \
       || { echo "$u: registry, database clock or ExecStart unreadable — nothing restarted" >&2; exit 1; }
     avant=$(bail_epoque <<<"$ligne")
