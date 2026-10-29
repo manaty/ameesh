@@ -1661,4 +1661,12 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
     # #3256 A : la feuille de route notée épuisée sur un lot de découpage
     from . import file_decoupage
     out += file_decoupage.exhausted_alerts(db, listing)
+    # #4148: adapter failures and withdrawals stuck past their bound are
+    # addressed to the mesh agents, like the reserved-capacity warnings.
+    from . import host_release
+    try:
+        out += host_release.alerts(cfg, db, now, listing=listing,
+                                   orchestrators=orchestras)
+    except Exception:  # an unavailable control never drops the other alerts
+        pass
     return out

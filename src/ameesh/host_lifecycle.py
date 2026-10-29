@@ -24,7 +24,8 @@ def staleness_s(interval_s) -> float:
     return max(MIN_STALENESS_S, 3.0 * interval)
 
 
-def drain(cfg, db, host, *, duration=None, critical=(), actor=None):
+def drain(cfg, db, host, *, duration=None, critical=(), actor=None,
+          automatic=False):
     """`actor`: the human the API authenticated (L87); otherwise the session's
     corrector (a human, an orchestrator or a design agent)."""
     if not isinstance(host, str) or not NAME_RE.fullmatch(host):
@@ -37,7 +38,52 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None):
     elif not actor.startswith(work.HUMAN_PREFIX):
         raise ValueError("drain: an explicit actor is a human (human:<id>)")
     critical = set(critical) | critical_names(cfg, db)
-    return storage.of(db).host_lifecycle.drain(host, actor=actor, duration=duration, critical=critical)
+    # #4148: only an external adapter requires the durable claim gate; without
+    # one, `draining` alone closes claims and `returning` must reopen at once
+    # for an old binary's agents to come home.
+    from . import canon as canon_mod
+    from . import host_release
+    try:
+        configured = bool(canon_mod.configured(cfg))
+    except Exception:  # unreadable configuration: fail closed
+        configured = True
+    try:
+        canons = work.configured_canons(cfg)
+    except Exception:  # an unreadable canon must not reopen the gate
+        canons = []
+        configured = True
+    try:
+        hook = host_release.hook_for(cfg, canons, host)
+    except ValueError:
+        hook = True  # ambiguous adapter config: fail closed
+    # A configured canon that did not load may hold the only Host card with
+    # the hook: fail closed rather than reopen the gate.
+    close_claims = bool(hook) or (configured and not canons)
+    return storage.of(db).host_lifecycle.drain(
+        host, actor=actor, duration=duration, critical=critical,
+        automatic=bool(automatic), close_claims=close_claims)
+
+
+def undrain(cfg, db, host, *, actor=None, runner=None, clock=None):
+    """#4148: return a withdrawn host in the strict order (`busy` first)."""
+    from . import host_release
+    if not isinstance(host, str) or not NAME_RE.fullmatch(host):
+        raise ValueError("invalid host name")
+    if actor is None:
+        actor = work.corrector(cfg, db)
+    kwargs = {} if clock is None else {"clock": clock}
+    return host_release.request_return(cfg, db, host, actor=actor,
+                                       runner=runner, **kwargs)
+
+
+def enter_draining(cfg, db, host, *, actor, runner=None):
+    """Emit the `draining` acknowledgement of a withdrawal (best effort).
+
+    Used by the command after a manual drain; the runner scanner retries
+    whatever this pass could not do, and a failure keeps claims closed."""
+    from . import host_release
+    return host_release.enter_draining(cfg, db, host, actor=actor,
+                                       runner=runner)
 
 
 def critical_names(cfg, db, *, canons=None):
@@ -176,7 +222,9 @@ class _ReadyAdapter:
 def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
     """One critical-first controller pass; no host effect without the enrolled helper."""
     api = storage.of(db)
-    api.host_lifecycle.expire_returns()
+    # #4148: never open claims here; the runner already expired with
+    # closed claims, and a due planned return must wait for `busy`.
+    api.host_lifecycle.expire_returns(open_claims=False)
     control = api.host_lifecycle.get(host)
     if not control or control["mode"] not in ("draining", "returning", "lost"):
         return []
@@ -273,15 +321,28 @@ def main(argv=None):
             # a bound agent session must not claim a human's name.
             actor = work.corrector(cfg, db, args.actor) if args.actor else None
             result = drain(cfg, db, args.host, duration=duration, actor=actor)
+            # #4148: best-effort adapter acknowledgement; the runner scanner
+            # retries, and a failure keeps the claims closed.
+            result = enter_draining(cfg, db, args.host,
+                                    actor=(actor or result.get("actor") or "ameesh")) or result
         elif args.command == "undrain":
-            result = api.undrain(args.host, actor=work.corrector(cfg, db, args.actor))
+            # #4148: the `busy` hook answers before any claim reopens.
+            result = undrain(cfg, db, args.host,
+                             actor=work.corrector(cfg, db, args.actor))
             if result is None:
                 raise ValueError("host has no drain request")
         elif args.command == "reconcile":
             result = reconcile(cfg, db, args.host,
                                actor=work.corrector(cfg, db, args.actor))
+        elif args.host:
+            row = api.get(args.host)
+            if row is not None:
+                # #4148: the acknowledged adapter transitions are the evidence
+                # an operator reads; one line per generation and state.
+                row["transitions"] = api.transition_journal(args.host)
+            result = [row]
         else:
-            result = [api.get(args.host)] if args.host else api.listing()
+            result = api.listing()
         print(json.dumps(result, ensure_ascii=False))
         if args.command == "reconcile" and not (
                 result.get("reconciled") or result.get("mode") == "available"):

@@ -11494,8 +11494,9 @@ class Runner:
             api.detect_losses(actor=self.runner_id,
                               older_than=int(host_lifecycle.staleness_s(
                                   self.cfg.resource_interval)),
-                              critical=host_lifecycle.critical_names(self.cfg, db))
-            api.expire_returns()
+                              critical=host_lifecycle.critical_names(self.cfg, db),
+                              released_grace=float(self.cfg.host_release_boot_grace))
+            api.expire_returns(open_claims=False)
             controls = api.listing()
             # #3035/#3180: a lost host that publishes fresh readings again is
             # reopened only on the database proof (origins home and unfenced, no
@@ -11513,12 +11514,48 @@ class Runner:
                               % (self.runner_id, control["host"], result.get("generation")))
             for control in controls:
                 if control["mode"] in ("draining", "returning", "lost"):
+                    # #4148: a returning host whose `busy` hook has not
+                    # reopened claims must not receive agents back yet.
+                    if control["mode"] == "returning" and not control.get("claims_open", True):
+                        continue
                     host_lifecycle.advance_host(
                         db, control["host"], limits_for=self.handoff_limits_for,
                         adapter=getattr(self, "_lifecycle_adapter", None),
                         requirements_for=getattr(self, "_lifecycle_requirements", None))
         except (db_mod.DbError, handoffs.HandoffError, ValueError):
             log_async("host lifecycle: request remains pending; helper or prerequisites unavailable")
+
+    def host_release_once(self) -> None:
+        """#4148: one release-scanner pass (adapter transitions, auto drain)."""
+        from . import host_release
+        db = None
+        try:
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
+            host_release.once(self.cfg, db, local_host=self.host,
+                              actor=self.runner_id)
+        except Exception as exc:  # a scanner pass never stops the runner
+            log_async("host release: pass failed (%s: %s)"
+                      % (type(exc).__name__, str(exc)[:160]))
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    def start_host_release_poll(self) -> None:
+        """#4148: transitions every minute; the idle scan is spaced in the DB."""
+        if self.once or getattr(self, "mediated", False):
+            return
+
+        def boucle() -> None:
+            while not self.stop.is_set():
+                self.host_release_once()
+                if self.stop.wait(60.0):
+                    return
+
+        threading.Thread(target=boucle, daemon=True, name="hotes-liberation").start()
 
     def start_resource_poll(self) -> None:
         """Relevé périodique des ressources (`AMEESH_RESOURCE_INTERVAL`,
@@ -13101,6 +13138,7 @@ class Runner:
         self._start_host_gate()
         self.start_balance_poll()
         self.start_resource_poll()
+        self.start_host_release_poll()
         self.start_version_poll()
         self.start_housekeeping_poll()
         self.start_notify_health_poll()

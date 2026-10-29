@@ -249,6 +249,29 @@ class Config:
     #: #4150: read-only host idle window and protected baseline size.
     idle_after_s: float = 1800.0
     baseline_hosts: int = 2
+    #: #4148 (B of #3167): host lifecycle adapter. `lifecycle_hook` applies to
+    #: every host of the mesh; `lifecycle_hooks` is the per-host map and wins.
+    #: ameesh runs `<command> busy|draining|idle-drained <host>` and owns no
+    #: cluster or cloud credential. Empty = no adapter, hence no automatic
+    #: release. The command also answers the read-only `runs <host>` verb.
+    lifecycle_hook: str = ""
+    lifecycle_hooks: dict = field(default_factory=dict)
+    #: a hook that has not answered within this delay is a failure (seconds)
+    lifecycle_hook_timeout: float = 300.0
+    #: how often the expensive idle projection runs for a host (seconds); the
+    #: cheap transitions and the automatic return are checked every pass.
+    host_release_interval: float = 300.0
+    #: a withdrawal that has not reached `idle-drained` after this delay is
+    #: reported (the runner's own drain bound is 30 min, plus margin).
+    host_release_drain_bound: float = 2100.0
+    #: a failed transition is retried after this delay (seconds)
+    host_release_retry: float = 300.0
+    #: quiet time after the last turn before `idle-drained` is proven
+    host_release_settle: float = 60.0
+    #: #4148 B1: a released host whose `busy` hook answered is booting; its
+    #: readings are stale on purpose. Loss detection leaves it alone this long
+    #: (or until the first post-ack reading reopens claims), then gives up.
+    host_release_boot_grace: float = 900.0
     #: L242b : part du plafond horaire payé au token du mesh au-delà de
     #: laquelle un agent NON critique s'arrête (décision de mesh-design du
     #: 2026-10-12 : 0.75, soit 15 $ sur 20) ; un critique va jusqu'au plafond
@@ -994,6 +1017,20 @@ def load(env: dict | None = None) -> Config:
         ) or cfg.interrupt_senders,
         idle_after_s=_as_bounded_positive(pick("AMEESH_IDLE_AFTER_S"), cfg.idle_after_s),
         baseline_hosts=int(_as_bounded_positive(pick("AMEESH_BASELINE_HOSTS"), cfg.baseline_hosts)),
+        lifecycle_hook=str(pick("AMEESH_LIFECYCLE_HOOK", default=cfg.lifecycle_hook)
+                           or "").strip(),
+        lifecycle_hook_timeout=_as_bounded_positive(
+            pick("AMEESH_LIFECYCLE_HOOK_TIMEOUT"), cfg.lifecycle_hook_timeout),
+        host_release_interval=_as_bounded_positive(
+            pick("AMEESH_HOST_RELEASE_INTERVAL"), cfg.host_release_interval),
+        host_release_drain_bound=_as_bounded_positive(
+            pick("AMEESH_HOST_RELEASE_DRAIN_BOUND"), cfg.host_release_drain_bound),
+        host_release_retry=_as_bounded_positive(
+            pick("AMEESH_HOST_RELEASE_RETRY"), cfg.host_release_retry),
+        host_release_settle=_as_bounded_positive(
+            pick("AMEESH_HOST_RELEASE_SETTLE"), cfg.host_release_settle),
+        host_release_boot_grace=_as_bounded_positive(
+            pick("AMEESH_HOST_RELEASE_BOOT_GRACE"), cfg.host_release_boot_grace),
         critical_agents=_as_names(pick("AMEESH_CRITICAL_AGENTS")) or tuple(
             n.strip() for n in (cfg.critical_agents.split(",")
                                 if isinstance(cfg.critical_agents, str)
@@ -1134,6 +1171,29 @@ def load(env: dict | None = None) -> Config:
     if cfg.host_gate_fallback not in ("", "available", "draining", "stopped"):
         raise SystemExit("AMEESH_HOST_GATE_FALLBACK invalide : %r "
                          "(available | draining | stopped)" % cfg.host_gate_fallback)
+    # #4148: never execute a malformed adapter command (NUL, unbounded text),
+    # and never let a per-host map silently keep a non-text value.
+    if "\x00" in cfg.lifecycle_hook or len(cfg.lifecycle_hook) > 1000:
+        raise SystemExit("invalid lifecycle hook: empty, NUL or longer than 1000 chars")
+    hooks = cfg.lifecycle_hooks
+    if not isinstance(hooks, dict):
+        raise SystemExit("invalid lifecycle_hooks: an object {host: command} expected")
+    for host, command in hooks.items():
+        if not isinstance(host, str) or not NAME_RE.match(host):
+            raise SystemExit("invalid lifecycle_hooks host: %r" % (host,))
+        if (not isinstance(command, str) or not command.strip()
+                or "\x00" in command or len(command.strip()) > 1000):
+            raise SystemExit("invalid lifecycle_hooks[%s]: a command line expected" % host)
+    if not 30 <= cfg.host_release_interval <= 86400:
+        raise SystemExit("invalid AMEESH_HOST_RELEASE_INTERVAL: 30..86400 seconds expected")
+    if not 10 <= cfg.lifecycle_hook_timeout <= 3600:
+        raise SystemExit("invalid AMEESH_LIFECYCLE_HOOK_TIMEOUT: 10..3600 seconds expected")
+    if not 60 <= cfg.host_release_drain_bound <= 86400:
+        raise SystemExit("invalid AMEESH_HOST_RELEASE_DRAIN_BOUND: 60..86400 seconds expected")
+    if cfg.host_release_settle > cfg.host_release_drain_bound:
+        raise SystemExit("invalid AMEESH_HOST_RELEASE_SETTLE: beyond the drain bound")
+    if not 60 <= cfg.host_release_boot_grace <= 86400:
+        raise SystemExit("invalid AMEESH_HOST_RELEASE_BOOT_GRACE: 60..86400 seconds expected")
     if cfg.canon_ref.startswith("-"):
         raise SystemExit("invalid AMEESH_CANON_REF: %r" % cfg.canon_ref)
     seen_paths: set[str] = set()

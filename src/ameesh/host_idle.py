@@ -107,6 +107,43 @@ def project(reading, history, agents, lots, *, now, idle_after_s=1800,
     return out
 
 
+def apply_release(footprint, control):
+    """#4148: overlay the host lifecycle release state on an A footprint.
+
+    Read-only. `idle-drained` means claims are closed and the adapter may have
+    released the resource; `draining` means the withdrawal is in progress and
+    no proof of release exists yet. An `available` host keeps the projection's
+    own busy/idle state. `runs` stays A's measurement (never the adapter).
+    """
+    out = dict(footprint)
+    release = {
+        'generation': control.get('generation'),
+        'mode': control.get('mode'),
+        'state': control.get('release_state') or 'busy',
+        'hook_state': control.get('hook_state'),
+        'claims_open': bool(control.get('claims_open', True)),
+        'automatic': bool(control.get('automatic')),
+        'requested_ts': control.get('requested_ts'),
+        'released_ts': control.get('released_ts'),
+        'error': control.get('release_error'),
+        'error_state': control.get('release_error_state'),
+        'error_ts': control.get('release_error_ts'),
+    }
+    mode = control.get('mode')
+    if mode == 'lost':
+        out['state'] = 'draining'
+        out['unknown'] = list(out.get('unknown') or []) + ['host lost']
+    elif mode == 'returning':
+        # claims closed: still withdrawing; claims open: the host is busy
+        # again (agents are coming back), never idle.
+        out['state'] = 'busy' if release['claims_open'] else 'draining'
+    elif mode == 'draining':
+        out['state'] = ('idle-drained' if release['state'] == 'idle-drained'
+                        else 'draining')
+    out['release'] = release
+    return out
+
+
 def capacities(canons, names, *, protected=(), baseline_hosts=2):
     """Explicit cards plus critical elected leaders/reserves when underspecified."""
     out, costs = {}, {}
@@ -163,8 +200,14 @@ def _complete_canons(cfg, canons):
     return canons
 
 
-def snapshot(cfg, db, canons, readings, *, now=None, listing=None):
-    """Read all common sources once, then project each host. No mutations."""
+def snapshot(cfg, db, canons, readings, *, now=None, listing=None, controls=None):
+    """Read all common sources once, then project each host. No mutations.
+
+    `controls` (#4148): the host_lifecycle rows, mapping host to row, when the
+    caller already read them. The release state then overlays the footprint
+    (draining/idle-drained, declared runs); without them the projection stays
+    the read-only A view.
+    """
     from . import canon as canon_mod
     from . import planned_waits
     now = time.time() if now is None else now
@@ -276,6 +319,9 @@ def snapshot(cfg, db, canons, readings, *, now=None, listing=None):
                             idle_after_s=idle_s, fresh_within=fresh,
                             capacity=capacity[host], cost_eur_h=costs[host], holds=holds)
         out[host]["baseline_guard"] = host in protected
+        control = (controls or {}).get(host) if isinstance(controls, dict) else None
+        if control is not None:
+            out[host] = apply_release(out[host], control)
     return out
 
 
@@ -284,11 +330,21 @@ def line(value):
     def fmt(key):
         v = value.get(key)
         return 'unknown' if v is None else '%g' % v
+    release = value.get('release') or {}
+    detail = ''
+    if release:
+        detail = ('; release %s (hook %s), claims %s%s%s' % (
+            release.get('state') or '?', release.get('hook_state') or 'none',
+            'open' if release.get('claims_open') else 'closed',
+            ', automatic' if release.get('automatic') else '',
+            ', error: ' + str(release.get('error'))[:120]
+            if release.get('error') else ''))
     return ('footprint  : %s (%s); reserved CPU %s, memory %s bytes; '
             'used CPU %s, memory %s bytes; turns %s; leases %s; runs %s (%s); '
-            'cost %s EUR/h%s' % (
+            'cost %s EUR/h%s%s' % (
                 value['state'], value['capacity'], fmt('reserved_cpu'),
                 fmt('reserved_mem_bytes'), fmt('used_cpu'), fmt('used_mem_bytes'),
                 fmt('active_turns'), fmt('leases'), fmt('runs'), value['runs_source'],
-                fmt('cost_eur_h'), '; unknown: ' + ', '.join(value['unknown'])
+                fmt('cost_eur_h'), detail,
+                '; unknown: ' + ', '.join(value['unknown'])
                 if value['unknown'] else ''))

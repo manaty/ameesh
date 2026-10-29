@@ -78,7 +78,11 @@ def alerts(cfg, db, listing, now, *, canons, readings, held_hosts=(), orchestrat
         # failure must not discard under-use alerts (same rule as
         # host_verdicts in sous_utilisation.alerts).
         controls = []
-    excluded = {row['host'] for row in controls if row.get('mode') != 'active'}
+    # #4148: `available` is the open mode; a return whose `busy` hook has not
+    # reopened claims is still closed. (The historical `active` literal never
+    # matched a mode and silenced every host that had ever been drained.)
+    excluded = {row['host'] for row in controls
+                if row.get('mode') != 'available' or not row.get('claims_open', True)}
     readings = {h: r for h, r in readings.items()
                 if h not in excluded and h not in held_hosts}
     if not readings:
@@ -88,7 +92,8 @@ def alerts(cfg, db, listing, now, *, canons, readings, held_hosts=(), orchestrat
     # 8 MB per pass on the real base). Members, lots and holds of these hosts
     # are the same; the full listing still names holders in project().
     members = [a for a in listing if a.get('host') in readings]
-    footprints = host_idle.snapshot(cfg, db, canons, readings, now=now, listing=members)
+    footprints = host_idle.snapshot(cfg, db, canons, readings, now=now, listing=members,
+                                    controls={row['host']: row for row in controls})
     return project(footprints, listing, now=now, idle_after_s=cfg.idle_after_s,
                    baseline_hosts=cfg.baseline_hosts, held_hosts=held_hosts,
                    draining_hosts=excluded, orchestrators=orchestrators)
