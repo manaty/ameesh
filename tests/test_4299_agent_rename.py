@@ -141,6 +141,38 @@ class AgentRenameTest(PgTestCase):
             self.db, 'new-worker', 'runner-test', claimed['lease_epoch'])[0])
         registry.release(self.db, 'new-worker', 'runner-test', lease['lease_epoch'])
 
+    def test_milestone_proof_survives_the_rename_and_its_reverse(self):
+        # B1 of cx2 on 98557ade4: the rename rewrites the milestone actor and
+        # keeps the receipt; the reader compares identities, not spellings.
+        from ameesh import review_provenance, storage
+        sha = 'a' * 40
+        lot = work.add(self.db, title='Proven verdict', app='ameesh', actor='human:owner')
+        with mock.patch('ameesh.freeze_checks.commit_in', return_value=sha):
+            mark = work.milestone(self.db, int(lot['id']), 'verdict', sha=sha[:12],
+                                  actor='worker', verdict='ok')
+        storage.of(self.db).provenance.add(
+            'milestone:%d' % mark['id'], sha, 'worker', 's-1', 't' * 32, 'codex',
+            work_item_id=int(lot['id']))
+        with mock.patch('ameesh.freeze_checks.commit_in', return_value=sha):
+            stranger = work.milestone(self.db, int(lot['id']), 'verdict', sha=sha[:12],
+                                      actor='worker', verdict='ok')
+        storage.of(self.db).provenance.add(
+            'milestone:%d' % stranger['id'], sha, 'reviewer', 's-2', 'u' * 32, 'claude',
+            work_item_id=int(lot['id']))
+
+        self.rename('worker', 'new-worker')
+        receipt = review_provenance.receipt_for_milestone(self.db, mark['id'])
+        self.assertEqual(receipt['actor'], 'worker')                 # proof unchanged
+        self.assertEqual(receipt['milestone']['actor'], 'new-worker')
+        # Another identity's proof is still refused.
+        with self.assertRaises(review_provenance.ProvenanceError):
+            review_provenance.receipt_for_milestone(self.db, stranger['id'])
+
+        self.rename('new-worker', 'worker')
+        receipt = review_provenance.receipt_for_milestone(self.db, mark['id'])
+        self.assertEqual((receipt['actor'], receipt['milestone']['actor']),
+                         ('worker', 'worker'))
+
     def test_reverse_is_the_same_gesture(self):
         self.db.execute("UPDATE agent_registry SET aliases = ARRAY['legacy'] WHERE name = 'worker'")
         self.rename('worker', 'new-worker')

@@ -47,7 +47,13 @@ class Provenance(Contract):
             "SELECT p.subject, p.sha, p.actor, p.session, p.turn, p.harness,"
             "       p.work_item_id, extract(epoch FROM p.at)::float8 AS at_ts,"
             "       m.id AS milestone_id, m.actor AS mark_actor, m.sha AS mark_sha,"
-            "       m.verdict, extract(epoch FROM m.at)::float8 AS mark_at_ts"
+            "       m.verdict, extract(epoch FROM m.at)::float8 AS mark_at_ts,"
+            # #4299: a rename rewrites the milestone actor, never the receipt;
+            # both spellings of one registry identity are the same actor.
+            "       EXISTS (SELECT 1 FROM agent_registry r"
+            "                WHERE (r.name = p.actor OR p.actor = ANY(r.aliases))"
+            "                  AND (r.name = m.actor OR m.actor = ANY(r.aliases)))"
+            "         AS same_identity"
             "  FROM provenance_receipts p"
             "  JOIN work_item_milestones m ON p.subject = 'milestone:' || m.id"
             " WHERE p.subject = %s", (subject,))

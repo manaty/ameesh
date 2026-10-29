@@ -35,4 +35,6 @@ class Provenance(abc.ABC):
         Rend None si l'une des deux lignes manque : une preuve sans fait (ou
         l'inverse) est une origine inconnue, pas une preuve partielle. La ligne
         porte `mark_actor`, `mark_sha`, `verdict`, `milestone_id`, `at_ts` —
-        les faits recopiés du jalon — et les champs de la preuve."""
+        les faits recopiés du jalon —, les champs de la preuve et
+        `same_identity` : les deux acteurs désignent la même fiche du registre
+        (nom ou alias, #4299 : un renommage réécrit le jalon, pas la preuve)."""
