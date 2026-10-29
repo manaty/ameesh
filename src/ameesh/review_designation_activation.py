@@ -208,6 +208,9 @@ class Inputs:
     manual: list = field(default_factory=list)
     #: the manual reviewers that prove an independent family (#2627)
     manual_seats: list = field(default_factory=list)
+    #: #4582 : les acteurs qui ont déjà un verdict sur la tête gelée (SHA
+    #: identique ou préfixe) : un siège manuel qui y figure n'est pas relancé.
+    answered: tuple = ()
     #: the raw `-none` waiver of the lot (`work reviewer --no-verdict`)
     waiver: bool = False
     #: {family: advance in points over its plan pace} (#2668); empty when no
@@ -1502,6 +1505,51 @@ def _manual_covers(inputs: Inputs) -> bool:
     return not rd.unknown_families(inputs.authors)
 
 
+def _held_manual(inputs: Inputs, reported: Sequence[str] = ()) -> list:
+    """Les sièges manuels gardés qui doivent être relancés sur cette tête.
+
+    #4582 : ils couvrent un avis (`missing: 0`) mais n'ont pas de verdict sur
+    la tête gelée et leur avis antérieur n'est pas reporté. `reported` sont les
+    acteurs dont le verdict va être reporté (#2442), même quand le plan est
+    partiel. Les sièges qui y figurent, comme ceux qui ont déjà rendu un avis
+    sur la tête (`inputs.answered`), ne sont pas relancés."""
+    answered = {str(name or "").strip().lower()
+                for name in inputs.answered or () if str(name or "").strip()}
+    answered |= {str(name or "").strip().lower()
+                 for name in reported or () if str(name or "").strip()}
+    return [dict(seat) for seat in inputs.manual_seats or ()
+            if str((seat or {}).get("name") or "").strip().lower()
+            not in answered]
+
+
+def _verdicts_on(db, lot: int, sha: str) -> tuple:
+    """Les acteurs qui ont déjà un verdict sur `sha` (tête gelée), #4582.
+
+    Un siège manuel gardé ne se relance pas quand son avis porte déjà sur la
+    tête gelée : le regel de la même tête, ou un verdict rendu avant le gel,
+    ne redemande rien. La lecture est celle des jalons du lot (`_same_freeze`,
+    les SHA abrégés compris) ; un journal illisible ne prouve aucun verdict —
+    le siège sera relancé, jamais laissé sans courrier sur un doute.
+    """
+    names: list = []
+    try:
+        rows = storage.of(db).work.milestones(int(lot), None) or []
+    except Exception:  # noqa: BLE001 - lecture impossible : aucun verdict prouvé
+        return ()
+    target = str(sha or "").strip().lower()
+    if not target:
+        return ()
+    for row in rows:
+        if str((row or {}).get("kind") or "") != "verdict":
+            continue
+        if not rd._same_freeze(target, (row or {}).get("sha")):
+            continue
+        name = str((row or {}).get("actor") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
 # --------------------------------------------------------------------------
 # the inputs of one freeze
 # --------------------------------------------------------------------------
@@ -1647,6 +1695,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                            % int(lot))
     manual = _manual(db, item)
     waiver = _waiver(item)
+    answered = _verdicts_on(db, int(lot), frozen_sha)
     if not paths:
         # no changed file: no review is due, and no policy needs to be read
         # #3948 : la marque est bornée par l'id provisoire du gel, comme la
@@ -1659,7 +1708,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                       policy=Policy(rules=(), families=(), risk="light", required=0,
                                     ref="", commit="", source=""),
                       authors=[], unknown_authors=[], correctors=[], candidates=[],
-                      notify="", manual=manual, waiver=waiver,
+                      notify="", manual=manual, waiver=waiver, answered=answered,
                       basis=_prepared_basis(item, target, latest))
     policy = _policy(cfg, db, project, paths)
     if isinstance(policy, Unavailable):
@@ -1715,7 +1764,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, correctors=correctors,
                   candidates=candidates, notify=notify,
-                  manual=manual, waiver=waiver,
+                  manual=manual, waiver=waiver, answered=answered,
                   manual_seats=_manual_seats(manual, listing, authors, families,
                                              correctors=correctors),
                   advances=_advances(db), author_commits=author_commits,
@@ -2589,14 +2638,20 @@ class _FloorPort(_ForcedPort):
 
 
 def _selection(inputs: Inputs, port, *, force: bool = False,
-               kept: Sequence[Mapping] = ()) -> dict:
+               kept: Sequence[Mapping] = (), reported: Sequence[str] = ()) -> dict:
     """The `apply` call, shared by the hook and the recovery path.
 
     `kept` (#3367) : the seats a reassignment keeps (live, or verdict acquired
     on the frozen head). They count like the manual seats: only the missing
-    seats are selected."""
+    seats are selected.
+
+    `reported` (#4582) : les acteurs dont le verdict va être reporté sur la
+    tête par le report (#2442), quand il ne couvre qu'une partie des sièges.
+    Leur siège ne reçoit pas de nouvelle demande : l'avis est déjà sur la
+    tête. `inputs.answered` écarte de même les avis déjà rendus sur elle."""
     if force:
         port = _ForcedPort(port)
+    held = _held_manual(inputs, reported)
     return rd.apply(
         inputs.item, policy=inputs.policy.rules, paths=list(inputs.paths),
         port=port, freeze_sha=str(inputs.freeze.get("sha") or ""),
@@ -2605,7 +2660,7 @@ def _selection(inputs: Inputs, port, *, force: bool = False,
         notify=inputs.notify, unknown_authors=inputs.unknown_authors,
         families=inputs.policy.families,
         already=list(inputs.manual_seats) + [dict(seat) for seat in kept or ()],
-        fixers=inputs.correctors,
+        fixers=inputs.correctors, held=held,
         required=inputs.policy.required, advances=inputs.advances)
 
 
@@ -2615,8 +2670,11 @@ def carried_plan(cfg, db, lot: int, sha: str) -> Optional[dict]:
     Lu **avant** le gel : `verdict_carry.would_carry` ne lit que les jalons et
     le dépôt, sans écrire. Un plan qui ne reporte pas la totalité des verdicts
     en attente (`refused`) ne fait pas s'abstenir la désignation : les sièges
-    manquants doivent être désignés normalement. Une erreur de lecture ne fait
-    jamais perdre le gel ni la désignation : None, le chemin normal.
+    manquants doivent être désignés normalement. Il est rendu quand même, car
+    ses entrées `carried` disent quels sièges n'ont pas à être relancés sur la
+    nouvelle tête (#4582) ; l'appelant teste `refused` avant de s'abstenir.
+    Une erreur de lecture ne fait jamais perdre le gel ni la désignation :
+    None, le chemin normal.
     """
     text = str(sha or "").strip()
     if not text:
@@ -2626,7 +2684,7 @@ def carried_plan(cfg, db, lot: int, sha: str) -> Optional[dict]:
         plan = verdict_carry.would_carry(cfg, db, int(lot), text)
     except Exception:  # noqa: BLE001 - aucune preuve : désignation normale
         return None
-    if plan.get("result") != "would-carry" or plan.get("refused"):
+    if plan.get("result") != "would-carry":
         return None
     return plan
 
@@ -2851,12 +2909,17 @@ def _fresh_prepared(cfg, tx, item: Mapping, freeze: Mapping,
                    int(floor.get("reviews_floor") or 0)))
     manual = _manual(tx, item)
     waiver = _waiver(item)
+    # #4582 : un verdict a pu être rendu pendant la lecture préalable ; sous le
+    # verrou, il est relu pour ne pas relancer un siège qui a déjà son avis.
+    answered = _verdicts_on(tx, int(item.get("id") or 0),
+                            str(freeze.get("sha") or ""))
     if list(manual) == list(inputs.manual) and bool(waiver) == bool(inputs.waiver):
-        return dataclasses.replace(inputs, item=dict(item), freeze=dict(freeze))
+        return dataclasses.replace(inputs, item=dict(item), freeze=dict(freeze),
+                                   answered=answered)
     listing = registry.overview(tx)
     return dataclasses.replace(
         inputs, item=dict(item), freeze=dict(freeze), manual=list(manual),
-        waiver=bool(waiver),
+        waiver=bool(waiver), answered=answered,
         manual_seats=_manual_seats(manual, listing, inputs.authors,
                                    inputs.policy.families,
                                    correctors=inputs.correctors))
@@ -2882,7 +2945,8 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
                               threads: list, carried: Optional[Mapping] = None,
                               reading: Optional[dict] = None, target=None,
                               freezing: bool = False,
-                              prepared: Optional[object] = None) -> dict:
+                              prepared: Optional[object] = None,
+                              reported: Sequence[str] = ()) -> dict:
     """The `on_frozen` body: all writes stay in the freeze's transaction.
 
     `prepared` (#3948) est le résultat de `prepare_for_freeze`, lu **avant**
@@ -2989,7 +3053,7 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
         # #2812 : la même lecture que la désignation, réutilisée par la
         # notification des blocages levés (aucune lecture git redoublée).
         reading["excluded"] = _excluded_names(inputs)
-    if _manual_covers(inputs):
+    if _manual_covers(inputs) and not _held_manual(inputs, reported):
         return _manual_outcome(tx, item, freeze, inputs.manual)
     checkpoint = len(threads)
     _savepoint(tx)
@@ -3002,7 +3066,13 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
             _sync_reviewers(tx, item, freeze, [])
             _waive_ownless_vehicle(tx, item, inputs)
         else:
-            out = _selection(inputs, pg.PgPort(tx, after_commit=threads))
+            out = _selection(inputs, pg.PgPort(tx, after_commit=threads),
+                             reported=reported)
+            if _manual_covers(inputs) and out.get("state") == "manual":
+                # #4582 : les demandes nommaient déjà cette tête (ou le siège
+                # est introuvable) : aucune marque, le journal de la
+                # couverture manuelle reste l'issue du gel (comme #3596).
+                out = _manual_outcome(tx, item, freeze, inputs.manual)
             if out.get("state") in (rd.DESIGNATED, rd.WAITING):
                 # #3596 : une désignation partielle reste `waiting` et nomme
                 # les sièges déjà pourvus ; la colonne les garde.
@@ -3213,7 +3283,8 @@ def _deferred_superseded(cfg, lot: int, freeze: Mapping, result: Mapping):
 def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                              threads: list, carried: Optional[Mapping] = None,
                              target=None, freezing: bool = False,
-                             prepared: Optional[object] = None) -> dict:
+                             prepared: Optional[object] = None,
+                             reported: Sequence[str] = ()) -> dict:
     """The `on_frozen` body, plus the superseded-block notification (#2681).
 
     The notification is best-effort: it runs after the designation writes, and
@@ -3233,7 +3304,8 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     result = _designate_in_transaction(cfg, tx, lot, milestone=milestone,
                                        threads=threads, carried=carried,
                                        reading=reading, target=target,
-                                       freezing=freezing, prepared=prepared)
+                                       freezing=freezing, prepared=prepared,
+                                       reported=reported)
     if (reading.get("excluded") is None
             and str(result.get("state") or "") not in ("unavailable", "stale")):
         # #3948 B cx3 : pas de lecture préparée sur ces chemins ; la
@@ -3253,7 +3325,8 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
 
 
 def hook(cfg, outcome: Optional[dict] = None, *, carried: Optional[Mapping] = None,
-         target=None, prepared: Optional[object] = None):
+         target=None, prepared: Optional[object] = None,
+         reported: Sequence[str] = ()):
     """The callback installed on the CLI's `frozen` milestone.
 
     `outcome`, when given, receives the designation shape for the command's
@@ -3268,7 +3341,8 @@ def hook(cfg, outcome: Optional[dict] = None, *, carried: Optional[Mapping] = No
         result = designate_in_transaction(cfg, tx, int(milestone["work_item_id"]),
                                           milestone=milestone, threads=threads,
                                           carried=carried, target=target,
-                                          freezing=True, prepared=prepared)
+                                          freezing=True, prepared=prepared,
+                                          reported=reported)
         if outcome is not None:
             outcome.clear()
             outcome.update(result)
@@ -3370,6 +3444,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     live = _live_column(item)
     completion = None
     waiting = False
+    reported: list = []
     if not force:
         effective = _effective_mark(db, int(lot), int(freeze.get("id") or 0),
                                     since_ts=float(freeze.get("at_ts") or 0.0))
@@ -3402,7 +3477,13 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 completion = {"mark_id": int(effective[0]), "shape": existing}
         if completion is None and not floor_error:
             plan = carried_plan(cfg, db, int(lot), str(freeze.get("sha") or ""))
-            if plan:
+            # #4582 : un plan partiel ne couvre pas la tête — la désignation
+            # réelle doit tourner — mais ses verdicts reportés ne sont pas
+            # relancés sur elle.
+            reported = [str((entry or {}).get("actor") or "").strip()
+                        for entry in (plan or {}).get("carried") or ()
+                        if str((entry or {}).get("actor") or "").strip()]
+            if plan and not plan.get("refused"):
                 with db.transaction() as tx:
                     if not _lock_current_freeze(tx, int(lot), freeze):
                         return _stale(freeze)
@@ -3442,7 +3523,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                     "why": inputs.why}
         # #3554 : même journal hors du hook (reprise), une fois par tête.
         _note_canon_lowering(db, item, freeze, inputs)
-        if _manual_covers(inputs):
+        if _manual_covers(inputs) and not _held_manual(inputs, reported):
             # #3596 : la couverture manuelle finale est marquée au journal
             # (`MANUAL_PREFIX`) pour que la boucle de reprise ne relise pas la
             # politique à chaque passe.
@@ -3519,7 +3600,12 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         with db.transaction() as tx:
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
                                                 at_freeze=False, retired=removed),
-                             force=force)
+                             force=force, reported=reported)
+            if _manual_covers(inputs) and out.get("state") == "manual":
+                # #4582 : couverture manuelle complète sans nouvelle demande
+                # (les courriers nomment déjà cette tête) : le journal #3596
+                # reste l'issue du gel, comme au hook.
+                out = _manual_outcome(tx, item, freeze, inputs.manual)
             names = ([r.get("name") for r in out.get("reviewers") or ()]
                      if out.get("state") in (rd.DESIGNATED, rd.WAITING) else [])
             _sync_reviewers(tx, item, freeze, names)

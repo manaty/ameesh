@@ -64,7 +64,8 @@ class RegistryTest(unittest.TestCase):
         module = registry.discover().get("dev")
         self.assertIsNotNone(module)
         self.assertEqual(module.storage, ())
-        self.assertEqual(module.capabilities, ("audit", "workspaces"))
+        # L100 T5 (#4386): it serves `ameesh module dev …` (capability cli).
+        self.assertEqual(module.capabilities, ("cli", "audit", "workspaces"))
 
     def test_un_nom_d_action_du_coeur_est_refuse_au_fournisseur(self):
         fake = mock.Mock(ACTION_CONNECTORS={"shell-noop": lambda *a, **k: None})

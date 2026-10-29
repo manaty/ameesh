@@ -477,7 +477,12 @@ class PgPort:
             raise DesignationError("a designation is %s or %s, not %r"
                                    % (DESIGNATED, WAITING, state))
         reviewers = [dict(r) for r in reviewers or ()]
-        if state == DESIGNATED and not reviewers:
+        # #4582 : une couverture entièrement manuelle n'a aucun relecteur
+        # automatique à nommer ; ses demandes exactes (marquées `manual`)
+        # restent la raison d'écrire la marque et sa liste `sent`.
+        manual_requests = [row for row in messages or ()
+                           if isinstance(row, Mapping) and row.get("manual")]
+        if state == DESIGNATED and not reviewers and not manual_requests:
             raise DesignationError("a designated review names its reviewers")
         names: dict = {}
         messages = _canonical_messages(
@@ -496,12 +501,20 @@ class PgPort:
             messages = [message for message in messages
                         if not _already_sent(message, sent)]
         undelivered = []
+        deliverable = []
         for row in messages:
             recipient = str(row.get("to") or "").strip()
+            known = bool(recipient) and registry.get(db, recipient) is not None
+            if row.get("manual") and not known:
+                # #4582 : le siège manuel reste acquis ; seule sa relance est
+                # perdue, jamais le gel ni la couverture manuelle.
+                continue
+            deliverable.append(row)
             if not recipient:
                 undelivered.append({"to": "", "reason": "no recipient"})
-            elif registry.get(db, recipient) is None:
+            elif not known:
                 undelivered.append({"to": recipient, "reason": "not in the registry"})
+        messages = deliverable
         if undelivered:
             if not hook:
                 # outside the hook: the refusal is better than a designation
@@ -594,6 +607,13 @@ class PgPort:
             deposited.append({"to": recipient,
                               "kind": str(row.get("kind") or "notify"),
                               "capacity": bool(row.get("capacity"))})
+        if state == DESIGNATED and not reviewers and not deposited:
+            # #4582 : la couverture manuelle est acquise, et ses demandes
+            # nomment déjà cette tête (ou le siège est introuvable) : rien
+            # n'est déposé, aucune marque n'est écrite. Le journal de la
+            # couverture manuelle reste l'issue du gel.
+            return {"state": "manual", "required": int(required), "reviewers": [],
+                    "missing": 0, "why": why, "freeze": freeze}
         ops.note(lot, str(rows[0].get("state") or ""),
                  _mark_note(lot, freeze_id, state=state, required=required,
                             reviewers=reviewers, missing=missing, why=why,

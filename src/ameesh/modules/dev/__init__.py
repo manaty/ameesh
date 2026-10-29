@@ -15,6 +15,13 @@ the core with ``registry.get("dev")``, and the workspaces control of
 
 The bare profile (``registry.discover(builtin=False)``) has no ``dev`` module:
 the workspaces façade then documents a no-op for housekeeping and worktrees.
+
+L100 T5 (#4386): it serves the ``cli`` capability, ``ameesh module dev
+sync-merges | sync-github | project-github | merge-pr | review-class``. The
+old commands (``ameesh work sync-merges | sync-github | project-github |
+merge-pr``, ``ameesh review-class``) stay aliases without a removal date
+(L104 removes them): both names run the same parser and handler, so outputs
+and exit codes are the same.
 """
 from __future__ import annotations
 
@@ -23,12 +30,56 @@ from .git_merge import GitMergeConnector
 NAME = "dev"
 
 #: Capabilities this module provides (see ``registry.CAPABILITIES``).
-CAPABILITIES = ("workspaces", "audit")
+CAPABILITIES = ("cli", "workspaces", "audit")
 
 #: Active on every host without a project selection (L101 T4): the canon may
 #: only select modules that declare a work item type, so ``dev`` never gets a
 #: ``project_modules`` row. ``modules.audit`` runs its hook once, host-scoped.
 ALWAYS_ACTIVE = True
+
+
+#: ``ameesh module dev <command>`` → the legacy command line it serves (L100 T5)
+COMMANDS = {
+    "sync-merges": ("work", "sync-merges"),
+    "sync-github": ("work", "sync-github"),
+    "project-github": ("work", "project-github"),
+    "merge-pr": ("work", "merge-pr"),
+    "review-class": ("review-class",),
+}
+
+#: ``ameesh module`` hands over without opening a database nor resolving the
+#: actor: each command does both itself, exactly as through its alias
+#: (``review-class`` reads no database at all).
+OWNS_CONNECTION = True
+
+USAGE = """usage: ameesh module dev {%s} …
+
+  sync-merges     close the work items whose frozen content is merged (git, L29)
+  sync-github     close the work items whose PR is merged (GitHub read-only)
+  project-github  one GitHub issue per work item of a project (L126)
+  merge-pr        merge a lot's PR without the gh API (REL-11)
+  review-class    review class of a change (0018)
+
+Aliases without a removal date (L104): ameesh work sync-merges | sync-github |
+project-github | merge-pr, ameesh review-class.""" % ",".join(COMMANDS)
+
+
+def main(db, argv, *, actor):
+    """``ameesh module dev <command> …``: the command its alias runs, same
+    parser, output and exit code (``db`` and ``actor`` unused: see
+    ``OWNS_CONNECTION``)."""
+    import sys
+    argv = list(argv)
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0 if argv else 2
+    command = COMMANDS.get(argv[0])
+    if command is None:
+        print("ameesh module dev: unknown command %r\n%s" % (argv[0], USAGE),
+              file=sys.stderr)
+        return 2
+    from ... import mesh_cli
+    return mesh_cli.main([*command, *argv[1:]])
 
 
 def descriptor(options=None):

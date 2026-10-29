@@ -672,6 +672,9 @@ class PilotRecomposeTest(HoraireBase):
         self.assertIn("--force", cmd)
         self.assertEqual(cmd[cmd.index("--exclude") + 1], "3801")
         self.assertEqual(cmd[cmd.index("--exclude-reason") + 1], "B de relecture (#3801)")
+        # #4581 : la recomposition du pilote garde, elle aussi, les membres de
+        # la composition gelée moins les exclus.
+        self.assertEqual(cmd[cmd.index("--keep-composition") + 1], HEAD)
 
     def test_recomposition_du_pilote_perdue_reprise_avec_ses_motifs(self):
         item = self.frozen(

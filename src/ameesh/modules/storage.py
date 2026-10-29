@@ -90,6 +90,17 @@ class ModuleStore:
             return []
         return self.db.query("SELECT project, module FROM project_modules ORDER BY project, module")
 
+    def stored(self):
+        """Applied project policies, full rows; tolerate a predating database.
+
+        L98 T2a: `ameesh modules --active` and `doctor` read the applied truth
+        here, then compare its descriptor digest with the readable canon."""
+        rows = self.db.query("SELECT to_regclass('project_modules') AS relation")
+        if not rows or not rows[0].get("relation"):
+            return []
+        return self.db.query("SELECT canon, project, module, types, schemas, rules "
+                             "FROM project_modules ORDER BY project, module")
+
     def audit_evidence(self, project, module, types, subject_kind, evidence_kind):
         """Read current declarations and matching evidence in one snapshot."""
         return self.db.query(

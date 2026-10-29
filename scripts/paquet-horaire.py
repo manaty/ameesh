@@ -49,8 +49,12 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    gelée : un rouge **déterministe** (chaque échec de test propre au paquet
    attribué par #3801 à une seule unité probable, rejoué rouge en local sur la
    tête) retire ces unités ; le paquet est recomposé sans elles
-   (`paquet-auto.py --force --exclude`), **une fois**, et l'auteur de chaque
-   unité retirée reçoit un courrier. Chaque lot retiré repasse en `build`
+   (`paquet-auto.py --force --exclude --keep-composition`), **une fois**, et
+   l'auteur de chaque unité retirée reçoit un courrier. La recomposition
+   reprend les membres de la composition précédente moins les exclus, à leur
+   source composée : un lot prêt entre-temps, un membre regelé (nouvelle tête)
+   ou sorti de la liste prête va à la coupure suivante, nommé aux écartés du
+   manifeste (#4581). Chaque lot retiré repasse en `build`
    avec sa trace (`paquet-horaire: exclu …` : paquet, porteur, run, tests ;
    #4028), sans consommer de boucle d'auteur (#4043) : il attend le correctif
    de son assigné jusqu'à un nouveau gel, et l'alerte SLO vise l'auteur, pas
@@ -652,8 +656,13 @@ def manifest_at(ctx: Context, item: dict, sha: str) -> str:
 def paquet_auto(ctx: Context, name: str, carrier: int, *,
                 exclude: list[int] = (), exclude_reasons: list[str] = (),
                 only: list[int] = (), force: bool = False,
-                publish: str = "") -> Result:
-    """`publish` : « réf@sha » de la tête testée (#4237), publiée sans retester."""
+                publish: str = "", keep_composition: str = "") -> Result:
+    """`publish` : « réf@sha » de la tête testée (#4237), publiée sans retester.
+
+    `keep_composition` (#4581) : la tête gelée dont la recomposition reprend
+    les membres, moins les `--exclude` ; les lots prêts depuis vont à la
+    coupure suivante.
+    """
     cmd = [ctx.python, str(SCRIPT_DIR / "paquet-auto.py"), "--repo", str(ctx.repo),
            "--target", ctx.target, "--name", name, "--carrier", str(carrier),
            "--pilot", ctx.pilot, "--from", ctx.actor]
@@ -674,6 +683,8 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
         cmd += ["--exclude", str(lot)]
     for reason in exclude_reasons:
         cmd += ["--exclude-reason", reason]
+    if keep_composition:
+        cmd += ["--keep-composition", keep_composition]
     if ctx.dry_run:
         ctx.say("[essai] %s" % " ".join(cmd))
         return Result(0, "aucun lot prêt : rien à composer (essai)\n", "")
@@ -1093,6 +1104,8 @@ def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
     result = paquet_auto(ctx, name, carrier, exclude=this.exclude,
                          exclude_reasons=reasons,
                          only=this.only,
+                         keep_composition=(this.base
+                                           if this.step == RECOMPOSITION else ""),
                          force=this.step == RECOMPOSITION or this.n > 1 or this.force)
     return after_compose(ctx, carrier, name, result, this)
 

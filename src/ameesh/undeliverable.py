@@ -716,6 +716,8 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
             now: float | None = None) -> dict:
     """Re-livre à `new` le courrier en attente de `old`, une boîte morte.
 
+    Les boîtes `human:*` sont refusées ; les demandes de décision ne sont
+    jamais copiées (y compris en aperçu).
     `old` doit être arrêté (`stopped`) ou absent du registre : on ne vide pas
     la boîte d'un agent qui la lit. `new` doit être inscrit, ni arrêté ni
     retiré (#3460).
@@ -728,6 +730,8 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
     verrou du registre DANS la transaction qui copie ; une relance de l'un ou
     un arrêt de l'autre, committé entre la lecture et la copie, lève `Refused`
     au lieu de copier le courrier d'un vivant vers un mort."""
+    if old.startswith("human:"):
+        raise RefusedOld("%s is a human mailbox: use ameesh decisions, not forward" % old)
     if old == new:
         raise Refused("old and new recipient are the same (%s)" % old)
     old_row, new_row = db_mod.batched(db, lambda d: [registry.get(d, old),
@@ -752,7 +756,8 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
         return {"old": old, "new": new, "old_state": state, "dry_run": True,
                 "messages": [{"id": int(r["id"]), "sender": r.get("sender"),
                               "kind": r.get("kind"), "created_ts": r.get("created_ts")}
-                             for r in rows],
+                             for r in rows if not (r.get("kind") == "request"
+                                 and (r.get("payload") or {}).get("decision") is not None)],
                 "forwarded": []}
     try:
         moved = storage.of(db).mailbox.forward(old, new, actor)

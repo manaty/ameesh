@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Decision requests to the owner, received and answered in one place (work item L124).
 
+#4256: new requests carry a recipient-local business-day deadline and a
+project-owned validation route. Private audit and contradiction links live in
+migration 0515; ``decide validation-history`` requires the owner's key.
+
   ameesh decide ask (--lot <id|ref> | --new-lot "title") --question "…"
                     --option a="…" [--option b="…" …] [--recommend a [--why "…"]]
                     [--urgent] [--by 2h|18:00|"2026-10-12 09:00"] [--needs-signature] [--json]
@@ -13,6 +17,7 @@
         the owner answers (a HUMAN identity only); the answer goes to the
         requester by mail (it wakes them up), to the thread and to the work item;
   ameesh decide withdraw <id> [--why "…"] [--json]     the requester withdraws their request;
+  ameesh decide repair-forward <id> [--json]           restore an accidentally forwarded request;
   ameesh decide show <id> [--json]                     a request, its answer, its proof;
   ameesh decisions [--all] [--for human:ID] [--json]   the queue, across all projects
         (served by `actions_cli`, together with gated actions).
@@ -69,6 +74,7 @@ import time
 from . import config as config_mod
 from . import db as db_mod
 from . import fil, identity, platform, registry, storage, work, work_lifecycle
+from . import validation_deadlines as validations
 from .config import NAME_RE, Config
 
 #: schéma du JSON d'une demande (`--json`, clé `requests` de `ameesh decisions`)
@@ -78,14 +84,12 @@ PAYLOAD_KEY = "decision"
 #: nature de la ligne de demande et du courrier de réponse (`agent_mailbox.kind`)
 KIND = "request"
 REPLY_KIND = "reply"
-STATES = ("pending", "answered", "withdrawn")
+STATES = ("pending", "answered", "withdrawn", "closed")
 #: canaux d'une réponse (`signed` : signée par la clé du propriétaire)
 CHANNELS = ("cli", "chat", "signed")
 CHANNEL_LABELS = {"cli": "cli", "chat": "chat", "signed": "signed"}
 #: destinataire d'une demande sans responsable connu : tout humain du mesh
 OWNER_ANY = "human:*"
-#: échéance par défaut d'une demande (relance du propriétaire passé ce délai)
-DEFAULT_DUE_S = 4 * 3600.0
 #: action et nature des approbations signées qui portent une réponse
 APPROVAL_ACTION = "decision"
 APPROVAL_KIND = "decision"
@@ -265,7 +269,11 @@ def view_of(row: dict, now: float | None = None) -> dict:
     d = _payload(row)
     created = float(row.get("created_ts") or 0.0)
     closed = row.get("closed_ts")
-    state = d.get("state") or ("pending" if closed is None else "answered")
+    state = d.get("state") or "pending"
+    # Mail delivery/old forwards can close the envelope without a decision.
+    # A delivery timestamp proves closure, never an owner's answer.
+    if closed is not None and state == "pending":
+        state = "closed"
     due = d.get("due_ts")
     due = float(due) if due is not None else None
     lot = d.get("lot")
@@ -295,6 +303,7 @@ def view_of(row: dict, now: float | None = None) -> dict:
         "host": row.get("host"),
         "answer": d.get("answer"),
         "withdrawn": d.get("withdrawn"),
+        "validation": d.get("validation"),
     }
 
 
@@ -466,7 +475,12 @@ def request_text(decision: dict, *, requester: str, owner: str | None,
     if decision.get("recommend"):
         lines.append("Recommendation: %s%s" % (
             decision["recommend"], " — %s" % decision["why"] if decision.get("why") else ""))
-    tail = ["Deadline: %s." % _local(decision["due_ts"])] if decision.get("due_ts") else []
+    validation = decision.get("validation") or {}
+    due_label = validation.get("due_local") or (_local(decision["due_ts"]) if decision.get("due_ts") else None)
+    tail = ["Deadline: %s (%s)." % (due_label, validation.get("timezone", "local"))] if due_label else []
+    if validation.get("defaulted"):
+        tail.append("Default: one business day.")
+    lines.extend(validation.get("links") or [])
     if decision.get("urgent"):
         tail.append("URGENT.")
     if decision.get("needs_signature"):
@@ -494,7 +508,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         new_lot: str | None = None, recommend: str | None = None, why: str | None = None,
         urgent: bool = False, due_ts: float | None = None, needs_signature: bool = False,
         source_mail: int | None = None, parent_lot: str | None = None,
-        now: float | None = None) -> dict:
+        now: float | None = None, domain: str = "decision", issue_links=()) -> dict:
     """Dépose une demande de décision de `requester` (un agent) ; rend la
     demande (`ameesh-decision/1`) avec `lot_state`. DecisionError si refusée
     (rien n'est déposé).
@@ -540,9 +554,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
     if (lot is None) == (new_lot is None):
         raise DecisionError("--lot <id|ref> OR --new-lot \"title\" (exactly one): a "
                             "request is attached to a work item")
-    if due_ts is None:
-        due_ts = now + DEFAULT_DUE_S
-    elif float(due_ts) <= now:
+    if due_ts is not None and float(due_ts) <= now:
         raise DecisionError("deadline already passed (%s)" % _local(due_ts))
 
     def body(db):
@@ -591,6 +603,22 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
                 raise DecisionError("work item %s not found: an open work item number, a unique "
                                     "reference, or --new-lot \"title\"" % lot)
         owner, source = resolve_owner(cfg, db, requester_row, item)
+        project = _project(db, item, requester_row)
+        try:
+            route = validations.routing(cfg, project, domain, owner or OWNER_ANY)
+        except (ValueError, KeyError) as exc:
+            raise DecisionError(str(exc)) from exc
+        recipient = route["nodes"][0]
+        owner = recipient["human"]
+        due = (validations.business_due(now, recipient["timezone"])
+               if due_ts is None else float(due_ts))
+        links = list(issue_links)
+        if item.get("issue_ref"):
+            ref = item["issue_ref"]
+            if "#" in ref:
+                repo, number = ref.rsplit("#", 1)
+                links.append("https://github.com/%s/issues/%s" % (repo, number))
+        validation = validations.metadata(route, due=due, defaulted=due_ts is None, links=links)
         lot_id = int(item["id"])
         previous = work_lifecycle.phase(item)
         if previous == "waiting_human":
@@ -601,7 +629,8 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         decision = {
             "v": 1, "state": "pending", "question": question, "options": opts,
             "recommend": recommend, "why": why, "urgent": bool(urgent),
-            "due_ts": round(float(due_ts), 3), "needs_signature": bool(needs_signature),
+            "due_ts": round(due, 3), "needs_signature": bool(needs_signature),
+            "validation": validation,
             "owner_source": source, "project": _project(db, item, requester_row),
             "lot": lot_id, "lot_title": item.get("title") or "", "previous_state": previous,
         }
@@ -614,6 +643,8 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
                 body=request_text(decision, requester=requester, owner=owner),
                 payload={PAYLOAD_KEY: decision}, work_item_id=str(lot_id), host=cfg.host)
             decision_id = int(row["id"])
+            validations.register(tx, decision_id, route, now=now, due=due,
+                                 defaulted=due_ts is None, links=validation["links"])
             fil.record(cfg, tx, sender=requester, recipients=[owner or OWNER_ANY],
                        text=request_text(decision, requester=requester, owner=owner,
                                          decision_id=decision_id),
@@ -644,7 +675,8 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
     try:
         fence = pilot_gesture.gate(cfg, db, "decision", ref)
         if fence is None:
-            return body(db)
+            with db.transaction() as tx:
+                return body(tx)
         with db.transaction() as tx:
             fence.hold(tx)
             return body(tx)
@@ -866,6 +898,8 @@ def verify_proof(db, view: dict) -> tuple[bool, str]:
 
 
 def _closed_reason(view: dict) -> str:
+    if view["state"] == "closed":
+        return "decision #%d closed without an answer or withdrawal" % view["id"]
     if view["state"] == "withdrawn":
         who = (view.get("withdrawn") or {}).get("by") or view.get("requester")
         return "decision #%d withdrawn by %s" % (view["id"], who)
@@ -1051,7 +1085,7 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
     view = get(db, decision_id, now)
     if view is None:
         raise DecisionError("decision #%s not found (ameesh decisions)" % decision_id)
-    if view["owner"] and view["owner"] != human:
+    if view["owner"] and view["owner"] != human and not validations.can_answer(db, decision_id, human):
         raise DecisionError("decision #%d is addressed to %s: %s does not answer it"
                             % (view["id"], view["owner"], human))
     text = str(text or "").strip()
@@ -1065,6 +1099,11 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
         raise DecisionError("unreadable answer — %s" % reason)
     option = match_option(view, text)
     if view["state"] != "pending":
+        if validations.can_answer(db, decision_id, human):
+            followup = validations.late_response(cfg, db, view, human=human,
+                                                  text=text, option=option, now=now)
+            if followup is not None:
+                return followup
         if _same_answer(view, text, option, human):
             return _replay_answer(cfg, db, view, text=text, option=option,
                                   human=human, now=now)
@@ -1124,6 +1163,7 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
                 # compris une approbation consommée), puis on relit.
                 raise _DecisionRace()
             view = view_of(closed, now)
+            validations.response(tx, view, human=human, text=text, now=now)
             lot = _release_lot(
                 tx, view, actor=human,
                 note="decision #%d answered by %s (%s): %s"
@@ -1132,6 +1172,11 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
                 cfg, tx, view, human=human, after=after)
     except _DecisionRace:
         latest = get(db, decision_id, now)
+        if latest is not None and validations.can_answer(db, decision_id, human):
+            followup = validations.late_response(cfg, db, latest, human=human,
+                                                  text=text, option=option, now=now)
+            if followup is not None:
+                return followup
         if latest is not None and _same_answer(latest, text, option, human):
             return _replay_answer(cfg, db, latest, text=text, option=option,
                                   human=human, now=now)
@@ -1303,6 +1348,9 @@ def format_view(view: dict, now: float | None = None) -> list[str]:
             answer.get("by"), CHANNEL_LABELS.get(answer.get("channel"), "?"),
             _local(answer.get("ts") or view.get("closed_ts") or now),
             fil.excerpt(answer.get("text") or "", 200)))
+    elif view["state"] == "closed":
+        lines.append("      closed on %s without an answer or withdrawal" %
+                     _local(view["closed_ts"]))
     else:
         withdrawn = view.get("withdrawn") or {}
         lines.append("      withdrawn by %s on %s%s" % (
@@ -1331,6 +1379,7 @@ USAGE = ("usage: ameesh decide ask (--lot <id|ref> | --new-lot \"title\") --ques
          "        ameesh decide <id> <option | \"free text\"> "
          "[--key FILE [--as NAME] | --signed] [--json]\n"
          "        ameesh decide withdraw <id> [--why \"…\"] [--json]\n"
+         "        ameesh decide repair-forward <id> [--json]\n"
          "        ameesh decide show <id> [--json]")
 
 
@@ -1370,7 +1419,9 @@ def cmd_ask(cfg: Config, argv: list[str]) -> int:
     parser.add_argument("--urgent", action="store_true")
     parser.add_argument("--by", default=None,
                         help="deadline: 30m, 2h, 1d, 18:00 or \"2026-10-12 09:00\" "
-                             "(default: in %d h)" % (DEFAULT_DUE_S // 3600))
+                             "(default: one business day in recipient timezone)")
+    parser.add_argument("--domain", default="decision", help="configured validation authority domain")
+    parser.add_argument("--issue", action="append", default=[], help="related issue URL (repeatable)")
     parser.add_argument("--needs-signature", action="store_true",
                         help="production or irreversible action: signed answer required")
     parser.add_argument("--json", action="store_true")
@@ -1391,7 +1442,7 @@ def cmd_ask(cfg: Config, argv: list[str]) -> int:
                    options=args.option, lot=args.lot, new_lot=args.new_lot,
                    recommend=args.recommend, why=args.why, urgent=args.urgent, due_ts=due,
                    needs_signature=args.needs_signature, source_mail=args.from_mail,
-                   parent_lot=args.parent_lot)
+                   parent_lot=args.parent_lot, domain=args.domain, issue_links=args.issue)
     finally:
         db.close()
     if args.json:
@@ -1406,7 +1457,7 @@ def cmd_ask(cfg: Config, argv: list[str]) -> int:
         if view["owner_source"] else "",
         view["lot"], view.get("lot_title") or "", view.get("lot_state")))
     print("deadline %s%s%s; the owner is notified, and reminded at the deadline." % (
-        _local(view["due_ts"]), " · URGENT" if view["urgent"] else "",
+        (view.get("validation") or {}).get("due_local") or _local(view["due_ts"]), " · URGENT" if view["urgent"] else "",
         " · SIGNED answer required" if view["needs_signature"] else ""))
     print("The answer will be delivered to you by mail (it wakes you up): do not wait in "
           "a loop, end your turn. Withdraw the request: ameesh decide withdraw %d"
@@ -1445,6 +1496,17 @@ def cmd_answer(cfg: Config, argv: list[str]) -> int:
         db.close()
     if args.json:
         _dump(result)
+        return 0
+    if result.get("followup"):
+        print("late response recorded; decision #%d remains unchanged; "
+              "new decision #%d (contradicts)" % (decision_id, result["followup"]))
+        return 0
+    if result.get("followup_pending"):
+        print("late response recorded; decision #%d remains unchanged; "
+              "contradictory follow-up pending" % decision_id)
+        return 0
+    if result.get("late_recorded"):
+        print("late response recorded; decision #%d remains unchanged" % decision_id)
         return 0
     view, answer_ = result["decision"], result["decision"]["answer"]
     replayed = bool(result.get("replayed"))
@@ -1504,6 +1566,30 @@ def cmd_withdraw(cfg: Config, argv: list[str]) -> int:
     return 0
 
 
+def cmd_repair_forward(cfg: Config, argv: list[str]) -> int:
+    parser = _parser("ameesh decide repair-forward")
+    parser.add_argument("id", type=int)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    db = _open(cfg)
+    try:
+        binding = identity.resolve_binding(cfg, db)
+        if not binding.ok:
+            raise DecisionError("repair-forward requires an agent identity")
+        try:
+            result = storage.of(db).decisions.repair_forward(args.id, actor=binding.name)
+        except ValueError as exc:
+            raise DecisionError(str(exc)) from None
+    finally:
+        db.close()
+    if args.json:
+        _dump(result)
+    else:
+        print("decision #%d restored to pending; copy #%d withdrawn" %
+              (result["decision"], result["withdrawn_copy"]))
+    return 0
+
+
 def cmd_show(cfg: Config, argv: list[str]) -> int:
     parser = _parser("ameesh decide show")
     parser.add_argument("id")
@@ -1545,10 +1631,14 @@ def main(argv: list[str] | None = None) -> int:
     command, rest = argv[0], argv[1:]
     cfg = config_mod.load()
     try:
+        if command == "validation-history":
+            return validations.main(cfg, rest)
         if command == "ask":
             return cmd_ask(cfg, rest)
         if command == "withdraw":
             return cmd_withdraw(cfg, rest)
+        if command == "repair-forward":
+            return cmd_repair_forward(cfg, rest)
         if command == "show":
             return cmd_show(cfg, rest)
         if _decision_id(command) is not None:
