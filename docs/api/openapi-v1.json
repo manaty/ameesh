@@ -450,7 +450,8 @@
               "alert.raised",
               "alert.resolved",
               "pilot.gesture",
-              "staging.attested"
+              "staging.attested",
+              "packet.pause"
             ]
           }
         },
