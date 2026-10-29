@@ -96,6 +96,14 @@ posée d'abord, si bien qu'un tic du détenteur courant reprend une recompositio
 perdue à la relève du bail comme les siennes. Elle ne compte pas dans le
 retrait automatique unique du point 4.
 
+Comme le retrait automatique, elle est **bornée par `--keep-composition`**
+(`this.base`, la tête gelée du paquet rouge) : elle reprend les membres de la
+composition précédente moins les exclus, chacun à sa source composée ; un lot
+prêt entre-temps, un membre regelé ou sorti de la liste prête va à la coupure
+suivante, nommé aux écartés. La **preuve parallèle** (#4319, `parallel-proof`),
+qui rejoue la ci-full ordinaire sur le même porteur, passe par le même chemin
+et la même borne.
+
 #3256 C : quand la médiane d'attente `qa_merge` de la veille dépasse
 `paquet.attente_mediane_s` (bloc du canon compilé, lu avec `ameesh debit
 --json --no-jobs`), le tic ouvre **deux** porteurs dans la même heure. Les
