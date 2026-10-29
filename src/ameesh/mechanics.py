@@ -49,6 +49,12 @@ mécanique, ce que l'outillage exécute sans agent :
   reset au-delà de laquelle `ameesh accounts` relève lui-même le rythme d'une
   fenêtre (bloc optionnel ; absent : `None`, le réglage local de l'hôte reste
   appliqué et signalé).
+- `session.max_tokens` et `session.max_tokens_by_harness` (#4448, bloc
+  optionnel) : le seuil de rotation de session (jetons cumulés de la session,
+  L11/0018) — la valeur commune, puis la surcharge de chaque harnais
+  (`claude`, `codex`, `deepseek`, une famille déclarée). Bloc absent : la
+  valeur locale de l'exécuteur (`AMEESH_SESSION_MAX_TOKENS`), jamais un seuil
+  supposé ; un harnais sans surcharge prend la valeur commune.
 
 Les classes sensibles et le nombre d'avis par chemin ne sont pas répétés : ils
 viennent de `federation.yaml` (`review_policies.risk_classes` et
@@ -98,7 +104,7 @@ _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
                   "merge", "prevalidation", "backlog", "staging", "accounts",
-                  "paquet", "packet_tests", "file", "projects")
+                  "paquet", "packet_tests", "file", "session", "projects")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production")
 _PRODUCTION_KEYS = ("branch",)
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
@@ -126,6 +132,8 @@ _PAQUET_KEYS = ("attente_mediane_s", "max_paquets")
 _PACKET_TESTS_KEYS = ("unit_timeout_seconds", "parallel")
 #: #3256 A : clés du bloc optionnel `file` (déclencheur du lot de découpage)
 _FILE_KEYS = ("repos_part", "repos_s")
+#: #4448 : clés du bloc optionnel `session` (rotation par harnais)
+_SESSION_KEYS = ("max_tokens", "max_tokens_by_harness")
 #: bornes du score de valeur d'un élément de backlog (`backlog.add`)
 _VALUE_SCORE = (1, 100)
 
@@ -229,6 +237,33 @@ class PacketTests:
 
 
 @dataclass(frozen=True)
+class Session:
+    """#4448 : le seuil de rotation de session, par harnais (canon §7).
+
+    `max_tokens` est la valeur commune (jetons cumulés de la session) ;
+    `by_harness` la surcharge d'un harnais déclaré, `()` si aucune. Un harnais
+    absent de la table prend la valeur commune — jamais un seuil local
+    implicite quand le bloc est là."""
+
+    max_tokens: int
+    by_harness: tuple[tuple[str, int], ...] = ()
+
+    def max_tokens_for(self, harness: str) -> float:
+        """Le seuil du harnais, sinon la valeur commune du bloc."""
+        for name, value in self.by_harness:
+            if name == harness:
+                return float(value)
+        return float(self.max_tokens)
+
+    def to_dict(self) -> dict:
+        out: dict = {"max_tokens": self.max_tokens}
+        if self.by_harness:
+            out["max_tokens_by_harness"] = {
+                name: value for name, value in self.by_harness}
+        return out
+
+
+@dataclass(frozen=True)
 class AccountsPace:
     """#3647 : le rythme des comptes de forfait, compilé du canon (§11).
 
@@ -307,12 +342,25 @@ class Document:
     packet_tests: PacketTests | None = None
     #: #3256 A : déclencheur du lot de découpage ; None = bloc absent
     queue_fill: QueueFill | None = None
+    #: #4448 : seuil de rotation de session par harnais ; None = bloc absent
+    session: Session | None = None
 
     def override(self, project: str) -> ProjectOverride | None:
         for item in self.overrides:
             if item.name == project:
                 return item
         return None
+
+    def session_max_tokens(self, harness: str, fallback: float) -> float:
+        """#4448 : le seuil de rotation du harnais, lu du bloc `session`.
+
+        Bloc absent : la valeur commune de l'exécuteur (`fallback`), jamais une
+        valeur supposée. Bloc présent : la surcharge du harnais, sinon la
+        valeur commune déclarée au canon.
+        """
+        if self.session is None:
+            return float(fallback)
+        return self.session.max_tokens_for(harness)
 
     def production_branch(self, project: str) -> str:
         """#3022 : la branche de prod déclarée du projet, sinon refuse.
@@ -361,6 +409,9 @@ class Document:
             payload["packet_tests"] = self.packet_tests.to_dict()
         if self.queue_fill is not None:
             payload["file"] = self.queue_fill.to_dict()
+        if self.session is not None:
+            # absent, la clé n'existe pas : un document sans bloc compile à l'identique
+            payload["session"] = self.session.to_dict()
         return payload
 
 
@@ -413,6 +464,8 @@ class Mechanics:
     staging: Staging | None = None
     #: #3256 C : paquets en parallèle ; None = bloc absent
     paquet: PaquetParallel | None = None
+    #: #4448 : seuil de rotation de session par harnais ; None = bloc absent
+    session: Session | None = None
 
     # -- coupures -----------------------------------------------------------
 
@@ -880,6 +933,31 @@ def _packet_tests(value, where: str) -> PacketTests:
                          for key in _PACKET_TESTS_KEYS))
 
 
+def _session(value, where: str, families: tuple[str, ...]) -> Session:
+    """#4448 : le bloc `session` (seuil de rotation par harnais).
+
+    `max_tokens` est requis et strictement positif ; `max_tokens_by_harness`
+    optionnel, chaque clé étant une famille de harnais déclarée par
+    `reviews.families` (une faute de frappe refuse, elle ne crée pas un
+    harnais silencieux), chaque valeur un entier strictement positif.
+    """
+    data = _mapping(value, where, _SESSION_KEYS)
+    common = _positive_int(data.get("max_tokens"), where + ".max_tokens")
+    table = data.get("max_tokens_by_harness", {})
+    if not isinstance(table, dict):
+        raise MechanicsError("%s.max_tokens_by_harness: a mapping is required" % where)
+    items: list[tuple[str, int]] = []
+    for harness, tokens in table.items():
+        name = _name(harness, where + ".max_tokens_by_harness")
+        if name not in families:
+            raise MechanicsError(
+                "%s.max_tokens_by_harness.%s: not a declared harness family (%s)"
+                % (where, name, ", ".join(families)))
+        items.append((name, _positive_int(
+            tokens, "%s.max_tokens_by_harness.%s" % (where, name))))
+    return Session(max_tokens=common, by_harness=tuple(sorted(items)))
+
+
 def _name(value, where: str) -> str:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise MechanicsError("%s: a non-empty name is required" % where)
@@ -973,6 +1051,7 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
     # inactive ; présent, il est validé strictement.
     lot_min_value = (_backlog(parsed["backlog"], source + ".backlog")
                      if "backlog" in parsed else None)
+    families = _families(reviews.get("families"), source + ".reviews.families")
     return Document(
         schema=schema,
         timezone=_timezone(parsed.get("timezone"), source + ".timezone"),
@@ -983,7 +1062,7 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
         ci_incident_label=label,
         ci_environment_red=environment,
         ci_faulty_lot=faulty,
-        families=_families(reviews.get("families"), source + ".reviews.families"),
+        families=families,
         exclude_author_family=_boolean(reviews.get("exclude_author_family"),
                                        source + ".reviews.exclude_author_family"),
         distinct_families=_boolean(reviews.get("distinct_families"),
@@ -1008,6 +1087,8 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                       if "packet_tests" in parsed else None),
         queue_fill=(_queue_fill(parsed["file"], source + ".file")
                     if "file" in parsed else None),
+        session=(_session(parsed["session"], source + ".session", families)
+                 if "session" in parsed else None),
     )
 
 
@@ -1112,6 +1193,22 @@ def configured(cfg) -> Document:
     if key not in _CONFIGURED:
         _CONFIGURED[key] = load_global(source.repo, source.commit)
     return _CONFIGURED[key]
+
+
+def session_max_tokens(cfg, harness: str, fallback: float) -> float:
+    """#4448 : le seuil de rotation du harnais, lu du canon appliqué.
+
+    Le bloc `session` fait foi (surcharge du harnais, sinon sa valeur commune).
+    Un canon absent ou illisible, ou un document sans bloc, laisse la valeur
+    locale `fallback` — le seuil commun de l'exécuteur
+    (`AMEESH_SESSION_MAX_TOKENS`) : c'est le seul repli permis, et il ne
+    fournit jamais une valeur propre à un harnais.
+    """
+    try:
+        document = configured(cfg)
+    except Exception:  # noqa: BLE001 — canon absent/illisible : repli local, jamais fatal
+        return float(fallback)
+    return document.session_max_tokens(harness, fallback)
 
 
 @functools.lru_cache(maxsize=256)
@@ -1304,4 +1401,5 @@ def load(repo: str, commit: str, project: str, *,
         backlog_lot_min_value=document.backlog_lot_min_value,
         staging=document.staging,
         paquet=document.paquet,
+        session=document.session,
     )

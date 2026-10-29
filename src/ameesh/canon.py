@@ -995,6 +995,10 @@ class HostPolicy:
     #: memory_max, disk_max, …}` validated by `ameesh.capacity_guard.parse_lend`
     #: (sizes in bytes); None = the host lends nothing (absent or unreadable).
     lend: dict | None = None
+    #: #4148 (B of #3167): external adapter of the host lifecycle. ameesh runs
+    #: `<command> busy|draining|idle-drained <host>` and never touches the
+    #: cluster or the cloud itself. None = no adapter, so no automatic release.
+    lifecycle_hook: str | None = None
 
     def work_dir(self, project: str | None, agent: str | None = None) -> str | None:
         """Dossier de travail d'un agent (et de son projet) sur cet hôte, ou None.
@@ -3752,6 +3756,18 @@ class _Loader:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.lease_ttl` : nombre de secondes entre 10 et 3600 "
                              "attendu", **where, **subject)
+            # #4148: the adapter command of the host lifecycle. A malformed
+            # value is an error but no command: an unreadable string must not
+            # become a hook that ameesh executes.
+            if raw.get("lifecycle_hook") is not None:
+                value = raw["lifecycle_hook"]
+                if (isinstance(value, str) and value.strip()
+                        and "\x00" not in value and len(value.strip()) <= 1000):
+                    policy.lifecycle_hook = value.strip()
+                else:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.lifecycle_hook`: a non-empty command line expected",
+                             **where, **subject)
             # Seuils de ressources (L31, 0028) : un mapping dont chaque clé est
             # validée ici ; une clé illisible est une erreur (fail closed sur le
             # seuil, qui retombe alors sur sa valeur par défaut prudente).

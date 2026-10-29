@@ -50,6 +50,8 @@ adoption automatique d'une nouvelle révision n'existe ici.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import json
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -58,10 +60,17 @@ SUPPORTED_SCHEMA = "process-workflow/1"
 
 #: Cœurs natifs qu'une étape Process peut projeter. `blocked` et
 #: `waiting_human` n'en sont pas : ce sont des retenues qui gardent l'étape.
-CORE_STATES = ("intake", "build", "qa", "merged", "promoted", "closed")
+CORE_STATES = (
+    lifecycle.REQUESTED,
+    lifecycle.IN_PROGRESS,
+    lifecycle.QA,
+    lifecycle.DELIVERY_RECORDED,
+    lifecycle.PROMOTED,
+    lifecycle.CLOSED,
+)
 
 #: Cœurs terminaux et leur issue : un cœur terminal ne se rouvre jamais.
-TERMINAL_CORES = {"promoted": "completed", "closed": "not_planned"}
+TERMINAL_CORES = {lifecycle.PROMOTED: "completed", lifecycle.CLOSED: "not_planned"}
 
 #: Registre fini des vérificateurs du contrat consommateur (#1379). Le
 #: compilateur ne les exécute pas : il refuse une garde hors de ce registre.

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import shutil
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -11,8 +13,14 @@ from ameesh.runner import AgentWorker
 
 
 class RotationLatencyTest(unittest.TestCase):
+    def setUp(self):
+        self.state_dir = tempfile.mkdtemp(prefix="test-706-")
+        self.addCleanup(shutil.rmtree, self.state_dir, ignore_errors=True)
+
     def worker(self, *, latency=900.0, cap=1800.0, agent_cap=None):
-        # rotation_due ne lit que l'état en mémoire, pas le registre.
+        # rotation_due lit l'état en mémoire et le fichier local du harnais
+        # (`turn_harness`, #4448), pas le registre : la doublure fournit donc
+        # un dossier d'état vide.
         worker = AgentWorker.__new__(AgentWorker)
         worker.cfg = dataclasses.replace(Config(), session_max_turn_seconds=latency,
                                          turn_max_seconds=cap)
@@ -20,6 +28,7 @@ class RotationLatencyTest(unittest.TestCase):
         worker.runner = SimpleNamespace(session_min_turns=3, session_max_tokens=150_000,
                                         session_max_turn_seconds=latency)
         worker.proc = None
+        worker.state_dir = self.state_dir
         worker.session_turns = 3
         worker.session_tokens = 0
         worker.last_turn_seconds = 0

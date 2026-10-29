@@ -77,6 +77,7 @@ import threading
 import time
 import uuid
 
+from . import alerts_delegation_pg
 from . import config as config_mod
 from . import db as db_mod
 
@@ -121,6 +122,7 @@ _SCHEMA = "ameesh-role-run/1"
 _READ_SQL = """
     SELECT name, host, releve, candidats, status, responsible,
            lease_owner, lease_epoch,
+           extract(epoch from lease_since)::float8    AS lease_since_ts,
            extract(epoch from lease_expires_at)::float8 AS lease_expires_ts,
            extract(epoch from clock_timestamp())::float8  AS now_ts
       FROM agent_registry
@@ -457,6 +459,7 @@ def _report(row: dict, *, epoch: int | None = None) -> dict:
         "holder": row.get("host") if held else None,
         "owner": row.get("lease_owner"),
         "epoch": row.get("lease_epoch"),
+        "lease_since_ts": row.get("lease_since_ts"),
         "expires_ts": expires,
         "left_s": None if left is None else round(left, 3),
         "stopped": stopped,
@@ -575,7 +578,9 @@ def _alerts_delegation(db, report: dict, *, host: str) -> dict:
     from . import election
     role = {"name": report.get("role"), "releve": report.get("releve"),
             "candidats": list(report.get("candidates") or ()),
-            "responsible": report.get("responsible")}
+            "responsible": report.get("responsible"),
+            # #4468: the holder's current tenure bounds its no-beat grace.
+            "lease_since_ts": report.get("lease_since_ts")}
     decision = election.alerts_delegate(db, role, holder=report.get("holder"))
     decision["this_host"] = host
     return decision
@@ -725,6 +730,20 @@ def run(cfg, args) -> int:
                           "passed before the child started", file=sys.stderr)
                     return 1
                 report["delegated"] = delegated
+                # #4468: remember this handover under the execution lease we
+                # just took. The memory bounds a delegate whose pass never
+                # beats: after its grace the pass moves to another candidate
+                # instead of staying on the newest dead beat. A failure here
+                # never prevents the pass from running.
+                try:
+                    remembered = alerts_delegation_pg.entrust(
+                        db, report["role"], host, lock_key=lease.key,
+                        owner=lease.owner, epoch=lease.epoch)
+                except Exception as exc:  # noqa: BLE001 - never blocks the pass
+                    remembered = False
+                    print("ameesh role run: alerts delegation memory not "
+                          "written: %s" % exc, file=sys.stderr)
+                report["delegation_recorded"] = bool(remembered)
             env = os.environ.copy()
             # The command is not an agent turn: never inherit the shell's turn,
             # identity or a foreign tenure. Its explicit actor is the ROLE, under

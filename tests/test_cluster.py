@@ -101,6 +101,9 @@ CONTENUS = {
     "host_handoffs": {"plan", "evidence"},
     "host_handoff_events": {"detail"},
     "host_lifecycle_agents": {"missing"},
+    # #4148 : sortie du crochet de libération et journal des transitions
+    "host_lifecycle": {"release_error"},
+    "host_lifecycle_transitions": {"detail"},
 }
 #: colonnes refusées au rôle de base. Une colonne nouvelle, ni accordée ni
 #: listée ici, fait échouer le test : une migration oblige à trancher.
@@ -210,6 +213,10 @@ FERMEES = {
     # détenteur, relue par l'exécuteur au redémarrage ; état interne fermé aux
     # deux rôles superviseur, aucun GRANT modifié.
     "role_handover": {"host", "name", "challenger", "released_until", "updated_at"},
+    # #4468 (0514) : mémoire de la remise de la passe alerts (hôte, instant),
+    # écrite par le garde sous le bail d'exécution et lue par l'élection ;
+    # état interne fermé aux deux rôles superviseur, aucun GRANT modifié.
+    "alerts_delegations": {"role", "host", "entrusted_at"},
     # #3007 (0474) : battement partagé du notificateur et réclamation des
     # briefs par (destinataire, humain). État interne lu par l'exécuteur, les
     # alertes et les décisions, pas par le rôle superviseur ; tables fermées
@@ -242,6 +249,12 @@ FERMEES = {
     # rôle superviseur ; fermé aux deux rôles, aucun GRANT modifié.
     "veille_readings": {"harness", "provider", "model_id", "first_seen",
                         "last_seen"},
+    # #4293 : état interne d'une adoption de version (rapport de rejeu, séquence
+    # canari/bascule, valeurs inverses), tenu et lu par `ameesh harness adopt`, pas par
+    # le rôle superviseur ; fermé aux deux rôles, aucun GRANT modifié.
+    "harness_adoptions": {"lot_id", "project", "harness", "object",
+                          "from_version", "to_version", "stage", "report",
+                          "report_digest", "state", "created_at", "updated_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

@@ -768,10 +768,15 @@ class OrphanGuardsTest(unittest.TestCase):
                     # #2174: the pass reads every tracked worktree, uncapped
                     self.assertIsNone(store.housekeeping.worktrees.call_args.kwargs["limit"])
                     # #2174: another agent's ENDED lot follows the orphan
-                    # rule; its open, unknown or unreadable lot proves nothing
+                    # rule; its open, unknown or unreadable lot proves nothing.
+                    # #4442: a foreign copy whose content is already on main
+                    # (`integrated`, even with a local HEAD not pushed) is no
+                    # longer pinned by the early foreign guard — the direct
+                    # removal applies like for an own copy.
                     self.assertEqual(plan[0]["action"] == "retrait",
                                      label in ("orphan", "own-closed", "other-closed",
-                                               "other-closed-candidates", "other-merged-kept"), plan)
+                                               "other-closed-candidates", "other-merged-kept",
+                                               "other-unpushed-equivalent"), plan)
                     if recent:
                         outcome, freed, reason, built = menage._remove_kept_worktree(
                             path, root, "", artifacts=None, allow=(),
@@ -809,8 +814,10 @@ class MergedKeptTest(_Repo):
                 "repo": menage.common_dir(self.main),
                 "status": "kept", "created_ts": time.time() - 3 * DAY,
                 "checked_ts": time.time() - checked_ago,
+                # #4442: the stored reason is the NORMALIZED one (no SHA, no
+                # file count), so the 24 h grace matches after a volatile change
                 "detail": detail if detail is not None else
-                "lot #%s merged: kept — %s" % (lot, st["reason"])}
+                menage.kept_detail("lot #%s merged" % lot, st)}
 
     def run_pass(self, rows, lots, *, dry_run=False, allow=()):
         store = _Store(rows, lots)

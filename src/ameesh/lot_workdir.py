@@ -91,27 +91,11 @@ def problem(cfg, agent, lot_project, *, canons=None) -> str | None:
 def mail_hold(cfg, db, agent, lot, *, canons=None) -> bool:
     """Le courrier de ce lot attend-il son dossier ? (#811 B1)
 
-    Règle PARTAGÉE entre l'exécuteur et le hook de harnais : un message dont
-    l'unique lot vise un projet DÉCLARÉ autre que le primaire, dont le dossier
-    n'est pas utilisable, ne se remet pas dans la session d'un autre lot — le
-    hook le marquerait livré et l'exécuteur ne le verrait jamais pour ce lot.
-    Faux pour le projet primaire, un projet non déclaré, un lot inconnu ou un
-    dossier prêt : ces messages suivent le flux normal. Un canon illisible ne
-    retient rien (flux normal), comme `problem` le fait pour son propre repli."""
-    names = projects.agent_projects(agent)
-    if len(names) < 2:                # mono-projet : pas de dossier secondaire
-        return False
-    try:
-        lot_project = project(db, lot)
-    except (WorkdirError, canon.CanonError):
-        return False                  # lot inconnu : flux normal
-    if not lot_project or lot_project == names[0]:
-        return False                  # projet primaire : flux normal
-    try:
-        canons = canon.load_configured(cfg) if canons is None else canons
-    except canon.CanonError:
-        return False
-    return bool(problem(cfg, agent, lot_project, canons=canons))
+    Compatibilité : la règle PARTAGÉE entre l'exécuteur et le hook de harnais
+    vit dans `workspaces.mail_hold` depuis L101 T3. L'import est local pour
+    éviter le cycle (la façade lit ce module)."""
+    from . import workspaces
+    return workspaces.mail_hold(cfg, db, agent, lot, canons=canons)
 
 
 def deliverable(cfg, db, agent, rows, *, deferred=None, canons=None) -> list[dict]:

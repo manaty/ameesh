@@ -20,6 +20,8 @@ garanties, inchangées :
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import json
 import re
 from typing import Any, Sequence
@@ -34,6 +36,8 @@ LINEAGE_MAX = 32
 
 AGENT_COLUMNS = """
     name, aliases, chantier, harness, host, cwd, session_id, status, status_text, model,
+    -- #4293 : binaire du harnais pour cet agent (canari/bascule d'adoption)
+    harness_bin,
     budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
     -- L165 (EP3) : brief de reprise d'une relève élue, lu une fois par le
     -- nouveau détenteur (contenu libre, jamais lisible par le superviseur)
@@ -41,6 +45,7 @@ AGENT_COLUMNS = """
     lease_owner, lease_epoch, runner_seen_host, runner_seen_owner,
     extract(epoch from runner_seen_at)::float8 as runner_seen_ts,
     extract(epoch from lease_wait_since)::float8 as lease_wait_since_ts,
+    extract(epoch from lease_since)::float8 as lease_since_ts,
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
     extract(epoch from created_at)::float8        as created_ts,
@@ -374,7 +379,7 @@ class Agents(interface.Agents):
                              # `promoted`) garde son assigné mais ne retient pas
                              "SELECT id, state FROM work_items"
                              " WHERE assignee = %s"
-                             "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                             f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                              " ORDER BY id",
                              (agent,))]
             blockers += [{"kind": "external_executor", "id": int(lot["id"]),
@@ -382,7 +387,7 @@ class Agents(interface.Agents):
                          for lot in tx.query(
                              "SELECT id, state FROM work_items"
                              " WHERE external_executor = %s"
-                             "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                             f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                              " ORDER BY id", (agent,))]
             blockers += [{"kind": "watch", "host": watch["host"]}
                          for watch in tx.query(
@@ -539,7 +544,11 @@ class Agents(interface.Agents):
                    (SELECT extract(epoch from r.retired_at)::float8 FROM agent_registry r
                      WHERE r.name=o.name) AS retired_ts,
                    chantier, harness, host, cwd, session_id, status, status_text,
-                   model, budget_usd, spent_usd, turns, pending_prompt, last_error,
+                   model,
+                   -- #4293 : colonne absente de la vue figée ; lue sur la ligne
+                   (SELECT r.harness_bin FROM agent_registry r
+                     WHERE r.name = o.name) AS harness_bin,
+                   budget_usd, spent_usd, turns, pending_prompt, last_error,
                    -- #3337 : un message déposé est un signe de vie distinct de
                    -- `last_seen` (hook/exécuteur). L'index (sender, id desc)
                    -- rend la lecture ponctuelle ; une identité `externe` écrit

@@ -57,6 +57,8 @@ lots stays with the auditor (`work estimates --publish`).
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import calendar
 import json
 import os
@@ -72,9 +74,9 @@ PHASES = ("agent", "ci", "review", "human")
 PRIORITY = ("human", "review", "ci", "agent")
 #: states counted as human time, and as review time
 HUMAN_STATES = ("waiting_human",)
-REVIEW_STATES = ("qa",)
+REVIEW_STATES = (lifecycle.QA,)
 #: the state that ends a review window (the agent works again)
-WORK_STATES = ("build",)
+WORK_STATES = (lifecycle.IN_PROGRESS,)
 #: size classes on changed lines (insertions + deletions)
 SIZE_S_MAX = 100
 SIZE_M_MAX = 500

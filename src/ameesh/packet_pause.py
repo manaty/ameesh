@@ -106,3 +106,80 @@ def describe(data: dict, zone=None) -> str:
     when = datetime.fromtimestamp(float(data["until"]), zone or timezone.utc)
     return "en pause jusqu'à %s (%s, par %s)" % (
         when.strftime("%Y-%m-%d %H:%M %Z"), data.get("reason") or "?", data.get("by") or "?")
+
+
+#: #4444: a read of the recent pauses keeps a bounded number of events
+WINDOWS_LIMIT = 200
+
+
+def windows(db, *, project: str) -> list[dict]:
+    """#4444: the recent pause windows of `project`, every target, oldest first.
+
+    Each window is ``{"start", "end", "until", "reason", "by", "target"}``:
+    it opens at the `paused` event and ends at its deadline, or earlier at the
+    next event of the same object (`resumed`, or a renewed pause that opens
+    its own window). The SLO reads them to stop the GO → merge clock while
+    no composition runs (`suspended_start`).
+    An event without a date opens no window.
+    """
+    prefix = key(project, "")
+    rows = [row for row in _events(db).recent_type(EVENT, LOOKBACK_DAYS, WINDOWS_LIMIT) or ()
+            if isinstance(row, dict) and str(row.get("object") or "").startswith(prefix)]
+    rows.sort(key=lambda row: (float(row.get("ts") or 0.0), int(row.get("id") or 0)))
+    out: list[dict] = []
+    open_: dict = {}
+    for row in rows:
+        data = row.get("data") if isinstance(row.get("data"), dict) else {}
+        obj = row["object"]
+        try:
+            ts = float(row["ts"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        current = open_.pop(obj, None)
+        if current is not None and ts < current["end"]:
+            current["end"] = ts
+        if data.get("state") != "paused":
+            continue
+        try:
+            until = float(data.get("until"))
+        except (TypeError, ValueError):
+            continue
+        if until <= ts:
+            continue
+        window = {"start": ts, "end": until, "until": int(until),
+                  "reason": data.get("reason") or "", "by": data.get("by") or "",
+                  "target": data.get("target") or obj[len(prefix):]}
+        open_[obj] = window
+        out.append(window)
+    return out
+
+
+def suspended_start(start: float, pauses, next_slot, now: float
+                    ) -> tuple[float, dict | None]:
+    """#4444: the equivalent start of a merge wait running from `start`.
+
+    A packet pause stops the clock, whenever it began (before the slot, or
+    while the lot was already waiting for one): no composition runs during
+    it, and the first one after it is `next_slot(end)` (`end` itself when
+    `next_slot` gives nothing). Time accrued before the pause stays accrued.
+    While a pause runs at `now`, the wait is planned: the equivalent start is
+    `now` (nothing elapsed). Returns that start, such that `now - start` is
+    the time counted, and the last pause crossed (None when none was).
+    """
+    now = float(now)
+    cursor = float(start)
+    accrued = 0.0
+    crossed = None
+    for window in sorted(pauses, key=lambda w: w["start"]):
+        if window["end"] <= cursor or window["start"] >= now or cursor >= now:
+            continue
+        crossed = window
+        if window["end"] > now:
+            return now, window
+        accrued += max(0.0, window["start"] - cursor)
+        after = next_slot(window["end"])
+        cursor = max(cursor, float(after) if after is not None else float(window["end"]))
+    if crossed is None:
+        return float(start), None
+    accrued += max(0.0, now - cursor)
+    return now - accrued, crossed

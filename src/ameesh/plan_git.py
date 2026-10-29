@@ -1641,11 +1641,12 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                     mark_lifted(entry, retention)
                 entry["result"] = "would-merge"
             else:
-                done = work_mod.close_merged(
-                    db, lot, sha=entry["ref"] or "", actor="composition:%s"
-                    % member["package_id"],
-                    source="package composition #%s (%s)"
-                    % (member["package_id"], member.get("package_branch") or "?"),
+                done = work_mod.deliver(
+                    db, lot, connector=work_mod.merge_connector(),
+                    evidence={"seen": "package composition #%s (%s)"
+                              % (member["package_id"], member.get("package_branch") or "?"),
+                              "sha": entry["ref"] or ""},
+                    actor="composition:%s" % member["package_id"],
                     frozen_id=int(freeze["id"]) if freeze else None,
                     # #2444 : aucun gel déclaré examiné (gel d'origine verdict) ;
                     # un gel apparu entre-temps refuse la fermeture.
@@ -1740,9 +1741,10 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                 mark_lifted(entry, retention)
             entry["result"] = "would-merge"
         else:
-            done = work_mod.close_merged(
-                db, lot, sha=entry["ref"] or "", actor="git:%s" % found_target,
-                source="content (%s)" % entry["how"], frozen_id=frozen_id,
+            done = work_mod.deliver(
+                db, lot, connector=work_mod.merge_connector(),
+                evidence={"seen": "content (%s)" % entry["how"], "sha": entry["ref"] or ""},
+                actor="git:%s" % found_target, frozen_id=frozen_id,
                 unfrozen=frozen_id is None,   # #2444 : un gel apparu entre-temps refuse
                 repo=repo_dir,          # L539 : dépôt du relevé, indice de classe
                 content_guard=content_retention)   # #2744 : verrou commun avec le hold
@@ -3768,9 +3770,10 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             source = ("%s — merged into %s, off the default target %s: declare "
                       "`git config %s %s` to make it explicit"
                       % (source, target, primary, TARGET_GIT_KEY, target))
-        done = work_mod.close_merged(
-            db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target,
-            source=source, frozen_id=found.get("frozen_id"),
+        done = work_mod.deliver(
+            db, lot, connector=work_mod.merge_connector(),
+            evidence={"seen": source, "sha": found["ref"] or ""},
+            actor=actor or "git:%s" % target, frozen_id=found.get("frozen_id"),
             repo=repo,                          # L539 : dépôt du relevé, indice de classe
             content_guard=content_retention)    # #2744 : verrou commun avec le hold
         entry["result"] = done["result"]

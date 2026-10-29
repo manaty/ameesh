@@ -61,6 +61,8 @@ publication et le passage d'un même porteur se sérialisent sous le bail
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import json
 import os
 import re
@@ -88,7 +90,14 @@ PARALLEL_CONFLICT = "parallel-second conflict "
 #: bail `auto-merge` (300 s) pour qu'un passage ne le laisse pas expirer.
 PARALLEL_FREEZE_TIMEOUT = 120.0
 #: états d'un porteur que `watch` relit
-OPEN_STATES = ("intake", "build", "qa", "validated", "blocked", "waiting_human")
+OPEN_STATES = (
+    lifecycle.REQUESTED,
+    lifecycle.IN_PROGRESS,
+    lifecycle.QA,
+    lifecycle.VALIDATED,
+    lifecycle.BLOCKED,
+    lifecycle.WAITING_HUMAN,
+)
 #: durée du bail `auto-merge:<lot>` qui sérialise la publication et le passage ;
 #: il est renouvelé avant chaque geste (B4 : plusieurs appels `gh` de 60 à 120 s)
 LOCK_TTL_S = 300.0

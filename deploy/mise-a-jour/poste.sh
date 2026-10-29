@@ -141,6 +141,10 @@ ancienne() { [ -f "$CONFIG_RESTE" ]; }
 ameesh_ancienne() { AMEESH_CONFIG="$CONFIG_RESTE" "$AMEESH" "$@"; }
 
 # exécuteurs du poste sur la base du mesh : ameesh-runner-agent@<p>, actifs
+# #4437 : c'est le périmètre commun de `redemarrer` (redemarrer_liste) et de
+# `controler` (controler_executeurs). Le registre ne décide que du statut :
+# une persona arrêtée n'est pas réactivée, mais son unité encore active est
+# rechargée (#1633) puis contrôlée sur le venv, comme toute unité active.
 unites_mesh() {
   systemctl --user list-units 'ameesh-runner-agent@*.service' --state=active \
     --plain --no-legend | awk '{print $1}'

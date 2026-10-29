@@ -32,6 +32,8 @@ Le SQL est dans le stockage (`storage.of(db).work`, spec §10).
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import os
 import re
 import time
@@ -74,32 +76,59 @@ MANUAL_REVIEW_START_RE = re.compile(r"^\s*R[12]\b", re.IGNORECASE)
 MANUAL_REVIEW_TITLE_RE = re.compile(r"^\s*R[12]\b[^:—–#]*#\s*(\d+)\b", re.IGNORECASE)
 MAX_QA_LOOPS = 2
 FORWARD = {
-    "intake": ("build",),
-    "build": ("qa",),
-    "qa": ("validated", "merged", "build"),
-    "validated": ("merged", "build"),
-    "merged": ("promoted",),
-    "promoted": (),
-    "closed": (),
+    lifecycle.REQUESTED: (lifecycle.IN_PROGRESS,),
+    lifecycle.IN_PROGRESS: (lifecycle.QA,),
+    lifecycle.QA: (lifecycle.VALIDATED, lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
+    lifecycle.VALIDATED: (lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
+    lifecycle.DELIVERY_RECORDED: (lifecycle.PROMOTED,),
+    lifecycle.PROMOTED: (),
+    lifecycle.CLOSED: (),
 }
 
 #: transitions autorisées, attentes comprises
 TRANSITIONS = {
-    "intake": {"build", "blocked", "waiting_human"},
-    "build": {"qa", "blocked", "waiting_human"},
-    "qa": {"validated", "merged", "build", "blocked", "waiting_human"},
-    "validated": {"qa", "merged", "build", "blocked", "waiting_human"},
-    "merged": {"promoted", "blocked", "waiting_human"},
-    "promoted": set(),
-    "closed": set(),
-    "blocked": {"intake", "build", "qa", "merged", "waiting_human"},
-    "waiting_human": {"intake", "build", "qa", "merged", "blocked"},
+    lifecycle.REQUESTED: {lifecycle.IN_PROGRESS, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
+    lifecycle.IN_PROGRESS: {lifecycle.QA, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
+    lifecycle.QA: {
+        lifecycle.VALIDATED,
+        lifecycle.DELIVERY_RECORDED,
+        lifecycle.IN_PROGRESS,
+        lifecycle.BLOCKED,
+        lifecycle.WAITING_HUMAN,
+    },
+    lifecycle.VALIDATED: {
+        lifecycle.QA,
+        lifecycle.DELIVERY_RECORDED,
+        lifecycle.IN_PROGRESS,
+        lifecycle.BLOCKED,
+        lifecycle.WAITING_HUMAN,
+    },
+    lifecycle.DELIVERY_RECORDED: {lifecycle.PROMOTED, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
+    lifecycle.PROMOTED: set(),
+    lifecycle.CLOSED: set(),
+    lifecycle.BLOCKED: {
+        lifecycle.REQUESTED,
+        lifecycle.IN_PROGRESS,
+        lifecycle.QA,
+        lifecycle.DELIVERY_RECORDED,
+        lifecycle.WAITING_HUMAN,
+    },
+    lifecycle.WAITING_HUMAN: {
+        lifecycle.REQUESTED,
+        lifecycle.IN_PROGRESS,
+        lifecycle.QA,
+        lifecycle.DELIVERY_RECORDED,
+        lifecycle.BLOCKED,
+    },
 }
 #: corrections d'un état posé par erreur (`move(..., correct=…)`) : (depuis,
 #: vers). Un `promoted` à tort revient en `merged` ; un `merged` à tort (une
 #: PR d'étape fermée trop tôt, #759) revient en `build` ; ensuite, les
 #: transitions habituelles (merged → blocked → …) s'appliquent.
-CORRECTIONS = {("promoted", "merged"), ("merged", "build")}
+CORRECTIONS = {
+    (lifecycle.PROMOTED, lifecycle.DELIVERY_RECORDED),
+    (lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
+}
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
@@ -961,7 +990,7 @@ def detach_branch(db: Db, item_id: int, branch: str | None = None, *, reason: st
     row = st.work.detach_branch(item_id, current, note=note, actor=actor)
     if row is None:
         now = get(db, item_id) or item
-        if now["state"] in MERGED_STATES or now["state"] == "closed":
+        if now["state"] in MERGED_STATES or now["state"] == lifecycle.CLOSED:
             raise WorkError("lot %s already %s: branch not detached" % (item_id, now["state"]))
         raise WorkError("lot %s: its branch changed meanwhile (now %s): nothing detached, "
                         "read the lot again" % (item_id, now.get("branch") or "none"))
@@ -1101,7 +1130,7 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
-    if item["state"] in ("merged", "promoted", "closed") and not release:
+    if item["state"] in lifecycle.COMPLETED and not release:
         raise WorkError("lot %s already %s: no reservation" % (item_id, item["state"]))
     reservations = reserved_migrations(item)
     current = item.get("migration")
@@ -1224,7 +1253,7 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         # référence d'issue a bougé pendant le scan du dépôt, le dire — sinon
         # c'est la fermeture du lot qui a refusé.
         again = get(db, item_id)
-        if (again is not None and again["state"] not in ("merged", "promoted", "closed")
+        if (again is not None and again["state"] not in lifecycle.COMPLETED
                 and (again.get("issue_ref") or "") != (item.get("issue_ref") or "")):
             raise WorkError("lot %s: issue reference changed meanwhile, retry" % item_id)
         raise WorkError("lot %s is no longer open: no reservation" % item_id)
@@ -1704,7 +1733,7 @@ def _review_item(cfg, db: Db, item_id: int, actor: str | None, *,
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
-    if item["state"] != "qa":
+    if item["state"] != lifecycle.QA:
         raise WorkError(
             "lot %s is %s, not qa: designate the reviewer on the entry to the "
             "review (ameesh work move %s qa --reviewer <agent>), or with "
@@ -1723,7 +1752,7 @@ def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str, *,
         # #705 r2 (B1) : la règle est relue dans l'écriture ; entre la lecture
         # et elle, le lot a pu quitter qa ou recevoir `value` comme assigné.
         latest = get(db, item_id)
-        if latest is not None and latest["state"] == "qa":
+        if latest is not None and latest["state"] == lifecycle.QA:
             raise WorkError("reviewer refused: %s now holds lot #%s — a reviewer "
                             "reviews another agent's work" % (value, item_id))
         raise WorkError("lot %s left qa in the meantime: retry" % item_id)
@@ -1899,7 +1928,7 @@ def waive_ownless_vehicle(db: Db, item_id: int, actor: str, event: str) -> bool:
     n'est écrit hors `qa`, sur une dispense déjà posée ni sous un verdict
     bloquant courant. Rend True si la dispense a été écrite."""
     item = get(db, int(item_id))
-    if item is None or item.get("state") != "qa" or _waived(item):
+    if item is None or item.get("state") != lifecycle.QA or _waived(item):
         return False
     if _blocked_current(db, int(item_id), item):
         return False
@@ -2140,7 +2169,7 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
-    if item["state"] in MERGED_STATES or item["state"] == "closed":
+    if item["state"] in MERGED_STATES or item["state"] == lifecycle.CLOSED:
         raise WorkError("lot %s already %s: nothing to reassign" % (item_id, item["state"]))
     previous = item.get("assignee")
     reserved = (item.get("external_executor") or "").strip()
@@ -2263,7 +2292,7 @@ def set_external_executor(db: Db, item_id: int, executor: str | None, *,
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
-    if item["state"] in MERGED_STATES or item["state"] == "closed":
+    if item["state"] in MERGED_STATES or item["state"] == lifecycle.CLOSED:
         raise WorkError("lot %s is %s: no external executor to declare"
                         % (item_id, item["state"]))
     previous = (item.get("external_executor") or "").strip() or None
@@ -2342,7 +2371,7 @@ def queue_warning(db: Db, item: dict, agent: str) -> str:
             "per agent, #540); %s" % (
                 item["id"], agent, item["queued_behind"],
                 "it is %s: it waits for the orchestrator (%s)" % (item["state"], later)
-                if item.get("state") != "intake" else
+                if item.get("state") != lifecycle.REQUESTED else
                 "an idle agent of team %s will take it (L165)" % team if team else
                 "it has no team: it waits for the orchestrator (%s)" % later))
 
@@ -2464,7 +2493,7 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
-    if item["state"] in MERGED_STATES or item["state"] == "closed":
+    if item["state"] in MERGED_STATES or item["state"] == lifecycle.CLOSED:
         raise WorkError("lot %s already %s: nothing to delegate" % (item_id, item["state"]))
     # #3447 : un lot réservé à un exécutant externe n'est pas délégable —
     # déléguer écrit un `assignee`, donc deux exécutants, et réveillerait un
@@ -2565,7 +2594,7 @@ def expire_delegations(db: Db, now: float | None = None, *, actor: str = SYSTEM_
     out: list[dict] = []
     for row in st.due_delegations(now):
         if dry_run:
-            if row["state"] in MERGED_STATES or row["state"] == "closed" \
+            if row["state"] in MERGED_STATES or row["state"] == lifecycle.CLOSED \
                     or row.get("assignee") != row["delegate"]:
                 outcome = "annulee"
             else:
@@ -2621,7 +2650,7 @@ def delegation_view(item: dict, now: float | None = None) -> dict | None:
     """
 
     if not item.get("delegated_by") or item.get("state") in MERGED_STATES \
-            or item.get("state") == "closed":
+            or item.get("state") == lifecycle.CLOSED:
         return None
     now = time.time() if now is None else float(now)
     due = item.get("due_ts")
@@ -2858,7 +2887,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "already", "item": item,
                     "detail": detail, "review_lot": review}
-        if state == "closed":
+        if state == lifecycle.CLOSED:
             return {"id": int(item_id), "result": "refused", "item": item,
                     "detail": "lot closed (%s): merge seen%s, not reopened"
                               % (item.get("close_reason"), " (%s)" % pr_ref if pr_ref else "")}
@@ -2926,7 +2955,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                     pr_ref=pr_ref, frozen_id=frozen_id, landed=landed,
                     unfrozen=unfrozen, release_landed=release_landed)
                 if row is not None:
-                    _notify_released(tx, item_id, blocker_state="merged",
+                    _notify_released(tx, item_id, blocker_state=lifecycle.DELIVERY_RECORDED,
                                      after_commit=threads)
         except DbError as exc:
             # A refused module requirement is a per-lot result, allowing a
@@ -3191,7 +3220,7 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
     evidence = {"sha": sha}
     if pr is not None:
         evidence["pr"] = pr
-    return deliver(db, item_id, connector=_merge_connector(), evidence=evidence,
+    return deliver(db, item_id, connector=merge_connector(), evidence=evidence,
                    actor=actor, note=note, repo=repo, migration_landed=migration_landed,
                    cfg=cfg, announce=announce)
 
@@ -3262,7 +3291,7 @@ def record_merge(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: 
     # Preserve idempotency and the closed-lot diagnostic without requiring
     # that an old clone or object still be available.
     fence = None
-    if item["state"] not in (*MERGED_STATES, "closed"):
+    if item["state"] not in (*MERGED_STATES, lifecycle.CLOSED):
         # L165 (EP4) : déclarer une fusion faite à la main est un geste du
         # pilote hors base (le constat ferme le lot). La garde ne fait que lire
         # ici : la preuve peut être longue (GitHub), le hold et l'écriture de
@@ -3308,7 +3337,7 @@ def record_merge(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: 
             done = close_merged(db, item_id, sha=text, actor=actor,
                                 source=actor or UNKNOWN_ACTOR, declared=True, extra=extra,
                                 landed=landed, pr_ref=pr_ref, repo=proof_repo,
-                                retry_review=retry_review, connector=_merge_connector(),
+                                retry_review=retry_review, connector=merge_connector(),
                                 **proof_guard)
         else:
             with db.transaction() as tx:
@@ -3317,7 +3346,7 @@ def record_merge(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: 
                                     source=actor or UNKNOWN_ACTOR, declared=True,
                                     extra=extra, landed=landed, pr_ref=pr_ref,
                                     repo=proof_repo, retry_review=retry_review,
-                                    connector=_merge_connector(), **proof_guard)
+                                    connector=merge_connector(), **proof_guard)
     except DbError as exc:
         # #1567 : course perdue sur l'index unique (dépôt, numéro atterri) —
         # message lisible plutôt que la DbError brute ; la pré-vérification a
@@ -3334,7 +3363,7 @@ def record_merge(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: 
         raise WorkError(done["detail"])
     if done["result"] == "refused":
         item = done["item"]
-        if item["state"] != "closed":
+        if item["state"] != lifecycle.CLOSED:
             raise WorkError(done["detail"])
         raise WorkError("lot %s closed (%s): not reopened; see ameesh work show %s"
                         % (item_id, close_how(item.get("close_reason"),
@@ -3665,7 +3694,8 @@ def deliver(db: Db, item_id: int, *, connector: str, evidence: dict | None = Non
     return handler(db, item_id, evidence=dict(evidence or {}), actor=actor, **options)
 
 
-def _merge_connector() -> str:
+def merge_connector() -> str:
+    """Le connecteur d'une fusion sur la cible (`git-merge`), lu dans le registre."""
     from .modules import registry
     return registry.merge_connector()
 
@@ -3775,7 +3805,7 @@ def _close(db: Db, item_id: int, *, abandoned: bool = False,
             raise WorkError("superseding lot %s not found" % superseded_by)
     state = item["state"]
     review, parent = _review_parent(item)
-    if state == "closed":
+    if state == lifecycle.CLOSED:
         row = _rectify_done(db, item, review=review, parent=parent, done=done,
                             note=note, actor=actor)
         if row is not None:
@@ -3831,7 +3861,7 @@ def _close(db: Db, item_id: int, *, abandoned: bool = False,
             superseded_by=int(superseded_by) if superseded_by is not None else None,
             sha=head, actor=actor, note=text)
         if row is not None:
-            _notify_released(tx, item_id, blocker_state="closed", blocker_reason=reason,
+            _notify_released(tx, item_id, blocker_state=lifecycle.CLOSED, blocker_reason=reason,
                              after_commit=threads)
     # le fil externe après le commit seulement : un envoi annulé n'y laisse rien
     for record in threads:
@@ -4073,16 +4103,16 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     state = _canonical_state(state)
     if package_exclusion and correct is not None:
         raise WorkError("--package-exclusion and --correct are distinct gestures")
-    if package_exclusion and state != "build":
+    if package_exclusion and state != lifecycle.IN_PROGRESS:
         raise WorkError("--package-exclusion: a lot excluded from a package returns "
                         "to build (ameesh work move %s build --package-exclusion)" % item_id)
-    if state == "closed":
+    if state == lifecycle.CLOSED:
         raise WorkError("to close a lot: ameesh work close <id> --abandoned | "
                         "--superseded-by <id> | --delivered --sha <reviewed head> | --done")
     reviewer = (reviewer or "").strip() or None
     reviewer_warning = ""
     if reviewer is not None:
-        if state != "qa":
+        if state != lifecycle.QA:
             raise WorkError(
                 "--reviewer: a reviewer is designated for a review: "
                 "ameesh work move %s qa --reviewer %s" % (item_id, reviewer))
@@ -4145,20 +4175,20 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             % (current, state, current, ", ".join(sorted(TRANSITIONS[current])) or "none",
                " — state set by mistake: ameesh work move %s %s --correct \"reason\""
                % (item_id, state) if (current, state) in CORRECTIONS else ""))
-    if state == "waiting_human" and not storage.of(db).decisions.pending_for_lot(str(item_id)):
+    if state == lifecycle.WAITING_HUMAN and not storage.of(db).decisions.pending_for_lot(str(item_id)):
         raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
     if package_exclusion and current not in TO_VALIDATE:
         raise WorkError("--package-exclusion: lot %s is in %s, not in qa: only a "
                         "frozen lot under review is in a package" % (item_id, current))
     # #4043 : un retrait de paquet n'est pas une boucle d'auteur
-    returning_loop = current in TO_VALIDATE and state == "build" and not package_exclusion
+    returning_loop = current in TO_VALIDATE and state == lifecycle.IN_PROGRESS and not package_exclusion
     if returning_loop and int(item["loops"]) >= MAX_QA_LOOPS:
         raise WorkError(
             "qa → build loop exhausted (%d): move the lot to blocked, or ask the "
             "owner: ameesh decide ask --lot %s --question \"…\""
             % (MAX_QA_LOOPS, item_id))
 
-    held = state == "waiting_human"
+    held = state == lifecycle.WAITING_HUMAN
     # #1664 r2 (B1) : la note de transition peut poser ou lever une retenue ;
     # elle s'authentifie au même titre que `work note`. Elle se stocke nette,
     # comme `work note` : la lecture groupée ciblée (`lot_hold_events`) lit le
@@ -4276,7 +4306,7 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
     if wake_ts is not None:
         if once:
             raise WorkError("a scheduled wake goes with a regular note, not `once`")
-        if item["state"] in ("merged", "promoted", "closed"):
+        if item["state"] in lifecycle.COMPLETED:
             raise WorkError("lot %s is %s: no wake to schedule" % (item_id, item["state"]))
         # #2466 : la note porte elle-même son échéance de reprise (témoin
         # lisible dans le journal) ; la colonne `wake_at` la rend exécutoire.
@@ -4286,7 +4316,7 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
                 row = storage.of(tx).work.lock(item_id)
                 if row is None:
                     raise WorkError("lot %s not found" % item_id)
-                if row["state"] in ("merged", "promoted", "closed"):
+                if row["state"] in lifecycle.COMPLETED:
                     raise WorkError("lot %s is %s: no wake to schedule"
                                     % (item_id, row["state"]))
                 actor = check_wait_note(cfg, tx, actor, note_text, item_id=item_id)
@@ -4322,7 +4352,7 @@ def schedule_wake(db: Db, item_id: int, wake_ts: float | None, *,
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
-    if item["state"] in ("merged", "promoted", "closed"):
+    if item["state"] in lifecycle.COMPLETED:
         raise WorkError("lot %s is %s: no wake to schedule" % (item_id, item["state"]))
     why = (text or "").strip()
     previous = item.get("wake_ts")

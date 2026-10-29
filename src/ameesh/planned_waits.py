@@ -483,7 +483,7 @@ def packet_carriers(rows):
     """
     out = {}
     for row in rows or ():
-        if row.get("state") in ("merged", "promoted", "closed"):
+        if row.get("state") in lifecycle.COMPLETED:
             continue
         branch = str(row.get("branch") or "").strip()
         if not branch.startswith(_PACKET_BRANCH):
@@ -738,7 +738,7 @@ def packet_waits(rows, open_items=None, attachments=None):
     if not carriers:
         return {}
     open_ids = {int(r["id"]) for r in universe.values()
-                if r.get("state") not in ("merged", "promoted", "closed")}
+                if r.get("state") not in lifecycle.COMPLETED}
     declared: dict[int, dict] = {}
     for cid, carrier in carriers.items():
         text = "%s\n%s" % (carrier.get("title") or "", carrier.get("body") or "")
@@ -756,7 +756,7 @@ def packet_waits(rows, open_items=None, attachments=None):
     out: dict[int, dict] = {}
     for row in rows or ():
         ident = int(row["id"])
-        if row.get("state") in ("merged", "promoted", "closed"):
+        if row.get("state") in lifecycle.COMPLETED:
             continue
         carrier = declared.get(ident)
         if carrier is not None:
@@ -800,7 +800,7 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     avant une dépendance (le paquet est le véhicule réel).
     """
     open_ids = {int(r["id"]) for r in open_items
-                if r.get("state") not in ("merged", "promoted", "closed")}
+                if r.get("state") not in lifecycle.COMPLETED}
     landing_by_item = {int(l["work_item_id"]): l for l in landings}
     package_lots = {}
     for row in open_items:
@@ -853,7 +853,7 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     packet = packets or {}
     for row in rows:
         ident = int(row["id"])
-        if row.get("state") in ("merged", "promoted", "closed"):
+        if row.get("state") in lifecycle.COMPLETED:
             continue
         start = dates.get(ident, {}).get("planned_start")
         start_package = None

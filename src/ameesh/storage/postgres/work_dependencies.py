@@ -5,8 +5,8 @@ from __future__ import annotations
 from ..work_dependencies import WorkDependencies as Contract
 from ... import work_lifecycle as lifecycle
 
-_DONE = ("merged", "promoted", "closed")
-_DONE_SQL = "('merged', 'promoted', 'closed')"
+_DONE = lifecycle.COMPLETED
+_DONE_SQL = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
 _LOCK = "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':work_dependencies', 0))"
 
 #: #1922 : un lot pinné sur une révision Process ne bouge que par le registre
@@ -315,7 +315,7 @@ class WorkDependencies(Contract):
                 return {"error": "not_in_review"}
             if states[vehicle_id] in _DONE:
                 return {"error": "finished_vehicle"}
-            if states[vehicle_id] == "blocked":
+            if states[vehicle_id] == lifecycle.BLOCKED:
                 return {"error": "blocked_vehicle"}
             # #1945, revue B : l'admission est ÉPINGLÉE au gel du véhicule. La
             # tête est lue dans la même transaction que l'écriture ; sans gel,
@@ -402,13 +402,13 @@ class WorkDependencies(Contract):
         ids = sorted({int(i) for i in item_ids})
         if not ids:
             return []
-        return self.db.query("""
+        return self.db.query(f"""
             SELECT l.work_item_id, l.vehicle_id, l.pinned_sha,
                    l.until_on::text AS until_on,
                    l.created_by,
                    extract(epoch FROM l.created_at)::float8 AS created_ts,
                    w.state AS vehicle_state,
-                   w.state NOT IN ('merged', 'promoted', 'closed') AS open
+                   w.state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}') AS open
             FROM work_landings l JOIN work_items w ON w.id = l.vehicle_id
             WHERE l.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
             " ORDER BY l.work_item_id", tuple(ids))
@@ -432,9 +432,9 @@ class WorkDependencies(Contract):
         if not ids:
             return []
         rows = self.db.query(
-            "UPDATE work_items SET state = 'intake', updated_at = clock_timestamp()"
+            f"UPDATE work_items SET state = '{lifecycle.REQUESTED}', updated_at = clock_timestamp()"
             " WHERE id IN (" + ", ".join(["%s"] * len(ids)) + ")"
-            " AND state = 'blocked' AND assignee IS NULL"
+            f" AND state = '{lifecycle.BLOCKED}' AND assignee IS NULL"
             " AND " + _UNPINNED + " RETURNING id", tuple(ids))
         for row in rows:
             self.db.execute(

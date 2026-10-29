@@ -34,12 +34,14 @@ l'aplatirait, l'arbre ne serait plus prouvé identique.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 from typing import Iterable, Mapping, Sequence
 
 from . import plan_git, work
 
 #: un lot terminé ne peut plus être un parent d'empilement
-DONE_STATES = ("merged", "promoted", "closed")
+DONE_STATES = lifecycle.COMPLETED
 
 #: cause du refus, dans la même forme que les autres refus de la porte du gel
 STACKED_COPIES = "stacked-copies"

@@ -121,12 +121,14 @@ class _Sweep:
         self.budget = float(budget)
         self.label = str(label or "")
         self.tripped = ""              # première étape refusée à l'échéance
+        self.trips = 0                 # #4469 : refus comptés, lus par lecture
 
     def check(self, step: str) -> None:
         if self.deadline.expired():
             self.trip(step)
 
     def trip(self, step: str) -> None:
+        self.trips += 1
         if not self.tripped:
             self.tripped = step
         raise SweepDeadline(
@@ -147,6 +149,11 @@ def sweep_deadline(budget: float, label: str = ""):
         yield sweep
     finally:
         _SWEEP.reset(token)
+
+
+def active_sweep():
+    """L'échéance de balayage posée par l'appelant courant, ou None (#4469)."""
+    return _SWEEP.get()
 
 
 def _sweep_grep(repo: str, rev: str, args: Sequence[str], patterns: Sequence[str],
@@ -2453,25 +2460,24 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
     """Les lignes (dépouillées) de `lines` égales à une ligne de l'arbre de
     `rev` (à l'indentation près), ou None si la lecture est impossible.
 
-    `git grep -F` trouve les lignes qui *contiennent* un motif ; seules celles
-    qui lui sont égales une fois dépouillées sont rendues. Le format de sortie
-    est fixé (ni couleur, ni numéro, ni colonne) : la configuration Git du
-    dépôt ou de l'hôte (`grep.lineNumber`, `color.grep=always`…) ne doit pas
-    changer la lecture (#2994 B1 cx1). `binary=True` lit aussi les fichiers
-    binaires comme du texte (`-a`) ; sinon ils sont ignorés (`-I`)."""
+    L'arbre est lu en entier avec un seul motif universel, puis mis en cache
+    indépendamment des lignes demandées (#4475). L'intersection en Python
+    évite le coût motifs × arbre de `git grep -F`. Le format de sortie est
+    fixé : ni couleur, ni numéro, ni colonne (#2994 B1 cx1).
+    `binary=True` lit aussi les fichiers binaires comme du texte (`-a`) ;
+    sinon ils sont ignorés (`-I`)."""
     wanted = {str(line).strip() for line in lines or () if str(line).strip()}
     if not wanted:
         return set()
     if not repo or not rev:
         return None
-    patterns = sorted(wanted)
     flag = "-a" if binary else "-I"
 
     def scan():
         try:
             proc = _sweep_grep(repo, rev, ("--no-color", "--no-line-number",
-                                           "--no-column", "-h", flag, "-F"),
-                               patterns, "git grep -h %s -F -f - %s" % (flag, rev))
+                                           "--no-column", "-h", flag, "-G"),
+                               ["^"], "git grep -h %s -G -f - %s" % (flag, rev))
         except SweepDeadline:
             raise
         except Exception:  # noqa: BLE001 - lecture impossible : doute
@@ -2480,15 +2486,15 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
             return []
         if proc.returncode != 0:
             return None
-        found = {line.strip() for line in
-                 proc.stdout.decode("utf-8", "replace").splitlines()}
-        return sorted(wanted & found)
+        return sorted({line.strip() for line in
+                       proc.stdout.decode("utf-8", "replace").splitlines()
+                       if line.strip()})
 
-    # #3974 : le résultat ne dépend que de l'arbre de `rev` et des motifs ; il
-    # est gardé par l'hôte, une plage gelée déjà jugée ne relance aucun grep.
-    found = grep_cache.cached(repo, str(rev), "lines" + flag, patterns, scan,
+    # Le mode distingue ce résultat des anciennes entrées limitées aux motifs.
+    # grep_cache lie aussi la clé à l'arbre immuable et à ses attributs (#3974).
+    found = grep_cache.cached(repo, str(rev), "tree-lines" + flag, [], scan,
                               wait=_cache_wait())
-    return None if found is None else set(found)
+    return None if found is None else wanted.intersection(found)
 
 
 def _lines_in_tree(repo: str, rev: str, lines: Sequence[str]) -> set:

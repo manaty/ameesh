@@ -328,14 +328,20 @@ test (three messages → three notifications) caught the bug.
   (this is logged): it is delivered like a message — since L125, without
   waiting for the batching window; the thread keeps a record of
   the interruption and its reason.
-* **Session rotation (0018)**: when the session exceeds
-  `AMEESH_SESSION_MAX_TOKENS` (default 150,000) or a turn lasted more than
-  `AMEESH_SESSION_MAX_TURN_SECONDS` (default 3,600 s), after at least
-  `AMEESH_SESSION_MIN_TURNS` turns (default 3) and **never during a turn**, a
-  summary turn is played in the session, the summary is written to the thread
-  (R12), the old session id is kept in
-  `<état>/<agent>/session-history.jsonl`, then the session is forgotten: the next
-  turn opens a fresh session prefixed with the summary. The summary is the
+* **Session rotation (0018)**: when the session exceeds the rotation threshold
+  of its harness or a turn lasted more than `AMEESH_SESSION_MAX_TURN_SECONDS`
+  (default 3,600 s), after at least `AMEESH_SESSION_MIN_TURNS` turns (default
+  3) and **never during a turn**, a summary turn is played in the session, the
+  summary is written to the thread (R12), the old session id is kept in
+  `<état>/<agent>/session-history.jsonl`, then the session is forgotten: the
+  next turn opens a fresh session prefixed with the summary. The threshold is
+  compiled from the canon (#4448): `session.max_tokens` (common) and
+  `session.max_tokens_by_harness` (`claude`, `codex`, `deepseek`) at the
+  applied commit; without that block — or with an unreadable canon — the
+  executor's common `AMEESH_SESSION_MAX_TOKENS` (default 150,000) applies, and
+  no harness-specific value is ever hard-coded. Codex publishes a **cumulative**
+  usage per turn: its session counter is the last reading of the thread, not
+  the sum of the readings. The summary is the
   **entire** final answer of the summary turn (L218), never the end of its
   display; beyond `adapters.SUMMARY_MAX_CHARS` (16,000 characters), its
   head is kept, cut at a paragraph end, and a note, included

@@ -40,8 +40,8 @@ from argparse import Namespace
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import (election, notify, registry, role_run, role_timers,
-                    role_standings_pg as pg)
+from ameesh import (alerts_delegation_pg, election, notify, registry, role_run,
+                    role_timers, role_standings_pg as pg)
 
 from .support import PgTestCase
 
@@ -102,7 +102,8 @@ class _AlertsCase(PgTestCase):
         self.cfg = dataclasses.replace(self.cfg, host=self.HOST)
         for table in ("role_standings", "role_handover", "agent_candidates",
                       "canon_state", "host_lifecycle", "host_holds",
-                      "credential_health", "host_resources", "merge_locks"):
+                      "credential_health", "host_resources", "merge_locks",
+                      "alerts_delegations"):
             self.db.execute("DELETE FROM " + table)
         # the role's harness need not exist on the bench (same fixture as the
         # election tests: the witness is about the route, not the harness)
@@ -299,6 +300,9 @@ class AlertsGateTest(_AlertsCase):
                 self.args(self.marker_command(marker)))
             self.assertEqual(code, 0)
             self.assertTrue(os.path.exists(marker))
+        # #4468: the wrapper records the handover under its execution lease,
+        # so a delegate that never beats is bounded by a shared clock.
+        self.assertEqual(alerts_delegation_pg.latest(self.db, NAME)["host"], "atelier")
 
     def test_the_delegate_does_not_carry_the_holders_epoch(self):
         self.role()

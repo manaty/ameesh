@@ -184,7 +184,7 @@ class LocalNeighborsTest(unittest.TestCase):
                    paquet_auto.Unit(2, "b", "2" * 40)],
             discarded=[], head="3" * 40)
 
-    def run_check(self, neighbors, results, at_base=frozenset()):
+    def run_check(self, neighbors, results, at_base=frozenset(), prefix_map=None):
         calls = []
         replayed = []
 
@@ -195,6 +195,17 @@ class LocalNeighborsTest(unittest.TestCase):
         def fake_run(_worktree, label, modules, *, timeout):
             calls.append((label, list(modules)))
             return results[label](modules)
+
+        def fake_prefix(_worktree, _composition, failures, *, timeout, log=None):
+            # #4217 : le rejeu des préfixes est simulé par test → lot.
+            found = {}
+            for failure in failures:
+                lot = (prefix_map or {}).get(failure["test"])
+                if lot is not None:
+                    found.setdefault(lot, []).append(failure)
+            if not found:
+                return {}, "préfixe non simulé pour %d test(s)" % len(failures)
+            return found, ""
 
         from unittest import mock
         with mock.patch.object(paquet_auto, "unit_test_modules",
@@ -208,7 +219,7 @@ class LocalNeighborsTest(unittest.TestCase):
                 log=lambda _line: None,
                 attribute=lambda *_a: {"status": "ok", "tests": []},
                 select=lambda *_a: (neighbors, "carte d'impact `abc` (lue)"),
-                base_sha="4" * 40, on_base=fake_base)
+                base_sha="4" * 40, on_base=fake_base, prefix=fake_prefix)
         self.replayed = replayed
         return calls, out
 
@@ -216,12 +227,13 @@ class LocalNeighborsTest(unittest.TestCase):
         neighbors = {1: [{"module": "tests.test_3512_slo_merged",
                           "reason": "support",
                           "files": ["tests/test_789_slo_alerts.py"]}]}
-        calls, (runs, faulty, _removals) = self.run_check(neighbors, {
-            "unité #1": lambda m: _red("unité #1", m,
-                                       "tests.test_3512_slo_merged"),
-            "unité #2": lambda m: _green("unité #2", m),
-            "contrats": lambda m: _green("contrats", m),
-        })
+        calls, (runs, faulty, _removals) = self.run_check(
+            neighbors, {
+                "unité #1": lambda m: _red("unité #1", m,
+                                           "tests.test_3512_slo_merged"),
+                "unité #2": lambda m: _green("unité #2", m),
+                "contrats": lambda m: _green("contrats", m),
+            }, prefix_map={"tests.test_3512_slo_merged.T.test_x": 1})
         self.assertEqual(calls[0], ("unité #1", ["tests.test_propre_1",
                                                  "tests.test_3512_slo_merged"]))
         self.assertEqual(faulty, [1])
@@ -238,7 +250,9 @@ class LocalNeighborsTest(unittest.TestCase):
         self.assertIn("carte d'impact `abc`", section)
         self.assertNotIn("#", section)
 
-    def test_voisin_de_carte_partage_ne_designe_personne(self) -> None:
+    def test_voisin_de_carte_partage_est_situe_au_prefixe(self) -> None:
+        # #4217 : un rouge partagé n'est plus laissé à la ci-full ; le rejeu
+        # des préfixes situe la première unité où le test apparaît.
         shared = {"module": "tests.test_l165b_agents_libres", "reason": "carte",
                   "files": ["src/ameesh/stagnation.py"]}
         calls, (_runs, faulty, _removals) = self.run_check(
@@ -248,18 +262,19 @@ class LocalNeighborsTest(unittest.TestCase):
                 "unité #2": lambda m: _red("unité #2", m,
                                            "tests.test_l165b_agents_libres"),
                 "contrats": lambda m: _green("contrats", m),
-            })
-        self.assertEqual(faulty, [])
+            }, prefix_map={"tests.test_l165b_agents_libres.T.test_x": 1})
+        self.assertEqual(faulty, [1])
 
     def test_voisin_de_carte_propre_a_l_unite_la_designe(self) -> None:
         mine = {"module": "tests.test_l165b_agents_libres", "reason": "carte",
                 "files": ["src/ameesh/stagnation.py"]}
-        _calls, (_runs, faulty, _removals) = self.run_check({2: [mine]}, {
-            "unité #1": lambda m: _green("unité #1", m),
-            "unité #2": lambda m: _red("unité #2", m,
-                                       "tests.test_l165b_agents_libres"),
-            "contrats": lambda m: _green("contrats", m),
-        })
+        _calls, (_runs, faulty, _removals) = self.run_check(
+            {2: [mine]}, {
+                "unité #1": lambda m: _green("unité #1", m),
+                "unité #2": lambda m: _red("unité #2", m,
+                                           "tests.test_l165b_agents_libres"),
+                "contrats": lambda m: _green("contrats", m),
+            }, prefix_map={"tests.test_l165b_agents_libres.T.test_x": 2})
         self.assertEqual(faulty, [2])
 
     def test_voisin_rouge_aussi_sur_la_base_ne_designe_personne(self) -> None:

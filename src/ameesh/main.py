@@ -76,6 +76,8 @@
   ameesh guard check|run|drain          capacity guard of a lending VM (L159e);
   ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
         reserved host move at a lot boundary, durable journal (L232a);
+  ameesh harness adopt|tick|show-adoption|rollback-adoption   adoption of a harness or model version
+        (#3264 C): auto at equal price after a canary, owner decision otherwise;
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh heavy [--nice N] -- <command> | --status [--json]
         heavy suite (tests, build) in one of the host's capped slots (L131);
@@ -138,10 +140,12 @@
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
-  ameesh provenance record --commit SHA | intent | created | install | show
+  ameesh provenance record --commit SHA | statement | intent | created | install | show
         #1465 : preuve exacte d'origine (acteur, session, tour, harnais) d'un
         commit ou d'un jalon — le hook `pre-commit` atteste le commit qui vient,
         le hook `post-commit` constate l'objet né puis écrit la preuve ;
+        record --signed : hors runner (bureau/owner), attestation signée par une
+        clé owner (#4485), sans PID local ni ameesh sur l'hôte du commit ;
   ameesh receipt verify       approval receipts (spec §8);
   ameesh release open|check|reason <lot>   release perimeter and validation;
   ameesh replay bench|run|report   banc de rejeu comparatif (#3264 B, L15) :

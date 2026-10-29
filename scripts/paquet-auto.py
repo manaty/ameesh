@@ -34,19 +34,21 @@ l'ordre, sans agent :
    tests par unité ;
 8. les tests par unité, pendant la CI : `tests/parts/toujours.txt`,
    `tests.test_l161f_plan`, `tests.test_cluster` et les modules de test
-   apportés par chaque unité. Un test ciblé **rouge** est attribué par la
-   même lecture que #3801 (`packet_red`) : l'unité désignée par une preuve
-   forte est retirée, son auteur est prévenu, et le paquet est recomposé
-   **une seule fois** sans elle (#3931), étapes 4 à 7 rejouées : la tête
-   recomposée remplace la poussée (bail sur la tête poussée), est regelée et
-   sa ci-full demandée ; une PR déjà close ou fusionnée arrête là ; une
-   recomposition sans unité annule la CI et ferme la PR. Un rouge non
-   attribuable garde le geste antérieur : une unité dont le module propre a
-   rougi est retirée, un contrat rouge arrête (l'attribution demande un
-   agent). Un run **non concluant** (délai, base absente, psql/psycopg
-   indisponible, rc inattendu) est consigné à la PR, au porteur et au
-   courrier, sans retirer d'unité ni arrêter le paquet : le canon §3 le veut,
-   la ci-full tranche ;
+   apportés par chaque unité. Un test ciblé **rouge** d'un module **voisin**
+   est situé en rejouant ce test sur les préfixes de l'empilement, dans
+   l'ordre (`base + u1`, `base + u1 + u2`, …) : la première unité où il
+   apparaît est retirée, son auteur est prévenu, et le paquet est recomposé
+   **une seule fois** sans elle (#4217). L'attribution par chevauchement de
+   fichiers (`packet_red`, #3801) ne désigne plus un voisin ; elle reste la
+   lecture des rouges propres et des contrats (#3931). Un rouge voisin
+   impossible à situer sur les préfixes n'entraîne **aucun retrait** : le
+   pilote est prévenu et le paquet s'arrête. Un rouge non attribuable garde
+   le geste antérieur : une unité dont le module propre a rougi est retirée,
+   un contrat rouge arrête (l'attribution demande un agent). Un run **non
+   concluant** (délai, base absente, psql/psycopg indisponible, erreur de
+   fixture DB en QueryCanceled/timeout, rc inattendu) est consigné à la PR,
+   au porteur et au courrier, sans retirer d'unité ni arrêter le paquet : le
+   canon §3 le veut, la ci-full tranche ;
 9. le résultat des tests au corps de la PR et au journal du porteur,
    courrier au pilote.
 
@@ -205,21 +207,28 @@ PARALLEL_EXCLUDE_REASON = "paquet parallèle : autre groupe disjoint"
 PARALLEL_GROUP_NOT_READY = "paquet parallèle : lot du groupe non prêt"
 PARALLEL_GROUP_GONE = "paquet parallèle : lot du groupe introuvable"
 #: sorties qui ne prouvent pas un rouge du lot (environnement, base absente)
+#: #4217 : un `tearDownClass`/`setUpClass` en `QueryCanceled` (statement
+#: timeout, base de test chargée) est une panne d'infrastructure, jamais un
+#: rouge du lot, qu'il sorte dans un module propre ou voisin.
 INCONCLUSIVE_RE = re.compile(
     r"(OperationalError|could not connect|connection refused|"
     r"server closed the connection|database system is starting up|"
     r"psql: error|No such file or directory: 'psql'|"
     r"could not translate host name|Temporary failure in name resolution|"
+    r"QueryCanceled|canceling statement|statement timeout|timeout expired|"
     r"ModuleNotFoundError: No module named 'psycopg)",
     re.IGNORECASE,
 )
 #: le **message** d'une exception d'environnement (sans les noms de types :
-#: un `AssertionError: expected OperationalError` reste un rouge réel)
+#: un `AssertionError: expected OperationalError` reste un rouge réel, et un
+#: `ValueError: expected QueryCanceled` aussi : le nom psycopg est reconnu par
+#: la ligne d'exception, pas par le message)
 ENV_MESSAGE_RE = re.compile(
     r"could not connect|connection refused|server closed the connection|"
     r"database system is starting up|psql: error|"
     r"No such file or directory: 'psql'|"
     r"could not translate host name|Temporary failure in name resolution|"
+    r"canceling statement|statement timeout|timeout expired|"
     r"No module named 'psycopg'",
     re.IGNORECASE,
 )
@@ -229,8 +238,43 @@ OK_RE = re.compile(r"^OK(?: \(skipped=(\d+)\))?", re.MULTILINE)
 FAILED_SUMMARY_RE = re.compile(r"^FAILED \((.*?)\)", re.MULTILINE)
 FAIL_HEADER_RE = re.compile(r"^FAIL: ", re.MULTILINE)
 ERROR_HEADER_RE = re.compile(r"^ERROR: .*$", re.MULTILINE)
-EXCEPTION_LINE_RE = re.compile(
-    r"^([\w.]+(?:Error|Exception)):\s*(.*)$", re.MULTILINE)
+#: la ligne qui ouvre une trace Python ; la dernière du bloc porte l'exception
+#: effective.
+TRACEBACK_RE = re.compile(r"^Traceback \(most recent call last\):\s*$",
+                          re.MULTILINE)
+#: lignes de suite d'un message psycopg3 : ce ne sont pas des exceptions
+_EXCEPTION_CONTINUATIONS = ("CONTEXT", "DETAIL", "HINT", "QUERY", "STATEMENT")
+
+
+def last_exception(block: str) -> tuple[str, str] | None:
+    """Le nom et le message de la dernière exception effective d'un bloc.
+
+    On part du **dernier** `Traceback (most recent call last):` et on lit la
+    première ligne non vide en colonne 0 après ses frames indentées : c'est la
+    ligne d'exception, avec ou sans message (`ValueError` nu). Les lignes de
+    suite psycopg3 (`CONTEXT:`, `DETAIL:`, `HINT:`…) ne sont jamais
+    l'exception ; une ligne source est indentée. None quand le bloc n'a pas de
+    traceback ou pas de ligne d'exception lisible (sortie psql, trace
+    tronquée).
+    """
+    matches = list(TRACEBACK_RE.finditer(block or ""))
+    if not matches:
+        return None
+    for raw in (block or "")[matches[-1].end():].splitlines():
+        if not raw.strip():
+            continue
+        if raw[:1].isspace():
+            continue
+        name, sep, message = raw.partition(":")
+        name = name.strip()
+        if name in _EXCEPTION_CONTINUATIONS:
+            return None
+        if not name:
+            continue
+        return name, (message.strip() if sep else "")
+    return None
+
+
 BLOCK_END_RE = re.compile(r"^=+$", re.MULTILINE)
 #: le seuil de preuve forte de #3801, le même que `paquet_horaire.classify`
 STRONG_EVIDENCE = 4
@@ -276,6 +320,19 @@ class CompositionBusy(PaquetAutoError):
         self.host = host
         self.pid = pid
         super().__init__("composition en cours (%s)" % holder_label(host, pid))
+
+
+class AttributionUnreadable(PaquetAutoError):
+    """Un rouge de voisin ne peut pas être situé sur les préfixes (#4217).
+
+    Aucun retrait automatique : le composeur prévient le pilote et s'arrête,
+    pour qu'un agent lise le journal du porteur.
+    """
+
+    def __init__(self, why: str, tests=()):
+        self.why = " ".join(str(why or "").split())
+        self.tests = [str(test) for test in tests if test]
+        super().__init__("attribution des préfixes illisible : %s" % self.why)
 
 
 @dataclass
@@ -326,6 +383,9 @@ class Removal:
     tests: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
     attributed: bool = False
+    #: #4217 : "" (repli), "3801" (preuve de fichiers) ou "prefixes" (test
+    #: rouge situé sur les préfixes de l'empilement).
+    proof: str = ""
 
 
 @dataclass
@@ -357,25 +417,31 @@ class TestRun:
 
     @staticmethod
     def _error_is_environment(block: str) -> bool:
-        """La dernière exception du bloc est-elle une panne d'environnement ?
+        """La dernière exception effective du bloc est-elle une panne ?
 
         Le **nom du type** ne suffit pas : `AssertionError: expected
-        OperationalError` est un rouge réel. On lit le message de la dernière
-        exception, et `AssertionError` est toujours réelle. Sans ligne
-        d'exception (sortie psql), on cherche un motif d'infrastructure.
+        OperationalError` est un rouge réel. On lit la ligne d'exception
+        effective du **dernier** traceback : les frames indentées, les lignes
+        source et les suites psycopg3 (`CONTEXT:`, `DETAIL:`…) ne sont pas des
+        exceptions ; un nom nu (`ValueError`) est lu. Une exception réelle
+        chaînée après une annulation de requête reste réelle, et un nom psycopg
+        sans suffixe `Error` (`QueryCanceled`) est lu comme les autres. Sans
+        traceback (sortie psql), on cherche un motif d'infrastructure.
         """
-        lines = EXCEPTION_LINE_RE.findall(block)
-        if lines:
-            kind, message = lines[-1]
-            name = kind.rsplit(".", 1)[-1]
-            if name == "AssertionError":
-                return False
-            if ENV_MESSAGE_RE.search(message):
-                return True
-            if name in ("ModuleNotFoundError", "ImportError") and "psycopg" in message:
-                return True
+        exception = last_exception(block)
+        if exception is None:
+            return bool(INCONCLUSIVE_RE.search(block))
+        kind, message = exception
+        name = kind.rsplit(".", 1)[-1]
+        if name == "AssertionError":
             return False
-        return bool(INCONCLUSIVE_RE.search(block))
+        if name == "QueryCanceled":
+            return True
+        if ENV_MESSAGE_RE.search(message):
+            return True
+        if name in ("ModuleNotFoundError", "ImportError") and "psycopg" in message:
+            return True
+        return False
 
     @property
     def real_failure(self) -> bool:
@@ -1609,6 +1675,110 @@ def attribute_composition(worktree: Path, composition: Composition,
     return report
 
 
+def _failure_name(failure) -> str:
+    return str((failure or {}).get("test") or "").strip()
+
+
+def _failure_matches(observed: str, failed: set[str]) -> bool:
+    """Le test observé fait-il partie des échecs d'un préfixe ?
+
+    Un nom exact, une classe dont un test a rougi, ou un test dont la classe
+    a rougi (`setUpClass`) : les trois formes désignent le même échec.
+    """
+    if not observed:
+        return False
+    if observed in failed:
+        return True
+    for name in failed:
+        if name and (name.startswith(observed + ".")
+                     or observed.startswith(name + ".")):
+            return True
+    return False
+
+
+def prefix_failures(worktree: Path, composition: Composition,
+                    failures: list[dict], *, timeout: int,
+                    replay=None, log=print) -> tuple[dict[int, list[dict]], str]:
+    """#4217 : la première unité où chaque test rouge apparaît.
+
+    Rejoue les tests rouges des modules **voisins** sur les préfixes de
+    l'empilement, dans l'ordre (`base + u1`, `base + u1 + u2`, …), dans un
+    worktree détaché jetable : le commit de chaque unité est la tête cumulée
+    de la composition à ce point. Une unité est retenue pour un test dès que
+    le préfixe correspondant le rend rouge ; les préfixes suivants ne le
+    rejouent plus.
+
+    Rend `({lot: [échecs]}, "")`, ou `({}, pourquoi)` quand le rejeu ne
+    conclut pas (worktree impossible, run non concluant, test vert sur tous
+    les préfixes) : l'appelant ne retire alors aucune unité. Aucune décision
+    de retrait ici.
+    """
+    tests: list[dict] = []
+    seen: set[str] = set()
+    for failure in failures or ():
+        name = _failure_name(failure)
+        if name and name not in seen:
+            seen.add(name)
+            tests.append(dict(failure))
+    if not tests:
+        return {}, "aucun nom de test à rejouer sur les préfixes"
+    if not composition.units:
+        return {}, "composition sans unité à rejouer"
+    replay = replay or run_tests
+    parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    path = Path(tempfile.mkdtemp(prefix="paquet-auto-prefixe-", dir=str(parent)))
+    path.rmdir()
+    first = composition.units[0].commit
+    added = git(worktree, "worktree", "add", "--detach", str(path), first,
+                check=False)
+    if added.returncode != 0:
+        shutil.rmtree(path, ignore_errors=True)
+        return {}, ("worktree de préfixe impossible : %s"
+                    % _tail(_decode(added.stderr), 3))
+    try:
+        unresolved = tests
+        found: dict[int, list[dict]] = {}
+        for index, unit in enumerate(composition.units, start=1):
+            if index > 1:
+                moved = git(path, "reset", "--hard", unit.commit, check=False)
+                if moved.returncode != 0:
+                    return {}, ("préfixe %d (#%d) illisible : %s"
+                                % (index, unit.lot,
+                                   _tail(_decode(moved.stderr), 3)))
+                git(path, "clean", "-fdq", check=False)
+            run = replay(path, "préfixe %d (#%d)" % (index, unit.lot),
+                         [_failure_name(failure) for failure in unresolved],
+                         timeout=timeout)
+            if run.inconclusive:
+                return {}, ("préfixe %d (#%d) non concluant : %s"
+                            % (index, unit.lot, run.motive()))
+            failed = {entry["test"]
+                      for entry in unittest_failures(run.output)}
+            if not run.green and not failed:
+                return {}, ("préfixe %d (#%d) rouge sans nom de test"
+                            % (index, unit.lot))
+            still = []
+            for failure in unresolved:
+                if _failure_matches(_failure_name(failure), failed):
+                    found.setdefault(unit.lot, []).append(failure)
+                else:
+                    still.append(failure)
+            log("préfixe %d/%d (#%d) : %d test(s) situé(s), %d à suivre"
+                % (index, len(composition.units), unit.lot,
+                   len(unresolved) - len(still), len(still)))
+            unresolved = still
+            if not unresolved:
+                break
+        if unresolved:
+            return {}, ("test(s) rouge(s) sur la tête mais verts sur tous les "
+                        "préfixes : %s"
+                        % ", ".join(_failure_name(failure)
+                                    for failure in unresolved[:5]))
+        return found, ""
+    finally:
+        remove_worktree(worktree, path)
+
+
 def designated_removals(attribution: dict, failures: list[dict], *,
                         known_lots=None) -> tuple[list[Removal], str]:
     """Les unités désignées sans ambiguïté pour **tous** les échecs.
@@ -1649,7 +1819,8 @@ def designated_removals(attribution: dict, failures: list[dict], *,
         lot = int(unit["lot"])
         if known_lots is not None and lot not in known_lots:
             return [], "unité #%d hors de la composition" % lot
-        removal = by_lot.setdefault(lot, Removal(lot=lot, attributed=True))
+        removal = by_lot.setdefault(
+            lot, Removal(lot=lot, attributed=True, proof="3801"))
         if name not in removal.tests:
             removal.tests.append(name)
         for item in unit.get("evidence") or []:
@@ -1706,24 +1877,60 @@ def _run_series(jobs: list, *, parallel: int, guard=None) -> list[TestRun]:
         pool.shutdown(wait=True, cancel_futures=True)
 
 
+def _merge_removals(*groups: list[Removal]) -> list[Removal]:
+    """Fusionne des retraits par lot, sans perdre tests ni preuves."""
+    by_lot: dict[int, Removal] = {}
+    order: list[int] = []
+    for group in groups:
+        for removal in group:
+            current = by_lot.get(removal.lot)
+            if current is None:
+                current = Removal(lot=removal.lot,
+                                  attributed=removal.attributed,
+                                  proof=removal.proof)
+                by_lot[removal.lot] = current
+                order.append(removal.lot)
+            for test in removal.tests:
+                if test not in current.tests:
+                    current.tests.append(test)
+            for item in removal.evidence:
+                if item not in current.evidence:
+                    current.evidence.append(item)
+            current.attributed = current.attributed or removal.attributed
+            if removal.proof == "prefixes":
+                current.proof = "prefixes"
+            elif removal.proof and not current.proof:
+                current.proof = removal.proof
+    return [by_lot[lot] for lot in order]
+
+
 def check_local_tests(worktree: Path, composition: Composition, *,
                       timeout: int, log=print,
                       attribute=None, base_sha: str = "",
                       select=None, on_base=None, guard=None,
-                      parallel: int = DEFAULT_PARALLEL) -> tuple[list[TestRun], list[int],
+                      prefix=None,
+                      parallel: int = DEFAULT_PARALLEL) -> tuple[list[TestRun],
+                                                          list[int],
                                                           list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
     Rend `(exécutions, unités fautives, retraits)`. Une unité est fautive
     quand un test ciblé la désigne :
-    * par attribution #3801 (`packet_red`) quand **chaque** échec est attribué
-      sans ambiguïté à une seule unité avec une preuve forte (#3931) ;
+    * pour un rouge de module **voisin**, par le rejeu du test sur les
+      préfixes de l'empilement (`prefix_failures`, injectable par `prefix`) :
+      la première unité où il apparaît est retirée (#4217) ;
+    * pour les rouges propres et les contrats, par attribution #3801
+      (`packet_red`) quand **chaque** échec est attribué sans ambiguïté à une
+      seule unité avec une preuve forte (#3931) ;
     * sinon par le geste antérieur : le module propre de l'unité a rougi, et un
       contrat rouge non attribuable arrête.
 
-    Un résultat non concluant (délai, base absente, psql/psycopg indisponible,
-    rc inattendu) est **consigné** dans `runs` et ne retire aucune unité : le
-    canon §3 veut qu'il ne retienne ni paquet ni release ; la ci-full tranche.
+    Un rouge de voisin que les préfixes ne permettent pas de situer lève
+    `AttributionUnreadable` : aucun retrait automatique, le pilote est
+    prévenu et un agent lit. Un résultat non concluant (délai, base absente,
+    psql/psycopg indisponible, rc inattendu) est **consigné** dans `runs` et
+    ne retire aucune unité : le canon §3 veut qu'il ne retienne ni paquet ni
+    release ; la ci-full tranche.
     `attribute` est injectable pour les témoins (`attribute_composition`).
 
     #4025 : la série d'une unité joue aussi ses modules voisins
@@ -1793,7 +2000,8 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             "borne %d s par série" % (len(jobs), min(parallel, len(jobs)), timeout))
     results = _run_series(jobs, parallel=parallel, guard=guard)
     contract = results.pop()
-    pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str]]] = []
+    pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str],
+                        set[str]]] = []
     for (unit, proper, added, modules), run in zip(planned, results):
         run.added = added
         runs.append(run)
@@ -1803,18 +2011,20 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             continue
         if not run.green:
             found = unittest_failures(run.output)
-            mine = {module.split(".", 1)[1] for module in proper}
+            proper_names = {module.split(".", 1)[1] for module in proper}
+            mine = set(proper_names)
             neighbor = {row["module"].split(".", 1)[1] for row in added}
             mine |= {row["module"].split(".", 1)[1] for row in added
                      if row["reason"] != "carte" or shared.get(row["module"]) == 1}
-            pending.append((unit, run, found, mine, neighbor))
+            pending.append((unit, run, found, proper_names, mine, neighbor))
             log("tests unité #%d : ROUGE (%d modules)\n%s"
                 % (unit.lot, len(modules), _tail(run.output)))
         else:
             log("tests unité #%d : vert (%d modules, %d tests)"
                 % (unit.lot, len(modules), run.tests))
     neighbor_red = sorted({"tests." + failure["module"]
-                           for _unit, _run, found, _mine, neighbor in pending
+                           for _unit, _run, found, _proper, _mine, neighbor
+                           in pending
                            for failure in found
                            if failure.get("module") in neighbor})
     at_base: set[str] | None = set()
@@ -1826,7 +2036,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         log("tests voisins rouges rejoués sur la base %s : %s"
             % (base_sha[:12] or "?", "non concluant" if at_base is None
                else "%d rouge(s) aussi sur la base" % len(at_base)))
-    for unit, run, found, mine, neighbor in pending:
+    neighbor_tests: dict[str, dict] = {}
+    owned_by_lot: dict[int, list[dict]] = {}
+    unparsed_lots: set[int] = set()
+    for unit, run, found, _proper, mine, neighbor in pending:
         kept = []
         for failure in found:
             if failure.get("module") in neighbor \
@@ -1834,15 +2047,31 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                 continue
             kept.append(failure)
         owned = [failure for failure in kept
-                 if not failure.get("module") or failure["module"] in mine]
-        if owned or not found:
-            own[unit.lot] = owned
+                 if failure.get("module") not in neighbor
+                 and (not failure.get("module") or failure["module"] in mine)]
+        owned_by_lot[unit.lot] = owned
+        if not found:
+            unparsed_lots.add(unit.lot)
+        for failure in kept:
+            if failure.get("module") in neighbor:
+                neighbor_tests.setdefault(_failure_name(failure), failure)
         if kept or not found:
             red.append((run, kept))
         else:
             run.ignored_red = True
             log("tests unité #%d : rouge des seuls voisins, aussi rouges sur la "
                 "base ou non rejoués — sans effet" % unit.lot)
+    own_names = {_failure_name(failure) for failures in owned_by_lot.values()
+                 for failure in failures}
+    prefix_names = {name for name in neighbor_tests
+                    if name and name not in own_names}
+    prefix_red = [neighbor_tests[name] for name in neighbor_tests
+                  if name in prefix_names]
+    for lot, owned in owned_by_lot.items():
+        remaining_own = [failure for failure in owned
+                         if _failure_name(failure) not in prefix_names]
+        if remaining_own or lot in unparsed_lots:
+            own[lot] = remaining_own
     modules = contract.modules
     runs.append(contract)
     contract_red = False
@@ -1871,35 +2100,82 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             failures.append(failure)
     why = ""
     removals: list[Removal] = []
-    if failures and all(found for _run, found in red):
-        reader = attribute or attribute_composition
-        report = reader(worktree, composition, failures)
-        removals, why = designated_removals(
-            report, failures,
-            known_lots={unit.lot for unit in composition.units})
-    else:
-        why = "un rouge sans nom de test attribuable"
+    if prefix_red:
+        if not all(found for _run, found in red):
+            raise AttributionUnreadable(
+                "un rouge sans nom de test ne peut pas être situé sur les "
+                "préfixes",
+                tests=[_failure_name(failure) for failure in prefix_red])
+        if guard is not None:
+            guard()
+        log("tests voisins : rejeu du rouge sur les préfixes de l'empilement "
+            "(%d test(s), %d unité(s))"
+            % (len(prefix_red), len(composition.units)))
+        try:
+            found_by_lot, prefix_why = (prefix or prefix_failures)(
+                worktree, composition, prefix_red, timeout=timeout, log=log)
+        except AttributionUnreadable:
+            raise
+        except PaquetAutoError as exc:
+            raise AttributionUnreadable(
+                str(exc), tests=[_failure_name(failure)
+                                 for failure in prefix_red]) from exc
+        if prefix_why:
+            raise AttributionUnreadable(
+                prefix_why,
+                tests=[_failure_name(failure) for failure in prefix_red])
+        positions = {unit.lot: index for index, unit in enumerate(
+            composition.units, start=1)}
+        unknown = [lot for lot in found_by_lot if lot not in positions]
+        if unknown:
+            raise AttributionUnreadable(
+                "unité(s) hors de la composition : %s"
+                % ", ".join("#%d" % lot for lot in unknown),
+                tests=[_failure_name(failure) for failure in prefix_red])
+        for lot, found in found_by_lot.items():
+            removals.append(Removal(
+                lot=lot,
+                tests=[_failure_name(failure) for failure in found],
+                evidence=["préfixe base+u1…u%d (premier rouge à #%d)"
+                          % (positions.get(lot, 0), lot)],
+                attributed=True, proof="prefixes"))
+    remaining = [failure for failure in failures
+                 if _failure_name(failure) not in prefix_names]
+    designated: list[Removal] = []
+    if remaining:
+        if all(found for _run, found in red):
+            reader = attribute or attribute_composition
+            report = reader(worktree, composition, remaining)
+            designated, why = designated_removals(
+                report, remaining,
+                known_lots={unit.lot for unit in composition.units})
+        else:
+            why = "un rouge sans nom de test attribuable"
+    if designated:
+        removals = _merge_removals(removals, designated)
+    elif own:
+        fallback = [Removal(lot=lot,
+                            tests=[_failure_name(failure) for failure in found])
+                    for lot, found in own.items()]
+        removals = _merge_removals(removals, fallback)
+        if contract_red:
+            log("tests contrats : rouge non attribuable (%s) — retrait des "
+                "unités aux tests propres rouges, puis recomposition"
+                % (why or "attribution incertaine"))
     if removals:
+        how = why
+        if not how and any(removal.proof == "prefixes" for removal in removals):
+            how = "préfixes de l'empilement"
         log("tests ciblés : retrait de %s (%s)"
             % (", ".join("#%d" % removal.lot for removal in removals),
-               why or "attribution #3801"))
+               how or "attribution"))
         return runs, [removal.lot for removal in removals], removals
     if contract_red and not own:
         raise PaquetAutoError(
             "tests de contrat rouges sur la tête composée (aucune unité retirée "
             "automatiquement : %s) :\n%s"
             % (why or "attribution incertaine", _tail(contract.output)))
-    removals = [Removal(lot=lot, tests=[failure["test"] for failure in found])
-                for lot, found in own.items()]
-    if contract_red:
-        log("tests contrats : rouge non attribuable (%s) — retrait des unités "
-            "aux tests propres rouges, puis recomposition"
-            % (why or "attribution incertaine"))
-    if removals:
-        log("tests ciblés : retrait de %s (module propre rouge, sans "
-            "attribution sûre)"
-            % ", ".join("#%d" % removal.lot for removal in removals))
-    return runs, [removal.lot for removal in removals], removals
+    return runs, [], []
 
 
 # ---------------------------------------------------------------------------
@@ -2362,7 +2638,13 @@ def notify_removals(repo: Path, name: str, removals: list[Removal], *,
             log("auteur de #%d inconnu : courrier non envoyé" % removal.lot)
             continue
         tests = ", ".join(removal.tests[:3]) or "tests ciblés"
-        if removal.attributed:
+        if removal.proof == "prefixes":
+            why = ("les tests ciblés de la composition ont rougi sur la tête "
+                   "composée, et le test rouge apparaît pour la première fois "
+                   "au préfixe de ton unité (%s)"
+                   % (" ; ".join(removal.evidence[:3])
+                      or "préfixes de l'empilement"))
+        elif removal.attributed:
             why = ("les tests ciblés de la composition ont rougi sur la tête "
                    "composée, et la lecture #3801 désigne ton unité (%s)"
                    % (" ; ".join(removal.evidence[:3]) or "attribution #3801"))
@@ -2384,6 +2666,29 @@ def notify_removals(repo: Path, name: str, removals: list[Removal], *,
         else:
             log("courrier à %s (#%d) envoyé" % (author, removal.lot))
     return failed
+
+
+def notify_unattributable(name: str, carrier: int, error,
+                          *, pilot: str = "mesh-design",
+                          sender: str | None = None, log=print) -> str:
+    """#4217 : aucun retrait automatique ; le pilote reçoit le rouge situé.
+
+    Un courrier qui ne part pas n'efface pas l'arrêt : il est consigné et le
+    gestionnaire de l'horaire prévient aussi le pilote. Rend le motif d'échec.
+    """
+    tests = ", ".join(error.tests[:5]) or "test(s) non nommé(s)"
+    body = (
+        "#%d paquet %s : un rouge de voisin n'a pas pu être situé sur les "
+        "préfixes de l'empilement (%s). Tests : %s. Aucun retrait automatique ; "
+        "un agent lit le journal du porteur."
+        % (carrier, name, error.why, tests))
+    try:
+        send_mail(pilot, carrier, body, sender)
+    except PaquetAutoError as exc:
+        log("courrier au pilote non envoyé : %s" % exc)
+        return str(exc)
+    log("courrier au pilote envoyé (%s)" % pilot)
+    return ""
 
 
 def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
@@ -3069,10 +3374,20 @@ def compose_packet(args: argparse.Namespace) -> int:
                            len(composition.discarded), rel))
                 print(freeze_carrier(worktree, args.carrier, head, note), flush=True)
                 print(request_full_ci(worktree, args.carrier, head), flush=True)
-            runs, faulty, removals = check_local_tests(
-                worktree, composition, timeout=args.tests_timeout,
-                base_sha=base_sha, guard=guard,
-                parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
+            try:
+                runs, faulty, removals = check_local_tests(
+                    worktree, composition, timeout=args.tests_timeout,
+                    base_sha=base_sha, guard=guard,
+                    parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
+            except AttributionUnreadable as error:
+                # #4217 : aucun retrait automatique ; le pilote reçoit le
+                # rouge que les préfixes n'ont pas permis de situer.
+                if not getattr(args, "local", False):
+                    notify_unattributable(
+                        args.name, args.carrier, error,
+                        pilot=getattr(args, "pilot", "mesh-design"),
+                        sender=getattr(args, "sender", None))
+                raise
             if not faulty:
                 break
             if pushed:
@@ -3101,7 +3416,14 @@ def compose_packet(args: argparse.Namespace) -> int:
                 modules = next(
                     (run.modules for run in runs
                      if run.label == "unité #%d" % removal.lot), [])
-                if removal.attributed:
+                if removal.proof == "prefixes":
+                    reason = ("tests ciblés rouges (%s), situés au premier "
+                              "préfixe de l'empilement, retirés de la "
+                              "recomposition"
+                              % (", ".join(removal.tests[:3])
+                                 or "tests illisibles"))
+                    detail = " ; ".join(removal.evidence[:3])
+                elif removal.attributed:
                     reason = ("tests ciblés rouges (%s), attribués à son "
                               "unité (#3801), retirés de la recomposition"
                               % (", ".join(removal.tests[:3])

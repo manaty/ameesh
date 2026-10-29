@@ -39,6 +39,8 @@ AGENT_MESH_<HARNESS>_BIN point to fake binaries.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import argparse
 import dataclasses
 import getpass
@@ -449,46 +451,10 @@ def _expanduser_in(path: str, env: dict) -> str:
     return os.path.expanduser(path)
 
 
-def worktree_marker(cwd: str | None) -> dict:
-    """Identité git d'un dossier de travail (0018 : suivre un renommage).
-
-    `git_common_dir` est le dépôt commun (le même pour tous les worktrees) ;
-    la branche distingue les worktrees d'un même dépôt. Best-effort : renvoie
-    `{}` si le dossier n'est pas un dépôt ou si git manque.
-    """
-    if not cwd or not os.path.isdir(cwd):
-        return {}
-    try:
-        common = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
-            capture_output=True, text=True, timeout=5)
-        branche = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    if common.returncode != 0 or not common.stdout.strip():
-        return {}
-    return {
-        "cwd": os.path.abspath(cwd),
-        "git_common_dir": os.path.abspath(os.path.join(cwd, common.stdout.strip())),
-        "branch": branche.stdout.strip() if branche.returncode == 0 else "",
-    }
-
-
-def write_worktree_marker(cfg: Config, name: str, cwd: str) -> dict:
-    """Écrit le marqueur du dossier de travail dans l'état de l'agent."""
-    marker = worktree_marker(cwd)
-    if not marker:
-        return {}
-    directory = cfg.agent_dir(name)
-    try:
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        with open(os.path.join(directory, "worktree.json"), "w", encoding="utf-8") as fh:
-            json.dump(marker, fh, ensure_ascii=False)
-    except OSError:
-        return {}
-    return marker
+#: 0018 : l'identité git d'un dossier de travail et son marqueur vivent dans
+#: la façade (L101 T3) ; ces noms restent importables depuis `runner`.
+worktree_marker = workspaces.worktree_marker
+write_worktree_marker = workspaces.write_worktree_marker
 
 
 def _preemption_generation(worker) -> int:
@@ -2090,6 +2056,46 @@ class AgentWorker(threading.Thread):
         return ((self.agent or {}).get("session_policy") or "").strip() \
             or self.cfg.session_policy
 
+    def session_max_tokens(self) -> float:
+        """Seuil de rotation sur la taille (L11) du harnais de la session.
+
+        #4448 : le canon compilé (`session.max_tokens` et
+        `session.max_tokens_by_harness`) fait foi, surcharge du harnais puis
+        valeur commune ; canon absent ou illisible, ou document sans bloc :
+        le seuil commun de l'exécuteur (`AMEESH_SESSION_MAX_TOKENS`), jamais
+        une valeur propre à un harnais écrite en dur.
+        """
+        from . import mechanics
+        return mechanics.session_max_tokens(
+            self.cfg, self._ledger_harness() or "", self.runner.session_max_tokens)
+
+    def _restore_session_counters(self) -> None:
+        """#4448 : reprendre les compteurs de la session depuis le grand livre.
+
+        Un worker relancé (déploiement, redémarrage) repartait de zéro alors
+        que la session, elle, continue : la décision de rotation et l'alerte
+        `session_too_big` ne mesuraient plus la même chose. La somme et le
+        nombre de tours de la session courante sont relus **une fois**, avant
+        la première décision. Seul le nombre de tours dit si ce worker a déjà
+        compté un tour (réussi ou non, la définition unifiée) : des jetons
+        seuls — un tour en cours, une mesure reprise — ne bloquent plus la
+        reprise. Une lecture en échec laisse les compteurs à zéro : la mesure
+        repart du tour suivant, jamais une valeur supposée.
+        """
+        if self.session_turns:
+            return
+        session = self.current_session()
+        if not session:
+            return
+        try:
+            total = storage.of(self.db).turn_costs.session_total(self.name, session)
+        except Exception:  # noqa: BLE001 — mesure seulement, jamais fatale au tour
+            return
+        if not total:
+            return
+        self.session_turns = int(total.get("turns") or 0)
+        self.session_tokens = float(total.get("tokens") or 0)
+
     def rotation_due(self) -> bool:
         """Rotation due ? Jamais pendant un tour, jamais avant le minimum.
 
@@ -2099,6 +2105,7 @@ class AgentWorker(threading.Thread):
             return False
         if self.session_policy() == "jamais":
             return False
+        self._restore_session_counters()
         if self.session_turns < self.runner.session_min_turns:
             return False
         # #706 : la latence d'un tour autorisé ne suffit pas à oublier la
@@ -2107,7 +2114,7 @@ class AgentWorker(threading.Thread):
         # borne du tour. Sans plafond, garder le seuil de latence configuré.
         latency_threshold = max(self.runner.session_max_turn_seconds,
                                 2 * self.turn_max_seconds())
-        return (self.session_tokens >= self.runner.session_max_tokens
+        return (self.session_tokens >= self.session_max_tokens()
                 or self.last_turn_seconds >= latency_threshold)
 
     def context_max_tokens(self) -> int:
@@ -2745,7 +2752,7 @@ class AgentWorker(threading.Thread):
             return str(assignes[0]["id"])
         # #408 : les lots en relecture ou en attente d'un humain ne comptent
         # pas ; l'unique lot sur lequel l'agent peut avancer est celui du tour
-        actifs = [a for a in assignes if a.get("state") in ("intake", "build")]
+        actifs = [a for a in assignes if a.get("state") in lifecycle.ACTIVE]
         if len(actifs) == 1:
             return str(actifs[0]["id"])
         return None
@@ -2914,7 +2921,7 @@ class AgentWorker(threading.Thread):
 
     #: états d'un lot FINI (#794) : sa session se ferme, comme la purge le
     #: faisait — fusionné, livré (`promoted`) ou fermé.
-    LOT_FINISHED_STATES = ("merged", "promoted", "closed")
+    LOT_FINISHED_STATES = lifecycle.COMPLETED
 
     def _lot_is_finished(self, lot: str | None) -> bool:
         """Le lot est-il FINI (fusionné, livré, fermé) ? (lecture du registre)
@@ -3342,77 +3349,19 @@ class AgentWorker(threading.Thread):
             return None
 
     # -- dossier de travail déplacé (0018) ---------------------------------
-    #: profondeur maximale de recherche d'un dossier de travail déplacé :
-    #: `~/development/manaty/ameesh/.claude/worktrees/<nom>` est à cinq niveaux.
-    WORKTREE_DEPTH = 6
-    #: dossiers cachés qu'on traverse quand même (worktrees imbriqués)
-    WORKTREE_HIDDEN = (".claude", ".worktrees")
-    #: répertoires jamais traversés (dépendances, caches, sorties de build)
-    WORKTREE_SKIP = ("node_modules", ".git", "venv", ".venv", "target", "build",
-                     "dist", "__pycache__", ".cache", ".local")
-
-    def _worktree_dirs(self, racine: str, ancien: str | None):
-        """Dossiers candidats sous une racine, profondeur bornée (0018 B4).
-
-        On ne descend pas dans les grands répertoires de dépendances ni dans
-        `.git`, mais on traverse `.claude` / `.worktrees` : les worktrees
-        imbriqués (ex. `~/development/manaty/ameesh/.claude/worktrees/<nom>`)
-        doivent être trouvés, ou l'adoption refuse proprement.
-        """
-        base = racine.rstrip(os.sep).count(os.sep)
-        for dossier, sous_dirs, _ in os.walk(racine):
-            sous_dirs[:] = [d for d in sous_dirs
-                            if d not in self.WORKTREE_SKIP
-                            and (not d.startswith(".") or d in self.WORKTREE_HIDDEN)]
-            if dossier.count(os.sep) - base >= self.WORKTREE_DEPTH:
-                sous_dirs[:] = []
-            if dossier != ancien and os.path.exists(os.path.join(dossier, ".git")):
-                yield dossier
-
     def adopt_moved_worktree(self) -> str | None:
         """Retrouve un dossier de travail déplacé, borné aux racines (0018).
 
-        Le marqueur git (common dir + branche) est écrit à l'inscription ; si le
-        cwd a disparu, on cherche un candidat **unique** sous les racines
-        configurées, en profondeur bornée, et on refuse un dossier déjà utilisé
-        par un autre agent.
-        """
-        marqueur: dict = {}
-        try:
-            with open(self._path("worktree.json"), encoding="utf-8") as fh:
-                marqueur = json.load(fh) or {}
-        except (OSError, ValueError):
-            return None
-        common = marqueur.get("git_common_dir")
-        if not common:
-            return None
-        branche = marqueur.get("branch") or ""
-        ancien = self.agent.get("cwd")
-        candidats = []
-        for racine in self.runner.worktree_roots:
-            if not os.path.isdir(racine):
-                continue
-            for chemin in self._worktree_dirs(racine, ancien):
-                ident = worktree_marker(chemin)
-                if not ident or ident.get("git_common_dir") != common:
-                    continue
-                if branche and ident.get("branch") != branche:
-                    continue
-                candidats.append(chemin)
-        if len(candidats) != 1:
-            if len(candidats) > 1:
-                log("[%s] moved directory ambiguous: %s" % (self.name, ", ".join(candidats)))
-            return None
-        candidat = candidats[0]
-        if registry.cwd_used(self.db, candidat, self.name):
-            log("[%s] moved directory %s already used by another agent"
-                % (self.name, candidat))
-            return None
-        registry.upsert(self.db, self.name, cwd=candidat)
-        self.agent["cwd"] = candidat
-        log("[%s] moved working directory adopted: %s" % (self.name, candidat))
-        self._fil_note("Moved working directory adopted: %s" % candidat,
-                       meta={"action": "deplacement", "cwd": candidat})
+        La recherche (marqueur git, candidat unique, dossier libre) et la mise
+        à jour du registre vivent dans `workspaces` (L101 T3) ; ce point garde
+        le journal de l'agent et la trace d'audit."""
+        candidat = workspaces.adopt_moved_worktree(
+            self.db, self.agent, marker_path=self._path("worktree.json"),
+            roots=self.runner.worktree_roots,
+            report=lambda texte: log("[%s] %s" % (self.name, texte)))
+        if candidat:
+            self._fil_note("Moved working directory adopted: %s" % candidat,
+                           meta={"action": "deplacement", "cwd": candidat})
         return candidat
 
     # -- panne de base (L72) -------------------------------------------------
@@ -3820,59 +3769,35 @@ class AgentWorker(threading.Thread):
     #: déplacé comprise) : 5 s, 10 s, 20 s… bornée à 5 min, par agent
     WORKDIR_BACKOFF_MIN = 5.0
     WORKDIR_BACKOFF_MAX = 300.0
-    #: #811 (B1) : dossier d'un lot secondaire absent — délai par lot (borné),
-    #: l'agent gardant ses autres tours
-    LOT_WORKDIR_BACKOFF_MIN = 30.0
-    LOT_WORKDIR_BACKOFF_MAX = 600.0
 
     def _resolve_workdir(self, adopt: bool = True, *, lot=None) -> str | None:
         """Le dossier de travail utilisable, ou None.
 
-        Le primaire garde le `cwd` du registre relu par `pick()` et l'adoption
-        bornée d'un worktree déplacé (0018). Un lot SECONDaire DÉCLARÉ (projet
-        de l'agent autre que le primaire) utilise le dossier de son projet au
-        Host, sans modifier le registre ; quand ce dossier manque, `None` ne
-        concerne que ce lot (`_lot_workdir_secondary`), jamais le blocage
-        global « dossier absent » (L35) réservé au cwd primaire. Un lot d'un
-        projet NON déclaré par l'agent, ou un lot inconnu, tourne dans le cwd
-        primaire comme avant L243-4 (#811 B1)."""
-        from . import canon as canon_mod, lot_workdir, projects as projects_mod
+        La règle (primaire, lot secondaire déclaré, projet inconnu) vit dans
+        `workspaces.resolve` (L101 T3) ; ce point garde l'appel et recopie le
+        diagnostic lu par la garde L35 (`_workdir_missing`, #811 B1)."""
         lot = lot or getattr(self, "_workdir_lot", None) or self.agent.get("session_work_item")
-        names = projects_mod.agent_projects(self.agent)
         self._lot_workdir_secondary = False
         self._lot_workdir_path = None
-        project = ""
-        if len(names) > 1:  # N3 : aucun accès base pour un agent mono-projet
-            try:
-                project = lot_workdir.project(self.db, lot)
-            except (lot_workdir.WorkdirError, canon_mod.CanonError):
-                project = ""  # lot inconnu : cwd primaire, comme avant L243-4
-        if project and project != names[0] and project in names[1:]:
-            self._lot_workdir_secondary = True
-            if getattr(self.runner, "mediated", False):
-                self._lot_workdir_error = "mediated executor has no per-project depot"
-                return None
-            try:
-                cwd = lot_workdir.destination(self.cfg, self.agent, project)
-            except (lot_workdir.WorkdirError, canon_mod.CanonError) as exc:
-                self._lot_workdir_error = "project %s: %s" % (project, exc)
-                return None
-            self._lot_workdir_path = cwd
-            self._lot_workdir_error = "project %s: %r" % (project, cwd)
-            return cwd if cwd and os.path.isdir(cwd) else None
         self._lot_workdir_error = ""
-        return self._primary_workdir(adopt=adopt)
+        issue = workspaces.resolve(
+            self.cfg, self.db, self.agent, lot,
+            mediated=getattr(self.runner, "mediated", False),
+            mediated_workdir=self._mediated_workdir,
+            adopt_worktree=(self.adopt_moved_worktree if adopt else None))
+        self._lot_workdir_secondary = issue.secondary
+        self._lot_workdir_path = issue.path
+        self._lot_workdir_error = issue.error
+        return issue.cwd
 
     def _primary_workdir(self, adopt: bool = True) -> str | None:
         """Le dossier primaire (cwd du registre, adoption bornée ; dépôt de
         l'exécuteur médié) — jamais un projet secondaire : la garde L35 ne se
         lève que sur le dossier qu'elle a vu manquer (#811 B1)."""
-        if getattr(self.runner, "mediated", False):
-            return self._mediated_workdir()  # L113 : dépôt de travail
-        cwd = self.agent.get("cwd")
-        if cwd and os.path.isdir(cwd):
-            return cwd
-        return self.adopt_moved_worktree() if adopt else None
+        return workspaces.primary_workdir(
+            self.agent, mediated=getattr(self.runner, "mediated", False),
+            mediated_workdir=self._mediated_workdir,
+            adopt_worktree=(self.adopt_moved_worktree if adopt else None))
 
     # -- dépôt de travail de l'exécuteur médié (L113) -------------------------
     def _depot_dir(self) -> str:
@@ -4024,15 +3949,16 @@ class AgentWorker(threading.Thread):
     def _lot_workdir_deferred(self, lot) -> None:
         """#811 (B1) : diffère CE lot secondaire (dossier absent), échéance
         croissante et dernier chemin connu — le dossier revenu le débloque au
-        sondage suivant, sans attendre l'échéance."""
+        sondage suivant, sans attendre l'échéance.
+
+        Le délai (30 s, 60 s… borné) et son échéance sont calculés par
+        `workspaces.lot_deferral` (L101 T3) ; l'état reste ici."""
         lot = str(lot or "")
         if not lot:
             return
-        delay = self._lot_wd_delay.get(lot)
-        delay = (self.LOT_WORKDIR_BACKOFF_MIN if delay is None
-                 else min(self.LOT_WORKDIR_BACKOFF_MAX, delay * 2))
+        delay, until = workspaces.lot_deferral(self._lot_wd_delay.get(lot))
         self._lot_wd_delay[lot] = delay
-        self._lot_wd_until[lot] = time.monotonic() + delay
+        self._lot_wd_until[lot] = until
         if self._lot_workdir_path:
             self._lot_wd_path[lot] = self._lot_workdir_path
         log("[%s] lot #%s: %s — lot deferred for %ds, the agent keeps its other "
@@ -4043,30 +3969,31 @@ class AgentWorker(threading.Thread):
         """#811 (B1) : ce lot secondaire attend-il encore son dossier ?
 
         Le dernier chemin connu est revérifié à chaque appel : un dossier
-        recréé lève le différé tout de suite (pas d'attente de l'échéance)."""
+        recréé lève le différé tout de suite (pas d'attente de l'échéance).
+        La règle vit dans `workspaces.lot_wait` (L101 T3) ; l'état reste ici."""
         lot = str(lot or "")
         if not lot or lot not in self._lot_wd_until:
             return False
-        path = self._lot_wd_path.get(lot)
-        if path and os.path.isdir(path):
+        etat = workspaces.lot_wait(self._lot_wd_path.get(lot),
+                                   self._lot_wd_until[lot])
+        if etat.back:
             self._lot_wd_until.pop(lot, None)
             self._lot_wd_delay.pop(lot, None)
             self._lot_wd_path.pop(lot, None)
-            return False
-        return self._lot_wd_until[lot] > time.monotonic()
+        return etat.waiting
 
     def _lot_workdir_blocked(self, lot) -> bool:
         """#811 (B1/B2) : ce lot ne peut pas ouvrir de tour faute de dossier.
 
         L'état de différé (mémoire de ce worker) d'abord ; sinon la règle
-        partagée avec le hook (`lot_workdir.mail_hold`), pour ne pas livrer de
-        courrier dans la session d'un autre lot ni consommer un réveil pour un
-        lot dont le dossier manque. Une lecture en échec ne bloque rien."""
+        partagée avec le hook (`workspaces.mail_hold`, L101 T3), pour ne pas
+        livrer de courrier dans la session d'un autre lot ni consommer un
+        réveil pour un lot dont le dossier manque. Une lecture en échec ne
+        bloque rien."""
         if self._lot_deferred(lot):
             return True
         try:
-            from . import lot_workdir
-            return lot_workdir.mail_hold(self.cfg, self.db, self.agent, lot)
+            return workspaces.mail_hold(self.cfg, self.db, self.agent, lot)
         except db_mod.DbError as exc:
             log_async("[%s] lot workdir unreadable (%s)" % (self.name, exc))
             return False
@@ -6043,7 +5970,10 @@ class AgentWorker(threading.Thread):
     # -- un tour -----------------------------------------------------------
     def _adapter(self) -> adapters.HarnessAdapter:
         harness = self.turn_harness()
-        adapter = adapters.adapter_for(harness)
+        # #4293 : binaire choisi pour CET agent (canari d'adoption) ; NULL =
+        # résolution de l'hôte inchangée. Un tour déjà lancé garde son
+        # adaptateur : la ligne est relue au début du tour suivant.
+        adapter = adapters.adapter_for(harness, (self.agent or {}).get("harness_bin") or None)
         # Traçabilité de chaîne d'approvisionnement (décision 0021) : chaque
         # descripteur utilisé est journalisé avec sa provenance et son empreinte,
         # une fois par changement (pas à chaque tour).
@@ -8108,7 +8038,19 @@ class AgentWorker(threading.Thread):
                         # Clés de chaque harnais normalisées (L60 : l'usage
                         # par étape de DeepSeek, `inputTokens`, comptait zéro).
                         entree, _cache, sortie = adapters.usage_tokens(usage)
-                        self.session_tokens += float(entree + sortie)
+                        # #4448 : `turn.completed` de Codex porte l'usage
+                        # CUMULÉ du fil, pas le tour. L'additionner à chaque
+                        # tour sommait des cumuls (un fil de 3 tours comptait
+                        # ~6 fois son dernier relevé) et faisait tourner une
+                        # session dès le minimum de tours, quel que soit le
+                        # seuil. Le cumul du fil est la mesure de la session ;
+                        # les autres harnais publient un usage par tour ou par
+                        # étape, qui s'additionne.
+                        if harness == "codex":
+                            self.session_tokens = max(self.session_tokens,
+                                                      float(entree + sortie))
+                        else:
+                            self.session_tokens += float(entree + sortie)
                     if parsed.get("cost") is not None:
                         cost = parsed["cost"]
                     if parsed.get("error"):
@@ -8294,6 +8236,13 @@ class AgentWorker(threading.Thread):
         # par plafond) : la réservation du compte reste comptée en entier
         self._compta_termine(modele_annonce, incertain=bool(
             error or result_code or lost or preempte or clos))
+        # #4448 B cx3 : le nombre de tours de la session est celui des tours
+        # COMPTÉS au grand livre — réussis ou non : la dépense a eu lieu même
+        # quand le harnais échoue (L13 B1), et toutes les sorties anticipées
+        # ci-dessous ont déjà leur ligne. L'alerte `session_too_big` relit ce
+        # même compte (`turn_costs`) : les deux mesures ne peuvent plus
+        # diverger, ni dépendre d'un redémarrage du worker.
+        self.session_turns += 1
         if clos and not lost and not preempte and not self.restarting.is_set():
             # L105 : tour clos par un plafond — un tour abouti, pas un échec ;
             # le code de sortie est celui de l'arrêt demandé.
@@ -8597,8 +8546,6 @@ class AgentWorker(threading.Thread):
         self.last_activity = time.monotonic()
         self._turn_end_mono = self.last_activity  # #3451
         self._backup_session(adapter, compte, session_new or session)
-        if ok:
-            self.session_turns += 1
         self._sync_memory()
         if spec["kind"] == "idle":
             self.nudged = True
@@ -11133,6 +11080,7 @@ class Runner:
             return True  # L109 : le canon est synchronisé par le serveur
         self._designation_retry_ready = False
         entries = canon_mod.configured(self.cfg)
+        self._canon_sync_counts = (0, len(entries))
         # L159f : aucun canon, aucune fiche Host prêteuse : la porte est fixée
         self._canon_complete = not entries
         if not entries:
@@ -11250,6 +11198,7 @@ class Runner:
             # exercé sur un objet factice (tests d'authentificateurs).
             # L159f : la porte d'hôte n'est fixée que sur TOUS les canons
             # configurés (un hôte prêteur l'est par sa fiche Host, `policy.lend`)
+            self._canon_sync_counts = (len(synced), len(entries))
             self._canon_complete = bool(entries) and len(synced) == len(entries)
             # #2561: only a pass that actually synced a canon may replay the
             # pending designations (a mocked/test `canon_sync_once` must not).
@@ -11324,13 +11273,28 @@ class Runner:
             log_async("review designation retry failed: %s"
                       % " ".join(str(exc).split())[:200])
 
+    def _canon_sync_pass(self) -> bool:
+        """Settle the host gate before optional, potentially slow review work."""
+        initial = not self._gate_settled.is_set()
+        started = time.monotonic()
+        if initial:
+            log_async("host gate: canon sync starting")
+        ok = self.canon_sync_once()
+        settled = self._settle_gate_after_sync()
+        if initial:
+            read, configured = getattr(self, "_canon_sync_counts", (0, 0))
+            cause = "complete" if settled else ("incomplete" if ok else "failed")
+            log_async("host gate: canon sync %.3fs, canons %d/%d, %s"
+                      % (time.monotonic() - started, read, configured, cause))
+        if ok and settled:
+            # A retry may scan Git history: it must neither delay the first
+            # claim nor postpone the next sync while the gate is incomplete.
+            self.retry_review_designations()
+        return settled
+
     def _canon_sync_loop(self) -> None:
         while not self.stop.is_set():
-            if self.canon_sync_once():
-                # #2561: a designation that waited on the canon policy or on a
-                # worktree now readable is retried on the same freeze.
-                self.retry_review_designations()
-            settled = self._settle_gate_after_sync()
+            settled = self._canon_sync_pass()
             # avant la première porte fixée, on réessaie vite
             wait = (self.canon_sync_interval if settled or self.canon_sync_interval <= 0
                     else min(self.canon_sync_interval, GATE_SETTLE_RETRY_S))
@@ -11357,15 +11321,12 @@ class Runner:
             self._gate_settled.set()
             return
         if self.once:
-            if self.canon_sync_once():
-                self.retry_review_designations()
+            self._canon_sync_pass()
             return
         if self.canon_thread is not None:
             return
         if self.canon_sync_interval <= 0:
-            if self.canon_sync_once():  # seulement au démarrage…
-                self.retry_review_designations()
-            if self._settle_gate_after_sync():
+            if self._canon_sync_pass():  # seulement au démarrage…
                 return
             # … ou jusqu'à la première porte d'hôte fixée (fil ci-dessous)
         self.canon_thread = threading.Thread(
@@ -11480,8 +11441,9 @@ class Runner:
             api.detect_losses(actor=self.runner_id,
                               older_than=int(host_lifecycle.staleness_s(
                                   self.cfg.resource_interval)),
-                              critical=host_lifecycle.critical_names(self.cfg, db))
-            api.expire_returns()
+                              critical=host_lifecycle.critical_names(self.cfg, db),
+                              released_grace=float(self.cfg.host_release_boot_grace))
+            api.expire_returns(open_claims=False)
             controls = api.listing()
             # #3035/#3180: a lost host that publishes fresh readings again is
             # reopened only on the database proof (origins home and unfenced, no
@@ -11499,12 +11461,48 @@ class Runner:
                               % (self.runner_id, control["host"], result.get("generation")))
             for control in controls:
                 if control["mode"] in ("draining", "returning", "lost"):
+                    # #4148: a returning host whose `busy` hook has not
+                    # reopened claims must not receive agents back yet.
+                    if control["mode"] == "returning" and not control.get("claims_open", True):
+                        continue
                     host_lifecycle.advance_host(
                         db, control["host"], limits_for=self.handoff_limits_for,
                         adapter=getattr(self, "_lifecycle_adapter", None),
                         requirements_for=getattr(self, "_lifecycle_requirements", None))
         except (db_mod.DbError, handoffs.HandoffError, ValueError):
             log_async("host lifecycle: request remains pending; helper or prerequisites unavailable")
+
+    def host_release_once(self) -> None:
+        """#4148: one release-scanner pass (adapter transitions, auto drain)."""
+        from . import host_release
+        db = None
+        try:
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
+            host_release.once(self.cfg, db, local_host=self.host,
+                              actor=self.runner_id)
+        except Exception as exc:  # a scanner pass never stops the runner
+            log_async("host release: pass failed (%s: %s)"
+                      % (type(exc).__name__, str(exc)[:160]))
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    def start_host_release_poll(self) -> None:
+        """#4148: transitions every minute; the idle scan is spaced in the DB."""
+        if self.once or getattr(self, "mediated", False):
+            return
+
+        def boucle() -> None:
+            while not self.stop.is_set():
+                self.host_release_once()
+                if self.stop.wait(60.0):
+                    return
+
+        threading.Thread(target=boucle, daemon=True, name="hotes-liberation").start()
 
     def start_resource_poll(self) -> None:
         """Relevé périodique des ressources (`AMEESH_RESOURCE_INTERVAL`,
@@ -12299,7 +12297,11 @@ class Runner:
         `blocked` : au moins un seuil est franchi — aucun nouveau tour ne
         démarre, les tours en cours finissent. `critical` : un franchissement
         est grave — les agents de plus faible priorité sont mis en pause, jamais
-        au milieu d'un tour. Sans relevé, aucune pression (on ne devine pas)."""
+        au milieu d'un tour. Sans relevé, aucune pression (on ne devine pas).
+
+        #4433 : une brèche mémoire de l'hôte imputée à un cgroup de runner ne
+        retient que ce runner (`own_path`, ou à défaut les agents servis) ; les
+        autres exécuteurs de l'hôte restent ouverts."""
         from . import resources as resources_mod
         now = time.monotonic() if now is None else float(now)
         with self._pressure_lock:
@@ -12330,6 +12332,7 @@ class Runner:
         if reading is None and not measured \
                 and power.get("on_ac") is None and power.get("battery_percent") is None:
             verdict: dict = {"blocked": False, "critical": False, "breaches": [],
+                             "attributed": [],
                              "limits": limits,
                              "scope": limits.get("pressure_scope", "host"),
                              "cgroup": {},
@@ -12341,7 +12344,11 @@ class Runner:
             # `host_resources.cgroup`); the pressure reader wants the flat
             # `cgroup_*` form for the live reading.
             merged.update({"cgroup_" + key: value for key, value in cgroup.items()})
-            verdict = resources_mod.pressure(merged, limits=limits)
+            # #4433 : un franchissement mémoire imputé au cgroup d'un runner ne
+            # retient que ce runner ; le chemin de SON cgroup fait foi.
+            verdict = resources_mod.pressure(
+                merged, limits=limits, own_path=cgroup.get("path") or None,
+                own_agents=getattr(self, "agents_filter", None) or ())
             if reading is not None:
                 verdict["since"] = reading.get("sampled_ts")
                 verdict["reading"] = reading
@@ -13087,6 +13094,7 @@ class Runner:
         self._start_host_gate()
         self.start_balance_poll()
         self.start_resource_poll()
+        self.start_host_release_poll()
         self.start_version_poll()
         self.start_housekeeping_poll()
         self.start_notify_health_poll()
@@ -13650,7 +13658,9 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
               file=sys.stderr)
         return 1
     try:
-        adapter = adapters.adapter_for(agent.get("harness") or "other")
+        # #4293 : le binaire du canari suit l'agent en session interactive aussi
+        adapter = adapters.adapter_for(agent.get("harness") or "other",
+                                       agent.get("harness_bin") or None)
         # #2706 : refus AVANT le bail. `dsh --profile agent` est headless et
         # exige une tâche : l'ancien code prenait le bail, lançait la commande
         # sans texte, puis le rendait en 4 s après « a task is required »,

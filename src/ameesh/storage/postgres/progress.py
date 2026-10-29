@@ -10,6 +10,8 @@ filtre absent n'est jamais un paramètre NULL typé par le serveur.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 from .. import interface
 from .work import item_columns
 
@@ -37,7 +39,7 @@ class Progress(interface.Progress):
     def lots(self, *, since_ts, project, limit) -> list[dict]:
         # L61 : lecture de `reviewer` sans sonde, cette commande est bornée
         sql = ("SELECT %s, count(*) OVER ()::bigint AS total FROM work_items"
-               " WHERE (state NOT IN ('merged', 'promoted', 'closed')"
+               f" WHERE (state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                "        OR updated_at >= to_timestamp(%%s))"
                % item_columns(self.db, "work_items"))
         params: list = [float(since_ts)]
@@ -45,7 +47,7 @@ class Progress(interface.Progress):
             sql += " AND (app = %s OR workstream = %s)"
             params += [project, project]
         # borne de rendu : les ouverts d'abord, puis les plus récents
-        sql += (" ORDER BY (state IN ('merged', 'promoted', 'closed')), updated_at DESC, id DESC"
+        sql += (f" ORDER BY (state IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')), updated_at DESC, id DESC"
                 " LIMIT %s")
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
@@ -185,7 +187,7 @@ class Progress(interface.Progress):
             % (_ACTION_COLUMNS, scope, open_marks), tuple(params))
 
     def agents(self, project) -> list[dict]:
-        sql = """
+        sql = f"""
             SELECT r.name, r.workstream, r.workstream AS chantier,
                    r.team, r.harness, r.host, r.model, r.provider,
                    r.credential_mode, r.status, r.status_text, r.current_prompt,
@@ -207,7 +209,7 @@ class Progress(interface.Progress):
                    -- §4 (owner 14/10/2026) : l'en-cours de l'agent, tous
                    -- projets confondus (le plafond est global)
                    (SELECT count(*) FROM work_items w
-                     WHERE w.assignee = r.name AND w.state = 'build')::int AS builds
+                     WHERE w.assignee = r.name AND w.state = '{lifecycle.IN_PROGRESS}')::int AS builds
               FROM agent_registry r
               LEFT JOIN spend_pending p ON p.agent = r.name
         """

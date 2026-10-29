@@ -50,6 +50,18 @@ conflit). Le journal de la surcharge est écrit par l'appelant, sur le lot.
 L'autorité de pilote est lue **en strict** : un registre ou un canon illisible
 rend la liste incomplète (`CandidateError`), jamais un lot réputé libre.
 
+#4429 : un lot prêt qui **ajoute** une migration numérotée (répertoire
+`migrations` du projet) n'est plus prêt si ce numéro est déjà sur la base du
+paquet (`migration-collision`, cas « cible »), ou si un autre lot prêt ajoute
+le même numéro (cas « candidats ») : un paquet qui porte les deux est rouge à
+`migrate` (« duplicate migration version »). Entre candidats, le lot qui
+détient la réservation L122 active du numéro reste ; sans détenteur parmi
+eux, le premier dans l'ordre des prêts (priorité, âge, id). Aucune
+renumérotation : le correctif reste un geste d'auteur (réserver, renommer,
+regeler). Un projet sans `migrations` déclaré n'est pas lu. La couverture
+par une réservation active du lot (#4430, `_check_migration_coverage`) passe
+avant : un lot non couvert ne départage personne.
+
 Un lot dont la préparation n'a pas pu être lue (branche, cible, classe, porte)
 n'est ni prêt ni écarté : il porte `error` et il est nommé dans `errors` et
 `errors_by_lot`. L'appelant peut alors composer les autres lots, mais il doit
@@ -59,13 +71,15 @@ inventaire) lève `CandidateError` et rend toute la liste inutilisable.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import os
 import re
 import subprocess
 import time
 
-from . import (lot_class, merge_queue, packet_guard, plan_git, resolutions,
-               storage, work, work_dependencies)
+from . import (lot_class, merge_queue, migrations, packet_guard, plan_git,
+               resolutions, storage, work, work_dependencies)
 from .canon import FETCH_TIMEOUT
 
 SCHEMA = "ameesh-packet-candidates/1"
@@ -76,6 +90,10 @@ _SHA = re.compile(r"[0-9a-f]{40}")
 REMISE_LOCAL = "refs/ameesh/candidates/remise/"
 #: #2496 : l'attribut qui rejoue une union mécanique (`merge=union`)
 _UNION_ATTRIBUTES = b"* merge=union\n"
+
+
+#: #4429 : un fichier de migration numéroté (toute largeur : Nexlink 3, ameesh 4)
+_MIGRATION = re.compile(r"^(\d+)_.+\.sql$")
 
 
 class CandidateError(RuntimeError):
@@ -186,6 +204,161 @@ def _check_migration_coverage(db, entry, *, repo, origin_repo, base, target, cfg
             % (', '.join(layout.label(number) for number in missing), entry['work_item']),
             numbers=missing))
         entry['ready'] = False
+
+
+def added_migrations(repo: str, base: str, source: str,
+                     directory: str) -> dict[int, list[str]]:
+    """#4429 : numéro → migrations que `source` **ajoute** sous `directory`
+    depuis sa base de fusion avec `base`, et qui ne sont pas déjà, au même
+    chemin, dans `base`. Un diff illisible est une erreur, jamais « aucune ».
+    """
+    proc = subprocess.run(
+        ["git", "-C", repo, "diff", "--name-only", "--no-renames", "-z",
+         "--diff-filter=A", "%s...%s" % (base, source), "--", directory + "/"],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise CandidateError(
+            "git diff %s...%s: %s"
+            % (base[:12], source[:12],
+               proc.stderr.decode("utf-8", "replace").strip()[:300]))
+    landed = set(target_migrations(repo, base, directory).get("paths", ()))
+    found: dict[int, list[str]] = {}
+    for name in proc.stdout.decode("utf-8", "replace").split("\0"):
+        match = _MIGRATION.match(os.path.basename(name)) if name else None
+        if (match and os.path.dirname(name) == directory and name not in landed):
+            found.setdefault(int(match.group(1)), []).append(name)
+    return found
+
+
+def target_migrations(repo: str, base: str, directory: str) -> dict:
+    """#4429 : les migrations numérotées de `base` : `{numbers: {n: [chemins]},
+    paths: [chemins]}`. Une lecture impossible lève `CandidateError`."""
+    proc = subprocess.run(
+        ["git", "-C", repo, "ls-tree", "-z", "--name-only", base, "--", directory + "/"],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise CandidateError(
+            "git ls-tree %s %s: %s"
+            % (base[:12], directory,
+               proc.stderr.decode("utf-8", "replace").strip()[:300]))
+    numbers: dict[int, list[str]] = {}
+    paths = []
+    for name in proc.stdout.decode("utf-8", "replace").split("\0"):
+        match = _MIGRATION.match(os.path.basename(name)) if name else None
+        if match:
+            numbers.setdefault(int(match.group(1)), []).append(name)
+            paths.append(name)
+    return {"numbers": numbers, "paths": paths}
+
+
+def _migration_directory(project) -> str:
+    return (getattr(project, "migrations", "") or "").strip().strip("/")
+
+
+def _migration_repo(project, repo: str) -> str:
+    """Le dépôt `owner/repo` des réservations L122 du projet, ou ""."""
+    slug = getattr(project, "github", "") or ""
+    if not slug:
+        try:
+            slug = migrations.origin_repo(repo) or ""
+        except Exception:  # noqa: BLE001 - sans dépôt, aucun détenteur lu
+            slug = ""
+    return migrations.repo_key(slug)
+
+
+def _exclude(entry: dict, cause: dict) -> None:
+    entry["causes"].append(cause)
+    entry["ready"] = False
+
+
+def _migration_collisions(db, candidates: list[dict], *, where: str,
+                          package_base: str, directory: str, slug: str,
+                          target_branch: str) -> None:
+    """#4429 : écarte les lots prêts dont une migration ajoutée entre en
+    collision (numéro sur la base du paquet, ou partagé entre lots prêts).
+
+    Lecture seule. Une lecture Git impossible met le lot en `error` (à
+    écarter explicitement, #3813) ; un registre illisible pour départager
+    deux candidats met **chacun** d'eux en erreur, jamais l'un réputé prioritaire.
+    """
+    ready = sorted((e for e in candidates if e["ready"] and not e["error"]),
+                   key=_ready_order)
+    if not ready:
+        return
+    try:
+        on_target = target_migrations(where, package_base, directory)["numbers"]
+    except CandidateError as exc:
+        for entry in ready:
+            entry["error"] = "cannot read the migrations of %s: %s" % (target_branch, exc)
+            entry["ready"] = False
+        return
+    added: dict[int, dict[int, list[str]]] = {}
+    for entry in ready:
+        try:
+            mine = added_migrations(where, package_base, entry["source"], directory)
+        except CandidateError as exc:
+            entry["error"] = "cannot read the added migrations: %s" % exc
+            entry["ready"] = False
+            continue
+        entry["migrations"] = {str(n): paths for n, paths in sorted(mine.items())}
+        for number, paths in sorted(mine.items()):
+            if number in on_target:
+                _exclude(entry, _cause(
+                    "migration-collision",
+                    "migration %s: number already on %s (%s): renumber, reserve, freeze again"
+                    % (", ".join(paths), target_branch, ", ".join(on_target[number])),
+                    number=number, paths=paths, case="target",
+                    with_paths=on_target[number]))
+            elif len(paths) > 1:
+                _exclude(entry, _cause(
+                    "migration-collision",
+                    "migrations %s share number %d in the same lot"
+                    % (", ".join(paths), number),
+                    number=number, paths=paths, case="lot"))
+        if entry["ready"]:
+            added[entry["work_item"]] = mine
+    by_number: dict[int, list[dict]] = {}
+    for entry in ready:
+        if entry["work_item"] in added:
+            for number in added[entry["work_item"]]:
+                by_number.setdefault(number, []).append(entry)
+    registry = None
+    for number, shared in sorted(by_number.items()):
+        if len(shared) < 2:
+            continue
+        holder_id = None
+        try:
+            if registry is None:
+                registry = storage.of(db).work
+            holder = registry.migration_holder(number, slug) if slug else None
+            holder_id = int(holder["id"]) if holder and holder.get("id") is not None else None
+        except Exception as exc:  # noqa: BLE001 - départage impossible
+            for entry in shared:
+                entry["error"] = ("cannot read the reservation of migration %d "
+                                  "shared with %s: %s" % (
+                                      number, ", ".join("#%d" % e["work_item"]
+                                                        for e in shared
+                                                        if e is not entry), exc))
+                entry["ready"] = False
+            continue
+        keeper = next((e for e in shared if e["work_item"] == holder_id), shared[0])
+        why = ("holds the active reservation" if keeper["work_item"] == holder_id
+               else "first in ready order, no candidate holds the reservation")
+        for entry in shared:
+            if entry is keeper:
+                continue
+            _exclude(entry, _cause(
+                "migration-collision",
+                "migration %s: number %d also added by #%d (%s), which stays (%s): "
+                "renumber, reserve, freeze again"
+                % (", ".join(added[entry["work_item"]][number]), number,
+                   keeper["work_item"],
+                   ", ".join(added[keeper["work_item"]][number]), why),
+                number=number, paths=added[entry["work_item"]][number],
+                case="candidates", with_lot=keeper["work_item"],
+                with_paths=added[keeper["work_item"]][number]))
 
 
 def _ancestor(repo: str, tip: str, base: str) -> bool:
@@ -534,7 +707,7 @@ def _items(db, app: str) -> list[dict]:
     lots assignés que #2404 a vus omis (le composeur doit voir tous les
     candidats, pas ceux qui restent à prendre).
     """
-    rows = [row for state in ("qa", "validated")
+    rows = [row for state in lifecycle.TO_VALIDATE
             for row in storage.of(db).work.items(state=state, assignee=None, limit=None)]
     return [row for row in rows if (row.get("app") or "") == app]
 
@@ -731,6 +904,7 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
                 entry["ready"] = False
         if entry["ready"] and not entry["source"]:
             entry["source"] = entry["published_head"]
+    for entry in candidates:
         # #3256 C : les fichiers modifiés d'un lot prêt, pour ne jamais
         # partager deux lots qui se croisent entre deux paquets parallèles.
         if entry["ready"]:
@@ -741,6 +915,15 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
             except CandidateError as exc:
                 entry["error"] = "cannot read the changed files: %s" % exc
                 entry["ready"] = False
+    # #4429 : après les prérequis et la couverture des réservations (#4430) :
+    # un lot bloqué ou non couvert ne départage personne. Une collision de
+    # migration (numéro sur la cible ou partagé) retire le lot des prêts.
+    directory = _migration_directory(project)
+    if directory:
+        _migration_collisions(db, candidates, where=where, package_base=package_base,
+                              directory=directory, slug=_migration_repo(project, repo),
+                              target_branch=target_branch)
+    for entry in candidates:
         if entry["error"]:
             errors.append("#%d : %s" % (entry["work_item"], entry["error"]))
             # #3813 : la même erreur, attribuée au lot. L'export lisible peut
@@ -883,6 +1066,8 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
         # les prérequis explicites du lot, même non bloquants.
         "files": [],
         "dependencies": [],
+        # #4429 : numéro → migrations ajoutées (lot prêt, projet à migrations)
+        "migrations": {},
         # #3375 : le hold de pilote actif, et la surcharge explicite éventuelle
         "pilot_hold": None,
         "hold_override": "",

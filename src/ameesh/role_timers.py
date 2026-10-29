@@ -694,7 +694,10 @@ def render_paquet_service(*, role: str, bin_path: str = DEFAULT_BIN) -> str:
     The tick reads everything in the database and the forge; it runs the
     script of the target (lesson #3767), so the clone is advanced first and a
     clone that does not advance has no tick. The interpreter is the one of
-    the venv that carries ``bin_path``.
+    the venv that carries ``bin_path``; since #4473 its ``ameesh`` library is
+    also the clone's (``PYTHONPATH=<clone>/src``), never the installed one: a
+    host rolled back to an older version must not make the target's script
+    import an older library.
     """
     binary = _check_bin(bin_path)
     python = binary.rsplit("/", 1)[0] + "/python" if "/" in binary else "python3"
@@ -717,7 +720,10 @@ def render_paquet_service(*, role: str, bin_path: str = DEFAULT_BIN) -> str:
         "EnvironmentFile=%s" % PAQUET_ENV.replace("~", "%h", 1),
         "ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull --ff-only --quiet "
         "origin ${AMEESH_PAQUET_TARGET}",
-        "ExecStart=%s role run %s -- %s ${AMEESH_PAQUET_REPO}/%s tick "
+        "# #4473: the script AND its `ameesh` library come from the clone; the",
+        "# installed venv only supplies the interpreter (and the `role run` gate).",
+        "ExecStart=%s role run %s -- /usr/bin/env PYTHONPATH=${AMEESH_PAQUET_REPO}/src "
+        "%s ${AMEESH_PAQUET_REPO}/%s tick "
         "--repo ${AMEESH_PAQUET_REPO} --target ${AMEESH_PAQUET_TARGET} "
         "--pilot ${AMEESH_PAQUET_PILOT}" % (binary, role, python, PAQUET_SCRIPT),
         # a composition (local tests included) is bounded to three hours by the script

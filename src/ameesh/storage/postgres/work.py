@@ -10,6 +10,8 @@ laisse une ligne dans `work_item_events` (qui, quand, pourquoi).
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import contextlib
 import datetime as _dt
 import functools
@@ -257,15 +259,15 @@ _HELD = """
                               FOR UPDATE)"""
 
 #: états de lot terminés (une délégation n'y a plus d'objet)
-_CLOSED = "('merged', 'promoted', 'closed')"
+_CLOSED = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
 #: #3370 : états d'un lot qui n'est plus ouvert — la correction de priorité
 #: les refuse, relus sous le verrou de ligne (une transition intercalée entre
 #: le contrôle de `work.set_priority` et l'écriture ne passe plus).
-_CLOSED_PRIORITY = ("merged", "promoted", "closed")
+_CLOSED_PRIORITY = lifecycle.COMPLETED
 #: L165b : un lot qui attend un autre que son agent (`qa`, `waiting_human`,
 #: `blocked`) ne l'occupe pas — même liste que `operations.listing` et
 #: `sous_utilisation.LOTS_WAITING_ON_OTHERS`
-_WAITING_ON_OTHERS = "('qa', 'validated', 'waiting_human', 'blocked')"
+_WAITING_ON_OTHERS = f"('{lifecycle.QA}', '{lifecycle.VALIDATED}', '{lifecycle.WAITING_HUMAN}', '{lifecycle.BLOCKED}')"
 #: #443, #478 : réservation automatique du prochain numéro libre — un budget
 #: de temps (et non plus un nombre d'essais) et une attente plein jitter
 #: (`uniform(0, min(plafond, base·2^n))`) bornée au budget restant, pour que
@@ -540,7 +542,7 @@ class WorkItems(interface.WorkItems):
                 return None
             item = rows[0]
             if if_empty and ((item.get("app") or "").strip()
-                             or item["state"] in ("merged", "promoted", "closed")
+                             or item["state"] in lifecycle.COMPLETED
                              or item.get("assignee") != assignee):
                 return None
             if item.get("app") == app:
@@ -752,7 +754,7 @@ class WorkItems(interface.WorkItems):
                 # same transaction as the creation — never a forgotten edge,
                 # and an edge failure never leaves the lot ready. The row was
                 # locked above, before the agent's lock (#540, ordre commun).
-                if parent[0]["state"] not in ("merged", "promoted", "closed"):
+                if parent[0]["state"] not in lifecycle.COMPLETED:
                     tx.execute(
                         "INSERT INTO work_item_dependencies(work_item_id, blocker_id,"
                         " created_by) VALUES (%s, %s, %s)",
@@ -1006,7 +1008,7 @@ class WorkItems(interface.WorkItems):
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), state, note, actor)
-            if state in ("merged", "promoted", "closed"):
+            if state in lifecycle.COMPLETED:
                 self._release_migration(tx, item_id, rows[0],
                                         why="état %s" % state, actor=actor)
             return rows[0]
@@ -1062,7 +1064,7 @@ class WorkItems(interface.WorkItems):
         if remove or not reviewer:
             locked = self.db.query(
                 "SELECT " + item_columns(self.db) + " FROM work_items"
-                " WHERE id = %s AND state = 'qa' FOR NO KEY UPDATE",
+                f" WHERE id = %s AND state = '{lifecycle.QA}' FOR NO KEY UPDATE",
                 (int(item_id),))
             if not locked:
                 return None
@@ -1084,7 +1086,7 @@ class WorkItems(interface.WorkItems):
             params = [REVIEWER_NONE, reviewer, reviewer]
         rows = self.db.query(
             "UPDATE work_items SET reviewers = " + expression + ", updated_at = now()"
-            " WHERE id = %s AND state = 'qa'"
+            f" WHERE id = %s AND state = '{lifecycle.QA}'"
             "   AND (assignee IS DISTINCT FROM %s OR %s)"
             + (" AND coalesce(reviewer, '') = ''" if vacant and not remove else "")
             + " RETURNING " + item_columns(self.db),
@@ -1136,7 +1138,7 @@ class WorkItems(interface.WorkItems):
             rows = self.db.query(
                 "SELECT id, state, assignee,"
                 "       to_jsonb(work_items)->>'external_executor' AS external_executor,"
-                "       (state = 'build' AND " + requeued_sql("work_items")
+                f"       (state = '{lifecycle.IN_PROGRESS}' AND " + requeued_sql("work_items")
                 + ") AS returned_to_queue"
                 "  FROM work_items"
                 " WHERE id = %s OR id IN (SELECT blocker_id FROM work_item_dependencies"
@@ -1148,7 +1150,7 @@ class WorkItems(interface.WorkItems):
             # — le filtre de `unassigned_lots` est revérifié sous le verrou.
             if current is not None or item is None or item["assignee"] is not None \
                     or (item.get("external_executor") or "").strip() \
-                    or (item["state"] != "intake" and not item["returned_to_queue"]):
+                    or (item["state"] != lifecycle.REQUESTED and not item["returned_to_queue"]):
                 return None
             # #2252 : toutes les dépendances doivent être FUSIONNÉES
             # (merged/promoted/closed) — un lot en `qa`, même à verdict
@@ -1165,7 +1167,7 @@ class WorkItems(interface.WorkItems):
                              " LIMIT 1", (int(item_id),)):
                 return None
             ready_state = item["state"]
-            if ready_state == "intake" and self._footprint_overlaps(item_id):
+            if ready_state == lifecycle.REQUESTED and self._footprint_overlaps(item_id):
                 return None
         else:
             ready_state = None
@@ -1260,7 +1262,7 @@ class WorkItems(interface.WorkItems):
                  "       updated_at = now(),"
                  "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
                  " WHERE id = %s AND assignee IS NOT DISTINCT FROM %s"
-                 "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                 f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                  "   AND (%s::text IS NULL OR state = %s)"
                  "   AND to_jsonb(work_items)->>'external_executor' IS NULL"
                  " RETURNING __COLUMNS__").replace("__COLUMNS__", item_columns(self.db)),
@@ -1282,7 +1284,7 @@ class WorkItems(interface.WorkItems):
         projets confondus."""
         rows = self.db.query(
             "SELECT count(*)::int AS n FROM work_items"
-            " WHERE assignee = %s AND state = 'build'", (str(assignee),))
+            f" WHERE assignee = %s AND state = '{lifecycle.IN_PROGRESS}'", (str(assignee),))
         return int(rows[0]["n"]) if rows else 0
 
     def assign_capped(self, item_id, assignee, *, current, note, actor,
@@ -1302,7 +1304,7 @@ class WorkItems(interface.WorkItems):
             tx.query(_WIP_LOCK, (_WIP_LOCK_PREFIX + str(assignee),))
             rows = tx.query(
                 "SELECT count(*)::int AS n FROM work_items"
-                " WHERE assignee = %s AND state = 'build'", (str(assignee),))
+                f" WHERE assignee = %s AND state = '{lifecycle.IN_PROGRESS}'", (str(assignee),))
             if rows and int(rows[0]["n"]) >= int(max_build):
                 return None
             return WorkItems(tx)._assign_locked(
@@ -1368,7 +1370,7 @@ class WorkItems(interface.WorkItems):
             work = WorkItems(tx)
             tx.query(_WIP_LOCK, (_WIP_LOCK_PREFIX + agent,))
             builds = tx.query(
-                "SELECT id FROM work_items WHERE assignee = %s AND state = 'build'"
+                f"SELECT id FROM work_items WHERE assignee = %s AND state = '{lifecycle.IN_PROGRESS}'"
                 " ORDER BY id FOR NO KEY UPDATE", (agent,))
             ids = [int(r["id"]) for r in builds]
             if int(item_id) not in ids:
@@ -1392,7 +1394,7 @@ class WorkItems(interface.WorkItems):
         with self.db.transaction() as tx:
             rows = tx.query(
                 ("UPDATE work_items SET external_executor = %s, updated_at = now()"
-                 " WHERE id = %s AND state NOT IN ('merged', 'promoted', 'closed')"
+                 f" WHERE id = %s AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                  "   AND (%s::text IS NULL OR assignee IS NULL)"
                  " RETURNING __COLUMNS__").replace("__COLUMNS__", item_columns(self.db)),
                 (executor or None, int(item_id), executor or None))
@@ -1619,7 +1621,7 @@ class WorkItems(interface.WorkItems):
                 return None
             row = rows[0]
             item_id = int(row["work_item_id"])
-            closed = row["state"] in ("merged", "promoted", "closed")
+            closed = row["state"] in lifecycle.COMPLETED
             if closed or row.get("assignee") != row["delegate"]:
                 outcome = "annulee"
             elif row.get("worked"):
@@ -1777,7 +1779,7 @@ class WorkItems(interface.WorkItems):
             rows = tx.query(
                 "SELECT state, extract(epoch from wake_at)::float8 AS wake_ts"
                 "  FROM work_items WHERE id = %s AND state NOT IN"
-                " ('merged', 'promoted', 'closed') FOR NO KEY UPDATE",
+                f" ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}') FOR NO KEY UPDATE",
                 (item_id,))
             if not rows:
                 return None
@@ -1812,18 +1814,18 @@ class WorkItems(interface.WorkItems):
         if not ids:
             return {}
         rows = self.db.query(
-            """
+            f"""
             SELECT w.id, coalesce(b.id, 0) AS episode,
                    extract(epoch from coalesce(b.created_at, w.created_at))::float8
                        AS start_ts,
                    extract(epoch from (
                        SELECT min(e.created_at) FROM work_item_events e
-                        WHERE e.work_item_id = w.id AND e.state = 'waiting_human'
+                        WHERE e.work_item_id = w.id AND e.state = '{lifecycle.WAITING_HUMAN}'
                           AND e.id > coalesce(b.id, 0)))::float8 AS first_ts
               FROM work_items w
               LEFT JOIN LATERAL (
                    SELECT e.id, e.created_at FROM work_item_events e
-                    WHERE e.work_item_id = w.id AND e.state <> 'waiting_human'
+                    WHERE e.work_item_id = w.id AND e.state <> '{lifecycle.WAITING_HUMAN}'
                     ORDER BY e.id DESC LIMIT 1) b ON true
              WHERE w.id IN (SELECT jsonb_array_elements_text(%s::jsonb)::bigint)
             """, (json.dumps(ids),))
@@ -1888,14 +1890,14 @@ class WorkItems(interface.WorkItems):
             borne = " AND c.work_item_id IN (%s)" % ", ".join(["%s"] * len(ids))
             params.extend(ids)
         rows = self.db.query(
-            """
+            f"""
             SELECT c.work_item_id,
                    max(extract(epoch from c.created_at))::float8 as created_ts
               FROM work_item_events c
               JOIN LATERAL (SELECT p.state FROM work_item_events p
                              WHERE p.work_item_id = c.work_item_id AND p.id < c.id
                              ORDER BY p.id DESC LIMIT 1) prev ON true
-             WHERE c.state = 'build' AND prev.state = 'merged'
+             WHERE c.state = '{lifecycle.IN_PROGRESS}' AND prev.state = '{lifecycle.DELIVERY_RECORDED}'
             """ + borne + """
              GROUP BY c.work_item_id
             """,
@@ -2015,13 +2017,17 @@ class WorkItems(interface.WorkItems):
             milestone = rows[0]
             if (kind == "verdict" and items and items[0]["state"] == "validated"
                     and not items[0].get("workflow_ref")):
-                tx.execute("UPDATE work_items SET state = 'qa', updated_at = now()"
+                tx.execute(f"UPDATE work_items SET state = '{lifecycle.QA}', updated_at = now()"
                            " WHERE id = %s", (int(item_id),))
                 WorkItems(tx)._event(int(item_id), "qa",
                                     "validated → qa — review quorum changed (#4351)", actor)
             if (kind == "frozen" and items
                     and not items[0].get("workflow_ref")
-                    and items[0]["state"] in ("intake", "build", "validated")):
+                    and items[0]["state"] in (
+                        lifecycle.REQUESTED,
+                        lifecycle.IN_PROGRESS,
+                        lifecycle.VALIDATED,
+                    )):
                 # #3467: freezing enters review before the designation hook.
                 # #3489: pinned lots keep their Process state; work.move
                 # rejects them. The milestone and designation still apply.
@@ -2029,10 +2035,10 @@ class WorkItems(interface.WorkItems):
                 # under this lot's lock and transaction: a failing hook must
                 # roll back the state, journal and milestone together.
                 from ... import work
-                if items[0]["state"] == "intake":
-                    work.move(tx, item_id, "build", actor=actor,
+                if items[0]["state"] == lifecycle.REQUESTED:
+                    work.move(tx, item_id, lifecycle.IN_PROGRESS, actor=actor,
                               note="intake → build — frozen (#3467)")
-                work.move(tx, item_id, "qa", actor=actor,
+                work.move(tx, item_id, lifecycle.QA, actor=actor,
                           note=("validated → qa — frozen (#4351)"
                                 if items[0]["state"] == "validated"
                                 else "build → qa — frozen (#3467)"))
@@ -2173,7 +2179,7 @@ class WorkItems(interface.WorkItems):
                 "       branch_head_at = CASE WHEN branch IS DISTINCT FROM %%s"
                 "                             THEN NULL ELSE branch_head_at END,"
                 "       branch = %%s, branch_target = %%s, updated_at = now()"
-                " WHERE id = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
+                f" WHERE id = %%s AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                 " RETURNING %s" % item_columns(self.db),
                 (branch, branch, branch, target, int(item_id)))
             if not rows:
@@ -2394,7 +2400,7 @@ class WorkItems(interface.WorkItems):
                             tx, item_id, slots=slots, scalar=scalar,
                             number=release_number, note=note, actor=actor,
                             state=current["state"], repo=repo)
-                    if current["state"] in ("merged", "promoted", "closed"):
+                    if current["state"] in lifecycle.COMPLETED:
                         return None
                     if (current["issue_ref"] or "") != (issue_ref or ""):
                         return None
@@ -2411,7 +2417,7 @@ class WorkItems(interface.WorkItems):
                     for old in tx.query(
                             "SELECT id, migration, state FROM work_items"
                             " WHERE migration_repo = %s"
-                            "   AND state IN ('merged', 'promoted', 'closed')"
+                            f"   AND state IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                             " ORDER BY id FOR UPDATE", (repo,)):
                         if has_migration_slots(tx):
                             tx.execute(
@@ -2462,7 +2468,7 @@ class WorkItems(interface.WorkItems):
                             value, params = (
                                 "greatest(%s, (SELECT coalesce(max(migration), 0) + 1"
                                 " FROM work_items WHERE migration_repo = %s"
-                                "   AND state NOT IN ('merged', 'promoted', 'closed')),"
+                                f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')),"
                                 " (SELECT coalesce(max(number), 0) + 1"
                                 "  FROM work_migration_reservations"
                                 "  WHERE target_repo = %s AND status = 'reserved'))",
@@ -2472,7 +2478,7 @@ class WorkItems(interface.WorkItems):
                         rows = tx.query(
                             "UPDATE work_items SET migration = %s, migration_repo = %%s,"
                             "       updated_at = now() WHERE id = %%s"
-                            "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                            f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                             "   AND coalesce(issue_ref, '') = coalesce(%%s, '')"
                             " RETURNING %s" % (value, item_columns(tx)),
                             params + (repo, int(item_id), issue_ref))
@@ -2495,7 +2501,7 @@ class WorkItems(interface.WorkItems):
                                 "SELECT greatest(%s,"
                                 " (SELECT coalesce(max(migration), 0) + 1 FROM work_items"
                                 "  WHERE migration_repo = %s"
-                                "    AND state NOT IN ('merged', 'promoted', 'closed')),"
+                                f"    AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')),"
                                 " (SELECT coalesce(max(number), 0) + 1"
                                 "  FROM work_migration_reservations"
                                 "  WHERE target_repo = %s AND status = 'reserved')) AS n",
@@ -2524,7 +2530,7 @@ class WorkItems(interface.WorkItems):
                         value, params = (
                             "greatest(%s, (SELECT coalesce(max(migration), 0) + 1"
                             " FROM work_items WHERE migration_repo = %s"
-                            "   AND state NOT IN ('merged', 'promoted', 'closed')),"
+                            f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')),"
                             " (SELECT coalesce(max(number), 0) + 1"
                             "  FROM work_migration_reservations"
                             "  WHERE target_repo = %s AND status = 'reserved'))",
@@ -2535,7 +2541,7 @@ class WorkItems(interface.WorkItems):
                         "UPDATE work_items SET migration = %s, migration_repo = %%s,"
                         "       updated_at = now()"
                         " WHERE id = %%s"
-                        "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                        f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                         "   AND coalesce(issue_ref, '') = coalesce(%%s, '')"
                         " RETURNING %s" % (value, item_columns(tx)),
                         params + (repo, int(item_id), issue_ref))
@@ -2572,7 +2578,7 @@ class WorkItems(interface.WorkItems):
         if has_migration_slots(self.db):
             rows = self.db.query(
                 "SELECT w.id, w.title, w.state FROM work_items w"
-                " WHERE w.state NOT IN ('merged', 'promoted', 'closed')"
+                f" WHERE w.state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                 "   AND ((w.migration = %s AND w.migration_repo = %s)"
                 "        OR EXISTS (SELECT 1 FROM work_migration_reservations r"
                 "                    WHERE r.work_item_id = w.id"
@@ -2584,7 +2590,7 @@ class WorkItems(interface.WorkItems):
             rows = self.db.query(
                 "SELECT id, title, state FROM work_items WHERE migration = %s"
                 " AND migration_repo = %s"
-                " AND state NOT IN ('merged', 'promoted', 'closed')", (int(number), repo))
+                f" AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')", (int(number), repo))
         return rows[0] if rows else None
 
     def record_landed_migration(self, item_id, number, repo, *, note, actor) -> dict | None:
@@ -2597,7 +2603,7 @@ class WorkItems(interface.WorkItems):
             rows = tx.query(
                 "UPDATE work_items SET migration_landed = %s, migration_landed_repo = %s,"
                 "       updated_at = now()"
-                " WHERE id = %s AND state IN ('merged', 'promoted')"
+                f" WHERE id = %s AND state IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}')"
                 " RETURNING __COLUMNS__".replace("__COLUMNS__", item_columns(self.db)),
                 (int(number), repo, int(item_id)))
             if not rows:
@@ -2628,7 +2634,7 @@ class WorkItems(interface.WorkItems):
         with self.db.transaction() as tx:
             rows = tx.query(
                 "SELECT __COLUMNS__ FROM work_items WHERE id = %s"
-                "   AND state IN ('merged', 'promoted') FOR UPDATE".replace(
+                f"   AND state IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}') FOR UPDATE".replace(
                     "__COLUMNS__", item_columns(self.db)), (int(item_id),))
             if not rows:
                 return None
@@ -2691,7 +2697,7 @@ class WorkItems(interface.WorkItems):
                   withdrawn_after=None) -> dict | None:
         with self.db.transaction() as tx:
             lot = tx.query("SELECT state, app, branch, branch_target, type FROM work_items WHERE id = %s"
-                           " AND state NOT IN ('merged', 'promoted', 'closed')"
+                           f" AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                            " FOR NO KEY UPDATE", (int(item_id),))
             if not lot:
                 return None
@@ -2720,7 +2726,7 @@ class WorkItems(interface.WorkItems):
                 return None
             if packet is not None:
                 fields = ("app", "branch", "branch_target", "type")
-                if frozen_id is None or lot[0]["state"] not in ("qa", "validated") \
+                if frozen_id is None or lot[0]["state"] not in lifecycle.TO_VALIDATE \
                         or set(packet) != set(fields) | {"resolved_target"} \
                         or packet["resolved_target"] != target \
                         or any(lot[0][key] != packet[key] for key in fields):
@@ -3189,14 +3195,14 @@ class WorkItems(interface.WorkItems):
         return self.db.query(
             "SELECT %s FROM work_items"
             " WHERE (branch IS NOT NULL OR assignee IS NOT NULL)"
-            "   AND state NOT IN ('merged', 'promoted', 'closed')"
+            f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
             " ORDER BY id LIMIT %%s" % item_columns(self.db), (int(limit),))
 
     def open_for(self, assignee) -> list[dict]:
         """Les lots ouverts (ni fusionnés, ni promus, ni fermés) d'un assigné."""
         return self.db.query(
             "SELECT %s FROM work_items"
-            " WHERE assignee = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
+            f" WHERE assignee = %%s AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
             " ORDER BY id" % item_columns(self.db), (assignee,))
 
     def held_by(self, agents) -> dict[str, dict]:
@@ -3207,10 +3213,10 @@ class WorkItems(interface.WorkItems):
         if not names:
             return {}
         rows = self.db.query(
-            "SELECT assignee, bool_or(state <> 'promoted') AS open,"
-            "       bool_or(state = 'promoted') AS promoted"
+            f"SELECT assignee, bool_or(state <> '{lifecycle.PROMOTED}') AS open,"
+            f"       bool_or(state = '{lifecycle.PROMOTED}') AS promoted"
             "  FROM work_items"
-            " WHERE assignee IN (%s) AND state NOT IN ('merged', 'closed')"
+            f" WHERE assignee IN (%s) AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.CLOSED}')"
             " GROUP BY assignee" % ", ".join(["%s"] * len(names)), tuple(names))
         return {row["assignee"]: {"open": bool(row["open"]),
                                   "promoted": bool(row["promoted"])} for row in rows}
@@ -3269,7 +3275,7 @@ class WorkItems(interface.WorkItems):
         # 1. lots ouverts : file d'équipe (assignee = NULL)
         rows = self.db.query(
             "SELECT %s FROM work_items WHERE assignee = %%s"
-            "   AND state NOT IN ('merged', 'promoted', 'closed')"
+            f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
             " ORDER BY id%s" % (item_columns(self.db), lock), (agent,))
         for row in rows:
             if dry_run:
@@ -3279,7 +3285,7 @@ class WorkItems(interface.WorkItems):
                 "UPDATE work_items SET assignee = NULL, updated_at = now(),"
                 "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
                 " WHERE id = %%s AND assignee = %%s"
-                "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                 " RETURNING %s" % item_columns(self.db), (int(row["id"]), agent))
             if not updated:
                 continue
@@ -3294,7 +3300,7 @@ class WorkItems(interface.WorkItems):
             limit = "" if dry_run else " FOR NO KEY UPDATE OF w"
             rows = self.db.query(
                 "SELECT %s FROM work_items w"
-                " WHERE w.assignee = %%s AND w.state = 'promoted'"
+                f" WHERE w.assignee = %%s AND w.state = '{lifecycle.PROMOTED}'"
                 " ORDER BY w.id%s" % (item_columns(self.db, "w"), limit), (agent,))
             for row in rows:
                 if dry_run:
@@ -3303,7 +3309,7 @@ class WorkItems(interface.WorkItems):
                 updated = self.db.query(
                     "UPDATE work_items SET assignee = %%s, updated_at = now(),"
                     "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
-                    " WHERE id = %%s AND assignee = %%s AND state = 'promoted'"
+                    f" WHERE id = %%s AND assignee = %%s AND state = '{lifecycle.PROMOTED}'"
                     " RETURNING %s" % item_columns(self.db),
                     (measure_actor, int(row["id"]), agent))
                 if not updated:
@@ -3322,7 +3328,7 @@ class WorkItems(interface.WorkItems):
         sans distinction de casse."""
         return self.db.query(
             "SELECT %s FROM work_items"
-            " WHERE state NOT IN ('merged', 'promoted', 'closed')"
+            f" WHERE state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
             "   AND (lower(issue_ref) = lower(%%s) OR lower(package_id) = lower(%%s)"
             "        OR lower(branch) = lower(%%s)"
             "        OR lower(rtrim(split_part(btrim(title), ' ', 1), ':')) = lower(%%s))"
@@ -3484,9 +3490,9 @@ class WorkItems(interface.WorkItems):
                             else not latest or int(latest[0]["id"]) != int(frozen_id)):
                         raise _Refrozen()
                 rows = tx.query(
-                    """
+                    f"""
                     UPDATE work_items
-                       SET state = 'merged', updated_at = now(), closed_at = NULL,
+                       SET state = '{lifecycle.DELIVERY_RECORDED}', updated_at = now(), closed_at = NULL,
                            pr_ref = coalesce(nullif(%s, ''), pr_ref),
                            migration_landed = coalesce(%s, migration_landed),
                            migration_landed_repo = coalesce(%s, migration_landed_repo)
@@ -3525,9 +3531,9 @@ class WorkItems(interface.WorkItems):
             if not _lock_migration_writer(tx, item_id):
                 return None
             rows = tx.query(
-                """
+                f"""
                 UPDATE work_items
-                   SET state = 'closed', close_reason = %s, superseded_by = %s,
+                   SET state = '{lifecycle.CLOSED}', close_reason = %s, superseded_by = %s,
                        updated_at = now(), closed_at = now()
                  WHERE id = %s AND state = %s AND __UNPINNED__
                 RETURNING __COLUMNS__
@@ -3558,10 +3564,10 @@ class WorkItems(interface.WorkItems):
         une rectification concurrente ne s'écrase pas."""
         with self.db.transaction() as tx:
             rows = tx.query(
-                """
+                f"""
                 UPDATE work_items
                    SET close_reason = %s, superseded_by = NULL, updated_at = now()
-                 WHERE id = %s AND state = 'closed' AND close_reason = %s
+                 WHERE id = %s AND state = '{lifecycle.CLOSED}' AND close_reason = %s
                 RETURNING __COLUMNS__
                 """.replace("__COLUMNS__", item_columns(self.db)),
                 (reason, int(item_id), current_reason))
@@ -3635,7 +3641,7 @@ class WorkItems(interface.WorkItems):
             # panier : l'équipe d'une ligne n'en ouvre pas un second.
             rows = tx.query(
                 "SELECT id FROM work_items"
-                " WHERE type = 'improvement' AND source = %s AND state = 'intake'"
+                f" WHERE type = 'improvement' AND source = %s AND state = '{lifecycle.REQUESTED}'"
                 "   AND assignee IS NULL"
                 " ORDER BY id LIMIT 1 FOR NO KEY UPDATE", (key,))
             opened = not rows
@@ -3700,7 +3706,7 @@ class WorkItems(interface.WorkItems):
         # prenable, comme un lot de l'équipe ; un `build` en cours, non.
         params: tuple = ()
         if open_only:
-            where = ("(state = 'intake' OR (state = 'build' AND "
+            where = (f"(state = '{lifecycle.REQUESTED}' OR (state = '{lifecycle.IN_PROGRESS}' AND "
                      + requeued_sql("work_items") + ")) AND assignee IS NULL")
             params = REQUEUED_PARAMS
         else:
@@ -3733,7 +3739,7 @@ class WorkItems(interface.WorkItems):
         # `work show` (`depends … blocking`) et de « planned: waiting on lots » :
         # une dépendance en `qa`, même jugée, n'offre pas de base stable.
         sql = ("SELECT w.*,"
-               "       (w.state = 'build' AND " + requeued_sql("w") + ") AS returned_to_queue,"
+               f"       (w.state = '{lifecycle.IN_PROGRESS}' AND " + requeued_sql("w") + ") AS returned_to_queue,"
                "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
                "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
                "       EXISTS (SELECT 1 FROM agent_mailbox b"
@@ -3748,7 +3754,7 @@ class WorkItems(interface.WorkItems):
                "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
                "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
                "          FROM work_items"
-               "         WHERE (state = 'intake' OR (state = 'build' AND "
+               f"         WHERE (state = '{lifecycle.REQUESTED}' OR (state = '{lifecycle.IN_PROGRESS}' AND "
                + requeued_sql("work_items") + "))"
                "           AND assignee IS NULL"
                # #3447 : un lot réservé à un exécutant externe n'est pas
@@ -3763,11 +3769,11 @@ class WorkItems(interface.WorkItems):
                # lot occupant du même dépôt attend sa fusion (un lot `build`
                # rendu à la file occupe déjà la sienne) ; même prédicat que la
                # garde de `_assign_locked`, avant le LIMIT.
-               "           AND (state <> 'intake' OR NOT "
+               f"           AND (state <> '{lifecycle.REQUESTED}' OR NOT "
                + footprint_overlap_sql("work_items") + ")) w"
                "  LEFT JOIN work_packages k ON k.id = w.package_id"
                "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
-               " ORDER BY coalesce(w.priority, 2), (w.state = 'build') DESC,"
+               f" ORDER BY coalesce(w.priority, 2), (w.state = '{lifecycle.IN_PROGRESS}') DESC,"
                "          w.planned_start NULLS LAST,"
                "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
                "          w.created_ts, w.id"
@@ -3809,7 +3815,7 @@ class WorkItems(interface.WorkItems):
             "  FROM work_items w"
             "  LEFT JOIN work_packages k ON k.id = w.package_id"
             "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
-            " WHERE w.state = 'qa'" + only +
+            f" WHERE w.state = '{lifecycle.QA}'" + only +
             "   AND w.assignee IS NOT NULL AND btrim(w.assignee) <> ''"
             "   AND left(w.assignee, 6) <> 'human:'"
             "   AND " + frozen_sha + " IS NOT NULL"
@@ -3901,7 +3907,7 @@ class WorkItems(interface.WorkItems):
             "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
             "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
             "          FROM work_items"
-            "         WHERE assignee = %%s AND state IN ('intake', 'build')"
+            f"         WHERE assignee = %%s AND state IN ('{lifecycle.REQUESTED}', '{lifecycle.IN_PROGRESS}')"
             "           AND type <> 'improvement') w"
             "  LEFT JOIN work_packages k ON k.id = w.package_id"
             "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
@@ -4092,7 +4098,7 @@ class WorkItems(interface.WorkItems):
             "                      ORDER BY e.at, e.id LIMIT 1) f ON true"
             "  LEFT JOIN LATERAL (SELECT count(*) AS n FROM work_item_estimates e"
             "                      WHERE e.work_item_id = w.id) n ON true"
-            " WHERE (w.state <> 'closed' OR w.close_reason = 'delivered')")
+            f" WHERE (w.state <> '{lifecycle.CLOSED}' OR w.close_reason = 'delivered')")
         params: list = []
         if app:
             sql += " AND (w.app = %s OR w.workstream = %s)"
@@ -4134,7 +4140,7 @@ class WorkItems(interface.WorkItems):
             "                   AND " + _effective_merged("x") +
             "                 ORDER BY x.at DESC, x.id DESC LIMIT 1) fus ON true"
             "  LEFT JOIN work_item_measures m ON m.work_item_id = w.id"
-            " WHERE w.started_at IS NOT NULL AND w.state <> 'closed'")
+            f" WHERE w.started_at IS NOT NULL AND w.state <> '{lifecycle.CLOSED}'")
         params: list = []
         if ids is not None:
             ids = [int(i) for i in ids]

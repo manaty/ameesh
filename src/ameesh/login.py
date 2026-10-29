@@ -141,7 +141,7 @@ ADAPTERS = {
         url_domains=("claude.ai", "claude.com", "anthropic.com"),
         paste_back=True,
         refused=("--console", "--api-key", "setup-token"),
-        note="--console et setup-token écartés (facturation API, hors pilote)"),
+        note="--console écarté (facturation API) ; setup-token importé par --token-file"),
     "codex": Adapter(
         harness="codex",
         argv=("codex", "login", "--device-auth"),
@@ -190,7 +190,8 @@ def check_extra(adapter: Adapter, extra=()) -> tuple:
 #: variables de compte héritées qu'une connexion ne doit jamais voir
 _DROP_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
              "GH_HOST", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-             "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY",
+             "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+             "CLAUDE_CODE_OAUTH_SCOPES", "OPENAI_API_KEY", "CODEX_API_KEY",
              "SSH_ASKPASS", "BROWSER")
 #: dossier de configuration du CLI, par harnais
 _HOME_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "gh": "GH_CONFIG_DIR"}

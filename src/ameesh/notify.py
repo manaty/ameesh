@@ -103,6 +103,8 @@ fallback success does not mark the alert delivered on the Nexlink side.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import argparse
 import base64
 import errno
@@ -291,6 +293,8 @@ TYPE_LABELS = {
     # #1107 (n2 P3 de #1035) : un lot que les passes d'alerte ne savent pas lire
     "lot_unreadable": "work item unreadable by the alert passes",
     "host_pressure": "host under pressure",
+    # #4433: the host's memory PSI comes from one runner's own memory.max
+    "runner_pressure": "runner at its own memory ceiling",
     "host_unsampled": "host sampler silent",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
@@ -331,6 +335,10 @@ TYPE_LABELS = {
     "host_unavailable": "host unavailable",
     "lease_not_taken": "runner cannot take its lease",
     "host_drain_overdue": "host drain overdue",
+    "host_release_failed": "host release adapter failed",
+    "host_release_overdue": "host release overdue",
+    "host_release_no_runs": "host release blocked by unknown runs",
+    "host_release_canon_unreadable": "host release blocked by unreadable canon",
     # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "turn_churn": "bursts of short turns",
@@ -3141,7 +3149,11 @@ class Notifier:
                         continue
                     if item and item.get("state") == entry.get("lot_state") \
                             and item.get("assignee") == entry.get("agent") \
-                            and item.get("state") not in ("closed", "merged", "promoted"):
+                            and item.get("state") not in (
+                                lifecycle.CLOSED,
+                                lifecycle.DELIVERY_RECORDED,
+                                lifecycle.PROMOTED,
+                            ):
                         continue
                 del sent[key]
         due = []
@@ -3351,8 +3363,7 @@ class Notifier:
                         # again before each delivery, including the desk thread.
                         item = storage.of(db).work.get(int(alert["lot"]))
                         # A missing row is no evidence that delivery happened.
-                        if item is not None and item.get("state") in (
-                                "merged", "promoted", "closed"):
+                        if item is not None and item.get("state") in lifecycle.COMPLETED:
                             break
                         if item is not None and alert.get("step") == "verdict_merge":
                             from . import slo_delivery

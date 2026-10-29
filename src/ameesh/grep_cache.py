@@ -16,6 +16,10 @@ un fichier par clé sous l'état de l'hôte, partagé par tous les exécuteurs d
 même utilisateur. Seuls les résultats réussis (`grep` à 0 ou 1) se gardent :
 un échec reste un doute et se relit au passage suivant.
 
+#4475 : les lectures complètes d’arbre sont partagées entre motifs. Après
+chaque publication, le LRU borne le magasin à 256 Mio et 20 000 entrées ;
+une entrée dépassant seule le budget est retirée.
+
 Attributs (B/P2 cx2 sur b4e42699) : `-I` dépend de l'attribut `binary`, que git
 lit dans les `.gitattributes` du dépôt de travail, `info/attributes`,
 `core.attributesFile` et le fichier système. Le balayage lit donc les
@@ -48,8 +52,8 @@ from . import canon
 CACHE_DIR = "git-grep"
 #: entrées gardées au plus (les plus anciennement lues retirées)
 MAX_ENTRIES = 20000
-#: magasins entre deux élagages
-PRUNE_EVERY = 256
+#: octets persistés au plus ; les arbres complets peuvent faire plusieurs Mo
+MAX_BYTES = 256 * 1024 * 1024
 #: attente au plus du verrou d'une clé qu'un autre processus calcule (s)
 LOCK_WAIT_S = canon.GIT_TIMEOUT
 #: pas de l'attente du verrou (s)
@@ -63,7 +67,6 @@ ATTR_SOURCE_GIT = (2, 41)
 #: `env_extra`, donc dans la clé du cache mémoire de `canon._git` (#3753)
 ATTR_TOKEN_ENV = "AMEESH_INFO_ATTRIBUTES"
 
-_stores = 0
 #: interrupteur du processus (la suite de tests le met à False)
 ENABLED = True
 
@@ -192,7 +195,6 @@ def _read(name: str):
 
 
 def _write(name: str, value: list) -> None:
-    global _stores
     path = _path(name)
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
@@ -210,13 +212,18 @@ def _write(name: str, value: list) -> None:
             raise
     except OSError:
         return                         # cache best-effort : la lecture vaut
-    _stores += 1
-    if _stores % PRUNE_EVERY == 0:
-        prune()
+    # Chaque publication applique la borne : 256 arbres entre deux élagages
+    # suffiraient à remplir un disque (#4475, B P2 auditeur).
+    prune()
 
 
-def prune(limit: int = MAX_ENTRIES) -> int:
-    """Retire les entrées les plus anciennement lues au-delà de `limit`."""
+def prune(limit: int = MAX_ENTRIES, max_bytes: Optional[int] = None) -> int:
+    """Élague les plus anciennes lectures jusqu’aux bornes de nombre/octets.
+
+    Une entrée plus grosse que le budget est retirée elle aussi. Les fichiers
+    de verrou et temporaires ne sont jamais des entrées à élaguer.
+    """
+    budget = MAX_BYTES if max_bytes is None else max(0, max_bytes)
     entries = []
     base = root()
     try:
@@ -234,18 +241,25 @@ def prune(limit: int = MAX_ENTRIES) -> int:
                 continue
             full = os.path.join(folder, name)
             try:
-                entries.append((os.stat(full).st_mtime, full))
+                stat = os.stat(full)
+                entries.append((stat.st_mtime, full, stat.st_size))
             except OSError:
                 continue
     removed = 0
-    if len(entries) > limit:
-        entries.sort()
-        for _mtime, full in entries[:len(entries) - limit]:
-            try:
-                os.unlink(full)
-                removed += 1
-            except OSError:
-                pass
+    total = sum(size for _mtime, _path, size in entries)
+    count = len(entries)
+    for _mtime, full, size in sorted(entries):
+        if count <= limit and total <= budget:
+            break
+        try:
+            os.unlink(full)
+            removed += 1
+        except FileNotFoundError:
+            pass                       # déjà retiré par un autre processus
+        except OSError:
+            continue                   # pas retiré : ses octets comptent encore
+        count -= 1
+        total -= size
     return removed
 
 

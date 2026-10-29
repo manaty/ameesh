@@ -141,6 +141,7 @@ class RenderTest(unittest.TestCase):
         self.assertIn("ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull "
                       "--ff-only --quiet origin ${AMEESH_PAQUET_TARGET}", text)
         self.assertIn("ExecStart=/opt/ameesh/bin/ameesh role run mesh-design -- "
+                      "/usr/bin/env PYTHONPATH=${AMEESH_PAQUET_REPO}/src "
                       "/opt/ameesh/bin/python ${AMEESH_PAQUET_REPO}/scripts/"
                       "paquet-horaire.py tick --repo ${AMEESH_PAQUET_REPO} "
                       "--target ${AMEESH_PAQUET_TARGET} --pilot ${AMEESH_PAQUET_PILOT}",

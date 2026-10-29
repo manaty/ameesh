@@ -14,11 +14,15 @@ MERGE_CONNECTOR = "git-merge"
 
 
 def deliver_git_merge(db, item_id, *, evidence, actor="", **options):
-    """A merge on the target, as one of two proofs.
+    """A merge on the target, as one of three proofs.
 
     - ``{"action": <id>}``: a gate action (`git-merge`) confirmed for this lot;
       its merge commit and PR are read from the action, then ``close_merged``
       records them. Returns the ``close_merged`` result (``refused`` included).
+    - ``{"seen": <source>[, "sha": S][, "pr": "owner/repo#N"]}``: a merge the
+      sweeps and the packet gate observed (`plan_git`, `plan_github`,
+      `packet_close`, `merge_pr`, `fire`, L99 T2b #4366); ``close_merged``
+      records it, ``options`` are its own (``frozen_id``, ``repo``…).
     - ``{"sha": S}`` or ``{"pr": "owner/repo#N"[, "sha": S]}``: a merge declared
       outside a PR or by a PR of another repository, checked by
       ``work.record_merge`` (`ameesh work merged`); ``options`` are its own."""
@@ -40,9 +44,18 @@ def deliver_git_merge(db, item_id, *, evidence, actor="", **options):
             actor=action.get("auth_approver") or actor or MERGE_CONNECTOR,
             source="the gate (action %s)" % action_id, pr_ref=action.get("target"),
             connector=MERGE_CONNECTOR)
+    if "seen" in evidence:
+        source = evidence.pop("seen")
+        extra = set(evidence) - {"sha", "pr"}
+        if extra or not source:
+            raise work.WorkError("git-merge: an observed merge takes its source, sha "
+                                 "and pr, not %s" % (", ".join(sorted(extra)) or "no source"))
+        return work.close_merged(
+            db, int(item_id), sha=evidence.get("sha") or "", actor=actor, source=source,
+            pr_ref=evidence.get("pr"), connector=MERGE_CONNECTOR, **options)
     extra = set(evidence) - {"sha", "pr"}
     if extra:
-        raise work.WorkError("git-merge: unknown evidence %s (sha, pr or action)"
+        raise work.WorkError("git-merge: unknown evidence %s (sha, pr, seen or action)"
                              % ", ".join(sorted(extra)))
     return work.record_merge(db, item_id, sha=evidence.get("sha") or "",
                              pr=evidence.get("pr"), actor=actor, **options)

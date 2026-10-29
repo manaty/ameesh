@@ -18,12 +18,14 @@ de session) est un numéro, ou une étiquette qui désigne UN SEUL lot ouvert
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 from .. import interface
 from .decisions import PENDING_BOARD_SQL
 from .mailbox import DEAD_LETTERS_SQL
 
 #: états de lot terminés (même liste que `work_items` ailleurs)
-_CLOSED = "('merged', 'promoted', 'closed')"
+_CLOSED = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
 #: messages de l'agent examinés au plus pour trouver le lot qu'il cite
 CITED_SCAN = 200
 
