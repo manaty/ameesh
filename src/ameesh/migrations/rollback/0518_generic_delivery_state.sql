@@ -132,3 +132,7 @@ DROP INDEX IF EXISTS work_items_fingerprint_open_uniq;
 CREATE UNIQUE INDEX work_items_fingerprint_open_uniq ON work_items (lower(source))
  WHERE source LIKE 'empreinte:%' AND state NOT IN ('merged', 'promoted', 'closed');
 ALTER TABLE work_items DROP COLUMN legacy_state;
+-- Forget 0518 so the switched code finds it pending again (doctor would
+-- otherwise report an unknown applied version, and a later deploy would
+-- skip the forward migration on a pre-switch schema).
+DELETE FROM schema_migrations WHERE version = 518;
