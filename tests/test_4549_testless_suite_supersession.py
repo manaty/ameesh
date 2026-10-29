@@ -32,7 +32,7 @@ import json
 import types
 import unittest
 
-from ameesh import fire, merge_pr, radar
+from ameesh import fire, merge_pr, packet_automerge, radar
 
 from tests.test_2271_fire_required_checks import FakeGh
 
@@ -180,8 +180,34 @@ class RequiredGateSuiteSupersessionTest(unittest.TestCase):
     def test_a_newer_green_suite_replaces_a_plan_failed_suite(self):
         runs = (_plan_failed(110747286243, "2026-10-29T10:23:27Z")
                 + _green(110756051303, "2026-10-29T10:47:45Z"))
-        self.assertEqual(self._gate(*runs), ([], []))
-        self.assertEqual(self._gate(*reversed(runs)), ([], []))
+        kwargs = {"slug": "manaty/ameesh", "head": SHA, "target": "main"}
+        self.assertEqual(self._gate(*runs, gh=_gh(BASE, check_runs=runs),
+                                    **kwargs), ([], []))
+        self.assertEqual(self._gate(*reversed(runs),
+                                    gh=_gh(BASE, check_runs=runs),
+                                    **kwargs), ([], []))
+
+    def test_without_a_reader_nothing_is_replaced(self):
+        # B3 de dev1, confirmé par cx2 : sans lecteur, la preuve de workflow
+        # et de base n'existe pas — la substitution est refusée, y compris
+        # pour la voie sans application imposée.
+        runs = (_plan_failed(1, "2026-10-29T10:23:27Z")
+                + _green(2, "2026-10-29T10:47:45Z"))
+        self.assertEqual(self._gate(*runs)[0], ["tests (FAILURE)"])
+        self.assertEqual(
+            fire._required_gate((("tests", None),), _rollup(runs), list(runs))[0],
+            ["tests (FAILURE)"])
+
+    def test_the_packet_gate_carries_the_run_proofs(self):
+        # la porte des paquets (`_inherited_red`) passe slug/gh/tête/base :
+        # la substitution reste prouvée, jamais tenue pour faite.
+        runs = (_plan_failed(1, "2026-10-29T10:23:27Z")
+                + _green(2, "2026-10-29T10:47:45Z"))
+        self.assertEqual(
+            packet_automerge._inherited_gate(
+                REQUIRED, _rollup(runs), list(runs), slug="manaty/ameesh",
+                gh=_gh(BASE, check_runs=runs), head=SHA, target="main"),
+            ([], []))
 
     def test_the_base_of_the_green_suite_must_be_the_current_target(self):
         runs = (_plan_failed(1, "2026-10-29T10:23:27Z")

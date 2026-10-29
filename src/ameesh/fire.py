@@ -1039,8 +1039,8 @@ def _current_base_ok(attested, *, slug: str | None, gh, target: str) -> bool:
     devenue la tête : un commit ancien poussé en fast-forward après le run
     garde sa date et laisserait passer une composition plus ancienne. Une
     base attestée absente ou une lecture impossible refuse : le doute ne
-    verdit jamais. Sans lecteur (appel unitaire), la preuve de base est
-    réputée faite, comme avant."""
+    verdit jamais. Sans lecteur, l'appelant ne substitue rien
+    (`_supersede_testless_runs` ferme par défaut)."""
     if not (slug and gh and target):
         return True
     if not isinstance(attested, str) or not attested.strip():
@@ -1063,7 +1063,8 @@ def _supersede_testless_runs(name, app_id, runs, provenance, *, required=(),
     ex aequo, plan de la suite verte non vert, workflow d'une autre famille,
     ancien rouge non prouvé « sans test », ou base de la suite verte non
     courante laissent toutes les entrées. Un rouge de test, une part lancée
-    ou un autre négatif ne sont donc pas masqués."""
+    ou un autre négatif ne sont donc pas masqués. Sans lecteur (`slug`/`gh`),
+    aucune preuve de workflow ni de base n'existe : rien n'est substitué."""
     from . import radar
     timeline = _suite_timeline(runs, provenance)
     if not timeline or len(timeline) < 2:
@@ -1094,21 +1095,24 @@ def _supersede_testless_runs(name, app_id, runs, provenance, *, required=(),
                 [check for check in checks if check.get("app_id") == app_id],
                 name, required=required_names):
             return runs
-    # La preuve de workflow et de base vient des runs Actions eux-mêmes. Sans
-    # lecteur (appel unitaire), elle est réputée faite ; avec un lecteur, une
-    # lecture impossible refuse : le doute ne verdit jamais.
-    if slug and gh:
-        cache: dict = {}
-        newest_run = _suite_run(slug, newest[2], gh=gh, head=head, cache=cache)
-        if newest_run is None:
+    # #4549 (B3 de dev1, confirmé par cx2) : la preuve de workflow et de base
+    # vient des runs Actions eux-mêmes. Sans lecteur, aucune preuve n'existe :
+    # aucune substitution (le doute ne verdit jamais, y compris sur la porte
+    # des paquets qui appelait cette fonction sans lecteur) ; avec un lecteur,
+    # une lecture impossible refuse aussi.
+    if not (slug and gh):
+        return runs
+    cache: dict = {}
+    newest_run = _suite_run(slug, newest[2], gh=gh, head=head, cache=cache)
+    if newest_run is None:
+        return runs
+    for _start, _suite, run, _checks in failures:
+        proof = _suite_run(slug, run, gh=gh, head=head, cache=cache)
+        if not _same_workflow(newest_run, proof):
             return runs
-        for _start, _suite, run, _checks in failures:
-            proof = _suite_run(slug, run, gh=gh, head=head, cache=cache)
-            if not _same_workflow(newest_run, proof):
-                return runs
-        if not _current_base_ok(newest_run.get("attested_base"), slug=slug,
-                                gh=gh, target=target):
-            return runs
+    if not _current_base_ok(newest_run.get("attested_base"), slug=slug,
+                            gh=gh, target=target):
+        return runs
     drop = {row[1] for row in failures}
     return [run for run in runs if run.get("check_suite_id") not in drop]
 
