@@ -136,6 +136,18 @@ class SetupTokenTest(unittest.TestCase):
 
 
 class ExpiryAlertTest(unittest.TestCase):
+    def test_rotating_oauth_at_25_days_does_not_alert(self):
+        from ameesh import storage
+        store = mock.Mock()
+        rows = [dict(host="host-a", harness=harness, account="primary", state="healthy",
+                     reason="OAuth credentials", expires_ts=NOW + 25 * 86400)
+                for harness in ("claude", "codex")]
+        store.credentials.listing.return_value = rows
+        with mock.patch.object(storage, "of", return_value=store):
+            self.assertEqual(exploitation._credentials(None, NOW), [])
+            rows[0]["expires_ts"] = NOW + sentinel.DEFAULT_WARN_HOURS * 3600
+            self.assertEqual(len(exploitation._credentials(None, NOW)), 1)
+
     def test_warn_at_30_days_and_immediate_failure(self):
         from ameesh import storage
         cfg = SimpleNamespace(credential_sentinel={})
