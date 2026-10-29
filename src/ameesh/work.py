@@ -4184,6 +4184,14 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             % (current, state, current, ", ".join(sorted(TRANSITIONS[current])) or "none",
                " — state set by mistake: ameesh work move %s %s --correct \"reason\""
                % (item_id, state) if (current, state) in CORRECTIONS else ""))
+    if state == "validated":
+        from . import merge_queue
+        gate = merge_queue.review_gate_for_item(
+            db, getattr(db, "cfg", None), item, milestones(db, item_id))
+        if not gate or not gate.get("ok"):
+            raise WorkError(
+                "transition to validated requires reviews on the current frozen head; "
+                "move it to qa")
     if state == lifecycle.WAITING_HUMAN and not storage.of(db).decisions.pending_for_lot(str(item_id)):
         raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
     if package_exclusion and current not in TO_VALIDATE:

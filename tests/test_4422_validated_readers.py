@@ -56,6 +56,16 @@ class ValidatedResumeTest(PgTestCase):
             with self.subTest(held=held):
                 ident = work.add(self.db, title="resume validation")["id"]
                 self.db.execute("UPDATE work_items SET state = %s WHERE id = %s", (held, ident))
-                with mock.patch("ameesh.merge_queue.review_gate_for_item", return_value={"ok": True}):
+                with mock.patch("ameesh.merge_queue.review_gate_for_item", return_value={"ok": True}) as gate:
                     work.move(self.db, ident, "validated")
+                gate.assert_called_once()
                 self.assertEqual(work.get(self.db, ident)["state"], "validated")
+
+    def test_resume_without_current_reviews_is_refused(self):
+        for held in ("blocked", "waiting_human"):
+            with self.subTest(held=held):
+                ident = work.add(self.db, title="unreviewed resume")["id"]
+                self.db.execute("UPDATE work_items SET state = %s WHERE id = %s", (held, ident))
+                with self.assertRaisesRegex(work.WorkError, "move it to qa"):
+                    work.move(self.db, ident, "validated")
+                self.assertEqual(work.get(self.db, ident)["state"], held)
