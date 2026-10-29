@@ -1,0 +1,173 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""L99 T5: persisted delivery core, lossless stages and transactional rollback."""
+from pathlib import Path
+import unittest
+
+from ameesh import work, work_lifecycle as lifecycle, plan_github, storage
+from ameesh.db import DbError
+from .support import PgTestCase
+
+MIGRATIONS = Path(__file__).parents[1] / 'src/ameesh/migrations'
+MIGRATION = (MIGRATIONS / '0518_generic_delivery_state.sql').read_text()
+
+
+class GenericDeliveryTest(PgTestCase):
+    def lot(self, title='generic delivery'):
+        return work.add(self.db, title=title, app='demo')['id']
+
+    def test_old_writers_are_normalized_without_losing_stage(self):
+        for stage in ('merged', 'promoted'):
+            lot = self.lot(stage)
+            self.db.execute('UPDATE work_items SET state = %s WHERE id = %s', (stage, lot))
+            row = work.get(self.db, lot)
+            self.assertEqual((row['state'], row['legacy_state'], row['workflow_stage']),
+                             ('delivered', stage, stage))
+
+    def test_promotion_and_correction_keep_one_delivery_core(self):
+        lot = self.lot()
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s", (lot,))
+        promoted = work.move(self.db, lot, 'promoted')
+        self.assertEqual((promoted['state'], promoted['legacy_state']),
+                         ('delivered', 'promoted'))
+        self.assertIsNotNone(promoted['closed_ts'])
+        corrected = work.move(self.db, lot, 'merged', correct='wrong promotion')
+        self.assertEqual((corrected['state'], corrected['legacy_state']),
+                         ('delivered', 'merged'))
+        self.assertIsNone(corrected['closed_ts'])
+        reopened = work.move(self.db, lot, 'build', correct='wrong merge')
+        self.assertEqual(reopened['state'], 'build')
+        self.assertIsNone(work.get(self.db, lot)['workflow_stage'])
+
+    def test_promote_cli_uses_the_development_workflow(self):
+        lot = self.lot()
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s", (lot,))
+        result = self.mesh('work', 'promote', str(lot))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = work.get(self.db, lot)
+        self.assertEqual((row['state'], row['legacy_state']), ('delivered', 'promoted'))
+
+    def test_promoted_cannot_return_without_explicit_correction(self):
+        lot = self.lot()
+        self.db.execute("UPDATE work_items SET state = 'promoted' WHERE id = %s", (lot,))
+        with self.assertRaises(work.WorkError):
+            work.move(self.db, lot, 'build')
+        with self.assertRaises(work.WorkError):
+            work.move(self.db, lot, 'merged')
+
+    def test_custom_pinned_stage_is_preserved(self):
+        lot = self.lot()
+        self.db.execute("UPDATE work_items SET state = 'merged', workflow_ref = 'custom@1',"
+                        " workflow_stage = 'integrated', workflow_version = 1 WHERE id = %s", (lot,))
+        row = work.get(self.db, lot)
+        self.assertEqual((row['state'], row['legacy_state'], row['workflow_stage']),
+                         ('delivered', 'merged', 'integrated'))
+        with self.assertRaises(work.WorkError):
+            work.move(self.db, lot, 'promoted')
+
+    def test_first_merge_records_one_milestone_and_promotion_does_not_duplicate(self):
+        lot = self.lot()
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s", (lot,))
+        work.move(self.db, lot, 'promoted')
+        work.move(self.db, lot, 'merged', correct='wrong promotion')
+        rows = self.db.query("SELECT id FROM work_item_milestones WHERE work_item_id = %s"
+                             " AND kind = 'merged'", (lot,))
+        self.assertEqual(len(rows), 1)
+
+    def test_fingerprint_can_recur_after_generic_delivery(self):
+        first = self.lot()
+        self.db.execute("UPDATE work_items SET source = 'empreinte:4353', state = 'merged'"
+                        " WHERE id = %s", (first,))
+        second = self.lot()
+        self.db.execute("UPDATE work_items SET source = 'empreinte:4353' WHERE id = %s", (second,))
+        with self.assertRaises(DbError):
+            with self.db.transaction() as tx:
+                tx.execute("UPDATE work_items SET state = 'build' WHERE id = %s", (first,))
+
+    def test_merge_connector_writes_stage_and_core_together(self):
+        lot = self.lot()
+        result = storage.of(self.db).work.close_merged(
+            lot, current="intake", sha="a" * 40, actor="test", note="merge", pr_ref="")
+        self.assertEqual((result['state'], result['legacy_state']), ('delivered', 'merged'))
+
+    def test_storage_cas_accepts_core_and_rejects_stale_phase(self):
+        lot = self.lot()
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s", (lot,))
+        store = storage.of(self.db).work
+        changed = store.move(lot, 'promoted', current='delivered', loops=0, note='promote', actor='test')
+        self.assertEqual(changed['legacy_state'], 'promoted')
+        self.assertIsNone(store.move(lot, 'build', current='merged', loops=0,
+                                     note='stale correction', actor='test'))
+
+    def test_old_filters_select_individual_stages(self):
+        ids = {}
+        for stage in ('merged', 'promoted'):
+            ids[stage] = self.lot(stage)
+            self.db.execute('UPDATE work_items SET state = %s WHERE id = %s', (stage, ids[stage]))
+        for stage, lot in ids.items():
+            self.assertEqual([r['id'] for r in work.list_items(self.db, state=stage)], [lot])
+        self.assertEqual({r['id'] for r in work.list_items(self.db, state='delivered')}, set(ids.values()))
+
+    def test_github_projection_is_unchanged(self):
+        for stage in ('merged', 'promoted'):
+            old = dict(id=17, state=stage, type='bug', priority=1, pr_ref='demo/repo#42')
+            new = dict(old, state='delivered', legacy_state=stage)
+            self.assertEqual(plan_github.lot_labels(old), plan_github.lot_labels(new))
+            self.assertEqual(plan_github.lot_issue_state(old), plan_github.lot_issue_state(new))
+            options = dict(repo='demo/repo', public=False, issue_of=lambda _: None)
+            self.assertEqual(plan_github._closing(old, **options), plan_github._closing(new, **options))
+
+    def test_operator_rollback_and_forward_restore_current_data(self):
+        ids = []
+        for stage in ('merged', 'promoted'):
+            lot = self.lot(stage)
+            ids.append(lot)
+            self.db.execute('UPDATE work_items SET state = %s WHERE id = %s', (stage, lot))
+        marks = self.db.query('SELECT * FROM work_item_milestones ORDER BY id')
+        with self.db.transaction() as tx:
+            tx.execute((MIGRATIONS / 'rollback/0518_generic_delivery_state.sql').read_text())
+            rows = tx.query('SELECT state, workflow_stage FROM work_items WHERE id IN (%s,%s) ORDER BY id', tuple(ids))
+            self.assertEqual(rows, [dict(state='merged', workflow_stage=None), dict(state='promoted', workflow_stage=None)])
+            self.assertEqual(tx.query('SELECT * FROM work_item_milestones ORDER BY id'), marks)
+            tx.execute(MIGRATION)
+            rows = tx.query('SELECT state, legacy_state FROM work_items WHERE id IN (%s,%s) ORDER BY id', tuple(ids))
+            self.assertEqual(rows, [dict(state='delivered', legacy_state='merged'), dict(state='delivered', legacy_state='promoted')])
+
+    def test_migration_round_trip_preserves_rows_and_milestones(self):
+        lot = self.lot()
+        self.db.execute("UPDATE work_items SET state = 'promoted' WHERE id = %s", (lot,))
+        class Rollback(Exception):
+            pass
+        with self.db.transaction() as tx:
+            # Reconstruct the actual pre-switch constraints/functions in the
+            # disposable test schema. The outer rollback restores the fixture.
+            tx.execute('DROP TRIGGER aa_work_items_generic_state_sync ON work_items')
+            tx.execute('ALTER TABLE work_items DROP CONSTRAINT work_items_state_check')
+            tx.execute('ALTER TABLE work_items DROP CONSTRAINT work_items_legacy_state_matches')
+            tx.execute('ALTER TABLE work_items DROP CONSTRAINT work_items_workflow_stage_needs_ref')
+            tx.execute("UPDATE work_items SET state = legacy_state, workflow_stage ="
+                       " CASE WHEN workflow_ref IS NULL THEN NULL ELSE workflow_stage END")
+            tx.execute('ALTER TABLE work_items DROP COLUMN legacy_state')
+            for name in ('0463_work_milestones_effective_merge.sql',
+                         '0467_migration_slot_landed_on_close.sql'):
+                tx.execute((MIGRATIONS / name).read_text())
+            tx.execute("ALTER TABLE work_items ADD CONSTRAINT work_items_state_check"
+                       " CHECK (state IN ('intake','build','qa','validated','merged',"
+                       "'promoted','blocked','waiting_human','closed'))")
+            before = tx.query('SELECT id, state, workflow_ref, workflow_stage FROM work_items ORDER BY id')
+            marks = tx.query('SELECT * FROM work_item_milestones ORDER BY id')
+            try:
+                with tx.transaction() as inner:
+                    inner.execute(MIGRATION)
+                    row = inner.query('SELECT state, legacy_state, workflow_stage FROM work_items WHERE id = %s', (lot,))[0]
+                    self.assertEqual(row, {'state': 'delivered', 'legacy_state': 'promoted', 'workflow_stage': 'promoted'})
+                    self.assertEqual(inner.query('SELECT * FROM work_item_milestones ORDER BY id'), marks)
+                    raise Rollback()
+            except Rollback:
+                pass
+            self.assertEqual(tx.query('SELECT id, state, workflow_ref, workflow_stage FROM work_items ORDER BY id'), before)
+            tx.execute(MIGRATION)
+            self.assertEqual(tx.query('SELECT state FROM work_items WHERE id = %s', (lot,))[0]['state'], 'delivered')
+
+
+if __name__ == '__main__':
+    unittest.main()

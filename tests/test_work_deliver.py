@@ -124,7 +124,7 @@ class DeliverTest(PgTestCase):
         self.assertEqual(spy.call_args.kwargs,
                          {"connector": "git-merge", "evidence": {"action": "act_1"},
                           "actor": "ameesh:porte"})
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
         self.assertTrue(any(n.startswith("merge seen by the gate (action act_1)")
                             and n.endswith("[via git-merge]")
                             for n in self.notes(lot["id"])), self.notes(lot["id"]))

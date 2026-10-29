@@ -2569,6 +2569,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         row["label"], row.get("file")
                         or "<migrations>/%s_<name>.sql" % row["label"]))
             return 0
+        if args.work_command == "promote":
+            item = work.promote(db, args.id, note=_note_arg(args.note), actor=args.actor)
+            print("lot #%d → %s (%s)" % (item["id"], item["state"],
+                                        item.get("legacy_state") or "promoted"))
+            return 0
         if args.work_command == "move":
             note = _note_arg(args.note)
             if args.device:
@@ -4063,6 +4068,11 @@ def build_parser() -> argparse.ArgumentParser:
     from . import migration_reservations
     migration_reservations.add_options(pw_mig)
     pw_mig.set_defaults(func=cmd_work)
+    pw_promote = work_sub.add_parser("promote", help="record a development delivery promotion")
+    pw_promote.add_argument("id", type=int)
+    pw_promote.add_argument("--note", default="")
+    pw_promote.add_argument("--actor", default="")
+    pw_promote.set_defaults(func=cmd_work)
     pw_move = work_sub.add_parser("move")
     pw_move.add_argument("id", type=int)
     pw_move.add_argument("state", choices=list(work_lifecycle.ACCEPTED_STATES),

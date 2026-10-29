@@ -367,7 +367,7 @@ class ReleasedWakeTest(PgTestCase):
         self.assertEqual(self.inbox(), [])
         done = work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")
         self.assertEqual(done["result"], "merged")
-        self.assertEqual(work.get(self.db, self.b)["state"], "merged")
+        self.assertEqual(work.get(self.db, self.b)["state"], "delivered")
         [row] = self.inbox()
         self.assertEqual(mail.message_payload(row)["dependency"],
                          {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})

@@ -164,19 +164,19 @@ CORE_STATES = (
     lifecycle.IN_PROGRESS,
     lifecycle.QA,
     lifecycle.VALIDATED,
-    lifecycle.DELIVERY_RECORDED,
-    lifecycle.PROMOTED,
+    "merged",
+    "promoted",
     lifecycle.CLOSED,
 )
 #: Terminal cores: never reopened by a command.
-TERMINAL_CORES = frozenset(lifecycle.TERMINAL)
+TERMINAL_CORES = frozenset(("promoted", lifecycle.CLOSED))
 #: Cores that release the lot for its dependants and give back its migration
 #: reservation (#956): the same as `work_dependencies._DONE`. An advance entering
 #: one carries the side effects of the legacy closure, which storage
 #: now refuses to pinned lots (#1922/N8): `close_reason`/
 #: `superseded_by`, `closed`/`delivered` milestones, reservation given back, wake
 #: of the dependants (L385).
-RELEASED_CORES = frozenset(lifecycle.COMPLETED)
+RELEASED_CORES = frozenset(("merged", "promoted", "delivered", lifecycle.CLOSED))
 #: Closures admitted for a `closed` core (`close_reason` constraint of
 #: migration 0430): the command evidence says which one, like the three
 #: doors of `work.close` (abandonment, replacement, delivery outside the target).
@@ -558,12 +558,15 @@ def _lock_lot(tx: Any, work_item_id: int) -> Mapping[str, Any]:
         "       w.title, w.closed_at, w.migration, w.migration_repo,"
         "       to_regclass('work_migration_reservations') IS NOT NULL AS migration_slots,"
         "       coalesce(to_jsonb(w)->>'reviewer', '') AS reviewer,"
-        "       w.workflow_ref, w.workflow_stage, w.workflow_version"
+        "       w.workflow_ref, w.workflow_stage, w.workflow_version,"
+        "       to_jsonb(w)->>'legacy_state' AS legacy_state"
         "  FROM work_items w WHERE w.id = %s FOR UPDATE",
         (int(work_item_id),))
     if not rows:
         raise RegistryRefusal("lot-unknown", "lot %s not found" % work_item_id)
-    return rows[0]
+    row = dict(rows[0])
+    row["state"] = lifecycle.phase(row)
+    return row
 
 
 def _check_authority(tx: Any, authority: Authority) -> dict:

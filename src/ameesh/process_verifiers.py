@@ -576,7 +576,7 @@ def _closed(snapshot: Snapshot) -> bool:
     """Lot terminal : `closed` comme `promoted` (N5 de la revue #1924)."""
     if snapshot.item.get("closed_at"):
         return True
-    return _text(snapshot.item.get("state")) in (lifecycle.CLOSED, lifecycle.PROMOTED)
+    return lifecycle.phase(snapshot.item) in (lifecycle.CLOSED, "promoted")
 
 
 #: Jalons qui portent une revision reelle.

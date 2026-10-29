@@ -104,3 +104,36 @@ The boundary check preserves the current runtime behavior. Module activation,
 renamed persisted states, validation as a stored state, extraction of development
 and forge tooling, vocabulary selection and declarative pipelines are subsequent
 parts of the generic-core transition.
+
+L99 tranche 5 (#4353, owner decision #164165, signed approval #167) stores
+both development delivery phases under `state = delivered`. Unpinned dev
+lots use the existing `workflow_stage` for `merged` or `promoted`;
+`legacy_state` carries the compatibility spelling. Pinned Process lots keep
+their admitted revision and arbitrary stage names: signed artifacts and
+receipts are not rewritten. Old Process cores remain interpreted under
+their original terminal and projection rules.
+
+The dev module declares these two stages and their compatibility transition
+maps through `registry.development_workflow()`. A core alone does not tell
+whether a development lot can still be promoted: use `work_lifecycle.phase`
+for that distinction. New core filters select both stages; the old `merged`
+and `promoted` filters continue selecting their individual stages. Public
+GitHub labels and closure text retain their phase-specific wording.
+
+Migration 0518 is explicitly non-additive. Stop executors before applying it
+and restart them after commit, as required by the signed decision. Do not
+roll back the code against the switched database alone: the old executor
+cannot read the new core. The disposable Postgres witness reconstructs the
+pre-switch constraints/functions, applies the migration in a transaction,
+rolls it back and verifies the original rows and milestones, then applies it
+again. Historical events stay intact; the migration adds no synthetic
+milestone or process receipt.
+
+The explicit operator rollback is
+`src/ameesh/migrations/rollback/0518_generic_delivery_state.sql`; it is outside
+automatic migration discovery. With executors stopped, execute its SQL in one
+transaction before restoring the previous code. It restores stage spellings,
+constraints, policy and milestone triggers, and the fingerprint index. Tests
+exercise this script and the forward migration on both delivery stages.
+`work promote <id>` delegates to the dev module; the old
+`work move <id> promoted` command remains accepted.

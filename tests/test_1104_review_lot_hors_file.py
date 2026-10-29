@@ -476,7 +476,7 @@ class CatchUpWitnessTest(_Witness):
                          first)
         rows = self.review_lots(old)
         self.assertEqual(len(rows), 1, rows)
-        self.assertEqual(work.get(self.db, old)["state"], "merged", "la fusion reste acquise")
+        self.assertEqual(work.get(self.db, old)["state"], "delivered", "la fusion reste acquise")
         with mock.patch.object(review_lot, "class_at_merge",
                                return_value={"class": "light", "why": "témoin"}):
             second = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
@@ -497,7 +497,7 @@ class CatchUpWitnessTest(_Witness):
         self.assertEqual((first["examined"], first["missing"], first["opened"]), (1, 1, 1),
                          first)
         self.assertEqual(len(self.review_lots(promoted)), 1)
-        self.assertEqual(work.get(self.db, promoted)["state"], "promoted")
+        self.assertEqual(work.get(self.db, promoted)["state"], "delivered")
         with mock.patch.object(review_lot, "class_at_merge",
                                return_value={"class": "light", "why": "témoin"}):
             second = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)

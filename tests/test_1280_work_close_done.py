@@ -141,7 +141,7 @@ class CloseDoneTest(PgTestCase):
         self.verdict()
         work.close_merged(self.db, review["id"], sha="a" * 40, actor="t",
                           source="sync-merges")
-        self.assertEqual(work.get(self.db, review["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, review["id"])["state"], "delivered")
         out = work.close(self.db, review["id"], done=True, actor="t")
         self.assertEqual((out["state"], out["close_reason"]), ("closed", "done"))
 
