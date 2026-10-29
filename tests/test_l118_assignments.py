@@ -273,7 +273,7 @@ class MailLinksLotsTest(_Base):
                          "--lot", str(lot["id"]))
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("message not delivered", proc.stderr)
-        self.assertIn("already merged", proc.stderr)
+        self.assertIn("already delivered", proc.stderr)
         self.assertEqual(self.unread("dev1"), [])
 
     def test_garde_d_attribution_rien_n_est_depose(self):

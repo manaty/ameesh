@@ -60,7 +60,7 @@ class CreationTest(PgTestCase):
         suite = work.add(self.db, title="suite", parent_lot=parent["id"])
         self.assertEqual(self.edges(suite["id"]), [])
         notes = [e["note"] for e in work.events(self.db, suite["id"])]
-        self.assertTrue(any("already merged" in n for n in notes), notes)
+        self.assertTrue(any("already delivered" in n for n in notes), notes)
 
     def test_mail_and_work_add_cli_carry_the_parent(self):
         # #540 : un agent ne reçoit qu'un seul lot non démarré ; les deux
