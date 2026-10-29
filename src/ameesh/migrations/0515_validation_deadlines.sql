@@ -24,5 +24,3 @@ create table validation_decision_links (
     primary key (source_id, response_key)
 );
 create index validation_events_person_idx on validation_events(person, id);
-revoke all on decision_validations, validation_events, validation_decision_links from public;
-revoke all on sequence validation_events_id_seq from public;
