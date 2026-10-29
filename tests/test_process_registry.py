@@ -35,9 +35,11 @@ verifiers through the documented seam.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import glob
 import json
 import os
+import tempfile
 import threading
 import time
 import unittest
@@ -1577,13 +1579,19 @@ class RegistryTest(PgTestCase):
                                  guard="review_requested", version=receipt.version),
             spec=self.spec, from_stage="implementation", to_stage="review")
         from ameesh import process_approvals as approvals_mod
+        from ameesh import process_observations as observations_mod
         with mock.patch.object(
                 approvals_mod, "local_projection",
                 side_effect=approvals_mod.ProjectionError(
-                    "projection-missing", "test bench")):
+                    "projection-missing", "test bench")), \
+                mock.patch.object(
+                    observations_mod, "local_projection",
+                    side_effect=observations_mod.ProjectionError(
+                        "projection-missing", "test bench")):
             sources = pr.read_sources(context)
-        self.assertEqual(set(sources), set(pr.SOURCE_KEYS) - {"approvals"})
-        self.assertNotIn("observations", sources)      # source not installed
+        self.assertEqual(set(sources),
+                         set(pr.SOURCE_KEYS) - {"approvals", "observations"})
+        self.assertNotIn("observations", sources)      # no projection here
         self.assertNotIn("approvals", sources)         # no projection here
         got = sources["receipts"][0]
         self.assertTrue(got["accepted"])
@@ -1600,6 +1608,51 @@ class RegistryTest(PgTestCase):
                          ["requested", "delivered"])
         with self.refusal("verifier-invalid"):
             pr.read_sources(object())
+
+    def test_read_sources_reads_a_fresh_observations_projection(self):
+        from ameesh import process_approvals as approvals_mod
+        from ameesh import process_observations as observations_mod
+        lot = self.pinned(stage="implementation", state="build")
+        row = self.row(lot)
+        moment = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        with tempfile.TemporaryDirectory() as directory:
+            journal = observations_mod.Journal(
+                os.path.join(directory, "journal.jsonl"), create=True)
+            journal.reload()
+            journal.record(observations_mod.Observation(
+                id="obs-deployed", kind="deployed", environment="staging",
+                work_item_id=lot, app=str(row.get("app") or ""),
+                artifact="a" * 40, source_revision="a" * 12, actor="",
+                observed_at=moment,
+                provenance={"kind": "staging-attestation",
+                            "ref": "actif-a.json", "sha256": "d" * 64,
+                            "attestation": "a" * 12,
+                            "hosts": ["ameesh-agents-1"]},
+                source_digest="d" * 64))
+            source = observations_mod.Source(
+                journal=os.path.join(directory, "journal.jsonl"),
+                projection=os.path.join(directory, "projection.json"),
+                authority="ima", journal_id="ima", repos=(), issues=(),
+                staging_app=str(row.get("app") or ""))
+            projection = observations_mod.build_projection(
+                source, journal, now=moment,
+                collector={"host": "bureau-goal"})
+        context = pr.VerificationContext(
+            db=self.db, work_item=row,
+            command=self.command(lot, version=0), spec=self.spec,
+            from_stage="implementation", to_stage="implementation")
+        with mock.patch.object(
+                approvals_mod, "local_projection",
+                side_effect=approvals_mod.ProjectionError(
+                    "projection-missing", "test bench")), \
+                mock.patch.object(
+                    observations_mod, "local_projection",
+                    return_value=projection):
+            sources = pr.read_sources(context)
+        self.assertIn("observations", sources)
+        self.assertEqual([item["id"] for item in sources["observations"]],
+                         ["obs-deployed"])
+        self.assertEqual(sources["observations"][0]["sha"], "a" * 40)
 
     def test_read_sources_names_the_reserved_verifiers(self):
         lot = self.pinned(stage="implementation", state="build")
