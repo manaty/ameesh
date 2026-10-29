@@ -26,14 +26,19 @@ adopté.
 
 ## Rapport de rejeu (contrat avec B, #4292)
 
-C lit **la sortie réelle de B** : une note de trois lignes sur le lot
+C lit **la sortie réelle de B** : une note de rejeu sur le lot
 d'évaluation, qui nomme le fichier JSON écrit par `ameesh replay run` :
 
 ```
 Rejeu comparatif deepseek 0.2.0-rc.2 → 0.2.1-rc.4 : meilleure.
 Banc : #1 (light), #2 (normal), #3 (sensitive) ; coût, durée, tests du lot et note aveugle dans le rapport.
 Rapport : /chemin/absolu/report.json
+Empreinte : <sha256 du fichier de rapport>
 ```
+
+L'empreinte est celle des **octets** du fichier (`ameesh replay report --note
+FICHIER` la calcule). C la vérifie avant de lire le rapport : une note sans
+empreinte, ou un fichier modifié après la note, est refusée (TOCTOU, #4312).
 
 Le fichier est le schéma `ameesh-replay-report/1` (`evaluated.kind`
 `harness|model`, `evaluated.old/new` avec `label`, `binary`, `version`,
@@ -94,8 +99,11 @@ la bascule :
 - **harnais** : `harness_bin` posé → il doit être l'ancien binaire du rapport ;
   `harness_bin` NULL → la version de l'hôte lue par `harness_versions` doit
   être `from_version`. Une version inconnue est exclue (fail-closed).
-- **modèle** : `model` posé → il doit être `from_version` ; `model` NULL est la
-  valeur héritée de l'hôte et reste candidate.
+- **modèle** : `model` posé → il doit être `from_version` ; `model` NULL suit
+  la précédence du **runner** : fichier d'état `model` de l'agent sur son hôte,
+  puis défaut du descripteur. Le tick ne peut lire ce fichier que sur son
+  propre hôte : un agent distant dont `model` est NULL est exclu
+  (fail-closed), jamais supposé au défaut du descripteur (#4312).
 
 Un agent déjà sur un autre binaire/modèle n'est ni canari, ni remplacé, ni
 compté dans « entre deux tours » ; l'hôte du canari reste dans l'ordre de
@@ -138,7 +146,11 @@ faut la carte explicite `AMEESH_HARNESS_ADOPTION_BINS` (ou
   "ameesh-agents-2": "/opt/harness/0.2.1-rc.4/bin/dsh"}}}}
 ```
 
-Un `--bin HOTE=CHEMIN` surcharge la carte. La décision owner est **signée**
+Un `--bin HOTE=CHEMIN` surcharge la carte. Un chemin de binaire doit être
+sous un **préfixe contrôlé** (`~/.local/`, `/opt/`, `/usr/local/`, `/usr/`,
+plus `AMEESH_BIN_DIR` et `AMEESH_HARNESS_ADOPTION_PREFIXES`, séparés par `:`) :
+un chemin absolu hors de ces racines est refusé avant tout geste (#4312). La
+décision owner est **signée**
 (`needs_signature`) et sa preuve est revérifiée avant chaque geste.
 
 Le tick **découvre** aussi les lots d'évaluation ouverts dont le titre
@@ -159,7 +171,9 @@ l'hôte du tick (même hôte, ou chemin partagé).
    illisible = pas de canari). Les tours sont lus
    dans `turn_costs` (médiane du coût et de la durée). Si une médiane sort des
    bornes du rejeu, ou si aucun tour n'a été mesuré, l'agent est remis sur la
-   version précédente et l'adoption est refusée.
+   version précédente et l'adoption est refusée. À l'échéance des 24 h, moins
+   de **3 tours mesurés** ne font pas un canari concluant : refus et retour à
+   la version précédente (#4312).
 2. **Bascule hôte par hôte** : après un canari conforme, chaque hôte du
    harnais passe à son tour. L'hôte du canari vient en premier ; les autres
    sont ordonnés par nom. Une bascule attend :
@@ -215,9 +229,11 @@ La carte des binaires installés (voir plus haut) est lue automatiquement par
 le tick ; `new_binary` ne couvre que l'hôte du canari, et un binaire absent ou
 non exécutable sur l'hôte du tick est refusé avant tout geste.
 
-Le tick est sans effet tant qu'aucune adoption n'est ouverte. Un seul tick
-tourne à la fois (verrou consultatif en base) ; plusieurs hôtes peuvent porter
-le timer sans double geste. Chaque transition laisse une note
+Le tick est sans effet tant qu'aucune adoption n'est ouverte. Un seul geste
+tourne à la fois : verrou consultatif **de transaction**
+(`pg_advisory_xact_lock`, effectif sous psql comme sous psycopg) ; plusieurs
+hôtes peuvent porter le timer sans double geste. Chaque transition laisse une
+note
 `harness-adoption:` au journal du lot, en plus de la table
 `harness_adoptions` (migration 0505).
 
@@ -226,6 +242,16 @@ le timer sans double geste. Chaque transition laisse une note
 - `agent_registry.harness_bin` : binaire du harnais pour un agent ; `NULL`
   garde le comportement d'hôte (`harness_bins`, PATH). `ameesh set <agent>
   harness_bin=/chemin/absolu` le pose, une valeur vide l'efface.
+- **Un `harness_bin` n'est lancé que s'il est déclaré sur l'hôte** (#4488) :
+  carte des binaires installés (`AMEESH_HARNESS_ADOPTION_BINS` ou
+  `~/.config/ameesh/harness-adoption.json`, toutes versions, pour cet hôte),
+  `harness_bins` de la configuration, ou `AMEESH_<HARNAIS>_BIN`. Un chemin
+  écrit en base par une autre identité ne peut donc pas faire exécuter un
+  binaire arbitraire avec les identifiants du compte ; la garde est dans
+  l'exécuteur et dans `ameesh attach`, au moment de la lecture. Installez la
+  carte sur chaque hôte qui porte des agents épinglés : un chemin fourni par
+  `--bin` ou `new_binary` mais absent de la carte de l'hôte est refusé
+  (« hôte non prêt »), jamais lancé.
 - L'exécuteur relit la ligne de l'agent au début de chaque tour ; un tour en
   cours ne change jamais de binaire sous lui. La même valeur suit l'agent en
   session interactive (`ameesh attach`).

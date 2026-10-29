@@ -1,14 +1,76 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""L100: legacy imports share the moved implementation, including patches."""
+"""L100 T1 (#4382) — `git-merge` and `merge_pr` moved into `modules/dev`.
+
+The old paths (`ameesh.merge_pr`, `ameesh.connectors.git_merge`) are declared
+aliases: both names resolve to the same module object, so importers and tests
+that patch a module global by the old name keep working unchanged (L104
+removes the aliases). `connectors.get("git-merge")` reads the implementation
+through the module registry, not through the old path.
+"""
+from __future__ import annotations
+
 import importlib
 import os
 from pathlib import Path
 import subprocess
+from unittest.mock import patch
 import sys
 import unittest
-from unittest.mock import patch
+from unittest import mock
 
-from . import support
+from tests import support  # noqa: F401 - isolate host config before product imports
+from ameesh import connectors
+from ameesh.modules import dev, registry
+
+
+class AliasTest(unittest.TestCase):
+    def test_merge_pr_ancien_et_nouveau_nom_sont_le_meme_module(self):
+        old = importlib.import_module("ameesh.merge_pr")
+        new = importlib.import_module("ameesh.modules.dev.merge_pr")
+        self.assertIs(old, new)
+        self.assertIs(sys.modules["ameesh.merge_pr"], new)
+        from ameesh import merge_pr as from_package
+        self.assertIs(from_package, new)
+
+    def test_patch_par_l_ancien_nom_est_vu_par_le_nouveau(self):
+        new = importlib.import_module("ameesh.modules.dev.merge_pr")
+        original = new._run
+        with mock.patch("ameesh.merge_pr._run", return_value="x") as patched:
+            self.assertIs(new._run, patched)
+            self.assertEqual(new._run("argv"), "x")
+        self.assertIs(new._run, original)
+
+    def test_alias_du_connecteur_git_merge(self):
+        old = importlib.import_module("ameesh.connectors.git_merge")
+        new = importlib.import_module("ameesh.modules.dev.git_merge")
+        self.assertIs(old, new)
+        self.assertIs(sys.modules["ameesh.connectors.git_merge"], new)
+        with mock.patch("ameesh.connectors.git_merge.resolve_gh") as patched:
+            self.assertIs(new.resolve_gh, patched)
+
+
+class RegistryTest(unittest.TestCase):
+    def test_connectors_get_lit_par_le_registre(self):
+        found = registry.action_connectors()
+        self.assertEqual(found, {"git-merge": ("dev", dev.git_merge.GitMergeConnector)})
+        connector = connectors.get("git-merge")
+        self.assertIsInstance(connector, dev.git_merge.GitMergeConnector)
+        self.assertEqual((connector.name, connector.dedupe), ("git-merge", "none"))
+
+    def test_le_module_dev_n_est_pas_un_module_de_cycle_de_vie(self):
+        self.assertNotIn("dev", registry.discover().names())
+
+    def test_un_nom_d_action_du_coeur_est_refuse_au_fournisseur(self):
+        fake = mock.Mock(ACTION_CONNECTORS={"shell-noop": lambda *a, **k: None})
+        with mock.patch.object(registry, "_connector_providers",
+                               return_value={"x": fake}):
+            with self.assertRaisesRegex(ValueError, "duplicate action connector"):
+                registry.action_connectors()
+
+    def test_un_connecteur_d_action_inconnu_nomme_les_connus(self):
+        with self.assertRaisesRegex(connectors.ConnectorError,
+                                    "unknown connector.*git-merge.*shell-noop"):
+            connectors.get("ftp")
 
 
 class DevAliasesTest(unittest.TestCase):
@@ -44,3 +106,7 @@ class DevAliasesTest(unittest.TestCase):
                                         env=env, capture_output=True, text=True,
                                         timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

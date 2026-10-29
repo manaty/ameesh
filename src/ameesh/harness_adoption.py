@@ -2,7 +2,7 @@
 """#4293 (#3264 C) — adoption d'une version de harnais ou de modèle.
 
 Le lot B (#4292) produit un **rapport de rejeu** (`ameesh-replay-report/1`,
-un fichier nommé par sa note de trois lignes) ; ce module lit ce rapport et
+un fichier nommé par sa note de rejeu, empreinte comprise) ; ce module lit ce rapport et
 applique la règle
 de l'owner (spec `docs/design/3264-veille-versions.md` §4) :
 
@@ -29,9 +29,10 @@ le même lot est refusé (une nouvelle évaluation est un nouveau lot).
 Geste de bascule : `agent_registry.harness_bin` pour un harnais, `model` pour
 un modèle. L'exécuteur relit la ligne de l'agent au début de chaque tour ; un
 tour en cours ne change donc jamais de binaire sous lui. Le binaire nommé doit
-exister sur l'hôte (l'exécuteur refuse un binaire absent : hôte non prêt) ;
-l'installation de la nouvelle version reste le fait de l'hôte (L17), ce module
-ne l'exécute pas.
+exister sur l'hôte **et y être déclaré** (#4488 : carte locale des binaires
+installés, `harness_bins` ou `AMEESH_<HARNAIS>_BIN` ; l'exécuteur refuse sinon :
+hôte non prêt) ; l'installation de la nouvelle version reste le fait de l'hôte
+(L17), ce module ne l'exécute pas.
 
   ameesh harness adopt <lot> --report FICHIER|- [--bin [HÔTE=]CHEMIN …]
                             [--agent NOM] [--requester NOM] [--dry-run]
@@ -41,6 +42,7 @@ ne l'exécute pas.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -58,9 +60,13 @@ REPORT_SCHEMA = "ameesh-veille-report/1"
 #: schéma réellement écrit par `ameesh.replay` (lot B, #4292) ; C le lit et
 #: le convertit, il ne l'impose pas.
 B_REPORT_SCHEMA = "ameesh-replay-report/1"
-#: préfixe de la note de trois lignes de B (`Rapport : /chemin`)
+#: préfixe de la note de B (`Rapport : /chemin`, `Empreinte : sha256`)
 B_NOTE_MARK = "Rejeu comparatif"
 B_NOTE_PATH = re.compile(r"^\s*Rapport\s*:\s*(.+?)\s*$", re.M)
+#: empreinte du fichier, dans la note de B (#4312) : le fichier peut changer
+#: entre la note et la lecture, la note doit le figer.
+B_NOTE_DIGEST = re.compile(
+    r"^\s*(?:Empreinte|SHA-?256)\s*:\s*([0-9a-fA-F]{64})\s*$", re.M)
 #: schéma de l'état d'une adoption
 STATE_SCHEMA = "ameesh-harness-adoption/1"
 #: préfixe des notes de journal (état lisible par un humain)
@@ -70,12 +76,22 @@ REPORT_PREFIX = "veille-report:"
 #: durées de la règle owner (spec §4) : 24 h ou 10 tours
 CANARY_SECONDS = 24 * 3600
 CANARY_TURNS = 10
+#: #4312 (N de l'auditeur sur #4293) : à l'échéance des 24 h, un seul tour ne
+#: fait pas un canari concluant. En dessous de ce plancher, l'adoption est
+#: refusée (fail-closed) comme si aucune mesure n'existait ; au-delà, les
+#: bornes du rejeu restent seules juges.
+CANARY_MIN_TURNS = 3
 #: marge avant une coupure de release (spec §4, canon §7) : 20 minutes
 CUTOFF_MARGIN_S = 20 * 60
 #: carte des binaires installés, lue par le timer (#4293, avis auditeur dc0d) :
 #: fichier JSON ou variable d'environnement, explicite par harnais/version/hôte.
 BINS_ENV = "AMEESH_HARNESS_ADOPTION_BINS"
 BINS_FILE = "~/.config/ameesh/harness-adoption.json"
+#: préfixes contrôlés d'un binaire de harnais (#4312) : un chemin hors de ces
+#: racines est refusé, même absolu et exécutable. `AMEESH_BIN_DIR` et
+#: `AMEESH_HARNESS_ADOPTION_PREFIXES` (séparés par `:`) étendent la liste.
+BINS_PREFIXES_ENV = "AMEESH_HARNESS_ADOPTION_PREFIXES"
+BINS_DEFAULT_PREFIXES = ("~/.local/", "/opt/", "/usr/local/", "/usr/")
 #: objets adoptables
 OBJECTS = ("harness", "model")
 #: conclusions du rapport de rejeu (`incomplete` : B n'a pas conclu, jamais
@@ -88,8 +104,9 @@ STAGES = ("canary", "rollout", "done", "refused", "waiting_owner",
           "blocked", "rolled_back")
 #: étapes terminales
 TERMINAL = ("done", "refused", "rolled_back")
-#: identifiant de verrou consultatif (un seul tick/geste à la fois par base)
-LOCK_KEY = 0x7665696C6C65  # « veille »
+#: identifiant de verrou consultatif (un seul tick/geste à la fois par
+#: schéma) : chaîne stable, hachée avec le schéma par PostgreSQL (#4312).
+LOCK_KEY = "harness-adoption"
 #: un identifiant court (harnais, agent, modèle)
 _IDENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,119}$")
 #: une version de harnais ou un identifiant de modèle : pas d'espace ni de
@@ -99,6 +116,14 @@ _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,119}$")
 
 class VeilleError(RuntimeError):
     """Rapport incomplet, état incohérent, geste refusé : rien n'est changé."""
+
+
+class OwnerProofInvalid(VeilleError):
+    """La décision owner n'est plus une approbation prouvée (#4312).
+
+    Distincte de `VeilleError` : un canari refusé pour ce motif est un refus
+    définitif (les valeurs d'avant sont rendues), pas un blocage réessayable.
+    """
 
 
 def _number(value, name: str) -> float:
@@ -463,7 +488,7 @@ def from_b_replay(raw: dict, lot: int, *,
 
 
 def _from_b_note(db, text: str, lot: int) -> Report | None:
-    """Lit la note de trois lignes de B et le fichier qu'elle nomme."""
+    """Lit la note de B (chemin + empreinte) et le fichier qu'elle nomme."""
     if B_NOTE_MARK not in text:
         return None
     match = B_NOTE_PATH.search(text)
@@ -471,10 +496,25 @@ def _from_b_note(db, text: str, lot: int) -> Report | None:
         raise VeilleError("replay note does not name its report path (`Rapport : …`)")
     path = match.group(1).strip().strip("`").strip()
     path = os.path.abspath(os.path.expanduser(path))
+    expected = B_NOTE_DIGEST.search(text)
+    if not expected:
+        raise VeilleError(
+            "replay note does not carry its report sha256 (`Empreinte : …`): "
+            "regenerate the note with `ameesh replay report --note FILE`")
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError) as exc:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        raise VeilleError("replay report %s unreadable: %s" % (path, exc)) from exc
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != expected.group(1).lower():
+        raise VeilleError(
+            "replay report %s: sha256 %s does not match the note's %s "
+            "(the file changed after the note)" % (path, digest,
+                                                   expected.group(1).lower()))
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
         raise VeilleError("replay report %s unreadable: %s" % (path, exc)) from exc
     if not isinstance(data, dict) or data.get("schema") != B_REPORT_SCHEMA:
         raise VeilleError("replay report %s: %s required" % (path, B_REPORT_SCHEMA))
@@ -601,6 +641,19 @@ def open_adoptions(db, *, project: str | None = None) -> list[dict]:
     return [_row_state(row) for row in rows]
 
 
+def open_adoption_for(db, lot: int) -> dict | None:
+    """L'adoption encore ouverte de ce lot, sinon None.
+
+    #4312 (interaction A/C) : la veille (#4291) ne doit pas réécrire le lot
+    d'évaluation qui porte cette adoption, sinon son titre diverge de la
+    version adoptée et le rapport suivant est refusé (une nouvelle évaluation
+    est un nouveau lot)."""
+    row = load(db, int(lot))
+    if row is None:
+        return None
+    return row if (row.get("state") or {}).get("stage") not in TERMINAL else None
+
+
 def save(db, row: dict, state: dict) -> None:
     state["updated_ts"] = round(time.time(), 3)
     db.execute(
@@ -633,19 +686,28 @@ def journal(db, lot: int, state: dict, text: str, *, actor: str = "ameesh") -> N
         print("harness-adoption: lot #%s: note not written (%s)" % (lot, exc), file=sys.stderr)
 
 
-def _lock(db) -> bool:
-    try:
-        rows = db.query("SELECT pg_try_advisory_lock(%s) AS ok", (LOCK_KEY,))
-        return bool(rows and rows[0].get("ok"))
-    except Exception:  # noqa: BLE001 — sans verrou, on ne touche à rien
-        return False
+@contextlib.contextmanager
+def _locked(db):
+    """Verrou consultatif de TRANSACTION, tenu par la session qui agit.
 
+    #4312 (N de l'auditeur sur #4293) : un `pg_try_advisory_lock` de session
+    est inopérant avec le pilote psql (chaque requête ouvre une session, le
+    verrou tombe avec elle) et se perd sans bruit si psycopg se reconnecte.
+    `pg_advisory_xact_lock` vit dans la transaction : psql garde la même
+    session de `BEGIN` à `COMMIT`, et `_live` refuse de reconnecter au milieu
+    d'une transaction explicite (elle lève, le geste est rejoué en entier).
 
-def _unlock(db) -> None:
-    try:
-        db.query("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
-    except Exception:  # noqa: BLE001
-        pass
+    Rend la transaction verrouillée, ou `None` si un autre geste la tient
+    (comportement « busy » du tick, sans attente)."""
+    with db.transaction() as tx:
+        rows = tx.query(
+            "SELECT pg_try_advisory_xact_lock("
+            "hashtextextended(current_schema() || %s, 0)) AS ok",
+            (LOCK_KEY,))
+        if not (rows and rows[0].get("ok")):
+            yield None
+            return
+        yield tx
 
 
 def _journal(row: dict, state: dict, text: str, actor: str) -> None:
@@ -665,6 +727,31 @@ def _block(row: dict, state: dict, reason: str, *, from_stage: str,
     save(row["_db"], row, state)
     _journal(row, state, "blocked (%s): %s" % (from_stage, reason), actor=actor)
     return True
+
+
+def _refuse(row: dict, state: dict, report: Report, reason: str, *,
+            actor: str = "ameesh") -> dict:
+    """Refus définitif : rend aux agents les valeurs d'avant, consigne, sauve.
+
+    Utilisé quand une preuve owner n'est plus valable (canari ou bascule) :
+    le geste ne doit pas être retenté à chaque tick, et un hôte déjà basculé
+    ne doit pas rester sur la nouvelle version sans approbation."""
+    db = row["_db"]
+    applied = state.get("applied") or []
+    state.update({
+        "stage": "refused",
+        "reason": reason,
+        "inverse": {
+            "version": report.from_version,
+            "restore": [{"agent": item["name"], "value": item["before"]}
+                        for entry in applied for item in entry.get("agents") or []],
+        },
+    })
+    with db.transaction() as tx:
+        _restore(tx, applied, report.object)
+        save(tx, row, state)
+    _journal(row, state, "refused: %s" % reason, actor=actor)
+    return state
 
 
 # --------------------------------------------------------------------------
@@ -756,8 +843,35 @@ def _same_binary(left: str | None, right: str | None) -> bool:
     return os.path.realpath(left) == os.path.realpath(right)
 
 
+def _effective_model(cfg, row: dict, report: Report) -> str | None:
+    """Le modèle effectif d'un agent dont `agent_registry.model` est NULL.
+
+    Le runner lit d'abord ce réglage, puis le fichier d'état `model` de
+    l'agent (propre à son hôte), puis le défaut du descripteur. Le tick ne
+    peut lire ce fichier que sur SON hôte : pour un agent distant, la valeur
+    est inconnue et l'agent est exclu (fail-closed), jamais supposé au défaut
+    du descripteur (#4312, N de l'auditeur sur #4293)."""
+    host = row.get("host") or ""
+    on_tick_host = bool(cfg) and bool(host) and \
+        host == (getattr(cfg, "host", "") or "")
+    if not on_tick_host:
+        return None
+    try:
+        with open(os.path.join(cfg.agent_dir(row["name"]), "model"),
+                  encoding="utf-8") as fh:
+            state_model = fh.read().strip()
+    except OSError:
+        state_model = ""
+    if state_model:
+        return state_model
+    descriptor = harnesses.get(report.harness)
+    if descriptor is not None and descriptor.model is not None:
+        return descriptor.model.default
+    return None
+
+
 def _target_agents(db, report: Report, *, host: str | None = None,
-                   versions: dict | None = None) -> list[dict]:
+                   versions: dict | None = None, cfg=None) -> list[dict]:
     """Les agents encore sur la version évaluée (`from_version`).
 
     Une bascule ne remplace jamais un agent qui tourne déjà sur un autre
@@ -768,8 +882,9 @@ def _target_agents(db, report: Report, *, host: str | None = None,
       surcharge explicite. `harness_bin` NULL : la version de l'hôte lue par
       `harness_versions` doit être `from_version` ; une version inconnue est
       exclue (fail-closed).
-    * modèle — `model` posé : il doit être `from_version` ; `model` NULL est
-      la valeur héritée de l'hôte, donc la cible.
+    * modèle — `model` posé : il doit être `from_version` ; `model` NULL suit
+      la précédence du runner (état local puis défaut du descripteur), et un
+      agent dont l'état n'est pas lisible sur l'hôte du tick est exclu.
     """
     versions = _host_versions(db, report.harness) if versions is None else versions
     out = []
@@ -785,19 +900,14 @@ def _target_agents(db, report: Report, *, host: str | None = None,
         else:
             current = row.get("model")
             if current is None:
-                # NULL = valeur héritée : celle du descripteur du harnais, ou
-                # inconnue. Elle n'est acceptée que si elle vaut exactement la
-                # version évaluée (avis auditeur dc0d, argent).
-                descriptor = harnesses.get(report.harness)
-                current = (descriptor.model.default
-                           if descriptor is not None and descriptor.model else None)
+                current = _effective_model(cfg, row, report)
             if current == report.from_version:
                 out.append(row)
     return out
 
 
-def _running(db, report: Report, host: str) -> list[str]:
-    return [row["name"] for row in _target_agents(db, report, host=host)
+def _running(db, report: Report, host: str, *, cfg=None) -> list[str]:
+    return [row["name"] for row in _target_agents(db, report, host=host, cfg=cfg)
             if row.get("status") == "running"]
 
 
@@ -846,10 +956,18 @@ def measure(db, agent: str, since: float) -> dict:
 
 
 def canary_verdict(report: Report, metrics: dict) -> tuple[bool, list[str]]:
-    """Les mesures du canari restent-elles dans les bornes du rejeu ?"""
+    """Les mesures du canari restent-elles dans les bornes du rejeu ?
+
+    #4312 : un canari jugé à l'échéance des 24 h avec un seul tour n'a pas
+    assez de mesures ; il est refusé (le plancher ne s'applique jamais quand
+    les 10 tours sont atteints, la condition de tours les couvre)."""
     failures = []
-    if int(metrics.get("turns") or 0) <= 0:
+    turns = int(metrics.get("turns") or 0)
+    if turns <= 0:
         return False, ["no measured turn"]
+    if turns < CANARY_MIN_TURNS:
+        return False, ["%d measured turn(s) at the deadline (< %d)"
+                       % (turns, CANARY_MIN_TURNS)]
     for key in ("cost_usd", "duration_s"):
         bound = report.bounds.get(key)
         if not bound:
@@ -884,11 +1002,11 @@ def _pick_canary(db, report: Report, *, bins: dict | None, agent: str | None,
             raise VeilleError("canary agent %s is in a turn: retry between turns"
                               % agent)
         if not any(candidate["name"] == row["name"]
-                   for candidate in _target_agents(db, report)):
+                   for candidate in _target_agents(db, report, cfg=cfg)):
             raise VeilleError("canary agent %s is not on the evaluated version %s"
                               % (agent, report.from_version))
         return row
-    candidates = _target_agents(db, report)
+    candidates = _target_agents(db, report, cfg=cfg)
     # #4293 : le canari se pose ENTRE deux tours. Un agent qui tourne n'est
     # pas candidat (son tour finirait sur l'ancienne version et sa mesure
     # serait comptée) ; les autres attendent le prochain tick.
@@ -931,26 +1049,50 @@ def _merge_bins(state: dict, bins: dict | None) -> dict:
     return merged
 
 
+def _bin_prefixes() -> tuple[str, ...]:
+    """Les racines sous lesquelles un `harness_bin` est accepté (#4312)."""
+    raw = [p for p in BINS_DEFAULT_PREFIXES]
+    for name in ("AMEESH_BIN_DIR", "AGENT_MESH_BIN_DIR"):
+        value = os.environ.get(name)
+        if value:
+            raw.append(value)
+    raw.extend(part for part in
+               (os.environ.get(BINS_PREFIXES_ENV) or "").split(os.pathsep)
+               if part)
+    out = []
+    for item in raw:
+        real = os.path.realpath(os.path.expanduser(item))
+        out.append(real.rstrip(os.sep) + os.sep)
+    return tuple(out)
+
+
 def _check_bin(path: str | None, *, executable: bool = False) -> str:
     if not path:
         raise VeilleError("a --bin path is required for a harness adoption")
     if "\x00" in path or "\n" in path or not os.path.isabs(path):
         raise VeilleError("invalid bin path %r: an absolute path is required" % path)
+    real = os.path.realpath(path)
+    prefixes = _bin_prefixes()
+    if not any(real == item.rstrip(os.sep) or real.startswith(item)
+               for item in prefixes):
+        raise VeilleError(
+            "bin path %r is outside the controlled prefixes (%s); set %s to "
+            "add one" % (path, ", ".join(prefixes), BINS_PREFIXES_ENV))
     if executable and not os.access(path, os.X_OK):
         raise VeilleError("binary not executable on this host: %s (give an "
                           "existing --bin, or install it there)" % path)
     return path
 
 
-def load_bins(report: Report) -> dict:
-    """La carte explicite des binaires installés, par hôte.
+def _bins_table(*, env=None) -> dict:
+    """La carte locale des binaires installés ({harnais: {version: {hôte: chemin}}}).
 
     Fichier `AMEESH_HARNESS_ADOPTION_BINS` ou
-    `~/.config/ameesh/harness-adoption.json` :
-    `{"bins": {"<harnais>": {"<version>": {"<hôte>": "/chemin"}}}}`.
-    Aucun défaut implicite : un hôte absent reste sans chemin (fail-closed).
-    """
-    path = os.environ.get(BINS_ENV) or os.path.expanduser(BINS_FILE)
+    `~/.config/ameesh/harness-adoption.json` ; absent = aucune déclaration.
+    Une carte illisible lève `VeilleError` (fail-closed), jamais un
+    laissez-passer."""
+    env = os.environ if env is None else env
+    path = env.get(BINS_ENV) or os.path.expanduser(BINS_FILE)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -963,6 +1105,41 @@ def load_bins(report: Report) -> dict:
     table = data.get("bins", data)
     if not isinstance(table, dict):
         raise VeilleError("harness-adoption bins: `bins` must be an object")
+    return table
+
+
+def declared_binaries(harness: str, host: str, *, env=None) -> set[str]:
+    """Chemins réels des binaires déclarés pour `harness` sur `host` (#4488).
+
+    La carte locale des binaires installés est la liste des exécutables que
+    l'exécuteur peut lancer pour cet hôte, toutes versions confondues : le
+    canari et la bascule visent des chemins qui y sont installés et déclarés.
+    Sans hôte (ou sans carte), rien n'est déclaré."""
+    if not host:
+        return set()
+    versions = _bins_table(env=env).get(harness) or {}
+    if not isinstance(versions, dict):
+        raise VeilleError("harness-adoption bins: harness %r must map versions"
+                          % harness)
+    out: set[str] = set()
+    for hosts in versions.values():
+        if not isinstance(hosts, dict):
+            continue
+        path = hosts.get(host)
+        if isinstance(path, str) and path and os.path.isabs(path):
+            out.add(os.path.realpath(path))
+    return out
+
+
+def load_bins(report: Report) -> dict:
+    """La carte explicite des binaires installés, par hôte.
+
+    Fichier `AMEESH_HARNESS_ADOPTION_BINS` ou
+    `~/.config/ameesh/harness-adoption.json` :
+    `{"bins": {"<harnais>": {"<version>": {"<hôte>": "/chemin"}}}}`.
+    Aucun défaut implicite : un hôte absent reste sans chemin (fail-closed).
+    """
+    table = _bins_table()
     for_version = table.get(report.harness) or {}
     if not isinstance(for_version, dict):
         raise VeilleError("harness-adoption bins: harness %r must map versions"
@@ -980,12 +1157,17 @@ def load_bins(report: Report) -> dict:
 
 def start_canary(cfg, db, row: dict, state: dict, report: Report, *,
                  agent: str | None = None, now: float,
-                 rules=None) -> dict:
+                 rules=None, actor: str = "ameesh") -> dict:
     """Démarre le canari : un seul agent passe sur la nouvelle version.
 
     Le démarrage est soumis à la même fenêtre que la bascule : jamais dans les
     20 minutes qui précèdent une coupure, et pas de calendrier lisible = pas
-    de canari (fail-closed)."""
+    de canari (fail-closed). La preuve owner est vérifiée ICI aussi (#4312) :
+    une reprise de canari bloqué ne contourne pas l'approbation."""
+    ok, why = _owner_proof_still_valid(db, state)
+    if not ok:
+        _refuse(row, state, report, why, actor=actor)
+        raise OwnerProofInvalid(why)
     try:
         remaining = _cutoff_seconds(cfg, state.get("project")
                                     or row.get("project") or "", now, rules)
@@ -1029,21 +1211,25 @@ def start_canary(cfg, db, row: dict, state: dict, report: Report, *,
         "reason": "",
         "blocked_from": None,
     })
-    state["applied"] = [{"host": host, "at": round(float(now), 3),
-                         "canary": True,
-                         "agents": [{"name": target["name"], "before": before}]}]
+    # #4312 : AJOUTER à l'inverse, jamais l'écraser. Une reprise de canari
+    # après un blocage doit conserver les gestes déjà faits (et leurs valeurs
+    # d'avant) ; `_restore` remonte les entrées dans l'ordre inverse.
+    state.setdefault("applied", []).append(
+        {"host": host, "at": round(float(now), 3),
+         "canary": True,
+         "agents": [{"name": target["name"], "before": before}]})
     # la bascule et son état sont UNE écriture : une panne entre les deux ne
     # laisse pas un agent sur la nouvelle version sans canari qui le suit.
     with db.transaction() as tx:
         _set_agent_value(tx, target["name"], report.object, value)
         save(tx, row, state)
     _journal(row, state, "canary started: %s on %s (%s)"
-             % (target["name"], host, value), actor="ameesh")
+             % (target["name"], host, value), actor=actor)
     return state
 
 
-def _hosts(db, report: Report, state: dict) -> list[str]:
-    hosts = [row["host"] for row in _target_agents(db, report)
+def _hosts(db, report: Report, state: dict, *, cfg=None) -> list[str]:
+    hosts = [row["host"] for row in _target_agents(db, report, cfg=cfg)
              if row.get("host")]
     ordered = sorted(set(hosts))
     canary_host = state.get("canary_host")
@@ -1070,14 +1256,12 @@ def adopt(cfg, db, lot: int, report: Report, *, bins: dict | None = None,
           actor: str = "", dry_run: bool = False, now: float | None = None,
           rules=None, prices: dict | None = None) -> dict:
     """Fige un rapport sur un lot, sous le verrou des gestes de veille."""
-    if not _lock(db):
-        raise VeilleError("another veille gesture holds the lock")
-    try:
-        return _adopt_locked(cfg, db, lot, report, bins=bins, agent=agent,
+    with _locked(db) as tx:
+        if tx is None:
+            raise VeilleError("another veille gesture holds the lock")
+        return _adopt_locked(cfg, tx, lot, report, bins=bins, agent=agent,
                              requester=requester, actor=actor, dry_run=dry_run,
                              now=now, rules=rules, prices=prices)
-    finally:
-        _unlock(db)
 
 
 def _adopt_locked(cfg, db, lot: int, report: Report, *, bins: dict | None = None,
@@ -1148,7 +1332,10 @@ def _adopt_locked(cfg, db, lot: int, report: Report, *, bins: dict | None = None
     # automatique : canari
     try:
         state = start_canary(cfg, db, row, state, report, agent=agent,
-                             now=now, rules=rules)
+                             now=now, rules=rules, actor=actor)
+    except OwnerProofInvalid as exc:
+        return {"lot": int(lot), "result": "refused", "state": state,
+                "reason": str(exc), "report": report.raw}
     except VeilleError as exc:
         _block(row, state, str(exc), from_stage="canary", actor=actor)
         return {"lot": int(lot), "result": "blocked", "state": state,
@@ -1201,7 +1388,10 @@ def advance(cfg, db, row: dict, *, now: float, bins: dict | None = None,
                         "reason": state.get("reason")}
             try:
                 state = start_canary(cfg, db, row, state, report, now=now,
-                             rules=rules)
+                             rules=rules, actor=actor)
+            except OwnerProofInvalid as exc:
+                return {"lot": row["lot_id"], "result": "refused",
+                        "reason": str(exc), "state": state}
             except VeilleError as exc:
                 _block(row, state, str(exc), from_stage="canary", actor=actor)
                 return {"lot": row["lot_id"], "result": "blocked",
@@ -1220,7 +1410,7 @@ def advance(cfg, db, row: dict, *, now: float, bins: dict | None = None,
                               actor=actor, dry_run=dry_run, rules=rules)
     if stage == "canary":
         return _advance_canary(db, row, state, report, now=now, actor=actor,
-                               dry_run=dry_run)
+                               dry_run=dry_run, cfg=cfg)
     if stage == "rollout":
         return _advance_rollout(cfg, db, row, state, report, now=now,
                                 actor=actor, rules=rules, dry_run=dry_run)
@@ -1308,7 +1498,10 @@ def _start_from_owner(cfg, db, row, state, report, *, now, actor, dry_run,
     state.update({"stage": "canary", "reason": "", "blocked_from": None})
     try:
         state = start_canary(cfg, db, row, state, report, now=now,
-                             rules=rules)
+                             rules=rules, actor=actor)
+    except OwnerProofInvalid as exc:
+        return {"lot": row["lot_id"], "result": "refused", "reason": str(exc),
+                "state": state}
     except VeilleError as exc:
         _block(row, state, str(exc), from_stage="waiting_owner_approved",
                actor=actor)
@@ -1317,7 +1510,8 @@ def _start_from_owner(cfg, db, row, state, report, *, now, actor, dry_run,
     return {"lot": row["lot_id"], "result": "canary", "state": state}
 
 
-def _advance_canary(db, row, state, report, *, now, actor, dry_run) -> dict:
+def _advance_canary(db, row, state, report, *, now, actor, dry_run,
+                   cfg=None) -> dict:
     target = registry.get(db, state.get("target_agent") or "")
     if target is None or target.get("status") == "stopped":
         if not dry_run:
@@ -1371,7 +1565,7 @@ def _advance_canary(db, row, state, report, *, now, actor, dry_run) -> dict:
                  actor=actor)
         return {"lot": row["lot_id"], "result": "refused",
                 "reason": state["reason"], "state": state}
-    hosts = _hosts(db, report, state)
+    hosts = _hosts(db, report, state, cfg=cfg)
     if not hosts:
         if not dry_run:
             _block(row, state, "no host runs harness %s" % report.harness,
@@ -1401,26 +1595,13 @@ def _advance_rollout(cfg, db, row, state, report, *, now, actor, rules,
         if dry_run:
             return {"lot": row["lot_id"], "result": "would-refuse",
                     "reason": why}
-        state.update({
-            "stage": "refused",
-            "reason": why,
-            "inverse": {"version": report.from_version,
-                        "restore": [{"agent": item["name"],
-                                     "value": item["before"]}
-                                    for entry in state.get("applied") or []
-                                    for item in entry.get("agents") or []]},
-        })
-        with db.transaction() as tx:
-            _restore(tx, state.get("applied") or [], report.object)
-            save(tx, row, state)
-        _journal(row, state, "rollout refused (%s); previous values restored"
-                 % why, actor=actor)
+        _refuse(row, state, report, why, actor=actor)
         return {"lot": row["lot_id"], "result": "refused", "reason": why,
                 "state": state}
     hosts = list(state.get("hosts") or [])
     # un hôte apparu pendant la bascule (agent déplacé) rejoint la file : il
     # ne doit pas rester sur l'ancienne version sans être vu.
-    current = _hosts(db, report, state)
+    current = _hosts(db, report, state, cfg=cfg)
     for host in current:
         if host not in hosts:
             hosts.append(host)
@@ -1457,13 +1638,13 @@ def _advance_rollout(cfg, db, row, state, report, *, now, actor, rules,
             save(db, row, state)
         return {"lot": row["lot_id"], "result": "waiting_cutoff", "host": host,
                 "seconds_to_cutoff": round(remaining, 3)}
-    running = _running(db, report, host)
+    running = _running(db, report, host, cfg=cfg)
     if running:
         if not dry_run:
             save(db, row, state)
         return {"lot": row["lot_id"], "result": "waiting_turn", "host": host,
                 "agents": running}
-    agents = _target_agents(db, report, host=host)
+    agents = _target_agents(db, report, host=host, cfg=cfg)
     if not agents:
         state["next_host"] = index + 1
         if not dry_run:
@@ -1498,40 +1679,50 @@ def _advance_rollout(cfg, db, row, state, report, *, now, actor, rules,
 def tick(cfg, db, *, now: float | None = None, project: str | None = None,
          bins: dict | None = None, actor: str = "ameesh", rules=None,
          dry_run: bool = False) -> dict:
-    """Avance toutes les adoptions ouvertes. Un seul passage à la fois."""
+    """Avance toutes les adoptions ouvertes. Un seul passage à la fois.
+
+    #4312 : chaque adoption est avancée dans SA transaction verrouillée. Une
+    erreur annule ce pas (aucune bascule à moitié écrite) sans perdre les
+    autres ; le verrou est de transaction, donc psql et psycopg le tiennent
+    réellement."""
     now = time.time() if now is None else float(now)
-    if not _lock(db):
-        return {"schema": "ameesh-harness-adoption-tick/1", "result": "busy",
-                "adoptions": []}
-    try:
-        discovered = discover(cfg, db, now=now, project=project, bins=bins,
-                              actor=actor, dry_run=dry_run, rules=rules)
-        results = []
-        for row in open_adoptions(db, project=project):
-            row["_db"] = db
-            state = row["state"]
-            try:
+    with _locked(db) as probe:
+        if probe is None:
+            return {"schema": "ameesh-harness-adoption-tick/1", "result": "busy",
+                    "adoptions": []}
+    discovered = discover(cfg, db, now=now, project=project, bins=bins,
+                          actor=actor, dry_run=dry_run, rules=rules)
+    results = []
+    for row in open_adoptions(db, project=project):
+        try:
+            with _locked(db) as tx:
+                if tx is None:
+                    results.append({"lot": row["lot_id"], "result": "busy"})
+                    continue
+                fresh = load(tx, row["lot_id"])
+                if fresh is None:
+                    continue
+                fresh["_db"] = tx
+                state = fresh["state"]
                 hosts = sorted({agent.get("host") or ""
-                                for agent in _agents(db, row["harness"])
+                                for agent in _agents(tx, fresh["harness"])
                                 if agent.get("host")}
                                | {host for host in (state.get("hosts") or [])
                                   if host}
                                | ({state.get("canary_host")}
                                   if state.get("canary_host") else set()))
-                row_bins = load_bins(Report(row["report"]))
+                row_bins = load_bins(Report(fresh["report"]))
                 row_bins.update(_expand_bins(bins or {}, hosts))
-                results.append(advance(cfg, db, row, now=now, bins=row_bins,
+                results.append(advance(cfg, tx, fresh, now=now, bins=row_bins,
                                        actor=actor, rules=rules, dry_run=dry_run))
-            except VeilleError as exc:
-                results.append({"lot": row["lot_id"], "result": "error",
-                                "reason": str(exc)})
-            except Exception as exc:  # noqa: BLE001 — une adoption ne bloque pas les autres
-                results.append({"lot": row["lot_id"], "result": "error",
-                                "reason": "%s: %s" % (type(exc).__name__, exc)})
-        return {"schema": "ameesh-harness-adoption-tick/1", "result": "ok",
-                "adoptions": results, "discovered": discovered}
-    finally:
-        _unlock(db)
+        except VeilleError as exc:
+            results.append({"lot": row["lot_id"], "result": "error",
+                            "reason": str(exc)})
+        except Exception as exc:  # noqa: BLE001 — une adoption ne bloque pas les autres
+            results.append({"lot": row["lot_id"], "result": "error",
+                            "reason": "%s: %s" % (type(exc).__name__, exc)})
+    return {"schema": "ameesh-harness-adoption-tick/1", "result": "ok",
+            "adoptions": results, "discovered": discovered}
 
 
 def discover(cfg, db, *, now: float, project: str | None = None,
@@ -1585,16 +1776,16 @@ def rollback(cfg, db, lot: int, *, reason: str, actor: str = "",
              now: float | None = None) -> dict:
     """Remet la version précédente, consignée dans le lot ; idempotent."""
     now = time.time() if now is None else float(now)
-    if not _lock(db):
-        raise VeilleError("another veille gesture holds the lock")
-    try:
+    with _locked(db) as tx:
+        if tx is None:
+            raise VeilleError("another veille gesture holds the lock")
         # #4293 (avis B cx2 du 17:16) : l'état est relu SOUS le verrou. Un
         # tick concurrent a pu basculer un hôte entre-temps ; restaurer la
         # copie lue avant le verrou perdrait cette bascule et son inverse.
-        row = load(db, int(lot))
+        row = load(tx, int(lot))
         if row is None:
             raise VeilleError("lot #%s: no adoption" % lot)
-        row["_db"] = db
+        row["_db"] = tx
         state = row["state"]
         report = Report(row["report"])
         applied = state.get("applied") or []
@@ -1608,14 +1799,11 @@ def rollback(cfg, db, lot: int, *, reason: str, actor: str = "",
             },
             "updated_ts": round(float(now), 3),
         })
-        with db.transaction() as tx:
-            _restore(tx, applied, report.object)
-            save(tx, row, state)
+        _restore(tx, applied, report.object)
+        save(tx, row, state)
         _journal(row, state, "rolled back: %s; inverse version: %s"
                  % (reason, report.from_version), actor=actor or "ameesh")
         return {"lot": int(lot), "result": "rolled_back", "state": state}
-    finally:
-        _unlock(db)
 
 
 # --------------------------------------------------------------------------

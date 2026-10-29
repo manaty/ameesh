@@ -77,6 +77,11 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    lancée hors du tic est ainsi « en cours » (`composition en cours
    (hôte:pid)`) au lieu de laisser le tic supprimer son worktree vivant ; le
    verrou tombe avec le processus, une tentative morte reste reprise.
+   #4501 : la vie d'une tentative sur cet hôte se lit au **pid vivant**, jamais
+   à la ligne de commande (une recomposition peut tourner sous un autre nom) ;
+   et si une tête poussée du porteur (gelée, ou vue en avance) a une ci-full en
+   cours, la reprise attend sa conclusion au lieu de recomposer et d'écraser
+   son manifeste.
 6. Un courrier au pilote à chaque étape (tête, unités, écartés, CI).
 
 **Recomposition du pilote** (#4237) : `paquet-horaire.py recompose --carrier N
@@ -322,12 +327,48 @@ class Context:
     log: list[str] = field(default_factory=list)
 
     def alive(self, pid: int) -> bool:
-        """Un tic de ce script tourne-t-il encore sous ce pid, sur cet hôte ?"""
+        """Un processus vit-il encore sous ce pid, sur cet hôte ? (#4501)
+
+        La ligne de commande ne prouve rien : une recomposition peut tourner
+        sous un autre nom (copie `scripts/.h12-tick.py`, wrapper de session) et
+        un pid vivant jugé mort fait recomposer le même porteur en parallèle.
+        On lit donc l'état du processus (`/proc/<pid>/stat`, un zombie ne
+        compte pas) ; hors Linux (`/proc` absent), `os.kill(pid, 0)`. Un pid
+        recyclé reste un doute, jamais une fausse mort : le verrou de
+        composition et le bail tranchent.
+        """
+        if pid <= 0:
+            return False
+        if os.path.isdir("/proc"):
+            try:
+                text = Path("/proc/%d/stat" % pid).read_text(
+                    encoding="ascii", errors="replace")
+            except FileNotFoundError:
+                return False
+            except OSError:
+                # procfs lisible en général mais pas pour ce pid (droits,
+                # course) : ne pas conclure à une mort sans le dire.
+                return self._alive_by_signal(pid)
+            # champ 3 = état ; le nom (champ 2) peut contenir espaces et
+            # parenthèses, on coupe après la dernière.
+            try:
+                state = text.rsplit(")", 1)[1].split()[0]
+            except (IndexError, ValueError):
+                return True
+            return state != "Z"
+        return self._alive_by_signal(pid)
+
+    @staticmethod
+    def _alive_by_signal(pid: int) -> bool:
         try:
-            cmdline = Path("/proc/%d/cmdline" % pid).read_bytes()
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
         except OSError:
             return False
-        return b"paquet-horaire" in cmdline
+        return True
 
     def say(self, text: str) -> None:
         self.log.append(text)
@@ -475,6 +516,29 @@ def run_for(report: dict, sha: str) -> dict | None:
     """Le run le plus récent de la tête gelée (`ci status` liste du plus récent)."""
     for run in report.get("runs") or []:
         if str(run.get("head_sha") or "").lower() == sha:
+            return run
+    return None
+
+
+def ci_in_progress(ctx: Context, item: dict) -> dict | None:
+    """#4501 : le run en cours de la tête poussée du porteur, ou None.
+
+    La tête poussée est la tête gelée et/ou la tête de branche vue en avance
+    (`branch_head`, relevé partagé) : une poussée plus récente, pas encore
+    gelée, est déjà sous CI. Un porteur dont une de ces têtes est sous ci-full
+    n'est ni recomposé ni réenregistré par un second composeur : la reprise
+    attend la conclusion du run. Une lecture impossible de `ci status` lève
+    (aucun geste), elle ne vaut jamais « aucun run ».
+    """
+    heads = {str(item.get("branch_head") or "").strip().lower(), frozen_sha(item)}
+    heads.discard("")
+    if not heads:
+        return None
+    report = ci_status(ctx, int(item["id"]))
+    for run in report.get("runs") or []:
+        if str(run.get("head_sha") or "").lower() in heads \
+                and str(run.get("status") or "") in (
+                    "running", "queued", "pending", "in_progress"):
             return run
     return None
 
@@ -839,9 +903,16 @@ def compose(ctx: Context, rows: list[dict]) -> str:
                 ctx.note(carrier, "%s%d groupe=%s"
                          % (SECOND_PREFIX, first,
                             ",".join(str(lot) for lot in group)))
-        results.append(attempt(ctx, carrier, name,
-                               Attempt(COMPOSITION, 1, "",
-                                       only=(list(group) if len(groups) == 2 else []))))
+        try:
+            results.append(attempt(ctx, carrier, name,
+                                   Attempt(COMPOSITION, 1, "",
+                                           only=(list(group) if len(groups) == 2 else []))))
+        except HoraireError as exc:
+            # The first carrier's journal already records its attempt. Keep
+            # composing the independent second group; the next tick resumes it.
+            if len(groups) != 2:
+                raise
+            results.append("#%d : %s" % (carrier, exc))
     return "\n".join(results)
 
 
@@ -1055,6 +1126,12 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
         return "#%d : composition en cours (%s)" % (carrier, holder)
     if running(ctx, this, name):
         return "#%d : %s en cours (%s:%d)" % (carrier, this.step, this.host, this.pid)
+    # #4501 : la tête poussée est sous ci-full ; un second composeur ne
+    # recompose ni ne réenregistre par-dessus (le premier peut encore aboutir).
+    pending_run = ci_in_progress(ctx, item)
+    if pending_run is not None:
+        return "#%d : ci-full en cours sur %s (run %s), reprise suspendue" % (
+            carrier, frozen_sha(item)[:12], pending_run.get("run_id") or "?")
     if this.fenced:
         # #4245 : refus de garde, non concluant : même numéro de tentative,
         # borné par MAX_FENCED ; `--force` ferme la branche et le worktree
@@ -1246,6 +1323,16 @@ def follow(ctx: Context, item: dict) -> str:
         return resume(ctx, item, left)
     if not sha:
         return "#%d sans gel ni tentative : rien à faire" % carrier
+    # #4319: an unavailable exemption proof requests the ordinary full-CI
+    # path, on the same carrier. The marker is scoped to its frozen head.
+    requested = any(
+        str(event.get("note") or "").startswith("auto-merge parallel-recompose ")
+        and "sha=%s " % sha in str(event.get("note") or "")
+        for event in item.get("events") or ())
+    if requested:
+        return attempt(ctx, carrier, name,
+                       Attempt(RECOMPOSITION, 1, sha, run_id="parallel-proof",
+                               only=carrier_group(item), force=True))
     noted = marks(item)
     if MARK_CI + sha not in noted:
         return publish(ctx, item)
@@ -1264,7 +1351,8 @@ def follow(ctx: Context, item: dict) -> str:
             verdict = Verdict(False, verdict.lots, verdict.tests, why)
     # #4237 : une recomposition du pilote n'use pas le retrait automatique
     recomposed = len({a.run_id for a in attempts(item)
-                      if a.step == RECOMPOSITION and a.run_id != PILOT_RUN})
+                      if a.step == RECOMPOSITION
+                      and a.run_id not in (PILOT_RUN, "parallel-proof")})
     if verdict.deterministic and recomposed < MAX_RECOMPOSITIONS:
         return recompose(ctx, item, run, verdict)
     reason = verdict.why if not verdict.deterministic else \
@@ -1573,6 +1661,13 @@ def pilot_recompose(ctx: Context, carrier: int, exclude: list[int],
     if left is not None and running(ctx, left):
         raise InputError("#%d : %s en cours (%s:%d), attendre sa fin"
                          % (carrier, left.step, left.host, left.pid))
+    # #4501 : une ci-full tourne sur la tête poussée ; la recomposition
+    # l'écraserait au lieu d'attendre son verdict.
+    run = ci_in_progress(ctx, item)
+    if run is not None:
+        raise InputError(
+            "#%d : ci-full en cours sur %s (run %s), recomposition refusée"
+            % (carrier, sha[:12], run.get("run_id") or "?"))
     ctx.epoch = session_epoch(ctx)
     name = str(item.get("branch") or "")[len(auto.PACKAGE_PREFIX):]
     ctx.say("#%d : recomposition du pilote sans %s" % (

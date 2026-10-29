@@ -127,16 +127,38 @@ def discover(*, builtin=True):
 
 #: L99 T2 (#4350): delivery connectors owned by the core itself (`work.deliver`)
 CORE_CONNECTORS = ("document", "done")
+#: L100 T1 (#4382): action connectors owned by the core itself (`connectors.get`)
+CORE_ACTION_CONNECTORS = ("shell-noop",)
 
 
 def _connector_providers():
-    """Built-in providers of delivery connectors: the lifecycle modules plus the
-    development tooling (`dev`), which is not a lifecycle module. Installed
-    entry points are not read: a delivery path is reviewed core code."""
+    """Built-in providers of action and delivery connectors: the lifecycle
+    modules plus the development tooling (`dev`), which is not a lifecycle
+    module. Installed entry points are not read: a connector path is reviewed
+    core code."""
     from . import dev
     providers = dict(_builtin())
     providers[dev.NAME] = dev
     return providers
+
+
+def action_connectors():
+    """`{name: (provider, connector)}` of the action connectors modules declare
+    in ``ACTION_CONNECTORS``; a name taken twice, or by the core, is refused.
+
+    L100 T1 (#4382): the registry is the core's only way to the development
+    module's action connectors (`git-merge`); the core keeps `shell-noop`."""
+    found = {}
+    for provider, module in sorted(_connector_providers().items()):
+        for name, connector in sorted((getattr(module, "ACTION_CONNECTORS", None)
+                                       or {}).items()):
+            if not NAME.fullmatch(name) or not callable(connector):
+                raise ValueError("module %r: invalid action connector %r"
+                                 % (provider, name))
+            if name in CORE_ACTION_CONNECTORS or name in found:
+                raise ValueError("duplicate action connector: %r" % (name,))
+            found[name] = (provider, connector)
+    return found
 
 
 def delivery_connectors():

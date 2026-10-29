@@ -245,8 +245,12 @@ def launch_fingerprint(harness: str, profile, env: dict) -> str | None:
     """#210 r4: the fingerprint of the credential a turn is launched with,
     read from the child's environment `env` once the account is applied — an
     API key is the exact value handed to the child (its key file may be
-    replaced before the turn fails), an OAuth store the file that
+    replaced before the turn fails), a setup token is likewise the value
+    handed to the child, an OAuth store the file that
     environment points to."""
+    from . import setup_token
+    if harness == "claude" and setup_token.VARIABLE in env:
+        return _digest(str(env.get(setup_token.VARIABLE) or "").strip())
     if profile is not None and profile.kind == "api_key_env":
         # the variable the child reads (`accounts.apply_env`)
         name = profile.env or accounts_mod.default_key_env_of(harness)

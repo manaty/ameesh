@@ -19,6 +19,7 @@ import json
 import random
 import time
 
+from ... import packet_head
 from ...db import DbError, in_transaction, is_unique_violation
 from ...slo import VEHICLE_EXIT_MARK
 from .. import interface
@@ -986,9 +987,24 @@ class WorkItems(interface.WorkItems):
                   + ((REVIEWER_NONE, state) if waiver else ())
                   + (int(item_id), current)
                   + ((str(int(item_id)),) if held else ()))
+        validation_item = self.get(item_id) if state == "validated" else None
+        validation_marks = self.milestones(item_id, None) if state == "validated" else None
+        validation_gate = (self._validation_gate(item_id, validation_marks, item=validation_item)
+                           if state == "validated" else None)
         with self.db.transaction() as tx:
             if not _lock_migration_writer(tx, item_id):
                 return None
+            if state == "validated":
+                # The same lock serializes freezes, verdicts and manual entry.
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                         (int(item_id),))
+                gate = validation_gate
+                if (WorkItems(tx).milestones(item_id, None) != validation_marks
+                        or WorkItems(tx).get(item_id) != validation_item):
+                    gate = None
+                if not gate or not gate.get("ok"):
+                    from ...work import WorkError
+                    raise WorkError("validated requires the review quorum on the frozen head")
             rows = tx.query(sql, params)
             if not rows:
                 return None
@@ -2050,7 +2066,53 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._lapse_waiver(int(item_id), milestone, actor)
             if on_frozen is not None:
                 on_frozen(tx, milestone, threads)
+        if kind in ("verdict", "frozen"):
+            # Git/classification reads run after the writer commits. Nested
+            # designation hooks are reconciled by the outer freeze writer.
+            from ...freeze_gate import _in_transaction
+            if not _in_transaction(self.db):
+                self._sync_validation(item_id, actor)
         return milestone
+
+    def _validation_gate(self, item_id, marks=None, *, item=None):
+        from ... import merge_queue
+        item = self.get(item_id) if item is None else item
+        marks = self.milestones(item_id, None) if marks is None else marks
+        gate = merge_queue.review_gate_for_item(
+            self.db, getattr(self.db, "cfg", None), item, marks)
+        return gate
+
+    def _sync_validation(self, item_id, actor):
+        """Compute the gate outside locks, then compare the immutable ledger.
+
+        Any concurrent freeze/verdict invalidates this observation. The next
+        writer reconciles its own snapshot; no stale quorum can promote a lot.
+        """
+        item = self.get(item_id)
+        if item["state"] != "qa" or item.get("workflow_ref"):
+            return
+        marks = self.milestones(item_id, None)
+        from ... import plan_git
+        freeze = plan_git.latest_freeze(marks)
+        # Refreezing alone resets validation, including on the same SHA.
+        if not freeze or not any(mark.get("kind") == "verdict"
+                                 and mark["id"] > freeze["id"] for mark in marks):
+            return
+        gate = self._validation_gate(item_id, marks, item=item)
+        if not gate or not gate.get("ok"):
+            return
+        with self.db.transaction() as tx:
+            tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                     (int(item_id),))
+            if (WorkItems(tx).milestones(item_id, None) != marks
+                    or WorkItems(tx).get(item_id) != item):
+                return
+            rows = tx.query("UPDATE work_items SET state = 'validated', updated_at = now()"
+                            " WHERE id = %s AND state = 'qa' AND " + _UNPINNED + " RETURNING id",
+                            (int(item_id),))
+            if rows:
+                WorkItems(tx)._event(int(item_id), "validated",
+                                    "qa → validated — review quorum (#4423)", actor)
 
     def _lapse_waiver(self, item_id, milestone, actor) -> None:
         """#1979 : un gel d'une AUTRE tête lève la dispense de re-verdict
@@ -3320,13 +3382,40 @@ class WorkItems(interface.WorkItems):
     )
 
     def record_packet(self, package_id, *, branch, base_sha, head_sha, units, note,
-                      actor) -> list[dict]:
+                      actor, expect_pushed=None) -> list[dict]:
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT id, state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                "SELECT id, state, branch_head,"
+                "       extract(epoch FROM branch_head_at)::float8 AS branch_head_ts"
+                " FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                 (int(package_id),))
             if not rows:
                 raise DbError("packet #%s: no such work item" % package_id)
+            # #4501 : sous le verrou du porteur, relire la tête poussée avant
+            # toute écriture. `FOR NO KEY UPDATE` est exclusif avec lui-même
+            # (matrice PostgreSQL : deux verrous de ce mode s'attendent) et
+            # avec les verrous pris par un gel (`add_milestone`) ou un relevé
+            # de `branch_head` (`UPDATE`) : soit ils ont commité avant et
+            # cette lecture les voit, soit ils attendent et l'enregistrement
+            # porte sur la tête courante. Sans cette relecture, une lecture
+            # initiale périmée de `packet_link.record` écrasait le manifeste
+            # d'une tête poussée entre-temps; sans le verrou exclusif, deux
+            # enregistrements concurrents mélangeaient leurs membres.
+            freeze = tx.query(
+                "SELECT sha, extract(epoch FROM at)::float8 AS at_ts"
+                " FROM work_item_milestones"
+                " WHERE work_item_id = %s AND kind = 'frozen'"
+                " ORDER BY at DESC, id DESC LIMIT 1", (int(package_id),))
+            protected = packet_head.protected_head(
+                freeze[0]["sha"] if freeze else "",
+                freeze[0]["at_ts"] if freeze else 0,
+                rows[0].get("branch_head") or "",
+                rows[0].get("branch_head_ts") or 0)
+            if protected and not packet_head.same_commit(protected, head_sha) \
+                    and not (expect_pushed
+                             and packet_head.same_commit(expect_pushed, protected)):
+                raise DbError(packet_head.refusal(
+                    int(package_id), protected, head_sha, expect_pushed))
             # #4369 : une unité que la recomposition retire sort du véhicule ;
             # la note du porteur la nomme, l'horloge « verdict → fusion »
             # repart de là (`slo.vehicle_exits`). Une seule ligne par
@@ -3672,6 +3761,50 @@ class WorkItems(interface.WorkItems):
             "   AND starts_with(note, %s)", (float(seconds), note_prefix))
         return int(rows[0]["n"]) if rows else 0
 
+    def project_plan_rows(self, project, *, assignment_id=None) -> list[dict]:
+        """#4174: complete open project snapshot, including every waiting lot."""
+        return self.db.query(
+            "WITH pending_decisions AS MATERIALIZED ("
+            " SELECT DISTINCT btrim(work_item_id) AS lot FROM agent_mailbox"
+            " WHERE delivered_at IS NULL AND kind = 'request'"
+            " AND payload->'decision' IS NOT NULL) "
+            "SELECT w.*, extract(epoch FROM w.created_at)::float8 AS created_ts,"
+            "       extract(epoch FROM w.wake_at)::float8 AS wake_ts,"
+            "       to_char(w.planned_start, 'YYYY-MM-DD') AS planned_start,"
+            "       to_char(w.planned_end, 'YYYY-MM-DD') AS planned_end,"
+            "       to_char(w.planned_delivery, 'YYYY-MM-DD') AS planned_delivery,"
+            "       CASE WHEN w.state = 'build' THEN " + requeued_sql("w") +
+            " ELSE false END AS returned_to_queue,"
+            "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
+            "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
+            "       ARRAY(SELECT d.blocker_id FROM work_item_dependencies d"
+            "             JOIN work_items b ON b.id = d.blocker_id"
+            "             WHERE d.work_item_id = w.id AND NOT " + _not_blocking("b") +
+            "             ORDER BY d.blocker_id) AS blocking_dependencies,"
+            "       ARRAY(SELECT b.id FROM work_item_links l"
+            "             JOIN work_items b ON b.id = CASE WHEN l.work_item_id = w.id"
+            "                  THEN l.other_id ELSE l.work_item_id END"
+            "             WHERE (l.work_item_id = w.id OR l.other_id = w.id)"
+            "               AND l.kind = 'conflicts_with' AND b.state NOT IN " + _CLOSED +
+            "             ORDER BY b.id) AS open_conflicts,"
+            "       (pd.lot IS NOT NULL) AS pending_decision,"
+            # Match the intake footprint guard used by dispatch (#4173).
+            "       (w.state = 'intake' AND " + footprint_overlap_sql("w") + ")"
+            "         AS footprint_overlap,"
+            "       EXISTS (SELECT 1 FROM commitments c WHERE c.work_item_id = w.id"
+            "               AND c.kind = 'decision' AND c.status IN ('proposed', 'open'))"
+            "         AS decision_milestone"
+            " FROM work_items w LEFT JOIN work_packages k ON k.id = w.package_id"
+            " LEFT JOIN work_packages kp ON kp.id = w.package_parent"
+            " LEFT JOIN pending_decisions pd ON pd.lot = w.id::text"
+            " WHERE coalesce(nullif(btrim(w.app), ''), nullif(btrim(w.team), ''),"
+            "                nullif(btrim(k.team), ''), nullif(btrim(kp.team), ''), '') = %s"
+            " AND w.state NOT IN " + _CLOSED + " AND w.type <> 'improvement'"
+            + (" AND (w.id = %s OR (w.type = 'bug' AND w.assignee IS NULL"
+               " AND w.state IN ('intake', 'build')))" if assignment_id is not None else "") +
+            " ORDER BY w.id", REQUEUED_PARAMS + (str(project),) +
+            ((int(assignment_id),) if assignment_id is not None else ()))
+
     def unassigned_lots(self, limit) -> list[dict]:
         # #2252 : seuls les lots dont TOUTES les dépendances sont fusionnées
         # (`merged`/`promoted`/`closed`) sont prenables. La règle est celle de
@@ -3718,7 +3851,8 @@ class WorkItems(interface.WorkItems):
                "          w.created_ts, w.id"
                " LIMIT %s")
         # les deux fragments attendent les mêmes paramètres, dans l'ordre du texte
-        return self.db.query(sql, REQUEUED_PARAMS + REQUEUED_PARAMS + (int(limit),))
+        return self.db.query(sql, REQUEUED_PARAMS + REQUEUED_PARAMS +
+                             (None if limit is None else int(limit),))
 
     def review_proposals(self, limit, *, proposal_prefix, window_s=21600.0) -> list[dict]:
         """#1677 (c) : les lots en `qa` qui attendent un geste de relecture —
