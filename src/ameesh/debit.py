@@ -50,6 +50,13 @@ Un lot relu (tous ses avis rendus) dont `branch_target` est la branche d'un
 autre lot **ouvert** n'est pas une attente de paquet : il ne peut entrer
 qu'avec ce lot, dont le hold couvre déjà l'attente. Le rapport le marque
 `depends_on` et ne produit ni `qa_merge` ni sortie 2 pour lui (#3437).
+
+#3256 B : la section `capacity` (spec `docs/design/3256-debit-file.md` §3) —
+agents réveillables au repos, heures-agent au repos, lots démarrables, lot de
+découpage, perte au reset par compte. `--check` sort aussi 2 quand un projet
+a au moins `file.repos_part` de ses agents réveillables au repos depuis
+`file.repos_s` (bloc mécanique du canon) et qu'aucun lot de découpage n'a moins
+d'une heure : une file vide n'est pas « rien à signaler ».
 """
 from __future__ import annotations
 
@@ -1494,6 +1501,255 @@ def build(*, items: Iterable[Mapping[str, Any]],
     }
 
 
+# -- capacité (#3256 B) ------------------------------------------------------
+
+def _decoupage_project(lot: Mapping[str, Any]) -> str | None:
+    """#3256 : le projet d'un lot de découpage, lu à sa `source`
+    (`file-decoupage:<projet>`, #4273), sinon None."""
+    from .file_decoupage import SOURCE_PREFIX
+    source = str(lot.get("source") or "")
+    if not source.startswith(SOURCE_PREFIX):
+        return None
+    return source[len(SOURCE_PREFIX):] or None
+
+
+def _exhausted_project(note: Any) -> str | None:
+    """Le projet d'une note `roadmap: épuisée <projet>` (#4273), sinon None."""
+    from .file_decoupage import EXHAUSTED_RE
+    match = EXHAUSTED_RE.match(str(note or ""))
+    return match.group(1).strip(".,;:") if match else None
+
+
+def _busy_spans(turns: Iterable[Mapping[str, Any]], start: float,
+                end: float) -> dict[str, list[tuple[float, float]]]:
+    """{agent: [(début, fin)]} des tours **sur un lot**, bornés à la fenêtre,
+    fusionnés. Un tour de courrier sans lot ne fait pas sortir du repos : un
+    agent sans lot en prend toutes les quelques minutes (N9 de #1677)."""
+    spans: dict[str, list[tuple[float, float]]] = {}
+    for row in turns or ():
+        if row.get("work_item_id") is None or not row.get("agent"):
+            continue
+        begin = float(row.get("at_ts") or 0.0)
+        finish = max(float(row.get("end_ts") or begin), begin)
+        if finish < start or begin > end:
+            continue
+        spans.setdefault(str(row["agent"]), []).append((max(begin, start),
+                                                        min(finish, end)))
+    for name, values in spans.items():
+        values.sort()
+        merged = [values[0]]
+        for begin, finish in values[1:]:
+            if begin <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], finish))
+            else:
+                merged.append((begin, finish))
+        spans[name] = merged
+    return spans
+
+
+def _idle_gaps(spans: list[tuple[float, float]], start: float, end: float,
+               min_gap_s: float) -> float:
+    """Les secondes de la fenêtre hors tour sur un lot, en ne comptant que les
+    intervalles d'au moins `min_gap_s` (un agent entre deux tours d'un même
+    lot, CI en cours, n'est pas « au repos depuis 30 min »)."""
+    total, cursor = 0.0, start
+    for begin, finish in list(spans) + [(end, end)]:
+        gap = begin - cursor
+        if gap > 0 and gap >= min_gap_s:
+            total += gap
+        cursor = max(cursor, finish)
+    return total
+
+
+def capacity(*, agents: Iterable[Mapping[str, Any]],
+             turns: Iterable[Mapping[str, Any]] = (),
+             startable: Iterable[Mapping[str, Any]] = (),
+             open_lots: Iterable[Mapping[str, Any]] = (),
+             roadmap_notes: Iterable[Mapping[str, Any]] = (),
+             reopened: Mapping[str, float] | None = None,
+             losses: Iterable[Mapping[str, Any]] = (),
+             now: float, window_s: float,
+             repos_part: float | None, repos_s: float | None,
+             canons=(), configured: bool = False,
+             held: Mapping[str, str] | None = None,
+             gating_ok: bool = True,
+             rule_source: str = "") -> dict:
+    """La section `capacity` du débit (spec #3256 §3.1), sans I/O.
+
+    * `agents` : le relevé des agents (`operations.listing`) ; un agent
+      **réveillable** l'est au sens de #4273 (`file_decoupage.wakeable` :
+      exécution, ni éphémère, ni chat, ni arrêté, ni en pause, ni critique ni
+      relecteur — `critical_verdict` sur `canons`, `configured`), et en
+      plus ni retiré (`retired_ts`), ni sans exécuteur vivant
+      (`_awake_runner`), ni tenu par son budget (`held`). Il compte dans le
+      projet primaire de sa fiche, et une fois au mesh.
+    * **au repos depuis `repos_s`** : sans lot actionnable (`idle_agents`)
+      et sans tour sur un lot depuis `repos_s` ; `idle_share` = au repos /
+      réveillables.
+    * `idle_agent_hours` : sur la fenêtre, le temps hors tour sur un lot des
+      agents réveillables, par intervalles d'au moins `repos_s`. L'état
+      réveillable est celui de l'instant ; un agent d'un projet à la feuille
+      de route épuisée ne compte d'heures ni dans son projet ni au mesh.
+    * `startable` : les lots démarrables (`split_startable`) ; `open_lots` :
+      les lots ouverts, où le lot de découpage se lit à sa `source`.
+    * `roadmap_notes` : `{note, at_ts, work_item_id, source}` ; seule une
+      note posée **sur un lot de découpage du même projet** vaut (§1).
+    * `reopened` : `{projet: instant}` du dernier lot du projet **arrivé
+      démarrable** — créé sans assigné puis pris (`assigned to … (before:
+      nobody)`), lu à l'historique. Il rouvre durablement une route notée
+      épuisée avant lui (§2.3) ; un lot démarrable de l'instant aussi. Un lot
+      créé déjà assigné ne rouvre rien.
+    * `losses` : la perte au reset par compte, comme `ameesh accounts`.
+    * `gating_ok` : faux quand une lecture dont dépend l'alerte a échoué
+      (lots ouverts, notes, tenues de budget, historique) ; la mesure reste
+      rendue, mais aucune alerte n'est levée sur une lecture incomplète.
+
+    Une alerte par projet quand `idle_share ≥ repos_part`, que la feuille de
+    route n'est pas épuisée et qu'aucun lot de découpage n'a moins de
+    `file_decoupage.FALLBACK_S` : c'est elle qui fait sortir `--check` 2."""
+    from . import file_decoupage
+    from . import projects as projects_mod
+    from . import sous_utilisation
+    now = float(now)
+    start = now - float(window_s)
+    held = dict(held or {})
+    min_gap = float(repos_s) if repos_s is not None else 0.0
+    rows = [dict(row) for row in agents or ()]
+    spans = _busy_spans(turns, start, now)
+    last_lot_turn = {name: values[-1][1] for name, values in spans.items()}
+
+    awake = [row for row in file_decoupage.wakeable(rows, list(canons or ()),
+                                                    configured=configured)
+             if not row.get("retired_ts") and sous_utilisation._awake_runner(row)
+             and row["name"] not in held]
+    idle_now = {row["name"] for row in sous_utilisation.idle_agents(
+        awake, now, min_gap, waiting_free=True, actionable_idle=True)}
+    rested = {name for name in idle_now
+              if now - last_lot_turn.get(name, start) >= min_gap}
+
+    startable = [dict(lot) for lot in startable or ()]
+    startable_by: dict[str, list[int]] = {}
+    for lot in startable:
+        startable_by.setdefault(projects_mod.lot_project(lot) or "",
+                                []).append(int(lot["id"]))
+    decoupage: dict[str, dict] = {}
+    for lot in open_lots or ():
+        project = _decoupage_project(lot)
+        if not project:
+            continue
+        created = _epoch(lot.get("created_ts"))
+        entry = {"lot": int(lot["id"]), "state": lot.get("state"),
+                 "assignee": lot.get("assignee") or None,
+                 "created_ts": created, "age_s": _age(now, created)}
+        current = decoupage.get(project)
+        if current is None or (created or 0.0) > (current.get("created_ts") or 0.0):
+            decoupage[project] = entry
+    exhausted: dict[str, dict] = {}
+    for note in sorted(roadmap_notes or (), key=lambda r: float(r.get("at_ts") or 0.0)):
+        project = _exhausted_project(note.get("note"))
+        # §1 : la note se pose sur le lot de découpage du projet, pas ailleurs
+        if project and _decoupage_project(note) == project:
+            exhausted[project] = {"lot": note.get("work_item_id"),
+                                  "at_ts": float(note.get("at_ts") or 0.0)}
+    reopened = dict(reopened or {})
+    for project, entry in list(exhausted.items()):
+        if startable_by.get(project) or float(reopened.get(project) or 0.0) > entry["at_ts"]:
+            del exhausted[project]
+
+    by_project: dict[str, list[dict]] = {}
+    primary: dict[str, str] = {}
+    for row in awake:
+        names = projects_mod.agent_projects(row)
+        primary[row["name"]] = names[0] if names else ""
+        by_project.setdefault(primary[row["name"]], []).append(row)
+
+    def summary(members: list[dict], project: str | None) -> dict:
+        names = sorted(row["name"] for row in members)
+        idle = sorted(name for name in names if name in rested)
+        # un agent d'un projet à la feuille de route épuisée ne compte
+        # d'heures au repos ni dans son projet, ni au mesh
+        seconds = sum(_idle_gaps(spans.get(name, []), start, now, min_gap)
+                      for name in names if primary.get(name) not in exhausted)
+        share = (len(idle) / len(names)) if names else 0.0
+        return {"wakeable": len(names), "idle": len(idle), "idle_agents": idle,
+                "idle_share": round(share, 4),
+                "idle_agent_hours": round(seconds / 3600.0, 2),
+                "roadmap_exhausted": exhausted.get(project) if project else None}
+
+    projects_out = []
+    alerts = []
+    for project in sorted(set(by_project) | {p for p in startable_by if p}):
+        if not project:
+            continue
+        entry = summary(by_project.get(project, []), project)
+        entry["project"] = project
+        entry["startable_lots"] = sorted(startable_by.get(project, []))
+        entry["decoupage"] = decoupage.get(project)
+        projects_out.append(entry)
+        fresh = entry["decoupage"] is not None and (
+            entry["decoupage"].get("age_s") or 0.0) < file_decoupage.FALLBACK_S
+        if (gating_ok and repos_part is not None and entry["wakeable"]
+                and entry["idle_share"] >= float(repos_part)
+                and entry["roadmap_exhausted"] is None and not fresh):
+            alerts.append({
+                "project": project, "idle": entry["idle"],
+                "wakeable": entry["wakeable"], "idle_share": entry["idle_share"],
+                "startable_lots": entry["startable_lots"][:20],
+                "decoupage": entry["decoupage"],
+                "gesture": _capacity_gesture(project, entry)})
+    mesh = summary(awake, None)
+    mesh["startable_lots"] = sum(len(v) for v in startable_by.values())
+    loss_rows = sorted((dict(row) for row in losses or ()),
+                       key=lambda r: (str(r.get("harness")), str(r.get("account"))))
+    return {
+        "rule": ({"repos_part": float(repos_part), "repos_s": float(repos_s),
+                  "source": rule_source}
+                 if repos_part is not None and repos_s is not None else None),
+        "window_s": float(window_s),
+        "decoupage_grace_s": file_decoupage.FALLBACK_S,
+        "gating_ok": bool(gating_ok),
+        "mesh": mesh,
+        "projects": projects_out,
+        "plan_loss_at_reset": loss_rows,
+        "held": [{"agent": name, "reason": reason} for name, reason in sorted(held.items())],
+        "alerts": alerts,
+    }
+
+
+def _capacity_gesture(project: str, entry: Mapping[str, Any]) -> str:
+    """Le geste d'une alerte de capacité, dans l'ordre de docs/AUDITEUR.md :
+    confier d'abord les lots démarrables, puis le repli du découpage, puis
+    l'ouverture du lot de découpage au pilote."""
+    head = "lots démarrables pour %d agent(s) de %s : " % (entry["idle"], project)
+    if entry.get("startable_lots"):
+        return head + "confier les lots démarrables (ameesh work assign)"
+    if entry.get("decoupage"):
+        return head + ("le lot de découpage #%d a plus d'une heure sans lot démarrable "
+                       "— l'auditeur crée les lots (niveau 1, spec §2.2)"
+                       % entry["decoupage"]["lot"])
+    return head + "aucun lot de découpage ouvert — l'ouvrir au pilote (spec #3256 §2.2)"
+
+
+def plan_losses(account_gauges: Mapping[Any, list], now: float) -> list[dict]:
+    """#3256 : la part de fenêtre perdue au reset par compte de forfait, comme
+    `ameesh accounts` (`accounts.lost_at_reset`, #1561 : un relevé périmé
+    n'annonce aucune perte et le dit). `account_gauges` : la forme de
+    `sous_utilisation.latest_account_gauges`."""
+    from . import accounts as accounts_mod
+    from . import cost as cost_mod
+    out = []
+    for (harness, account), pairs in sorted(account_gauges.items(),
+                                            key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
+        gauges = [gauge for gauge, _ in pairs]
+        stale = bool(gauges) and cost_mod.stale_reading(gauges, now)
+        found = None if stale else accounts_mod.expiry(gauges, now)
+        out.append({"harness": harness, "account": account, "stale": stale,
+                    "lost": round(float(found[1]), 4) if found else None,
+                    "window": found[2].key if found else None,
+                    "resets_in_s": (float(found[0]) - now) if found else None})
+    return out
+
+
 # -- lecture -----------------------------------------------------------------
 
 def _epoch(value) -> float | None:
@@ -1584,11 +1840,55 @@ _AGENTS_SQL = """
 
 _TURNS_SQL = """
     SELECT extract(epoch FROM coalesce(started_at, recorded_at))::float8 AS at_ts,
-           agent
+           extract(epoch FROM recorded_at)::float8 AS end_ts,
+           agent, work_item_id
       FROM turn_costs
      WHERE recorded_at > to_timestamp(%s)
        AND coalesce(void_reason, '') = ''
      ORDER BY recorded_at
+"""
+
+#: #3256 : les notes `roadmap:` avec la `source` de leur lot (seule une note
+#: sur un lot de découpage du projet vaut, spec §1).
+_ROADMAP_SQL = """
+    SELECT e.work_item_id, e.note, w.source,
+           extract(epoch FROM e.created_at)::float8 AS at_ts
+      FROM work_item_events e
+      JOIN work_items w ON w.id = e.work_item_id
+     WHERE e.created_at > to_timestamp(%s)
+       AND w.source LIKE 'file-decoupage:%%'
+       AND lower(left(ltrim(e.note), 8)) = 'roadmap:'
+     ORDER BY e.created_at
+"""
+
+#: #3256 : la `source` des lots ouverts de découpage. `open_lots_activity`
+#: ne la rend pas (B6 d'impl-04 sur ac79c550) : elle est lue ici pour les
+#: seuls lots ouverts qu'elle a rendus, sans élargir l'interface partagée.
+_SPLIT_SOURCES_SQL = """
+    SELECT id, source
+      FROM work_items
+     WHERE id = ANY(string_to_array(%s, ',')::bigint[])
+       AND source LIKE 'file-decoupage:%%'
+"""
+
+#: #3256 : par projet, la création du dernier lot **arrivé démarrable** :
+#: créé sans assigné ni exécutant externe, puis pris dans la file (le
+#: journal porte `assigned to … (before: nobody)`). Un lot créé déjà
+#: assigné n'a pas cette ligne et ne rouvre pas une route épuisée (§2.3).
+#: Lue seulement pour les projets qui ont une note d'épuisement, depuis elle :
+#: le cas courant (aucune note) ne coûte rien (N5 de la relecture).
+_REOPENED_SQL = """
+    SELECT w.app, extract(epoch FROM max(w.created_at))::float8 AS created_ts
+      FROM work_items w
+      JOIN (SELECT DISTINCT work_item_id FROM work_item_events
+             WHERE created_at > to_timestamp(%s)
+               AND note LIKE 'assigned to %% (before: nobody)%%') e
+        ON e.work_item_id = w.id
+     WHERE w.created_at > to_timestamp(%s)
+       AND w.app = ANY(string_to_array(%s, ','))
+       AND coalesce(w.source, '') NOT LIKE 'file-decoupage:%%'
+       AND coalesce(to_jsonb(w)->>'external_executor', '') = ''
+     GROUP BY w.app
 """
 
 _MERGES_SQL = """
@@ -1761,8 +2061,109 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    ci_slow_s=ci_slow_s, devices=devices, installed=installed,
                    holds=holds, closure_allowed=closure_allowed,
                    ci_unreadable=ci_unreadable, packets=packets, zone=zone)
+    report["capacity"] = read_capacity(db, cfg=cfg, now=now, hours=hours, turns=turns,
+                                       canons=canons, unreadable=unreadable)
+    report["totals"]["capacity_alerts"] = len(report["capacity"]["alerts"])
     report["unreadable"] = list(dict.fromkeys(list(report["unreadable"]) + unreadable))
     return report
+
+
+def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
+                  canons=None, unreadable: list) -> dict:
+    """#3256 B : lit ce que `capacity` calcule. Chaque lecture en échec est
+    nommée dans `unreadable` ; si l'une de celles dont dépend l'alerte manque
+    (agents, lots ouverts, démarrables, notes, tenues de budget, historique),
+    la mesure est rendue mais aucune alerte n'est levée (`gating_ok` faux)."""
+    from . import file_decoupage
+    from . import mechanics
+    from . import storage
+    from . import sous_utilisation
+    failed: list[str] = []
+
+    def attempt(what, read_fn, default, *, gating=True):
+        try:
+            return read_fn()
+        except Exception as exc:  # noqa: BLE001 - nommé, jamais deviné
+            unreadable.append("capacity: %s unreadable: %s"
+                              % (what, " ".join(str(exc).split())[:160]))
+            if gating:
+                failed.append(what)
+            return default
+
+    # Le seuil absent n'est pas une lecture en échec du débit : il est dit
+    # dans la section (`rule_error`), qui ne lève alors aucune alerte.
+    rule, rule_error = None, ""
+    try:
+        rule = mechanics.configured(cfg).queue_fill if cfg is not None else None
+        if rule is None:
+            rule_error = ("no `file` block in the canon mechanics "
+                          "(file.repos_part, file.repos_s)")
+    except Exception as exc:  # noqa: BLE001 - canon illisible : dit
+        rule_error = "canon mechanics unreadable: %s" % " ".join(str(exc).split())[:160]
+    store = storage.of(db)
+    horizon = now - EVENT_DAYS * 86400
+    listing = attempt("agents", store.operations.listing, [])
+    lots = attempt("open lots", lambda: store.operations.open_lots_activity(None), [])
+    if lots:
+        sources = attempt("split lot sources", lambda: {
+            int(row["id"]): row["source"] for row in _rows(
+                db, _SPLIT_SOURCES_SQL, (",".join(str(int(l["id"])) for l in lots),))}, {})
+        lots = [dict(lot, source=sources.get(int(lot["id"]), lot.get("source")))
+                for lot in lots]
+    # B de cx1 sur ac79c550 : `waiting_project_lots(db=…)` et `_budget_held`
+    # absorbent l'échec de leur lecteur (contrat conservateur de leurs autres
+    # appelants). Ici, les lecteurs sont appelés en direct : un échec ferme
+    # l'alerte au lieu de rendre « tout démarrable » ou « personne tenu ».
+    def startable_lots():
+        from . import planned_waits
+        waiting = sous_utilisation.waiting_project_lots(lots)
+        waits = planned_waits.read(db, waiting, now=now) if waiting else {}
+        return sous_utilisation.split_startable(waiting, waits)[0]
+
+    def budget_holds(rows):
+        if cfg is None:
+            return {}
+        from . import account_turn
+        held = {}
+        for row in rows:
+            reason = account_turn.turn_hold(cfg, db, row["name"], row)
+            if reason:
+                held[row["name"]] = reason
+        return held
+
+    startable = attempt("startable lots", startable_lots, []) if lots else []
+    # la tenue de budget ne se lit que pour les agents au repos (comme
+    # `idle_capacity`) : un agent occupé n'entre pas dans la part au repos
+    idle = sous_utilisation.idle_agents(
+        [row for row in listing if not row.get("retired_ts")], now, 0.0,
+        waiting_free=True, actionable_idle=True)
+    held = attempt("budget holds", lambda: budget_holds(idle), {})
+    notes = attempt("roadmap notes", lambda: _rows(db, _ROADMAP_SQL, (horizon,)), [])
+    spent = {}
+    for note in notes:
+        project = _exhausted_project(note.get("note"))
+        if project and _decoupage_project(note) == project:
+            spent[project] = min(spent.get(project, now), float(note.get("at_ts") or now))
+    reopened = attempt("lot history", lambda: {
+        str(row["app"]): float(row["created_ts"] or 0.0)
+        for row in _rows(db, _REOPENED_SQL, (min(spent.values()), min(spent.values()),
+                                             ",".join(sorted(spent))))}, {}) if spent else {}
+    losses = attempt("account gauges", lambda: plan_losses(
+        sous_utilisation.latest_account_gauges(db, now), now), [], gating=False)
+    out = capacity(agents=listing, turns=turns, startable=startable, open_lots=lots,
+                   roadmap_notes=notes, reopened=reopened, losses=losses, now=now,
+                   window_s=int(hours) * 3600,
+                   repos_part=rule.repos_part if rule else None,
+                   repos_s=rule.repos_s if rule else None,
+                   canons=list(canons or []),
+                   configured=bool(canons) or cfg is not None, held=held,
+                   gating_ok=bool(listing) and not failed,
+                   rule_source=mechanics.PATH if rule else "")
+    if rule_error:
+        out["rule_error"] = rule_error
+    if failed:
+        out["gating_unreadable"] = failed
+    return out
 
 
 # -- texte -------------------------------------------------------------------
@@ -1778,6 +2179,52 @@ def _duration(seconds: float | None) -> str:
     return "%d h %02d" % (hours, minutes)
 
 
+def _share(value) -> str:
+    return "—" if value is None else "%d %%" % round(float(value) * 100)
+
+
+def _capacity_text(cap: Mapping[str, Any] | None) -> list[str]:
+    """#3256 B : la capacité se lit en premier, avec les attentes."""
+    if not cap:
+        return []
+    rule = cap.get("rule")
+    mesh = cap.get("mesh") or {}
+    lines = ["", "Capacité (%s) — %d/%d agent(s) réveillable(s) au repos (%s), "
+             "%.1f heure(s)-agent au repos, %d lot(s) démarrable(s)"
+             % ("seuil %s depuis %s" % (_share(rule["repos_part"]),
+                                        _duration(rule["repos_s"]))
+                if rule else "sans seuil, aucune alerte : %s"
+                % (cap.get("rule_error") or "bloc `file` absent du canon"),
+                mesh.get("idle", 0), mesh.get("wakeable", 0),
+                _share(mesh.get("idle_share")), float(mesh.get("idle_agent_hours") or 0),
+                int(mesh.get("startable_lots") or 0))]
+    for row in cap.get("projects") or []:
+        decoupage = row.get("decoupage")
+        lines.append("  %-14s %2d/%-2d au repos (%s) · %5.1f h-agent · %d démarrable(s)%s%s"
+                     % (row["project"][:14], row["idle"], row["wakeable"],
+                        _share(row["idle_share"]), float(row["idle_agent_hours"]),
+                        len(row.get("startable_lots") or ()),
+                        " · découpage #%d (%s)" % (decoupage["lot"],
+                                                   _duration(decoupage.get("age_s")))
+                        if decoupage else "",
+                        " · feuille de route épuisée" if row.get("roadmap_exhausted")
+                        else ""))
+    losses = [row for row in cap.get("plan_loss_at_reset") or []]
+    if losses:
+        lines.append("  Perte au reset : %s" % " · ".join(
+            "%s/%s %s" % (row["harness"], row.get("account") or "défaut",
+                          "relevé périmé" if row.get("stale") else
+                          "%s de %s dans %s" % (_share(row.get("lost")), row.get("window"),
+                                                _duration(row.get("resets_in_s")))
+                          if row.get("lost") is not None else "rien n'expire")
+            for row in losses))
+    for alert in cap.get("alerts") or []:
+        lines.append("  ⚠ %s : %d/%d au repos (%s) → %s"
+                     % (alert["project"], alert["idle"], alert["wakeable"],
+                        _share(alert["idle_share"]), alert["gesture"]))
+    return lines
+
+
 def format_text(report: Mapping[str, Any]) -> str:
     """Le tableau court du passage, dans l'ordre du canon."""
     totals = report.get("totals") or {}
@@ -1785,6 +2232,7 @@ def format_text(report: Mapping[str, Any]) -> str:
              % (report.get("at_iso"), (report.get("throughput") or {}).get("turns_total", 0),
                 (report.get("throughput") or {}).get("merges_total", 0),
                 report.get("hours") or 0, totals.get("lots", 0))]
+    lines.extend(_capacity_text(report.get("capacity")))
     waits = report.get("slow_waits") or []
     if waits:
         lines.append("")
@@ -1933,7 +2381,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="sortir 2 si une attente d'agent dépasse le seuil "
                              "(hors attentes humaines, externes et fenêtres "
                              "d'observation non échues, même avec une relance "
-                             "due ; aucun « rien à signaler »)")
+                             "due ; aucun « rien à signaler »), ou si un "
+                             "projet a file.repos_part de ses agents réveillables "
+                             "au repos sans lot de découpage de moins d'une heure "
+                             "(#3256)")
     parser.add_argument("--canon", action="append", default=None,
                         help="racine d'un canon à lire pour les appareils (répétable)")
     parser.add_argument("--installed", default=None,
@@ -1982,7 +2433,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         else:
             print(format_text(report))
-        if args.check and report["totals"].get("slow_waits"):
+        if args.check and (report["totals"].get("slow_waits")
+                           or report["totals"].get("capacity_alerts")):
             return 2
         return 0
     except DebitError as exc:

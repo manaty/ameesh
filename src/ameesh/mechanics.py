@@ -98,7 +98,7 @@ _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
                   "merge", "prevalidation", "backlog", "staging", "accounts",
-                  "paquet", "packet_tests", "projects")
+                  "paquet", "packet_tests", "file", "projects")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production")
 _PRODUCTION_KEYS = ("branch",)
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
@@ -124,6 +124,8 @@ _ACCOUNTS_KEYS = ("pace_multipliers", "underused_loss")
 _PAQUET_KEYS = ("attente_mediane_s", "max_paquets")
 #: #4271 : clés du bloc optionnel `packet_tests` (tests ciblés du paquet)
 _PACKET_TESTS_KEYS = ("unit_timeout_seconds", "parallel")
+#: #3256 A : clés du bloc optionnel `file` (déclencheur du lot de découpage)
+_FILE_KEYS = ("repos_part", "repos_s")
 #: bornes du score de valeur d'un élément de backlog (`backlog.add`)
 _VALUE_SCORE = (1, 100)
 
@@ -254,6 +256,21 @@ class AccountsPace:
 
 
 @dataclass(frozen=True)
+class QueueFill:
+    """#3256 A : le déclencheur du lot de découpage, compilé du canon (§4).
+
+    `repos_part` : part des agents réveillables d'un projet au repos, dans
+    ]0, 1] ; `repos_s` : durée (secondes) pendant laquelle cette part et
+    l'absence de lot démarrable doivent tenir."""
+
+    repos_part: float
+    repos_s: int
+
+    def to_dict(self) -> dict:
+        return {"repos_part": self.repos_part, "repos_s": self.repos_s}
+
+
+@dataclass(frozen=True)
 class Document:
     """Le document global compilé et validé, sans politique de revue."""
 
@@ -288,6 +305,8 @@ class Document:
     paquet: PaquetParallel | None = None
     #: #4271 : tests ciblés du paquet horaire ; None = bloc absent
     packet_tests: PacketTests | None = None
+    #: #3256 A : déclencheur du lot de découpage ; None = bloc absent
+    queue_fill: QueueFill | None = None
 
     def override(self, project: str) -> ProjectOverride | None:
         for item in self.overrides:
@@ -340,6 +359,8 @@ class Document:
             payload["paquet"] = self.paquet.to_dict()
         if self.packet_tests is not None:
             payload["packet_tests"] = self.packet_tests.to_dict()
+        if self.queue_fill is not None:
+            payload["file"] = self.queue_fill.to_dict()
         return payload
 
 
@@ -901,6 +922,17 @@ def _accounts(value, where: str) -> AccountsPace:
     return AccountsPace(multipliers=tuple(multipliers), underused_loss=loss)
 
 
+def _queue_fill(value, where: str) -> QueueFill:
+    """Le bloc `file` (#3256 A, canon §4) : `repos_part` dans ]0, 1],
+    `repos_s` entier > 0 ; les deux sont requis."""
+    data = _mapping(value, where, _FILE_KEYS)
+    part = _number(data.get("repos_part"), where + ".repos_part")
+    if not 0 < part <= 1:
+        raise MechanicsError("%s.repos_part: a share in ]0, 1] is required" % where)
+    return QueueFill(repos_part=part,
+                     repos_s=_positive_int(data.get("repos_s"), where + ".repos_s"))
+
+
 def compile_document(text: str, *, source: str = PATH) -> Document:
     """Compile le document global. Strict : toute règle manquante ou inconnue refuse."""
     try:
@@ -974,6 +1006,8 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                 if "paquet" in parsed else None),
         packet_tests=(_packet_tests(parsed["packet_tests"], source + ".packet_tests")
                       if "packet_tests" in parsed else None),
+        queue_fill=(_queue_fill(parsed["file"], source + ".file")
+                    if "file" in parsed else None),
     )
 
 

@@ -53,7 +53,7 @@ from . import planned_waits
 from . import storage
 
 UNDERUSE_TYPES = ("host_idle_reserved", "baseline_oversized", "plan_underused", "idle_capacity", "orchestrator_held", "host_underused",
-                  "backlog_empty")
+                  "backlog_empty", "roadmap_exhausted")
 
 #: `balance_low` (L94, ajout validé par le propriétaire) : solde bas d'un
 #: fournisseur payé au token — autonomie au rythme RÉEL sous 48 h, ou solde
@@ -1658,4 +1658,7 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
     out += balance_low(db, listing, now, hours=balance_hours, min_usd=balance_min_usd,
                        window_s=balance_window_s)
     out += backlog_empty(db, listing, now, idle_s=backlog_empty_s)
+    # #3256 A : la feuille de route notée épuisée sur un lot de découpage
+    from . import file_decoupage
+    out += file_decoupage.exhausted_alerts(db, listing)
     return out
