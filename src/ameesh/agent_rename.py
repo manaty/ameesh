@@ -250,14 +250,16 @@ def _rename_tx(tx, old: str, new: str, who: str, reason: str) -> dict:
     summary = {"old": old, "new": new, "actor": who, "aliases": final_aliases,
                "lease_epoch": row["lease_epoch"], "rewritten": rewritten,
                "cascaded": cascaded}
-    tx.execute(
+    journal = tx.query(
         "INSERT INTO agent_renames (old_name, new_name, actor, reason, lease_epoch, rewritten)"
-        " VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
+        " VALUES (%s, %s, %s, %s, %s, %s::jsonb) RETURNING id",
         (old, new, who, reason, row["lease_epoch"],
          json.dumps({"rewritten": rewritten, "cascaded": cascaded}, sort_keys=True)))
+    # The reason is free text, readable by the contents role only: the event
+    # (base supervisor role) carries identifiers and the journal row.
     summary["event"] = storage.of(tx).events.record(
         RENAMED_EVENT, "agent:%s" % new, None,
-        {"agent": new, "old": old, "actor": who, "reason": reason})
+        {"agent": new, "old": old, "actor": who, "rename": journal[0]["id"]})
     return summary
 
 

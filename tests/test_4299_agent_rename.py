@@ -247,6 +247,17 @@ class AgentRenameTest(PgTestCase):
         pose('new-worker', 'reviewer')
         self.assertEqual(review_floor.of_lot(self.db, other)['floor'], 0)
 
+    def test_the_event_carries_no_free_text(self):
+        # B of mty-amh-docs-01 on 68e0c55d: the reason is readable by the
+        # contents role only; the event points at the journal row.
+        self.rename('worker', 'new-worker')
+        data = self.db.query("SELECT data FROM ameesh_events WHERE type = 'agent.renamed'"
+                             " ORDER BY id DESC LIMIT 1")[0]['data']
+        journal = self.db.query("SELECT id FROM agent_renames ORDER BY id DESC LIMIT 1")[0]
+        self.assertEqual(data, {'agent': 'new-worker', 'old': 'worker',
+                                'actor': data['actor'], 'rename': journal['id']})
+        self.assertNotIn('test #4299', json.dumps(data))
+
     def test_reverse_is_the_same_gesture(self):
         self.db.execute("UPDATE agent_registry SET aliases = ARRAY['legacy'] WHERE name = 'worker'")
         self.rename('worker', 'new-worker')
