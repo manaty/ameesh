@@ -4088,6 +4088,141 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     return authors, unknown, [correctors[name] for name in sorted(correctors)]
 
 
+def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
+                            repo: str, *, head: str = "", strict: bool = False,
+                            fetch: bool = True, recover=None) -> dict[str, dict]:
+    """Les correctifs de relecteur **retirés** après leur gel (#4457).
+
+    Un relecteur désigné corrige lui-même au premier tour (canon §2) : son
+    commit est poussé **après** la tête gelée, pas dedans. Quand l'auteur le
+    réécrit depuis le B, le commit d'origine n'est plus ancêtre de la nouvelle
+    tête : la lecture de la plage n'en voit rien, et `_carried_from_previous`
+    ne le connaît pas non plus (il n'a jamais été une tête gelée). Le relecteur
+    réapparaissait donc comme un candidat indépendant, alors que le §2
+    l'exclut **par son nom** — sa famille, elle, redevient éligible (« un
+    autre agent relit »).
+
+    La preuve ne vient pas d'une note : le reçu exact du commit
+    (`provenance_receipts`, #1465) nomme l'acteur et le SHA, et la topologie
+    Git prouve le geste. Pour chaque gel antérieur du lot et chaque verdict
+    rendu par un relecteur sur sa tête, on lit les commits que ce relecteur a
+    créés après le gel. Un commit qui descend de la tête gelée et qui n'est
+    plus ancêtre de la tête lue est le correctif réécrit : son acteur reste
+    exclu par son nom, sans famille.
+
+    Un dépôt ou une tête illisible rend `{}` (la lecture garde son
+    comportement historique) ; `strict` (la porte, le train) refuse au
+    contraire une lecture des reçus qui échoue, comme le reste de la
+    provenance. `recover`/`fetch` rapatrient l'objet du commit retiré quand
+    le clone de lecture ne l'a pas (clone scratch de `merge-pr`) ; un objet
+    irrécupérable est ignoré, faute de topologie prouvable.
+    """
+    item = dict(item or {})
+    if db is None or not repo or packet_composer(item):
+        return {}
+    lot = int(item.get("id") or 0)
+    if not lot:
+        return {}
+    head_sha = str(head or (milestone or {}).get("sha") or "").strip().lower()
+    if not head_sha:
+        return {}
+    try:
+        if not plan_git.local_commit(repo, head_sha):
+            return {}
+    except Exception:  # noqa: BLE001 - tête illisible : comportement historique
+        return {}
+    try:
+        rows = storage.of(db).work.milestones(lot, None) or []
+    except Exception:  # noqa: BLE001 - frise illisible : comportement historique
+        return {}
+    freezes = sorted((row for row in rows if row.get("kind") == "frozen"),
+                     key=lambda value: (float(value.get("at_ts") or 0.0),
+                                        int(value.get("id") or 0)))
+    if not freezes:
+        return {}
+    current_id = int((milestone or {}).get("id") or 0)
+    verdicts = [row for row in rows
+                if row.get("kind") == "verdict"
+                and str(row.get("sha") or "").strip()]
+    author = str(item.get("assignee") or "").strip().casefold()
+    # nominalement : acteur -> [(gel, tête, instant)] des têtes qu'il a relues
+    wanted: dict[str, list] = {}
+    for freeze in freezes:
+        freeze_id = int(freeze.get("id") or 0)
+        if current_id and freeze_id >= current_id:
+            continue
+        sha = str(freeze.get("sha") or "").strip().lower()
+        if not sha or plan_git.same_commit(sha, head_sha):
+            continue
+        for verdict in verdicts:
+            if not plan_git.same_commit(verdict.get("sha"), sha):
+                continue
+            actor = str(verdict.get("actor") or "").strip()
+            key = actor.casefold()
+            if not actor or key == author:
+                continue
+            wanted.setdefault(key, []).append(
+                (freeze_id, sha, float(freeze.get("at_ts") or 0.0), actor))
+    if not wanted:
+        return {}
+    out: dict[str, dict] = {}
+    for key in sorted(wanted):
+        entries = wanted[key]
+        actor = entries[0][3]
+        since = min(value[2] for value in entries)
+        try:
+            receipts = storage.of(db).provenance.commits(actor, since_ts=since)
+        except Exception as exc:  # noqa: BLE001 - lecture des reçus impossible
+            if strict:
+                raise review_provenance.ProvenanceError(
+                    "the provenance of prior reviewer corrections cannot be read"
+                    " (%s)" % exc) from exc
+            return out
+        for receipt in receipts or ():
+            sha = str((receipt or {}).get("sha") or "").strip().lower()
+            if not sha:
+                continue
+            try:
+                full = plan_git.local_commit(repo, sha)
+            except Exception:  # noqa: BLE001 - objet illisible : ignoré
+                full = None
+            if not full and recover is not None:
+                try:
+                    recover(sha)
+                except Exception:  # noqa: BLE001 - source en échec
+                    pass
+                try:
+                    full = plan_git.local_commit(repo, sha)
+                except Exception:  # noqa: BLE001 - objet illisible : ignoré
+                    full = None
+            if not full and fetch:
+                try:
+                    _forge_fetch(repo, sha)
+                except Exception:  # noqa: BLE001 - forge injoignable
+                    pass
+                try:
+                    full = plan_git.local_commit(repo, sha)
+                except Exception:  # noqa: BLE001 - objet illisible : ignoré
+                    full = None
+            if not full:
+                continue
+            if _is_ancestor(repo, full, head_sha) is True:
+                continue                # encore dans la tête : lu par la plage
+            for freeze_id, freeze_sha, _at, _name in entries:
+                if _is_ancestor(repo, freeze_sha, full) is not True:
+                    continue
+                # Un seul nom par acteur ; la première tête gelée qui porte
+                # le correctif suffit à la trace.
+                out.setdefault(key, {"name": actor, "family": "",
+                                     "families": [],
+                                     "rewritten": full,
+                                     "freeze": freeze_id})
+                break
+            if key in out:
+                break
+    return out
+
+
 def reading(db, item: Mapping, milestone: Optional[Mapping],
             commits: Sequence[str], repo: str = "", families=(),
             *, reference: Optional[Mapping] = None,
@@ -4149,7 +4284,12 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     produit. La désignation ignore sa famille et exclut toujours son nom. Le
     report des gels antérieurs garde cette distinction. Un correctif au-delà
     du seuil ou de conception est aussi un auteur, mais n'est pas un
-    « correcteur » de premier tour.
+    « correcteur » de premier tour. #4457 : un correctif de relecteur poussé
+    **après** un gel et réécrit par l'auteur n'est ni dans la tête ni dans un
+    gel ; le reçu exact du commit retiré et la topologie le retrouvent, et son
+    acteur reste dans `correctors` avec une famille vide (`rewritten` nomme le
+    commit). Exclu par son nom seulement, il laisse sa famille éligible : un
+    autre agent relit (canon §2).
     #3335 : cette promotion et la trace « correcteur » suivent la survie du
     contenu (#3220). Un correctif de relecteur dont aucune ligne significative
     ne subsiste plus dans la tête n'exclut plus sa famille ; une ligne qui
@@ -4480,9 +4620,31 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                          str(row.get("family") or ""),
                          row.get("families") or (),
                          test_only=bool(row.get("test_only")))
-    correctors = [dict({"name": row["name"], "family": row["family"]},
-                       **({"test_only": True} if row["test_only"] else {}))
-                  for row in corrector_rows.values()]
+    # #4457 : un correctif de relecteur poussé **après** la tête gelée puis
+    # réécrit par l'auteur n'est dans aucune plage ni aucun gel : son acteur
+    # reste exclu par son nom, sans famille (le §2 laisse un autre agent de la
+    # même famille relire). Une trace de correcteur survivante garde, elle, sa
+    # famille : ne jamais l'effacer.
+    for row in _rewritten_after_freeze(
+            db, item, milestone, repo, head=head, strict=strict,
+            fetch=fetch, recover=recover).values():
+        key = str(row.get("name") or "").strip().lower()
+        if not key or key in corrector_rows:
+            continue
+        corrector_rows[key] = {"name": row["name"], "family": "",
+                               "proven": set(), "test_only": False,
+                               "rewritten": str(row.get("rewritten") or ""),
+                               "freeze": int(row.get("freeze") or 0)}
+    correctors = []
+    for row in corrector_rows.values():
+        entry = {"name": row["name"], "family": row["family"]}
+        if row["test_only"]:
+            entry["test_only"] = True
+        if row.get("rewritten"):
+            entry["rewritten"] = row["rewritten"]
+            if row.get("freeze"):
+                entry["freeze"] = int(row["freeze"])
+        correctors.append(entry)
     return out, unknown, correctors
 
 

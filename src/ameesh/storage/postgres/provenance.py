@@ -52,3 +52,15 @@ class Provenance(Contract):
             "  JOIN work_item_milestones m ON p.subject = 'milestone:' || m.id"
             " WHERE p.subject = %s", (subject,))
         return rows[0] if rows else None
+
+    def commits(self, actor, *, since_ts=None, limit=500):
+        sql = ("SELECT " + _COLUMNS +
+               "  FROM provenance_receipts"
+               " WHERE actor = %s AND subject LIKE 'commit:%%'")
+        params = [str(actor)]
+        if since_ts is not None:
+            sql += " AND extract(epoch FROM at) >= %s"
+            params.append(float(since_ts))
+        sql += " ORDER BY at DESC, subject DESC LIMIT %s"
+        params.append(max(int(limit), 1))
+        return [dict(row) for row in self.db.query(sql, tuple(params))]

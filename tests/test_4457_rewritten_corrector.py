@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#4457 — le correcteur d'un correctif réécrit après le gel n'est pas redésigné.
+
+Cas réels #4445 (gel #24857, 1dea508d) et #4446 (gel #24907, 45fa46a3) : le
+relecteur cx3 avait poussé un correctif **après** le gel, puis l'auteur l'a
+réécrit depuis le B en citant le commit retiré. Le commit d'origine n'était
+dans aucune plage gelée : la lecture de la tête ne le voyait plus, et la
+désignation suivante redésignait cx3. Le §2 l'exclut pourtant **par son nom**
+(« exclusion nominative ») tout en laissant sa famille éligible : un autre
+agent relit.
+
+Le reçu exact du commit retiré est la preuve machine : il nomme l'acteur, et
+la topologie Git (le commit descend de la tête gelée, il n'est plus ancêtre de
+la nouvelle tête) prouve que l'auteur l'a réécrit. Aucune note n'est lue.
+"""
+from __future__ import annotations
+
+from ameesh import merge_queue, registry, review_designation as rd, work
+
+from .support import PgTestCase
+from .test_2447_review_designation_activation import _ActivationFixture
+
+FAMILIES = ("claude", "codex", "deepseek")
+
+
+class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
+    """Un lot gelé, un correctif de relecteur retiré, puis un re-gel."""
+
+    def setUp(self):
+        super().setUp()
+        registry.upsert(self.db, "cx3", harness="codex", host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
+                        " WHERE name = %s", ("cx3",))
+
+    def commit_receipt(self, actor, harness, sha):
+        """Le reçu exact d'un commit hors tour (work_item_id reste NULL)."""
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, NULL)"
+            " ON CONFLICT (subject) DO NOTHING",
+            ("commit:" + sha, sha, actor, "s-" + harness, "t", harness))
+
+    def verdict_receipt(self, mark, harness):
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (subject) DO NOTHING",
+            ("milestone:%d" % int(mark["id"]), self.frozen, mark["actor"],
+             "s-" + harness, "t", harness, self.lot))
+
+    def _rewrite_after_the_freeze(self):
+        """F1, correctif de cx3 sur F1, réécriture par l'auteur, F2."""
+        head_a = self.frozen
+        self.freeze()                       # F1 désigne r1 (claude) et r2 (codex)
+        # Le correctif du relecteur est poussé APRÈS le gel, sur sa tête.
+        self.repo.write("src/ameesh/mail.py", "lot\ncx3 petit correctif\n")
+        fix = self.repo.commit("cx3: correctif de relecture", agent="cx3")
+        self.commit_receipt("cx3", "codex", fix)
+        work.milestone(self.db, self.lot, "verdict", sha=head_a, actor="cx3",
+                       verdict="blocked")
+        # L'auteur le réécrit depuis le B : le commit du relecteur n'est plus
+        # ancêtre d'aucune tête, et le contenu diffère (pas de report).
+        self.repo.git("reset", "--hard", head_a)
+        self.repo.write("src/ameesh/mail.py",
+                        "lot\ncx3 petit correctif\nauteur : reprise\n")
+        head_b = self.repo.commit("author: reprise du correctif", agent="author")
+        self.receipts(commits=[head_b])
+        self.frozen = head_b
+        _mark, out = self.freeze()          # F2
+        return head_a, fix, head_b, out
+
+    def test_a_rewritten_corrector_is_not_redesignated_and_its_family_stays(self):
+        _head_a, _fix, _head_b, out = self._rewrite_after_the_freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        names = [row["name"] for row in out["reviewers"]]
+        self.assertNotIn("cx3", names)
+        # Le §2 laisse la famille codex éligible : r2, de la même famille, relit.
+        self.assertIn("r2", names)
+        self.assertIn("r1", names)
+        self.assertIn("corrector(s) excluded: cx3", out["why"])
+
+    def test_the_merge_gate_refuses_the_rewritten_corrector(self):
+        _head_a, _fix, head_b, _out = self._rewrite_after_the_freeze()
+        harnesses = {"r1": "claude", "r2": "codex", "cx3": "codex"}
+        for actor, harness in harnesses.items():
+            mark = work.milestone(self.db, self.lot, "verdict", sha=head_b,
+                                  actor=actor, verdict="ok")
+            self.verdict_receipt(mark, harness)
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/mail.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/*"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        out = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), head_b,
+            repo=self.repo.root, klass=klass, item=work.get(self.db, self.lot),
+            required=2, families=FAMILIES)
+        self.assertFalse(out.get("error"), out)
+        self.assertIn("cx3", out["corrections"])
+        self.assertNotIn("cx3", [entry["actor"] for entry in out["accepted"]])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]],
+                         ["r1", "r2"])
