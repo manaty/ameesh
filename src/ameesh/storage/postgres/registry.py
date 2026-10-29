@@ -530,6 +530,19 @@ class Agents(interface.Agents):
         return self.db.query("SELECT ameesh_resolve_agent_name(%s, %s) AS name",
                              (name, operation))[0]["name"]
 
+    def same_identity(self, first, second) -> bool:
+        first, second = str(first or "").strip(), str(second or "").strip()
+        if not first or not second:
+            return False
+        if first.casefold() == second.casefold():
+            return True
+        rows = self.db.query(
+            "SELECT EXISTS (SELECT 1 FROM agent_registry r"
+            "                WHERE (r.name = %s OR %s = ANY(r.aliases))"
+            "                  AND (r.name = %s OR %s = ANY(r.aliases))) AS same",
+            (first, first, second, second))
+        return bool(rows and rows[0]["same"])
+
     def harnesses(self) -> dict[str, str]:
         rows = self.db.query("SELECT name, harness FROM agent_registry")
         return {row["name"]: row["harness"] or "" for row in rows}

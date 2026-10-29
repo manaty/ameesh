@@ -80,7 +80,7 @@ def of_lot(db, lot: int, *, cfg=None) -> dict:
     for row in sorted(rows, key=lambda r: int(r.get("id") or 0)):
         value = parse(row.get("note"))
         actor = str(row.get("actor") or "").strip()
-        if value is None or not _authentic(row.get("evidence"), value, actor):
+        if value is None or not _authentic(db, row.get("evidence"), value, actor):
             continue
         human = actor.startswith(work.HUMAN_PREFIX)
         if not human and value < current["human_floor"]:
@@ -94,8 +94,11 @@ def of_lot(db, lot: int, *, cfg=None) -> dict:
     return current
 
 
-def _authentic(evidence, value: int, actor: str) -> bool:
-    """Vrai si `evidence` est la preuve écrite par `set_floor` pour cette ligne."""
+def _authentic(db, evidence, value: int, actor: str) -> bool:
+    """Vrai si `evidence` est la preuve écrite par `set_floor` pour cette ligne.
+
+    #4299 : un renommage réécrit l'acteur de la ligne, jamais la preuve ; les
+    deux graphies d'une même fiche du registre sont le même acteur."""
     if isinstance(evidence, str):
         try:
             evidence = json.loads(evidence)
@@ -104,7 +107,9 @@ def _authentic(evidence, value: int, actor: str) -> bool:
     return (isinstance(evidence, dict)
             and evidence.get("schema") == EVIDENCE_SCHEMA
             and type(evidence.get("floor")) is int and evidence["floor"] == value
-            and str(evidence.get("actor") or "") == actor and bool(actor))
+            and bool(actor)
+            and (str(evidence.get("actor") or "") == actor
+                 or storage.of(db).agents.same_identity(evidence.get("actor"), actor)))
 
 
 def apply(klass: dict, db, lot: int, *, cfg=None) -> dict:

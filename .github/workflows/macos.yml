@@ -52,14 +52,22 @@ on:
 permissions:
   contents: read
 
-# Une étiquette `ci-macos` posée deux fois remplace la suite de la même PR ;
-# le nocturne n'est jamais annulé par le suivant (il attend son tour). Le nom
-# de l'étiquette est dans le groupe : une étiquette de gel `ci-lot`/`ci-full`
-# crée son propre groupe et ne peut donc pas annuler une suite `ci-macos` en
-# cours (elle est sautée par le `if` du job).
+# #4567 : les suites longues (nocturne, dispatch, étiquette `ci-macos`)
+# partagent UN groupe. `max-parallel` ne borne qu'un run : le nocturne, un
+# dispatch sur un autre réf et une étiquette `ci-macos` pouvaient tenir trois
+# suites à la fois (six parts), au-delà des cinq jobs macOS hébergés — dont le
+# job court requis `platform-macos` de tests.yml. Une seule suite longue tient
+# donc la capacité ; un run en cours n'est jamais annulé
+# (`cancel-in-progress: false`) et les suivants attendent leur tour — seul un
+# run encore en attente peut être remplacé par un plus récent.
+#
+# Une étiquette de gel `ci-lot`/`ci-full` réveille aussi ce workflow : elle
+# reçoit un groupe unique (son run ne fait rien, ses jobs sont sautés) et ne
+# peut donc ni annuler ni retarder une suite en cours. Poser `ci-macos` deux
+# fois remplace le run encore en attente, jamais celui qui tourne.
 concurrency:
-  group: macos-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || github.event_name }}
-  cancel-in-progress: ${{ github.event.label.name == 'ci-macos' }}
+  group: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request_target' && github.event.label.name == 'ci-macos')) && 'macos-suite' || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   # #4063 : le plan une fois, sur Linux (la sélection `--mode full` ne dépend
