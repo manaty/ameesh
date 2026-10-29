@@ -517,6 +517,13 @@ class Config:
     #: `ameesh.veille` ; absente = aucune veille. Aucune source propre à un
     #: client n'est codée ici : tout vient de `veille.sources`.
     veille: dict = field(default_factory=dict)
+    #: #4425 : journal d'observations IMA. Clé `observations` du fichier de
+    #: configuration : `authority` (sans défaut), `journal` et `projection`
+    #: (chemins locaux), `max_age_s`, `owner_uid` éventuel, et côté bureau
+    #: `source` (identité `journal_id`/`repos`/`issues`, `staging` pour les
+    #: attestations natives, `acceptances` pour le lecteur #4006, `ttl_s`).
+    #: Jamais de secret ici : la collecte lit la projection locale de #4006.
+    observations: dict = field(default_factory=dict)
     #: #2448 : release aux coupures du canon compilé (clé `release` du fichier
     #: de l'hôte opérateur : `host` et `projects` — dépôt, cible, staging,
     #: rapport). Validée par `ameesh.release_cutoff` ; absente = aucune.

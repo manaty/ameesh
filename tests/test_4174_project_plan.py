@@ -158,6 +158,15 @@ class ProjectSnapshotTest(PgTestCase):
         row = self.report()["lots"][0]
         self.assertIn("planned start: 2099-01-01", row["waiting"])
 
+    def test_plan_lists_bugs_and_evolutions_not_the_improvement_queue(self):
+        improvement = storage.of(self.db).work.backlog_add(
+            title="basket line", body="", source="", expected_value="value",
+            value_score=10, priority=3, team=None, required_capabilities=None,
+            package_id=None, package_parent=None, note="basket", actor="test",
+            app="acme")["id"]
+        self.assertNotIn(improvement, [int(r["id"]) for r in self.report()["lots"]])
+        self.assertIn(self.b, [int(r["id"]) for r in self.report()["lots"]])
+
 
 class DispatchTest(_Lots):
     def test_dispatch_bug_before_higher_priority_evolution_and_resume(self):

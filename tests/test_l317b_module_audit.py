@@ -44,9 +44,54 @@ class AuditReportingTest(unittest.TestCase):
     def test_no_active_modules_and_unknown_module_do_not_run_it(self):
         for entries in ([], [{"project": "acme", "module": "unknown"}]):
             with mock.patch.object(ModuleStore, "active", return_value=entries), \
-                    mock.patch.object(it, "audit") as audit:
+                    mock.patch.object(it, "audit") as audit, \
+                    mock.patch("ameesh.modules.dev.audit", return_value=[]) as dev_audit:
                 self.assertEqual(modules.audit(mock.Mock()), [])
                 audit.assert_not_called()
+            # L101 T4 : le module toujours actif `dev` est audité une fois,
+            # sans projet (portée hôte).
+            dev_audit.assert_called_once_with(mock.ANY, None)
+
+    def test_always_active_dev_runs_once_through_the_real_audit_path(self):
+        """L101 T4: `dev` has no `project_modules` row (the canon refuses its
+        selection), yet the common `modules.audit(db)` path returns its host
+        findings once, alongside the project modules really activated."""
+        from ameesh import canon
+        finding = canon.Finding("host-work-dir-missing", canon.WARNING,
+                                "agent a on host h: no working directory",
+                                host="h", agent="a", member="m", path="p")
+        active = [{"project": "acme", "module": "it"},     # real activations:
+                  {"project": "other", "module": "it"}]    # no `dev` row exists
+        with mock.patch.object(ModuleStore, "active", return_value=active), \
+                mock.patch.object(it, "audit", return_value=[]) as it_audit, \
+                mock.patch("ameesh.config.load", return_value=object()), \
+                mock.patch("ameesh.canon.load_configured", return_value=[object()]), \
+                mock.patch("ameesh.canon.validate", return_value=[finding]):
+            result = modules.audit(mock.Mock())
+        self.assertEqual(it_audit.call_count, 2)          # once per project
+        # One host pass, not one per project, and no project owns it.
+        self.assertEqual([(f["module"], f["rule"], f["project"], f["host"])
+                          for f in result],
+                         [("dev", "host-work-dir-missing", None, "h")])
+
+    def test_always_active_dev_is_absent_in_the_bare_profile(self):
+        with mock.patch("ameesh.modules._builtin", return_value={}), \
+                mock.patch("ameesh.modules._entry_points", return_value=()), \
+                mock.patch.object(ModuleStore, "active", return_value=[]), \
+                mock.patch("ameesh.modules.dev.audit") as dev_audit:
+            self.assertEqual(modules.audit(mock.Mock()), [])
+        dev_audit.assert_not_called()
+
+    def test_host_scoped_module_findings_keep_distinct_alert_keys(self):
+        """L101 T4: two hosts with the same rule are two alerts."""
+        base = {"type": "module_deviation", "module": "dev",
+                "rule": "host-work-dir-missing", "project": None,
+                "lot": None, "declaration_id": None}
+        self.assertNotEqual(notify.key_of(dict(base, host="h1", agent="a1")),
+                            notify.key_of(dict(base, host="h2", agent="a2")))
+        project = dict(base, project="acme", lot=42, declaration_id=7)
+        self.assertEqual(notify.key_of(project),
+                         notify.key_of(dict(project, agent="reassigned")))
 
     def test_old_schema_is_supported_but_unavailability_propagates(self):
         db = mock.Mock()
@@ -58,7 +103,8 @@ class AuditReportingTest(unittest.TestCase):
 
     def test_module_is_the_only_source_of_rule_and_findings(self):
         with mock.patch.object(ModuleStore, "active", return_value=[{"project": "acme", "module": "it"}]), \
-                mock.patch.object(it, "audit", return_value=[self.finding()]) as audit:
+                mock.patch.object(it, "audit", return_value=[self.finding()]) as audit, \
+                mock.patch("ameesh.modules.dev.audit", return_value=[]):
             result = modules.audit(mock.Mock())
         audit.assert_called_once_with(mock.ANY, "acme")
         self.assertEqual(result[0]["rule"], "execution-proof")
