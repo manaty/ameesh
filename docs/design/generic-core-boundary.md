@@ -84,7 +84,10 @@ through `registry.get("dev")`; its `audit` hook delegates the `canon check`
 workspace findings (`host-work-dir-*`, `host-workspaces-unknown`) under the
 Module interface. Those settings are host-scoped, so `modules.audit` runs the
 hook once, with `project=None`, after the project modules: one finding is not
-repeated per project and carries its host and agent. The bare profile has no
+repeated per project and carries its host and agent. It has no project
+orchestrator or project event brief; the human route uses the responsible of
+its agent, then of its host, then `notify.default_human`, and two hosts with
+the same rule stay two alerts. The bare profile has no
 `dev` module and documents housekeeping and worktrees as no-ops. Installed
 entry points cannot declare connectors, and a name declared twice or taken by
 the core is refused. `registry.merge_connector()` replaces

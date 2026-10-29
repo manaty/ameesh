@@ -1047,8 +1047,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     traitaient le même lot) ; `plan_underused`, ceux des équipes des agents au
     repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
-    rôle explicite et projet, sans repli. `stale_lot` d'un lot en qa : le
-    relecteur DÉSIGNÉ reçoit en outre le verdict qui lui est dû (#705).
+    rôle explicite et projet, sans repli ; un constat de portée hôte
+    (`project` absent, `dev` workspaces) n'a pas de fil de projet et part au
+    responsable humain de son hôte ou agent (`notify.Router`), jamais en
+    diffusion aux agents. `stale_lot` d'un lot en qa : le relecteur DÉSIGNÉ
+    reçoit en outre le verdict qui lui est dû (#705).
     Auditeurs : pour tous les types sauf `stale_lot` (L713) et
     `plan_underused` (#3274) — lus à la passe de l'auditeur, sans réveil ;
     sans aucun orchestrateur vivant, `plan_underused` se replie sur l'auditeur
@@ -1074,6 +1077,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         text = alert.get("action") or alert.get("detail") or "Module procedure deviation"
         project = alert.get("project")
         if not project:
+            # Host-scoped finding: no project owns it, so no project thread
+            # and no agent brief. `notify.Router` sends it to the responsible
+            # human of its host or agent; never broadcast it to every agent.
             return {}
         out = {o: text for o in orchestras
                if o in orchestrator_names and o in by_name

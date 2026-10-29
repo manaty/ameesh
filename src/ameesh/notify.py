@@ -1553,9 +1553,12 @@ class Router:
             human = normalize_human(self.ncfg.default_human)
             if human:
                 return human, "defaut"
-        if alert.get("type") == "module_deviation":
+        if alert.get("type") == "module_deviation" and alert.get("project"):
             # A project procedure finding belongs to the lot, even when its
             # assignee (or their host/responsible human) belongs elsewhere.
+            # A host-scoped finding (`dev` workspaces control, no project)
+            # takes the generic route below: the responsible of its agent,
+            # then of its host, then the default human.
             for source, value in (("lot", self.lot_responsible(alert.get("lot"))),
                                   ("defaut", self.ncfg.default_human)):
                 human = normalize_human(value)
