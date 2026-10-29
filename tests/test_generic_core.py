@@ -132,7 +132,9 @@ def report() -> None:
 class GenericCoreTest(unittest.TestCase):
     def test_core_does_not_import_module_implementations(self):
         # L98 T3 (#4406): the legacy adapters read through the registry.
-        exceptions = Counter()
+        # L100 T4 (#4385): temporary identity aliases, removed by L104.
+        exceptions = Counter({(name + ".py", "module-import"): 1
+                              for name in ("review", "lot_class", "review_target")})
         actual = Counter({key: count for key, count in scan_core().items()
                           if key[1] == "module-import"})
         self.assertFalse(actual - exceptions,
