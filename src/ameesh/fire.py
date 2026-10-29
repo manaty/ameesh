@@ -807,7 +807,8 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
             # sur le seul assigné.
             try:
                 authors, families = merge_queue._complete_authors(
-                    db, row, frozen, repo, target, klass=klass, marks=marks)
+                    db, row, frozen, repo, target, klass=klass, marks=marks,
+                    cfg=cfg)
             except merge_queue._ProvenanceError as exc:
                 return False, (
                     "no review verdict ok on the freeze %s (class: %s): the complete "

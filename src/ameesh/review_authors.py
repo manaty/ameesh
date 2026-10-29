@@ -56,6 +56,13 @@ auteurs, avec les mêmes exceptions du canon §2 :
   un commit hérité d'un parent empilé puis retiré (revert, annulation) n'est
   pas un contenu de cette tête et sa famille redevient éligible ; une ligne
   qui survit, ou une lecture impossible, garde l'exclusion ;
+* un lot empilé sur la tête gelée d'un parent — prérequis déclaré ou membre
+  du même paquet — lit `parent..tête` (#4343/#4478) : les commits du parent,
+  relus sur sa propre tête, ne sont ni auteurs ni inconnus de l'enfant. La
+  porte de fusion ne retire cette tête que si la **propre porte du parent**
+  est satisfaite sur elle (`merge_queue._admitted_stacked_parents`) ; un
+  parent jamais relu ou bloqué reste dans le périmètre de l'enfant. Le doute
+  (parent, gel ou objet illisible) conserve l'auteur ;
 * un ancien commit sans reçu et sans attribution ne bloque plus quand son
   contenu a disparu, ou quand le même auteur l'a réémis avec reçu exact et
   patch-id verbatim identique dans la plage courante (#3301, constat
@@ -968,6 +975,79 @@ def target_commit(repo: str, target: str) -> str:
         if found:
             return found
     return ""
+
+
+def stacked_parents(db, item: Mapping, repo: str, head: str) -> list[dict]:
+    """Les parents d'empilement dont une tête gelée précède `head` (#4478).
+
+    Un lot empilé sur la tête gelée d'un parent — prérequis déclaré
+    (`work dependencies`) ou membre du même paquet (#3589) — porte dans sa
+    plage, lue depuis la cible, les commits du parent. Ces commits ont été
+    relus sur la tête du parent : ils ne sont ni auteurs ni périmètre de
+    relecture de l'enfant. La lecture d'auteurs (`reading`, `admitted_heads`)
+    part donc de ces têtes.
+
+    Rend `[{lot, frozen, source, target}]`, réduits aux têtes les plus proches
+    (`freeze_stack.parent_heads`). On ne rend que ce qui est **prouvé** : un
+    parent ouvert, un gel lisible dans ce dépôt et l'ascendance de cette tête
+    sur la tête lue. Une lecture impossible (graphe, frise du parent, objet
+    git) ne retire rien : le doute conserve les auteurs.
+
+    Comme #3513 pour les têtes des membres admis, une tête absente de
+    l'historique de `head` ne retire aucun commit. La porte de fusion ne
+    retire en plus que les parents dont la **propre porte** est satisfaite
+    (`merge_queue._admitted_stacked_parents`) : un parent jamais relu ou
+    bloqué reste dans le périmètre de l'enfant.
+    """
+    lot = int((item or {}).get("id") or 0)
+    if not lot:
+        return []
+    from . import freeze_stack
+
+    store = storage.of(db).work
+    try:
+        candidates = freeze_stack.candidates(db, lot)
+    except Exception:  # noqa: BLE001 - graphe illisible : aucun parent retiré
+        return []
+    # #4478 : sans parent candidat, aucune sonde git n'est nécessaire. La
+    # résolution locale de `head` ouvre un dépôt d'objets temporaire
+    # (`plan_git.local_commit`) : la faire pour tout lot changeait le compte
+    # des temporaires d'un post sans radar (#1761, test_l160e) sans rien
+    # prouver de plus.
+    if not candidates:
+        return []
+    head_full = plan_git.local_commit(repo, str(head or ""))
+    if not head_full:
+        return []
+    parents: list[dict] = []
+    for candidate in candidates or ():
+        parent = int((candidate or {}).get("lot") or 0)
+        if not parent:
+            continue
+        try:
+            row = store.get(parent)
+            if row is None or str(row.get("state") or "") in freeze_stack.DONE_STATES:
+                continue
+            rows = store.milestones(parent, None) or ()
+        except Exception:  # noqa: BLE001 - parent illisible : aucun retrait
+            continue
+        for freeze in rows:
+            if str((freeze or {}).get("kind") or "") != "frozen":
+                continue
+            frozen = plan_git.local_commit(repo, str((freeze or {}).get("sha") or ""))
+            if not frozen or frozen == head_full:
+                continue
+            if canon.git_contains(repo, frozen, head_full):
+                parents.append({"lot": parent, "frozen": frozen,
+                                "source": str((candidate or {}).get("source") or ""),
+                                "target": str(row.get("branch_target") or "")})
+    return freeze_stack.parent_heads(repo, parents)
+
+
+def stacked_parent_heads(db, item: Mapping, repo: str, head: str) -> tuple[str, ...]:
+    """Les SHA des têtes gelées des parents d'empilement (#4478)."""
+    return tuple(entry["frozen"] for entry in
+                 stacked_parents(db, item, repo, head))
 
 
 def _applied_in(repo: str, target: str, sha: str) -> bool:
@@ -4210,7 +4290,9 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     #3513 : `admitted_heads` sont les gels des membres déjà admis par la
     porte du même véhicule. Leurs commits sont écartés de la plage courante
     et des gels antérieurs, comme ceux de la cible ; aucun autre tiers
-    ne bénéficie de cette exclusion. Une lecture Git impossible ne retire rien.
+    ne bénéficie de cette exclusion. #4478 : les têtes gelées des parents
+    d'empilement (`stacked_parent_heads`) sont la même borne pour un lot
+    empilé. Une lecture Git impossible ne retire rien.
     Une portée est un gel (texte) ou la portée de `provenance_scope` (dict,
     #3533). #3544 : `exclusions_out` reçoit les commits écartés du report des
     gels antérieurs (`carried_from` = le gel reporté) ; la plage courante est
