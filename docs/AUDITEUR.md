@@ -111,6 +111,41 @@ mention d'une règle ou d'une consigne de l'owner, ou d'une décision déjà
 signée, ne classe pas l'attente humaine ; un `hold_undeployed` ne l'est jamais
 (canon §11 bis).
 
+#### Capacité au repos (#3256, owner 28/10/2026)
+
+La section `capacity` du débit se lit **en premier, avec les attentes**. Pour
+chaque projet et pour le mesh, elle donne les agents réveillables au repos et
+leur part (`idle_share` : sans lot actionnable ni tour sur un lot depuis
+`file.repos_s`), les **heures-agent au repos** sur la fenêtre
+(`idle_agent_hours`), les lots démarrables (`startable_lots`), le lot de
+découpage ouvert et son âge (`decoupage`), la feuille de route notée épuisée
+(`roadmap_exhausted`), et la **part de fenêtre perdue au reset** de chaque
+compte de forfait (`plan_loss_at_reset`, le calcul d'`ameesh accounts`).
+Les relecteurs, les pilotes, l'auditeur, mesh-design et les agents en pause
+ne sont pas réveillables et n'y comptent pas.
+
+Une file vide n'est pas « rien à signaler ». Quand au moins `file.repos_part`
+(20 %) des agents réveillables d'un projet sont au repos depuis
+`file.repos_s` (30 min) et qu'aucun lot de découpage du projet n'a moins
+d'une heure, `ameesh debit --check` sort 2 et `capacity.alerts` nomme le
+projet et le geste. **Un passage qui conclut « rien à signaler » avec 20 % ou
+plus d'agents au repos est un défaut de son travail**, au même titre qu'une
+attente de plus de 2 h. Le geste dépend de l'état :
+
+- des lots démarrables existent : les confier (niveau 1, ligne « Idle
+  capacity ») ;
+- aucun lot de découpage : le pilote du projet doit en recevoir un (spec
+  `docs/design/3256-debit-file.md` §2.2, #4273) ; s'il manque, l'auditeur le
+  signale au pilote ;
+- un lot de découpage a plus d'une heure sans lot démarrable créé : le
+  **repli** de la spec §2.2, geste de niveau 1 ci-dessous.
+
+Une feuille de route notée épuisée (`roadmap: épuisée <projet>` sur le lot de
+découpage) retire le projet de l'alerte et de ses heures au repos. Sans bloc
+`file` au canon (`processus/mecanique.yaml`), la mesure est rendue sans
+seuil et `capacity.rule_error` le dit : l'auditeur juge alors la part au repos
+lui-même contre 20 % et le signale au pilote.
+
 ### Liste de contrôle
 
 Chaque commande accepte `--json` quand elle est indiquée ainsi ; l'auditeur lit
@@ -118,7 +153,7 @@ le JSON plutôt que le texte.
 
 | # | Point | Commandes | Signe d'un problème |
 |---|---|---|---|
-| 0 | **Débit (en premier)** | `ameesh debit --json` (`--check` pour le code de sortie) | `slow_waits` non vide (attente de plus de 2 h sans geste) ; `device_holds` ou `undeployed_holds` non vides ; `external_reminders` (relances bureau/owner/tiers dues, #3498, #3773) ; `window_waits` (fenêtres d'observation en cours, #4235 : à suivre jusqu'à l'échéance, pas un goulot) ; `reviews_by_reviewer` (avis dus) ; `idle_agents_with_work` ; `ci.slow_runs` et `ci.slow_jobs` (le job macOS de 3 à 4 h avant #3198) |
+| 0 | **Débit (en premier)** | `ameesh debit --json` (`--check` pour le code de sortie) | `slow_waits` non vide (attente de plus de 2 h sans geste) ; `device_holds` ou `undeployed_holds` non vides ; `external_reminders` (relances bureau/owner/tiers dues, #3498, #3773) ; `window_waits` (fenêtres d'observation en cours, #4235 : à suivre jusqu'à l'échéance, pas un goulot) ; `reviews_by_reviewer` (avis dus) ; `idle_agents_with_work` ; `capacity.alerts` (20 % ou plus d'agents réveillables au repos depuis 30 min sans lot de découpage récent, #3256) et `capacity.plan_loss_at_reset` ; `ci.slow_runs` et `ci.slow_jobs` (le job macOS de 3 à 4 h avant #3198) |
 | 1 | Agents bloqués, arrêtés ou à vide | `ameesh list`, `ameesh show <agent>`, `ameesh alerts --json` | `stopped_with_mail`, `idle_with_mail`, `dead_runner`, `host_not_ready` ; agent au repos avec un lot actionnable (`idle_actionable_lot`, niveau 1 : il relance) ; `critical_budget_pause` (urgent, L242b) : un orchestrateur, l'agent de conception ou un auditeur en pause budget |
 | 2 | Tours longs, sessions qui grossissent | `ameesh alerts --json`, `ameesh cost turns` | `long_turn`, `session_too_big`, `stale_lot` |
 | 3 | Forfaits | `ameesh accounts list` | capacité perdue à la prochaine remise à zéro (`plan_underused`), compte au seuil de rythme, compte forcé depuis longtemps |
@@ -285,7 +320,10 @@ en lecture seule, puis les correctifs.
 
 ### Quand
 
-* chaque nuit, au courrier « Analyse profonde » : les dernières 24 heures ;
+* chaque nuit, au courrier « Analyse profonde » : les dernières 24 heures,
+  avec la courbe de la capacité au repos sur 24 h (heures-agent au repos et
+  perte au reset par heure : `ameesh debit --hours 24 --json`, section
+  `capacity`, et ses rapports courts de la journée ; #3256) ;
 * après un incident notable : un agent arrêté après des échecs, un tour tué ou
   clos par un plafond, une pression critique sur un hôte, une ressource
   orpheline, une CI rouge sur la branche principale, un retour arrière de
@@ -697,6 +735,7 @@ FIN
 | orchestrateur muet avec du courrier | `agent-mail send <orchestrateur> "…"` | aucun |
 | « Idle with an actionable lot: … » (`idle_actionable_lot`, #408) : un agent au repos détient un lot `intake`/`build` et les réveils de son exécuteur (règle 1) sont restés sans effet | **relancer, pas seulement nommer** : `agent-mail send <agent> "…" --lot <lot>` (ce qui est attendu sur le lot, ou qu'il note pourquoi il ne peut pas avancer : `ameesh work note <lot> "hold: <raison>"`) ; exécuteur pas vivant : `ameesh resume <agent>` d'abord ; s'il ne peut pas prendre le lot : `ameesh work assign <lot> <agent>` | `ameesh work assign <lot> <ancien>` |
 | « Idle capacity: … » qui cite des lots ouverts sans agent, toujours vrai à son passage 30 min ou plus après le courrier (L165b) | `ameesh work assign <lot> <agent>` (un agent au repos de l'équipe du lot, le lot le plus prioritaire d'abord), puis `agent-mail send <agent> "…" --lot <lot>` pour le réveiller | `ameesh work assign <lot> <autre>` |
+| lot de découpage ouvert depuis plus d'une heure sans lot démarrable créé (`capacity.alerts`, repli de la spec #3256 §2.2) | créer lui-même les lots démarrables du projet, d'au plus une journée chacun, depuis la feuille de route citée par le lot de découpage : `ameesh work add --app <projet> --estimate <durée> …`, puis les nommer dans une note du lot de découpage ; il ne touche ni au code ni à la priorité des lots du pilote | `ameesh work close <lot>` |
 | dépense au-dessus de l'estimation | `ameesh budget set --per-hour X [--per-day Y] [--agent A]`, **uniquement vers le bas**, et seulement si la dépense de la fenêtre en cours reste sous le nouveau plafond | `ameesh budget set` à l'ancienne valeur, par un humain |
 | CI en file, réserve arrêtée ; ou réserve inactive | `"$AUDITEUR_RESERVE_DIR"/demarrer-reserve.sh` ou `arreter-reserve.sh` | le script inverse |
 | avis dû depuis plus de 2 h sur la tête gelée (`reviews_by_reviewer`) | relancer le relecteur avec la liste de ses avis dus (le débit la porte : `agent-mail send <relecteur> "…" --lot <lot>`) ; au repos, `ameesh resume <relecteur>` | le verdict rendu, ou la redésignation |
@@ -921,8 +960,12 @@ le fil du projet que lit le propriétaire.
   au plus : ce qui va mal, ce qu'il a fait (avec l'inverse), ce qu'il propose.
   Il **commence par le tableau de débit** (`ameesh debit`) et, pour chaque
   attente de plus de 2 h, par le geste fait (niveau 1) ou le pilote nommé.
-  « Rien à signaler » avec une attente de plus de 2 h est un défaut ; sans
-  aucune attente, une ligne (« Audit 14:00 : rien à signaler »).
+  Il donne aussi les **heures-agent au repos** et la **perte au reset** par
+  compte (section `capacity`), et le quota perdu sur la dernière heure (écart
+  avec son passage précédent).
+  « Rien à signaler » avec une attente de plus de 2 h, ou avec 20 % ou plus
+  d'agents réveillables au repos (#3256), est un défaut ; sinon, une ligne
+  (« Audit 14:00 : rien à signaler »).
 * **Un corps qui cite une commande** (backticks, `$(…)`) ne part jamais entre
   guillemets doubles : le shell de l'auditeur l'exécuterait avant l'envoi.
   Envoyer le corps sur l'entrée standard, avec un délimiteur entre apostrophes

@@ -11,7 +11,7 @@ n'était ni composé ni « écarté » au manifeste.
 Ce module rend la liste **calculée** que la composition doit lire avant tout
 courrier :
 
-* état `qa` (aucun filtre d'assigné : un lot assigné est un candidat comme un
+* état `qa` ou `validated` (aucun filtre d'assigné : un lot assigné est un candidat comme un
   autre) ;
 * aucun prérequis explicite encore bloquant (`work_dependencies`, #4144),
   même si le parent est hors `qa` ; un parent fusionné ne bloque plus ;
@@ -149,6 +149,43 @@ def changed_files(repo: str, base: str, source: str) -> list[str]:
                proc.stderr.decode("utf-8", "replace").strip()[:300]))
     return sorted({name for name in proc.stdout.decode("utf-8", "replace").split("\0")
                    if name})
+
+
+def _check_migration_coverage(db, entry, *, repo, origin_repo, base, target, cfg=None):
+    """#4430: added migration files require this lot's active reservation."""
+    from . import migration_reservations, migrations
+    slug = migrations.origin_repo(origin_repo)
+    layout = migrations.layout_for(slug, cfg) if slug else None
+    if layout is None:
+        return
+    paths = [path for path in entry['files']
+             if os.path.dirname(path) == layout.directory.rstrip('/')
+             and migration_reservations._NUMBER.fullmatch(os.path.basename(path))]
+    if not paths:
+        return
+    proc = subprocess.run(
+        ['git', '-C', repo, 'diff', '--name-only', '--no-renames', '--diff-filter=A',
+         '-z', '%s...%s' % (base, entry['source']), '--', layout.directory + '/'],
+        capture_output=True)
+    if proc.returncode:
+        raise CandidateError('cannot read added migration files: ' +
+                             proc.stderr.decode('utf-8', 'replace')[:300])
+    added = set(proc.stdout.decode('utf-8', 'replace').split('\0'))
+    numbers = {int(migration_reservations._NUMBER.fullmatch(os.path.basename(path)).group(1))
+               for path in paths if path in added}
+    if not numbers:
+        return
+    try:
+        missing = migration_reservations.uncovered(
+            db, entry['work_item'], numbers, repository=slug, target_branch=target)
+    except Exception as exc:
+        raise CandidateError('cannot read active migration reservations: %s' % exc) from exc
+    if missing:
+        entry['causes'].append(_cause(
+            'migration-collision', 'migration number(s) %s not covered by an active reservation of lot #%s'
+            % (', '.join(layout.label(number) for number in missing), entry['work_item']),
+            numbers=missing))
+        entry['ready'] = False
 
 
 def _ancestor(repo: str, tip: str, base: str) -> bool:
@@ -491,13 +528,14 @@ def default_app(repo: str) -> str:
 
 
 def _items(db, app: str) -> list[dict]:
-    """Tous les lots `qa` du projet, sans filtre d'assigné ni borne de page.
+    """Tous les lots `qa` et `validated` du projet, sans filtre d'assigné ni borne de page.
 
     Un filtre `assignee` ou une limite d'interface cacherait précisément les
     lots assignés que #2404 a vus omis (le composeur doit voir tous les
     candidats, pas ceux qui restent à prendre).
     """
-    rows = storage.of(db).work.items(state="qa", assignee=None, limit=None)
+    rows = [row for state in ("qa", "validated")
+            for row in storage.of(db).work.items(state=state, assignee=None, limit=None)]
     return [row for row in rows if (row.get("app") or "") == app]
 
 
@@ -698,6 +736,8 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
         if entry["ready"]:
             try:
                 entry["files"] = changed_files(where, package_base, entry["source"])
+                _check_migration_coverage(db, entry, repo=where, origin_repo=repo,
+                                          base=package_base, target=target_branch, cfg=cfg)
             except CandidateError as exc:
                 entry["error"] = "cannot read the changed files: %s" % exc
                 entry["ready"] = False

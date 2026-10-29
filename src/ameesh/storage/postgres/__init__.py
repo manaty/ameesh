@@ -21,6 +21,7 @@ from .authenticators import Authenticators
 from .authority import Approvals, Keys, Nonces
 from .canon import Canon, Ephemerals
 from .catalog import Catalog
+from .veille import Veille
 from .ci import CiResults
 from .decisions import Decisions
 from .costs import TurnCosts
@@ -77,6 +78,7 @@ class PostgresStorage(interface.Storage):
         self.watches = Watches(db)
         self.events = Events(db)
         self.catalog = Catalog(db)
+        self.veille = Veille(db)
         self.mailbox = Mailbox(db)
         self.github_watch = GithubWatch(db)
         self.fingerprints = FingerprintWatch(db)

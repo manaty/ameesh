@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..work_dependencies import WorkDependencies as Contract
+from ... import work_lifecycle as lifecycle
 
 _DONE = ("merged", "promoted", "closed")
 _DONE_SQL = "('merged', 'promoted', 'closed')"
@@ -310,7 +311,7 @@ class WorkDependencies(Contract):
                 return {"error": "finished_lot"}
             # #2171 N3 : seul un lot en revue peut être parqué ; un lot en
             # build, bloqué ou en attente d'un humain garde son signal.
-            if states[item_id] != "qa":
+            if states[item_id] not in lifecycle.TO_VALIDATE:
                 return {"error": "not_in_review"}
             if states[vehicle_id] in _DONE:
                 return {"error": "finished_vehicle"}

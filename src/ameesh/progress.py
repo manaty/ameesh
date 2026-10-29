@@ -225,11 +225,11 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
             continue
         if state == prev:
             continue                      # une note, pas une transition
-        if state == lifecycle.TO_VALIDATE:
+        if state == lifecycle.QA:
             ev_freezes.append(at)
-        if prev == lifecycle.TO_VALIDATE and state in (
-                lifecycle.IN_PROGRESS, lifecycle.DELIVERY_RECORDED):
-            ev_verdicts.append((at, "ok" if state == lifecycle.DELIVERY_RECORDED else "blocked",
+        if prev in lifecycle.TO_VALIDATE and state in (
+                lifecycle.IN_PROGRESS, lifecycle.VALIDATED, lifecycle.DELIVERY_RECORDED):
+            ev_verdicts.append((at, "ok" if state in (lifecycle.VALIDATED, lifecycle.DELIVERY_RECORDED) else "blocked",
                                 ev.get("actor") or None))
         if state == lifecycle.DELIVERY_RECORDED and merged is None:
             # #1693 (N4) : la première entrée en merged APRÈS la dernière
@@ -416,7 +416,9 @@ def lot_state(work_state: str, jalons: dict) -> str:
         return "closed"
     if work_state in _WAITING:
         return "blocked"
-    if work_state == lifecycle.TO_VALIDATE:
+    if work_state == lifecycle.VALIDATED:
+        return "approved"
+    if work_state in lifecycle.TO_VALIDATE:
         current = jalons.get("verdict_current")
         if current is None:                 # jalons partiels : repli par les instants
             last_frozen = jalons.get("last_frozen", jalons.get("frozen")) or 0

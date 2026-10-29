@@ -60,6 +60,9 @@ REVIEW_SOURCE_PREFIX = "review-after-merge:"
 #: le titre d'un lot de relecture après fusion (review_lot.title_of), repris
 #: par les relectures ouvertes à la main : `REVUE #<parent> : …`.
 REVIEW_TITLE_RE = re.compile(r"^\s*REVUE\s*#\s*(\d+)\b", re.IGNORECASE)
+#: expéditeur des événements qu'ameesh écrit lui-même (échéance d'une
+#: délégation, rafraîchissement d'un lot généré par la veille des versions)
+SYSTEM_SENDER = "ameesh"
 #: #1280 : les missions de relecture ouvertes à la main hors convention
 #: `REVUE #N` : `R1 <harnais> #<parent> …` (cas #1249), et ses variantes
 #: observées `R1 delta Codex #1037 r2`, `R1 Codex de #1066`. La forme est
@@ -74,6 +77,7 @@ FORWARD = {
     "intake": ("build",),
     "build": ("qa",),
     "qa": ("merged", "build"),
+    "validated": ("merged", "build"),
     "merged": ("promoted",),
     "promoted": (),
     "closed": (),
@@ -84,6 +88,7 @@ TRANSITIONS = {
     "intake": {"build", "blocked", "waiting_human"},
     "build": {"qa", "blocked", "waiting_human"},
     "qa": {"merged", "build", "blocked", "waiting_human"},
+    "validated": {"qa", "merged", "build", "blocked", "waiting_human"},
     "merged": {"promoted", "blocked", "waiting_human"},
     "promoted": set(),
     "closed": set(),
@@ -663,6 +668,33 @@ def open_with_source(db: Db, source: str, *, limit: int = 1000) -> dict | None:
     return found
 
 
+def with_source(db: Db, source: str, *, limit: int = 50) -> list[dict]:
+    """#4291 : lots portant exactement `source`, tous états confondus, du plus
+    récent au plus ancien. Lecture seule, bornée ; `by_source` garde son ordre
+    historique (`id`) pour les empreintes."""
+    rows = list(storage.of(db).work.by_source(source))
+    rows.sort(key=lambda row: (str(row.get("updated_at") or ""), int(row["id"])),
+              reverse=True)
+    return rows[:int(limit)] if limit else rows
+
+
+def update_generated(db: Db, item_id: int, *, title: str, body: str,
+                     priority: int | None = None, note: str = "",
+                     actor: str = SYSTEM_SENDER) -> dict | None:
+    """#4291 : rafraîchit le titre, le corps et (seulement à la hausse) la
+    priorité d'un lot généré encore ouvert, avec une ligne de journal.
+
+    Une priorité plus basse (2 ou 3) ne remplace jamais une priorité plus
+    haute déjà posée, par un humain notamment : la détection automatique ne
+    rétrograde pas un lot. Rend le lot relu, ou None s'il n'est plus ouvert.
+    """
+    if not (title or "").strip():
+        raise WorkError("generated title required")
+    return storage.of(db).work.update_generated(
+        int(item_id), title=title.strip(), body=body, priority=priority,
+        note=(note or "").strip(), actor=actor)
+
+
 def add_or_note(db: Db, *, source: str, occurrence: str, actor: str = "",
                 **fields) -> dict:
     """#3209 : un seul lot ouvert par `source` — un suivi automatique (lot de
@@ -701,8 +733,8 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         from . import estimates
         minutes = estimates.parse(estimate)
     if type not in ("bug", "evolution"):
-        from .modules.storage import ModuleStore
-        if not ModuleStore(db).admits(app or workstream or "", type):
+        from .modules import registry as module_registry
+        if not module_registry.admits(db, app or workstream or "", type):
             raise WorkError("unknown type %r for project %r: enable its module in the canon"
                             % (type, app or workstream or ""))
     if size not in (None, "") and size not in SIZES:
@@ -1100,6 +1132,9 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         if row is None:
             raise WorkError("lot %s: migration reservation changed meanwhile, retry" % item_id)
         return _with_file(row, cfg)
+    if current is None and any(row["slot"] != "default" and row["slot"] != "legacy-%d" % row["number"]
+                               for row in reservations):
+        raise WorkError("named migration slots require --slot; legacy allocation refused")
     if number is not None and not 1 <= int(number) <= 9999:
         raise WorkError("migration number outside 0001-9999: %s" % number)
     held = {row["number"] for row in reservations}
@@ -2372,8 +2407,6 @@ def count_builds(db: Db, assignee: str) -> int:
 # délégation à échéance (L40, point 5 de la décision 0030)
 # --------------------------------------------------------------------------
 
-#: expéditeur des événements qu'ameesh écrit lui-même (échéance d'une délégation)
-SYSTEM_SENDER = "ameesh"
 #: issues d'une délégation au registre `work_item_delegations`
 DELEGATION_OUTCOMES = ("soldee", "rendue", "remplacee", "annulee")
 
@@ -4036,7 +4069,7 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     (`corrector`).
 
     `state` accepte l'orthographe v1 et le nom générique du cycle de vie
-    (#4349 : `in_progress` pour `build`, `validated` pour `merged`…)."""
+    (#4349 : `in_progress` pour `build`, `to_validate` pour `qa`…)."""
     state = _canonical_state(state)
     if package_exclusion and correct is not None:
         raise WorkError("--package-exclusion and --correct are distinct gestures")
@@ -4114,11 +4147,11 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
                % (item_id, state) if (current, state) in CORRECTIONS else ""))
     if state == "waiting_human" and not storage.of(db).decisions.pending_for_lot(str(item_id)):
         raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
-    if package_exclusion and current != "qa":
+    if package_exclusion and current not in TO_VALIDATE:
         raise WorkError("--package-exclusion: lot %s is in %s, not in qa: only a "
                         "frozen lot under review is in a package" % (item_id, current))
     # #4043 : un retrait de paquet n'est pas une boucle d'auteur
-    returning_loop = current == "qa" and state == "build" and not package_exclusion
+    returning_loop = current in TO_VALIDATE and state == "build" and not package_exclusion
     if returning_loop and int(item["loops"]) >= MAX_QA_LOOPS:
         raise WorkError(
             "qa → build loop exhausted (%d): move the lot to blocked, or ask the "

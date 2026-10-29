@@ -28,6 +28,17 @@ def scope_digest(operation,machine_id,uid,gid, *, name=NAME,home=HOME):
                      password_disabled=True,supplementary_groups=[])))
 
 
+def expected(uid,gid, *, name=NAME,home=HOME):
+    """Exact reviewed identity `ensure()` admits for this uid/gid.
+
+    One definition shared by the install and its dry run: a plan can only
+    announce `present` when every field below already matches.
+    """
+    return dict(group=dict(name=name,gid=gid,members=[]),
+                account=dict(name=name,uid=uid,gid=gid,home=home,shell='/bin/sh',
+                             password_disabled=True,supplementary_groups=[]))
+
+
 class AccountError(ValueError):
     pass
 
@@ -136,9 +147,9 @@ def ensure(journal,request, *, authority,system,name=NAME,home=HOME,step='accoun
                                              name=name,home=home):
         raise AccountError('account scope digest mismatch')
     request = dict(request)
-    expected_group = dict(name=name,gid=request['gid'],members=[])
-    expected_account = dict(name=name,uid=request['uid'],gid=request['gid'],home=home,
-                            shell='/bin/sh',password_disabled=True,supplementary_groups=[])
+    reviewed = expected(request['uid'],request['gid'],name=name,home=home)
+    expected_group = reviewed['group']
+    expected_account = reviewed['account']
     def approved():
         try:
             valid = (system.machine()==request['machine_id']

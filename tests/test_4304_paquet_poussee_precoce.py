@@ -127,6 +127,9 @@ class Flux:
             mock.patch.object(paquet_auto, "note_carrier", side_effect=self.log("note", "note")),
             mock.patch.object(paquet_auto, "send_mail", side_effect=self.log("mail", "envoyé")),
             mock.patch.object(paquet_auto, "remove_worktree"),
+            # #4329 : le verrou de composition exige un dépôt git réel ; ce
+            # banc monte un dépôt factice et mocke déjà tous les gestes git.
+            mock.patch.object(paquet_auto, "PackageLock"),
         ]
         with contextlib.ExitStack() as stack:
             for patch in patches:

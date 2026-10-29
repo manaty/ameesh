@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # #3845 — un tic toutes les dix minutes ; le script compose au plus un porteur
 # par heure et suit sinon le porteur ouvert (ci-full, rouge, recomposition).
+# #4361 : ne pas arrêter cette minuterie pour suspendre le tic (le contrôle
+# `role timers --check` échouerait) : `paquet-horaire.py pause --until …`.
 [Unit]
 Description=ameesh paquet horaire, tic (#3845)
 

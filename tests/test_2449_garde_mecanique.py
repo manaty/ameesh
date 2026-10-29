@@ -56,6 +56,7 @@ def reader_keys() -> set[str]:
             ("accounts", mechanics._ACCOUNTS_KEYS),
             ("paquet", mechanics._PAQUET_KEYS),
             ("packet_tests", mechanics._PACKET_TESTS_KEYS),
+            ("file", mechanics._FILE_KEYS),
             # #3022 : `production.branch` est un bloc **par projet**, pas un
             # bloc du document global ; la garde doit le voir comme les autres.
             ("production", mechanics._PRODUCTION_KEYS)):
@@ -76,7 +77,7 @@ class SchemaCoverageTest(unittest.TestCase):
                          {"schema", "timezone", "cutoffs", "packets", "build",
                           "ci", "reviews", "merge", "prevalidation", "backlog",
                           "staging", "accounts", "paquet", "packet_tests",
-                          "projects"})
+                          "file", "projects"})
         # #3022 : les surcharges par projet peuvent porter un bloc qui n'est
         # pas un bloc du document global (`production`) ; il reste couvert par
         # `production.branch` ci-dessus, jamais ajouté au schéma du document.
@@ -133,6 +134,8 @@ POSITIVE = {
     "paquet.max_paquets": "MAX_PAQUETS = 2\n",
     "packet_tests.unit_timeout_seconds": "UNIT_TIMEOUT_SECONDS = 900\n",
     "packet_tests.parallel": "UNIT_TESTS_PARALLEL = 4\n",
+    "file.repos_part": "REPOS_PART = 0.2\n",
+    "file.repos_s": "REPOS_S = 1800\n",
     "projects": 'PROJECT_OVERRIDES = {"ameesh": {"build": {"max_in_build": 3}}}\n',
     "production.branch": 'production_branch = "main"\n',
 }

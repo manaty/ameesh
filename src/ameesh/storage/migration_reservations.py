@@ -28,7 +28,7 @@ class MigrationReservations(abc.ABC):
         """Allocate/replay or transition a slot atomically; return record or error.
 
         Apply ancestry/file observations taken under the target lock before allocating.
-        Arrivals become landed; only ancestors lacking their numbers are released.
+        Arrivals become landed; ancestors lacking their numbers remain reserved.
         A landed slot never reallocates. A released slot can reserve again.
         Allocation and journaling commit together. Lot state and slot are
         checked under locks; different lots share the target's allocator.

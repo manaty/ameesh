@@ -230,6 +230,8 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
             # jusqu'au regel qui rend ce GO caduc.
             return _waiting("fix", assignee)
         return _waiting("build", assignee or (item.get("external_executor") or None))
+    if state == lifecycle.VALIDATED:
+        return _merge_wait(actions, responsible, assignee, canon=canon)
     # qa : en revue — approuvé par un verdict `ok` courant, ou dispensé de
     # re-verdict par le pilote (#1979 : résolution de composition mécanique,
     # canon §11 bis/#87), ou lot léger dont la relecture suit la fusion
@@ -245,7 +247,7 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
         # §2 : la relecture d'un lot léger suit la fusion ; aucun verdict
         # n'est dû avant, même si un relecteur est désigné (#1822).
         return _merge_wait(actions, responsible, assignee, canon=canon)
-    if state == lifecycle.TO_VALIDATE and not freeze_declared:
+    if state in lifecycle.TO_VALIDATE and not freeze_declared:
         return _waiting("freeze", assignee)
     if jalons.get("pending_reviewers"):
         return _waiting("verdict", jalons["pending_reviewers"])

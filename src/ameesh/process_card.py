@@ -39,6 +39,10 @@ sur une erreur de lecture ou d'usage. `--json` imprime aussi le document natif
 La carte elle-même reste une fiche Process ordinaire : `canon check` valide
 `type: Process`, `title`, `responsible` et `updated` ; il ne valide pas ce bloc
 `workflow:` (clé inconnue conservée). Le contrôle du workflow est celui-ci.
+
+L103 (#4395) : une carte `Pipeline` (`pipelines/*.md`) porte le même bloc sous
+`pipeline:` (alias `workflow:`) ; `pipeline_of_page`/`pipeline_block` le
+lisent et `canon check` le compile avec `compile_block`.
 """
 from __future__ import annotations
 
@@ -59,6 +63,11 @@ TRANSITION_KEYS = ("from", "to", "guard")
 PROJECTION_KEYS = ("project", "status_field", "product_field",
                    "issue_open", "issue_completed", "issue_not_planned")
 PROJECTION_GROUPS = ("issue_open", "issue_completed", "issue_not_planned")
+
+#: L103 (#4395) : type de la carte qui déclare un pipeline (module déclaratif),
+#: et ses clés de bloc — `pipeline:`, puis `workflow:` en alias transitoire.
+PIPELINE_TYPE = "Pipeline"
+PIPELINE_KEYS = ("pipeline", "workflow")
 
 #: alias de types de lots admis par le canon ; la valeur est le type natif.
 TYPE_ALIASES = {"governance": "governance-tracking"}
@@ -327,6 +336,49 @@ def workflow_of_page(text: str) -> Mapping | None:
     et `canon.load_yaml`) : clés dupliquées refusées, dates normalisées. Un
     bloc absent ou en prose (`workflow: "…"`) laisse la carte inchangée.
     """
+    data = _frontmatter(text, "Process")
+    workflow = data.get("workflow")
+    if workflow is None or isinstance(workflow, str):
+        return None
+    if not isinstance(workflow, Mapping):
+        _refuse("value-type", "$.workflow", "object expected (or prose)")
+    return workflow
+
+
+def pipeline_block(data: Mapping) -> Mapping:
+    """L103 (#4395) : le bloc d'une carte `Pipeline` lu dans son frontmatter.
+
+    La clé est `pipeline:` ; `workflow:` reste lu comme alias transitoire.
+    Les deux à la fois sont refusés (`key-conflict`), aucune des deux aussi
+    (`key-missing`) : une carte Pipeline sans bloc n'est pas un module. Le bloc
+    a la forme canon d'un bloc `workflow:` de carte Process (même encodeur)."""
+    present = [key for key in PIPELINE_KEYS if data.get(key) is not None]
+    if len(present) > 1:
+        _refuse("key-conflict", "$",
+                "`pipeline:` and its transitional alias `workflow:` both "
+                "declared (keep `pipeline:`)")
+    if not present:
+        _refuse("key-missing", "$.pipeline",
+                "required key (the pipeline block; `workflow:` is accepted "
+                "as a transitional alias)")
+    key = present[0]
+    block = data[key]
+    if not isinstance(block, Mapping):
+        _refuse("value-type", "$.%s" % key,
+                "object expected (prose is not a pipeline)")
+    return block
+
+
+def pipeline_of_page(text: str) -> Mapping:
+    """L103 (#4395) : le bloc d'une carte `Pipeline` (`pipelines/*.md`).
+
+    Même lecture que `workflow_of_page` (lecteur du canon), mais le type est
+    `Pipeline` et le bloc est obligatoire (`pipeline_block`)."""
+    data = _frontmatter(text, PIPELINE_TYPE)
+    return pipeline_block(data)
+
+
+def _frontmatter(text: str, kind: str) -> Mapping:
     from . import canon
 
     try:
@@ -335,22 +387,28 @@ def workflow_of_page(text: str) -> Mapping | None:
         _refuse("frontmatter-invalid", "$", str(exc))
     if frontmatter is None:
         _refuse("frontmatter-missing", "$",
-                "YAML frontmatter required (type: Process, then workflow:)")
+                "YAML frontmatter required (type: %s, then %s:)"
+                % (kind, "workflow" if kind == "Process" else "pipeline"))
     try:
         data = canon.load_yaml(frontmatter)
     except canon.YamlError as exc:
         _refuse("frontmatter-invalid", "$", str(exc))
     if not isinstance(data, Mapping):
         _refuse("value-type", "$", "frontmatter object expected")
-    if data.get("type") != "Process":
+    if data.get("type") != kind:
         _refuse("value-type", "$.type",
-                "`type: Process` expected on a Process card")
-    workflow = data.get("workflow")
-    if workflow is None or isinstance(workflow, str):
-        return None
-    if not isinstance(workflow, Mapping):
-        _refuse("value-type", "$.workflow", "object expected (or prose)")
-    return workflow
+                "`type: %s` expected on a %s card" % (kind, kind))
+    return data
+
+
+def compile_block(workflow: Mapping, *, ref: str,
+                  version: int = 0) -> tuple[CompiledWorkflow, CanonWorkflow | None]:
+    """Compile un bloc (forme canon, ou native si `stages` est une liste) :
+    l'artefact et l'encodage canon (None pour la forme native)."""
+    if isinstance(workflow.get("stages"), list):
+        return compile_workflow(workflow, ref=ref, version=version), None
+    encoding = encode_canon_workflow(workflow)
+    return compile_workflow(encoding.document, ref=ref, version=version), encoding
 
 
 def check_page(path: str, *, ref: str | None = None, version: int = 0) -> CheckResult:
@@ -367,17 +425,10 @@ def check_page(path: str, *, ref: str | None = None, version: int = 0) -> CheckR
     if workflow is None:
         return CheckResult(path=path, ref=workflow_ref, version=version,
                            artifact=None, encoding=None)
-    if isinstance(workflow.get("stages"), list):
-        artifact = compile_workflow(workflow, ref=workflow_ref, version=version)
-        return CheckResult(path=path, ref=workflow_ref, version=version,
-                           artifact=artifact, encoding=None,
-                           source_schema=artifact.schema)
-    encoding = encode_canon_workflow(workflow)
-    artifact = compile_workflow(encoding.document, ref=workflow_ref,
-                                version=version)
+    artifact, encoding = compile_block(workflow, ref=workflow_ref, version=version)
     return CheckResult(path=path, ref=workflow_ref, version=version,
                        artifact=artifact, encoding=encoding,
-                       source_schema=encoding.source_schema)
+                       source_schema=encoding.source_schema if encoding else artifact.schema)
 
 
 def artifact_document(artifact: CompiledWorkflow) -> dict:

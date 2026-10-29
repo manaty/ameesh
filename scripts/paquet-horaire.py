@@ -3,6 +3,8 @@
 """Paquet horaire déclenché par minuterie, sans agent (#3845, #1606 point 1).
 
     scripts/paquet-horaire.py tick --repo ~/ameesh-composeur --target main
+    scripts/paquet-horaire.py pause --until 20:15 --reason "staging hors créneau"
+    scripts/paquet-horaire.py resume | status
 
 `scripts/paquet-auto.py` (#3807) compose sans jugement, mais un agent devait
 encore le lancer chaque heure, créer le lot porteur, poser « verdict non
@@ -66,6 +68,11 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    après des tests verts, `paquet-auto: tête testée …` au journal), la reprise
    la publie (`paquet-auto.py --publish`) sans recomposer ; une chaîne refusée
    (cible bougée) recompose dans le même tic.
+   #4329 : un verrou `flock` par nom de paquet, tenu par `paquet-auto.py` de
+   `clear_local_branch` à la fin, est relu avant toute reprise. Une composition
+   lancée hors du tic est ainsi « en cours » (`composition en cours
+   (hôte:pid)`) au lieu de laisser le tic supprimer son worktree vivant ; le
+   verrou tombe avec le processus, une tentative morte reste reprise.
 6. Un courrier au pilote à chaque étape (tête, unités, écartés, CI).
 
 **Recomposition du pilote** (#4237) : `paquet-horaire.py recompose --carrier N
@@ -86,6 +93,14 @@ sans refaire la suite complète quand la fusion de sa tête dans la cible
 avancée est propre et les contrôles de gel verts. Un conflit le rend à la
 file. Sous le seuil, ou si les lots ne sont pas disjoints, un seul paquet
 part.
+
+**Pause (#4361).** `pause --until … --reason …` suspend le tic (staging hors
+créneau) sans arrêter la minuterie : `role timers --check` reste vert et nomme
+la pause. L'échéance est obligatoire (au plus 12 h) ; la pause vit au journal
+partagé (`packet.pause`, `ameesh.packet_pause`), pas sur l'hôte : un bail qui
+change de main la garde. Pendant la pause, le tic ne fait aucun geste (ni
+migration ni composition) et le dit ; à l'échéance il reprend seul ; `resume`
+lève avant. Pose et levée sont dites au pilote et au bureau.
 
 Ce script ne fusionne jamais : la fusion reste celle de `packet_automerge`
 sur la tête gelée, CI requise verte. Les marques d'idempotence sont des notes
@@ -108,14 +123,14 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 TITLE_PREFIX = "Paquet horaire "
 HOURLY_RE = re.compile(r"^Paquet horaire (h-(\d{8})-(\d+))\b")
 CARRIER_BRANCH_PREFIX = "integration/paquet"
-OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
+OPEN_STATES = ("intake", "build", "qa", "validated", "blocked", "waiting_human")
 #: #4171 : fusion vue d'un porteur (miroir de `work_lifecycle.DELIVERED` et
 #: des raisons de clôture livrée de `work.CLOSE_REASONS`).
 MERGED_STATES = ("merged", "promoted")
@@ -253,6 +268,9 @@ class Context:
     parallel: object | None = None
     #: l'inventaire calculé du tic, gardé pour ne pas relire la cible
     candidates_cache: dict = field(default_factory=dict)
+    #: #4361 : la pause active de la cible (`packet_pause`), None sans pause ;
+    #: None ici : aucune lecture (tests)
+    pause_of: object = None
     log: list[str] = field(default_factory=list)
 
     def alive(self, pid: int) -> bool:
@@ -756,6 +774,12 @@ def compose(ctx: Context, rows: list[dict]) -> str:
     results: list[str] = []
     for index, group in enumerate(groups):
         name = next_name(ctx)
+        # #4329 : une composition du même paquet vit (lancement à la main ou
+        # tick) ; ne pas créer un porteur qu'elle refuserait.
+        holder = composition_in_progress(ctx, name)
+        if holder:
+            results.append("composition en cours (%s)" % holder)
+            continue
         carrier = _create_carrier(ctx, name, group,
                                   parallel=(index + 1 if len(groups) == 2 else 0))
         if len(groups) == 2:
@@ -845,8 +869,19 @@ def attempts(item: dict) -> list[Attempt]:
     return found
 
 
+def composition_in_progress(ctx: Context, name: str) -> str:
+    """« hôte:pid » du verrou vivant de `name`, ou "" (#4329)."""
+    holder = auto.composition_holder(ctx.repo, name)
+    return auto.holder_label(*holder) if holder is not None else ""
+
+
 def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
     """Lancer paquet-auto pour une étape, la marque d'intention d'abord."""
+    holder = composition_in_progress(ctx, name)
+    if holder:
+        # #4329 : une composition du même paquet vit (tick ou lancement à la
+        # main) ; ne pas écrire une tentative que son verrou va refuser.
+        return "#%d : composition en cours (%s)" % (carrier, holder)
     mark = "%s%s n=%d base=%s par=%s:%d" % (MARK_ATTEMPT, this.step, this.n,
                                             this.base or "-", ctx.host, ctx.pid)
     if this.step == RECOMPOSITION:
@@ -944,9 +979,13 @@ def lease_epoch() -> int:
         return 0
 
 
-def running(ctx: Context, this: Attempt) -> bool:
+def running(ctx: Context, this: Attempt, name: str = "") -> bool:
     if this.failed:
         return False
+    # #4329 : un verrou vivant, même sans marque de tentative (composition
+    # lancée hors du tic), fait compter la composition comme en cours.
+    if name and composition_in_progress(ctx, name):
+        return True
     if this.host == ctx.host:
         return this.pid == ctx.pid or ctx.alive(this.pid)
     if this.epoch and ctx.epoch:
@@ -960,8 +999,13 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
     """Une tentative sans aboutissement : attendre, relancer, ou prévenir une fois."""
     carrier = int(item["id"])
     branch = str(item.get("branch") or "")
-    name = branch[len(auto.PACKAGE_PREFIX):]
-    if running(ctx, this):
+    name = auto.package_name(branch)
+    holder = composition_in_progress(ctx, name) if name else ""
+    if holder:
+        # #4329 : le verrou du paquet prime le pid de la marque, qui peut être
+        # celui d'une tentative morte.
+        return "#%d : composition en cours (%s)" % (carrier, holder)
+    if running(ctx, this, name):
         return "#%d : %s en cours (%s:%d)" % (carrier, this.step, this.host, this.pid)
     if this.fenced:
         # #4245 : refus de garde, non concluant : même numéro de tentative,
@@ -1049,26 +1093,31 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
                  % (carrier, name, step, ctx.epoch, this.n, MAX_ATTEMPTS,
                     auto._tail(result.text, 10)))
         return "#%d : %s non concluante (refus de garde d'époque)" % (carrier, step)
-    if this.publish and result.returncode == auto.PUBLISH_REFUSED \
-            and this.n < MAX_ATTEMPTS:
-        # tête testée non publiable (cible bougée, chaîne) : recomposer tout de suite
-        ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (
-            MARK_FAILED, step, this.n, this.base or "-", result.returncode))
-        ctx.say("#%d : tête testée refusée (%s), recomposition"
-                % (carrier, auto._tail(result.text, 3)))
-        # #3256 C : la recomposition d'un porteur parallèle garde son groupe ;
-        # le repli relit la note du porteur si la tentative ne le portait pas.
-        only = list(this.only)
-        if not only:
-            try:
-                only = carrier_group(show(ctx, carrier))
-            except HoraireError:
-                only = []
-        return attempt(ctx, carrier, name, Attempt(step, this.n + 1, this.base,
-                                                   run_id=this.run_id,
-                                                   exclude=list(this.exclude),
-                                                   only=only,
-                                                   reasons=list(this.reasons)))
+    if this.publish and result.returncode == auto.PUBLISH_REFUSED:
+        if this.n < MAX_ATTEMPTS:
+            # tête testée non publiable (cible bougée, chaîne) : recomposer tout de suite
+            ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (
+                MARK_FAILED, step, this.n, this.base or "-", result.returncode))
+            ctx.say("#%d : tête testée refusée (%s), recomposition"
+                    % (carrier, auto._tail(result.text, 3)))
+            # #3256 C : la recomposition d'un porteur parallèle garde son groupe ;
+            # le repli relit la note du porteur si la tentative ne le portait pas.
+            only = list(this.only)
+            if not only:
+                try:
+                    only = carrier_group(show(ctx, carrier))
+                except HoraireError:
+                    only = []
+            return attempt(ctx, carrier, name, Attempt(step, this.n + 1, this.base,
+                                                       run_id=this.run_id,
+                                                       exclude=list(this.exclude),
+                                                       only=only,
+                                                       reasons=list(this.reasons)))
+    elif result.returncode == auto.IN_PROGRESS_RC:
+        # #4329 : le verrou du paquet est vivant ; ce n'est pas un échec de
+        # composition et le tic n'écrit ni marque d'échec ni courrier.
+        holder = composition_in_progress(ctx, name) or "verrou tenu"
+        return "#%d : composition en cours (%s)" % (carrier, holder)
     if result.returncode != 0:
         ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (
             MARK_FAILED, step, this.n, this.base or "-", result.returncode))
@@ -1136,6 +1185,13 @@ def publish(ctx: Context, item: dict) -> str:
 def follow(ctx: Context, item: dict) -> str:
     """Un porteur horaire ouvert : publier, attendre, ou traiter un rouge."""
     carrier = int(item["id"])
+    name = auto.package_name(str(item.get("branch") or ""))
+    if name:
+        holder = composition_in_progress(ctx, name)
+        if holder:
+            # #4329 : une composition (tick ou lancement à la main) tient le
+            # verrou du paquet ; ne rien publier, retirer ni recomposer avant.
+            return "#%d : composition en cours (%s)" % (carrier, holder)
     sha = frozen_sha(item)
     left = pending(ctx, item, sha)
     if left is not None:
@@ -1177,7 +1233,12 @@ def follow(ctx: Context, item: dict) -> str:
 def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
     carrier = int(item["id"])
     branch = str(item.get("branch") or "")
-    name = branch[len(auto.PACKAGE_PREFIX):]
+    name = auto.package_name(branch)
+    holder = composition_in_progress(ctx, name) if name else ""
+    if holder:
+        # #4329 : ne pas retirer d'unité ni écrire aux auteurs pour une
+        # composition que le verrou dit déjà en cours.
+        return "#%d : composition en cours (%s)" % (carrier, holder)
     run_id = str(run.get("run_id") or "?")
     removed = ", ".join("#%d" % lot for lot in verdict.lots)
     for lot in verdict.lots:
@@ -1362,6 +1423,32 @@ def alert_schema(ctx: Context, kind: str, what: str, message: str) -> None:
             ctx.say("courrier à %s non envoyé : %s" % (to, auto._tail(sent.text, 5)))
 
 
+def paused(ctx: Context) -> str | None:
+    """#4361 : la pause bornée de la cible, lue au journal partagé ; une
+    lecture impossible n'autorise aucun geste."""
+    if ctx.pause_of is None:
+        return None
+    try:
+        data = ctx.pause_of()
+    except Exception as error:  # noqa: BLE001 - base illisible : aucun geste
+        raise HoraireError("pause illisible (%s) : aucun geste" % error) from error
+    if not data:
+        return None
+    from ameesh import packet_pause
+    return "%s %s : aucun geste" % (ctx.target, packet_pause.describe(data, ctx.zone))
+
+
+def run(ctx: Context) -> str:
+    """Un tic complet : pause d'abord (#4361 : ni migration ni composition
+    pendant un staging hors créneau), puis fraîcheur, schéma et gestes."""
+    held = paused(ctx)
+    if held:
+        return held
+    check_fresh(ctx)
+    align_schema(ctx)
+    return tick(ctx)
+
+
 def tick(ctx: Context) -> str:
     rows = open_lots(ctx)
     carriers = [row for row in rows if is_carrier(row, ctx.project, ctx.target)]
@@ -1463,6 +1550,119 @@ def pose_git_identity(pilot: str) -> dict:
     return env
 
 
+DURATION_RE = re.compile(r"^(\d+)\s*(h|m|min)$")
+CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def parse_until(text: str, now: float, zone: ZoneInfo) -> float:
+    """#4361 : l'échéance d'une pause : durée (`90m`, `2h`), heure locale du
+    canon (`20:15`, prochaine occurrence) ou date ISO (sans fuseau : celui du
+    canon)."""
+    text = (text or "").strip()
+    match = DURATION_RE.match(text)
+    if match:
+        n = int(match.group(1))
+        return now + n * (3600 if match.group(2) == "h" else 60)
+    match = CLOCK_RE.match(text)
+    if match:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        if hour > 23 or minute > 59:
+            raise InputError("heure invalide : %s" % text)
+        base = datetime.fromtimestamp(now, zone).replace(
+            hour=hour, minute=minute, second=0, microsecond=0)
+        when = base.timestamp()
+        if when <= now:
+            when = (base + timedelta(days=1)).timestamp()
+        return when
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        raise InputError("échéance illisible : %r (90m, 2h, 20:15 ou date ISO)" % text) from None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=zone)
+    return when.timestamp()
+
+
+def _connect():
+    from ameesh import config as config_mod, db as db_mod
+    return db_mod.connect(config_mod.load())
+
+
+def read_pause(project: str, target: str) -> dict | None:
+    """#4361 : la pause active de la cible, une lecture par tic."""
+    from ameesh import packet_pause
+    db = _connect()
+    try:
+        return packet_pause.active(db, project=project, target=target)
+    finally:
+        close = getattr(db, "close", None)
+        if close:
+            close()
+
+
+def _zone() -> tuple[ZoneInfo, object]:
+    from ameesh import config as config_mod, mechanics
+    rules = mechanics.configured(config_mod.load())
+    return ZoneInfo(rules.timezone), rules
+
+
+def tell(shell: Shell, pilot: str, body: str) -> None:
+    """La pause et sa levée sont dites au pilote et au bureau (#4361)."""
+    for to in dict.fromkeys((pilot, BUREAU)):
+        sent = shell.run(["agent-mail", "send", to, "-"], input_text=body, timeout=120)
+        if sent.returncode != 0:
+            print("courrier à %s non envoyé : %s" % (to, auto._tail(sent.text, 5)),
+                  file=sys.stderr)
+
+
+def main_pause(args, *, connect=_connect, shell: Shell | None = None,
+               now: float | None = None) -> int:
+    """`pause`, `resume`, `status` (#4361) : l'état vit au journal partagé."""
+    from ameesh import packet_pause
+    try:
+        zone, _ = _zone()
+    except Exception as error:  # noqa: BLE001 - sans canon, aucune heure sûre
+        print("paquet-horaire : fuseau du canon compilé illisible (%s)" % error,
+              file=sys.stderr)
+        return 1
+    now = time.time() if now is None else now
+    by = args.by or os.environ.get("AGENT_MAIL_NAME") or os.environ.get("AMEESH_ROLE") \
+        or os.environ.get("USER") or "inconnu"
+    try:
+        db = connect()
+    except Exception as error:  # noqa: BLE001 - base injoignable
+        print("paquet-horaire : base injoignable (%s)" % error, file=sys.stderr)
+        return 1
+    where = "%s/%s" % (args.project, args.target)
+    try:
+        if args.command == "status":
+            data = packet_pause.active(db, project=args.project, target=args.target, now=now)
+            print("%s : %s" % (where, packet_pause.describe(data, zone) if data
+                               else "aucune pause, le tic compose"))
+            return 0
+        if args.command == "resume":
+            before = packet_pause.active(db, project=args.project, target=args.target, now=now)
+            packet_pause.resume(db, project=args.project, target=args.target, by=by)
+            text = "paquet horaire %s : pause levée par %s%s" % (
+                where, by, "" if before else " (aucune pause active)")
+        else:
+            until = parse_until(args.until, now, zone)
+            data = packet_pause.pause(db, project=args.project, target=args.target,
+                                      until=until, reason=args.reason, by=by, now=now)
+            text = "paquet horaire %s : %s ; le tic reprend seul à l'échéance " \
+                   "(`paquet-horaire.py resume` pour lever avant)" % (
+                       where, packet_pause.describe(data, zone))
+    except InputError as error:
+        print("paquet-horaire : %s" % error, file=sys.stderr)
+        return 2
+    except packet_pause.PauseError as error:
+        print("paquet-horaire : pause refusée : %s" % error, file=sys.stderr)
+        return 2
+    print(text, flush=True)
+    tell(shell or Shell(), args.pilot, text)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Paquet horaire déclenché par minuterie, sans agent (#3845).")
@@ -1478,17 +1678,29 @@ def main(argv: list[str] | None = None) -> int:
                        help="motif au manifeste, apparié par ordre aux --exclude")
     for each in (one, again):
         each.add_argument("--repo", default=".", help="clone du projet (défaut : .)")
-        each.add_argument("--target", default="main")
-        each.add_argument("--project", default="ameesh")
-        each.add_argument("--pilot", default="mesh-design",
-                          help="destinataire des courriers et assigné du porteur")
         each.add_argument("--actor", default=None,
                           help="auteur des gestes (défaut : AMEESH_ROLE, sinon --pilot)")
         each.add_argument("--python", default=None,
                           help="interpréteur des scripts enfants (défaut : celui-ci)")
         each.add_argument("--dry-run", action="store_true",
                           help="lire et dire, sans créer, pousser, noter ni écrire")
+    hold = sub.add_parser("pause", help="#4361 : suspendre le tic jusqu'à une échéance")
+    hold.add_argument("--until", required=True,
+                      help="échéance obligatoire : 90m, 2h, 20:15 (canon) ou date ISO")
+    hold.add_argument("--reason", required=True, help="raison, dite au tic et au pilote")
+    lift = sub.add_parser("resume", help="#4361 : lever la pause avant l'échéance")
+    look = sub.add_parser("status", help="#4361 : la pause active, s'il y en a une")
+    for each in (one, again, hold, lift, look):
+        each.add_argument("--target", default="main")
+        each.add_argument("--project", default="ameesh")
+        each.add_argument("--pilot", default="mesh-design",
+                          help="destinataire des courriers et assigné du porteur")
+    for each in (hold, lift, look):
+        each.add_argument("--by", default=None,
+                          help="auteur (défaut : AGENT_MAIL_NAME, AMEESH_ROLE, USER)")
     args = parser.parse_args(argv)
+    if args.command in ("pause", "resume", "status"):
+        return main_pause(args)
     repo = Path(args.repo).resolve()
     if not (repo / ".git").exists():
         print("paquet-horaire : --repo %s n'est pas un clone" % repo, file=sys.stderr)
@@ -1496,9 +1708,7 @@ def main(argv: list[str] | None = None) -> int:
     actor = args.actor or os.environ.get("AMEESH_ROLE") or args.pilot
     pose_git_identity(args.pilot)
     try:
-        from ameesh import config as config_mod, mechanics
-        document = mechanics.configured(config_mod.load())
-        zone = ZoneInfo(document.timezone)
+        zone, document = _zone()
         unit_tests = getattr(document, "packet_tests", None)
         parallel = getattr(document, "paquet", None)
     except Exception as error:  # noqa: BLE001 - sans canon, aucune heure sûre
@@ -1509,15 +1719,17 @@ def main(argv: list[str] | None = None) -> int:
                   pilot=args.pilot, actor=actor, shell=Shell(),
                   python=args.python or auto.project_python(repo),
                   dry_run=args.dry_run, zone=zone, epoch=lease_epoch(),
-                  unit_tests=unit_tests, parallel=parallel)
+                  unit_tests=unit_tests, parallel=parallel,
+                  pause_of=lambda: read_pause(args.project, args.target))
     try:
-        check_fresh(ctx)
-        align_schema(ctx)
         if args.command == "recompose":
+            # geste explicite du pilote (#4237) : la pause (#4361) ne vise que le tic
+            check_fresh(ctx)
+            align_schema(ctx)
             print(pilot_recompose(ctx, args.carrier, args.exclude, args.exclude_reason),
                   flush=True)
         else:
-            print(tick(ctx), flush=True)
+            print(run(ctx), flush=True)
         return 0
     except InputError as error:
         print("paquet-horaire : %s" % error, file=sys.stderr)

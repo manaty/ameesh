@@ -65,9 +65,9 @@ precedence over the local branch. The CLI does not fetch or attest remote
 freshness. A landing coordinator must fetch, reserve and recheck the remote
 target before applying a batch. A mismatch of the supplied SHA and the clone's
 target is refused. A target ref moving during allocation rolls the transaction
-back. Reservations at an earlier SHA of this key become `released` when a new
-SHA is used for reservation, but only if the original SHA is an ancestor
-of the new target and the number is absent from its migration directory.
+back. Reservations at an earlier SHA remain `reserved` when their number is
+absent from the new target. Target requalification never releases a reservation
+of an open lot; these numbers still contribute to the allocation maximum (#4430).
 When the ancestor's number is already present, the record becomes `landed`,
 including when another lot reserves before the landing caller reports success.
 Reservations whose SHA is not an ancestor remain active and contribute to the
@@ -122,7 +122,7 @@ already applied and immutable, so its header's older claim that the last
 applied leaves the same state is superseded by this paragraph. Explicit
 cleanup and landing remain possible after the lot is closed or merged. The
 reservation stays active across freeze, review and lot-state changes until
-explicitly landed, released, or invalidated by target requalification.
+explicitly landed or released, or the lot enters a terminal state.
 
 Migration `0419_migration_reservation_slots.sql` adds the reservation table,
 a partial unique index on reserved numbers and a trigger for the old
@@ -133,7 +133,15 @@ the Git default branch. That reservation conservatively occupies its number
 on every target of the repository until a target is set or the legacy record
 is released/landed. A SQL guard serializes this overlap check with named slots,
 so an absent project or target cannot bypass uniqueness. They keep the original CLI lifecycle. New named
-slots always have a pinned SHA and use the explicit lifecycle above.
+slots always have a pinned SHA and use the explicit lifecycle above. Releasing
+a legacy primary number never promotes a named slot to `default`: the named
+slot keeps its number, identity and status. A legacy allocation with no primary
+number and active named slots is refused; use the named slot API instead.
+
+Packet candidates adding numbered SQL migrations must hold an active reservation
+on that repository and target. A missing reservation produces a
+`migration-collision` cause; an unreadable registry is a candidate read error.
+Modifying an existing historical migration does not require a new reservation.
 
 The named allocator takes a repository advisory lock (unknown legacy targets
 span branches), then the target lock, then affected lot rows in id order.

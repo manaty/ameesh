@@ -265,7 +265,7 @@ _CLOSED_PRIORITY = ("merged", "promoted", "closed")
 #: L165b : un lot qui attend un autre que son agent (`qa`, `waiting_human`,
 #: `blocked`) ne l'occupe pas — même liste que `operations.listing` et
 #: `sous_utilisation.LOTS_WAITING_ON_OTHERS`
-_WAITING_ON_OTHERS = "('qa', 'waiting_human', 'blocked')"
+_WAITING_ON_OTHERS = "('qa', 'validated', 'waiting_human', 'blocked')"
 #: #443, #478 : réservation automatique du prochain numéro libre — un budget
 #: de temps (et non plus un nombre d'essais) et une attente plein jitter
 #: (`uniform(0, min(plafond, base·2^n))`) bornée au budget restant, pour que
@@ -978,7 +978,7 @@ class WorkItems(interface.WorkItems):
         # lot qui quitte qa (reprise, correction) la perd — sa prochaine revue
         # est due.
         waiver = has_reviewer(self.db)
-        sql = sql.replace("__WAIVER__", ", reviewer = CASE WHEN reviewer = %s AND %s <> 'qa'"
+        sql = sql.replace("__WAIVER__", ", reviewer = CASE WHEN reviewer = %s AND %s NOT IN ('qa', 'validated')"
                                         " THEN '' ELSE reviewer END" if waiver else "")
         params = ((state, loops, state, state)
                   + ((REVIEWER_NONE, state) if waiver else ())
@@ -1720,6 +1720,38 @@ class WorkItems(interface.WorkItems):
                 "       wake_claim_at = NULL, updated_at = now() WHERE id = %s",
                 (float(wake_ts), int(item_id)))
 
+    def update_generated(self, item_id, *, title, body, priority, note,
+                         actor) -> dict | None:
+        """#4291 : titre et corps générés, priorité seulement montée."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT %s FROM work_items WHERE id = %%s AND state NOT IN %s"
+                " FOR NO KEY UPDATE" % (item_columns(self.db, "work_items"), _CLOSED),
+                (int(item_id),))
+            if not rows:
+                return None
+            row = rows[0]
+            current = row.get("priority")
+            wanted = current
+            if priority is not None and (current is None or int(priority) < int(current)):
+                wanted = int(priority)
+            if (row.get("title") == title and row.get("body") == body
+                    and wanted == current):
+                return row
+            updated = tx.query(
+                "UPDATE work_items SET title = %%s, body = %%s, priority = %%s,"
+                " updated_at = now() WHERE id = %%s RETURNING %s"
+                % item_columns(self.db, "work_items"),
+                (title, body, wanted, int(item_id)))
+            if not updated:
+                return None
+            if note:
+                tx.execute(
+                    "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+                    " VALUES (%s, %s, %s, %s)",
+                    (int(item_id), updated[0]["state"], note, actor or ""))
+            return updated[0]
+
     def schedule_wake(self, item_id, wake_ts, *, text, actor) -> dict | None:
         """#2466 : pose (ou efface) le réveil programmé et journalise, atomique."""
         if not has_wake_at(self.db):
@@ -1966,9 +1998,15 @@ class WorkItems(interface.WorkItems):
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
             milestone = rows[0]
+            if (kind == "verdict" and items and items[0]["state"] == "validated"
+                    and not items[0].get("workflow_ref")):
+                tx.execute("UPDATE work_items SET state = 'qa', updated_at = now()"
+                           " WHERE id = %s", (int(item_id),))
+                WorkItems(tx)._event(int(item_id), "qa",
+                                    "validated → qa — review quorum changed (#4351)", actor)
             if (kind == "frozen" and items
                     and not items[0].get("workflow_ref")
-                    and items[0]["state"] in ("intake", "build")):
+                    and items[0]["state"] in ("intake", "build", "validated")):
                 # #3467: freezing enters review before the designation hook.
                 # #3489: pinned lots keep their Process state; work.move
                 # rejects them. The milestone and designation still apply.
@@ -1980,7 +2018,9 @@ class WorkItems(interface.WorkItems):
                     work.move(tx, item_id, "build", actor=actor,
                               note="intake → build — frozen (#3467)")
                 work.move(tx, item_id, "qa", actor=actor,
-                          note="build → qa — frozen (#3467)")
+                          note=("validated → qa — frozen (#4351)"
+                                if items[0]["state"] == "validated"
+                                else "build → qa — frozen (#3467)"))
             if kind == "verdict" and items:
                 from ... import merge_queue, train_events
                 item = items[0]
@@ -2168,10 +2208,11 @@ class WorkItems(interface.WorkItems):
         """Libère le numéro `number` (None : tous) du lot, et rend sa ligne.
 
         Le scalaire est la réservation principale ; s'il est libéré alors que
-        d'autres créneaux restent, le plus petit d'entre eux est promu et son
+        d'autres créneaux legacy restent, le plus petit est promu et son
         créneau libéré AVANT l'UPDATE du scalaire : le déclencheur
         `work_items_migration_slot_sync` réécrit alors le créneau `default`
-        sans rencontrer le doublon du créneau promu."""
+        sans rencontrer le doublon du créneau promu. Les slots nommés restent
+        intacts : leur identité ne devient jamais `default` (#4430)."""
         numbers = sorted({int(row["number"]) for row in slots})
         if scalar is not None and int(scalar) not in numbers:
             numbers.append(int(scalar))
@@ -2192,7 +2233,10 @@ class WorkItems(interface.WorkItems):
                 "UPDATE work_items SET migration = NULL, migration_repo = NULL,"
                 "       updated_at = now() WHERE id = %s", (int(item_id),))
         elif scalar is not None and target == int(scalar):
-            remaining = [row for row in slots if int(row["number"]) != target]
+            remaining = [row for row in slots if int(row["number"]) != target
+                         and (row["slot"] == "default" or (
+                             row["slot"] == "legacy-%d" % int(row["number"])
+                             and row.get("target_sha") is None))]
             promoted = remaining[0] if remaining else None
             if table:
                 for row in slots:
@@ -2280,7 +2324,7 @@ class WorkItems(interface.WorkItems):
                     slots = []
                     if has_migration_slots(tx):
                         slots = tx.query(
-                            "SELECT slot, number, target_repo"
+                            "SELECT slot, number, target_repo, target_sha"
                             "  FROM work_migration_reservations"
                             " WHERE work_item_id = %s AND status = 'reserved'"
                             " ORDER BY number, slot", (int(item_id),))
@@ -2323,6 +2367,10 @@ class WorkItems(interface.WorkItems):
                             "migration %s released (lot %s %s, #956)" % (
                                 old["migration"], old["id"], old["state"]), actor)
                     if scalar is None and slots:
+                        if any(row["slot"] != "default" and not (
+                                row["slot"] == "legacy-%d" % int(row["number"])
+                                and row.get("target_sha") is None) for row in slots):
+                            raise ValueError("named migration slots require --slot; legacy allocation refused")
                         # état incohérent (scalaire effacé hors API) : le plus
                         # petit créneau redevient la réservation principale
                         first = slots[0]
@@ -2611,7 +2659,7 @@ class WorkItems(interface.WorkItems):
                 return None
             if packet is not None:
                 fields = ("app", "branch", "branch_target", "type")
-                if frozen_id is None or lot[0]["state"] != "qa" \
+                if frozen_id is None or lot[0]["state"] not in ("qa", "validated") \
                         or set(packet) != set(fields) | {"resolved_target"} \
                         or packet["resolved_target"] != target \
                         or any(lot[0][key] != packet[key] for key in fields):

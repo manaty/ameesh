@@ -381,6 +381,40 @@ or unknown piece refuses by name, never by a fallback. Configuration, the
 named refusals, the proof and the rollback are described in
 [`docs/operations/service-train.md`](docs/operations/service-train.md).
 
+### Daily version watch (#3264 A)
+
+`ameesh veille scan` watches the harness and model versions of the mesh. It
+reads each host's installed version (`harness_versions`, probed by the runners
+and by the command itself), the published versions (npm `dist-tags` and
+`time`, or GitHub releases), the models served by the provider and the model
+id actually billed in `turn_costs.model`. Stable and rc releases are watched;
+alpha, beta and other pre-releases are ignored. A published version newer than
+the newest installed one opens **one** evaluation lot per harness, priority 2,
+or priority 1 when the changelog carries an explicit vendor recommendation
+("version X or later"). A later publication updates that lot in place; a lot
+whose evaluated version is already merged, promoted or closed is not reopened.
+
+Everything comes from the host configuration, never from a client name:
+
+```json
+{"veille": {
+  "app": "<project>",
+  "estimate": "6h",
+  "host": "<host that reconciles the lots>",
+  "sources": [
+    {"harness": "<descriptor id>", "npm": "<@org/package>",
+     "changelog": "https://…", "provider": "<discovery source>"}
+  ]}}
+```
+
+`npm` and `releases` (`owner/repo`) are alternatives; `provider` is optional
+and must be a model-list source of `ameesh.discovery` (`anthropic`, `openai`,
+`deepseek`). Without `host`, every host reconciles, serialized by a database
+advisory lock per harness. Each host installs the daily
+`deploy/systemd/ameesh-veille.timer`; `ameesh doctor` warns when a host
+declares `veille.sources` without an active timer. The specification is
+issue #3264 (spec PR manaty/ameesh#3265).
+
 ## Language choice
 
 **Python 3 (stdlib) + `psycopg`, with the `psql` binary as a fallback.**

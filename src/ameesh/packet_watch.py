@@ -52,7 +52,7 @@ import shutil
 import tempfile
 import types
 
-from . import mail, work
+from . import mail, work, work_lifecycle as lifecycle
 
 SCHEMA = "ameesh-packet-watch/1"
 #: délai laissé au composeur après le créneau avant l'alerte
@@ -60,7 +60,7 @@ GRACE_S = 900.0
 #: préfixe des branches de porteur de paquet (`paquet-h-…`, `paquet-84-nexlink`)
 CARRIER_PREFIX = "integration/paquet"
 #: états d'un porteur ouvert
-OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
+OPEN_STATES = ("intake", "build", *lifecycle.TO_VALIDATE, "blocked", "waiting_human")
 #: porteurs fusionnés relus pour « vient d'être fusionné »
 RECENT_MERGED = 50
 

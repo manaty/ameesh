@@ -628,6 +628,24 @@ class Catalog(Domain):
         """Les lignes qui portent ce modèle, tous fournisseurs confondus."""
 
 
+class Veille(Domain):
+    """Le relevé précédent de la veille des versions (#4291, migration 0512).
+
+    La présence au catalogue partagé n'en est pas un : `models discover` y
+    écrit avant la veille. Ce domaine est la référence durable propre à la
+    veille, par harnais et fournisseur.
+    """
+
+    @abc.abstractmethod
+    def readings(self, harness: str, provider: str) -> list[str]:
+        """Les modèles déjà vus par la veille pour ce harnais et fournisseur."""
+
+    @abc.abstractmethod
+    def record_readings(self, harness: str, provider: str,
+                        model_ids: Sequence[str]) -> int:
+        """Enregistre le relevé courant : une ligne par modèle, `last_seen` avance."""
+
+
 class PendingSpend(Domain):
     """Marqueur comptable d'un tour (`spend_pending`) : une ligne par agent.
 
@@ -796,6 +814,13 @@ class TurnCosts(Domain):
         hors lignes écartées : `{agent, harness, account, ts, usd}`. Sert à
         rapprocher l'estimation des baisses de solde compte par compte et
         intervalle par intervalle (`CostBook.paid_spent`)."""
+
+    @abc.abstractmethod
+    def models_used(self, harness: str, from_ts: float, *, limit: int = 50) -> list[dict]:
+        """#4291 : les modèles distincts réellement facturés pour ce harnais
+        depuis `from_ts` (epoch), hors lignes écartées et hors appareils
+        médiés : `{model, turns, first_ts, last_ts}`, du plus récent au plus
+        ancien. Lecture seule, bornée par `limit`."""
 
     @abc.abstractmethod
     def unpriced(self, since_ts: float, prefix: str) -> list[dict]:
@@ -1182,13 +1207,20 @@ class ProviderCredits(Domain):
     hôtes — le solde prépayé est celui du fournisseur. Les lignes ne portent
     que des noms, une raison courte et le texte d'erreur borné du
     fournisseur : jamais de secret ni d'invite. Instants de la base (`now()`).
+
+    #4166 : `low` s'évalue sur un **montant de référence** — le prépayé
+    déclaré par un humain, sinon le dernier sommet de la série de soldes — et
+    un solde projeté (dépense réglée) ou réel (API du fournisseur). L'état et
+    son instant (`since`) sont la clé d'alerte ; `balance_usd`, `ratio` et
+    `runway_ts` sont le dernier relevé, pour l'affichage et les alertes.
     """
 
     @abc.abstractmethod
     def get(self, harness: str, account: str) -> dict | None:
         """La ligne du compte (`state`, `since_ts`, `checked_ts`,
-        `next_probe_ts`, `reason`, `detail`, `source`, `agent`, `host`),
-        None si le compte n'a jamais été vu."""
+        `next_probe_ts`, `reason`, `detail`, `source`, `agent`, `host`, et
+        #4166 `prepaid_usd`, `prepaid_ts`, `prepaid_by`, `balance_usd`,
+        `ratio`, `runway_ts`), None si le compte n'a jamais été vu."""
 
     @abc.abstractmethod
     def listing(self) -> list[dict]:
@@ -1197,17 +1229,57 @@ class ProviderCredits(Domain):
     @abc.abstractmethod
     def mark_exhausted(self, harness: str, account: str, *, reason: str,
                        detail: str | None, source: str, agent: str | None,
-                       host: str | None, probe_after_s: float) -> bool:
+                       host: str | None, probe_after_s: float,
+                       balance_usd: float | None = None,
+                       ratio: float | None = None,
+                       runway_ts: float | None = None) -> bool:
         """Pose `exhausted` (prochaine sonde dans `probe_after_s`). Vrai si
         c'est une **transition** (le compte n'était pas déjà épuisé) ; sinon
         seuls l'heure du contrôle et le détail sont actualisés — l'échéance de
-        sonde n'avance que par `claim_probe`."""
+        sonde n'avance que par `claim_probe`. Le relevé (#4166) est facultatif
+        et n'écrase pas l'ancien quand il est absent."""
+
+    @abc.abstractmethod
+    def mark_low(self, harness: str, account: str, *, reason: str,
+                 detail: str | None, source: str, agent: str | None,
+                 host: str | None, balance_usd: float | None,
+                 ratio: float | None, runway_ts: float | None,
+                 allow_from_exhausted: bool = True) -> bool:
+        """Pose `low` avec le relevé qui l'a décidé. Vrai si c'est une
+        **transition** (depuis `ok` ou, si `allow_from_exhausted`, depuis
+        `exhausted` : des crédits sont revenus, mais bas) ; un compte déjà
+        `low` garde son `since` (une seule alerte par épisode) et ne voit que
+        son relevé actualisé. Avec `allow_from_exhausted=False`, un compte
+        `exhausted` n'est jamais modifié : les écritures de l'évaluation
+        périodique ne rouvrent pas un compte que seule la sonde rouvre
+        (#4164, B1 cx2/auditeur)."""
 
     @abc.abstractmethod
     def mark_ok(self, harness: str, account: str, *, source: str,
-                agent: str | None = None, host: str | None = None) -> bool:
-        """Pose `ok`. Vrai si c'est une transition depuis `low`/`exhausted`
-        (une seule des écritures concurrentes l'obtient)."""
+                agent: str | None = None, host: str | None = None,
+                balance_usd: float | None = None, ratio: float | None = None,
+                runway_ts: float | None = None,
+                allow_from_exhausted: bool = True) -> bool:
+        """Pose `ok` et le relevé éventuel. Vrai si c'est une transition
+        depuis `low`/`exhausted` (une seule des écritures concurrentes
+        l'obtient). Avec `allow_from_exhausted=False`, un compte `exhausted`
+        n'est jamais rouvert par cette écriture (seule la sonde ou un relevé
+        de solde réel le rouvre)."""
+
+    @abc.abstractmethod
+    def declare_prepaid(self, harness: str, account: str, *, usd: float,
+                        actor: str) -> tuple[bool, float | None]:
+        """Déclare le montant prépayé disponible **maintenant** (un humain) :
+        `prepaid_usd`, `prepaid_at = now()`, `prepaid_by = actor`, et le
+        relevé repart de ce montant. Rend `(changé, ancien montant)`. N'écrit
+        jamais `state` : l'évaluation qui suit décide (et un compte `exhausted`
+        ne repasse `ok` qu'à la sonde, #4164)."""
+
+    @abc.abstractmethod
+    def clear_prepaid(self, harness: str, account: str, *, actor: str
+                      ) -> tuple[bool, float | None]:
+        """Retire la déclaration prépayée (l'état repasse par l'évaluation).
+        Rend `(changé, ancien montant)`."""
 
     @abc.abstractmethod
     def claim_probe(self, harness: str, account: str, interval_s: float) -> bool:
@@ -2327,6 +2399,18 @@ class WorkItems(Domain):
         """
 
     @abc.abstractmethod
+    def update_generated(self, item_id: int, *, title: str, body: str,
+                         priority: int | None, note: str, actor: str) -> dict | None:
+        """#4291 : rafraîchit le titre et le corps **générés** d'un lot ouvert
+        (veille des versions), et ne fait que **monter** la priorité (1 est la
+        plus haute) : une priorité choisie par un humain n'est jamais
+        abaissée par une détection automatique. Écriture et ligne de journal
+        `note` dans la même transaction, sous le verrou de ligne du lot ; une
+        valeur inchangée n'écrit rien. Rend le lot relu, ou None s'il n'existe
+        pas ou n'est plus ouvert.
+        """
+
+    @abc.abstractmethod
     def note_with_wake(self, item_id: int, state: str, text: str, actor: str,
                        wake_ts: float, *, once: bool = False) -> None:
         """#2466 : journalise une note et pose, dans la même transaction, le
@@ -2570,8 +2654,10 @@ class WorkItems(Domain):
                       proof: dict | None = None) -> dict:
         """Écrit un jalon déclaré (`frozen`, `verdict`) et le rend.
 
-        Un gel depuis `intake` ou `build` entre en `qa` avant son callback
-        (#3467), par les transitions ordinaires, dans la même transaction.
+        Un gel depuis `intake`, `build` ou `validated` entre en `qa` avant
+        son callback (#3467/#4351), dans la même transaction. Un verdict
+        retire la validation précédente. Cette tranche de compatibilité ne
+        crée pas de lot `validated` : l’écrivain suivra le staging des lecteurs.
         Un lot épinglé à un Process conserve son état (#3489).
         Un état bloqué ou terminal n'est pas levé par ce geste.
 
@@ -5135,6 +5221,7 @@ class Storage(abc.ABC):
     """Les domaines du stockage, liés à une connexion ou une transaction."""
 
     catalog: Catalog
+    veille: Veille
 
     #: nom du pilote de stockage (`postgres`)
     driver: str

@@ -238,27 +238,20 @@ def record(db, source: BalanceSource, account: str | None = None,
     return rows
 
 
-def _spendable(reading: BalanceReading) -> bool:
-    if reading.available is not None:
-        return bool(reading.available)
-    return float(reading.total) > 0.0
-
-
 def credit_state(db, provider: str, account: str | None,
                  readings: list[BalanceReading]) -> bool | None:
-    """#4164 : un relevé de solde dit aussi l'état des crédits du compte —
-    aucune devise utilisable → `exhausted`, une utilisable → `ok` (s'il était
-    épuisé). La clé du compte fournisseur est (harnais = fournisseur, compte).
-    Une base sans migration 0500 n'empêche pas le relevé."""
+    """#4164/#4166 : un relevé de solde dit aussi l'état des crédits du
+    compte. Aucune devise utilisable → `exhausted` ; sinon `low` (sous 20 %
+    de la référence, critique sous 5 %, ou épuisement projeté à moins de 24 h)
+    ou `ok`. La référence est le prépayé déclaré, sinon le dernier sommet de
+    la série de soldes. La clé du compte fournisseur est (harnais =
+    fournisseur, compte). Une base sans migration 0500/0504 n'empêche pas le
+    relevé."""
     from . import db as db_mod, provider_credits
     if not readings:
         return None
-    usable = [r for r in readings if _spendable(r)]
-    ref = usable[0] if usable else readings[0]
     try:
-        return provider_credits.from_balance(
-            db, provider, account or "", ref.total if usable else min(0.0, ref.total),
-            ref.currency)
+        return provider_credits.from_readings(db, provider, account or "", readings)
     except db_mod.Unavailable:
         raise
     except db_mod.DbError:

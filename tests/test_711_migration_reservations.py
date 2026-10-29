@@ -126,7 +126,7 @@ class ScopedReservationsTest(PgTestCase):
         self.assertIn("lot #%d" % self.a['id'], str(refused.exception))
         self.assertIsNone(work.get(self.db, self.b['id'])['migration'])
 
-    def test_target_advance_releases_other_lots_and_requalifies_slots(self):
+    def test_target_advance_preserves_other_lots_and_requalifies_slots(self):
         old = self.reserve(slots=('schema', 'backfill'))
         self.reserve(self.b)
         self.advance('380_other.sql')
@@ -135,8 +135,73 @@ class ScopedReservationsTest(PgTestCase):
         refreshed = self.reserve(slots=('schema', 'backfill'))
         self.assertEqual([r['number'] for r in refreshed], [381, 382])
         self.assertEqual([r['id'] for r in refreshed], [r['id'] for r in old])
-        self.assertEqual(reservations.listing(self.db, self.b['id'])[0]['status'], 'released')
+        self.assertEqual(reservations.listing(self.db, self.b['id'])[0]['status'], 'reserved')
         self.assertEqual(self.reserve(self.b)[0]['number'], 383)
+
+    def test_unmerged_ancestors_keep_their_numbers_after_target_advance(self):
+        a = self.reserve()[0]
+        b = self.reserve(self.b)[0]
+        self.advance('100_unrelated.sql')
+        c = self.reserve(self.lot('c'))[0]
+        self.assertEqual(c['number'], 379)
+        self.assertEqual(reservations.listing(self.db, self.a['id']), [a])
+        self.assertEqual(reservations.listing(self.db, self.b['id']), [b])
+        work.close(self.db, self.a['id'], abandoned=True, actor='dev')
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'released')
+
+    def test_legacy_release_preserves_named_slot_identity(self):
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 509, repo=self.repo)
+        named = self.reserve(slots=('pending-decisions',))[0]
+        self.assertEqual(named['number'], 510)
+        work.reserve_migration(self.db, self.a['id'], 509, release=True, repo=self.repo)
+        rows = {r['slot']: r for r in reservations.listing(self.db, self.a['id'])}
+        self.assertEqual(rows['default']['status'], 'released')
+        self.assertEqual(rows['default']['number'], 509)
+        self.assertEqual(rows['pending-decisions'], named)
+        self.assertIsNone(work.get(self.db, self.a['id'])['migration'])
+        with self.assertRaisesRegex(work.WorkError, 'require --slot'):
+            work.reserve_migration(self.db, self.a['id'], 511, repo=self.repo)
+        self.assertEqual(reservations.listing(self.db, self.a['id']),
+                         sorted(rows.values(), key=lambda r: (r['number'], r['slot'])))
+
+    def test_named_slot_with_legacy_shaped_name_is_not_promoted(self):
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 509, repo=self.repo)
+        named = self.reserve(slots=('legacy-510',))[0]
+        work.reserve_migration(self.db, self.a['id'], 509, release=True, repo=self.repo)
+        rows = {r['slot']: r for r in reservations.listing(self.db, self.a['id'])}
+        self.assertEqual(rows['legacy-510'], named)
+        self.assertIsNone(work.get(self.db, self.a['id'])['migration'])
+
+    def test_coverage_requires_active_reservation_of_this_lot_and_target(self):
+        self.reserve()
+        self.reserve(self.b)
+        def missing(lot, numbers, branch='develop'):
+            return reservations.uncovered(self.db, lot['id'], numbers,
+                                          repository='manaty/nexlink', target_branch=branch)
+        self.assertEqual(missing(self.a, [377, 378, 400]), [378, 400])
+        self.assertEqual(missing(self.a, [377], 'other'), [377])
+        self.reserve(action='release')
+        self.assertEqual(missing(self.a, [377]), [377])
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo)
+        self.assertEqual(missing(self.a, [400]), [])
+
+    def test_named_reservation_retries_a_deadlock(self):
+        from ameesh.storage.postgres.migration_reservations import MigrationReservations
+        real = MigrationReservations.lock_target
+        calls = []
+        def lock(api, repo, branch):
+            calls.append(1)
+            if len(calls) == 1:
+                raise DbError('deadlock detected', sqlstate='40P01')
+            return real(api, repo, branch)
+        with mock.patch.object(MigrationReservations, 'lock_target', lock):
+            row = self.reserve()[0]
+        self.assertEqual(row['number'], 377)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(len(reservations.listing(self.db, self.a['id'])), 1)
 
     def test_landed_requires_numbers_in_descendant_target_and_keeps_history(self):
         first = self.reserve(slots=('schema', 'backfill'))

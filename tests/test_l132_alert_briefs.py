@@ -83,6 +83,12 @@ class BriefsTest(unittest.TestCase):
         self.assertLess(text.index("ameesh work dependencies 42"),
                         text.index("ameesh mail send dev1"))
 
+    def test_validated_lot_is_still_a_packet_candidate(self):
+        candidate = dict(STALE, lot_state="validated", waiting_for="fusion")
+        text = alert_briefs.briefs(candidate, self.listing, auditor_names=["auditeur"])["orch"]
+        self.assertIn("candidate for its merge packet/queue", text)
+        self.assertNotIn("ameesh mail send dev1", text)
+
     def test_stale_lot_candidat_de_paquet_ne_propose_pas_de_relance(self):
         """#1773 : en qa, une attente de fusion (gel + verdict acquis) est un
         candidat de paquet : le brief ne propose ni relance ni réassignation —

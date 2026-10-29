@@ -131,9 +131,8 @@ def report() -> None:
 
 class GenericCoreTest(unittest.TestCase):
     def test_core_does_not_import_module_implementations(self):
-        # Legacy generic storage adapters; replace through the registry in L98.
-        exceptions = Counter({("mesh_cli.py", "module-import"): 1,
-                              ("work.py", "module-import"): 1})
+        # L98 T3 (#4406): the legacy adapters read through the registry.
+        exceptions = Counter()
         actual = Counter({key: count for key, count in scan_core().items()
                           if key[1] == "module-import"})
         self.assertFalse(actual - exceptions,
@@ -172,14 +171,14 @@ class GenericCoreTest(unittest.TestCase):
                          {"state:qa": 1})
 
     def test_legacy_terminal_and_completed_semantics_remain_distinct(self):
-        self.assertEqual(work.STATES, ("intake", "build", "qa", "merged", "promoted",
+        self.assertEqual(work.STATES, ("intake", "build", "qa", "validated", "merged", "promoted",
                                        "blocked", "waiting_human", "closed"))
         self.assertEqual(work.TERMINAL, ("promoted", "closed"))
         self.assertEqual(work.COMPLETED, ("merged", "promoted", "closed"))
         self.assertEqual(work.DELIVERED, work.MERGED_STATES)
         self.assertEqual(work.ACTIVE, ("intake", "build"))
         self.assertEqual(work.WAITING, {"blocked", "waiting_human"})
-        self.assertEqual(work.TO_VALIDATE, "qa")
+        self.assertEqual(work.TO_VALIDATE, ("qa", "validated"))
         self.assertEqual(registry.merge_connector(), "git-merge")
         for state in work.TERMINAL:
             self.assertFalse(work.TRANSITIONS[state])

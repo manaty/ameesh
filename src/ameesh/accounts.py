@@ -2480,6 +2480,16 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     active = by_name(items, active_name) or items[0]
     # L226b : un compte en échec d'authentification n'est jamais choisi
     sick = auth_failure.failing(db, host, harness)
+    # #4166 : un compte fournisseur épuisé n'est jamais choisi non plus. Un
+    # autre compte déclaré du harnais le remplace (le repli, sans geste) ; s'il
+    # n'en reste aucun, le compte épuisé est rendu tel quel pour que la garde
+    # `provider_credits_exhausted` de l'exécuteur s'applique (sonde bornée
+    # comprise), comme un compte en échec d'authentification est rendu.
+    from . import provider_credits
+    try:
+        epuises = provider_credits.exhausted_names(db, harness)
+    except db_mod.DbError:
+        epuises = set()
     # L226b/#1883 (R1 auditeur, B1) : les retenues d'overage publiées par les
     # AUTRES processus de l'hôte priment sur tout placement — forçage,
     # continuité comme classement. Un compte facturé au-delà du plan ne reçoit
@@ -2510,8 +2520,17 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         écartés priment sur le forçage, la continuité et le classement.
         Les jeux sont relus à l'instant du placement (R2 auditeur, B1)."""
         nonlocal row, cache
-        candidates = healthy(items, sick)
+        candidates = [p for p in healthy(items, sick) if p.name not in epuises]
         ecartes = retenus | conflits
+
+        def stuck_exhausted(own: Profile | None) -> Profile | None:
+            """Le compte épuisé à rendre quand aucun autre n'est plaçable : la
+            garde de l'exécuteur le retient (et sa sonde bornée passe)."""
+            for profil in (own, active, *items):
+                if (profil is not None and profil.name in epuises
+                        and profil.name not in ecartes):
+                    return profil
+            return None
 
         # 1. forçage manuel : il prime, même sur la continuité (un compte forcé en
         # échec d'authentification est rendu tel quel : la garde de l'exécuteur
@@ -2527,6 +2546,10 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                 return Choice(None, profile, reason=(
                     "account %s forced (ameesh accounts use): in overage for another "
                     "runner of this host" % profile.name), forced=True)
+            if profile.name in epuises:
+                return Choice(None, profile, reason=(
+                    "account %s forced (ameesh accounts use): provider credits "
+                    "exhausted" % profile.name), forced=True)
             if current.ok or (not paced and current.unpaced_ok):
                 return Choice(profile, profile, forced=True,
                               why="forced (ameesh accounts use)")
@@ -2546,14 +2569,25 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                     and p.name not in ecartes
                     and placeable(ev(p), now)
                     and (ev(p).ok if paced else ev(p).unpaced_ok)]
+            # #4166 : le motif de la levée dit l'épuisement, pas un seuil
+            raison_forcee = (
+                "forced account %s: provider credits exhausted; %s free"
+                % (active.name, free[0].name) if free and active.name in epuises
+                else "forced account %s at threshold (%s); %s free"
+                % (active.name, cache[active.name].reason,
+                   free[0].name if free else "no account"))
             if critical:
                 pass        # L242b : choix propre à l'agent, le forçage reste aux autres
             elif not free:
+                # #4166 : forcer un compte épuisé sans autre compte plaçable ne
+                # donne pas de tour ; la garde des crédits le retient et le dit
+                if active.name in epuises:
+                    return Choice(active, active, forced=True,
+                                  why="forced account %s: provider credits exhausted"
+                                      % active.name)
                 return held
             elif not simulate and not store.set_auto(
-                    host, harness, expected=active.name,
-                    reason="forced account %s at threshold (%s); %s free"
-                    % (active.name, cache[active.name].reason, free[0].name)):
+                    host, harness, expected=active.name, reason=raison_forcee):
                 # #295: the row changed since it was read — a human forced another
                 # account meanwhile: that force holds (never lifted in the same turn)
                 row = store.active(host, harness) or {}
@@ -2567,7 +2601,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         # part pas sur un compte facturé au-delà du plan (R1 auditeur, B1).
         own = by_name(items, session_account) if session_account else None
         if (own is not None and own in candidates and own.name not in ecartes
-                and ev(own).ok):
+                and own.name not in epuises and ev(own).ok):
             return Choice(own, active, kept=True,
                           why="continuity: the session stays on %s, under its "
                               "threshold" % own.name)
@@ -2613,6 +2647,15 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                                   harness, "; ".join("%s: %s" % (p.name, sick[p.name].get(
                                       "reason") or "authentication failing")
                                       for p in items if p.name in sick)))
+            # #4166 : plus aucun compte plaçable, mais un compte épuisé existe —
+            # le rendre plutôt que pauser : la garde des crédits le retient
+            # (aucun tour) et sa sonde bornée peut le rouvrir ; un autre compte
+            # déclaré aurait été choisi ci-dessus (le repli).
+            stuck = stuck_exhausted(own)
+            if stuck is not None:
+                return Choice(stuck, active, why=(
+                    "no %s account to place: provider credits exhausted on %s "
+                    "(bounded probe only)" % (harness, stuck.name)))
             # #1672 : un relevé plus vieux que toute fenêtre encore ouverte est
             # écarté du placement — le dire, plutôt que de le compter comme « au
             # seuil » (le relevé ne mesure plus l'état du compte). C'est une

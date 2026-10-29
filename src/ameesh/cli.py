@@ -2338,6 +2338,10 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         # désignation au gel (« no repository holds the frozen head »).
         for line in hostcheck.packet_watch_lines(cfg):
             print(line)
+        # #3264 A : la veille des versions est un passage quotidien ; sans
+        # minuterie active, aucun lot d'évaluation n'est ouvert.
+        for line in hostcheck.veille_lines(cfg):
+            print(line)
         for line in hostcheck.radar_repo_lines(cfg, db):
             print(line)
     except db_mod.DbError:

@@ -161,6 +161,20 @@ def merge_connector():
     return dev.MERGE_CONNECTOR
 
 
+def admits(db, project, kind):
+    """Whether a module active for ``project`` stores work items of ``kind``.
+
+    L98 T3 (#4406): read for the core (`work add`), without module semantics."""
+    from .storage import ModuleStore
+    return ModuleStore(db).admits(project, kind)
+
+
+def milestones(db, item_id, limit=100):
+    """The module milestones recorded on a work item, newest first (`work show`)."""
+    from .storage import ModuleStore
+    return ModuleStore(db).milestones(item_id, limit)
+
+
 def main(argv):
     """`ameesh modules [--json]`: read-only list of the discovered modules."""
     import argparse

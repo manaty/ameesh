@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import time
 
-from . import sous_utilisation
+from . import sous_utilisation, work_lifecycle as lifecycle
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("host_idle_reserved", "baseline_oversized", "idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
@@ -329,7 +329,7 @@ def _stale_move(alert: dict, lot: int, who: str | None) -> str:
     réassigner ne fait pas avancer la fusion. Le brief le dit — sans retirer
     l'alerte (canon §4 : un lot sans mouvement se signale au pilote) ni les
     portes de clôture, qui restent offertes plus bas."""
-    if alert.get("lot_state") == "qa" and alert.get("waiting_for") == "fusion":
+    if alert.get("lot_state") in lifecycle.TO_VALIDATE and alert.get("waiting_for") == "fusion":
         return ("this lot is frozen with its verdict acquired: it is a candidate for its "
                 "merge packet/queue — no author action, do not nudge its assignee or "
                 "reassign it; the composer/pilot carries the merge and can declare the "

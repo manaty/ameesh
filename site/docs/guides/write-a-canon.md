@@ -44,6 +44,31 @@ rules injected into each agent's brief. A card may also carry an executable
 `workflow:` block, whose data is compiled to the native
 `process-workflow/1` schema; see [Write a Process card](write-a-process.md).
 
+A `pipelines/` folder holds **Pipeline cards** (`type: Pipeline`): a pipeline
+declared as data, without Python code. The card carries `title`,
+`responsible` (a `human:<id>` Member), `updated` (YYYY-MM-DD), an optional
+`name` (default: the file name without `.md`; letters, digits, `.`, `_`, `-`)
+and a `pipeline:` block written exactly like a Process card's `workflow:`
+block. `workflow:` is accepted as a transitional alias, never together with
+`pipeline:`. `ameesh canon check` compiles the block: a refused block, a
+missing key, a name outside the grammar, a duplicate name or a card outside
+`pipelines/` is a `pipeline-*` error, which fails the check without blocking
+any agent.
+
+```markdown
+---
+type: Pipeline
+title: Support after-sales
+name: support-work-delivery
+responsible: human:alice
+updated: 2026-10-28
+pipeline:
+  schema: process-workflow/1
+  initial: new
+  # types, stages, transitions, projection: as in a Process card
+---
+```
+
 ## 2. Humans
 
 ```yaml title="membres/alice.md"
