@@ -59,6 +59,10 @@ CHECKS = (
     # L161a : un module qui lit docs/ ou site/ est déclaré lecteur de la doc
     ("doc readers L161a", ["-m", "unittest", "-q",
                            "tests.test_l161a_ci_sans_code.ReadersTest"]),
+    # #4521 : un alias `sys.modules` vers une implémentation de module ne peut
+    # pas tomber dans une classe de relecture plus faible que son ancien chemin
+    # (les `modules/dev/**` déplacés par L100 tombent au défaut léger).
+    ("alias de module #4521", ["scripts/garde-alias-classe.py", "--root", "."]),
 )
 #: #3687 : les modules de contrat de la porte de fusion (avis, auteurs, feu,
 #: désignation, report des verdicts) ; seules leurs classes sans base tournent
