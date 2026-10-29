@@ -1082,9 +1082,18 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if publication_error:
             out["production_scope_error"] = publication_error
         inherited = tuple((vehicle or {}).get("admitted_heads") or ())
-        scopes = tuple(admitted_heads) + inherited + ((production,) if production else ())
+        from . import review_authors
+        # #4478 : les têtes gelées des parents d'empilement sont hors du
+        # périmètre de relecture de l'enfant, comme celles des membres admis
+        # (#3513) : leurs commits ont été relus dans le parent. La porte et sa
+        # trace de provenance partent donc de la même borne.
+        stacked = tuple(
+            {"head": sha, "reason": "stacked-parent", "ref": "parent"}
+            for sha in (review_authors.stacked_parent_heads(db, item, repo, frozen)
+                        if db is not None and repo and item else ()))
+        scopes = (tuple(admitted_heads) + inherited + stacked
+                  + ((production,) if production else ()))
         if scopes and repo:
-            from . import review_authors
             boundary = (review_authors.target_commit(repo, target or (klass or {}).get("target") or "")
                         or (klass or {}).get("base_sha"))
             if boundary:
@@ -1717,16 +1726,18 @@ def _delta_head(repo, frozen, *, target_repo: str | None = None) -> tuple[str, s
 def _delta_log(repo, row, frozen, *, base: str | None = None,
                base_repo: str | None = None, target: str | None = None,
                target_repo: str | None = None, queue: bool = False,
-               args=()) -> list[str]:
+               args=(), exclude=()) -> list[str]:
     """Les lignes de `git log <args> base..head` (#1515 N1/B3).
 
     Le delta est lu depuis la **base effective** (`_delta_base`, refs privées
     de la file comprises). `args` choisit la lecture : noms Git des auteurs,
     commits de contenu (`--no-merges`) ou auteurs des fusions (`--merges`).
     Une fusion peut ajouter du contenu : son auteur est un auteur du lot et ne
-    peut plus compter comme relecteur indépendant. Lève `_ProvenanceError`
-    quand le gel, la base ou `git log` ne peut pas être lu : la porte refuse,
-    elle n'invente pas une liste partielle."""
+    peut plus compter comme relecteur indépendant. `exclude` nomme des têtes
+    déjà relues ailleurs (parents d'empilement, #4478) : leur histoire sort du
+    delta, fusions comprises. Lève `_ProvenanceError` quand le gel, la base ou
+    `git log` ne peut pas être lu : la porte refuse, elle n'invente pas une
+    liste partielle."""
     if not repo or not frozen:
         return []
     head, head_repo = _delta_head(repo, frozen, target_repo=target_repo)
@@ -1736,6 +1747,9 @@ def _delta_log(repo, row, frozen, *, base: str | None = None,
     if base == head:
         return []
     argv = list(args) + ["%s..%s" % (base, head)]
+    excluded = [str(sha).strip() for sha in exclude or () if str(sha).strip()]
+    if excluded:
+        argv += ["--not", *excluded]
     proc = plan_git._git(head_repo, "log", *argv)
     if proc.returncode != 0 and base_repo != head_repo:
         # Objets non partagés (banc, clone incomplet) : la tête peut aussi
@@ -1768,7 +1782,8 @@ def _unique_names(names) -> list[str]:
 
 def _delta_commits(repo, row, frozen, *, base: str | None = None,
                    base_repo: str | None = None, target: str | None = None,
-                   target_repo: str | None = None, queue: bool = False) -> list[str]:
+                   target_repo: str | None = None, queue: bool = False,
+                   exclude=()) -> list[str]:
     """Les commits de contenu du delta gelé (#1515), fusions exclues.
 
     C'est la plage que lit le lecteur partagé (`review_authors.reading`) et la
@@ -1776,17 +1791,19 @@ def _delta_commits(repo, row, frozen, *, base: str | None = None,
     à part (`_merge_authors`) pour ne pas perdre une résolution."""
     return _unique_names(_delta_log(
         repo, row, frozen, base=base, base_repo=base_repo, target=target,
-        target_repo=target_repo, queue=queue,
+        target_repo=target_repo, queue=queue, exclude=exclude,
         args=("--no-merges", "--format=%H")))
 
 
 def _merge_authors(repo, row, frozen, *, base: str | None = None,
                    base_repo: str | None = None, target: str | None = None,
-                   target_repo: str | None = None, queue: bool = False) -> list[str]:
+                   target_repo: str | None = None, queue: bool = False,
+                   exclude=()) -> list[str]:
     """Les auteurs Git des fusions du delta gelé (#1515 N1/B3)."""
     return _unique_names(_delta_log(
         repo, row, frozen, base=base, base_repo=base_repo, target=target,
-        target_repo=target_repo, queue=queue, args=("--merges", "--format=%an")))
+        target_repo=target_repo, queue=queue, exclude=exclude,
+        args=("--merges", "--format=%an")))
 
 
 def _commit_author(places, sha: str) -> str:
@@ -1954,6 +1971,7 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
             if value:
                 row["families"].add(value)
 
+    parent_heads: tuple = ()
     if db is None:
         # Sans magasin (banc, dry-run), la provenance n'est pas lisible : on
         # garde la lecture Git historique, comme `_corrections_on_freeze`
@@ -1963,8 +1981,15 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
                 target_repo=target_repo, queue=queue, args=("--format=%an",))):
             add(name)
     else:
+        # #4478 : un lot empilé sur la tête gelée d'un parent (prérequis
+        # déclaré ou membre du paquet) ne relit pas les commits du parent ; sa
+        # famille d'auteur n'est pas une famille de cette tête, et la porte ne
+        # peut pas lui opposer un avis rendu par une autre famille. La borne
+        # s'applique aussi aux fusions du parent.
+        parent_heads = review_authors.stacked_parent_heads(db, item, repo, frozen)
         commits = _delta_commits(repo, item, frozen, base=base, base_repo=base_repo,
-                                 target=target, target_repo=target_repo, queue=queue)
+                                 target=target, target_repo=target_repo, queue=queue,
+                                 exclude=parent_heads)
         milestone = _freeze_milestone(marks, frozen, repo)
         reference_families: dict = {}
         try:
@@ -1988,7 +2013,8 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
                 db, item, milestone, commits, repo,
                 families=families, strict=True, families_out=proven_families,
                 reference=reference, reference_families=reference_families,
-                base=base, head=frozen, target=base, recover=recover)
+                base=base, head=frozen, target=base, recover=recover,
+                admitted_heads=parent_heads)
         except Exception as exc:  # noqa: BLE001 - une lecture illisible ne conclut pas
             raise _ProvenanceError(
                 "the authors of the frozen range cannot be read (%s)" % exc) from exc
@@ -2014,7 +2040,8 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
                     "historical author unreadable for the unknown %s" % sha)
             add(fallback)
     for name in _merge_authors(repo, item, frozen, base=base, base_repo=base_repo,
-                               target=target, target_repo=target_repo, queue=queue):
+                               target=target, target_repo=target_repo, queue=queue,
+                               exclude=parent_heads):
         add(name)
     authors: list[dict] = []
     for key, entry in found.items():

@@ -636,51 +636,19 @@ def _repository(db, cfg, item: Mapping, frozen_sha: str, *,
 
 
 def _declared_parent_heads(db, item: Mapping, repo: str, head: str) -> tuple[str, ...]:
-    """Les têtes gelées des prérequis déclarés qui précèdent `head` (#4343).
+    """Les têtes gelées des parents d'empilement qui précèdent `head` (#4343/#4478).
 
-    Un lot empilé sur la tête gelée de son prérequis (`work dependencies`) porte
-    dans la plage lue depuis la cible les commits du parent. Ces commits ont été
-    relus sur la tête du parent : ils ne sont pas des auteurs de l'enfant, et la
-    provenance inconnue d'un commit du parent ne bloque pas l'enfant. On ne
-    retire donc que ce qui est **prouvé** prérequis : une arête explicite du
-    graphe, un gel du parent lisible dans ce dépôt, et l'ascendance de cette
-    tête sur la tête lue. Une lecture impossible (graphe, frise du parent ou
-    objet git) ne retire rien : le doute conserve les auteurs.
+    Un lot empilé sur la tête gelée d'un parent — prérequis déclaré
+    (`work dependencies`) ou membre du même paquet (#3589) — porte dans la
+    plage lue depuis la cible les commits du parent. Ces commits ont été relus
+    sur la tête du parent : ils ne sont pas des auteurs de l'enfant, et la
+    provenance inconnue d'un commit du parent ne bloque pas l'enfant.
 
-    Comme #3513 pour les têtes des membres admis, la borne est une tête gelée,
-    pas la cible : les commits qui la précèdent sont hors de la lecture
-    d'auteurs du lot. Le parent garde sa propre lecture ; l'enfant ne relit que
-    son delta.
+    La lecture est celle du garde d'empilement (`freeze_stack.candidates`),
+    partagée avec la porte de fusion (`review_authors.stacked_parent_heads`) :
+    mêmes parents, même preuve d'ascendance, même doute qui conserve l'auteur.
     """
-    lot = int((item or {}).get("id") or 0)
-    head_full = plan_git.local_commit(repo, str(head or ""))
-    if not lot or not head_full:
-        return ()
-    try:
-        edges = storage.of(db).work_dependencies.for_items([lot]) or ()
-    except Exception:  # noqa: BLE001 - graphe illisible : aucun parent retiré
-        return ()
-    heads: list[str] = []
-    for edge in edges:
-        try:
-            parent = int((edge or {}).get("blocker_id") or 0)
-        except (TypeError, ValueError):
-            continue
-        if not parent or parent == lot:
-            continue
-        try:
-            rows = work.milestones(db, parent) or ()
-        except Exception:  # noqa: BLE001 - frise du parent illisible : aucun retrait
-            continue
-        for row in rows:
-            if str((row or {}).get("kind") or "") != "frozen":
-                continue
-            frozen = plan_git.local_commit(repo, str((row or {}).get("sha") or ""))
-            if not frozen or frozen == head_full or frozen in heads:
-                continue
-            if canon_mod.git_contains(repo, frozen, head_full):
-                heads.append(frozen)
-    return tuple(heads)
+    return review_authors.stacked_parent_heads(db, item, repo, head)
 
 
 def _resolve_base(repo: str, base: str) -> str:
@@ -3094,7 +3062,9 @@ def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping, *,
         _start, _paths, commits = _range(repo, base, sha)
         authors, _unknown, correctors = review_authors.reading(
             db, item, dict(freeze or {}), commits, repo, families=(),
-            base=base, head=sha, target=_target_tip(repo, base), fetch=fetch)
+            base=base, head=sha, target=_target_tip(repo, base), fetch=fetch,
+            admitted_heads=review_authors.stacked_parent_heads(
+                db, item, repo, sha))
     except Exception:  # noqa: BLE001 - plage illisible : comportement historique
         return set()
     return {str(row.get("name") or "").strip().lower()
