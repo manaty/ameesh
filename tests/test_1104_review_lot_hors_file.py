@@ -1032,7 +1032,7 @@ class DeclaredMergeWitnessTest(_Witness):
         proc = self.mesh("work", "merged", str(lot), "--sha", "abcdef1234",
                          "--repo", self.repo)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("lot #%d already merged:" % lot, proc.stdout)
+        self.assertIn("lot #%d already delivered:" % lot, proc.stdout)
         self.assertIn("relecture non ouverte", proc.stdout)
         self.assertNotIn("nothing to do", proc.stdout)
 
