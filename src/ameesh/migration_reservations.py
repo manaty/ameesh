@@ -222,6 +222,23 @@ def listing(db, item_id, slots=None):
     return [record(row) for row in rows]
 
 
+def uncovered(db, item_id, numbers, *, repository, target_branch):
+    """Numbers added by a candidate without an active reservation on its target.
+
+    Read the registry, including legacy records whose target is unknown.
+    A reservation from another lot, branch or repository cannot cover a file;
+    released and landed history is not an active reservation. Read errors
+    propagate so a candidate cannot be declared ready on an unreadable registry.
+    """
+    slug = migrations.repo_key(repository)
+    if not slug:
+        raise work.WorkError('migration coverage needs a repository')
+    branch = merge_queue._remote_branch(target_branch)
+    rows = storage.of(db).migration_reservations.for_target('github.com/' + slug, branch)
+    held = {int(row['number']) for row in rows if int(row['work_item_id']) == int(item_id)}
+    return sorted(set(int(number) for number in numbers) - held)
+
+
 def update(db, item_id, slots, *, target_branch, target_sha, repo=None, action='reserve',
            actor='', cfg=None, reservation_ids=None, repository=None):
     if not slots or len(set(slots)) != len(slots) or any(
@@ -307,7 +324,7 @@ def update(db, item_id, slots, *, target_branch, target_sha, repo=None, action='
                         previous = row['target_sha']
                         if previous and previous != target_sha and _ancestor(checkout, previous, target_sha):
                             requalified[int(row['id'])] = (
-                                'landed' if int(row['number']) in numbers else 'released')
+                                'landed' if int(row['number']) in numbers else 'reserved')
                 result = api.update(
                     item_id, slots, project, canonical, branch, target_sha, max(numbers or {0}) + 1,
                     action=action, actor=actor, expected=expected,

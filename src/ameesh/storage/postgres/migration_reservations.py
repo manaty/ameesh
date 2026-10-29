@@ -95,11 +95,13 @@ class MigrationReservations(Contract):
             if observed is None or active != observed:
                 return {'error': 'target reservation observations changed; retry'}
             changes = requalified or {}
+            if any(status not in ('reserved', 'landed') for status in changes.values()):
+                return {'error': 'requalification cannot release a reservation'}
             for row in current.values():
                 if row['status'] == 'landed' or changes.get(int(row['id'])) == 'landed':
                     return {'error': 'landed slot cannot reserve again'}
                 if (row['status'] == 'reserved' and row['target_sha'] != sha
-                        and changes.get(int(row['id'])) != 'released'):
+                        and changes.get(int(row['id'])) != 'reserved'):
                     return {'error': 'target does not descend from slot reservation'}
             replay = [current.get(slot) for slot in slots]
             live = [row for row in replay if row and row['status'] == 'reserved' and row['target_sha'] == sha]
@@ -108,16 +110,16 @@ class MigrationReservations(Contract):
                         range(int(live[0]['number']), int(live[0]['number']) + len(slots))):
                     return {'error': 'batch must replay the same contiguous slots in order'}
                 return live
-            remaining = [int(row['number']) for row in active if int(row['id']) not in changes]
+            remaining = [int(row['number']) for row in active if changes.get(int(row['id'])) != 'landed']
             number = max(int(floor), max(remaining or [0]) + 1)
             if number + len(slots) - 1 > 9999:
                 return {'error': 'migration numbers exhausted (9999)'}
             for row in active:
                 status = changes.get(int(row['id']))
-                if status is not None:
+                if status == 'landed':
                     changed = tx.query('UPDATE work_migration_reservations SET status = %s, updated_at = now()'
                                        ' WHERE id = %s RETURNING ' + _COLUMNS, (status, row['id']))[0]
-                    self._journal(tx, changed, actor, 'landed' if status == 'landed' else 'invalidated')
+                    self._journal(tx, changed, actor, 'landed')
             result = []
             for offset, slot in enumerate(slots):
                 row = tx.query('INSERT INTO work_migration_reservations'
