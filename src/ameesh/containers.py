@@ -406,16 +406,21 @@ class Runtime:
                             "tags": tags})
         return out
 
-    def remove_image(self, ident: str) -> tuple[bool, str]:
-        """`image rm <id>` (L73/#4560) : réservé aux images que l'appelant a
-        DÉCLARÉES jetables et qui ne portent plus aucun tag.
+    def remove_image(self, ident: str, *, tag: str | None = None) -> tuple[bool, str]:
+        """Retire une image DÉCLARÉE jetable et SANS tag (L73/#4560).
 
-        Un tag apparu depuis le relevé (course avec un `docker tag`) est
-        refusé par une inspection fraîche : `docker image rm <id>` retirerait
-        aussi l'unique tag d'une image retaguée. Docker refuse par ailleurs une
-        image encore utilisée par un conteneur, même arrêté : la course avec un
-        `docker run` qui la reprend est fermée par le moteur."""
+        `docker image rm <id>` ne sait pas distinguer « toujours sans tag » de
+        « retaguée depuis le relevé » : un `docker tag` concurrent verrait son
+        unique tag retiré avec l'image. L'image reçoit donc d'abord un tag
+        TEMPORAIRE à nous (`docker tag`, atomique), puis seul ce tag est
+        retiré avec `--no-prune` : si un autre tag est apparu entre-temps,
+        Docker ne retire que le nôtre et l'image reste ; `--no-prune` interdit
+        en outre de supprimer les images parentes non taguées. Docker refuse
+        encore une image utilisée par un conteneur, même arrêté. En cas de
+        refus, le tag temporaire peut rester (l'image est alors conservée,
+        jamais supprimée) : le message le nomme pour le nettoyage manuel."""
         import json
+        import secrets
         argv = self._argv("image", "inspect", "--format", "{{json .RepoTags}}", ident)
         try:
             proc = self.run(argv, capture_output=True, text=True,
@@ -430,14 +435,38 @@ class Runtime:
             return False, "tags unreadable"
         if tags:
             return False, "image is tagged again"
-        argv = self._argv("image", "rm", ident)
+        temp = tag or "ameesh-reap:%s" % secrets.token_hex(16)
+        argv = self._argv("tag", ident, temp)
         try:
-            proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout * 6)
+            proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout)
         except (OSError, subprocess.SubprocessError) as exc:
             return False, str(exc)
         if getattr(proc, "returncode", 1) != 0:
-            return False, (getattr(proc, "stderr", "") or "refused").strip()[:300]
-        return True, ""
+            return False, (getattr(proc, "stderr", "") or "tag refused").strip()[:300]
+        argv = self._argv("image", "rm", "--no-prune", temp)
+        try:
+            proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout * 6)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, "%s (temporary tag %s may remain)" % (exc, temp)
+        if getattr(proc, "returncode", 1) != 0:
+            return False, "%s (temporary tag %s may remain)" % (
+                (getattr(proc, "stderr", "") or "refused").strip()[:300], temp)
+        # L'image est partie, ou un autre tag l'a retenue : le dire.
+        argv = self._argv("image", "inspect", "--format", "{{json .RepoTags}}", ident)
+        try:
+            proc = self.run(argv, capture_output=True, text=True,
+                            timeout=self.timeout * 6)
+        except (OSError, subprocess.SubprocessError):
+            return True, ""                 # image disparue
+        if getattr(proc, "returncode", 1) != 0:
+            return True, ""
+        try:
+            tags = json.loads(proc.stdout or "null")
+        except ValueError:
+            return False, "image still present; tags unreadable after reap"
+        if tags:
+            return False, "image is tagged again (temporary reap tag %s removed)" % temp
+        return False, "image still referenced (temporary reap tag %s removed)" % temp
 
 
 #: #4560 : plus de 6 chiffres après la virgule ne sont lus par

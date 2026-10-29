@@ -41,8 +41,10 @@ agents-2 on 29 October 2026. The shim labels an **untagged** image built during 
 `ameesh.lifetime=test` (a tagged build is a deliberate artifact and gets no
 disposable label); an image without any tag carrying that label is reaped
 after the same `docker_volume_idle` of continuous absence. A tagged image is
-never deleted, even labelled: a tag is a reference. Images without the label
-are only counted.
+never deleted, even labelled: a tag is a reference. The removal first puts a
+temporary tag of ours on the image (`docker tag`) and removes only that tag
+with `--no-prune`: a tag added concurrently survives, and untagged parent
+images are never pruned. Images without the label are only counted.
 
 Nothing else is ever deleted automatically: an anonymous volume
 (`com.docker.volume.anonymous`) carries no mesh provenance and is never reaped

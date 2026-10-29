@@ -162,24 +162,37 @@ class ImagesMoteurTest(unittest.TestCase):
 
         self.assertIsNone(containers.Runtime(binary="docker", run=run_ls_ko).images())
 
-    def test_remove_image_et_parse_created(self):
+    def test_remove_image_tag_temporaire_et_no_prune(self):
         appels = []
+        inspects = []
 
         def run(argv, **kw):
             appels.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "null", "")
+            if argv[1:3] == ["image", "inspect"]:
+                inspects.append(argv)
+                if len(inspects) == 1:
+                    return subprocess.CompletedProcess(argv, 0, "null", "")
+                return subprocess.CompletedProcess(argv, 1, "", "No such image")
+            return subprocess.CompletedProcess(argv, 0, "", "")
 
         moteur = containers.Runtime(binary="docker", run=run)
-        self.assertEqual(moteur.remove_image("sha256:aaa"), (True, ""))
+        self.assertEqual(moteur.remove_image("sha256:aaa", tag="ameesh-reap:test"),
+                         (True, ""))
         self.assertEqual(appels[0], ["docker", "image", "inspect", "--format",
                                      "{{json .RepoTags}}", "sha256:aaa"])
-        self.assertEqual(appels[1], ["docker", "image", "rm", "sha256:aaa"])
+        self.assertEqual(appels[1], ["docker", "tag", "sha256:aaa",
+                                     "ameesh-reap:test"])
+        # --no-prune : les images parentes non taguées ne sont jamais visées
+        self.assertEqual(appels[2], ["docker", "image", "rm", "--no-prune",
+                                     "ameesh-reap:test"])
+        self.assertEqual(appels[3], ["docker", "image", "inspect", "--format",
+                                     "{{json .RepoTags}}", "sha256:aaa"])
         self.assertEqual(containers.parse_created("2026-10-06T01:33:02.828687149Z"),
                          containers.parse_created("2026-10-06T01:33:02.828687Z"))
 
     def test_remove_image_refuse_un_tag_apparu_depuis_le_releve(self):
-        """La course avec un `docker tag` : `image rm <id>` retirerait aussi
-        l'unique tag d'une image retaguée. L'inspection fraîche refuse."""
+        """La course avec un `docker tag` : l'inspection fraîche refuse, aucun
+        tag temporaire n'est posé."""
         appels = []
 
         def run(argv, **kw):
@@ -187,10 +200,50 @@ class ImagesMoteurTest(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, '["repo:tag"]', "")
 
         moteur = containers.Runtime(binary="docker", run=run)
-        ok, why = moteur.remove_image("sha256:aaa")
+        ok, why = moteur.remove_image("sha256:aaa", tag="ameesh-reap:test")
         self.assertFalse(ok)
         self.assertIn("tagged again", why)
-        self.assertEqual(len(appels), 1)          # aucun `image rm` lancé
+        self.assertEqual(len(appels), 1)          # ni tag ni image rm
+
+    def test_remove_image_ne_retire_que_son_tag_si_un_autre_apparait(self):
+        """Le tag temporaire rend le retrait sûr : un tag concurrent ajouté
+        juste après le nôtre survit, seul `ameesh-reap:test` est retiré."""
+        appels = []
+        inspects = []
+
+        def run(argv, **kw):
+            appels.append(argv)
+            if argv[1:3] == ["image", "inspect"]:
+                inspects.append(argv)
+                if len(inspects) == 1:
+                    return subprocess.CompletedProcess(argv, 0, "null", "")
+                return subprocess.CompletedProcess(argv, 0, '["repo:tag"]', "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        moteur = containers.Runtime(binary="docker", run=run)
+        ok, why = moteur.remove_image("sha256:aaa", tag="ameesh-reap:test")
+        self.assertFalse(ok)
+        self.assertIn("tagged again", why)
+        self.assertIn("ameesh-reap:test", why)
+        self.assertNotIn(["docker", "image", "rm", "sha256:aaa"], appels)
+
+    def test_remove_image_refus_du_moteur_nomme_le_tag_temporaire(self):
+        appels = []
+
+        def run(argv, **kw):
+            appels.append(argv)
+            if argv[1:3] == ["image", "inspect"]:
+                return subprocess.CompletedProcess(argv, 0, "null", "")
+            if argv[1:3] == ["image", "rm"]:
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "image is being used by stopped container")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        moteur = containers.Runtime(binary="docker", run=run)
+        ok, why = moteur.remove_image("sha256:aaa", tag="ameesh-reap:test")
+        self.assertFalse(ok)
+        self.assertIn("stopped container", why)
+        self.assertIn("ameesh-reap:test", why)
 
     def test_les_volumes_de_base_ne_sont_jamais_recoltes(self):
         for nom in ("ameesh-pg-data", "agent-mesh-pg-data",

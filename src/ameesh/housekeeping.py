@@ -4712,11 +4712,13 @@ def reap_images(runtime, db, host: str, policy: Policy, *, dry_run: bool = False
     image retaguée referme l'épisode, une image reconstruite (autre `Id` ou
     `Created`) en ouvre un autre, une image disparue le referme. Le délai est
     celui des volumes (`docker_volume_idle`) et se mesure sur les relevés
-    successifs, jamais sur l'âge de création. Avant `docker image rm`, une
-    inspection fraîche refuse une image retaguée depuis le relevé ; le moteur
-    refuse une image encore utilisée par un conteneur, même arrêté : la course
-    avec un `docker run` qui la reprend est fermée. Seul `docker` est couvert
-    (comme la mesure #411). `dry_run` : le plan seulement.
+    successifs, jamais sur l'âge de création. Le retrait passe par un tag
+    TEMPORAIRE à nous (`docker tag`, atomique) puis `docker image rm
+    --no-prune <tag>` : un tag concurrent ajouté entre-temps survit (seul le
+    nôtre est retiré) et les images parentes non taguées ne sont jamais
+    visées. Le moteur refuse encore une image utilisée par un conteneur, même
+    arrêté : la course avec un `docker run` qui la reprend est fermée. Seul
+    `docker` est couvert (comme la mesure #411). `dry_run` : le plan seulement.
 
     Rend `{entries, plan, ours, others_total}` ; `ours` à None si le moteur ne
     répond pas."""
