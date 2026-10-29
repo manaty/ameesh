@@ -376,6 +376,14 @@ def configured_class_of(project: str):
         raise GuardError("canon configuré illisible : %s" % exc) from exc
     if not canons:
         raise GuardError("aucun canon configuré : politique de %r inconnue" % project)
+    for loaded in canons:
+        # un canon déclaré mais dont le chemin manque est rendu sans
+        # fédération (`federation=None`, `sources=[]`) : ce n'est pas une
+        # politique, et `class_of_paths` le lirait comme « normal », donc
+        # comme un vert. Refus fermé (#4521, B/P2 de cx2).
+        if not getattr(loaded, "federation", None):
+            raise GuardError("canon illisible : %s (fédération absente)"
+                             % (getattr(loaded, "root", "") or "canon"))
     ref = [""]
 
     def class_of(path: str) -> tuple:
