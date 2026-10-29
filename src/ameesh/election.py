@@ -65,10 +65,13 @@ a beat written before `agent_registry.lease_since` proves nothing). Two
 bounded graces (`ALERTS_GRACE_S`) cover a host that has not beaten yet: a
 freshly claimed holder, and the host the pass was just entrusted to
 (`alerts_delegations`, written by `role_run` under the shared execution
-lease). When nobody proves a live pass, the routed candidate that has waited
-longest gets it, never the one that just exhausted its grace: the pass leaves
-a delegate that stopped beating and comes back to a recovered holder instead
-of staying on the oldest or the newest dead beat.
+lease; only a host change starts a new window, so a wrapper that re-runs
+without beating does not renew its own grace). When nobody proves a live
+pass, the routed candidates take turns from the last evidence (the last
+delivery, else the last handover, else the holder's tenure), one per bounded
+window: the pass leaves a delegate that stopped beating, a delegate whose
+timer never starts cannot keep it for good, and a recovered host gets its
+turn back.
 """
 from __future__ import annotations
 
@@ -769,13 +772,16 @@ def alerts_delegate(db, role: Mapping, *, holder: str | None = None,
       it returns, still takes precedence (#3568/#3575);
     * the host the pass was last **entrusted** to (`alerts_delegations`,
       written by `role_run` under the shared execution lease) keeps it while
-      it has not beaten yet and its grace runs.
+      it has not beaten yet and its grace runs. Only a host change starts a
+      new window: a wrapper that re-runs without beating does not renew its
+      own grace (review cx3).
 
-    When nobody proves a live pass, the routed candidate that has waited
-    longest gets it, never the one that just exhausted its grace without
-    beating: the pass therefore leaves a delegate that stopped beating and
-    comes back to a recovered holder instead of staying on the oldest or the
-    newest dead beat.
+    When nobody proves a live pass, the routed candidates take turns from the
+    last evidence (the last delivery, else the last handover, else the
+    holder's tenure), one per bounded window. The pass therefore leaves a
+    delegate that stopped beating, a delegate whose timer never starts cannot
+    keep it for good, and a recovered host gets its turn back instead of
+    staying on the oldest or the newest dead beat.
 
     `holder` and `ranked` let a caller that already read them (`status`,
     `role run`) avoid a second, possibly incoherent read; they must come from
@@ -876,35 +882,34 @@ def alerts_delegate(db, role: Mapping, *, holder: str | None = None,
                     % (mem_host,
                        max(0, int(ALERTS_GRACE_S - (now - mem_ts)))))
 
-    # 4. Nobody proves a live pass: the routed candidate that has waited
-    #    longest gets it, never the host that just exhausted its grace without
-    #    beating. This is what gives the pass back to a recovered holder, and
-    #    what keeps a dead delegate from keeping it for good.
-    failed_memory = (mem_item is not None and mem_ts is not None
-                     and now - mem_ts > ALERTS_GRACE_S
-                     and (mem_beat is None or mem_beat < mem_ts))
-    candidates = pool
-    if failed_memory:
-        candidates = [item for item in pool if item["host"] != mem_host] or pool
-    pick = None
-    oldest = None
-    for item in candidates:  # election order breaks a tie deterministically
-        seen = _as_ts(beats.get(item["host"]))
-        age = float("-inf") if seen is None else float(seen)
-        if pick is None or age < oldest:
-            pick, oldest = item, age
-    if pick is None:
+    # 4. Nobody proves a live pass: rotate from the last evidence — the last
+    #    delivery, else the last handover, else the holder's tenure — one
+    #    candidate per bounded window. The candidate that just used its grace
+    #    is left for the next turn, so a delegate whose timer never starts
+    #    cannot keep the pass for good; a recovered host gets its turn back.
+    if not pool:
         out["reason"] = ("no fresh candidate can push"
                          + (" (holder %s cannot)" % holder if holder else ""))
         return out
+    evidence = []
+    if beats:
+        host, seen = max(beats.items(), key=lambda row: (row[1], row[0]))
+        evidence.append((float(seen), host))
+    if mem_ts is not None:
+        evidence.append((float(mem_ts), mem_host))
+    if began is not None:
+        evidence.append((float(began), holder or ""))
+    anchor, base_host = max(evidence) if evidence else (None, "")
+    elapsed = 0.0 if anchor is None else max(0.0, now - float(anchor) - alive_s)
+    steps = int(elapsed // ALERTS_GRACE_S)
+    order = [item["host"] for item in pool]  # election order, deterministic
+    base = order.index(base_host) if base_host in order else -1
+    pick = in_pool[order[(base + 1 + steps) % len(order)]]
     if pick["host"] == holder:
         return keep(pick, "%s; no other candidate proves a live alerts pass, "
                           "the holder takes it back" % holder_gap())
-    if failed_memory:
-        return keep(pick, "%s; %s had its grace without beating, %s takes the "
-                          "pass" % (holder_gap(), mem_host, pick["host"]))
-    return keep(pick, "%s; no candidate proves a live pass, %s has waited "
-                      "longest" % (holder_gap(), pick["host"]))
+    return keep(pick, "%s; no candidate proves a live pass, %s gets the pass"
+                      % (holder_gap(), pick["host"]))
 
 
 def rank_delay_s(rank: int) -> float:

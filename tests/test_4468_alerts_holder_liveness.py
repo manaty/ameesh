@@ -131,9 +131,9 @@ class _HolderCase(PgTestCase):
             " entrusted_at = excluded.entrusted_at",
             (NAME, host, float(age)))
 
-    def decide(self, *, holder: str = "banc") -> dict:
+    def decide(self, *, holder: str = "banc", now: float | None = None) -> dict:
         return election.alerts_delegate(
-            self.db, registry.get(self.db, NAME), holder=holder)
+            self.db, registry.get(self.db, NAME), holder=holder, now=now)
 
 
 class HolderLivenessTest(_HolderCase):
@@ -162,7 +162,7 @@ class HolderLivenessTest(_HolderCase):
         self.assertEqual(decision["delegate"], "atelier")
         self.assertFalse(decision["holder_notify_ok"])
         self.assertIn("banc stopped beating", decision["reason"])
-        self.assertIn("atelier has waited longest", decision["reason"])
+        self.assertIn("atelier gets the pass", decision["reason"])
 
     def test_a_holder_that_has_not_beaten_yet_gets_a_bounded_grace(self):
         decision = self.decide()
@@ -181,7 +181,7 @@ class HolderLivenessTest(_HolderCase):
     def test_a_stale_beat_from_a_previous_tenure_does_not_count(self):
         # The holder has beaten, but before it took its current lease: that
         # is a fresh-tenure grace, not proof the current pass runs.
-        self.beat("banc", age=notify_gap.ALIVE_S + 120.0)
+        self.beat("banc", age=notify_gap.ALIVE_S + 60.0)
         self.tenure(age=10.0)
         self.assertEqual(self.decide()["delegate"], "banc")
         self.tenure(age=election.ALERTS_GRACE_S + 30.0)
@@ -222,6 +222,20 @@ class HolderLivenessTest(_HolderCase):
         decision = self.decide()
         self.assertEqual(decision["delegate"], "banc")
         self.assertIn("the holder takes it back", decision["reason"])
+
+    def test_a_candidate_whose_timer_never_runs_does_not_keep_the_pass(self):
+        # Review auditeur: a step-4 pick that never launches its pass writes
+        # neither memory nor beat. The rotation must still move on, one grace
+        # window after the last evidence.
+        self.tenure(age=notify_gap.ALIVE_S + 120.0)
+        self.beat("banc", age=notify_gap.ALIVE_S + 60.0)
+        self.assertEqual(self.decide()["delegate"], "atelier")
+        self.beat("atelier", age=notify_gap.ALIVE_S + 30.0)
+        now = time.time()
+        self.assertEqual(self.decide(now=now)["delegate"], "banc")
+        self.assertEqual(
+            self.decide(now=now + election.ALERTS_GRACE_S + 1.0)["delegate"],
+            "atelier")
 
     def test_the_entrusted_delegate_gets_a_bounded_grace(self):
         self.tenure(age=notify_gap.ALIVE_S + 120.0)
@@ -293,6 +307,39 @@ class DelegationMemoryTest(_HolderCase):
         self.assertFalse(alerts_delegation_pg.entrust(
             self.db, NAME, "atelier", lock_key=lease.key, owner=owner, epoch=epoch))
         self.assertEqual(alerts_delegation_pg.latest(self.db, NAME)["host"], "banc")
+
+    def test_a_rerun_without_a_beat_does_not_renew_the_grace(self):
+        # Review cx3: role_run re-runs the pass every 30 s. The same host must
+        # not refresh its own handover clock, otherwise a child that exits
+        # without beating keeps the pass forever.
+        self.hold("banc")
+        self.tenure(age=notify_gap.ALIVE_S + 120.0)
+        self.standing("banc", notify_ok=True)
+        self.standing("atelier", notify_ok=True)
+        lease = role_run._AlertsLease(self.db, NAME, "atelier", ttl=60.0)
+        self.assertIsNotNone(lease.acquire())
+        self.addCleanup(lease.release)
+        self.assertTrue(alerts_delegation_pg.entrust(
+            self.db, NAME, "atelier", lock_key=lease.key, owner=lease.owner,
+            epoch=lease.epoch))
+        first = alerts_delegation_pg.latest(self.db, NAME)["entrusted_ts"]
+        for _ in range(4):  # successive ticks: same host, still no beat
+            self.assertFalse(alerts_delegation_pg.entrust(
+                self.db, NAME, "atelier", lock_key=lease.key, owner=lease.owner,
+                epoch=lease.epoch))
+        self.assertEqual(
+            alerts_delegation_pg.latest(self.db, NAME)["entrusted_ts"], first)
+        # Time passes beyond the grace without a beat; a re-run of the same
+        # host must not bring the grace back.
+        self.db.execute(
+            "UPDATE alerts_delegations SET entrusted_at = clock_timestamp()"
+            " - make_interval(secs => %s) WHERE role = %s",
+            (election.ALERTS_GRACE_S + 1.0, NAME))
+        self.assertFalse(alerts_delegation_pg.entrust(
+            self.db, NAME, "atelier", lock_key=lease.key, owner=lease.owner,
+            epoch=lease.epoch))
+        decision = self.decide()
+        self.assertNotEqual(decision["delegate"], "atelier")
 
     def test_a_second_handover_replaces_the_first(self):
         lease = role_run._AlertsLease(self.db, NAME, "banc", ttl=60.0)

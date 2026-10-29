@@ -25,8 +25,12 @@ def entrust(db, role: str, host: str, *, lock_key: str, owner: str,
 
     The CTE is the fence: an INSERT without a conflict must also see the live
     `merge_locks` row, which a plain `ON CONFLICT ... WHERE` would not check.
-    Returns False when the lease is gone (another host may run) or when the
-    statement did not write.
+    The same host does not renew its handover: a pass that runs every 30 s and
+    exits without beating would otherwise reset its own grace forever (review
+    cx3). Only a host change starts a new handover window.
+
+    Returns False when the lease is gone (another host may run), when the
+    handover is unchanged, or when the statement did not write.
     """
     rows = db.query(
         """
@@ -41,6 +45,7 @@ def entrust(db, role: str, host: str, *, lock_key: str, owner: str,
             ON CONFLICT (role) DO UPDATE
                SET host = excluded.host,
                    entrusted_at = excluded.entrusted_at
+             WHERE alerts_delegations.host IS DISTINCT FROM excluded.host
             RETURNING role
         )
         SELECT role FROM wrote
