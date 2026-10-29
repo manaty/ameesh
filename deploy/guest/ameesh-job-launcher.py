@@ -437,6 +437,7 @@ def cmd_check(args: list[str]) -> int:
 def cmd_open(args: list[str]) -> int:
     job_id = job_arg(args)
     cfg = load_config()
+    prune_job_volumes()
     props = ["MemoryMax=%s" % cfg["agent_memory_max"], "MemorySwapMax=0"] \
         if cfg.get("agent_memory_max") else []
     if not props:
@@ -458,8 +459,33 @@ def cmd_close(args: list[str]) -> int:
     slice_name, _ = unit_names(job_id)
     systemctl("kill", "--signal=SIGKILL", slice_name)
     systemctl("stop", slice_name)
+    # The after hook may never have run (cancelled/killed job). Remove its
+    # container too, including legacy PGDATA volumes. A stuck Podman must
+    # not prevent dropping the slice's runtime caps.
+    podman_cleanup("rm", "-f", "-v", "-t", "2", "ameesh-job-%s-pg" % job_id)
+    prune_job_volumes()
     systemctl("revert", slice_name)
     return 0
+
+
+def podman_cleanup(*args: str) -> None:
+    """Best effort, bounded cleanup as the dedicated job user, never root."""
+    try:
+        result = subprocess.run(["/usr/bin/podman", *args], capture_output=True,
+                                text=True, check=False, timeout=30)
+        if result.returncode:
+            die("podman cleanup failed: %s" % result.stderr.strip())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        die("podman cleanup unavailable: %s" % exc)
+
+
+def prune_job_volumes() -> None:
+    # Podman itself checks references at deletion: a volume of any container
+    # (running or stopped) is protected, including during concurrent jobs.
+    # Explicit anonymous=true also fails closed on older unsupported Podman.
+    # The one-hour creation grace leaves newly allocated volumes alone.
+    podman_cleanup("volume", "prune", "--force", "--filter", "anonymous=true",
+                   "--filter", "until=1h")
 
 
 def cmd_clean(args: list[str]) -> int:

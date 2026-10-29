@@ -750,6 +750,31 @@ JIT_SESSION_ON = (JIT_SESSION_ON_PREFIX + " (source %s) — db.connect "
                   "compile (#3503)")
 
 
+def inode_lines(paths=("/",), *, stat=None) -> list[str]:
+    """#4436: warn at 80% inode use, independently of free disk bytes."""
+    stat = stat or getattr(os, "statvfs", None)
+    if stat is None:
+        return ["inodes     : unavailable on this OS"]
+    lines = []
+    seen = set()
+    for path in paths:
+        try:
+            reading = stat(path)
+            # f_fsid identifies mounts; paths on the same filesystem need one
+            # warning. A zero inode count (e.g. btrfs) is not a full disk.
+            ident = getattr(reading, "f_fsid", path)
+            if ident in seen or not reading.f_files:
+                continue
+            seen.add(ident)
+            used = 1 - reading.f_ffree / reading.f_files
+            if (reading.f_files - reading.f_ffree) * 100 >= reading.f_files * 80:
+                lines.append("inodes     : WARNING %s: %.1f%% used (%d free)"
+                             % (path, used * 100, reading.f_ffree))
+        except OSError as exc:
+            lines.append("inodes     : %s unreadable (%s)" % (path, exc))
+    return lines
+
+
 def jit_lines(db) -> list[str]:
     """#3503 : lignes de `ameesh doctor` sur le JIT de Postgres.
 
