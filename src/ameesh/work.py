@@ -1100,6 +1100,9 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         if row is None:
             raise WorkError("lot %s: migration reservation changed meanwhile, retry" % item_id)
         return _with_file(row, cfg)
+    if current is None and any(row["slot"] != "default" and row["slot"] != "legacy-%d" % row["number"]
+                               for row in reservations):
+        raise WorkError("named migration slots require --slot; legacy allocation refused")
     if number is not None and not 1 <= int(number) <= 9999:
         raise WorkError("migration number outside 0001-9999: %s" % number)
     held = {row["number"] for row in reservations}

@@ -2168,10 +2168,11 @@ class WorkItems(interface.WorkItems):
         """Libère le numéro `number` (None : tous) du lot, et rend sa ligne.
 
         Le scalaire est la réservation principale ; s'il est libéré alors que
-        d'autres créneaux restent, le plus petit d'entre eux est promu et son
+        d'autres créneaux legacy restent, le plus petit est promu et son
         créneau libéré AVANT l'UPDATE du scalaire : le déclencheur
         `work_items_migration_slot_sync` réécrit alors le créneau `default`
-        sans rencontrer le doublon du créneau promu."""
+        sans rencontrer le doublon du créneau promu. Les slots nommés restent
+        intacts : leur identité ne devient jamais `default` (#4430)."""
         numbers = sorted({int(row["number"]) for row in slots})
         if scalar is not None and int(scalar) not in numbers:
             numbers.append(int(scalar))
@@ -2192,7 +2193,10 @@ class WorkItems(interface.WorkItems):
                 "UPDATE work_items SET migration = NULL, migration_repo = NULL,"
                 "       updated_at = now() WHERE id = %s", (int(item_id),))
         elif scalar is not None and target == int(scalar):
-            remaining = [row for row in slots if int(row["number"]) != target]
+            remaining = [row for row in slots if int(row["number"]) != target
+                         and (row["slot"] == "default" or (
+                             row["slot"] == "legacy-%d" % int(row["number"])
+                             and row.get("target_sha") is None))]
             promoted = remaining[0] if remaining else None
             if table:
                 for row in slots:
@@ -2280,7 +2284,7 @@ class WorkItems(interface.WorkItems):
                     slots = []
                     if has_migration_slots(tx):
                         slots = tx.query(
-                            "SELECT slot, number, target_repo"
+                            "SELECT slot, number, target_repo, target_sha"
                             "  FROM work_migration_reservations"
                             " WHERE work_item_id = %s AND status = 'reserved'"
                             " ORDER BY number, slot", (int(item_id),))
@@ -2323,6 +2327,10 @@ class WorkItems(interface.WorkItems):
                             "migration %s released (lot %s %s, #956)" % (
                                 old["migration"], old["id"], old["state"]), actor)
                     if scalar is None and slots:
+                        if any(row["slot"] != "default" and not (
+                                row["slot"] == "legacy-%d" % int(row["number"])
+                                and row.get("target_sha") is None) for row in slots):
+                            raise ValueError("named migration slots require --slot; legacy allocation refused")
                         # état incohérent (scalaire effacé hors API) : le plus
                         # petit créneau redevient la réservation principale
                         first = slots[0]
