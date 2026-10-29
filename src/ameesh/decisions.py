@@ -13,6 +13,7 @@
         the owner answers (a HUMAN identity only); the answer goes to the
         requester by mail (it wakes them up), to the thread and to the work item;
   ameesh decide withdraw <id> [--why "…"] [--json]     the requester withdraws their request;
+  ameesh decide repair-forward <id> [--json]           restore an accidentally forwarded request;
   ameesh decide show <id> [--json]                     a request, its answer, its proof;
   ameesh decisions [--all] [--for human:ID] [--json]   the queue, across all projects
         (served by `actions_cli`, together with gated actions).
@@ -1331,6 +1332,7 @@ USAGE = ("usage: ameesh decide ask (--lot <id|ref> | --new-lot \"title\") --ques
          "        ameesh decide <id> <option | \"free text\"> "
          "[--key FILE [--as NAME] | --signed] [--json]\n"
          "        ameesh decide withdraw <id> [--why \"…\"] [--json]\n"
+         "        ameesh decide repair-forward <id> [--json]\n"
          "        ameesh decide show <id> [--json]")
 
 
@@ -1504,6 +1506,30 @@ def cmd_withdraw(cfg: Config, argv: list[str]) -> int:
     return 0
 
 
+def cmd_repair_forward(cfg: Config, argv: list[str]) -> int:
+    parser = _parser("ameesh decide repair-forward")
+    parser.add_argument("id", type=int)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    db = _open(cfg)
+    try:
+        binding = identity.resolve_binding(cfg, db)
+        if not binding.ok:
+            raise DecisionError("repair-forward requires an agent identity")
+        try:
+            result = storage.of(db).decisions.repair_forward(args.id, actor=binding.name)
+        except ValueError as exc:
+            raise DecisionError(str(exc)) from None
+    finally:
+        db.close()
+    if args.json:
+        _dump(result)
+    else:
+        print("decision #%d restored to pending; copy #%d withdrawn" %
+              (result["decision"], result["withdrawn_copy"]))
+    return 0
+
+
 def cmd_show(cfg: Config, argv: list[str]) -> int:
     parser = _parser("ameesh decide show")
     parser.add_argument("id")
@@ -1549,6 +1575,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_ask(cfg, rest)
         if command == "withdraw":
             return cmd_withdraw(cfg, rest)
+        if command == "repair-forward":
+            return cmd_repair_forward(cfg, rest)
         if command == "show":
             return cmd_show(cfg, rest)
         if _decision_id(command) is not None:
