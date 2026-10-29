@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# ameesh harness-adoption — advances version adoptions (#4293, #3264 C).
+# USER service, on ONE host that has the database (the release host or an agent
+# host): the state lives in the database, and each executor re-reads its
+# agent's row at the start of every turn. This tick launches no binary.
+#
+# Install, on one host only:
+#   install -m 0644 deploy/systemd/ameesh-harness-adoption.service \
+#                      deploy/systemd/ameesh-harness-adoption.timer \
+#                      ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ameesh-harness-adoption.timer
+#   journalctl --user -u ameesh-harness-adoption -f
+#
+# The tick is a no-op while no adoption is open. It refuses to switch a host
+# when the next release cutoff is less than 20 minutes away, or while a turn
+# of the harness is running on that host (spec §4).
+#
+# The installed-binary map is read from ~/.config/ameesh/harness-adoption.json
+# (or AMEESH_HARNESS_ADOPTION_BINS): explicit per harness/version/host paths.
+# The report's new_binary covers the canary host only.
+[Unit]
+Description=ameesh harness adoption (harness/model versions, #4293)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/ameesh/env
+ExecStart=%h/.local/share/ameesh/venv/bin/ameesh harness tick
+TimeoutStartSec=30m
+NoNewPrivileges=yes

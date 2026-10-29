@@ -76,6 +76,8 @@
   ameesh guard check|run|drain          capacity guard of a lending VM (L159e);
   ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
         reserved host move at a lot boundary, durable journal (L232a);
+  ameesh harness adopt|tick|show-adoption|rollback-adoption   adoption of a harness or model version
+        (#3264 C): auto at equal price after a canary, owner decision otherwise;
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh heavy [--nice N] -- <command> | --status [--json]
         heavy suite (tests, build) in one of the host's capped slots (L131);

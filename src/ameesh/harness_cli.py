@@ -231,6 +231,12 @@ def cmd_versions(cfg, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_adoption(cfg, args: argparse.Namespace) -> int:
+    """#4293 : `ameesh harness adopt|tick|show-adoption|rollback-adoption`."""
+    from . import harness_adoption
+    return harness_adoption.run(cfg, args)
+
+
 def add_parsers(sub) -> None:
     """Branche `harness …` sur le parseur de mesh_cli."""
     p_harness = sub.add_parser("harness", help="harness descriptors (L16)")
@@ -259,3 +265,46 @@ def add_parsers(sub) -> None:
                             help="read the versions of this host first, and record them")
     p_versions.add_argument("--json", action="store_true")
     p_versions.set_defaults(func=cmd_versions)
+
+    # -- #4293 (#3264 C) : adoption d'une version de harnais ou de modèle ----
+    p_adopt = harness_sub.add_parser(
+        "adopt", help="freeze a replay report and apply the adoption rule (#3264 C)")
+    p_adopt.add_argument("id", type=int, help="evaluation work item")
+    p_adopt.add_argument("--report", default=None,
+                         help="report file, or - for standard input (default: the "
+                              "latest report note of the lot)")
+    p_adopt.add_argument("--bin", action="append", default=[], metavar="[HOST=]PATH",
+                         help="new harness binary (all hosts, or one host)")
+    p_adopt.add_argument("--agent", default=None,
+                         help="canary agent (default: automatic)")
+    p_adopt.add_argument("--requester", default=None,
+                         help="agent filing the owner decision (default: assignee)")
+    p_adopt.add_argument("--actor", default=None)
+    p_adopt.add_argument("--dry-run", action="store_true")
+    p_adopt.add_argument("--now", type=float, default=None)
+    p_adopt.add_argument("--json", action="store_true")
+    p_adopt.set_defaults(func=cmd_adoption, veille_command="adopt")
+
+    p_tick = harness_sub.add_parser(
+        "tick", help="advance open adoptions (canary, host-by-host switch)")
+    p_tick.add_argument("--project", default=None)
+    p_tick.add_argument("--bin", action="append", default=[], metavar="[HOST=]PATH")
+    p_tick.add_argument("--actor", default=None)
+    p_tick.add_argument("--now", type=float, default=None)
+    p_tick.add_argument("--dry-run", action="store_true")
+    p_tick.add_argument("--json", action="store_true")
+    p_tick.set_defaults(func=cmd_adoption, veille_command="tick")
+
+    p_show = harness_sub.add_parser("show-adoption", help="show an adoption")
+    p_show.add_argument("id", type=int)
+    p_show.add_argument("--json", action="store_true")
+    p_show.set_defaults(func=cmd_adoption, veille_command="show")
+
+    p_roll = harness_sub.add_parser("rollback-adoption",
+                                    help="restore the previous version")
+    p_roll.add_argument("id", type=int)
+    p_roll.add_argument("--reason", required=True)
+    p_roll.add_argument("--actor", default=None)
+    p_roll.add_argument("--now", type=float, default=None)
+    p_roll.add_argument("--json", action="store_true")
+    p_roll.set_defaults(func=cmd_adoption, veille_command="rollback")
