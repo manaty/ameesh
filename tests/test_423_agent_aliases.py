@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from ameesh import agent_names, authority, canon, canon_sync, exploitation, identity, mail, placement
-from ameesh import fil, registry, reprise, runner, session_bindings, work
+from ameesh import fil, platform, registry, reprise, runner, session_bindings, work
 from .support import PgTestCase
 from .test_canon import _TmpMixin, codes, fiche, write
 from .test_l39_adoption_reprise import SID, _dossier, _rollout
@@ -286,6 +286,14 @@ class SessionCommandAliasTest(PgTestCase):
 
     def setUp(self):
         super().setUp()
+        # #4589 : les détenteurs de session sont une observation de l'hôte,
+        # pas le sujet de ces alias. Un processus de l'utilisateur aux fd
+        # illisibles (gpg-agent, python3) fait lever HoldersUnreadable et
+        # rougir resume/adopt ; la lecture réelle a ses témoins dans
+        # test_l63_platform, test_1037 fait le même montage.
+        holders = mock.patch.object(platform, "holders", lambda *a, **k: [])
+        holders.start()
+        self.addCleanup(holders.stop)
         self.travail = os.path.join(self.tmp, "travail")
         os.makedirs(self.travail, exist_ok=True)
         self.register("worker", "codex", cwd=self.travail)
