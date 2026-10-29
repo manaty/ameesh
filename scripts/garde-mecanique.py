@@ -17,7 +17,7 @@ script (il porte les motifs et les exemptions). Pour chaque clé du schéma
 fuseau, cadence des paquets, plafond de lots en build, politique CI, familles
 et indépendance des avis, politique de fusion, seuils et plafonds de
 prévalidation, seuil de lot du backlog (#2584), seuil et marges du staging
-hors créneau (#3291), rythme des comptes de forfait (#3647) — et exige une exemption nommée et datée pour un littéral
+hors créneau (#3291), rythme des comptes de forfait (#3647), capacité au repos (#3256) — et exige une exemption nommée et datée pour un littéral
 historique.
 
 Une exemption vit dans `EXEMPTIONS` ci-dessous : chemin, paramètre, littéral
@@ -101,6 +101,8 @@ SCHEMA_KEYS = (
     "paquet.max_paquets",
     "packet_tests.unit_timeout_seconds",
     "packet_tests.parallel",
+    "file.repos_part",
+    "file.repos_s",
     "production.branch",
     "projects",
 )
@@ -154,6 +156,8 @@ BINDINGS = {
     "max_paquets": "paquet.max_paquets",
     "unit_timeout_seconds": "packet_tests.unit_timeout_seconds",
     "unit_tests_parallel": "packet_tests.parallel",
+    "repos_part": "file.repos_part",
+    "repos_s": "file.repos_s",
     "production_branch": "production.branch",
 }
 
@@ -201,6 +205,8 @@ DICT_BINDINGS = {
     "attente_mediane_s": "paquet.attente_mediane_s",
     "max_paquets": "paquet.max_paquets",
     "unit_timeout_seconds": "packet_tests.unit_timeout_seconds",
+    "repos_part": "file.repos_part",
+    "repos_s": "file.repos_s",
 }
 #: clés du bloc `prevalidation` dans un mapping, seulement dans un fichier
 #: qui parle de prévalidation
@@ -502,6 +508,13 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "paquet.max_paquets":
         # #3256 C : le nombre de paquets simultanés, au moins deux
         return type(value) is int and value >= 2
+    if key == "file.repos_part":
+        # #3256 : la part d'agents au repos qui dit la file vide, ]0, 1]
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and 0 < value <= 1)
+    if key == "file.repos_s":
+        # #3256 : la durée de repos, en secondes
+        return type(value) is int and value > 0
     if key == "production.branch":
         # #3022 : la branche de prod d'un projet se lit dans le canon
         # (`projects.<projet>.production.branch`), jamais recopiée en dur.
@@ -545,6 +558,10 @@ def _binding_key(name: str, value, train_context: bool,
         key = "packet_tests.unit_timeout_seconds"
     if key is None and lower.endswith("unit_tests_parallel"):
         key = "packet_tests.parallel"
+    if key is None and lower.endswith("repos_part"):
+        key = "file.repos_part"
+    if key is None and lower.endswith("repos_s"):
+        key = "file.repos_s"
     if key is None:
         return None
     if key == "timezone" and not train_context:
