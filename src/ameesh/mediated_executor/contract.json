@@ -1723,6 +1723,18 @@
      },
      "required": false,
      "default": 200
+    },
+    {
+     "name": "turn_id",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
     }
    ],
    "result": {

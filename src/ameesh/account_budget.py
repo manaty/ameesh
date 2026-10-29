@@ -129,6 +129,26 @@ def settle(db, spend_key: str | None, *, state: str = "settled", actor: str = "r
     return _api(db).account_settle(spend_key, state=state, actor=actor)
 
 
+def reservation(db, spend_key: str | None) -> dict | None:
+    """The reservation of this ledger key, for the turn-context snapshot.
+
+    The document records the accounting state OPENED at launch, so this is a
+    read of the fact the runner just wrote, never a re-derivation. None when
+    the turn has no reservation (no billing account) or the backend does not
+    track accounts. A database error propagates: the caller refuses the turn
+    rather than write an accounting block it cannot vouch for."""
+    if not spend_key:
+        return None
+    try:
+        api = _api(db)
+    except db_mod.DbError:
+        return None
+    getter = getattr(api, "account_get", None)
+    if getter is None:
+        return None
+    return getter(spend_key)
+
+
 def usage(db) -> list:
     """The envelopes, for `ameesh budget`; [] when the table is missing."""
     try:
