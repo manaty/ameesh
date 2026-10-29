@@ -210,6 +210,10 @@ FERMEES = {
     # détenteur, relue par l'exécuteur au redémarrage ; état interne fermé aux
     # deux rôles superviseur, aucun GRANT modifié.
     "role_handover": {"host", "name", "challenger", "released_until", "updated_at"},
+    # #4468 (0514) : mémoire de la remise de la passe alerts (hôte, instant),
+    # écrite par le garde sous le bail d'exécution et lue par l'élection ;
+    # état interne fermé aux deux rôles superviseur, aucun GRANT modifié.
+    "alerts_delegations": {"role", "host", "entrusted_at"},
     # #3007 (0474) : battement partagé du notificateur et réclamation des
     # briefs par (destinataire, humain). État interne lu par l'exécuteur, les
     # alertes et les décisions, pas par le rôle superviseur ; tables fermées

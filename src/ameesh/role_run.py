@@ -77,6 +77,7 @@ import threading
 import time
 import uuid
 
+from . import alerts_delegation_pg
 from . import config as config_mod
 from . import db as db_mod
 
@@ -729,6 +730,20 @@ def run(cfg, args) -> int:
                           "passed before the child started", file=sys.stderr)
                     return 1
                 report["delegated"] = delegated
+                # #4468: remember this handover under the execution lease we
+                # just took. The memory bounds a delegate whose pass never
+                # beats: after its grace the pass moves to another candidate
+                # instead of staying on the newest dead beat. A failure here
+                # never prevents the pass from running.
+                try:
+                    remembered = alerts_delegation_pg.entrust(
+                        db, report["role"], host, lock_key=lease.key,
+                        owner=lease.owner, epoch=lease.epoch)
+                except Exception as exc:  # noqa: BLE001 - never blocks the pass
+                    remembered = False
+                    print("ameesh role run: alerts delegation memory not "
+                          "written: %s" % exc, file=sys.stderr)
+                report["delegation_recorded"] = bool(remembered)
             env = os.environ.copy()
             # The command is not an agent turn: never inherit the shell's turn,
             # identity or a foreign tenure. Its explicit actor is the ROLE, under

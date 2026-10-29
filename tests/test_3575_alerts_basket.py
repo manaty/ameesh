@@ -51,7 +51,7 @@ class _ElectionCase(PgTestCase):
         for table in ("role_standings", "role_handover", "agent_candidates",
                       "canon_state", "host_lifecycle", "host_holds",
                       "credential_health", "host_resources", "merge_locks",
-                      "notify_liveness"):
+                      "notify_liveness", "alerts_delegations"):
             self.db.execute("DELETE FROM " + table)
         # the role's harness need not exist on the bench (same fixture as the
         # election tests: the witness is about the route, not the harness)

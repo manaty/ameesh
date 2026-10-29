@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#4468: the alerts pass does not stay with a holder whose pass stopped beating.
+"""#4468: the alerts pass follows liveness on every routed candidate.
 
 `election.alerts_delegate` used to keep the pass on the lease holder as soon
 as its standing was fresh and `notify_ok` was true. Both prove that the host
@@ -9,22 +9,31 @@ timeout (#4469) and the shared `notify_liveness` beat went stale while every
 other candidate stood by "the holder can push": nothing was pushed to
 human:smichea for ten minutes (#161260).
 
-The holder now keeps the pass only while its own shared beat is fresh. Two
-edges remain:
+The same liveness rule now applies to **every** routed candidate, the holder
+included. A host keeps the pass only while its own shared beat is fresh; for
+the holder the beat must also belong to its **current tenure**
+(`agent_registry.lease_since`), otherwise a beat written before the claim
+would keep the new holder after its grace. Two bounded graces remain:
 
-* a holder that has not beaten yet in its **current tenure** keeps the pass
-  for `HOLDER_NOTIFY_GRACE_S` (`agent_registry.lease_since`): a freshly
-  claimed executor must get the chance to run its first pass, and a beat from
-  a previous tenure is not evidence about this one;
-* a holder that is the only candidate able to push keeps the pass even
-  without a beat: standing by would leave nobody to run it.
+* a freshly claimed holder that has not beaten yet gets the first pass
+  (`ALERTS_GRACE_S`): its route, when it returns, must take
+  precedence (#3568/#3575), but not forever;
+* the host the pass was last entrusted to (`alerts_delegations`, written by
+  `role_run` under the shared execution lease) keeps it while it has not
+  beaten yet and its grace runs, so a child that never starts cannot keep the
+  pass for good.
+
+When nobody proves a live pass, the routed candidate that has waited longest
+gets it, never the one that just exhausted its grace without beating: the
+pass leaves a delegate that stopped beating and comes back to a recovered
+holder instead of staying on the oldest or the newest dead beat.
 
 Witnesses: a beating holder keeps it; a holder that stopped beating hands it
-to the first routed candidate; the bounded grace of a holder that has not
-beaten yet (and its expiry); the tenure trigger (claim starts it, renew keeps
-it, a new epoch restarts it, a release clears it); the `role status` and
-`role run` reads agreeing; and the holder taking the pass back as soon as its
-beat returns (#3568).
+over; the bounded holder grace and its expiry; a fresh beat from a previous
+tenure does not keep the holder (review cx3); a delegate that stops beating
+returns the pass to the holder (review auditeur); the memory grace and its
+expiry; the execution-lease fence on the memory; the tenure trigger; the
+`role status` and `role run` reads agreeing.
 """
 from __future__ import annotations
 
@@ -33,7 +42,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import election, notify_gap, registry, role_run, role_timers, storage
+from ameesh import (alerts_delegation_pg, election, notify_gap, registry,
+                    role_run, role_timers, storage)
 
 from .support import PgTestCase
 
@@ -52,7 +62,7 @@ class _HolderCase(PgTestCase):
         for table in ("role_standings", "role_handover", "agent_candidates",
                       "canon_state", "host_lifecycle", "host_holds",
                       "credential_health", "host_resources", "merge_locks",
-                      "notify_liveness"):
+                      "notify_liveness", "alerts_delegations"):
             self.db.execute("DELETE FROM " + table)
         # the role's harness need not exist on the bench (same fixture as the
         # election tests: the witness is about the route, not the harness)
@@ -112,6 +122,15 @@ class _HolderCase(PgTestCase):
         storage.of(self.db).notify_liveness.beat(
             host, [human], now=time.time() - float(age))
 
+    def memory(self, host: str, *, age: float = 0.0) -> None:
+        """The handover memory `role_run` writes under the execution lease."""
+        self.db.execute(
+            "INSERT INTO alerts_delegations (role, host, entrusted_at)"
+            " VALUES (%s, %s, clock_timestamp() - make_interval(secs => %s))"
+            " ON CONFLICT (role) DO UPDATE SET host = excluded.host,"
+            " entrusted_at = excluded.entrusted_at",
+            (NAME, host, float(age)))
+
     def decide(self, *, holder: str = "banc") -> dict:
         return election.alerts_delegate(
             self.db, registry.get(self.db, NAME), holder=holder)
@@ -126,11 +145,12 @@ class HolderLivenessTest(_HolderCase):
         self.standing("atelier", notify_ok=True)
 
     def test_a_beating_holder_keeps_the_pass(self):
+        self.tenure(age=60.0)
         self.beat("banc", age=5.0)
         decision = self.decide()
         self.assertEqual(decision["delegate"], "banc")
         self.assertTrue(decision["holder_notify_ok"])
-        self.assertIsNone(decision["last_executor"])
+        self.assertEqual(decision["last_executor"], "banc")
         self.assertIn("alerts pass beats", decision["reason"])
 
     def test_a_holder_that_stopped_beating_leaves_the_pass(self):
@@ -142,7 +162,7 @@ class HolderLivenessTest(_HolderCase):
         self.assertEqual(decision["delegate"], "atelier")
         self.assertFalse(decision["holder_notify_ok"])
         self.assertIn("banc stopped beating", decision["reason"])
-        self.assertIn("first candidate that can push", decision["reason"])
+        self.assertIn("atelier has waited longest", decision["reason"])
 
     def test_a_holder_that_has_not_beaten_yet_gets_a_bounded_grace(self):
         decision = self.decide()
@@ -151,8 +171,8 @@ class HolderLivenessTest(_HolderCase):
         self.assertIn("holder can push", decision["reason"])
         self.assertIn("grace left", decision["reason"])
         # Past the grace with no beat in this tenure: the first routed
-        # candidate takes the pass.
-        self.tenure(age=election.HOLDER_NOTIFY_GRACE_S + 30.0)
+        # candidate in the election order takes the pass.
+        self.tenure(age=election.ALERTS_GRACE_S + 30.0)
         decision = self.decide()
         self.assertEqual(decision["delegate"], "atelier")
         self.assertIn("has not run the alerts pass in its current tenure",
@@ -164,8 +184,22 @@ class HolderLivenessTest(_HolderCase):
         self.beat("banc", age=notify_gap.ALIVE_S + 120.0)
         self.tenure(age=10.0)
         self.assertEqual(self.decide()["delegate"], "banc")
-        self.tenure(age=election.HOLDER_NOTIFY_GRACE_S + 30.0)
+        self.tenure(age=election.ALERTS_GRACE_S + 30.0)
         self.assertEqual(self.decide()["delegate"], "atelier")
+
+    def test_a_fresh_beat_from_a_previous_tenure_does_not_keep_the_holder(self):
+        # Review cx3: the beat is still inside ALIVE_S but older than the
+        # lease. It proves nothing about this tenure, and the grace is spent.
+        self.tenure(age=150.0)
+        self.beat("banc", age=200.0)
+        decision = self.decide()
+        self.assertEqual(decision["delegate"], "atelier")
+        self.assertIn("has not run the alerts pass in its current tenure",
+                      decision["reason"])
+        # Inside the grace the same pre-tenure beat is harmless: the holder
+        # still gets its first pass.
+        self.tenure(age=10.0)
+        self.assertEqual(self.decide()["delegate"], "banc")
 
     def test_the_holder_takes_the_pass_back_when_its_beat_returns(self):
         self.tenure(age=notify_gap.ALIVE_S + 120.0)
@@ -177,8 +211,36 @@ class HolderLivenessTest(_HolderCase):
         self.assertTrue(decision["holder_notify_ok"])
         self.assertIn("alerts pass beats", decision["reason"])
 
+    def test_a_delegate_that_stops_beating_returns_the_pass(self):
+        # Review auditeur: the pass must not stay on the newest dead beat
+        # either. `banc` stopped first, `atelier` then runs and stops; the
+        # candidate that has waited longest, `banc`, gets the pass back.
+        self.tenure(age=notify_gap.ALIVE_S + 120.0)
+        self.beat("banc", age=notify_gap.ALIVE_S + 60.0)
+        self.assertEqual(self.decide()["delegate"], "atelier")
+        self.beat("atelier", age=notify_gap.ALIVE_S + 30.0)
+        decision = self.decide()
+        self.assertEqual(decision["delegate"], "banc")
+        self.assertIn("the holder takes it back", decision["reason"])
+
+    def test_the_entrusted_delegate_gets_a_bounded_grace(self):
+        self.tenure(age=notify_gap.ALIVE_S + 120.0)
+        self.beat("banc", age=notify_gap.ALIVE_S + 60.0)
+        self.assertEqual(self.decide()["delegate"], "atelier")
+        # The wrapper of atelier just took the pass and has not beaten yet.
+        self.memory("atelier", age=30.0)
+        decision = self.decide()
+        self.assertEqual(decision["delegate"], "atelier")
+        self.assertIn("just entrusted", decision["reason"])
+        # Its grace is spent without a beat: another candidate takes over,
+        # never the same dead hand.
+        self.memory("atelier", age=election.ALERTS_GRACE_S + 30.0)
+        decision = self.decide()
+        self.assertEqual(decision["delegate"], "banc")
+        self.assertIn("the holder takes it back", decision["reason"])
+
     def test_status_and_role_run_read_the_same_tenure(self):
-        self.tenure(age=election.HOLDER_NOTIFY_GRACE_S + 30.0)
+        self.tenure(age=election.ALERTS_GRACE_S + 30.0)
         report = role_run.live(self.db, NAME)
         self.assertIsNotNone(report["lease_since_ts"])
         decision = role_run._alerts_delegation(self.db, report, host="banc")
@@ -197,18 +259,54 @@ class OnlyRouteTest(_HolderCase):
         self.standing("banc", notify_ok=True)
 
     def test_the_only_route_keeps_the_pass_without_a_beat(self):
-        self.tenure(age=election.HOLDER_NOTIFY_GRACE_S + 30.0)
+        self.tenure(age=election.ALERTS_GRACE_S + 30.0)
         decision = self.decide()
         self.assertEqual(decision["delegate"], "banc")
         self.assertTrue(decision["holder_notify_ok"])
-        self.assertIn("only candidate that can push", decision["reason"])
+        self.assertIn("no other candidate proves a live alerts pass",
+                      decision["reason"])
 
     def test_a_stale_beat_does_not_silence_the_only_route(self):
-        self.tenure(age=election.HOLDER_NOTIFY_GRACE_S + 30.0)
+        self.tenure(age=election.ALERTS_GRACE_S + 30.0)
         self.beat("banc", age=notify_gap.ALIVE_S + 60.0)
         decision = self.decide()
         self.assertEqual(decision["delegate"], "banc")
-        self.assertIn("only candidate that can push", decision["reason"])
+        self.assertIn("no other candidate proves a live alerts pass",
+                      decision["reason"])
+
+
+class DelegationMemoryTest(_HolderCase):
+    """`alerts_delegations` is written under the shared execution lease."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.role()
+
+    def test_the_memory_is_fenced_by_the_execution_lease(self):
+        lease = role_run._AlertsLease(self.db, NAME, "banc", ttl=60.0)
+        self.assertIsNotNone(lease.acquire())
+        owner, epoch = lease.owner, lease.epoch
+        self.assertTrue(alerts_delegation_pg.entrust(
+            self.db, NAME, "banc", lock_key=lease.key, owner=owner, epoch=epoch))
+        self.assertEqual(alerts_delegation_pg.latest(self.db, NAME)["host"], "banc")
+        lease.release()
+        self.assertFalse(alerts_delegation_pg.entrust(
+            self.db, NAME, "atelier", lock_key=lease.key, owner=owner, epoch=epoch))
+        self.assertEqual(alerts_delegation_pg.latest(self.db, NAME)["host"], "banc")
+
+    def test_a_second_handover_replaces_the_first(self):
+        lease = role_run._AlertsLease(self.db, NAME, "banc", ttl=60.0)
+        self.assertIsNotNone(lease.acquire())
+        self.addCleanup(lease.release)
+        self.assertTrue(alerts_delegation_pg.entrust(
+            self.db, NAME, "banc", lock_key=lease.key, owner=lease.owner,
+            epoch=lease.epoch))
+        self.assertTrue(alerts_delegation_pg.entrust(
+            self.db, NAME, "atelier", lock_key=lease.key, owner=lease.owner,
+            epoch=lease.epoch))
+        row = alerts_delegation_pg.latest(self.db, NAME)
+        self.assertEqual(row["host"], "atelier")
+        self.assertIsNotNone(row["entrusted_ts"])
 
 
 class LeaseSinceTriggerTest(_HolderCase):
@@ -252,12 +350,12 @@ class LeaseSinceTriggerTest(_HolderCase):
 
 
 class GraceAnchorTest(unittest.TestCase):
-    """The grace is anchored on the database tenure, not the host clock."""
+    """The grace is anchored on the database clocks, not the host clock."""
 
     def test_the_grace_covers_at_least_four_alerts_ticks(self):
         # The timer runs every 30 s (role_timers.ALERTS_INTERVAL_S): four
         # ticks cover a fresh executor, its first pass and a slow database.
-        self.assertGreaterEqual(election.HOLDER_NOTIFY_GRACE_S,
+        self.assertGreaterEqual(election.ALERTS_GRACE_S,
                                 4 * role_timers.ALERTS_INTERVAL_S)
 
 
