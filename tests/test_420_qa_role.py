@@ -543,7 +543,7 @@ class QaEvidenceTest(PgTestCase):
             ModuleStore(tx).replace("", modules.declarations(federation(require_qa=["promoted"])))
         findings = [f for f in modules.audit(self.db) if f["rule"] in ("missing_qa", "stale_qa")]
         self.assertEqual([(f["rule"], f["lot"], f["lot_state"]) for f in findings],
-                         [("missing_qa", self.lot, "promoted")])
+                         [("missing_qa", self.lot, "delivered")])
         self.qa()
         self.assertEqual([f for f in modules.audit(self.db) if f["rule"] in ("missing_qa", "stale_qa")],
                          [])
