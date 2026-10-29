@@ -4,6 +4,7 @@ relecture à l'aveugle et conclusion."""
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import subprocess
@@ -1074,6 +1075,22 @@ class ReportTest(unittest.TestCase):
         note = replay.note_text(report)
         self.assertEqual(len(note.splitlines()), 3)
         self.assertIn("équivalente", note)
+
+    def test_note_carries_the_report_sha256(self):
+        """#4312 : la note de B fige le fichier par son empreinte."""
+        report = {"schema": replay.REPORT_SCHEMA, "project": "p", "harness": "deepseek",
+                  "model": "m", "effort": "high", "turn_cap_s": 1800,
+                  "versions": {"old": {"version": "0.1"}, "new": {"version": "0.2"}},
+                  "lots": [self._entry(1)], "conclusion": "equal", "notes": []}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "report.json")
+            payload = b'{"schema": "ameesh-replay-report/1"}'
+            with open(path, "wb") as fh:
+                fh.write(payload)
+            report["report_path"] = path
+            note = replay.note_text(report)
+        self.assertIn("Rapport : %s" % path, note)
+        self.assertIn("Empreinte : %s" % hashlib.sha256(payload).hexdigest(), note)
 
 
 if __name__ == "__main__":

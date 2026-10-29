@@ -8,7 +8,9 @@ n'est lancé ici : l'exécuteur est couvert par la résolution d'adaptateur.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import hashlib
 import json
 import os
 import threading
@@ -238,6 +240,11 @@ class ReportRuleTest(unittest.TestCase):
 class AdoptionTest(PgTestCase):
     def setUp(self):
         super().setUp()
+        # #4312 : les binaires de test vivent dans le bac à sable ; déclarer
+        # ce préfixe est le geste explicite que la production demande.
+        prefixes = mock.patch.dict(os.environ, {veille.BINS_PREFIXES_ENV: self.tmp})
+        prefixes.start()
+        self.addCleanup(prefixes.stop)
         for name, host in (("canary", "h1"), ("impl", "h1"), ("other", "h2")):
             registry.upsert(
                 self.db, name, chantier="ameesh", harness="deepseek", host=host,
@@ -278,6 +285,15 @@ class AdoptionTest(PgTestCase):
     def _bins(self):
         return {name: registry.get(self.db, name)["harness_bin"]
                 for name in ("canary", "impl", "other")}
+
+    def _b_note(self, path, first=None):
+        """La note de B (#4292) avec l'empreinte du fichier (#4312)."""
+        with open(path, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        return ("%s\nBanc : #1 (light) ; coût, durée, tests du lot et note "
+                "aveugle dans le rapport.\nRapport : %s\nEmpreinte : %s"
+                % (first or "Rejeu comparatif deepseek 0.2.0-rc.2 -> "
+                             "0.2.1-rc.4 : meilleure.", path, digest))
 
     def _owner_adoption(self, bins=None):
         """Une adoption plus chère : décision owner #91 en attente, canari."""
@@ -357,18 +373,37 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(out["adoptions"][0]["result"], "canary")
         self.assertEqual(self._bins()["canary"], self.bins["h1"])
 
-    def test_inherited_model_must_match_the_evaluated_model(self):
-        """model NULL vaut le défaut du descripteur, jamais from_version par
-        hypothèse : pro → pro2 ne doit pas emmener les agents flash."""
+    def test_inherited_model_follows_the_runner_precedence(self):
+        """#4312 (N de l'auditeur sur #4293) : `model` NULL suit la précédence
+        du runner — état local de l'agent, puis défaut du descripteur. Un
+        agent distant (état illisible) est exclu, jamais supposé au défaut du
+        descripteur lu sur l'hôte du tick."""
         self.db.execute("UPDATE agent_registry SET model = NULL "
                         "WHERE name IN ('canary', 'impl', 'other')")
-        old = self._report(object="model", from_version="model-old",
-                           to_version="model-new")
-        self.assertEqual(veille._target_agents(self.db, old), [])
         flash = self._report(object="model", from_version="deepseek-flash",
                              to_version="model-new")
-        self.assertEqual({row["name"] for row in veille._target_agents(self.db, flash)},
-                         {"canary", "impl", "other"})
+        self.assertEqual(veille._target_agents(self.db, flash, cfg=self.cfg), [],
+                         "un agent distant sans état lisible n'est pas une cible")
+        # l'agent local, lui, est résolu comme le runner : sans fichier
+        # d'état, le défaut du descripteur (deepseek-flash) s'applique.
+        self.db.execute("UPDATE agent_registry SET host = %s WHERE name = 'canary'",
+                        (self.cfg.host,))
+        self.assertEqual(
+            {row["name"] for row in veille._target_agents(self.db, flash, cfg=self.cfg)},
+            {"canary"})
+        # un fichier d'état local différent du défaut l'emporte.
+        local_dir = self.cfg.agent_dir("canary")
+        os.makedirs(local_dir, exist_ok=True)
+        state_model = os.path.join(local_dir, "model")
+        with open(state_model, "w", encoding="utf-8") as fh:
+            fh.write("model-old\n")
+        self.assertEqual(veille._target_agents(self.db, flash, cfg=self.cfg), [])
+        # et celui qui vaut from_version le rend cible.
+        with open(state_model, "w", encoding="utf-8") as fh:
+            fh.write("deepseek-flash\n")
+        self.assertEqual(
+            {row["name"] for row in veille._target_agents(self.db, flash, cfg=self.cfg)},
+            {"canary"})
 
     def test_canary_regression_restores_the_previous_version(self):
         veille.adopt(self.cfg, self.db, self.lot, self._report(), bins=self.bins,
@@ -383,6 +418,22 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(state["stage"], "refused")
         self.assertEqual(state["inverse"]["version"], "0.2.0-rc.2")
         self.assertIn("cost_usd", state["reason"])
+
+    def test_canary_with_one_turn_at_the_deadline_is_refused(self):
+        """#4312 (N de l'auditeur sur #4293) : à 24 h, un seul tour ne fait
+        pas un canari concluant ; l'agent est remis sur l'ancienne version."""
+        veille.adopt(self.cfg, self.db, self.lot, self._report(), bins=self.bins,
+                     now=1000.0, rules=self.rules)
+        self._turn("canary", 0.01, 10.0, 1000.0 + 4000)
+        out = veille.tick(
+            self.cfg, self.db,
+            now=1000.0 + veille.CANARY_SECONDS + 1, rules=Rules(30 * 60))
+        self.assertEqual(out["adoptions"][0]["result"], "refused")
+        self.assertIn("turn", out["adoptions"][0]["reason"])
+        self.assertIsNone(self._bins()["canary"])
+        state = veille.load(self.db, self.lot)["state"]
+        self.assertEqual(state["stage"], "refused")
+        self.assertEqual(state["inverse"]["version"], "0.2.0-rc.2")
 
     def test_report_regression_changes_no_host(self):
         result = veille.adopt(self.cfg, self.db, self.lot,
@@ -553,16 +604,18 @@ class AdoptionTest(PgTestCase):
                 now=1000.0 + 5200, actor="tick", rules=Rules(30 * 60),
                 dry_run=False)
 
-        real_lock = veille._lock
+        real_locked = veille._locked
 
+        @contextlib.contextmanager
         def lock_after_the_concurrent_tick(db):
-            if not real_lock(db):
-                return False
+            # le tick concurrent bascule h2 ENTRE la lecture de l'état et la
+            # prise du verrou, puis rend la main au rollback.
             switch_h2_as_a_tick(db)
-            return True
+            with real_locked(db) as tx:
+                yield tx
 
-        with mock.patch.object(veille, "_lock",
-                               side_effect=lock_after_the_concurrent_tick):
+        with mock.patch.object(veille, "_locked",
+                               lock_after_the_concurrent_tick):
             result = veille.rollback(self.cfg, self.db, self.lot,
                                      reason="régression constatée",
                                      now=1000.0 + 5300)
@@ -573,13 +626,92 @@ class AdoptionTest(PgTestCase):
         restored = {item["agent"] for item in state["inverse"]["restore"]}
         self.assertEqual(restored, {"canary", "impl", "other"})
 
+    def test_lock_is_transactional_across_sessions(self):
+        """#4312 : le verrou doit être visible d'une AUTRE session pendant le
+        geste (verrou de transaction), et rendu à la sortie. Un verrou de
+        session avec psql ne survivrait pas à la requête suivante."""
+        with veille._locked(self.db) as tx:
+            self.assertIsNotNone(tx)
+            other = self.connect()
+            try:
+                rows = other.query(
+                    "SELECT pg_try_advisory_xact_lock("
+                    "hashtextextended(current_schema() || %s, 0)) AS ok",
+                    (veille.LOCK_KEY,))
+            finally:
+                other.close()
+            self.assertFalse(rows[0]["ok"], "la seconde session ne prend pas le verrou")
+        with veille._locked(self.db) as tx:
+            self.assertIsNotNone(tx, "le verrou est rendu à la fin du geste")
+
     def test_rollback_releases_the_lock_when_the_lot_is_absent(self):
-        with mock.patch.object(veille, "_lock", return_value=True), \
-             mock.patch.object(veille, "_unlock") as unlock:
-            with self.assertRaises(veille.VeilleError):
-                veille.rollback(self.cfg, self.db, 999999,
-                                reason="lot absent", now=1000.0)
-        unlock.assert_called_once()
+        # #4312 : le verrou est de transaction ; l'erreur doit le rendre avec
+        # la transaction (sinon le tick suivant resterait « busy »).
+        with self.assertRaises(veille.VeilleError):
+            veille.rollback(self.cfg, self.db, 999999,
+                            reason="lot absent", now=1000.0)
+        with veille._locked(self.db) as tx:
+            self.assertIsNotNone(tx, "le verrou a été rendu par rollback")
+
+    def _blocked_owner_canary(self):
+        """Adoption owner approuvée, canari bloqué faute de carte de binaires."""
+        self._owner_adoption(bins={})
+        answered = {"state": "answered", "answer": {"option": "adopt"}}
+        with mock.patch.object(veille.decisions, "get", return_value=answered), \
+             mock.patch.object(veille.decisions, "verify_proof",
+                               return_value=(True, "signed owner key")):
+            out = veille.tick(self.cfg, self.db, now=1001.0, bins={},
+                              rules=Rules(1800))
+        self.assertEqual(out["adoptions"][0]["result"], "blocked")
+        state = veille.load(self.db, self.lot)["state"]
+        self.assertEqual(state["blocked_from"], "waiting_owner_approved")
+
+    def test_blocked_canary_resume_with_a_withdrawn_decision_is_refused(self):
+        """#4312 (N de l'auditeur sur #4293 dc0d) : la reprise d'un canari
+        bloqué après approbation ne contourne pas une décision retirée."""
+        self._blocked_owner_canary()
+        with mock.patch.object(veille.decisions, "get",
+                               return_value={"state": "withdrawn"}):
+            out = veille.tick(self.cfg, self.db, now=1002.0, bins=self.bins,
+                              rules=Rules(1800))
+        self.assertEqual(out["adoptions"][0]["result"], "refused")
+        self.assertIn("decision", out["adoptions"][0]["reason"])
+        self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
+        self.assertEqual(veille.load(self.db, self.lot)["state"]["stage"], "refused")
+
+    def test_blocked_canary_resume_with_an_invalid_proof_is_refused(self):
+        """#4312 : même reprise avec une preuve invalide (clé révoquée)."""
+        self._blocked_owner_canary()
+        answered = {"state": "answered", "answer": {"option": "adopt"}}
+        with mock.patch.object(veille.decisions, "get", return_value=answered), \
+             mock.patch.object(veille.decisions, "verify_proof",
+                               return_value=(False, "key revoked since")):
+            out = veille.tick(self.cfg, self.db, now=1002.0, bins=self.bins,
+                              rules=Rules(1800))
+        self.assertEqual(out["adoptions"][0]["result"], "refused")
+        self.assertIn("proof", out["adoptions"][0]["reason"])
+        self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
+        self.assertEqual(veille.load(self.db, self.lot)["state"]["stage"], "refused")
+
+    def test_blocked_canary_restart_appends_to_applied(self):
+        """#4312 (N de l'auditeur a00fa) : une reprise de canari AJOUTE à
+        `applied` ; elle n'écrase pas l'inverse déjà consigné."""
+        veille.adopt(self.cfg, self.db, self.lot, self._report(), bins=self.bins,
+                     now=1000.0, rules=self.rules)
+        row = veille.load(self.db, self.lot)
+        state = row["state"]
+        state.update({"stage": "blocked", "blocked_from": "canary",
+                      "reason": "no idle agent"})
+        row["_db"] = self.db
+        veille.save(self.db, row, state)
+        out = veille.tick(self.cfg, self.db, now=1001.0, bins=self.bins,
+                          rules=Rules(1800))
+        self.assertEqual(out["adoptions"][0]["result"], "canary")
+        state = veille.load(self.db, self.lot)["state"]
+        self.assertEqual(len(state["applied"]), 2,
+                         "la reprise ajoute son geste, ne remplace pas l'ancien")
+        self.assertEqual(state["applied"][0]["agents"][0]["name"], "canary")
+        self.assertEqual(state["applied"][1]["agents"][0]["name"], "impl")
 
     def test_owner_approval_without_a_valid_proof_is_refused(self):
         higher = self._report(price={
@@ -704,11 +836,7 @@ class AdoptionTest(PgTestCase):
         raw["evaluated"]["new"]["binary"] = self.new_bin
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(raw, fh)
-        note = ("Rejeu comparatif deepseek 0.2.0-rc.2 -> 0.2.1-rc.4 : meilleure.\n"
-                "Banc : #1 (light) ; coût, durée, tests du lot et note aveugle "
-                "dans le rapport.\n"
-                "Rapport : %s" % path)
-        work.note(self.db, self.lot, note, actor="canary")
+        work.note(self.db, self.lot, self._b_note(path), actor="canary")
         local_cfg = dataclasses.replace(self.cfg, host="h1")
         out = veille.tick(local_cfg, self.db, now=1000.0, bins={},
                           rules=Rules(30 * 60))
@@ -717,6 +845,35 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(state["stage"], "canary")
         self.assertEqual(state["canary_bin"], self.new_bin)
         self.assertEqual(self._bins()["canary"], self.new_bin)
+
+    def test_b_note_requires_the_report_hash_and_rejects_a_changed_file(self):
+        """#4312 (N de l'auditeur sur #4293 dc0d) : la note de B doit figer
+        le fichier par son sha256 ; un fichier changé après la note est
+        refusé (TOCTOU)."""
+        path = os.path.join(self.tmp, "b-report.json")
+        raw = b_report()
+        raw["evaluated"]["old"]["binary"] = self.old_bin
+        raw["evaluated"]["new"]["binary"] = self.new_bin
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(raw, fh)
+        work.note(self.db, self.lot,
+                  "Rejeu comparatif deepseek : meilleure.\n"
+                  "Banc : #1 (light).\nRapport : %s" % path, actor="canary")
+        with self.assertRaises(veille.VeilleError) as caught:
+            veille.report_from_lot(self.db, self.lot)
+        self.assertIn("sha256", str(caught.exception))
+
+        work.note(self.db, self.lot,
+                  self._b_note(path, "Rejeu comparatif deepseek : meilleure."),
+                  actor="canary")
+        self.assertEqual(veille.report_from_lot(self.db, self.lot).evaluation_lot,
+                         self.lot)
+
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(" ")
+        with self.assertRaises(veille.VeilleError) as caught:
+            veille.report_from_lot(self.db, self.lot)
+        self.assertIn("changed", str(caught.exception))
 
     def test_b_report_binary_is_refused_on_another_host(self):
         """new_binary est local au tick : un canari distant sans carte
@@ -727,9 +884,8 @@ class AdoptionTest(PgTestCase):
         raw["evaluated"]["new"]["binary"] = self.new_bin
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(raw, fh)
-        work.note(self.db, self.lot,
-                  "Rejeu comparatif deepseek : meilleure.\n"
-                  "Banc : #1 (light).\nRapport : %s" % path, actor="canary")
+        work.note(self.db, self.lot, self._b_note(
+            path, "Rejeu comparatif deepseek : meilleure."), actor="canary")
         out = veille.tick(self.cfg, self.db, now=1000.0, bins={},
                           rules=Rules(30 * 60))
         self.assertEqual(out["discovered"][0]["result"], "blocked")
@@ -749,6 +905,17 @@ class AdoptionTest(PgTestCase):
         self.assertIn("explicit map", result["state"]["reason"])
         self.assertEqual(self._bins(), {"canary": None, "impl": None,
                                         "other": None})
+
+    def test_bin_outside_the_controlled_prefix_is_refused(self):
+        """#4312 : un chemin absolu exécutable hors des racines autorisées ne
+        doit pas devenir `harness_bin` (défense en profondeur)."""
+        outside = os.path.join("/var/tmp", "ameesh-evil-dsh")
+        with mock.patch.dict(os.environ, {veille.BINS_PREFIXES_ENV: ""}):
+            with self.assertRaises(veille.VeilleError) as caught:
+                veille._check_bin(outside)
+        self.assertIn("controlled prefixes", str(caught.exception))
+        # le chemin autorisé passe
+        self.assertEqual(veille._check_bin(self.new_bin), self.new_bin)
 
     def test_explicit_bin_for_a_remote_canary_is_not_probed_here(self):
         """Un chemin explicite vise l'hôte distant : sa forme est vérifiée,
@@ -770,9 +937,8 @@ class AdoptionTest(PgTestCase):
         raw["evaluated"]["new"]["binary"] = self.new_bin
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(raw, fh)
-        work.note(self.db, self.lot,
-                  "Rejeu comparatif deepseek : meilleure.\n"
-                  "Banc : #1 (light).\nRapport : %s" % path, actor="canary")
+        work.note(self.db, self.lot, self._b_note(
+            path, "Rejeu comparatif deepseek : meilleure."), actor="canary")
         bins_path = os.path.join(self.tmp, "bins.json")
         with open(bins_path, "w", encoding="utf-8") as fh:
             json.dump({"bins": {"deepseek": {"0.2.1-rc.4": {
