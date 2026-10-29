@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Shared lifecycle vocabulary during the generic-core transition (#114).
 
-L99 T3 (#4351) stores validated separately from a recorded merge.
+L99 T3 (#4351) recognizes validated separately from a recorded merge;
+its writer follows the reader compatibility release (#4426).
 L99 T1 (#4349) adds the generic
 names as aliases: `canonical` returns the persisted spelling and
 `lifecycle_name` the generic one. TERMINAL means no further normal

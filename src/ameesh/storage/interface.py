@@ -2572,8 +2572,8 @@ class WorkItems(Domain):
 
         Un gel depuis `intake`, `build` ou `validated` entre en `qa` avant
         son callback (#3467/#4351), dans la même transaction. Un verdict
-        retire la validation précédente ; après commit, une porte complète
-        peut rétablir `validated`, sous contrôle du lot et des jalons observés.
+        retire la validation précédente. Cette tranche de compatibilité ne
+        crée pas de lot `validated` : l’écrivain suivra le staging des lecteurs.
         Un lot épinglé à un Process conserve son état (#3489).
         Un état bloqué ou terminal n'est pas levé par ce geste.
 

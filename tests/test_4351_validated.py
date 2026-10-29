@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Stored validation is derived from the exact-head review gate."""
+"""Reader-first compatibility: understand validated without producing it."""
 import datetime
 import types
 from unittest import mock
@@ -18,10 +18,6 @@ class ValidatedTest(PgTestCase):
         work.move(self.db, self.lot, "build")
         work.move(self.db, self.lot, "qa")
         self.ops = storage.of(self.db).work
-        self.gate = mock.patch("ameesh.merge_queue.review_gate_for_item")
-        self.read = self.gate.start()
-        self.addCleanup(self.gate.stop)
-        self.read.return_value = {"ok": False, "accepted": []}
         self.mark("frozen")
 
     def mark(self, kind="verdict", sha=HEAD, verdict="ok"):
@@ -32,29 +28,35 @@ class ValidatedTest(PgTestCase):
     def current_state(self):
         return work.get(self.db, self.lot)["state"]
 
-    def test_quorum_promotes_and_blocker_revokes_validation(self):
-        self.mark("frozen")
-        self.mark()
-        self.assertEqual(self.current_state(), "qa")
-        self.read.return_value = {"ok": True, "accepted": [{"actor": "reader"}]}
-        self.mark()
-        self.assertEqual(self.current_state(), "validated")
-        self.assertEqual(self.read.call_args.args[2]["id"], self.lot)
-        self.assertEqual(self.read.call_args.args[3][0]["kind"], "verdict")
-        self.read.return_value = {"ok": False, "blocked": [{"actor": "reader"}]}
-        self.mark(verdict="blocked")
+    def existing_validated(self):
+        # Model rows produced by the later writer release. This reader tranche
+        # must support those rows after that release rolls back to its baseline.
+        self.db.execute("UPDATE work_items SET state = 'validated' WHERE id = %s", (self.lot,))
+
+    def test_verdict_keeps_legacy_qa_even_with_a_quorum(self):
+        with mock.patch("ameesh.merge_queue.review_gate_for_item", return_value={"ok": True}) as gate:
+            self.mark()
+        gate.assert_not_called()
         self.assertEqual(self.current_state(), "qa")
 
-    def test_refreeze_resets_validation_in_the_same_transaction(self):
-        self.read.return_value = {"ok": True}
+    def test_manual_writer_is_unavailable_in_the_reader_release(self):
         self.mark()
-        self.assertEqual(self.current_state(), "validated")
+        with self.assertRaisesRegex(work.WorkError, "transition refused"):
+            work.move(self.db, self.lot, "validated")
+        self.assertEqual(self.current_state(), "qa")
+
+    def test_refreeze_resets_existing_validation_in_the_same_transaction(self):
+        self.existing_validated()
         self.mark("frozen", NEXT)
         self.assertEqual(self.current_state(), "qa")
 
+    def test_verdict_returns_existing_validation_to_qa(self):
+        self.existing_validated()
+        self.mark(verdict="blocked")
+        self.assertEqual(self.current_state(), "qa")
+
     def test_failed_freeze_hook_rolls_back_state_and_milestone(self):
-        self.read.return_value = {"ok": True}
-        self.mark()
+        self.existing_validated()
         before = self.ops.milestones(self.lot, None)
         def fail(*args):
             raise RuntimeError("designation failed")
@@ -64,30 +66,15 @@ class ValidatedTest(PgTestCase):
         self.assertEqual(self.current_state(), "validated")
         self.assertEqual(self.ops.milestones(self.lot, None), before)
 
-    def test_manual_validation_requires_quorum_and_unreadable_gate_refuses(self):
-        for gate in ({"ok": False}, None):
-            self.read.return_value = gate
-            with self.assertRaisesRegex(work.WorkError, "quorum"):
-                work.move(self.db, self.lot, "validated")
-            self.assertEqual(self.current_state(), "qa")
-        self.read.return_value = {"ok": True}
-        work.move(self.db, self.lot, "validated")
-        self.assertEqual(self.current_state(), "validated")
+    def test_existing_validation_can_return_to_build(self):
+        self.existing_validated()
         work.move(self.db, self.lot, "build")
+        self.assertEqual(self.current_state(), "build")
         self.assertEqual(work.get(self.db, self.lot)["loops"], 1)
 
-    def test_concurrent_freeze_invalidates_the_computed_quorum(self):
-        def freeze_during_gate(*args, **kwargs):
-            self.mark("frozen", NEXT)
-            return {"ok": True}
-        self.read.side_effect = freeze_during_gate
-        self.mark()
-        self.assertEqual(self.current_state(), "qa")
-
     def test_validated_lot_can_declare_a_landing(self):
-        self.read.return_value = {"ok": True}
         self.mark()
-        self.assertEqual(self.current_state(), "validated")
+        self.existing_validated()
         vehicle = work.add(self.db, title="vehicle", app="demo")["id"]
         self.ops.add_milestone(vehicle, "frozen", sha=NEXT, actor="pilot", verdict=None, note="")
         until = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()

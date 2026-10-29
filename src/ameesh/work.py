@@ -73,7 +73,7 @@ MAX_QA_LOOPS = 2
 FORWARD = {
     "intake": ("build",),
     "build": ("qa",),
-    "qa": ("validated", "merged", "build"),
+    "qa": ("merged", "build"),
     "validated": ("merged", "build"),
     "merged": ("promoted",),
     "promoted": (),
@@ -84,7 +84,7 @@ FORWARD = {
 TRANSITIONS = {
     "intake": {"build", "blocked", "waiting_human"},
     "build": {"qa", "blocked", "waiting_human"},
-    "qa": {"validated", "merged", "build", "blocked", "waiting_human"},
+    "qa": {"merged", "build", "blocked", "waiting_human"},
     "validated": {"qa", "merged", "build", "blocked", "waiting_human"},
     "merged": {"promoted", "blocked", "waiting_human"},
     "promoted": set(),

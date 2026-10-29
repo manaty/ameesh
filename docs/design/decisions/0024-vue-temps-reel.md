@@ -35,10 +35,16 @@ readable on a phone:
 - Lot L24: JSON export of the events and the state (`ameesh progress --json`),
   timeline data model, and a reference view.
 
-# L99 T3 — persisted approval (#4351)
+# L99 T3 — reader compatibility for approval (#4351)
 
-`validated` is a distinct stored state after `qa`: the review gate's quorum
-on the frozen head promotes the lot automatically. A new freeze returns it
-to `qa`; a current blocking verdict removes validation. `merged` continues
-to mean a recorded merge. Package readers accept both `validated` and legacy
-`qa` lots with a quorum, and recheck the review gate before admission.
+`validated` is a distinct stored state after `qa`, separate from `merged`.
+This compatibility release understands it in transitions, progress, package
+and train candidates, carriers and planned landings. A new freeze or verdict
+returns an existing validated lot to `qa`.
+
+It does not create validated lots: review verdicts keep writing `qa`, and
+manual `qa → validated` is unavailable. The writer follows in lot #4426, in a subsequent release,
+after staging has established a compatible reader and rollback baseline.
+During that transition, package readers still qualify legacy `qa` lots with
+the full exact-head review gate. The first writer implementation is retained
+in commit `91d9f3e28191a8b47f353599632d6b7b718368a0` for the follow-up.
