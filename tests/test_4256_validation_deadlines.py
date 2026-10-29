@@ -122,6 +122,36 @@ class ValidationTest(PgTestCase):
                 if r["kind"] == "late_response"]
         self.assertEqual(len(late), 1)
 
+    def test_late_contradiction_survives_merged_lot_and_retries(self):
+        view = self.ask(due_ts=self.now + 60)
+        vd.sweep(self.cfg, self.db, now=self.now + 61)
+        self.answer(view, human="human:po", now=self.now + 62)
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (self.lot["id"],))
+        for offset in (63, 64):
+            result = self.answer(view, text="b", now=self.now + offset)
+            self.assertTrue(result["followup_pending"])
+        late = [r for r in storage.of(self.db).decisions.validation_history(person="human:tpm")
+                if r["kind"] == "late_response"]
+        self.assertEqual(len(late), 1)
+        pending = [r for r in storage.of(self.db).decisions.validation_history(person="human:tpm")
+                   if r["kind"] == "followup_pending"]
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["facts"]["relation"], "contradicts")
+        self.assertEqual(decisions.get(self.db, view["id"])["answer"]["option"], "a")
+
+    def test_long_late_reply_is_preserved_and_followup_fits(self):
+        view = self.ask(due_ts=self.now + 60)
+        vd.sweep(self.cfg, self.db, now=self.now + 61)
+        self.answer(view, human="human:po", now=self.now + 62)
+        text = "x" * decisions.MAX_ANSWER
+        result = self.answer(view, text=text, now=self.now + 63)
+        self.assertTrue(result["followup"])
+        late = [r for r in storage.of(self.db).decisions.validation_history(person="human:tpm")
+                if r["kind"] == "late_response"]
+        self.assertEqual(len(late), 1)
+        self.assertEqual(late[0]["facts"]["text"], text)
+
     def test_agent_cannot_read_private_history(self):
         self.ask()
         with mock.patch.object(decisions, "answering_human",

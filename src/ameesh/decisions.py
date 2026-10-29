@@ -1490,6 +1490,10 @@ def cmd_answer(cfg: Config, argv: list[str]) -> int:
         print("late response recorded; decision #%d remains unchanged; "
               "new decision #%d (contradicts)" % (decision_id, result["followup"]))
         return 0
+    if result.get("followup_pending"):
+        print("late response recorded; decision #%d remains unchanged; "
+              "contradictory follow-up pending" % decision_id)
+        return 0
     if result.get("late_recorded"):
         print("late response recorded; decision #%d remains unchanged" % decision_id)
         return 0

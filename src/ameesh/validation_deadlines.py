@@ -204,10 +204,14 @@ def late_response(cfg, db, view, *, human, text, option, now):
     answer = view.get("answer") or {}
     same = (answer.get("option") == option if option is not None
             else answer.get("text") == text)
+    # The factual reply must survive a refused follow-up (closed lot,
+    # invalid routing, etc.). Retrying remains safe through the event key.
+    with db.transaction() as tx:
+        storage.of(tx).decisions.validation_lock(view["id"])
+        response(tx, view, human=human, text=text, now=now)
     with db.transaction() as tx:
         store = storage.of(tx).decisions
         store.validation_lock(view["id"])
-        response(tx, view, human=human, text=text, now=now)
         if same:
             if answer.get("by") != human:
                 return {"decision": view, "late_recorded": True, "replayed": False}
@@ -217,12 +221,25 @@ def late_response(cfg, db, view, *, human, text, option, now):
         if existing:
             return {"decision": decisions.get(tx, view["id"], now),
                     "followup": existing, "relation": "contradicts", "replayed": True}
-        followup = decisions.ask(
-            cfg, tx, requester=view["requester"], lot=str(view["lot"]),
-            question="Conflicting late response to decision #%s: %s" % (view["id"], text),
-            options=["keep=Keep the recorded decision", "revise=Reconsider the decision"],
-            needs_signature=view["needs_signature"],
-            domain=view["validation"]["domain"], issue_links=view["validation"]["links"], now=now)
+        try:
+            # ask may write before refusing: isolate those writes as well.
+            with tx.transaction() as followup_tx:
+                followup = decisions.ask(
+                    cfg, followup_tx, requester=view["requester"], lot=str(view["lot"]),
+                    question=("Conflicting late response to decision #%s: %s" %
+                              (view["id"], text))[:decisions.MAX_QUESTION],
+                    options=["keep=Keep the recorded decision", "revise=Reconsider the decision"],
+                    needs_signature=view["needs_signature"],
+                    domain=view["validation"]["domain"],
+                    issue_links=view["validation"]["links"], now=now)
+        except decisions.DecisionError:
+            store.validation_event(
+                view["id"], person=human, kind="followup_pending", now=now,
+                facts={"response_key": response_key, "relation": "contradicts"},
+                event_key="followup_pending:" + response_key)
+            return {"decision": decisions.get(tx, view["id"], now),
+                    "late_recorded": True, "followup_pending": True,
+                    "relation": "contradicts", "replayed": False}
         store.validation_followup(view["id"], followup_id=followup["id"], response_key=response_key)
         return {"decision": decisions.get(tx, view["id"], now),
                 "followup": followup["id"], "relation": "contradicts", "replayed": False}
