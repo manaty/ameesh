@@ -794,6 +794,15 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                     parts.append("memory PSI %.1f %%" % cgroup["mem_some"])
                 if parts:
                     print("  cgroup     %s" % "; ".join(parts))
+            # #4433 : la PSI mémoire de l'hôte suit un runner à son propre
+            # memory.max — la brèche est nominative, l'hôte n'est pas retenu.
+            for runner in (verdict or {}).get("attributed") or ():
+                print("  pressure   runner %s at %s of its memory.max (%s); its own "
+                      "memory PSI %s — its new turns are held, the host's are not"
+                      % (runner.get("agent") or runner.get("unit") or "?",
+                         res.fmt_value("max_cgroup_memory_used", runner.get("mem_used")),
+                         _fmt_bytes(runner.get("mem_max_bytes")),
+                         res.fmt_value("max_mem_pressure", runner.get("mem_some"))))
             manque = res.unmeasured(latest)
             if manque:
                 # L64: a measure the host cannot give, said rather than a "—"

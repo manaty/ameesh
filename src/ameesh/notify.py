@@ -287,6 +287,8 @@ TYPE_LABELS = {
     # #1107 (n2 P3 de #1035) : un lot que les passes d'alerte ne savent pas lire
     "lot_unreadable": "work item unreadable by the alert passes",
     "host_pressure": "host under pressure",
+    # #4433: the host's memory PSI comes from one runner's own memory.max
+    "runner_pressure": "runner at its own memory ceiling",
     "host_unsampled": "host sampler silent",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",

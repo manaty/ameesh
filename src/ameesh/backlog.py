@@ -192,7 +192,9 @@ CLASS_CAPABILITIES = ("sensible", "sensitive", "production", "decision")
 #: capacité exigée qui désigne un harnais (`harness:codex`)
 HARNESS_PREFIX = "harness:"
 TAKE_WINDOW_S = 3600.0
-#: alertes qui empêchent une prise sur l'hôte de l'agent
+#: alertes qui empêchent une prise sur l'hôte de l'agent. #4433 :
+#: `runner_pressure` est absent volontairement — la pression d'un runner ne
+#: retient que ses propres tours, pas la prise des autres agents de l'hôte.
 HOST_BLOCKING_ALERTS = ("host_pressure", "host_power_low", "host_not_ready", "host_disk_low")
 SENDER = "ameesh"
 #: #2584 : `source` d'un panier — `backlog-basket:<projet>:<chantier>:<jour>`
