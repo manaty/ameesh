@@ -13,9 +13,10 @@ import json
 import os
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import cost, registry, harness_adoption as veille, work
+from ameesh import adapters, cost, registry, harness_adoption as veille, work
 from ameesh.adapters import HarnessMissing
 
 from .support import PgTestCase
@@ -845,18 +846,30 @@ class AdoptionTest(PgTestCase):
         os.chmod(binary, 0o755)
         worker = AgentWorker.__new__(AgentWorker)
         threading.Thread.__init__(worker, name="canary", daemon=True)
+        worker.cfg = SimpleNamespace(host="h1")
         worker.agent = {"name": "canary", "harness": "deepseek",
                         "harness_bin": binary}
         worker.descriptor_seen = None
         worker.resolution_seen = ""
         worker.turn_harness = lambda: "deepseek"
-        adapter = worker._adapter()
+        # #4488 : le binaire épinglé est déclaré sur l'hôte (harness_bins).
+        with mock.patch.dict(adapters._HARNESS_BINS, {"deepseek": binary}):
+            adapter = worker._adapter()
         self.assertEqual(adapter.binary, binary)
-        # un chemin absent est une erreur d'hôte, jamais un repli silencieux
+        # un chemin déclaré mais absent est une erreur d'hôte, jamais un
+        # repli silencieux
+        absent = os.path.join(self.tmp, "absent")
         worker.agent = {"name": "canary", "harness": "deepseek",
-                        "harness_bin": os.path.join(self.tmp, "absent")}
-        with self.assertRaises(HarnessMissing):
-            worker._adapter()
+                        "harness_bin": absent}
+        with mock.patch.dict(adapters._HARNESS_BINS, {"deepseek": absent}):
+            with self.assertRaises(HarnessMissing) as ctx:
+                worker._adapter()
+        self.assertIn("not found or not executable", str(ctx.exception))
+        # #4488 : un chemin NON déclaré est refusé avant toute résolution.
+        with mock.patch.dict(adapters._HARNESS_BINS, {"deepseek": binary}):
+            with self.assertRaises(HarnessMissing) as ctx:
+                worker._adapter()
+        self.assertIn("not a binary declared", str(ctx.exception))
 
     def test_ameesh_set_accepts_an_absolute_harness_bin(self):
         binary = os.path.join(self.tmp, "dsh")

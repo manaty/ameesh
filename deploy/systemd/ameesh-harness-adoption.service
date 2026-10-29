@@ -19,7 +19,9 @@
 #
 # The installed-binary map is read from ~/.config/ameesh/harness-adoption.json
 # (or AMEESH_HARNESS_ADOPTION_BINS): explicit per harness/version/host paths.
-# The report's new_binary covers the canary host only.
+# The report's new_binary covers the canary host only. Each executor also reads
+# this map (#4488) to accept a pinned harness_bin: install it on the hosts whose
+# agents are switched.
 [Unit]
 Description=ameesh harness adoption (harness/model versions, #4293)
 After=network-online.target

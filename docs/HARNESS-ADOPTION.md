@@ -226,6 +226,16 @@ le timer sans double geste. Chaque transition laisse une note
 - `agent_registry.harness_bin` : binaire du harnais pour un agent ; `NULL`
   garde le comportement d'hôte (`harness_bins`, PATH). `ameesh set <agent>
   harness_bin=/chemin/absolu` le pose, une valeur vide l'efface.
+- **Un `harness_bin` n'est lancé que s'il est déclaré sur l'hôte** (#4488) :
+  carte des binaires installés (`AMEESH_HARNESS_ADOPTION_BINS` ou
+  `~/.config/ameesh/harness-adoption.json`, toutes versions, pour cet hôte),
+  `harness_bins` de la configuration, ou `AMEESH_<HARNAIS>_BIN`. Un chemin
+  écrit en base par une autre identité ne peut donc pas faire exécuter un
+  binaire arbitraire avec les identifiants du compte ; la garde est dans
+  l'exécuteur et dans `ameesh attach`, au moment de la lecture. Installez la
+  carte sur chaque hôte qui porte des agents épinglés : un chemin fourni par
+  `--bin` ou `new_binary` mais absent de la carte de l'hôte est refusé
+  (« hôte non prêt »), jamais lancé.
 - L'exécuteur relit la ligne de l'agent au début de chaque tour ; un tour en
   cours ne change jamais de binaire sous lui. La même valeur suit l'agent en
   session interactive (`ameesh attach`).

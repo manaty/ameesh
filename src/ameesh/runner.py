@@ -471,6 +471,35 @@ def _preemption_generation(worker) -> int:
         return worker.preempt_gen
 
 
+def declared_adoption_binaries(harness: str, host: str) -> set[str]:
+    """Les binaires installés déclarés sur CET hôte (#4488).
+
+    La carte locale est relue à chaque tour : un binaire installé puis déclaré
+    est vu sans redémarrer l'exécuteur. Une carte illisible est une erreur
+    d'hôte (fail-closed), jamais un laissez-passer."""
+    from . import harness_adoption
+    try:
+        return harness_adoption.declared_binaries(harness, host)
+    except harness_adoption.VeilleError as exc:
+        raise adapters.HarnessMissing("harness-adoption bins: %s" % exc) from exc
+
+
+def agent_adapter(harness: str, harness_bin: str | None,
+                  host: str) -> adapters.HarnessAdapter:
+    """L'adaptateur d'un agent, avec la garde de lecture de #4488.
+
+    Un `harness_bin` écrit en base n'est lancé que s'il est DÉCLARÉ sur cet
+    hôte : carte des binaires installés (`harness_adoption`), `harness_bins`
+    de la configuration, ou `AMEESH_<HARNAIS>_BIN`. Sinon c'est une erreur
+    d'hôte (`HarnessMissing`) : le tour n'est pas lancé, et le binaire nommé
+    par la base ne reçoit jamais les identifiants du compte."""
+    if harness_bin:
+        adapters.require_declared_harness_bin(
+            harness, harness_bin, host=host,
+            extra=declared_adoption_binaries(harness, host))
+    return adapters.adapter_for(harness, harness_bin)
+
+
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
     MAX_RENEW_FAILURES = 3
@@ -5973,7 +6002,15 @@ class AgentWorker(threading.Thread):
         # #4293 : binaire choisi pour CET agent (canari d'adoption) ; NULL =
         # résolution de l'hôte inchangée. Un tour déjà lancé garde son
         # adaptateur : la ligne est relue au début du tour suivant.
-        adapter = adapters.adapter_for(harness, (self.agent or {}).get("harness_bin") or None)
+        agent = self.agent or {}
+        choisi = agent.get("harness_bin") or None
+        if choisi and agent.get("harness") and harness != agent.get("harness"):
+            # #4488 : le binaire épinglé est celui du harnais de l'agent. Un
+            # tour de repli (L242b) ou le résumé d'une rotation sous l'ancien
+            # harnais ne doit ni lancer ce binaire sous un autre adaptateur,
+            # ni être bloqué par sa garde : on reprend la résolution de l'hôte.
+            choisi = None
+        adapter = agent_adapter(harness, choisi, getattr(self.cfg, "host", ""))
         # Traçabilité de chaîne d'approvisionnement (décision 0021) : chaque
         # descripteur utilisé est journalisé avec sa provenance et son empreinte,
         # une fois par changement (pas à chaque tour).
@@ -13681,9 +13718,10 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
               file=sys.stderr)
         return 1
     try:
-        # #4293 : le binaire du canari suit l'agent en session interactive aussi
-        adapter = adapters.adapter_for(agent.get("harness") or "other",
-                                       agent.get("harness_bin") or None)
+        # #4293 : le binaire du canari suit l'agent en session interactive
+        # aussi ; #4488 : seulement s'il est déclaré sur cet hôte.
+        adapter = agent_adapter(agent.get("harness") or "other",
+                                agent.get("harness_bin") or None, cfg.host)
         # #2706 : refus AVANT le bail. `dsh --profile agent` est headless et
         # exige une tâche : l'ancien code prenait le bail, lançait la commande
         # sans texte, puis le rendait en 4 s après « a task is required »,
