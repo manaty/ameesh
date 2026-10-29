@@ -63,6 +63,12 @@ CHECKS = (
     # pas tomber dans une classe de relecture plus faible que son ancien chemin
     # (les `modules/dev/**` déplacés par L100 tombent au défaut léger).
     ("alias de module #4521", ["scripts/garde-alias-classe.py", "--root", "."]),
+    # #4521 B/P1 auditeur : la politique épinglée lue en CI (canon privé
+    # illisible sur un runner) doit suivre le canon de l'hôte ; une politique
+    # périmée ou affaiblie refuse le gel.
+    ("alias de module #4521 (politique épinglée)",
+     ["scripts/garde-alias-classe.py", "--root", ".",
+      "--check-policy", "scripts/alias-review-classes.json"]),
 )
 #: #3687 : les modules de contrat de la porte de fusion (avis, auteurs, feu,
 #: désignation, report des verdicts) ; seules leurs classes sans base tournent

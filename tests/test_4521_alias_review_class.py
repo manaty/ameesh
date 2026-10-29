@@ -362,6 +362,9 @@ class RealTreeTest(unittest.TestCase):
         spec.loader.exec_module(freeze)
         commands = [args for _name, args in freeze.CHECKS]
         self.assertIn(["scripts/garde-alias-classe.py", "--root", "."], commands)
+        self.assertIn(["scripts/garde-alias-classe.py", "--root", ".",
+                       "--check-policy", "scripts/alias-review-classes.json"],
+                      commands)
 
 
 class BranchementCITest(unittest.TestCase):
@@ -388,12 +391,24 @@ class BranchementCITest(unittest.TestCase):
 
     def test_la_garde_tourne_dans_le_job_plan_requis(self):
         plan = self.job_block("plan")
+        # le canon est privé : la CI lit la politique épinglée du dépôt
         self.assertIn(
-            "run: python3 scripts/garde-alias-classe.py --root . --project ameesh",
-            plan)
+            "run: python3 scripts/garde-alias-classe.py --root . --project ameesh "
+            "--policy scripts/alias-review-classes.json", plan)
+        self.assertNotIn("https://github.com/manaty/home.git", plan)
+        self.assertNotIn("CANON_REF", plan)
         # `plan` est une dépendance de l'agrégat requis `tests` : son échec
         # rougit le check requis (`scripts/ci-agregat.py`, plan != success).
         self.assertIn("needs: [plan,", self.job_block("tests"))
+
+    def test_la_politique_epinglee_couvre_les_alias_du_depot(self):
+        path = REPO / "scripts" / "alias-review-classes.json"
+        policy = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(policy.get("project"), "ameesh")
+        classes = policy.get("classes") or {}
+        for alias in script.aliases(str(REPO)):
+            self.assertIn(alias.old, classes)
+            self.assertIn(alias.new, classes)
 
 
 #: un git de banc, sans la configuration de l'hôte
@@ -410,10 +425,11 @@ GIT_ENV = {
 class CanonReelTest(unittest.TestCase):
     """#4521 B cx2 : la garde sous un canon git réel, pas une politique simulée.
 
-    La commande est celle de la CI (`--root . --project ameesh`, même
-    interpréteur), lancée sur l'arbre réel du dépôt ; le canon est un dépôt git
-    jetable. Une implémentation plus légère est refusée, un canon absent ou
-    illisible aussi.
+    La commande de la CI (`--root . --project ameesh --policy FILE`) est
+    rejouée dans l'environnement nu d'un runner, sans canon ni config d'hôte
+    (B/P1 auditeur) ; les témoins de génération et de vérification utilisent
+    un canon git jetable. Une implémentation plus légère est refusée, une
+    politique absente, invalide ou périmée aussi.
     """
 
     def setUp(self):
@@ -465,7 +481,7 @@ class CanonReelTest(unittest.TestCase):
             json.dump(payload, fh)
         return path
 
-    def run_guard(self, config):
+    def run_guard(self, config, *args):
         env = {key: value for key, value in os.environ.items()
                if not key.startswith(("AMEESH_CANON", "AMEESH_CANONS",
                                        "AGENT_MESH_CONFIG", "AGENT_MESH_CANON"))}
@@ -475,8 +491,34 @@ class CanonReelTest(unittest.TestCase):
         os.makedirs(env["HOME"], exist_ok=True)
         return subprocess.run(
             [sys.executable, str(REPO / "scripts" / "garde-alias-classe.py"),
-             "--root", str(REPO), "--project", "ameesh"],
+             "--root", str(REPO), "--project", "ameesh", *args],
             env=env, capture_output=True, text=True)
+
+    def run_guard_policy(self, policy, *args):
+        """L'étape de CI : politique épinglée, sans canon ni config d'hôte.
+
+        L'environnement ne porte que ``PATH``, ``PYTHONPATH`` et un ``HOME``
+        vide (équivalent de ``env -i``) : ni ``AMEESH_CONFIG``, ni canon de
+        l'hôte. C'est l'environnement d'un runner.
+        """
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "PYTHONPATH": str(REPO / "src"),
+            "HOME": os.path.join(self.root, "home-ci"),
+        }
+        os.makedirs(env["HOME"], exist_ok=True)
+        return subprocess.run(
+            [sys.executable, str(REPO / "scripts" / "garde-alias-classe.py"),
+             "--root", str(REPO), "--project", "ameesh",
+             "--policy", str(policy), *args],
+            env=env, capture_output=True, text=True)
+
+    def generate_policy(self, name="policy.json"):
+        path = os.path.join(self.root, name)
+        proc = self.run_guard(self.config(canon=self.canon),
+                              "--write-policy", path)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return path
 
     def test_refuse_une_implementation_light_sous_un_canon_reel(self):
         self.write_canon([["src/ameesh/merge_pr.py"]])
@@ -489,6 +531,56 @@ class CanonReelTest(unittest.TestCase):
                            "src/ameesh/modules/dev/merge_pr.py"]])
         proc = self.run_guard(self.config(canon=self.canon))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_politique_epinglee_lue_sans_canon_d_hote(self):
+        """Witness B/P1 auditeur : l'étape CI rejouée sans canon ni config."""
+        self.write_canon([["src/ameesh/merge_pr.py",
+                           "src/ameesh/modules/dev/merge_pr.py"]])
+        policy = self.generate_policy()
+        proc = self.run_guard_policy(policy)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_politique_epinglee_refuse_une_implementation_light(self):
+        self.write_canon([["src/ameesh/merge_pr.py",
+                           "src/ameesh/modules/dev/merge_pr.py"]])
+        policy = self.generate_policy()
+        with open(policy, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["classes"]["src/ameesh/modules/dev/merge_pr.py"]["class"] = "light"
+        with open(policy, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        proc = self.run_guard_policy(policy)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("src/ameesh/modules/dev/merge_pr.py", proc.stdout)
+
+    def test_politique_epinglee_invalide_refusee(self):
+        path = os.path.join(self.root, "policy-vide.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
+        proc = self.run_guard_policy(path)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("politique épinglée invalide", proc.stderr)
+
+    def test_politique_epinglee_perimee_refusee(self):
+        self.write_canon([["src/ameesh/merge_pr.py",
+                           "src/ameesh/modules/dev/merge_pr.py"]])
+        policy = self.generate_policy()
+        fresh = self.run_guard(self.config(canon=self.canon),
+                               "--check-policy", policy)
+        self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+        # le canon se resserre : l'implémentation retombe en light
+        self.write_canon([["src/ameesh/merge_pr.py"]])
+        stale = self.run_guard(self.config(canon=self.canon),
+                               "--check-policy", policy)
+        self.assertEqual(stale.returncode, 1, stale.stdout + stale.stderr)
+        self.assertIn("PÉRIMÉE", stale.stdout)
+        self.assertIn("régénérer", stale.stdout)
+
+    def test_canon_epingle_absent_refuse(self):
+        missing = os.path.join(self.root, "canon-absent")
+        proc = self.run_guard(self.config(), "--canon", missing, "--ref", "HEAD")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("canon épinglé illisible", proc.stderr)
 
     def test_sans_canon_refuse(self):
         proc = self.run_guard(self.config())

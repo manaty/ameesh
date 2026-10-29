@@ -34,15 +34,26 @@ gel, ``scripts/freeze-checks.py`` est lancé dans l'arbre du commit, avec
 ``PYTHONPATH`` sur son ``src/`` : la garde lit le code gelé et le canon de
 l'hôte. Sans canon configuré, elle refuse plutôt que de supposer une classe.
 
+En CI, le canon de l'hôte n'est pas lisible (``manaty/home`` est privé) : la
+garde lit une **politique épinglée** versionnée, ``scripts/alias-review-
+classes.json``, générée depuis le canon audité (``--write-policy``). Le gel
+vérifie que ce fichier suit le canon de l'hôte (``--check-policy``) : une
+classe affaiblie ou une politique périmée refuse. La CI ne devine donc
+jamais une classe, et le gel reste la source de vérité.
+
 Usage : scripts/garde-alias-classe.py [--root REPO] [--project ameesh]
+        [--canon DIR --ref REV] [--policy FILE]
+        [--write-policy FILE | --check-policy FILE]
 Sortie : 0 tous les alias sont couverts, 1 au moins un alias affaiblit la
-classe, 2 lecture impossible (déclaration, alias ou politique).
+classe (ou la politique épinglée est périmée), 2 lecture impossible
+(déclaration, alias, canon ou politique).
 """
 from __future__ import annotations
 
 import argparse
 import ast
 import importlib.util
+import json
 import os
 import sys
 from dataclasses import dataclass
@@ -359,31 +370,14 @@ def check(declared, class_of) -> list:
     return findings
 
 
-def configured_class_of(project: str):
-    """La politique du canon configuré, comme ``ameesh review-class``.
+def _policy(canons, project: str):
+    """La politique de revue d'une liste de canons déjà lus.
 
-    Rend ``(class_of, ref)`` : ``ref`` porte le commit du canon lu. Un canon
-    absent, un projet non déclaré ou une politique illisible refusent.
+    Rend ``(class_of, ref)`` : ``ref`` porte le commit du canon lu. Un projet
+    non déclaré ou une politique illisible refusent.
     """
-    from ameesh import canon as canon_mod
-    from ameesh import config as config_mod
     from ameesh import lot_class
 
-    try:
-        cfg = config_mod.load()
-        canons = canon_mod.load_configured(cfg)
-    except Exception as exc:  # config ou canon illisible : pas de classe supposée
-        raise GuardError("canon configuré illisible : %s" % exc) from exc
-    if not canons:
-        raise GuardError("aucun canon configuré : politique de %r inconnue" % project)
-    for loaded in canons:
-        # un canon déclaré mais dont le chemin manque est rendu sans
-        # fédération (`federation=None`, `sources=[]`) : ce n'est pas une
-        # politique, et `class_of_paths` le lirait comme « normal », donc
-        # comme un vert. Refus fermé (#4521, B/P2 de cx2).
-        if not getattr(loaded, "federation", None):
-            raise GuardError("canon illisible : %s (fédération absente)"
-                             % (getattr(loaded, "root", "") or "canon"))
     ref = [""]
 
     def class_of(path: str) -> tuple:
@@ -401,10 +395,154 @@ def configured_class_of(project: str):
     return class_of, ref
 
 
+def configured_canons(project: str):
+    """Les canons configurés de l'hôte, comme ``ameesh review-class``."""
+    from ameesh import canon as canon_mod
+    from ameesh import config as config_mod
+
+    try:
+        cfg = config_mod.load()
+        canons = canon_mod.load_configured(cfg)
+    except Exception as exc:  # config ou canon illisible : pas de classe supposée
+        raise GuardError("canon configuré illisible : %s" % exc) from exc
+    if not canons:
+        raise GuardError("aucun canon configuré : politique de %r inconnue" % project)
+    for loaded in canons:
+        # un canon déclaré mais dont le chemin manque est rendu sans
+        # fédération (`federation=None`, `sources=[]`) : ce n'est pas une
+        # politique, et `class_of_paths` le lirait comme « normal », donc
+        # comme un vert. Refus fermé (#4521, B/P2 de cx2).
+        if not getattr(loaded, "federation", None):
+            raise GuardError("canon illisible : %s (fédération absente)"
+                             % (getattr(loaded, "root", "") or "canon"))
+    return canons
+
+
+def explicit_canon(root: str, ref: str):
+    """Un canon épinglé lu hors configuration de l'hôte (dépôt git)."""
+    from ameesh import canon as canon_mod
+
+    try:
+        loaded = canon_mod.load(root, ref=ref or "HEAD")
+    except Exception as exc:  # racine, git ou ref illisible : pas de classe supposée
+        raise GuardError("canon épinglé illisible : %s (%s)" % (root, exc)) from exc
+    if not getattr(loaded, "readable", False):
+        raise GuardError("canon épinglé illisible : %s" % root)
+    if not getattr(loaded, "federation", None):
+        raise GuardError("canon épinglé illisible : %s (fédération absente)" % root)
+    return [loaded]
+
+
+def configured_class_of(project: str):
+    """La politique du canon configuré, comme ``ameesh review-class``.
+
+    Rend ``(class_of, ref)`` : ``ref`` porte le commit du canon lu. Un canon
+    absent, un projet non déclaré ou une politique illisible refusent.
+    """
+    return _policy(configured_canons(project), project)
+
+
+def explicit_class_of(root: str, ref: str, project: str):
+    """La politique d'un canon épinglé, hors configuration de l'hôte."""
+    return _policy(explicit_canon(root, ref), project)
+
+
+#: version du format de la politique épinglée (JSON)
+POLICY_VERSION = 1
+
+
+def policy_for(canons, project: str, declared) -> dict:
+    """La politique épinglée des alias déclarés, lue sur les canons chargés.
+
+    Le fichier produit est la source que la CI peut lire sans canon : les
+    classes des anciens chemins et de leurs implémentations, telles que le
+    canon audité les donne. ``policy_ref`` rappelle le canon lu ; la
+    vérification au gel compare les classes au canon de l'hôte.
+    """
+    class_of, ref = _policy(canons, project)
+    classes = {}
+    for alias in declared:
+        for path in (alias.old, alias.new):
+            cls, rule = class_of(path)
+            classes[path] = {"class": cls, "rule": list(rule) if rule else []}
+    return {"version": POLICY_VERSION, "project": project,
+            "policy_ref": ref[0], "classes": classes}
+
+
+def write_policy(path: str, policy: dict) -> None:
+    """Écrit la politique épinglée, triée et stable (diff lisible)."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(policy, fh, indent=2, sort_keys=True, ensure_ascii=False)
+        fh.write("\n")
+
+
+def read_policy(path: str) -> dict:
+    """Lit une politique épinglée ; une forme inconnue refuse."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            policy = json.load(fh)
+    except OSError as exc:
+        raise GuardError("politique épinglée illisible : %s" % exc) from exc
+    except ValueError as exc:
+        raise GuardError("politique épinglée invalide : %s" % exc) from exc
+    if not isinstance(policy, dict) or not isinstance(policy.get("classes"), dict):
+        raise GuardError("politique épinglée invalide : classes absentes")
+    return policy
+
+
+def pinned_class_of(policy: dict):
+    """``class_of`` depuis la politique épinglée : aucun canon, aucun réseau."""
+    classes = policy["classes"]
+
+    def class_of(path: str) -> tuple:
+        entry = classes.get(path)
+        if not isinstance(entry, dict) or entry.get("class") not in RANK:
+            raise GuardError("chemin absent ou classe inconnue dans la politique "
+                             "épinglée : %s" % path)
+        return entry["class"], tuple(entry.get("rule") or ())
+
+    return class_of
+
+
+def policy_gaps(path: str, expected: dict) -> list:
+    """Les chemins dont la politique épinglée diverge du canon lu."""
+    classes = read_policy(path)["classes"]
+    gaps = []
+    for source, wanted in sorted(expected["classes"].items()):
+        entry = classes.get(source)
+        actual = None
+        if isinstance(entry, dict):
+            actual = {"class": entry.get("class"),
+                      "rule": list(entry.get("rule") or ())}
+        if actual != wanted:
+            gaps.append((source, actual, wanted))
+    return gaps
+
+
+def _class_name(entry) -> str:
+    """Une entrée de politique lisible dans un message de divergence."""
+    if not isinstance(entry, dict):
+        return "absent"
+    return "%s (%s)" % (entry.get("class"),
+                        ", ".join(entry.get("rule") or ()) or "défaut")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", default=".", help="racine du dépôt (défaut : .)")
     parser.add_argument("--project", default="ameesh", help="projet du canon (défaut : ameesh)")
+    parser.add_argument("--canon", default="",
+                        help="canon épinglé (dépôt git) ; sinon canon configuré de l'hôte")
+    parser.add_argument("--ref", default="HEAD",
+                        help="référence du canon épinglé (défaut : HEAD)")
+    parser.add_argument("--policy", default="",
+                        help="politique épinglée (JSON) ; sinon canon configuré")
+    parser.add_argument("--write-policy", default="",
+                        help="écrit la politique épinglée depuis le canon lu")
+    parser.add_argument("--check-policy", default="",
+                        help="vérifie la politique épinglée contre le canon lu")
     args = parser.parse_args(argv)
     root = os.path.abspath(args.root)
     try:
@@ -412,11 +550,46 @@ def main(argv=None) -> int:
     except GuardError as exc:
         print("garde alias/classe #4521 : %s" % exc, file=sys.stderr)
         return 2
+    if args.write_policy or args.check_policy:
+        try:
+            canons = (explicit_canon(args.canon, args.ref) if args.canon
+                      else configured_canons(args.project))
+            expected = policy_for(canons, args.project, declared)
+            if args.write_policy:
+                write_policy(args.write_policy, expected)
+                print("garde alias/classe #4521 : politique épinglée écrite dans %s "
+                      "(%d chemins, canon %s)"
+                      % (args.write_policy, len(expected["classes"]),
+                         expected["policy_ref"] or "?"))
+                return 0
+            gaps = policy_gaps(args.check_policy, expected)
+        except GuardError as exc:
+            print("garde alias/classe #4521 : %s" % exc, file=sys.stderr)
+            return 2
+        if gaps:
+            for source, actual, wanted in gaps:
+                print("PÉRIMÉE  %s (politique : %s ; canon : %s)"
+                      % (source, _class_name(actual), _class_name(wanted)))
+            print("garde alias/classe #4521 : politique épinglée périmée (%d "
+                  "chemin(s)) — régénérer : scripts/garde-alias-classe.py --root . "
+                  "--write-policy %s" % (len(gaps), args.check_policy))
+            return 1
+        print("garde alias/classe #4521 : politique épinglée à jour (%d chemins, "
+              "canon %s)" % (len(expected["classes"]),
+                             expected["policy_ref"] or "?"))
+        return 0
     if not declared:
         print("garde alias/classe #4521 : aucun alias de module déclaré")
         return 0
     try:
-        class_of, ref = configured_class_of(args.project)
+        if args.policy:
+            policy = read_policy(args.policy)
+            class_of = pinned_class_of(policy)
+            ref = [policy.get("policy_ref") or ""]
+        elif args.canon:
+            class_of, ref = explicit_class_of(args.canon, args.ref, args.project)
+        else:
+            class_of, ref = configured_class_of(args.project)
         findings = check(declared, class_of)
     except GuardError as exc:
         print("garde alias/classe #4521 : %s" % exc, file=sys.stderr)
