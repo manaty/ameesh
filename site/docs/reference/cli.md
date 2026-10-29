@@ -436,6 +436,7 @@ ameesh work list [--state S] [--assignee A] [--limit N] [--stale-after S] [--jso
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
 ameesh work move <id> merged --correct REASON [--actor A]
+ameesh work promote <id> [--note N] [--actor A]
 ameesh work merged <id> (--sha SHA | --pr OWNER/REPO#N) [--migration-landed N]
                      [--note N] [--actor A]
 ameesh work assign <id> <agent> [--externe] [--actor A] [--claim] [--branch agent/…] [--target BRANCH]
@@ -480,6 +481,10 @@ ameesh work backlog add --title T --value "expected value" --score 1-100
 ameesh work backlog list [--all] [--limit N] [--json]
 ameesh work unrecorded [--since 24h|2h|7d|ISO-DATE] [--limit N] [--json]
 ```
+
+The development stages `merged` and `promoted` both persist as the generic core
+`delivered`. `workflow_stage` and `legacy_state` retain the stage; the historical
+command names remain accepted.
 
 **Plumbing around the lot.** `work dependencies` records explicit blocking
 prerequisites between lots (L385). `work migration` reserves the next free

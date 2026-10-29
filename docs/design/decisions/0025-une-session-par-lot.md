@@ -42,3 +42,13 @@ maximum effort. See finding no. 5 of the
   big"). Lot L26.
 - In the meantime, the rule is applied by hand with the v0 loop (fresh session
   when a lot starts).
+
+# L99 T5 — persisted delivery core (#4353)
+
+Implementation of signed owner decision #164165 (29 October 2026,
+approval #167): `merged` and `promoted` persist as `delivered`, with the
+existing workflow stage and `legacy_state` preserving their distinction.
+The dev module owns promotion and correction transitions. Historical
+milestones, signed Process artifacts and public GitHub vocabulary keep
+their contracts. Migration and rollback are qualified in a disposable
+Postgres schema; the storage switch precedes executor restart.

@@ -47,6 +47,7 @@ import uuid
 from dataclasses import dataclass
 from unittest import mock
 
+from ameesh import work_lifecycle as lifecycle
 from ameesh import process_registry as pr
 from ameesh import storage
 from ameesh import work
@@ -837,7 +838,8 @@ class RegistryTest(PgTestCase):
         self.assertEqual(len(mails), 1)
         self.assertEqual(mails[0]["payload"]["dependency"]["blocker_state"], "promoted")
         self.assertIn("is promoted", mails[0]["body"])
-        self.assertEqual(self.row(blocker)["state"], "promoted")
+        self.assertEqual(self.row(blocker)["state"], "delivered")
+        self.assertEqual(self.row(blocker)["legacy_state"], "promoted")
         self.assertEqual(self.row(dependent)["state"], "blocked")
 
     def test_a_lot_already_released_does_not_wake_twice(self):
@@ -949,7 +951,7 @@ class RegistryTest(PgTestCase):
                     self.transfer(lot)
                 self.assertEqual(self.events(lot), [])
                 row = self.row(lot)
-                self.assertEqual(row["state"], state)
+                self.assertEqual(row["state"], lifecycle.canonical(state))
                 self.assertIsNone(row["workflow_ref"])
                 self.assertEqual(row["workflow_version"], 0)
 
@@ -962,7 +964,7 @@ class RegistryTest(PgTestCase):
                 with self.refusal("stage-mismatch"):
                     self.transfer(lot)
                 self.assertEqual(self.events(lot), [])
-                self.assertEqual(self.row(lot)["state"], state)
+                self.assertEqual(self.row(lot)["state"], lifecycle.canonical(state))
         held = self.lot(state="blocked")           # hold: core to be proven
         with self.refusal("hold-core-unproven"):   # N10: silent journal
             self.transfer(held)
@@ -1532,7 +1534,14 @@ class RegistryTest(PgTestCase):
         self.db.execute(
             "ALTER TABLE work_items ADD CONSTRAINT"
             " work_items_workflow_stage_needs_ref"
-            " CHECK (workflow_stage is null or workflow_ref is not null)")
+            " CHECK (workflow_stage is null or workflow_ref is not null"
+            " OR (state = 'delivered' AND workflow_stage IN ('merged', 'promoted')))")
+        self.db.execute("UPDATE work_items SET legacy_state = state")
+        self.db.execute("CREATE TRIGGER aa_work_items_generic_state_sync BEFORE INSERT OR UPDATE"
+                        " ON work_items FOR EACH ROW EXECUTE FUNCTION work_items_generic_state_sync()")
+        self.db.execute("ALTER TABLE work_items ADD CONSTRAINT work_items_legacy_state_matches"
+                        " CHECK (((state = 'delivered' AND legacy_state IN ('merged','promoted'))"
+                        " OR (state <> 'delivered' AND legacy_state = state)) IS TRUE)")
 
     def test_before_0452_historical_commands_do_not_break(self):
         """B5 (package 0650), pre-0452 support: without the registry
@@ -1542,6 +1551,8 @@ class RegistryTest(PgTestCase):
         moved = self.lot(state="build")
         to_close = self.lot(state="build")
         to_freeze = self.lot(state="intake")
+        self.db.execute("DROP TRIGGER aa_work_items_generic_state_sync ON work_items")
+        self.db.execute("ALTER TABLE work_items DROP CONSTRAINT work_items_legacy_state_matches")
         self.db.execute("ALTER TABLE work_items DROP COLUMN workflow_ref CASCADE")
         self.db.execute("ALTER TABLE work_items DROP COLUMN workflow_stage")
         self.db.execute("ALTER TABLE work_items DROP COLUMN workflow_version")

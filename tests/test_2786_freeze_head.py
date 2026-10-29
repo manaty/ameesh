@@ -335,7 +335,7 @@ class SweepDoubtTest(_SweepBase):
         report = plan_git.sync_branches(self.db, host=self.cfg.host)
         entry = self.entry(report, lot)
         self.assertEqual(entry["result"], "merged")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def test_un_gel_marque_ferme_meme_en_avance_rapide(self):
         # #2786 (5) : le gel réel écrit la marque des branches où il était
@@ -356,7 +356,7 @@ class SweepDoubtTest(_SweepBase):
         report = plan_git.sync_branches(self.db, host=self.cfg.host)
         entry = self.entry(report, item)
         self.assertEqual(entry["result"], "merged")
-        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
 
 
 class StaleCloneTest(PgTestCase):
@@ -452,7 +452,7 @@ class StaleCloneTest(PgTestCase):
         git(self.author, "push", "-q", "origin", "HEAD:refs/heads/main")
         report = plan_git.sync_branches(self.db, host=self.cfg.host)
         self.assertEqual(self.entry(report)["result"], "merged")
-        self.assertEqual(work.get(self.db, self.item["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, self.item["id"])["state"], "delivered")
 
     def test_une_marque_fournie_est_remplacee_par_la_preuve_calculee(self):
         # avis dev4 : la marque de l'appelant ne contourne pas le gel ; la

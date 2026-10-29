@@ -128,7 +128,7 @@ class PromotedMeasurementTest(_Base):
                                  measure_reason="post-deployment measurement to redo (#753)")
         self.assertEqual([row["id"] for row in done], [lot["id"]])
         item = work.get(self.db, lot["id"])
-        self.assertEqual((item["state"], item["assignee"]), ("promoted", "auditeur"))
+        self.assertEqual((item["state"], item["assignee"]), ("delivered", "auditeur"))
         ev = self.db.query(
             "SELECT note, actor FROM work_item_events WHERE work_item_id = %s"
             " ORDER BY id DESC LIMIT 1", (lot["id"],))[0]

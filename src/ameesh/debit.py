@@ -469,7 +469,7 @@ _CLOSURE_STATES = ("blocked", "waiting_human")
 #: états terminaux (le jalon, pas seulement la colonne)
 _TERMINAL_STATES = ("merged", "closed", "delivered")
 #: états finis au journal (promu, fermé) : plus aucune attente (#3672)
-_CLOSED_STATES = work_lifecycle.TERMINAL
+_CLOSED_STATES = ("promoted", "delivered", "closed")
 
 
 def _reopened(events: list[dict], terminal_ts: float | None) -> bool:

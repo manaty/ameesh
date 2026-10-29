@@ -47,3 +47,13 @@ manual `qa → validated` is unavailable. The writer follows in a subsequent rel
 after staging has established a compatible reader and rollback baseline.
 During that transition, package readers still qualify legacy `qa` lots with
 the full exact-head review gate.
+
+# L99 T5 — persisted delivery core (#4353)
+
+Implementation of signed owner decision #164165 (29 October 2026,
+approval #167): `merged` and `promoted` persist as `delivered`, with the
+existing workflow stage and `legacy_state` preserving their distinction.
+The dev module owns promotion and correction transitions. Historical
+milestones, signed Process artifacts and public GitHub vocabulary keep
+their contracts. Migration and rollback are qualified in a disposable
+Postgres schema; the storage switch precedes executor restart.

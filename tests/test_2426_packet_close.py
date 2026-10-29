@@ -117,7 +117,7 @@ class PacketCloseTest(_PlanDb):
                          {"merged"})
         for item, unit in zip((first, second), units):
             row = work.get(self.db, item["id"])
-            self.assertEqual(row["state"], "merged")
+            self.assertEqual(row["state"], "delivered")
             merged = [m for m in work.milestones(self.db, item["id"])
                       if m["kind"] == "merged"][0]
             self.assertEqual(merged["sha"], unit["source"])
@@ -167,7 +167,7 @@ class PacketCloseTest(_PlanDb):
         results = self.by_lot(report)
         self.assertEqual(results[first["id"]]["result"], "merged", report)
         self.assertEqual(results[second["id"]]["result"], "merged", report)
-        self.assertEqual(work.get(self.db, second["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, second["id"])["state"], "delivered")
         self.assertEqual(called, [],
                          "#2508 : le balayage global `items()` ne doit plus être lu")
 
@@ -218,7 +218,7 @@ class PacketCloseTest(_PlanDb):
         self.assertEqual(report[unit["id"]]["result"], "merged")
         self.assertEqual(report[unit["id"]]["how"], "trailer")
         self.assertEqual(report[unit["id"]]["ref"], units[0]["unit"])
-        self.assertEqual(work.get(self.db, unit["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, unit["id"])["state"], "delivered")
 
     def test_un_lot_sans_gel_dont_l_unite_est_reverte_n_est_pas_ferme(self):
         unit = self.item("sans gel, unité annulée")
@@ -257,7 +257,7 @@ class PacketCloseTest(_PlanDb):
         self.freeze(unit, units[0]["source"])
         report = packet_close.sync_project(self.cfg, self.db, project)
         self.assertEqual(report["merged"], 1)
-        self.assertEqual(work.get(self.db, unit["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, unit["id"])["state"], "delivered")
 
     def test_cli_sync_packages(self):
         [unit] = [self.item("unité")]
@@ -268,7 +268,7 @@ class PacketCloseTest(_PlanDb):
         self.assertEqual(out.returncode, 0, out.stderr)
         report = json.loads(out.stdout)
         self.assertEqual(report["merged"], 1)
-        self.assertEqual(work.get(self.db, unit["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, unit["id"])["state"], "delivered")
 
     def _manifest_sans_commit(self, items: list[dict]) -> None:
         """#3629 : la forme du manifeste de #3514 — colonne « lot », aucune
