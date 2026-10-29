@@ -200,17 +200,23 @@ class HandoffTest(PgTestCase):
 
         @contextmanager
         def watched_guard(hosts_self, host):
-            with original_guard(hosts_self, host) as guarded:
-                # The publication lock spans the synchronous enable: remember
-                # its exact backend so the deadline release is proven by
-                # identity, never by a wall-clock constant.
-                pid = guarded.db.query("SELECT pg_backend_pid() AS pid")[0]["pid"]
-                self.assertEqual(gate_held(guarded.db, pid), 1,
-                                 "gate guard must hold the publication lock")
-                gate_backends.append(pid)
-                try:
+            entered = False
+            try:
+                with original_guard(hosts_self, host) as guarded:
+                    # The publication lock spans the synchronous enable:
+                    # remember its exact backend so the deadline release is
+                    # proven by identity, never by a wall-clock constant.
+                    pid = guarded.db.query("SELECT pg_backend_pid() AS pid")[0]["pid"]
+                    self.assertEqual(gate_held(guarded.db, pid), 1,
+                                     "gate guard must hold the publication lock")
+                    gate_backends.append(pid)
+                    entered = True
                     yield guarded
-                finally:
+            finally:
+                if entered:
+                    # Measure after the guard's __exit__: rollback and the
+                    # backend's close are part of the release, including when
+                    # enable leaves by its deadline exception.
                     released_at.append(time.monotonic())
 
         def enable(intent):
