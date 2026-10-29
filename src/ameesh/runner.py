@@ -2090,6 +2090,44 @@ class AgentWorker(threading.Thread):
         return ((self.agent or {}).get("session_policy") or "").strip() \
             or self.cfg.session_policy
 
+    def session_max_tokens(self) -> float:
+        """Seuil de rotation sur la taille (L11) du harnais de la session.
+
+        #4448 : le canon compilé (`session.max_tokens` et
+        `session.max_tokens_by_harness`) fait foi, surcharge du harnais puis
+        valeur commune ; canon absent ou illisible, ou document sans bloc :
+        le seuil commun de l'exécuteur (`AMEESH_SESSION_MAX_TOKENS`), jamais
+        une valeur propre à un harnais écrite en dur.
+        """
+        from . import mechanics
+        return mechanics.session_max_tokens(
+            self.cfg, self._ledger_harness() or "", self.runner.session_max_tokens)
+
+    def _restore_session_counters(self) -> None:
+        """#4448 : reprendre les compteurs de la session depuis le grand livre.
+
+        Un worker relancé (déploiement, redémarrage) repartait de zéro alors
+        que la session, elle, continue : la décision de rotation et l'alerte
+        `session_too_big` ne mesuraient plus la même chose. La somme et le
+        nombre de tours de la session courante sont relus **une fois**, avant
+        la première décision ; un compteur déjà non nul (tour de ce worker)
+        n'est jamais écrasé. Une lecture en échec laisse les compteurs à zéro :
+        la mesure repart du tour suivant, jamais une valeur supposée.
+        """
+        if self.session_turns or self.session_tokens:
+            return
+        session = self.current_session()
+        if not session:
+            return
+        try:
+            total = storage.of(self.db).turn_costs.session_total(self.name, session)
+        except Exception:  # noqa: BLE001 — mesure seulement, jamais fatale au tour
+            return
+        if not total:
+            return
+        self.session_turns = int(total.get("turns") or 0)
+        self.session_tokens = float(total.get("tokens") or 0)
+
     def rotation_due(self) -> bool:
         """Rotation due ? Jamais pendant un tour, jamais avant le minimum.
 
@@ -2099,6 +2137,7 @@ class AgentWorker(threading.Thread):
             return False
         if self.session_policy() == "jamais":
             return False
+        self._restore_session_counters()
         if self.session_turns < self.runner.session_min_turns:
             return False
         # #706 : la latence d'un tour autorisé ne suffit pas à oublier la
@@ -2107,7 +2146,7 @@ class AgentWorker(threading.Thread):
         # borne du tour. Sans plafond, garder le seuil de latence configuré.
         latency_threshold = max(self.runner.session_max_turn_seconds,
                                 2 * self.turn_max_seconds())
-        return (self.session_tokens >= self.runner.session_max_tokens
+        return (self.session_tokens >= self.session_max_tokens()
                 or self.last_turn_seconds >= latency_threshold)
 
     def context_max_tokens(self) -> int:
@@ -8108,7 +8147,19 @@ class AgentWorker(threading.Thread):
                         # Clés de chaque harnais normalisées (L60 : l'usage
                         # par étape de DeepSeek, `inputTokens`, comptait zéro).
                         entree, _cache, sortie = adapters.usage_tokens(usage)
-                        self.session_tokens += float(entree + sortie)
+                        # #4448 : `turn.completed` de Codex porte l'usage
+                        # CUMULÉ du fil, pas le tour. L'additionner à chaque
+                        # tour sommait des cumuls (un fil de 3 tours comptait
+                        # ~6 fois son dernier relevé) et faisait tourner une
+                        # session dès le minimum de tours, quel que soit le
+                        # seuil. Le cumul du fil est la mesure de la session ;
+                        # les autres harnais publient un usage par tour ou par
+                        # étape, qui s'additionne.
+                        if harness == "codex":
+                            self.session_tokens = max(self.session_tokens,
+                                                      float(entree + sortie))
+                        else:
+                            self.session_tokens += float(entree + sortie)
                     if parsed.get("cost") is not None:
                         cost = parsed["cost"]
                     if parsed.get("error"):

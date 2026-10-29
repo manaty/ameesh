@@ -750,6 +750,16 @@ class TurnCosts(Domain):
         lot)."""
 
     @abc.abstractmethod
+    def session_total(self, agent: str, session: str) -> dict | None:
+        """#4448 : la mesure de rotation d'une session — somme des jetons
+        (`input_tokens + output_tokens`, cache compris quand le harnais le
+        compte dans l'entrée) des tours de `agent` pour `session`, leur
+        nombre, le harnais du dernier tour et son instant : `tokens`, `turns`,
+        `harness`, `last_ts` (epoch) ; ou None si aucun tour. C'est la même
+        mesure que les compteurs en mémoire de l'exécuteur, relue du grand
+        livre pour l'alerte `session_too_big`."""
+
+    @abc.abstractmethod
     def first_after(self, agent: str, ts: float) -> dict | None:
         """#1777 : la première ligne écrite de `agent` à `ts` (epoch) ou après :
         `harness`, `session`, `recorded_ts` (epoch) ; ou None. `cost.record`
