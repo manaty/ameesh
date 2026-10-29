@@ -293,6 +293,10 @@ def child_env(**extra: str) -> dict:
     # Les relevés de ressources de l'hôte réel (L31) ne fuient pas non plus :
     # les tests de pression posent eux-mêmes leur intervalle et leurs mesures.
     env["AMEESH_RESOURCE_INTERVAL"] = "0"
+    # #4609 : la base du banc n'est pas celle du mesh déployé ; la vérification
+    # de la lecture complète quotidienne y serait toujours rouge. Les témoins
+    # de `mesh_backup_unseen` posent eux-mêmes leur part (`mesh_backup_min_share`).
+    env["AMEESH_MESH_BACKUP_MIN_SHARE"] = "0"
     # Un SIGTERM arrête l'exécuteur tout de suite, comme avant le drainage
     # (2026-10-11) : les tests du drainage posent leur borne eux-mêmes.
     env["AMEESH_DRAIN_SECONDS"] = "0"

@@ -89,6 +89,43 @@ def _as_share(value, default: float) -> float:
     return part if 0.0 <= part <= 1.0 else default
 
 
+_TIME_OF_DAY_RE = re.compile(r"([01]?[0-9]|2[0-3]):([0-5][0-9])\Z")
+
+
+def _as_time_of_day(value, default: int | None = None):
+    """Secondes depuis minuit UTC pour « HH:MM », un entier de secondes, ou défaut."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        seconds = int(value)
+        return seconds if 0 <= seconds < 86400 else default
+    match = _TIME_OF_DAY_RE.fullmatch(str(value or "").strip())
+    if not match:
+        return default
+    return int(match.group(1)) * 3600 + int(match.group(2)) * 60
+
+
+def _as_window(value, default):
+    """Fenêtre (début, fin) en secondes depuis minuit UTC ; défaut si illisible.
+
+    Accepte « 03:30-04:30 », `["03:30", "04:30"]` ou `[12600, 16200]`. Une fin
+    antérieure ou égale au début est refusée : une fenêtre vide rendrait toute
+    sauvegarde invisible.
+    """
+    if isinstance(value, str) and "-" in value:
+        left, right = value.split("-", 1)
+        parts = (left, right)
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        parts = value
+    else:
+        return default
+    start = _as_time_of_day(parts[0])
+    end = _as_time_of_day(parts[1])
+    if start is None or end is None or end <= start:
+        return default
+    return (start, end)
+
+
 def _as_days(value, default: int) -> int:
     """Nombre entier de jours ≥ 0 (L361) : « 0.5 » ou « 1.9 » ne sont pas
     tronqués (0 couperait l'expiration) ; illisible ou non entier : défaut."""
@@ -197,6 +234,14 @@ class Config:
     #: au-delà, une requête est annulée par le serveur (0 = pas de limite).
     #: Empêche un renouvellement de bail de bloquer le battement indéfiniment.
     statement_timeout_ms: float = 30000.0
+    #: #4609 : fenêtre UTC de la sauvegarde quotidienne de la base du mesh,
+    #: en secondes depuis minuit (`(12600, 16200)` = 03:30–04:30), et part
+    #: minimale des tables qu'une même transaction doit avoir lues pour que
+    #: `mesh_backup_unseen` se taise. La fenêtre par défaut suit la minuterie
+    #: `ameesh-sauvegarde` (03:30 + jusqu'à 15 min d'aléa) ; une part nulle
+    #: désactive l'alerte.
+    mesh_backup_window: tuple[int, int] = (12600, 16200)
+    mesh_backup_min_share: float = 0.9
     #: L304 : session en lecture seule (`default_transaction_read_only`) ;
     #: jamais lu de l'environnement, posé par `ameesh progress --serve`
     read_only: bool = False
@@ -989,6 +1034,12 @@ def load(env: dict | None = None) -> Config:
         statement_timeout_ms=_as_float(
             pick("AMEESH_STATEMENT_TIMEOUT_MS", "AGENT_MESH_STATEMENT_TIMEOUT_MS"),
             cfg.statement_timeout_ms),
+        mesh_backup_window=_as_window(
+            pick("AMEESH_MESH_BACKUP_WINDOW", default=cfg.mesh_backup_window),
+            cfg.mesh_backup_window),
+        mesh_backup_min_share=_as_share(
+            pick("AMEESH_MESH_BACKUP_MIN_SHARE", default=cfg.mesh_backup_min_share),
+            cfg.mesh_backup_min_share),
         lease_ttl=_as_float(pick("AMEESH_LEASE_TTL", "AGENT_MESH_LEASE_TTL"), cfg.lease_ttl),
         idle_nudge=_as_float(pick("AMEESH_IDLE_NUDGE", "AGENT_MESH_IDLE_NUDGE"), cfg.idle_nudge),
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
