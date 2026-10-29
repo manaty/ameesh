@@ -39,7 +39,9 @@
                                                  (`send <dest> - <<'EOF' … EOF`): with a quoted
                                                  delimiter nothing is expanded, so a command
                                                  cited in the body is not run by your shell
-                                                 (#3504)
+                                                 (#3504); a body starting with an unknown
+                                                 option (`--stdin`) is refused, `--` before
+                                                 the body sends it as is (#4445)
   agent-mail forward <old> <new> [--dry-run] [--json]
                                                  re-delivers the pending mail of a stopped
                                                  agent (or one missing from the registry) to a
@@ -286,6 +288,10 @@ _COMMAND_OUTPUT_RE = re.compile(
     r")")
 
 
+#: #4445 : premier mot d'un corps qui ressemble à une option longue.
+_OPTION_LIKE_RE = re.compile(r"--[A-Za-z][\w-]*(?:=\S*)?")
+
+
 def _stdin_body(what: str = "body") -> tuple[str | None, str | None]:
     """#3504 : corps de `send <dest> -`, lu sur l'entrée standard.
 
@@ -445,7 +451,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
               "[--ack] [--info] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] "
               "[--request-expires 2h] [--queue]\n"
               "       a body of `-` is read on standard input "
-              "(send <dest> - <<'EOF' … EOF: a quoted delimiter expands nothing)",
+              "(send <dest> - <<'EOF' … EOF: a quoted delimiter expands nothing); "
+              "`--` before a body that starts with `--`",
               file=sys.stderr)
         return 2
     if lot is not None and not NAME_RE.match(lot):
@@ -491,7 +498,12 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         parent_lot = int(number)
     dest = args[0]
     body = args[1:]
-    if body == ["-"]:
+    # #4445 : `--` juste après le destinataire marque la fin des options ; le
+    # reste est le corps tel quel, même s'il commence par `--`.
+    literal = bool(body) and body[0] == "--"
+    if literal:
+        body = body[1:]
+    if body == ["-"] and not literal:
         # #3504 : le corps vient de l'entrée standard, pour citer une commande
         # sans que le shell de l'expéditeur ne la lance (heredoc `<<'EOF'`).
         text, error = _stdin_body()
@@ -504,6 +516,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     else:
         text = " ".join(body).strip()
+        words = text.split()
+        if not literal and words and _OPTION_LIKE_RE.fullmatch(words[0]):
+            # #4445 : une option inconnue (`--stdin`) prise pour le corps
+            # partait telle quelle et réveillait le destinataire pour rien.
+            print("unknown option %s: the body would start with it. To read "
+                  "the body on standard input, give `-` (send <dest> - <<'EOF' "
+                  "… EOF); to send a text that starts with `--`, put `--` "
+                  "before it (send <dest> -- <text>)" % words[0], file=sys.stderr)
+            return 2
         if text == "-":
             # #3693 : un argument « - » entouré de blancs n'est pas le marqueur
             # d'entrée standard (il doit être seul) ; un corps nettoyé ne vaut
