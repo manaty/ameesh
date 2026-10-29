@@ -23,10 +23,13 @@ fenêtres observées sont des **faits de runtime**, pas un catalogue universel.
 
 ## 1. Décision en une page
 
-1. **Sept grandeurs distinctes** : entrée du dernier appel (`C_last`),
-   occupation projetée du prochain (`C_next`), entrées cumulées du tour
-   (`R_turn`), entrées cumulées de la session (`R_session`), sortie (`O`),
-   durée (`D`) et coût (`Cost`). Aucune ne peut servir à la place d'une autre.
+1. **Sept grandeurs principales** : entrée du dernier appel (`C_last`),
+   occupation projetée du prochain (`C_next`, décomposée en entrée projetée
+   `C_next_input` et occupation avec réserve de sortie), entrées cumulées du
+   tour (`R_turn`), entrées cumulées de la session (`R_session`), sortie (`O`),
+   durée (`D`) et coût (`Cost`). `O_last`, sortie du dernier appel, alimente la
+   projection et ne se confond pas avec `O`. Aucune grandeur ne peut servir à
+   la place d'une autre.
 2. **`context_max_tokens` n'est pas un budget de relecture** : depuis #2336, il
    plafonne `C_last`, la taille du contexte du dernier appel du fil principal
    (fenêtre), cache lu **et** écrit compris. Un budget cumulé de relecture est
@@ -71,7 +74,8 @@ valeur supposée.
 | Id | Grandeur | Unité | Périmètre | Source | Cache | Remise à zéro | Déduplication | Absence |
 |---|---|---|---|---|---|---|---|---|
 | `C_last` | entrée du dernier appel au modèle | jetons | un appel du **fil principal** | flux du harnais (usage de l'appel) ; Codex : journal de session du fil | Claude : entrée + cache lu + cache écrit ; Codex : entrée (cache inclus) ; DeepSeek/ACP : entrée + cache lu | à chaque appel ; dernière valeur du tour | un appel = un `call_id` quand il existe ; blocs répétés d'un même message comptés une fois ; Codex : un `last_token_usage` par tour | `null` + `context_unknown` ; jamais `0` ; jamais la valeur du modèle précédent |
-| `C_next` | occupation projetée du prochain appel | jetons | prochain appel du fil principal | **dérivée** de `C_last` + composantes déclarées | idem `C_last` pour la part déjà mesurée | à chaque appel | ne pas ajouter ce qui est déjà dans `C_last` (system, outils, historique) | `null` si une composante est inconnue ; intervalle possible, jamais un point supposé |
+| `O_last` | sortie du dernier appel | jetons | dernier appel du fil principal | usage de l'appel (`output_tokens` / `outputTokens` ; Codex : `last_token_usage.output_tokens`) | sans objet (sortie) | à chaque appel ; dernière valeur du tour | un appel compté une fois ; jamais `O` du tour | `null` + `output_unknown` ; ne jamais remplacer par `O` du tour ni par `0` |
+| `C_next` | occupation projetée du prochain appel | jetons | prochain appel du fil principal | **dérivée** : `C_next_input` + réserve de sortie du prochain appel (§2.3) | idem `C_last` pour la part déjà mesurée | à chaque appel | ne pas ajouter ce qui est déjà dans `C_last` ; `O_last` une seule fois ; `O` du tour jamais | `null` si `O_last` ou une composante est inconnue ; `C_next_input` peut rester connu ; intervalle possible, jamais un point supposé |
 | `R_turn` | entrées cumulées du tour | jetons | un tour, fil principal | somme des entrées des appels du tour | Claude/DeepSeek/ACP : entrée + cache lu, **hors cache écrit** ; Codex : entrée (cache inclus) | au début du tour | un appel une fois ; cumuls Codex en delta | `null` si le tour n'a aucune mesure ; somme partielle marquée `partial` |
 | `R_session` | entrées cumulées de la session | jetons | session courante | cumul des `R_turn` de la session | même convention que `R_turn` ; l'alerte résidente L81 mesure `R_session_L81` (cache écrit inclus), cas distinct (§5.3) | nouvelle session / rotation | jamais la somme de relevés cumulés | `null` sans session ou sans tour mesuré ; pas de reprise d'une valeur supposée |
 | `W` | fenêtre du modèle effectif | jetons | profil `(modèle, harnais, version, mode, rôle)` | métadonnée runtime du harnais (ex. `modelUsage.contextWindow`, `modelContextWindow`, `usage_update.size`) | sans objet | changement de profil ; redémarrage si la métadonnée n'est pas re-annoncée | une entrée = un modèle ; ne pas sommer plusieurs modèles | `null` + `window_unknown` ; jamais une fenêtre auxiliaire ou précédente |
@@ -116,6 +120,11 @@ Règles :
   additionner les deux : `C_last = input_tokens`, pas `input + cached`.
 * **DeepSeek/ACP** : pas de champ d'écriture de cache dans le contrat actuel ;
   un harnais qui en publierait un devrait être qualifié avant d'être agrégé.
+* **`O_last`** : `output_tokens` (Claude, Codex `last_token_usage`) ou
+  `outputTokens` (DeepSeek). Le pont ACP actuel publie `output_tokens: 0`
+  faute de champ de sortie : ce `0` n'est **pas** une mesure d'`O_last` ;
+  `O_last` reste `unknown` tant que le harnais ne fournit pas une sortie
+  explicite, et `C_next` n'est alors pas calculable.
 * **Sous-agents** : leurs appels ne comptent ni dans `C_last`, ni dans
   `R_turn`, ni dans `R_session` du fil principal. Ils sont mesurés à part, pour
   information et coût, et ne sont jamais un point sûr du tour principal.
@@ -135,20 +144,42 @@ Règles :
 d'un compactage ou d'un renouvellement *qualifié* (CTX-04/CTX-05), jamais à
 présenter un budget cumulé comme un pourcentage de fenêtre.
 
+La projection distingue deux choses :
+
 ```
-C_next = C_last
-       + O_réservé          (sortie maximale du prochain appel)
-       + G_consigne         (nouvelle consigne et résultats d'outils attendus)
-       + G_protocole_outils (croissance non déjà comptée dans C_last)
-       + M_harnais          (marge déclarée par le harnais)
+C_next_input = C_last          (entrée du dernier appel, déjà dans l'historique)
+             + O_last          (sortie du dernier appel, ajoutée à l'historique)
+             + G_consigne      (nouvelle consigne et résultats d'outils attendus)
+             + G_protocole_outils (croissance non déjà comptée dans C_last)
+             + M_harnais       (marge déclarée par le harnais)
+
+C_next       = C_next_input
+             + O_reserve_next  (sortie maximale du prochain appel)
 ```
 
-* Chaque composante a une **source** et une **qualité** ; une composante
-  inconnue rend `C_next` `null` (ou un intervalle explicitement borné).
+* `C_next_input` est l'**entrée projetée** du prochain appel : ce que le
+  harnais va relire avant de générer. `C_next` est l'**occupation** de la
+  fenêtre pendant le prochain appel, réserve de sortie comprise. Les deux sont
+  publiées séparément : une décision « reste-t-il de la place pour la sortie ? »
+  compare `C_next` à `W`, ou de façon équivalente `C_next_input` à
+  `W - O_reserve_next`.
+* **`O_last` n'est pas `O`.** `O` est la sortie cumulée du tour ; dans un tour
+  à plusieurs appels, elle ne dit pas ce que le dernier appel a ajouté à
+  l'historique. Seul `O_last` entre dans `C_next_input`. Exemple : `C_last`
+  50 000, `O_last` 30 000, `G_consigne` 1 000, `O_reserve_next` 5 000 →
+  `C_next_input` = 81 000, `C_next` = 86 000. La formule qui ignorerait
+  `O_last` donnerait 56 000 et sous-estimerait la fenêtre de 30 000.
 * **Pas de double comptage** : le prompt système, les schémas d'outils et
   l'historique déjà présents dans `C_last` ne sont pas ajoutés une seconde
-  fois. `G_protocole_outils` ne compte que la croissance, et vaut `0` avec la
-  provenance `included` si le harnais l'a déjà incluse.
+  fois. `O_last` est ajouté une seule fois, comme croissance de l'historique
+  depuis `C_last` ; `O` du tour n'est jamais ajouté. `G_protocole_outils` ne
+  compte que la croissance, et vaut `0` avec la provenance `included` si le
+  harnais l'a déjà incluse.
+* **Absence** : `O_last` absent (harnais qui ne publie que l'usage du tour,
+  tour interrompu, relevé partiel) → `C_next` et `C_next_input` sont `null` ou
+  un intervalle explicitement borné ; jamais `O` du tour, jamais `0`. Une
+  réserve `O_reserve_next` inconnue rend `C_next` `null`, mais peut laisser
+  `C_next_input` connu.
 * Aucune valeur numérique de réserve n'est fixée par ce lot : les profils les
   déclareront, avec leur source et leur date. Sans déclaration, `C_next` n'est
   pas calculable et aucune décision en pourcentage n'est prise.
@@ -368,7 +399,7 @@ non-résident ne vaut pas en résident.
    ces gardes.
 2. **Plafond dur de contexte** : `C_last >= context_max_tokens` → clôture au
    prochain point sûr, puis rotation avant le tour suivant.
-3. **Entretien de fenêtre qualifié** : `C_next`/`C_last` proche de `W`, avec
+3. **Entretien de fenêtre qualifié** : `C_next`/`C_next_input` proche de `W`, avec
    fenêtre connue et compaction supportée → compactage ou renouvellement.
 4. **Budget cumulé** : `R_turn`/`R_session` au-delà d'un budget configuré →
    clôture sûre, même session, sans rotation ni compactage pour ce seul motif
@@ -383,7 +414,7 @@ non-résident ne vaut pas en résident.
 | Déclencheur | Mesure | Décision | Ne fait pas |
 |---|---|---|---|
 | **Budget cumulé** | `R_turn`, `R_session` | clôture sûre au point sûr, puis continuation sur la même session ; budget explicite et tracé | ne présente pas le budget comme un % de `W` ; ne tourne pas la session pour ce seul motif ; ne déclenche pas un compactage de fenêtre |
-| **Occupation de fenêtre** | `C_last`, `C_next`, `W` | compactage natif qualifié si supporté et `C_next` proche de `W` ; sinon rotation au plafond dur ; `C_next` inconnu → aucune décision en pourcentage | n'utilise pas `R_turn`/`R_session` comme taille de fenêtre ; n'invente pas `W` |
+| **Occupation de fenêtre** | `C_last`, `C_next_input`, `C_next`, `W` | compactage natif qualifié si supporté et `C_next` proche de `W` (ou `C_next_input` proche de `W - O_reserve_next`) ; sinon rotation au plafond dur ; projection inconnue → aucune décision en pourcentage | n'utilise pas `R_turn`/`R_session` comme taille de fenêtre ; n'invente pas `W` |
 | **Frontière de lot / identité** | lot du tour, profil | session dédiée `par-lot`, fermeture du lot fini, nouveau profil et revalidation à chaque bascule | ne réutilise pas une fenêtre, un seuil natif ou une marge de l'ancien profil |
 | **Garde de sécurité** | bail, humain, hôte, budget, durée, courrier | traitement immédiat, prioritaire sur tout entretien | ne diffère jamais une garde pour « finir le contexte » |
 
@@ -480,7 +511,8 @@ le contrat ne prétend pas que l'ancien résultat est encore le résultat actuel
 | **Bascule de harnais / version** | nouveau profil ; conventions d'usage et de cache changent ; aucune comparaison brute avec l'ancien ; session réouverte si le harnais/le compte/le dossier change (règle actuelle) | EX-03, EX-06 |
 | **Cache inclus / exclu** | appliquer la table §2.2 ; jamais additionner `input` et `cached` pour Codex ; jamais comparer un total Claude à un total Codex | EX-03 |
 | **Sous-agent** | mesuré à part ; exclu de `C_last`, `R_turn`, `R_session` du fil principal ; jamais un point sûr du tour principal | EX-04 |
-| **Interruption avant résultat** | usage par appel s'il existe (`partial`) ; sinon `null` ; pas de `0` ; Codex sans relevé d'appel : pas de rotation sur la somme ; le tour de résumé raté devient le dernier tour mesuré | EX-04, EX-05 |
+| **Tour à plusieurs appels** | `O` est la sortie du tour, jamais celle du dernier appel ; `C_next` utilise seulement `O_last` ; si `O_last` n'est pas publié, projection `null`, pas de décision en pourcentage | EX-04, EX-05 |
+| **Interruption avant résultat** | usage par appel s'il existe (`partial`) ; sinon `null` ; pas de `0` ; `O_last` du dernier appel s'il est publié, sinon projection `null` ; Codex sans relevé d'appel : pas de rotation sur la somme ; le tour de résumé raté devient le dernier tour mesuré | EX-04, EX-05 |
 | **Compactage incomplet** | pas de `post_tokens` → garder l'avant, marquer `partial`, ne pas inventer l'après ; retry borné ; rotation si le plafond dur est atteint | EX-08 |
 | **Tour de résumé** | mesure `C_last` par appel si le flux en publie ; sinon repli `R_turn` du dernier tour, nommé `fallback`, **jamais** pour Codex | EX-05 |
 | **Session reprise après redémarrage** | `S_hist` relu du grand livre ; `C_last`/`R_turn` non rechargés ; la décision de fenêtre attend le tour suivant | EX-04, EX-05 |
@@ -491,7 +523,7 @@ le contrat ne prétend pas que l'ancien résultat est encore le résultat actuel
 | Id | Exigence | Où |
 |---|---|---|
 | EX-01 | chaque grandeur a unité, périmètre, source, cache, remise à zéro, déduplication, absence | §2.1, §2.2 |
-| EX-02 | `C_last`, `C_next`, `R_turn`, `R_session`, `O`, `D`, `Cost` sont distingués | §2, §5 |
+| EX-02 | `C_last`, `O_last`, `C_next_input`, `C_next`, `R_turn`, `R_session`, `O`, `D`, `Cost` sont distingués | §2, §5 |
 | EX-03 | conventions de cache par harnais, sans comparaison brute | §2.2, §6.2 |
 | EX-04 | déduplication : appel, blocs, cumuls, sous-agents, reprise | §2.1, §2.4, §6.2 |
 | EX-05 | absence = `null` + raison ; repli nommé ; jamais `0` ni valeur supposée | §2.1, §6.2 |
@@ -525,8 +557,9 @@ le contrat ne prétend pas que l'ancien résultat est encore le résultat actuel
 
 ### 7.3 Vérification attendue des lots suivants
 
-* **CTX-02** : fixtures par harnais pour `C_last`, `R_turn`, `S_hist`, cache
-  écrit, blocs répétés, cumuls Codex, sous-agents, interruption.
+* **CTX-02** : fixtures par harnais pour `C_last`, `O_last`, `C_next_input`,
+  `C_next`, `R_turn`, `S_hist`, cache écrit, blocs répétés, cumuls Codex,
+  sous-agents, interruption.
 * **CTX-03** : `modelUsage` avec auxiliaire en premier ; alias ; bascule de
   modèle ; `post_tokens` absent ; fenêtre `null`.
 * **CTX-04** : budget de tour opt-in → clôture sûre sans rotation ; fenêtre
