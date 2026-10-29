@@ -4262,12 +4262,16 @@ class HostLifecycle(Domain):
         """
 
     @abc.abstractmethod
-    def undrain(self, host: str, *, actor: str, claims_open: bool = True) -> dict | None:
+    def undrain(self, host: str, *, actor: str, claims_open: bool = True,
+                generation: int | None = None,
+                release_epoch: int | None = None) -> dict | None:
         """Request agents' return; retained origin rows survive this request.
 
         #4148: `claims_open=False` leaves the claim gate closed for the
         `busy` hook; only the hook's success (or the explicit default) opens
         it. `release_state` returns to `busy` only when claims are opened.
+        `generation`/`release_epoch` are the CAS of a return decided from a
+        snapshot: a new withdrawal or another return makes it stale.
         """
 
     @abc.abstractmethod
@@ -4302,12 +4306,27 @@ class HostLifecycle(Domain):
         """
 
     @abc.abstractmethod
-    def open_claims(self, host: str, generation: int, *, require_busy: bool = True) -> bool:
+    def open_claims(self, host: str, generation: int, *,
+                    require_busy: bool = True,
+                    release_epoch: int | None = None) -> bool:
         """Reopen claims after a `busy` acknowledgement and a fresh reading.
 
         Only a host whose acknowledged hook state is `busy` can reopen; a
-        replay or a stale generation opens nothing. `require_busy=False` is
-        the explicit operator path of a host whose adapter was removed.
+        replay, a stale generation or a moved `release_epoch` opens nothing.
+        `require_busy=False` is the explicit operator path of a host whose
+        adapter was removed.
+        """
+
+    @abc.abstractmethod
+    def reopen_return(self, host: str, *, generation: int, release_epoch: int,
+                      actor: str) -> dict | None:
+        """Atomically reopen a return after a valid `busy` proof.
+
+        The CAS is the generation and the release epoch of the snapshot, and
+        the row must still carry `hook_state='busy'`; a released host also
+        needs a `busy` journal entry newer than its last `idle-drained`. A
+        new withdrawal, another return, or an in-flight release transition
+        leaves the claims closed. Returns the updated row, or None.
         """
 
     @abc.abstractmethod

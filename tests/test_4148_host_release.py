@@ -394,6 +394,35 @@ class HostReleaseTest(PgTestCase):
         self.once(now=time.time())
         self.assertTrue(self.control()["claims_open"])
 
+    def test_old_binary_return_is_not_closed_forever_after_the_migration(self):
+        # Between migration 0507 and the restart, or after a rollback, the old
+        # code moves draining -> returning -> available without touching
+        # claims_open. The SQL function must not keep such a host closed.
+        self.add_agent()
+        self.api.host_lifecycle.drain("vm", actor="human:op")
+        self.db.execute("UPDATE host_lifecycle SET mode='returning', actor='human:op', "
+                        "return_at=NULL, updated_at=clock_timestamp() WHERE host='vm'")
+        self.db.execute("UPDATE host_lifecycle SET mode='available', "
+                        "updated_at=clock_timestamp() WHERE host='vm'")
+        opened = self.db.query(
+            "SELECT ameesh_host_claims_open('vm') AS open")[0]["open"]
+        self.assertTrue(opened)
+
+    def test_reopen_return_is_refused_after_a_new_withdrawal(self):
+        self.add_agent()
+        self.api.host_lifecycle.drain("vm", actor="human:op")
+        snapshot = self.control()
+        self.api.host_lifecycle.undrain("vm", actor="human:op", claims_open=True)
+        self.api.host_lifecycle.drain("vm", actor="human:op")
+        self.assertEqual(self.control()["mode"], "draining")
+        self.assertFalse(self.control()["claims_open"])
+        stale = self.api.host_lifecycle.reopen_return(
+            "vm", generation=snapshot["generation"],
+            release_epoch=snapshot["release_epoch"], actor="runner")
+        self.assertIsNone(stale)
+        self.assertEqual(self.control()["mode"], "draining")
+        self.assertFalse(self.control()["claims_open"])
+
     def test_draining_hook_failure_keeps_claims_closed_and_alerts(self):
         self.add_agent()
         self.quiet_history()

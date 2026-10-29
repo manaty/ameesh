@@ -354,14 +354,16 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, holds, known,
         if mode == "returning" and not row.get("claims_open"):
             # No adapter: a first drain (or a migrated row) has hook_state
             # NULL; there is no `busy` answer to wait for.
-            api.open_claims(host, row["generation"], require_busy=False)
+            api.open_claims(host, row["generation"], require_busy=False,
+                            release_epoch=row.get("release_epoch"))
         return "no hook"
     if mode == "returning":
         if row.get("claims_open"):
             return "returning"
         if row.get("hook_state") == "busy":
             if _busy_sample_ok(cfg, api, db, row, now=now):
-                api.open_claims(host, row["generation"])
+                api.open_claims(host, row["generation"],
+                                release_epoch=row.get("release_epoch"))
                 return "claims open"
             return "waiting for a fresh reading"
         _run_transition(cfg, api, canons, row, "busy", actor=actor,
@@ -401,7 +403,8 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, holds, known,
             # work or for declared runs): reopen claims once a fresh reading
             # proves the host is back.
             if _busy_sample_ok(cfg, api, db, row, now=now):
-                api.undrain(host, actor=actor, claims_open=True)
+                api.reopen_return(host, generation=row["generation"],
+                                  release_epoch=row["release_epoch"], actor=actor)
                 return "returning"
             return "waiting for a fresh reading"
         # A new withdrawal: busy is where we start, draining is the next step.
@@ -519,16 +522,16 @@ def request_return(cfg, db, host, *, actor, runner=None, now=None, clock=time.ti
         canons = canon_mod.load_configured(cfg)
     except Exception:
         canons = []
-    try:
-        hook = hook_for(cfg, canons, host)
-    except ValueError:
-        raise
+    hook = hook_for(cfg, canons, host)
     now = clock() if now is None else float(now)
     if not hook:
         if row.get("mode") == "returning" and not row.get("claims_open"):
-            api.open_claims(host, row["generation"], require_busy=False)
+            api.open_claims(host, row["generation"], require_busy=False,
+                            release_epoch=row.get("release_epoch"))
         else:
-            api.undrain(host, actor=actor, claims_open=True)
+            api.undrain(host, actor=actor, claims_open=True,
+                        generation=row["generation"],
+                        release_epoch=row.get("release_epoch"))
         return api.get(host)
     if row.get("mode") == "returning" and row.get("claims_open"):
         return row
@@ -543,10 +546,8 @@ def request_return(cfg, db, host, *, actor, runner=None, now=None, clock=time.ti
     # None and the row stays draining; the scanner retries after it finishes.
     if not _busy_sample_ok(cfg, api, db, row, now=now):
         return row
-    if row.get("mode") == "returning":
-        api.open_claims(host, row["generation"])
-    else:
-        api.undrain(host, actor=actor, claims_open=True)
+    api.reopen_return(host, generation=row["generation"],
+                      release_epoch=row["release_epoch"], actor=actor)
     return api.get(host)
 
 

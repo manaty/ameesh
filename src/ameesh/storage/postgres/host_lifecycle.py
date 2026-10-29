@@ -92,7 +92,14 @@ class HostLifecycle(interface.HostLifecycle):
             "                      AND NOT c.claims_open"
             "                      AND c.updated_at > clock_timestamp()"
             "                          - make_interval(secs => %s))"
-            " ORDER BY h.host", (older_than, released_grace))
+            # A scheduled return whose `busy` hook is still pending also has
+            # closed claims and stale readings: it is booting, not lost.
+            "   AND NOT EXISTS (SELECT 1 FROM host_lifecycle c"
+            "                    WHERE c.host = h.host AND c.mode = 'returning'"
+            "                      AND NOT c.claims_open"
+            "                      AND c.updated_at > clock_timestamp()"
+            "                          - make_interval(secs => %s))"
+            " ORDER BY h.host", (older_than, released_grace, released_grace))
         changed = []
         for candidate in candidates:
             host = candidate["host"]
@@ -111,8 +118,9 @@ class HostLifecycle(interface.HostLifecycle):
                             or old.get("hook_attempt_state") == "idle-drained"):
                     # #4148: off by decision, between two readings.
                     continue
-                if old and old.get("released_at") is not None \
-                        and old.get("hook_state") == "busy" \
+                if old and ((old.get("released_ts") is not None
+                             and old.get("hook_state") == "busy")
+                            or old.get("mode") == "returning") \
                         and not old.get("claims_open"):
                     # #4148 B1: the boot is bounded by the grace; after it a
                     # host that still publishes nothing is lost.
@@ -216,9 +224,15 @@ class HostLifecycle(interface.HostLifecycle):
             _release_elected(tx, host)
             return row
 
-    def undrain(self, host, *, actor, claims_open=True):
+    def undrain(self, host, *, actor, claims_open=True, generation=None,
+                release_epoch=None):
         if not isinstance(claims_open, bool):
             raise ValueError("claims_open: a boolean expected")
+        for value, name in ((generation, "generation"),
+                            (release_epoch, "release_epoch")):
+            if value is not None and (isinstance(value, bool)
+                                      or not isinstance(value, int) or value < 1):
+                raise ValueError("%s: a positive integer expected" % name)
         with self.db.transaction() as tx:
             Hosts._lock_gate(tx, host)
             tx.query("SELECT name FROM agent_registry WHERE host=%s ORDER BY name FOR UPDATE", (host,))
@@ -233,8 +247,12 @@ class HostLifecycle(interface.HostLifecycle):
                 # keeps saying `draining` until the busy hook answers.
                 "release_state=CASE WHEN %s THEN 'busy' ELSE release_state END, "
                 "updated_at=clock_timestamp() WHERE host=%s "
-                "AND mode='draining' RETURNING " + _ROW,
-                (actor, claims_open, claims_open, host))
+                "AND mode='draining' "
+                "AND (%s::bigint IS NULL OR generation=%s) "
+                "AND (%s::bigint IS NULL OR release_epoch=%s) "
+                "RETURNING " + _ROW,
+                (actor, claims_open, claims_open, host, generation, generation,
+                 release_epoch, release_epoch))
             return rows[0] if rows else HostLifecycle(tx).get(host)
 
     def agents(self, host, generation):
@@ -420,12 +438,51 @@ class HostLifecycle(interface.HostLifecycle):
                     (state, state, state, state, host, generation))
             return HostLifecycle(tx).get(host)
 
-    def open_claims(self, host, generation, *, require_busy=True):
+    def open_claims(self, host, generation, *, require_busy=True,
+                    release_epoch=None):
+        if release_epoch is not None and (isinstance(release_epoch, bool)
+                                         or not isinstance(release_epoch, int)
+                                         or release_epoch < 1):
+            raise ValueError("release_epoch: a positive integer expected")
         rows = self.db.query(
             "UPDATE host_lifecycle SET claims_open=true,updated_at=clock_timestamp() "
             "WHERE host=%s AND generation=%s AND (NOT %s OR hook_state='busy') "
-            "AND NOT claims_open RETURNING host", (host, generation, bool(require_busy)))
+            "AND (%s::bigint IS NULL OR release_epoch=%s) "
+            "AND NOT claims_open RETURNING host",
+            (host, generation, bool(require_busy), release_epoch, release_epoch))
         return bool(rows)
+
+    def reopen_return(self, host, *, generation, release_epoch, actor):
+        """Atomic CAS of a return after a valid `busy` proof (see interface)."""
+        for value, name in ((generation, "generation"),
+                            (release_epoch, "release_epoch")):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError("%s: a positive integer expected" % name)
+        if not isinstance(actor, str) or not actor.strip() \
+                or any(ord(c) < 32 for c in actor):
+            raise ValueError("return actor required")
+        with self.db.transaction() as tx:
+            Hosts._lock_gate(tx, host)
+            rows = tx.query(
+                "UPDATE host_lifecycle c SET mode='returning',actor=%s,"
+                "return_at=NULL,claims_open=true,release_state='busy',"
+                "release_epoch=c.release_epoch+1,updated_at=clock_timestamp() "
+                "WHERE c.host=%s AND c.generation=%s AND c.release_epoch=%s "
+                "AND c.mode IN ('draining','returning') "
+                "AND c.hook_state='busy' AND NOT c.claims_open "
+                # A released host needs a busy acknowledgement after its last
+                # release; a never-released legacy row is its own proof.
+                "AND (c.released_at IS NULL OR EXISTS ("
+                "  SELECT 1 FROM host_lifecycle_transitions t "
+                "   WHERE t.host=c.host AND t.generation=c.generation "
+                "     AND t.state='busy' "
+                "     AND NOT EXISTS (SELECT 1 FROM host_lifecycle_transitions r "
+                "                      WHERE r.host=c.host AND r.generation=c.generation "
+                "                        AND r.state='idle-drained' "
+                "                        AND r.created_at > t.created_at))) "
+                "RETURNING " + _ROW,
+                (actor, host, generation, release_epoch))
+            return rows[0] if rows else None
 
     def transition_journal(self, host):
         rows = self.db.query(

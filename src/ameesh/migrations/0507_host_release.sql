@@ -85,9 +85,14 @@ CREATE TABLE host_release_locks (
 CREATE OR REPLACE FUNCTION ameesh_host_claims_open(wanted_host text)
 RETURNS boolean LANGUAGE plpgsql VOLATILE AS $$
 BEGIN
+    -- #4148 auditeur B1: `claims_open` only closes the return window. A host
+    -- brought back to `available` by an older binary (between migration and
+    -- restart, or after a rollback) never touches the column; it must be open,
+    -- not closed forever. The new code opens claims before `available`.
     RETURN NOT EXISTS (SELECT 1 FROM host_lifecycle
                        WHERE host = wanted_host
-                         AND (mode IN ('draining', 'lost') OR NOT claims_open))
+                         AND (mode IN ('draining', 'lost')
+                              OR (mode = 'returning' AND NOT claims_open)))
        AND NOT EXISTS (SELECT 1 FROM host_release_fences WHERE host = wanted_host);
 END $$;
 

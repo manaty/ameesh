@@ -5050,6 +5050,7 @@
     "open_claims",
     "progress",
     "reconcile_loss",
+    "reopen_return",
     "release_locks",
     "transition_journal",
     "undrain"
