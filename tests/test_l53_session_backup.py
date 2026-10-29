@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import os
 import shutil
@@ -451,6 +452,8 @@ class S3EndpointTest(unittest.TestCase):
         def request(argv, **kwargs):
             self.assertNotIn("--user", argv)
             self.assertFalse(any(value in " ".join(argv) for value in ("test-access", "test-secret")))
+            self.assertEqual(argv[argv.index("-H") + 1], "x-amz-content-sha256: "
+                             + hashlib.sha256(kwargs.get("input") or b"").hexdigest())
             path = argv[argv.index("--config") + 1]
             configs.append(path)
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)

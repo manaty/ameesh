@@ -99,3 +99,9 @@ Une fois installé, le serveur se met à jour depuis le poste avec
 paquet : le gabarit `ameesh-runner@.service` et le script de sauvegarde
 installés ne changent que si l'on rejoue `installer-serveur.sh`, sans risque
 (idempotent) : `ORGANISATION=<id> /opt/ameesh/src/deploy/serveur/installer-serveur.sh`.
+Le rejeu réinstalle aussi `sauvegarder-prive.py` et `retention-scaleway.py` en
+0755 root:root ; le passage suivant du service resserre le répertoire en 0700
+et normalise les dumps existants en 0600 sans les réécrire (#1305/#1309).
+Après le rejeu, `systemctl start ameesh-sauvegarde.service` doit rendre
+`Result=success` et un nouveau dump 0600 ; l'objet distant se vérifie ensuite
+avec l'identité de récupération.
