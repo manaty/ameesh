@@ -815,6 +815,22 @@ class PaquetAutoBanc(unittest.TestCase):
             paquet_auto.compute_candidates(worktree, "main", self.base, ready)
         self.assertIn("base illisible", str(caught.exception))
 
+    def test_grouped_composition_admits_every_lot(self):
+        source = "a" * 40
+        composition = paquet_auto.Composition(
+            [paquet_auto.Unit(1, source, "b" * 40)], [], "b" * 40)
+        table = ("## Composition\n\n| ordre | lots | source | commit | note |\n"
+                 "|---|---|---|---|---|\n"
+                 "| 1 | #1, #2 | `%s` | `%s` | résolution |\n" % (source, "b" * 40))
+        manifest = paquet_auto.build_manifest(
+            name="grouped", target="main", base_sha=self.base, carrier=99,
+            composition=composition, table=table, tests=[], freeze_seconds=0.0)
+        from ameesh import packet_parallel
+        self.assertEqual(packet_parallel.manifest_units(manifest), [
+            {"work_item": 1, "source": source},
+            {"work_item": 2, "source": source}])
+        self.assertIn("1 unités, 2 lots", manifest)
+
     def test_manifeste_lu_par_le_controle_d_inclusion(self) -> None:
         first, conflict, third = self.fixture()
         worktree = self.worktree("inclusion")

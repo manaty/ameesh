@@ -639,21 +639,27 @@ def request_return(cfg, db, host, *, actor, runner=None, now=None, clock=time.ti
 
 
 def once(cfg, db, *, local_host=None, actor="", now=None, runner=None,
-         clock=time.time):
+         clock=time.time, hosts=None):
     """One release-scanner pass; never raises (the runner thread must live).
 
     `local_host` is the host of the calling runner: only it may start an
     automatic withdrawal (a host knows its own quiet window best). Controlled
     hosts are advanced from any runner, serialised by the per-host lock.
+    `hosts` restricts the controlled hosts advanced by this pass (the mediated
+    server only scans the hosts it mediates); None keeps every one.
     """
     now = clock() if now is None else float(now)
     api = storage.of(db).host_lifecycle
+    # The full control map is kept for the return targets: a host outside the
+    # pass may still be closed, and it must not be read as an open host.
     controls = {row["host"]: row for row in api.listing()}
+    wanted = None if hosts is None else set(hosts)
     owners = []
     for host, control in controls.items():
-        if control.get("mode") in ("draining", "returning"):
+        if control.get("mode") in ("draining", "returning") \
+                and (wanted is None or host in wanted):
             owners.append(host)
-    if local_host:
+    if local_host and (wanted is None or local_host in wanted):
         owners.append(local_host)
     owners = sorted(set(owners))
     if not owners:

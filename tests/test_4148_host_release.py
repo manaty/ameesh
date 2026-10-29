@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#4148 (B of #3167): strict host release ordering, adapter protocol and runs."""
+"""#4148 (B of #3167): strict host release ordering, adapter protocol and runs.
+
+#4435: the release scanner also covers a one-shot executor and the mediated
+hosts scanned by their server, from a planned return to the closed return.
+"""
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
 import sys
@@ -15,6 +20,8 @@ from unittest import mock
 
 from ameesh import (config, db as db_mod, host_idle, host_lifecycle,
                     host_release, registry, storage, work)
+from ameesh.mediated_executor import server as mediated_server
+from ameesh.runner import Runner
 
 from .support import PgTestCase
 
@@ -581,6 +588,85 @@ class HostReleaseTest(PgTestCase):
         self.assertFalse(self.control()["claims_open"])
         self.once(now=time.time())
         self.assertTrue(self.control()["claims_open"])
+
+    def test_once_runner_makes_one_release_pass_and_completes_the_return(self):
+        self.add_agent()
+        self.cfg = dataclasses.replace(self.cfg, lifecycle_hooks={})
+        self.api.host_lifecycle.drain("vm", actor="human:op", duration=3600,
+                                      close_claims=True)
+        self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
+                        "WHERE host='vm'")
+        self.assertEqual(self.control()["mode"], "draining")
+        self.assertFalse(self.control()["claims_open"])
+        # No long-running runner: the one-shot pass itself must expire the
+        # planned return, reopen the claims and close it before handing back.
+        Runner(self.cfg, self.db, once=True).start_host_release_poll()
+        control = self.control()
+        self.assertTrue(control["claims_open"])
+        self.assertEqual(control["mode"], "available")
+
+    def test_mediated_server_pass_completes_a_mediated_scheduled_return(self):
+        self.add_agent()
+        self.cfg = dataclasses.replace(self.cfg, lifecycle_hooks={})
+        self.api.host_lifecycle.drain("vm", actor="human:op", duration=3600,
+                                      close_claims=True)
+        self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
+                        "WHERE host='vm'")
+        with mock.patch.object(mediated_server, "mediated_hosts",
+                               return_value=["vm"]):
+            completed = mediated_server.release_once(self.cfg, self.db)
+        control = self.control()
+        self.assertTrue(control["claims_open"])
+        self.assertEqual(control["mode"], "available")
+        self.assertEqual(completed, ["vm"])
+
+    def test_mediated_server_pass_leaves_a_native_host_to_its_runner(self):
+        self.add_agent()
+        self.cfg = dataclasses.replace(self.cfg, lifecycle_hooks={})
+        self.api.host_lifecycle.drain("vm", actor="human:op", duration=3600,
+                                      close_claims=True)
+        self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
+                        "WHERE host='vm'")
+        # Another host is mediated: the pass runs and must still not expire the
+        # native host's planned return (its own runner does that).
+        with mock.patch.object(mediated_server, "mediated_hosts",
+                               return_value=["other"]):
+            completed = mediated_server.release_once(self.cfg, self.db)
+        self.assertEqual(completed, [])
+        control = self.control()
+        self.assertFalse(control["claims_open"])
+        self.assertEqual(control["mode"], "draining")
+
+    def test_expire_returns_can_be_restricted_to_hosts(self):
+        self.add_agent()
+        self.api.host_lifecycle.drain("vm", actor="human:op", duration=3600,
+                                      close_claims=True)
+        self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
+                        "WHERE host='vm'")
+        self.assertEqual(self.api.host_lifecycle.expire_returns(
+            open_claims=False, hosts=["other"]), [])
+        self.assertEqual(self.control()["mode"], "draining")
+        rows = self.api.host_lifecycle.expire_returns(
+            open_claims=False, hosts=["vm"])
+        self.assertEqual([row["host"] for row in rows], ["vm"])
+        self.assertEqual(self.control()["mode"], "returning")
+        self.assertFalse(self.control()["claims_open"])
+
+    def test_mediated_release_loop_runs_a_pass_before_waiting(self):
+        class Pool:
+            @contextlib.contextmanager
+            def connection(self):
+                yield "db"
+        app = NS(closing=threading.Event(), pool=Pool())
+        seen = []
+
+        def pass_(cfg, db):
+            seen.append((cfg, db))
+            app.closing.set()
+
+        with mock.patch.object(mediated_server, "release_once", side_effect=pass_):
+            mediated_server._release_loop(app, self.cfg, interval=3600)
+        self.assertEqual(seen, [(self.cfg, "db")])
 
     def test_old_binary_return_is_not_closed_forever_after_the_migration(self):
         # Between migration 0507 and the restart, or after a rollback, the old

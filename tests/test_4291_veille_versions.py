@@ -15,7 +15,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import hostcheck, storage, veille, veille_cli, work
+from ameesh import harness_adoption, hostcheck, storage, veille, veille_cli, work
 from ameesh.discovery.base import ModelSeen, SourceResult
 
 from .support import PgTestCase
@@ -503,6 +503,37 @@ class VeilleDbTest(PgTestCase):
         known = {row["model_id"] for row in storage.of(self.db).catalog.listing()}
         self.assertIn("deepseek-model", known)
 
+    def test_open_adoption_keeps_the_harness_lot(self):
+        """#4312 (interaction A x C) : A ne réécrit pas le lot qui porte une
+        adoption ouverte ; une fois l'adoption terminale, il reprend."""
+        self.record("vm-a", "0.2.0-rc.2")
+        first = self.scan(["0.2.0-rc.2", "0.2.1-rc.4"],
+                          tags={"rc": "0.2.1-rc.4"})
+        self.assertEqual(first["actions"][0]["action"], "created", first)
+        lot_id = first["actions"][0]["lot"]
+        self.db.execute(
+            "INSERT INTO harness_adoptions (lot_id, project, harness, object,"
+            " from_version, to_version, stage, report, report_digest, state)"
+            " VALUES (%s, 'ameesh', 'deepseek', 'harness', '0.2.0-rc.2',"
+            " '0.2.1-rc.4', 'canary', '{}'::jsonb, 'x', %s::jsonb)",
+            (lot_id, json.dumps({"schema": harness_adoption.STATE_SCHEMA,
+                                 "stage": "canary"})))
+        second = self.scan(["0.2.0-rc.2", "0.2.1-rc.4", "0.2.1-rc.5"],
+                           tags={"rc": "0.2.1-rc.5"})
+        self.assertEqual(second["actions"][0]["action"], "kept-object", second)
+        self.assertEqual(work.get(self.db, lot_id)["title"],
+                         "Évaluer deepseek 0.2.1-rc.4")
+
+        self.db.execute(
+            "UPDATE harness_adoptions SET stage = 'done', "
+            "state = jsonb_set(state, '{stage}', '\"done\"') "
+            "WHERE lot_id = %s", (lot_id,))
+        third = self.scan(["0.2.0-rc.2", "0.2.1-rc.4", "0.2.1-rc.5"],
+                          tags={"rc": "0.2.1-rc.5"})
+        self.assertEqual(third["actions"][0]["action"], "updated", third)
+        self.assertEqual(work.get(self.db, lot_id)["title"],
+                         "Évaluer deepseek 0.2.1-rc.5")
+
     def test_discover_before_scan_does_not_hide_a_new_model(self):
         # `models discover` écrit au catalogue avant la veille : la présence au
         # catalogue n'est pas un relevé de la veille (B de l'auditeur, #4291)
@@ -614,6 +645,45 @@ class VeilleDbTest(PgTestCase):
                            tags={"rc": "0.2.1-rc.4"}, dry_run=True)
         self.assertEqual(report["actions"][0]["action"], "would-create")
         self.assertEqual(self.lots(), [])
+
+    def test_dry_run_probes_without_recording(self):
+        """L'appel normal de la veille (`probe=True`, sans `--no-probe`) ne
+        persiste pas la sonde en dry-run : « write nothing » vaut aussi pour
+        `harness_versions` (#4438). Le dry-run juge sur l'état frais."""
+        cfg = self.configure()
+        probe = {"harness": "deepseek", "path": "/opt/dsh",
+                 "version": "0.2.0-rc.2", "raw": "dsh 0.2.0-rc.2",
+                 "error": None}
+        before = storage.of(self.db).hosts.harness_versions()
+        with mock.patch("ameesh.harness_versions.probe", return_value=probe):
+            report = veille.scan(
+                cfg, self.db, probe=True, dry_run=True,
+                http_get=self.fetch(["0.2.0-rc.2", "0.2.1-rc.4"],
+                                    tags={"rc": "0.2.1-rc.4"}))
+        self.assertEqual(report["probed"], [probe])
+        self.assertEqual(
+            report["sources"][0]["installed"]["hosts"],
+            {"vm-a": {"version": "0.2.0-rc.2", "path": "/opt/dsh"}})
+        self.assertEqual(report["actions"][0]["action"], "would-create")
+        self.assertEqual(storage.of(self.db).hosts.harness_versions(), before)
+        self.assertEqual(self.lots(), [])
+
+    def test_scan_records_the_probe_outside_dry_run(self):
+        """Le même passage hors dry-run enregistre bien la sonde."""
+        cfg = self.configure()
+        probe = {"harness": "deepseek", "path": "/opt/dsh",
+                 "version": "0.2.0-rc.2", "raw": "dsh 0.2.0-rc.2",
+                 "error": None}
+        with mock.patch("ameesh.harness_versions.probe", return_value=probe):
+            report = veille.scan(
+                cfg, self.db, probe=True, dry_run=False,
+                http_get=self.fetch(["0.2.0-rc.2", "0.2.1-rc.4"],
+                                    tags={"rc": "0.2.1-rc.4"}))
+        rows = storage.of(self.db).hosts.harness_versions()
+        self.assertEqual(
+            [(row["host"], row["harness"], row["version"]) for row in rows],
+            [("vm-a", "deepseek", "0.2.0-rc.2")])
+        self.assertEqual(report["actions"][0]["action"], "created")
 
     def test_designated_host_does_not_reconcile(self):
         self.record("vm-a", "0.2.0-rc.2")

@@ -16,9 +16,22 @@ un fichier par clé sous l'état de l'hôte, partagé par tous les exécuteurs d
 même utilisateur. Seuls les résultats réussis (`grep` à 0 ou 1) se gardent :
 un échec reste un doute et se relit au passage suivant.
 
-#4475 : les lectures complètes d’arbre sont partagées entre motifs. Après
-chaque publication, le LRU borne le magasin à 256 Mio et 20 000 entrées ;
-une entrée dépassant seule le budget est retirée.
+#4475 : les lectures complètes d’arbre sont partagées entre motifs. Le LRU
+borne le magasin à 256 Mio et 20 000 entrées ; une entrée dépassant seule le
+budget est retirée.
+
+#4482 : une entrée `tree-lines` d'un gros arbre pèse des dizaines de Mo en
+JSON (536 944 lignes, 32,8 Mo sur `main`) et ne tenait que ~7 fois dans le
+budget ; chaque lecture refaisait ce `json.load` (~0,4 s). Le contenu est donc
+stocké **compressé** (gzip niveau 4 ; lignes jointes par `\\n`, 10,0 Mo pour
+un arbre de 544 000 lignes, ~3,2 fois plus d'arbres dans le budget), relu sans
+JSON (liste de chaînes) et **mémoïsé dans le processus** (`MEMO_MAX_BYTES` :
+le même arbre n'est décodé qu'une fois par processus, pas une fois par appel). L'élagage
+n'est plus refait après chaque écriture (0,14-0,31 s à 20 000 entrées) : une
+grosse entrée l'applique aussitôt, les petites l'amortissent sur
+`PRUNE_EVERY` écritures ou `PRUNE_PENDING_BYTES` octets. Sous concurrence, la
+borne peut être dépassée de moins de `PRUNE_PENDING_BYTES` par processus
+entre deux élagages ; le compte exact est refait à chaque élagage.
 
 Attributs (B/P2 cx2 sur b4e42699) : `-I` dépend de l'attribut `binary`, que git
 lit dans les `.gitattributes` du dépôt de travail, `info/attributes`,
@@ -39,11 +52,16 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import gzip
 import hashlib
+import io
 import json
 import os
 import tempfile
+import threading
 import time
+import zlib
+from collections import OrderedDict
 from typing import Callable, Optional, Sequence
 
 from . import canon
@@ -54,12 +72,25 @@ CACHE_DIR = "git-grep"
 MAX_ENTRIES = 20000
 #: octets persistés au plus ; les arbres complets peuvent faire plusieurs Mo
 MAX_BYTES = 256 * 1024 * 1024
+#: magasins entre deux élagages des petites entrées
+PRUNE_EVERY = 256
+#: au-delà, une écriture paie un élagage immédiat : c'est la taille des
+#: arbres, seuls à pouvoir remplir le budget en quelques publications
+PRUNE_LARGE_BYTES = 1024 * 1024
+#: octets écrits par ce processus depuis le dernier élagage avant de le
+#: refaire (les petites entrées amortissent le coût du balayage)
+PRUNE_PENDING_BYTES = MAX_BYTES // 16
+#: valeurs décodées gardées dans le processus, en octets encodés
+MEMO_MAX_BYTES = 24 * 1024 * 1024
+MEMO_MAX_ENTRIES = 64
+#: niveau gzip : le niveau 4 tient 25 arbres de `main` dans 256 Mio
+GZIP_LEVEL = 4
 #: attente au plus du verrou d'une clé qu'un autre processus calcule (s)
 LOCK_WAIT_S = canon.GIT_TIMEOUT
 #: pas de l'attente du verrou (s)
 LOCK_STEP_S = 0.1
 #: version du format : un changement de format change toutes les clés
-FORMAT = 2
+FORMAT = 3
 #: première version de git qui lit `GIT_ATTR_SOURCE` (absent de l'attr.c de
 #: v2.40.0, présent en v2.41.0 : relevé cx2)
 ATTR_SOURCE_GIT = (2, 41)
@@ -69,6 +100,18 @@ ATTR_TOKEN_ENV = "AMEESH_INFO_ATTRIBUTES"
 
 #: interrupteur du processus (la suite de tests le met à False)
 ENABLED = True
+
+#: état du processus : racine courante, octets en attente d'élagage,
+#: magasins depuis le dernier élagage, valeurs décodées (LRU) et compteurs.
+_STATE_LOCK = threading.RLock()
+_STATE_ROOT: Optional[str] = None
+_PENDING_BYTES = 0
+_STORES = 0
+_MEMO: "OrderedDict[str, tuple[tuple[int, int], list, int]]" = OrderedDict()
+_MEMO_BYTES = 0
+_COUNTERS = {"reads": 0, "hits": 0, "memo_hits": 0, "misses": 0,
+             "stores": 0, "prunes": 0, "pruned": 0,
+             "lookups": 0, "served": 0, "deduped": 0, "computed": 0}
 
 
 def enabled() -> bool:
@@ -83,6 +126,59 @@ def root() -> str:
     state = (os.environ.get("AMEESH_STATE") or os.environ.get("AGENT_MESH_STATE")
              or "~/.local/state/ameesh")
     return os.path.join(os.path.expanduser(state), CACHE_DIR)
+
+
+def _state() -> None:
+    """Réinitialise l'état du processus si la racine du cache a changé."""
+    global _STATE_ROOT, _PENDING_BYTES, _STORES, _MEMO_BYTES
+    current = root()
+    with _STATE_LOCK:
+        if current == _STATE_ROOT:
+            return
+        _STATE_ROOT = current
+        _PENDING_BYTES = 0
+        _STORES = 0
+        _MEMO.clear()
+        _MEMO_BYTES = 0
+        for key in _COUNTERS:
+            _COUNTERS[key] = 0
+
+
+def _reset_process_state() -> None:
+    """Vide l'état du processus (témoin des tests, qui changent de racine)."""
+    global _STATE_ROOT, _PENDING_BYTES, _STORES, _MEMO_BYTES
+    with _STATE_LOCK:
+        _STATE_ROOT = root()           # la racine courante ne re-vide pas après
+        _PENDING_BYTES = 0
+        _STORES = 0
+        _MEMO.clear()
+        _MEMO_BYTES = 0
+        for key in _COUNTERS:
+            _COUNTERS[key] = 0
+
+
+def _count(name: str, amount: int = 1) -> None:
+    with _STATE_LOCK:
+        _COUNTERS[name] = _COUNTERS.get(name, 0) + amount
+
+
+def stats() -> dict:
+    """Compteurs du processus (lectures, réussites, mémo, élagages).
+
+    `lookups` compte les appels à `cached` qui ont interrogé le cache ;
+    `served` ceux servis par une entrée déjà là, `deduped` ceux qu'un autre
+    processus venait de publier, `computed` ceux qui ont balayé. Le taux de
+    réussite du cache est `served / lookups`."""
+    _state()
+    with _STATE_LOCK:
+        result = dict(_COUNTERS)
+        result["memo_entries"] = len(_MEMO)
+        result["memo_bytes"] = _MEMO_BYTES
+    reads = result.get("reads") or 0
+    result["hit_rate"] = (result.get("hits", 0) / reads) if reads else None
+    lookups = result.get("lookups") or 0
+    result["lookup_hit_rate"] = (result.get("served", 0) / lookups) if lookups else None
+    return result
 
 
 def neutral_attributes(rev: str, repo: str = "") -> dict:
@@ -176,33 +272,142 @@ def _path(name: str) -> str:
     return os.path.join(root(), name[:2], name + ".json")
 
 
-def _read(name: str):
-    """(True, valeur) si l'entrée est lisible, sinon (False, None)."""
-    path = _path(name)
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        return False, None
-    if not isinstance(data, dict) or data.get("format") != FORMAT \
-            or not isinstance(data.get("value"), list):
-        return False, None
+#: L'en-tête du fichier est un JSON court, suivi du corps. Les entrées de
+#: chaînes (tous les appelants de production) sont des lignes jointes par
+#: `\n`, sans JSON ; les autres valeurs gardent un JSON exact (contrat de
+#: `cached`). Le tout est compressé : un arbre complet de 536 944 lignes passe
+#: de 32,8 Mo à ~10 Mo, ce qui met ~25 arbres dans le budget de 256 Mio.
+def _entry_parts(value: list):
+    value = list(value)
+    if all(isinstance(item, str) and "\n" not in item for item in value):
+        meta = {"format": FORMAT, "kind": "lines"}
+        body = "\n".join(value).encode("utf-8")
+    else:
+        meta = {"format": FORMAT, "kind": "json"}
+        body = json.dumps(value, ensure_ascii=False).encode("utf-8")
+    return json.dumps(meta, separators=(",", ":")).encode("ascii"), body
+
+
+def _encode(value: list) -> bytes:
+    """L'entrée encodée (témoin des tests ; l'écriture la produit en flux)."""
+    meta, body = _entry_parts(value)
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb", compresslevel=GZIP_LEVEL, mtime=0,
+                       filename="") as handle:
+        handle.write(meta)
+        handle.write(b"\n")
+        handle.write(body)
+    return buffer.getvalue()
+
+
+def _write_entry(handle, value: list) -> None:
+    meta, body = _entry_parts(value)
+    with gzip.GzipFile(fileobj=handle, mode="wb", compresslevel=GZIP_LEVEL, mtime=0,
+                       filename="") as stream:
+        stream.write(meta)
+        stream.write(b"\n")
+        stream.write(body)
+
+
+def _decode(raw: bytes) -> list:
+    meta_raw, separator, body = raw.partition(b"\n")
+    if not separator:
+        raise ValueError("cache entry without a header")
+    meta = json.loads(meta_raw)
+    if not isinstance(meta, dict) or meta.get("format") != FORMAT:
+        raise ValueError("cache entry of another format")
+    kind = meta.get("kind")
+    if kind == "lines":
+        return body.decode("utf-8").split("\n") if body else []
+    if kind == "json":
+        value = json.loads(body)
+        if not isinstance(value, list):
+            raise ValueError("cache entry is not a list")
+        return value
+    raise ValueError("cache entry of another kind")
+
+
+def _touch(path: str) -> None:
     try:
         os.utime(path)                 # élagage : la plus anciennement lue part
     except OSError:
         pass
-    return True, data["value"]
+
+
+def _memo_get(name: str, signature: tuple) -> Optional[list]:
+    with _STATE_LOCK:
+        entry = _MEMO.get(name)
+        if entry is None or entry[0] != signature:
+            return None
+        _MEMO.move_to_end(name)
+        _COUNTERS["memo_hits"] += 1
+        return list(entry[1])
+
+
+def _memo_put(name: str, value: list, signature: tuple, size: int) -> None:
+    global _MEMO_BYTES
+    if size > MEMO_MAX_BYTES:
+        return
+    with _STATE_LOCK:
+        old = _MEMO.pop(name, None)
+        if old is not None:
+            _MEMO_BYTES -= old[2]
+        _MEMO[name] = (signature, value, size)
+        _MEMO_BYTES += size
+        while _MEMO and (len(_MEMO) > MEMO_MAX_ENTRIES
+                         or _MEMO_BYTES > MEMO_MAX_BYTES):
+            _name, entry = _MEMO.popitem(last=False)
+            _MEMO_BYTES -= entry[2]
+
+
+def _memo_drop(name: str) -> None:
+    global _MEMO_BYTES
+    with _STATE_LOCK:
+        old = _MEMO.pop(name, None)
+        if old is not None:
+            _MEMO_BYTES -= old[2]
+
+
+def _read(name: str):
+    """(True, valeur) si l'entrée est lisible, sinon (False, None)."""
+    _state()
+    _count("reads")
+    path = _path(name)
+    try:
+        info = os.stat(path)
+    except OSError:
+        _memo_drop(name)
+        _count("misses")
+        return False, None
+    signature = (info.st_ino, info.st_size)
+    value = _memo_get(name, signature)
+    if value is not None:
+        _touch(path)
+        _count("hits")
+        return True, value
+    try:
+        with gzip.open(path, "rb") as handle:
+            raw = handle.read()
+        value = _decode(raw)
+    except (OSError, EOFError, ValueError, zlib.error):
+        _count("misses")
+        return False, None
+    _memo_put(name, value, signature, info.st_size)
+    _touch(path)
+    _count("hits")
+    return True, list(value)           # le mémo garde l'original
 
 
 def _write(name: str, value: list) -> None:
+    global _PENDING_BYTES, _STORES
+    _state()
     path = _path(name)
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"format": FORMAT, "value": value}, handle,
-                          ensure_ascii=False)
+            with os.fdopen(fd, "wb") as handle:
+                _write_entry(handle, value)
             os.replace(tmp, path)
         except BaseException:
             try:
@@ -212,43 +417,65 @@ def _write(name: str, value: list) -> None:
             raise
     except OSError:
         return                         # cache best-effort : la lecture vaut
-    # Chaque publication applique la borne : 256 arbres entre deux élagages
-    # suffiraient à remplir un disque (#4475, B P2 auditeur).
-    prune()
+    try:
+        info = os.stat(path)
+    except OSError:
+        info = None
+    if info is not None:
+        _memo_put(name, list(value), (info.st_ino, info.st_size), info.st_size)
+    size = info.st_size if info is not None else 0
+    with _STATE_LOCK:
+        _STORES += 1
+        _PENDING_BYTES += size
+        _COUNTERS["stores"] += 1
+        pending = _PENDING_BYTES
+        stores = _STORES
+    # #4482 (N3) : l'élagage (0,14-0,31 s à 20 000 entrées) n'est plus payé
+    # par chaque petite publication. Une grosse entrée — un arbre — l'applique
+    # aussitôt ; les petites l'amortissent, et les octets en attente bornent
+    # ce qu'elles peuvent ajouter entre deux élagages.
+    if (size >= PRUNE_LARGE_BYTES
+            or size > MAX_BYTES
+            or pending >= min(PRUNE_PENDING_BYTES, MAX_BYTES)
+            or stores % PRUNE_EVERY == 0):
+        prune()
+        with _STATE_LOCK:
+            _PENDING_BYTES = 0
 
 
-def prune(limit: int = MAX_ENTRIES, max_bytes: Optional[int] = None) -> int:
-    """Élague les plus anciennes lectures jusqu’aux bornes de nombre/octets.
-
-    Une entrée plus grosse que le budget est retirée elle aussi. Les fichiers
-    de verrou et temporaires ne sont jamais des entrées à élaguer.
-    """
-    budget = MAX_BYTES if max_bytes is None else max(0, max_bytes)
+def _prune_entries(limit: int, budget: int):
+    """Élague ; rend (retirées, octets restants, entrées restantes)."""
     entries = []
     base = root()
     try:
-        shards = os.listdir(base)
+        with os.scandir(base) as shards:
+            shards = list(shards)
     except OSError:
-        return 0
+        return 0, 0, 0
     for shard in shards:
-        folder = os.path.join(base, shard)
         try:
-            names = os.listdir(folder)
+            if not shard.is_dir():
+                continue
         except OSError:
             continue
-        for name in names:
-            if not name.endswith(".json"):
+        try:
+            with os.scandir(shard.path) as names:
+                names = list(names)
+        except OSError:
+            continue
+        for entry in names:
+            if not entry.name.endswith(".json"):
                 continue
-            full = os.path.join(folder, name)
             try:
-                stat = os.stat(full)
-                entries.append((stat.st_mtime, full, stat.st_size))
+                info = entry.stat(follow_symlinks=False)
             except OSError:
                 continue
-    removed = 0
-    total = sum(size for _mtime, _path, size in entries)
+            entries.append((info.st_mtime, entry.path, entry.name,
+                            info.st_size))
+    total = sum(size for _mtime, _path, _name, size in entries)
     count = len(entries)
-    for _mtime, full, size in sorted(entries):
+    removed = 0
+    for _mtime, full, name, size in sorted(entries):
         if count <= limit and total <= budget:
             break
         try:
@@ -258,8 +485,23 @@ def prune(limit: int = MAX_ENTRIES, max_bytes: Optional[int] = None) -> int:
             pass                       # déjà retiré par un autre processus
         except OSError:
             continue                   # pas retiré : ses octets comptent encore
+        _memo_drop(name[:-len(".json")])
         count -= 1
         total -= size
+    return removed, total, count
+
+
+def prune(limit: int = MAX_ENTRIES, max_bytes: Optional[int] = None) -> int:
+    """Élague les plus anciennes lectures jusqu’aux bornes de nombre/octets.
+
+    Une entrée plus grosse que le budget est retirée elle aussi. Les fichiers
+    de verrou et temporaires ne sont jamais des entrées à élaguer.
+    """
+    budget = MAX_BYTES if max_bytes is None else max(0, max_bytes)
+    removed, _total, _count = _prune_entries(max(0, int(limit)), budget)
+    with _STATE_LOCK:
+        _COUNTERS["prunes"] += 1
+        _COUNTERS["pruned"] += removed
     return removed
 
 
@@ -333,14 +575,19 @@ def cached(repo: str, rev: str, mode: str, patterns: Sequence[str],
     if tree is None or attributes is None:
         return compute()
     name = key(tree, mode, patterns, attributes)
+    _state()
+    _count("lookups")
     found, value = _read(name)
     if found:
+        _count("served")
         return value
     with _KeyLock(name, LOCK_WAIT_S if wait is None else wait):
         found, value = _read(name)     # un autre processus a pu le poser
         if found:
+            _count("deduped")
             return value
         value = compute()
+        _count("computed")
         if value is not None:
             _write(name, list(value))
     return value

@@ -43,6 +43,25 @@ class SetupTokenTest(unittest.TestCase):
         self.assertNotIn(TOKEN, repr(verdict))
         self.assertEqual(verdict.fingerprint, sentinel.fingerprint("claude", self.profile, {}))
 
+    def test_launch_fingerprint_survives_concurrent_token_import(self):
+        setup_token.install(self.profile, TOKEN)
+        env = {}
+        accounts.launch_env(env, {"claude": [self.profile]}, self.profile, {})
+        replacement = TOKEN + "-replacement"
+        setup_token.install(self.profile, replacement)
+        self.assertEqual(sentinel.launch_fingerprint("claude", self.profile, env),
+                         sentinel._digest(TOKEN))
+        self.assertEqual(sentinel.fingerprint("claude", self.profile, {}),
+                         sentinel._digest(replacement))
+        os.unlink(setup_token.path(self.profile))
+        self.assertEqual(sentinel.launch_fingerprint("claude", self.profile, env),
+                         sentinel._digest(TOKEN))
+
+    def test_empty_child_token_does_not_fall_back_to_disk(self):
+        setup_token.install(self.profile, TOKEN)
+        self.assertIsNone(sentinel.launch_fingerprint(
+            "claude", self.profile, {setup_token.VARIABLE: ""}))
+
     def test_permission_symlink_and_malformed_store_refused_without_leak(self):
         setup_token.install(self.profile, TOKEN)
         target = setup_token.path(self.profile)

@@ -31,7 +31,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Sequence
 
@@ -483,6 +483,69 @@ def configure(cfg) -> None:
     """Retient `harness_bins` de la configuration de l'hôte (L106)."""
     global _HARNESS_BINS
     _HARNESS_BINS = dict(getattr(cfg, "harness_bins", None) or {})
+
+
+def _declared_path(value: str, env: Mapping[str, str]) -> str:
+    """Le chemin réel d'une déclaration locale ; un nom nu est résolu par le
+    PATH (même règle que `resolve_harness`), puis comparé par `realpath`."""
+    path = os.path.expanduser(str(value))
+    if os.path.sep not in path:
+        path = shutil.which(path, path=env.get("PATH") or os.defpath) or path
+    return os.path.realpath(path)
+
+
+def declared_binaries(descriptor: HarnessDescriptor, *,
+                      env: Mapping[str, str] | None = None,
+                      bins: Mapping[str, str] | None = None,
+                      extra: Iterable[str] = ()) -> set[str]:
+    """Chemins réels des binaires DÉCLARÉS sur l'hôte pour ce harnais.
+
+    Déclarations locales seulement (L106) : `harness_bins` de la
+    configuration, `AMEESH_<HARNAIS>_BIN`, et `extra` (la carte des binaires
+    installés de l'hôte, #4488). Le PATH et les emplacements connus ne sont
+    pas des déclarations : ils ne rendent pas un chemin nommé par la base
+    exécutable (voir `require_declared_harness_bin`)."""
+    env = os.environ if env is None else env
+    bins = _HARNESS_BINS if bins is None else bins
+    out: set[str] = set()
+    choisi = bins.get(descriptor.id) if isinstance(bins, Mapping) else None
+    if choisi:
+        out.add(_declared_path(str(choisi), env))
+    for key in descriptor.binary_env:
+        value = env.get(key)
+        if value:
+            out.add(_declared_path(value, env))
+    for value in extra:
+        if value:
+            out.add(_declared_path(str(value), env))
+    return out
+
+
+def require_declared_harness_bin(harness: str, path: str, *, host: str = "",
+                                 env: Mapping[str, str] | None = None,
+                                 bins: Mapping[str, str] | None = None,
+                                 extra: Iterable[str] = ()) -> None:
+    """Refuse un `harness_bin` qui n'est pas déclaré sur CET hôte (#4488).
+
+    `agent_registry.harness_bin` est écrit en base (`ameesh set`, sans
+    contrôle d'auteur) et l'exécuteur le lançait tel quel, avec les
+    identifiants du compte. Un chemin nommé par la base ne peut plus lancer un
+    binaire non déclaré localement : `harness_bins` de l'hôte,
+    `AMEESH_<HARNAIS>_BIN`, ou la carte des binaires installés (`extra`). Un
+    harnais inconnu n'est pas jugé ici : `adapter_for` le refuse avec sa liste
+    des connus."""
+    descriptor = harnesses.get(harness)
+    if descriptor is None:
+        return
+    allowed = declared_binaries(descriptor, env=env, bins=bins, extra=extra)
+    if os.path.realpath(os.path.expanduser(path)) in allowed:
+        return
+    env_key = descriptor.binary_env[0] if descriptor.binary_env else "harness_bins"
+    raise HarnessMissing(
+        "harness_bin %s is not a binary declared on host %s: declare it in "
+        "`harness_bins` of the configuration, %s, or the host's "
+        "harness-adoption bin map before the executor runs it"
+        % (path, host or "?", env_key))
 
 
 @dataclass(frozen=True)

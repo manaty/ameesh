@@ -15,7 +15,7 @@ preconditions at the end of this document.
 ## Command
 
 ```
-ameesh accounts login <harness> [<account>] --approver human:<id> \
+ameesh accounts login <harness> [<account>] [--approver human:<id>] \
     [--scope "TEXT"] [--wait SECONDS] [--json]
 ```
 
@@ -25,7 +25,9 @@ ameesh accounts login <harness> [<account>] --approver human:<id> \
   no declared account, the profile is synthetic (`GH_CONFIG_DIR`, else
   `~/.config/gh`) and its account name is the empty string, like the other
   `gh` readers (`host_preflight`, `sentinel`).
-- `--approver human:<id>`: required, the member who signs the challenge.
+- `--approver human:<id>`: the member who signs the challenge. Optional when
+  `notify.default_human` is configured on the host; an explicit `--approver`
+  overrides that default. Without either, the command refuses to start.
 - `--wait`: bounded wait for the receipt, default 900 s; the challenge's TTL is
   `min(15 min, provider expiry)`.
 - Exit code 0 only when the decision is `done` **and** the health probe says
