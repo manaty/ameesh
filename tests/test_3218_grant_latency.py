@@ -38,6 +38,9 @@ class RecuTest(unittest.TestCase):
         self.assertEqual(recu["dominant"], "harness_start")
         self.assertEqual(recu["total_s"], 9.4)
         self.assertEqual(recu["ts"]["delivered_ts"], 101.45)
+        # #4594 : les deux étages nommés de #3513
+        self.assertEqual(recu["reserve_s"], 0.1)   # due → admis
+        self.assertEqual(recu["deliver_s"], 0.05)  # lancé → remis
         self.assertEqual(recu["held_reasons"], [])
 
     def test_tour_precedent_et_garde(self):
@@ -54,6 +57,8 @@ class RecuTest(unittest.TestCase):
         # la garde d'avant le message n'est pas une raison de ce tour
         self.assertEqual(recu["held_reasons"], ["short_window"])
         self.assertEqual(recu["total_s"], 21.0)
+        self.assertEqual(recu["reserve_s"], 0.5)   # due → admis
+        self.assertIsNone(recu["deliver_s"])       # aucun jalon de remise
 
     def test_decalage_d_horloge_et_jalons_absents(self):
         # base en avance sur l'hôte : l'étape négative vaut zéro
@@ -63,7 +68,12 @@ class RecuTest(unittest.TestCase):
         self.assertEqual(recu["stages_s"]["admit"], 0.1)
         self.assertNotIn("spawned_ts", recu["ts"])
         self.assertEqual(recu["dominant"], "admit")
-        self.assertIsNone(turn_stages.receipt({})["dominant"])
+        self.assertEqual(recu["reserve_s"], 0.1)
+        self.assertIsNone(recu["deliver_s"])
+        vide = turn_stages.receipt({})
+        self.assertIsNone(vide["dominant"])
+        self.assertIsNone(vide["reserve_s"])
+        self.assertIsNone(vide["deliver_s"])
 
     def test_identifiants_bornes(self):
         recu = turn_stages.receipt({"ids": list(range(50))})
@@ -161,6 +171,9 @@ class RecuDeBoutEnBoutTest(_Base):
                       "delivered_ts"):
             self.assertIn(jalon, data["ts"])
         self.assertEqual(set(data["stages_s"]), set(turn_stages.STAGES))
+        # #4594 : les étages nommés sont dans le reçu de bout en bout
+        self.assertIn("reserve_s", data)
+        self.assertIn("deliver_s", data)
         self.assertIn(data["dominant"], turn_stages.STAGES + (None,))
         # Pas de borne sur le total (CI chargée : 9 s vus) : sans fenêtre de
         # lot, l'étape batch reste nulle à la milliseconde près.

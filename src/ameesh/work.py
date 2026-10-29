@@ -107,6 +107,7 @@ TRANSITIONS = {
     lifecycle.PROMOTED: set(),
     lifecycle.CLOSED: set(),
     lifecycle.BLOCKED: {
+        lifecycle.VALIDATED,
         lifecycle.REQUESTED,
         lifecycle.IN_PROGRESS,
         lifecycle.QA,
@@ -114,6 +115,7 @@ TRANSITIONS = {
         lifecycle.WAITING_HUMAN,
     },
     lifecycle.WAITING_HUMAN: {
+        lifecycle.VALIDATED,
         lifecycle.REQUESTED,
         lifecycle.IN_PROGRESS,
         lifecycle.QA,
@@ -1733,6 +1735,10 @@ def _review_item(cfg, db: Db, item_id: int, actor: str | None, *,
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    if item["state"] == lifecycle.VALIDATED:
+        raise WorkError(
+            "lot %s is validated: move it to qa before changing reviewers "
+            "(ameesh work move %s qa)" % (item_id, item_id))
     if item["state"] != lifecycle.QA:
         raise WorkError(
             "lot %s is %s, not qa: designate the reviewer on the entry to the "
@@ -1755,6 +1761,10 @@ def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str, *,
         if latest is not None and latest["state"] == lifecycle.QA:
             raise WorkError("reviewer refused: %s now holds lot #%s — a reviewer "
                             "reviews another agent's work" % (value, item_id))
+        if latest is not None and latest["state"] == lifecycle.VALIDATED:
+            raise WorkError(
+                "lot %s became validated: move it to qa before changing reviewers "
+                "(ameesh work move %s qa)" % (item_id, item_id))
         raise WorkError("lot %s left qa in the meantime: retry" % item_id)
     return row
 
@@ -4175,6 +4185,14 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             % (current, state, current, ", ".join(sorted(TRANSITIONS[current])) or "none",
                " — state set by mistake: ameesh work move %s %s --correct \"reason\""
                % (item_id, state) if (current, state) in CORRECTIONS else ""))
+    if state == "validated":
+        from . import merge_queue
+        gate = merge_queue.review_gate_for_item(
+            db, getattr(db, "cfg", None), item, milestones(db, item_id))
+        if not gate or not gate.get("ok"):
+            raise WorkError(
+                "transition to validated requires the review quorum on the current frozen head; "
+                "move it to qa")
     if state == lifecycle.WAITING_HUMAN and not storage.of(db).decisions.pending_for_lot(str(item_id)):
         raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
     if package_exclusion and current not in TO_VALIDATE:

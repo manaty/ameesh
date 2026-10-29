@@ -882,6 +882,18 @@ def _required_pairs(required) -> tuple:
     return tuple(pairs)
 
 
+def _run_stamp(run):
+    """La date de début d'un check run de provenance, en secondes epoch, ou
+    None (date absente ou illisible)."""
+    from datetime import datetime
+
+    try:
+        stamp = datetime.fromisoformat(run.get("started_at").replace("Z", "+00:00"))
+        return stamp.timestamp() if stamp.tzinfo is not None else None
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+
+
 def _latest_runs(runs) -> list:
     """#3008 : les derniers check runs par (application, suite, nom), comme
     `radar.latest_rollup` pour le rollup (#2524) : un re-run vert sur la même
@@ -891,19 +903,12 @@ def _latest_runs(runs) -> list:
     inconnue, date absente, invalide ou ex aequo : toutes les entrées
     ambiguës restent, afin de ne jamais masquer un échec sur la foi de
     l'ordre reçu."""
-    from datetime import datetime
-
     groups = {}
     for index, run in enumerate(runs or ()):
         suite = run.get("check_suite_id")
         key = (("suite", run.get("app_id"), suite, _rollup_name(run))
                if suite is not None else ("unknown", index))
-        try:
-            stamp = datetime.fromisoformat(run.get("started_at").replace("Z", "+00:00"))
-            stamp = stamp.timestamp() if stamp.tzinfo is not None else None
-        except (AttributeError, TypeError, ValueError, OverflowError):
-            stamp = None
-        groups.setdefault(key, []).append((run, stamp))
+        groups.setdefault(key, []).append((run, _run_stamp(run)))
     latest = []
     for entries in groups.values():
         if any(stamp is None for _, stamp in entries):
@@ -914,8 +919,244 @@ def _latest_runs(runs) -> list:
     return latest
 
 
+def _suite_timeline(runs, provenance):
+    """#4549 : `[(début, suite, run requis, tous ses check runs)]` pour les
+    suites de `runs`, ou None si une suite ou une date manque.
+
+    Le début d'une suite est la plus ancienne date de ses runs (le `plan`
+    démarre en premier) : l'ordre des agrégats ne dit pas l'ordre des suites.
+    Une date absente, une suite inconnue ou une suite absente de la
+    provenance rendent la preuve impossible : l'appelant garde alors toutes
+    les entrées."""
+    by_suite: dict = {}
+    for run in provenance or ():
+        suite = run.get("check_suite_id")
+        if suite is not None:
+            by_suite.setdefault(suite, []).append(run)
+    timeline = []
+    for run in runs:
+        suite = run.get("check_suite_id")
+        if suite is None:
+            return None
+        checks = by_suite.get(suite) or []
+        stamps = [_run_stamp(check) for check in checks]
+        if not checks or any(stamp is None for stamp in stamps):
+            return None
+        timeline.append((min(stamps), suite, run, checks))
+    return timeline
+
+
+def _workflow_kind(checks):
+    """#4549 : la famille du workflow d'une suite, lue sur ses seuls jobs.
+
+    `paquet` publie le portier (couverture / suite complète) en plus de la
+    suite appelée ; `tests` porte `plan` et l'agrégat `tests`. Une suite
+    d'une autre forme ne permet pas de comparer deux workflows : None (le
+    doute ne masque rien)."""
+    from . import radar
+    names = {_rollup_name(check) for check in checks or ()}
+    if any(name == radar.PACKET_COVERAGE
+           or name == radar.PACKET_SUITE
+           or name.startswith(radar.PACKET_SUITE + " / ")
+           for name in names):
+        return "paquet"
+    if radar.PLAN_CHECK in names and "tests" in names:
+        return "tests"
+    return None
+
+
+def _plan_green(checks, app_id) -> bool:
+    """#4549 : la suite a un `plan` conclu vert de la même application que le
+    check requis — la composition a été validée et les parts sélectionnées."""
+    from . import radar
+    return any(_rollup_name(check) == radar.PLAN_CHECK
+               and (app_id is None or check.get("app_id") == app_id)
+               and radar.check_result(check) == radar.CI_GREEN_RESULT
+               for check in checks or ())
+
+
+def _suite_run(slug: str, run, *, gh, head: str = "", cache: dict | None = None):
+    """#4549 : le run Actions d'une suite — identité du workflow, base
+    attestée et tête — ou None si la preuve ne se lit pas.
+
+    L'identité de workflow vient du run lui-même (`workflow_id`, `path`), pas
+    des noms de checks : deux workflows homonymes restent distincts. La base
+    attestée est celle que le run-name de la demande porte (`ci.pr_run`) :
+    c'est la base que la porte du gel a composée, pas la tête du dépôt."""
+    from . import ci, radar
+    run_id = radar.actions_run_id(slug, run)
+    if run_id is None or gh is None:
+        return None
+    if cache is not None and run_id in cache:
+        return cache[run_id]
+    try:
+        proc = gh(["api", "repos/%s/actions/runs/%d" % (slug, run_id)])
+        if getattr(proc, "returncode", 1) != 0:
+            return None
+        data = json.loads(proc.stdout or "{}")
+    except (ValueError, TypeError, AttributeError, OSError):
+        return None
+    if not isinstance(data, dict) or data.get("id") != run_id:
+        return None
+    if head and str(data.get("head_sha") or "").strip().lower() != head.strip().lower():
+        return None
+    identity = data.get("workflow_id")
+    if isinstance(identity, bool) or not isinstance(identity, int):
+        identity = None
+    path = data.get("path")
+    if not isinstance(path, str):
+        path = None
+    # #4549 (B2 de cx2) : la base est lue dans le run-name de la demande ;
+    # un run sans demande lisible n'atteste aucune base (le doute refuse).
+    attested = None
+    try:
+        request = ci.pr_run(data)
+    except (AttributeError, TypeError, ValueError):
+        request = None
+    if request is not None:
+        attested = request.get("base")
+    proof = {"workflow_id": identity, "path": path, "attested_base": attested}
+    if cache is not None:
+        cache[run_id] = proof
+    return proof
+
+
+def _same_workflow(left, right) -> bool:
+    """#4549 : deux runs sortent du même workflow (identité ou chemin)."""
+    if not left or not right:
+        return False
+    if left.get("workflow_id") is not None and right.get("workflow_id") is not None:
+        return left["workflow_id"] == right["workflow_id"]
+    return bool(left.get("path") and left.get("path") == right.get("path"))
+
+
+def _current_base_ok(attested, *, slug: str | None, gh, target: str) -> bool:
+    """#4549 (B de cx2) : la suite verte atteste, par son run-name, la base
+    sur laquelle elle a été demandée ; cette base doit être la tête courante
+    de la cible, comparée par **SHA**.
+
+    La date de committer de la tête de la cible ne prouve pas quand elle est
+    devenue la tête : un commit ancien poussé en fast-forward après le run
+    garde sa date et laisserait passer une composition plus ancienne. Une
+    base attestée absente ou une lecture impossible refuse : le doute ne
+    verdit jamais. Sans lecteur, l'appelant ne substitue rien
+    (`_supersede_testless_runs` ferme par défaut)."""
+    if not (slug and gh and target):
+        return True
+    if not isinstance(attested, str) or not attested.strip():
+        return False
+    try:
+        current = land.base_oid(slug, merge_queue._remote_branch(target), gh=gh)
+    except (land.LandError, ValueError, TypeError, AttributeError, OSError):
+        return False
+    return attested.strip().lower() == str(current or "").strip().lower()
+
+
+def _supersede_testless_runs(name, app_id, runs, provenance, *, required=(),
+                             slug: str | None = None, gh=None, head: str = "",
+                             target: str = "") -> list:
+    """#4549 : écarter les runs d'une suite ancienne échouée au plan sans
+    exécuter de test lorsqu'une suite plus récente, sur la même tête, a conclu
+    vert et a été composée sur la base courante de la cible.
+
+    Le doute ne verdit jamais : suite inconnue ou en cours, dates absentes ou
+    ex aequo, plan de la suite verte non vert, workflow d'une autre famille,
+    ancien rouge non prouvé « sans test », ou base de la suite verte non
+    courante laissent toutes les entrées. Un rouge de test, une part lancée
+    ou un autre négatif ne sont donc pas masqués. Sans lecteur (`slug`/`gh`),
+    aucune preuve de workflow ni de base n'existe : rien n'est substitué."""
+    from . import radar
+    timeline = _suite_timeline(runs, provenance)
+    if not timeline or len(timeline) < 2:
+        return runs
+    if len({row[0] for row in timeline}) != len(timeline):
+        return runs
+    timeline.sort(key=lambda row: row[0])
+    newest = timeline[-1]
+    if radar.check_result(newest[2]) != radar.CI_GREEN_RESULT:
+        return runs
+    if not _plan_green(newest[3], app_id):
+        return runs
+    failures = [row for row in timeline[:-1]
+                if radar.check_result(row[2]) == radar.CI_NEGATIVE_RESULT]
+    if not failures:
+        return runs
+    if any(radar.check_result(row[2]) == radar.CI_WAITING_RESULT
+           for row in timeline):
+        return runs
+    kind = _workflow_kind(newest[3])
+    if kind is None:
+        return runs
+    required_names = {pair[0] for pair in _required_pairs(required)}
+    for _start, _suite, _run, checks in failures:
+        if _workflow_kind(checks) != kind:
+            return runs
+        if not radar.testless_failure(
+                [check for check in checks if check.get("app_id") == app_id],
+                name, required=required_names):
+            return runs
+    # #4549 (B3 de dev1, confirmé par cx2) : la preuve de workflow et de base
+    # vient des runs Actions eux-mêmes. Sans lecteur, aucune preuve n'existe :
+    # aucune substitution (le doute ne verdit jamais, y compris sur la porte
+    # des paquets qui appelait cette fonction sans lecteur) ; avec un lecteur,
+    # une lecture impossible refuse aussi.
+    if not (slug and gh):
+        return runs
+    cache: dict = {}
+    newest_run = _suite_run(slug, newest[2], gh=gh, head=head, cache=cache)
+    if newest_run is None:
+        return runs
+    for _start, _suite, run, _checks in failures:
+        proof = _suite_run(slug, run, gh=gh, head=head, cache=cache)
+        if not _same_workflow(newest_run, proof):
+            return runs
+    if not _current_base_ok(newest_run.get("attested_base"), slug=slug,
+                            gh=gh, target=target):
+        return runs
+    drop = {row[1] for row in failures}
+    return [run for run in runs if run.get("check_suite_id") not in drop]
+
+
+def _proven_superseded_suites(name, provenance, *, required=(), slug=None, gh=None,
+                              head: str = "", target: str = "") -> set:
+    """#4549 (B2 de cx2) : les suites dont le run de `name` est supplanté,
+    prouvées application par application.
+
+    `radar.latest_rollup` ne masque plus rien sur le seul nom : la décision
+    se prend ici, avec la même preuve que la voie `app_id` (même workflow,
+    plan vert, aucun test lancé, base attestée = cible courante). Un nom
+    porté par deux applications, ou deux workflows homonymes, n'est donc
+    jamais verdit par la suite de l'autre."""
+    by_app: dict = {}
+    for run in provenance or ():
+        if not isinstance(run, dict) or _rollup_name(run) != name:
+            continue
+        app_id = run.get("app_id")
+        if isinstance(app_id, bool) or not isinstance(app_id, int):
+            continue
+        by_app.setdefault(app_id, []).append(run)
+    dropped: set = set()
+    for app_id, runs in by_app.items():
+        before = {run.get("check_suite_id") for run in runs}
+        kept = _supersede_testless_runs(name, app_id, _latest_runs(runs),
+                                        provenance, required=required,
+                                        slug=slug, gh=gh, head=head,
+                                        target=target)
+        dropped |= before - {run.get("check_suite_id") for run in kept}
+    return dropped
+
+
+def _entry_suite(entry):
+    """L'identifiant de suite d'une entrée de rollup (`checkSuiteId`) ou d'un
+    check run de provenance (`check_suite_id`), ou None."""
+    if not isinstance(entry, dict):
+        return None
+    return entry.get("checkSuiteId", entry.get("check_suite_id"))
+
+
 def _required_gate(required, rollup, provenance=None, *, strict: bool = False,
-                   unconcluded: list | None = None) -> tuple:
+                   unconcluded: list | None = None, slug: str | None = None,
+                   gh=None, head: str = "", target: str = "") -> tuple:
     """Les checks requis que `rollup` et `provenance` ne prouvent pas.
 
     `provenance` porte les check runs de la tête exacte avec leur application
@@ -948,7 +1189,16 @@ def _required_gate(required, rollup, provenance=None, *, strict: bool = False,
 
     `strict=True` garde l'ancienne preuve (tout ce qui n'est pas `SUCCESS`
     manque), pour les lecteurs qui n'ont pas reçu la règle du 23/10 (file de
-    fusion, `merge-pr`)."""
+    fusion, `merge-pr`).
+
+    #4549 : une suite plus récente conclue verte remplace un run échoué au
+    plan d'une suite plus ancienne **sans aucun test exécuté**
+    (`_supersede_testless_runs`) ; un rouge de test, une suite concurrente ou
+    une base de composition non courante gardent la porte fermée. La preuve
+    vaut aussi pour un nom sans application imposée, application par
+    application (`_proven_superseded_suites`, B2 de cx2) : le rollup n'est
+    jamais filtré sur le seul nom. `slug`/`gh`/`target` portent la preuve de
+    la base attestée."""
     from . import radar
     rollup = radar.latest_rollup(rollup)
     gaps, consigned = [], []
@@ -992,11 +1242,27 @@ def _required_gate(required, rollup, provenance=None, *, strict: bool = False,
             if not entries:
                 gaps.append("%s (absent)" % name)
                 continue
+            # #4549 (B2 de cx2) : le remplacement d'une suite échouée au plan
+            # par une suite verte sans test se prouve ici, sur la provenance
+            # de la tête et la base attestée ; le rollup n'est jamais filtré
+            # sur le seul nom. Sans entrée restante, on garde tout : un vert
+            # ne se déduit pas d'une absence.
+            dropped = _proven_superseded_suites(
+                name, provenance, required=required, slug=slug, gh=gh,
+                head=head, target=target)
+            if dropped:
+                kept = [entry for entry in entries
+                        if _entry_suite(entry) not in dropped]
+                if kept:
+                    entries = kept
             classify(name, entries)
             continue
         runs = _latest_runs([entry for entry in provenance or ()
                              if _rollup_name(entry) == name
                              and entry.get("app_id") == app_id])
+        runs = _supersede_testless_runs(name, app_id, runs, provenance,
+                                        required=required, slug=slug, gh=gh,
+                                        head=head, target=target)
         if not runs:
             providers = sorted({str(entry.get("app_id")) for entry in provenance or ()
                                 if _rollup_name(entry) == name
@@ -1048,12 +1314,15 @@ def relaunch_unconcluded(db, lot: int, slug: str, head: str, report: dict | None
     return reruns
 
 
-def _required_gap(required, rollup, provenance=None) -> list:
+def _required_gap(required, rollup, provenance=None, *, slug: str | None = None,
+                  gh=None, head: str = "", target: str = "") -> list:
     """L'ancienne preuve stricte (file de fusion, `merge-pr`) : les checks
     requis que `rollup` et `provenance` ne prouvent pas. #3085 : `ready_pr`
     passe par `_required_gate(strict=False)`, qui consigne un non concluant
-    au lieu de le compter comme un manque."""
-    return _required_gate(required, rollup, provenance, strict=True)[0]
+    au lieu de le compter comme un manque. #4549 : la même règle de
+    remplacement par une suite verte sans test s'applique."""
+    return _required_gate(required, rollup, provenance, strict=True,
+                          slug=slug, gh=gh, head=head, target=target)[0]
 
 
 def _packet_proof_gate(rollup) -> tuple:
@@ -1545,7 +1814,8 @@ def required_on_head(project, target: str, sha: str, *, gh) -> list:
                     **({"startedAt": run["started_at"], "checkSuiteId": run["check_suite_id"]}
                        if run.get("check_suite_id") is not None else {}))
                for run in runs] + statuses)
-    return _required_gap(required, rollup, runs)
+    return _required_gap(required, rollup, runs, slug=slug, gh=gh, head=sha,
+                         target=target)
 
 
 def _required_status_gate(entries, required) -> tuple:
@@ -1638,7 +1908,9 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
                                % (target or "the target", frozen[:12], exc))
         unconcluded: list = []
         gaps, consigned = _required_gate(pairs, rollup, provenance, strict=False,
-                                         unconcluded=unconcluded)
+                                         unconcluded=unconcluded, slug=slug,
+                                         gh=gh, head=head or frozen_head,
+                                         target=target)
         # #2876/#3066 : la preuve du portier `paquet` n'est jamais un check
         # facultatif — un rouge ou une preuve indisponible bloque ; un non
         # concluant du portier se consigne.

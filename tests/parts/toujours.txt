@@ -26,6 +26,7 @@ test_2340_auditeur_role  # #2340: auditeur login role, read-only, two supervisor
 test_2449_garde_mecanique  # #2449: canon mechanics (no hardcoded parameter, named/dated exemptions), ui workflow trigger
 test_2457_garde_non_python  # #2457: shell/systemd/workflow mechanics guard and tracked-file scope
 test_339_orphan_settle  # #749: orphan turn groups settled without a reboot, outside the measured blocks
+test_4256_validation_deadlines  # #4256: validation authority, private audit and single-winner escalation (SQL contract)
 test_cluster  # roles created on the cluster (supervisor, approve), grants checked against every column
 test_events_attach  # LISTEN/NOTIFY channels, global to the cluster
 test_l31_orphans  # #749: orphan resources of a turn, lease and alert contract (the release red module)

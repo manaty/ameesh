@@ -47,6 +47,16 @@ them read-only and exits 1 when an entry point is refused. The bare profile
 (`discover(builtin=False)` with no entry point) is an empty registry without
 error, pinned by `tests/test_l98_modules_registry.py`.
 
+L103 tranche 2 (#4396) adds a third source to the registry: with a canon,
+`registry.discover(canon=…)` turns each valid `Pipeline` card into a `Module`
+of source `canon` (`card_ref` for the trace, capability `lifecycle`, no stored
+type). Its `PipelineModule` adapter lives in the registry and is built from
+canon data: nothing is imported. `modules.installed(canon)` and
+`modules.declarations(federation, canon)` accept the card's name as a project
+module; a declarative module is the one module without types a project may
+select (an installed one, and the always-active `dev`, still may not). A card
+never shadows an installed name.
+
 L99 tranche 1 adds the generic lifecycle names as accepted aliases:
 `requested` (intake), `in_progress` (build), `to_validate` (qa), `validated`
 (merged) and `delivered` (promoted); `blocked`, `waiting_human` and `closed`
@@ -65,11 +75,24 @@ behind `work close --done`). `git-merge` is declared by the built-in `dev`
 tooling provider in `DELIVERY_CONNECTORS` and read through
 `registry.delivery_connectors()`; its evidence is either `{sha}`/`{pr}` (a
 declared merge, `work merged`) or `{action}` (a merge confirmed by the gate).
-`dev` is not a lifecycle module: it is absent from `discover()` and the canon
-cannot select it. Installed entry points cannot declare connectors, and a name
-declared twice or taken by the core is refused. `registry.merge_connector()`
-replaces `work_lifecycle.delivery_connector()`. The lot journal names the
-connector (`[via <connector>]`); storage is unchanged. Tranche 2b (#4366)
+L101 tranche 4 (#4357) integrates `dev` on the Module interface: `discover()`
+lists it as a built-in tooling module with the `workspaces` capability and no
+work item type. It is always active, and the canon still cannot select it (a
+descriptor without types is refused in a project policy) until L98 T2 defines
+activation by federation or host. The core obtains the workspaces façade
+through `registry.get("dev")`; its `audit` hook delegates the `canon check`
+workspace findings (`host-work-dir-*`, `host-workspaces-unknown`) under the
+Module interface. Those settings are host-scoped, so `modules.audit` runs the
+hook once, with `project=None`, after the project modules: one finding is not
+repeated per project and carries its host and agent. It has no project
+orchestrator or project event brief; the human route uses the responsible of
+its agent, then of its host, then `notify.default_human`, and two hosts with
+the same rule stay two alerts. The bare profile has no
+`dev` module and documents housekeeping and worktrees as no-ops. Installed
+entry points cannot declare connectors, and a name declared twice or taken by
+the core is refused. `registry.merge_connector()` replaces
+`work_lifecycle.delivery_connector()`. The lot journal names the connector
+(`[via <connector>]`); storage is unchanged. Tranche 2b (#4366)
 routes the merges observed by the sweeps and the packet and merge-queue paths
 (`plan_git`, `plan_github`, `packet_close`, `merge_pr`, `fire`) through the
 same verb, with a third `git-merge` evidence `{seen: <source>, sha, pr}`; a

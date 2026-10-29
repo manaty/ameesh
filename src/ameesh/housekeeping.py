@@ -81,19 +81,26 @@ l'humain. Chaque famille a sa règle :
   travaille. Un clone sans lot nommé est seulement signalé ; l'essai
   (`ameesh menage`) montre le plan, `--apply` exécute.
 
-* **Volumes Docker sans conteneur** (L73/#2003, [`reap_volumes`]) : seuls
-  ceux dont le mesh a DÉCLARÉ le cycle de vie jetable sont récoltés —
-  l'étiquette `ameesh.bench=disposable`, posée par `scripts/pg-up.sh` quand
-  l'appelant a déclaré le banc de lot jetable (`AMEESH_PG_DISPOSABLE=1`) —
-  et seulement après `docker_volume_idle` (24 h) d'ABSENCE
-  CONTINUE, mesurée par les relevés successifs du ménage (jamais l'âge de
-  création). Le banc partagé persistant (`ameesh-pg-data`), tout volume nommé
-  sans étiquette, tout volume anonyme (`com.docker.volume.anonymous`, sans
-  provenance du mesh : il part avec le conteneur étiqueté qui l'a créé,
-  `rm -f -v`) : listés dans `others` (borné) avec la commande
-  `docker volume rm`, JAMAIS supprimés (précédent #411 : les volumes nommés
-  existants sont conservés) ; `docker volume rm` refuse de lui-même un volume
-  encore monté.
+* **Volumes Docker sans conteneur** (L73/#2003/#4560, [`reap_volumes`]) :
+  seuls ceux dont le mesh a DÉCLARÉ le cycle de vie jetable sont récoltés —
+  l'étiquette de durée de vie `ameesh.lifetime=test`, posée par
+  `scripts/pg-up.sh` sur le volume d'un banc de lot déclaré jetable
+  (`AMEESH_PG_DISPOSABLE=1`), ou l'ancienne `ameesh.bench=disposable` — et
+  seulement après `docker_volume_idle` (24 h) d'ABSENCE CONTINUE, mesurée par
+  les relevés successifs du ménage (jamais l'âge de création). Un volume de
+  BASE nommé (`ameesh-pg-data`, `*-pg-data`) n'est JAMAIS récolté, même
+  étiqueté ; tout volume nommé sans étiquette et tout volume anonyme
+  (`com.docker.volume.anonymous`, sans provenance du mesh : le shim d'un tour
+  force `rm -v`, donc il part avec le conteneur que la suite supprime) sont
+  listés dans `others` (borné) avec la commande `docker volume rm`, JAMAIS
+  supprimés (précédent #411 : les volumes nommés existants sont conservés) ;
+  `docker volume rm` refuse de lui-même un volume encore monté.
+
+* **Images Docker sans tag** (#4560, [`reap_images`]) : une image construite
+  dans un tour porte `ameesh.lifetime=test` (shim L73) ; une fois SANS TAG et
+  après le même délai d'absence continue, elle est récoltée (`docker image
+  rm`). Une image taguée n'est JAMAIS supprimée, même étiquetée : un tag est
+  une référence. Les images dangling sans étiquette sont seulement comptées.
 
 * **Scopes systemd `dsh-subprocess-*`** (#3226, [`reap_dsh_scopes`]) : sans
   la garde #490, dsh lance ses outils dans des scopes du gestionnaire
@@ -459,7 +466,8 @@ POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_aler
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
                "artifact_idle", "artifact_ended_idle", "unreadable_ok",
                "docker_orphan_volumes_alert",
-               "docker_build_cache_alert", "docker_volumes", "docker_volume_idle",
+               "docker_build_cache_alert", "docker_volumes", "docker_images",
+               "docker_volume_idle",
                "events_quota", "former_mesh_keys", "dirty_worktree_after",
                "dirty_archive_retention")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
@@ -481,10 +489,15 @@ class Policy:
     docker_orphan_volumes_alert: int = 100
     docker_build_cache_alert: int = 20 * 1024 ** 3
     #: #2003 : récolter les volumes Docker DÉCLARÉS JETABLES par le mesh
-    #: (`ameesh.bench=disposable`) ; `false` : aucun volume n'est supprimé
+    #: (`ameesh.bench=disposable`, `ameesh.lifetime=test`) ; `false` : aucun
+    #: volume n'est supprimé
     docker_volumes: bool = True
-    #: #2003 : absence continue (secondes, mesurée par les relevés) avant
-    #: cette récolte
+    #: #4560 : récolter les images SANS TAG déclarées jetables par le mesh
+    #: (`ameesh.lifetime=test`, posée par le shim sur les constructions d'un
+    #: tour) ; `false` : aucune image n'est supprimée
+    docker_images: bool = True
+    #: #2003/#4560 : absence continue (secondes, mesurée par les relevés) avant
+    #: cette récolte (volumes et images)
     docker_volume_idle: float = DEFAULT_DOCKER_VOLUME_IDLE_S
     redirect: bool = True
     xdg_cache: bool = False
@@ -620,7 +633,7 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
         else:
             parsed["former_mesh_keys"] = tuple(sorted(set(keys)))
     for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "deps",
-                "docker_volumes"):
+                "docker_volumes", "docker_images"):
         if raw.get(key) is None:
             continue
         if not isinstance(raw[key], bool):
@@ -694,7 +707,8 @@ def effective(canons, host: str) -> Policy:
                           "artifact_ended_idle", "docker_volume_idle",
                           "dirty_worktree_after",
                           "dirty_archive_retention") and value > values[key]) or \
-                    (key in ("orphan_cleanup", "deps", "docker_volumes") and value is False
+                    (key in ("orphan_cleanup", "deps", "docker_volumes",
+                             "docker_images") and value is False
                      and values[key] is not False):
                 values[key], origin[key] = value, label
     return Policy(origin=origin, worktree_roots=tuple(sorted(roots)), **values)
@@ -4475,6 +4489,18 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
 #: volume (le volume était sans conteneur à ce relevé-là)
 _VOLUME_EPISODE_ACTIONS = ("waiting", "kept")
 
+#: #4560 : les mêmes actions pour une image sans tag (dangling)
+_IMAGE_EPISODE_ACTIONS = _VOLUME_EPISODE_ACTIONS
+
+
+def _lifetime_declared(labels: dict) -> bool:
+    """#4560 : cette étiquette de durée de vie déclare-t-elle la ressource
+    jetable ? Le label générique `ameesh.lifetime=test` d'abord ; l'ancien
+    `ameesh.bench=disposable` des volumes de banc reste honoré (#2003)."""
+    from . import containers as containers_mod
+    return (labels.get(containers_mod.LIFETIME_LABEL) == containers_mod.LIFETIME_TEST
+            or labels.get(containers_mod.BENCH_LABEL) == containers_mod.BENCH_DISPOSABLE)
+
 
 def _volume_episode(previous: dict | None, created: float | None) -> float | None:
     """#2003 : début de l'épisode d'absence continue d'un volume, tel que le
@@ -4495,21 +4521,31 @@ def _volume_episode(previous: dict | None, created: float | None) -> float | Non
         return None
 
 
+def _image_episode(previous: dict | None, created: float | None) -> float | None:
+    """#4560 : début de l'épisode d'absence continue d'une image, exactement
+    comme pour un volume (#2003) : l'identité est le couple `id`/`Created`, une
+    image retaguée referme l'épisode, une image reconstruite en ouvre un
+    autre."""
+    return _volume_episode(previous, created)
+
+
 def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = False,
                  now: float | None = None, budget: PassBudget | None = None) -> dict:
-    """Volumes Docker de l'hôte (L73/#2003) : récolte les volumes SANS
+    """Volumes Docker de l'hôte (L73/#2003/#4560) : récolte les volumes SANS
     conteneur (arrêtés compris, `volume ls --filter dangling=true`) dont le
-    mesh a DÉCLARÉ le cycle de vie jetable — l'étiquette `ameesh.bench`
-    [`containers.BENCH_DISPOSABLE`] que `scripts/pg-up.sh` pose sur le volume
-    d'un banc de lot quand son appelant l'a déclaré jetable
-    (`AMEESH_PG_DISPOSABLE=1`) — et seulement après `policy.docker_volume_idle`
-    d'ABSENCE CONTINUE.
+    mesh a DÉCLARÉ le cycle de vie jetable — l'étiquette de durée de vie
+    `ameesh.lifetime` [`containers.LIFETIME_TEST`], posée par
+    `scripts/pg-up.sh` sur le volume d'un banc de lot, ou l'ancienne étiquette
+    `ameesh.bench` [`containers.BENCH_DISPOSABLE`] — et seulement après
+    `policy.docker_volume_idle` d'ABSENCE CONTINUE.
 
     La provenance n'est jamais déduite d'une proximité d'heure : un volume
     anonyme (`com.docker.volume.anonymous`) ne porte aucune identité du mesh
-    et n'est jamais supprimé ici (les conteneurs étiquetés d'un tour partent
-    avec leurs volumes anonymes, `rm -f -v`) ; le banc partagé et persistant
-    (`ameesh-pg-data`) ne porte pas l'étiquette et n'est jamais récolté.
+    et n'est jamais supprimé ici (le shim d'un tour force `rm -v`, donc les
+    volumes anonymes d'un conteneur supprimé par une suite partent avec lui) ;
+    un volume de BASE nommé (`ameesh-pg-data`, `*-pg-data`) n'est jamais
+    récolté, même si une étiquette jetable y a été posée : ses données
+    survivent aux conteneurs et aux suites.
 
     Le délai sans conteneur se mesure sur les relevés successifs : chaque
     passage journalise l'épisode (`episode_since`, avec l'identité `created`
@@ -4560,21 +4596,38 @@ def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = Fals
         if budget is not None and budget.expired():
             budget.timed_out = True
             break                      # #3802: a bounded host pass
-        label = (row.get("labels") or {}).get(containers_mod.BENCH_LABEL)
-        if label is None:
+        labels = row.get("labels") or {}
+        bench = labels.get(containers_mod.BENCH_LABEL)
+        lifetime = labels.get(containers_mod.LIFETIME_LABEL)
+        if bench is None and lifetime is None:
             continue
-        if label == containers_mod.BENCH_DISPOSABLE:
+        if _lifetime_declared(labels):
+            if containers_mod.is_base_volume(row["name"]):
+                # #4560 : une base nommée n'est jamais récoltée, même
+                # étiquetée jetable par erreur. Dite, sans commande.
+                why = ("named base volume (*%s): never reaped, even labelled disposable"
+                       % containers_mod.BASE_VOLUME_SUFFIX)
+                base = {"kind": "volume", "path": row["name"]}
+                out["plan"].append(dict(base, action="garde", detail=why))
+                ours.append(dict(base, action="garde", detail=why))
+                continue
             declared.append(row)
         elif row["name"] in free:
+            marks = []
+            if bench is not None:
+                marks.append("%s=%s" % (containers_mod.BENCH_LABEL, bench))
+            if lifetime is not None:
+                marks.append("%s=%s" % (containers_mod.LIFETIME_LABEL, lifetime))
             _other(row, row["name"],
-                   "labelled %s=%s: not declared disposable by the mesh"
-                   % (containers_mod.BENCH_LABEL, label))
+                   "labelled %s: not declared disposable by the mesh"
+                   % ", ".join(marks))
     for row in dangling_rows:
         if budget is not None and budget.expired():
             budget.timed_out = True
             break                      # #3802: a bounded host pass
         labels = row.get("labels") or {}
-        if containers_mod.BENCH_LABEL in labels:
+        if (containers_mod.BENCH_LABEL in labels
+                or containers_mod.LIFETIME_LABEL in labels):
             continue                    # déclaré (plus bas) ou déjà signalé
         if containers_mod.ANONYMOUS_LABEL in labels:
             _other(row, row["name"],
@@ -4641,6 +4694,120 @@ def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = Fals
         ours.append(entry)
     out["ours"] = ours
     out["others"] = others
+    out["others_total"] = others_total
+    return out
+
+
+def reap_images(runtime, db, host: str, policy: Policy, *, dry_run: bool = False,
+                now: float | None = None, budget: PassBudget | None = None) -> dict:
+    """Images Docker de l'hôte (L73/#4560) : récolte les images SANS TAG
+    (`dangling`) dont le mesh a DÉCLARÉ le cycle de vie jetable — l'étiquette
+    de durée de vie `ameesh.lifetime` [`containers.LIFETIME_TEST`], posée par
+    le shim sur une image construite dans un tour, ou l'ancienne
+    `ameesh.bench` [`containers.BENCH_DISPOSABLE`] — et seulement après
+    `policy.docker_volume_idle` d'ABSENCE CONTINUE.
+
+    Une image TAGUÉE n'est JAMAIS supprimée, même étiquetée jetable : un tag
+    est une référence (socle de l'hôte, image de release ou de suite). Une
+    image retaguée referme l'épisode, une image reconstruite (autre `Id` ou
+    `Created`) en ouvre un autre, une image disparue le referme. Le délai est
+    celui des volumes (`docker_volume_idle`) et se mesure sur les relevés
+    successifs, jamais sur l'âge de création. Le retrait passe par un tag
+    TEMPORAIRE à nous (`docker tag`, atomique) puis `docker image rm
+    --no-prune <tag>` : un tag concurrent ajouté entre-temps survit (seul le
+    nôtre est retiré) et les images parentes non taguées ne sont jamais
+    visées. Le moteur refuse encore une image utilisée par un conteneur, même
+    arrêté : la course avec un `docker run` qui la reprend est fermée. Seul
+    `docker` est couvert (comme la mesure #411). `dry_run` : le plan seulement.
+
+    Rend `{entries, plan, ours, others_total}` ; `ours` à None si le moteur ne
+    répond pas."""
+    from . import containers as containers_mod
+    out: dict = {"entries": [], "plan": [], "ours": None, "others_total": None}
+    if runtime is None or not getattr(policy, "docker_images", True):
+        return out
+    binary = os.path.basename(getattr(runtime, "binary", "docker") or "docker")
+    if binary != "docker" or not hasattr(runtime, "images"):
+        return out
+    rows = runtime.images()
+    if rows is None:
+        return out
+    now = time.time() if now is None else float(now)
+    idle = max(0.0, float(policy.docker_volume_idle))
+    ours: list = []
+    declared, others_total = [], 0
+    for row in rows:
+        if budget is not None and budget.expired():
+            budget.timed_out = True
+            break                      # #3802: a bounded host pass
+        labels = row.get("labels") or {}
+        if _lifetime_declared(labels):
+            declared.append(row)
+        elif not (row.get("tags") or ()):
+            # image dangling sans provenance du mesh : signalée par le compte,
+            # jamais supprimée (précédent #411).
+            others_total += 1
+    previous: dict = {}
+    if db is not None:
+        try:
+            for line in storage.of(db).housekeeping.latest_by_path(host or None, "image"):
+                if line.get("path"):
+                    previous[str(line["path"])] = line
+        except Exception:               # journal illisible : chaque épisode repart
+            previous = {}
+    present = {str(row.get("id") or "") for row in rows}
+    for ident, line in previous.items():
+        if (line.get("action") in _IMAGE_EPISODE_ACTIONS and ident not in present):
+            out["entries"].append({"kind": "image", "path": ident, "action": "gone",
+                                   "detail": "image gone: the absence episode is closed"})
+    for row in declared:
+        if budget is not None and budget.expired():
+            budget.timed_out = True
+            break                      # #3802: a bounded host pass
+        ident = str(row.get("id") or "")
+        if not ident:
+            continue
+        base = {"kind": "image", "path": ident}
+        stamp = row.get("created")
+        tags = row.get("tags") or ()
+        if tags:
+            # Un tag suffit à fermer l'absence, même si l'inspection de
+            # Created échoue : elle ne doit pas préserver l'ancien délai.
+            if (previous.get(ident) or {}).get("action") in _IMAGE_EPISODE_ACTIONS:
+                out["entries"].append(dict(
+                    base, action="referenced",
+                    detail="image %s is tagged again: the absence episode is closed"
+                           % ident[:19], data={"created": stamp}))
+            continue
+        if stamp is None:
+            why = "declared disposable: creation identity unreadable: flagged only"
+            ours.append(dict(base, action="signalé", detail=why))
+            out["plan"].append(dict(base, action="signalé", detail=why))
+            continue
+        since = _image_episode(previous.get(ident), stamp)
+        if since is None:
+            since = now
+        absence = max(0.0, now - since)
+        if absence < idle:
+            detail = "declared disposable image; no tag for %s (under %s)" % (
+                fmt_idle(absence), fmt_idle(idle))
+            out["entries"].append(dict(base, action="waiting", detail=detail,
+                                       data={"created": stamp, "episode_since": since}))
+            ours.append(dict(base, action="attend", detail=detail))
+            continue
+        why = "declared disposable image; no tag for %s" % fmt_idle(absence)
+        out["plan"].append(dict(base, action="suppression", detail=why))
+        if dry_run:
+            ours.append(dict(base, action="suppression", detail=why))
+            continue
+        ok, error = runtime.remove_image(ident)
+        entry = dict(base, action="removed" if ok else "kept",
+                     detail=("%s: %s image rm" % (why, binary)) if ok
+                     else "%s: deletion refused — %s" % (why, error),
+                     data={"created": stamp, "episode_since": since})
+        out["entries"].append(entry)
+        ours.append(entry)
+    out["ours"] = ours
     out["others_total"] = others_total
     return out
 
@@ -5600,6 +5767,15 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                            budget=budget)
     entries += volumes["entries"]
     plan += volumes["plan"]
+    # 4b-bis. #4560 : images Docker sans tag — celles que le mesh a déclarées
+    #     jetables (`ameesh.lifetime=test`, construction d'un tour) récoltées
+    #     après le même délai d'absence continue ; les images taguées et les
+    #     images sans étiquette ne sont jamais supprimées.
+    budget.check("images")
+    images = reap_images(runtime, db, host, policy, dry_run=dry_run, now=now,
+                         budget=budget)
+    entries += images["entries"]
+    plan += images["plan"]
     # 4c. #3226 : scopes systemd `dsh-subprocess-*` laissés par un tour clos
     #     (dsh sans la garde #490) : tués après le délai de grâce ; ceux qu'on
     #     ne sait pas attribuer gardés et signalés
@@ -5649,6 +5825,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     report_measure["volumes"] = {
         "ameesh": volumes["ours"], "others": volumes["others"],
         "others_total": volumes["others_total"]}
+    report_measure["images"] = {
+        "ameesh": images["ours"], "others_total": images["others_total"]}
     from . import docker_storage
     report_measure["docker_storage"] = docker_storage.collect(runtime, now=now)
     # #3103 : un pont sur le réseau local de l'hôte (incident #3092), relevé
@@ -5681,6 +5859,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             "measure": report_measure,
             "containers": report_measure["containers"],
             "volumes": report_measure["volumes"],
+            "images": report_measure["images"],
             "policy": policy.as_dict()}
 
 
@@ -5782,10 +5961,11 @@ def print_report(report: dict) -> None:
             print("  skipped   %s" % note)
     conteneurs = report.get("containers") or {}
     volumes = report.get("volumes") or {}
+    images = report.get("images") or {}
     docker = (report.get("measure") or {}).get("docker_storage")
     if docker:
-        print("  Docker storage (orphan count reported; only volumes this mesh DECLARED "
-              "DISPOSABLE are reaped, after a measured idle delay): "
+        print("  Docker storage (orphan count reported; only volumes and images this mesh "
+              "DECLARED DISPOSABLE are reaped, after a measured idle delay): "
               "%s orphan volumes; %s private reclaimable build cache" % (
                   docker.get("orphan_volumes"), _fmt(docker.get("build_cache_reclaimable_bytes"))))
         if docker.get("build_cache_unsupported"):
@@ -5806,6 +5986,14 @@ def print_report(report: dict) -> None:
             continue
         print("  volume %-12s %s — %s" % (action_label(v["action"]), v["path"],
                                           v.get("detail") or ""))
+    for v in images.get("ameesh") or ():
+        if v["path"] in vus:
+            continue
+        print("  image %-13s %s — %s" % (action_label(v["action"]), v["path"][:19],
+                                         v.get("detail") or ""))
+    if images.get("others_total"):
+        print("    … %d untagged image(s) without the lifetime label "
+              "(never deleted by ameesh)" % images["others_total"])
     autres = conteneurs.get("others") or []
     if autres:
         print("  containers not started by an ameesh turn (never deleted by ameesh):")

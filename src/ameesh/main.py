@@ -112,6 +112,9 @@
   ameesh models list|show|discover      model catalog and discovery;
   ameesh module <name> …              installed project module commands, --list
                                       for installation evidence;
+  ameesh module dev sync-merges | sync-github | project-github | merge-pr
+        | review-class    development tooling (L100 T5); `work sync-merges…`
+        and `review-class` stay aliases without a removal date;
   ameesh modules [--json]             discovered modules (built in and ameesh.modules
                                       entry points): version, capabilities (L98);
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
@@ -134,6 +137,10 @@
         GitHub approval bridge (#4006): bureau reader on bureau-goal,
         fail-closed local projection for the hosts; source=api is never an
         authority;
+  ameesh process-observations refresh|check|show|revoke
+        observations journal (#4425): the bureau collects staging
+        attestations and approvals, the hosts read a fresh fail-closed
+        projection; deployed never expires by age, QA observations do;
   ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since 24h]
         progress: work items, agents, milestones, budget (schema ameesh-progress/1);
         --serve: the page served locally, read-only, with a Refresh button (L304);
@@ -479,6 +486,11 @@ def _dispatch(argv: list[str] | None) -> int:
         # #4006 : pont d'approbation GitHub (projection locale fail-closed)
         from . import process_approvals_cli
         return process_approvals_cli.main(rest)
+    if command == "process-observations":
+        # #4425 : journal d'observations IMA (journal append-only, projection
+        # locale fail-closed)
+        from . import process_observations_cli
+        return process_observations_cli.main(rest)
     print("ameesh: unknown subcommand %r" % command, file=sys.stderr)
     print(__doc__)
     return 2

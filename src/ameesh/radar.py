@@ -1449,11 +1449,60 @@ def _status_success(contexts, required) -> list:
     return [p for p in required if not any((c or "").startswith(p) for c in won)]
 
 
+#: #4549 : le job de planification de la suite `tests`. Son échec saute
+#: toutes les parts qui en dépendent : la suite n'exécute alors aucun test.
+PLAN_CHECK = "plan"
+#: #4549 : préfixe des checks de flux d'une part (`ci.CHECK_PREFIX`). Leur
+#: existence prouve qu'une part a démarré, donc qu'un test a pu s'exécuter.
+#: Recopié ici pour rester lisible sans import circulaire ; `ci.py` reste la
+#: source du nom.
+TEST_FLOW_PREFIX = "tests (flux)"
+
+
+def _entry_name(entry) -> str:
+    """Le nom d'une entrée de rollup : `name` d'un check run, `context` d'un
+    statut de commit."""
+    return str(entry.get("name") or entry.get("context") or "")
+
+
+def testless_failure(checks, name, required=()) -> bool:
+    """#4549 : la suite a-t-elle échoué au plan **sans exécuter de test** ?
+
+    La preuve est fermée par défaut : un job `plan` en `FAILURE`, aucun check
+    de flux de part (`tests (flux) …`) — une part qui démarre publie le sien —,
+    aucun autre négatif que le plan et les checks requis, et aucun check
+    encore en cours. Un test rouge, une part lancée ou une suite encore
+    active ne sont donc jamais masqués. `required` nomme les autres checks
+    requis : leur échec, dans une suite au plan rouge, ne prouve pas un test
+    exécuté (toutes les parts dépendent du plan)."""
+    rows = [entry for entry in checks or () if isinstance(entry, dict)]
+    plan = [entry for entry in rows if _entry_name(entry) == PLAN_CHECK]
+    if not plan or not any(check_result(entry) == CI_NEGATIVE_RESULT
+                           for entry in plan):
+        return False
+    required = set(required or ())
+    for entry in rows:
+        label = _entry_name(entry)
+        if label.startswith(TEST_FLOW_PREFIX):
+            return False
+        if check_result(entry) == CI_WAITING_RESULT:
+            return False
+        if label in (PLAN_CHECK, name) or label in required:
+            continue
+        if check_result(entry) == CI_NEGATIVE_RESULT:
+            return False
+    return True
+
+
 def latest_rollup(rollup) -> list:
     """#2524 : les derniers checks par (workflow, nom), statuts par contexte.
     #3008 : une suite connue (`checkSuiteId`, rollup construit depuis les
     check runs de la tête) entre dans la clé : deux workflows homonymes ne se
     masquent pas.
+    #4549 (B2 de cx2) : aucune suite n'est masquée ici sur le seul nom de
+    workflow ni sur une date : une suite verdit sur ses preuves (workflow,
+    plan, base attestée) dans la porte (`fire._required_gate`), jamais par un
+    filtrage du rollup.
 
     Seule une date strictement plus récente remplace une entrée. Dates
     absentes, invalides ou ex aequo : garder les entrées ambiguës afin de ne
@@ -1461,8 +1510,9 @@ def latest_rollup(rollup) -> list:
     """
     from datetime import datetime
 
+    rows = list(rollup or ())
     groups = {}
-    for index, entry in enumerate(rollup or ()):
+    for index, entry in enumerate(rows):
         context = (entry.get("__typename") == "StatusContext"
                    or "state" in entry and "conclusion" not in entry)
         name = entry.get("context" if context else "name")
