@@ -126,6 +126,7 @@ from . import config as config_mod
 from . import db as db_mod
 from . import alert_briefs, exploitation, fil, nexlink_alerts, notify_gap, \
     sous_utilisation, storage
+from . import vocab
 from .config import Config
 from .platform import notify as platform_notify
 
@@ -279,14 +280,14 @@ TYPE_LABELS = {
     "pgbouncer_pool_waiting": "local PgBouncer clients waiting",
     "pgbouncer_console_unreadable": "local PgBouncer console unreadable",
     "stopped_with_mail": "agent stopped with mail",
-    "orphan_lot": "orphan lot",
+    "orphan_lot": "orphan {work}",
     "dead_runner": "dead runner",
     "idle_with_mail": "agent idle with mail",
     "delegation_expired": "delegation expired",
     "engagement_overdue": "commitment or due date passed",
     "long_turn": "long turn",
     "session_too_big": "session too big",
-    "stale_lot": "stale lot",
+    "stale_lot": "stale {work}",
     # #789 t2 (canon §9) : adressée aux agents (alert_briefs) ; poussée aux
     # humains si le type est dans `notify.types`
     "slo_breach": "internal deadline (SLO) overdue",
@@ -298,7 +299,7 @@ TYPE_LABELS = {
     "host_unsampled": "host sampler silent",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
-    "worktree_kept": "worktree kept at end of lot",
+    "worktree_kept": "worktree kept at end of {work}",
     # #3396 : le doute sur les processus retient les retraits ; #3802 : un
     # verrou d'hôte trop vieux empêche tout passage — dans les deux cas
     # l'hôte se remplit, le détail de l'alerte dit lequel.
@@ -361,7 +362,7 @@ TYPE_LABELS = {
     "turn_unpriced": "turn without a known price",
     # L233: briefed to the assignee and the orchestrators (alert_briefs); not
     # pushed to humans by default (add it to `notify.types` to receive it)
-    "waiting_without_question": "lot waiting for the owner with no question asked",
+    "waiting_without_question": "{work} waiting for the owner with no question asked",
     # L159e6: not pushed by default (add it to `notify.types`)
     "guard_restart": "agents started again by the capacity guard",
     "merge_blocked": "merge queue blocked",
@@ -392,6 +393,20 @@ TYPE_LABELS = {
     "host_hold": "host on hold",
     "budget_drift": "counted spend strays from the provider balance",
 }
+
+
+def type_label(kind: str, vocabulary=None) -> str:
+    """The readable label of an alert type, in the active module's vocabulary.
+
+    ``{work}``/``{works}`` in a ``TYPE_LABELS`` value are the work item's
+    singular/plural (L102 T1, #4391); every other label passes through
+    unchanged. The alert type itself, and the keys carrying it, never change.
+    """
+    vocabulary = vocab.active() if vocabulary is None else vocabulary
+    label = TYPE_LABELS.get(kind, kind.replace("_", " "))
+    return label.format(work=vocabulary.singular, works=vocabulary.plural)
+
+
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
@@ -784,7 +799,8 @@ def _account(alert: dict) -> str | None:
                       _clean(alert.get("account") or "default", 64))
 
 
-def _subject(alert: dict) -> str:
+def _subject(alert: dict, vocabulary=None) -> str:
+    vocabulary = vocab.active() if vocabulary is None else vocabulary
     parts = []
     if _account(alert):
         parts.append("account %s" % _account(alert))
@@ -795,7 +811,7 @@ def _subject(alert: dict) -> str:
     if alert.get("decision") is not None:
         parts.append("decision #%s" % alert["decision"])
     if alert.get("lot") is not None:
-        lot = "lot #%s" % alert["lot"]
+        lot = vocabulary.label(alert["lot"])
         if alert.get("title"):
             lot += ' "%s"' % _clean(alert["title"], 80)
         parts.append(lot)
@@ -813,20 +829,21 @@ def _readable(title: str, body: str, detail_line: str | None) -> tuple:
 
 def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     """Le message d'une alerte levée (`raised`) ou résolue (`resolved`)."""
+    vocabulary = vocab.active()
     kind = str(alert.get("type") or "?")
     if kind == "orphan_lot" and alert.get("grouped"):
         subject = "agent %s" % _clean(alert.get("agent") or "unknown", 64)
-        title = "ameesh: %sorphan lots (%s)" % (
-            "resolved — " if event == "resolved" else "", subject)
+        title = "ameesh: %sorphan %s (%s)" % (
+            "resolved — " if event == "resolved" else "", vocabulary.plural, subject)
         text = "[orphan_lot] %s\n%s" % (subject, _clean(alert.get("detail"), GROUPED_DETAIL_LIMIT))
         return _identify(Message(title, text, low=event == "resolved",
                                  urgent=event != "resolved"), alert, event, now)
-    label = TYPE_LABELS.get(kind, kind.replace("_", " "))
-    subject = _subject(alert)
+    label = type_label(kind, vocabulary)
+    subject = _subject(alert, vocabulary)
     since = alert.get("since")
     start = float(since) if since is not None else (float(raised_ts) if raised_ts else None)
     who = alert.get("agent") or alert.get("host") or _account(alert) or (
-        "lot #%s" % alert["lot"] if alert.get("lot") is not None else "")
+        vocabulary.label(alert["lot"]) if alert.get("lot") is not None else "")
     suffix = " (%s)" % _clean(who, 64) if who else ""
     if event == "resolved":
         title = "ameesh: resolved — %s%s" % (label, suffix)
@@ -893,7 +910,7 @@ def render_summary(bucket: dict, host: str, *, alert_id: str | None = None,
     underuse = sum(n for kind, n in raised.items() if kind in sous_utilisation.UNDERUSE_TYPES)
     if underuse:
         parts.append("underuse: %d (%s)" % (underuse, ", ".join(
-            "%d %s" % (n, TYPE_LABELS.get(kind, kind)) for kind, n in sorted(raised.items())
+            "%d %s" % (n, type_label(kind)) for kind, n in sorted(raised.items())
             if kind in sous_utilisation.UNDERUSE_TYPES)))
     body = "%s\nsee `ameesh alerts` on host %s" % ("; ".join(parts) or "—", host)
     return Message(title, body, urgent=any(k in URGENT_TYPES for k in raised),
@@ -2228,6 +2245,7 @@ def group_orphan_lots(alerts: list, resolve) -> list:
     The original alerts remain available to automatic assignment and briefs.
     """
     out, groups = [], {}
+    vocabulary = vocab.active()
     for alert in alerts:
         if alert.get("type") != "orphan_lot":
             out.append(alert)
@@ -2243,8 +2261,9 @@ def group_orphan_lots(alerts: list, resolve) -> list:
                 if len(lots) > GROUPED_LOTS_SHOWN else "")
         grouped = {"type": "orphan_lot", "agent": agent, "reason": reason,
                    "responsible": human, "grouped": True, "value": len(lots),
-                   "detail": "%d orphan lot(s) (%s): %s%s" % (
-                       len(lots), _clean(reason or "unknown", 64), names, more)}
+                   "detail": "%d orphan %s (%s): %s%s" % (
+                       len(lots), vocabulary.abbreviation,
+                       _clean(reason or "unknown", 64), names, more)}
         out.append(grouped)
     return out
 
