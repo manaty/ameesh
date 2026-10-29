@@ -54,7 +54,13 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual((connector.name, connector.dedupe), ("git-merge", "none"))
 
     def test_le_module_dev_n_est_pas_un_module_de_cycle_de_vie(self):
-        self.assertNotIn("dev", registry.discover().names())
+        # L101 T4 (#4357): `dev` joins the Module interface as a built-in
+        # tooling module. It stays outside the lifecycle: no work item type,
+        # so `modules.declarations` refuses it (see test_l317_project_modules).
+        module = registry.discover().get("dev")
+        self.assertIsNotNone(module)
+        self.assertEqual(module.storage, ())
+        self.assertEqual(module.capabilities, ("audit", "workspaces"))
 
     def test_un_nom_d_action_du_coeur_est_refuse_au_fournisseur(self):
         fake = mock.Mock(ACTION_CONNECTORS={"shell-noop": lambda *a, **k: None})
