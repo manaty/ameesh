@@ -1143,7 +1143,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         scopes = (tuple(admitted_heads) + inherited + stacked
                   + ((production,) if production else ()))
         if scopes and repo:
-            boundary = (review_authors.target_commit(repo, target or (klass or {}).get("target") or "")
+            boundary = (review_authors.target_commit(
+                            repo, target or (klass or {}).get("target") or "",
+                            fetch=True)
                         or (klass or {}).get("base_sha"))
             if boundary:
                 listing = plan_git._out(repo, "rev-list", "%s..%s" % (boundary, frozen))
@@ -1741,6 +1743,19 @@ def _delta_base(repo: str, row, target: str | None = None, *,
                                "project target and repository default are all empty)")
     short = _remote_branch(target)
     places = [repo] + ([other] if other and other != repo else [])
+    # #4673 : la ref distante du checkout n'est fraîche que de son dernier
+    # fetch. Le delta de la porte se lit sur la **pointe publiée** de la
+    # cible : sans cela, les commits que la cible a gagnés depuis comptent
+    # comme des tiers de la plage et refusent la provenance. La lecture est
+    # best-effort : une forge muette laisse la ref locale (doute fermé).
+    if not queue:
+        try:
+            from . import review_authors
+            fresh = review_authors.refreshed_target(repo, target)
+        except Exception:  # noqa: BLE001 - rafraîchissement au mieux
+            fresh = ""
+        if fresh:
+            return fresh, target, repo
     private = QUEUE_REF + short
     if queue:
         for place in places:

@@ -818,9 +818,13 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
             gate_authors = {"authors": authors, "families": families,
                             "authors_complete": True}
     # #3091 : la base de composition du véhicule est prouvée sur cette cible
-    # résolue, jamais sur la ref du checkout.
+    # résolue, jamais sur la ref du checkout. #4673 : sans base déjà résolue
+    # par l'appelant, la porte reçoit la **branche** cible et relit sa pointe
+    # publiée ; un clone partagé non rafraîchi ne fait alors plus passer des
+    # commits déjà dans la cible pour des tiers.
+    gate_target = resolved if class_sha else (target or resolved or base)
     gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass,
-                                   item=row, cfg=cfg, target=resolved or base,
+                                   item=row, cfg=cfg, target=gate_target,
                                    **gate_authors)
     if not gate["ok"]:
         return False, gate["why"], klass
