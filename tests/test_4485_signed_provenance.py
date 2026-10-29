@@ -84,7 +84,7 @@ class SignedProvenanceTest(PgTestCase):
         fields.update(kwargs)
         return prov.record_signed_commit(self.db, sha or self.commit(), **fields)
 
-    def approval(self, sha, **fields):
+    def approval(self, sha, *, decision="approved", **fields):
         """Une approbation pré-signée pour le même texte canonique."""
         statement = prov.signed_statement(
             commit=sha, actor=fields.get("actor", "bureau"),
@@ -101,7 +101,7 @@ class SignedProvenanceTest(PgTestCase):
         return authority.create_approval(
             self.db, self.seed, approver=OWNER, action=prov.SIGNED_ACTION,
             artifact_kind=prov.SIGNED_KIND, artifact_hash=digest,
-            meta={"statement": statement})
+            decision=decision, meta={"statement": statement})
 
     # -- la preuve --------------------------------------------------------
     def test_an_owner_signed_commit_is_proven_outside_a_turn(self):
@@ -148,6 +148,28 @@ class SignedProvenanceTest(PgTestCase):
         receipt = prov.receipt_for_commit(self.db, head)
         self.assertEqual(receipt["actor"], "bureau")
         self.assertEqual(receipt["turn"], "signed:%d" % int(built["id"]))
+
+    def test_a_rejected_approval_proves_nothing(self):
+        """Un refus signé reste un refus : il ne crée ni reçu ni consommation.
+
+        B P1 de la relecture cx3 (#4485) : `build_approval` accepte
+        `decision=rejected`, et `verify_approval` en vérifie la signature sans
+        exiger « approved ». La décision doit être contrôlée avant l'écriture."""
+        head = self.commit("refusé")
+        built = self.approval(head, decision="rejected")
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            prov.record_signed_commit(
+                self.db, head, actor="bureau", session=SESSION,
+                harness="claude", host=HOST, families=FAMILIES,
+                lot=int(self.lot["id"]), approval_id=int(built["id"]),
+                cwd=self.repo)
+        self.assertIn("not an approved statement", str(raised.exception))
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
+        rows = authority.list_approvals(
+            self.db, action=prov.SIGNED_ACTION,
+            artifact_hash=built["artifact_hash"], limit=5)
+        row = next(r for r in rows if int(r["id"]) == int(built["id"]))
+        self.assertIsNone(row.get("consumed_ts"))
 
     def test_the_statement_is_canonical_and_deterministic(self):
         head = self.commit("canon")

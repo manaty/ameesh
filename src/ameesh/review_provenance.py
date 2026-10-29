@@ -539,6 +539,14 @@ def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
             or str(row.get("artifact_kind") or "") != SIGNED_KIND):
         raise ProvenanceError(
             "approval #%s is not a signed provenance statement" % approval_id)
+    if str(row.get("decision") or "") != "approved":
+        # Un refus signé est une signature valide (authority.build_approval
+        # accepte `rejected`) : la décision portée par la ligne et signée dans
+        # son payload doit être « approved ». Sinon le refus deviendrait une
+        # preuve de provenance (B P1 de la relecture cx3, #4485).
+        raise ProvenanceError(
+            "approval #%s is %r, not an approved statement"
+            % (approval_id, row.get("decision") or "?"))
     if str(row.get("artifact_hash") or "").lower() != digest:
         raise ProvenanceError(
             "approval #%s does not cover this signed statement" % approval_id)
