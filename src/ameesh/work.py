@@ -4191,7 +4191,7 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             db, getattr(db, "cfg", None), item, milestones(db, item_id))
         if not gate or not gate.get("ok"):
             raise WorkError(
-                "transition to validated requires reviews on the current frozen head; "
+                "transition to validated requires the review quorum on the current frozen head; "
                 "move it to qa")
     if state == lifecycle.WAITING_HUMAN and not storage.of(db).decisions.pending_for_lot(str(item_id)):
         raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})

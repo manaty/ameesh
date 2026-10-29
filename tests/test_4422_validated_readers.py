@@ -58,7 +58,12 @@ class ValidatedResumeTest(PgTestCase):
                 self.db.execute("UPDATE work_items SET state = %s WHERE id = %s", (held, ident))
                 with mock.patch("ameesh.merge_queue.review_gate_for_item", return_value={"ok": True}) as gate:
                     work.move(self.db, ident, "validated")
-                gate.assert_called_once()
+                # The writer (#4423) also checks the quorum and compares its
+                # ledger under lock. Both layers may read it; every read must
+                # concern this lot, regardless of the number of checks.
+                self.assertTrue(gate.called)
+                for call in gate.call_args_list:
+                    self.assertEqual(call.args[2]["id"], ident)
                 self.assertEqual(work.get(self.db, ident)["state"], "validated")
 
     def test_resume_without_current_reviews_is_refused(self):
