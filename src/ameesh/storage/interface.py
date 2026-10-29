@@ -2720,12 +2720,11 @@ class WorkItems(Domain):
         journal du porteur dans la même transaction. Rend les lignes relues
         par `packet_members` (ordre de `recorded_at` décroissant).
 
-        #4501 : le porteur est verrouillé (`FOR SHARE`, qui bloque le
-        `FOR NO KEY UPDATE` d'un gel ou d'un relevé de `branch_head`) avant
-        toute lecture de sa tête poussée ; le dernier gel et `branch_head` sont
-        relus **dans cette transaction**, et l'écriture est refusée si la tête
-        poussée n'est ni `head_sha` ni `expect_pushed`. Un gel ou une poussée
-        concurrente est ainsi sérialisé avec l'enregistrement.
+        #4501 : le porteur est verrouillé (`FOR NO KEY UPDATE`) avant toute
+        lecture de sa tête poussée ; le dernier gel et `branch_head` sont relus
+        **dans cette transaction**, et l'écriture est refusée si la tête
+        poussée n'est ni `head_sha` ni `expect_pushed`. Un gel, un relevé ou un
+        autre enregistrement concurrent est ainsi sérialisé avec l'écriture.
         """
 
     @abc.abstractmethod

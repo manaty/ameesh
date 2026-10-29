@@ -3320,19 +3320,20 @@ class WorkItems(interface.WorkItems):
             rows = tx.query(
                 "SELECT id, state, branch_head,"
                 "       extract(epoch FROM branch_head_at)::float8 AS branch_head_ts"
-                " FROM work_items WHERE id = %s FOR SHARE",
+                " FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                 (int(package_id),))
             if not rows:
                 raise DbError("packet #%s: no such work item" % package_id)
             # #4501 : sous le verrou du porteur, relire la tête poussée avant
-            # toute écriture. `FOR SHARE` bloque le `FOR NO KEY UPDATE` que
-            # prennent un gel (`add_milestone`) et un relevé de `branch_head`
-            # (`UPDATE`) : soit ils ont commité avant et cette lecture les
-            # voit, soit ils attendent et l'enregistrement porte sur la tête
-            # courante. (`FOR NO KEY UPDATE` ne suffirait pas : deux verrous de
-            # ce mode sont compatibles.) Sans cette relecture, une lecture
+            # toute écriture. `FOR NO KEY UPDATE` est exclusif avec lui-même
+            # (matrice PostgreSQL : deux verrous de ce mode s'attendent) et
+            # avec les verrous pris par un gel (`add_milestone`) ou un relevé
+            # de `branch_head` (`UPDATE`) : soit ils ont commité avant et
+            # cette lecture les voit, soit ils attendent et l'enregistrement
+            # porte sur la tête courante. Sans cette relecture, une lecture
             # initiale périmée de `packet_link.record` écrasait le manifeste
-            # d'une tête poussée entre-temps.
+            # d'une tête poussée entre-temps; sans le verrou exclusif, deux
+            # enregistrements concurrents mélangeaient leurs membres.
             freeze = tx.query(
                 "SELECT sha, extract(epoch FROM at)::float8 AS at_ts"
                 " FROM work_item_milestones"

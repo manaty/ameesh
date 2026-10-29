@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 import unittest
 from unittest import mock
 
-from ameesh import packet_link, plan_git, storage, work
+from ameesh import db as db_mod, packet_head, packet_link, plan_git, storage, work
 
 from .support import PgTestCase
 from .test_canon import _TmpMixin, git
@@ -279,6 +281,67 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
             {m["head_sha"] for m in
              packet_link.memberships(self.db, package_ids=[porteur["id"]])},
             {head})
+
+    def test_concurrent_records_serialize_on_the_carrier_lock(self):
+        """#4501 (B cx3/auditeur) : deux enregistrements concurrents ne se mélangent pas.
+
+        Deux connexions appellent `record_packet` sur le même porteur avec le
+        même `expect_pushed` (la tête gelée), des têtes et des unités
+        différentes. Le verrou `FOR NO KEY UPDATE` du porteur sérialise : le
+        second attend le premier avant de relire la tête, puis écrit son
+        ensemble complet. Avec deux `FOR SHARE` compatibles, il passerait
+        pendant que le premier dort et les membres pourraient se mélanger.
+        """
+        head = self.base
+        carrier = self.carrier()
+        work.milestone(self.db, carrier["id"], "frozen", sha=head, actor="pilote")
+        unit_a = self.lot("unit A")
+        unit_b = self.lot("unit B")
+        conn_a, conn_b = db_mod.connect(self.cfg), db_mod.connect(self.cfg)
+        self.addCleanup(conn_a.close)
+        self.addCleanup(conn_b.close)
+        locked = threading.Event()
+        real = packet_head.protected_head
+
+        def slow_a(*args):
+            if threading.current_thread().name == "record-a":
+                locked.set()
+                time.sleep(0.6)
+            return real(*args)
+
+        def record(conn, head_sha, unit):
+            storage.of(conn).work.record_packet(
+                int(carrier["id"]), branch="integration/paquet-1",
+                base_sha=self.base, head_sha=head_sha,
+                units=[{"work_item_id": int(unit["id"]), "unit_sha": "d" * 40,
+                        "source_sha": self.base, "frozen_sha": self.base}],
+                note="concurrence", actor="test", expect_pushed=head)
+
+        done: dict = {}
+
+        def run_a():
+            try:
+                record(conn_a, "2" * 40, unit_a)
+                done["a"] = True
+            except Exception as exc:  # noqa: BLE001 - remonté par le témoin
+                done["a_error"] = exc
+
+        with mock.patch.object(packet_head, "protected_head", side_effect=slow_a):
+            thread = threading.Thread(target=run_a, name="record-a", daemon=True)
+            thread.start()
+            self.assertTrue(locked.wait(5), "le premier n'a pas pris le verrou")
+            started = time.monotonic()
+            record(conn_b, "3" * 40, unit_b)
+            elapsed = time.monotonic() - started
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertNotIn("a_error", done)
+        self.assertGreaterEqual(elapsed, 0.4,
+                                "le second n'a pas attendu le verrou du porteur")
+        self.assertEqual(
+            {m["work_item_id"] for m in
+             packet_link.memberships(self.db, package_ids=[carrier["id"]])},
+            {unit_b["id"]})
 
     def test_record_reuses_the_recorded_base_after_a_target_update(self):
         """Une mise à jour de la cible dans le paquet ne perd pas les unités."""
