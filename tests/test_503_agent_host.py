@@ -121,9 +121,10 @@ if sys.argv[1:] == ['list', '--json']:
 elif sys.argv[1] == 'show':
     name = sys.argv[2]
     # #2198/N4 : lecture lente ; la borne de lecture doit la couper avant la
-    # borne (plus longue) des gestes de drain.
+    # borne (plus longue) des gestes de drain. #4528 : plus longue que cette
+    # dernière, pour que seule la borne de lecture explique un balayage court.
     if scenario == 'show-lent':
-        time.sleep(5)
+        time.sleep(45)
     # #4358 (après l'ancre #2198/N4 que test_3114 remplace) : sortie VIDE, code 0 (staging h-07, relève du rôle mesh-design) ;
     # le fichier compte les lectures vides restantes, « toujours » ne
     # s'épuise jamais.
@@ -1057,8 +1058,12 @@ class AgentHostTest(unittest.TestCase):
         # #4358 : une lecture coupée est vide, donc non concluante : relue
         # en fin de balayage puis laissée en l'état, sans échec de l'étape.
         # Un seul essai et un seul agent : deux lectures coupées en tout.
-        self.env.update(DRAIN_APPEL_DELAI='10', DRAIN_MARGE_LOCALE='1',
-                        DRAIN_LECTURE_DELAI='1', LECTURE_ESSAIS='1')
+        # #4528 : `list` doit aboutir sous la même borne ; sa chaîne factice
+        # (garde locale, ssh, sudo, CLI : quatre interpréteurs) passait 2 s
+        # (1 + marge 1) sous la charge de la CI (code 124, « appel de drain
+        # expiré »). 3 s + 3 s la couvrent avec un CPU au dixième.
+        self.env.update(DRAIN_APPEL_DELAI='30', DRAIN_MARGE_LOCALE='3',
+                        DRAIN_LECTURE_DELAI='3', LECTURE_ESSAIS='1')
         agents = [dict(name='dev9', host='host-agents', mode='execute', status='idle')]
         debut = time.monotonic()
         p = self.run_vm(scenario='show-lent', agents=agents)
@@ -1066,9 +1071,19 @@ class AgentHostTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn('laissée(s) en l\'état (non concluant) : dev9', p.stdout)
         self.assertEqual(self.starts(), [])
-        # #3832 : 8 s reste strictement sous la borne des gestes de drain
-        # (10 s) et laisse la marge d'ordonnancement de --parallel.
-        self.assertLess(ecoule, 8,
+        # #4528 : la borne passée à chaque lecture se lit dans le journal ssh,
+        # sans dépendre de l'horloge ; les deux `show` portent celle des
+        # lectures, jamais celle des gestes.
+        lectures = [l for l in (self.state / 'ssh.log').read_text().splitlines()
+                    if l.rstrip().endswith('/bin/ameesh show dev9 --json')]
+        self.assertEqual(len(lectures), 2, lectures)
+        for ligne in lectures:
+            self.assertIn('timeout --kill-after=5 3 /', ligne)
+        # #3832, #4528 : le show lent (45 s) dépasse la borne des gestes
+        # (30 s) ; une seule lecture coupée par elle porterait le balayage
+        # au-delà de 30 s. Deux coupures à 3 s (6 s au pire par la garde
+        # locale) laissent la marge d'ordonnancement de --parallel.
+        self.assertLess(ecoule, 30,
                         'show doit être coupé par DRAIN_LECTURE_DELAI, pas par '
                         'DRAIN_APPEL_DELAI')
 
