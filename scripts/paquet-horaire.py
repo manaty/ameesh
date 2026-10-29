@@ -309,7 +309,8 @@ class Context:
     #: fuseau des coupures, lu au canon compilé (`mechanics.timezone`, #2449)
     zone: ZoneInfo = ZoneInfo("UTC")
     #: #4271 : `packet_tests` du canon compilé (borne d'une série d'unité,
-    #: séries simultanées) ; None : bloc absent, les défauts de paquet-auto
+    #: séries simultanées, #4463 borne totale) ; None : bloc absent, les
+    #: défauts de paquet-auto
     unit_tests: object = None
     now: float = field(default_factory=time.time)
     host: str = field(default_factory=socket.gethostname)
@@ -608,6 +609,12 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
     if ctx.unit_tests is not None:
         cmd += ["--tests-timeout", str(ctx.unit_tests.unit_timeout_seconds),
                 "--tests-parallel", str(ctx.unit_tests.parallel)]
+        total = getattr(ctx.unit_tests, "total_timeout_seconds", None)
+        if total:
+            cmd += ["--tests-budget", str(total)]
+        else:
+            ctx.say("packet_tests.total_timeout_seconds absent du canon "
+                    "compilé : tests par unité sans borne totale (#4463)")
     else:
         ctx.say("packet_tests absent du canon compilé : tests ciblés en série, "
                 "borne par défaut de paquet-auto (#4271)")

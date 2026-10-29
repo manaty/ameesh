@@ -101,6 +101,7 @@ SCHEMA_KEYS = (
     "paquet.max_paquets",
     "packet_tests.unit_timeout_seconds",
     "packet_tests.parallel",
+    "packet_tests.total_timeout_seconds",
     "file.repos_part",
     "file.repos_s",
     "session.max_tokens",
@@ -158,6 +159,7 @@ BINDINGS = {
     "max_paquets": "paquet.max_paquets",
     "unit_timeout_seconds": "packet_tests.unit_timeout_seconds",
     "unit_tests_parallel": "packet_tests.parallel",
+    "total_timeout_seconds": "packet_tests.total_timeout_seconds",
     "repos_part": "file.repos_part",
     "repos_s": "file.repos_s",
     "production_branch": "production.branch",
@@ -211,6 +213,7 @@ DICT_BINDINGS = {
     "attente_mediane_s": "paquet.attente_mediane_s",
     "max_paquets": "paquet.max_paquets",
     "unit_timeout_seconds": "packet_tests.unit_timeout_seconds",
+    "total_timeout_seconds": "packet_tests.total_timeout_seconds",
     "repos_part": "file.repos_part",
     "repos_s": "file.repos_s",
     # #4448 : une table de seuils par harnais recopiée dans un mapping
