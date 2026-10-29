@@ -159,6 +159,7 @@ class HandoffTest(PgTestCase):
 
     def test_stalled_enable_releases_gate_and_keeps_uncertain_intent(self):
         from ameesh import db as db_mod
+        from ameesh.storage.postgres.hosts import Hosts
         op = self.request()
         for _ in range(7): op = self.advance(op)
         started, release, finished = threading.Event(), threading.Event(), threading.Event()
@@ -166,18 +167,63 @@ class HandoffTest(PgTestCase):
         errors, elapsed = [], []
         other = db_mod.connect(self.cfg)
         timeout = 0.2
+        # #4584 : le run 40890487268 (paquet h-06) a dépassé la borne de 2 s
+        # sur la fin de l'écriture concurrente, pas sur la libération du
+        # verrou : son journal Postgres montre des checkpoints de 45 à 172 s
+        # (write=171 s). On borne donc la libération sur l'échéance du test
+        # (ENABLE_TIMEOUT + marge), et la seule liveness de l'écriture sur la
+        # marge de charge de #3868 (60 s). 24 répétitions à six processus
+        # (ameesh heavy) mesurent 10 à 239 ms entre l'échéance et la
+        # fermeture du backend : 5 s garde plus de vingt fois cette marge,
+        # et un verrou tenu 8 s de trop fait bien échouer le test.
+        release_margin = 5
+        load_margin = 60
+        gate = "host-gate:target"
+        gate_backends, deadline_at, released_at = [], [], []
+        original_guard = Hosts.gate_guard
+        original_bounded = handoffs._enable_bounded
+
+        def watched_bounded(adapter, intent, slot):
+            try:
+                return original_bounded(adapter, intent, slot)
+            except handoffs.HandoffError:
+                deadline_at.append(time.monotonic())
+                raise
+
+        def gate_held(conn, pid):
+            return conn.query(
+                "SELECT count(*)::int AS n FROM pg_locks WHERE locktype='advisory'"
+                " AND granted AND objsubid=1"
+                " AND classid=((hashtextextended(%s,0)>>32)&4294967295)::oid"
+                " AND objid=(hashtextextended(%s,0)&4294967295)::oid AND pid=%s",
+                (gate, gate, pid))[0]["n"]
+
+        @contextmanager
+        def watched_guard(hosts_self, host):
+            with original_guard(hosts_self, host) as guarded:
+                # The publication lock spans the synchronous enable: remember
+                # its exact backend so the deadline release is proven by
+                # identity, never by a wall-clock constant.
+                pid = guarded.db.query("SELECT pg_backend_pid() AS pid")[0]["pid"]
+                self.assertEqual(gate_held(guarded.db, pid), 1,
+                                 "gate guard must hold the publication lock")
+                gate_backends.append(pid)
+                try:
+                    yield guarded
+                finally:
+                    released_at.append(time.monotonic())
 
         def enable(intent):
             started.set()
             try:
-                release.wait(5)  # finite fallback also lets the parent fail safely
+                release.wait(60)  # finite fallback also lets the parent fail safely
                 return True
             finally:
                 finished.set()
 
         def withdraw():
             try:
-                if not started.wait(5):
+                if not started.wait(60):
                     raise AssertionError("enable did not start")
                 before = time.monotonic()
                 storage.of(other).hosts.record({"host": "target", "gate_state": "draining"})
@@ -190,21 +236,37 @@ class HandoffTest(PgTestCase):
         publisher.start()
         try:
             with mock.patch.object(self.adapter, "enable", side_effect=enable), mock.patch.object(
-                    handoffs, "ENABLE_TIMEOUT", timeout):
+                    handoffs, "ENABLE_TIMEOUT", timeout), mock.patch.object(
+                    Hosts, "gate_guard", watched_guard), mock.patch.object(
+                    handoffs, "_enable_bounded", watched_bounded):
                 held = self.advance(op)
             self.assertEqual((held["state"], held["fenced"]), ("held", True))
             self.assertIn("pending_effect", held["evidence"])
             self.assertEqual(held["evidence"]["pending_effect"]["name"], "enable")
             self.assertFalse(finished.is_set())
-            self.assertTrue(published.wait(2), "withdrawal blocked beyond enable deadline")
+            # The deadline itself releases the publication lock: the release
+            # path (fence then close the gate backend) must stay within the
+            # test's own deadline + margin, and the backend that held it
+            # during enable must no longer hold it. The concurrent write may
+            # already own it at this instant on its own backend.
+            self.assertEqual((len(gate_backends), len(deadline_at), len(released_at)), (1, 1, 1))
+            self.assertLess(released_at[0] - deadline_at[0], release_margin,
+                            "gate lock held after enable deadline")
+            self.assertEqual(gate_held(self.db, gate_backends[0]), 0,
+                             "gate lock still held after enable deadline")
+            # Liveness of the queued write only: its scheduling and commit
+            # latency under a saturated runner is an environment measure, not
+            # the deadline.
+            self.assertTrue(published.wait(timeout + load_margin),
+                            "withdrawal not published after the gate release: %r" % (errors,))
             self.assertFalse(errors)
-            self.assertLess(elapsed[0], timeout + 2)
+            self.assertLess(elapsed[0], timeout + load_margin)
             self.assertEqual(self.api.hosts.latest("target")["gate_state"], "draining")
             with self.assertRaises(handoffs.HandoffError):
                 self.advance(held)
             # Even a successful late result cannot settle the uncertain intent.
             release.set()
-            self.assertTrue(finished.wait(2))
+            self.assertTrue(finished.wait(15))
             current = self.api.handoffs.get(op["id"])
             self.assertEqual((current["state"], current["fenced"]), ("held", True))
             self.assertEqual(current["evidence"]["pending_effect"], held["evidence"]["pending_effect"])
@@ -217,8 +279,8 @@ class HandoffTest(PgTestCase):
             self.assertNotIn("restore_source", self.adapter.calls)
         finally:
             release.set()
-            publisher.join(5)
-            finished.wait(5)
+            publisher.join(15)
+            finished.wait(15)
             other.close()
 
     def test_worker_capacity_defers_next_handoff_without_effect_and_recovers(self):
