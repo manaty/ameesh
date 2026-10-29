@@ -1349,7 +1349,7 @@ def _sync_locked(lock: receipts.RegistryLock, canon: Canon, trusted_ref: str,
     partial = _partial(canon, unread)
     from . import modules as project_modules
     try:
-        project_modules.declarations(canon.federation)
+        project_modules.declarations(canon.federation, canon)
     except ValueError as exc:
         return AuthenticatorSync(AUTH_REFUSED, str(exc), canon=key)
     # contrôles faits, verrou détenu : la seule écriture du registre (de CE canon)
@@ -1536,7 +1536,8 @@ def _same(row: dict, values: dict) -> bool:
     return True
 
 
-def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float) -> SyncReport | None:
+def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
+                  on_incomplete=None) -> SyncReport | None:
     """#3963: one complete sync per host/canon/interval, without a long lock.
 
     Other executors reuse only a completed result for the same immutable
@@ -1546,17 +1547,29 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float) -> SyncRep
     if interval_s <= 0 or canon.untrusted or not canon.readable or not canon.sources:
         return sync(db, canon, host)
     key = state_key(db, canon, host)
-    signature = hashlib.sha256(json.dumps({
+    signature_payload = {
         "sources": [(s.member, s.commit, s.mode) for s in canon.sources],
         "trusted_ref": configured_ref(db, canon),
         "id": canon.id, "default": canon.is_default,
         "findings": [str(f) for f in canon.load_findings],
-    }, sort_keys=True).encode()).hexdigest()
+    }
+    signature = hashlib.sha256(json.dumps(signature_payload, sort_keys=True).encode()).hexdigest()
     store = storage.of(db).canon
     token = uuid.uuid4().hex
     if not store.claim_sync(host, key, token, interval_s):
         shared = store.shared_sync(host, key)
         if shared is None or shared["sync_signature"] != signature:
+            if on_incomplete is not None:
+                reason = ("shared sync pending or failed (no completed token)"
+                          if shared is None else
+                          "snapshot mismatch: local signature %s, shared signature %s"
+                          % (signature, shared["sync_signature"]))
+                sources = ", ".join("%s=%s@%s (%s)" % (
+                    s.member, s.repo, s.commit, s.mode) for s in canon.sources)
+                on_incomplete("canon %s at %s: %s; sources [%s]; "
+                              "claim interval %.1fs; local signature payload %s" % (
+                                  canon.id, canon.root, reason, sources, interval_s,
+                                  json.dumps(signature_payload, sort_keys=True)))
             return None
         return SyncReport(host, str(canon.root), False, [], [],
                           status=shared["status"], diagnostic=shared["diagnostic"], shared=True)

@@ -506,6 +506,48 @@ class FrozenHeadLinkTest(HoraireBase):
         self.assertIsNone(ph.pending(self.ctx, item, foreign))
         self.assertEqual(self.autos(), [])
 
+    def test_gel_etranger_sans_marque_apres_tentative_morte_non_repris(self):
+        """#4506 : ni publish ni tête testée ; le gel postérieur à la tentative
+        morte a été posé à la main (note du jalon), il la clôt au lieu de la
+        reprendre en recomposant."""
+        foreign = "f" * 40
+        item = carrier(sha=foreign, created=NOW - 3600)
+        item["freeze"]["declared"].update(at_ts=NOW - 100, id=25229)
+        item["milestones"] = [{
+            "id": 25229, "kind": "frozen", "sha": foreign,
+            "actor": "mty-amh-impl-01", "at_ts": NOW - 100,
+            "note": "gel manuel après échec paquet-auto au gel."}]
+        item["events"] = [{"note": ph.MARK_ATTEMPT + "recomposition n=1 base=%s "
+                           "par=agents-1:42 epoque=288" % HEAD,
+                           "created_ts": NOW - 3000}]
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        self.assertIsNone(ph.pending(self.ctx, item, foreign))
+        out = ph.tick(self.ctx)
+        self.assertIn("ci-full demandée sur %s" % foreign[:12], out)
+        self.assertEqual(self.autos(), [])
+        tried = [n for n in ph.marks(item) if n.startswith(ph.MARK_ATTEMPT)]
+        self.assertEqual(len(tried), 1)
+
+    def test_gel_paquet_auto_apres_tentative_reprend(self):
+        """#4506 : la note du gel précoce de paquet-auto (#4304) est la main de
+        la tentative ; un gel postérieur portant cette note ne la clôt pas."""
+        foreign = "f" * 40
+        item = carrier(sha=foreign, created=NOW - 3600)
+        item["freeze"]["declared"].update(at_ts=NOW - 100, id=25229)
+        item["milestones"] = [{
+            "id": 25229, "kind": "frozen", "sha": foreign, "actor": "inconnu",
+            "at_ts": NOW - 100,
+            "note": "paquet h-20261029-03 poussé par scripts/paquet-auto.py dès "
+                    "la composition (canon §6, #4304) : 25 unités, 6 écartés, "
+                    "inclusion verte, tests par unité en cours ; manifeste x"}]
+        item["events"] = [{"note": ph.MARK_ATTEMPT + "recomposition n=1 base=%s "
+                           "par=agents-1:42 epoque=288" % HEAD,
+                           "created_ts": NOW - 3000}]
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        self.assertIsNotNone(ph.pending(self.ctx, item, foreign))
+
     def test_marque_de_sortie_repare_la_note_perdue(self):
         item = self.lost()
         mark = item["events"].pop(1)["note"]
@@ -566,6 +608,44 @@ class FrozenHeadLinkTest(HoraireBase):
         self.assertIsNone(ph.pending(self.ctx, item, HEAD2))
 
 
+class MergedCarrierTest(HoraireBase):
+    """#4506 : un porteur fusionné reste en qa jusqu'à sa clôture (hold du
+    pilote, balayage) ; le tic n'y reprend ni ne recompose rien."""
+
+    ATTEMPT = (ph.MARK_ATTEMPT + "recomposition n=1 base=%s par=agents-1:42 "
+               "epoque=288")
+
+    def merged(self, *notes):
+        item = carrier(sha=HEAD, notes=notes)
+        item["freeze"]["declared"]["at_ts"] = NOW - 100
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        return item
+
+    def test_note_auto_merge_merged_aucun_geste(self):
+        item = self.merged(
+            self.ATTEMPT % HEAD,
+            "auto-merge merged repo=manaty/ameesh pr=3429 sha=%s base=main "
+            "commit=%s — merged by ameesh into main at its published head, "
+            "gates green" % (HEAD, "c" * 40))
+        out = ph.tick(self.ctx)
+        self.assertIn("fusionné, rien à faire", out)
+        self.assertEqual(self.autos(), [])
+        self.assertEqual(self.shell.ran("ci", "run"), [])
+        tried = [n for n in ph.marks(item) if n.startswith(ph.MARK_ATTEMPT)]
+        self.assertEqual(len(tried), 1)
+
+    def test_tete_ancetre_de_la_cible_aucun_geste(self):
+        item = self.merged(self.ATTEMPT % HEAD)
+        self.shell.ancestor = True
+        out = ph.tick(self.ctx)
+        self.assertIn("fusionné, rien à faire", out)
+        self.assertEqual(self.autos(), [])
+        self.assertEqual(self.shell.ran("ci", "run"), [])
+        tried = [n for n in ph.marks(item) if n.startswith(ph.MARK_ATTEMPT)]
+        self.assertEqual(len(tried), 1)
+
+
 class PilotRecomposeTest(HoraireBase):
     def frozen(self, *notes):
         item = carrier(sha=HEAD, created=NOW - 3600)
@@ -592,6 +672,9 @@ class PilotRecomposeTest(HoraireBase):
         self.assertIn("--force", cmd)
         self.assertEqual(cmd[cmd.index("--exclude") + 1], "3801")
         self.assertEqual(cmd[cmd.index("--exclude-reason") + 1], "B de relecture (#3801)")
+        # #4581 : la recomposition du pilote garde, elle aussi, les membres de
+        # la composition gelée moins les exclus.
+        self.assertEqual(cmd[cmd.index("--keep-composition") + 1], HEAD)
 
     def test_recomposition_du_pilote_perdue_reprise_avec_ses_motifs(self):
         item = self.frozen(

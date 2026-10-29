@@ -1003,8 +1003,10 @@ def roadmap_waiting(db: Db, project: str, *, now: float | None = None) -> list:
         return []
     stamp = time.time() if now is None else float(now)
     today = time.strftime("%Y-%m-%d", time.localtime(stamp))
-    # #3565 : le projet filtre AVANT la lecture des holds — seuls les candidats
-    # du projet sont lus, sans borne sur la file des autres projets.
+    # #3565 : le projet filtre AVANT la lecture des holds — seuls les holds des
+    # candidats du projet sont lus. La file elle-même (`unassigned_lots(None)`)
+    # couvre tous les projets, sans borne : c'est le coût réel de ce passage,
+    # revu au panier #4250.
     candidates = [item for item in storage.of(db).work.unassigned_lots(None)
                   if _lot_project(item) == project]
     holds = _take_holds(db, candidates)

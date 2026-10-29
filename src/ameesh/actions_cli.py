@@ -591,11 +591,12 @@ def _prose_and_unasked(prose: list[dict], waiting: list[dict], now: float) -> No
 
 
 def _closed_requests(rows: list[dict], now: float) -> None:
-    """`--all` : les demandes répondues ou retirées, les plus récentes d'abord."""
+    """`--all` : les demandes closes (répondues, retirées ou closes sans
+    réponse), les plus récentes d'abord."""
     if not rows:
         return
     from . import decisions as decisions_mod
-    print("\nanswered or withdrawn requests (most recent first):")
+    print("\nanswered, withdrawn or closed without an answer (most recent first):")
     for view in rows:
         for line in decisions_mod.format_view(view, now):
             print("  " + line)
@@ -739,7 +740,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_dec = sub.add_parser("decisions", help="human decision queue")
     p_dec.add_argument("--for", dest="for_human", default=None, metavar="human:ID")
     p_dec.add_argument("--all", action="store_true",
-                       help="also answered or withdrawn requests (most recent)")
+                       help="also answered, withdrawn or closed without an answer "
+                            "(most recent)")
     p_dec.add_argument("--json", action="store_true")
     p_dec.set_defaults(func=cmd_decisions)
     return parser

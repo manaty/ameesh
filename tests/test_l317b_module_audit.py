@@ -44,9 +44,71 @@ class AuditReportingTest(unittest.TestCase):
     def test_no_active_modules_and_unknown_module_do_not_run_it(self):
         for entries in ([], [{"project": "acme", "module": "unknown"}]):
             with mock.patch.object(ModuleStore, "active", return_value=entries), \
-                    mock.patch.object(it, "audit") as audit:
+                    mock.patch.object(it, "audit") as audit, \
+                    mock.patch("ameesh.modules.dev.audit", return_value=[]) as dev_audit:
                 self.assertEqual(modules.audit(mock.Mock()), [])
                 audit.assert_not_called()
+            # L101 T4 : le module toujours actif `dev` est audité une fois,
+            # sans projet (portée hôte).
+            dev_audit.assert_called_once_with(mock.ANY, None)
+
+    def test_always_active_dev_runs_once_through_the_real_audit_path(self):
+        """L101 T4: `dev` has no `project_modules` row (the canon refuses its
+        selection), yet the common `modules.audit(db)` path returns its host
+        findings once, alongside the project modules really activated."""
+        from ameesh import canon
+        finding = canon.Finding("host-work-dir-missing", canon.WARNING,
+                                "agent a on host h: no working directory",
+                                host="h", agent="a", member="m", path="p")
+        active = [{"project": "acme", "module": "it"},     # real activations:
+                  {"project": "other", "module": "it"}]    # no `dev` row exists
+        with mock.patch.object(ModuleStore, "active", return_value=active), \
+                mock.patch.object(it, "audit", return_value=[]) as it_audit, \
+                mock.patch("ameesh.config.load", return_value=object()), \
+                mock.patch("ameesh.canon.load_configured", return_value=[object()]), \
+                mock.patch("ameesh.canon.validate", return_value=[finding]):
+            result = modules.audit(mock.Mock())
+        self.assertEqual(it_audit.call_count, 2)          # once per project
+        # One host pass, not one per project, and no project owns it.
+        self.assertEqual([(f["module"], f["rule"], f["project"], f["host"])
+                          for f in result],
+                         [("dev", "host-work-dir-missing", None, "h")])
+
+    def test_always_active_dev_is_absent_in_the_bare_profile(self):
+        with mock.patch("ameesh.modules._builtin", return_value={}), \
+                mock.patch("ameesh.modules._entry_points", return_value=()), \
+                mock.patch.object(ModuleStore, "active", return_value=[]), \
+                mock.patch("ameesh.modules.dev.audit") as dev_audit:
+            self.assertEqual(modules.audit(mock.Mock()), [])
+        dev_audit.assert_not_called()
+
+    def test_host_scoped_module_findings_keep_distinct_alert_keys(self):
+        """L101 T4: two hosts with the same rule are two alerts."""
+        base = {"type": "module_deviation", "module": "dev",
+                "rule": "host-work-dir-missing", "project": None,
+                "lot": None, "declaration_id": None}
+        self.assertNotEqual(notify.key_of(dict(base, host="h1", agent="a1")),
+                            notify.key_of(dict(base, host="h2", agent="a2")))
+        project = dict(base, project="acme", lot=42, declaration_id=7)
+        self.assertEqual(notify.key_of(project),
+                         notify.key_of(dict(project, agent="reassigned")))
+
+    def test_host_scoped_findings_get_no_project_orchestrator(self):
+        """A host setting belongs to no project: never scope it by
+        `chantier == None`, which would attach a project-less orchestrator to
+        every host finding; a project finding keeps its project route."""
+        host = {"type": "module_deviation", "module": "dev",
+                "rule": "host-work-dir-missing", "project": None, "lot": None,
+                "host": "h1", "agent": "a1", "since": None,
+                "detail": "x", "action": "x"}
+        project = dict(self.finding(), orchestrators=[])
+        listing = [{"name": "global-orch"}, {"name": "orch-acme", "chantier": "acme"}]
+        with mock.patch.object(modules, "audit", return_value=[host, project]), \
+                mock.patch("ameesh.sous_utilisation.orchestrators",
+                           return_value=["global-orch", "orch-acme"]):
+            alerts = exploitation._module_deviations(None, mock.Mock(), listing)
+        self.assertEqual(alerts[0]["orchestrators"], [])
+        self.assertEqual(alerts[1]["orchestrators"], ["orch-acme"])
 
     def test_old_schema_is_supported_but_unavailability_propagates(self):
         db = mock.Mock()
@@ -58,7 +120,8 @@ class AuditReportingTest(unittest.TestCase):
 
     def test_module_is_the_only_source_of_rule_and_findings(self):
         with mock.patch.object(ModuleStore, "active", return_value=[{"project": "acme", "module": "it"}]), \
-                mock.patch.object(it, "audit", return_value=[self.finding()]) as audit:
+                mock.patch.object(it, "audit", return_value=[self.finding()]) as audit, \
+                mock.patch("ameesh.modules.dev.audit", return_value=[]):
             result = modules.audit(mock.Mock())
         audit.assert_called_once_with(mock.ANY, "acme")
         self.assertEqual(result[0]["rule"], "execution-proof")
@@ -288,6 +351,37 @@ class AuditEvidenceTest(PgTestCase):
         self.assertEqual(router.resolve(dict(alert, agent="dev-b")), ("human:owner-a", "lot"))
         self.db.execute("UPDATE work_packages SET responsible = NULL WHERE id = 'owner-a'")
         self.assertEqual(router.resolve(dict(alert, agent="dev-b")), ("human:default", "defaut"))
+
+    def test_two_host_scoped_findings_reach_their_own_responsible_human(self):
+        """L101 T4 / #4552: a host-scoped module finding has no lot; it must
+        reach the responsible human of its host or agent, not fall back to the
+        default human. Two hosts with the same rule stay two routes."""
+        root = Path(self.tmp) / "canon-two-hosts"
+        hosts = root / "hotes"
+        hosts.mkdir(parents=True, exist_ok=True)
+        for host in ("h1", "h2"):
+            (hosts / ("%s.md" % host)).write_text(
+                "---\ntype: Host\ntitle: %s\nresponsible: human:resp-%s\n"
+                "policy:\n  harnesses: [claude]\n  max_agents: 2\n---\n\n# %s\n"
+                % (host, host, host), encoding="utf-8")
+        for agent, host in (("a1", "h1"), ("a2", "h2")):
+            registry.upsert(self.db, agent, harness="claude", host=host)
+        cfg = dataclasses.replace(self.cfg, canon=str(root), canon_untrusted=True)
+        ncfg = notify.parse_config({"default_human": "human:default"})
+
+        def finding(host, agent):
+            return {"type": "module_deviation", "module": "dev",
+                    "rule": "host-work-dir-missing", "project": None, "lot": None,
+                    "host": host, "agent": agent, "since": None,
+                    "detail": "workspace finding", "action": "fix the host"}
+
+        router = notify.Router(cfg, self.db, ncfg)
+        self.assertEqual(router.resolve(finding("h1", "a1")), ("human:resp-h1", "hote"))
+        self.assertEqual(router.resolve(finding("h2", "a2")), ("human:resp-h2", "hote"))
+        # The agent's responsible human is consulted before its host's.
+        self.db.execute("UPDATE agent_registry SET responsible = 'human:resp-a2' WHERE name = 'a2'")
+        self.assertEqual(notify.Router(cfg, self.db, ncfg).resolve(finding("h2", "a2")),
+                         ("human:resp-a2", "agent"))
 
     def test_persisted_foreign_human_delivery_is_reconciled_before_retry_or_resolution(self):
         storage.of(self.db).packages.upsert({"id": "owner-a", "kind": "lot", "title": "A",

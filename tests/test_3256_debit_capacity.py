@@ -316,8 +316,11 @@ class ReadCapacityTest(unittest.TestCase):
         from types import SimpleNamespace
         lot = {"id": 12, "title": "lot", "state": "intake", "assignee": None,
                "app": "ameesh", "type": "evolution", "created_ts": T - H}
-        store = SimpleNamespace(operations=SimpleNamespace(
-            listing=lambda: team(2, 8), open_lots_activity=lambda limit: [lot]))
+        store = SimpleNamespace(
+            operations=SimpleNamespace(
+                listing=lambda: team(2, 8), open_lots_activity=lambda limit: [lot]),
+            # #4561 : la garde d'empreinte est lue pour la part démarrable.
+            work_footprints=SimpleNamespace(for_items=lambda ids: []))
         rule = SimpleNamespace(queue_fill=SimpleNamespace(repos_part=PART, repos_s=REPOS))
         db = mock.Mock()
         db.query.return_value = []

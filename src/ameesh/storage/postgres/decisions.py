@@ -72,6 +72,56 @@ class Decisions(interface.Decisions):
             (int(decision_id),))
         return rows[0] if rows else None
 
+    def repair_forward(self, decision_id, *, actor):
+        # #4571: no approval or answer is created. Row locks serialize this
+        # repair with close/forward; ambiguous or already answered copies stay put.
+        with self.db.transaction() as tx:
+            rows = tx.query("SELECT id, recipient, kind, payload, meta, status, delivered_at"
+                            " FROM agent_mailbox WHERE id = %s FOR UPDATE",
+                            (int(decision_id),))
+            if not rows:
+                raise ValueError("decision not found")
+            original = rows[0]
+            decision = (original["payload"] or {}).get("decision")
+            forwarded = (original["meta"] or {}).get("forwarded") or {}
+            copy_id = forwarded.get("message_id")
+            if (original["kind"] != "request" or not isinstance(decision, dict)
+                    or not original["recipient"].startswith("human:")
+                    or not copy_id or original["status"] != "delivered"
+                    or original["delivered_at"] is None):
+                raise ValueError("not an accidentally forwarded human decision")
+            copies = tx.query("SELECT id, recipient, kind, payload, meta, status"
+                              " FROM agent_mailbox WHERE id = %s FOR UPDATE", (copy_id,))
+            if not copies:
+                raise ValueError("forwarded decision copy not found")
+            copy = copies[0]
+            origin = (copy["meta"] or {}).get("forwarded_from") or {}
+            for row in (original, copy):
+                content = (row["payload"] or {}).get("decision") or {}
+                if (content.get("state", "pending") != "pending"
+                        or content.get("answer") or content.get("withdrawn")
+                        or row["status"] == "answered"):
+                    raise ValueError("decision or copy was already answered or withdrawn")
+            if (copy["kind"] != "request" or copy["payload"] != original["payload"]
+                    or origin.get("message_id") != int(decision_id)
+                    or origin.get("agent") != original["recipient"]
+                    or forwarded.get("to") != copy["recipient"]
+                    or (copy["meta"] or {}).get("forwarded")):
+                raise ValueError("forward chain or changed copy: repair refused")
+            record = json.dumps({"state": "withdrawn", "withdrawn": {
+                "by": actor, "why": "accidental forward repaired; original #%d restored"
+                % int(decision_id)}})
+            tx.execute("UPDATE agent_mailbox SET status = 'delivered', delivered_at = now(),"
+                       " payload = jsonb_set(payload, '{decision}',"
+                       " (payload->'decision') || %s::jsonb),"
+                       " meta = meta - 'consigne' WHERE id = %s", (record, copy_id))
+            tx.execute("UPDATE agent_mailbox SET status = 'pending', delivered_at = NULL,"
+                       " meta = (meta - 'forwarded') || jsonb_build_object("
+                       " 'forward_repaired', jsonb_build_object('copy', %s::bigint,"
+                       " 'by', %s::text, 'ts', extract(epoch from now()))) WHERE id = %s",
+                       (copy_id, actor, int(decision_id)))
+            return {"decision": int(decision_id), "withdrawn_copy": int(copy_id)}
+
     def pending(self, *, limit) -> list[dict]:
         return self.db.query(
             "SELECT %s FROM agent_mailbox WHERE delivered_at IS NULL AND %s"
@@ -146,6 +196,67 @@ class Decisions(interface.Decisions):
              LIMIT %s
             """.replace("__COLUMNS__", _MAIL_COLUMNS),
             (float(since_ts), json.dumps(list(recipients)), int(limit)))[::-1]
+
+    def validation_register(self, decision_id, *, routing):
+        self.db.execute("INSERT INTO decision_validations(decision_id, routing)"
+                        " VALUES (%s, %s::jsonb)",
+                        (int(decision_id), json.dumps(routing)))
+
+    def validation_route(self, decision_id):
+        rows = self.db.query("SELECT routing FROM decision_validations WHERE decision_id = %s",
+                             (int(decision_id),))
+        return rows[0]["routing"] if rows else None
+
+    def validation_due(self, *, now):
+        return self.db.query(
+            "SELECT m.id FROM agent_mailbox m JOIN decision_validations v ON v.decision_id = m.id"
+            " WHERE m.delivered_at IS NULL AND v.escalated_at IS NULL"
+            " AND CASE WHEN jsonb_typeof(m.payload->'decision'->'due_ts') = 'number'"
+            " THEN (m.payload->'decision'->>'due_ts')::numeric <= %s ELSE true END"
+            " ORDER BY m.id", (float(now),))
+
+    def validation_lock(self, decision_id):
+        rows = self.db.query(
+            "SELECT %s FROM agent_mailbox WHERE id = %%s AND %s FOR UPDATE"
+            % (_COLUMNS, _IS_DECISION), (int(decision_id),))
+        return rows[0] if rows else None
+
+    def validation_escalate(self, decision_id, *, recipient, decision, body, now):
+        self.db.execute(
+            "UPDATE agent_mailbox SET recipient = %s, body = %s,"
+            " payload = jsonb_set(payload, '{decision}', %s::jsonb) WHERE id = %s",
+            (recipient, body, json.dumps(decision), int(decision_id)))
+        self.db.execute(
+            "UPDATE decision_validations SET escalated_at = to_timestamp(%s),"
+            " routing = routing || %s::jsonb WHERE decision_id = %s",
+            (float(now), json.dumps({"escalated_to": recipient}), int(decision_id)))
+
+    def validation_event(self, decision_id, *, person, kind, now, facts, event_key):
+        self.db.execute(
+            "INSERT INTO validation_events(decision_id, person, kind, occurred_at, facts, event_key)"
+            " VALUES (%s, %s, %s, to_timestamp(%s), %s::jsonb, %s)"
+            " ON CONFLICT(decision_id, event_key) DO NOTHING",
+            (int(decision_id), person, kind, float(now), json.dumps(facts), event_key))
+
+    def validation_history(self, *, person):
+        # Deliberately absent from the mediated executor's closed contract.
+        return self.db.query(
+            "SELECT e.decision_id, person, kind, extract(epoch from occurred_at)::float8 AS ts,"
+            " facts, routing->>'domain' AS domain FROM validation_events e"
+            " JOIN decision_validations v ON v.decision_id = e.decision_id"
+            " WHERE person = %s ORDER BY e.id", (person,))
+
+    def validation_followup(self, decision_id, *, followup_id, response_key):
+        self.db.execute(
+            "INSERT INTO validation_decision_links(source_id, target_id, relation, response_key)"
+            " VALUES (%s, %s, 'contradicts', %s)",
+            (int(decision_id), int(followup_id), response_key))
+
+    def validation_followup_id(self, decision_id, *, response_key):
+        rows = self.db.query(
+            "SELECT target_id FROM validation_decision_links WHERE source_id = %s AND response_key = %s",
+            (int(decision_id), response_key))
+        return rows[0]["target_id"] if rows else None
 
     def register_chat(self, name, *, human, host, harness, cwd, status_text) -> dict | None:
         # L123 : un agent `execute` du même nom, ou un bail vivant, ne se

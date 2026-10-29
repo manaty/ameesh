@@ -132,10 +132,11 @@ def report() -> None:
 class GenericCoreTest(unittest.TestCase):
     def test_core_does_not_import_module_implementations(self):
         # L98 T3 (#4406): the legacy adapters read through the registry.
-        # L100 T1/T4: temporary identity aliases, removed by L104.
+        # L100 T1/T2/T4: temporary identity aliases, removed by L104.
         exceptions = Counter({(name + ".py", "module-import"): 1
-                              for name in ("merge_pr", "connectors/git_merge",
-                                           "review", "lot_class", "review_target")})
+                              for name in ("plan_github", "plan_git", "merge_pr",
+                                           "connectors/git_merge", "review",
+                                           "lot_class", "review_target")})
         actual = Counter({key: count for key, count in scan_core().items()
                           if key[1] == "module-import"})
         self.assertFalse(actual - exceptions,
@@ -172,6 +173,12 @@ class GenericCoreTest(unittest.TestCase):
     def test_template_includes_javascript_state_literals(self):
         self.assertEqual(scan_template("const state = 'qa'; const merged = true;"),
                          {"state:qa": 1})
+
+    def test_the_workspaces_facade_is_read_through_the_registry(self):
+        """L101 T4: the core asks the registry for `dev`, never imports it."""
+        source = (SOURCE / "workspaces.py").read_text()
+        self.assertIn('registry.get("dev")', source)
+        self.assertEqual(scan_python(source, "workspaces.py")["module-import"], 0)
 
     def test_legacy_terminal_and_completed_semantics_remain_distinct(self):
         self.assertEqual(work.STATES, ("intake", "build", "qa", "validated", "merged", "promoted",

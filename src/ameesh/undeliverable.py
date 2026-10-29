@@ -28,6 +28,11 @@ Les parades, appelées par `ameesh mail send|forward`, `ameesh alerts` /
 * `alerts` : `mail_undeliverable`, du courrier en attente depuis plus de
   15 min chez un agent arrêté ou inexistant, pour le responsable humain et,
   par courrier (`orchestrator_briefs`), les orchestrateurs de l'équipe ;
+* un humain DÉCLARÉ (`human:<id>` : `humans` de la configuration, Member du
+  canon, ou humain déjà résolu en base) n'est pas une boîte d'agent : il lit
+  par `ameesh decide` et par le fil. Son courrier n'est donc ni alerté
+  `mail_undeliverable` ni expiré (#4519) ; un `human:<id>` non déclaré reste
+  un nom inconnu, et l'alerte le dit (faute de frappe probable) ;
 * `forward` : `ameesh mail forward <ancien> <nouveau>` re-livre le courrier en
   attente d'une boîte morte à un agent vivant, expéditeur et date d'origine
   gardés, renvoi noté ; l'original n'est plus en attente.
@@ -205,14 +210,68 @@ def suggestions(dest: str, rows: list, *, role_names=(), team: str = "") -> list
     return out[:MAX_SUGGESTIONS]
 
 
-def _known_human(cfg, db, name: str) -> str | None:
+def _known_human(cfg, db, name: str, *, canons=None) -> str | None:
     from . import work
     try:
-        return work.known_human(db, name, cfg)
+        return work.known_human(db, name, cfg, canons=canons)
     except db_mod.SchemaMissing:
         raise
     except Exception:
         return None
+
+
+def human_recipient(cfg, db, name: str, *, canons=None) -> bool:
+    """#4519 : `name` désigne un humain DÉCLARÉ (`human:<id>`), pas une boîte
+    d'agent. Un humain lit par `ameesh decide` et par le fil : son courrier
+    n'est ni « non distribuable » ni expiré. Un `human:<id>` non déclaré reste
+    un nom inconnu (faute de frappe probable) ; un nom nu n'est jamais un
+    destinataire humain ici."""
+    prefix = "human:"
+    name = (name or "").strip()
+    if not name.startswith(prefix):
+        return False
+    bare = name[len(prefix):].strip()
+    if not bare or ":" in bare:
+        return False
+    return _known_human(cfg, db, bare, canons=canons) == name
+
+
+def _canons_once(cfg):
+    """Un chargeur de canon lu au plus une fois par passage (`known_human`)."""
+    from . import work
+    loaded: list = []
+
+    def canons() -> list:
+        if not loaded:
+            loaded.append(work.configured_canons(cfg))
+        return loaded[0]
+    return canons
+
+
+def without_human_boxes(cfg, db, rows: list[dict], *, canons=None) -> list[dict]:
+    """#4519 : écarte les lignes de courrier en souffrance dont le destinataire
+    est un humain DÉCLARÉ : il lit par `ameesh decide` et par le fil, pas par
+    une boîte d'agent — son courrier n'est pas perdu et n'a pas à alerter.
+    `canons` : un chargeur déjà en cache chez l'appelant, sinon lu ici une
+    fois."""
+    if not rows:
+        return rows
+    loader = canons if canons is not None else _canons_once(cfg)
+    cache: dict = {}
+
+    def declared(name: str) -> bool:
+        if name not in cache:
+            cache[name] = human_recipient(cfg, db, name, canons=loader)
+        return cache[name]
+
+    return [row for row in rows if not declared(str(row.get("recipient") or ""))]
+
+
+def dead_letters(cfg, db, *, canons=None) -> list[dict]:
+    """Les lignes de `mailbox.dead_letters` qui sont vraiment des boîtes
+    mortes : un humain déclaré n'en est pas une (#4519)."""
+    return without_human_boxes(cfg, db, storage.of(db).mailbox.dead_letters(),
+                               canons=canons)
 
 
 # --------------------------------------------------------------------------
@@ -412,11 +471,27 @@ def wake_note(cfg, db, name: str, row: dict) -> list[str]:
     réveil est possible, ou quand aucun n'est attendu : une identité `externe`
     (session humaine) est lue à son prochain tour, et un destinataire arrêté
     est déjà refusé ou averti par l'appelant. Le répertoire réduit du contrat
-    1.1 (pas de `mode`) ne permet pas de juger : on n'avertit pas."""
+    1.1 (pas de `mode`) ne permet pas de juger : on n'avertit pas.
+
+    #4610 : le sommeil automatique du découpage est réveillable pour qu'une
+    attribution passe, mais un courrier ordinaire ne le lève pas ; l'expéditeur
+    reçoit donc un avertissement, comme pour une pause d'opérateur."""
     if "mode" not in row or (row.get("mode") or "execute") == "externe":
         return []
     ok, why, _note = registry.wake_status(db, cfg, name)
     if ok:
+        # #4610 : seuls une attribution, un lot démarrable, un courrier du
+        # pilote ou d'un orchestrateur, ou l'échéance lèvent ce sommeil ; un
+        # message d'un autre expéditeur attend. Le taire ferait croire à un
+        # réveil qui n'arrivera pas.
+        from . import file_decoupage
+        if (row.get("operator_paused")
+                and file_decoupage.is_sleep_reason(row.get("operator_pause_reason"))):
+            return ["%s is under the automatic roadmap sleep: the message is stored, "
+                    "but it does not open a turn by itself; the sleep is lifted by a "
+                    "lot assigned to it, a startable lot in its project, mail from its "
+                    "pilot or an orchestrator, or its deadline; if the request cannot "
+                    "wait, address another agent" % name]
         return []
     if row.get("operator_paused"):
         # #2200 : la pause humaine a sa propre sortie ; « prochain canon sync »
@@ -515,10 +590,11 @@ def alerts(cfg, db, listing: list, now: float, *, threshold_s: float = DEFAULT_T
     (`inconnu`). Une alerte par destinataire ; `responsible` : le responsable
     de l'agent arrêté, ou le plus fréquent des expéditeurs pour un nom inconnu ;
     `orchestrators` : ceux de l'équipe (le courrier de `ameesh notify` les
-    prévient). Un seuil nul ou négatif désactive l'alerte."""
+    prévient). Un seuil nul ou négatif désactive l'alerte. Un humain déclaré
+    n'est pas une boîte morte (#4519)."""
     if threshold_s <= 0:
         return []
-    due = [g for g in by_recipient(storage.of(db).mailbox.dead_letters())
+    due = [g for g in by_recipient(dead_letters(cfg, db, canons=canons))
            if g["oldest_ts"] is not None and now - g["oldest_ts"] >= threshold_s]
     if not due:
         return []
@@ -656,6 +732,8 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
             now: float | None = None) -> dict:
     """Re-livre à `new` le courrier en attente de `old`, une boîte morte.
 
+    Les boîtes `human:*` sont refusées ; les demandes de décision ne sont
+    jamais copiées (y compris en aperçu).
     `old` doit être arrêté (`stopped`) ou absent du registre : on ne vide pas
     la boîte d'un agent qui la lit. `new` doit être inscrit, ni arrêté ni
     retiré (#3460).
@@ -668,6 +746,8 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
     verrou du registre DANS la transaction qui copie ; une relance de l'un ou
     un arrêt de l'autre, committé entre la lecture et la copie, lève `Refused`
     au lieu de copier le courrier d'un vivant vers un mort."""
+    if old.startswith("human:"):
+        raise RefusedOld("%s is a human mailbox: use ameesh decisions, not forward" % old)
     if old == new:
         raise Refused("old and new recipient are the same (%s)" % old)
     old_row, new_row = db_mod.batched(db, lambda d: [registry.get(d, old),
@@ -692,7 +772,8 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
         return {"old": old, "new": new, "old_state": state, "dry_run": True,
                 "messages": [{"id": int(r["id"]), "sender": r.get("sender"),
                               "kind": r.get("kind"), "created_ts": r.get("created_ts")}
-                             for r in rows],
+                             for r in rows if not (r.get("kind") == "request"
+                                 and (r.get("payload") or {}).get("decision") is not None)],
                 "forwarded": []}
     try:
         moved = storage.of(db).mailbox.forward(old, new, actor)
@@ -786,7 +867,9 @@ def sweep(cfg, db, *, days=None, now=None, dry_run=False, actor="ameesh:mail-swe
     """L976 : re-livre ou expire le courrier en souffrance, sans geste humain.
 
     Destinataires visés : ceux de `dead_letters` (agent arrêté, ou nom absent
-    du registre) — personne ne lit leur boîte.
+    du registre) — personne ne lit leur boîte. Un humain déclaré n'en est pas
+    une (#4519) : son courrier se lit par `ameesh decide` et par le fil, ni
+    expiré ni alerté.
 
     * un agent arrêté dont le successeur est connu (`successor` : la session de
       l'arrêté est liée à un agent vivant) : le courrier lui est re-livré
@@ -812,7 +895,7 @@ def sweep(cfg, db, *, days=None, now=None, dry_run=False, actor="ameesh:mail-swe
     now = time.time() if now is None else float(now)
     cutoff = now - days * 86400.0 if days > 0 else None
     mail = storage.of(db).mailbox
-    groups = sorted(by_recipient(mail.dead_letters()), key=lambda g: g["recipient"])
+    groups = sorted(by_recipient(dead_letters(cfg, db)), key=lambda g: g["recipient"])
     rows = registry_rows(db, [g["recipient"] for g in groups]) if groups else {}
     bindings: list | None = None
     report = {"days": days, "cutoff": cutoff, "dry_run": bool(dry_run),

@@ -42,7 +42,10 @@ l'ordre, sans agent :
    fichiers (`packet_red`, #3801) ne désigne plus un voisin ; elle reste la
    lecture des rouges propres et des contrats (#3931). Un rouge voisin
    impossible à situer sur les préfixes n'entraîne **aucun retrait** : le
-   pilote est prévenu et le paquet s'arrête. Un rouge non attribuable garde
+   pilote est prévenu et le paquet s'arrête. Un test rouge sur la tête mais
+   **vert sur tous les préfixes** est instable (#4221) : consigné non
+   concluant, sans retrait, le paquet continue et le pilote est prévenu. Un
+   rouge non attribuable garde
    le geste antérieur : une unité dont le module propre a rougi est retirée,
    un contrat rouge arrête (l'attribution demande un agent). Un run **non
    concluant** (délai, base absente, psql/psycopg indisponible, erreur de
@@ -72,6 +75,13 @@ prêts — celui d'un paquet parallèle. Tout autre lot prêt est écrit aux éc
 avec le motif « paquet parallèle : autre groupe disjoint », jamais composé
 dans deux paquets.
 
+#4581 : `--keep-composition REF` reprend **les membres** de la composition du
+manifeste gelé à REF, moins les `--exclude`, chacun à sa source composée. Un
+lot prêt depuis cette composition, un membre regelé (nouvelle tête) ou disparu
+de la liste prête n'est pas admis : il est écrit aux écartés avec le motif
+« coupure suivante : … ». Après un rouge, le paquet ne grossit donc plus à
+chaque recomposition, et aucune tête neuve n'entre sans ci de paquet.
+
 #4113 : hors banc sans base, la même garde d’époque que `packet record`
 est relue avant la composition, entre unités, avant chaque série de tests et
 avant publication. Une perte de bail arrête avant l’opération suivante ;
@@ -84,6 +94,16 @@ paquet-horaire les lit dans `packet_tests` du canon compilé. Les voisins de la
 carte sont pesés par `tests/parts/durees.json` pour le pilote des tests
 (`test_driver`), que le manifeste nomme : sous psql, la suite est ~6 fois plus
 lente que la mesure psycopg de la carte.
+
+#4463 : une fois la tête poussée, la garde relue avant chaque série relit
+aussi l'état de la PR : fusionnée (ou close) pendant les tests par unité, leurs
+résultats ne peuvent plus retirer une unité ; les séries non parties sont
+abandonnées et le porteur reçoit « tests par unité interrompus : porteur
+fusionné à <sha> ». `--tests-budget S` (paquet-horaire :
+`packet_tests.total_timeout_seconds` du canon compilé) borne la durée totale
+des tests : chaque série est bornée au temps restant, celles qui ne partent
+plus avant l'échéance sont non concluantes (canon §3) et le tic suivant peut
+partir.
 
 #4237 : un refus de geste (bail relevé, `GestureRefused`) **après des tests
 verts** ne perd plus le paquet : depuis #4304, la tête est déjà poussée,
@@ -130,11 +150,13 @@ une tête testée n'est pas publiable (`--publish`, #4237).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -169,6 +191,10 @@ DEFAULT_TIMEOUT = 1800
 DEFAULT_PARALLEL = 1
 #: #4271 : code de sortie d'`ameesh heavy` arrêté par sa borne (`heavy.CAPPED_EXIT`)
 HEAVY_CAPPED_EXIT = 124
+#: #4463 : après SIGTERM au temps mural échu, le délai laissé à `ameesh heavy`
+#: pour arrêter sa série : SIGKILL au groupe après `heavy.GROUP_GRACE_S`
+#: (10 s), puis arrêt de ses autres descendants (SIGTERM, SIGKILL 10 s après)
+WALL_GRACE_S = 30
 FREEZE_TIMEOUT = 600
 GIT_TIMEOUT = 300
 #: #4245 : `RESTART_RESERVE_S` (90 s) de l'élection, plus la lecture
@@ -206,6 +232,12 @@ PARALLEL_EXCLUDE_REASON = "paquet parallèle : autre groupe disjoint"
 #: écarté avec ce motif, jamais une erreur qui garde la cible réservée.
 PARALLEL_GROUP_NOT_READY = "paquet parallèle : lot du groupe non prêt"
 PARALLEL_GROUP_GONE = "paquet parallèle : lot du groupe introuvable"
+#: #4581 : motifs écrits par une recomposition qui garde la composition
+#: précédente. Les lots prêts depuis vont au paquet suivant, jamais dans
+#: celui-ci ; un membre regelé n'est pas réadmis sur une tête sans ci de paquet.
+KEEP_READY_REASON = "coupure suivante : recomposition"
+KEEP_REFROZEN_REASON = "coupure suivante : tête regelée"
+KEEP_NOT_READY_REASON = "coupure suivante : membre non prêt"
 #: sorties qui ne prouvent pas un rouge du lot (environnement, base absente)
 #: #4217 : un `tearDownClass`/`setUpClass` en `QueryCanceled` (statement
 #: timeout, base de test chargée) est une panne d'infrastructure, jamais un
@@ -219,6 +251,17 @@ INCONCLUSIVE_RE = re.compile(
     r"ModuleNotFoundError: No module named 'psycopg)",
     re.IGNORECASE,
 )
+#: #4221 : un QueryCanceled ou un lock timeout **reproduit** en rejouant seul,
+#: hors charge, est un rouge réel ; hors rejeu, il reste non concluant.
+CANCEL_MESSAGE_RE = re.compile(
+    r"canceling statement due to (?:statement|lock) timeout|timeout expired",
+    re.IGNORECASE,
+)
+#: #4221 : une erreur levée dans `setUp`/`tearDown` (comme dans
+#: `setUpClass`/`tearDownClass`) est une panne de fixture : non concluante
+#: même rejouée seule. Seul le corps de la méthode de test peut se confirmer.
+FIXTURE_FRAME_RE = re.compile(
+    r"^\s+File .*, line \d+, in (?:setUp|tearDown)\s*$", re.MULTILINE)
 #: le **message** d'une exception d'environnement (sans les noms de types :
 #: un `AssertionError: expected OperationalError` reste un rouge réel, et un
 #: `ValueError: expected QueryCanceled` aussi : le nom psycopg est reconnu par
@@ -306,6 +349,19 @@ class GitError(PaquetAutoError):
 
 class EpochLost(PaquetAutoError):
     """#4237 : un geste refusé par la garde d'époque (bail relevé)."""
+
+
+class CarrierSettled(PaquetAutoError):
+    """#4463 : la PR du paquet a fusionné (ou a été close) pendant ses tests."""
+
+    def __init__(self, state: str) -> None:
+        self.state = state
+        super().__init__("PR %s pendant les tests par unité" % state.lower())
+
+
+class BudgetSpent(PaquetAutoError):
+    """#4463 : l'échéance totale des tests par unité passée en plein rejeu des
+    préfixes : non concluant, aucune unité retirée (§3)."""
 
 
 class ChainRefused(PaquetAutoError):
@@ -403,6 +459,9 @@ class TestRun:
     #: Rouge écarté après rejeu des seuls voisins sur la base (#4048).
     ignored_red: bool = False
     log_path: str = ""
+    #: #4221 : tests rouges sur la tête mais verts sur tous les préfixes de
+    #: l'empilement (instables) : non concluants, ils ne retirent aucune unité.
+    flaky_tests: list[str] = field(default_factory=list)
 
     @property
     def green(self) -> bool:
@@ -443,6 +502,40 @@ class TestRun:
             return True
         return False
 
+    def body_cancel_tests(self) -> set[str]:
+        """#4221 : les tests dont un QueryCanceled/lock timeout est l'exception.
+
+        Seuls les `ERROR:` du **corps** d'un test comptent : une erreur de
+        `setUpClass`/`tearDownClass` reste une panne de fixture, non
+        concluante même rejouée seule. Sert au rejeu hors charge : un même
+        test qui redonne ce QueryCanceled reproduit une erreur déterministe,
+        alors qu'un QueryCanceled de charge ne revient pas.
+        """
+        found: set[str] = set()
+        for match in FAIL_LINE_RE.finditer(self.output or ""):
+            kind, test = match.group(1), match.group(2).strip()
+            if kind != "ERROR" or not test:
+                continue
+            header = match.group(0)
+            if header.startswith("ERROR: setUpClass") \
+                    or header.startswith("ERROR: tearDownClass"):
+                continue
+            rest = (self.output or "")[match.end():]
+            end = BLOCK_END_RE.search(rest)
+            block = rest[:end.start()] if end else rest
+            if FIXTURE_FRAME_RE.search(block):
+                continue
+            exception = last_exception(block)
+            if exception is None:
+                continue
+            name, message = exception
+            short = name.rsplit(".", 1)[-1]
+            if short == "AssertionError":
+                continue
+            if short == "QueryCanceled" or CANCEL_MESSAGE_RE.search(message):
+                found.add(test)
+        return found
+
     @property
     def real_failure(self) -> bool:
         """Un test négatif réel, même mêlé à une erreur d'environnement.
@@ -453,6 +546,8 @@ class TestRun:
         `FAIL + OperationalError` est donc rouge, jamais « non concluant ».
         """
         if self.returncode == 0:
+            return False
+        if self.flaky_tests:
             return False
         if self.timed_out or self.returncode != 1:
             return False
@@ -483,6 +578,8 @@ class TestRun:
 
     @property
     def inconclusive(self) -> bool:
+        if self.flaky_tests:
+            return True
         if self.timed_out or self.returncode not in (0, 1):
             return True
         if self.returncode == 1:
@@ -501,6 +598,10 @@ class TestRun:
 
     def motive(self) -> str:
         """Pourquoi un run est non concluant, en une ligne."""
+        if self.flaky_tests:
+            return ("test(s) rouge(s) sur la tête mais vert(s) sur tous les "
+                    "préfixes (instable) : %s"
+                    % ", ".join(self.flaky_tests[:3]))
         if self.timed_out:
             return "délai dépassé"
         if self.returncode not in (0, 1):
@@ -1038,6 +1139,108 @@ def exclude_discards(requested: list[int], reasons: list[str],
     return discards
 
 
+def composition_specs(repo: Path, reference: str, name: str) -> list[tuple[list[int], str]]:
+    """#4581 : la table `## Composition` du manifeste gelé à `reference`."""
+    sha = rev(repo, reference)
+    if sha is None:
+        raise InputError("--keep-composition : référence %r introuvable" % reference)
+    rel = manifest_rel(name)
+    show = git(repo, "show", "%s:%s" % (sha, rel), check=False)
+    if show.returncode != 0:
+        raise InputError(
+            "--keep-composition : manifeste %s illisible sur %s : %s"
+            % (rel, sha[:12], _tail(_decode(show.stderr))))
+    try:
+        return parse_composition_table(_decode(show.stdout))
+    except InputError as error:
+        raise InputError(
+            "--keep-composition : %s illisible sur %s : %s"
+            % (rel, sha[:12], error)) from error
+
+
+def same_source(worktree: Path, composed: str, candidate: str) -> bool:
+    """Le candidat pointe-t-il le commit de la source **composée** ?
+
+    La table `## Composition` écrit la source abrégée (#3629, `--short=12`) ;
+    on la résout donc dans le worktree avant de comparer au SHA complet du
+    candidat. Une source composée absente du clone n'est jamais reprise en
+    silence : elle va à la coupure suivante (l'invariant « second parent de la
+    tête gelée » est ainsi vérifié, pas supposé). Le SHA du candidat est résolu
+    de même quand il est présent.
+    """
+    if not composed or not candidate:
+        return False
+    resolved = rev(worktree, composed)
+    if resolved is None:
+        return False
+    return resolved == (rev(worktree, candidate) or candidate)
+
+
+def keep_composition(candidates: list[Candidate],
+                     specs: list[tuple[list[int], str]], *,
+                     worktree: Path,
+                     already_discarded: set[int]) -> tuple[list[Candidate], list[Discarded]]:
+    """#4581 : restreint la liste prête aux membres de la composition précédente.
+
+    `specs` vient du manifeste gelé de la composition à conserver ;
+    `already_discarded` porte les lots déjà écartés (erreurs de la liste
+    calculée, `--exclude`, groupe parallèle). Un membre n'est repris que sur sa
+    source composée : une nouvelle tête, un lot sorti de la liste prête ou les
+    lots d'une unité de résolution sont écrits aux écartés pour la coupure
+    suivante, jamais composés ici. Tout lot prêt qui n'était pas dans la
+    composition précédente est nommé de même.
+    """
+    by_lot = {candidate.lot: candidate for candidate in candidates}
+    members: list[Candidate] = []
+    discarded: list[Discarded] = []
+    seen: set[int] = set(already_discarded)
+    for lots, source in specs:
+        if any(lot in seen for lot in lots):
+            seen.update(lots)
+            continue
+        seen.update(lots)
+        if len(lots) != 1:
+            # paquet-auto ne compose pas de résolution (jugement humain) ; une
+            # telle unité ne se reprend pas sans la relire. Chaque lot de
+            # l'unité est nommé aux écartés : sinon les suivants ne seraient
+            # ni composés ni expliqués au contrôle d'inclusion (#4593).
+            detail = ("unité de résolution (%s), non reprise par une recomposition"
+                      % ", ".join("#%d" % lot for lot in lots))
+            discarded.extend(Discarded(lot, KEEP_NOT_READY_REASON, detail)
+                             for lot in lots)
+            continue
+        lot = lots[0]
+        candidate = by_lot.get(lot)
+        if candidate is None:
+            discarded.append(Discarded(
+                lot, KEEP_NOT_READY_REASON,
+                "composé %s, plus dans la liste prête" % source[:12]))
+            continue
+        if rev(worktree, source) is None:
+            # la source composée est le second parent d'une fusion de la tête
+            # gelée : absente du clone, elle ne se reprend pas en silence.
+            discarded.append(Discarded(
+                lot, KEEP_NOT_READY_REASON,
+                "source composée %s introuvable dans le clone" % source[:12]))
+            continue
+        if not same_source(worktree, source, candidate.source):
+            discarded.append(Discarded(
+                lot, KEEP_REFROZEN_REASON,
+                "composé %s, tête actuelle %s : pas de ci de paquet sur la "
+                "nouvelle tête" % (source[:12], candidate.source[:12])))
+            continue
+        candidate.source = source
+        members.append(candidate)
+    for candidate in candidates:
+        if candidate.lot in seen:
+            continue
+        seen.add(candidate.lot)
+        discarded.append(Discarded(
+            candidate.lot, KEEP_READY_REASON,
+            "hors de la composition conservée ; non admis, coupure suivante"))
+    return members, discarded
+
+
 def compute_candidates(worktree: Path, target: str, base_sha: str,
                        ready_out: Path) -> tuple[list[Candidate], dict]:
     """`paquet-candidats.py` **du worktree**, à la base exacte du paquet.
@@ -1423,12 +1626,13 @@ def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
 
 
 def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
-                  timeout: int) -> set[str] | None:
+                  timeout: int, wall: int | None = None) -> set[str] | None:
     """#4025 : les tests de `modules` rouges sur la base, ou None (non concluant).
 
     Un module voisin rouge ne désigne l'unité que s'il est vert sur la base :
     un rouge aussi présent sur la base vient de l'environnement de l'hôte ou
     lui préexiste. Les modules sont rejoués dans un worktree détaché de la base.
+    #4463 : `wall` borne le rejeu en temps mural (`run_tests(wall=…)`).
     """
     if not base_sha or not modules:
         return None
@@ -1445,7 +1649,8 @@ def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
                    if (path / (module.replace(".", "/") + ".py")).is_file()]
         if not present:
             return set()
-        run = run_tests(path, "base", present, timeout=timeout)
+        walled = {"wall": wall} if wall is not None else {}
+        run = run_tests(path, "base", present, timeout=timeout, **walled)
         if run.inconclusive:
             return None
         return {failure["test"] for failure in unittest_failures(run.output)}
@@ -1529,14 +1734,69 @@ def test_driver(worktree: Path) -> str:
 _SERIES = iter(range(1, 1 << 30))
 
 
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def run_walled(cmd: list[str], *, cwd: Path, env: dict,
+               wall: int) -> subprocess.CompletedProcess | None:
+    """#4463 : `cmd` borné en temps mural (attente d'un créneau comprise).
+
+    La commande a sa propre session, dont elle mène le groupe. À l'échéance,
+    SIGTERM à ce groupe : une série directe et ce qu'elle a lancé le
+    reçoivent ; `ameesh heavy` le relaie au groupe de sa série, l'escalade en
+    SIGKILL et arrête ses autres descendants avant de rendre le créneau. Ce
+    qui reste du groupe reçoit SIGKILL au plus `WALL_GRACE_S` après, même si
+    le meneur est déjà sorti ; None si la borne a été atteinte. La lecture des
+    sorties reste bornée."""
+    proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=wall)
+        return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        pass
+    stop_by = time.monotonic() + WALL_GRACE_S      # une seule grâce en tout
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.communicate(timeout=WALL_GRACE_S)
+        # meneur sorti : le reste de son groupe a le reste de la grâce
+        while time.monotonic() < stop_by and _group_alive(proc.pid):
+            time.sleep(0.1)
+    except subprocess.TimeoutExpired:
+        pass
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    # un descendant hors de la session peut tenir les tubes : on les lâche
+    for pipe in (proc.stdout, proc.stderr):
+        with contextlib.suppress(OSError):
+            pipe.close()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=max(1.0, stop_by - time.monotonic()))
+    return None
+
+
 def run_tests(worktree: Path, label: str, modules: list[str], *,
-              timeout: int, heavy: bool = False) -> TestRun:
+              timeout: int, heavy: bool = False,
+              wall: int | None = None) -> TestRun:
     """Une série unittest bornée par `timeout` (au-delà : non concluant).
 
     #4271 : avec `heavy`, la série prend un créneau de l'hôte
     (`ameesh heavy --max-duration`) et son propre schéma par défaut : la borne
     est tenue par `heavy`, qui arrête tout le groupe de la série ; l'attente
-    d'un créneau a la même borne en plus."""
+    d'un créneau a la même borne en plus.
+
+    #4463 : avec `wall` (le temps restant de l'échéance totale), attente du
+    créneau et exécution tiennent ensemble dans `wall` secondes (`run_walled`) ;
+    au-delà, la série est non concluante."""
     if not modules:
         return TestRun(label=label, modules=[], returncode=0, output="",
                        seconds=0.0)
@@ -1549,6 +1809,18 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
         cmd = [wrapper, "heavy", "--max-duration", "%ds" % timeout, "--", *cmd]
         env["AMEESH_SCHEMA"] = "t_paq_%d_%d" % (os.getpid(), next(_SERIES))
         wait = timeout + 60
+    if wall is not None:
+        proc = run_walled(cmd, cwd=worktree, env=env, wall=wall)
+        if proc is None:
+            return save_test_log(TestRun(
+                label=label, modules=list(modules), returncode=None,
+                output="borne totale des tests par unité atteinte après %d s "
+                       "(attente du créneau comprise) : série arrêtée (#4463)" % wall,
+                seconds=time.monotonic() - start, timed_out=True))
+        return save_test_log(TestRun(
+            label=label, modules=list(modules), returncode=proc.returncode,
+            output=_output(proc), seconds=time.monotonic() - start,
+            timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT))
     try:
         proc = run_command(cmd, cwd=worktree, timeout=timeout + wait, env=env)
         result = TestRun(label=label, modules=list(modules),
@@ -1662,7 +1934,9 @@ def _failure_matches(observed: str, failed: set[str]) -> bool:
 
 def prefix_failures(worktree: Path, composition: Composition,
                     failures: list[dict], *, timeout: int,
-                    replay=None, log=print) -> tuple[dict[int, list[dict]], str]:
+                    replay=None, log=print, guard=None,
+                    deadline: float | None = None,
+                    ) -> tuple[dict[int, list[dict]], str, list[dict]]:
     """#4217 : la première unité où chaque test rouge apparaît.
 
     Rejoue les tests rouges des modules **voisins** sur les préfixes de
@@ -1672,10 +1946,17 @@ def prefix_failures(worktree: Path, composition: Composition,
     le préfixe correspondant le rend rouge ; les préfixes suivants ne le
     rejouent plus.
 
-    Rend `({lot: [échecs]}, "")`, ou `({}, pourquoi)` quand le rejeu ne
-    conclut pas (worktree impossible, run non concluant, test vert sur tous
-    les préfixes) : l'appelant ne retire alors aucune unité. Aucune décision
-    de retrait ici.
+    Rend `({lot: [échecs]}, "", [])`, ou `({}, "", [échecs])` quand des tests
+    restent rouges sur la tête mais verts sur **tous** les préfixes : ce sont
+    des instables (#4221), consignés non concluants, sans retrait. Rend
+    `({}, pourquoi, [])` quand le rejeu ne conclut pas (worktree impossible,
+    run non concluant, rouge sans nom de test) : l'appelant ne retire alors
+    aucune unité. Aucune décision de retrait ici.
+
+    #4463 : `guard` est relu avant chaque préfixe après le premier (fusion du
+    porteur comprise) ; sous `deadline`, chaque rejeu est borné au temps
+    restant, en temps mural, et `BudgetSpent` est levée quand il n'en reste
+    plus, avant un préfixe ou pendant (rejeu coupé par l'échéance).
     """
     tests: list[dict] = []
     seen: set[str] = set()
@@ -1685,9 +1966,9 @@ def prefix_failures(worktree: Path, composition: Composition,
             seen.add(name)
             tests.append(dict(failure))
     if not tests:
-        return {}, "aucun nom de test à rejouer sur les préfixes"
+        return {}, "aucun nom de test à rejouer sur les préfixes", []
     if not composition.units:
-        return {}, "composition sans unité à rejouer"
+        return {}, "composition sans unité à rejouer", []
     replay = replay or run_tests
     parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
     path = Path(tempfile.mkdtemp(prefix="paquet-auto-prefixe-", dir=str(parent)))
@@ -1698,29 +1979,41 @@ def prefix_failures(worktree: Path, composition: Composition,
     if added.returncode != 0:
         shutil.rmtree(path, ignore_errors=True)
         return {}, ("worktree de préfixe impossible : %s"
-                    % _tail(_decode(added.stderr), 3))
+                    % _tail(_decode(added.stderr), 3)), []
     try:
         unresolved = tests
         found: dict[int, list[dict]] = {}
         for index, unit in enumerate(composition.units, start=1):
+            if index > 1 and guard is not None:
+                guard()
+            limit = series_timeout(timeout, deadline)
+            if limit is None:
+                raise BudgetSpent("borne totale atteinte avant le préfixe %d "
+                                  "(#%d)" % (index, unit.lot))
             if index > 1:
                 moved = git(path, "reset", "--hard", unit.commit, check=False)
                 if moved.returncode != 0:
                     return {}, ("préfixe %d (#%d) illisible : %s"
                                 % (index, unit.lot,
-                                   _tail(_decode(moved.stderr), 3)))
+                                   _tail(_decode(moved.stderr), 3))), []
                 git(path, "clean", "-fdq", check=False)
             run = replay(path, "préfixe %d (#%d)" % (index, unit.lot),
                          [_failure_name(failure) for failure in unresolved],
-                         timeout=timeout)
+                         timeout=limit,
+                         **({"wall": limit} if deadline is not None else {}))
             if run.inconclusive:
+                if deadline is not None and series_timeout(timeout, deadline) is None:
+                    # #4463 : coupé par l'échéance totale, pas par le préfixe
+                    raise BudgetSpent("borne totale atteinte pendant le préfixe "
+                                      "%d (#%d) : %s" % (index, unit.lot,
+                                                         run.motive()))
                 return {}, ("préfixe %d (#%d) non concluant : %s"
-                            % (index, unit.lot, run.motive()))
+                            % (index, unit.lot, run.motive())), []
             failed = {entry["test"]
                       for entry in unittest_failures(run.output)}
             if not run.green and not failed:
                 return {}, ("préfixe %d (#%d) rouge sans nom de test"
-                            % (index, unit.lot))
+                            % (index, unit.lot)), []
             still = []
             for failure in unresolved:
                 if _failure_matches(_failure_name(failure), failed):
@@ -1734,11 +2027,11 @@ def prefix_failures(worktree: Path, composition: Composition,
             if not unresolved:
                 break
         if unresolved:
-            return {}, ("test(s) rouge(s) sur la tête mais verts sur tous les "
-                        "préfixes : %s"
-                        % ", ".join(_failure_name(failure)
-                                    for failure in unresolved[:5]))
-        return found, ""
+            # #4221 : verts au rejeu sur tous les préfixes : instables,
+            # l'appelant les consigne non concluants sans arrêter le paquet ;
+            # les tests déjà situés (`found`, B1 cx2) restent retirables.
+            return found, "", unresolved
+        return found, "", []
     finally:
         remove_worktree(worktree, path)
 
@@ -1868,14 +2161,30 @@ def _merge_removals(*groups: list[Removal]) -> list[Removal]:
     return [by_lot[lot] for lot in order]
 
 
+def series_timeout(timeout: int, deadline: float | None) -> int | None:
+    """#4463 : la borne d'une série sous l'échéance totale ; None si échue."""
+    if deadline is None:
+        return timeout
+    left = int(deadline - time.monotonic())
+    return min(timeout, left) if left > 0 else None
+
+
+def budget_spent(label: str, modules: list[str]) -> TestRun:
+    """#4463 : une série qui ne part plus, l'échéance totale passée (§3)."""
+    return TestRun(label=label, modules=list(modules), returncode=None,
+                   output="borne totale des tests par unité atteinte : série "
+                          "non jouée (#4463)", seconds=0.0, timed_out=True)
+
+
+
 def check_local_tests(worktree: Path, composition: Composition, *,
                       timeout: int, log=print,
                       attribute=None, base_sha: str = "",
                       select=None, on_base=None, guard=None,
                       prefix=None,
-                      parallel: int = DEFAULT_PARALLEL) -> tuple[list[TestRun],
-                                                          list[int],
-                                                          list[Removal]]:
+                      parallel: int = DEFAULT_PARALLEL,
+                      deadline: float | None = None) -> tuple[list[TestRun], list[int],
+                                                              list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
     Rend `(exécutions, unités fautives, retraits)`. Une unité est fautive
@@ -1891,10 +2200,12 @@ def check_local_tests(worktree: Path, composition: Composition, *,
 
     Un rouge de voisin que les préfixes ne permettent pas de situer lève
     `AttributionUnreadable` : aucun retrait automatique, le pilote est
-    prévenu et un agent lit. Un résultat non concluant (délai, base absente,
-    psql/psycopg indisponible, rc inattendu) est **consigné** dans `runs` et
-    ne retire aucune unité : le canon §3 veut qu'il ne retienne ni paquet ni
-    release ; la ci-full tranche.
+    prévenu et un agent lit. Un test rouge sur la tête mais **vert sur tous
+    les préfixes** est instable (#4221) : consigné non concluant dans `runs`
+    (`flaky_tests`), sans retrait, et le paquet continue. Un résultat non
+    concluant (délai, base absente, psql/psycopg indisponible, rc inattendu)
+    est **consigné** dans `runs` et ne retire aucune unité : le canon §3 veut
+    qu'il ne retienne ni paquet ni release ; la ci-full tranche.
     `attribute` est injectable pour les témoins (`attribute_composition`).
 
     #4025 : la série d'une unité joue aussi ses modules voisins
@@ -1908,6 +2219,12 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     sont indépendantes et jouées en même temps (au plus `parallel`), chacune
     dans un créneau `ameesh heavy` de l'hôte ; leurs résultats sont lus dans
     l'ordre des unités, comme en série. `guard` est relu avant chaque série.
+
+    #4463 : `deadline` (horloge monotone) borne la durée totale : chaque série
+    est bornée au temps restant ; une série qui n'est pas partie à l'échéance
+    est non concluante sans être jouée. L'attente d'un créneau `ameesh heavy`
+    compte dans ce temps (`run_tests(wall=…)`) : à l'échéance la série est
+    arrêtée, au plus `WALL_GRACE_S` après.
     """
     runs: list[TestRun] = []
     red: list[tuple[TestRun, list[dict]]] = []
@@ -1949,13 +2266,21 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                              for row in added)))
         planned.append((unit, proper, added, modules))
 
+    def bounded(label: str, modules: list[str]) -> TestRun:
+        limit = series_timeout(timeout, deadline)
+        if limit is None:
+            log("tests %s : borne totale atteinte, série non jouée (non "
+                "concluant)" % label)
+            return budget_spent(label, modules)
+        # sous l'échéance, attente du créneau comprise (relecture cx3)
+        walled = {"wall": limit} if deadline is not None else {}
+        return run_tests(worktree, label, modules, timeout=limit, **slots, **walled)
+
     def unit_job(label: str, modules: list[str]):
-        return lambda: run_tests(worktree, label, modules, timeout=timeout,
-                                 **slots)
+        return lambda: bounded(label, modules)
 
     def contract_job():
-        modules = contract_modules(worktree)
-        return run_tests(worktree, "contrats", modules, timeout=timeout, **slots)
+        return bounded("contrats", contract_modules(worktree))
 
     jobs = [unit_job("unité #%d" % unit.lot, modules)
             for unit, _proper, _added, modules in planned] + [contract_job]
@@ -1995,8 +2320,11 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     if neighbor_red:
         if guard is not None:
             guard()
-        at_base = (on_base or base_failures)(worktree, base_sha, neighbor_red,
-                                             timeout=timeout)
+        limit = series_timeout(timeout, deadline)
+        walled = {"wall": limit} if deadline is not None and limit else {}
+        at_base = (None if limit is None else
+                   (on_base or base_failures)(worktree, base_sha, neighbor_red,
+                                              timeout=limit, **walled))
         log("tests voisins rouges rejoués sur la base %s : %s"
             % (base_sha[:12] or "?", "non concluant" if at_base is None
                else "%d rouge(s) aussi sur la base" % len(at_base)))
@@ -2032,10 +2360,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     prefix_red = [neighbor_tests[name] for name in neighbor_tests
                   if name in prefix_names]
     for lot, owned in owned_by_lot.items():
-        remaining_own = [failure for failure in owned
-                         if _failure_name(failure) not in prefix_names]
-        if remaining_own or lot in unparsed_lots:
-            own[lot] = remaining_own
+        # #4221 (P3) : `prefix_names` exclut déjà `own_names`, donc aucun
+        # échec propre ne peut y figurer ; le filtre `remaining_own` était mort.
+        if owned or lot in unparsed_lots:
+            own[lot] = owned
     modules = contract.modules
     runs.append(contract)
     contract_red = False
@@ -2075,10 +2403,20 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         log("tests voisins : rejeu du rouge sur les préfixes de l'empilement "
             "(%d test(s), %d unité(s))"
             % (len(prefix_red), len(composition.units)))
+        bounds = ({"guard": guard} if guard is not None else {}) | (
+            {"deadline": deadline} if deadline is not None else {})
         try:
-            found_by_lot, prefix_why = (prefix or prefix_failures)(
-                worktree, composition, prefix_red, timeout=timeout, log=log)
-        except AttributionUnreadable:
+            found_by_lot, prefix_why, flaky = (prefix or prefix_failures)(
+                worktree, composition, prefix_red, timeout=timeout, log=log,
+                **bounds)
+        except BudgetSpent as spent:
+            # #4463 : non concluant (§3) ; la ci-full tranche, rien n'est retiré
+            log("tests voisins : préfixes NON CONCLUANTS (%s) — consigné, le "
+                "paquet continue" % spent)
+            runs.append(budget_spent("préfixes", [_failure_name(failure)
+                                                  for failure in prefix_red]))
+            found_by_lot, prefix_why, flaky = {}, "", []
+        except (AttributionUnreadable, CarrierSettled, EpochLost):
             raise
         except PaquetAutoError as exc:
             raise AttributionUnreadable(
@@ -2088,6 +2426,48 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             raise AttributionUnreadable(
                 prefix_why,
                 tests=[_failure_name(failure) for failure in prefix_red])
+        if flaky:
+            # #4221 : rouge sur la tête mais vert sur tous les préfixes =
+            # instable. Consigné non concluant, le paquet continue (canon §3).
+            flaky_names = sorted({_failure_name(failure) for failure in flaky
+                                  if _failure_name(failure)})
+            log("tests voisins : %d test(s) rouge(s) sur la tête mais vert(s) "
+                "sur tous les préfixes (instable) : %s — consigné(s) non "
+                "concluant(s), le paquet continue"
+                % (len(flaky_names), ", ".join(flaky_names[:5])))
+            kept_red: list[tuple[TestRun, list[dict]]] = []
+            for run, found in red:
+                names_here = sorted({_failure_name(failure)
+                                     for failure in found
+                                     if _failure_name(failure) in flaky_names})
+                left = [failure for failure in found
+                        if _failure_name(failure) not in flaky_names]
+                if len(left) == len(found):
+                    kept_red.append((run, found))
+                    continue
+                if left:
+                    # des rouges réels restent dans la même série : la série
+                    # reste rouge, l'instable est consigné à part.
+                    kept_red.append((run, left))
+                    runs.append(TestRun(
+                        label="%s (instable)" % run.label,
+                        modules=sorted({"tests." + str(failure.get("module"))
+                                        for failure in found
+                                        if failure.get("module")
+                                        and _failure_name(failure)
+                                        in names_here}),
+                        returncode=1,
+                        output="tests rouges sur la tête mais verts sur tous "
+                               "les préfixes : %s" % ", ".join(names_here),
+                        seconds=0.0, flaky_tests=names_here,
+                        log_path=run.log_path))
+                else:
+                    run.flaky_tests = names_here
+            red = kept_red
+            if not red:
+                return runs, [], []
+            failures = [failure for failure in failures
+                        if _failure_name(failure) not in flaky_names]
         positions = {unit.lot: index for index, unit in enumerate(
             composition.units, start=1)}
         unknown = [lot for lot in found_by_lot if lot not in positions]
@@ -2531,6 +2911,53 @@ def withdraw_packet(worktree: Path, carrier: int, pr_number: int | None,
     return failed
 
 
+def pull_request_merge_sha(worktree: Path, branch: str) -> str:
+    """Le commit de fusion de la PR de la branche, "" si illisible."""
+    view = _gh(worktree, "pr", "view", branch, "--json", "mergeCommit")
+    if view.returncode != 0:
+        return ""
+    try:
+        commit = json.loads(_decode(view.stdout)).get("mergeCommit") or {}
+        return str(commit.get("oid") or "")
+    except (ValueError, AttributeError):
+        return ""
+
+
+def watch_carrier(worktree: Path, branch: str) -> None:
+    """#4463 : la PR poussée a-t-elle fusionné (ou été close) ? Lu avant chaque
+    série ; un état illisible laisse les tests continuer."""
+    state = pull_request_state(worktree, branch)
+    if state and state != "OPEN":
+        raise CarrierSettled(state)
+
+
+def interrupted_by_carrier(args: argparse.Namespace, worktree: Path,
+                           branch: str, head: str, state: str) -> int:
+    """#4463 : la PR a fusionné (ou été close) pendant les tests par unité.
+
+    Leurs résultats ne peuvent plus retirer une unité : les séries non parties
+    sont abandonnées, le porteur le dit en une ligne. Fusionnée, la sortie finit
+    sur `MERGED_LINE` (paquet-horaire ne publie pas) ; close, un agent lit.
+    """
+    if state == "MERGED":
+        sha = pull_request_merge_sha(worktree, branch) or "?"
+        print(note_carrier(
+            worktree, args.carrier,
+            "paquet %s : tests par unité interrompus : porteur fusionné à %s "
+            "(tête %s) ; les résultats ne pouvaient plus retirer d'unité (#4463)"
+            % (args.name, sha[:12], head[:12])), flush=True)
+        print("%s : %s, tête %s, tests par unité interrompus (fusionné à %s)"
+              % (MERGED_LINE, branch, head[:12], sha[:12]), flush=True)
+        return 0
+    print(note_carrier(
+        worktree, args.carrier,
+        "paquet %s : tests par unité interrompus : PR %s (tête %s) (#4463)"
+        % (args.name, state.lower(), head[:12])), flush=True)
+    raise PaquetAutoError(
+        "PR de %s %s pendant les tests par unité : tests interrompus, rien "
+        "n'est recomposé, un agent lit" % (branch, state.lower()))
+
+
 def merged_during_tests(args: argparse.Namespace, worktree: Path, head: str,
                         runs: list[TestRun], faulty: list[int], branch: str,
                         rel: str) -> int:
@@ -2661,6 +3088,30 @@ def notify_unattributable(name: str, carrier: int, error,
         log("courrier au pilote non envoyé : %s" % exc)
         return str(exc)
     log("courrier au pilote envoyé (%s)" % pilot)
+    return ""
+
+
+def notify_flaky(name: str, carrier: int, tests: list[str],
+                 *, pilot: str = "mesh-design",
+                 sender: str | None = None, log=print) -> str:
+    """#4221 : un test instable est consigné non concluant, le paquet continue.
+
+    Le canon §3 veut qu'un instable ne retienne ni paquet ni release ; le
+    pilote le sait pour le corriger à part. Un courrier qui ne part pas est
+    consigné, sans arrêter la composition. Rend le motif d'échec.
+    """
+    listed = ", ".join(tests[:5]) or "test(s) non nommé(s)"
+    body = (
+        "#%d paquet %s : test(s) rouge(s) sur la tête mais vert(s) sur tous "
+        "les préfixes de l'empilement (%s) : instable(s), consigné(s) non "
+        "concluant(s) (canon §3) ; aucun retrait pour eux, le paquet "
+        "continue. À corriger à part." % (carrier, name, listed))
+    try:
+        send_mail(pilot, carrier, body, sender)
+    except PaquetAutoError as exc:
+        log("courrier d'instabilité au pilote non envoyé : %s" % exc)
+        return str(exc)
+    log("courrier d'instabilité au pilote envoyé (%s)" % pilot)
     return ""
 
 
@@ -3234,6 +3685,17 @@ def compose_packet(args: argparse.Namespace) -> int:
                     Discarded(candidate.lot, PARALLEL_EXCLUDE_REASON,
                               "--only, second paquet parallèle (#3256 C)")
                     for candidate in outside]
+        # #4581 : une recomposition après un rouge garde les membres de la
+        # composition précédente, moins les exclus, à leur source composée.
+        # Les lots devenus prêts entre-temps vont à la coupure suivante ; ils
+        # sont nommés aux écartés (le contrôle d'inclusion lit ce motif).
+        keep = str(getattr(args, "keep_composition", None) or "")
+        if keep:
+            specs = composition_specs(repo, keep, args.name)
+            candidates, kept_discards = keep_composition(
+                candidates, specs, worktree=worktree,
+                already_discarded={item.lot for item in errors})
+            errors = errors + kept_discards
         for item in errors:
             print("écarté #%d : %s — %s"
                   % (item.lot, item.reason, item.detail), flush=True)
@@ -3278,6 +3740,15 @@ def compose_packet(args: argparse.Namespace) -> int:
         ready_count = len([lot for lot in (payload.get("ready") or [])
                            if int(lot) not in error_lots])
         expected_file = Path(tmp.name) / "attendus.txt"
+        # #4463 : l'échéance totale des tests par unité, recompositions comprises
+        budget = int(getattr(args, "tests_budget", 0) or 0)
+        deadline = time.monotonic() + budget if budget > 0 else None
+
+        def tests_guard() -> None:
+            if guard is not None:
+                guard()
+            if pushed:
+                watch_carrier(worktree, branch)
 
         def title() -> str:
             return "Paquet %s — %d unités sur %s %s" % (
@@ -3352,8 +3823,14 @@ def compose_packet(args: argparse.Namespace) -> int:
             try:
                 runs, faulty, removals = check_local_tests(
                     worktree, composition, timeout=args.tests_timeout,
-                    base_sha=base_sha, guard=guard,
-                    parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
+                    base_sha=base_sha, guard=tests_guard,
+                    parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL),
+                    deadline=deadline)
+            except CarrierSettled as settled:
+                rc = interrupted_by_carrier(args, worktree, branch, head,
+                                            settled.state)
+                success = True
+                return rc
             except AttributionUnreadable as error:
                 # #4217 : aucun retrait automatique ; le pilote reçoit le
                 # rouge que les préfixes n'ont pas permis de situer.
@@ -3363,6 +3840,14 @@ def compose_packet(args: argparse.Namespace) -> int:
                         pilot=getattr(args, "pilot", "mesh-design"),
                         sender=getattr(args, "sender", None))
                 raise
+            flaky = sorted({name for run in runs
+                            for name in getattr(run, "flaky_tests", [])})
+            if flaky and not getattr(args, "local", False):
+                # #4221 : instable consigné non concluant, le paquet continue ;
+                # le pilote le sait même si une recomposition suit.
+                notify_flaky(args.name, args.carrier, flaky,
+                             pilot=getattr(args, "pilot", "mesh-design"),
+                             sender=getattr(args, "sender", None))
             if not faulty:
                 break
             if pushed:
@@ -3544,6 +4029,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="#3256 C : ne composer que ces lots prêts (répétable) ; "
                              "les autres, prêts, sont écrits aux écartés avec le "
                              "motif du paquet parallèle, jamais composés deux fois")
+    parser.add_argument("--keep-composition", default=None, metavar="REF",
+                        help="#4581 : recomposition après un rouge : ne garder "
+                             "que les membres de la composition du manifeste gelé "
+                             "à REF, moins les --exclude, chacun à sa source "
+                             "composée ; un lot prêt depuis, regelé ou disparu va "
+                             "à la coupure suivante (écarté, non composé)")
     parser.add_argument("--replay", default=None, metavar="REF",
                         help="rejouer le manifeste d'une référence et comparer "
                              "les arbres (avec --candidates-json : refuser une "
@@ -3566,6 +4057,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="#4271 : séries d'unités jouées en même temps, "
                              "dans les créneaux `ameesh heavy` (défaut : %d, "
                              "en série)" % DEFAULT_PARALLEL)
+    parser.add_argument("--tests-budget", type=int, default=0, metavar="S",
+                        help="#4463 : borne totale des tests par unité, en "
+                             "secondes (paquet-horaire : packet_tests."
+                             "total_timeout_seconds ; défaut : 0, sans borne totale)")
     parser.add_argument("--keep-worktree", action="store_true",
                         help="conserver le worktree jetable (diagnostic)")
     parser.add_argument("--keep-failed-hours", type=float, default=24.0,
@@ -3596,6 +4091,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.replay:
             if args.carrier or args.local:
                 raise InputError("--replay : ni --carrier ni --local")
+            if args.keep_composition:
+                raise InputError("--keep-composition ne s'applique pas à --replay")
             if not args.base:
                 raise InputError("--replay exige --base")
             if args.candidates_json:
@@ -3616,9 +4113,11 @@ def main(argv: list[str] | None = None) -> int:
             if not re.fullmatch(r"[0-9a-f]{40}", args.publish_sha or ""):
                 raise InputError("--publish exige --publish-sha : le SHA complet "
                                  "attesté par la marque de tests")
-            if args.local or args.no_packet_record or args.exclude:
+            if args.local or args.no_packet_record or args.exclude \
+                    or args.keep_composition:
                 raise InputError("--publish : ni --local, ni --no-packet-record, "
-                                 "ni --exclude (la tête testée est publiée telle quelle)")
+                                 "ni --exclude, ni --keep-composition (la tête "
+                                 "testée est publiée telle quelle)")
             return publish_tested(args)
         if args.no_packet_record and not args.local:
             raise InputError("--no-packet-record est réservé au banc avec --local")

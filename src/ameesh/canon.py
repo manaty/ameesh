@@ -4864,11 +4864,27 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
     # `canon check` la valide en entier, `ameesh review-class` la relit.
     root_member = canon.sources[0].member if canon.sources else ""
     from . import modules as project_modules
+    resolution = None
     try:
-        project_modules.declarations(canon.federation)
+        resolution = project_modules.resolve(canon.federation, canon)
     except ValueError as exc:
         add("project-modules-invalid", ERROR, str(exc),
             **({"member": root_member, "path": "federation.yaml"} if root_member else {}))
+    if resolution is not None:
+        # L98 T2a decision 3: a refused entry point no scope activates is a
+        # warning; the same entry activated above is `project-modules-invalid`.
+        for warning in resolution.warnings:
+            if warning["code"] == "pipeline-module-duplicate":
+                # L103 T2 (#4396): a Pipeline card taking the name of an
+                # installed module (or of another card) is refused even when
+                # no project selects it; it fails `canon check` without
+                # blocking any agent (`pipeline` subject).
+                card = canon.pipeline(warning["name"])
+                add("pipeline-module-duplicate", ERROR, warning["message"],
+                    card.fiche if card is not None else None, pipeline=warning["name"])
+                continue
+            add("module-refused", WARNING, warning["message"],
+                **({"member": root_member, "path": "federation.yaml"} if root_member else {}))
     _scoped = review_mod.scoped_from_federation(canon.federation)
     for code, severity, message in _scoped.problems:
         add(code, severity, message,

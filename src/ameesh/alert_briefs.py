@@ -513,6 +513,13 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
     sa CI complète, et ne prescrit jamais de réassigner le porteur — il pousse
     le pilote/le composeur à voir le paquet jusqu'à sa fusion.
 
+    #4572 : quand `waiting.candidate` nomme une cause côté auteur
+    (`freeze-not-head`, `conflict`…), le composeur ne peut rien : le geste
+    nomme l'auteur et ce qu'il doit faire (regeler, résoudre le conflit,
+    obtenir l'avis de la remise). Le texte « le composeur le porte » reste
+    réservé au lot réellement prêt (`ready`) ; une lecture incomplète renvoie
+    à la liste calculée sans nommer personne au hasard.
+
     #2378 : de même pour une demande de décision ouverte et échue
     (`waiting.decision`) : le geste est de vérifier l'échéance avec le
     demandeur (renouveler ou retirer la demande) ; le décideur a le rappel de
@@ -562,6 +569,12 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
         # (`exploitation._slo_targets`): the brief follows them, so a text
         # addressed to the pilot never reaches the assignee.
         what = None
+    # #4572 : la cause du refus d'admission au paquet, lue par la passe SLO
+    # avec les codes de `paquet-candidats` (`exploitation._slo_breaches`).
+    # Côté auteur (`freeze-not-head`, conflit…), le composeur ne peut rien :
+    # le brief nomme l'auteur et son geste. « Le composeur le porte » reste
+    # réservé au lot réellement prêt (`ready`) et pas encore composé.
+    cause = waiting.get("candidate") if isinstance(waiting, dict) else None
     if what in ("merge", "merge-approval", "merge-outcome"):
         if canon:
             if level >= 3:
@@ -573,6 +586,46 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                 move = ("bureau: merge it directly — its `canon/…` branch targets the canon "
                         "repository (manaty/home), outside the ameesh package; the "
                         "pilot/composer cannot carry it, do not wait for them")
+        elif cause and cause.get("code") and cause.get("owner") == "author":
+            author = who or alert.get("responsible") or "the author"
+            code = str(cause["code"])
+            detail = str(cause.get("detail") or "")
+            seen = " — %s" % detail if detail else ""
+            gesture = str(cause.get("gesture") or "")
+            if level >= 3:
+                move = ("bureau or auditor: the lot is frozen with its review verdict "
+                        "acquired, but a package cannot carry it — cause `%s`%s; the "
+                        "author %s still owes the fix (%s) — push the author and the "
+                        "pilot, reassign the lot to a free agent of the same family if "
+                        "the author cannot act; do not wait for the composer"
+                        % (code, seen, author, gesture))
+            elif level >= 2:
+                move = ("pilot: the lot is frozen with its review verdict acquired, but a "
+                        "package cannot carry it — cause `%s`%s; the author %s owes the fix "
+                        "(%s) — push them; if they cannot act, hand the lot to a free agent "
+                        "of the same family (ameesh work assign %d <agent>%s); the composer "
+                        "cannot carry it before"
+                        % (code, seen, author, gesture, lot, holder))
+            else:
+                move = ("author %s: the lot is frozen with its review verdict acquired, but "
+                        "a package cannot carry it — cause `%s`%s; %s; the composer cannot "
+                        "advance it until this is cleared"
+                        % (author, code, seen, gesture))
+        elif cause and cause.get("unknown"):
+            # Lecture incomplète sur cet hôte (dépôt absent, refs manquantes) :
+            # on ne nomme ni l'auteur ni le composeur au hasard ; le brief
+            # renvoie à la liste calculée, qui fait foi à la composition.
+            if level >= 3:
+                move = ("bureau or auditor: the lot is frozen with its review verdict "
+                        "acquired; this host cannot read the candidate refusal — check "
+                        "`scripts/paquet-candidats.py` before pushing the composer, the "
+                        "lot may be waiting on its author (freeze-not-head, conflict)")
+            else:
+                move = ("pilot: the lot is frozen with its review verdict acquired; this "
+                        "host cannot read the candidate refusal — check "
+                        "`scripts/paquet-candidats.py` before acting; the lot may be "
+                        "waiting on its author (freeze-not-head, conflict), and the "
+                        "composer can only carry a ready lot")
         elif alert.get("vehicle_exit_ts") is not None:
             # #4369 : retiré du paquet par sa recomposition ; le temps passé
             # dans le véhicule n'est pas compté, l'horloge part de la sortie.
@@ -757,7 +810,22 @@ def _budget_pause_long(alert: dict) -> str:
 
 def _operator_pause(alert: dict) -> str:
     """#3961 : une pause opérateur qui dure (un agent, ou la plupart des
-    agents d'un hôte). Aux orchestrateurs de l'équipe et aux auditeurs."""
+    agents d'un hôte). Aux orchestrateurs de l'équipe et aux auditeurs.
+
+    #4525 : le sommeil automatique du découpage (`SLEEP_REASON`) n'est pas une
+    maintenance. L'alerte le reconnaît et dit qu'il est levé au premier lot
+    démarrable, sans demander à l'owner de mettre fin à une maintenance.
+    #4610 : la levée est aussi automatique sur un lot attribué ou un courrier
+    du pilote ou d'un orchestrateur.
+    """
+    from . import file_decoupage
+    if alert.get("sleep") or file_decoupage.is_sleep_reason(alert.get("reason")):
+        return ("Automatic sleep still in place: %s. This is the automatic sleep of an "
+                "exhausted roadmap, not a maintenance: it is lifted by the first "
+                "startable lot, an assigned actionable lot, or pilot/orchestrator "
+                "mail, and at the latest when its deadline expires. No "
+                "operator action is expected; the owner is not asked to end any "
+                "maintenance." % (alert.get("detail") or "?"))
     return ("Operator pause still in place: %s. Expected action: check with whoever set it "
             "(ameesh show <agent>) whether the maintenance is over; if so, lift it "
             "(ameesh resume <agent> --operator --reason <reason>), otherwise hand the "
@@ -979,8 +1047,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     traitaient le même lot) ; `plan_underused`, ceux des équipes des agents au
     repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
-    rôle explicite et projet, sans repli. `stale_lot` d'un lot en qa : le
-    relecteur DÉSIGNÉ reçoit en outre le verdict qui lui est dû (#705).
+    rôle explicite et projet, sans repli ; un constat de portée hôte
+    (`project` absent, `dev` workspaces) n'a pas de fil de projet et part au
+    responsable humain de son hôte ou agent (`notify.Router`), jamais en
+    diffusion aux agents. `stale_lot` d'un lot en qa : le relecteur DÉSIGNÉ
+    reçoit en outre le verdict qui lui est dû (#705).
     Auditeurs : pour tous les types sauf `stale_lot` (L713) et
     `plan_underused` (#3274) — lus à la passe de l'auditeur, sans réveil ;
     sans aucun orchestrateur vivant, `plan_underused` se replie sur l'auditeur
@@ -1006,6 +1077,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         text = alert.get("action") or alert.get("detail") or "Module procedure deviation"
         project = alert.get("project")
         if not project:
+            # Host-scoped finding: no project owns it, so no project thread
+            # and no agent brief. `notify.Router` sends it to the responsible
+            # human of its host or agent; never broadcast it to every agent.
             return {}
         out = {o: text for o in orchestras
                if o in orchestrator_names and o in by_name

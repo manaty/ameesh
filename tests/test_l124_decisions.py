@@ -88,8 +88,8 @@ class DemandeTest(_Base):
                          (1, "pending", ALICE, "agent", "orch", self.lot["id"], True, "a"))
         self.assertEqual(view["lot_state"], "waiting_human")
         self.assertEqual(view["previous_state"], "build")
-        self.assertAlmostEqual(view["due_ts"] - view["created_ts"], decisions.DEFAULT_DUE_S,
-                               delta=5)
+        self.assertAlmostEqual(view["due_ts"], decisions.validations.business_due(
+            view["created_ts"], view["validation"]["timezone"]), delta=5)
         row = self.db.query("SELECT kind, recipient, work_item_id, status, delivered_at "
                             "FROM agent_mailbox")[0]
         self.assertEqual((row["kind"], row["recipient"], row["work_item_id"], row["status"],
@@ -648,7 +648,7 @@ class IdentiteTest(_Base):
         proc = self.mesh("decide", "show", "1", env=self.mesh_env())
         self.assertIn("answered by human:alice (cli)", proc.stdout)
         proc = self.mesh("decisions", "--all", env=self.mesh_env())
-        self.assertIn("answered or withdrawn requests", proc.stdout)
+        self.assertIn("answered, withdrawn or closed without an answer", proc.stdout)
 
 
 # ==========================================================================
