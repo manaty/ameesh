@@ -44,6 +44,8 @@ BENCH_ENV_VARS = frozenset((
     "AMEESH_DB_TRACE",
     # #3752 : AMEESH_TEST_GABARIT=0 rejoue migrate() à chaque classe
     "AMEESH_TEST_GABARIT",
+    # L98 T2b (#4408) : AMEESH_MODULES=bare, le job « profil nu » de la CI
+    "AMEESH_MODULES",
 ))
 #: L73/L142 : les caches de gestionnaires de paquets que le ménage redirige
 #: (`menage.CACHES`, `menage.XDG_CACHE`) sont un « choix de l'hôte » que le
@@ -52,6 +54,13 @@ BENCH_ENV_VARS = frozenset((
 #: un test qui veut ce cas les pose explicitement (`child_env`, `turn_env`).
 HOST_CACHE_PREFIXES = ("npm_config_", "pnpm_config_")
 HOST_CACHE_VARS = ("YARN_CACHE_FOLDER", "XDG_CACHE_HOME")
+
+
+#: L98 T2b (#4408) : au profil nu (`AMEESH_MODULES=bare`), le cœur tourne sans
+#: module intégré ; un test qui lit `dev` ou `it` est alors sauté, jamais faux.
+BARE_PROFILE = os.environ.get("AMEESH_MODULES", "").strip() == "bare"
+needs_builtin_modules = unittest.skipIf(
+    BARE_PROFILE, "modules intégrés requis (profil nu, AMEESH_MODULES=bare)")
 
 
 def _host_cache_var(name: str) -> bool:

@@ -102,6 +102,7 @@ class BareProfileTest(unittest.TestCase):
 
 
 class RegistryTest(unittest.TestCase):
+    @support.needs_builtin_modules
     def test_it_is_listed_and_still_served_as_before(self):
         with points():
             found = registry.discover()
@@ -118,6 +119,7 @@ class RegistryTest(unittest.TestCase):
             proof = {row["name"]: row for row in modules.evidence()}
         self.assertEqual(proof["it"]["descriptor_sha256"], it.descriptor_sha256)
 
+    @support.needs_builtin_modules
     def test_dev_is_listed_as_builtin_tooling_through_the_registry(self):
         """L101 T4: `dev` joins the Module interface, without a work type."""
         with points():
@@ -140,6 +142,7 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(installed["dev"].descriptor({}), {
             "types": [], "schemas": {}, "rules": []})
 
+    @support.needs_builtin_modules
     def test_dev_descriptor_takes_no_option_and_declares_no_type(self):
         with points():
             dev = modules.installed()["dev"]
@@ -215,6 +218,7 @@ class RegistryTest(unittest.TestCase):
         self.assertIsNone(found.get("sample"))
         self.assertIn("declares audit without providing it", found.refused[0]["error"])
 
+    @support.needs_builtin_modules
     def test_refused_entries_are_listed_and_fail_the_command(self):
         with points(FakeEntryPoint(ImportError("boom"), name="broken"),
                     FakeEntryPoint(sample(name="it"), name="it"),
