@@ -280,6 +280,31 @@ class SurveyTest(_Base):
         spent = ba.Budget(0.0, clock=iter([0.0, 1.0, 1.0, 1.0]).__next__)
         self.assertIn("time budget", ba.survey(wt, ba.rules_of(None), budget=spent)["why"])
 
+    def test_reflog_last_entry_dates_activity_not_the_file_mtime(self):
+        """#4685 : `git gc` réécrit logs/HEAD sans changer les entrées ; seule
+        la dernière entrée date une opération, pas la mtime du fichier."""
+        wt = self.worktree()
+        gitdir = os.path.join(self.base, "repo.git", "worktrees", "wt")
+        _write(os.path.join(gitdir, "index"))
+        with open(os.path.join(wt, ".git"), "w") as fh:
+            fh.write("gitdir: %s\n" % gitdir)
+        reflog = os.path.join(gitdir, "logs", "HEAD")
+        old = time.time() - 10 * DAY
+        entry = "%s %s t <t@t> %d +0000\tcommit: old\n" % (
+            "0" * 40, "1" * 40, int(old))
+        _write(reflog, text=entry)
+        # the maintenance rewrites the reflog: fresh mtime, unchanged entry
+        now = time.time()
+        os.utime(reflog, (now, now))
+        self.assertEqual(ba._reflog_latest(reflog), float(int(old)))
+        # a real operation is an appended entry, dated now: the survey sees it
+        future = time.time() + DAY
+        _write(reflog, text=entry + "%s %s t <t@t> %d +0000\treset: moving to HEAD\n" % (
+            "1" * 40, "2" * 40, int(future)))
+        os.utime(reflog, (old, old))
+        self.assertEqual(ba.survey(wt, ba.rules_of(None))["latest"], float(int(future)))
+        self.assertIsNone(ba._reflog_latest(os.path.join(gitdir, "logs", "absent")))
+
 
 class RunTest(_Base):
     def test_idle_worktree_artifacts_deleted_and_logged(self):

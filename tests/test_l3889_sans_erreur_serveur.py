@@ -376,9 +376,12 @@ class EnrollReplayTest(ApproveBase):
     enroll_link = base.ApproveEnrollTest.enroll_link
     proposals = base.ApproveEnrollTest.proposals
 
-    def body(self, path):
+    def body(self, path, *, credential_id=None):
+        device = SoftWebAuthn("ES256")
+        if credential_id is not None:
+            device.credential_id = credential_id
         page = self.page_data(self.page(path)[2], "ameesh-enroll")
-        return attestation(SoftWebAuthn("ES256"), receipts.b64u_decode(page["challenge"]))
+        return attestation(device, receipts.b64u_decode(page["challenge"]))
 
     def test_reponse_perdue_le_meme_corps_rend_la_proposition(self):
         path = self.enroll_link()
@@ -410,6 +413,17 @@ class EnrollReplayTest(ApproveBase):
         self.assertEqual(status, 200, result)
         self.assertEqual(self.proposals(), [result["proposal"]])
         # un AUTRE corps sur le lien consommé reste un refus
+        status, other = self.submit(path, self.body_for_other(path, body))
+        self.assertEqual((status, other["error"]), (410, "used"))
+
+    def test_autre_corps_meme_si_l_identifiant_finit_par_AA(self):
+        """#4682 : l'identifiant b64u(16 octets) finit par « AA » une fois sur
+        256 ; le corps « autre » doit alors encore différer, sinon le serveur
+        le rejoue (200, sans clé « error ») au lieu de refuser le lien usé."""
+        path = self.enroll_link()
+        body = self.body(path, credential_id=receipts.b64u_encode(bytes(16)))
+        self.assertTrue(body["credential_id"].endswith("AA"))
+        self.assertEqual(self.submit(path, body)[0], 200)
         status, other = self.submit(path, self.body_for_other(path, body))
         self.assertEqual((status, other["error"]), (410, "used"))
 
@@ -451,7 +465,11 @@ class EnrollReplayTest(ApproveBase):
         self.assertIn('<script src="../static/approve.js"', text)
 
     def body_for_other(self, path, body):
-        return dict(body, credential_id=body["credential_id"][:-2] + "AA")
+        # #4682 : b64u(16 octets) finit par A, Q, g ou w. Remplacer la fin par
+        # « AA » peut donc ne rien changer (1/256) : le corps serait identique
+        # et rejoué (200) au lieu d'être refusé. Choisir un suffixe différent.
+        suffix = "AQ" if body["credential_id"].endswith("AA") else "AA"
+        return dict(body, credential_id=body["credential_id"][:-2] + suffix)
 
     def test_deux_envois_concurrents_une_proposition(self):
         path = self.enroll_link()

@@ -672,16 +672,18 @@ def _resolve_base(repo: str, base: str) -> str:
     return ""
 
 
-def _target_tip(repo: str, base: str) -> str:
+def _target_tip(repo: str, base: str, *, fetch: bool = True) -> str:
     """Le commit de la cible au moment de la lecture (#3116), ou "".
 
     `base` est la cible déclarée (`develop`, `origin/main`, un commit) ; on la
     résout d'abord comme `_range` (la ref distante fait foi) puis en commit.
-    Une cible illisible rend "" : la lecture garde son comportement d'avant."""
+    #4673 : avec `fetch=True`, la pointe publiée est relue à la forge avant la
+    lecture ; `fetch=False` (transaction de gel) garde la ref locale. Une
+    cible illisible rend "" : la lecture garde son comportement d'avant."""
     resolved = _resolve_base(repo, base)
     if not resolved:
         return ""
-    return review_authors.target_commit(repo, resolved)
+    return review_authors.target_commit(repo, resolved, fetch=fetch)
 
 
 def _range(repo: str, base: str, head: str, *, bounded: bool = True) -> tuple[str, list, list]:
@@ -3134,7 +3136,8 @@ def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping, *,
         _start, _paths, commits = _range(repo, base, sha)
         authors, _unknown, correctors = review_authors.reading(
             db, item, dict(freeze or {}), commits, repo, families=(),
-            base=base, head=sha, target=_target_tip(repo, base), fetch=fetch,
+            base=base, head=sha, target=_target_tip(repo, base, fetch=fetch),
+            fetch=fetch,
             admitted_heads=review_authors.stacked_parent_heads(
                 db, item, repo, sha))
     except Exception:  # noqa: BLE001 - plage illisible : comportement historique
