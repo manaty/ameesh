@@ -40,7 +40,7 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None):
     return storage.of(db).host_lifecycle.drain(host, actor=actor, duration=duration, critical=critical)
 
 
-def critical_names(cfg, db):
+def critical_names(cfg, db, *, canons=None):
     """Declared critical agents and every agent L242c treats as critical.
 
     #3643: the roles are each canon's `critical_roles` (`federation.yaml`; the
@@ -57,7 +57,9 @@ def critical_names(cfg, db):
     """
     from . import canon as canon_mod, sous_utilisation
     names = set(getattr(cfg, "critical_agents", ()) or ())
-    canons = work.configured_canons(cfg)
+    # #4377: a caller that already holds every configured canon passes them
+    # (`host_idle._complete_canons`); otherwise the all-or-nothing read.
+    canons = list(canons) if canons is not None else work.configured_canons(cfg)
     try:
         # A canon configured but unreadable yields no loaded canon; it is
         # still a configured canon, and its agents must fall back to the last
