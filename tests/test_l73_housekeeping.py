@@ -45,6 +45,12 @@ class _Cfg:
     def __init__(self, state_dir: str):
         self.state_dir = state_dir
         self.host = "pc"
+        # #4609 : `exploitation.alerts` lit la fenêtre et la part de la
+        # sauvegarde du mesh. Valeurs par défaut de `config.Config`
+        # (03:30-04:30 UTC, 90 %), pour que la doublure reste un config
+        # crédible sans dépendre de l'environnement du banc.
+        self.mesh_backup_window = (12600, 16200)
+        self.mesh_backup_min_share = 0.9
 
 
 def _write(path: str, size: int, age_s: float = 0.0) -> None:
