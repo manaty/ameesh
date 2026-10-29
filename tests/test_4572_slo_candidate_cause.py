@@ -135,6 +135,69 @@ class RefusalOfTest(unittest.TestCase):
         self.assertFalse(cause["ready"])
         self.assertTrue(cause["unknown"])
 
+    def test_une_remise_propre_rend_le_lot_pret(self):
+        # #2496 : le lot en conflit dont une remise propre et couverte porte
+        # la source n'attend pas l'auteur — le composeur peut le prendre.
+        frozen, published = repo_with_branch(self.repo, conflict=True)
+        ref = "refs/ameesh/resolutions/4572/main-%s" % published[:12]
+        cause = self._refusal(
+            frozen=frozen, raw_freeze=frozen, published=frozen,
+            published_source="origin", target="main",
+            remises=[{"ref": ref, "sha": "b" * 40, "ok": True, "cover": "verdict"}])
+        self.assertEqual(cause["code"], "")
+        self.assertTrue(cause["ready"])
+
+    def test_une_remise_refusee_reste_un_conflit_auteur(self):
+        frozen, published = repo_with_branch(self.repo, conflict=True)
+        ref = "refs/ameesh/resolutions/4572/main-%s" % published[:12]
+        cause = self._refusal(
+            frozen=frozen, raw_freeze=frozen, published=frozen,
+            published_source="origin", target="main",
+            remises=[{"ref": ref, "sha": "b" * 40, "ok": False,
+                      "why": "no verdict on the remise"}])
+        self.assertEqual(cause["code"], "conflict")
+        self.assertIn("remise(s) refused", cause["detail"])
+        self.assertIn("no verdict on the remise", cause["detail"])
+
+    def test_une_remise_illisible_ne_fait_pas_accuser_l_auteur(self):
+        frozen, published = repo_with_branch(self.repo, conflict=True)
+        ref = "refs/ameesh/resolutions/4572/main-%s" % published[:12]
+        cause = self._refusal(
+            frozen=frozen, raw_freeze=frozen, published=frozen,
+            published_source="origin", target="main",
+            remises=[{"ref": ref, "sha": "", "ok": False,
+                      "unreadable": "commit not available locally"}])
+        self.assertEqual(cause["code"], "")
+        self.assertTrue(cause["unknown"])
+
+    def test_le_journal_annonce_la_remise_et_son_sha(self):
+        ref = "refs/ameesh/resolutions/4572/main-d1c59da2cb5a"
+        events = [{"note": "Remise sur main d1c59da2 poussée : %s, ref %s "
+                           "(parents 3f8ed2efc + d1c59da2)" % ("c1" + "0" * 38, ref)}]
+        self.assertEqual(packet_candidates.announced_remises(events, 4572, "main"),
+                         [{"ref": ref, "sha": "c1" + "0" * 38}])
+        # ni un autre lot, ni une autre cible
+        self.assertEqual(packet_candidates.announced_remises(events, 4505, "main"), [])
+        self.assertEqual(packet_candidates.announced_remises(events, 4572, "develop"), [])
+
+    def test_une_remise_annoncee_est_evaluee_avant_de_conclure(self):
+        frozen, published = repo_with_branch(self.repo, conflict=True)
+        ref = "refs/ameesh/resolutions/4572/main-%s" % published[:12]
+        events = [{"note": "Remise sur main %s poussée : %s, ref %s"
+                           % (published[:12], "b" * 40, ref)}]
+        row = {"id": 4572, "branch": "lot/4572-x", "branch_target": "main"}
+        with mock.patch.object(packet_candidates, "evaluate_known_remises",
+                               return_value=[{"ref": ref, "sha": "b" * 40,
+                                              "ok": True, "cover": "verdict"}]) as seen:
+            cause = packet_candidates.candidate_refusal(
+                None, None, row,
+                [{"kind": "frozen", "sha": frozen, "at_ts": 1.0}],
+                repo=self.repo, events=events)
+        self.assertTrue(cause["ready"])
+        self.assertEqual(cause["code"], "")
+        self.assertTrue(seen.called)
+        self.assertEqual(seen.call_args.kwargs["remises"][0]["ref"], ref)
+
     def test_sans_depot_la_lecture_ne_conclut_pas(self):
         frozen, published = repo_with_branch(self.repo)
         cause = packet_candidates.refusal_of(

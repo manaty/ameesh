@@ -1222,8 +1222,8 @@ AUTHOR_CAUSES = {
     "missing-branch":
         "give the lot its branch, push it, then freeze",
     "conflict":
-        "resolve the conflict with the target, then freeze and have it reviewed, "
-        "or prepare a clean remise on the target and have that reviewed",
+        "resolve the conflict with the target, then freeze and have it reviewed; "
+        "if a remise on the target is refused, fix it and have the remise reviewed",
 }
 
 
@@ -1242,7 +1242,7 @@ def _author_refusal(code: str, detail: str, **extra) -> dict:
 
 def refusal_of(row: dict, *, frozen: str = "", raw_freeze: str = "",
                published: str = "", published_source: str = "", repo: str = "",
-               target: str = "", base: str = "") -> dict:
+               target: str = "", base: str = "", remises=()) -> dict:
     """#4572 : le premier refus **côté auteur** d'un lot, ou son absence.
 
     Le calcul reste celui de `inventory` (`_candidate`) : mêmes codes, même
@@ -1258,7 +1258,14 @@ def refusal_of(row: dict, *, frozen: str = "", raw_freeze: str = "",
     fusion est propre. `unknown=True` quand la lecture n'a pas pu conclure
     (dépôt absent, gel non résolu, refs manquantes, essai illisible). Aucun
     code n'est inventé : un refus non nommé ici (avis, hold, release…) laisse
-    `code` vide, `unknown` inchangé."""
+    `code` vide, `unknown` inchangé.
+
+    `remises` (#2496/#4572) : les remises du lot sur la cible, déjà évaluées
+    (`evaluate_remise`) ou marquées `unreadable` quand leur commit n'est pas
+    local. Une remise propre et couverte rend le lot **prêt** (le composeur
+    peut le porter) ; des remises toutes refusées gardent `conflict` avec
+    leurs motifs ; une remise non lisible ici rend `unknown` — on ne dit
+    jamais « l'auteur doit résoudre » quand une remise peut le porter."""
     row = row or {}
     branch = str(row.get("branch") or "").strip()
     raw = str(raw_freeze or frozen or "").strip()
@@ -1301,11 +1308,32 @@ def refusal_of(row: dict, *, frozen: str = "", raw_freeze: str = "",
         out["unknown"] = True
         return out
     if merged.get("state") == "conflict":
-        return _author_refusal(
-            "conflict", "conflict with %s: %s"
-            % (target or "the target",
-               ", ".join(merged.get("files") or ()) or "files unreadable"),
-            files=list(merged.get("files") or ()))
+        detail = "conflict with %s: %s" % (
+            target or "the target",
+            ", ".join(merged.get("files") or ()) or "files unreadable")
+        files = list(merged.get("files") or ())
+        known = [rem for rem in (remises or ()) if isinstance(rem, dict)]
+        good = [rem for rem in known if rem.get("ok")]
+        if good:
+            # #2496 : une remise propre et couverte est la source du lot ;
+            # le composeur la porte, l'auteur n'a rien à débloquer.
+            chosen = good[0]
+            out["ready"] = True
+            out["source"] = str(chosen.get("sha") or "")
+            out["remise"] = chosen
+            return out
+        unreadable = [rem for rem in known if rem.get("unreadable")]
+        if unreadable:
+            out["unknown"] = True
+            out["detail"] = detail + "; remise(s) unreadable here: " + "; ".join(
+                "%s: %s" % (str(rem.get("ref") or "?").rsplit("/", 1)[-1],
+                            rem.get("unreadable")) for rem in unreadable)
+            return out
+        if known:
+            detail += "; remise(s) refused: " + "; ".join(
+                "%s: %s" % (str(rem.get("ref") or "?").rsplit("/", 1)[-1],
+                            rem.get("why") or "no reason") for rem in known)
+        return _author_refusal("conflict", detail, files=files)
     if not published or observed:
         out["unknown"] = True
         return out
@@ -1313,8 +1341,102 @@ def refusal_of(row: dict, *, frozen: str = "", raw_freeze: str = "",
     return out
 
 
+#: #4572 : un SHA complet dans une note de remise.
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def announced_remises(events, lot: int, target: str) -> list[dict]:
+    """Les remises du lot sur `target` annoncées au journal (#4572).
+
+    Un résolveur pousse sa remise et la note : « Remise sur main … poussée :
+    <sha>, ref refs/ameesh/resolutions/<lot>/main-… ». Le journal est la
+    seule trace locale quand le commit n'est pas dans ce dépôt ; on en tire
+    la ref et le SHA complet qui la précède, jamais une conclusion —
+    `evaluate_remise` tranche ensuite si l'objet est là. Lecture seule."""
+    prefix = "%s%d/" % (resolutions.REF_PREFIX, int(lot))
+    found: dict = {}
+    for event in events or ():
+        note = str(event.get("note") or "")
+        for word in note.replace(",", " ").split():
+            ref = word.strip().rstrip(".;:)")
+            if not ref.startswith(prefix):
+                continue
+            tail = ref[len(prefix):]
+            if not (tail.startswith(target + "-")
+                    or tail.startswith("union-%s-" % target)):
+                continue
+            before = note[:note.find(ref)]
+            shas = _FULL_SHA.findall(before)
+            found.setdefault(ref, shas[-1] if shas else "")
+    return [{"ref": ref, "sha": sha} for ref, sha in sorted(found.items())]
+
+
+def local_remises(repo: str, lot: int, target: str) -> list[dict]:
+    """Les refs de remise du lot **déjà présentes** dans `repo` (#4572).
+
+    Aucun fetch, aucun réseau : un clone d'auteur ne suit pas
+    `refs/ameesh/resolutions/*` ; le journal (`announced_remises`) complète.
+    """
+    proc = _git_out(repo, "for-each-ref", "--format=%(objectname)\t%(refname)",
+                    resolutions.REF_PREFIX)
+    if proc.returncode:
+        return []
+    found: dict = {}
+    for line in _text(proc).splitlines():
+        sha, _, ref = line.partition("\t")
+        sha, ref = sha.strip().lower(), ref.strip()
+        if _SHA.fullmatch(sha) and is_remise(ref, lot, target):
+            found[ref] = sha
+    return [{"ref": ref, "sha": sha} for ref, sha in sorted(found.items())]
+
+
+def evaluate_known_remises(db, cfg, row: dict, marks, *, repo: str, target: str,
+                           base: str, frozen: str, remises) -> list[dict]:
+    """#4572 : évalue les remises connues du lot, comme `_apply_remises`.
+
+    Une remise dont le commit n'est pas local, ou dont la lecture échoue, est
+    rendue `unreadable` — l'appelant ne conclut alors pas. Une remise évaluée
+    porte `ok`/`why`/`cover`, la forme d'`evaluate_remise` (#2496). Aucune
+    écriture, aucun fetch."""
+    known = [dict(rem) for rem in remises or () if isinstance(rem, dict)]
+    if not known:
+        return []
+    klass = None
+    canons = None
+    try:
+        canons = work.configured_canons(cfg) if cfg is not None else None
+        klass = lot_class.of_lot(db, int(row["id"]), cfg=cfg,
+                                 item=_class_row(row, target), repo=repo,
+                                 base=base, head=frozen, milestones=list(marks or ()),
+                                 canons=canons)
+    except Exception:  # noqa: BLE001 - classe illisible : remises non concluantes
+        klass = None
+    out: list[dict] = []
+    for rem in known:
+        sha = plan_git.local_commit(repo, rem.get("sha") or rem.get("ref") or "")
+        if not sha:
+            out.append({"ref": rem.get("ref") or "", "sha": rem.get("sha") or "",
+                        "ok": False, "unreadable": "commit not available locally"})
+            continue
+        if klass is None:
+            out.append({"ref": rem.get("ref") or "", "sha": sha, "ok": False,
+                        "unreadable": "review class unreadable"})
+            continue
+        try:
+            result = evaluate_remise(
+                db, _class_row(row, target), list(marks or ()), repo=repo,
+                package_base=base, frozen=frozen, ref=rem.get("ref") or "",
+                sha=sha, klass=klass, cfg=cfg, canons=canons)
+        except Exception as exc:  # noqa: BLE001 - lecture impossible : on ne conclut pas
+            result = {"ok": False, "unreadable": "%s: %s" % (type(exc).__name__, exc)}
+        result["ref"] = rem.get("ref") or ""
+        result["sha"] = sha
+        out.append(result)
+    return out
+
+
 def candidate_refusal(db, cfg, row: dict, marks=None, *, overview=None,
-                      repo: str | None = None) -> dict:
+                      repo: str | None = None, events=None) -> dict:
     """#4572 : `refusal_of` avec la résolution des refs locales du lot.
 
     `marks` : les jalons du lot (relus de la base s'ils manquent). `repo` peut
@@ -1372,6 +1494,33 @@ def candidate_refusal(db, cfg, row: dict, marks=None, *, overview=None,
         observed = str(row.get("branch_head") or "").strip()
         if observed:
             published, source = observed, "observed"
-    return refusal_of(row, frozen=frozen, raw_freeze=raw,
-                      published=published, published_source=source,
-                      repo=repo or "", target=target_name, base=base)
+    result = refusal_of(row, frozen=frozen, raw_freeze=raw,
+                        published=published, published_source=source,
+                        repo=repo or "", target=target_name, base=base)
+    if (result.get("code") == "conflict" and repo and frozen
+            and target_name and base):
+        # #2496/#4572 : un conflit n'est pas forcément côté auteur — une
+        # remise propre et couverte sur la cible fait du lot une unité que le
+        # composeur porte. On lit les remises locales et celles annoncées au
+        # journal, puis on les évalue comme `_apply_remises`. Sans objet local
+        # ni raison lisible, `refusal_of` rend `unknown`, jamais « l'auteur
+        # doit résoudre ».
+        known: dict = {rem["ref"]: rem for rem in
+                       local_remises(repo, int(row["id"]), target_name)}
+        if events is None and db is not None:
+            try:
+                events = storage.of(db).progress.lot_events([int(row["id"])])
+            except Exception:  # noqa: BLE001 - journal illisible : pas d'indice
+                events = ()
+        for rem in announced_remises(events, int(row["id"]), target_name):
+            known.setdefault(rem["ref"], rem)
+        if known:
+            evaluated = evaluate_known_remises(
+                db, cfg, row, marks, repo=repo, target=target_name, base=base,
+                frozen=frozen, remises=list(known.values()))
+            if evaluated:
+                result = refusal_of(
+                    row, frozen=frozen, raw_freeze=raw, published=published,
+                    published_source=source, repo=repo, target=target_name,
+                    base=base, remises=evaluated)
+    return result
