@@ -676,7 +676,6 @@ class Mailbox(interface.Mailbox):
              " WHERE name = %%s FOR SHARE) ")
         where = """
              WHERE m.recipient = %%s
-               AND left(m.recipient, 6) <> 'human:'
                AND m.delivered_at IS NULL
                AND m.created_at <= to_timestamp(%%s)
                AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)

@@ -504,11 +504,11 @@ keeping the original sender and date. The executor's cleanup also sweeps dead
 mailboxes (`ameesh mail sweep`, L976): a stopped agent's mail goes to its bound
 successor, and mail nobody can read expires after `mail_dead_letter_days`
 (7 by default), with a thread trace — the alert clears without a human.
-Declared human mailboxes are excluded from dead-mail alerts (#4519); unknown
-`human:*` recipients remain visible as configuration errors. All `human:*`
-mailboxes are excluded from forwarding and expiry. Structured decision requests
-are never forwarded, even if addressed to an agent. Read their queue with
-`ameesh decisions`.
+Declared human mailboxes are excluded from dead-mail alerts and expiry (#4519);
+unknown `human:*` recipients remain visible as configuration errors and their
+ordinary mail can expire. All `human:*` mailboxes are excluded from forwarding.
+Structured decision requests never expire or get forwarded, even if addressed
+to an agent. Read their queue with `ameesh decisions`.
 
 To repair a human decision accidentally forwarded by an older version, a bound
 agent runs `ameesh decide repair-forward <original-id>`. The command atomically

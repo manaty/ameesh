@@ -26,8 +26,9 @@ class HumanDecisionForwardTest(_Base):
             with self.assertRaisesRegex(undeliverable.Refused, 'human mailbox'):
                 undeliverable.forward(self.cfg, self.db, ALICE, 'dev1',
                                       actor='orch', dry_run=dry)
-            self.assertEqual(box.expire_dead_letters(ALICE, {}, time.time(),
-                                                     dry_run=dry), [])
+            expired = box.expire_dead_letters(ALICE, {}, time.time(), dry_run=dry)
+            self.assertEqual(len(expired), 1)  # ordinary mail only, never the decision
+            self.assertNotEqual(expired[0]["id"], view["id"])
         with self.assertRaisesRegex(storage.MailboxRefused, 'human mailbox'):
             box.forward(ALICE, 'dev1', 'orch')
         self.assertEqual(decisions.get(self.db, view['id'])['state'], 'pending')
