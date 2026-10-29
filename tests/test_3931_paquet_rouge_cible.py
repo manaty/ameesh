@@ -629,6 +629,9 @@ class ComposePacketTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.repo = pathlib.Path(self.tmp.name) / "repo"
         self.repo.mkdir()
+        # #4329 : le verrou de composition vit sous le `.git` commun.
+        subprocess.run(["git", "-C", str(self.repo), "init", "-q", "-b", "main"],
+                       check=True)
         self.worktree = pathlib.Path(self.tmp.name) / "wt"
         (self.worktree / "scripts").mkdir(parents=True)
         (self.worktree / "scripts" / "paquet-compose.py").write_text("")

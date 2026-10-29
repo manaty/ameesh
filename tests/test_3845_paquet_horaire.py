@@ -124,16 +124,23 @@ class Base(unittest.TestCase):
                               pilot="mesh-design", actor="mesh-design",
                               shell=self.shell, python="python3", now=NOW,
                               zone=ZONE)
-        self._saved = (ph.ready_lots, ph.manifest_at, ph.replay_locally)
+        self._saved = (ph.ready_lots, ph.manifest_at, ph.replay_locally,
+                       ph.auto.composition_holder)
         self.ready = [3801, 3807]
         self.manifest = MANIFEST
         self.replay = ""
         ph.ready_lots = lambda ctx: list(self.ready)
         ph.manifest_at = lambda ctx, item, sha: self.manifest
         ph.replay_locally = lambda ctx, sha, tests: self.replay
+        # #4329 : le verrou de composition est lu dans le `.git` du checkout ;
+        # les témoins du tic le remplacent pour ne pas dépendre du dépôt réel
+        # (guest de prévalidation sans histoire, safe.directory, etc.). Les
+        # témoins du verrou le patchent explicitement dans leur with.
+        ph.auto.composition_holder = lambda repo, name: None
 
     def tearDown(self):
-        ph.ready_lots, ph.manifest_at, ph.replay_locally = self._saved
+        (ph.ready_lots, ph.manifest_at, ph.replay_locally,
+         ph.auto.composition_holder) = self._saved
 
 
 class ComposeTest(Base):
@@ -149,6 +156,15 @@ class ComposeTest(Base):
             self.shell.lists[""] = [dict(carrier(), state="closed", close_reason=reason,
                                          created_ts=NOW - 60)]
             self.assertIn("déjà créé", ph.tick(self.ctx))
+        self.assertEqual(self.shell.ran("work", "add"), [])
+
+    def test_nouveau_nom_de_paquet_deja_verrouille(self):
+        # #4329 : un paquet-auto lancé à la main tient le verrou du nom que le
+        # tic allait prendre : rien n'est créé.
+        with mock.patch.object(ph.auto, "composition_holder",
+                               return_value=(self.ctx.host, 4321)):
+            self.assertIn("composition en cours (%s:4321)" % self.ctx.host,
+                          ph.tick(self.ctx))
         self.assertEqual(self.shell.ran("work", "add"), [])
 
     def test_porteur_fusionne_dans_l_heure_libere_le_creneau(self):
@@ -265,6 +281,17 @@ class FollowTest(Base):
         self.open_carrier()
         self.shell.ci[4000] = {"runs": [dict(red_run(), status="running")]}
         self.assertIn("en cours", ph.tick(self.ctx))
+
+    def test_composition_vivante_compte_comme_en_cours(self):
+        # #4329 : le tick suit un porteur dont une composition lancée hors du
+        # tic tient le verrou : ni publication, ni ci-full, ni recomposition.
+        self.open_carrier()
+        with mock.patch.object(ph.auto, "composition_holder",
+                               return_value=(self.ctx.host, 4321)):
+            out = ph.tick(self.ctx)
+        self.assertIn("composition en cours (%s:4321)" % self.ctx.host, out)
+        self.assertEqual(self.shell.ran("ci", "run"), [])
+        self.assertEqual(self.shell.ran("work", "reviewer"), [])
 
     def test_rouge_deterministe_retire_et_recompose_une_fois(self):
         self.open_carrier()
@@ -402,6 +429,19 @@ class ResumeTest(Base):
         self.unfrozen(created=NOW - 30)
         self.assertIn("en cours", ph.tick(self.ctx))
         self.assertEqual(self.autos(), [])
+
+    def test_paquet_auto_refuse_une_composition_vivante_sans_echec(self):
+        # #4329 : le refus « composition en cours » (rc 3) n'est pas un échec
+        # de composition : aucune marque d'échec, aucun courrier.
+        item = self.unfrozen()
+        self.shell.auto_rc = ph.auto.IN_PROGRESS_RC
+        self.shell.auto_out = "paquet-auto : composition en cours (hote:1)\n"
+        out = ph.tick(self.ctx)
+        self.assertIn("composition en cours", out)
+        notes = ph.marks(item)
+        self.assertTrue(notes)
+        self.assertFalse([n for n in notes if n.startswith(ph.MARK_FAILED)])
+        self.assertEqual(self.shell.mails, [])
 
     def test_tentative_vivante_sur_cet_hote_attend(self):
         self.ctx.alive = lambda pid: True

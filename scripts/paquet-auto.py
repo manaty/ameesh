@@ -97,6 +97,14 @@ l'arbre égal à la fusion propre des deux parents ; le manifeste seul
 au-dessus) ; les tests d'origine restent ceux du manifeste. Une chaîne
 refusée sort en 3 : le porteur se recompose.
 
+#4329 : une composition tient un verrou `flock` **par nom de paquet**, sous le
+`.git` commun du clone, de `clear_local_branch` à la fin de la composition. Une
+seconde composition du même paquet refuse « composition en cours (hôte:pid) »
+(code 3) au lieu de prendre le worktree vivant pour celui d'une tentative
+précédente et de le supprimer ; le tick la compte comme en cours. Le noyau rend
+le verrou à la mort du processus, donc le worktree d'une tentative morte reste
+nettoyable comme avant, sans expiration à deviner.
+
 Modes :
 
 * normal : composition réelle, poussée, PR, gel, ci-full, tests et courrier ;
@@ -114,15 +122,18 @@ Modes :
 
 Codes de retour : 0 composition réussie (ou aucun lot prêt), 1 échec
 opérationnel (git, test, contrôle, poussée, PR, gel, courrier), 2 entrée
-invalide, 3 tête testée non publiable (`--publish`, #4237).
+invalide, 3 une composition du même paquet est en cours (verrou vivant), ou
+une tête testée n'est pas publiable (`--publish`, #4237).
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -143,6 +154,10 @@ CONTRACT_MODULES = ("tests.test_l161f_plan", "tests.test_cluster")
 COMPOSE_SCRIPT = "scripts/paquet-compose.py"
 CANDIDATES_SCRIPT = "scripts/paquet-candidats.py"
 INCLUSION_SCRIPT = "scripts/paquet-inclusion.py"
+#: #4329 : verrou de composition par nom de paquet, sous le `.git` commun
+LOCK_DIR = "ameesh-paquet-auto"
+#: #4329 : code de retour d'un refus « composition en cours »
+IN_PROGRESS_RC = 3
 #: #3916 : les remises (`ameesh.resolutions.REF_PREFIX`) et leur copie locale
 REMISE_PREFIX = "refs/ameesh/resolutions/"
 REMISE_LOCAL = "refs/ameesh/paquet-auto/remise/"
@@ -251,6 +266,16 @@ class EpochLost(PaquetAutoError):
 
 class ChainRefused(PaquetAutoError):
     """#4237 : une tête testée que `--publish` ne publie pas (chaîne, base)."""
+
+
+class CompositionBusy(PaquetAutoError):
+    """#4329 : une autre composition du même paquet tient son verrou."""
+
+    def __init__(self, name: str, host: str = "", pid: int = 0) -> None:
+        self.name = name
+        self.host = host
+        self.pid = pid
+        super().__init__("composition en cours (%s)" % holder_label(host, pid))
 
 
 @dataclass
@@ -636,6 +661,157 @@ def remote_branch(repo: Path, branch: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Verrou de composition (#4329)
+# ---------------------------------------------------------------------------
+
+
+def package_name(branch: str) -> str:
+    """Le nom de paquet d'une branche `integration/paquet-<nom>`, sinon ""."""
+    if not branch.startswith(PACKAGE_PREFIX):
+        return ""
+    name = branch[len(PACKAGE_PREFIX):]
+    return name if NAME_RE.fullmatch(name) else ""
+
+
+def _git_common_dir(repo: Path) -> Path:
+    """Le `.git` **commun** du dépôt (les worktrees le partagent)."""
+    text = out(repo, "rev-parse", "--path-format=absolute",
+               "--git-common-dir", check=False).strip()
+    if not text:
+        text = out(repo, "rev-parse", "--git-common-dir").strip()
+    path = Path(text)
+    if not path.is_absolute():
+        path = repo / path
+    return path.resolve()
+
+
+def package_lock_path(repo: Path, name: str) -> Path:
+    """Le verrou de composition d'un nom de paquet, sous le `.git` commun."""
+    return _git_common_dir(repo) / LOCK_DIR / (name + ".lock")
+
+
+def holder_label(host: str, pid: int) -> str:
+    """« hôte:pid », ou ce qu'on sait du détenteur du verrou."""
+    if host and pid > 0:
+        return "%s:%d" % (host, pid)
+    if host:
+        return host
+    return "hôte inconnu"
+
+
+def _read_holder(path: Path) -> tuple[str, int] | None:
+    """`hôte:pid` écrit dans le verrou, sans croire qu'il est vivant."""
+    try:
+        text = path.read_text(encoding="ascii", errors="replace").strip()
+    except OSError:
+        return None
+    host, sep, pid = text.rpartition(":")
+    if not sep:
+        return (host, 0) if host else None
+    try:
+        return host, int(pid)
+    except ValueError:
+        return host, 0
+
+
+#: #4329 : les verrous tenus par ce processus (le sien ne se refuse pas)
+_HELD_LOCKS: set[str] = set()
+
+
+class PackageLock:
+    """Le verrou `flock` d'une composition, par nom de paquet (#4329).
+
+    Il vit sous le `.git` commun : le tick et une composition lancée à la main,
+    dans le même clone, se voient. Le noyau le rend à la mort du processus,
+    donc le worktree d'une tentative morte reste nettoyable sans expiration à
+    deviner. Le fichier ne porte `hôte:pid` que pour le message de refus ; la
+    vérité de la vie est le `flock`, jamais le pid relu.
+    """
+
+    def __init__(self, repo: Path, name: str) -> None:
+        self.repo = repo
+        self.name = name
+        self.path = package_lock_path(repo, name)
+        self.fd: int | None = None
+
+    def acquire(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError as exc:
+            raise PaquetAutoError(
+                "verrou de composition %s : %s" % (self.path, exc)) from exc
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = _read_holder(self.path) or ("", 0)
+            os.close(fd)
+            raise CompositionBusy(self.name, *holder) from None
+        except OSError as exc:
+            os.close(fd)
+            raise PaquetAutoError(
+                "verrou de composition %s : %s" % (self.path, exc)) from exc
+        self.fd = fd
+        _HELD_LOCKS.add(str(self.path.resolve()))
+        try:
+            data = ("%s:%d\n" % (socket.gethostname(), os.getpid())).encode(
+                "ascii", "replace")
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, data)
+            os.ftruncate(fd, len(data))
+        except OSError as exc:
+            # le verrou tient : un message sans identité vaut mieux qu'un refus
+            print("identité du verrou non écrite : %s" % exc, file=sys.stderr)
+
+    def release(self) -> None:
+        if self.fd is None:
+            return
+        fd, self.fd = self.fd, None
+        _HELD_LOCKS.discard(str(self.path.resolve()))
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def __enter__(self) -> "PackageLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.release()
+
+
+def composition_holder(repo: Path, name: str) -> tuple[str, int] | None:
+    """Qui tient le verrou de `name`, ou None (#4329).
+
+    Le `flock` partagé non bloquant dit la vie, pas le contenu du fichier : un
+    `hôte:pid` laissé par un processus mort ne fait pas refuser. Le processus
+    appelant peut être le détenteur : à l'appelant de reconnaître son pid.
+    """
+    path = package_lock_path(repo, name)
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return _read_holder(path) or ("", 0)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None
+    finally:
+        os.close(fd)
+
+
+def composition_holder_elsewhere(repo: Path, name: str) -> tuple[str, int] | None:
+    """Le détenteur du verrou de `name` s'il n'est pas ce processus (#4329)."""
+    if str(package_lock_path(repo, name).resolve()) in _HELD_LOCKS:
+        return None
+    return composition_holder(repo, name)
+
+
+# ---------------------------------------------------------------------------
 # Worktree jetable
 # ---------------------------------------------------------------------------
 
@@ -678,9 +854,18 @@ def clear_local_branch(repo: Path, branch: str, log=print) -> None:
     #3916 : un worktree `paquet-auto-*` gardé par la tentative précédente sur
     cette branche (diagnostic d'échec, déjà dans son courrier) est fermé ;
     tout autre worktree ouvert dessus refuse la recomposition.
+
+    #4329 : un verrou de composition vivant sur ce nom de paquet refuse avant
+    toute suppression. Un worktree dont la composition est morte n'a plus de
+    verrou (`flock` rendu par le noyau) : il reste nettoyable comme avant.
     """
     if rev(repo, "refs/heads/" + branch) is None:
         return
+    name = package_name(branch)
+    if name:
+        holder = composition_holder_elsewhere(repo, name)
+        if holder is not None:
+            raise CompositionBusy(name, *holder)
     for path in _worktrees_on(repo, branch):
         if path == repo or not path.name.startswith("paquet-auto-"):
             raise InputError(
@@ -701,6 +886,20 @@ def remove_worktree(repo: Path, path: Path) -> None:
     git(repo, "worktree", "prune", check=False)
 
 
+def _worktree_branches(listing: str) -> dict[Path, str]:
+    """Le chemin -> branche locale de chaque bloc de `worktree list --porcelain`."""
+    branches: dict[Path, str] = {}
+    path: Path | None = None
+    prefix = "branch refs/heads/"
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            path = Path(line[len("worktree "):])
+            branches[path] = ""
+        elif line.startswith(prefix) and path is not None:
+            branches[path] = line[len(prefix):]
+    return branches
+
+
 def prune_stale_worktrees(repo: Path, max_age_hours: float,
                           *, now: float | None = None) -> list[str]:
     """N1 (revue #3807) : borne les worktrees d'échec gardés pour diagnostic.
@@ -710,11 +909,15 @@ def prune_stale_worktrees(repo: Path, max_age_hours: float,
     chemins `paquet-auto-*` **du dépôt** sont retirés, au-delà de
     `max_age_hours` (0 = jamais), puis `worktree prune` ; la branche locale
     reste (petite), le prochain run peut la supprimer avec `--force`.
+
+    #4329 : un worktree dont le paquet a une composition vivante (verrou tenu
+    par un autre processus) n'est jamais purgé, quel que soit son âge.
     """
     if max_age_hours <= 0:
         return []
     cutoff = (time.time() if now is None else float(now)) - max_age_hours * 3600
     listing = out(repo, "worktree", "list", "--porcelain", check=False)
+    branches = _worktree_branches(listing)
     removed: list[str] = []
     for line in listing.splitlines():
         if not line.startswith("worktree "):
@@ -722,6 +925,11 @@ def prune_stale_worktrees(repo: Path, max_age_hours: float,
         path = Path(line[len("worktree "):])
         if path == repo or not path.name.startswith("paquet-auto-"):
             continue
+        name = package_name(branches.get(path, ""))
+        if name:
+            holder = composition_holder_elsewhere(repo, name)
+            if holder is not None:
+                continue
         try:
             stamp = max(path.stat().st_ctime, path.stat().st_mtime)
         except OSError:
@@ -2657,31 +2865,42 @@ def compose_packet(args: argparse.Namespace) -> int:
     guard = (lambda: check_epoch(args.carrier, repo)) if not args.no_packet_record else None
     if guard is not None:
         guard()
-    base_sha = fresh_base(repo, args.target)
-    print("paquet %s : base %s %s" % (args.name, args.target, base_sha), flush=True)
-    remote_sha: str | None = None
-    if not args.no_packet_record:
-        remote_sha = remote_branch(repo, branch)
-        if remote_sha and not args.force:
-            raise InputError(
-                "%s existe déjà sur origin (%s) : un paquet n'est pas réécrit "
-                "sans --force (recomposition) ; choisir un autre --name ou "
-                "inspecter la PR en cours" % (branch, remote_sha[:12]))
-        if remote_sha:
-            git(repo, "fetch", "--no-tags", "origin", branch, check=False)
-            remote_sha = rev(repo, "origin/" + branch) or remote_sha
-        ensure_carrier_branch(repo, args.carrier, branch, args.target)
-    if args.force:
-        clear_local_branch(repo, branch, log=lambda line: print(line, flush=True))
-    stale = prune_stale_worktrees(repo, args.keep_failed_hours)
-    for path in stale:
-        print("worktree d'échec purgé : %s" % path, flush=True)
-    worktree = make_worktree(repo, base_sha, branch)
-    keep_worktree = bool(args.keep_worktree)
-    success = False
-    empty = False
-    tmp = tempfile.TemporaryDirectory(prefix="paquet-auto-",
-                                      dir=os.environ.get("TMPDIR"))
+    # #4329 : le verrou par nom de paquet est pris avant toute lecture d'état
+    # et toute suppression de worktree. Une composition vivante du même paquet
+    # le tient : on refuse au lieu de prendre son worktree pour celui d'une
+    # tentative précédente ; aucun geste (porteur, branche) n'est fait avant.
+    lock = PackageLock(repo, args.name)
+    lock.acquire()
+    try:
+        base_sha = fresh_base(repo, args.target)
+        print("paquet %s : base %s %s"
+              % (args.name, args.target, base_sha), flush=True)
+        remote_sha: str | None = None
+        if not args.no_packet_record:
+            remote_sha = remote_branch(repo, branch)
+            if remote_sha and not args.force:
+                raise InputError(
+                    "%s existe déjà sur origin (%s) : un paquet n'est pas réécrit "
+                    "sans --force (recomposition) ; choisir un autre --name ou "
+                    "inspecter la PR en cours" % (branch, remote_sha[:12]))
+            if remote_sha:
+                git(repo, "fetch", "--no-tags", "origin", branch, check=False)
+                remote_sha = rev(repo, "origin/" + branch) or remote_sha
+            ensure_carrier_branch(repo, args.carrier, branch, args.target)
+        if args.force:
+            clear_local_branch(repo, branch, log=lambda line: print(line, flush=True))
+        stale = prune_stale_worktrees(repo, args.keep_failed_hours)
+        for path in stale:
+            print("worktree d'échec purgé : %s" % path, flush=True)
+        worktree = make_worktree(repo, base_sha, branch)
+        keep_worktree = bool(args.keep_worktree)
+        success = False
+        empty = False
+        tmp = tempfile.TemporaryDirectory(prefix="paquet-auto-",
+                                          dir=os.environ.get("TMPDIR"))
+    except BaseException:
+        lock.release()
+        raise
     try:
         ready_out = Path(tmp.name) / "prets.txt"
         if guard is not None:
@@ -2979,13 +3198,16 @@ def compose_packet(args: argparse.Namespace) -> int:
         success = True
         return 0
     finally:
-        if success and not keep_worktree:
-            remove_worktree(repo, worktree)
-            if empty:
-                git(repo, "branch", "-D", branch, check=False)
-        elif not success:
-            print("worktree conservé pour diagnostic : %s" % worktree,
-                  file=sys.stderr)
+        try:
+            if success and not keep_worktree:
+                remove_worktree(repo, worktree)
+                if empty:
+                    git(repo, "branch", "-D", branch, check=False)
+            elif not success:
+                print("worktree conservé pour diagnostic : %s" % worktree,
+                      file=sys.stderr)
+        finally:
+            lock.release()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3109,6 +3331,9 @@ def main(argv: list[str] | None = None) -> int:
     except ChainRefused as error:
         print("paquet-auto : tête testée non publiable : %s" % error, file=sys.stderr)
         return PUBLISH_REFUSED
+    except CompositionBusy as error:
+        print("paquet-auto : %s" % error, file=sys.stderr)
+        return IN_PROGRESS_RC
     except PaquetAutoError as error:
         print("paquet-auto : %s" % error, file=sys.stderr)
         return 1

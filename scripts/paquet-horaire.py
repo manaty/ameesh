@@ -66,6 +66,11 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    après des tests verts, `paquet-auto: tête testée …` au journal), la reprise
    la publie (`paquet-auto.py --publish`) sans recomposer ; une chaîne refusée
    (cible bougée) recompose dans le même tic.
+   #4329 : un verrou `flock` par nom de paquet, tenu par `paquet-auto.py` de
+   `clear_local_branch` à la fin, est relu avant toute reprise. Une composition
+   lancée hors du tic est ainsi « en cours » (`composition en cours
+   (hôte:pid)`) au lieu de laisser le tic supprimer son worktree vivant ; le
+   verrou tombe avec le processus, une tentative morte reste reprise.
 6. Un courrier au pilote à chaque étape (tête, unités, écartés, CI).
 
 **Recomposition du pilote** (#4237) : `paquet-horaire.py recompose --carrier N
@@ -756,6 +761,12 @@ def compose(ctx: Context, rows: list[dict]) -> str:
     results: list[str] = []
     for index, group in enumerate(groups):
         name = next_name(ctx)
+        # #4329 : une composition du même paquet vit (lancement à la main ou
+        # tick) ; ne pas créer un porteur qu'elle refuserait.
+        holder = composition_in_progress(ctx, name)
+        if holder:
+            results.append("composition en cours (%s)" % holder)
+            continue
         carrier = _create_carrier(ctx, name, group,
                                   parallel=(index + 1 if len(groups) == 2 else 0))
         if len(groups) == 2:
@@ -845,8 +856,19 @@ def attempts(item: dict) -> list[Attempt]:
     return found
 
 
+def composition_in_progress(ctx: Context, name: str) -> str:
+    """« hôte:pid » du verrou vivant de `name`, ou "" (#4329)."""
+    holder = auto.composition_holder(ctx.repo, name)
+    return auto.holder_label(*holder) if holder is not None else ""
+
+
 def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
     """Lancer paquet-auto pour une étape, la marque d'intention d'abord."""
+    holder = composition_in_progress(ctx, name)
+    if holder:
+        # #4329 : une composition du même paquet vit (tick ou lancement à la
+        # main) ; ne pas écrire une tentative que son verrou va refuser.
+        return "#%d : composition en cours (%s)" % (carrier, holder)
     mark = "%s%s n=%d base=%s par=%s:%d" % (MARK_ATTEMPT, this.step, this.n,
                                             this.base or "-", ctx.host, ctx.pid)
     if this.step == RECOMPOSITION:
@@ -944,9 +966,13 @@ def lease_epoch() -> int:
         return 0
 
 
-def running(ctx: Context, this: Attempt) -> bool:
+def running(ctx: Context, this: Attempt, name: str = "") -> bool:
     if this.failed:
         return False
+    # #4329 : un verrou vivant, même sans marque de tentative (composition
+    # lancée hors du tic), fait compter la composition comme en cours.
+    if name and composition_in_progress(ctx, name):
+        return True
     if this.host == ctx.host:
         return this.pid == ctx.pid or ctx.alive(this.pid)
     if this.epoch and ctx.epoch:
@@ -960,8 +986,13 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
     """Une tentative sans aboutissement : attendre, relancer, ou prévenir une fois."""
     carrier = int(item["id"])
     branch = str(item.get("branch") or "")
-    name = branch[len(auto.PACKAGE_PREFIX):]
-    if running(ctx, this):
+    name = auto.package_name(branch)
+    holder = composition_in_progress(ctx, name) if name else ""
+    if holder:
+        # #4329 : le verrou du paquet prime le pid de la marque, qui peut être
+        # celui d'une tentative morte.
+        return "#%d : composition en cours (%s)" % (carrier, holder)
+    if running(ctx, this, name):
         return "#%d : %s en cours (%s:%d)" % (carrier, this.step, this.host, this.pid)
     if this.fenced:
         # #4245 : refus de garde, non concluant : même numéro de tentative,
@@ -1049,26 +1080,31 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
                  % (carrier, name, step, ctx.epoch, this.n, MAX_ATTEMPTS,
                     auto._tail(result.text, 10)))
         return "#%d : %s non concluante (refus de garde d'époque)" % (carrier, step)
-    if this.publish and result.returncode == auto.PUBLISH_REFUSED \
-            and this.n < MAX_ATTEMPTS:
-        # tête testée non publiable (cible bougée, chaîne) : recomposer tout de suite
-        ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (
-            MARK_FAILED, step, this.n, this.base or "-", result.returncode))
-        ctx.say("#%d : tête testée refusée (%s), recomposition"
-                % (carrier, auto._tail(result.text, 3)))
-        # #3256 C : la recomposition d'un porteur parallèle garde son groupe ;
-        # le repli relit la note du porteur si la tentative ne le portait pas.
-        only = list(this.only)
-        if not only:
-            try:
-                only = carrier_group(show(ctx, carrier))
-            except HoraireError:
-                only = []
-        return attempt(ctx, carrier, name, Attempt(step, this.n + 1, this.base,
-                                                   run_id=this.run_id,
-                                                   exclude=list(this.exclude),
-                                                   only=only,
-                                                   reasons=list(this.reasons)))
+    if this.publish and result.returncode == auto.PUBLISH_REFUSED:
+        if this.n < MAX_ATTEMPTS:
+            # tête testée non publiable (cible bougée, chaîne) : recomposer tout de suite
+            ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (
+                MARK_FAILED, step, this.n, this.base or "-", result.returncode))
+            ctx.say("#%d : tête testée refusée (%s), recomposition"
+                    % (carrier, auto._tail(result.text, 3)))
+            # #3256 C : la recomposition d'un porteur parallèle garde son groupe ;
+            # le repli relit la note du porteur si la tentative ne le portait pas.
+            only = list(this.only)
+            if not only:
+                try:
+                    only = carrier_group(show(ctx, carrier))
+                except HoraireError:
+                    only = []
+            return attempt(ctx, carrier, name, Attempt(step, this.n + 1, this.base,
+                                                       run_id=this.run_id,
+                                                       exclude=list(this.exclude),
+                                                       only=only,
+                                                       reasons=list(this.reasons)))
+    elif result.returncode == auto.IN_PROGRESS_RC:
+        # #4329 : le verrou du paquet est vivant ; ce n'est pas un échec de
+        # composition et le tic n'écrit ni marque d'échec ni courrier.
+        holder = composition_in_progress(ctx, name) or "verrou tenu"
+        return "#%d : composition en cours (%s)" % (carrier, holder)
     if result.returncode != 0:
         ctx.note(carrier, "%s%s n=%d base=%s rc=%d" % (
             MARK_FAILED, step, this.n, this.base or "-", result.returncode))
@@ -1136,6 +1172,13 @@ def publish(ctx: Context, item: dict) -> str:
 def follow(ctx: Context, item: dict) -> str:
     """Un porteur horaire ouvert : publier, attendre, ou traiter un rouge."""
     carrier = int(item["id"])
+    name = auto.package_name(str(item.get("branch") or ""))
+    if name:
+        holder = composition_in_progress(ctx, name)
+        if holder:
+            # #4329 : une composition (tick ou lancement à la main) tient le
+            # verrou du paquet ; ne rien publier, retirer ni recomposer avant.
+            return "#%d : composition en cours (%s)" % (carrier, holder)
     sha = frozen_sha(item)
     left = pending(ctx, item, sha)
     if left is not None:
@@ -1177,7 +1220,12 @@ def follow(ctx: Context, item: dict) -> str:
 def recompose(ctx: Context, item: dict, run: dict, verdict: Verdict) -> str:
     carrier = int(item["id"])
     branch = str(item.get("branch") or "")
-    name = branch[len(auto.PACKAGE_PREFIX):]
+    name = auto.package_name(branch)
+    holder = composition_in_progress(ctx, name) if name else ""
+    if holder:
+        # #4329 : ne pas retirer d'unité ni écrire aux auteurs pour une
+        # composition que le verrou dit déjà en cours.
+        return "#%d : composition en cours (%s)" % (carrier, holder)
     run_id = str(run.get("run_id") or "?")
     removed = ", ".join("#%d" % lot for lot in verdict.lots)
     for lot in verdict.lots:

@@ -582,6 +582,13 @@ concluant** (délai, base absente, psql/psycopg indisponible) est consigné à l
 PR, au porteur et au courrier, sans retirer d'unité ni arrêter le paquet :
 seul un test négatif bloque (canon §3), la ci-full tranche.
 
+Une composition tient un verrou `flock` **par nom de paquet**, sous le `.git`
+commun du clone (#4329) : une seconde composition du même paquet — le tic et un
+lancement manuel, par exemple — refuse « composition en cours (hôte:pid) »
+(code 3) au lieu de supprimer le worktree vivant, et le tic la compte comme en
+cours. Le verrou tombe avec le processus : le worktree d'une tentative morte
+reste nettoyable comme avant.
+
 ```sh
 scripts/paquet-auto.py --target main --name h-20261027-01 --carrier 3808
 ```
