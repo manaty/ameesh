@@ -7,6 +7,11 @@ discovered either built in (``it``) or through an ``ameesh.modules`` entry
 point (#2847); each one is described by a read-only `Module`: name, version,
 declared capabilities, CLI entry point and storage entry point.
 
+L103 T2 (#4396): a valid `Pipeline` card of the canon (`pipelines/*.md`) is a
+declarative module of source ``canon``: data, never imported code. Its
+`PipelineModule` adapter stores no work item type (descriptor
+``{types: [], schemas: {}, rules: []}``) and only declares ``lifecycle``.
+
 Discovery is read-only and fails closed per entry: a refused entry point is
 reported with its error and never becomes a `Module`. The bare profile (no
 built-in, no entry point) yields an empty registry without error.
@@ -28,20 +33,43 @@ class Module:
     """Descriptor of one discovered module (no behaviour, only facts)."""
     name: str
     version: str | None
-    source: str                      # "builtin" or "external"
+    source: str                      # "builtin", "external" or "canon"
     capabilities: tuple[str, ...]
     cli: str | None                  # command line served, or None
     storage: tuple[str, ...]         # work item types stored for the module
     distribution: str | None = None
     entry_point: str | None = None
     descriptor_sha256: str = ""
+    card_ref: str | None = None      # L103 T2: canon_ref of a Pipeline card
 
     def as_dict(self):
         return {"name": self.name, "version": self.version, "source": self.source,
                 "capabilities": list(self.capabilities), "cli": self.cli,
                 "storage": {"types": list(self.storage)},
                 "distribution": self.distribution, "entry_point": self.entry_point,
-                "descriptor_sha256": self.descriptor_sha256}
+                "descriptor_sha256": self.descriptor_sha256,
+                "card_ref": self.card_ref}
+
+
+class PipelineModule:
+    """L103 T2 (#4396): the module face of a valid `Pipeline` card.
+
+    Same surface as an installed descriptor (``NAME``, ``descriptor(options)``),
+    built from canon data: the card's types are the ones its workflow covers,
+    not types stored by the module, so the descriptor declares none. No
+    ``main`` and no ``audit``: only ``lifecycle`` until the generic commands
+    (T3)."""
+
+    CAPABILITIES = ("lifecycle",)
+    TYPES = ()
+
+    def __init__(self, pipeline):
+        self.NAME = pipeline.name
+        self.CARD_REF = pipeline.fiche.ref
+        self.pipeline = pipeline
+
+    def descriptor(self, options=None):
+        return {"types": [], "schemas": {}, "rules": []}
 
 
 @dataclass(frozen=True)
@@ -97,13 +125,14 @@ def _core_version():
     return version()
 
 
-def _discover(*, builtin=True):
+def _discover(*, builtin=True, canon=None):
     """`(implementations, Module rows, refusals)` for the discovery.
 
     Same refusals as `ameesh.modules.installed()`, but per entry: a refused
     entry point is listed in the third item instead of raising. `declarations`
     reads the implementations here to compile per-project options without
-    reopening `installed()` and its all-or-nothing failure."""
+    reopening `installed()` and its all-or-nothing failure. With a ``canon``,
+    its Pipeline cards are added as modules of source ``canon`` (`_with_canon`)."""
     implementations, modules, refused = {}, [], []
     builtins = _builtin() if builtin else {}
     for name, module in sorted(builtins.items()):
@@ -130,15 +159,57 @@ def _discover(*, builtin=True):
                                      entry_point=row["entry_point"]))
         except ValueError as exc:
             refused.append(dict(row, error=str(exc)))
+    discovery = (implementations, tuple(modules), tuple(refused))
+    return _with_canon(discovery, canon) if canon is not None else discovery
+
+
+def _with_canon(discovery, canon):
+    """`discovery` plus the Pipeline cards of ``canon`` (L103 T2, #4396).
+
+    A valid card becomes a `PipelineModule` of source ``canon``; nothing is
+    imported. A card is refused (third item, ``source: "canon"``) when it is
+    invalid or shares its name with another card (``reason: "invalid"``,
+    already a `pipeline-*` finding), or when its name is already a discovered
+    module (``reason: "duplicate"``). Installed names are never shadowed."""
+    implementations, modules, refused = discovery
+    implementations, modules, refused = dict(implementations), list(modules), list(refused)
+    taken = set(implementations) | {row["name"] for row in refused}
+    cards = [p for p in (getattr(canon, "pipelines", None) or ()) if p.name]
+    counts = Counter(p.name for p in cards)
+    for pipeline in sorted(cards, key=lambda p: (p.name, p.fiche.path)):
+        row = {"name": pipeline.name, "source": "canon", "distribution": None,
+               "version": None, "entry_point": None, "card_ref": pipeline.fiche.ref}
+        if pipeline.name in taken or counts[pipeline.name] > 1:
+            # two cards of one name are `pipeline-duplicate` already: invalid
+            refused.append(dict(row, reason=("duplicate" if pipeline.name in taken
+                                             else "invalid"),
+                                error="duplicate module: %r (Pipeline card %s)"
+                                      % (pipeline.name, pipeline.fiche.ref)))
+            continue
+        if not pipeline.valid or not NAME.fullmatch(pipeline.name):
+            refused.append(dict(row, reason="invalid",
+                                error="Pipeline card %s is invalid: %s"
+                                      % (pipeline.fiche.ref,
+                                         pipeline.error or "see canon check")))
+            continue
+        module = PipelineModule(pipeline)
+        compiled = _validate_descriptor(pipeline.name, module.descriptor({}),
+                                        allow_empty=True)
+        implementations[pipeline.name] = module
+        modules.append(Module(name=pipeline.name, version=None, source="canon",
+                              capabilities=PipelineModule.CAPABILITIES, cli=None,
+                              storage=(), descriptor_sha256=_digest(compiled),
+                              card_ref=pipeline.fiche.ref))
     return implementations, tuple(modules), tuple(refused)
 
 
-def discover(*, builtin=True):
+def discover(*, builtin=True, canon=None):
     """All discovered modules, by name; ``builtin=False`` is the bare profile.
 
     Same refusals as `ameesh.modules.installed()`, but per entry: a refused
-    entry point is listed in `Registry.refused` instead of raising."""
-    _, modules, refused = _discover(builtin=builtin)
+    entry point is listed in `Registry.refused` instead of raising. With a
+    ``canon``, its valid Pipeline cards are modules of source ``canon``."""
+    _, modules, refused = _discover(builtin=builtin, canon=canon)
     return Registry(modules, refused)
 
 
@@ -261,21 +332,46 @@ def _active_payload():
     return payload, bool(canons), db is not None
 
 
+def _canon_registry():
+    """The discovered modules plus the configured canons' Pipeline cards.
+
+    L103 T2 (#4396): `ameesh modules` reads the canon by default; a canon that
+    cannot be read only warns, and the installed modules are still listed."""
+    import sys
+    from .. import config
+    from .. import canon as canon_mod
+    try:
+        canons = canon_mod.load_configured(config.load())
+    except Exception as exc:  # a reading never prevents the installed listing
+        print("warning: canon not read (%s)"
+              % (" ".join(str(exc).split())[:160],), file=sys.stderr)
+        canons = []
+    discovery = _discover()
+    for canon in canons:
+        discovery = _with_canon(discovery, canon)
+    return Registry(discovery[1], discovery[2])
+
+
 def main(argv):
-    """`ameesh modules [--json] [--active]` — discovered or active modules."""
+    """`ameesh modules [--json] [--active] [--no-canon]` — discovered or active
+    modules."""
     import argparse
     import json
     import sys
 
     parser = argparse.ArgumentParser(
         prog="ameesh modules",
-        description="Modules: discovered (built in and ameesh.modules entry points), "
+        description="Modules: discovered (built in, ameesh.modules entry points and "
+                    "the canon's Pipeline cards), "
                     "with version and capabilities, or active (applied project "
                     "policies); read only.")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     parser.add_argument("--active", action="store_true",
                         help="active project modules (project_modules, or the local "
                              "canon without a database)")
+    parser.add_argument("--no-canon", action="store_true",
+                        help="installed modules only, without the canon's Pipeline "
+                             "cards (L103)")
     args = parser.parse_args(argv)
     if args.active:
         payload, have_canon, have_db = _active_payload()
@@ -297,7 +393,7 @@ def main(argv):
                     row["canon"], scope, row["project"], row["module"],
                     row["version"] or "-", row["descriptor_sha256"]))
         return 0
-    registry = discover()
+    registry = discover() if args.no_canon else _canon_registry()
     if args.json:
         print(json.dumps({"modules": [module.as_dict() for module in registry.modules],
                           "refused": list(registry.refused)},

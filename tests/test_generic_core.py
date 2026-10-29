@@ -134,7 +134,8 @@ class GenericCoreTest(unittest.TestCase):
         # L98 T3 (#4406): the legacy adapters read through the registry.
         # L100 T1/T2 (#4382, #4383): the old paths are declared aliases of
         # modules/dev; L104 removes them and empties these exceptions.
-        exceptions = Counter({("plan_git.py", "module-import"): 1,
+        exceptions = Counter({("plan_github.py", "module-import"): 1,
+                              ("plan_git.py", "module-import"): 1,
                               ("merge_pr.py", "module-import"): 1,
                               ("connectors/git_merge.py", "module-import"): 1})
         actual = Counter({key: count for key, count in scan_core().items()

@@ -486,6 +486,20 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(out["adoptions"][0]["result"], "refused")
         self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
 
+    def test_owner_decision_closed_without_an_answer_says_so(self):
+        """N dev1 du 29/10 sur #4601 : une enveloppe close sans réponse n'est
+        pas un refus de l'owner ; le motif doit le dire, sans « free text »."""
+        self._owner_adoption()
+        with mock.patch.object(veille.decisions, "get",
+                               return_value={"state": "closed"}):
+            out = veille.tick(self.cfg, self.db, now=1001.0, rules=Rules(1800))
+        self.assertEqual(out["adoptions"][0]["result"], "refused")
+        self.assertIn("closed without an answer or withdrawal",
+                      out["adoptions"][0]["reason"])
+        self.assertNotIn("did not approve", out["adoptions"][0]["reason"])
+        self.assertEqual(self._bins(), {"canary": None, "impl": None, "other": None})
+        self.assertEqual(veille.load(self.db, self.lot)["state"]["stage"], "refused")
+
     def test_owner_approval_starts_the_canary(self):
         higher = self._report(price={
             "kind": "higher", "projected_7d_usd": 12.5,

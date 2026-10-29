@@ -53,6 +53,9 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_TURN_GRACE_SECONDS` | `turn_grace_seconds` | 1200 s | grace after a turn's end before a background resource held only by it is closed (`0` = immediate cleanup) |
 | `AMEESH_DRAIN_SECONDS` | `drain_seconds` | 1800 s | drainage left to the running turn and its background work when the **runner itself** stops (systemd `SIGTERM`, `SIGINT`): no new turn, then stop; `0` = immediate stop (the running turn is stopped and its instruction put back); a second signal stops at once, and the systemd unit keeps `TimeoutStopSec` above. A host withdrawal is separate: the `host_gate`/`host_gate_drain` settings and `ameesh host drain --for` |
 | `AMEESH_HOUSEKEEPING_INTERVAL` | `housekeeping_interval` | 600 s | cadence of the runner's housekeeping pass (L73) |
+| `AMEESH_DB_ADMISSION_PRIORITY` | — | 1 | priority admission on the shared psycopg connection (#4602): a worker woken by mail and the `agent_mail` listener go before idle polling passes; `0` restores the plain `RLock` |
+| `AMEESH_DB_AGING_S` | — | 2 s | a NORMAL admission waiting this long goes before newer CONTROL ones (starvation guard) |
+| `AMEESH_DB_WAIT_WARN_S` | — | 1 s | a shared-connection admission wait above this is logged once per agent per 30 s (`deferred: shared database admission`) |
 | `AMEESH_THREAD_RETENTION_DAYS` | `thread_retention_days` | 365 | readable-thread retention: entries older than this are removed by `ameesh fil expire` and the runner's housekeeping (L361, decision 0033 §9); 0 = never |
 | `AMEESH_HEAVY_MAX_S` | `heavy_max_seconds` | 3600 s | duration cap of a heavy command (`ameesh heavy`, or a suite a turn launches), message then SIGTERM/SIGKILL and exit 124 (#453); 0 = none |
 | `AMEESH_SESSION_MIN_TURNS` | `session_min_turns` | 3 | minimum turns before a rotation |

@@ -620,6 +620,10 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
     #2200 : une pause opérateur n'est PAS réveillable — le geste humain dit
     « aucun nouveau tour » et `claim` la respecte déjà ; la disponibilité
     partagée (attribution, courrier, adoption, alertes) la nomme donc.
+    #4610 : le sommeil automatique du découpage (#3256 §2.3) n'est pas ce
+    geste : il est réveillable pour recevoir un lot, avec la remarque qui dit
+    que l'attribution le lèvera à la passe suivante. `claim` reste fermé tant
+    que la pause est là.
 
     #3460 : un agent retiré n'est pas réveillable non plus. Sans ce refus
     explicite, `canon_claim_ok` (qui inclut `retired_at IS NULL`) se lisait
@@ -636,6 +640,7 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
         return False, ("%s is an external agent (human session, cannot be woken)%s"
                        % (name, "" if row.get("responsible")
                           else " and has no human owner")), ""
+    sleep_note = ""
     if row.get("operator_paused"):
         # #2200 : une pause opérateur est un geste humain explicite (« aucun
         # nouveau tour »). `claim` la respecte déjà en SQL ; la disponibilité
@@ -643,14 +648,24 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
         # qui ne le prendra pas. `resume --operator` la lève nommément.
         reason = (row.get("operator_pause_reason") or "").strip()
         by = (row.get("operator_pause_by") or "").strip()
-        # #3961 : le demandeur sait jusqu'à quand (code `operator_paused`)
-        until = row.get("operator_pause_until_ts")
-        if until:
-            from .agent_pause import until_label
-            until = " until %s" % until_label(until)
-        return False, ("%s is under operator pause%s%s%s"
-                       % (name, " by %s" % by if by else "", until or " (no deadline)",
-                          ": %s" % reason if reason else "")), ""
+        # #4610 : le sommeil automatique « feuille de route épuisée » n'est pas
+        # ce geste humain — il est levé par l'attribution elle-même. Un lot
+        # peut donc lui être confié ; les autres contrôles (vivant,
+        # responsable, placement, canon) continuent de juger l'agent. `claim`
+        # reste fermé tant que la passe de découpage n'a pas levé la pause.
+        from . import file_decoupage
+        if not file_decoupage.is_sleep_reason(reason):
+            # #3961 : le demandeur sait jusqu'à quand (code `operator_paused`)
+            until = row.get("operator_pause_until_ts")
+            if until:
+                from .agent_pause import until_label
+                until = " until %s" % until_label(until)
+            return False, ("%s is under operator pause%s%s%s"
+                           % (name, " by %s" % by if by else "",
+                              until or " (no deadline)",
+                              ": %s" % reason if reason else "")), ""
+        sleep_note = ("%s is under the automatic roadmap sleep: the assignment "
+                      "wakes it at the next pass" % name)
     if not row.get("alive"):
         return False, "%s is an expired ephemeral agent" % name, ""
     if cfg is None:
@@ -674,11 +689,13 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
                 else "placement refused")
         return False, ("%s is not admitted on its host %s (%s)"
                        % (name, row.get("host") or "?", why)), ""
-    note = ""
+    note = sleep_note
     if not row.get("canon_claim_ok"):
-        note = ("canon of host %s temporarily %s: %s will only be claimed at the "
-                "next valid sync" % (
-                    row.get("host") or "?", row.get("canon_status") or "no state", name))
+        claim_note = ("canon of host %s temporarily %s: %s will only be claimed at the "
+                      "next valid sync" % (
+                          row.get("host") or "?", row.get("canon_status") or "no state",
+                          name))
+        note = "; ".join(part for part in (note, claim_note) if part)
     return True, "", note
 
 

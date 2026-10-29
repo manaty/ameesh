@@ -1553,9 +1553,12 @@ class Router:
             human = normalize_human(self.ncfg.default_human)
             if human:
                 return human, "defaut"
-        if alert.get("type") == "module_deviation":
+        if alert.get("type") == "module_deviation" and alert.get("project"):
             # A project procedure finding belongs to the lot, even when its
             # assignee (or their host/responsible human) belongs elsewhere.
+            # A host-scoped finding (`dev` workspaces control, no project)
+            # takes the generic route below: the responsible of its agent,
+            # then of its host, then the default human.
             for source, value in (("lot", self.lot_responsible(alert.get("lot"))),
                                   ("defaut", self.ncfg.default_human)):
                 human = normalize_human(value)
@@ -2406,9 +2409,12 @@ class Notifier:
                 gate_cache = self.state["gates"] = {}
             from . import canon as canon_mod
             with canon_mod.configured_cache():
+                # #4579 : la passe de livraison, sous bail, date seule les
+                # épisodes d'attente d'empreinte ; une passe à blanc n'écrit rien.
                 current = exploitation.alerts(
                     self.cfg, db, now=now, local_pool=False,
-                    unreadable=unreadable, gate_cache=gate_cache, **thresholds)
+                    unreadable=unreadable, gate_cache=gate_cache,
+                    record_footprint=not self.dry_run, **thresholds)
         # #3913 B1 : la lecture/le calcul a pu durer plus que le bail. Avant
         # la première écriture (les accusés) et la première poussée, on
         # reprend le verdict : un détenteur périmé se tait, même si son
