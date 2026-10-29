@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Development tooling (L99 T2, #4350): the `git-merge` delivery connector.
+"""Development tooling (L99 T2 #4350, L100 T1 #4382).
 
-Not a lifecycle module (no descriptor, never selected by the canon): it only
-provides delivery connectors, read by the core through
-``ameesh.modules.registry.delivery_connectors()``.
+Not a lifecycle module (no descriptor, never selected by the canon): it
+provides the `git-merge` action connector, read by the core through
+``ameesh.modules.registry.action_connectors()``, and the `git-merge` delivery
+connector, read through ``delivery_connectors()``.
 """
 from __future__ import annotations
+
+from .git_merge import GitMergeConnector
 
 NAME = "dev"
 
@@ -61,5 +64,8 @@ def deliver_git_merge(db, item_id, *, evidence, actor="", **options):
                              pr=evidence.get("pr"), actor=actor, **options)
 
 
-#: connectors this provider declares, by name
+#: action connectors this provider declares, by name (`connectors.get`)
+ACTION_CONNECTORS = {MERGE_CONNECTOR: GitMergeConnector}
+
+#: delivery connectors this provider declares, by name (`work.deliver`)
 DELIVERY_CONNECTORS = {MERGE_CONNECTOR: deliver_git_merge}

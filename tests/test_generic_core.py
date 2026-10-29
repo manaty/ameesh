@@ -132,9 +132,11 @@ def report() -> None:
 class GenericCoreTest(unittest.TestCase):
     def test_core_does_not_import_module_implementations(self):
         # L98 T3 (#4406): the legacy adapters read through the registry.
-        # L100 T2 (#4383): compatibility alias of modules/dev/plan_git;
-        # removed with L104.
-        exceptions = Counter({("plan_git.py", "module-import"): 1})
+        # L100 T1/T2 (#4382, #4383): the old paths are declared aliases of
+        # modules/dev; L104 removes them and empties these exceptions.
+        exceptions = Counter({("plan_git.py", "module-import"): 1,
+                              ("merge_pr.py", "module-import"): 1,
+                              ("connectors/git_merge.py", "module-import"): 1})
         actual = Counter({key: count for key, count in scan_core().items()
                           if key[1] == "module-import"})
         self.assertFalse(actual - exceptions,

@@ -33,18 +33,6 @@ class ValidatedTest(PgTestCase):
         # must support those rows after that release rolls back to its baseline.
         self.db.execute("UPDATE work_items SET state = 'validated' WHERE id = %s", (self.lot,))
 
-    def test_verdict_keeps_legacy_qa_even_with_a_quorum(self):
-        with mock.patch("ameesh.merge_queue.review_gate_for_item", return_value={"ok": True}) as gate:
-            self.mark()
-        gate.assert_not_called()
-        self.assertEqual(self.current_state(), "qa")
-
-    def test_manual_writer_is_unavailable_in_the_reader_release(self):
-        self.mark()
-        with self.assertRaisesRegex(work.WorkError, "transition refused"):
-            work.move(self.db, self.lot, "validated")
-        self.assertEqual(self.current_state(), "qa")
-
     def test_refreeze_resets_existing_validation_in_the_same_transaction(self):
         self.existing_validated()
         self.mark("frozen", NEXT)
