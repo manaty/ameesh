@@ -117,7 +117,7 @@ class PacketCloseTest(_PlanDb):
                          {"merged"})
         for item, unit in zip((first, second), units):
             row = work.get(self.db, item["id"])
-            self.assertEqual(row["state"], "merged")
+            self.assertEqual(row["state"], "delivered")
             merged = [m for m in work.milestones(self.db, item["id"])
                       if m["kind"] == "merged"][0]
             self.assertEqual(merged["sha"], unit["source"])

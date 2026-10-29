@@ -356,7 +356,7 @@ class CloseTest(_PlanDb):
         work.move(self.db, a["id"], "build")
         done = work.close_merged(self.db, a["id"], sha=SHA, actor="github:alice",
                                  source="sync-github", pr_ref="acme/web#3")
-        self.assertEqual((done["result"], done["item"]["state"]), ("merged", "merged"))
+        self.assertEqual((done["result"], done["item"]["state"]), ("merged", "delivered"))
         self.assertEqual(done["item"]["pr_ref"], "acme/web#3")
         merged = [m for m in work.milestones(self.db, a["id"]) if m["kind"] == "merged"]
         self.assertEqual(len(merged), 1)
@@ -388,7 +388,7 @@ class GateMergeCloseTest(ActionsBase):
         result = self.execute(action, gh)
         self.assertEqual(result["state"], "confirmed")
         row = work.get(self.db, item["id"])
-        self.assertEqual((row["state"], row["pr_ref"]), ("merged", PR))
+        self.assertEqual((row["state"], row["pr_ref"]), ("delivered", PR))
         merged = [m for m in work.milestones(self.db, item["id"]) if m["kind"] == "merged"][0]
         self.assertEqual(merged["sha"], self.pr()["mergeCommit"]["oid"])
         self.assertEqual(merged["actor"], ALICE)

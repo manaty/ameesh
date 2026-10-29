@@ -68,7 +68,7 @@ import time
 
 from . import config as config_mod
 from . import db as db_mod
-from . import fil, identity, platform, registry, storage, work
+from . import fil, identity, platform, registry, storage, work, work_lifecycle
 from .config import NAME_RE, Config
 
 #: schéma du JSON d'une demande (`--json`, clé `requests` de `ameesh decisions`)
@@ -480,7 +480,7 @@ def request_text(decision: dict, *, requester: str, owner: str | None,
 
 def _hold_lot(db, item: dict, *, note: str, actor: str) -> str:
     """Le lot passe en `waiting_human` (journal) ; rend son état."""
-    state = item["state"]
+    state = work_lifecycle.phase(item)
     if state != "waiting_human" and "waiting_human" in work.TRANSITIONS.get(state, ()):
         try:
             return work.move(db, int(item["id"]), "waiting_human", note=note, actor=actor)["state"]
@@ -592,7 +592,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
                                     "reference, or --new-lot \"title\"" % lot)
         owner, source = resolve_owner(cfg, db, requester_row, item)
         lot_id = int(item["id"])
-        previous = item["state"]
+        previous = work_lifecycle.phase(item)
         if previous == "waiting_human":
             # une autre demande tient déjà le lot : son état d'avant est le bon
             inherited = [view_of(r, now).get("previous_state")

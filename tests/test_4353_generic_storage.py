@@ -2,13 +2,28 @@
 """L99 T5: persisted delivery core, lossless stages and transactional rollback."""
 from pathlib import Path
 import unittest
+from unittest import mock
 
-from ameesh import work, work_lifecycle as lifecycle, plan_github, storage
+from ameesh import work, work_lifecycle as lifecycle, plan_github, storage, decisions
 from ameesh.db import DbError
 from .support import PgTestCase
 
 MIGRATIONS = Path(__file__).parents[1] / 'src/ameesh/migrations'
 MIGRATION = (MIGRATIONS / '0518_generic_delivery_state.sql').read_text()
+
+
+class DeliveryDecisionTest(unittest.TestCase):
+    def test_merged_delivery_can_wait_for_a_decision(self):
+        item = dict(id=1, state='delivered', legacy_state='merged')
+        with mock.patch.object(work, 'move', return_value={'state': 'waiting_human'}) as move:
+            self.assertEqual(decisions._hold_lot(None, item, note='decision', actor='test'), 'waiting_human')
+        move.assert_called_once_with(None, 1, 'waiting_human', note='decision', actor='test')
+
+    def test_promoted_delivery_is_not_reopened_for_a_decision(self):
+        item = dict(id=1, state='delivered', legacy_state='promoted')
+        with mock.patch.object(work, 'move') as move, mock.patch.object(work, 'note'):
+            self.assertEqual(decisions._hold_lot(None, item, note='decision', actor='test'), 'promoted')
+        move.assert_not_called()
 
 
 class GenericDeliveryTest(PgTestCase):
@@ -53,6 +68,13 @@ class GenericDeliveryTest(PgTestCase):
             work.move(self.db, lot, 'build')
         with self.assertRaises(work.WorkError):
             work.move(self.db, lot, 'merged')
+
+    def test_invalid_pinned_compatibility_state_is_rejected(self):
+        lot = self.lot()
+        with self.assertRaises(DbError):
+            with self.db.transaction() as tx:
+                tx.execute("UPDATE work_items SET state = 'delivered', legacy_state = 'delivered',"
+                           " workflow_ref = 'custom@1', workflow_stage = 'integrated' WHERE id = %s", (lot,))
 
     def test_custom_pinned_stage_is_preserved(self):
         lot = self.lot()

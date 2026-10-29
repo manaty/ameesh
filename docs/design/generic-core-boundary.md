@@ -14,8 +14,9 @@ Readers should use these groups rather than repeat storage spellings:
 - `TO_VALIDATE`: work awaiting validation.
 - `DELIVERED`: delivery recorded or promoted.
 - `COMPLETED`: delivered work and explicitly closed work.
-- `TERMINAL`: states without further normal transitions. A recorded delivery
-  can still be promoted, so it is completed without being terminal.
+- `TERMINAL`: completed core outcomes (`delivered`, `closed`), including the
+  historical promotion spelling for compatibility. Development transitions
+  inside a delivered core are governed by its module stage.
 
 The legacy `closed` state also covers delivery outside the target and completed
 review missions. Its close reason must be checked before treating it as an

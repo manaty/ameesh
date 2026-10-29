@@ -152,5 +152,5 @@ ALTER TABLE work_items ADD CONSTRAINT work_items_workflow_stage_needs_ref
  CHECK (workflow_stage IS NULL OR workflow_ref IS NOT NULL
         OR (state = 'delivered' AND workflow_stage IN ('merged', 'promoted')));
 ALTER TABLE work_items ADD CONSTRAINT work_items_legacy_state_matches
- CHECK ((state = 'delivered' AND legacy_state IN ('merged', 'promoted'))
-        OR legacy_state = state);
+ CHECK (((state = 'delivered' AND legacy_state IN ('merged', 'promoted'))
+         OR (state <> 'delivered' AND legacy_state = state)) IS TRUE);

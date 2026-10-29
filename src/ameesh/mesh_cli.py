@@ -346,7 +346,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         except mechanics.MechanicsError:
             cap = None
         for lot in lots:
-            if lot.get("assignee") and lot.get("state") not in work.TERMINAL:
+            if lot.get("assignee") and work_lifecycle.phase(lot) not in ("promoted", "closed"):
                 open_by_agent[lot["assignee"]] = open_by_agent.get(lot["assignee"], 0) + 1
                 if lot.get("state") == lifecycle.IN_PROGRESS:
                     # §4 (owner 14/10/2026) : le compte d'en-cours est tous

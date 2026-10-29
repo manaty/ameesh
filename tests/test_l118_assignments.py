@@ -445,7 +445,7 @@ class BranchMergeTest(_Base):
         report = self.sync()
         self.assertEqual((report["merged"], report["results"][0]["how"]), (1, "ancestor"))
         item = work.get(self.db, lot["id"])
-        self.assertEqual(item["state"], "merged")
+        self.assertEqual(item["state"], "delivered")
         notes = [e["note"] for e in work.events(self.db, lot["id"])]
         self.assertTrue(any("branch agent/dev1-a" in n for n in notes), notes)
         self.assertEqual(self.sync()["results"], [])          # lot livré : plus examiné

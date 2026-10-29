@@ -1540,8 +1540,8 @@ class RegistryTest(PgTestCase):
         self.db.execute("CREATE TRIGGER aa_work_items_generic_state_sync BEFORE INSERT OR UPDATE"
                         " ON work_items FOR EACH ROW EXECUTE FUNCTION work_items_generic_state_sync()")
         self.db.execute("ALTER TABLE work_items ADD CONSTRAINT work_items_legacy_state_matches"
-                        " CHECK ((state = 'delivered' AND legacy_state IN ('merged','promoted'))"
-                        " OR legacy_state = state)")
+                        " CHECK (((state = 'delivered' AND legacy_state IN ('merged','promoted'))"
+                        " OR (state <> 'delivered' AND legacy_state = state)) IS TRUE)")
 
     def test_before_0452_historical_commands_do_not_break(self):
         """B5 (package 0650), pre-0452 support: without the registry

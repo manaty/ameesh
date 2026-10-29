@@ -396,6 +396,7 @@ def _effective_merged(alias: str) -> str:
 #: font foi ; `verdicts` et `blocked_verdicts` comptent les tours de revue.
 _DELAYS_SELECT = """
     SELECT w.id AS work_item_id, w.state, w.assignee, w.title,
+           to_jsonb(w)->>'legacy_state' AS legacy_state,
            extract(epoch FROM w.created_at)::float8 AS created_ts,
            extract(epoch FROM w.updated_at)::float8 AS updated_ts,
            extract(epoch FROM req.at)::float8 AS requested_ts,
