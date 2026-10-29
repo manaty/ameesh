@@ -110,6 +110,17 @@ class MechanicsBlockTest(unittest.TestCase):
                                          "  repos_s: 1800\n")
         self.assertEqual(doc.queue_fill, SETTINGS)
         self.assertEqual(doc.to_dict()["file"], {"repos_part": 0.2, "repos_s": 1800})
+        self.assertEqual(doc.queue_fill.mail_window(), 1800.0)
+
+    def test_the_mail_window_is_its_own_key_and_defaults_to_repos_s(self):
+        # #4610 : la fenêtre du courrier récent se règle à part ; sans clé,
+        # elle vaut `repos_s` (le bloc `file` existant garde son sens).
+        doc = mechanics.compile_document(self.BASE + "file:\n  repos_part: 0.20\n"
+                                         "  repos_s: 1800\n  wake_mail_s: 3600\n")
+        self.assertEqual(doc.queue_fill.wake_mail_s, 3600)
+        self.assertEqual(doc.queue_fill.mail_window(), 3600.0)
+        self.assertEqual(doc.to_dict()["file"],
+                         {"repos_part": 0.2, "repos_s": 1800, "wake_mail_s": 3600})
 
     def test_absent_block_means_no_trigger(self):
         self.assertIsNone(mechanics.compile_document(self.BASE).queue_fill)
@@ -119,6 +130,7 @@ class MechanicsBlockTest(unittest.TestCase):
         for block in ("file:\n  repos_part: 0\n  repos_s: 1800\n",
                       "file:\n  repos_part: 1.5\n  repos_s: 1800\n",
                       "file:\n  repos_part: 0.2\n",
+                      "file:\n  repos_part: 0.2\n  repos_s: 1800\n  wake_mail_s: 0\n",
                       "file:\n  repos_part: 0.2\n  repos_s: 1800\n  other: 1\n"):
             with self.assertRaises(mechanics.MechanicsError, msg=block):
                 mechanics.compile_document(self.BASE + block)
