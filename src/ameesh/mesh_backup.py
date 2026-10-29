@@ -10,13 +10,15 @@ fenêtre de sauvegarde et alerte quand il n'existe pas.
 
 Deux précautions, apprises du relevé du 29/10 (#4300) :
 
-* les tables relues ensuite par l'activité normale **perdent** cet instant et
-  sortent de la fenêtre : le seuil porte donc sur les tables dont le
-  `last_seq_scan` est encore dans la fenêtre, jamais sur toutes les tables
-  (au 29/10 à 16:2xZ, 150 tables portaient encore l'instant du `pg_dump` et
-  121 avaient été relues ; compter ces dernières contre la sauvegarde
-  produirait une fausse alerte chaque après-midi). Le nombre total de tables
-  est reporté dans la ligne, pour que le lecteur voie la couverture ;
+* les tables relues ensuite par l'activité normale **avancent** leur instant :
+  le critère ne compte donc pas les tables encore dans la fenêtre, mais
+  demande qu'un groupe de tables partage un même instant T dans la fenêtre
+  (preuve d'une transaction) et qu'au moins 90 % des tables lisibles aient un
+  `last_seq_scan` **au moins égal** à T (elles ont pu être lues par le dump,
+  puis relues plus tard). Compter les tables relues après le dump contre la
+  sauvegarde produisait une fausse alerte chaque matin vers 04:30 (#4609 B) ;
+  un plancher de groupe écarte la petite transaction ordinaire qui, seule,
+  donnerait 100 % (faux vert) ;
 * la fenêtre évaluée est la **dernière fenêtre close** : avant 04:30Z, c'est
   celle de la veille, pour qu'une sauvegarde manquante ne disparaisse pas à
   minuit et ne se relève pas chaque matin.
@@ -35,9 +37,14 @@ from datetime import datetime, timezone
 #: `ameesh-sauvegarde.timer` part à 03:30 avec jusqu'à 15 min d'aléa, et la
 #: fenêtre se referme une heure plus tard. Réglable (`mesh_backup_window`).
 DEFAULT_WINDOW = (3 * 3600 + 30 * 60, 4 * 3600 + 30 * 60)
-#: Part minimale des tables de la fenêtre qui doivent partager un même
-#: instant. 0 désactive l'alerte (`mesh_backup_min_share`).
+#: Part minimale des tables lisibles qui doivent avoir été lues au moins à
+#: l'instant de la transaction. 0 désactive l'alerte (`mesh_backup_min_share`).
 DEFAULT_MIN_SHARE = 0.9
+#: Part minimale des tables lisibles qu'une même transaction doit avoir lues
+#: pour compter comme signature de `pg_dump` (`mesh_backup_min_group_share`).
+#: Un groupe de 2-3 tables peut être une transaction ordinaire, pas une
+#: sauvegarde : sans plancher, il donnerait 100 % et un faux vert.
+DEFAULT_MIN_GROUP_SHARE = 0.05
 SECONDS_PER_DAY = 86400
 MICROSECONDS = 1000000
 
@@ -64,36 +71,75 @@ def window_bounds(now, window=DEFAULT_WINDOW):
     return start * MICROSECONDS, end * MICROSECONDS
 
 
-def project(rows, now, *, window=DEFAULT_WINDOW, min_share=DEFAULT_MIN_SHARE):
+def project(rows, now, *, window=DEFAULT_WINDOW, min_share=DEFAULT_MIN_SHARE,
+            min_group_share=DEFAULT_MIN_GROUP_SHARE):
     """Évalue la signature du `pg_dump` sur les statistiques simulées ou lues.
 
     `rows` : `[{"relname": str, "last_seq_scan_us": int | None}]`. Rend un
-    dictionnaire stable (fenêtre, nombre total de tables, tables encore dans
-    la fenêtre, plus grand groupe au même instant, part, verdict `ok`).
+    dictionnaire stable (fenêtre, tables lisibles, tables encore dans la
+    fenêtre, groupe et part, verdict `ok`).
+
+    Le `pg_dump` lit toutes les tables dans une seule transaction : après lui,
+    chaque table a un `last_seq_scan` **au moins égal** à l'instant T du dump ;
+    une table relue plus tard n'a fait que avancer. Le critère est donc :
+    il existe T dans la fenêtre, porté par un groupe d'au moins
+    `min_group_share` des tables lisibles, tel qu'au moins `min_share` des
+    tables aient un `last_seq_scan >= T`. Les tables relues après T ne
+    diluent plus la part (l'ancien dénominateur « tables encore dans la
+    fenêtre » produisait une fausse alerte à 04:30, #4609 B de relecture) ;
+    le plancher de groupe écarte une petite transaction ordinaire, qui
+    donnerait sinon 100 % (faux vert).
     """
     start_us, end_us = window_bounds(now, window)
     instants: Counter = Counter()
-    total = 0
+    values = []
     for row in rows or ():
-        total += 1
         value = row.get("last_seq_scan_us")
         if value is None:
             continue
         value = int(value)
+        values.append(value)
         if start_us <= value < end_us:
             instants[value] += 1
+    total = len(values)
     in_window = sum(instants.values())
-    shared_us, shared = instants.most_common(1)[0] if instants else (None, 0)
-    share = shared / in_window if in_window else 0.0
+    # plancher du groupe : au moins 2 tables, et `min_group_share` des tables
+    # lisibles ; jamais plus que le nombre de tables (petite base).
+    floor = min(total, max(2, math.ceil(float(min_group_share) * total))) if total else 0
+    share_floor = float(min_share)
+    best = None       # groupe au-dessus du plancher, couverture la plus haute
+    fallback = None   # plus grand groupe, même sous le plancher (pour le detail)
+    for instant, group in instants.items():
+        covered = sum(1 for value in values if value >= instant)
+        if group >= floor:
+            if best is None or (covered, group) > (best[0], best[1]):
+                best = (covered, group, instant)
+        if fallback is None or (group, instant) > (fallback[1], fallback[2]):
+            fallback = (covered, group, instant)
+    if best is not None and best[0] >= share_floor * total:
+        covered, group, instant = best
+        ok = True
+    elif best is not None:
+        covered, group, instant = best
+        ok = False
+    elif fallback is not None:
+        covered, group, instant = fallback
+        ok = False
+    else:
+        covered, group, instant = 0, 0, None
+        ok = False
+    share = covered / total if total else 0.0
     return {
         "window_start": start_us / MICROSECONDS,
         "window_end": end_us / MICROSECONDS,
         "tables": total,
         "in_window": in_window,
-        "shared": shared,
+        "shared": group,
+        "covered": covered,
+        "min_group": floor,
         "share": share,
-        "instant_us": shared_us,
-        "ok": in_window > 0 and share >= float(min_share),
+        "instant_us": instant,
+        "ok": ok,
     }
 
 
@@ -104,24 +150,34 @@ def read(db):
     return mesh_backup.read(db)
 
 
-def alert_detail(result, min_share):
+def alert_detail(result, min_share, min_group_share=DEFAULT_MIN_GROUP_SHARE):
     """Le texte de l'alerte : constat, commande de vérification, limites."""
     start = _stamp(result["window_start"])
     end = _stamp(result["window_end"])
     if result["in_window"]:
-        seen = (
-            "the largest group is %d of the %d tables still showing a sequential "
-            "scan inside %s..%s, all at %s (%.0f %% against a %.0f %% floor)"
-            % (result["shared"], result["in_window"], start, end,
-               _instant(result["instant_us"]), 100 * result["share"],
-               100 * float(min_share)))
+        if result["shared"] < result["min_group"]:
+            seen = (
+                "the largest group inside %s..%s is %d of the %d readable tables, "
+                "all at %s, below the %d-table floor for a full-dump transaction"
+                % (start, end, result["shared"], result["tables"],
+                   _instant(result["instant_us"]), result["min_group"]))
+        else:
+            seen = (
+                "the largest transaction inside %s..%s read %d tables at %s; only "
+                "%d of the %d readable tables have last_seq_scan at or after it "
+                "(%.0f %% against a %.0f %% floor)"
+                % (start, end, result["shared"], _instant(result["instant_us"]),
+                   result["covered"], result["tables"], 100 * result["share"],
+                   100 * float(min_share)))
     else:
         seen = "no table still shows a sequential scan inside %s..%s" % (start, end)
     return (
-        "mesh database backup not seen: %s (%d tables in pg_stat_user_tables). "
-        "The daily pg_dump reads every table in one transaction, so the tables it "
-        "read share last_seq_scan to the microsecond; tables re-read later by "
-        "normal activity lose that instant and are not counted as failures. "
+        "mesh database backup not seen: %s (%d readable tables in "
+        "pg_stat_user_tables). The daily pg_dump reads every table in one "
+        "transaction, so after it every table's last_seq_scan is at or after the "
+        "dump instant; tables re-read later only move forward. A group of tables "
+        "sharing one microsecond instant marks that transaction; the group floor "
+        "rejects a small ordinary transaction. "
         "Check: psql \"$AMEESH_DSN\" -Atc \"SELECT last_seq_scan, count(*) FROM "
         "pg_stat_user_tables GROUP BY 1 ORDER BY 2 DESC LIMIT 5\" (the mesh DSN "
         "is `dsn` in the ameesh config). Statistics reset at server start: check "
@@ -130,7 +186,8 @@ def alert_detail(result, min_share):
         % (seen, result["tables"]))
 
 
-def alerts(db, now, *, window=DEFAULT_WINDOW, min_share=DEFAULT_MIN_SHARE):
+def alerts(db, now, *, window=DEFAULT_WINDOW, min_share=DEFAULT_MIN_SHARE,
+           min_group_share=DEFAULT_MIN_GROUP_SHARE):
     """L'alerte `mesh_backup_unseen` du jour, ou une liste vide."""
     floor = float(min_share)
     if floor <= 0:                  # réglage explicite : alerte désactivée
@@ -138,17 +195,20 @@ def alerts(db, now, *, window=DEFAULT_WINDOW, min_share=DEFAULT_MIN_SHARE):
     rows = read(db)
     if rows is None:                # serveur sans `last_seq_scan` : pas de preuve
         return []
-    result = project(rows, now, window=window, min_share=floor)
+    result = project(rows, now, window=window, min_share=floor,
+                     min_group_share=min_group_share)
     if result["ok"]:
         return []
     from .exploitation import _alert
 
     return [_alert(
         "mesh_backup_unseen", None, result["window_start"],
-        round(result["share"], 3), floor, alert_detail(result, floor),
+        round(result["share"], 3), floor,
+        alert_detail(result, floor, min_group_share),
         window_start=result["window_start"], window_end=result["window_end"],
         tables=result["tables"], in_window=result["in_window"],
-        shared=result["shared"],
+        shared=result["shared"], covered=result["covered"],
+        min_group=result["min_group"],
         instant=(_instant(result["instant_us"])
                  if result["instant_us"] is not None else None))]
 

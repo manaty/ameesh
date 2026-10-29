@@ -3,7 +3,12 @@
 
 Le constat du 29/10 (#4300) : sous PostgreSQL 17, les 150 tables encore lues
 par le `pg_dump` de 03:37Z portaient le même `last_seq_scan` à la microseconde ;
-121 autres, relues depuis par l'activité normale, avaient perdu cet instant.
+121 autres, relues depuis par l'activité normale, avaient avancé cet instant.
+Le critère (B de relecture du 29/10) : un groupe d'au moins 5 % des tables
+lisibles partage un instant T dans la fenêtre, et au moins 90 % des tables
+lisibles ont un `last_seq_scan >= T` — une table relue après le dump a pu être
+lue par lui, elle ne compte pas contre la sauvegarde. Le plancher de groupe
+écarte la petite transaction ordinaire qui donnerait sinon 100 % (faux vert).
 Les témoins ci-dessous simulent ces statistiques : ils ne dépendent ni de la
 base, ni de l'heure murale, ni d'un `pg_dump` réel.
 """
@@ -53,6 +58,8 @@ class ProjectionTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual((result["tables"], result["in_window"], result["shared"]),
                          (13, 10, 10))
+        self.assertEqual(result["covered"], 13)
+        self.assertEqual(result["min_group"], 2)
         self.assertEqual(result["share"], 1.0)
         self.assertEqual(result["instant_us"], DUMP)
 
@@ -82,6 +89,46 @@ class ProjectionTest(unittest.TestCase):
                          (271, 150, 150))
         self.assertEqual(result["share"], 1.0)
 
+    def test_faux_positif_0430_les_tables_relues_apres_le_dump_ne_comptent_pas(self):
+        """B de relecture : à 04:30:30, 150 tables au dump et 59 relues depuis
+        dans la fenêtre ; l'ancien dénominateur donnait 150/209 < 0,9."""
+        result = mesh_backup.project(
+            rows(*([DUMP] * 150), *([ts(3, 50)] * 59), *([ts(4, 10)] * 62)),
+            ts(4, 30, 30) / 1000000)
+        self.assertTrue(result["ok"])
+        self.assertEqual((result["tables"], result["in_window"], result["shared"]),
+                         (271, 271, 150))
+        self.assertEqual(result["covered"], 271)
+        self.assertEqual(result["share"], 1.0)
+
+    def test_faux_vert_un_petit_groupe_seul_ne_prouve_pas_le_dump(self):
+        """Sans dump, 3 tables d'une même transaction ne font pas 100 %."""
+        result = mesh_backup.project(rows(*([ts(3, 35)] * 3),
+                                          *([ts(2)] * 97)), NOW)
+        self.assertFalse(result["ok"])
+        self.assertEqual((result["tables"], result["in_window"]), (100, 3))
+        self.assertEqual(result["shared"], 3)
+        self.assertEqual(result["min_group"], 5)
+        self.assertAlmostEqual(result["share"], 0.03)
+        detail = mesh_backup.alert_detail(result, 0.9)
+        self.assertIn("below the 5-table floor", detail)
+
+    def test_un_groupe_au_plancher_sans_couverture_alerte(self):
+        """Une transaction incomplète : 89 tables lues, 11 restées avant T."""
+        result = mesh_backup.project(rows(*([DUMP] * 89), *([ts(2)] * 11)), NOW)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["shared"], 89)
+        self.assertEqual(result["covered"], 89)
+        self.assertAlmostEqual(result["share"], 0.89)
+
+    def test_le_plancher_de_groupe_est_reglable(self):
+        """3 tables à T et 97 relues après : le plancher par défaut refuse,
+        un plancher plus bas laisse passer la couverture."""
+        instants = [ts(3, 35)] * 3 + [ts(10)] * 97
+        self.assertFalse(mesh_backup.project(rows(*instants), NOW)["ok"])
+        self.assertTrue(mesh_backup.project(rows(*instants), NOW,
+                                            min_group_share=0.01)["ok"])
+
     def test_avant_la_fin_la_derniere_fenetre_close_est_celle_de_la_veille(self):
         result = mesh_backup.project(rows(*([DUMP - DAY_US] * 10)), ts(4) / 1000000)
         self.assertTrue(result["ok"])
@@ -94,7 +141,8 @@ class ProjectionTest(unittest.TestCase):
         self.assertEqual(result["window_end"], ts(4, 30) / 1000000)
 
     def test_seuil_reglable(self):
-        instants = [DUMP] * 8 + [ts(3, 50), ts(3, 51)]
+        # 8 tables au dump, 2 lues avant T : la couverture est 8/10.
+        instants = [DUMP] * 8 + [ts(3, 31), ts(3, 32)]
         self.assertTrue(mesh_backup.project(rows(*instants), NOW,
                                             min_share=0.75)["ok"])
         self.assertFalse(mesh_backup.project(rows(*instants), NOW,
@@ -223,12 +271,15 @@ class ConfigurationTest(unittest.TestCase):
         cfg = config_mod.Config()
         self.assertEqual(cfg.mesh_backup_window, (12600, 16200))
         self.assertEqual(cfg.mesh_backup_min_share, 0.9)
+        self.assertEqual(cfg.mesh_backup_min_group_share, 0.05)
 
     def test_environnement(self):
         cfg = self.load(AMEESH_MESH_BACKUP_WINDOW="04:00-05:00",
-                        AMEESH_MESH_BACKUP_MIN_SHARE="0.8")
+                        AMEESH_MESH_BACKUP_MIN_SHARE="0.8",
+                        AMEESH_MESH_BACKUP_MIN_GROUP_SHARE="0.02")
         self.assertEqual(cfg.mesh_backup_window, (14400, 18000))
         self.assertEqual(cfg.mesh_backup_min_share, 0.8)
+        self.assertEqual(cfg.mesh_backup_min_group_share, 0.02)
 
     def test_fenetre_illisible_ou_inversee_garde_le_defaut(self):
         for value in ("04:30-03:30", "minuit-midi", "03:30", "25:00-26:00"):
@@ -242,15 +293,24 @@ class ConfigurationTest(unittest.TestCase):
                 self.assertEqual(self.load(AMEESH_MESH_BACKUP_MIN_SHARE=value)
                                  .mesh_backup_min_share, 0.9)
 
+    def test_plancher_de_groupe_hors_bornes_garde_le_defaut(self):
+        for value in ("2", "-1", "part"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self.load(AMEESH_MESH_BACKUP_MIN_GROUP_SHARE=value)
+                    .mesh_backup_min_group_share, 0.05)
+
     def test_fichier_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "config.json")
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump({"mesh_backup_window": ["03:30", "04:30"],
-                           "mesh_backup_min_share": 0.75}, fh)
+                           "mesh_backup_min_share": 0.75,
+                           "mesh_backup_min_group_share": 0.02}, fh)
             cfg = config_mod.load(env={"AMEESH_CONFIG": path})
         self.assertEqual(cfg.mesh_backup_window, (12600, 16200))
         self.assertEqual(cfg.mesh_backup_min_share, 0.75)
+        self.assertEqual(cfg.mesh_backup_min_group_share, 0.02)
 
 
 class AlertsWiringTest(_Base):

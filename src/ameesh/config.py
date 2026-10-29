@@ -235,13 +235,16 @@ class Config:
     #: Empêche un renouvellement de bail de bloquer le battement indéfiniment.
     statement_timeout_ms: float = 30000.0
     #: #4609 : fenêtre UTC de la sauvegarde quotidienne de la base du mesh,
-    #: en secondes depuis minuit (`(12600, 16200)` = 03:30–04:30), et part
-    #: minimale des tables qu'une même transaction doit avoir lues pour que
-    #: `mesh_backup_unseen` se taise. La fenêtre par défaut suit la minuterie
+    #: en secondes depuis minuit (`(12600, 16200)` = 03:30–04:30), part
+    #: minimale des tables lisibles qui doivent avoir été lues au moins à
+    #: l'instant du `pg_dump`, et part minimale du groupe de tables qui
+    #: partagent cet instant (une petite transaction ordinaire ne prouve pas
+    #: une sauvegarde). La fenêtre par défaut suit la minuterie
     #: `ameesh-sauvegarde` (03:30 + jusqu'à 15 min d'aléa) ; une part nulle
     #: désactive l'alerte.
     mesh_backup_window: tuple[int, int] = (12600, 16200)
     mesh_backup_min_share: float = 0.9
+    mesh_backup_min_group_share: float = 0.05
     #: L304 : session en lecture seule (`default_transaction_read_only`) ;
     #: jamais lu de l'environnement, posé par `ameesh progress --serve`
     read_only: bool = False
@@ -1040,6 +1043,10 @@ def load(env: dict | None = None) -> Config:
         mesh_backup_min_share=_as_share(
             pick("AMEESH_MESH_BACKUP_MIN_SHARE", default=cfg.mesh_backup_min_share),
             cfg.mesh_backup_min_share),
+        mesh_backup_min_group_share=_as_share(
+            pick("AMEESH_MESH_BACKUP_MIN_GROUP_SHARE",
+                 default=cfg.mesh_backup_min_group_share),
+            cfg.mesh_backup_min_group_share),
         lease_ttl=_as_float(pick("AMEESH_LEASE_TTL", "AGENT_MESH_LEASE_TTL"), cfg.lease_ttl),
         idle_nudge=_as_float(pick("AMEESH_IDLE_NUDGE", "AGENT_MESH_IDLE_NUDGE"), cfg.idle_nudge),
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
