@@ -22,8 +22,14 @@ from .git_merge import GitMergeConnector
 
 NAME = "dev"
 
-#: capabilities this module provides (see ``registry.CAPABILITIES``)
+#: Capabilities this module provides (see ``registry.CAPABILITIES``).
 CAPABILITIES = ("workspaces", "audit")
+
+#: Active on every host without a project selection (L101 T4): the canon may
+#: only select modules that declare a work item type, so ``dev`` never gets a
+#: ``project_modules`` row. ``modules.audit`` runs its hook once, host-scoped.
+ALWAYS_ACTIVE = True
+
 
 def descriptor(options=None):
     """No work item type: tooling lives outside the project lifecycle.
@@ -48,40 +54,54 @@ def workspaces():
     return facade
 
 
-def _workspace_finding(finding, project):
-    """One ``canon check`` workspace finding, shaped like a module finding."""
+def _workspace_finding(finding):
+    """One ``canon check`` workspace finding, shaped like a module finding.
+
+    Host-scoped: no project owns a work directory, so ``project`` is ``None``;
+    the host and the agent it concerns stay explicit."""
     where = finding.where()
     return {"type": "module_deviation", "module": NAME,
-            "rule": finding.code, "project": project, "lot": None,
+            "rule": finding.code, "project": None, "lot": None,
             "title": where, "agent": finding.agent or None,
-            "assignee": finding.agent or None, "lot_state": None,
-            "declaration_id": None, "subject": None, "since": None,
-            "value": 1, "threshold": 0,
+            "assignee": finding.agent or None, "host": finding.host or None,
+            "lot_state": None, "declaration_id": None, "subject": None,
+            "since": None, "value": 1, "threshold": 0,
             "reason": "dev:%s:%s" % (finding.code,
                                      finding.host or finding.agent or where),
             "detail": finding.message, "action": finding.message}
 
 
-def audit(store, project):
+def audit(store, project=None):
     """Doctor's workspaces control (L101 T4): the ``canon check`` findings on
     ``policy.workspaces``, delegated under the Module interface.
 
     Read-only and thin: the hook reloads the configured canons and keeps the
     existing ``host-work-dir-*`` and ``host-workspaces-unknown`` findings; it
     invents no new check (exploitation alerts such as ``worktree_kept`` stay
-    in alerts). No readable canon yields an empty list, like the bare profile
-    where this module is absent (``registry.get("dev")`` is None)."""
+    in alerts). A host setting belongs to no project, so ``modules.audit``
+    calls this hook once with ``project=None`` and the findings are
+    host-scoped; the ``project`` argument is accepted for the Module audit
+    signature and ignored, which is what keeps one host finding from being
+    repeated for every project. No readable canon yields an empty list, like
+    the bare profile where this module is absent (``registry.get("dev")`` is
+    None)."""
     from ... import canon as canon_mod, config
     try:
         canons = canon_mod.load_configured(config.load())
     except (OSError, ValueError):
         return []
-    out = []
+    out, seen = [], set()
     for canon in canons:
         for finding in canon_mod.validate(canon):
-            if (finding.code == "host-workspaces-unknown"
+            if not (finding.code == "host-workspaces-unknown"
                     or finding.code.startswith("host-work-dir-")):
-                out.append(_workspace_finding(finding, project))
+                continue
+            key = (finding.code, finding.host, finding.agent, finding.member,
+                   finding.path, finding.message)
+            if key in seen:
+                continue                 # one finding per host/agent, no duplicates
+            seen.add(key)
+            out.append(_workspace_finding(finding))
     return out
 
 

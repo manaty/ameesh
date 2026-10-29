@@ -38,6 +38,19 @@ def _builtin():
     return {dev.NAME: dev, it.NAME: it}
 
 
+def always_active():
+    """Built-in modules active across the mesh, without a project selection.
+
+    L101 T4: ``dev`` declares no work item type, so the canon cannot select it
+    and it never gets a ``project_modules`` row. Such a module marks itself
+    ``ALWAYS_ACTIVE = True``; :func:`audit` runs its hook once, host-scoped,
+    after the project modules. External entry points are never read here: they
+    stay selectable lifecycle extensions.
+    """
+    return tuple(sorted(name for name, module in _builtin().items()
+                        if getattr(module, "ALWAYS_ACTIVE", False)))
+
+
 def _entry_points():
     """Installed external descriptors, across the supported Python versions."""
     points = metadata.entry_points()
@@ -271,14 +284,27 @@ def main(argv):
 
 
 def audit(db):
-    """Collect findings only from installed modules active in the database."""
+    """Collect findings from installed modules active in the database.
+
+    Project-scoped modules come from ``project_modules``. A built-in module
+    marked ``ALWAYS_ACTIVE`` (`dev`) has no row there: its hook runs once,
+    host-scoped (``project=None``), after them — never once per project, so a
+    host finding is not repeated for every project of the mesh."""
     from .storage import ModuleStore
     store = ModuleStore(db)
     registry = installed()
+    host_scoped = set(always_active())
     out = []
     for entry in store.active():
+        if entry["module"] in host_scoped:
+            continue                 # host-scoped, run once below
         module = registry.get(entry["module"])
         hook = getattr(module, "audit", None)
         if hook is not None:
             out.extend(hook(store, entry["project"]))
+    for name in sorted(host_scoped):
+        module = registry.get(name)
+        hook = getattr(module, "audit", None) if module is not None else None
+        if hook is not None:
+            out.extend(hook(store, None))
     return out

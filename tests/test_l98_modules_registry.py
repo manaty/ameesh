@@ -134,6 +134,8 @@ class RegistryTest(unittest.TestCase):
         self.assertIs(registry.get("dev"), installed["dev"])
         self.assertIs(installed["dev"].workspaces(), workspaces)
         self.assertIn("workspaces", registry.CAPABILITIES)
+        self.assertEqual(modules.always_active(), ("dev",))
+        self.assertTrue(installed["dev"].ALWAYS_ACTIVE)
         self.assertEqual(installed["dev"].descriptor({}), {
             "types": [], "schemas": {}, "rules": []})
 
@@ -154,7 +156,7 @@ class RegistryTest(unittest.TestCase):
                       found.refused[0]["error"])
 
     def test_dev_audit_delegates_the_canon_workspaces_checks(self):
-        """L101 T4: `audit` is a thin, read-only Module view of `canon check`."""
+        """L101 T4: `audit` is a thin, read-only, host-scoped Module view."""
         from ameesh import canon
         from ameesh.modules import dev
         missing = canon.Finding("host-work-dir-missing", canon.WARNING,
@@ -166,13 +168,14 @@ class RegistryTest(unittest.TestCase):
         with mock.patch("ameesh.config.load", return_value=object()), \
                 mock.patch("ameesh.canon.load_configured", return_value=[object()]), \
                 mock.patch("ameesh.canon.validate",
-                           return_value=[missing, unknown, other]):
+                           return_value=[missing, unknown, other, missing]):
             findings = dev.audit(mock.Mock(), "acme")
         self.assertEqual([f["rule"] for f in findings],
                          ["host-work-dir-missing", "host-workspaces-unknown"])
         self.assertEqual((findings[0]["type"], findings[0]["module"],
-                          findings[0]["project"], findings[0]["agent"]),
-                         ("module_deviation", "dev", "acme", "a"))
+                          findings[0]["project"], findings[0]["agent"],
+                          findings[0]["host"]),
+                         ("module_deviation", "dev", None, "a", "h"))
         self.assertIn("no working directory", findings[0]["detail"])
 
     def test_dev_audit_is_empty_without_a_readable_canon(self):
@@ -182,12 +185,13 @@ class RegistryTest(unittest.TestCase):
             self.assertEqual(dev.audit(mock.Mock(), "acme"), [])
 
     def test_the_bare_profile_audits_no_module(self):
-        """No built-in module (bare profile): an active name runs no hook."""
+        """No built-in module (bare profile): no always-active hook is invented."""
         from ameesh.modules.storage import ModuleStore
-        with mock.patch("ameesh.modules._builtin", return_value={}), \
-                mock.patch.object(ModuleStore, "active",
-                                  return_value=[{"project": "acme", "module": "dev"}]):
+        with points(), mock.patch("ameesh.modules._builtin", return_value={}), \
+                mock.patch.object(ModuleStore, "active", return_value=[]), \
+                mock.patch("ameesh.modules.dev.audit") as dev_audit:
             self.assertEqual(modules.audit(mock.Mock()), [])
+        dev_audit.assert_not_called()
 
     def test_an_external_entry_point_is_described(self):
         with points(FakeEntryPoint(sample())):
