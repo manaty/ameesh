@@ -8943,6 +8943,17 @@ class AgentWorker(threading.Thread):
         admission_lock.set_priority(
             admission_lock.CONTROL if prioritaire else admission_lock.NORMAL)
 
+    def _admission_control(self) -> None:
+        """#4602 : ne fait que MONTER en CONTROL pour un nouveau réveil.
+
+        Le second appel, juste avant le choix du tour, ne doit jamais
+        redescendre en NORMAL : sinon la passe réveillée perd sa priorité au
+        moment précis où elle choisit et ouvre son tour (B2 de la relecture
+        dev1). La classe est rendue au repos en fin de passe."""
+        if self._priority_wake:
+            self._priority_wake = False
+            admission_lock.set_priority(admission_lock.CONTROL)
+
     def run(self) -> None:
         """Mode service : boucle jusqu'à l'arrêt, réveillée par NOTIFY."""
         self.ensure_watchdog()
@@ -9027,8 +9038,9 @@ class AgentWorker(threading.Thread):
                         continue
                     # #4602 : une notification a pu arriver pendant les
                     # lectures de cette passe ; le choix du tour passe alors
-                    # en CONTROL sans attendre la passe suivante.
-                    self._admission_priority()
+                    # en CONTROL sans attendre la passe suivante — et sans
+                    # jamais redescendre s'il était déjà CONTROL.
+                    self._admission_control()
                     spec = self._pick_for_turn()
                     if spec is not None and self._moved_before_turn(spec):
                         break
@@ -9039,6 +9051,7 @@ class AgentWorker(threading.Thread):
                 if spec is None:
                     self._deferral_over()  # #1914 : plus rien à prendre
                     self._resident_between_turns()  # L76 : mort, sommeil
+                    admission_lock.reset()  # #4602 : la passe prioritaire est finie
                     self.wake.wait(timeout=self.wait_timeout(self._until_due(
                         min(self.runner.poll, max(1.0, self.runner.lease_ttl / 3.0)))))
                     self.wake.clear()
@@ -10891,8 +10904,10 @@ class Runner:
                 worker.wake.set()
                 log_async("message for %s: waking the turn" % target)
             else:
+                # #4602 (N dev1) : pas de priorité pour un réveil sans cible —
+                # soixante-dix CONTROL ne seraient plus une priorité ; ces
+                # workers restent des sondeurs NORMAL.
                 for autre in self.workers.values():
-                    autre._priority_wake = True
                     autre.wake.set()
         self.wake_all.set()
 

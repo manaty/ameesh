@@ -130,8 +130,8 @@ class OrdreTest(unittest.TestCase):
 
     def test_rafale_laisse_passer_un_normal(self):
         lock = admission_lock.PriorityRLock()
-        control = admission_lock._Ticket(admission_lock.CONTROL, 100.0)
-        normal = admission_lock._Ticket(admission_lock.NORMAL, 100.0)
+        control = admission_lock._Ticket(admission_lock.CONTROL, 100.0, 1)
+        normal = admission_lock._Ticket(admission_lock.NORMAL, 100.0, 2)
         lock._queues[0].append(control)
         lock._queues[1].append(normal)
         lock._burst = admission_lock.BOOST_BURST
@@ -142,15 +142,46 @@ class OrdreTest(unittest.TestCase):
     def test_vieillissement(self):
         lock = admission_lock.PriorityRLock()
         now = 100.0
-        control = admission_lock._Ticket(admission_lock.CONTROL, now)
+        control = admission_lock._Ticket(admission_lock.CONTROL, now, 1)
         normal = admission_lock._Ticket(admission_lock.NORMAL,
-                                        now - admission_lock.AGING_S - 1)
+                                        now - admission_lock.AGING_S - 1, 2)
         lock._queues[0].append(control)
         lock._queues[1].append(normal)
         self.assertIs(lock._next(now), normal)
         # un contrôle plus ancien garde la tête
         control.since = now - admission_lock.AGING_S - 2
         self.assertIs(lock._next(now), control)
+
+    def test_pas_de_reveil_perdu_entre_deux_ages(self):
+        """B1 dev1 : deux attentes ne doivent pas se renvoyer la sélection.
+
+        La passation est faite une fois par `release()` ; avec une horloge
+        simulée, une NORMAL qui vieillit pendant que la CONTROL attend ne peut
+        pas laisser le verrou libre sans réveiller personne."""
+        clock = [100.0]
+        lock = admission_lock.PriorityRLock(clock=lambda: clock[0])
+        lock.acquire()
+        order: list[str] = []
+
+        def waiter(kind: int, label: str):
+            admission_lock.set_priority(kind)
+            with lock:
+                order.append(label)
+
+        normal = threading.Thread(target=waiter, args=(admission_lock.NORMAL, "normal"))
+        normal.start()
+        _wait_queued(lock, 1, admission_lock.NORMAL)
+        clock[0] = 100.2
+        control = threading.Thread(target=waiter, args=(admission_lock.CONTROL, "control"))
+        control.start()
+        _wait_queued(lock, 1, admission_lock.CONTROL)
+        clock[0] = 102.2  # la NORMAL est vieillie (2,2 s), la CONTROL non (2,0 s)
+        lock.release()
+        normal.join(timeout=2)
+        control.join(timeout=2)
+        self.assertFalse(normal.is_alive() or control.is_alive(),
+                         "réveil perdu : le verrou est resté libre avec des attentes")
+        self.assertEqual(order, ["normal", "control"])
 
     def test_bascule_de_secours(self):
         import os
@@ -227,6 +258,16 @@ class PrioriteWorkerTest(unittest.TestCase):
         self.assertTrue(worker._priority_wake)
         self.assertTrue(worker.wake.is_set())
 
+    def test_sans_cible_ne_met_pas_tout_en_control(self):
+        worker = _Worker()
+        fake = types.SimpleNamespace(lock=threading.RLock(),
+                                     workers={"x": worker},
+                                     wake_all=threading.Event())
+        Runner.dispatch(fake, {"channel": "agent_mail",
+                               "payload": json.dumps({})})
+        self.assertTrue(worker.wake.is_set())
+        self.assertFalse(worker._priority_wake)
+
     def test_le_worker_consomme_sa_priorite(self):
         partial = AgentWorker.__new__(AgentWorker)
         partial._priority_wake = True
@@ -235,6 +276,16 @@ class PrioriteWorkerTest(unittest.TestCase):
         self.assertFalse(partial._priority_wake)
         AgentWorker._admission_priority(partial)
         self.assertEqual(admission_lock.priority(), admission_lock.NORMAL)
+
+    def test_la_passe_reveillee_reste_control_jusqu_au_choix(self):
+        """B2 dev1 : le second appel ne redescend jamais la passe en NORMAL."""
+        partial = AgentWorker.__new__(AgentWorker)
+        partial._priority_wake = True
+        AgentWorker._admission_priority(partial)
+        self.assertEqual(admission_lock.priority(), admission_lock.CONTROL)
+        AgentWorker._admission_control(partial)  # avant _pick_for_turn
+        self.assertEqual(admission_lock.priority(), admission_lock.CONTROL)
+        self.assertFalse(partial._priority_wake)
 
 
 class BancAdmissionTest(unittest.TestCase):

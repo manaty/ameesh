@@ -136,25 +136,38 @@ def _notify(waited: float) -> None:
 
 
 class _Ticket:
-    __slots__ = ("priority", "since")
+    __slots__ = ("priority", "since", "ident", "granted")
 
-    def __init__(self, priority: int, since: float):
+    def __init__(self, priority: int, since: float, ident: int):
         self.priority = priority
         self.since = since
+        self.ident = ident
+        self.granted = False
 
 
 class PriorityRLock:
     """Verrou réentrant à deux classes, FIFO par classe, avec vieillissement.
 
-    L'API est celle de ``threading.RLock`` pour les usages du pilote
-    (``with``, ``acquire``, ``release``, ``locked``)."""
+    La **passation** est faite une seule fois, par ``release()``, sous la
+    condition : il choisit un ticket, le marque ``granted`` et pose son
+    propriétaire, puis réveille les attentes. Une attente ne recalcule jamais
+    la sélection à son réveil : deux attentes qui évalueraient ``_next`` à des
+    instants différents pourraient chacune choisir l'autre et s'endormir
+    ensemble, laissant le verrou libre sans personne pour le notifier (#4602,
+    B1 de la relecture dev1).
 
-    def __init__(self):
+    L'API est celle de ``threading.RLock`` pour les usages du pilote
+    (``with``, ``acquire``, ``release``, ``locked``). ``clock`` est injectable
+    par les tests de vieillissement.
+    """
+
+    def __init__(self, clock=None):
         self._condition = threading.Condition()
         self._owner: int | None = None
         self._depth = 0
         self._queues = (collections.deque(), collections.deque())
         self._burst = 0
+        self._clock = clock or time.monotonic
 
     # -- état (diagnostic et tests) ---------------------------------------
     def locked(self) -> bool:
@@ -184,6 +197,19 @@ class PriorityRLock:
             return normal[0]
         return normal[0] if normal else None
 
+    def _grant_next(self, now: float) -> None:
+        """Choisit UN ticket et le passe propriétaire ; sous la condition."""
+        ticket = self._next(now)
+        if ticket is None:
+            self._owner = None
+            return
+        self._queues[ticket.priority].remove(ticket)
+        ticket.granted = True
+        self._owner = ticket.ident
+        self._depth = 1
+        self._burst = self._burst + 1 if ticket.priority == CONTROL else 0
+        self._condition.notify_all()
+
     # -- acquisition ------------------------------------------------------
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
         ident = threading.get_ident()
@@ -192,37 +218,48 @@ class PriorityRLock:
             if self._owner == ident:
                 self._depth += 1
                 return True
+            if self._owner is None and not self._queues[0] and not self._queues[1]:
+                # verrou libre, personne n'attend : acquisition immédiate
+                self._owner, self._depth = ident, 1
+                self._burst = self._burst + 1 if want == CONTROL else 0
+                return True
             if not blocking:
-                if self._owner is None:
-                    self._owner, self._depth = ident, 1
-                    self._burst = self._burst + 1 if want == CONTROL else 0
-                    return True
                 return False
-            ticket = _Ticket(want, time.monotonic())
+            ticket = _Ticket(want, self._clock(), ident)
             self._queues[want].append(ticket)
+            if self._owner is None:
+                # ne jamais laisser un verrou libre avec des attentes : la
+                # passation part immédiatement (une attente plus ancienne
+                # peut être choisie, la nôtre attendra son tour)
+                self._grant_next(self._clock())
             deadline = None if timeout is None or timeout < 0 \
                 else time.monotonic() + float(timeout)
             waited = 0.0
             try:
-                while self._owner is not None or self._next(time.monotonic()) is not ticket:
+                while not ticket.granted:
                     if deadline is None:
                         self._condition.wait()
-                    else:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            self._queues[want].remove(ticket)
-                            self._condition.notify_all()
-                            return False
-                        self._condition.wait(remaining)
-                self._queues[want].remove(ticket)
-                waited = time.monotonic() - ticket.since
-                self._owner, self._depth = ident, 1
-                self._burst = self._burst + 1 if want == CONTROL else 0
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        if ticket.granted:
+                            break  # la passation a gagné la course
+                        self._queues[want].remove(ticket)
+                        self._condition.notify_all()
+                        return False
+                    self._condition.wait(remaining)
+                waited = self._clock() - ticket.since
             except BaseException:
-                try:
-                    self._queues[want].remove(ticket)
-                except ValueError:
-                    pass
+                if ticket.granted:
+                    # passation reçue mais acquisition interrompue : la rendre
+                    self._depth -= 1
+                    if not self._depth:
+                        self._grant_next(self._clock())
+                else:
+                    try:
+                        self._queues[want].remove(ticket)
+                    except ValueError:
+                        pass
                 self._condition.notify_all()
                 raise
         _notify(waited)
@@ -233,9 +270,10 @@ class PriorityRLock:
             if self._owner != threading.get_ident():
                 raise RuntimeError("cannot release an un-acquired lock")
             self._depth -= 1
-            if not self._depth:
-                self._owner = None
-                self._condition.notify_all()
+            if self._depth:
+                return
+            self._owner = None
+            self._grant_next(self._clock())
 
     def __enter__(self):
         self.acquire()
