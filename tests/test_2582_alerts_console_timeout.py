@@ -121,38 +121,37 @@ class SnapshotStaysReadable(PgTestCase):
 
     def test_a_hanging_console_does_not_blind_the_other_families(self):
         lot = self.stale_lot()
+        calls: list = []
 
         def read(dsn):
-            # 30 s : plus long que la borne du relevé, pour que la console ne
-            # puisse pas se débloquer pendant le test même sur un hôte chargé.
-            self.release.wait(30)
+            # La console reste muette jusqu'au nettoyage du test : même un
+            # relevé PostgreSQL lent ne peut pas la libérer (#4446).
+            calls.append(dsn)
+            self.release.wait()
             return {}
 
-        started = time.monotonic()
         with mock.patch.object(pgbouncer_local, "admin_dsn", return_value="admin"), \
                 mock.patch.object(pgbouncer_local, "read", side_effect=read), \
                 mock.patch.object(pgbouncer_local, "PROBE_TIMEOUT_S", 0.05):
             # La sonde est bornée à 0,05 s ; le relevé complet, lui, peut être
-            # lent (psql : 6-7 s sur un hôte chargé) mais ne doit jamais
-            # attendre la console. La lecture de la console reste bloquée 30 s.
+            # lent (psql : plusieurs secondes sur un hôte chargé) et ne doit
+            # jamais attendre la console. On vérifie le délai configuré et le
+            # nombre de lectures, jamais la durée du relevé (#4446).
             with self.assertRaises(db_mod.Unavailable):
                 pgbouncer_local.probe(self.cfg)
-            probe_elapsed = time.monotonic() - started
-            alerts_started = time.monotonic()
             alerts = exploitation.alerts(self.cfg, self.db, local_pool=True,
                                          **self.seuils)
-            alerts_elapsed = time.monotonic() - alerts_started
+        self.assertEqual(len(calls), 1,
+                         "the snapshot reuses the in-flight read, it starts none")
         self.assertFalse(self.release.is_set(), "the snapshot waited for the console")
-        self.assertLess(probe_elapsed, 1.0,
-                        "the probe must not wait for the console")
-        self.assertLess(alerts_elapsed, 20.0,
-                        "the snapshot must not wait for the console")
         types = {a["type"]: a for a in alerts}
         self.assertIn("stale_lot", types, "the other families stay readable")
         self.assertEqual(types["stale_lot"]["lot"], lot["id"])
         self.assertIn("pgbouncer_console_unreadable", types,
                       "the timed-out family is marked unreadable")
-        self.assertIn("no answer within", types["pgbouncer_console_unreadable"]["detail"])
+        self.assertIn("no answer within 0.05s",
+                      types["pgbouncer_console_unreadable"]["detail"],
+                      "the snapshot used the configured probe delay, not the console")
 
     def test_the_batched_snapshot_reads_the_console_once(self):
         """Les passes à blanc de `db.batched` ne sondent pas la console."""
