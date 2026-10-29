@@ -65,6 +65,23 @@ class CatalogStoreTest(PgTestCase):
         self.assertEqual(rows[0]["source"], SOURCE, "un barème ne vole pas la source")
         self.assertEqual(float(rows[0]["price_input"]), 9.0)
 
+    def test_upsert_models_preserves_the_source_owner(self):
+        """#4312 (N de l'auditeur sur #4291) : une autre source qui revoit le
+        même modèle met à jour ses mesures, jamais la propriété de la ligne.
+        Le retrait d'une source ne voit que ses propres lignes : changer
+        `source` ferait échapper le modèle à celui qui l'a créé."""
+        self.store.upsert_models([{"provider": "anthropic", "model_id": "modele-4312",
+                                   "source": "provider-A", "price_input": 1.0}])
+        self.store.upsert_models([{"provider": "anthropic", "model_id": "modele-4312",
+                                   "source": "provider-B", "price_output": 5.0}])
+        rows = self.store.show("modele-4312")
+        self.assertEqual(rows[0]["source"], "provider-A",
+                         "le second passage ne vole pas la source")
+        self.assertEqual(float(rows[0]["price_input"]), 1.0)
+        self.assertEqual(float(rows[0]["price_output"]), 5.0)
+        self.assertEqual(self.store.active("provider-B"), [],
+                         "provider-B ne peut pas retirer une ligne de provider-A")
+
     def test_harnais_et_listing(self):
         self.store.upsert_models([{"provider": "anthropic", "model_id": "modele-L14", "source": SOURCE}])
         self.store.upsert_harnesses([{"provider": "anthropic", "model_id": "modele-L14",
