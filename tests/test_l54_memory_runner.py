@@ -43,10 +43,14 @@ class MemoryRunnerTest(PgTestCase):
         with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN,
                                          "AMEESH_TEST_LOG": self.turns_log}):
             self.assertTrue(self.worker.run_turn({"kind": "prompt", "prompt": "work", "ids": []}))
-        for thread in threading.enumerate():
-            if thread.name == "memory-a-memory":
-                thread.join(10)
-                self.assertFalse(thread.is_alive())
+            # The memory transport reads os.environ in its background thread.
+            # Wait for it before leaving the patch: restoring the environment
+            # under `dict(os.environ)` raises KeyError and the push is lost
+            # (CI run 40952915094, main ba41e3bb6282).
+            for thread in threading.enumerate():
+                if thread.name == "memory-a-memory":
+                    thread.join(10)
+                    self.assertFalse(thread.is_alive())
 
     def test_run_turn_designates_memory_and_automatically_syncs(self):
         original = pm.preface
