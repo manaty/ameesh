@@ -1379,7 +1379,7 @@ def lot_state(items: list[dict]) -> tuple[str | None, str]:
     if status == "pending":
         return lifecycle.REQUESTED, "open"
     if status == "merged":
-        return lifecycle.DELIVERY_RECORDED, "closed"
+        return "merged", "closed"
     if status == "abandoned":
         return None, "closed"
     states = {(lifecycle.DELIVERY_RECORDED if i["state"] in lifecycle.DELIVERED else i["state"])

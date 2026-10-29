@@ -13,6 +13,13 @@ MIGRATION = (MIGRATIONS / '0518_generic_delivery_state.sql').read_text()
 
 
 class DeliveryDecisionTest(unittest.TestCase):
+    def test_aggregate_github_label_keeps_public_merged_name(self):
+        for stage in ('merged', 'promoted'):
+            with self.subTest(stage=stage):
+                self.assertEqual(plan_github.lot_state([
+                    dict(state='delivered', workflow_stage=stage, legacy_state=stage)
+                ]), ('merged', 'closed'))
+
     def test_merged_delivery_can_wait_for_a_decision(self):
         item = dict(id=1, state='delivered', legacy_state='merged')
         with mock.patch.object(work, 'move', return_value={'state': 'waiting_human'}) as move:
