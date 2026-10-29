@@ -120,10 +120,10 @@ class PrefixReplayTest(unittest.TestCase):
 
     def test_le_premier_prefixe_rouge_est_le_fautif(self) -> None:
         replay, calls = self.replay_at({"préfixe 1 (#1)"})
-        found, why = paquet_auto.prefix_failures(
+        found, why, flaky = paquet_auto.prefix_failures(
             self.repo, self.composition, [self.failure], timeout=1,
             replay=replay, log=lambda _line: None)
-        self.assertEqual(why, "")
+        self.assertEqual((why, flaky), ("", []))
         self.assertEqual(list(found), [1])
         self.assertEqual(found[1][0]["test"], TARGET)
         # Le premier préfixe suffit : les suivants ne sont pas rejoués.
@@ -131,20 +131,20 @@ class PrefixReplayTest(unittest.TestCase):
 
     def test_une_unite_sans_rouge_est_sautee(self) -> None:
         replay, calls = self.replay_at({"préfixe 2 (#2)"})
-        found, why = paquet_auto.prefix_failures(
+        found, why, flaky = paquet_auto.prefix_failures(
             self.repo, self.composition, [self.failure], timeout=1,
             replay=replay, log=lambda _line: None)
-        self.assertEqual(why, "")
+        self.assertEqual((why, flaky), ("", []))
         self.assertEqual(list(found), [2])
         self.assertEqual([label for label, _modules in calls],
                          ["préfixe 1 (#1)", "préfixe 2 (#2)"])
 
     def test_rouge_seulement_a_la_tete(self) -> None:
         replay, calls = self.replay_at({"préfixe 3 (#3)"})
-        found, why = paquet_auto.prefix_failures(
+        found, why, flaky = paquet_auto.prefix_failures(
             self.repo, self.composition, [self.failure], timeout=1,
             replay=replay, log=lambda _line: None)
-        self.assertEqual(why, "")
+        self.assertEqual((why, flaky), ("", []))
         self.assertEqual(list(found), [3])
         self.assertEqual(len(calls), 3)
 
@@ -154,19 +154,46 @@ class PrefixReplayTest(unittest.TestCase):
                                        "did not finish in 1 s", 1.0,
                                        timed_out=True)
 
-        found, why = paquet_auto.prefix_failures(
+        found, why, flaky = paquet_auto.prefix_failures(
             self.repo, self.composition, [self.failure], timeout=1,
             replay=replay, log=lambda _line: None)
-        self.assertEqual(found, {})
+        self.assertEqual((found, flaky), ({}, []))
         self.assertIn("non concluant", why)
 
-    def test_rouge_de_la_tete_mais_vert_sur_les_prefixes_est_illisible(self) -> None:
+    def test_un_rouge_situe_survit_a_un_instable(self) -> None:
+        # B1 cx2 : un test rouge situé sur un préfixe et un test instable dans
+        # le même rejeu ; le premier doit rester retirable.
+        real = {"test": "tests.test_target.T.test_real", "module": "test_target"}
+        flaky = {"test": "tests.test_target.T.test_flaky",
+                 "module": "test_target"}
+
+        def replay(_worktree, label, modules, *, timeout):
+            if label == "préfixe 1 (#1)":
+                return paquet_auto.TestRun(
+                    label, list(modules), 1,
+                    "FAIL: test_real (tests.test_target.T.test_real)\n"
+                    "AssertionError: real\n", 0.1)
+            return _green(label, modules)
+
+        found, why, remaining = paquet_auto.prefix_failures(
+            self.repo, self.composition, [real, flaky], timeout=1,
+            replay=replay, log=lambda _line: None)
+        self.assertEqual(why, "")
+        self.assertEqual({lot: [failure["test"] for failure in failures]
+                          for lot, failures in found.items()},
+                         {1: [real["test"]]})
+        self.assertEqual([failure["test"] for failure in remaining],
+                         [flaky["test"]])
+
+    def test_rouge_de_la_tete_mais_vert_sur_les_prefixes_est_instable(self) -> None:
+        # #4221 : vert sur tous les préfixes = instable, consigné non
+        # concluant, le paquet continue ; ce n'est plus une lecture illisible.
         replay, _calls = self.replay_at(set())
-        found, why = paquet_auto.prefix_failures(
+        found, why, flaky = paquet_auto.prefix_failures(
             self.repo, self.composition, [self.failure], timeout=1,
             replay=replay, log=lambda _line: None)
-        self.assertEqual(found, {})
-        self.assertIn("verts sur tous les préfixes", why)
+        self.assertEqual((found, why), ({}, ""))
+        self.assertEqual([failure["test"] for failure in flaky], [TARGET])
 
 
 class CheckLocalTestsTest(unittest.TestCase):
@@ -264,7 +291,7 @@ class CheckLocalTestsTest(unittest.TestCase):
 
     def test_un_rejeu_illisible_ne_retire_rien(self) -> None:
         def unreadable(*_args, **_kwargs):
-            return {}, "worktree de préfixe impossible"
+            return {}, "worktree de préfixe impossible", []
 
         with self.assertRaises(paquet_auto.AttributionUnreadable) as caught:
             self.check(prefix=unreadable)
