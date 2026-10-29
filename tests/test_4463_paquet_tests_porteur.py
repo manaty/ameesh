@@ -379,6 +379,123 @@ class SerieDirecteTest(unittest.TestCase):
             self.assertFalse(_alive(pid), "pid %d vivant" % pid)
 
 
+class PrefixesBornesTest(unittest.TestCase):
+    """Relectures cx2 (#162578) et docs-01 (#162602) : un voisin rouge mène au
+    rejeu sur les préfixes, qui ignorait l'échéance totale et la fusion du
+    porteur. Empilement réel A, B, C de #4217, rejeu simulé."""
+
+    def setUp(self) -> None:
+        from tests import test_4217_paquet_attribution_prefixes as t4217
+        self.t4217 = t4217
+        self.auto = t4217.paquet_auto
+        fixture = t4217.PrefixReplayTest
+        for name in ("git", "write", "commit", "commit_unit"):
+            setattr(self, name, getattr(fixture, name).__get__(self))
+        fixture.setUp(self)
+
+    def prefixes(self, replay, **bounds):
+        return self.auto.prefix_failures(
+            self.repo, self.composition, [self.failure], timeout=900,
+            replay=replay, log=lambda _line: None, **bounds)
+
+    def worktrees(self) -> int:
+        return self.git("worktree", "list", "--porcelain").count("worktree ")
+
+    def test_fusion_relue_avant_chaque_prefixe(self) -> None:
+        calls, guards = [], []
+
+        def replay(_worktree, label, modules, *, timeout):
+            calls.append(label)
+            return self.t4217._green(label, modules)
+
+        def guard():
+            guards.append(len(calls))
+            if len(calls) >= 1:
+                raise self.auto.CarrierSettled("MERGED")
+
+        with self.assertRaises(self.auto.CarrierSettled):
+            self.prefixes(replay, guard=guard)
+        self.assertEqual(calls, ["préfixe 1 (#1)"])
+        self.assertEqual(guards, [1])
+        self.assertEqual(self.worktrees(), 1)         # préfixe rendu
+
+    def test_echeance_borne_chaque_prefixe_puis_arrete(self) -> None:
+        calls = []
+
+        def replay(_worktree, label, modules, *, timeout, wall):
+            calls.append((label, timeout, wall))
+            time.sleep(1.2)
+            return self.t4217._green(label, modules)
+
+        with self.assertRaises(self.auto.BudgetSpent):
+            self.prefixes(replay, deadline=time.monotonic() + 2)
+        self.assertEqual([label for label, _t, _w in calls], ["préfixe 1 (#1)"])
+        _label, timeout, wall = calls[0]
+        self.assertLessEqual(timeout, 2)
+        self.assertEqual(wall, timeout)
+        self.assertEqual(self.worktrees(), 1)
+
+    def test_sans_borne_inchange(self) -> None:
+        replay, calls = self.t4217.PrefixReplayTest.replay_at(self, {"préfixe 2 (#2)"})
+        found, why = self.prefixes(replay)
+        self.assertEqual((list(found), why), ([2], ""))
+        self.assertEqual(len(calls), 2)
+
+
+class VoisinRougePrefixesTest(unittest.TestCase):
+    """Le vrai `check_local_tests` : voisin rouge, base, préfixes, sous
+    l'échéance et la garde."""
+
+    def setUp(self) -> None:
+        from tests import test_4217_paquet_attribution_prefixes as t4217
+        self.auto = t4217.paquet_auto
+        fixture = t4217.CheckLocalTestsTest
+        for name in ("git", "write", "commit", "commit_unit"):
+            setattr(self, name, getattr(fixture, name).__get__(self))
+        fixture.setUp(self)
+        self.base_calls = []
+
+    def check(self, prefix):
+        neighbors = {3: [{"module": "tests.test_target", "reason": "carte",
+                          "files": ["src/pkg/value.py"]}]}
+
+        def on_base(_worktree, _sha, modules, **kwargs):
+            self.base_calls.append(kwargs)
+            return set()
+
+        import sys
+        with mock.patch.object(self.auto, "project_python", return_value=sys.executable):
+            return self.auto.check_local_tests(
+                self.repo, self.composition, timeout=30, base_sha=self.base,
+                attribute=lambda *_a: self.fail("attribution inattendue"),
+                select=lambda *_a: (neighbors, "carte simulée"),
+                on_base=on_base, prefix=prefix, guard=lambda: None,
+                deadline=time.monotonic() + 600, log=lambda _line: None)
+
+    def test_echeance_aux_prefixes_non_concluant_rien_retire(self) -> None:
+        seen = {}
+
+        def prefix(*_args, **kwargs):
+            seen.update(kwargs)
+            raise self.auto.BudgetSpent("borne totale atteinte avant le préfixe 2 (#2)")
+
+        runs, faulty, removals = self.check(prefix)
+        self.assertEqual((faulty, removals), ([], []))
+        self.assertIn("deadline", seen)
+        self.assertIn("guard", seen)
+        self.assertTrue(runs[-1].inconclusive)
+        self.assertEqual(runs[-1].label, "préfixes")
+        # la base aussi est bornée en temps mural
+        self.assertEqual(self.base_calls[0]["wall"], self.base_calls[0]["timeout"])
+
+    def test_fusion_aux_prefixes_remonte_telle_quelle(self) -> None:
+        def prefix(*_args, **_kwargs):
+            raise self.auto.CarrierSettled("MERGED")
+
+        with self.assertRaises(self.auto.CarrierSettled):
+            self.check(prefix)
+
+
 class CanonTest(unittest.TestCase):
     def test_cle_optionnelle_compilee(self) -> None:
         doc = mechanics.compile_document(

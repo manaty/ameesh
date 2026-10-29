@@ -332,6 +332,11 @@ class CarrierSettled(PaquetAutoError):
         super().__init__("PR %s pendant les tests par unité" % state.lower())
 
 
+class BudgetSpent(PaquetAutoError):
+    """#4463 : l'échéance totale des tests par unité passée en plein rejeu des
+    préfixes : non concluant, aucune unité retirée (§3)."""
+
+
 class ChainRefused(PaquetAutoError):
     """#4237 : une tête testée que `--publish` ne publie pas (chaîne, base)."""
 
@@ -1493,12 +1498,13 @@ def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
 
 
 def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
-                  timeout: int) -> set[str] | None:
+                  timeout: int, wall: int | None = None) -> set[str] | None:
     """#4025 : les tests de `modules` rouges sur la base, ou None (non concluant).
 
     Un module voisin rouge ne désigne l'unité que s'il est vert sur la base :
     un rouge aussi présent sur la base vient de l'environnement de l'hôte ou
     lui préexiste. Les modules sont rejoués dans un worktree détaché de la base.
+    #4463 : `wall` borne le rejeu en temps mural (`run_tests(wall=…)`).
     """
     if not base_sha or not modules:
         return None
@@ -1515,7 +1521,8 @@ def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
                    if (path / (module.replace(".", "/") + ".py")).is_file()]
         if not present:
             return set()
-        run = run_tests(path, "base", present, timeout=timeout)
+        walled = {"wall": wall} if wall is not None else {}
+        run = run_tests(path, "base", present, timeout=timeout, **walled)
         if run.inconclusive:
             return None
         return {failure["test"] for failure in unittest_failures(run.output)}
@@ -1799,7 +1806,8 @@ def _failure_matches(observed: str, failed: set[str]) -> bool:
 
 def prefix_failures(worktree: Path, composition: Composition,
                     failures: list[dict], *, timeout: int,
-                    replay=None, log=print) -> tuple[dict[int, list[dict]], str]:
+                    replay=None, log=print, guard=None,
+                    deadline: float | None = None) -> tuple[dict[int, list[dict]], str]:
     """#4217 : la première unité où chaque test rouge apparaît.
 
     Rejoue les tests rouges des modules **voisins** sur les préfixes de
@@ -1813,6 +1821,11 @@ def prefix_failures(worktree: Path, composition: Composition,
     conclut pas (worktree impossible, run non concluant, test vert sur tous
     les préfixes) : l'appelant ne retire alors aucune unité. Aucune décision
     de retrait ici.
+
+    #4463 : `guard` est relu avant chaque préfixe après le premier (fusion du
+    porteur comprise) ; sous `deadline`, chaque rejeu est borné au temps
+    restant, en temps mural, et `BudgetSpent` est levée quand il n'en reste
+    plus.
     """
     tests: list[dict] = []
     seen: set[str] = set()
@@ -1840,6 +1853,12 @@ def prefix_failures(worktree: Path, composition: Composition,
         unresolved = tests
         found: dict[int, list[dict]] = {}
         for index, unit in enumerate(composition.units, start=1):
+            if index > 1 and guard is not None:
+                guard()
+            limit = series_timeout(timeout, deadline)
+            if limit is None:
+                raise BudgetSpent("borne totale atteinte avant le préfixe %d "
+                                  "(#%d)" % (index, unit.lot))
             if index > 1:
                 moved = git(path, "reset", "--hard", unit.commit, check=False)
                 if moved.returncode != 0:
@@ -1849,7 +1868,8 @@ def prefix_failures(worktree: Path, composition: Composition,
                 git(path, "clean", "-fdq", check=False)
             run = replay(path, "préfixe %d (#%d)" % (index, unit.lot),
                          [_failure_name(failure) for failure in unresolved],
-                         timeout=timeout)
+                         timeout=limit,
+                         **({"wall": limit} if deadline is not None else {}))
             if run.inconclusive:
                 return {}, ("préfixe %d (#%d) non concluant : %s"
                             % (index, unit.lot, run.motive()))
@@ -2163,9 +2183,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         if guard is not None:
             guard()
         limit = series_timeout(timeout, deadline)
+        walled = {"wall": limit} if deadline is not None and limit else {}
         at_base = (None if limit is None else
                    (on_base or base_failures)(worktree, base_sha, neighbor_red,
-                                              timeout=limit))
+                                              timeout=limit, **walled))
         log("tests voisins rouges rejoués sur la base %s : %s"
             % (base_sha[:12] or "?", "non concluant" if at_base is None
                else "%d rouge(s) aussi sur la base" % len(at_base)))
@@ -2244,10 +2265,20 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         log("tests voisins : rejeu du rouge sur les préfixes de l'empilement "
             "(%d test(s), %d unité(s))"
             % (len(prefix_red), len(composition.units)))
+        bounds = ({"guard": guard} if guard is not None else {}) | (
+            {"deadline": deadline} if deadline is not None else {})
         try:
             found_by_lot, prefix_why = (prefix or prefix_failures)(
-                worktree, composition, prefix_red, timeout=timeout, log=log)
-        except AttributionUnreadable:
+                worktree, composition, prefix_red, timeout=timeout, log=log,
+                **bounds)
+        except BudgetSpent as spent:
+            # #4463 : non concluant (§3) ; la ci-full tranche, rien n'est retiré
+            log("tests voisins : préfixes NON CONCLUANTS (%s) — consigné, le "
+                "paquet continue" % spent)
+            runs.append(budget_spent("préfixes", [_failure_name(failure)
+                                                  for failure in prefix_red]))
+            found_by_lot, prefix_why = {}, ""
+        except (AttributionUnreadable, CarrierSettled, EpochLost):
             raise
         except PaquetAutoError as exc:
             raise AttributionUnreadable(
