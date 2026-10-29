@@ -1547,12 +1547,13 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
     if interval_s <= 0 or canon.untrusted or not canon.readable or not canon.sources:
         return sync(db, canon, host)
     key = state_key(db, canon, host)
-    signature = hashlib.sha256(json.dumps({
+    signature_payload = {
         "sources": [(s.member, s.commit, s.mode) for s in canon.sources],
         "trusted_ref": configured_ref(db, canon),
         "id": canon.id, "default": canon.is_default,
         "findings": [str(f) for f in canon.load_findings],
-    }, sort_keys=True).encode()).hexdigest()
+    }
+    signature = hashlib.sha256(json.dumps(signature_payload, sort_keys=True).encode()).hexdigest()
     store = storage.of(db).canon
     token = uuid.uuid4().hex
     if not store.claim_sync(host, key, token, interval_s):
@@ -1566,8 +1567,9 @@ def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float, *,
                 sources = ", ".join("%s=%s@%s (%s)" % (
                     s.member, s.repo, s.commit, s.mode) for s in canon.sources)
                 on_incomplete("canon %s at %s: %s; sources [%s]; "
-                              "claim interval %.1fs" % (
-                                  canon.id, canon.root, reason, sources, interval_s))
+                              "claim interval %.1fs; local signature payload %s" % (
+                                  canon.id, canon.root, reason, sources, interval_s,
+                                  json.dumps(signature_payload, sort_keys=True)))
             return None
         return SyncReport(host, str(canon.root), False, [], [],
                           status=shared["status"], diagnostic=shared["diagnostic"], shared=True)
