@@ -72,6 +72,11 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_BALANCE_INTERVAL` | `balance_interval` | 900 s | provider balance reading by the runner (0 = never; only with a key) |
 | `AMEESH_DEEPSEEK_API_BASE` | — | the provider's API | base URL of the balance reading |
 | `AMEESH_IDLE_AFTER_S`, `AMEESH_BASELINE_HOSTS` | `idle_after_s`, `baseline_hosts` | 1800 s, 2 | read-only host inactivity window and baseline size; fresh uninterrupted samples and no agent work are required; critical elected leaders and reserves remain baseline when cards do not declare enough baseline hosts |
+| `AMEESH_LIFECYCLE_HOOK`, `AMEESH_LIFECYCLE_HOOK_TIMEOUT` | `lifecycle_hook`, `lifecycle_hook_timeout` | —, 300 s | external host lifecycle adapter: ameesh runs `<command> busy\|draining\|idle-drained <host>` and owns no cluster or cloud credential; `lifecycle_hooks` maps one command per host and wins over the Host card's `policy.lifecycle_hook`, which wins over the global key. A failed or timed-out hook keeps the previous state and the claims closed |
+| `AMEESH_HOST_RELEASE_INTERVAL` | `host_release_interval` | 300 s | spacing of the idle projection that may drain a burst host; transitions and the automatic return are checked every pass |
+| `AMEESH_HOST_RELEASE_DRAIN_BOUND` | `host_release_drain_bound` | 2100 s | a withdrawal that has not reached `idle-drained` after this delay raises `host_release_overdue`; it is never forced |
+| `AMEESH_HOST_RELEASE_RETRY` | `host_release_retry` | 300 s | retry delay after a failed adapter transition |
+| `AMEESH_HOST_RELEASE_SETTLE` | `host_release_settle` | 60 s | quiet time after the last turn before `idle-drained` can be proven |
 | `AMEESH_RESOURCE_INTERVAL` | `resource_interval` | 60 s | host resource reading by the runner (0 = none; see `ameesh hosts`) |
 | `AMEESH_BRANCH_SWEEP_INTERVAL` | `branch_sweep_interval` | 300 s | runner check of lot branches: a lot whose branch is merged into its target is closed (L118; 0 = none) |
 | `AMEESH_RELOCATE` | `relocate` | off | move an agent of a host under pressure to another admitted host, between two turns |
@@ -280,9 +285,15 @@ Operator procedure and exact relay values: `docs/EXECUTEUR-MEDIEE.md`.
 | `AMEESH_FILL_FROM` | — | package set a cache fill starts from |
 
 Host resource views include a `footprint` projection (also in the JSON `measure`).
-Host cards may declare `capacity: baseline` or `capacity: burst` and
-`tarif_eur_h`. Missing prices and reservations remain unknown. The projection
-requires fresh, uninterrupted samples with readable cgroup limits; older
-publishers without the readability marker cannot prove inactivity. Declared
-runs are zero with source “aucune interface de déclaration” until a run
-registry is available. This projection does not drain hosts.
+Host cards may declare `capacity: baseline` or `capacity: burst`,
+`tarif_eur_h`, and `policy.lifecycle_hook` (an external adapter command).
+Missing prices and reservations remain unknown. The projection requires fresh,
+uninterrupted samples with readable cgroup limits; older publishers without
+the readability marker cannot prove inactivity. Declared runs are zero with
+source “aucune interface de déclaration” until #4147 publishes a real run
+source; the automatic release treats that as unknown and refuses to drain
+(`host_release_no_runs`). With a hook, a burst host proven idle is drained
+(L232e, claims closed), then `idle-drained` is emitted only after no turn and
+no lease remain and a fresh post-withdrawal reading exists; a return emits
+`busy` before any claim reopens. See [EXPLOITATION.md](https://github.com/manaty/ameesh/blob/main/docs/EXPLOITATION.md)
+(“Automatic release of a burst host”).

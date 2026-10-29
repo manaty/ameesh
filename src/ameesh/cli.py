@@ -2284,8 +2284,10 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     print(host_measures_line(cfg))
     from . import host_idle, resources, canon as canon_mod
     try:
+        controls = {r["host"]: r for r in storage.of(db).host_lifecycle.listing()}
         footprints = host_idle.snapshot(cfg, db, canon_mod.load_configured(cfg),
-                                        {r["host"]: r for r in resources.current(db, cfg.host)})
+                                        {r["host"]: r for r in resources.current(db, cfg.host)},
+                                        controls=controls)
         if cfg.host in footprints:
             print(host_idle.line(footprints[cfg.host]))
     except Exception as exc:  # an unavailable footprint never breaks the doctor

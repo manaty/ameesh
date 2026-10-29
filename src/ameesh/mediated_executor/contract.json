@@ -5035,15 +5035,23 @@
    ],
    "host_lifecycle": [
     "agents",
+    "begin_transition",
+    "claim_release_scan",
     "complete_return",
     "demand",
     "detect_losses",
     "drain",
     "expire_returns",
+    "finish_release_scan",
+    "finish_transition",
     "get",
     "listing",
+    "note_release_blocked",
+    "open_claims",
     "progress",
     "reconcile_loss",
+    "release_locks",
+    "transition_journal",
     "undrain"
    ],
    "github_watch": [

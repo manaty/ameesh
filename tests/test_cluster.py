@@ -101,6 +101,9 @@ CONTENUS = {
     "host_handoffs": {"plan", "evidence"},
     "host_handoff_events": {"detail"},
     "host_lifecycle_agents": {"missing"},
+    # #4148 : sortie du crochet de libération et journal des transitions
+    "host_lifecycle": {"release_error"},
+    "host_lifecycle_transitions": {"detail"},
 }
 #: colonnes refusées au rôle de base. Une colonne nouvelle, ni accordée ni
 #: listée ici, fait échouer le test : une migration oblige à trancher.

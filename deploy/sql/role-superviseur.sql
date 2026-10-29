@@ -382,10 +382,26 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- L232a (0371) : état et réservations ; plans et preuves dans le rôle contenus
     -- L232e (0380): withdrawal intent and agent origins; refusals in contents role
     ('host_lifecycle', ARRAY[
-        'host', 'mode', 'generation', 'actor', 'requested_at', 'return_at', 'updated_at'
+        'host', 'mode', 'generation', 'actor', 'requested_at', 'return_at', 'updated_at',
+        -- #4148 : states and evidence of the external release adapter; the
+        -- free-text failure stays in the contents role.
+        'release_state', 'hook_state', 'claims_open', 'release_generation',
+        'automatic', 'released_at', 'release_error_state', 'release_error_at',
+        'release_error_since', 'hook_attempt_at', 'hook_attempt_state',
+        'hook_attempt_generation'
     ]),
     ('host_lifecycle_agents', ARRAY[
         'host', 'generation', 'agent', 'critical', 'operation'
+    ]),
+    -- #4148 : one journal line per acknowledged adapter transition; `detail`
+    -- (command output) is a content.
+    ('host_lifecycle_transitions', ARRAY[
+        'host', 'generation', 'state', 'actor', 'created_at'
+    ]),
+    -- #4148 : per-host scanner lock and the reason a scan did not drain.
+    ('host_release_locks', ARRAY[
+        'host', 'owner', 'expires_at', 'next_scan_at', 'blocked_reason',
+        'blocked_source', 'blocked_since', 'updated_at'
     ]),
     -- L232b (0417) : la fermeture de release, lue par `ameesh_host_gate_state`
     -- (`host` seulement ; périmètre d'opération et reçus exclus)

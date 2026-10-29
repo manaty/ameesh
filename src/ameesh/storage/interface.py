@@ -4228,30 +4228,115 @@ class Operations(Domain):
 # --------------------------------------------------------------------------
 
 class HostLifecycle(Domain):
-    """Durable withdrawal and return intent for admitted hosts (L232e)."""
+    """Durable withdrawal and return intent for admitted hosts (L232e).
+
+    #4148 (B): `release_state` is what ameesh decided, `hook_state` the last
+    state the external adapter acknowledged, `claims_open` the durable claim
+    gate of a return. `begin_transition`/`finish_transition` journal a
+    successful hook call per (host, generation, state), so a replay never
+    calls it twice. `claim_release_scan` serialises the release scanner of
+    one host across its runners; `next_scan_ts` spaces the expensive idle
+    projection without slowing the cheap transitions.
+    """
 
     @abc.abstractmethod
     def get(self, host: str) -> dict | None:
-        """Current host mode/generation and scheduled return."""
+        """Current host mode/generation, scheduled return and release state."""
 
     @abc.abstractmethod
     def listing(self) -> list[dict]:
-        """Persistent host controls, including withdrawn hosts."""
+        """Persistent host controls, release/hook states included."""
 
     @abc.abstractmethod
     def drain(self, host: str, *, actor: str, duration: int | None = None,
-              critical: Sequence[str] = ()) -> dict:
+              critical: Sequence[str] = (), automatic: bool = False) -> dict:
         """Close claims/enable atomically and retain agents' original host.
 
         #3029: an elected role holding its lease on this host is returned in
         the same transaction, with its epoch bumped, so another candidate can
         claim at once instead of waiting for the TTL. It stays out of the
         L232e handoff journal (there is no local work to publish).
+
+        #4148: `automatic=True` records that ameesh drained a burst host by
+        itself; `release_state` becomes `draining` and `claims_open` false.
         """
 
     @abc.abstractmethod
-    def undrain(self, host: str, *, actor: str) -> dict | None:
-        """Request agents' return; retained origin rows survive this request."""
+    def undrain(self, host: str, *, actor: str, claims_open: bool = True) -> dict | None:
+        """Request agents' return; retained origin rows survive this request.
+
+        #4148: `claims_open=False` leaves the claim gate closed for the
+        `busy` hook; only the hook's success (or the explicit default) opens
+        it. `release_state` returns to `busy` only when claims are opened.
+        """
+
+    @abc.abstractmethod
+    def begin_transition(self, host: str, generation: int, state: str, *,
+                         actor: str, stale_after: float, retry_after: float) -> dict | None:
+        """Claim the right to call the adapter for one generation and state.
+
+        None when the transition already succeeded (journal), when it is not
+        due yet, when another live attempt holds it (younger than
+        `stale_after`), or when a failure is younger than `retry_after`.
+        The returned row carries the control fields read under the lock.
+        """
+
+    @abc.abstractmethod
+    def finish_transition(self, host: str, generation: int, state: str, *,
+                          actor: str, detail: dict, error: str | None = None) -> dict | None:
+        """Record one adapter transition, success or failure.
+
+        Success journals `(host, generation, state)` (idempotent), clears the
+        attempt and the error, and advances `hook_state`; `busy` also sets the
+        release state to busy, `idle-drained` stamps the release. Claims stay
+        closed until `open_claims` (a `busy` acknowledgement only means the
+        adapter is ready, not that ameesh may already take a lease). Failure
+        keeps the acknowledged state and the closed claims, and stores the
+        bounded error for the alert. Returns the updated row.
+        """
+
+    @abc.abstractmethod
+    def open_claims(self, host: str, generation: int, *, require_busy: bool = True) -> bool:
+        """Reopen claims after a `busy` acknowledgement and a fresh reading.
+
+        Only a host whose acknowledged hook state is `busy` can reopen; a
+        replay or a stale generation opens nothing. `require_busy=False` is
+        the explicit operator path of a host whose adapter was removed.
+        """
+
+    @abc.abstractmethod
+    def transition_journal(self, host: str) -> list[dict]:
+        """Successful adapter transitions of a host, oldest first."""
+
+    @abc.abstractmethod
+    def claim_release_scan(self, host: str, *, owner: str, lock_seconds: float,
+                           scan_interval: float) -> dict | None:
+        """Take or renew the per-host release scanner lock.
+
+        None while another owner holds a live lock. The first claim schedules
+        a scan now; `scan_due` says whether `next_scan_at` is due. A later
+        claim by the same owner renews it.
+        """
+
+    @abc.abstractmethod
+    def finish_release_scan(self, host: str, *, owner: str,
+                            next_scan_at: float | None = None) -> bool:
+        """Release the scanner lock, optionally scheduling the next scan."""
+
+    @abc.abstractmethod
+    def note_release_blocked(self, host: str, *, owner: str,
+                             reason: str | None = None,
+                             source: str | None = None) -> bool:
+        """Record why the last automatic release scan did not drain a host.
+
+        #4148: mainly the unknown run source of A's measurement, so the alert
+        pass does not have to recompute the idle projection. `reason=None`
+        clears the block; only the owner of the scanner lock writes.
+        """
+
+    @abc.abstractmethod
+    def release_locks(self) -> list[dict]:
+        """Scanner locks with their last block (`blocked_reason`, source, since)."""
 
     @abc.abstractmethod
     def agents(self, host: str, generation: int) -> list[dict]:
@@ -4267,8 +4352,13 @@ class HostLifecycle(Domain):
         """CAS progress against the current host generation."""
 
     @abc.abstractmethod
-    def expire_returns(self) -> list[dict]:
-        """Convert elapsed planned withdrawals to durable return requests."""
+    def expire_returns(self, *, open_claims: bool = True) -> list[dict]:
+        """Convert elapsed planned withdrawals to durable return requests.
+
+        #4148: `open_claims=False` keeps the claim gate closed so the `busy`
+        hook answers first (the runner's path); the default preserves the
+        historical direct call, where no adapter is involved.
+        """
 
     @abc.abstractmethod
     def complete_return(self, host: str, generation: int) -> bool:

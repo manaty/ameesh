@@ -218,8 +218,11 @@ def agent_detail(db, name: str, *, cfg=None, footprint: bool = False) -> dict | 
         from . import host_idle, resources, canon as canon_mod
         try:
             readings = {r["host"]: r for r in resources.current(db, row["host"])}
+            controls = {r["host"]: r
+                        for r in storage.of(db).host_lifecycle.listing()}
             row["footprint"] = host_idle.snapshot(
-                cfg, db, canon_mod.load_configured(cfg), readings).get(row["host"])
+                cfg, db, canon_mod.load_configured(cfg), readings,
+                controls=controls).get(row["host"])
         except Exception as exc:  # optional diagnostics must not hide the agent
             row["footprint_unavailable"] = " ".join(str(exc).split())[:120]
     return row
@@ -549,7 +552,9 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
     holds = host_holds.live(db)
     latest_by_host = {row["host"]: row for row in res.current(db)}
     from . import host_idle
-    footprints = host_idle.snapshot(cfg, db, canons, latest_by_host)
+    # #4148: show the durable release state next to the read-only footprint.
+    controls = {row["host"]: row for row in storage.of(db).host_lifecycle.listing()}
+    footprints = host_idle.snapshot(cfg, db, canons, latest_by_host, controls=controls)
     # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
     # worktrees suivis)
     hk = storage.of(db).housekeeping
