@@ -34,6 +34,12 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   courrier compte s'il a moins de `file.wake_mail_s`, à défaut `file.repos_s`,
   secondes) ; la pause est levée dès qu'un de ces deux événements arrive,
   avec l'acteur et la raison au journal de la pause.
+* **#4623, la dernière note fait foi** : une note `roadmap: rouverte <projet>`
+  postérieure à la dernière `roadmap: épuisée <projet>` désarme le sommeil et
+  lève les dormeurs du projet dans la même passe (le geste est journalisé sur
+  le lot de découpage, avec l'auteur et la note) ; `roadmap_exhausted` suit la
+  même règle. Une note de réouverture antérieure à la dernière note
+  d'épuisement ne change rien.
 
 « Au repos » se lit comme `idle_capacity` (#1677 : sans lot actionnable) ;
 la durée de 30 min porte sur la condition du projet, suivie dans l'état du
@@ -60,11 +66,23 @@ FALLBACK_MARK = "repli auditeur"
 #: la note du pilote (§1, « Feuille de route épuisée »)
 EXHAUSTED_PREFIX = "roadmap: épuisée"
 EXHAUSTED_RE = re.compile(r"^\s*roadmap\s*:\s*épuisée\s+(\S+)", re.IGNORECASE)
+#: #4623 : la note qui rouvre la feuille de route ; deux orthographes déclarées
+REOPENED_PREFIX = "roadmap: rouverte"
+REOPENED_RE = re.compile(r"^\s*roadmap\s*:\s*r(?:é)?ouverte\s+(\S+)", re.IGNORECASE)
+#: toutes les notes de feuille de route, lues d'un seul préfixe : les deux
+#: formes sont ensuite départagées par leur ordre dans le journal
+ROADMAP_PREFIX = "roadmap:"
 #: raison de la pause opérateur posée par le sommeil, levée par elle seule
 SLEEP_REASON = "roadmap: épuisée %s (#3256 §2.3)"
+#: #4623 : raison journalisée à la levée automatique due à une réouverture
+REOPEN_REASON = "roadmap: rouverte %s (#3256 §2.3)"
 #: #4525 : reconnaissance de CETTE pause, pour l'alerte (une raison humaine qui
-#: ressemblerait au texte ne doit pas être prise pour le sommeil automatique)
+#: ressemblerait au texte ne doit pas être prise pour le sommeil automatique) ;
+#: le projet est capturé pour retrouver les dormeurs d'un projet sans mesure
 SLEEP_REASON_RE = re.compile(r"^roadmap\s*:\s*épuisée\s+(\S+)\s+\(#3256\s+§2\.3\)$")
+#: #4623 : marque de la levée journalisée sur le lot de découpage, une fois
+#: par note de réouverture
+REOPEN_MARK = "sleep lifted: roadmap reopened"
 #: préfixe de la note d'exemption écrite sur le lot de découpage
 SLEEP_EXEMPT_PREFIX = "sleep exempted:"
 #: #4610 : préfixe de la raison de levée automatique, au journal des pauses
@@ -202,13 +220,82 @@ def held(measures: dict, since: dict, now: float, part: float, repos_s: float) -
     return due, state
 
 
-def exhausted(notes: list, project: str) -> bool:
-    """La note du pilote `roadmap: épuisée <projet>` figure-t-elle ?"""
-    for row in notes:
-        match = EXHAUSTED_RE.match(row.get("note") or "")
+#: états rendus par `roadmap_state`
+EXHAUSTED_STATE = "exhausted"
+REOPENED_STATE = "reopened"
+
+
+def _roadmap_order(notes: list) -> list:
+    """Les notes dans l'ordre du journal quand il est lisible (#4623).
+
+    Les lignes de `events_noted` portent leur `id`, monotone pour un lot ; une
+    liste sans `id` (appel direct, test) garde son ordre d'entrée, qui est
+    celui du journal par contrat."""
+    rows = list(notes or ())
+    if rows and all(row.get("id") is not None for row in rows):
+        rows.sort(key=lambda row: int(row.get("id") or 0))
+    return rows
+
+
+def roadmap_notes(db, item_id: int) -> list:
+    """Les notes de feuille de route du lot, de la plus ancienne à la plus
+    récente (#4623).
+
+    Un seul préfixe (`roadmap:`) suffit : les formes épuisée/rouverte sont
+    départagées par `roadmap_state`, dans l'ordre du journal (`id` d'événement,
+    stable et monotone pour un lot)."""
+    return _roadmap_order(work.events_noted(db, int(item_id), ROADMAP_PREFIX))
+
+
+def roadmap_state(notes: list, project: str) -> str | None:
+    """L'état de la feuille de route de `project` : `exhausted`, `reopened`,
+    ou None sans note qui nomme le projet (#4623).
+
+    `notes` est lue dans l'ordre chronologique et **la dernière note qui nomme
+    le projet fait foi** : une réouverture postérieure à la dernière note
+    d'épuisement désarme le sommeil, et inversement. C'est ce que le pilote
+    attend en notant `roadmap: rouverte <projet>` ; avant #4623, la seule
+    présence d'une note d'épuisement rendait le sommeil définitif jusqu'au
+    classement du lot de découpage."""
+    state = None
+    for row in _roadmap_order(notes):
+        note = str((row or {}).get("note") or "")
+        match = EXHAUSTED_RE.match(note)
         if match and match.group(1).strip(".,;:") == project:
-            return True
-    return False
+            state = EXHAUSTED_STATE
+            continue
+        match = REOPENED_RE.match(note)
+        if match and match.group(1).strip(".,;:") == project:
+            state = REOPENED_STATE
+    return state
+
+
+def exhausted(notes: list, project: str) -> bool:
+    """La dernière note de feuille de route nommant le projet est-elle
+    `roadmap: épuisée <projet>` ? (#4623 : une réouverture postérieure rend
+    faux, même si une note d'épuisement plus ancienne figure dans `notes`.)"""
+    return roadmap_state(notes, project) == EXHAUSTED_STATE
+
+
+def sleeping_projects(listing: list) -> set:
+    """Les projets dont au moins un agent porte la pause du sommeil (#4623).
+
+    `measure` écarte les agents en pause : sans cette union, un projet dont
+    tous les exécutants dorment sortirait de la passe, et la note de
+    réouverture ne serait jamais lue."""
+    from . import projects as projects_mod
+    out = set()
+    for row in listing or ():
+        if not row.get("operator_paused"):
+            continue
+        match = SLEEP_REASON_RE.match(
+            str(row.get("operator_pause_reason") or "").strip())
+        if not match:
+            continue
+        project = match.group(1)
+        if project in projects_mod.agent_projects(row):
+            out.add(project)
+    return out
 
 
 def body_of(project: str, item: Measure, since_ts: float, now: float,
@@ -232,8 +319,9 @@ def body_of(project: str, item: Measure, since_ts: float, now: float,
         "classe conforme au §1 du canon, pour %d agent(s) ; ce lot se ferme quand la "
         "file en compte assez. Rien à découper : notez « %s %s » avec sa source "
         "et laissez ce lot ouvert (les agents en trop passent en sommeil jusqu'au "
-        "prochain lot démarrable, l'owner reçoit une alerte)." % (
-            len(item.idle), EXHAUSTED_PREFIX, project),
+        "prochain lot démarrable, l'owner reçoit une alerte). Pour rouvrir : notez "
+        "« %s %s » sur ce lot, le sommeil est levé à la passe suivante." % (
+            len(item.idle), EXHAUSTED_PREFIX, project, REOPENED_PREFIX, project),
         "Repli : sans lot démarrable créé dans l'heure, l'auditeur crée les lots.",
     ]
     return "\n".join(lines)
@@ -674,19 +762,23 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
     return out
 
 
-def _wake(db, project: str, listing: list) -> list:
+def _wake(db, project: str, listing: list, *, reason: str | None = None) -> list:
     """Le premier lot démarrable réveille les dormeurs du projet : seule la
     pause posée par le sommeil est levée (`expect_reason`).
 
     #4525 : le geste de levée est automatique comme la pose ; l'acteur est
     `ameesh:file-decoupage`, le principal reste l'humain qui portait la pause.
+    #4623 : `reason` nomme la cause de la levée (une note de réouverture) ;
+    c'est elle qui est journalisée dans l'événement de pause, la reconnaissance
+    de la pause restant `SLEEP_REASON`.
     """
     from . import agent_pause
     from . import projects as projects_mod
-    reason = SLEEP_REASON % project
+    sleep_reason = SLEEP_REASON % project
+    lift_reason = reason or sleep_reason
     out = []
     for row in listing:
-        if not row.get("operator_paused") or row.get("operator_pause_reason") != reason:
+        if not row.get("operator_paused") or row.get("operator_pause_reason") != sleep_reason:
             continue
         if project not in projects_mod.agent_projects(row):
             continue
@@ -695,9 +787,9 @@ def _wake(db, project: str, listing: list) -> list:
         if not owner:
             continue
         try:
-            done = agent_pause.change(db, row["name"], paused=False, reason=reason,
+            done = agent_pause.change(db, row["name"], paused=False, reason=lift_reason,
                                       actor=SLEEP_ACTOR, principal=owner,
-                                      expect_reason=reason)
+                                      expect_reason=sleep_reason)
         except Exception:  # noqa: BLE001 - la pause expire d'elle-même (#3961)
             continue
         if done.get("changed"):
@@ -756,6 +848,33 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None) -> list:
             for project, names in sorted(woken.items())]
 
 
+def _journal_reopen(db, split_id, project: str, notes: list, woken: list) -> None:
+    """Journalise une fois sur le lot de découpage la levée due à la dernière
+    note de réouverture (#4623) : auteur et note d'origine, puis dormeurs levés.
+
+    Une note par événement de réouverture (marque préfixée de son `id`), pas
+    une par passe ; une trace en échec ne défait pas la levée."""
+    note = None
+    for row in _roadmap_order(notes):
+        match = REOPENED_RE.match(str((row or {}).get("note") or ""))
+        if match and match.group(1).strip(".,;:") == project:
+            note = row
+    if note is None:
+        return
+    note_id = int(note.get("id") or 0)
+    prefix = "%s %s (note #%d)" % (REOPEN_MARK, project, note_id)
+    try:
+        if work.events_noted(db, int(split_id), prefix):
+            return
+        lifted = ", ".join(woken) if woken else "no sleeper"
+        work.note(db, int(split_id),
+                  "%s (actor %s, reason %r; %s)"
+                  % (prefix, note.get("actor") or "?", note.get("note") or "", lifted),
+                  actor=SLEEP_ACTOR)
+    except Exception:  # noqa: BLE001 - une trace ne bloque jamais la levée
+        pass
+
+
 def run(cfg, db, *, now: float | None = None, state: dict | None = None,
         dry_run: bool = False, actor: str = "ameesh:file-decoupage",
         listing: list | None = None, canons=None, settings=None) -> list:
@@ -790,12 +909,40 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
     # dormeurs du sommeil automatique.
     if not dry_run:
         out.extend(_wake_work(db, listing, now, cfg=cfg, canons=canons))
-    for project, item in sorted(measures.items()):
+    # #4623 : un projet dont tous les exécutants dorment n'a plus de mesure
+    # (`measure` écarte les pauses). Il doit rester dans la passe, sinon la
+    # note de réouverture ne serait jamais lue et les dormeurs jamais levés.
+    sleeping = sleeping_projects(listing)
+    for project in sorted(set(measures) | sleeping):
+        item = measures.get(project) or Measure(project)
         split = _open_split(db, project)
-        if item.startable:
-            woken = [] if dry_run else _wake(db, project, listing)
+        state = None
+        notes = []
+        if split is not None:
+            split = dict(split)
+            if not split.get("created_ts"):
+                match = next((lot for lot in lots
+                              if int(lot["id"]) == int(split["id"])), None)
+                split["created_ts"] = (match or {}).get("created_ts")
+            notes = roadmap_notes(db, int(split["id"]))
+            state = roadmap_state(notes, project)
+        if item.startable or state == REOPENED_STATE:
+            reason = REOPEN_REASON % project if state == REOPENED_STATE else None
+            woken = [] if dry_run else _wake(db, project, listing, reason=reason)
             if woken:
                 out.append({"kind": "wake", "project": project, "agents": woken})
+            if state == REOPENED_STATE and not dry_run:
+                _journal_reopen(db, int(split["id"]), project, notes, woken)
+        if state == EXHAUSTED_STATE:
+            if not item.startable and item.idle and not dry_run:
+                slept = _sleep(db, project, item, by_name, now,
+                               split_id=int(split["id"]), lots=lots, listing=listing,
+                               cfg=cfg, canons=canons,
+                               mail_window_s=settings.mail_window())
+                if slept:
+                    out.append({"kind": "sleep", "project": project,
+                                "lot": int(split["id"]), "agents": slept})
+            continue
         if split is None:
             if project in due:
                 if dry_run:
@@ -807,21 +954,6 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
                 out.append(dict(made, kind="split", project=project,
                                 measure=item.to_dict()))
             continue
-        split = dict(split)
-        if not split.get("created_ts"):
-            match = next((lot for lot in lots if int(lot["id"]) == int(split["id"])), None)
-            split["created_ts"] = (match or {}).get("created_ts")
-        notes = work.events_noted(db, int(split["id"]), EXHAUSTED_PREFIX)
-        if exhausted(notes, project):
-            if not item.startable and item.idle and not dry_run:
-                slept = _sleep(db, project, item, by_name, now,
-                               split_id=int(split["id"]), lots=lots, listing=listing,
-                               cfg=cfg, canons=canons,
-                               mail_window_s=settings.mail_window())
-                if slept:
-                    out.append({"kind": "sleep", "project": project,
-                                "lot": int(split["id"]), "agents": slept})
-            continue
         if split.get("created_ts") is None or dry_run:
             continue
         done = _fallback(db, project, split,
@@ -832,9 +964,11 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
 
 
 def exhausted_alerts(db, listing: list) -> list:
-    """`roadmap_exhausted` : un lot de découpage ouvert porte la note du
-    pilote. Une alerte par lot ; le notifieur la pousse une fois à l'owner
-    (dédoublonnage par clé) tant qu'elle dure."""
+    """`roadmap_exhausted` : un lot de découpage ouvert dont la **dernière**
+    note de feuille de route est `roadmap: épuisée <projet>` (#4623 : une
+    réouverture postérieure retire l'alerte). Une alerte par lot ; le
+    notifieur la pousse une fois à l'owner (dédoublonnage par clé) tant
+    qu'elle dure."""
     from . import projects as projects_mod
     out = []
     projects = sorted({p for row in listing for p in projects_mod.agent_projects(row)})
@@ -843,7 +977,7 @@ def exhausted_alerts(db, listing: list) -> list:
             split = _open_split(db, project)
             if split is None:
                 continue
-            notes = work.events_noted(db, int(split["id"]), EXHAUSTED_PREFIX)
+            notes = roadmap_notes(db, int(split["id"]))
         except Exception:  # noqa: BLE001 - une lecture en échec ne lève rien
             continue
         if not exhausted(notes, project):
@@ -853,10 +987,10 @@ def exhausted_alerts(db, listing: list) -> list:
             "roadmap_exhausted", None, None, 1, None,
             "roadmap exhausted for %s: the pilot noted it on split lot #%d; idle "
             "execution agents are asleep until a startable lot, an assigned actionable "
-            "lot, or pilot/orchestrator mail arrives, burst hosts are "
-            "released by the host drain (#3167 B). Action: add roadmap items or a "
-            "decision (ameesh decide), or close #%d" % (
-                project, int(split["id"]), int(split["id"])),
+            "lot, or pilot/orchestrator mail arrives, or the pilot notes `%s %s`; "
+            "burst hosts are released by the host drain (#3167 B). Action: add "
+            "roadmap items or a decision (ameesh decide), or close #%d" % (
+                project, int(split["id"]), REOPENED_PREFIX, project, int(split["id"])),
             lot=int(split["id"]), project=project,
             responsible=_owner_of(rows)))
     return out

@@ -305,7 +305,8 @@ def new_token() -> str:
 
 def reserve(db: Db, recipient: str, owner: str | None, epoch: int | None, token: str,
             *, ids: Sequence[int] | None = None, porteur: str,
-            ttl_seconds: float = RESERVATION_TTL, limit: int = 200) -> list[dict]:
+            ttl_seconds: float = RESERVATION_TTL, limit: int = 200,
+            turn_id: str | None = None) -> list[dict]:
     """Réserve atomiquement des non-lus pour UNE remise (consigne ou hook).
 
     Protocole unique de l'exécuteur et du hook : réserver sous un jeton,
@@ -315,12 +316,19 @@ def reserve(db: Db, recipient: str, owner: str | None, epoch: int | None, token:
     déjà réservé (réservation active) n'est jamais réservé deux fois. Chaque
     message rendu porte `deja_consigne` : une réservation antérieure n'a
     jamais été soldée (panne), il est peut-être déjà vu.
+
+    `turn_id` (#2894) : le tour de l'exécuteur qui réserve sa consigne ;
+    écrit dans `meta.consigne.turn` (additif, sans migration), il relie la
+    remise au document `ameesh-turn-context/1`. Un hook ne le passe pas.
     """
     from .agent_names import resolve as resolve_agent_name
     recipient = resolve_agent_name(recipient, db=db, operation="mail.reserve")
+    options = dict(ids=ids, porteur=porteur, ttl_seconds=ttl_seconds, limit=limit)
+    if turn_id is not None:
+        # a hook leaves the parameter out: its golden request is unchanged
+        options["turn_id"] = turn_id
     return storage.of(db).mailbox.reserve(
-        recipient, owner or None, epoch if owner else None, token, ids=ids,
-        porteur=porteur, ttl_seconds=ttl_seconds, limit=limit)
+        recipient, owner or None, epoch if owner else None, token, **options)
 
 
 def deliver(db: Db, recipient: str, owner: str | None, epoch: int | None, token: str,
