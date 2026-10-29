@@ -1068,7 +1068,15 @@ class AgentHostTest(unittest.TestCase):
         # #4358 : une lecture coupée est vide, donc non concluante : relue
         # en fin de balayage puis laissée en l'état, sans échec de l'étape.
         # Un seul essai et un seul agent : deux lectures coupées en tout.
-        self.env.update(DRAIN_APPEL_DELAI='10', DRAIN_MARGE_LOCALE='1',
+        # #4529 : la marge locale (30 s) place la borne du client (31 s)
+        # loin au-dessus du transport, que le scénario ralentit de 2,5 s ;
+        # à 1 s, le client tuait la lecture du registre avant que le
+        # `timeout` distant n'ait rendu son code, et l'étape échouait
+        # (rouge main 40849515562). La lecture `show` reste coupée par sa
+        # propre borne (1 s) : si elle ne l'était plus, son sommeil de 5 s
+        # rendrait un statut et le témoin verrait le redémarrage, pas le
+        # non-concluant.
+        self.env.update(DRAIN_APPEL_DELAI='60', DRAIN_MARGE_LOCALE='30',
                         DRAIN_LECTURE_DELAI='1', LECTURE_ESSAIS='1')
         agents = [dict(name='dev9', host='host-agents', mode='execute', status='idle')]
         debut = time.monotonic()
@@ -1077,9 +1085,10 @@ class AgentHostTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn('laissée(s) en l\'état (non concluant) : dev9', p.stdout)
         self.assertEqual(self.starts(), [])
-        # #3832 : 8 s reste strictement sous la borne des gestes de drain
-        # (10 s) et laisse la marge d'ordonnancement de --parallel.
-        self.assertLess(ecoule, 8,
+        # #3832 : garde de pendaison sous la borne des gestes (60 s), avec la
+        # marge d'ordonnancement de --parallel ; une lecture coupée par la
+        # borne locale (31 s) la dépasserait.
+        self.assertLess(ecoule, 20,
                         'show doit être coupé par DRAIN_LECTURE_DELAI, pas par '
                         'DRAIN_APPEL_DELAI')
 
