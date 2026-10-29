@@ -11,6 +11,7 @@ refus d'une identité d'expéditeur arrêtée, alerte `mail_undeliverable` (et
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shlex
@@ -411,6 +412,39 @@ class AlerteTest(_Base):
         # l'agent relancé : plus d'alerte pour lui
         registry.set_status(self.db, "claude3", "idle")
         self.assertEqual([a["agent"] for a in self.alertes()], ["orchestrator"])
+
+    def test_humain_declare_n_est_pas_une_boite_morte(self):
+        """#4519 : un humain DÉCLARÉ (`human:<id>`) lit par `ameesh decide` et
+        par le fil ; son courrier n'est ni alerté « non distribuable » ni
+        expiré. Un `human:<id>` non déclaré reste un nom inconnu."""
+        cfg = dataclasses.replace(self.cfg, humans="smichea")
+        mail.send(self.db, "claude1", "human:smichea",
+                  "Passe de cohérence du backlog — ameesh.", kind="event")
+        mail.send(self.db, "claude1", "human:inconnu", "Rapport.", kind="event")
+        self.vieillir()
+        alertes = [a for a in exploitation.alerts(
+            cfg, self.db, orchestrators_declared=("orchestrateur",))
+            if a["type"] == "mail_undeliverable"]
+        self.assertEqual([a["agent"] for a in alertes], ["human:inconnu"])
+        self.assertEqual((alertes[0]["reason"], alertes[0]["value"]), ("inconnu", 1))
+        # le ménage de l'exécuteur n'expire pas le courrier de l'humain déclaré
+        self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '8 days'")
+        report = undeliverable.sweep(cfg, self.db, days=7)
+        self.assertEqual([r["recipient"] for r in report["expired"]], ["human:inconnu"])
+        self.assertEqual(len(mail.unread(self.db, "human:smichea")), 1)
+
+    def test_vue_projets_ignore_le_courrier_d_un_humain_declare(self):
+        """#4519 : `ameesh projects` (et la vue `snapshot`) ne compte pas le
+        courrier d'un humain déclaré comme non distribuable."""
+        mail.send(self.db, "claude1", "human:smichea",
+                  "Passe de cohérence du backlog — ameesh.", kind="event")
+        self.vieillir()
+        db = self.connect(humans="smichea")
+        self.addCleanup(db.close)
+        view = projects.snapshot(db)
+        self.assertEqual(view["undeliverable"], 0)
+        self.assertEqual([p["name"] for p in view["projects"]
+                          if p["undeliverable_mail"]], [])
 
     def test_notify_previent_les_orchestrateurs(self):
         self.stop("claude3")

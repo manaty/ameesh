@@ -106,14 +106,15 @@ sources = pr.read_sources(context)                # real collections, in the tx
 * `read_sources(context) -> Mapping`: the source read for C (which is pure and
   SQL-free), **inside the transaction and under lock**. The mapping declares
   only what is really collected (`SOURCE_KEYS`: `milestones`, `receipts`,
-  `decisions`, `deliveries`, plus the conditional `approvals` of #4006);
-  `observations` is not installed and is **not** declared: a verifier that
-  requires it refuses `source-unavailable` (fail-closed). `approvals` is
-  declared only when the host has a fresh, valid IMA #704 projection; absent,
-  a verifier that requires it refuses the same way. `receipts` carries
-  `{accepted, guard, event_id, command_id, workflow_stage, workflow_version,
-  sha256, evidence, facts}` — `guard` is the Process guard or the reserved
-  verifier name (`hold`, `revision_transfer`).
+  `observations`, `decisions`, `deliveries`, plus the conditional `approvals`
+  of #4006 and the conditional `observations` of #4425); a collection absent
+  from the host is not declared: a verifier that requires it refuses
+  `source-unavailable` (fail-closed). `approvals` is declared only when the
+  host has a fresh, valid IMA #704 projection; `observations` is declared only
+  when the host has a fresh, valid IMA observations projection (#4425).
+  `receipts` carries `{accepted, guard, event_id, command_id, workflow_stage,
+  workflow_version, sha256, evidence, facts}` — `guard` is the Process guard
+  or the reserved verifier name (`hold`, `revision_transfer`).
 
 ## Transaction invariants
 
@@ -204,7 +205,7 @@ here).
 | 1c | reviewed governance authority | no generic native object; only candidates: native decision request L233 (open requests only), module proof `work_module_milestones` (`schemas`/`rules`, `actor_role`, `separation_of_duties`), `reviewer` designation | nothing generic | source role/actor and review rule — **missing**; any acceptance would be invented |
 | 2 | `revision_transfer`: admission/transfer explicitly reviewed, bounded to lot/project/revision/actor, refused on absent or stale proof | reserved name `TRANSFER_VERIFIER = "revision_transfer"` (`process_registry` and `process_verifiers`), called by `transfer_revision`; **installed** by `install_verifiers` (#4007) and published in `RESERVED_VERIFIERS`; source: the conditional `approvals` collection (#4006) | contract `revision-transfer/1` (#4007): see [Revision transfer](#revision-transfer-4007-a-of-2846) | approver identity is a GitHub login compared to agent names (see the named limit there) |
 | 3 | `docs`, `investigation`, `governance-tracking`, `promotion`, `human_operation` admitted by an **active project module**, without bypassing the SQL guard | `INSTALLED_TYPES` carries the five (+ `bug`, `evolution`); completion is per type; SQL guard `ameesh_module_requirements` (migration 0363): `bug`/`evolution`/`improvement` stay admitted, any other type needs `project_modules.types` for the lot's project; modules are written only by canon sync | SQL `AMEESH_MODULE_RULE: work item type % has no active module in project %` (every write of the lot — insert, state change or any other update — and module-milestone insert; trigger of 0363, `ameesh_module_requirements` redefined by 0427); C `type-unsupported` | the active module is canon-declared: `extensions.ameesh.projects.<project>.modules` names **installed** descriptors only (`modules.installed()`), whose types must be disjoint within a project; the installed registry also discovers external descriptors installed in the environment through the `ameesh.modules` entry point group (#2847); a private descriptor (for example ThePackengers', name chosen by its owner, not in this repository) declares the five, so a project admits them by selecting that module in its canon, while a project without it is still refused by the SQL guard; the exact external descriptor revision and project/canon admission revisions remain to be supplied by its owner; `improvement` is admitted by the legacy SQL but absent from `INSTALLED_TYPES`, so C refuses its `advance` `type-unsupported` (`hold`/`release` do not check the type and pass) |
-| 4 | `observations` staging/preprod: reliable source absent, refusal kept | `observations` is declared in `SOURCE_COLLECTIONS` but absent from `SOURCE_KEYS`/`read_sources`: the snapshot never carries it | `source-unavailable` before the guard's own check, after the earlier refusals (see the order below), for `merged_and_staging_deployed`, `staging_pass`/`staging_failure`, `preprod_*`, `repair_started` | shape, attestation and freshness of the reliable source — **not designed, named missing**; nothing invented (no table edit, no client boolean) |
+| 4 | `observations` staging/preprod: reliable native source, fail-closed | conditional `observations` collection (#4425): the local `ameesh-observations/1` projection derived from the bureau's append-only journal; `deployed` records from native staging attestations, QA `pass`/`fail` from the IMA contract #796 when it exists, human acceptances from #4006 | absent projection → `source-unavailable` for `merged_and_staging_deployed`, `staging_pass`/`staging_failure`, `preprod_*`, `repair_started`; revoked/superseded/expired/future record → `evidence-missing`; stale artifact/environment/kind → `revision-mismatch` / `observation-result-mismatch`; the guard still requires an accepted receipt referencing the observation | QA envelope (external IMA #796) — named missing; the reader and the witness are ready and nothing is invented |
 
 ### Refusals: two levels (B and C)
 
@@ -269,9 +270,11 @@ C checks neither type nor guard sources (except `decisions` for
   `install_verifier("revision_transfer", …)` is added without a published
   contract (lot/project binding, identity of the reviewed revision and actor,
   proof source, staleness rule, independence rule).
-* **Q3** — keep the fail-closed `observations` → `source-unavailable` refusal
-  and qualify it with a witness **on C's callable** (through B it is only
-  `verifier-refused`).
+* **Q3** — (superseded by #4425, see [Observations journal](#observations-journal-ima-4425-b-of-2846))
+  the source is now conditional: without a fresh projection, C still refuses
+  `source-unavailable` (witnessed on C's callable; through B it is
+  `verifier-refused`); with a fresh projection, the guarded collection is
+  present and a revoked/superseded/expired record is absent from it.
 
 `planning`/`start_work` stay on today's subset (title, assignee, installed
 type); the matrix publishes "not admitted" for the missing facts below.
@@ -285,15 +288,16 @@ type); the matrix publishes "not admitted" for the missing facts below.
 | 3 | governance: source role/actor and review rule | consumer policy / module rules |
 | 4 | transfer proof: binding to lot (`work_item_id`) and project (`app`/`workstream`, native), reviewed revision identity and reviewing actor, proof source, staleness rule, independence rule, refusal codes | consumer policy; codes published with the contract |
 | 5 | module declaring the five types (name, content) | pilot decision |
-| 6 | reliable observation source: shape, attestation, freshness | consumer policy |
+| 6 | reliable observation source: shape, attestation, freshness | #4425 publishes the `ameesh-observations/1` projection, the native staging attestations, the supersession/freshness rules and the fail-closed reader; the QA envelope waits for the external IMA #796 contract |
 
 ### Seam unchanged
 
 `process_registry.install_verifier(name, callable)` and `read_sources(context)`
 remain **the** generic seam: the source read happens inside the transaction,
 under the lot lock and after the authority check; the collections are declared
-(`SOURCE_KEYS`: `milestones`, `receipts`, `decisions`, `deliveries`, and the
-conditional `approvals` of #4006); the verifier returns a `Verification`; no
+(`SOURCE_KEYS`: `milestones`, `receipts`, `observations`, `decisions`,
+`deliveries`, and the conditional `approvals` of #4006 / `observations` of
+#4425); the verifier returns a `Verification`; no
 caller-supplied verifier and no client boolean. A field that needs more asks
 for **one more declared collection**, read in the same transaction; absent ⇒
 `source-unavailable`, never a private SQL read by C.
@@ -489,7 +493,163 @@ Witnesses name the level they observe: **C** = the verifier callable
 | `start_work` | no assignee → C `evidence-missing`, B `verifier-refused` |
 | type | `docs` lot, no module → SQL `AMEESH_MODULE_RULE` at insert; `release` lot with the `it` module active → SQL admitted; `improvement` lot → SQL admitted, then `advance` C `type-unsupported` / B `verifier-refused`, while `hold`/`release` pass |
 | `revision_transfer` | #4007: see the refusal contract in [Revision transfer](#revision-transfer-4007-a-of-2846) (existing codes only, the bridge code in `facts["detail"]`) |
-| `observations` | any staging/preprod advance → C `source-unavailable`, B `verifier-refused`, no effect (rollback); a well-formed command refuses identically |
+| `observations` | without a fresh projection: any staging/preprod advance → C `source-unavailable`, B `verifier-refused`, no effect (rollback). With a fresh projection: a valid record referenced by an accepted receipt is accepted; a revoked, superseded, expired or future record is absent → C `evidence-missing`; a bad revision or environment → C `revision-mismatch` / `observation-result-mismatch` |
+
+## Observations journal IMA (#4425, B of #2846)
+
+Owner decision #155437 (option a, signed 29/10 00:05Z, approval #146) makes
+IMA the trusted collector: deployments, QA results and human acceptances are
+native observations, written through a local journal API and projected
+read-only to the hosts. Lot B implements the collector and the fail-closed
+reader; the real qualification runs from `bureau-goal` with the #4424
+credential, and the QA envelope waits for the external IMA #796 contract
+(nothing is invented).
+
+### Journal and projection are distinct
+
+The **journal** is an append-only JSONL file on `bureau-goal` (0600, directory
+0700). Only `process_observations.Journal` writes it:
+
+* `record(observation)` appends a normalised record; the same id with the same
+  `source_digest` is idempotent, another digest is `observation-edited` (the
+  journal is never rewritten);
+* `supersede(id, by, reason)` appends the replacement;
+* `revoke(id, reason, actor)` appends a terminal revocation (`rev-N`).
+
+Until the external QA contract #796 exists, the writer refuses any `pass` or
+`fail` observation in `staging`/`preprod` (`observation-invalid`): the config
+refusal is not the only boundary. Only a human acceptance (`environment
+=acceptance`, provenance `github-comment`) can be a `pass` today.
+
+Each entry carries `seq`, `prev` (the previous entry's digest) and its own
+JCS+SHA-256 digest, so a tampered or truncated line is `journal-invalid`. The
+history of corrections and revocations survives a GitHub comment edit or
+deletion: a change in the source digest revokes the old record, it never
+rewrites it. **Named limit**: the chain proves order and content, not
+completeness; a truncation at an entry boundary (removing whole trailing
+lines) is not detectable from the file alone. The journal is owner-only and
+must be backed up; the projection digest is integrity, not a signature. A
+host-side "last seen" anchor is not implemented.
+
+The **projection** `ameesh-observations/1` is derived from the journal at each
+refresh: `schema`, `authority`, `source` (`journal_id`, `repos`, `issues`,
+`source_digest`, `entries`), `generated_at`, `expires_at`, `collector` (host,
+identity, version, reader), `observations`, `revocations`, `refusals`, and
+`digest` (JCS+SHA-256 of the rest). The projection carries every current
+record plus the most recent `MAX_HISTORY` (1000) superseded/revoked records;
+the journal keeps the full history. `show --all` reads that bounded window,
+older history stays bureau-only. Each observation carries `id`, `kind`
+(`deployed`/`pass`/`fail`), `environment` (`staging`/`preprod`/`acceptance`),
+`work_item_id` (null for a global acceptance), `app`, `artifact` (the full
+revision), `source_revision`, `actor`, `observed_at`, `state`
+(`current`/`superseded`/`revoked`), `superseded_by`, `revoked_by`,
+`provenance` and `digest`.
+
+### Collected sources and kind mapping
+
+* **Native staging attestations**: `ameesh-staging-actif/1` under
+  `mise-a-jour/actif-*.json`, and cut-off reports `ameesh-release-cutoff/1`
+  under `release/reports/*.json` → `deployed` (environment `staging`). A
+  report is used only when its project is `staging.app`, its result is
+  `released` or `reconciled`, `staging.exit == 0`, and the embedded
+  attestation carries the same full `release_sha`. `staging.hosts` is
+  **required** and names the expected completeness: every named host must be
+  present (active or reported). Every active host's `actif` must be a 7–40 hex
+  prefix of the attested `sha` (the rule already used by
+  `staging_pending._merge_attestation`); a reported host must carry a
+  non-empty `raison`, must not also be active, and must appear in
+  `staging.reportable_hosts` (a required agent VM is never reportable). A
+  mismatched, empty or contradictory host proof is `source-invalid`: the name
+  alone never proves that this commit is active on that host.
+  The deployment timestamp is the attestation's own `date`, never the release
+  cut `completed_at`: a later cut for an older commit cannot supersede a newer
+  deployment. `completed_at` stays in the digest and the provenance.
+  The observation id is derived from a digest of the attestation (or report)
+  and the lot, so the attestation's notification bookkeeping can be rewritten
+  without changing the id.
+* **Human acceptances**: the local #4006 projection
+  (`process-approvals`), with its revocation and its expiry → `pass`,
+  environment `acceptance`, no lot and no app (global acceptance), provenance
+  `github-comment`. No freshness threshold is added to #4006's own. These
+  observations are **audit-only today**: no Process guard consumes
+  `environment=acceptance` (the revision-transfer guard reads #4006 directly);
+  wiring a consumer is a separate decision, not inferred here.
+* **QA IMA**: the envelope is the external IMA #796 contract. Until it exists,
+  a configured `qa` key is refused `reader-config` and no QA `pass`/`fail` is
+  collected; the reader and the witness are ready for the contract.
+
+Kind mapping of the relay: `merged_and_staging_deployed` and
+`preprod_deployed` → `deployed`; `*_pass` → `pass`; `*_failure` → `fail`.
+`repair_started` is mapped to nothing: it is not a deployment proof and no
+guard accepts it as one.
+
+### Freshness, supersession and revocation
+
+The projection TTL is 300 s by default (`source.ttl_s`, minimum 120 s =
+two refresh periods), refreshed every minute, with a 60 s clock skew.
+
+* `deployed` never expires by age. The latest non-revoked deployment of the
+  same `(app, work_item_id, environment)` supersedes the previous ones
+  (`next-deployment`); a newer record in another environment does not.
+* QA `pass`/`fail` expire after `QA_TTL_S` (7 days).
+* Human acceptances follow the #4006 projection and the approval's own
+  `expires_at`; an expired approval is revoked `acceptance-expired`.
+* An approval that disappears from a fresh #4006 projection is revoked
+  `source-disappeared`; a changed source digest is revoked `source-edited`,
+  never rewritten. Revocation is terminal.
+
+### Identity and fail-closed reading
+
+Hosts declare `observations.authority` and `observations.source`
+(`journal_id`, `repos`, `issues`, even empty). A projection whose authority,
+journal, repositories or issues differ is `projection-source`; a
+GitHub-provenance observation whose repository is outside the identity is
+also `projection-source`. The host refuses a projection that is missing,
+unreadable, group/other writable, owned by another uid, over 4 MiB, with a
+bad digest, an unknown schema, an expired TTL, older than `max_age_s`, or in
+the future. The expected owner defaults to the reading uid; a copy
+synchronised by root declares `owner_uid: 0`. The journal lives in a
+0700 directory and the published projection in a separate 0755 directory
+(never group/other writable), so a different-uid host can read the copy. The projection is written atomically
+(0644, owner-writable only); the journal is 0600 in a 0700 directory.
+
+### Seam and refusal codes
+
+`process_registry.SOURCE_KEYS` gains the **conditional** `observations`
+collection. `read_sources` adds it only when
+`process_observations.local_projection()` succeeds; the value is the list of
+current, non-expired, non-future records for the lot and app (global
+acceptances included), in the shape the guards already read:
+`{id, kind, env, sha, state, lot, app, actor, observed_at, source_revision,
+provenance}`. A revoked, superseded, expired or future record is absent, so
+an existing Process guard refuses `evidence-missing`; a missing projection
+removes the key and the guard refuses `source-unavailable`. No network read
+happens on a host, and this lot publishes **no new Process refusal code**.
+
+Observation and journal codes (stable, module-level; `ObservationError.code`):
+
+| family | codes |
+|---|---|
+| collector | `reader-config`, `reader-unavailable`, `reader-bounds`, `acceptances-unavailable` |
+| journal | `journal-missing`, `journal-unreadable`, `journal-permissions`, `journal-bounds`, `journal-invalid` |
+| projection | `projection-missing`, `projection-unreadable`, `projection-permissions`, `projection-owner`, `projection-bounds`, `projection-invalid`, `projection-digest`, `projection-stale`, `projection-future`, `projection-source` |
+| observation | `observation-missing`, `observation-invalid`, `observation-edited`, `observation-revoked`, `observation-superseded`, `observation-expired`, `observation-future`, `observation-stale`, `observation-source` |
+| collection witnesses | `source-invalid`, `source-bounds` |
+
+### Qualification
+
+`tests/test_process_observations.py` covers the journal (append-only chain,
+idempotence, edited source, revocation), the derived states, the projection
+(digest, permissions, owner, stale, future, identity), the reader (lot/app
+filter, QA age, deployed never expiring, stable refusals).
+`tests/test_process_observations_collector.py` covers the staging fixtures,
+the native supersession, the acceptance source with revocation, supersession,
+disappearance, expiry and edit, the CLI, and the absence of writes on a
+dry run or an unavailable source. `tests/test_process_observations_registry.py`
+proves the B/C seam and the guard acceptance/refusal on the real shape.
+`tests/test_process_observations_real.py` is skipped by default; on
+`bureau-goal` it reads `AMEESH_OBSERVATIONS_REAL_CONFIG`, runs a dry refresh
+on the real attestations and the #4006 projection, and never writes.
 
 ## Revision transfer (#4007, A of #2846)
 

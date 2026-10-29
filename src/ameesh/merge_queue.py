@@ -1491,10 +1491,29 @@ GATE_CACHE_MAX_ENTRIES = 2000
 #: numéro de paquet (qui ne bouge qu'aux releases).
 _GATE_CODE_FILES = (
     "merge_queue.py", "review_authors.py", "review_designation_activation.py",
-    "lot_class.py", "plan_git.py", "canon.py", "review_lot.py", "review.py",
-    "provenance_scope.py", "packet_reviews.py",
+    "lot_class.py", "plan_git.py", "modules/dev/plan_git.py", "canon.py",
+    "review_lot.py", "review.py", "provenance_scope.py", "packet_reviews.py",
 )
 _GATE_CODE_FINGERPRINT: str | None = None
+
+
+def _gate_code_digest(root: str) -> str:
+    """L'empreinte du code de la porte sous `root` (le dossier `ameesh`).
+
+    Les chemins déplacés par une tranche de module (L100) comptent par leur
+    nouveau fichier, pas seulement par l'alias constant laissé derrière :
+    `plan_git.py` n'est qu'un alias depuis #4383, le vrai code est dans
+    `modules/dev/plan_git.py`. Un chemin absent est haché comme
+    `unreadable` : son apparition change l'empreinte."""
+    digest = hashlib.sha256()
+    for name in _GATE_CODE_FILES:
+        digest.update(name.encode("utf-8"))
+        try:
+            with open(os.path.join(root, name), "rb") as fh:
+                digest.update(fh.read())
+        except OSError:
+            digest.update(b"unreadable")
+    return digest.hexdigest()[:16]
 
 
 def _gate_code_version() -> str:
@@ -1505,21 +1524,13 @@ def _gate_code_version() -> str:
     global _GATE_CODE_FINGERPRINT
     if _GATE_CODE_FINGERPRINT is not None:
         return _GATE_CODE_FINGERPRINT
-    digest = hashlib.sha256()
     root = os.path.dirname(os.path.abspath(__file__))
-    for name in _GATE_CODE_FILES:
-        digest.update(name.encode("utf-8"))
-        try:
-            with open(os.path.join(root, name), "rb") as fh:
-                digest.update(fh.read())
-        except OSError:
-            digest.update(b"unreadable")
     try:
         from . import version as ameesh_version
         label = ameesh_version()
     except Exception:  # noqa: BLE001 - version illisible : l'empreinte suffit
         label = "unknown"
-    _GATE_CODE_FINGERPRINT = "%s+%s" % (label, digest.hexdigest()[:16])
+    _GATE_CODE_FINGERPRINT = "%s+%s" % (label, _gate_code_digest(root))
     return _GATE_CODE_FINGERPRINT
 
 
@@ -1883,8 +1894,12 @@ def _object_recoverer(where: str, sources):
     l'agent ou à l'origine du projet, puis on vérifie que l'objet est bien
     lisible localement. Aucun ref n'est déplacé et aucune tête n'est changée :
     seule la preuve manquante est réparée. Rend False (jamais une exception)
-    quand la récupération échoue, pour que l'appelant strict refuse fermé."""
-    def recover(sha: str) -> bool:
+    quand la récupération échoue, pour que l'appelant strict refuse fermé.
+
+    #4457 (B/P2 cx3) : `timeout` est le temps qui reste à l'appelant ; il
+    borne l'ensemble des sources, pas chacune. Sans lui, le plafond par source
+    reste `FETCH_TIMEOUT` (comportement historique)."""
+    def recover(sha: str, *, timeout=None) -> bool:
         text = str(sha or "").strip().lower()
         if not _HEX.fullmatch(text):
             return False
@@ -1897,17 +1912,25 @@ def _object_recoverer(where: str, sources):
         # localement s'il était lisible.
         if len(text) not in (40, 64):
             return False
+        remaining = None if timeout is None else max(float(timeout), 0.0)
         for source in sources or ():
             source = str(source or "").strip()
             if not source:
                 continue
+            if remaining is not None and remaining <= 0:
+                break
+            bound = (FETCH_TIMEOUT if remaining is None
+                     else min(remaining, FETCH_TIMEOUT))
+            started = time.monotonic()
             try:
                 proc = plan_git._git(where, "fetch", "--quiet", "--no-tags",
                                      "--no-write-fetch-head", "--", source, text,
-                                     timeout=FETCH_TIMEOUT)
+                                     timeout=bound)
             except Exception:  # noqa: BLE001 - source injoignable : suivante
-                continue
-            if proc.returncode != 0:
+                proc = None
+            if remaining is not None:
+                remaining -= time.monotonic() - started
+            if proc is None or proc.returncode != 0:
                 continue
             try:
                 if plan_git.local_commit(where, text):

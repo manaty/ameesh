@@ -407,3 +407,59 @@ class RunnerWorkdirDelegationTest(unittest.TestCase):
                 (runner.AgentWorker._lot_workdir_blocked, "workspaces.mail_hold")):
             with self.subTest(appel=appel):
                 self.assertIn(appel, inspect.getsource(methode))
+
+
+class DevModuleRegistryTest(unittest.TestCase):
+    """L101 T4 : la façade est obtenue par `registry.get("dev")`."""
+
+    def test_dev_module_vient_du_registre_et_porte_la_facade(self):
+        from ameesh.modules import dev, registry
+        self.assertIs(workspaces.dev_module(), dev)
+        self.assertIn("workspaces", registry.CAPABILITIES)
+        self.assertIs(registry.get("dev").workspaces(), workspaces)
+
+    def test_profil_nu_n_a_pas_de_module_dev(self):
+        with mock.patch("ameesh.modules.registry._builtin", return_value={}):
+            self.assertIsNone(workspaces.dev_module())
+
+
+class BareWorkspacesProfileTest(unittest.TestCase):
+    """L101 T4 : sans module `dev`, ménage et worktrees sont des no-ops documentés."""
+
+    def setUp(self):
+        self.cfg = mock.Mock(host="pc")
+        self.pol = housekeeping.Policy()
+        patch = mock.patch.object(workspaces, "dev_module", return_value=None)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.tmp = tempfile.TemporaryDirectory(prefix="l101-bare-")
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_before_turn_rend_un_tour_eteint(self):
+        turn = workspaces.before_turn(self.cfg, self.pol, "a1", self.tmp.name,
+                                      new_session=True, base_env={"KEEP": "1"})
+        self.assertTrue(turn.off)
+        self.assertEqual(turn.env, {})
+        self.assertEqual(workspaces.after_turn(
+            turn, lot="4357", turn_id="t1", db=object(), host="pc"), [])
+
+    def test_passage_periodique_et_attach_sont_des_no_ops(self):
+        self.assertEqual(
+            workspaces.periodic_pass(self.cfg, object(), self.pol,
+                                     host="pc", actor="runner:1"),
+            {"status": "no-dev-module", "entries": []})
+        holds = []
+        self.assertEqual(workspaces.attach_env(self.cfg, "a1", {"KEEP": "1"}, holds), {})
+        self.assertEqual(holds, [])
+
+    def test_worktrees_et_courrier_sont_des_no_ops(self):
+        self.assertEqual(workspaces.worktree_marker(self.tmp.name), {})
+        self.assertEqual(workspaces.write_worktree_marker(
+            self.cfg, "a1", self.tmp.name), {})
+        self.assertIsNone(workspaces.adopt_moved_worktree(
+            object(), {"name": "a1"}, marker_path="/absent", roots=[]))
+        agent = {"name": "worker", "cwd": self.tmp.name}
+        self.assertEqual(workspaces.primary_workdir(agent), self.tmp.name)
+        self.assertEqual(workspaces.resolve(self.cfg, object(), agent, "7"),
+                         workspaces.Workdir(self.tmp.name))
+        self.assertFalse(workspaces.mail_hold(self.cfg, object(), agent, "7"))

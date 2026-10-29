@@ -120,6 +120,20 @@ class ModuleConfigurationTest(unittest.TestCase):
         self.assertEqual(modules.declarations({}), [])
         self.assertEqual(modules.declarations(federation(names=[])), [])
 
+    def test_dev_descriptor_without_a_type_leaves_project_policies_unchanged(self):
+        """L101 T4: `dev` is built in, always active and stores no work type.
+
+        The project declarations (and the SQL policy rows they compile) are
+        unchanged; selecting `dev` is not an activation (L98 T2), so the canon
+        refuses it instead of creating an empty policy row."""
+        self.assertEqual(modules.installed()["dev"].descriptor({}),
+                         {"types": [], "schemas": {}, "rules": []})
+        entries = modules.declarations(federation())
+        self.assertEqual([(e["project"], e["module"]) for e in entries],
+                         [("acme", "it")])
+        with self.assertRaisesRegex(ValueError, "types must be unique non-empty"):
+            modules.declarations(federation(names=["it", "dev"]))
+
     def test_unknown_duplicate_and_malformed_modules_refused(self):
         for names in (["not.installed"], ["it", "it"], "it", [3]):
             with self.subTest(names=names), self.assertRaises(ValueError):

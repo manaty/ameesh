@@ -3600,11 +3600,9 @@ class AgentWorker(threading.Thread):
         l'exécuteur, puis `adapter.env()` (un descripteur peut poser
         `CLAUDE_CONFIG_DIR` ou `CODEX_HOME`), puis le compte du tour
         (`accounts.launch_env`) ; `~` se lit avec le HOME de cet environnement.
-        Le prédicat ne dit « inconnue » que si la session n'est ni là, ni sous
-        un autre compte déclaré du harnais : dans le doute (stockage
-        introuvable, recherche incomplète), la session est gardée (verdict
-        codex #183) — une reprise ratée est rattrapée, un faux négatif efface
-        une vraie session."""
+        Une session présente seulement sous un autre compte repart avec un
+        brief (#4546). Dans le doute (stockage introuvable, recherche
+        incomplète), la session est gardée (verdict codex #183)."""
         if (harness not in self.SESSION_STORES or compte is account_turn.INVALID
                 or os.environ.get("AMEESH_SESSION_STORE_CHECK") == "0"):
             return None
@@ -3624,10 +3622,10 @@ class AgentWorker(threading.Thread):
         except Exception as exc:  # configuration illisible : on ne sait pas
             self._avertit_session("harness directory %s not resolved (%s)" % (harness, exc))
             return None
-        if not os.path.isdir(reprise.session_root(harness, home)):
+        store_present = os.path.isdir(reprise.session_root(harness, home))
+        if not store_present:
             self._avertit_session("session store %s not found"
                                   % reprise.session_root(harness, home))
-            return None
 
         def connue(session: str) -> bool:
             try:
@@ -3637,14 +3635,16 @@ class AgentWorker(threading.Thread):
                     if reprise.find_session(harness, autre, session, strict=True):
                         self._avertit_session(
                             "session %s found under %s, not under %s (turn directory): "
-                            "kept" % (session, autre, home))
-                        return True
+                            "resume brief required" % (session, autre, home))
+                        return False
             except reprise.SessionSearchIncomplete as exc:
                 # stockage momentanément illisible : introuvable n'est pas établi
                 self._avertit_session("search for session %s incomplete (%s): "
                                       "kept" % (session, exc))
                 return True
-            return False
+            # No store and no positive evidence of an account mismatch:
+            # preserve the existing conservative behavior.
+            return not store_present
         return connue
 
     def _avertit_session(self, texte: str) -> None:

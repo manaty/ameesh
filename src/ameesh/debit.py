@@ -1566,6 +1566,7 @@ def _idle_gaps(spans: list[tuple[float, float]], start: float, end: float,
 def capacity(*, agents: Iterable[Mapping[str, Any]],
              turns: Iterable[Mapping[str, Any]] = (),
              startable: Iterable[Mapping[str, Any]] = (),
+             footprint: Mapping[int, Iterable[Mapping[str, Any]]] | None = None,
              open_lots: Iterable[Mapping[str, Any]] = (),
              roadmap_notes: Iterable[Mapping[str, Any]] = (),
              reopened: Mapping[str, float] | None = None,
@@ -1592,7 +1593,10 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
       agents réveillables, par intervalles d'au moins `repos_s`. L'état
       réveillable est celui de l'instant ; un agent d'un projet à la feuille
       de route épuisée ne compte d'heures ni dans son projet ni au mesh.
-    * `startable` : les lots démarrables (`split_startable`) ; `open_lots` :
+    * `startable` : les lots démarrables (`split_startable`) ; `footprint` :
+      `{lot: [bloqueurs]}` des lots d'intake retenus par la garde d'empreinte
+      (#3185, #4561) — ils ne sont jamais démarrables, ils attendent la fusion
+      de leur bloqueur et se lisent à part (`footprint_lots`) ; `open_lots` :
       les lots ouverts, où le lot de découpage se lit à sa `source`.
     * `roadmap_notes` : `{note, at_ts, work_item_id, source}` ; seule une
       note posée **sur un lot de découpage du même projet** vaut (§1).
@@ -1629,13 +1633,38 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
     rested = {name for name in idle_now
               if now - last_lot_turn.get(name, start) >= min_gap}
 
-    startable = [dict(lot) for lot in startable or ()]
+    # #4561 : les lots retenus par la garde d'empreinte ne sont pas
+    # démarrables — `work assign` les refuse — et se lisent à part, avec le
+    # lot qui les retient et son état.
+    lots_by_id = {int(lot["id"]): dict(lot) for lot in open_lots or ()}
+    footprint = {int(ident): [dict(blocker) for blocker in blockers]
+                 for ident, blockers in (footprint or {}).items() if blockers}
+    footprint_by: dict[str, list[dict]] = {}
+    for ident, blockers in sorted(footprint.items()):
+        lot = lots_by_id.get(ident) or {}
+        project = projects_mod.lot_project(lot) or ""
+        delayed = []
+        for blocker in blockers:
+            other = lots_by_id.get(int(blocker["id"])) or blocker
+            last = (other.get("last_activity_ts") or other.get("updated_ts")
+                    or other.get("created_ts"))
+            delayed.append({
+                "id": int(blocker["id"]),
+                "state": other.get("state") or blocker.get("state") or "?",
+                "assignee": other.get("assignee") or blocker.get("assignee") or None,
+                "stalled_s": (int(max(0.0, now - float(last)))
+                              if last is not None else None)})
+        footprint_by.setdefault(project, []).append({
+            "lot": ident, "state": lot.get("state") or "",
+            "blockers": delayed})
+    startable = [dict(lot) for lot in startable or ()
+                 if int(lot["id"]) not in footprint]
     startable_by: dict[str, list[int]] = {}
     for lot in startable:
         startable_by.setdefault(projects_mod.lot_project(lot) or "",
                                 []).append(int(lot["id"]))
     decoupage: dict[str, dict] = {}
-    for lot in open_lots or ():
+    for lot in lots_by_id.values():
         project = _decoupage_project(lot)
         if not project:
             continue
@@ -1655,7 +1684,10 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
                                   "at_ts": float(note.get("at_ts") or 0.0)}
     reopened = dict(reopened or {})
     for project, entry in list(exhausted.items()):
-        if startable_by.get(project) or float(reopened.get(project) or 0.0) > entry["at_ts"]:
+        # un lot en attente d'empreinte est du travail réel, pas une feuille
+        # de route épuisée : le projet ne se tait pas (#4561).
+        if (startable_by.get(project) or footprint_by.get(project)
+                or float(reopened.get(project) or 0.0) > entry["at_ts"]):
             del exhausted[project]
 
     by_project: dict[str, list[dict]] = {}
@@ -1680,12 +1712,15 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
 
     projects_out = []
     alerts = []
-    for project in sorted(set(by_project) | {p for p in startable_by if p}):
+    for project in sorted(set(by_project) | {p for p in startable_by if p}
+                          | {p for p in footprint_by if p}):
         if not project:
             continue
         entry = summary(by_project.get(project, []), project)
         entry["project"] = project
         entry["startable_lots"] = sorted(startable_by.get(project, []))
+        entry["footprint_lots"] = sorted(footprint_by.get(project, []),
+                                         key=lambda row: row["lot"])
         entry["decoupage"] = decoupage.get(project)
         projects_out.append(entry)
         fresh = entry["decoupage"] is not None and (
@@ -1697,10 +1732,12 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
                 "project": project, "idle": entry["idle"],
                 "wakeable": entry["wakeable"], "idle_share": entry["idle_share"],
                 "startable_lots": entry["startable_lots"][:20],
+                "footprint_lots": entry["footprint_lots"][:20],
                 "decoupage": entry["decoupage"],
                 "gesture": _capacity_gesture(project, entry)})
     mesh = summary(awake, None)
     mesh["startable_lots"] = sum(len(v) for v in startable_by.values())
+    mesh["footprint_lots"] = sum(len(v) for v in footprint_by.values())
     loss_rows = sorted((dict(row) for row in losses or ()),
                        key=lambda r: (str(r.get("harness")), str(r.get("account"))))
     return {
@@ -1720,16 +1757,44 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
 
 def _capacity_gesture(project: str, entry: Mapping[str, Any]) -> str:
     """Le geste d'une alerte de capacité, dans l'ordre de docs/AUDITEUR.md :
-    confier d'abord les lots démarrables, puis le repli du découpage, puis
-    l'ouverture du lot de découpage au pilote."""
+    confier d'abord les lots démarrables, puis nommer les lots en attente
+    d'empreinte et le lot qui les retient (#4561), puis le repli du découpage,
+    puis l'ouverture du lot de découpage au pilote."""
     head = "lots démarrables pour %d agent(s) de %s : " % (entry["idle"], project)
     if entry.get("startable_lots"):
         return head + "confier les lots démarrables (ameesh work assign)"
+    if entry.get("footprint_lots"):
+        return head + _footprint_gesture(entry["footprint_lots"])
     if entry.get("decoupage"):
         return head + ("le lot de découpage #%d a plus d'une heure sans lot démarrable "
                        "— l'auditeur crée les lots (niveau 1, spec §2.2)"
                        % entry["decoupage"]["lot"])
     return head + "aucun lot de découpage ouvert — l'ouvrir au pilote (spec #3256 §2.2)"
+
+
+def _footprint_gesture(rows: Iterable[Mapping[str, Any]]) -> str:
+    """#4561 : les lots d'intake que la garde d'empreinte (#3185) retient, et
+    le geste dû. L'assignation n'est pas ce geste : `work assign` refuse le
+    lot, et le temps perdu est celui du bloqueur — son verdict ou son paquet.
+    Un bloqueur sans mouvement depuis 2 h est nommé comme tel."""
+    parts = []
+    for row in rows:
+        blockers = list(row.get("blockers") or ())
+        names = ", ".join(
+            "#%d (%s)" % (int(blocker["id"]), blocker.get("state") or "?")
+            for blocker in blockers)
+        stalled = [blocker for blocker in blockers
+                   if (blocker.get("stalled_s") or 0) >= 2 * 3600]
+        tail = ""
+        if stalled:
+            tail = " ; sans mouvement depuis %s : %s" % (
+                _duration(stalled[0].get("stalled_s")),
+                ", ".join("#%d" % int(blocker["id"]) for blocker in stalled))
+        parts.append("#%d (%s) attend %s%s"
+                     % (int(row["lot"]), row.get("state") or "intake", names, tail))
+    return ("lots en attente d'empreinte : %s — le geste dû porte sur le lot "
+            "qui les retient (verdict, paquet), pas sur l'assignation"
+            % " ; ".join(parts))
 
 
 def plan_losses(account_gauges: Mapping[Any, list], now: float) -> list[dict]:
@@ -2117,10 +2182,25 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
     # appelants). Ici, les lecteurs sont appelés en direct : un échec ferme
     # l'alerte au lieu de rendre « tout démarrable » ou « personne tenu ».
     def startable_lots():
-        from . import planned_waits
+        from . import planned_waits, slo
         waiting = sous_utilisation.waiting_project_lots(lots)
         waits = planned_waits.read(db, waiting, now=now) if waiting else {}
-        return sous_utilisation.split_startable(waiting, waits)[0]
+        startable = sous_utilisation.split_startable(waiting, waits)[0]
+        # #4561 : la garde d'empreinte (#3185) retient un lot d'intake sans
+        # porteur ; il n'est pas démarrable (`work assign` le refuse) et se
+        # lit à part, avec ses bloqueurs et leur état.
+        footprint: dict = {}
+        if waiting:
+            paths: dict = {}
+            for row in store.work_footprints.for_items([int(lot["id"]) for lot in lots]):
+                paths.setdefault(int(row["work_item_id"]), []).append(str(row["path"]))
+            for lot in waiting:
+                blockers = slo.footprint_blockers(lot, lots, paths)
+                if blockers:
+                    footprint[int(lot["id"])] = blockers
+            startable = [lot for lot in startable
+                         if int(lot["id"]) not in footprint]
+        return startable, footprint
 
     def budget_holds(rows):
         if cfg is None:
@@ -2133,7 +2213,8 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
                 held[row["name"]] = reason
         return held
 
-    startable = attempt("startable lots", startable_lots, []) if lots else []
+    startable, footprint = (attempt("startable lots", startable_lots, ([], {}))
+                            if lots else ([], {}))
     # la tenue de budget ne se lit que pour les agents au repos (comme
     # `idle_capacity`) : un agent occupé n'entre pas dans la part au repos
     idle = sous_utilisation.idle_agents(
@@ -2152,7 +2233,8 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
                                              ",".join(sorted(spent))))}, {}) if spent else {}
     losses = attempt("account gauges", lambda: plan_losses(
         sous_utilisation.latest_account_gauges(db, now), now), [], gating=False)
-    out = capacity(agents=listing, turns=turns, startable=startable, open_lots=lots,
+    out = capacity(agents=listing, turns=turns, startable=startable,
+                   footprint=footprint, open_lots=lots,
                    roadmap_notes=notes, reopened=reopened, losses=losses, now=now,
                    window_s=int(hours) * 3600,
                    repos_part=rule.repos_part if rule else None,
@@ -2192,25 +2274,30 @@ def _capacity_text(cap: Mapping[str, Any] | None) -> list[str]:
     rule = cap.get("rule")
     mesh = cap.get("mesh") or {}
     lines = ["", "Capacité (%s) — %d/%d agent(s) réveillable(s) au repos (%s), "
-             "%.1f heure(s)-agent au repos, %d lot(s) démarrable(s)"
+             "%.1f heure(s)-agent au repos, %d lot(s) démarrable(s), "
+             "%d en attente d'empreinte"
              % ("seuil %s depuis %s" % (_share(rule["repos_part"]),
                                         _duration(rule["repos_s"]))
                 if rule else "sans seuil, aucune alerte : %s"
                 % (cap.get("rule_error") or "bloc `file` absent du canon"),
                 mesh.get("idle", 0), mesh.get("wakeable", 0),
                 _share(mesh.get("idle_share")), float(mesh.get("idle_agent_hours") or 0),
-                int(mesh.get("startable_lots") or 0))]
+                int(mesh.get("startable_lots") or 0),
+                int(mesh.get("footprint_lots") or 0))]
     for row in cap.get("projects") or []:
         decoupage = row.get("decoupage")
-        lines.append("  %-14s %2d/%-2d au repos (%s) · %5.1f h-agent · %d démarrable(s)%s%s"
-                     % (row["project"][:14], row["idle"], row["wakeable"],
-                        _share(row["idle_share"]), float(row["idle_agent_hours"]),
-                        len(row.get("startable_lots") or ()),
-                        " · découpage #%d (%s)" % (decoupage["lot"],
-                                                   _duration(decoupage.get("age_s")))
-                        if decoupage else "",
-                        " · feuille de route épuisée" if row.get("roadmap_exhausted")
-                        else ""))
+        parts = ["  %-14s %2d/%-2d au repos (%s) · %5.1f h-agent · %d démarrable(s)"
+                 % (row["project"][:14], row["idle"], row["wakeable"],
+                    _share(row["idle_share"]), float(row["idle_agent_hours"]),
+                    len(row.get("startable_lots") or ()))]
+        if row.get("footprint_lots"):
+            parts.append("%d en attente d'empreinte" % len(row["footprint_lots"]))
+        if decoupage:
+            parts.append("découpage #%d (%s)" % (decoupage["lot"],
+                                                 _duration(decoupage.get("age_s"))))
+        if row.get("roadmap_exhausted"):
+            parts.append("feuille de route épuisée")
+        lines.append(" · ".join(parts))
     losses = [row for row in cap.get("plan_loss_at_reset") or []]
     if losses:
         lines.append("  Perte au reset : %s" % " · ".join(
