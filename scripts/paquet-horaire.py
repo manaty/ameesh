@@ -903,9 +903,16 @@ def compose(ctx: Context, rows: list[dict]) -> str:
                 ctx.note(carrier, "%s%d groupe=%s"
                          % (SECOND_PREFIX, first,
                             ",".join(str(lot) for lot in group)))
-        results.append(attempt(ctx, carrier, name,
-                               Attempt(COMPOSITION, 1, "",
-                                       only=(list(group) if len(groups) == 2 else []))))
+        try:
+            results.append(attempt(ctx, carrier, name,
+                                   Attempt(COMPOSITION, 1, "",
+                                           only=(list(group) if len(groups) == 2 else []))))
+        except HoraireError as exc:
+            # The first carrier's journal already records its attempt. Keep
+            # composing the independent second group; the next tick resumes it.
+            if len(groups) != 2:
+                raise
+            results.append("#%d : %s" % (carrier, exc))
     return "\n".join(results)
 
 
@@ -1316,6 +1323,16 @@ def follow(ctx: Context, item: dict) -> str:
         return resume(ctx, item, left)
     if not sha:
         return "#%d sans gel ni tentative : rien à faire" % carrier
+    # #4319: an unavailable exemption proof requests the ordinary full-CI
+    # path, on the same carrier. The marker is scoped to its frozen head.
+    requested = any(
+        str(event.get("note") or "").startswith("auto-merge parallel-recompose ")
+        and "sha=%s " % sha in str(event.get("note") or "")
+        for event in item.get("events") or ())
+    if requested:
+        return attempt(ctx, carrier, name,
+                       Attempt(RECOMPOSITION, 1, sha, run_id="parallel-proof",
+                               only=carrier_group(item), force=True))
     noted = marks(item)
     if MARK_CI + sha not in noted:
         return publish(ctx, item)
@@ -1334,7 +1351,8 @@ def follow(ctx: Context, item: dict) -> str:
             verdict = Verdict(False, verdict.lots, verdict.tests, why)
     # #4237 : une recomposition du pilote n'use pas le retrait automatique
     recomposed = len({a.run_id for a in attempts(item)
-                      if a.step == RECOMPOSITION and a.run_id != PILOT_RUN})
+                      if a.step == RECOMPOSITION
+                      and a.run_id not in (PILOT_RUN, "parallel-proof")})
     if verdict.deterministic and recomposed < MAX_RECOMPOSITIONS:
         return recompose(ctx, item, run, verdict)
     reason = verdict.why if not verdict.deterministic else \
