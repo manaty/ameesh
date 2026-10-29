@@ -112,6 +112,9 @@
   ameesh models list|show|discover      model catalog and discovery;
   ameesh module <name> …              installed project module commands, --list
                                       for installation evidence;
+  ameesh module dev sync-merges | sync-github | project-github | merge-pr
+        | review-class    development tooling (L100 T5); `work sync-merges…`
+        and `review-class` stay aliases without a removal date;
   ameesh modules [--json]             discovered modules (built in and ameesh.modules
                                       entry points): version, capabilities (L98);
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
