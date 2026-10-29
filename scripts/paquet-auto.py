@@ -83,6 +83,16 @@ carte sont pesés par `tests/parts/durees.json` pour le pilote des tests
 (`test_driver`), que le manifeste nomme : sous psql, la suite est ~6 fois plus
 lente que la mesure psycopg de la carte.
 
+#4463 : une fois la tête poussée, la garde relue avant chaque série relit
+aussi l'état de la PR : fusionnée (ou close) pendant les tests par unité, leurs
+résultats ne peuvent plus retirer une unité ; les séries non parties sont
+abandonnées et le porteur reçoit « tests par unité interrompus : porteur
+fusionné à <sha> ». `--tests-budget S` (paquet-horaire :
+`packet_tests.total_timeout_seconds` du canon compilé) borne la durée totale
+des tests : chaque série est bornée au temps restant, celles qui ne partent
+plus avant l'échéance sont non concluantes (canon §3) et le tic suivant peut
+partir.
+
 #4237 : un refus de geste (bail relevé, `GestureRefused`) **après des tests
 verts** ne perd plus le paquet : depuis #4304, la tête est déjà poussée,
 enregistrée et gelée avant ses tests ; sa fin (corps de PR, note, ci-full,
@@ -262,6 +272,14 @@ class GitError(PaquetAutoError):
 
 class EpochLost(PaquetAutoError):
     """#4237 : un geste refusé par la garde d'époque (bail relevé)."""
+
+
+class CarrierSettled(PaquetAutoError):
+    """#4463 : la PR du paquet a fusionné (ou a été close) pendant ses tests."""
+
+    def __init__(self, state: str) -> None:
+        self.state = state
+        super().__init__("PR %s pendant les tests par unité" % state.lower())
 
 
 class ChainRefused(PaquetAutoError):
@@ -1706,12 +1724,28 @@ def _run_series(jobs: list, *, parallel: int, guard=None) -> list[TestRun]:
         pool.shutdown(wait=True, cancel_futures=True)
 
 
+def series_timeout(timeout: int, deadline: float | None) -> int | None:
+    """#4463 : la borne d'une série sous l'échéance totale ; None si échue."""
+    if deadline is None:
+        return timeout
+    left = int(deadline - time.monotonic())
+    return min(timeout, left) if left > 0 else None
+
+
+def budget_spent(label: str, modules: list[str]) -> TestRun:
+    """#4463 : une série qui ne part plus, l'échéance totale passée (§3)."""
+    return TestRun(label=label, modules=list(modules), returncode=None,
+                   output="borne totale des tests par unité atteinte : série "
+                          "non jouée (#4463)", seconds=0.0, timed_out=True)
+
+
 def check_local_tests(worktree: Path, composition: Composition, *,
                       timeout: int, log=print,
                       attribute=None, base_sha: str = "",
                       select=None, on_base=None, guard=None,
-                      parallel: int = DEFAULT_PARALLEL) -> tuple[list[TestRun], list[int],
-                                                          list[Removal]]:
+                      parallel: int = DEFAULT_PARALLEL,
+                      deadline: float | None = None) -> tuple[list[TestRun], list[int],
+                                                              list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
     Rend `(exécutions, unités fautives, retraits)`. Une unité est fautive
@@ -1737,6 +1771,11 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     sont indépendantes et jouées en même temps (au plus `parallel`), chacune
     dans un créneau `ameesh heavy` de l'hôte ; leurs résultats sont lus dans
     l'ordre des unités, comme en série. `guard` est relu avant chaque série.
+
+    #4463 : `deadline` (horloge monotone) borne la durée totale : chaque série
+    est bornée au temps restant ; une série qui n'est pas partie à l'échéance
+    est non concluante sans être jouée. En parallèle, l'attente d'un créneau
+    `ameesh heavy` s'y ajoute (au plus la borne de la série et 60 s).
     """
     runs: list[TestRun] = []
     red: list[tuple[TestRun, list[dict]]] = []
@@ -1778,13 +1817,19 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                              for row in added)))
         planned.append((unit, proper, added, modules))
 
+    def bounded(label: str, modules: list[str]) -> TestRun:
+        limit = series_timeout(timeout, deadline)
+        if limit is None:
+            log("tests %s : borne totale atteinte, série non jouée (non "
+                "concluant)" % label)
+            return budget_spent(label, modules)
+        return run_tests(worktree, label, modules, timeout=limit, **slots)
+
     def unit_job(label: str, modules: list[str]):
-        return lambda: run_tests(worktree, label, modules, timeout=timeout,
-                                 **slots)
+        return lambda: bounded(label, modules)
 
     def contract_job():
-        modules = contract_modules(worktree)
-        return run_tests(worktree, "contrats", modules, timeout=timeout, **slots)
+        return bounded("contrats", contract_modules(worktree))
 
     jobs = [unit_job("unité #%d" % unit.lot, modules)
             for unit, _proper, _added, modules in planned] + [contract_job]
@@ -1821,8 +1866,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     if neighbor_red:
         if guard is not None:
             guard()
-        at_base = (on_base or base_failures)(worktree, base_sha, neighbor_red,
-                                             timeout=timeout)
+        limit = series_timeout(timeout, deadline)
+        at_base = (None if limit is None else
+                   (on_base or base_failures)(worktree, base_sha, neighbor_red,
+                                              timeout=limit))
         log("tests voisins rouges rejoués sur la base %s : %s"
             % (base_sha[:12] or "?", "non concluant" if at_base is None
                else "%d rouge(s) aussi sur la base" % len(at_base)))
@@ -2280,6 +2327,53 @@ def withdraw_packet(worktree: Path, carrier: int, pr_number: int | None,
         if proc.returncode != 0:
             failed.append("gh pr close #%d : %s" % (pr_number, _tail(_output(proc))))
     return failed
+
+
+def pull_request_merge_sha(worktree: Path, branch: str) -> str:
+    """Le commit de fusion de la PR de la branche, "" si illisible."""
+    view = _gh(worktree, "pr", "view", branch, "--json", "mergeCommit")
+    if view.returncode != 0:
+        return ""
+    try:
+        commit = json.loads(_decode(view.stdout)).get("mergeCommit") or {}
+        return str(commit.get("oid") or "")
+    except (ValueError, AttributeError):
+        return ""
+
+
+def watch_carrier(worktree: Path, branch: str) -> None:
+    """#4463 : la PR poussée a-t-elle fusionné (ou été close) ? Lu avant chaque
+    série ; un état illisible laisse les tests continuer."""
+    state = pull_request_state(worktree, branch)
+    if state and state != "OPEN":
+        raise CarrierSettled(state)
+
+
+def interrupted_by_carrier(args: argparse.Namespace, worktree: Path,
+                           branch: str, head: str, state: str) -> int:
+    """#4463 : la PR a fusionné (ou été close) pendant les tests par unité.
+
+    Leurs résultats ne peuvent plus retirer une unité : les séries non parties
+    sont abandonnées, le porteur le dit en une ligne. Fusionnée, la sortie finit
+    sur `MERGED_LINE` (paquet-horaire ne publie pas) ; close, un agent lit.
+    """
+    if state == "MERGED":
+        sha = pull_request_merge_sha(worktree, branch) or "?"
+        print(note_carrier(
+            worktree, args.carrier,
+            "paquet %s : tests par unité interrompus : porteur fusionné à %s "
+            "(tête %s) ; les résultats ne pouvaient plus retirer d'unité (#4463)"
+            % (args.name, sha[:12], head[:12])), flush=True)
+        print("%s : %s, tête %s, tests par unité interrompus (fusionné à %s)"
+              % (MERGED_LINE, branch, head[:12], sha[:12]), flush=True)
+        return 0
+    print(note_carrier(
+        worktree, args.carrier,
+        "paquet %s : tests par unité interrompus : PR %s (tête %s) (#4463)"
+        % (args.name, state.lower(), head[:12])), flush=True)
+    raise PaquetAutoError(
+        "PR de %s %s pendant les tests par unité : tests interrompus, rien "
+        "n'est recomposé, un agent lit" % (branch, state.lower()))
 
 
 def merged_during_tests(args: argparse.Namespace, worktree: Path, head: str,
@@ -2999,6 +3093,15 @@ def compose_packet(args: argparse.Namespace) -> int:
         ready_count = len([lot for lot in (payload.get("ready") or [])
                            if int(lot) not in error_lots])
         expected_file = Path(tmp.name) / "attendus.txt"
+        # #4463 : l'échéance totale des tests par unité, recompositions comprises
+        budget = int(getattr(args, "tests_budget", 0) or 0)
+        deadline = time.monotonic() + budget if budget > 0 else None
+
+        def tests_guard() -> None:
+            if guard is not None:
+                guard()
+            if pushed:
+                watch_carrier(worktree, branch)
 
         def title() -> str:
             return "Paquet %s — %d unités sur %s %s" % (
@@ -3069,10 +3172,17 @@ def compose_packet(args: argparse.Namespace) -> int:
                            len(composition.discarded), rel))
                 print(freeze_carrier(worktree, args.carrier, head, note), flush=True)
                 print(request_full_ci(worktree, args.carrier, head), flush=True)
-            runs, faulty, removals = check_local_tests(
-                worktree, composition, timeout=args.tests_timeout,
-                base_sha=base_sha, guard=guard,
-                parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
+            try:
+                runs, faulty, removals = check_local_tests(
+                    worktree, composition, timeout=args.tests_timeout,
+                    base_sha=base_sha, guard=tests_guard,
+                    parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL),
+                    deadline=deadline)
+            except CarrierSettled as settled:
+                rc = interrupted_by_carrier(args, worktree, branch, head,
+                                            settled.state)
+                success = True
+                return rc
             if not faulty:
                 break
             if pushed:
@@ -3268,6 +3378,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="#4271 : séries d'unités jouées en même temps, "
                              "dans les créneaux `ameesh heavy` (défaut : %d, "
                              "en série)" % DEFAULT_PARALLEL)
+    parser.add_argument("--tests-budget", type=int, default=0, metavar="S",
+                        help="#4463 : borne totale des tests par unité, en "
+                             "secondes (paquet-horaire : packet_tests."
+                             "total_timeout_seconds ; défaut : 0, sans borne totale)")
     parser.add_argument("--keep-worktree", action="store_true",
                         help="conserver le worktree jetable (diagnostic)")
     parser.add_argument("--keep-failed-hours", type=float, default=24.0,

@@ -134,6 +134,7 @@ POSITIVE = {
     "paquet.max_paquets": "MAX_PAQUETS = 2\n",
     "packet_tests.unit_timeout_seconds": "UNIT_TIMEOUT_SECONDS = 900\n",
     "packet_tests.parallel": "UNIT_TESTS_PARALLEL = 4\n",
+    "packet_tests.total_timeout_seconds": "TOTAL_TIMEOUT_SECONDS = 1800\n",
     "file.repos_part": "REPOS_PART = 0.2\n",
     "file.repos_s": "REPOS_S = 1800\n",
     "projects": 'PROJECT_OVERRIDES = {"ameesh": {"build": {"max_in_build": 3}}}\n',

@@ -50,8 +50,10 @@ def green(label="unité #1"):
 class Flux:
     """Le flux de `compose_packet`, chaque geste extérieur consigné dans l'ordre."""
 
-    def __init__(self, test, *, tests, compositions, states=("OPEN",), local=False):
+    def __init__(self, test, *, tests, compositions, states=("OPEN",), local=False,
+                 **extra):
         self.test = test
+        self.extra = extra
         self.events: list[tuple] = []
         self.tests = list(tests)
         self.compositions = list(compositions)
@@ -76,7 +78,7 @@ class Flux:
             repo=tmp, name=NAME, target="main", carrier=4304, base=None,
             local=self.local, no_packet_record=True, keep_worktree=False,
             keep_failed_hours=24.0, force=False, tests_timeout=10,
-            pilot="mesh-design", sender="mesh-design")
+            pilot="mesh-design", sender="mesh-design", **self.extra)
         first, *rest = self.compositions
 
         def manifest(**kwargs):
@@ -88,9 +90,11 @@ class Flux:
             self.events.append(("manifest", (head,), {}))
             return head
 
-        def tests(*_args, **_kwargs):
+        def tests(*_args, **kwargs):
             self.events.append(("tests", (), {}))
-            return self.tests.pop(0)
+            entry = self.tests.pop(0)
+            # #4463 : une entrée appelable joue la garde des séries
+            return entry(**kwargs) if callable(entry) else entry
 
         def state(*_args):
             self.events.append(("state", (), {}))

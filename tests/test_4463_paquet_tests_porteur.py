@@ -1,0 +1,241 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#4463 — les tests par unité s'arrêtent à la fusion du porteur, et sont bornés.
+
+Le 29/10, le tic de 01:20Z a composé h-11 (14 unités) ; la ci-full a fusionné
+la PR à 02:00:52Z, mais les tests par unité ont continué en série jusqu'à
+03:02:51Z, et `ameesh-paquet-horaire.service` est resté « activating » : aucun
+tic suivant. Témoins :
+
+* PR fusionnée pendant les tests : la garde relue avant chaque série arrête
+  les séries suivantes, le porteur reçoit « tests par unité interrompus :
+  porteur fusionné à <sha> », la sortie finit sur `MERGED_LINE` ;
+* tests plus longs que la borne totale (`--tests-budget`, canon
+  `packet_tests.total_timeout_seconds`) : chaque série est bornée au temps
+  restant, les séries non parties sont non concluantes et rien n'est retiré ;
+* cas nominal : PR ouverte, sans borne totale, comportement inchangé.
+
+Aucune base, aucun réseau.
+"""
+from __future__ import annotations
+
+import contextlib
+import io
+import pathlib
+import time
+import unittest
+from unittest import mock
+
+from ameesh import mechanics
+from tests.test_4271_paquet_series import DOCUMENT, paquet_horaire
+from tests.test_4304_paquet_poussee_precoce import Flux, green, paquet_auto
+
+MERGE_SHA = "3c16763c9cc5" + "0" * 28
+
+
+def _composition(lots=(1, 2, 3)):
+    return paquet_auto.Composition(
+        units=[paquet_auto.Unit(lot, "a" * 40, ("%d" % lot) * 40) for lot in lots],
+        discarded=[], head="e" * 40)
+
+
+def _run(label, modules, **_kwargs):
+    return green(label)
+
+
+class LocalTests:
+    """`check_local_tests` en série, `run_tests` remplacé et consigné."""
+
+    def __init__(self, lots=(1, 2, 3), run=_run):
+        self.composition = _composition(lots)
+        self.calls: list[tuple[str, int]] = []
+        self.lines: list[str] = []
+        self.run_fn = run
+
+    def run(self, **kwargs):
+        def fake(_worktree, label, modules, *, timeout, heavy=False):
+            self.calls.append((label, timeout))
+            return self.run_fn(label, modules, timeout=timeout)
+
+        with mock.patch.object(paquet_auto, "unit_test_modules",
+                               side_effect=lambda _w, unit: ["tests.test_u%d" % unit.lot]), \
+                mock.patch.object(paquet_auto, "contract_modules",
+                                  return_value=["tests.test_contrat"]), \
+                mock.patch.object(paquet_auto, "run_tests", side_effect=fake):
+            return paquet_auto.check_local_tests(
+                pathlib.Path("."), self.composition, timeout=900, parallel=1,
+                select=lambda *_: ({}, ""), log=self.lines.append, **kwargs)
+
+
+class FusionDuPorteurTest(unittest.TestCase):
+    def test_la_garde_arrete_les_series_apres_la_fusion(self) -> None:
+        states = iter(["OPEN", "MERGED"])
+        local = LocalTests()
+
+        def guard():
+            state = next(states)
+            if state != "OPEN":
+                raise paquet_auto.CarrierSettled(state)
+
+        with self.assertRaises(paquet_auto.CarrierSettled) as caught:
+            local.run(guard=guard)
+        self.assertEqual(caught.exception.state, "MERGED")
+        # la première série a tourné ; la deuxième n'est jamais partie
+        self.assertEqual([label for label, _ in local.calls], ["unité #1"])
+
+    def test_porteur_fusionne_pendant_les_tests_ligne_au_porteur(self) -> None:
+        flux = Flux(self, tests=[self._guarded], compositions=[_composition((1, 2))],
+                    states=("OPEN", "MERGED"))
+        out = io.StringIO()
+        with mock.patch.object(paquet_auto, "pull_request_merge_sha",
+                               return_value=MERGE_SHA), \
+                contextlib.redirect_stdout(out):
+            rc = flux.run()
+        self.assertEqual(rc, 0)
+        notes = [call[1][2] for call in flux.calls("note")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("tests par unité interrompus : porteur fusionné à "
+                      "3c16763c9cc5", notes[0])
+        # ni recomposition, ni retrait, ni courrier ; paquet-horaire ne publie pas
+        self.assertEqual(flux.calls("mail"), [])
+        self.assertEqual(flux.calls("withdraw"), [])
+        self.assertEqual(len(flux.calls("push")), 1)
+        last = out.getvalue().strip().splitlines()[-1]
+        self.assertTrue(last.startswith(paquet_auto.MERGED_LINE), last)
+        self.assertIn("interrompus", last)
+
+    def test_porteur_clos_pendant_les_tests_dit_et_arrete(self) -> None:
+        flux = Flux(self, tests=[self._guarded], compositions=[_composition((1, 2))],
+                    states=("OPEN", "CLOSED"))
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(paquet_auto.PaquetAutoError):
+            flux.run()
+        notes = [call[1][2] for call in flux.calls("note")]
+        self.assertTrue(any("interrompus : PR closed" in note for note in notes), notes)
+
+    @staticmethod
+    def _guarded(**kwargs):
+        """Deux séries : la garde passe avant chacune (état lu par Flux)."""
+        for _ in range(2):
+            kwargs["guard"]()
+        return [green()], [], []
+
+    def test_cas_nominal_pr_ouverte_inchange(self) -> None:
+        flux = Flux(self, tests=[self._guarded], compositions=[_composition((1, 2))])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(flux.run(), 0)
+        notes = [call[1][2] for call in flux.calls("note")]
+        self.assertTrue(any("tests par unité verts" in note for note in notes), notes)
+        self.assertFalse(any("interrompus" in note for note in notes))
+        self.assertEqual(len(flux.calls("mail")), 1)
+
+    def test_local_sans_poussee_ne_lit_pas_la_pr(self) -> None:
+        flux = Flux(self, tests=[self._guarded], compositions=[_composition((1, 2))],
+                    states=("MERGED",), local=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(flux.run(), 0)
+        self.assertEqual(flux.calls("state"), [])
+
+
+class BorneTotaleTest(unittest.TestCase):
+    def test_echeance_passee_series_non_jouees_non_concluantes(self) -> None:
+        local = LocalTests()
+        runs, faulty, removals = local.run(deadline=time.monotonic() - 1)
+        self.assertEqual(local.calls, [])
+        self.assertEqual((faulty, removals), ([], []))
+        self.assertEqual([run.label for run in runs],
+                         ["unité #1", "unité #2", "unité #3", "contrats"])
+        self.assertTrue(all(run.inconclusive for run in runs))
+        self.assertIn("borne totale", runs[0].output)
+
+    def test_chaque_serie_bornee_au_temps_restant(self) -> None:
+        clock = [1000.0]
+
+        def slow(label, modules, *, timeout):
+            clock[0] += 400  # chaque série prend 400 s
+            return green(label)
+
+        local = LocalTests(run=slow)
+        with mock.patch.object(paquet_auto.time, "monotonic", side_effect=lambda: clock[0]):
+            runs, faulty, _ = local.run(deadline=1000.0 + 600)
+        # 1re série : min(900, 600) ; 2e : 200 s restants ; ensuite plus rien
+        self.assertEqual(local.calls, [("unité #1", 600), ("unité #2", 200)])
+        self.assertEqual(faulty, [])
+        self.assertEqual([run.inconclusive for run in runs],
+                         [False, False, True, True])
+
+    def test_sans_borne_totale_inchange(self) -> None:
+        local = LocalTests()
+        runs, faulty, _ = local.run()
+        self.assertEqual(local.calls, [("unité #1", 900), ("unité #2", 900),
+                                       ("unité #3", 900), ("contrats", 900)])
+        self.assertEqual(faulty, [])
+        self.assertFalse(any(run.inconclusive for run in runs))
+
+    def test_le_budget_arme_l_echeance_de_compose_packet(self) -> None:
+        seen = {}
+
+        def tests(**kwargs):
+            seen["deadline"] = kwargs["deadline"]
+            return [green()], [], []
+
+        flux = Flux(self, tests=[tests], compositions=[_composition((1,))],
+                    tests_budget=600)
+        before = time.monotonic()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(flux.run(), 0)
+        self.assertGreaterEqual(seen["deadline"], before + 600)
+        self.assertLessEqual(seen["deadline"], time.monotonic() + 600)
+
+    def test_argument_par_defaut_sans_borne(self) -> None:
+        flux = Flux(self, tests=[lambda **kw: ([green()], [], []) if kw["deadline"] is None
+                                 else self.fail("échéance inattendue")],
+                    compositions=[_composition((1,))])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(flux.run(), 0)
+
+
+class CanonTest(unittest.TestCase):
+    def test_cle_optionnelle_compilee(self) -> None:
+        doc = mechanics.compile_document(
+            DOCUMENT + "packet_tests:\n  unit_timeout_seconds: 600\n  parallel: 2\n"
+                       "  total_timeout_seconds: 1800\n")
+        self.assertEqual(doc.packet_tests, mechanics.PacketTests(600, 2, 1800))
+        self.assertEqual(doc.to_dict()["packet_tests"]["total_timeout_seconds"], 1800)
+        doc = mechanics.compile_document(
+            DOCUMENT + "packet_tests:\n  unit_timeout_seconds: 600\n  parallel: 2\n")
+        self.assertIsNone(doc.packet_tests.total_timeout_seconds)
+        self.assertNotIn("total_timeout_seconds", doc.to_dict()["packet_tests"])
+
+    def test_cle_mal_formee_refusee(self) -> None:
+        for value in ("0", "-5", "trente"):
+            with self.subTest(value=value), self.assertRaises(mechanics.MechanicsError):
+                mechanics.compile_document(
+                    DOCUMENT + "packet_tests:\n  unit_timeout_seconds: 600\n"
+                               "  parallel: 2\n  total_timeout_seconds: %s\n" % value)
+
+    def context(self, unit_tests):
+        shell = mock.Mock()
+        shell.run.return_value = paquet_horaire.Result(0, "", "")
+        ctx = paquet_horaire.Context(
+            repo=pathlib.Path("."), target="main", project="ameesh", pilot="p",
+            actor="p", shell=shell, python="python3", unit_tests=unit_tests)
+        ctx.say = mock.Mock()
+        return ctx, shell
+
+    def test_paquet_horaire_transmet_la_borne_totale(self) -> None:
+        ctx, shell = self.context(mechanics.PacketTests(600, 2, 1800))
+        paquet_horaire.paquet_auto(ctx, "h-20261029-12", 4463)
+        cmd = shell.run.call_args.args[0]
+        self.assertEqual(cmd[cmd.index("--tests-budget") + 1], "1800")
+
+    def test_borne_totale_absente_dite_sans_valeur_supposee(self) -> None:
+        ctx, shell = self.context(mechanics.PacketTests(600, 2))
+        paquet_horaire.paquet_auto(ctx, "h-20261029-12", 4463)
+        cmd = shell.run.call_args.args[0]
+        self.assertNotIn("--tests-budget", cmd)
+        self.assertIn("total_timeout_seconds absent", ctx.say.call_args.args[0])
+
+
+if __name__ == "__main__":
+    unittest.main()
