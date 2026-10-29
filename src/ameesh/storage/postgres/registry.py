@@ -34,6 +34,8 @@ LINEAGE_MAX = 32
 
 AGENT_COLUMNS = """
     name, aliases, chantier, harness, host, cwd, session_id, status, status_text, model,
+    -- #4293 : binaire du harnais pour cet agent (canari/bascule d'adoption)
+    harness_bin,
     budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
     -- L165 (EP3) : brief de reprise d'une relève élue, lu une fois par le
     -- nouveau détenteur (contenu libre, jamais lisible par le superviseur)
@@ -539,7 +541,11 @@ class Agents(interface.Agents):
                    (SELECT extract(epoch from r.retired_at)::float8 FROM agent_registry r
                      WHERE r.name=o.name) AS retired_ts,
                    chantier, harness, host, cwd, session_id, status, status_text,
-                   model, budget_usd, spent_usd, turns, pending_prompt, last_error,
+                   model,
+                   -- #4293 : colonne absente de la vue figée ; lue sur la ligne
+                   (SELECT r.harness_bin FROM agent_registry r
+                     WHERE r.name = o.name) AS harness_bin,
+                   budget_usd, spent_usd, turns, pending_prompt, last_error,
                    -- #3337 : un message déposé est un signe de vie distinct de
                    -- `last_seen` (hook/exécuteur). L'index (sender, id desc)
                    -- rend la lecture ponctuelle ; une identité `externe` écrit

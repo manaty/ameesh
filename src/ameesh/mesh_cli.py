@@ -3225,7 +3225,10 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
             "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
             "permission_mode", "lot_wake", "resident", "resident_sleep",
-            "resident_reread_max")
+            "resident_reread_max",
+            # #4293 : binaire du harnais pour cet agent (canari d'adoption) ;
+            # vide = revenir au binaire de l'hôte (PATH / harness_bins)
+            "harness_bin")
 #: L76: settings written in the local state of the agent's host only
 LOCAL_SET_KEYS = ("mail_batch", "permission_mode", "resident", "resident_sleep",
                   "resident_reread_max")
@@ -3322,7 +3325,8 @@ def cmd_set(cfg: Config, args) -> int:
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
                       "permission_mode=auto|acceptEdits|… lot_wake=on|off "
-                      "resident=on|off resident_sleep=30m|0 resident_reread_max=50M|0"
+                      "resident=on|off resident_sleep=30m|0 resident_reread_max=50M|0 "
+                      "harness_bin=/absolute/path (empty = host binary)"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -3340,6 +3344,14 @@ def cmd_set(cfg: Config, args) -> int:
             if cle == "tier" and valeur and not _TIER_RE.match(valeur):
                 print("invalid tier: %r (e.g. fast, flex)" % valeur, file=sys.stderr)
                 return 2
+            if cle == "harness_bin" and valeur:
+                # #4293 : un chemin absolu, jamais un nom cherché dans le PATH
+                # (le canari doit nommer exactement le binaire évalué) ; la
+                # présence est vérifiée à la résolution, sur l'hôte de l'agent.
+                if "\x00" in valeur or "\n" in valeur or not os.path.isabs(valeur):
+                    print("invalid harness_bin: %r (an absolute path; empty = the "
+                          "host binary)" % valeur, file=sys.stderr)
+                    return 2
             if cle == "context_max_tokens" and valeur:
                 try:
                     valeur = str(parse_token_count(valeur))
@@ -3472,10 +3484,11 @@ def cmd_set(cfg: Config, args) -> int:
         reveil_txt = agent.get("lot_wake") or "default (%s)" % ("on" if cfg.lot_wake else "off")
         print("%s: model=%s effort=%s tier=%s session=%s mode=%s context=%s "
               "turn_max_s=%s mail_per_turn=%s background_grace_s=%s mail_batch=%s "
-              "lot_wake=%s (takes effect at the next turn)"
+              "lot_wake=%s harness_bin=%s (takes effect at the next turn)"
               % (args.agent, modele, effort, tier, politique,
                  agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
-                 grace_txt, regroupement_txt, reveil_txt))
+                 grace_txt, regroupement_txt, reveil_txt,
+                 agent.get("harness_bin") or "host binary"))
         for local in LOCAL_SET_KEYS:
             if local in valeurs and (agent.get("host") or "") not in ("", cfg.host):
                 print("warning: %s is read from the local state of the agent's host "

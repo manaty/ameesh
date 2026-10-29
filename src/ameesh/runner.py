@@ -6043,7 +6043,10 @@ class AgentWorker(threading.Thread):
     # -- un tour -----------------------------------------------------------
     def _adapter(self) -> adapters.HarnessAdapter:
         harness = self.turn_harness()
-        adapter = adapters.adapter_for(harness)
+        # #4293 : binaire choisi pour CET agent (canari d'adoption) ; NULL =
+        # résolution de l'hôte inchangée. Un tour déjà lancé garde son
+        # adaptateur : la ligne est relue au début du tour suivant.
+        adapter = adapters.adapter_for(harness, (self.agent or {}).get("harness_bin") or None)
         # Traçabilité de chaîne d'approvisionnement (décision 0021) : chaque
         # descripteur utilisé est journalisé avec sa provenance et son empreinte,
         # une fois par changement (pas à chaque tour).
@@ -13702,7 +13705,9 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
               file=sys.stderr)
         return 1
     try:
-        adapter = adapters.adapter_for(agent.get("harness") or "other")
+        # #4293 : le binaire du canari suit l'agent en session interactive aussi
+        adapter = adapters.adapter_for(agent.get("harness") or "other",
+                                       agent.get("harness_bin") or None)
         # #2706 : refus AVANT le bail. `dsh --profile agent` est headless et
         # exige une tâche : l'ancien code prenait le bail, lançait la commande
         # sans texte, puis le rendait en 4 s après « a task is required »,

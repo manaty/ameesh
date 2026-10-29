@@ -245,6 +245,12 @@ FERMEES = {
     # rôle superviseur ; fermé aux deux rôles, aucun GRANT modifié.
     "veille_readings": {"harness", "provider", "model_id", "first_seen",
                         "last_seen"},
+    # #4293 : état interne d'une adoption de version (rapport de rejeu, séquence
+    # canari/bascule, valeurs inverses), tenu et lu par `ameesh harness adopt`, pas par
+    # le rôle superviseur ; fermé aux deux rôles, aucun GRANT modifié.
+    "harness_adoptions": {"lot_id", "project", "harness", "object",
+                          "from_version", "to_version", "stage", "report",
+                          "report_digest", "state", "created_at", "updated_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
