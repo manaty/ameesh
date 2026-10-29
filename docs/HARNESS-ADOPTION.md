@@ -215,13 +215,6 @@ La carte des binaires installés (voir plus haut) est lue automatiquement par
 le tick ; `new_binary` ne couvre que l'hôte du canari, et un binaire absent ou
 non exécutable sur l'hôte du tick est refusé avant tout geste.
 
-**La carte est aussi la liste locale de l'exécuteur** (#4488) : sur chaque
-hôte qui porte des agents épinglés, `harness_bin` n'est lancé que s'il figure
-dans cette carte pour cet hôte (toutes versions), ou dans `harness_bins` /
-`AMEESH_<HARNAIS>_BIN`. Installez donc la carte sur ces hôtes ; un chemin
-fourni par `--bin` ou par `new_binary` mais absent de la carte de l'hôte est
-refusé par l'exécuteur (« hôte non prêt »), jamais lancé.
-
 Le tick est sans effet tant qu'aucune adoption n'est ouverte. Un seul tick
 tourne à la fois (verrou consultatif en base) ; plusieurs hôtes peuvent porter
 le timer sans double geste. Chaque transition laisse une note
@@ -239,7 +232,10 @@ le timer sans double geste. Chaque transition laisse une note
   `harness_bins` de la configuration, ou `AMEESH_<HARNAIS>_BIN`. Un chemin
   écrit en base par une autre identité ne peut donc pas faire exécuter un
   binaire arbitraire avec les identifiants du compte ; la garde est dans
-  l'exécuteur et dans `ameesh attach`, au moment de la lecture.
+  l'exécuteur et dans `ameesh attach`, au moment de la lecture. Installez la
+  carte sur chaque hôte qui porte des agents épinglés : un chemin fourni par
+  `--bin` ou `new_binary` mais absent de la carte de l'hôte est refusé
+  (« hôte non prêt »), jamais lancé.
 - L'exécuteur relit la ligne de l'agent au début de chaque tour ; un tour en
   cours ne change jamais de binaire sous lui. La même valeur suit l'agent en
   session interactive (`ameesh attach`).
