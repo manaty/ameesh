@@ -1254,6 +1254,19 @@ def _fresh_events(slug: str, head: str, rid: int, attempt: int, *, gh) -> list[d
     return ci_mod.events_of(runs, int(rid), int(attempt))
 
 
+def _inherited_gate(pairs, rollup, provenance, *, slug: str, gh, head: str,
+                    target: str) -> tuple:
+    """#4549 (B3 de dev1, confirmé par cx2) : la porte du paquet porte les
+    mêmes preuves que le feu — workflow, tête et base de la cible — pour le
+    remplacement d'une suite échouée au plan par une suite verte sans test.
+    Sans ces preuves, `fire._supersede_testless_runs` ne remplace rien (le
+    doute ne verdit jamais) ; l'appel sans elles de la version précédente
+    laissait une suite verte d'un autre workflow ou sur une base périmée
+    masquer un rouge."""
+    return fire._required_gate(pairs, rollup, provenance, strict=False,
+                               slug=slug, gh=gh, head=head, target=target)
+
+
 def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
                    project, gh) -> dict | None:
     """#3558 : la preuve qu'une tête n'est rouge que d'échecs **hérités** de
@@ -1533,8 +1546,9 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
     masked_provenance = ([masked_run(run) for run in provenance]
                          if provenance is not None else None)
     try:
-        gaps, _consigned = fire._required_gate(pairs, masked_rollup,
-                                               masked_provenance, strict=False)
+        gaps, _consigned = _inherited_gate(pairs, masked_rollup,
+                                           masked_provenance, slug=slug,
+                                           gh=gh, head=sha, target=base)
         proof_gaps, _proof_consigned = fire._packet_proof_gate(masked_rollup)
         detail_gaps, _detail_consigned = fire._aggregate_detail_gate(masked_rollup)
     except Exception:  # noqa: BLE001 - une porte illisible ne fusionne pas

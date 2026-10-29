@@ -20,7 +20,7 @@ from . import (NAME, _builtin, _check_types, _digest, _distribution, _entry_poin
                _external, _validate_descriptor)
 
 #: Capabilities a module may declare in ``CAPABILITIES``.
-CAPABILITIES = ("lifecycle", "cli", "audit")
+CAPABILITIES = ("lifecycle", "cli", "audit", "workspaces")
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,10 @@ def _capabilities(name, module):
         provided.append("cli")
     if callable(getattr(module, "audit", None)):
         provided.append("audit")
+    if callable(getattr(module, "workspaces", None)):
+        # L101 T4 (#4357): a tooling module owns the workspaces façade; the core
+        # reads it through the registry, never by importing the implementation.
+        provided.append("workspaces")
     declared = getattr(module, "CAPABILITIES", None)
     if declared is None:
         return tuple(provided)
@@ -93,18 +97,21 @@ def _core_version():
     return version()
 
 
-def discover(*, builtin=True):
-    """All discovered modules, by name; ``builtin=False`` is the bare profile.
+def _discover(*, builtin=True):
+    """`(implementations, Module rows, refusals)` for the discovery.
 
     Same refusals as `ameesh.modules.installed()`, but per entry: a refused
-    entry point is listed in `Registry.refused` instead of raising."""
-    modules, refused = [], []
+    entry point is listed in the third item instead of raising. `declarations`
+    reads the implementations here to compile per-project options without
+    reopening `installed()` and its all-or-nothing failure."""
+    implementations, modules, refused = {}, [], []
     builtins = _builtin() if builtin else {}
     for name, module in sorted(builtins.items()):
-        compiled = _validate_descriptor(name, module.descriptor({}))
+        compiled = _validate_descriptor(name, module.descriptor({}), allow_empty=True)
         _check_types(name, module, compiled)
+        implementations[name] = module
         modules.append(_describe(name, module, compiled, source="builtin",
-                                 version=_core_version()))
+                                  version=_core_version()))
     entries = sorted(_entry_points(), key=lambda point: getattr(point, "name", ""))
     counts = Counter(getattr(entry, "name", None) for entry in entries)
     for entry in entries:
@@ -117,12 +124,33 @@ def discover(*, builtin=True):
             continue
         try:
             module, compiled = _external(entry)
+            implementations[name] = module
             modules.append(_describe(name, module, compiled, source="external",
                                      version=version, distribution=dist,
                                      entry_point=row["entry_point"]))
         except ValueError as exc:
             refused.append(dict(row, error=str(exc)))
-    return Registry(tuple(modules), tuple(refused))
+    return implementations, tuple(modules), tuple(refused)
+
+
+def discover(*, builtin=True):
+    """All discovered modules, by name; ``builtin=False`` is the bare profile.
+
+    Same refusals as `ameesh.modules.installed()`, but per entry: a refused
+    entry point is listed in `Registry.refused` instead of raising."""
+    _, modules, refused = _discover(builtin=builtin)
+    return Registry(modules, refused)
+
+
+def get(name):
+    """A built-in module implementation by name, or None in the bare profile.
+
+    L101 T4 (#4357): the core obtains a built-in module's façade through the
+    registry (``registry.get("dev")``), never by importing the implementation
+    (L97 boundary). Only built-ins are read here: an installed entry point is
+    loaded by discovery and selected by the canon, not by a core runtime path.
+    """
+    return _builtin().get(name)
 
 
 #: L99 T2 (#4350): delivery connectors owned by the core itself (`work.deliver`)
@@ -133,13 +161,10 @@ CORE_ACTION_CONNECTORS = ("shell-noop",)
 
 def _connector_providers():
     """Built-in providers of action and delivery connectors: the lifecycle
-    modules plus the development tooling (`dev`), which is not a lifecycle
-    module. Installed entry points are not read: a connector path is reviewed
-    core code."""
-    from . import dev
-    providers = dict(_builtin())
-    providers[dev.NAME] = dev
-    return providers
+    modules plus the development tooling (`dev`, now a built-in module).
+    Installed entry points are not read: a connector path is reviewed core
+    code."""
+    return dict(_builtin())
 
 
 def action_connectors():
@@ -179,8 +204,8 @@ def delivery_connectors():
 
 def merge_connector():
     """Name of the connector of a merge on the target (gate actions, `merged`)."""
-    from . import dev
-    return dev.MERGE_CONNECTOR
+    module = get("dev")
+    return getattr(module, "MERGE_CONNECTOR", "git-merge")
 
 
 def admits(db, project, kind):
@@ -197,17 +222,81 @@ def milestones(db, item_id, limit=100):
     return ModuleStore(db).milestones(item_id, limit)
 
 
+def _active_payload():
+    """Active module rows, from `project_modules` or the local canon.
+
+    L98 T2a: `project_modules` is the applied truth; the configured canons
+    supply the scope and the descriptor compared by `doctor`. No database
+    (or an unreadable one) falls back to the canon compiled locally."""
+    import sys
+    from . import active as active_modules
+    from .. import config, db as db_mod
+    from .. import canon as canon_mod
+    cfg = config.load()
+    canons = []
+    try:
+        canons = canon_mod.load_configured(cfg)
+    except Exception as exc:  # a reading never prevents the local fallback
+        print("warning: canon not read (%s)"
+              % (" ".join(str(exc).split())[:160],), file=sys.stderr)
+    try:
+        db = db_mod.connect(cfg)
+    except db_mod.Unavailable as exc:
+        db = None
+        print("warning: database not reachable (%s); reading the local canon"
+              % (" ".join(str(exc).split())[:160],), file=sys.stderr)
+    try:
+        if db is not None:
+            try:
+                payload = active_modules(db, canons)
+            except db_mod.DbError as exc:
+                print("warning: database unreadable (%s); reading the local canon"
+                      % (" ".join(str(exc).split())[:160],), file=sys.stderr)
+                payload = active_modules(None, canons)
+        else:
+            payload = active_modules(None, canons)
+    finally:
+        if db is not None:
+            db.close()
+    return payload, bool(canons), db is not None
+
+
 def main(argv):
-    """`ameesh modules [--json]`: read-only list of the discovered modules."""
+    """`ameesh modules [--json] [--active]` — discovered or active modules."""
     import argparse
     import json
+    import sys
 
     parser = argparse.ArgumentParser(
         prog="ameesh modules",
-        description="Discovered modules (built in and ameesh.modules entry points), "
-                    "with version and capabilities; read only.")
+        description="Modules: discovered (built in and ameesh.modules entry points), "
+                    "with version and capabilities, or active (applied project "
+                    "policies); read only.")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--active", action="store_true",
+                        help="active project modules (project_modules, or the local "
+                             "canon without a database)")
     args = parser.parse_args(argv)
+    if args.active:
+        payload, have_canon, have_db = _active_payload()
+        if not payload["active"] and not have_canon and not have_db:
+            print("ameesh modules --active: no canon and no database", file=sys.stderr)
+            return 1
+        for warning in payload["warnings"]:
+            print("warning: %s" % warning["message"], file=sys.stderr)
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        elif not payload["active"]:
+            print("no active module")
+        else:
+            for row in payload["active"]:
+                scope = row["scope"] or "-"
+                if row.get("team"):
+                    scope = "%s:%s" % (scope, row["team"])
+                print("%-10s %-14s %-12s %-10s %-10s %s" % (
+                    row["canon"], scope, row["project"], row["module"],
+                    row["version"] or "-", row["descriptor_sha256"]))
+        return 0
     registry = discover()
     if args.json:
         print(json.dumps({"modules": [module.as_dict() for module in registry.modules],

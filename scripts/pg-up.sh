@@ -4,8 +4,10 @@
 #
 # Le port n'est publié que sur la boucle locale : la base n'est pas exposée au
 # réseau. Le volume nommé garde les données entre deux démarrages ; un banc de
-# lot qui se déclare jetable (AMEESH_PG_DISPOSABLE=1) est, lui, récoltable par
-# le ménage d'ameesh après `docker_volume_idle` (24 h) sans conteneur.
+# lot qui se déclare jetable (AMEESH_PG_DISPOSABLE=1) porte les étiquettes de
+# durée de vie `ameesh.lifetime=test` et `ameesh.bench=disposable`, et le ménage
+# d'ameesh le récolte après `docker_volume_idle` (24 h) sans conteneur. Un
+# volume de base `*-pg-data` n'est jamais récolté (#4560).
 # Aucun mot de passe n'est codé ici : AMEESH_PG_PASSWORD le fixe à la création
 # du conteneur ; ensuite les clients le lisent dans PGPASSWORD ou ~/.pgpass.
 # scripts/test.sh dérive de ce profil l'entrée de ses bases jetables (#2170).
@@ -192,8 +194,10 @@ else
   # au conteneur (le contrat de ce script). Le volume d'un banc de lot ne
   # reçoit `ameesh.bench=disposable` que si l'appelant a déclaré le banc
   # jetable (`AMEESH_PG_DISPOSABLE=1`) ; toute autre création reste sans
-  # étiquette. Un volume existant garde ses étiquettes : Docker ne les modifie
-  # pas, et le ménage ne supprime jamais un volume non déclaré.
+  # étiquette. #4560 : il porte aussi `ameesh.lifetime=test`, la durée de vie
+  # que le ménage reconnaît (volumes ET images de test), jamais un volume de
+  # base nommé (`*-pg-data`). Un volume existant garde ses étiquettes : Docker
+  # ne les modifie pas, et le ménage ne supprime jamais un volume non déclaré.
   if [ "${VOLUME#/}" = "$VOLUME" ] && ! grep -qxF -- "$VOLUME" <<<"${volumes:-}"; then
     ETIQUETTE=""
     case "$DISPOSABLE" in
@@ -212,7 +216,8 @@ else
         esac ;;
     esac
     if [ -n "$ETIQUETTE" ]; then
-      docker volume create --label "$ETIQUETTE" "$VOLUME" >/dev/null \
+      docker volume create --label "$ETIQUETTE" \
+        --label "ameesh.lifetime=test" "$VOLUME" >/dev/null \
         || { echo "création du volume $VOLUME en échec" >&2; exit 1; }
     else
       docker volume create "$VOLUME" >/dev/null \

@@ -201,7 +201,10 @@ class SelectedTurnRefusedTest(unittest.TestCase):
             _servir=mock.Mock(),
             # #2096 : `run_turn` rend la mémoire du tour dans son `finally` ;
             # la doublure n'a pas d'allocateur, le rappel est inerte.
-            _release_turn_memory=lambda *a, **k: None)
+            # #2894 : `run_turn` retire d'abord un document de tour périmé ;
+            # la doublure n'a pas de document, le rappel est inerte.
+            _release_turn_memory=lambda *a, **k: None,
+            _purge_turn_context=lambda: None)
         # #290 a séparé l'enveloppe (`run_turn`) du tour (`_run_guarded_turn`) :
         # la doublure porte la vraie logique de tour et une enveloppe inerte.
         worker._run_guarded_turn = types.MethodType(
@@ -210,6 +213,8 @@ class SelectedTurnRefusedTest(unittest.TestCase):
         # porte aussi le tour réel, appelé par cette enveloppe.
         worker._run_turn_or_defer = types.MethodType(
             runner_mod.AgentWorker._run_turn_or_defer, worker)
+        # #2894 : l'allocation de l'identifiant de tour, statique sur le worker.
+        worker._with_turn_id = runner_mod.AgentWorker._with_turn_id
         # #1462 : run_turn lit d’abord la pause opérateur dans le registre —
         # agent non pausé ici, la doublure de base ne porte pas de requêtes.
         with mock.patch.object(registry, "restore_prompt", return_value=True) as restore, \

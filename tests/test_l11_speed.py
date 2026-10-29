@@ -478,7 +478,7 @@ class CanonSyncTest(PgTestCase):
 
         with mock.patch("ameesh.canon.from_config", return_value="canon-fictif"), \
                 mock.patch("ameesh.canon_sync.periodic_sync",
-                           side_effect=lambda db, canon, host, interval:
+                           side_effect=lambda db, canon, host, interval, **kwargs:
                            faux_sync(db, canon, host)):
             self.assertTrue(runner.canon_sync_once())
         self.assertEqual(appels, [("canon-fictif", self.cfg.host)])

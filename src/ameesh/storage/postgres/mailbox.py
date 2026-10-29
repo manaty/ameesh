@@ -34,6 +34,7 @@ MAIL_COLUMNS = """
     meta->'consigne'->>'runner' as consigne_runner,
     meta->'consigne'->>'jeton' as consigne_jeton,
     (meta->'consigne'->>'epoch')::bigint as consigne_epoch,
+    meta->'consigne'->>'turn' as consigne_turn,
     (meta->'consigne' IS NOT NULL
      OR coalesce((meta->>'deja_consigne')::boolean, false)) as deja_consigne,
     meta->'forwarded_from'->>'agent' as forwarded_from
@@ -341,7 +342,7 @@ class Mailbox(interface.Mailbox):
     """
 
     def reserve(self, recipient, owner, epoch, token, *, ids=None, porteur,
-                ttl_seconds, limit=200) -> list[dict]:
+                ttl_seconds, limit=200, turn_id=None) -> list[dict]:
         filtre = ""
         if ids is not None:
             clean = sorted({int(i) for i in ids})
@@ -369,6 +370,7 @@ class Mailbox(interface.Mailbox):
                        'consigne', jsonb_build_object(
                            'runner', %%s::text, 'epoch', %%s::bigint,
                            'jeton', %%s::text, 'porteur', %%s::text,
+                           'turn', %%s::text,
                            'ts', extract(epoch from clock_timestamp())::float8,
                            'expire', extract(epoch from clock_timestamp())::float8
                                      + %%s::float8),
@@ -380,7 +382,7 @@ class Mailbox(interface.Mailbox):
                MAIL_COLUMNS.replace("id,", "m.id,", 1))
         params = ((recipient, recipient) + self._lease_params(owner, epoch)
                   + (int(limit), owner or None, int(epoch) if owner else None,
-                     token, porteur, float(ttl_seconds)))
+                     token, porteur, turn_id, float(ttl_seconds)))
         rows = self.db.query(sql, params)
         for row in rows:
             # l'état AVANT cette réservation : « re-livré » si une réservation
@@ -571,6 +573,9 @@ class Mailbox(interface.Mailbox):
         # destinataire, ne suit pas), puis l'original remis et noté. Un
         # message pris entre-temps par une remise (verrou de ligne, WHERE
         # réévalué) n'est pas renvoyé.
+        if old.startswith("human:"):
+            raise interface.MailboxRefused(
+                "%s is a human mailbox: use ameesh decisions, not forward" % old)
         with self.db.transaction() as tx:
             # L976 (R2 delta codex3, B1 résiduel) : le verrou par nom est pris
             # AVANT toute lecture du registre, et les chemins de création
@@ -615,6 +620,7 @@ class Mailbox(interface.Mailbox):
             ids = sorted(int(row["id"]) for row in tx.query(
                 "SELECT m.id FROM agent_mailbox m"
                 " WHERE m.recipient = %%s AND m.delivered_at IS NULL"
+                "   AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)"
                 "   AND NOT (%s)"
                 " ORDER BY m.id FOR UPDATE" % _RESERVED_SQL, (old,)))
             if not ids:

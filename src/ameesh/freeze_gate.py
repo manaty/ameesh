@@ -862,7 +862,14 @@ def milestone(
             # #2487 : un gel réaligné dont les verdicts vont être reportés
             # n'appelle pas de nouvelle désignation. Le plan est lu avant la
             # transaction du jalon (lectures git/réseau hors verrou de ligne).
-            carried = activation.carried_plan(cfg, db, item_id, sha)
+            plan = activation.carried_plan(cfg, db, item_id, sha)
+            # Un plan partiel (certains verdicts reportables, d'autres non,
+            # #4582) ne fait pas s'abstenir : la désignation tourne pour les
+            # sièges manquants, et ses relecteurs reportés ne sont pas relancés.
+            carried = (plan if plan and not plan.get("refused") else None)
+            reported = [str((entry or {}).get("actor") or "").strip()
+                        for entry in (plan or {}).get("carried") or ()
+                        if str((entry or {}).get("actor") or "").strip()]
             # #3250: a locally present head does not certify a fresh target.
             # Pin the exact published target before taking the lot's lock.
             target = (None if carried else
@@ -881,7 +888,8 @@ def milestone(
                 prepared = activation.prepare_for_freeze(
                     cfg, db, item, sha, target=target, actor=actor, proof=proof)
             on_frozen = activation.hook(cfg, outcome, carried=carried,
-                                        target=target, prepared=prepared)
+                                        target=target, prepared=prepared,
+                                        reported=reported)
             if after_commit is None:
                 after_commit = []
                 drain = after_commit

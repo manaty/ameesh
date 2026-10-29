@@ -163,6 +163,7 @@ CORE_STATES = (
     lifecycle.REQUESTED,
     lifecycle.IN_PROGRESS,
     lifecycle.QA,
+    lifecycle.VALIDATED,
     lifecycle.DELIVERY_RECORDED,
     lifecycle.PROMOTED,
     lifecycle.CLOSED,
@@ -1387,12 +1388,13 @@ def receipt_of(db: Db, work_item_id: int, command_id: str) -> dict | None:
     return row
 
 
-#: Collections actually collected for slice C (no `observations`:
-#: the source is not installed, a verifier that requires it must refuse).
-#: `approvals` is conditional: it is present only when the host has a fresh,
-#: valid local projection of the approval records (#4006).
-SOURCE_KEYS = ("milestones", "receipts", "decisions", "deliveries",
-               "approvals")
+#: Collections actually collected for slice C. `observations` is conditional:
+#: it is present only when the host has a fresh, valid local projection of the
+#: IMA observations journal (#4425). `approvals` is conditional too: it is
+#: present only when the host has a fresh, valid local projection of the
+#: approval records (#4006).
+SOURCE_KEYS = ("milestones", "receipts", "observations", "decisions",
+               "deliveries", "approvals")
 
 
 def read_sources(context: VerificationContext) -> dict[str, Any]:
@@ -1400,9 +1402,9 @@ def read_sources(context: VerificationContext) -> dict[str, Any]:
 
     slice C: its verifiers are pure and SQL-free; this reader is
     theirs, called from the installed callable. The mapping declares only what is
-    actually collected — `SOURCE_KEYS` — never an absent collection
-    (`observations` is not installed): a verifier that requires it refuses
-    `source-unavailable` (fail-closed), never a default agreement.
+    actually collected — `SOURCE_KEYS` — never an absent collection: a verifier
+    that requires it refuses `source-unavailable` (fail-closed), never a
+    default agreement.
 
     * `milestones`: `{id, kind, sha, verdict, note, actor}` — the actor is
       projected (#1994): C assigns the verdict per actor (`_current_verdict`),
@@ -1423,6 +1425,13 @@ def read_sources(context: VerificationContext) -> dict[str, Any]:
       projection is not configured, missing, stale, unreadable or invalid:
       a verifier that requires approvals then refuses `source-unavailable`,
       never a default agreement. No network read happens here.
+    * `observations` (#4425): the current, non-expired records of the local
+      observations projection for this lot and project,
+      `[{id, kind, env, sha, state, lot, app, actor, observed_at,
+      source_revision, provenance}]`. The key is **absent** when the
+      projection is not configured, missing, stale, unreadable or invalid;
+      a revoked, superseded, expired or future record is never listed. No
+      network read happens here.
     """
     if not isinstance(context, VerificationContext):
         raise RegistryRefusal("verifier-invalid", "VerificationContext expected")
@@ -1497,4 +1506,23 @@ def read_sources(context: VerificationContext) -> dict[str, Any]:
         projection = None
     if projection is not None:
         sources["approvals"] = projection.as_source()
+    # #4425 : la projection locale du journal d'observations est la seule
+    # source des deploiements/QA/acceptations. Toute absence, peremption ou
+    # invalidite la retire du mapping (fail-closed) ; aucune lecture reseau
+    # n'a lieu ici.
+    from . import process_observations as observations_mod
+    try:
+        observations = observations_mod.local_projection()
+    except observations_mod.ObservationError:
+        observations = None
+    if observations is not None:
+        item = context.work_item if isinstance(context.work_item, Mapping) else {}
+        try:
+            sources["observations"] = observations_mod.read_sources(
+                observations, work_item_id=item_id,
+                app=str(item.get("app") or ""))
+        except (observations_mod.ObservationError, ValueError):
+            # Un lot hors forme (app invalide) ne doit pas transformer la
+            # garde en `verifier-error` : la source est absente, fail-closed.
+            pass
     return sources

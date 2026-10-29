@@ -101,7 +101,9 @@ scripts/pg-up.sh                    # container ameesh-pg, postgres:17, 127.0.0.
 # several agents on one host: AMEESH_PG_NAME=<agent>-pgtest AMEESH_PG_PORT=…
 # AMEESH_PG_DISPOSABLE=1 declares a lot bench disposable: housekeeping may reap
 # its <name>-data volume after 24 h without a container (conservation by
-# default; the shared ameesh-pg volume is never declared disposable)
+# default; the shared ameesh-pg volume is never declared disposable). The
+# volume then carries ameesh.lifetime=test and ameesh.bench=disposable; a
+# *-pg-data base volume is never reaped, even labelled (#4560).
 # (its volume is then <name>-data; a volume already mounted is refused)
 # #3833: the bench is created with docker-init (--init) and a shell-free
 # healthcheck (`exec pg_isready`): without them, a healthcheck killed at its

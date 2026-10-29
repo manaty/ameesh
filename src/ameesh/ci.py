@@ -2606,9 +2606,10 @@ def quota_line(state_dir, *, now=None) -> str | None:
 #     + contrat) ou `ci-full-<S>` (suite complète), posée par la commande sur
 #     la PR (`pull_request` `types: [labeled]`). Le job `plan` compare
 #     exactement ce SHA à `pull_request.head.sha`, vérifie que le checkout est
-#     le merge-ref composé de la pointe cible figée dans la description de
-#     l'étiquette et de cette tête (ses deux parents), puis sélectionne contre
-#     cette base (#2328 : `pull_request.base.sha` peut être périmé) ;
+#     le merge-ref de cette tête composé de la pointe cible figée dans la
+#     description de l'étiquette (ou d'une pointe qui n'en diffère que par des
+#     atterrissages de coupure, #4533), puis sélectionne contre sa base réelle
+#     (#2328 : `pull_request.base.sha` peut être périmé) ;
 #   * le jeton `gh` doit produire l'événement `pull_request: labeled` : un
 #     `GITHUB_TOKEN` d'Actions (acteur `github-actions[bot]`) ne déclenche
 #     aucun workflow et est refusé ;

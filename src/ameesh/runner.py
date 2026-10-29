@@ -66,6 +66,7 @@ from . import account_window
 from . import provider_credits
 from . import persona_memory as memory_mod
 from . import train_events
+from . import turn_context
 from . import events as events_mod, turn_stages
 from . import venv_guard
 from . import workspaces
@@ -3600,11 +3601,9 @@ class AgentWorker(threading.Thread):
         l'exécuteur, puis `adapter.env()` (un descripteur peut poser
         `CLAUDE_CONFIG_DIR` ou `CODEX_HOME`), puis le compte du tour
         (`accounts.launch_env`) ; `~` se lit avec le HOME de cet environnement.
-        Le prédicat ne dit « inconnue » que si la session n'est ni là, ni sous
-        un autre compte déclaré du harnais : dans le doute (stockage
-        introuvable, recherche incomplète), la session est gardée (verdict
-        codex #183) — une reprise ratée est rattrapée, un faux négatif efface
-        une vraie session."""
+        Une session présente seulement sous un autre compte repart avec un
+        brief (#4546). Dans le doute (stockage introuvable, recherche
+        incomplète), la session est gardée (verdict codex #183)."""
         if (harness not in self.SESSION_STORES or compte is account_turn.INVALID
                 or os.environ.get("AMEESH_SESSION_STORE_CHECK") == "0"):
             return None
@@ -3624,10 +3623,10 @@ class AgentWorker(threading.Thread):
         except Exception as exc:  # configuration illisible : on ne sait pas
             self._avertit_session("harness directory %s not resolved (%s)" % (harness, exc))
             return None
-        if not os.path.isdir(reprise.session_root(harness, home)):
+        store_present = os.path.isdir(reprise.session_root(harness, home))
+        if not store_present:
             self._avertit_session("session store %s not found"
                                   % reprise.session_root(harness, home))
-            return None
 
         def connue(session: str) -> bool:
             try:
@@ -3637,14 +3636,16 @@ class AgentWorker(threading.Thread):
                     if reprise.find_session(harness, autre, session, strict=True):
                         self._avertit_session(
                             "session %s found under %s, not under %s (turn directory): "
-                            "kept" % (session, autre, home))
-                        return True
+                            "resume brief required" % (session, autre, home))
+                        return False
             except reprise.SessionSearchIncomplete as exc:
                 # stockage momentanément illisible : introuvable n'est pas établi
                 self._avertit_session("search for session %s incomplete (%s): "
                                       "kept" % (session, exc))
                 return True
-            return False
+            # No store and no positive evidence of an account mismatch:
+            # preserve the existing conservative behavior.
+            return not store_present
         return connue
 
     def _avertit_session(self, texte: str) -> None:
@@ -4630,6 +4631,42 @@ class AgentWorker(threading.Thread):
         if left.get("created_at") or right.get("created_at"):
             return left.get("created_at") == right.get("created_at")
         return left.get("created_ts") == right.get("created_ts")
+
+    def _annule_tour_avant_lancement(self, marker: dict | None,
+                                     spend_key: str | None) -> None:
+        """Un tour refusé avant le `Popen` ne laisse rien de comptable ouvert.
+
+        Le harnais n'a pas tourné : le marqueur est effacé par son identité
+        exacte et la réservation du compte est rendue (`released`), pour que
+        le refus ne compte pas comme dépense et ne bloque pas l'admission
+        suivante. Au mieux : le tour est déjà refusé ; une panne de base est
+        journalisée et la réparation reste fail-closed."""
+        marker = marker or {}
+        try:
+            registry.pending_spend_clear(self.db, self.name, marker)
+        except db_mod.DbError as exc:
+            log_async("[%s] turn marker not cleared (%s)"
+                      % (self.name, db_mod.explain(exc)))
+        if spend_key:
+            try:
+                account_budget.settle(self.db, spend_key, state="released")
+            except db_mod.DbError as exc:
+                log_async("[%s] account reservation not released (%s)"
+                          % (self.name, db_mod.explain(exc)))
+        self._compta_travail = None
+
+    def _purge_turn_context(self) -> None:
+        """Retire le document du tour ; ne casse jamais un tour.
+
+        Les workers partiels des tests (et l'arrêt d'un worker avant sa
+        première réclamation) n'ont pas de dossier d'état : rien à retirer."""
+        state_dir = getattr(self, "state_dir", "")
+        if not state_dir:
+            return
+        try:
+            turn_context.remove(state_dir)
+        except OSError as exc:
+            log("[%s] turn context not removed (%s)" % (self.name, exc))
 
     def _compta_termine(self, model_annonce: str | None = None, *,
                         incertain: bool = False) -> None:
@@ -6296,12 +6333,32 @@ class AgentWorker(threading.Thread):
             log_async("[%s] deferred lock status not cleared (%s)"
                       % (self.name, db_mod.explain(exc)))
 
+    @staticmethod
+    def _with_turn_id(spec: dict) -> dict:
+        """The one turn id of this turn (#2167 / L2894).
+
+        It is allocated before the first side effect — mail reservation,
+        accounting marker, account reservation — and travels in `spec` so
+        `mail.reserve` (`meta.consigne.turn`), the marker, the resource row,
+        the ledger row, `AMEESH_TURN_ID` and `turn-context.json` name the same
+        id. Never allocate another one downstream.
+        """
+        if spec.get("turn_id"):
+            return spec
+        return dict(spec, turn_id=uuid.uuid4().hex)
+
     def run_turn(self, spec: dict) -> bool | None:
         """Un tour (voir `_run_turn_or_defer`).
 
         #2614 : le tour qui porte un réveil programmé oublie son claim en
         sortant, lancé ou non : non consommé, le bail n'est plus renouvelé,
-        expire, et le réveil est délivré de nouveau."""
+        expire, et le réveil est délivré de nouveau.
+
+        #2894 : l'identifiant du tour est alloué ici, avant la réservation du
+        courrier et tout autre effet de bord, et un document périmé d'un
+        processus mort est retiré avant que ce tour puisse écrire le sien."""
+        self._purge_turn_context()
+        spec = dict(spec, turn_id=uuid.uuid4().hex)
         try:
             return self._run_turn_or_defer(spec)
         finally:
@@ -6408,6 +6465,7 @@ class AgentWorker(threading.Thread):
         du tour quand elle existe, puis `_solde_steers` clôt les steers.
         """
         self._solde_steers(False)  # restes d'un tour précédent, jamais réservés
+        spec = self._with_turn_id(spec)
         generation = self._begin_turn_generation()
         result = False
         try:
@@ -6454,6 +6512,9 @@ class AgentWorker(threading.Thread):
         # pour ce tour et ne sera pas effacée à son début.
         if "_preempt_gen" not in spec:
             spec = dict(spec, _preempt_gen=_preemption_generation(self))
+        # #2894 : direct callers (rotation, compaction, tests) also get the
+        # turn id before the mail reservation.
+        spec = self._with_turn_id(spec)
         candidats = spec.get("candidats")
         if self.runner.draining.is_set():
             # Drainage commencé entre le choix du tour et son lancement : rien
@@ -6508,7 +6569,8 @@ class AgentWorker(threading.Thread):
             reserves = mail.reserve(
                 self.db, self.name, self.runner.runner_id, self.epoch, jeton,
                 ids=[int(m["id"]) for m in retenus], porteur="consigne",
-                ttl_seconds=self._reservation_ttl(spec))
+                ttl_seconds=self._reservation_ttl(spec),
+                turn_id=spec.get("turn_id"))
         except db_mod.DbError as exc:
             log("[%s] mail reservation failed (%s): turn postponed"
                 % (self.name, exc))
@@ -7369,6 +7431,11 @@ class AgentWorker(threading.Thread):
             return self._run_turn_sous_battement(spec)
         finally:
             heartbeat_done.set()
+            # #2894 : le document de tour vit exactement le tour. Retiré sur
+            # tout retour (succès, échec, lancement impossible, exception) ;
+            # un document resté après un crash est refusé par le lecteur
+            # (bail et marqueur) et remplacé au tour suivant.
+            self._purge_turn_context()
 
     def _run_turn_sous_battement(self, spec: dict) -> bool:
         if spec.get("lot_switch_failed"):
@@ -7569,8 +7636,9 @@ class AgentWorker(threading.Thread):
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         # L31 (0028) : identifiant du tour et étiquettes à poser sur les
         # conteneurs lancés par ses outils, pour repérer les orphelins.
+        # #2894 : celui alloué en tête de tour, jamais un second.
         from . import containers as containers_mod
-        turn_id = uuid.uuid4().hex
+        turn_id = spec.get("turn_id") or uuid.uuid4().hex
         self._turn_id = turn_id
         lot_du_tour = lot or self.agent.get("session_work_item") or None
         # #3452 : le lot imputé au grand livre ne se replie pas sur le lot de
@@ -7586,6 +7654,9 @@ class AgentWorker(threading.Thread):
             "AGENT_MAIL_STATE": self.cfg.v0_state,
             "AGENT_MAIL_CONFIG": self.cfg.config_dir,
             "AMEESH_TURN_ID": turn_id,
+            # #2894 : le document du tour, écrit avant que le harnais puisse
+            # agir (voir `turn_context`) ; chemin stable pour un résident.
+            turn_context.ENV: turn_context.path(self.state_dir),
             # L224 : le hook d'un autre harnais lancé pendant le tour (codex
             # exec sous claude) est refusé
             "AMEESH_HARNESS": harness,
@@ -7761,6 +7832,35 @@ class AgentWorker(threading.Thread):
                 self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
                 return False
 
+        # #2894 (TPK #2167 A1) : le document de tour, écrit après le marqueur
+        # comptable et la réservation de compte (l'état ouvert au lancement),
+        # et avant que le harnais puisse agir. Écriture atomique et privée ;
+        # un échec ne lance pas le harnais et ne laisse ni marqueur ni
+        # réservation ouverts derrière lui.
+        marqueur = self._compta_travail or {}
+        spend_key = self._spend_key(events_start, marqueur)
+        try:
+            reservation = account_budget.reservation(self.db, spend_key)
+            document = turn_context.build(
+                turn_id=turn_id, agent=self.name, host=self.runner.host,
+                kind=spec.get("kind") or "prompt", started_ts=started,
+                session=session, work_item_id=lot_du_tour,
+                lease_owner=self.runner.runner_id, lease_epoch=self.epoch,
+                lease_expires_ts=self.lease_deadline or None,
+                requests=spec.get("rows") or (),
+                harness=harness, model=model or None,
+                budget_usd=self.agent.get("budget_usd"),
+                spent_usd=self.agent.get("spent_usd"),
+                spend_key=spend_key, marker=marqueur,
+                reservation=reservation)
+            turn_context.write(self.state_dir, document,
+                               secrets=turn_context.environment_secrets())
+        except (OSError, turn_context.ContextError, db_mod.DbError) as exc:
+            self._annule_tour_avant_lancement(marqueur, spend_key)
+            self.fail_turn("turn context unavailable",
+                           "turn context not written: %s" % exc)
+            return False
+
         preempt_done = threading.Event()
         preempt_thread = threading.Thread(
             target=self._preempt_monitor, args=(preempt_done,),
@@ -7839,6 +7939,18 @@ class AgentWorker(threading.Thread):
             from .platform import turn_cgroup
             with open(stderr_path, "ab") as stderr:
                 stderr_debut = stderr.tell()
+                if cle_resident is not None:
+                    # #2894 : le pointeur de tour du résident est écrit AVANT
+                    # le démarrage du pilote (le document de tour l'est déjà).
+                    # Sans lui, le hook lirait le tour précédent : ce tour
+                    # part un par événement plutôt que d'être mal fencé.
+                    try:
+                        resident_runner.write_turn(
+                            self._path(resident_runner.TURN_FILE), turn_id)
+                    except OSError as exc:
+                        log("[%s] resident turn file not written (%s): one turn "
+                            "per event" % (self.name, exc))
+                        cle_resident = None
                 if cle_resident is not None:
                     # L76 : le processus résident (démarré, ou relancé sur la
                     # session) ; un démarrage raté : un tour par événement
@@ -10792,6 +10904,13 @@ class Runner:
             target = payload.get("to")
             with self.lock:
                 worker = self.workers.get(target) if target else None
+            if worker is not None:
+                # #4594 : le signal part AVANT toute lecture en base. Un
+                # `mail.get` sur la connexion partagée peut attendre derrière
+                # des dizaines de passes au repos ; le réveil ne doit pas
+                # dépendre de cette file. Le contrôle d'urgence vient ensuite,
+                # et #2810 couvre la course avec un tour qui a déjà commencé.
+                worker.wake.set()
             if payload.get("restart"):
                 # `ameesh restart` (L26) : le NOTIFY n'est qu'un réveil ; la
                 # demande est relue en base avant d'arrêter quoi que ce soit.
@@ -11189,7 +11308,10 @@ class Runner:
             for canon in loaded:
                 try:
                     interval = getattr(self, "canon_sync_interval", 0.0)
-                    report = (canon_sync.periodic_sync(db, canon, self.host, interval)
+                    report = (canon_sync.periodic_sync(
+                        db, canon, self.host, interval,
+                        on_incomplete=lambda why: log_async(
+                            "host gate: canon sync incomplete: %s" % why))
                               if interval > 0 else canon_sync.sync(db, canon, self.host))
                     if report is None:
                         # Another executor is syncing, or this snapshot differs
@@ -11827,7 +11949,13 @@ class Runner:
             if own:
                 from .scoped_db import ScopedDb
                 db = ScopedDb(self.cfg)
-            from . import notify_gap
+            from . import notify_gap, validation_deadlines
+            try:
+                validation_deadlines.sweep(self.cfg, db, now=now)
+            except Exception as exc:
+                # Deadline failures never suppress the notifier safety brief.
+                # Do not log private routing or audit data from an exception.
+                log_async("validation deadlines: sweep failed (%s)" % type(exc).__name__)
             report = notify_gap.brief_once(self.cfg, db, now=now)
         except Exception as exc:      # jamais fatal pour l'exécuteur
             log_async("notify gap: pass failed (%s: %s)" % (type(exc).__name__, exc))
@@ -13171,7 +13299,8 @@ class Runner:
             if not self.did_turn:
                 log_async("no work available")  # chemin de sortie : par la file
             return 0 if self.did_turn else 3
-        self.listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self.listener_thread = threading.Thread(target=self._listen_loop,
+                                                name="listen", daemon=True)
         self.listener_thread.start()
         # Travail de fond des tours (délai de grâce) : l'exécuteur adopte les
         # orphelins de ses tours (codes de sortie), et les suit.
