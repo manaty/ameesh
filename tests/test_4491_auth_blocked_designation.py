@@ -45,8 +45,9 @@ class AvailabilityTest(unittest.TestCase):
         self.assertFalse(rd.is_available(
             row("dev2", status="blocked",
                 text=auth_failure.status_text("claude", "tertiaire"))))
-        # Même sans texte : un `blocked` sans fenêtre courte est un siège mort.
-        self.assertFalse(rd.is_available(row("dev2", status="blocked")))
+        # B1 : un `blocked` sans cause nommée n'est pas une pause longue — le
+        # runner écrit ce statut à la fin de tout tour échoué.
+        self.assertTrue(rd.is_available(row("dev2", status="blocked")))
         self.assertTrue(rd.is_available(row("dev1")))
 
     def test_le_texte_auth_blocked_ecarte_meme_un_statut_non_blocked(self):
@@ -72,14 +73,44 @@ class AvailabilityTest(unittest.TestCase):
                 self.assertFalse(rd.is_blocked_pause(row("cx1", text=text)))
                 self.assertTrue(rd.is_available(row("cx1", text=text)))
 
+    def test_un_tour_echoue_ou_un_429_reste_disponible(self):
+        # B1 : le runner écrit `blocked` à la fin d'un tour échoué (#1268) et
+        # pendant un épisode de débit (#1270, 429 relancé une minute après).
+        # Ces pauses ne retirent ni le candidat ni son siège.
+        texts = (
+            ("failures x1 since 2026-10-29T07:00:00Z: last turn: flux coupé, "
+             "412s (failed)"),
+            ("critical failures x1 since 2026-10-29T07:00:00Z: last turn: "
+             "flux coupé, 412s (failed)"),
+            ("[rate_limited x1 since 2026-10-29T07:00:00Z, retry in 60s, "
+             "retry at 2026-10-29T07:01:00Z] last turn: 429, 12s (failed)"),
+            ("[quota x1 since 2026-10-29T07:00:00Z, retry in 60s, "
+             "retry at 2026-10-29T07:01:00Z] last turn: quota, 12s (failed)"),
+        )
+        for text in texts:
+            with self.subTest(text=text):
+                dead = row("dev2", text=text)
+                self.assertFalse(rd.is_blocked_pause(dead))
+                self.assertTrue(rd.is_available(dead))
+                self.assertEqual(act._unreachable_reviewer(dead, set()), "")
+
     def test_un_blocked_sans_fenetre_courte_est_un_siege_mort(self):
         # Le même fait sert à la désignation et à la reprise (#3328) : un
-        # `blocked` d'authentification, d'hôte ou de compte est un siège mort.
-        self.assertTrue(rd.is_blocked_pause(
-            row("dev2", status="blocked",
-                text=auth_failure.status_text("claude", "tertiaire"))))
-        self.assertTrue(rd.is_blocked_pause(
-            row("dev2", status="blocked", text="hôte non prêt : harnais introuvable")))
+        # `blocked` de cause nommée (auth, crédits, hôte, compte) est un siège
+        # mort, mais un tour échoué ou un 429 ne l'est pas (B1).
+        auth = row("dev2", status="blocked",
+                   text=auth_failure.status_text("claude", "tertiaire"))
+        host = row("dev2", status="blocked", text="hôte non prêt : harnais introuvable")
+        credits = row("dev2", status="blocked",
+                      text="provider_credits_exhausted: claude/tertiaire")
+        for dead in (auth, host, credits):
+            with self.subTest(text=dead["status_text"]):
+                self.assertTrue(rd.is_blocked_pause(dead))
+                self.assertFalse(rd.is_available(dead))
+        self.assertEqual(act._unreachable_reviewer(auth, set()),
+                         "authentication blocked")
+        self.assertEqual(act._unreachable_reviewer(host, set()), "status blocked")
+        self.assertEqual(act._unreachable_reviewer(credits, set()), "status blocked")
         self.assertFalse(rd.is_blocked_pause(row("dev1", status="idle")))
 
 

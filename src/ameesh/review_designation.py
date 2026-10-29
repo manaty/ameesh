@@ -63,11 +63,13 @@ PLACEHOLDER_FAMILIES = frozenset(("", "none", "other", "unknown", "inconnu"))
 #: `review_designation_activation` (#3328), so the two never disagree.
 NON_LIVE_STATUS = frozenset(("stopped", "dead"))
 #: #4491: the runner's marked pause (`status` `blocked`) — a failing
-#: credential (`auth_blocked`, L226b), a host or database that is not ready, a
-#: missing account. No turn is taken until the cause is fixed, so a request
-#: deposited there would hold the seat. The account's short-window pause is
-#: written the same way but lifts in minutes (#3876): `is_blocked_pause` is the
-#: single reading that tells the two apart.
+#: credential (`auth_blocked`, L226b), exhausted provider credits, a host that
+#: is not ready, a missing account. No turn is taken until the cause is fixed,
+#: so a request deposited there would hold the seat. The runner writes the
+#: **same** status at the end of every failed turn (`last turn: … (failed)`,
+#: or a `429` episode retried in a minute): those stay candidates, like the
+#: account's short-window pause (#3876). `is_blocked_pause` is the single
+#: reading that tells the named long causes from the short ones.
 BLOCKED_STATUS = frozenset(("blocked",))
 #: the registry states that forbid designation: the non-live ones and the
 #: legacy `paused` state. An operator pause is a **column**, read by
@@ -86,6 +88,18 @@ AUTH_BLOCKED_PREFIX = "auth_blocked"
 #: fixed, so a request deposited there would hold the seat. #4491 adds the
 #: authentication block (`auth_failure.STATUS_PREFIX`, L226b).
 PAUSE_PREFIXES = ("paused", "budget : ", "accounts : ", AUTH_BLOCKED_PREFIX)
+#: #4491 B1: the **named long causes** written under `blocked`. Only these
+#: make a lost seat: the end-of-turn failure marker (#1268, "failures x1
+#: since …: last turn: … (failed)") and the transient rate episode (#1270,
+#: "[rate_limited x1 …, retry in 60s, retry at …]", or "quota") are not here —
+#: their pause lasts a minute and the reviewer resumes on its own (#3876).
+#: `provider_credits.STATUS_PREFIX` and `runner.AgentWorker.HOST_STATUS` are
+#: named here rather than imported (the runner is a heavy, higher layer);
+#: `PAUSE_PREFIXES` already carries the account, auth and budget blocks.
+BLOCKED_LONG_PREFIXES = (
+    "provider_credits_exhausted",
+    "hôte non prêt",
+) + PAUSE_PREFIXES
 #: a commit SHA (full or abbreviated): a branch name is not a freeze
 _SHA = re.compile(r"[0-9a-f]{7,64}")
 
@@ -257,24 +271,27 @@ def is_available(row: Mapping, *, closed_hosts: Iterable[str] = ()) -> bool:
 
     An agent in a turn remains available: the mail waits for it and opens its
     next turn. Unavailable are a `stopped`/`dead`/`paused` agent (#3415: a
-    reaped lease writes `dead`), a `blocked` agent whose pause is not the
-    account's short window (#4491: the runner marks a failing credential, a
-    host or database that is not ready, a missing account; #3876 keeps the
-    short window a candidate), an `external` session (never run by the
-    executor, L46), an operations or budget pause (`status_text` "paused…" or
-    "budget : …", except the short-window pause of the account, #3876), an
-    account configuration block (#3973: "accounts : …", no valid account on
-    the host, #3969), an authentication block (#4491: "auth_blocked…", the
-    credential is failing, L226b), an operator pause (`operator_paused`, a
-    column: the row keeps `status` `idle` and its text "last turn: …", so the
-    status and the prefixes never see it), and — #3328 — an agent whose host is
-    `draining`/`lost` (claims closed): the request deposited there is not read
-    until the host comes back, so the seat would stay blocked while the freeze
-    waits. The host evidence is the one agent-mail uses
-    (`alert_briefs.claims_closed_hosts`, #3036); an unreadable host state
-    closes nothing, and a missing lease is not read: an idle reviewer is woken
-    by the request mail, so it is still a candidate. A row with no readable
-    mode or status is refused: doubt designates nobody.
+    reaped lease writes `dead`), a `blocked` agent with a **named long cause**
+    (#4491: the runner marks a failing credential, exhausted provider credits,
+    a host that is not ready, a missing account; `is_blocked_pause`), an
+    `external` session (never run by the executor, L46), an operations or
+    budget pause (`status_text` "paused…" or "budget : …", except the
+    short-window pause of the account, #3876), an account configuration block
+    (#3973: "accounts : …", no valid account on the host, #3969), an
+    authentication block (#4491: "auth_blocked…", the credential is failing,
+    L226b), an operator pause (`operator_paused`, a column: the row keeps
+    `status` `idle` and its text "last turn: …", so the status and the prefixes
+    never see it), and — #3328 — an agent whose host is `draining`/`lost`
+    (claims closed): the request deposited there is not read until the host
+    comes back, so the seat would stay blocked while the freeze waits. The host
+    evidence is the one agent-mail uses (`alert_briefs.claims_closed_hosts`,
+    #3036); an unreadable host state closes nothing, and a missing lease is not
+    read: an idle reviewer is woken by the request mail, so it is still a
+    candidate. The end-of-turn failure marker (#1268) and the transient
+    `429`/`quota` episode (#1270) are minute-scale pauses, not lost seats:
+    they stay candidates like the short window (#3876), as the auditeur's B1
+    on #4491 required. A row with no readable mode or status is refused: doubt
+    designates nobody.
     """
     row = dict(row or {})
     if (row.get("mode") or "execute") != "execute":
@@ -324,23 +341,31 @@ def is_short_window_pause(text: str) -> bool:
 
 
 def is_blocked_pause(row: Mapping) -> bool:
-    """#4491: the runner's long `blocked` pause, as opposed to the short window.
+    """#4491: a `blocked` pause with a **named long cause**, not a short pause.
 
     The runner writes **one** status, `blocked`, for very different causes:
-    a failing credential (`auth_blocked`, L226b), a host or database that is
-    not ready, a missing account, a gauge pause — and the account's
-    short-window refusal (cooldown, start gap, provider burst bucket, #3779).
-    The short window lasts minutes and must stay a reviewer candidate (#3876,
-    including the raw reason of a claim-start refusal written without the
-    budget prefix); the others take no turn until a human or the next poll
-    fixes them, so a request deposited there would hold the seat.
+    a failing credential (`auth_blocked`, L226b), exhausted provider credits,
+    a host that is not ready, a missing account, a gauge pause — and, at the
+    end of **every failed turn**, a minute-scale retry (#1268 failure marker,
+    #1270 `429`/`quota` episode with its `retry at`), and the account's
+    short-window refusal (#3779). Only the named long causes take no turn
+    until a human or the next poll fixes them; the failed-turn and short-window
+    pauses stay reviewer candidates (#3876 and the auditeur's B1 on #4491).
+    Treating the failure marker as a lost seat made a reviewer who failed one
+    turn lose its seat and be replaced 60 s before resuming.
 
     A row that is not `blocked` is never a blocked pause: the long pauses
-    written as `status_text` prefixes are read by `PAUSE_PREFIXES`.
+    written as `status_text` prefixes are read by `PAUSE_PREFIXES`. A long
+    series of real failures is not read here either: the runner itself stops
+    the agent after its fast-failure threshold (`stopped`, already a non-live
+    status), and a slow series is an incident for the alerts, not a proof
+    that the reviewer will not read its request.
     """
     if str((row or {}).get("status") or "").strip().lower() not in BLOCKED_STATUS:
         return False
     text = str((row or {}).get("status_text") or "").strip().lower()
+    if not any(text.startswith(prefix) for prefix in BLOCKED_LONG_PREFIXES):
+        return False
     if is_short_window_pause(text):
         return False
     from . import account_window

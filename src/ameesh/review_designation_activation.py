@@ -3907,12 +3907,14 @@ def _unreachable_reviewer(row: Optional[Mapping], closed_hosts: set) -> str:
     agent is stopped/dead/blocked or no longer run by the executor. A missing
     lease is deliberately not read: an idle reviewer is woken by the request
     mail. A budget/operator pause is not read either — the agent comes back and
-    its seat is not lost. #4491: a long `blocked` pause (the runner's marked
-    authentication, host, database or account block) and an `auth_blocked`
-    text are lost seats, like a closed host, and are handed to `reseat`
-    (dropped when the kept seats cover the reviews, otherwise replaced by an
-    available agent). The account's short-window pause stays a live seat
-    (#3876), hence `is_blocked_pause` rather than the bare `blocked` status.
+    its seat is not lost. #4491: a `blocked` pause with a **named long cause**
+    (authentication, exhausted provider credits, host not ready, account
+    block) and an `auth_blocked` text are lost seats, like a closed host, and
+    are handed to `reseat` (dropped when the kept seats cover the reviews,
+    otherwise replaced by an available agent). The account's short-window
+    pause (#3876) and the end-of-turn failure marker / `429` episode (#1268,
+    #1270, a minute-scale retry) stay live seats: `is_blocked_pause` reads the
+    named causes, not the bare `blocked` status (auditeur's B1 on #4491).
     """
     if row is None:
         return "absent from the registry"
