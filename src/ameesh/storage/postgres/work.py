@@ -1764,7 +1764,7 @@ class WorkItems(interface.WorkItems):
             rows = tx.query(
                 "SELECT state, extract(epoch from wake_at)::float8 AS wake_ts"
                 "  FROM work_items WHERE id = %s AND state NOT IN"
-                " ('merged', 'promoted', 'closed') FOR NO KEY UPDATE",
+                f" ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}') FOR NO KEY UPDATE",
                 (item_id,))
             if not rows:
                 return None
