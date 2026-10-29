@@ -147,6 +147,8 @@ celui du projet de l'agent.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import json
 import re
 import time
@@ -192,7 +194,9 @@ CLASS_CAPABILITIES = ("sensible", "sensitive", "production", "decision")
 #: capacité exigée qui désigne un harnais (`harness:codex`)
 HARNESS_PREFIX = "harness:"
 TAKE_WINDOW_S = 3600.0
-#: alertes qui empêchent une prise sur l'hôte de l'agent
+#: alertes qui empêchent une prise sur l'hôte de l'agent. #4433 :
+#: `runner_pressure` est absent volontairement — la pression d'un runner ne
+#: retient que ses propres tours, pas la prise des autres agents de l'hôte.
 HOST_BLOCKING_ALERTS = ("host_pressure", "host_power_low", "host_not_ready", "host_disk_low")
 SENDER = "ameesh"
 #: #2584 : `source` d'un panier — `backlog-basket:<projet>:<chantier>:<jour>`
@@ -955,12 +959,12 @@ def lot_takeable(item: dict, today: str | None = None, *, holds=None,
     file par la limite d'en-cours (`returned_to_queue` : la note de retour est
     postérieure à la dernière attribution) — un lot en cours sans preneur
     (prérequis, travail confié par courrier) n'est pas à la file."""
-    if item.get("state") not in ("intake", "build") \
+    if item.get("state") not in lifecycle.ACTIVE \
             or (item.get("assignee") or "").strip():
         return False
     if (item.get("external_executor") or "").strip():
         return False
-    if item.get("state") == "build" and not item.get("returned_to_queue"):
+    if item.get("state") == lifecycle.IN_PROGRESS and not item.get("returned_to_queue"):
         return False
     if _hold_blocks(item, (holds or {}).get(int(item.get("id") or 0)), now):
         return False
@@ -1409,7 +1413,7 @@ def _still_free(st, item_id) -> bool:
         return False
     return (not (item.get("assignee") or "").strip()
             and not (item.get("external_executor") or "").strip()
-            and item.get("state") in ("intake", "build"))
+            and item.get("state") in lifecycle.ACTIVE)
 
 
 def _cap_reached(st, agent: str, cap: int) -> bool:

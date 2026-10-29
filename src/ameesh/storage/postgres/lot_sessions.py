@@ -3,6 +3,8 @@
 actionnable, sur Postgres (`agent_lot_sessions`, migration 0384)."""
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import datetime as _dt
 import time
 
@@ -11,7 +13,7 @@ from ..interface import HOLD_NOTE_WHITESPACE
 from .work import has_wake_at
 from .work_dependencies import freeze_due
 
-_CLOSED = "('merged', 'promoted', 'closed')"
+_CLOSED = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
 
 _COLUMNS = """
     l.agent, l.work_item_id, l.session_id, l.harness, l.account, l.cwd, l.wakes,
@@ -118,7 +120,7 @@ class LotSessions(interface.LotSessions):
         today = today or _dt.date.today().isoformat()
         lift = HOLD_NOTE_PATTERNS[1]
         return self.db.query(
-            """
+            f"""
             SELECT w.id, w.title, w.state, w.priority,
                    extract(epoch from greatest(w.updated_at, w.branch_head_at, ev.at, mb.at)
                            )::float8 AS activity_ts,
@@ -134,8 +136,8 @@ class LotSessions(interface.LotSessions):
                   SELECT max(b.created_at) AS at FROM agent_mailbox b
                    WHERE btrim(b.work_item_id) = w.id::text) mb ON true
              WHERE w.assignee = %s
-               AND (w.state IN ('intake', 'build')
-                    OR (w.state = 'qa' AND """ + freeze_due("w") + """))
+               AND (w.state IN ('{lifecycle.REQUESTED}', '{lifecycle.IN_PROGRESS}')
+                    OR (w.state = '{lifecycle.QA}' AND """ + freeze_due("w") + """))
                AND (w.planned_start IS NULL OR w.planned_start <= %s::date)
                AND NOT EXISTS (SELECT 1 FROM agent_mailbox b
                                 WHERE b.delivered_at IS NULL AND b.kind = 'request'

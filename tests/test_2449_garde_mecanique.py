@@ -57,6 +57,7 @@ def reader_keys() -> set[str]:
             ("paquet", mechanics._PAQUET_KEYS),
             ("packet_tests", mechanics._PACKET_TESTS_KEYS),
             ("file", mechanics._FILE_KEYS),
+            ("session", mechanics._SESSION_KEYS),
             # #3022 : `production.branch` est un bloc **par projet**, pas un
             # bloc du document global ; la garde doit le voir comme les autres.
             ("production", mechanics._PRODUCTION_KEYS)):
@@ -77,7 +78,7 @@ class SchemaCoverageTest(unittest.TestCase):
                          {"schema", "timezone", "cutoffs", "packets", "build",
                           "ci", "reviews", "merge", "prevalidation", "backlog",
                           "staging", "accounts", "paquet", "packet_tests",
-                          "file", "projects"})
+                          "file", "session", "projects"})
         # #3022 : les surcharges par projet peuvent porter un bloc qui n'est
         # pas un bloc du document global (`production`) ; il reste couvert par
         # `production.branch` ci-dessus, jamais ajouté au schéma du document.
@@ -136,6 +137,9 @@ POSITIVE = {
     "packet_tests.parallel": "UNIT_TESTS_PARALLEL = 4\n",
     "file.repos_part": "REPOS_PART = 0.2\n",
     "file.repos_s": "REPOS_S = 1800\n",
+    "session.max_tokens": "SESSION_MAX_TOKENS = 150000\n",
+    "session.max_tokens_by_harness":
+        'SESSION_MAX_TOKENS_BY_HARNESS = {"codex": 2000000}\n',
     "projects": 'PROJECT_OVERRIDES = {"ameesh": {"build": {"max_in_build": 3}}}\n',
     "production.branch": 'production_branch = "main"\n',
 }
@@ -153,6 +157,12 @@ class RulesTest(unittest.TestCase):
             'CONFIG = {"schema": "ameesh-mechanics/1"}\n'))
         self.assertIn("staging.waiting_lots_min", findings(
             'STAGING = {"waiting_lots_min": 3}\n'))
+        # #4448 : une table de seuils de rotation par harnais est une règle du
+        # canon recopiée, pas une constante d'implémentation
+        self.assertIn("session.max_tokens_by_harness", findings(
+            'SESSION_MAX_TOKENS_BY_HARNESS = {"codex": 2_000_000}\n'))
+        self.assertIn("session.max_tokens", findings(
+            "def f(*, session_max_tokens=150_000):\n    pass\n"))
 
     def test_unrelated_literals_do_not_mordent(self):
         for source in (

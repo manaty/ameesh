@@ -1288,9 +1288,10 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                                          "refused" if state == lifecycle.CLOSED else "would-merge"),
                                  detail="%s (dry run)" % state)
                 else:
-                    done = work_mod.close_merged(
-                        db, item_id, sha=sha or "", actor=actor,
-                        source="sync-github", pr_ref=ref)
+                    done = work_mod.deliver(
+                        db, item_id, connector=work_mod.merge_connector(),
+                        evidence={"seen": "sync-github", "sha": sha or "", "pr": ref},
+                        actor=actor)
                     entry.update(result=done["result"], detail=done["detail"])
             results.append(entry)
     return {"repo": repo, "dry_run": bool(dry_run), "pull_requests": len(prs),

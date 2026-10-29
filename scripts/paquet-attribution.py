@@ -16,7 +16,9 @@ pour chaque échec, l'unité désignée et ses preuves (fichier du test, support
 importé, liste attendue, migration, module couvert), ou `unattributable`.
 Aucune décision de retrait ici : le script ne modifie ni lot, ni branche, ni
 base. `scripts/paquet-auto.py` applique le seuil de preuve forte et retire ;
-sans attribution sûre, il garde son échec actuel.
+sans attribution sûre, il garde son échec actuel. #4217 : un rouge de module
+**voisin** ne passe plus par cette attribution — paquet-auto le situe en
+rejouant le test sur les préfixes de l'empilement.
 
 La carte d'impact est lue **localement** (clone ou cache de l'hôte, sans
 téléchargement) : un tic de composition ne dépend pas du réseau. Sans carte,

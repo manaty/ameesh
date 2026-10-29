@@ -16,10 +16,25 @@ venv après une bascule. Le contrôle lit l'`argv[0]` concret du MainPID dans
 rend le contrôle rouge. Sans cela, un hôte dont seul le CLI avait changé de
 venv passait pour sain (staging du 24/10/2026, #3311).
 
+Le périmètre de `agents redemarrer` et de `agents controler` est unique (#4437).
+Les agents du registre que l’hôte mène (mode `execute`, non retirés, non
+arrêtés, unité ni désactivée ni masquée) sont redémarrés avec preuve d’arrêt,
+puis contrôlés (unité active, bail repris, venv). Toute autre unité
+`ameesh-runner-agent@` **active** sur l’hôte — persona arrêtée (#1633), unité
+désactivée encore active (résident expérimental), agent retiré ou déplacé,
+candidat d’un rôle élu (#4248) — est rechargée sur le nouveau code par arrêt
+prouvé puis démarrage, sans drain ni bail exigé, et son venv est prouvé. Une
+unité désactivée encore active ne peut donc plus être ignorée au redémarrage
+puis rejetée au contrôle (cas `pilot-dryrun-3389` du 29/10/2026). Une unité
+désactivée ou masquée **inactive** n’est jamais démarrée ; une unité masquée
+encore active est seulement arrêtée, systemd refusant de la démarrer. Le poste
+(`poste.sh`) suit déjà le même principe : ce sont ses unités actives qui font
+le périmètre, le registre ne décidant que du bail et de l’arrêt.
+
 La liste du registre ne suffit pas : un rôle élu (§11) a un exécuteur sur
-chaque hôte candidat, mais le registre ne porte que l'hôte du bail. `agents
+chaque hôte candidat, mais le registre ne porte que l’hôte du bail. `agents
 redemarrer` et `agents controler` mènent donc aussi toute unité
-`ameesh-runner-agent@` **active** sur l'hôte hors de cette liste : arrêt prouvé
+`ameesh-runner-agent@` **active** sur l’hôte hors de cette liste : arrêt prouvé
 puis démarrage, venv prouvé, sans drain ni bail exigé. Sans cela, le candidat
 `mesh-design` d'agents-2 est resté 13 h sur l'ancien code, puis a repris le
 bail sur ce code (staging du 28/10/2026, #4248).
@@ -37,9 +52,11 @@ Le mode agents ne demande ni `VM` ni `PERSONAS_VM`. Il lit `ameesh list
 --json` **sur la VM**, avec la configuration de l’utilisateur `ameesh` et le même
 `~/.config/ameesh/env` que le runner (DSN et schéma compris), et
 sélectionne les agents placés sur `HOTE_AGENTS`, en mode `execute`, non
-arrêtés. Il contrôle aussi les unités manquantes ou inactives. Un registre
-illisible ou une sélection vide fait échouer la commande. Aucun nom d’agent
-n’est à maintenir dans le fichier de paramètres.
+retirés. Les personas arrêtées sont lues aussi, sans bail : leur unité encore
+active est rechargée sur le nouveau code. Il contrôle aussi les unités
+manquantes ou inactives des agents menés. Un registre illisible ou une
+sélection vide fait échouer la commande. Aucun nom d’agent n’est à maintenir
+dans le fichier de paramètres.
 
 ```sh
 deploy/mise-a-jour/vm.sh agents verifier
@@ -161,12 +178,15 @@ n’y change rien : un hôte encore sur l’ancien code l’ignore et elle expir
 en 90 s. L’échec tient si aucun autre hôte candidat ne détient un bail
 vivant au moment du contrôle. Une persona dont l’unité est désactivée
 (`UnitFileState=disabled` ou `masked`, résident expérimental) n’a pas
-d’exécuteur actif attendu : le contrôle et le redémarrage la classent hors
-périmètre, sans exiger de bail et sans relancer son unité. Un agent retiré
-du registre (`retired_ts` dans `ameesh list`) est également hors périmètre.
-Une unité absente ou illisible reste une erreur. En cas d’échec, la commande
-indique l’unité et la commande `journalctl --user` à lancer sous `ameesh`
-sur la VM.
+d’exécuteur actif attendu : ni unité active ni bail ne sont exigés, et une
+unité inactive n’est jamais démarrée. Si elle tourne encore, elle est rechargée
+sur le nouveau code (arrêt prouvé puis démarrage) et son venv est prouvé, comme
+toute unité active hors du périmètre mené (#4437) ; une unité masquée encore
+active est seulement arrêtée, systemd refusant de la démarrer. Un agent retiré
+du registre (`retired_ts` dans `ameesh list`) est également hors périmètre ;
+s’il tourne encore, la même règle le recharge. Une unité absente ou illisible
+reste une erreur. En cas d’échec, la commande indique l’unité et la commande
+`journalctl --user` à lancer sous `ameesh` sur la VM.
 
 ## Installer une révision gelée, revenir en arrière
 

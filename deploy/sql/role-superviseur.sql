@@ -240,6 +240,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- harnais, dossier et id de la session dont ils notent l'ouverture
         -- (même nature que harness, cwd, session_id)
         'lot_wake', 'session_harness', 'session_cwd', 'session_origin',
+        -- #4293 : binaire du harnais choisi pour cet agent (canari d'adoption),
+        -- un chemin — même nature que cwd, pas de contenu ni de secret
+        'harness_bin',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
         'canon',
         -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
@@ -258,7 +261,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'retired_at', 'retired_by', 'retired_reason',
         -- #4245 (0503) : lignée de bail au même hôte (un nom d'hôte et une
         -- époque, même nature que `host` et `lease_epoch`, pas de contenu)
-        'lease_lineage_host', 'lease_lineage_epoch'
+        'lease_lineage_host', 'lease_lineage_epoch',
+        -- #4468 (0513) : début de la tenure du bail courant (un instant, même
+        -- nature que `lease_wait_since` et `lease_expires_at`, pas de contenu)
+        'lease_since'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
@@ -382,10 +388,27 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- L232a (0371) : état et réservations ; plans et preuves dans le rôle contenus
     -- L232e (0380): withdrawal intent and agent origins; refusals in contents role
     ('host_lifecycle', ARRAY[
-        'host', 'mode', 'generation', 'actor', 'requested_at', 'return_at', 'updated_at'
+        'host', 'mode', 'generation', 'actor', 'requested_at', 'return_at', 'updated_at',
+        -- #4148 : states and evidence of the external release adapter; the
+        -- free-text failure stays in the contents role.
+        'release_state', 'hook_state', 'claims_open', 'release_epoch',
+        'release_generation', 'automatic', 'released_at',
+        'return_requested_at', 'return_requested_by', 'release_error_state',
+        'release_error_at', 'release_error_since', 'hook_attempt_at',
+        'hook_attempt_state', 'hook_attempt_generation', 'hook_attempt_epoch'
     ]),
     ('host_lifecycle_agents', ARRAY[
         'host', 'generation', 'agent', 'critical', 'operation'
+    ]),
+    -- #4148 : one journal line per acknowledged adapter transition; `detail`
+    -- (command output) is a content.
+    ('host_lifecycle_transitions', ARRAY[
+        'host', 'generation', 'release_epoch', 'state', 'actor', 'created_at'
+    ]),
+    -- #4148 : per-host scanner lock and the reason a scan did not drain.
+    ('host_release_locks', ARRAY[
+        'host', 'owner', 'expires_at', 'next_scan_at', 'blocked_reason',
+        'blocked_source', 'blocked_since', 'updated_at'
     ]),
     -- L232b (0417) : la fermeture de release, lue par `ameesh_host_gate_state`
     -- (`host` seulement ; périmètre d'opération et reçus exclus)

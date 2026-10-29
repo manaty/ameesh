@@ -13,6 +13,8 @@ l'instruction qui écrit. Les listes d'ids sont développées en marqueurs `%s`
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 from typing import Any
 
 import json
@@ -24,9 +26,9 @@ from .work import REQUEUED_PARAMS, has_reviewer, requeued_sql
 from .work_dependencies import current_verdict as _current_verdict, freeze_due
 
 #: états de lot terminés (le reste est « ouvert »)
-_CLOSED = "('merged', 'promoted', 'closed')"   # closed : abandonné ou remplacé (L29)
+_CLOSED = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"   # closed : abandonné ou remplacé (L29)
 #: L165b : un lot dans ces états attend quelqu'un d'autre que son assigné
-_WAITING_ON_OTHERS = "('qa', 'validated', 'waiting_human', 'blocked')"
+_WAITING_ON_OTHERS = f"('{lifecycle.QA}', '{lifecycle.VALIDATED}', '{lifecycle.WAITING_HUMAN}', '{lifecycle.BLOCKED}')"
 #: L125 : un message passif de la boîte `mb`
 _PASSIVE = PASSIVE_SQL.format(t="mb")
 
@@ -69,7 +71,7 @@ class Operations(interface.Operations):
         # authorised agent. Old host/lease observations are never reused.
         # An empty declared responsible never authorises an empty reader:
         # the two empty strings must not match (N4, #1398).
-        rows = self.db.query("""
+        rows = self.db.query(f"""
             SELECT r.host, r.status, r.status_text,
                    w.id AS lot_id, w.title AS lot_title, w.state AS lot_state,
                    extract(epoch FROM p.captured_at)::float8 AS captured_ts, p.payload
@@ -78,9 +80,9 @@ class Operations(interface.Operations):
                                      AND p.lease_epoch = r.lease_epoch
             LEFT JOIN LATERAL (
                 SELECT id, title, state FROM work_items
-                WHERE assignee = r.name AND state NOT IN ('merged','promoted','closed')
+                WHERE assignee = r.name AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}','{lifecycle.PROMOTED}','{lifecycle.CLOSED}')
                 ORDER BY (id::text = r.session_work_item) DESC NULLS LAST,
-                         (state = 'build') DESC, updated_at DESC, id DESC LIMIT 1
+                         (state = '{lifecycle.IN_PROGRESS}') DESC, updated_at DESC, id DESC LIMIT 1
             ) w ON true
             WHERE r.name = %s AND r.responsible <> '' AND r.responsible = %s
             """, (name, human))
@@ -136,9 +138,9 @@ class Operations(interface.Operations):
         # `reviewer` n'existe qu'après la migration 0421.
         review_due = ""
         if has_reviewer(self.db):
-            review_due = ("""
+            review_due = (f"""
                      + (SELECT count(*) FROM work_items w
-                         WHERE w.state = 'qa' AND w.reviewer = r.name
+                         WHERE w.state = '{lifecycle.QA}' AND w.reviewer = r.name
                            AND """ + _current_verdict("w") + """ IS NULL)""")
         return self.db.query(
             """
@@ -239,8 +241,8 @@ class Operations(interface.Operations):
                   -- son verdict avant de prendre autre chose.
                   SELECT count(*)""" + review_due + """ AS n FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
-                     AND (w.state NOT IN """ + _WAITING_ON_OTHERS + """
-                          OR (w.state = 'qa' AND (""" + freeze_due("w") + """
+                     AND (w.state NOT IN """ + _WAITING_ON_OTHERS + f"""
+                          OR (w.state = '{lifecycle.QA}' AND (""" + freeze_due("w") + """
                               OR """ + _current_verdict("w") + """ = 'blocked')))
                      AND (w.planned_start IS NULL OR w.planned_start <= j.today)) ac ON true
               LEFT JOIN LATERAL (
@@ -495,7 +497,7 @@ class Operations(interface.Operations):
         # travail confié par courrier) — voir `work.requeued_sql`.
         sql = (self._LOTS_ACTIVITY
                .replace("__REVIEWER__", reviewer)
-               .replace("__RETURNED__", "(w.state = 'build' AND "
+               .replace("__RETURNED__", f"(w.state = '{lifecycle.IN_PROGRESS}' AND "
                         + requeued_sql("w") + ") AS returned_to_queue,")
                .replace("__WHERE__", where))
         return self.db.query(sql, REQUEUED_PARAMS + tuple(params))
@@ -516,7 +518,7 @@ class Operations(interface.Operations):
         balayage de la limite d'en-cours, sans le plafond global des lots
         ouverts."""
         return self.db.query(
-            """
+            f"""
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
@@ -531,7 +533,7 @@ class Operations(interface.Operations):
                                   WHERE a.work_item = w.id) ac ON true
               LEFT JOIN LATERAL (SELECT max(created_at) AS at FROM agent_mailbox b
                                   WHERE b.work_item_id = w.id::text) mb ON true
-             WHERE w.state = 'build' AND w.assignee IS NOT NULL
+             WHERE w.state = '{lifecycle.IN_PROGRESS}' AND w.assignee IS NOT NULL
              ORDER BY last_activity_ts ASC, w.id
              LIMIT %s
             """,

@@ -190,7 +190,8 @@ expéditeur habilité (l'owner, un événement de CI vérifié en base, ou
 `AMEESH_INTERRUPT_SENDERS` ; demain une capacité du canon)
 **interrompt le tour en cours** : le harnais est arrêté, la consigne repart en
 attente et le message passe en tête. La **rotation de session** (résumé de
-reprise puis session neuve, seuils `AMEESH_SESSION_MAX_TOKENS` /
+reprise puis session neuve, seuil de taille **par harnais** compilé du canon —
+`AMEESH_SESSION_MAX_TOKENS` en repli commun — et
 `AMEESH_SESSION_MAX_TURN_SECONDS`) et l'**adoption d'un dossier de travail
 déplacé** (`AMEESH_WORKTREE_ROOTS`) sont décrites dans
 [`docs/V1-MAILBOX-RUNNER.md`](docs/V1-MAILBOX-RUNNER.md). Depuis L26, la

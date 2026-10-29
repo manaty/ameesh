@@ -2,6 +2,8 @@
 """#4173 : empreintes de lot, écrites et journalisées dans une transaction."""
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 from ..work_footprints import WorkFootprints as Contract
 from .work_dependencies import _DONE_SQL, _LOCK as _GRAPH_LOCK
 
@@ -9,7 +11,7 @@ from .work_dependencies import _DONE_SQL, _LOCK as _GRAPH_LOCK
 #: fusion (ou sa fermeture) : sa branche peut encore entrer en conflit. Un lot
 #: `intake` sans assigné n'occupe rien.
 _OCCUPYING = ("({o}.state NOT IN " + _DONE_SQL +
-              " AND ({o}.assignee IS NOT NULL OR {o}.state <> 'intake'))")
+              f" AND ({{o}}.assignee IS NOT NULL OR {{o}}.state <> '{lifecycle.REQUESTED}'))")
 
 #: Deux chemins se chevauchent : égaux, ou l'un est un dossier parent de
 #: l'autre. Même règle que `ameesh.work_footprints.overlaps`.

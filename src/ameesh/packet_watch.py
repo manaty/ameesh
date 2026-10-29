@@ -60,7 +60,7 @@ GRACE_S = 900.0
 #: préfixe des branches de porteur de paquet (`paquet-h-…`, `paquet-84-nexlink`)
 CARRIER_PREFIX = "integration/paquet"
 #: états d'un porteur ouvert
-OPEN_STATES = ("intake", "build", *lifecycle.TO_VALIDATE, "blocked", "waiting_human")
+OPEN_STATES = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, *lifecycle.TO_VALIDATE, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN)
 #: porteurs fusionnés relus pour « vient d'être fusionné »
 RECENT_MERGED = 50
 
@@ -196,7 +196,7 @@ def carriers(db, app: str, now: float, grace_s: float, *, slot_at: float,
                     continue
             opened.append(int(row["id"]))
     merged_ids = [int(row["id"])
-                  for row in st.items(state="merged", assignee=None, limit=RECENT_MERGED)
+                  for row in st.items(state=lifecycle.DELIVERY_RECORDED, assignee=None, limit=RECENT_MERGED)
                   if _carrier(row, app, target)]
     recent, served = [], []
     for row in st.delays(RECENT_MERGED, ids=merged_ids) if merged_ids else ():
@@ -317,12 +317,36 @@ def body(watch: ProjectWatch, at: dict, payload: dict, *, now: float | None = No
     return "\n".join(lines)
 
 
+def _paused(db, watch: ProjectWatch, target: str, now: float) -> dict:
+    """#4466 : la pause déclarée du paquet horaire de la cible (`packet.pause`,
+    #4361), `{"pause": …}` si elle court encore ou s'est échue depuis moins
+    que la grâce (le tic reprend à son prochain passage), sinon `{}`.
+
+    Pendant une suspension voulue (staging hors créneau), aucun créneau n'est
+    manqué et aucun composeur n'est désigné. Une pause levée (`resumed`) rend
+    la main tout de suite. Un journal illisible ne tait rien
+    (`{"error": …}`, l'alerte part comme avant #4466).
+    """
+    if not target:
+        return {}
+    from . import packet_pause
+    try:
+        data = packet_pause.latest(db, project=watch.name, target=target)
+    except Exception as exc:  # noqa: BLE001 — journal illisible : aucune pause lue
+        return {"error": "%s: %s" % (type(exc).__name__, exc)}
+    if packet_pause.active_of(data, float(now) - watch.grace_s) is None:
+        return {}
+    return {"pause": {"until": data.get("until"), "reason": data.get("reason") or "",
+                      "by": data.get("by") or "", "target": target}}
+
+
 def check(cfg, db, watch: ProjectWatch, rules, *, now: float, state: dict,
           inventory=None, send=None, dry_run: bool = False) -> dict:
     """Un passage pour un projet ; rend `{result, …}` et met `state` à jour.
 
-    `result` : `no-cadence`, `grace`, `already-alerted`, `busy` (porteur
-    ouvert ou tout juste fusionné), `served`, `nothing-ready`, `alerted`, `would-alert`.
+    `result` : `no-cadence`, `grace`, `already-alerted`, `paused` (pause
+    déclarée de la cible, #4466), `busy` (porteur ouvert ou tout juste
+    fusionné), `served`, `nothing-ready`, `alerted`, `would-alert`.
     """
     app = watch.app or watch.name
     at = slot(rules, now, watch.grace_s)
@@ -347,6 +371,11 @@ def check(cfg, db, watch: ProjectWatch, rules, *, now: float, state: dict,
     target = watch.target or (getattr(project, "target", "") if project else "")
     previous_at = float(rules.last_packet(at["at"] - 1)) \
         if getattr(rules, "packet_cutoffs", None) else None
+    paused = _paused(db, watch, target, now)
+    if paused.get("pause"):
+        return dict(out, result="paused", pause=paused["pause"])
+    if paused.get("error"):
+        out["pause_error"] = paused["error"]
     held = carriers(db, app, now, watch.grace_s, slot_at=at["at"], target=target,
                     previous_at=previous_at)
     if held["served"]:

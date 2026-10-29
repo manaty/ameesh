@@ -55,11 +55,12 @@ class HostUnsampledTest(unittest.TestCase):
         found = self.alerts({HOST: {"sampled_ts": NOW - 2 * DAY}}, max_agents=3,
                             orphans=[self.orphan()])
         # le relevé ancien ne dit plus rien de la pression, mais l'alerte de
-        # silence paraît ; les ressources de tour restent signalées tant que
-        # l'hôte n'est pas retiré (l'exécuteur les soldera à son retour)
+        # silence regroupe les ressources de tour (#4443) jusqu’au retour
+        # de l’hôte pour leur revue physique
         self.assertEqual([a["type"] for a in found],
-                         ["host_unsampled", "orphan_resource"])
+                         ["host_unsampled"])
         alert = found[0]
+        self.assertEqual(alert["orphan_turns"], ["tour-1"])
         self.assertEqual(
             (alert["host"], alert["max_agents"], alert["value"], alert["threshold"]),
             (HOST, 3, int(2 * DAY), 600))

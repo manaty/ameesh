@@ -131,6 +131,8 @@ component, not a view.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import hashlib
 import json
 import re
@@ -155,18 +157,25 @@ TRANSFER_VERIFIER = "revision_transfer"
 HOLD_VERIFIER = "hold"
 
 ACTIONS = ("advance", "hold", "release", "transfer")
-HOLDS = ("blocked", "waiting_human")
+HOLDS = (lifecycle.BLOCKED, lifecycle.WAITING_HUMAN)
 #: Native cores a stage can project (same as slice A).
-CORE_STATES = ("intake", "build", "qa", "merged", "promoted", "closed")
+CORE_STATES = (
+    lifecycle.REQUESTED,
+    lifecycle.IN_PROGRESS,
+    lifecycle.QA,
+    lifecycle.DELIVERY_RECORDED,
+    lifecycle.PROMOTED,
+    lifecycle.CLOSED,
+)
 #: Terminal cores: never reopened by a command.
-TERMINAL_CORES = frozenset(("promoted", "closed"))
+TERMINAL_CORES = frozenset(lifecycle.TERMINAL)
 #: Cores that release the lot for its dependants and give back its migration
 #: reservation (#956): the same as `work_dependencies._DONE`. An advance entering
 #: one carries the side effects of the legacy closure, which storage
 #: now refuses to pinned lots (#1922/N8): `close_reason`/
 #: `superseded_by`, `closed`/`delivered` milestones, reservation given back, wake
 #: of the dependants (L385).
-RELEASED_CORES = frozenset(("merged", "promoted", "closed"))
+RELEASED_CORES = frozenset(lifecycle.COMPLETED)
 #: Closures admitted for a `closed` core (`close_reason` constraint of
 #: migration 0430): the command evidence says which one, like the three
 #: doors of `work.close` (abandonment, replacement, delivery outside the target).
@@ -174,7 +183,7 @@ CLOSE_REASONS = ("abandoned", "superseded", "delivered")
 #: Admitted identity sources (`identity.Binding.source`).
 SOURCES = ("runner", "explicit", "session")
 #: qa → build repairs counted by `work_items.loops` (same bound as work).
-REPAIR_CORES = ("qa", "build")
+REPAIR_CORES = (lifecycle.QA, lifecycle.IN_PROGRESS)
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -821,7 +830,7 @@ def _plan_advance(tx: Any, row: Mapping[str, Any], command: Command, spec: Any) 
             % MAX_QA_LOOPS)
     note = "%s → %s (%s)" % (command.from_stage, command.to_stage, command.guard)
     close_reason, superseded_by, delivered_sha = "", None, ""
-    if core_to == "closed":
+    if core_to == lifecycle.CLOSED:
         close_reason, superseded_by, delivered_sha = _close_facts(tx, command)
         if close_reason == "delivered":
             _guard_review_delivery(tx, command)
@@ -882,7 +891,7 @@ def _plan_hold(tx: Any, row: Mapping[str, Any], command: Command) -> _Plan:
     if row["state"] == command.hold:
         raise RegistryRefusal("hold-redundant",
                               "lot %s already in %s" % (command.work_item_id, command.hold))
-    if command.hold == "waiting_human" and not _pending_decision(tx, command.work_item_id):
+    if command.hold == lifecycle.WAITING_HUMAN and not _pending_decision(tx, command.work_item_id):
         raise RegistryRefusal(
             "hold-no-decision",
             "waiting_human requires a pending native decision request (L233)")
@@ -895,7 +904,7 @@ def _plan_release(tx: Any, row: Mapping[str, Any], command: Command, spec: Any) 
         raise RegistryRefusal("not-held",
                               "lot %s in %s: no hold to lift"
                               % (command.work_item_id, row["state"]))
-    if row["state"] == "waiting_human" and _pending_decision(tx, command.work_item_id):
+    if row["state"] == lifecycle.WAITING_HUMAN and _pending_decision(tx, command.work_item_id):
         raise RegistryRefusal(
             "decision-pending",
             "lot %s in waiting_human: the native decision is still open, "
@@ -926,7 +935,7 @@ def _pre_hold_core(tx: Any, work_item_id: int) -> str | None:
     """
     rows = tx.query(
         "SELECT state FROM work_item_events"
-        " WHERE work_item_id = %s AND state NOT IN ('blocked', 'waiting_human')"
+        f" WHERE work_item_id = %s AND state NOT IN ('{lifecycle.BLOCKED}', '{lifecycle.WAITING_HUMAN}')"
         " ORDER BY id DESC LIMIT 1", (int(work_item_id),))
     if not rows:
         return None
@@ -1097,7 +1106,7 @@ def _notify_released(tx: Any, command: Command, plan: _Plan, previous: str,
     from . import work_dependencies
     work_dependencies.notify_released(
         tx, int(command.work_item_id), blocker_state=plan.state,
-        blocker_reason=plan.close_reason if plan.state == "closed" else "",
+        blocker_reason=plan.close_reason if plan.state == lifecycle.CLOSED else "",
         after_commit=threads)
 
 
@@ -1207,7 +1216,7 @@ def _apply(db: Db, command: Command, *, spec: Any,
              int(command.work_item_id)))
         if plan.state in RELEASED_CORES:
             _release_migration(tx, command, row, plan.state)
-        if plan.state == "closed":
+        if plan.state == lifecycle.CLOSED:
             _close_milestones(tx, command, plan)
         evidence = _evidence(command, authority, verification, intent,
                              _applied(command, plan), verifier_name)

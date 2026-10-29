@@ -696,6 +696,12 @@ GUEST_CGROUP_ENV = "AMEESH_GUEST_CGROUP"
 #: slices that hold the guest: the lent VM's (L159e, L159g) and the agents'
 #: slice of the workstation and the mesh VM (L159c)
 GUEST_SLICES = ("ameesh-guest.slice", "ameesh-agents.slice")
+#: #4433: prefixes of the per-agent runner units (hostcheck.RUNNER_TEMPLATE
+#: and SYSTEM_RUNNER_TEMPLATE) whose cgroups live in `ameesh-agents.slice`.
+#: The instance is the agent name; `ameesh-runner-agent@` (user service) and
+#: `ameesh-runner@` (system service) are both measured.
+RUNNER_UNIT_PREFIXES = ("ameesh-runner-agent@", "ameesh-runner@")
+RUNNER_UNIT_SUFFIX = ".service"
 
 #: margin applied to what the application left free at its worst moment
 LEND_MARGIN = 0.5
@@ -746,6 +752,36 @@ def psi(base: str | None = None, window: str = "avg60") -> dict:
     return out
 
 
+def host_cgroup_bases(root: str | None = None) -> list[str]:
+    """The cgroup v2 directories where systemd nests the host's slices: the
+    hierarchy root (system units) and each user manager (`user@<uid>.service`,
+    user units of a workstation). A cgroup directory also holds interface
+    files (`cgroup.controllers`, …): they are skipped, never opened as a
+    directory. A missing or unreadable tree gives only the root, never an
+    error: a host without cgroup v2 measures nothing."""
+    root = root or os.environ.get(CGROUP_ROOT_ENV) or platform.CGROUP_ROOT
+    bases = [root]
+    users = os.path.join(root, "user.slice")
+    try:
+        entries = sorted(os.listdir(users))
+    except OSError:
+        entries = []
+    for user in entries:
+        user_dir = os.path.join(users, user)
+        if not os.path.isdir(user_dir):
+            continue
+        try:
+            managers = sorted(os.listdir(user_dir))
+        except OSError:
+            continue
+        for manager in managers:
+            manager_dir = os.path.join(user_dir, manager)
+            if manager.startswith("user@") and manager.endswith(".service") \
+                    and os.path.isdir(manager_dir):
+                bases.append(manager_dir)
+    return bases
+
+
 def guest_cgroups(root: str | None = None) -> list[str]:
     """The guest's cgroups that exist on this host.
 
@@ -757,18 +793,55 @@ def guest_cgroups(root: str | None = None) -> list[str]:
     explicit = os.environ.get(GUEST_CGROUP_ENV)
     if explicit is not None:
         return [path for path in explicit.split(":") if path and os.path.isdir(path)]
-    root = root or os.environ.get(CGROUP_ROOT_ENV) or platform.CGROUP_ROOT
-    bases = [root]
-    users = os.path.join(root, "user.slice")
-    try:
-        for user in sorted(os.listdir(users)):
-            for manager in sorted(os.listdir(os.path.join(users, user))):
-                if manager.startswith("user@") and manager.endswith(".service"):
-                    bases.append(os.path.join(users, user, manager))
-    except OSError:
-        pass
-    paths = [os.path.join(base, slice_path(name)) for base in bases for name in GUEST_SLICES]
+    paths = [os.path.join(base, slice_path(name))
+             for base in host_cgroup_bases(root) for name in GUEST_SLICES]
     return [path for path in paths if os.path.isdir(path)]
+
+
+def runner_cgroups(root: str | None = None) -> list[dict]:
+    """#4433: the cgroups of this host's per-agent runners, measured.
+
+    Every runner is one unit in `ameesh-agents.slice`
+    (`ameesh-runner-agent@<agent>.service` on a workstation or a mesh VM,
+    `ameesh-runner@<agent>.service` on an L55 server), under the system
+    manager or each user manager. Each entry is
+    `{agent, unit, path, mem_current_bytes, mem_max_bytes, mem_used, mem_some}`:
+    the memory charged to the cgroup against its `memory.max` (share, None
+    when unreadable or unlimited) and its own `memory.pressure` (`some`,
+    60 s average). A measure the cgroup does not give stays None; nothing is
+    guessed. Sorted by path so a reading is stable."""
+    out: dict[str, dict] = {}
+    for base in host_cgroup_bases(root):
+        agents_slice = os.path.join(base, slice_path("ameesh-agents.slice"))
+        try:
+            units = sorted(os.listdir(agents_slice))
+        except OSError:
+            continue
+        for unit in units:
+            agent = None
+            for prefix in RUNNER_UNIT_PREFIXES:
+                if unit.startswith(prefix) and unit.endswith(RUNNER_UNIT_SUFFIX):
+                    agent = unit[len(prefix):-len(RUNNER_UNIT_SUFFIX)]
+                    break
+            if not agent:
+                continue
+            path = os.path.join(agents_slice, unit)
+            if path in out:
+                continue
+            current = platform.cgroup_memory_bytes(path)
+            maximum = platform.cgroup_memory_max(path)
+            pressure = platform.cgroup_pressure("memory", path)
+            out[path] = {
+                "agent": agent,
+                "unit": unit,
+                "path": path,
+                "mem_current_bytes": current,
+                "mem_max_bytes": maximum,
+                "mem_used": (round(min(1.0, current / maximum), 4)
+                             if current is not None and maximum else None),
+                "mem_some": pressure.get("some", {}).get("avg60"),
+            }
+    return [out[path] for path in sorted(out)]
 
 
 def slice_path(name: str) -> str:
@@ -1196,7 +1269,12 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     out.update(_CPU_METER.read(cgroups=cgroups))
     # #2814 : la mesure du cgroup de CE processus, publiée avec le relevé ;
     # elle sert l'admission (`own_cgroup`) et `ameesh hosts` sur un conteneur
-    out["cgroup"] = _CGROUP_METER.read()
+    cgroup = _CGROUP_METER.read()
+    # #4433 : les cgroups des autres exécuteurs de l'hôte, pour imputer une
+    # PSI mémoire d'hôte au runner qui récupère contre son propre memory.max
+    # (voir `runner_pressure_attribution`).
+    cgroup["runners"] = runner_cgroups()
+    out["cgroup"] = cgroup
     return out
 
 
@@ -1645,6 +1723,52 @@ def swap_ceiling_applies(reading: dict, limits: dict) -> bool:
     return psi > limit * SWAP_PRESSURE_SHARE
 
 
+def runner_pressure_attribution(reading: dict, limits: dict) -> list[dict]:
+    """#4433 : la pression mémoire de l'hôte expliquée par des cgroups de runner.
+
+    Une PSI mémoire d'hôte agrège les stalls de tous ses cgroups : un runner
+    qui récupère contre son propre `memory.max` (jest à six workers sans
+    `--maxWorkers`, auditeur 29/10) fait monter la PSI de l'hôte alors que la
+    mémoire de l'hôte reste disponible, et l'admission en périmètre `host`
+    mettait tout l'hôte en pause. Un runner rend compte de la brèche quand :
+
+    * `MemAvailable` reste au-dessus du plancher `min_mem_available` — l'hôte
+      n'est pas à court de mémoire ;
+    * son cgroup est à au moins `max_cgroup_memory_used` de son `memory.max` ;
+    * sa propre PSI mémoire (`memory.pressure`, `some` 60 s) est au moins
+      celle de l'hôte : la PSI d'un parent agrège ses enfants, donc un enfant
+      qui vaut le parent rend compte de tous les stalls de l'hôte sur la
+      fenêtre.
+
+    Rend les cgroups attribués (liste vide sinon). Plusieurs runners peuvent
+    être à leur plafond en même temps : ils sont tous rendus, chacun retenu
+    pour ses propres tours. Aucune mesure (cgroup absent, `memory.max` infini
+    ou illisible, PSI du cgroup absente) ne devine : la brèche reste celle de
+    l'hôte.
+    """
+    available = reading.get("mem_available_bytes")
+    floor = limits.get("min_mem_available")
+    if available is None or floor is None or available < floor:
+        return []
+    psi = reading.get("psi_mem_some")
+    limit = limits.get("max_mem_pressure")
+    share = limits.get("max_cgroup_memory_used")
+    if psi is None or limit is None or share is None or psi <= limit:
+        return []
+    stored = reading.get("cgroup")
+    runners = stored.get("runners") if isinstance(stored, dict) else None
+    out = []
+    for entry in runners or ():
+        if not isinstance(entry, dict):
+            continue
+        used = finite_float(entry.get("mem_used"))
+        own = finite_float(entry.get("mem_some"))
+        if used is None or own is None or used < share or own < psi:
+            continue
+        out.append(entry)
+    return out
+
+
 def breaches(reading: dict, limits: dict) -> list[dict]:
     """Les seuils franchis par un relevé, du plus grave au moins grave.
 
@@ -1665,6 +1789,13 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     plafonds `max_cgroup_memory_used` et `max_cgroup_throttled` s'ajoutent.
     En périmètre `host`, les mesures de cgroup sont ignorées : le relevé de
     l'hôte reste la référence.
+
+    #4433 : en périmètre `host`, une PSI mémoire franchie qui s'explique par
+    des cgroups de runner à leur propre `memory.max` n'est pas un
+    franchissement de l'HÔTE (`runner_pressure_attribution`) : ces
+    franchissements sortent marqués `attributed` (et nomment leur runner), et
+    `pressure` ne retient que ceux du runner qui interroge. La brèche de
+    `min_mem_available`, elle, reste celle de l'hôte.
     """
     out: list[dict] = []
     scope = limits.get("pressure_scope", "host")
@@ -1766,11 +1897,31 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     mem_pressure = cg("mem_some") if own else reading.get("psi_mem_some")
     limit = limits.get("max_mem_pressure")
     if mem_pressure is not None and limit is not None and mem_pressure > limit:
-        out.append({"key": "max_mem_pressure",
-                    "label": "memory pressure (PSI some 60 s%s)"
-                    % (", own cgroup" if own else ""),
-                    "value": mem_pressure, "limit": limit,
-                    "critical": mem_pressure >= limit + (100.0 - limit) / 2.0})
+        critical = mem_pressure >= limit + (100.0 - limit) / 2.0
+        attributed = [] if own else runner_pressure_attribution(reading, limits)
+        if attributed:
+            # #4433 : la PSI de l'hôte suit un cgroup de runner à son plafond ;
+            # le franchissement nomme ce runner au lieu de retenir l'hôte.
+            for entry in attributed:
+                out.append({
+                    "key": "max_mem_pressure",
+                    "label": "memory pressure (PSI some 60 s) of runner %s at its "
+                             "memory.max" % (entry.get("agent")
+                                             or entry.get("unit") or "?"),
+                    "value": mem_pressure, "limit": limit, "critical": critical,
+                    "attributed": True,
+                    "agent": entry.get("agent"), "unit": entry.get("unit"),
+                    "path": entry.get("path"), "cgroup": entry.get("path"),
+                    "mem_used": entry.get("mem_used"),
+                    "mem_current_bytes": entry.get("mem_current_bytes"),
+                    "mem_max_bytes": entry.get("mem_max_bytes"),
+                    "mem_some": entry.get("mem_some")})
+        else:
+            out.append({"key": "max_mem_pressure",
+                        "label": "memory pressure (PSI some 60 s%s)"
+                        % (", own cgroup" if own else ""),
+                        "value": mem_pressure, "limit": limit,
+                        "critical": critical})
     # L159d: CPU pressure of the host; critical halfway between the ceiling
     # and 100 %. #2814: the cgroup's own CPU PSI in own-cgroup mode.
     cpu_pressure = cg("cpu_some") if own else reading.get("psi_cpu_some")
@@ -1949,13 +2100,22 @@ def power_state(reading: dict | None, limits: dict | None = None) -> dict:
     return out
 
 
-def pressure(reading: dict, policy=None, *, limits: dict | None = None) -> dict:
+def pressure(reading: dict, policy=None, *, limits: dict | None = None,
+             own_path: str | None = None, own_agents=()) -> dict:
     """État de pression d'un hôte : seuils effectifs et franchissements.
 
     `critical` est vrai dès qu'un franchissement est critique ; `blocked` est
     vrai dès qu'un seuil est franchi (aucun NOUVEAU tour, les tours en cours
     finissent). `limits` permet de réutiliser des seuils déjà calculés (cache
     de l'exécuteur) ; sinon ils viennent de `policy`.
+
+    #4433 : `own_path` (le cgroup de l'exécuteur qui interroge) et/ou
+    `own_agents` (les agents qu'il sert) disent QUI demande. Un
+    franchissement mémoire `attributed` à un runner ne bloque que ce runner :
+    le verdict d'un autre exécuteur de l'hôte reste ouvert. Le chemin du
+    cgroup fait foi quand il est connu (un exécuteur générique ne doit pas
+    retenir ses autres agents) ; à défaut, le nom de l'agent attribué tranche.
+    `attributed` porte toujours les franchissements imputés, pour l'alerte.
     """
     if limits is None:
         limits = thresholds(policy)
@@ -1969,6 +2129,21 @@ def pressure(reading: dict, policy=None, *, limits: dict | None = None) -> dict:
         limits = dict(limits, pressure_scope="host")
         scope = "host"
     found = breaches(reading, limits)
+    # #4433 : une brèche imputée à un runner n'est pas celle de l'hôte. Elle
+    # ne retient que l'exécuteur qu'elle nomme ; `own_path` fait foi sur
+    # `own_agents` quand il est lisible.
+    attributed = [b for b in found if b.get("attributed")]
+    host_found = [b for b in found if not b.get("attributed")]
+    mine: list[dict] = []
+    if attributed and (own_path or own_agents):
+        agents = set(own_agents or ())
+        for entry in attributed:
+            if own_path:
+                if entry.get("cgroup") == own_path:
+                    mine.append(entry)
+            elif entry.get("agent") in agents:
+                mine.append(entry)
+    kept = host_found + mine
     stored_cgroup = reading.get("cgroup") if isinstance(reading.get("cgroup"), dict) else {}
 
     def cgroup_value(key):
@@ -1980,9 +2155,10 @@ def pressure(reading: dict, policy=None, *, limits: dict | None = None) -> dict:
     verdict = {
         "limits": limits,
         "scope": scope,
-        "breaches": found,
-        "blocked": bool(found),
-        "critical": any(b["critical"] for b in found),
+        "breaches": kept,
+        "attributed": attributed,
+        "blocked": bool(kept),
+        "critical": any(b["critical"] for b in kept),
         "power": power_state(reading, limits),
         # #2814: the cgroup measure the verdict was made on (None keys when
         # the executor is not measuring one)

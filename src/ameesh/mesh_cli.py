@@ -58,6 +58,8 @@ hold its private key.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import argparse
 import getpass
 import json
@@ -218,8 +220,11 @@ def agent_detail(db, name: str, *, cfg=None, footprint: bool = False) -> dict | 
         from . import host_idle, resources, canon as canon_mod
         try:
             readings = {r["host"]: r for r in resources.current(db, row["host"])}
+            controls = {r["host"]: r
+                        for r in storage.of(db).host_lifecycle.listing()}
             row["footprint"] = host_idle.snapshot(
-                cfg, db, canon_mod.load_configured(cfg), readings).get(row["host"])
+                cfg, db, canon_mod.load_configured(cfg), readings,
+                controls=controls).get(row["host"])
         except Exception as exc:  # optional diagnostics must not hide the agent
             row["footprint_unavailable"] = " ".join(str(exc).split())[:120]
     return row
@@ -343,7 +348,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         for lot in lots:
             if lot.get("assignee") and lot.get("state") not in work.TERMINAL:
                 open_by_agent[lot["assignee"]] = open_by_agent.get(lot["assignee"], 0) + 1
-                if lot.get("state") == "build":
+                if lot.get("state") == lifecycle.IN_PROGRESS:
                     # §4 (owner 14/10/2026) : le compte d'en-cours est tous
                     # projets confondus, comme le plafond lui-même
                     build_by_agent[lot["assignee"]] = build_by_agent.get(lot["assignee"], 0) + 1
@@ -549,7 +554,9 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
     holds = host_holds.live(db)
     latest_by_host = {row["host"]: row for row in res.current(db)}
     from . import host_idle
-    footprints = host_idle.snapshot(cfg, db, canons, latest_by_host)
+    # #4148: show the durable release state next to the read-only footprint.
+    controls = {row["host"]: row for row in storage.of(db).host_lifecycle.listing()}
+    footprints = host_idle.snapshot(cfg, db, canons, latest_by_host, controls=controls)
     # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
     # worktrees suivis)
     hk = storage.of(db).housekeeping
@@ -794,6 +801,15 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                     parts.append("memory PSI %.1f %%" % cgroup["mem_some"])
                 if parts:
                     print("  cgroup     %s" % "; ".join(parts))
+            # #4433 : la PSI mémoire de l'hôte suit un runner à son propre
+            # memory.max — la brèche est nominative, l'hôte n'est pas retenu.
+            for runner in (verdict or {}).get("attributed") or ():
+                print("  pressure   runner %s at %s of its memory.max (%s); its own "
+                      "memory PSI %s — its new turns are held, the host's are not"
+                      % (runner.get("agent") or runner.get("unit") or "?",
+                         res.fmt_value("max_cgroup_memory_used", runner.get("mem_used")),
+                         _fmt_bytes(runner.get("mem_max_bytes")),
+                         res.fmt_value("max_mem_pressure", runner.get("mem_some"))))
             manque = res.unmeasured(latest)
             if manque:
                 # L64: a measure the host cannot give, said rather than a "—"
@@ -3220,7 +3236,10 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
             "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
             "permission_mode", "lot_wake", "resident", "resident_sleep",
-            "resident_reread_max")
+            "resident_reread_max",
+            # #4293 : binaire du harnais pour cet agent (canari d'adoption) ;
+            # vide = revenir au binaire de l'hôte (PATH / harness_bins)
+            "harness_bin")
 #: L76: settings written in the local state of the agent's host only
 LOCAL_SET_KEYS = ("mail_batch", "permission_mode", "resident", "resident_sleep",
                   "resident_reread_max")
@@ -3317,7 +3336,8 @@ def cmd_set(cfg: Config, args) -> int:
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
                       "permission_mode=auto|acceptEdits|… lot_wake=on|off "
-                      "resident=on|off resident_sleep=30m|0 resident_reread_max=50M|0"
+                      "resident=on|off resident_sleep=30m|0 resident_reread_max=50M|0 "
+                      "harness_bin=/absolute/path (empty = host binary)"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -3335,6 +3355,14 @@ def cmd_set(cfg: Config, args) -> int:
             if cle == "tier" and valeur and not _TIER_RE.match(valeur):
                 print("invalid tier: %r (e.g. fast, flex)" % valeur, file=sys.stderr)
                 return 2
+            if cle == "harness_bin" and valeur:
+                # #4293 : un chemin absolu, jamais un nom cherché dans le PATH
+                # (le canari doit nommer exactement le binaire évalué) ; la
+                # présence est vérifiée à la résolution, sur l'hôte de l'agent.
+                if "\x00" in valeur or "\n" in valeur or not os.path.isabs(valeur):
+                    print("invalid harness_bin: %r (an absolute path; empty = the "
+                          "host binary)" % valeur, file=sys.stderr)
+                    return 2
             if cle == "context_max_tokens" and valeur:
                 try:
                     valeur = str(parse_token_count(valeur))
@@ -3467,10 +3495,11 @@ def cmd_set(cfg: Config, args) -> int:
         reveil_txt = agent.get("lot_wake") or "default (%s)" % ("on" if cfg.lot_wake else "off")
         print("%s: model=%s effort=%s tier=%s session=%s mode=%s context=%s "
               "turn_max_s=%s mail_per_turn=%s background_grace_s=%s mail_batch=%s "
-              "lot_wake=%s (takes effect at the next turn)"
+              "lot_wake=%s harness_bin=%s (takes effect at the next turn)"
               % (args.agent, modele, effort, tier, politique,
                  agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
-                 grace_txt, regroupement_txt, reveil_txt))
+                 grace_txt, regroupement_txt, reveil_txt,
+                 agent.get("harness_bin") or "host binary"))
         for local in LOCAL_SET_KEYS:
             if local in valeurs and (agent.get("host") or "") not in ("", cfg.host):
                 print("warning: %s is read from the local state of the agent's host "
@@ -4471,8 +4500,12 @@ def build_parser() -> argparse.ArgumentParser:
     pa_login.add_argument("harness", help="harness: " + ", ".join(login_cli_mod.adapter_names()))
     pa_login.add_argument("account", nargs="?", default=None,
                           help="declared account (default: the harness's primary account)")
-    pa_login.add_argument("--approver", required=True,
+    pa_login.add_argument("--approver", default=None,
                           help="human:<id> who will sign the challenge")
+    pa_login.add_argument("--token-file", metavar="FILE",
+                          help="import a human-issued Claude setup-token (0600 file, or - for stdin)")
+    pa_login.add_argument("--expires-at", type=float, default=None, metavar="UNIX_TIMESTAMP",
+                          help="issuer expiry of an imported setup-token; omitted means unknown")
     pa_login.add_argument("--scope", default="", help="short text shown in the signed summary")
     pa_login.add_argument("--wait", type=float, default=login_cli_mod.TTL_WAIT_S,
                           help="bounded wait for the receipt, in seconds (default 900)")

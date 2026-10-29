@@ -69,9 +69,12 @@ declared merge, `work merged`) or `{action}` (a merge confirmed by the gate).
 cannot select it. Installed entry points cannot declare connectors, and a name
 declared twice or taken by the core is refused. `registry.merge_connector()`
 replaces `work_lifecycle.delivery_connector()`. The lot journal names the
-connector (`[via <connector>]`); storage is unchanged. Merges observed by the
-sweeps and the packet and merge-queue paths (`plan_git`, `plan_github`,
-`packet_close`, `merge_pr`, `fire`) still call `work.close_merged` directly.
+connector (`[via <connector>]`); storage is unchanged. Tranche 2b (#4366)
+routes the merges observed by the sweeps and the packet and merge-queue paths
+(`plan_git`, `plan_github`, `packet_close`, `merge_pr`, `fire`) through the
+same verb, with a third `git-merge` evidence `{seen: <source>, sha, pr}`; a
+test refuses any new direct call to `work.close_merged` outside the
+`git-merge` connector and `work.record_merge`.
 
 The boundary check preserves the current runtime behavior. Module activation,
 renamed persisted states, validation as a stored state, extraction of development

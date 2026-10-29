@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#3728 — archive, then removal, of a worktree of an ended lot kept only for
-modified or untracked files (#3734: or for ignored files only).
+modified or untracked files (#3734: or for ignored files only; #4442: or for
+commits absent from the forge).
 
-The housekeeping keeps such a worktree for good (`kept — N file(s) modified
-or untracked`): 137 on ameesh-agents-2 and 147 on ameesh-agents-1 on
-26/10/2026, most of them of lots merged days before, and nothing ever
-removed them. Past `policy.housekeeping.dirty_worktree_after` (a duration of
-the Host card, compiled from the canon; undeclared: nothing is archived),
-the pass archives what removing it would lose, then removes it like a kept
-merged worktree (`housekeeping._remove_kept_worktree`):
+The housekeeping keeps such a worktree for good (`kept — modified or
+untracked files`, `kept — commits not pushed`): 137 on ameesh-agents-2 and 147
+on ameesh-agents-1 on 26/10/2026, most of them of lots merged days before,
+and nothing ever removed them; #4442 counted 491 kept worktrees. Past
+`policy.housekeeping.dirty_worktree_after` (a duration of the Host card,
+compiled from the canon; undeclared: nothing is archived), the pass archives
+what removing it would lose, then removes it like a kept merged worktree
+(`housekeeping._remove_kept_worktree`):
 
 - `staged.patch` (`git diff --cached --binary HEAD`: HEAD → index) and
   `unstaged.patch` (`git diff --binary`: index → working copy), two layers so
@@ -20,16 +22,20 @@ merged worktree (`housekeeping._remove_kept_worktree`):
   regenerable build output (`artifacts` rules: node_modules, target) and the
   cache directories (`EXCLUDED_NAMES`; #3734: a file or a link so named is
   archived); symbolic links stored as links, never followed;
+- `HEAD.bundle` (#4442): `git bundle create … HEAD --not --remotes`, so the
+  commits no remote holds survive the removal; absent when every commit of
+  HEAD is on a remote (an empty bundle is refused by git). Fetched back with
+  `git fetch <archive>/HEAD.bundle HEAD:refs/heads/<name>`;
 - `manifest.json`: path, branch, HEAD, lot, `git status`, the archived files,
-  sizes, and `retain_until_ts` (`policy.housekeeping.dirty_archive_retention`).
+  sizes, the bundle and its commit count, and `retain_until_ts`
+  (`policy.housekeeping.dirty_archive_retention`).
 
 Archives live under `<state>/.menage/worktree-archives/` (mode 0700: an
 ignored `.env` may hold a secret), are written under a `.partial-` name then
 renamed, and go once their `retain_until_ts` is past (`prune`). The guards of
-the removal (lot ended, no commit missing from the forge, no process, no git
-lock, no turn in progress, idle) are the caller's; this module refuses
-(`ArchiveRefused`) whatever it cannot archive whole: in doubt, the worktree
-stays."""
+the removal (lot ended, no process, no git lock, no turn in progress, idle)
+are the caller's; this module refuses (`ArchiveRefused`) whatever it cannot
+archive whole: in doubt, the worktree stays."""
 from __future__ import annotations
 
 import json
@@ -232,13 +238,31 @@ def _write(path: str, data: bytes) -> None:
         os.fsync(fh.fileno())
 
 
+def unpushed_commits(path: str, *, timeout=GIT_TIMEOUT) -> int:
+    """#4442 : commits de HEAD qu'aucune branche distante ne porte (0 : tout
+    est sur la forge). Un Git illisible est un refus : sans ce compte, on ne
+    peut pas prouver que les commits seront archivés."""
+    raw = _git(path, "rev-list", "--count", "HEAD", "--not", "--remotes",
+               timeout=timeout).stdout.strip()
+    try:
+        return int(raw or b"0")
+    except ValueError as exc:
+        raise ArchiveRefused("git rev-list count unreadable (%r)" % raw[:40]) from exc
+
+
+def _restore_ref(name: str) -> str:
+    return "ameesh-archive-" + re.sub(r"[^0-9A-Za-z._-]", "-", name)
+
+
 def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
-            branch: str = "", head: str = "", now: float | None = None,
-            retention_s: float, max_bytes: int | None = None,
-            max_files: int | None = None, deadline: float | None = None) -> dict:
+            branch: str = "", head: str = "", repo: str = "",
+            now: float | None = None, retention_s: float,
+            max_bytes: int | None = None, max_files: int | None = None,
+            deadline: float | None = None) -> dict:
     """Archives the worktree `path` under `root` (created 0700). Returns
     `archive` (its directory), `bytes` (on disk), `patch_bytes`, `files`
-    (untracked archived), `tracked` (tracked entries changed),
+    (untracked archived), `tracked` (tracked entries changed), `commits`
+    (#4442: commits of HEAD absent from every remote, bundled) and
     `retain_until_ts`. `ArchiveRefused` when it cannot be whole: nothing is
     left behind (the partial directory is deleted)."""
     now = time.time() if now is None else now
@@ -288,6 +312,12 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
     if size + len(staged) + len(unstaged) > max_bytes:
         raise ArchiveRefused("%d bytes to archive (limit %d)" % (
             size + len(staged) + len(unstaged), max_bytes))
+    # #4442 : les commits qu'aucune branche distante ne porte partent dans
+    # `HEAD.bundle`, sinon retirer le worktree perdrait ce travail. Le compte
+    # est lu avant de créer le dossier partiel (un bundle vide est refusé par
+    # git, et un worktree sans commit non poussé n'en a pas besoin).
+    commits = unpushed_commits(path, timeout=_timeout()) if head else 0
+    bundle_bytes = 0
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
     label = re.sub(r"[^0-9A-Za-z._-]", "_", os.path.basename(path.rstrip("/")))[:80] or "wt"
     name = "%s-lot%s-%s-%s" % (stamp, re.sub(r"[^0-9A-Za-z]", "", str(lot or "")),
@@ -318,16 +348,38 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
                 if sorted(m.name for m in tar.getmembers()) != sorted(
                         os.path.normpath(rel) for rel in files):
                     raise ArchiveRefused("untracked.tar.gz does not hold every file")
+        if commits:
+            bundle_path = os.path.join(partial, "HEAD.bundle")
+            _check()
+            _git(path, "bundle", "create", bundle_path, "HEAD", "--not", "--remotes",
+                 timeout=_timeout())
+            try:
+                bundle_bytes = os.stat(bundle_path).st_size
+            except OSError as exc:
+                raise ArchiveRefused("HEAD.bundle not written (%s)" % exc) from exc
+            _check()
+            # #4442 : le bundle compte dans la borne, comme les patchs (N1 de
+            # #3728) ; un bundle trop gros refuse l'archive entière.
+            if size + len(staged) + len(unstaged) + bundle_bytes > max_bytes:
+                raise ArchiveRefused("%d bytes to archive (limit %d)" % (
+                    size + len(staged) + len(unstaged) + bundle_bytes, max_bytes))
+        ref = _restore_ref(name)
+        restore = (["git -C %s fetch %s/HEAD.bundle HEAD:refs/heads/%s"
+                    % (repo or "<repo>", final, ref)]
+                   if commits else []) + [
+            "git worktree add --detach <path> %s" % (ref if commits else head or "<HEAD>")]
         manifest = {
             "schema": "ameesh-worktree-archive/1", "path": path, "branch": branch,
-            "head": head, "lot": lot, "lot_state": state, "archived_ts": now,
-            "retain_until_ts": now + float(retention_s), "status": entries,
-            "untracked": files, "untracked_bytes": size,
+            "head": head, "repo": repo, "lot": lot, "lot_state": state,
+            "archived_ts": now, "retain_until_ts": now + float(retention_s),
+            "status": entries, "untracked": files, "untracked_bytes": size,
             "patch_bytes": len(staged) + len(unstaged),
+            "commits": commits, "bundle": "HEAD.bundle" if commits else None,
+            "bundle_bytes": bundle_bytes, "restore_ref": ref if commits else None,
             # dev3 B2: `git apply` refuses an empty patch (exit 128): only
             # the layers that hold something are in the command
             "restore": " && ".join(
-                ["git worktree add --detach <path> %s" % (head or "<HEAD>")]
+                restore
                 + (["git -C <path> apply --index --binary %s/staged.patch" % final]
                    if staged else [])
                 + (["git -C <path> apply --binary %s/unstaged.patch" % final]
@@ -348,6 +400,7 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
     return {"archive": final, "bytes": disk_bytes(final),
             "patch_bytes": len(staged) + len(unstaged),
             "files": len(files), "tracked": len(tracked),
+            "commits": commits, "bundle_bytes": bundle_bytes,
             "retain_until_ts": manifest["retain_until_ts"]}
 
 

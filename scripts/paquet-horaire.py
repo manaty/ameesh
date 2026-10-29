@@ -37,12 +37,15 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    propres, §2 : aucun avis) — avec une résolution le geste reste au pilote
    (#1979) et le courrier le dit ; puis `ameesh ci run <porteur> --full`, qui
    arme la fusion automatique (`packet_automerge`, tic de release).
-4. **Rouge.** À la composition, un test ciblé rouge est attribué par la même
-   lecture que #3801 (`packet_red`) : l'unité désignée par une preuve forte
-   est retirée, son auteur prévenu, et `paquet-auto.py` recompose sans elle
-   dans le même lancement (#3931) — la tentative n'est pas perdue. Sans
-   attribution sûre, `paquet-auto.py` garde son échec antérieur (contrat rouge
-   ou reprise bornée) et le pilote est prévenu. Sur la ci-full rouge de la tête
+4. **Rouge.** À la composition, un test ciblé rouge **d'un module voisin**
+   est situé en le rejouant sur les préfixes de l'empilement (#4217) : la
+   première unité où il apparaît est retirée, son auteur prévenu, et
+   `paquet-auto.py` recompose sans elle dans le même lancement — la tentative
+   n'est pas perdue. Les rouges propres et les contrats gardent la lecture
+   #3801 (`packet_red`) : l'unité désignée par une preuve forte est retirée
+   (#3931). Sans attribution sûre (rejeu des préfixes illisible, contrat
+   rouge), `paquet-auto.py` ne retire rien, prévient le pilote et garde son
+   échec antérieur. Sur la ci-full rouge de la tête
    gelée : un rouge **déterministe** (chaque échec de test propre au paquet
    attribué par #3801 à une seule unité probable, rejoué rouge en local sur la
    tête) retire ces unités ; le paquet est recomposé sans elles
@@ -53,8 +56,9 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    de son assigné jusqu'à un nouveau gel, et l'alerte SLO vise l'auteur, pas
    le pilote. Un rouge non concluant (§3 : run annulé ou
    hors délai, échec de job sans test, échec non attribuable ou ambigu, test
-   vert en local) ne retire rien : il est consigné au journal du porteur et le
-   pilote est prévenu, une fois.
+   vert en local, erreur de fixture DB en QueryCanceled/timeout) ne retire
+   rien : il est consigné au journal du porteur et le pilote est prévenu, une
+   fois.
 5. **Reprise.** Chaque lancement de `paquet-auto.py` laisse d'abord une
    marque « tentative » (étape, tête de départ, hôte:pid, époque du bail) ;
    son achèvement se lit à la tête gelée qui a bougé, son échec à une marque
@@ -101,6 +105,13 @@ partagé (`packet.pause`, `ameesh.packet_pause`), pas sur l'hôte : un bail qui
 change de main la garde. Pendant la pause, le tic ne fait aucun geste (ni
 migration ni composition) et le dit ; à l'échéance il reprend seul ; `resume`
 lève avant. Pose et levée sont dites au pilote et au bureau.
+
+**Cohérence de version (#4473).** Le tic exécute le script de la cible exacte
+(`check_fresh`) ; `main()` met `src/` de ce même clone en tête de `sys.path`
+et de `PYTHONPATH`, si bien que sa bibliothèque `ameesh`, la CLI et les
+migrations viennent de la cible, jamais du venv installé. Un hôte revenu en
+arrière ne fait donc plus échouer l'import d'un module récent (`packet_pause`)
+par le script de main.
 
 Ce script ne fusionne jamais : la fusion reste celle de `packet_automerge`
 sur la tête gelée, CI requise verte. Les marques d'idempotence sont des notes
@@ -176,6 +187,8 @@ CARRIER_ESTIMATE = "165m"
 CARRIER_ESTIMATE_SOURCE = "auditeur #153989, 28/10/2026 : médiane 164 min sur 112 paquets (#4113)"
 CREATED_RE = re.compile(r"^lot #(\d+) created", re.MULTILINE)
 SCRIPT_DIR = Path(__file__).resolve().parent
+#: #4473 : la bibliothèque du même arbre que le script (voir `use_tree_library`)
+TREE_SRC = SCRIPT_DIR.parent / "src"
 LIST_LIMIT = 300
 COMMAND_TIMEOUT = 600
 COMPOSE_TIMEOUT = 3 * 3600
@@ -206,6 +219,41 @@ def _load_auto():
 
 
 auto = _load_auto()
+
+
+def use_tree_library(src: Path | None = None) -> str:
+    """#4473 : le script et sa bibliothèque viennent du même arbre.
+
+    Le tic exécute le script de la cible (`check_fresh`), mais l'unité le
+    lançait avec le Python du venv **installé** : après un retour arrière de
+    l'hôte, le script de main importait une bibliothèque plus ancienne
+    (`packet_pause` absent) et sortait en « pause illisible », sans composer.
+    On met donc `src/` de l'arbre du script en tête de `sys.path` et dans
+    `PYTHONPATH` : les enfants (`ameesh` CLI, migrations, outils) héritent de
+    la même bibliothèque. Le staging reste la version **déployée** (§14) :
+    le tic est l'outil qui compose la cible, il doit lire le code de la cible
+    exacte que `check_fresh` vient de vérifier, pas celui d'un venv en retard
+    ou revenu en arrière.
+
+    Rend le chemin chargé, ou "" si `src/ameesh` manque ou si un `ameesh`
+    déjà importé vient d'ailleurs : dans ce cas l'appelant refuse le geste
+    plutôt que de mélanger les deux versions.
+    """
+    root = (Path(src) if src is not None else TREE_SRC).resolve()
+    if not (root / "ameesh" / "__init__.py").is_file():
+        return ""
+    path = str(root)
+    if path in sys.path:
+        sys.path.remove(path)
+    sys.path.insert(0, path)
+    parts = [part for part in (os.environ.get("PYTHONPATH") or "").split(os.pathsep)
+             if part and part != path]
+    os.environ["PYTHONPATH"] = os.pathsep.join([path, *parts])
+    import ameesh
+    loaded = getattr(ameesh, "__file__", "") or ""
+    if not loaded or Path(loaded).resolve().parent.parent != root:
+        return ""
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -1699,6 +1747,12 @@ def main(argv: list[str] | None = None) -> int:
         each.add_argument("--by", default=None,
                           help="auteur (défaut : AGENT_MAIL_NAME, AMEESH_ROLE, USER)")
     args = parser.parse_args(argv)
+    if not use_tree_library():
+        loaded = getattr(sys.modules.get("ameesh"), "__file__", "") or "aucune"
+        print("paquet-horaire : bibliothèque ameesh de l'arbre %s indisponible "
+              "ou déjà chargée ailleurs (%s) : aucun geste" % (TREE_SRC, loaded),
+              file=sys.stderr)
+        return 1
     if args.command in ("pause", "resume", "status"):
         return main_pause(args)
     repo = Path(args.repo).resolve()

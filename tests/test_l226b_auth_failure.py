@@ -424,6 +424,34 @@ class ChooseTest(_AuthBase):
         self.assertEqual(accounts.choose(self.db, self.cfg.host, "codex", items, book,
                                          now=now).profile.name, "primaire")
 
+    def test_forced_failing_account_is_skipped_and_switch_is_logged(self):
+        items = self._items()
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+        store = storage.of(self.db).accounts
+        store.force_switch(self.cfg.host, "codex", initial="primaire", to="primaire",
+                           reason="test force", agent="test", forced_until=time.time() + 3600,
+                           now=time.time())
+        self._report("codex", "primaire", "failing", "turn")
+        choice = accounts.choose(self.db, self.cfg.host, "codex", items, book)
+        self.assertEqual(choice.profile.name, "secondaire")
+        self.assertIn("skipped authentication failing accounts", choice.why)
+        self.assertFalse(store.active(self.cfg.host, "codex")["forced"])
+        # A failure belongs to its host: another host retains the primary.
+        other = accounts.choose(self.db, self.cfg.host + "-other", "codex", items, book,
+                                simulate=True)
+        self.assertEqual(other.profile.name, "primaire")
+
+    def test_forced_failing_account_without_replacement_is_auth_blocked(self):
+        items = self._items()
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+        storage.of(self.db).accounts.force_switch(
+            self.cfg.host, "codex", initial="primaire", to="primaire", reason="test",
+            agent="test", forced_until=time.time() + 3600, now=time.time())
+        for name in ("primaire", "secondaire"):
+            self._report("codex", name, "failing", "turn")
+        choice = accounts.choose(self.db, self.cfg.host, "codex", items, book)
+        self.assertTrue(choice.auth_blocked)
+
     def test_no_healthy_account_is_auth_blocked_not_a_budget_pause(self):
         items = self._items()
         book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)

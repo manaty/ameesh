@@ -1057,9 +1057,10 @@ def run(cfg, db, args) -> int:
                 # lot/freeze/branch/target and read back the remote result.
                 # Its scratch clone is gone; the caller's checkout need not
                 # contain the commit required by a manual work.merged call.
-                recorded = work.close_merged(
-                    db, args.lot, sha=sha, actor=actor, source="merge-pr",
-                    pr_ref="%s#%d" % (slug, args.pr),
+                recorded = work.deliver(
+                    db, args.lot, connector=work.merge_connector(),
+                    evidence={"seen": "merge-pr", "sha": sha,
+                              "pr": "%s#%d" % (slug, args.pr)}, actor=actor,
                     extra="ameesh work merge-pr %d --head %s (merge outside gh, "
                          "#1003/REL-11)" % (args.pr, out["frozen"][:12]))
                 if recorded["result"] not in ("merged", "already"):

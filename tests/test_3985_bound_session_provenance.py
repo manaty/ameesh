@@ -126,6 +126,37 @@ class BoundSessionProvenanceTest(PgTestCase):
         self.assertEqual(ident["turn"], "t" * 32)
         self.assertNotIn("session", ident)
 
+    # -- #4485 : le nom annoncé ne masque plus la liaison ------------------
+    def test_an_announced_identity_is_covered_by_a_valid_binding(self):
+        """Un shell qui a gardé AGENT_MAIL_NAME ne masque pas sa liaison.
+
+        C'était l'écart du bureau : `_identity` refusait dès qu'un nom était
+        annoncé sans tour, sans jamais consulter la liaison. Une liaison
+        valide couvre désormais le nom annoncé, quand c'est le même agent."""
+        self.bind()
+        ident = prov.capture({"AGENT_MAIL_NAME": "bureau"}, families=FAMILIES,
+                             db=self.db)
+        self.assertEqual(ident["actor"], "bureau")
+        self.assertEqual(ident["session"], "s-bureau-1")
+        self.assertEqual(ident["turn"], "session:s-bureau-1")
+        self.assertEqual(ident["harness"], "codex")
+
+    def test_an_announced_identity_does_not_borrow_another_binding(self):
+        """La liaison doit nommer l'agent annoncé, pas n'importe qui."""
+        self.bind()
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            prov.capture({"AGENT_MAIL_NAME": "ameesh-cx3"},
+                         families=FAMILIES, db=self.db)
+        self.assertIn("announced but nothing proves it", str(raised.exception))
+        self.assertIn("not the agent of this bound session", str(raised.exception))
+
+    def test_an_announced_identity_without_binding_still_refuses(self):
+        with self.assertRaises(prov.ProvenanceError) as raised:
+            prov.capture({"AGENT_MAIL_NAME": "bureau"}, families=FAMILIES,
+                         db=self.db)
+        self.assertIn("announced but nothing proves it", str(raised.exception))
+        self.assertIn("session binding", str(raised.exception))
+
     # -- les refus nommés --------------------------------------------------
     def test_an_execute_agent_cannot_prove_a_family_by_binding(self):
         registry.upsert(self.db, "executeur", harness="codex",

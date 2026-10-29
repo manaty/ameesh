@@ -505,7 +505,7 @@ def _released_text(row, blocker_id, blocker_state, blocker_reason=""):
     lot = int(row["id"])
     title = (row.get("title") or "").strip()[:60]
     title = " \"%s\"" % title if title else ""
-    if blocker_state in ("merged", "promoted"):
+    if blocker_state in lifecycle.DELIVERED:
         return ("Dependency released: lot #%d is %s; lot #%d%s no longer waits on "
                 "any lot. Resume it when you are ready."
                 % (int(blocker_id), blocker_state, lot, title))

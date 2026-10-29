@@ -13,7 +13,10 @@
 # Préalable : un clone dédié du projet, `AMEESH_PAQUET_REPO`, déclaré dans
 # ~/.config/ameesh/paquet-horaire.env (avec, au besoin, AMEESH_PAQUET_TARGET,
 # AMEESH_PAQUET_PILOT). Le clone est avancé sur origin/<cible> avant chaque
-# tic : le script exécuté est celui de la cible (leçon #3767).
+# tic : le script exécuté est celui de la cible (leçon #3767), et depuis #4473
+# sa bibliothèque `ameesh` aussi (`PYTHONPATH=<clone>/src`) : un hôte revenu en
+# arrière ne fait plus importer une bibliothèque plus ancienne par le script
+# de la cible.
 #
 # Install:
 #   install -m 0644 deploy/systemd/ameesh-paquet-horaire.service \
@@ -37,7 +40,10 @@ EnvironmentFile=%h/.config/ameesh/paquet-horaire.env
 # Fatal (#3845, revue cx2) : un clone qui n'avance pas n'a pas de tic ; le
 # script revérifie aussi que sa tête est celle de origin/<cible>.
 ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull --ff-only --quiet origin ${AMEESH_PAQUET_TARGET}
+# #4473 : le script ET sa bibliothèque `ameesh` viennent du clone ; le venv
+# installé ne fournit que l'interpréteur (et la porte `role run`).
 ExecStart=%h/.local/share/ameesh/venv/bin/ameesh role run mesh-design -- \
+    /usr/bin/env PYTHONPATH=${AMEESH_PAQUET_REPO}/src \
     %h/.local/share/ameesh/venv/bin/python ${AMEESH_PAQUET_REPO}/scripts/paquet-horaire.py tick \
     --repo ${AMEESH_PAQUET_REPO} --target ${AMEESH_PAQUET_TARGET} --pilot ${AMEESH_PAQUET_PILOT}
 # Une composition (tests locaux compris) est bornée à trois heures par le script.
