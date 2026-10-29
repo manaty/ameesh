@@ -65,6 +65,7 @@ from . import accounts as accounts_mod
 PERIOD_S = 600
 #: a forecast expiry closer than this raises `credential_expiring`
 DEFAULT_WARN_HOURS = 24.0
+ACCOUNT_WARN_HOURS = 30 * 24.0
 #: Google Workspace default session length (admin console: 16 h)
 DEFAULT_GCLOUD_SESSION_HOURS = 16.0
 PROBE_TIMEOUT_S = 30
@@ -209,6 +210,12 @@ def fingerprint(harness: str, profile=None, environ=None) -> str | None:
                 return None
         name = profile.key_env or profile.env or accounts_mod.default_key_env_of(harness)
         return _digest(str(environ.get(name) or "").strip()) if name else None
+    from . import setup_token
+    if setup_token.present(profile, environ):
+        try:
+            return _digest(setup_token.read(profile, environ)[0])
+        except setup_token.TokenError:
+            return None
     home = profile.home(environ)
     if harness == "claude":
         try:
@@ -290,6 +297,22 @@ def probe_claude(profile, now: float, environ=None, run=None,
                        "API key present" if ok else "API key missing",
                        fix="set the key of account %s" % (name or "default"),
                        fingerprint=fingerprint("claude", profile, environ))
+    from . import setup_token
+    if setup_token.present(profile, environ):
+        fix = "ameesh accounts login claude %s --token-file FILE" % name
+        try:
+            token, expires = setup_token.read(profile, environ)
+        except setup_token.TokenError as exc:
+            return Verdict("claude", name, "failing", str(exc), fix=fix)
+        held = _digest(token)
+        if expires is not None and expires <= now:
+            return Verdict("claude", name, "failing", "setup-token expired", expires, fix,
+                           fingerprint=held)
+        # Presence cannot undo a server rejection of this same token: kept_failure
+        # below keeps turn failures until the operator replaces the credential.
+        return Verdict("claude", name, "healthy",
+                       "setup-token installed" + ("; expiry unknown" if expires is None else ""),
+                       expires, fix, fingerprint=held)
     home = profile.home(environ)
     path = os.path.join(home, ".credentials.json")
     fix = "CLAUDE_CONFIG_DIR=%s claude auth login" % shlex.quote(home)

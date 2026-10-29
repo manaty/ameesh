@@ -893,6 +893,15 @@ def check(profile: Profile, environ=None) -> list[str]:
 
 def _check(profile: Profile, environ=None) -> list[str]:
     environ = os.environ if environ is None else environ
+    from . import setup_token
+    if setup_token.present(profile, environ):
+        try:
+            _, expires = setup_token.read(profile, environ)
+            if expires is not None and expires <= time.time():
+                return ["setup-token expired: import a new human-issued token"]
+            return []
+        except setup_token.TokenError as exc:
+            return [str(exc)]
     problems: list[str] = []
     uid = os.getuid() if hasattr(os, "getuid") else None
     if profile.kind == "config_dir":
@@ -967,6 +976,10 @@ def auth_variables(declared: dict[str, list[Profile]], *, selected: bool) -> set
             if selected and profile.env:
                 out.add(profile.env)
     if selected:
+        out.update({"ANTHROPIC_AUTH_TOKEN", "CODEX_API_KEY"})
+        out.add("CLAUDE_CODE_OAUTH_TOKEN")
+        out.add("CLAUDE_CODE_OAUTH_REFRESH_TOKEN")
+        out.add("CLAUDE_CODE_OAUTH_SCOPES")
         out.update(_all_account_keys("config_env"))
         out.update(_all_account_keys("key_env"))
     return out
@@ -1019,6 +1032,12 @@ def apply_env(env: dict, profile: Profile, environ=None) -> None:
     if problems:
         raise AccountError("account %s/%s unusable: %s"
                            % (profile.harness, profile.name, "; ".join(problems)))
+    from . import setup_token
+    if setup_token.present(profile, environ):
+        token, _ = setup_token.read(profile, environ)
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        env[setup_token.VARIABLE] = token
+        return
     variable = config_env_of(profile.harness)
     if profile.kind == "config_dir":
         if not profile.default and variable:
@@ -2532,11 +2551,13 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                     return profil
             return None
 
-        # 1. forçage manuel : il prime, même sur la continuité (un compte forcé en
-        # échec d'authentification est rendu tel quel : la garde de l'exécuteur
-        # bloque l'agent, elle ne bascule pas contre un geste humain)
+        # 1. A forced authentication failure yields to another healthy account;
+        # without a replacement the runner's auth guard holds the agent.
         def forced(profile: Profile) -> Choice:
             current = ev(profile)
+            if profile.name in sick:
+                return Choice(None, profile, forced=True, auth_blocked=True,
+                              reason="forced account %s: authentication failing on this host" % profile.name)
             if profile.name in conflits:
                 return Choice(None, profile, reason=(
                     "account %s forced (ameesh accounts use): declared with another "
@@ -2571,7 +2592,9 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                     and (ev(p).ok if paced else ev(p).unpaced_ok)]
             # #4166 : le motif de la levée dit l'épuisement, pas un seuil
             raison_forcee = (
-                "forced account %s: provider credits exhausted; %s free"
+                "forced account %s: authentication failing; %s free"
+                % (active.name, free[0].name) if free and active.name in sick
+                else "forced account %s: provider credits exhausted; %s free"
                 % (active.name, free[0].name) if free and active.name in epuises
                 else "forced account %s at threshold (%s); %s free"
                 % (active.name, cache[active.name].reason,
@@ -2585,6 +2608,9 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                     return Choice(active, active, forced=True,
                                   why="forced account %s: provider credits exhausted"
                                       % active.name)
+                if active.name in sick:
+                    return Choice(active, active, forced=True, auth_blocked=True,
+                                  why="forced account %s: authentication failing on this host" % active.name)
                 return held
             elif not simulate and not store.set_auto(
                     host, harness, expected=active.name, reason=raison_forcee):
@@ -2696,6 +2722,9 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             return Choice(None, active, reason=why)
         target = ranked[0]
         why = reason_of(ranked, cache, now)
+        if sick:
+            why = "skipped authentication failing accounts on %s: %s; %s" % (
+                host, ", ".join(sorted(sick)), why)
         if beyond:
             why = ("critical agent: %s beyond its %.0f%% cap, every other account at "
                    "threshold (owner decision 2026-10-12); %s" % (
