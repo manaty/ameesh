@@ -17,7 +17,10 @@ class HumanDecisionForwardTest(_Base):
         self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '16 minutes'"
                         " WHERE recipient = %s", (ALICE,))
         box = storage.of(self.db).mailbox
-        self.assertEqual(box.dead_letters(), [])
+        # Raw dead mail retains ordinary human mail; #4519 filters only
+        # declared human boxes when building alerts. Decisions stay excluded.
+        self.assertEqual([(r['recipient'], r['n']) for r in box.dead_letters()],
+                         [(ALICE, 1)])
         self.assertEqual(undeliverable.alerts(self.cfg, self.db, [], time.time()), [])
         for dry in (True, False):
             with self.assertRaisesRegex(undeliverable.Refused, 'human mailbox'):

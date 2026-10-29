@@ -51,7 +51,6 @@ DEAD_LETTERS_SQL = """
       FROM agent_mailbox m
       LEFT JOIN agent_registry r ON r.name = m.recipient
      WHERE m.delivered_at IS NULL
-       AND left(m.recipient, 6) <> 'human:'
        AND (r.name IS NULL OR r.status = 'stopped')
        -- L124 : une demande de décision attend un humain (`human:<id>`),
        -- jamais un agent : elle n'est pas en souffrance
