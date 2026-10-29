@@ -45,6 +45,8 @@ view keeps working. No write, ever.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import base64
 import binascii
 import datetime as _dt
@@ -77,7 +79,13 @@ LIMIT = 1000
 #: dossier des notes de version du dépôt
 NOTES_DIR = "docs/versions"
 #: ordre d'attention d'un train de release : le premier état présent est dit
-STATE_ORDER = ("blocked", "waiting_human", "qa", "build", "intake")
+STATE_ORDER = (
+    lifecycle.BLOCKED,
+    lifecycle.WAITING_HUMAN,
+    lifecycle.QA,
+    lifecycle.IN_PROGRESS,
+    lifecycle.REQUESTED,
+)
 
 #: `v1.9.1`, `desktop-v0.2.8`, `desktop-0.2.8`, `v0.2.11-rc.1`… : préfixe de
 #: produit optionnel, pré-version semver (`-rc.1`, `-beta.2`…) gardée entière
@@ -627,7 +635,7 @@ def _products(store, db, name: str, repo: str, rows: list[dict], reader: Reader,
 
     open_rows = [row for row in rows
                  if row.get("state") not in work_mod.MERGED_STATES
-                 and row.get("state") != "closed"
+                 and row.get("state") != lifecycle.CLOSED
                  and (row.get("app") or row.get("workstream")) == name]
     candidates: dict = {}            # (prefix, version) -> entry
     unassigned_versions: dict = {}   # version -> entry, aucun flux ne la porte

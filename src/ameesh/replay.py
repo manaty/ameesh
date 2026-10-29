@@ -58,6 +58,8 @@ sont des paramètres.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import argparse
 import dataclasses
 import datetime
@@ -522,7 +524,7 @@ def discover(db, cfg: Config, project: str, *, limit: int = CANDIDATE_LIMIT,
         "       (SELECT max(m.at) FROM work_item_milestones m"
         "         WHERE m.work_item_id = w.id AND m.kind = 'merged') AS merged_at"
         "  FROM work_items w"
-        " WHERE w.state = 'merged' AND w.app = %s"
+        f" WHERE w.state = '{lifecycle.DELIVERY_RECORDED}' AND w.app = %s"
         " ORDER BY merged_at DESC NULLS LAST, w.id DESC LIMIT %s",
         (project, int(limit)))
     candidates: list[BenchLot] = []

@@ -30,6 +30,8 @@ du journal ne pose ; `work note` refuse en outre le préfixe.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import json
 import re
 from typing import Optional
@@ -167,7 +169,7 @@ def set_floor(cfg, db, lot: int, floor: int, *, reason: str = "",
     item = work.get(db, lot)
     if item is None:
         raise work.WorkError("lot %s not found" % lot)
-    if item["state"] in ("merged", "promoted", "closed"):
+    if item["state"] in lifecycle.COMPLETED:
         raise work.WorkError("lot %s is %s: no review floor to set" % (lot, item["state"]))
     if storage.is_remote(db):
         raise work.WorkError("review floor refused: a mediated session cannot write "

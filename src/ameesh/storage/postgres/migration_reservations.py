@@ -2,6 +2,8 @@
 """Atomic target allocation, slot lifecycle and lot journal."""
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 from ..migration_reservations import MigrationReservations as Contract
 
 _COLUMNS = 'id, work_item_id, slot, number, project, target_repo, target_branch, target_sha, status'
@@ -89,7 +91,7 @@ class MigrationReservations(Contract):
                         self._journal(tx, row, actor, status)
                     result.append(row)
                 return result
-            if lot['state'] in ('merged', 'promoted', 'closed'):
+            if lot['state'] in lifecycle.COMPLETED:
                 return {'error': 'lot already finished: no reservation'}
             active = api.for_target(repo, branch)
             if observed is None or active != observed:

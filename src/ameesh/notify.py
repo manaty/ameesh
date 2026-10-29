@@ -103,6 +103,8 @@ fallback success does not mark the alert delivered on the Nexlink side.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import argparse
 import base64
 import errno
@@ -3141,7 +3143,11 @@ class Notifier:
                         continue
                     if item and item.get("state") == entry.get("lot_state") \
                             and item.get("assignee") == entry.get("agent") \
-                            and item.get("state") not in ("closed", "merged", "promoted"):
+                            and item.get("state") not in (
+                                lifecycle.CLOSED,
+                                lifecycle.DELIVERY_RECORDED,
+                                lifecycle.PROMOTED,
+                            ):
                         continue
                 del sent[key]
         due = []
@@ -3351,8 +3357,7 @@ class Notifier:
                         # again before each delivery, including the desk thread.
                         item = storage.of(db).work.get(int(alert["lot"]))
                         # A missing row is no evidence that delivery happened.
-                        if item is not None and item.get("state") in (
-                                "merged", "promoted", "closed"):
+                        if item is not None and item.get("state") in lifecycle.COMPLETED:
                             break
                         if item is not None and alert.get("step") == "verdict_merge":
                             from . import slo_delivery

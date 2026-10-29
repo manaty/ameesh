@@ -60,6 +60,8 @@ d'une heure : une file vide n'est pas « rien à signaler ».
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import argparse
 import datetime
 import json
@@ -461,7 +463,7 @@ def _terminal_at(milestones: list[dict]) -> float | None:
 
 
 #: états d'une vraie reprise de revue : le lot retravaille sa tête
-_OPEN_STATES = ("intake", "build", "qa")
+_OPEN_STATES = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, lifecycle.QA)
 #: états d'une retenue de fermeture : le contenu est déjà dans la cible
 _CLOSURE_STATES = ("blocked", "waiting_human")
 #: états terminaux (le jalon, pas seulement la colonne)
@@ -966,7 +968,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
         external = str(item.get("external_executor") or "").strip()
         state = state_by_lot.get(ident)
         if external and not (item.get("assignee") or "").strip() \
-                and terminal_ts is None and state in ("intake", "build"):
+                and terminal_ts is None and state in lifecycle.ACTIVE:
             since = item.get("created_ts")
             for event in lot_events:
                 text = str(event.get("note") or "")
@@ -1773,7 +1775,7 @@ def _rows(db, sql: str, params=()) -> list[dict]:
 #: assigné, exécutant externe déclaré, instant de création, branche et cible) ;
 #: jamais state, reviewer(s), wake_at ni updated_at (canon 24/10). L'état
 #: courant d'un lot se lit au journal (`state_by_lot`), pas dans sa colonne.
-_ITEMS_SQL = """
+_ITEMS_SQL = f"""
     SELECT w.id, w.title, w.app, w.assignee, w.priority,
            to_jsonb(w)->>'external_executor' AS external_executor,
            extract(epoch FROM w.created_at)::float8 AS created_ts,
@@ -1804,7 +1806,7 @@ _ITEMS_SQL = """
                            AND t.kind IN ('merged', 'closed', 'delivered'))
                   AND (lower(left(e2.note, 21)) LIKE 'hold:%%'
                        OR lower(left(e2.note, 20)) LIKE 'wake:%%'
-                       OR e2.state IN ('intake', 'build', 'qa'))))
+                       OR e2.state IN ('{lifecycle.REQUESTED}', '{lifecycle.IN_PROGRESS}', '{lifecycle.QA}'))))
      ORDER BY w.id
      LIMIT %s
 """

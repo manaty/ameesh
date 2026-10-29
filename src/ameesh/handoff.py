@@ -41,6 +41,8 @@ décide. La revue codex reste exigée comme pour tout lot.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import os
 import time
 
@@ -62,7 +64,7 @@ SKIP_NOTE = "pause budget : lot non repris"
 SOURCE_HARNESS = "claude"
 TARGET_HARNESSES = ("deepseek", "codex")
 #: états traités : `intake` rendu à la file, `build` repris (jamais `qa`)
-STATES = ("intake", "build")
+STATES = lifecycle.ACTIVE
 #: reprises au plus par heure glissante, pour tout le mesh (0 : coupé)
 DEFAULT_MAX_PER_HOUR = 4
 #: repos minimal du preneur
@@ -154,7 +156,7 @@ def lot_git(item: dict, source: dict, *, host: str | None, worktrees: list,
     state = state or menage.worktree_state
     git = git or menage._git
     branch = (item.get("branch") or "").strip()
-    build = item.get("state") == "build"
+    build = item.get("state") == lifecycle.IN_PROGRESS
     if not branch:
         return {"ok": not build, "reason": "no branch" if build else "", "paths": []}
     if (source.get("host") or "") != (host or ""):
@@ -418,7 +420,7 @@ def budget_handoff(cfg, db, *, now: float | None = None,
             if last_assigner(st.work.assignment_events(
                     int(item["id"]), assign_prefixes())).startswith("human:"):
                 continue
-            if item["state"] == "intake":
+            if item["state"] == lifecycle.REQUESTED:
                 # lot non démarré : rendu à la file d'équipe (assigné NULL) ;
                 # la prise automatique (L165, #754) choisit le preneur
                 checked = checked_git(item, source)
@@ -435,7 +437,7 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                 # `intake`, la source encore en pause, le plafond horaire ;
                 # aucun preneur n'est exigé
                 row = st.work.handoff(int(item["id"]), None, current=source["name"],
-                                      state="intake", paused_prefix=budget_mod.PAUSE_PREFIX,
+                                      state=lifecycle.REQUESTED, paused_prefix=budget_mod.PAUSE_PREFIX,
                                       still_paused=gauge_text,
                                       note_prefix=NOTE_PREFIX, window_s=backlog.TAKE_WINDOW_S,
                                       max_per_window=max_per_hour,
@@ -504,7 +506,7 @@ def budget_handoff(cfg, db, *, now: float | None = None,
             # contrôlé ci-dessus (pas un autre des STATES), la source encore en
             # pause, le preneur encore sans lot, le plafond horaire
             row = st.work.handoff(int(item["id"]), check["assignee"], current=source["name"],
-                                  state="build", paused_prefix=budget_mod.PAUSE_PREFIX,
+                                  state=lifecycle.IN_PROGRESS, paused_prefix=budget_mod.PAUSE_PREFIX,
                                   still_paused=gauge_text,
                                   note_prefix=NOTE_PREFIX, window_s=backlog.TAKE_WINDOW_S,
                                   max_per_window=max_per_hour,

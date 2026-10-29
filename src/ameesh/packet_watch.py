@@ -60,7 +60,7 @@ GRACE_S = 900.0
 #: préfixe des branches de porteur de paquet (`paquet-h-…`, `paquet-84-nexlink`)
 CARRIER_PREFIX = "integration/paquet"
 #: états d'un porteur ouvert
-OPEN_STATES = ("intake", "build", *lifecycle.TO_VALIDATE, "blocked", "waiting_human")
+OPEN_STATES = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, *lifecycle.TO_VALIDATE, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN)
 #: porteurs fusionnés relus pour « vient d'être fusionné »
 RECENT_MERGED = 50
 
@@ -196,7 +196,7 @@ def carriers(db, app: str, now: float, grace_s: float, *, slot_at: float,
                     continue
             opened.append(int(row["id"]))
     merged_ids = [int(row["id"])
-                  for row in st.items(state="merged", assignee=None, limit=RECENT_MERGED)
+                  for row in st.items(state=lifecycle.DELIVERY_RECORDED, assignee=None, limit=RECENT_MERGED)
                   if _carrier(row, app, target)]
     recent, served = [], []
     for row in st.delays(RECENT_MERGED, ids=merged_ids) if merged_ids else ():

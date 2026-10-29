@@ -56,6 +56,8 @@ then the newer lot. The radar names the resolver in its mail.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import fcntl
 import json
 import os
@@ -101,7 +103,7 @@ RERERE_TRAIN = (
 )
 _MARKER_RE = re.compile(rb"^(<{7} |>{7} |={7}$|\|{7} )", re.M)
 #: how far along a lot is, to guess which of two lots merges first
-_STATE_RANK = {"qa": 2, "build": 1}
+_STATE_RANK = {lifecycle.QA: 2, lifecycle.IN_PROGRESS: 1}
 
 
 class ResolveError(RuntimeError):

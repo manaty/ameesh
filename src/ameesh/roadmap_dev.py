@@ -13,6 +13,8 @@ Rien d'autre dans `roadmap` ne nomme un état ou un jalon de module.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 from . import work as work_mod
 
 #: LA table. Clés génériques → valeurs du cycle actuel.
@@ -25,16 +27,16 @@ CORRESPONDANCES = {
         "livree": "merged",
     },
     # états du journal qui marquent le premier passage « en cours »
-    "etats_en_cours": ("build",),
+    "etats_en_cours": (lifecycle.IN_PROGRESS,),
     # états où la date prévue reste pilotable par le porteur : la tâche est
     # demandée ou en cours ; plus avancée (relecture, attente), elle ne l'est
     # plus, et sa date ne déclenche donc pas d'alerte (#2342)
-    "etats_actifs": ("intake", "build"),
+    "etats_actifs": lifecycle.ACTIVE,
     # états d'une tâche livrée (l'effet a eu lieu) et d'une tâche abandonnée
     "etats_livres": tuple(work_mod.MERGED_STATES),
-    "etats_abandonnes": ("closed",),
+    "etats_abandonnes": (lifecycle.CLOSED,),
     # états qui attendent une décision humaine (jalon de décision)
-    "etats_decision": ("waiting_human",),
+    "etats_decision": (lifecycle.WAITING_HUMAN,),
     # état affiché par `progress.lot_state` → état générique
     "etats_affiches": {
         "active": "en_cours",
@@ -56,7 +58,7 @@ def delivered(state: str | None, close_reason: str | None = None) -> bool:
     """Livrée : fusionnée, promue, ou livrée hors cible (#988 : `closed` +
     `delivered`)."""
     return ((state or "") in CORRESPONDANCES["etats_livres"]
-            or (state == "closed" and close_reason == "delivered"))
+            or (state == lifecycle.CLOSED and close_reason == "delivered"))
 
 
 def abandoned(state: str | None, close_reason: str | None = None) -> bool:

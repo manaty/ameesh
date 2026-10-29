@@ -28,6 +28,8 @@ lendemain du retour (la prise automatique l'attend), sans arête de dépendance.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import datetime
 import re
 import time
@@ -51,7 +53,7 @@ TRACE = "qualification physique reportée"
 #: titre des lots de vérification : ils attendent l'appareil, jamais levés
 VERIFY_TITLE = "Vérification au retour"
 #: états où le lot revient ; tout autre état d'avant `blocked` revient en build
-RETURN_STATES = ("intake", "build", "qa", "merged")
+RETURN_STATES = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, lifecycle.QA, lifecycle.DELIVERY_RECORDED)
 ACTOR = "device-gates"
 #: borne de la lecture des lots `blocked` d'une passe
 BLOCKED_LIMIT = 1000
@@ -96,10 +98,10 @@ def episode(events) -> dict | None:
     start, before, previous = None, None, None
     for index, event in enumerate(ordered):
         state = event.get("state")
-        if state == "blocked" and previous != "blocked":
+        if state == lifecycle.BLOCKED and previous != lifecycle.BLOCKED:
             start, before = index, previous
         previous = state
-    if start is None or previous != "blocked":
+    if start is None or previous != lifecycle.BLOCKED:
         return None
     devices: list[str] = []
     cases: list[str] = []
@@ -149,7 +151,7 @@ def assess(item: dict, events, *, hosts: dict, dependencies=(), decisions=(),
     connu, indisponible, et jusqu'à quand ; `others` liste les autres
     blocages (texte court) ; `liftable` est vrai seulement sans autre blocage
     et avec tous les appareils indisponibles maintenant."""
-    if item.get("state") != "blocked":
+    if item.get("state") != lifecycle.BLOCKED:
         return None
     found = episode(events)
     if found is None:
@@ -182,7 +184,7 @@ def assess(item: dict, events, *, hosts: dict, dependencies=(), decisions=(),
         others.append("pinned to Process revision %s" % item["workflow_ref"])
     before = found["before"]
     return {"lot": int(item["id"]), "before": before,
-            "back_to": before if before in RETURN_STATES else "build",
+            "back_to": before if before in RETURN_STATES else lifecycle.IN_PROGRESS,
             "devices": devices, "cases": found["cases"], "others": others,
             "liftable": not others and not str(item.get("title") or "").startswith(VERIFY_TITLE)}
 
@@ -243,7 +245,7 @@ def _verify_body(item: dict, view: dict) -> str:
 def _assess_read(db, item: dict, *, hosts: dict, now: float) -> dict | None:
     """`assess` sur ce que la base dit maintenant du lot (journal complet,
     arêtes, demandes de décision), lu par `db` (la transaction de la levée)."""
-    if item.get("state") != "blocked":
+    if item.get("state") != lifecycle.BLOCKED:
         return None
     ident = int(item["id"])
     st = storage.of(db)
@@ -262,7 +264,7 @@ def candidates(db, *, canons, now: float | None = None) -> list[dict]:
     """Les évaluations de tous les lots `blocked` qui déclarent une séance."""
     now = time.time() if now is None else float(now)
     st = storage.of(db)
-    blocked = work.list_items(db, state="blocked", limit=BLOCKED_LIMIT)
+    blocked = work.list_items(db, state=lifecycle.BLOCKED, limit=BLOCKED_LIMIT)
     if not blocked:
         return []
     hosts = hosts_by_name(canons)
@@ -316,7 +318,7 @@ def lift_one(db, ident: int, *, hosts: dict, now: float,
             storage.of(tx).roadmap.plan_item(int(verify["id"]),
                                              {"start": _return_day(view)},
                                              source=ACTOR, actor=actor)
-            row = storage.of(tx).work.move(ident, view["back_to"], current="blocked",
+            row = storage.of(tx).work.move(ident, view["back_to"], current=lifecycle.BLOCKED,
                                            loops=0, note=_trace(view, int(verify["id"])),
                                            actor=actor)
             if row is None:
