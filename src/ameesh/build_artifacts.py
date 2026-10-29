@@ -12,7 +12,9 @@ housekeeping pass frees what a build regenerates:
   through a symbolic link (a `node_modules` shared by #248 is a link into the
   cache: skipped, not even unlinked), never under the managed cache root.
 * **When**: the worktree had no activity (mtime or ctime of anything outside
-  its artifacts, and of its git index and HEAD) for `artifact_idle` (24 h by
+  its artifacts, of its git index and HEAD, and of the last entry of its
+  reflog: its file mtime is rewritten by `git gc`, #4685) for
+  `artifact_idle` (24 h by
   default), or for `artifact_ended_idle` (6 h by default, #3956) when every
   lot it names is finished: nothing rebuilds in it any more, so its
   regenerable output is only weight. And NO process of the user has its cwd,
@@ -263,12 +265,38 @@ def _gitdir(worktree: str) -> str:
     return os.path.normpath(os.path.join(worktree, line[len("gitdir:"):].strip()))
 
 
+def _reflog_latest(path: str) -> float | None:
+    """Epoch of the last entry of the reflog `path` (None: unreadable).
+
+    The file's own mtime is not activity: `git gc` rewrites every reflog of
+    the repository (its `reflog expire` task) without changing the entries,
+    so an activity read from it would see all the worktrees active again
+    (#4685). A real operation (checkout, reset, commit) appends an entry
+    dated now."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 4096))
+            data = fh.read()
+    except OSError:
+        return None
+    for line in reversed(data.splitlines()):
+        fields = line.split(b"\t", 1)[0].split()
+        if len(fields) < 2 or not re.fullmatch(rb"[+-]\d{4}", fields[-1]):
+            continue
+        try:
+            return float(fields[-2])
+        except ValueError:
+            continue
+    return None
+
+
 def survey(worktree: str, rules, *, skip_roots=(), skip_ids=(), limit: int = WALK_LIMIT,
            budget: Budget | None = None) -> dict:
     """Walk of a worktree outside its artifacts: `latest` activity (mtime or
-    ctime, git index and HEAD included), `artifacts` (directories matched by
-    the rules, not entered), `real` and `identity` (device, inode) of its
-    root, `complete`, `why`.
+    ctime, git index, HEAD and the last reflog entry included), `artifacts`
+    (directories matched by the rules, not entered), `real` and `identity`
+    (device, inode) of its root, `complete`, `why`.
 
     Not entered: `.git`, a nested checkout (a directory with a `.git`), a
     symbolic link, another filesystem (incomplete), `skip_roots`, the trash
@@ -284,13 +312,19 @@ def survey(worktree: str, rules, *, skip_roots=(), skip_ids=(), limit: int = WAL
     out["identity"] = (top.st_dev, top.st_ino)
     latest = max(top.st_mtime, top.st_ctime)
     gitdir = _gitdir(worktree)
-    for name in ("index", "HEAD", os.path.join("logs", "HEAD")):
+    for name in ("index", "HEAD"):
         try:
             st = os.stat(os.path.join(gitdir, name)) if gitdir else None
         except OSError:
             st = None
         if st is not None:
             latest = max(latest, st.st_mtime, st.st_ctime)
+    # the reflog's file mtime is rewritten by `git gc`: only its last entry
+    # dates an operation in the worktree (#4685)
+    if gitdir:
+        reflog = _reflog_latest(os.path.join(gitdir, "logs", "HEAD"))
+        if reflog is not None:
+            latest = max(latest, reflog)
     skip = {os.path.realpath(p) for p in skip_roots if p}
     skip_ids = {tuple(i) for i in skip_ids}
     count = 0
