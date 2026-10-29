@@ -158,6 +158,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
                  # #4164 : un compte fournisseur sans crédit — aucun tour accordé
                  "provider_credits_exhausted",
+                 # #4166 : un compte fournisseur bas — recharger avant la panne
+                 "provider_credits_low",
                  # L226b/#1883 : un compte de forfait facturé au-delà du plan —
                  # l'owner le sait tout de suite, la règle est « jamais de dépassement »
                  "account_overage",
@@ -313,6 +315,7 @@ TYPE_LABELS = {
     "baseline_oversized": "oversized baseline",
     "balance_low": "low balance",
     "provider_credits_exhausted": "provider credits exhausted",
+    "provider_credits_low": "provider credits low",
     "host_not_ready": "host not ready",
     "auth_blocked": "authentication failing",
     "credential_failing": "credential failing",

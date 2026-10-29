@@ -5070,9 +5070,12 @@
    ],
    "provider_credits": [
     "claim_probe",
+    "clear_prepaid",
+    "declare_prepaid",
     "get",
     "listing",
     "mark_exhausted",
+    "mark_low",
     "mark_ok"
    ]
   }
