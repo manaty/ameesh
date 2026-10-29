@@ -562,7 +562,12 @@ def notify_released(db, blocker_id, *, blocker_state, blocker_reason="",
     return out
 
 
-def wait_label(wait):
+def wait_label(wait, plural="lots"):
+    """Le libellé d'une attente planifiée.
+
+    `plural` est le nom d'une tâche dans le vocabulaire actif : `progress`
+    passe celui de l'instantané (CORE « tâches »), les lecteurs v1 gardent
+    « lots » (#4729)."""
     if not wait:
         return None
     if wait["what"] == "scheduled":
@@ -592,7 +597,7 @@ def wait_label(wait):
         # #2378 : la demande de décision ouverte, son décideur et son échéance
         return "decision #%d for %s until %s" % (
             wait["decision"], wait.get("owner") or "any human", wait.get("until"))
-    return "waiting on lots %s" % ", ".join("#%d" % i for i in wait["lots"])
+    return "waiting on %s %s" % (plural, ", ".join("#%d" % i for i in wait["lots"]))
 
 
 def add_parser(sub, func):
