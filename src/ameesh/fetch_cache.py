@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import os
 import time
+from typing import Optional
 
 #: âge au-delà duquel un refus n'est plus cru (s) : la forge peut réparer
 TTL_S = 6 * 3600
@@ -35,13 +36,19 @@ def enabled() -> bool:
         "off", "0", "no", "false")
 
 
-def root() -> str:
+def root(state_dir: Optional[str] = None) -> str:
+    """Le dossier du cache : `AMEESH_FETCH_CACHE_DIR`, puis l'état de l'hôte.
+
+    `state_dir` est l'état **configuré** de l'appelant (`db.cfg.state_dir`) :
+    les tests le dirigent vers leur dossier jetable, et une commande ne lit
+    jamais le cache d'un autre profil. Sans lui, l'environnement puis le
+    défaut de l'hôte."""
     explicit = str(os.environ.get("AMEESH_FETCH_CACHE_DIR") or "").strip()
     if explicit:
         return os.path.expanduser(explicit)
-    state = (os.environ.get("AMEESH_STATE") or os.environ.get("AGENT_MESH_STATE")
-             or "~/.local/state/ameesh")
-    return os.path.join(os.path.expanduser(state), CACHE_DIR)
+    state = (state_dir or os.environ.get("AMEESH_STATE")
+             or os.environ.get("AGENT_MESH_STATE") or "~/.local/state/ameesh")
+    return os.path.join(os.path.expanduser(str(state)), CACHE_DIR)
 
 
 def _key(repo: str, sha: str) -> str:
@@ -49,15 +56,15 @@ def _key(repo: str, sha: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _path(repo: str, sha: str) -> str:
-    return os.path.join(root(), _key(repo, sha))
+def _path(repo: str, sha: str, state_dir: Optional[str] = None) -> str:
+    return os.path.join(root(state_dir), _key(repo, sha))
 
 
-def refused(repo: str, sha: str) -> bool:
+def refused(repo: str, sha: str, *, state_dir: Optional[str] = None) -> bool:
     """La forge a-t-elle déjà refusé ce commit récemment ?"""
     if not enabled():
         return False
-    path = _path(repo, sha)
+    path = _path(repo, sha, state_dir)
     try:
         age = time.time() - os.stat(path).st_mtime
     except OSError:
@@ -71,14 +78,14 @@ def refused(repo: str, sha: str) -> bool:
     return False
 
 
-def note(repo: str, sha: str) -> None:
+def note(repo: str, sha: str, *, state_dir: Optional[str] = None) -> None:
     """Retient un refus ; jamais d'exception (le cache ne bloque rien)."""
     if not enabled():
         return
-    directory = root()
+    directory = root(state_dir)
     try:
         os.makedirs(directory, mode=0o700, exist_ok=True)
-        path = _path(repo, sha)
+        path = _path(repo, sha, state_dir)
         descriptor = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
         os.close(descriptor)
         os.utime(path, None)

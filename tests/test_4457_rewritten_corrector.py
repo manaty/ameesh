@@ -18,7 +18,7 @@ from __future__ import annotations
 import time
 from unittest import mock
 
-from ameesh import (merge_queue, registry, review_authors,
+from ameesh import (fetch_cache, merge_queue, registry, review_authors,
                     review_designation as rd, work)
 
 from .support import PgTestCase
@@ -222,6 +222,10 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
                         self.db, work.get(self.db, self.lot),
                         {"id": 999999, "sha": head_b}, self.repo.root,
                         head=head_b, fetch=True)
+        # Une coupure par l'échéance n'est pas un refus net : rien à mémoriser.
+        self.assertFalse(fetch_cache.refused(
+            self.repo.root, "%040x" % 0x44570000,
+            state_dir=self.cfg.state_dir))
 
     def test_a_slow_fetch_cannot_exceed_the_local_budget(self):
         head_b = self._only_absent_receipt()
@@ -237,3 +241,28 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
                     self.db, work.get(self.db, self.lot),
                     {"id": 999999, "sha": head_b}, self.repo.root,
                     head=head_b, fetch=True)
+        self.assertFalse(fetch_cache.refused(
+            self.repo.root, "%040x" % 0x44570000,
+            state_dir=self.cfg.state_dir))
+
+    def test_only_a_clean_refusal_is_cached(self):
+        # B/P2 auditeur : un fetch non lancé ou coupé (None) ne doit pas être
+        # mémorisé « refusé » pour 6 h ; un code non nul (False) l'est.
+        head_b = self._only_absent_receipt()
+        dummy = "%040x" % 0x44570000
+        with mock.patch.object(review_authors, "_forge_fetch", return_value=None):
+            out = review_authors._rewritten_after_freeze(
+                self.db, work.get(self.db, self.lot),
+                {"id": 999999, "sha": head_b}, self.repo.root,
+                head=head_b, fetch=True)
+        self.assertEqual(out, {})
+        self.assertFalse(fetch_cache.refused(
+            self.repo.root, dummy, state_dir=self.cfg.state_dir))
+        with mock.patch.object(review_authors, "_forge_fetch", return_value=False):
+            out = review_authors._rewritten_after_freeze(
+                self.db, work.get(self.db, self.lot),
+                {"id": 999999, "sha": head_b}, self.repo.root,
+                head=head_b, fetch=True)
+        self.assertEqual(out, {})
+        self.assertTrue(fetch_cache.refused(
+            self.repo.root, dummy, state_dir=self.cfg.state_dir))

@@ -3394,7 +3394,7 @@ def unknown_refusal(unknown: Sequence[str], *, head_sha: str = "") -> str:
     return out
 
 
-def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None) -> bool:
+def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None):
     """Rapatrie le commit exact `sha` depuis la forge du clone (`origin`).
 
     #3147 : la forge sert encore par SHA un commit devenu inaccessible après un
@@ -3412,34 +3412,40 @@ def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None) -> boo
     #4457 (B/P2 cx3) : `timeout` est le temps qui reste à l'appelant ; le
     fetch ne peut pas dépasser son échéance ni `FETCH_TIMEOUT`. Un temps nul
     ne lance aucun fetch.
+
+    Rend `True` (objet lisible), `False` (refus **net** de git fetch, code
+    non nul : le seul cas mémorisable par `fetch_cache`) ou `None` (non
+    lancé, coupé par l'échéance ou par une exception : un doute qui se
+    relit). #4457 B/P2 auditeur : une coupure notée « refusée » pour 6 h
+    effacerait le correcteur de toutes les lectures suivantes.
     """
     text = plan_git.full_commit_id(sha)
     if not text:
-        return False
+        return None
     try:
         if plan_git.local_commit(repo, text):
             return True
     except Exception:  # noqa: BLE001 - dépôt illisible : aucune récupération
-        return False
+        return None
     bound = plan_git.FETCH_TIMEOUT if timeout is None else min(
         float(timeout), plan_git.FETCH_TIMEOUT)
     if bound <= 0:
-        return False
+        return None
     try:
         forge = plan_git.forge_remote(repo)
         if forge is None:
-            return False
+            return None
         proc = plan_git._git(
             repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
             "--", forge, text, timeout=bound)
-    except Exception:  # noqa: BLE001 - forge injoignable : absence
-        return False
+    except Exception:  # noqa: BLE001 - forge injoignable ou coupée : doute
+        return None
     if proc.returncode != 0:
         return False
     try:
         return bool(plan_git.local_commit(repo, text))
-    except Exception:  # noqa: BLE001 - lecture impossible : absence
-        return False
+    except Exception:  # noqa: BLE001 - lecture impossible : doute
+        return None
 
 
 def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list[str]:
@@ -4148,6 +4154,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     item = dict(item or {})
     if db is None or not repo or packet_composer(item):
         return {}
+    state_dir = str(getattr(getattr(db, "cfg", None), "state_dir", "") or "")
     lot = int(item.get("id") or 0)
     if not lot:
         return {}
@@ -4246,11 +4253,11 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     full = plan_git.local_commit(repo, sha)
                 except Exception:  # noqa: BLE001 - objet illisible : ignoré
                     full = None
-                if not full and not fetch_cache.refused(repo, sha):
-                    attempted = False
+                if not full and not fetch_cache.refused(
+                        repo, sha, state_dir=state_dir):
+                    refused = False
                     if recover is not None:
                         check()
-                        attempted = True
                         try:
                             recover(sha, timeout=remaining())
                         except Exception:  # noqa: BLE001 - source en échec
@@ -4261,20 +4268,24 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                             full = None
                     if not full and fetch:
                         check()
-                        attempted = True
                         try:
-                            _forge_fetch(repo, sha, timeout=remaining())
+                            outcome = _forge_fetch(repo, sha, timeout=remaining())
                         except Exception:  # noqa: BLE001 - forge injoignable
-                            pass
+                            outcome = None
+                        # Seul un refus **net** de git fetch se mémorise ; une
+                        # coupure par l'échéance ou une exception reste un
+                        # doute qui se relit (#4457 B/P2 auditeur).
+                        refused = outcome is False
                         try:
                             full = plan_git.local_commit(repo, sha)
                         except Exception:  # noqa: BLE001 - objet illisible : ignoré
                             full = None
-                    if not full and attempted:
-                        fetch_cache.note(repo, sha)
                     # L'appel bloquant a pu consommer toute l'échéance : le
-                    # constat d'absence ne doit pas l'absorber (#4457 B/P2).
+                    # constat d'absence ne doit pas l'absorber, et on ne note
+                    # rien sous une lecture expirée (#4457 B/P2 cx3/auditeur).
                     check()
+                    if refused and not full:
+                        fetch_cache.note(repo, sha, state_dir=state_dir)
                 if not full:
                     continue
                 check()
