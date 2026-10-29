@@ -189,6 +189,29 @@ class SleepSparesTest(PgTestCase):
         self.assertEqual(sorted(row["agent"] for row in sleep["agents"] if row["slept"]),
                          ["codex1", "codex2", "codex3", "dev0", "dev1"])
 
+    def test_the_project_pilot_is_not_the_family_representative(self):
+        # B/P2 de la relecture cx2 : si le pilote est le plus grand nom de la
+        # famille, il ne doit pas être retenu comme représentant (la
+        # désignation l'exclut) ; c'est le vrai relecteur qui reste éveillé.
+        registry.upsert(self.db, "zz-pilote", harness="codex", host=self.cfg.host,
+                        cwd=self.tmp)
+        self.db.execute("UPDATE agent_registry SET responsible = 'human:alice',"
+                        " team = 'ameesh' WHERE name = 'zz-pilote'")
+        split = self.make_split()
+        self.qa_lot(author_family="deepseek")
+        work.note(self.db, split, "roadmap: épuisée ameesh (test)", actor="pilote")
+        listing = [agent("codex1", harness="codex"),
+                   agent("zz-pilote", harness="codex"), agent("dev0")]
+        with mock.patch("ameesh.alert_briefs.project_pilots",
+                        return_value=["zz-pilote"]):
+            out = self.run_pass(1900, listing)
+        sleep = next(g for g in out if g["kind"] == "sleep")
+        by_agent = {row["agent"]: row for row in sleep["agents"]}
+        self.assertFalse(by_agent["codex1"]["slept"])
+        self.assertTrue(by_agent["zz-pilote"]["slept"])
+        self.assertFalse(registry.get(self.db, "codex1")["operator_paused"])
+        self.assertTrue(registry.get(self.db, "zz-pilote")["operator_paused"])
+
     def test_an_unreadable_review_read_spares_everyone(self):
         split = self.make_split()
         work.note(self.db, split, "roadmap: épuisée ameesh (test)", actor="pilote")

@@ -337,7 +337,8 @@ def _owner_of(rows: list) -> str | None:
     return owner
 
 
-def _reviewer_spares(db, project: str, lots: list, listing: list) -> tuple:
+def _reviewer_spares(db, project: str, lots: list, listing: list, *,
+                     cfg=None, canons=None) -> tuple:
     """#4525 : qui le sommeil doit-il épargner, et pourquoi ?
 
     Rend `(pending, keep, error)` :
@@ -402,6 +403,18 @@ def _reviewer_spares(db, project: str, lots: list, listing: list) -> tuple:
     except Exception:  # noqa: BLE001 - pas de vivier : rien à épargner en plus
         candidates = []
     by_name = {c.name: c for c in candidates}
+    # Le pilote du projet reçoit l'alerte de capacité, il n'est pas un siège de
+    # relecture : la désignation l'exclut (`_candidates`), le sommeil doit donc
+    # l'exclure aussi du choix du représentant de famille. Sinon un pilote au
+    # nom « max » serait épargné et le vrai relecteur de la famille endormi
+    # (B/P2 de la relecture cx2, #4525).
+    try:
+        pilots = alert_briefs.project_pilots(
+            project, listing or (), cfg=cfg, db=db, canons=canons)
+    except Exception:  # noqa: BLE001 - rôle illisible : ne retire personne
+        pilots = []
+    if pilots:
+        by_name.pop(pilots[0], None)
 
     waiting = [lot for lot in lots or ()
                if str((lot or {}).get("state") or "") == "qa"
@@ -472,7 +485,7 @@ def _journal_exemption(db, split_id, name: str, why: str) -> None:
 
 
 def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
-           split_id=None, lots=(), listing=()) -> list:
+           split_id=None, lots=(), listing=(), cfg=None, canons=None) -> list:
     """Met en sommeil les agents d'exécution au repos du projet (§2.3).
 
     #4525 : une relecture désignée ouverte n'est jamais endormie, et le dernier
@@ -482,7 +495,8 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
     from . import agent_pause
     out = []
     reason = SLEEP_REASON % project
-    pending, keep, unreadable = _reviewer_spares(db, project, lots, listing)
+    pending, keep, unreadable = _reviewer_spares(
+        db, project, lots, listing, cfg=cfg, canons=canons)
     if unreadable:
         why = "review exemptions unreadable: %s" % unreadable
         _journal_exemption(db, split_id, "*", why)
@@ -605,7 +619,8 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
         if exhausted(notes, project):
             if not item.startable and item.idle and not dry_run:
                 slept = _sleep(db, project, item, by_name, now,
-                               split_id=int(split["id"]), lots=lots, listing=listing)
+                               split_id=int(split["id"]), lots=lots, listing=listing,
+                               cfg=cfg, canons=canons)
                 if slept:
                     out.append({"kind": "sleep", "project": project,
                                 "lot": int(split["id"]), "agents": slept})
