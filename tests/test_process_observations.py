@@ -103,7 +103,10 @@ class JournalTest(Bench):
         self.assertEqual(lines[0]["prev"], "")
         self.assertEqual(lines[1]["prev"], lines[0]["digest"])
         self.assertEqual(stat.S_IMODE(os.stat(self.journal_path).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(self.directory).st_mode), 0o700)
+        # Le dossier temporaire herite du setgid de son parent (guest :
+        # 02700) ; l'invariant est 0700 sur les seuls bits de permission.
+        self.assertEqual(
+            stat.S_IMODE(os.stat(self.directory).st_mode) & 0o777, 0o700)
         reloaded = self.journal()
         self.assertEqual([entry["digest"] for entry in reloaded.entries],
                          [entry["digest"] for entry in lines])
