@@ -312,7 +312,7 @@ EXEMPTIONS = (
                "qu'elle est déclarée (retrait : PR home)",
     ),
     Exemption(
-        path="src/ameesh/lot_class.py",
+        path="src/ameesh/modules/dev/lot_class.py",
         parameter="reviews.exclude_author_family",
         literal="True",
         name="lot #2726 (ameesh-dev3), 20/10",
@@ -324,7 +324,7 @@ EXEMPTIONS = (
                "lot_class lira un repli nommé du lecteur.",
     ),
     Exemption(
-        path="src/ameesh/lot_class.py",
+        path="src/ameesh/modules/dev/lot_class.py",
         parameter="reviews.exclude_author_family",
         literal="False",
         name="lot #2726 (ameesh-dev3), 20/10",
@@ -336,7 +336,7 @@ EXEMPTIONS = (
                "exacte : aucune autre valeur n'est couverte.",
     ),
     Exemption(
-        path="src/ameesh/lot_class.py",
+        path="src/ameesh/modules/dev/lot_class.py",
         parameter="reviews.distinct_families",
         literal="True",
         name="lot #2726 (ameesh-dev3), 20/10",
