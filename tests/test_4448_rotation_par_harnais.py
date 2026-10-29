@@ -132,15 +132,26 @@ class _RotationBase(PgTestCase):
                                   lease)
         self.addCleanup(self.worker.watchdog_stop.set)
 
-    def tour(self, usage: int) -> bool:
-        """Un tour Codex dont `turn.completed` porte l'usage cumulé du fil."""
+    def tour(self, usage: int, *, exit_code: int = 0) -> bool:
+        """Un tour Codex dont `turn.completed` porte l'usage cumulé du fil.
+
+        `exit_code` non nul : le harnais publie son usage puis échoue — le
+        tour est compté au grand livre (L13 B1), donc il compte dans la
+        session (#4448 B cx3).
+        """
         env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+               "AMEESH_TEST_EXIT": str(exit_code),
                "AMEESH_TEST_CODEX_USAGE": json.dumps({
                    "input_tokens": usage, "cached_input_tokens": usage,
                    "output_tokens": 0})}
         with mock.patch.dict(os.environ, env, clear=False):
             return self.worker.run_turn({"kind": "prompt", "prompt": "relecture",
                                          "ids": []})
+
+    def alertes(self):
+        with mock.patch.object(mechanics, "configured", return_value=document(BLOC)):
+            return [a for a in exploitation.alerts(self.cfg, self.db)
+                    if a["type"] == "session_too_big"]
 
 
 class SeuilDuHarnaisTest(_RotationBase):
@@ -179,11 +190,6 @@ class SeuilDuHarnaisTest(_RotationBase):
 
 
 class AlerteEtRotationDAccordTest(_RotationBase):
-    def alertes(self):
-        with mock.patch.object(mechanics, "configured", return_value=document(BLOC)):
-            return [a for a in exploitation.alerts(self.cfg, self.db)
-                    if a["type"] == "session_too_big"]
-
     def test_accord_sur_la_meme_session_et_le_meme_seuil(self):
         with mock.patch.object(mechanics, "configured", return_value=document(BLOC)):
             for usage in (800_000, 1_600_000, 2_400_000):
@@ -238,6 +244,53 @@ class AlerteEtRotationDAccordTest(_RotationBase):
                        if a["type"] == "session_too_big"]
         self.assertEqual(len(alertes), 1)
         self.assertEqual(alertes[0]["threshold"], SEUIL_COMMUN)
+
+
+class ToursEchouesTest(_RotationBase):
+    """#4448 B cx3 : un tour échoué est compté au grand livre, donc il compte.
+
+    L'alerte et la rotation doivent lire le même nombre de tours avant comme
+    après la recréation du worker : plus de rotation qui n'apparaît qu'après un
+    redémarrage, plus d'alerte sans geste.
+    """
+
+    def test_tours_echoues_accord_alerte_rotation_et_reprise(self):
+        with mock.patch.object(mechanics, "configured", return_value=document(BLOC)):
+            for usage in (800_000, 1_600_000, 2_400_000):
+                self.assertFalse(self.tour(usage, exit_code=1),
+                                 "le harnais échoue après avoir publié son usage")
+            self.assertEqual(self.worker.session_turns, 3)
+            self.assertEqual(self.worker.session_tokens, 2_400_000)
+            self.assertTrue(self.worker.rotation_due())
+            # la même session reprise par un worker neuf : mêmes compteurs,
+            # même décision, même alerte.
+            suivant = AgentWorker(self.executeur, registry.get(self.db, "cx-4448"),
+                                  {"lease_epoch": self.worker.epoch})
+            self.addCleanup(suivant.watchdog_stop.set)
+            self.assertEqual((suivant.session_turns, suivant.session_tokens), (0, 0.0))
+            self.assertTrue(suivant.rotation_due())
+            self.assertEqual((suivant.session_turns, suivant.session_tokens),
+                             (3, 2_400_000))
+        alertes = self.alertes()
+        self.assertEqual(len(alertes), 1)
+        self.assertEqual((alertes[0]["value"], alertes[0]["threshold"]),
+                         (2_400_000, SEUIL_CODEX))
+        self.assertEqual(alertes[0]["turns"], 3)
+
+    def test_tours_echoues_sous_le_seuil_pas_de_rotation_ni_d_alerte(self):
+        with mock.patch.object(mechanics, "configured", return_value=document(BLOC)):
+            for usage in (100_000, 200_000, 300_000):
+                self.assertFalse(self.tour(usage, exit_code=1))
+            self.assertEqual(self.worker.session_turns, 3)
+            self.assertEqual(self.worker.session_tokens, 300_000)
+            self.assertFalse(self.worker.rotation_due())
+            suivant = AgentWorker(self.executeur, registry.get(self.db, "cx-4448"),
+                                  {"lease_epoch": self.worker.epoch})
+            self.addCleanup(suivant.watchdog_stop.set)
+            self.assertFalse(suivant.rotation_due())
+            self.assertEqual((suivant.session_turns, suivant.session_tokens),
+                             (3, 300_000))
+        self.assertEqual(self.alertes(), [])
 
 
 if __name__ == "__main__":

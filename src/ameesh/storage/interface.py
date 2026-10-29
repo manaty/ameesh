@@ -755,9 +755,11 @@ class TurnCosts(Domain):
         (`input_tokens + output_tokens`, cache compris quand le harnais le
         compte dans l'entrée) des tours de `agent` pour `session`, leur
         nombre, le harnais du dernier tour et son instant : `tokens`, `turns`,
-        `harness`, `last_ts` (epoch) ; ou None si aucun tour. C'est la même
-        mesure que les compteurs en mémoire de l'exécuteur, relue du grand
-        livre pour l'alerte `session_too_big`."""
+        `harness`, `last_ts` (epoch) ; ou None si aucun tour. `turns` compte
+        **tous** les tours inscrits au grand livre, réussis ou non — la
+        définition du compteur vivant de l'exécuteur (#4448 B), et non les
+        seuls succès. C'est la même mesure que ce compteur, relue pour
+        l'alerte `session_too_big`."""
 
     @abc.abstractmethod
     def first_after(self, agent: str, ts: float) -> dict | None:

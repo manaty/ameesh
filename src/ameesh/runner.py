@@ -2110,11 +2110,13 @@ class AgentWorker(threading.Thread):
         que la session, elle, continue : la décision de rotation et l'alerte
         `session_too_big` ne mesuraient plus la même chose. La somme et le
         nombre de tours de la session courante sont relus **une fois**, avant
-        la première décision ; un compteur déjà non nul (tour de ce worker)
-        n'est jamais écrasé. Une lecture en échec laisse les compteurs à zéro :
-        la mesure repart du tour suivant, jamais une valeur supposée.
+        la première décision. Seul le nombre de tours dit si ce worker a déjà
+        compté un tour (réussi ou non, la définition unifiée) : des jetons
+        seuls — un tour en cours, une mesure reprise — ne bloquent plus la
+        reprise. Une lecture en échec laisse les compteurs à zéro : la mesure
+        repart du tour suivant, jamais une valeur supposée.
         """
-        if self.session_turns or self.session_tokens:
+        if self.session_turns:
             return
         session = self.current_session()
         if not session:
@@ -8345,6 +8347,13 @@ class AgentWorker(threading.Thread):
         # par plafond) : la réservation du compte reste comptée en entier
         self._compta_termine(modele_annonce, incertain=bool(
             error or result_code or lost or preempte or clos))
+        # #4448 B cx3 : le nombre de tours de la session est celui des tours
+        # COMPTÉS au grand livre — réussis ou non : la dépense a eu lieu même
+        # quand le harnais échoue (L13 B1), et toutes les sorties anticipées
+        # ci-dessous ont déjà leur ligne. L'alerte `session_too_big` relit ce
+        # même compte (`turn_costs`) : les deux mesures ne peuvent plus
+        # diverger, ni dépendre d'un redémarrage du worker.
+        self.session_turns += 1
         if clos and not lost and not preempte and not self.restarting.is_set():
             # L105 : tour clos par un plafond — un tour abouti, pas un échec ;
             # le code de sortie est celui de l'arrêt demandé.
@@ -8648,8 +8657,6 @@ class AgentWorker(threading.Thread):
         self.last_activity = time.monotonic()
         self._turn_end_mono = self.last_activity  # #3451
         self._backup_session(adapter, compte, session_new or session)
-        if ok:
-            self.session_turns += 1
         self._sync_memory()
         if spec["kind"] == "idle":
             self.nudged = True
