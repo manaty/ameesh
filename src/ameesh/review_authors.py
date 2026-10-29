@@ -121,12 +121,14 @@ class _Sweep:
         self.budget = float(budget)
         self.label = str(label or "")
         self.tripped = ""              # première étape refusée à l'échéance
+        self.trips = 0                 # #4469 : refus comptés, lus par lecture
 
     def check(self, step: str) -> None:
         if self.deadline.expired():
             self.trip(step)
 
     def trip(self, step: str) -> None:
+        self.trips += 1
         if not self.tripped:
             self.tripped = step
         raise SweepDeadline(
@@ -147,6 +149,11 @@ def sweep_deadline(budget: float, label: str = ""):
         yield sweep
     finally:
         _SWEEP.reset(token)
+
+
+def active_sweep():
+    """L'échéance de balayage posée par l'appelant courant, ou None (#4469)."""
+    return _SWEEP.get()
 
 
 def _sweep_grep(repo: str, rev: str, args: Sequence[str], patterns: Sequence[str],

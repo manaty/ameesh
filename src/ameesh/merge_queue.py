@@ -1564,6 +1564,11 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
                 age = None
             if age is not None and 0.0 <= age <= GATE_CACHE_TTL_S:
                 return {"ok": bool(entry.get("ok")), "cached": True}
+    # #4469 : sous une échéance de balayage (passe d'alertes), une lecture
+    # dont un balayage a été refusé ne conclut pas : None, et rien en cache.
+    from . import review_authors
+    sweep = review_authors.active_sweep()
+    trips = sweep.trips if sweep is not None else 0
     try:
         klass = klass or lot_class.of_lot(
             db, lot, cfg=cfg, item=item,
@@ -1583,6 +1588,8 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
                            repo=klass.get("repo") or repo or None,
                            klass=klass, item=item, cfg=cfg, target=target)
     except Exception:  # noqa: BLE001 - une porte illisible ne conclut pas
+        return None
+    if sweep is not None and sweep.trips != trips:
         return None
     if gate_cache is not None and isinstance(gate, dict):
         _gate_cache_store(gate_cache, lot, signature, gate.get("ok"), now)
