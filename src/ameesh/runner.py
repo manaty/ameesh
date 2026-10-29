@@ -11790,7 +11790,8 @@ class Runner:
             if own:
                 from .scoped_db import ScopedDb
                 db = ScopedDb(self.cfg)
-            from . import notify_gap
+            from . import notify_gap, validation_deadlines
+            validation_deadlines.sweep(self.cfg, db, now=now)
             report = notify_gap.brief_once(self.cfg, db, now=now)
         except Exception as exc:      # jamais fatal pour l'exécuteur
             log_async("notify gap: pass failed (%s: %s)" % (type(exc).__name__, exc))

@@ -147,6 +147,59 @@ class Decisions(interface.Decisions):
             """.replace("__COLUMNS__", _MAIL_COLUMNS),
             (float(since_ts), json.dumps(list(recipients)), int(limit)))[::-1]
 
+    def validation_register(self, decision_id, *, routing):
+        self.db.execute("INSERT INTO decision_validations(decision_id, routing)"
+                        " VALUES (%s, %s::jsonb)",
+                        (int(decision_id), json.dumps(routing)))
+
+    def validation_route(self, decision_id):
+        rows = self.db.query("SELECT routing FROM decision_validations WHERE decision_id = %s",
+                             (int(decision_id),))
+        return rows[0]["routing"] if rows else None
+
+    def validation_lock(self, decision_id):
+        rows = self.db.query(
+            "SELECT %s FROM agent_mailbox WHERE id = %%s AND %s FOR UPDATE"
+            % (_COLUMNS, _IS_DECISION), (int(decision_id),))
+        return rows[0] if rows else None
+
+    def validation_escalate(self, decision_id, *, recipient, decision, body, now):
+        self.db.execute(
+            "UPDATE agent_mailbox SET recipient = %s, body = %s,"
+            " payload = jsonb_set(payload, '{decision}', %s::jsonb) WHERE id = %s",
+            (recipient, body, json.dumps(decision), int(decision_id)))
+        self.db.execute(
+            "UPDATE decision_validations SET escalated_at = to_timestamp(%s),"
+            " routing = routing || %s::jsonb WHERE decision_id = %s",
+            (float(now), json.dumps({"escalated_to": recipient}), int(decision_id)))
+
+    def validation_event(self, decision_id, *, person, kind, now, facts, event_key):
+        self.db.execute(
+            "INSERT INTO validation_events(decision_id, person, kind, occurred_at, facts, event_key)"
+            " VALUES (%s, %s, %s, to_timestamp(%s), %s::jsonb, %s)"
+            " ON CONFLICT(decision_id, event_key) DO NOTHING",
+            (int(decision_id), person, kind, float(now), json.dumps(facts), event_key))
+
+    def validation_history(self, *, person):
+        # Deliberately absent from the mediated executor's closed contract.
+        return self.db.query(
+            "SELECT e.decision_id, person, kind, extract(epoch from occurred_at)::float8 AS ts,"
+            " facts, routing->>'domain' AS domain FROM validation_events e"
+            " JOIN decision_validations v ON v.decision_id = e.decision_id"
+            " WHERE person = %s ORDER BY e.id", (person,))
+
+    def validation_followup(self, decision_id, *, followup_id, response_key):
+        self.db.execute(
+            "INSERT INTO validation_decision_links(source_id, target_id, relation, response_key)"
+            " VALUES (%s, %s, 'contradicts', %s)",
+            (int(decision_id), int(followup_id), response_key))
+
+    def validation_followup_id(self, decision_id, *, response_key):
+        rows = self.db.query(
+            "SELECT target_id FROM validation_decision_links WHERE source_id = %s AND response_key = %s",
+            (int(decision_id), response_key))
+        return rows[0]["target_id"] if rows else None
+
     def register_chat(self, name, *, human, host, harness, cwd, status_text) -> dict | None:
         # L123 : un agent `execute` du même nom, ou un bail vivant, ne se
         # transforment jamais en conversation (rien n'est écrit : la ligne

@@ -3896,6 +3896,40 @@ class Decisions(Domain):
         (état, réponse ou retrait). Rend la ligne close, ou None (déjà close,
         inconnue) — rien n'est écrit."""
 
+    def validation_register(self, decision_id: int, *, routing: dict):
+        """#4256: immutable authority snapshot, outside the mediated contract."""
+        raise NotImplementedError
+
+    def validation_route(self, decision_id: int):
+        """Private routing snapshot, or None for a legacy request."""
+        raise NotImplementedError
+
+    def validation_lock(self, decision_id: int):
+        """Lock the decision mailbox row before escalation or a late reply."""
+        raise NotImplementedError
+
+    def validation_escalate(self, decision_id: int, *, recipient: str,
+                            decision: dict, body: str, now: float):
+        """Update a locked, pending decision and record its single escalation."""
+        raise NotImplementedError
+
+    def validation_event(self, decision_id: int, *, person: str, kind: str,
+                         now: float, facts: dict, event_key: str):
+        """Append idempotent private facts; never a work note or thread entry."""
+        raise NotImplementedError
+
+    def validation_history(self, *, person: str):
+        """Private audit rows; caller must verify owner key and human session."""
+        raise NotImplementedError
+
+    def validation_followup(self, decision_id: int, *, followup_id: int, response_key: str):
+        """Record the typed contradiction link under the decision row lock."""
+        raise NotImplementedError
+
+    def validation_followup_id(self, decision_id: int, *, response_key: str):
+        """Existing contradiction follow-up, or None."""
+        raise NotImplementedError
+
     def reply_for(self, decision_id: int, *, sender: str | None = None) -> dict | None:
         """#3892 : le courrier de réponse déjà déposé pour `decision_id`
         (`kind = 'reply'`, `payload.decision_answer.decision`), ou None.
