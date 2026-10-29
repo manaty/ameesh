@@ -618,21 +618,52 @@ class EventLogPgTest(PgTestCase):
         following, _, _ = store.readable((int(first["tx"]), int(first["id"])), 1)
         self.assertEqual([r["object"] for r in following], ["alert:ten"])
 
+    def notification(self, listener, payload, timeout=5.0):
+        """The notification of `events.CHANNEL` carrying `payload`, patiently.
+
+        `ameesh_events` is database-wide: on the shared bench another schema
+        (or any other writer) notifies its own ids on the same channel
+        (#4600). The payload is the id of the row this insert made, so any
+        other message is a stranger's wake-up: ignore it and wait for ours,
+        up to the bound, then fail cleanly.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            got = listener.wait(max(0.0, min(0.5, deadline - time.monotonic())))
+            if got == {"channel": events.CHANNEL, "payload": payload}:
+                return got
+            if got and got.get("event") == "down":
+                self.fail("event listener went down while waiting for %r: %r"
+                          % (payload, got))
+            if time.monotonic() >= deadline:
+                self.fail("no %s notification carrying %r within %gs (last: %r)"
+                          % (events.CHANNEL, payload, timeout, got))
+
     def test_notify_carries_the_id_alone(self):
         listener = db_mod.listener(self.db, [events.CHANNEL])
         if listener is None:
             self.skipTest("driver without LISTEN")
-        try:
-            new = events.record(self.db, "alert.raised", "alert:x", agent="nobody")
-            deadline = time.monotonic() + 5
-            got = None
-            while time.monotonic() < deadline:
-                got = listener.wait(0.5)
-                if got and got.get("channel") == events.CHANNEL:
-                    break
-            self.assertEqual(got, {"channel": events.CHANNEL, "payload": str(new)})
-        finally:
-            listener.close()
+        self.addCleanup(listener.close)
+        new = events.record(self.db, "alert.raised", "alert:x", agent="nobody")
+        got = self.notification(listener, str(new))
+        self.assertEqual(got, {"channel": events.CHANNEL, "payload": str(new)})
+
+    def test_a_foreign_notification_on_the_channel_is_ignored(self):
+        """#4600: witness. The channel is database-wide, so a notification of
+        another schema (or any other writer) can be delivered before ours; it
+        must neither fail the wait nor stand in for the witness of this
+        insert."""
+        listener = db_mod.listener(self.db, [events.CHANNEL])
+        if listener is None:
+            self.skipTest("driver without LISTEN")
+        self.addCleanup(listener.close)
+        foreign = "foreign-%s" % uuid.uuid4().hex
+        self.db.execute("SELECT pg_notify(%s, %s)", (events.CHANNEL, foreign))
+        self.assertEqual(self.notification(listener, foreign),
+                         {"channel": events.CHANNEL, "payload": foreign})
+        new = events.record(self.db, "alert.raised", "alert:x", agent="nobody")
+        self.assertEqual(self.notification(listener, str(new)),
+                         {"channel": events.CHANNEL, "payload": str(new)})
 
     def test_listen_works_on_a_read_only_session(self):
         ro = db_mod.connect(dataclasses.replace(self.cfg, read_only=True))
