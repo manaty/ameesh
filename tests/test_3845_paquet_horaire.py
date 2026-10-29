@@ -58,6 +58,8 @@ class FakeShell:
         self.auto_rc = 0
         self.added: list[list[str]] = []
         self.clock = NOW
+        #: #4506 : la tête gelée est-elle un ancêtre de origin/<cible> ?
+        self.ancestor = False
 
     def run(self, cmd, *, cwd=None, input_text=None, timeout=0):
         self.calls.append(list(cmd))
@@ -67,6 +69,8 @@ class FakeShell:
         if cmd[0] == "git":
             if "ls-remote" in cmd:
                 return ph.Result(0, "%s\trefs/heads/integration/paquet-h-20261027-03\n" % HEAD)
+            if "merge-base" in cmd and "--is-ancestor" in cmd:
+                return ph.Result(0 if self.ancestor else 1)
             return ph.Result(0)
         if cmd[0] == "ameesh":
             args = cmd[1:]
@@ -261,6 +265,9 @@ class ComposeTest(Base):
         self.assertEqual(add[add.index("--title") + 1][:31], "Paquet horaire h-20261027-04 — ")
         auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
         self.assertNotIn("--force", auto)
+        # #4581 : une composition neuve n'est pas une recomposition ; elle ne
+        # reprend pas une composition précédente.
+        self.assertNotIn("--keep-composition", auto)
         self.assertTrue(self.shell.ran("work", "reviewer", "4000", "--no-verdict"))
         ci = self.shell.ran("ci", "run", "4000", "--full")[0]
         self.assertEqual(ci[ci.index("--sha") + 1], HEAD)
@@ -335,6 +342,9 @@ class FollowTest(Base):
         auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
         self.assertIn("--force", auto)
         self.assertEqual(auto[auto.index("--exclude") + 1], "3801")
+        # #4581 : la recomposition reprend les membres de la composition
+        # précédente (la tête gelée rouge), moins l'unité exclue.
+        self.assertEqual(auto[auto.index("--keep-composition") + 1], HEAD)
         # #4201 : la recomposition automatique dit son vrai motif au manifeste.
         self.assertEqual(auto[auto.index("--exclude-reason") + 1],
                          ph.EXCLUDE_CI_FULL_REASON)
@@ -631,6 +641,9 @@ class ResumeTest(Base):
         auto = self.autos()[0]
         self.assertIn("--force", auto)
         self.assertEqual(auto[auto.index("--exclude") + 1], "3801")
+        # #4581 : une reprise de recomposition garde la même composition de
+        # départ, sans réadmettre les lots prêts entre-temps.
+        self.assertEqual(auto[auto.index("--keep-composition") + 1], HEAD)
         self.assertIn(ph.MARK_ATTEMPT + "recomposition n=2 base=%s" % HEAD,
                       " ".join(ph.marks(item)))
         self.assertNotIn("mty-amh-impl-02", [to for to, _ in self.shell.mails])

@@ -204,8 +204,9 @@ class LocalNeighborsTest(unittest.TestCase):
                 if lot is not None:
                     found.setdefault(lot, []).append(failure)
             if not found:
-                return {}, "préfixe non simulé pour %d test(s)" % len(failures)
-            return found, ""
+                return {}, ("préfixe non simulé pour %d test(s)"
+                            % len(failures)), []
+            return found, "", []
 
         from unittest import mock
         with mock.patch.object(paquet_auto, "unit_test_modules",

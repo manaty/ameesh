@@ -2,12 +2,18 @@
 """#1465 : preuves exactes d'origine, sur Postgres (migration 0445)."""
 from __future__ import annotations
 
+import json
+
 from ..provenance import Provenance as Contract
 
 _COLUMNS = """
     subject, sha, actor, session, turn, harness, work_item_id,
     extract(epoch FROM at)::float8 AS at_ts
 """
+
+#: une liste de textes passée en paramètre : `NULL` si vide, sinon un JSON
+#: que l'instruction convertit en `text[]` (même idiome que `hosts.py`)
+_ARRAY_SQL = "ARRAY(SELECT jsonb_array_elements_text(%s::jsonb))"
 
 
 class Provenance(Contract):
@@ -52,3 +58,36 @@ class Provenance(Contract):
             "  JOIN work_item_milestones m ON p.subject = 'milestone:' || m.id"
             " WHERE p.subject = %s", (subject,))
         return rows[0] if rows else None
+
+    def commits(self, actor, *, since_ts=None, until_ts=None, limit=None):
+        sql = ("SELECT " + _COLUMNS +
+               "  FROM provenance_receipts"
+               " WHERE actor = %s AND subject LIKE 'commit:%%'")
+        params = [str(actor)]
+        if since_ts is not None:
+            sql += " AND extract(epoch FROM at) >= %s"
+            params.append(float(since_ts))
+        if until_ts is not None:
+            sql += " AND extract(epoch FROM at) <= %s"
+            params.append(float(until_ts))
+        sql += " ORDER BY at DESC, subject DESC"
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(max(int(limit), 1))
+        return [dict(row) for row in self.db.query(sql, tuple(params))]
+
+    def origins(self, commits):
+        values = sorted({str(sha).strip().lower() for sha in commits or ()
+                         if str(sha or "").strip()})
+        if not values:
+            return []
+        rows = self.db.query(
+            "SELECT DISTINCT p.work_item_id"
+            "  FROM provenance_receipts p"
+            "  JOIN work_item_milestones m ON p.subject = 'milestone:' || m.id"
+            " WHERE p.work_item_id IS NOT NULL"
+            "   AND m.kind IN ('frozen', 'verdict')"
+            "   AND p.sha = ANY(" + _ARRAY_SQL + ")"
+            " ORDER BY p.work_item_id",
+            (json.dumps(values),))
+        return [int(row["work_item_id"]) for row in rows]

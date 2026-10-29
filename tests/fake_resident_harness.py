@@ -185,6 +185,15 @@ class Claude:
              "model": "fake-model"})
         texts = [self.replay(first)]
         trace({"user": texts[0]})
+        # #2894 : the harness's own turn document, as handed at launch. Kept
+        # in a separate entry so existing exact-entry assertions still hold.
+        context_path = os.environ.get("AMEESH_TURN_CONTEXT")
+        if context_path:
+            try:
+                with open(context_path, encoding="utf-8") as fh:
+                    trace({"turn_context": json.load(fh)})
+            except (OSError, ValueError) as exc:
+                trace({"turn_context_error": str(exc)})
         if texts[0].strip() == "/compact":
             self.compact()
         if "ORPHAN" in texts[0]:

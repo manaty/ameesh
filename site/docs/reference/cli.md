@@ -904,6 +904,41 @@ Operator procedure and the configuration key (`approvals`) are in
 `docs/EXPLOITATION.md`; the contract is in
 `docs/design/process-workflow-registry.md`.
 
+## Observations journal: `ameesh process-observations`
+
+```
+ameesh process-observations refresh [--config F] [--dry-run] [--json]  # collect and write the local projection
+ameesh process-observations check [--config F] [--json]                # freshness, counts, digests
+ameesh process-observations show [--config F] [--id ID] [--lot N] [--app A] \
+    [--kind deployed|pass|fail] [--environment staging|preprod|acceptance] \
+    [--artifact SHA] [--all] [--json]
+ameesh process-observations revoke --id ID --reason R [--actor A] [--config F] [--json]
+```
+
+The IMA observations journal (#4425) is the native path for deployments, QA
+results and human acceptances. The bureau (`bureau-goal`) is the only
+collector: it appends to a JSONL journal (0600, directory 0700), whose entries
+are chained by JCS+SHA-256 digests, and derives the read-only
+`ameesh-observations/1` projection. Hosts only read that projection and never
+contact a source. A projection that is missing, stale, unreadable, writable by
+the group or others, of another identity or of an unknown schema is refused
+(fail-closed): the `observations` source disappears from the snapshot and
+every guard that requires it refuses `source-unavailable`. A revoked,
+superseded, expired or future record is never collected.
+
+`refresh` collects the native staging attestations
+(`ameesh-staging-actif/1`, release cut-off reports) and the human acceptances
+of the #4006 approval projection; the QA envelope waits for the external IMA
+#796 contract and a configured `qa` key is refused, no envelope being
+invented. `deployed` never expires by age: the next deployment of the same
+environment supersedes it; QA `pass`/`fail` expire after 7 days; acceptances
+follow #4006's own expiry and revocation. `--dry-run` reads and derives
+without writing either file. `revoke` appends a terminal revocation and
+republishes the projection. `check`/`show` make no network call, so an agent
+host can use them. The configuration key (`observations`) and the operator
+procedure are in `docs/EXPLOITATION.md`; the contract (journal, projection,
+identity, refusal codes) is in `docs/design/process-workflow-registry.md`.
+
 ## Model catalogue: `ameesh models`
 
 ```

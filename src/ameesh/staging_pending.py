@@ -202,6 +202,7 @@ def waiting(db, project, *, active=None) -> dict:
                       lifecycle.REQUESTED,
                       lifecycle.IN_PROGRESS,
                       lifecycle.QA,
+                      lifecycle.VALIDATED,
                       lifecycle.BLOCKED,
                   )]
     ids = [int(r["id"]) for r in candidates]
