@@ -52,6 +52,7 @@ import re
 import stat
 import sys
 import time
+import uuid
 
 
 def module(name):
@@ -100,6 +101,7 @@ class Release:
     directories=installer.DIRECTORIES
     private=('/etc/ameesh-release','/var/lib/ameesh-release','/opt/ameesh-release/store')
     keys=frozenset({files_mod.KEY})
+    account=installer.account
     errors=(entry.OperatorError,bootstrap.BootstrapError)
 
 
@@ -113,6 +115,7 @@ class Channels:
     directories=channels.delegation.DIRECTORIES
     private=channels.delegation.PRIVATE
     keys=frozenset(channels.delegation.KEYS)
+    account=channels.account
     errors=(channels.BootstrapError,channels.delegation.DelegationError)
 
 
@@ -312,15 +315,24 @@ class Backend:
                 probe_turn=value.get('probe_turn'),expires_at=value['expires_at'],db=self.db,
                 runtime_seal=value.get('runtime_seal'))
         bundle=stage/'bundle.json'
+        question=stage/'question.txt'
         if bundle.exists() or bundle.is_symlink():
             # Never re-render a reviewed bundle: a resumed install keeps it.
             if protocol.identity(json.loads(self.private(bundle,1<<24)))!=protocol.identity(prepared.bundle):
                 raise BackendError('another bundle is already prepared for this operation')
+            # The question is derived from that frozen bundle and the staged
+            # deadline: a lost or altered one is repaired, never re-rendered.
+            try:
+                current=self.private(question,entry.MAX_QUESTION).decode()
+            except (OSError,ValueError):
+                current=None
+            if current!=prepared.question:
+                self.replace(question,prepared.question)
         else:
             # The bundle is written last: it alone marks a completed prepare,
             # so a question left by an interrupted run is replaced.
-            (stage/'question.txt').unlink(missing_ok=True)
-            self.write(stage/'question.txt',prepared.question)
+            question.unlink(missing_ok=True)
+            self.write(question,prepared.question)
             self.write(bundle,json.dumps(prepared.bundle,sort_keys=True,separators=(',',':')))
         self.gestes.append(command='prepare',operation=operation,phase='prepared',
                            bundle_digest=prepared.bundle['digest'],
@@ -333,6 +345,18 @@ class Backend:
         with os.fdopen(fd,'w') as stream:
             stream.write(text); stream.flush(); os.fsync(stream.fileno())
         runtime.fsync_directory(path.parent)
+
+    @staticmethod
+    def replace(path,text):
+        temporary=path.with_name('.'+path.name+'-'+uuid.uuid4().hex)
+        try:
+            fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+            with os.fdopen(fd,'w') as stream:
+                stream.write(text); stream.flush(); os.fsync(stream.fileno())
+            os.replace(temporary,path)
+            runtime.fsync_directory(path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def prepared(self,operation):
         stage=self.stage(operation); runtime.trusted(stage)
@@ -409,6 +433,28 @@ class Backend:
             return {}
         return protocol.load(path)
 
+    def account_intent(self,path,request):
+        """Durable account intent `compte-release.ensure` would resume, or None.
+
+        Read-only: the dry run must know whether a pre-existing group/account
+        is the one a previous run created (resume) or an unowned identity the
+        install refuses. Bad intent records refuse instead of rendering a plan.
+        """
+        path=Path(path)
+        if not path.exists() and not path.is_symlink():
+            return None
+        try:
+            runtime.trusted(path.parent)
+            record=protocol.load(path)
+        except Exception:
+            raise BackendError('account intent unavailable') from None
+        if (not isinstance(record,dict) or set(record)!={'request','phase','receipt'}
+                or record['request']!=request
+                or record['phase'] not in ('group','user_ready','user','complete')
+                or (record['phase']!='complete' and record['receipt'] is not None)):
+            raise BackendError('account intent unavailable')
+        return record
+
     def tree(self,path):
         try:
             return runtime.inventory(path)['digest']
@@ -435,8 +481,22 @@ class Backend:
             for logical,mode in kind.directories.items():
                 target=self.path(logical)
                 if not target.exists() and not target.is_symlink():
+                    # The real layout trusts the nearest existing ancestor
+                    # before creating the missing chain; a linked or writable
+                    # ancestor is refused, never repaired.
+                    parent=target
+                    while not parent.exists() and not parent.is_symlink():
+                        parent=parent.parent
+                    try:
+                        runtime.trusted(parent)
+                    except Exception:
+                        result[logical]='refuse untrusted'; continue
                     result[logical]='create %04o'%mode
                     continue
+                try:
+                    runtime.trusted(target)
+                except Exception:
+                    result[logical]='refuse untrusted'; continue
                 info=target.lstat()
                 ok=(stat.S_ISDIR(info.st_mode) and info.st_uid==os.geteuid()
                     and (stat.S_IMODE(info.st_mode)==mode or not logical.startswith(tuple(kind.private))))
@@ -450,21 +510,45 @@ class Backend:
         if step=='account' or step in channels.ACCOUNT_STEPS and kind is Channels:
             if kind is Channels:
                 ids=bundle['accounts'][channels.ACCOUNT_STEPS[step]]
-                observe=channels.account.Named(self.system,ids['name'],ids['home'])
+                account_name,account_home=ids['name'],ids['home']
+                observe=kind.account.Named(self.system,account_name,account_home)
             else:
                 ids=bundle['account']; observe=self.system
+                account_name,account_home=kind.account.NAME,kind.account.HOME
+            # `compte-release.ensure` names one intent per account.
+            suffix='.json' if account_name==kind.account.NAME else '.'+account_name+'.json'
+            request=dict(operation=operation,machine_id=bundle['machine_id'],uid=ids['uid'],
+                         gid=ids['gid'],scope_digest=kind.account.scope_digest(
+                             operation,bundle['machine_id'],ids['uid'],ids['gid'],
+                             name=account_name,home=account_home))
             try:
                 group,user=observe.group(),observe.account()
+                free=observe.free(ids['uid'],ids['gid'])
             except Exception:
                 return dict(account='unavailable')
-            def state(observed,wanted):
-                if observed is None:
-                    return 'create'
-                return 'present' if all(observed.get(k)==v for k,v in wanted.items()) else 'conflict'
-            return dict(group=state(group,dict(gid=ids['gid'])),
-                        account=state(user,dict(uid=ids['uid'],gid=ids['gid'],home=ids.get('home',
-                                                bootstrap.account.HOME))),
-                        name=ids['name'],uid=ids['uid'],gid=ids['gid'])
+            record=self.account_intent(self.admin/'effects/account'/(operation+suffix),request)
+            reviewed=kind.account.expected(ids['uid'],ids['gid'],name=account_name,home=account_home)
+            if record is None:
+                # Without its durable intent, ensure() refuses any pre-existing
+                # group/account or taken numeric identity before creating.
+                reasons=[]
+                if group is not None: reasons.append('existing group')
+                if user is not None: reasons.append('existing account')
+                if not free: reasons.append('taken uid/gid')
+                if reasons:
+                    return dict(group='conflict',account='conflict',name=ids['name'],
+                                uid=ids['uid'],gid=ids['gid'],refused=', '.join(reasons))
+                return dict(group='create',account='create',name=ids['name'],
+                            uid=ids['uid'],gid=ids['gid'])
+            group_state='present' if group==reviewed['group'] else 'conflict'
+            if group_state=='conflict':
+                account_state='conflict'
+            elif record['phase'] in ('group','user_ready'):
+                account_state='create' if user is None else 'conflict'
+            else:
+                account_state='present' if user==reviewed['account'] else 'conflict'
+            return dict(group=group_state,account=account_state,name=ids['name'],uid=ids['uid'],
+                        gid=ids['gid'],phase=record['phase'])
         if step in ('configuration','enable'):
             result={}
             for logical,info in sorted(bundle['files'].items()):
