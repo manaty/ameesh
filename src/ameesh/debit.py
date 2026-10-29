@@ -2128,11 +2128,68 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    ci_slow_s=ci_slow_s, devices=devices, installed=installed,
                    holds=holds, closure_allowed=closure_allowed,
                    ci_unreadable=ci_unreadable, packets=packets, zone=zone)
+    annotate_candidate_causes(db, cfg, report, milestones, unreadable)
     report["capacity"] = read_capacity(db, cfg=cfg, now=now, hours=hours, turns=turns,
                                        canons=canons, unreadable=unreadable)
     report["totals"]["capacity_alerts"] = len(report["capacity"]["alerts"])
     report["unreadable"] = list(dict.fromkeys(list(report["unreadable"]) + unreadable))
     return report
+
+
+def annotate_candidate_causes(db, cfg, report: Mapping[str, Any],
+                              milestones: Iterable[Mapping[str, Any]],
+                              unreadable: list[str]) -> None:
+    """#4572 : nomme la cause **côté auteur** des attentes `qa_merge`.
+
+    L'escalade SLO lit la même cause (`exploitation._slo_breaches`) avec le
+    même moteur que `scripts/paquet-candidats.py` : le débit doit dire la
+    même chose, jamais « en attente du paquet » quand le composeur ne peut
+    rien. Les codes sont ceux de `packet_candidates.AUTHOR_CAUSES`
+    (`freeze-not-head`, `conflict`, …), le geste nomme l'auteur.
+
+    La lecture est locale (refs du dépôt trouvé par le gel, aucun fetch) et
+    ne touche que les attentes déjà retenues ; une lecture impossible laisse
+    la ligne telle quelle et se consigne. Aucune écriture."""
+    from . import packet_candidates, registry, storage
+
+    waits = list(report.get("slow_waits") or ()) \
+        + list(report.get("human_waits") or ())
+    rows = [row for row in waits if str(row.get("kind")) == "qa_merge"]
+    if not rows:
+        return
+    marks_by_lot = _rows_by_lot(milestones)
+    try:
+        overview = registry.overview(db)
+    except Exception:  # noqa: BLE001 - registre illisible : lecture par lot
+        overview = []
+    for row in rows:
+        lot = int(row.get("lot") or 0)
+        try:
+            item = storage.of(db).work.get(lot)
+        except Exception as exc:  # noqa: BLE001 - ligne illisible : cause inconnue
+            unreadable.append("lot %d: candidate cause unreadable: %s" % (lot, exc))
+            continue
+        if item is None or not str(item.get("branch") or "").strip():
+            # Un lot sans branche n'est pas un candidat au paquet : la cause
+            # `missing-branch` relève de la prise du lot, pas de la fusion.
+            continue
+        try:
+            cause = packet_candidates.candidate_refusal(
+                db, cfg, item, marks_by_lot.get(lot, ()), overview=overview)
+        except Exception as exc:  # noqa: BLE001 - une lecture ne fait pas tomber le débit
+            unreadable.append("lot %d: candidate cause unreadable: %s" % (lot, exc))
+            continue
+        if not cause.get("code"):
+            continue
+        # Le porteur du paquet n'est pas le débiteur : le geste est celui de
+        # l'auteur, avec le code et le détail du refus (mêmes mots que la
+        # liste calculée).
+        author = item.get("assignee") or "l'auteur"
+        detail = " (%s)" % cause["detail"] if cause.get("detail") else ""
+        row["cause"] = cause
+        row["who"] = author
+        row["gesture"] = "cause `%s`%s — %s : %s" % (
+            cause["code"], detail, author, cause.get("gesture") or "")
 
 
 def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,

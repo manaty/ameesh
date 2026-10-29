@@ -68,6 +68,13 @@ n'est ni prêt ni écarté : il porte `error` et il est nommé dans `errors` et
 écarter explicitement chaque lot en erreur : l'omettre en silence reste
 interdit (#3813). Seule une erreur globale (base, cible, base de données,
 inventaire) lève `CandidateError` et rend toute la liste inutilisable.
+
+#4572 : `candidate_refusal` rend le **premier refus côté auteur** d'un seul
+lot (`freeze-not-head`, `conflict`, …), avec le geste attendu, pour les
+lecteurs qui ne composent pas — escalade SLO « review GO → merge » et
+`ameesh debit`. Mêmes codes que `_candidate`, lecture locale des refs du
+dépôt (aucun fetch) ; `ready=True` seulement quand le gel est la tête publiée
+et que la fusion avec la cible est propre.
 """
 from __future__ import annotations
 
@@ -1194,3 +1201,177 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
         return entry
     entry["ready"] = not entry["causes"] and not entry["error"]
     return entry
+
+
+# --------------------------------------------------------------------------
+# #4572 : la cause côté auteur, pour l'escalade SLO et le débit
+# --------------------------------------------------------------------------
+
+#: #4572 : refus qu'un **auteur** peut lever lui-même, avec le geste attendu.
+#: Le composeur du paquet ne peut rien y faire : il ne compose que `ready`.
+#: Les codes sont ceux de `_candidate` (`inventory`), jamais un vocabulaire
+#: parallèle. Un refus absent de cette table (avis, hold, dépendance, release,
+#: cible) n'est pas une cause d'auteur et n'est pas touché ici.
+AUTHOR_CAUSES = {
+    "freeze-not-head":
+        "freeze again on the published head, then have it reviewed",
+    "freeze-required":
+        "declare the freeze of the published head, then have it reviewed",
+    "freeze-unresolved":
+        "freeze again on a commit of the repository, then have it reviewed",
+    "missing-branch":
+        "give the lot its branch, push it, then freeze",
+    "conflict":
+        "resolve the conflict with the target, then freeze and have it reviewed, "
+        "or prepare a clean remise on the target and have that reviewed",
+}
+
+
+def author_gesture(code: str) -> str:
+    """#4572 : le geste de l'auteur pour un refus, vide si ce n'est pas le sien."""
+    return AUTHOR_CAUSES.get(str(code or ""), "")
+
+
+def _author_refusal(code: str, detail: str, **extra) -> dict:
+    """Un refus d'auteur, dans la forme que lisent l'escalade et le débit."""
+    out = {"code": code, "detail": detail, "owner": "author",
+           "gesture": author_gesture(code), "ready": False, "unknown": False}
+    out.update(extra)
+    return out
+
+
+def refusal_of(row: dict, *, frozen: str = "", raw_freeze: str = "",
+               published: str = "", published_source: str = "", repo: str = "",
+               target: str = "", base: str = "") -> dict:
+    """#4572 : le premier refus **côté auteur** d'un lot, ou son absence.
+
+    Le calcul reste celui de `inventory` (`_candidate`) : mêmes codes, même
+    ordre de lecture (branche, gel, tête publiée, essai de fusion contre la
+    cible). Il ne fait **aucune I/O réseau** et ne compose rien : il lit les
+    refs locales que `candidate_refusal` a résolues. `published` est la tête
+    publiée de la branche (`origin/<branche>`) ; `branch_head` n'est qu'une
+    observation et ne doit pas la remplacer (voir `plan_git.freeze_candidate`).
+    Un `published` vide laisse la tête inconnue : si aucun conflit n'est
+    trouvé, le résultat est `unknown` — on ne dit jamais « prêt » sans preuve.
+
+    `ready=True` seulement quand le gel est la tête publiée et que l'essai de
+    fusion est propre. `unknown=True` quand la lecture n'a pas pu conclure
+    (dépôt absent, gel non résolu, refs manquantes, essai illisible). Aucun
+    code n'est inventé : un refus non nommé ici (avis, hold, release…) laisse
+    `code` vide, `unknown` inchangé."""
+    row = row or {}
+    branch = str(row.get("branch") or "").strip()
+    raw = str(raw_freeze or frozen or "").strip()
+    out = {"code": "", "detail": "", "owner": "", "gesture": "",
+           "ready": False, "unknown": False,
+           "published": str(published or ""),
+           "published_source": str(published_source or "")}
+    if not branch:
+        return _author_refusal("missing-branch",
+                               "the lot has no branch to package")
+    if not raw:
+        return _author_refusal("freeze-required",
+                               "the lot declares no freeze")
+    if not plan_git.commit_id(raw):
+        return _author_refusal("freeze-unresolved",
+                               "freeze %r is not a commit id" % raw)
+    if not frozen:
+        out["unknown"] = True
+        return out
+    observed = str(published_source or "") == "observed"
+    if published:
+        if not plan_git.same_commit(frozen, published):
+            return _author_refusal(
+                "freeze-not-head",
+                "freeze %s is not the %s head %s"
+                % (frozen[:12], "observed" if observed else "published",
+                   published[:12]))
+        # Une tête publiée égale au gel autorise l'essai de fusion ; une simple
+        # observation (`branch_head`) ne prouve pas la tête publiée et ne
+        # permettra jamais de conclure « prêt ».
+    if not repo or not base:
+        out["unknown"] = True
+        return out
+    try:
+        merged = merge_tree(repo, base, frozen)
+    except Exception:  # noqa: BLE001 - essai illisible : on ne conclut pas
+        out["unknown"] = True
+        return out
+    if merged.get("state") == "error":
+        out["unknown"] = True
+        return out
+    if merged.get("state") == "conflict":
+        return _author_refusal(
+            "conflict", "conflict with %s: %s"
+            % (target or "the target",
+               ", ".join(merged.get("files") or ()) or "files unreadable"),
+            files=list(merged.get("files") or ()))
+    if not published or observed:
+        out["unknown"] = True
+        return out
+    out["ready"] = True
+    return out
+
+
+def candidate_refusal(db, cfg, row: dict, marks=None, *, overview=None,
+                      repo: str | None = None) -> dict:
+    """#4572 : `refusal_of` avec la résolution des refs locales du lot.
+
+    `marks` : les jalons du lot (relus de la base s'ils manquent). `repo` peut
+    être fourni par un appelant qui l'a déjà résolu. Le dépôt est retrouvé par
+    le commit gelé comme dans `merge_queue.review_gate_for_item` (#2559) ;
+    `overview` réutilise les lignes du registre déjà lues par la passe.
+    `published` est la ref `origin/<branche>` du dépôt, jamais `branch_head` ;
+    à défaut de dépôt, `branch_head` ne sert qu'à **nommer** la tête dans le
+    détail (`published_source="observed"`), la conclusion restant `unknown`
+    sans essai de fusion. Lecture seule, aucun fetch, aucune écriture."""
+    row = row or {}
+    if marks is None:
+        marks = storage.of(db).work.milestones(int(row["id"]), None)
+    freeze = plan_git.latest_freeze(list(marks or ()))
+    raw = str((freeze or {}).get("sha") or "").strip()
+    frozen = ""
+    target_name = str(row.get("branch_target") or "").strip()
+    base = ""
+    published = ""
+    source = ""
+    if plan_git.commit_id(raw):
+        if repo is None:
+            try:
+                repo, frozen = lot_class.repo_for_freeze(db, cfg, row, raw,
+                                                         overview=overview)
+            except Exception:  # noqa: BLE001 - dépôt illisible : on ne conclut pas
+                repo, frozen = "", ""
+        else:
+            try:
+                frozen = plan_git.local_commit(repo, raw) or ""
+            except Exception:  # noqa: BLE001 - commit illisible : on ne conclut pas
+                frozen = ""
+    if repo:
+        branch = str(row.get("branch") or "").strip()
+        if branch:
+            try:
+                published = plan_git.local_commit(
+                    repo, "origin/" + merge_queue._remote_branch(branch)) or ""
+            except Exception:  # noqa: BLE001 - ref illisible : tête inconnue
+                published = ""
+            if published:
+                source = "origin"
+        try:
+            target_name = lot_class.default_base(cfg, row, repo) or target_name
+        except Exception:  # noqa: BLE001 - cible illisible : essai sans cible
+            target_name = str(row.get("branch_target") or "").strip()
+        target_name = merge_queue._remote_branch(target_name) or target_name
+        if target_name:
+            try:
+                ref = merge_queue._class_base(repo, target_name)
+                base = (plan_git._commit(repo, ref) or "") if ref else ""
+            except Exception:  # noqa: BLE001 - cible illisible : essai sans base
+                base = ""
+    if not published:
+        observed = str(row.get("branch_head") or "").strip()
+        if observed:
+            published, source = observed, "observed"
+    return refusal_of(row, frozen=frozen, raw_freeze=raw,
+                      published=published, published_source=source,
+                      repo=repo or "", target=target_name, base=base)

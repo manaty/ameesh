@@ -562,6 +562,12 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
         # (`exploitation._slo_targets`): the brief follows them, so a text
         # addressed to the pilot never reaches the assignee.
         what = None
+    # #4572 : la cause du refus d'admission au paquet, lue par la passe SLO
+    # avec les codes de `paquet-candidats` (`exploitation._slo_breaches`).
+    # Côté auteur (`freeze-not-head`, conflit…), le composeur ne peut rien :
+    # le brief nomme l'auteur et son geste. « Le composeur le porte » reste
+    # réservé au lot réellement prêt (`ready`) et pas encore composé.
+    cause = waiting.get("candidate") if isinstance(waiting, dict) else None
     if what in ("merge", "merge-approval", "merge-outcome"):
         if canon:
             if level >= 3:
@@ -573,6 +579,46 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                 move = ("bureau: merge it directly — its `canon/…` branch targets the canon "
                         "repository (manaty/home), outside the ameesh package; the "
                         "pilot/composer cannot carry it, do not wait for them")
+        elif cause and cause.get("code") and cause.get("owner") == "author":
+            author = who or alert.get("responsible") or "the author"
+            code = str(cause["code"])
+            detail = str(cause.get("detail") or "")
+            seen = " — %s" % detail if detail else ""
+            gesture = str(cause.get("gesture") or "")
+            if level >= 3:
+                move = ("bureau or auditor: the lot is frozen with its review verdict "
+                        "acquired, but a package cannot carry it — cause `%s`%s; the "
+                        "author %s still owes the fix (%s) — push the author and the "
+                        "pilot, reassign the lot to a free agent of the same family if "
+                        "the author cannot act; do not wait for the composer"
+                        % (code, seen, author, gesture))
+            elif level >= 2:
+                move = ("pilot: the lot is frozen with its review verdict acquired, but a "
+                        "package cannot carry it — cause `%s`%s; the author %s owes the fix "
+                        "(%s) — push them; if they cannot act, hand the lot to a free agent "
+                        "of the same family (ameesh work assign %d <agent>%s); the composer "
+                        "cannot carry it before"
+                        % (code, seen, author, gesture, lot, holder))
+            else:
+                move = ("author %s: the lot is frozen with its review verdict acquired, but "
+                        "a package cannot carry it — cause `%s`%s; %s; the composer cannot "
+                        "advance it until this is cleared"
+                        % (author, code, seen, gesture))
+        elif cause and cause.get("unknown"):
+            # Lecture incomplète sur cet hôte (dépôt absent, refs manquantes) :
+            # on ne nomme ni l'auteur ni le composeur au hasard ; le brief
+            # renvoie à la liste calculée, qui fait foi à la composition.
+            if level >= 3:
+                move = ("bureau or auditor: the lot is frozen with its review verdict "
+                        "acquired; this host cannot read the candidate refusal — check "
+                        "`scripts/paquet-candidats.py` before pushing the composer, the "
+                        "lot may be waiting on its author (freeze-not-head, conflict)")
+            else:
+                move = ("pilot: the lot is frozen with its review verdict acquired; this "
+                        "host cannot read the candidate refusal — check "
+                        "`scripts/paquet-candidats.py` before acting; the lot may be "
+                        "waiting on its author (freeze-not-head, conflict), and the "
+                        "composer can only carry a ready lot")
         elif alert.get("vehicle_exit_ts") is not None:
             # #4369 : retiré du paquet par sa recomposition ; le temps passé
             # dans le véhicule n'est pas compté, l'horloge part de la sortie.
