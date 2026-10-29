@@ -921,6 +921,44 @@ def _is_ancestor(repo: str, before: str, after: str) -> Optional[bool]:
     return None
 
 
+def _present_commits(repo: str, shas: Sequence[str], *,
+                     timeout: Optional[float] = None) -> Optional[dict[str, str]]:
+    """Les SHA de commits présents **localement**, en une seule commande git.
+
+    #4457 (gel #25249) : `plan_git.local_commit` lançait un processus git par
+    reçu ; 500 reçus prenaient ~40 s, au-delà du budget de 60 s du balayage en
+    CI. `cat-file --batch-check` lit la présence des objets en un passage, sans
+    fetch paresseux (`GIT_NO_LAZY_FETCH`), et rend `{sha: sha complet}`.
+    `None` quand la lecture échoue : l'appelant retombe sur la sonde par SHA.
+    """
+    wanted = [value for value in
+              (plan_git.full_commit_id(sha) for sha in shas or ()) if value]
+    if not wanted:
+        return {}
+    if timeout is not None and timeout <= 0:
+        return None
+    try:
+        proc = plan_git._git(
+            repo, "cat-file", "--batch-check=%(objectname) %(objecttype)",
+            stdin=("\n".join(wanted) + "\n").encode("utf-8"),
+            timeout=(plan_git.GIT_TIMEOUT if timeout is None
+                     else min(float(timeout), plan_git.GIT_TIMEOUT)),
+            env_extra=dict(plan_git.NO_LAZY_FETCH))
+    except Exception:  # noqa: BLE001 - lecture impossible : repli par SHA
+        return None
+    if proc.returncode != 0:
+        return None
+    present = {}
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split()
+        if len(fields) < 2 or fields[1] != "commit":
+            continue
+        sha = fields[0].strip().lower()
+        if sha:
+            present[sha] = sha
+    return present
+
+
 def target_commit(repo: str, target: str) -> str:
     """Le commit qu'une cible nomme dans `repo`, ou "" (#3116).
 
@@ -4244,42 +4282,52 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                         " (%s)" % exc) from exc
                 check()
                 return out
+            # #4457 (gel #25249) : une seule sonde `cat-file --batch-check`
+            # pour tous les reçus, au lieu d'un processus git par SHA ; les
+            # 500 reçus du témoin passent de ~40 s à moins d'une seconde.
+            present = _present_commits(
+                repo, [str((row or {}).get("sha") or "").strip()
+                       for row in receipts or ()], timeout=remaining())
+            check()
             for receipt in receipts or ():
                 check()
                 sha = str((receipt or {}).get("sha") or "").strip().lower()
                 if not sha:
                     continue
-                try:
-                    full = plan_git.local_commit(repo, sha)
-                except Exception:  # noqa: BLE001 - objet illisible : ignoré
-                    full = None
+                if present is None:
+                    # Lecture groupée impossible : repli par SHA, jamais une
+                    # absence supposée.
+                    try:
+                        full = plan_git.local_commit(repo, sha)
+                    except Exception:  # noqa: BLE001 - objet illisible : ignoré
+                        full = None
+                else:
+                    full = present.get(sha)
                 if not full and not fetch_cache.refused(
                         repo, sha, state_dir=state_dir):
                     refused = False
                     if recover is not None:
                         check()
                         try:
-                            recover(sha, timeout=remaining())
+                            if recover(sha, timeout=remaining()):
+                                full = sha
                         except Exception:  # noqa: BLE001 - source en échec
                             pass
-                        try:
-                            full = plan_git.local_commit(repo, sha)
-                        except Exception:  # noqa: BLE001 - objet illisible : ignoré
-                            full = None
                     if not full and fetch:
                         check()
                         try:
                             outcome = _forge_fetch(repo, sha, timeout=remaining())
                         except Exception:  # noqa: BLE001 - forge injoignable
                             outcome = None
+                        # `_forge_fetch` rend l'objet trouvé (True), un refus
+                        # net (False) ou un doute (None) : une seule sonde, pas
+                        # de `local_commit` par SHA après un échec (#25249).
+                        if outcome is True:
+                            full = sha
                         # Seul un refus **net** de git fetch se mémorise ; une
                         # coupure par l'échéance ou une exception reste un
                         # doute qui se relit (#4457 B/P2 auditeur).
                         refused = outcome is False
-                        try:
-                            full = plan_git.local_commit(repo, sha)
-                        except Exception:  # noqa: BLE001 - objet illisible : ignoré
-                            full = None
                     # L'appel bloquant a pu consommer toute l'échéance : le
                     # constat d'absence ne doit pas l'absorber, et on ne note
                     # rien sous une lecture expirée (#4457 B/P2 cx3/auditeur).

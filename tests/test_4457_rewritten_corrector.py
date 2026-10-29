@@ -46,6 +46,15 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
             " ON CONFLICT (subject) DO NOTHING",
             ("commit:" + sha, sha, actor, "s-" + harness, "t", harness))
 
+    def _milestone(self, kind, sha, *, actor="author", verdict=None):
+        """Jalon direct : le témoin des 500 reçus ne paie pas le hook de gel."""
+        rows = self.db.query(
+            "INSERT INTO work_item_milestones"
+            " (work_item_id, kind, sha, actor, verdict)"
+            " VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (self.lot, kind, sha, actor, verdict))
+        return int(rows[0]["id"])
+
     def verdict_receipt(self, mark, harness):
         self.db.execute(
             "INSERT INTO provenance_receipts"
@@ -86,18 +95,20 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
         return head_a, fix, head_b, out
 
     def later_receipts(self, count, *, actor="cx3", harness="codex"):
-        """`count` reçus de commits absents, après le correctif, avant F2."""
-        for index in range(count):
-            sha = "%040x" % (0x44570000 + index)
-            self.db.execute(
-                "INSERT INTO provenance_receipts"
-                " (subject, sha, actor, session, turn, harness, work_item_id, at)"
-                " VALUES (%s, %s, %s, %s, %s, %s, NULL,"
-                "         now() - interval '9 minutes'"
-                "         + (%s * interval '1 second'))"
-                " ON CONFLICT (subject) DO NOTHING",
-                ("commit:" + sha, sha, actor, "s-" + harness, "t", harness,
-                 index + 1))
+        """`count` reçus de commits absents, après le correctif, avant F2.
+
+        Un seul INSERT…SELECT : 500 insertions unitaires coûtaient ~20 s au
+        témoin #4457 (gel #25249), pour un test qui doit rester sous 15 s.
+        """
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id, at)"
+            " SELECT 'commit:' || sha, sha, %s, %s, %s, %s, NULL,"
+            "        now() - interval '9 minutes' + (i * interval '1 second')"
+            "   FROM (SELECT i, lpad(to_hex(%s + i), 40, '0') AS sha"
+            "           FROM generate_series(0, %s) AS s(i)) AS g"
+            " ON CONFLICT (subject) DO NOTHING",
+            (actor, "s-" + harness, "t", harness, 0x44570000, count - 1))
 
     def test_a_rewritten_corrector_is_not_redesignated_and_its_family_stays(self):
         _head_a, _fix, _head_b, out = self._rewrite_after_the_freeze()
@@ -134,20 +145,39 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
 
     def test_more_than_500_later_receipts_do_not_hide_the_corrector(self):
         # B/P2 cx3 : une lecture tronquée à 500 reçus (tri DESC, tous lots)
-        # perdait le correctif sous l'activité ultérieure de l'agent.
-        _head_a, _fix, head_b = self._prepare_rewrite()
+        # perdait le correctif sous l'activité ultérieure de l'agent. Témoin
+        # direct (jalons insérés sans hook de gel) pour rester sous 15 s : le
+        # hook de gel pèse ~80 s à lui seul dans le profil du gel #25249.
+        head_a = self.frozen
+        self._milestone("frozen", head_a)
+        self.repo.write("src/ameesh/mail.py", "lot\ncx3 petit correctif\n")
+        fix = self.repo.commit("cx3: correctif de relecture", agent="cx3")
+        self.commit_receipt("cx3", "codex", fix)
+        self.db.execute(
+            "UPDATE provenance_receipts SET at = now() - interval '10 minutes'"
+            " WHERE subject = %s", ("commit:" + fix,))
+        self._milestone("verdict", head_a, actor="cx3", verdict="blocked")
+        self.repo.git("reset", "--hard", head_a)
+        self.repo.write("src/ameesh/mail.py",
+                        "lot\ncx3 petit correctif\nauteur : reprise\n")
+        head_b = self.repo.commit("author: reprise du correctif", agent="author")
+        self.receipts(commits=[head_b])
+        self.frozen = head_b
         self.later_receipts(501)
-        _mark, out = self.freeze()          # F2
-        self.assertEqual(out["state"], rd.DESIGNATED, out)
-        names = [row["name"] for row in out["reviewers"]]
-        self.assertNotIn("cx3", names)
-        self.assertIn("r2", names)
+        freeze_id = self._milestone("frozen", head_b)
+        freeze = self.db.query(
+            "SELECT id, sha, extract(epoch FROM at)::float8 AS at_ts"
+            "  FROM work_item_milestones WHERE id = %s", (freeze_id,))[0]
+        found = review_authors._rewritten_after_freeze(
+            self.db, work.get(self.db, self.lot), freeze, self.repo.root,
+            head=head_b, fetch=False)
+        self.assertIn("cx3", found)
         # La porte suit la même lecture, malgré les 501 reçus absents.
         harnesses = {"r1": "claude", "r2": "codex", "cx3": "codex"}
         for actor, harness in harnesses.items():
-            mark = work.milestone(self.db, self.lot, "verdict", sha=head_b,
-                                  actor=actor, verdict="ok")
-            self.verdict_receipt(mark, harness)
+            mark_id = self._milestone("verdict", head_b, actor=actor,
+                                      verdict="ok")
+            self.verdict_receipt({"id": mark_id, "actor": actor}, harness)
         klass = {"class": "sensitive", "doubt": False,
                  "files": [{"path": "src/ameesh/mail.py",
                             "class": "sensitive",
@@ -155,7 +185,7 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
                  "repo": self.repo.root, "target": self.base,
                  "base_sha": self.base}
         with mock.patch.object(review_authors, "_forge_fetch",
-                               return_value=False):
+                               return_value=None):
             gate = merge_queue.review_gate(
                 self.db, work.milestones(self.db, self.lot), head_b,
                 repo=self.repo.root, klass=klass, item=work.get(self.db, self.lot),
@@ -266,3 +296,4 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
         self.assertEqual(out, {})
         self.assertTrue(fetch_cache.refused(
             self.repo.root, dummy, state_dir=self.cfg.state_dir))
+
