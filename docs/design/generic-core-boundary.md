@@ -76,6 +76,20 @@ same verb, with a third `git-merge` evidence `{seen: <source>, sha, pr}`; a
 test refuses any new direct call to `work.close_merged` outside the
 `git-merge` connector and `work.record_merge`.
 
+L100 tranche 1 (#4382) moves the development merge paths into the built-in
+`dev` provider. The `git-merge` action connector lives in
+`modules/dev/git_merge.py`; `connectors.get("git-merge")` reads it through
+`registry.action_connectors()`, which follows the delivery rule: the core
+keeps `shell-noop`, a name declared twice or taken by the core is refused, and
+installed entry points cannot declare action connectors. The `work merge-pr`
+gesture lives in `modules/dev/merge_pr.py`; the `ameesh work merge-pr` route is
+unchanged. The old paths `ameesh.connectors.git_merge` and `ameesh.merge_pr`
+are `sys.modules` aliases of the same module object, so importers and tests
+patching a module global by the old name keep working;
+`tests/test_l100_dev_aliases.py` pins identity and patching for both. Those two
+aliases are the only new direct module imports outside `modules/`, declared as
+exceptions in `tests/test_generic_core.py` until L104 removes them.
+
 The boundary check preserves the current runtime behavior. Module activation,
 renamed persisted states, validation as a stored state, extraction of development
 and forge tooling, vocabulary selection and declarative pipelines are subsequent
