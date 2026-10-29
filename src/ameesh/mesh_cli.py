@@ -1867,8 +1867,8 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
             item["milestones"], repo=repo,
             target=target or item.get("branch_target") or plan_git.DEFAULT_TARGET,
             waived=merge_queue.is_waived(item))
-        from .modules.storage import ModuleStore
-        item["module_milestones"] = ModuleStore(db).milestones(lot_id)
+        from .modules import registry as module_registry
+        item["module_milestones"] = module_registry.milestones(db, lot_id)
         item["delays"] = work.timeline(db, lot_id)
         # L539 : la classe de revue du lot (lecture seule ; ne lève jamais, un
         # doute rend `sensitive` et le dit) — résolue avant l'annotation pour
