@@ -1349,7 +1349,7 @@ def _sync_locked(lock: receipts.RegistryLock, canon: Canon, trusted_ref: str,
     partial = _partial(canon, unread)
     from . import modules as project_modules
     try:
-        project_modules.declarations(canon.federation)
+        project_modules.declarations(canon.federation, canon)
     except ValueError as exc:
         return AuthenticatorSync(AUTH_REFUSED, str(exc), canon=key)
     # contrôles faits, verrou détenu : la seule écriture du registre (de CE canon)
