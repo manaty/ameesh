@@ -238,6 +238,25 @@ class ActiveViewTest(unittest.TestCase):
                           for row in payload["active"]],
                          [("test", "acme", "it")])
 
+    def test_modules_active_cli_writes_warnings_and_refusals_to_stderr(self):
+        # #4407 (auditeur): both stderr paths of `--active` print without a
+        # NameError — a refused, inactive entry point, and no canon nor database.
+        warned = {"active": [], "refused": [], "warnings": [
+            {"code": "module-refused", "name": "bad",
+             "message": "installed module 'bad' is refused and not activated: x"}]}
+        for payload, have, code_expected, needle in (
+                (warned, (True, True), 0, "warning: installed module 'bad'"),
+                ({"active": [], "refused": [], "warnings": []}, (False, False), 1,
+                 "no canon and no database")):
+            err = io.StringIO()
+            with mock.patch.object(registry, "_active_payload",
+                                   return_value=(payload,) + have), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                code = registry.main(["--active"])
+            self.assertEqual(code, code_expected)
+            self.assertIn(needle, err.getvalue())
+
 
 class ActivationStorageTest(PgTestCase):
     def setUp(self):

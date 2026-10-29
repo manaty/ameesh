@@ -265,6 +265,7 @@ def main(argv):
     """`ameesh modules [--json] [--active]` — discovered or active modules."""
     import argparse
     import json
+    import sys
 
     parser = argparse.ArgumentParser(
         prog="ameesh modules",
