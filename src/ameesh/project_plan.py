@@ -29,6 +29,7 @@ def spec_reason(item, rule):
 
 
 def order_key(item):
+    """L165 and the plan view: priority, planned dates, age, lot number — one key."""
     return (int(item.get("priority") or 2),
             str(item.get("planned_start") or "9999-99-99"),
             str(item.get("planned_end") or "9999-99-99"),
