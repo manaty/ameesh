@@ -38,17 +38,23 @@ def _item(**kw):
     return item
 
 
-def _note(at, ids=(1,), ident=1):
+def _note(at, ids=(1,), ident=1, *, stamped=True):
     return {"id": ident, "state": "intake", "created_ts": at,
-            "note": slo.footprint_wait_note([{"id": i} for i in ids])}
+            "note": slo.footprint_wait_note([{"id": i} for i in ids],
+                                            at=at if stamped else None)}
+
+
+def _release(at, ids=(1,), ident=9):
+    return {"id": ident, "state": "intake", "created_ts": at,
+            "note": slo.footprint_release_note([{"id": i} for i in ids], at=at)}
 
 
 class EngineTest(unittest.TestCase):
-    """Le moteur : suspension, redémarrage, garde qui ne s'applique pas."""
+    """Le moteur : suspension, redémarrage, épisodes, garde qui ne s'applique pas."""
 
     def test_les_deux_pas_sont_suspendus_pendant_l_attente(self):
         blockers = [{"id": 1, "state": "qa", "assignee": "dev1"}]
-        wait = slo.footprint_wait(_item(), [], blockers)
+        wait = slo.footprint_wait([], blockers)
         rows = slo.lot_steps(_item(), {"requested": T0}, [],
                              now=T0 + 3 * 3600, footprint=wait)
         self.assertEqual(rows, [])
@@ -56,8 +62,7 @@ class EngineTest(unittest.TestCase):
     def test_l_horloge_repart_de_la_fusion_pas_de_la_creation(self):
         release = T0 + 7200.0
         events = [_note(T0 + 60, ids=(1,))]
-        wait = slo.footprint_wait(_item(), events, [], lots=[],
-                                  satisfied={1: release})
+        wait = slo.footprint_wait(events, [], satisfied={1: release})
         rows = slo.lot_steps(_item(), {"requested": T0}, events,
                              now=release + 1800, footprint=wait)
         by_step = {row["step"]: row for row in rows}
@@ -73,9 +78,9 @@ class EngineTest(unittest.TestCase):
     def test_apres_la_levée_le_retard_ne_part_plus_de_la_creation(self):
         # Sans la levée datée, #4515 aurait 13 h de retard : niveau 3.
         release = T0 + 4 * 3600.0
-        wait = slo.footprint_wait(_item(), [_note(T0 + 60)], [], lots=[],
-                                  satisfied={1: release})
-        rows = slo.lot_steps(_item(), {"requested": T0}, [_note(T0 + 60)],
+        events = [_note(T0 + 60)]
+        wait = slo.footprint_wait(events, [], satisfied={1: release})
+        rows = slo.lot_steps(_item(), {"requested": T0}, events,
                              now=release + 1.5 * 3600, footprint=wait)
         levels = {row["step"]: row["level"] for row in rows}
         self.assertEqual(levels, {"signal_assigned": 1, "intake_started": 1})
@@ -105,47 +110,54 @@ class EngineTest(unittest.TestCase):
         done = dict(other, state="merged")
         self.assertEqual(slo.footprint_blockers(_item(), [done], paths), [])
 
-    def test_la_note_nomme_les_bloqueurs_et_la_derniere_fait_foi(self):
+    def test_l_episode_nomme_tous_les_bloqueurs_et_l_union_fait_foi(self):
         first = _note(T0, ids=(1, 5), ident=1)
         second = _note(T0 + 60, ids=(7,), ident=2)
         self.assertEqual(slo.footprint_wait_note([{"id": 5}, {"id": 1}]),
                          "en attente d'empreinte : #1, #5")
-        # B1 de cx2 : l'union de toutes les notes, pas la dernière seule —
-        # un ensemble qui revient ({1, 5} -> {5} -> {1, 5}) est dédoublonné
-        # au journal, et la dernière note seule perdrait #1.
-        self.assertEqual(slo.footprint_note([second, first]), ([1, 5, 7], T0 + 60))
-        self.assertIsNone(slo.footprint_note([{"note": "autre"}]))
-        # un bloqueur encore ouvert mais qui ne chevauche plus date la levée
-        # par sa dernière activité (empreinte corrigée)
-        wait = slo.footprint_wait(
-            _item(), [first], [],
-            lots=[{"id": 1, "state": "qa", "updated_ts": T0 + 300},
-                  {"id": 5, "state": "qa", "updated_ts": T0 + 600}],
-            satisfied={})
-        self.assertEqual(wait["released_ts"], T0 + 600)
+        # B1 de cx2 : l'union des bloqueurs de l'épisode, pas la dernière
+        # note seule — un ensemble qui revient serait dédoublonné au journal.
+        episode = slo.footprint_episode([second, first])
+        self.assertEqual((episode["open"], episode["ids"]), (True, [1, 5, 7]))
+        self.assertEqual(slo.footprint_episode([{"note": "autre"}])["ids"], [])
 
     def test_un_ensemble_de_bloqueurs_qui_revient_garde_la_vraie_levee(self):
-        # A/B/A : {A, B} -> {B} -> {A, B}, la seconde note {A, B} est
-        # dédoublonnée ; la levée est la fusion de A (la plus tardive), pas
-        # celle de B (B1 de cx2 sur 1f182041f).
+        # A/B/A : {A, B} -> {B} -> {A, B} ; l'union garde A, la levée est sa
+        # fusion, la plus tardive (B1 de cx2 sur 1f182041f).
         both = _note(T0, ids=(1, 5), ident=1)
         only_b = _note(T0 + 60, ids=(5,), ident=2)
-        wait = slo.footprint_wait(_item(), [only_b, both], [],
+        wait = slo.footprint_wait([only_b, both], [],
                                   satisfied={1: T0 + 900, 5: T0 + 300})
         self.assertEqual(wait["released_ts"], T0 + 900)
+        self.assertFalse(wait["undated"])
 
     def test_une_levee_sans_date_reste_suspendue_deux_passes(self):
         # B2 de cx2 : sans date de levée, l'horloge ne repart pas de chaque
         # passe (elle ne vieillirait jamais) ; l'attente reste suspendue.
         events = [_note(T0, ids=(1,))]
-        first = slo.footprint_wait(_item(), events, [], lots=[], satisfied={})
+        first = slo.footprint_wait(events, [], satisfied={})
         self.assertTrue(first["undated"])
         self.assertIsNone(first["released_ts"])
-        second = slo.footprint_wait(_item(), events, [], lots=[], satisfied={})
+        second = slo.footprint_wait(events, [], satisfied={})
         self.assertEqual(first, second)
         for now in (T0 + 2 * 3600, T0 + 4 * 3600):
             self.assertEqual(slo.lot_steps(_item(), {"requested": T0}, events,
                                            now=now, footprint=first), [])
+
+    def test_la_fermeture_datee_ne_bouge_plus_avec_l_activite_du_bloqueur(self):
+        # P1 de cx1 sur b8d7a9901 : la levée est datée une fois (note de
+        # clôture) ; une activité ultérieure du bloqueur ne la déplace pas.
+        events = [_note(T0, ids=(1,)), _release(T0 + 1000, ids=(1,))]
+        wait = slo.footprint_wait(events, [], satisfied={})
+        self.assertEqual(wait["released_ts"], T0 + 1000)
+        first = slo.lot_steps(_item(), {"requested": T0}, events,
+                              now=T0 + 10000, footprint=wait)
+        self.assertEqual({row["elapsed_s"] for row in first}, {9000})
+        # deux passes plus tard, la même date : pas de dérive
+        self.assertEqual(slo.footprint_wait(events, [], satisfied={}), wait)
+        later = slo.lot_steps(_item(), {"requested": T0}, events,
+                              now=T0 + 20000, footprint=wait)
+        self.assertEqual({row["elapsed_s"] for row in later}, {19000})
 
     def test_sans_bloqueur_ni_note_rien_ne_change(self):
         rows = slo.lot_steps(_item(), {"requested": T0}, [], now=T0 + 3 * 3600,
@@ -192,13 +204,17 @@ class TemoinAqaBintakeTest(_Base):
                         " WHERE id = %s", (b["id"],))
 
         self.assertEqual(self.slo(), [])
-        self.assertIn("en attente d'empreinte : #%d" % a["id"], self.journal(b))
+        self.assertTrue(any(("en attente d'empreinte : #%d" % a["id"]) in note
+                            for note in self.journal(b)))
 
         self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
                         (a["id"],))
         merged = time.time()
         self.now = merged + 60
         self.assertEqual(self.slo(), [])
+        # la clôture est datée une fois, avec les bloqueurs de l'épisode
+        self.assertTrue(any("empreinte libérée : #%d" % a["id"] in note
+                            for note in self.journal(b)))
         self.now = merged + 1.5 * H
         alerts = self.slo()
         self.assertEqual([(alert["step"], alert["level"], alert["targets"])

@@ -431,48 +431,101 @@ def current_hold_start(events: Iterable[dict], state: str | None) -> float | Non
     return started
 
 
-#: #4561 : la note qui date l'attente de la garde d'empreinte (#3185) sur le
-#: lot retenu. Elle nomme les lots occupants qui chevauchent le sien ; sa
-#: dernière ligne est la mémoire de l'attente après leur fusion (le lot, lui,
-#: n'est plus « occupant » et ne se lit plus dans la garde).
+#: #4561 : les notes qui datent une attente de la garde d'empreinte (#3185)
+#: sur le lot retenu. Une attente est un ÉPISODE : une note d'ouverture (les
+#: bloqueurs), d'éventuelles notes de changement d'ensemble, une note de
+#: clôture datée. L'épisode est la mémoire de la levée : un blocage suivant en
+#: ouvre un autre, et une note de clôture ne se confond jamais avec la
+#: précédente (son horodatage fait partie du texte).
 FOOTPRINT_WAIT_NOTE = "en attente d'empreinte : "
+FOOTPRINT_RELEASE_NOTE = "empreinte libérée : "
 _LOT_REF_RE = re.compile(r"#(\d+)")
 
 
-def footprint_wait_note(blockers: Iterable[dict]) -> str:
-    """La note d'attente d'empreinte : « en attente d'empreinte : #12, #34 »."""
-    ids = sorted({int(lot["id"]) for lot in blockers or ()
-                  if lot.get("id") is not None})
-    return FOOTPRINT_WAIT_NOTE + ", ".join("#%d" % ident for ident in ids)
+def _footprint_ids(blockers: Iterable) -> list[int]:
+    """Les ids des bloqueurs, en acceptant les lignes (`{"id": …}`) et les
+    ids nus (l'épisode rend déjà des entiers)."""
+    out = set()
+    for lot in blockers or ():
+        ident = lot.get("id") if hasattr(lot, "get") else lot
+        if ident is not None:
+            out.add(int(ident))
+    return sorted(out)
 
 
-def footprint_note(events: Iterable[dict]) -> tuple[list[int], float] | None:
-    """Tous les bloqueurs nommés par les notes d'attente d'empreinte, avec
-    l'instant de la dernière note (`None` sans note).
+def _footprint_stamp(at: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(at)))
 
-    C'est l'UNION, jamais la seule dernière note : un ensemble qui revient
-    après un autre (`{A, B}`, puis `{B}`, puis `{A, B}`) ne réécrit pas la
-    note `{A, B}` (dédoublonnage du journal) ; garder la dernière note
-    perdrait A, et la levée serait datée sur B, avant la vraie libération
-    (B1 de cx2 sur 1f182041f). L'union garde tous les bloqueurs qui ont
-    réellement retenu le lot, et la plus grande levée fait foi."""
-    found = set()
-    last = None
-    for event in events or ():
+
+def footprint_wait_note(blockers: Iterable[dict], *,
+                        at: float | None = None) -> str:
+    """La note d'ouverture (ou de changement) d'une attente d'empreinte :
+    « en attente d'empreinte : #12, #34 ». `at` y ajoute son horodatage, pour
+    qu'un ensemble de bloqueurs qui revient ouvre un épisode neuf au journal
+    (une note de texte identique serait dédoublonnée)."""
+    text = FOOTPRINT_WAIT_NOTE + ", ".join("#%d" % ident
+                                           for ident in _footprint_ids(blockers))
+    if at is not None:
+        text += " (%s)" % _footprint_stamp(at)
+    return text
+
+
+def footprint_release_note(blockers: Iterable[dict], *, at: float) -> str:
+    """La note de clôture datée d'une attente : « empreinte libérée : #… »."""
+    return (FOOTPRINT_RELEASE_NOTE
+            + ", ".join("#%d" % ident for ident in _footprint_ids(blockers))
+            + " (%s)" % _footprint_stamp(at))
+
+
+def footprint_episode(events: Iterable[dict]) -> dict:
+    """L'épisode d'attente d'empreinte porté par le journal du lot (#4561).
+
+    Rend `{open, ids, released_ts}` : `open` (le dernier fait est une ouverture
+    ou un changement, aucune clôture depuis), `ids` l'UNION des bloqueurs
+    nommés dans l'épisode et `released_ts` l'instant de clôture du dernier
+    épisode.
+
+    C'est l'union, jamais la seule dernière note : un ensemble qui revient
+    (`{A, B}`, puis `{B}`, puis `{A, B}`) ne réécrit pas la note `{A, B}` ;
+    garder la dernière note perdrait A, et la levée serait datée sur B, avant
+    la vraie libération (B1 de cx2 sur 1f182041f). La clôture, elle, est datée
+    une seule fois et ne bouge plus (P1 de cx1 sur b8d7a9901)."""
+    opened = False
+    ids: set = set()
+    released = None
+    ordered = sorted(events or (),
+                     key=lambda ev: (float(ev.get("created_ts") or 0.0),
+                                     int(ev.get("id") or 0)))
+    for event in ordered:
         note = str(event.get("note") or "")
         at = event.get("created_ts")
-        if not note.startswith(FOOTPRINT_WAIT_NOTE) or at is None:
+        if at is None:
             continue
-        ids = {int(match) for match in _LOT_REF_RE.findall(note)}
-        if not ids:
-            continue
-        found.update(ids)
-        key = (float(at), int(event.get("id") or 0))
-        if last is None or key >= last:
-            last = key
-    if not found:
-        return None
-    return (sorted(found), last[0])
+        if note.startswith(FOOTPRINT_WAIT_NOTE):
+            found = {int(match) for match in _LOT_REF_RE.findall(note)}
+            if not found:
+                continue
+            if not opened:
+                ids = set()
+                opened = True
+            ids.update(found)
+        elif note.startswith(FOOTPRINT_RELEASE_NOTE) and opened:
+            opened = False
+            released = float(at)
+    return {"open": opened, "ids": sorted(ids), "released_ts": released}
+
+
+def _footprint_exact_release(named: Iterable[int],
+                             satisfied: dict | None) -> float | None:
+    """La levée exacte, si TOUS les bloqueurs nommés ont un jalon datable."""
+    satisfied = satisfied or {}
+    stamps = []
+    for ident in named:
+        stamp = satisfied.get(ident, satisfied.get(str(ident)))
+        if stamp is None:
+            return None
+        stamps.append(float(stamp))
+    return max(stamps) if stamps else None
 
 
 def footprint_blockers(item: dict, lots: Iterable[dict],
@@ -519,53 +572,47 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
     return sorted(out, key=lambda blocker: blocker["id"])
 
 
-def footprint_wait(item: dict, events: Iterable[dict],
-                   blockers: Iterable[dict], *, lots: Iterable[dict] = (),
+def footprint_wait(events: Iterable[dict], blockers: Iterable[dict], *,
                    satisfied: dict | None = None) -> dict | None:
     """L'attente d'empreinte d'un lot, pour `lot_steps` (#4561).
 
     `blockers` : les lots occupants qui le retiennent maintenant
     (`footprint_blockers`) — l'attente est en cours, aucun pas SLO ne court.
-    Sans bloqueur courant, les notes (`footprint_note`) nomment ceux qui l'ont
-    retenu ; leur levée date le redémarrage de l'horloge : jalon
-    `merged`/`closed` du bloqueur (`satisfied`, lu par l'appelant), ou sa
-    dernière activité quand il est encore ouvert mais ne chevauche plus
-    (empreinte corrigée).
+    Sans bloqueur courant, l'épisode (`footprint_episode`) nomme ceux qui
+    l'ont retenu ; sa clôture date le redémarrage de l'horloge. Elle est lue
+    des jalons `merged`/`closed` des bloqueurs quand TOUS en ont un ; sinon
+    de la note de clôture, écrite une fois et stable même si un bloqueur
+    encore ouvert bouge ensuite (P1 de cx1 sur b8d7a9901).
 
-    Si un seul bloqueur nommé n'a pas de date de levée, la levée est
-    **inconnue** (`undated`) : l'attente reste suspendue, sans durée inventée
-    (#1982) et sans repartir de l'instant de chaque passe — sinon les deux
-    horloges ne vieilliraient jamais (B2 de cx2 sur 1f182041f).
+    Si la clôture n'est pas encore datable, la levée est **inconnue**
+    (`undated`) : l'attente reste suspendue, sans durée inventée (#1982) et
+    sans repartir de l'instant de chaque passe (B2 de cx2 sur 1f182041f).
 
-    Rend `{lots, released_ts, named, undated}` ; `None` sans attente connue."""
+    Rend `{lots, released_ts, named, undated, open}` ; `None` sans attente."""
     blockers = list(blockers or ())
     if blockers:
         return {"lots": blockers, "released_ts": None, "undated": False,
-                "named": sorted({int(b["id"]) for b in blockers})}
-    found = footprint_note(events)
-    if found is None:
+                "named": _footprint_ids(blockers), "open": True}
+    episode = footprint_episode(events)
+    named = episode["ids"]
+    if not named:
         return None
-    named, _noted_ts = found
-    open_by_id = {int(lot["id"]): lot for lot in lots or ()}
-    satisfied = satisfied or {}
-    stamps = []
-    for ident in named:
-        stamp = satisfied.get(ident, satisfied.get(str(ident)))
-        if stamp is not None:
-            stamps.append(float(stamp))
-            continue
-        row = open_by_id.get(ident)
-        if row is None:
-            # nommé, plus ouvert, sans jalon datable : la levée est inconnue.
+    exact = _footprint_exact_release(named, satisfied)
+    if not episode["open"]:
+        release = exact if exact is not None else episode["released_ts"]
+        if release is None:
             return {"lots": [], "released_ts": None, "named": named,
-                    "undated": True}
-        stamp = row.get("updated_ts") or row.get("last_activity_ts")
-        if stamp is None:
-            return {"lots": [], "released_ts": None, "named": named,
-                    "undated": True}
-        stamps.append(float(stamp))
-    return {"lots": [], "released_ts": max(stamps), "named": named,
-            "undated": False}
+                    "undated": True, "open": False}
+        return {"lots": [], "released_ts": release, "named": named,
+                "undated": False, "open": False}
+    # L'épisode est ouvert et plus aucun bloqueur ne chevauche : la clôture
+    # est observée maintenant. Une date exacte (jalons) suffit ; sinon
+    # l'appelant écrit la note de clôture et passe son instant.
+    if exact is not None:
+        return {"lots": [], "released_ts": exact, "named": named,
+                "undated": False, "open": True}
+    return {"lots": [], "released_ts": None, "named": named,
+            "undated": True, "open": True}
 
 
 def intake_ready_ts(assigned: float | None, requested: float | None,
