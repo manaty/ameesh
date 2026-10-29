@@ -85,6 +85,9 @@ def _write_fake_tree(base: Path) -> Path:
     (package / "mechanics.py").write_text(FAKE_MECHANICS, encoding="utf-8")
     (package / "db.py").write_text(FAKE_DB, encoding="utf-8")
     (package / "packet_pause.py").write_text(FAKE_PAUSE, encoding="utf-8")
+    # #4319: the packet scripts share interpreter resolution in this module.
+    shutil.copyfile(ROOT / "src" / "ameesh" / "project_python.py",
+                    package / "project_python.py")
     return tree
 
 

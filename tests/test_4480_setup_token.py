@@ -31,7 +31,7 @@ class SetupTokenTest(unittest.TestCase):
                "ANTHROPIC_AUTH_TOKEN": "ambient", "CODEX_API_KEY": "ambient"}
         accounts.launch_env(env, {"claude": [self.profile]}, self.profile, {})
         self.assertEqual(env[setup_token.VARIABLE], TOKEN)
-        self.assertNotIn("CLAUDE_CONFIG_DIR", env)
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], self.home)
         self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
         self.assertNotIn("CODEX_API_KEY", env)
@@ -42,6 +42,25 @@ class SetupTokenTest(unittest.TestCase):
         self.assertEqual(verdict.expires_at, NOW + 40 * 86400)
         self.assertNotIn(TOKEN, repr(verdict))
         self.assertEqual(verdict.fingerprint, sentinel.fingerprint("claude", self.profile, {}))
+
+    def test_launch_fingerprint_survives_concurrent_token_import(self):
+        setup_token.install(self.profile, TOKEN)
+        env = {}
+        accounts.launch_env(env, {"claude": [self.profile]}, self.profile, {})
+        replacement = TOKEN + "-replacement"
+        setup_token.install(self.profile, replacement)
+        self.assertEqual(sentinel.launch_fingerprint("claude", self.profile, env),
+                         sentinel._digest(TOKEN))
+        self.assertEqual(sentinel.fingerprint("claude", self.profile, {}),
+                         sentinel._digest(replacement))
+        os.unlink(setup_token.path(self.profile))
+        self.assertEqual(sentinel.launch_fingerprint("claude", self.profile, env),
+                         sentinel._digest(TOKEN))
+
+    def test_empty_child_token_does_not_fall_back_to_disk(self):
+        setup_token.install(self.profile, TOKEN)
+        self.assertIsNone(sentinel.launch_fingerprint(
+            "claude", self.profile, {setup_token.VARIABLE: ""}))
 
     def test_permission_symlink_and_malformed_store_refused_without_leak(self):
         setup_token.install(self.profile, TOKEN)
@@ -175,7 +194,7 @@ from .test_l30_accounts import _Base
 
 
 class TokenRunnerTest(_Base):
-    def test_runner_turn_uses_setup_token_without_config_dir(self):
+    def test_runner_turn_uses_setup_token_with_profile_directory(self):
         import subprocess
         profiles = self._claude_comptes()
         profile = accounts.parse({"claude": profiles})["claude"][0]
@@ -188,7 +207,7 @@ class TokenRunnerTest(_Base):
             if any("fakebin/claude" in str(item) for item in argv):
                 env = kwargs.get("env") or {}
                 observed.append((env.get(setup_token.VARIABLE) == TOKEN,
-                                 "CLAUDE_CONFIG_DIR" in env,
+                                 env.get("CLAUDE_CONFIG_DIR"),
                                  "ANTHROPIC_API_KEY" in env))
             return original(argv, *args, **kwargs)
 
@@ -196,6 +215,6 @@ class TokenRunnerTest(_Base):
             with mock.patch("subprocess.Popen", side_effect=spawn):
                 result = self._tour(worker, ANTHROPIC_API_KEY="ambient-billed-key")
             self.assertIsNotNone(result)
-            self.assertEqual(observed, [(True, False, False)])
+            self.assertEqual(observed, [(True, profile.path, False)])
         finally:
             worker.watchdog_stop.set()

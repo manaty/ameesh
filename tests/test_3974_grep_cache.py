@@ -3,12 +3,17 @@
 
 Témoin du lot : la même lecture deux fois, la seconde sans processus
 `git grep` (le cache en mémoire de #3753 est vidé entre les deux, comme entre
-deux exécutions). Un autre arbre relance le balayage, mais pas d'autres motifs ; un
-échec n'est jamais gardé. Une échéance épuisée refuse en nommant le lot et
+deux exécutions). Un autre arbre relance le balayage, mais pas d'autres motifs ;
+un échec n'est jamais gardé. Une échéance épuisée refuse en nommant le lot et
 l'étape, même quand une couche intermédiaire l'a lue comme un doute.
+
+#4482 : les entrées sont compressées et relues sans JSON, la seconde lecture
+d'un même processus ne décode plus rien (`stats`), l'élagage n'est plus payé
+par chaque petite écriture, et les bornes de nombre/octets restent tenues.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -298,24 +303,163 @@ class GrepCacheTest(unittest.TestCase):
 
     def test_each_write_enforces_the_byte_budget_and_keeps_recent_reads(self):
         names = [grep_cache.key("bounded%d" % i, "m", []) for i in range(3)]
-        with mock.patch.object(grep_cache, "MAX_BYTES", 1000):
-            for name in names[:2]:
-                grep_cache._write(name, ["x" * 300])
-            # La première entrée relue devient la plus récente.
+        # Des valeurs incompressibles : le budget porte sur les octets écrits,
+        # et une chaîne répétée tiendrait en quelques dizaines d'octets gzip.
+        values = [os.urandom(600).hex() for _ in range(3)]
+        with mock.patch.object(grep_cache, "MAX_BYTES", 1500):
+            for name, value in zip(names[:2], values[:2]):
+                grep_cache._write(name, [value])
+            # La première entrée relue devient la plus récente ; la seconde
+            # reste clairement la plus ancienne (les écritures du banc peuvent
+            # partager le même grain d'horodatage).
             os.utime(grep_cache._path(names[0]), (2000000000, 2000000000))
-            grep_cache._write(names[2], ["x" * 600])
+            os.utime(grep_cache._path(names[1]), (1000000000, 1000000000))
+            grep_cache._write(names[2], [values[2]])
             paths = [grep_cache._path(name) for name in names]
             self.assertLessEqual(sum(os.path.getsize(p) for p in paths
-                                     if os.path.exists(p)), 1000)
+                                     if os.path.exists(p)), 1500)
             self.assertTrue(grep_cache._read(names[0])[0])
             self.assertFalse(grep_cache._read(names[1])[0])
             self.assertTrue(grep_cache._read(names[2])[0])
             # Une seule entrée surdimensionnée ne peut contourner la borne.
             huge = grep_cache.key("huge", "m", [])
-            grep_cache._write(huge, ["x" * 2000])
+            grep_cache._write(huge, [os.urandom(4000).hex()])
             self.assertFalse(grep_cache._read(huge)[0])
             self.assertLessEqual(sum(os.path.getsize(p) for p in paths
-                                     if os.path.exists(p)), 1000)
+                                     if os.path.exists(p)), 1500)
+
+    def test_a_second_read_is_served_from_process_memory(self):
+        name = grep_cache.key("memo", "m", [])
+        with mock.patch.object(grep_cache, "MAX_BYTES", 10 ** 9):
+            grep_cache._write(name, ["un", "deux"])
+        grep_cache._reset_process_state()
+        with mock.patch.object(grep_cache, "_decode",
+                               wraps=grep_cache._decode) as decode:
+            first = grep_cache._read(name)
+            second = grep_cache._read(name)
+        self.assertEqual(first, (True, ["un", "deux"]))
+        self.assertEqual(second, (True, ["un", "deux"]))
+        self.assertEqual(decode.call_count, 1)     # un décodage, pas deux
+        self.assertEqual(grep_cache.stats()["memo_hits"], 1)
+
+    def test_the_process_memo_returns_a_copy(self):
+        name = grep_cache.key("copy", "m", [])
+        grep_cache._write(name, ["un"])
+        grep_cache._reset_process_state()
+        _found, value = grep_cache._read(name)
+        value.append("deux")
+        self.assertEqual(grep_cache._read(name)[1], ["un"])
+
+    def test_a_new_entry_is_not_served_stale_from_the_memo(self):
+        name = grep_cache.key("replaced", "m", [])
+        grep_cache._write(name, ["un"])
+        _found, first = grep_cache._read(name)
+        self.assertEqual(first, ["un"])
+        grep_cache._write(name, ["deux"])
+        self.assertEqual(grep_cache._read(name)[1], ["deux"])
+
+    def test_another_inode_for_the_same_name_is_decoded_again(self):
+        name = grep_cache.key("inode", "m", [])
+        path = grep_cache._path(name)
+        grep_cache._write(name, ["un"])
+        _found, first = grep_cache._read(name)
+        self.assertEqual(first, ["un"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".new"
+        with open(tmp, "wb") as handle:
+            handle.write(grep_cache._encode(["deux"]))
+        os.replace(tmp, path)
+        self.assertEqual(grep_cache._read(name)[1], ["deux"])
+
+    def test_entries_round_trip_compressed_and_exact(self):
+        name = grep_cache.key("roundtrip", "m", [])
+        value = ["", "  indenté  ", "accentué é", "x" * 1000, "un\ndeux"]
+        grep_cache._write(name, value)
+        with open(grep_cache._path(name), "rb") as handle:
+            self.assertEqual(handle.read(2), b"\x1f\x8b")
+        grep_cache._reset_process_state()
+        self.assertEqual(grep_cache._read(name), (True, value))
+
+    def test_a_corrupt_entry_is_a_miss(self):
+        name = grep_cache.key("corrupt", "m", [])
+        grep_cache._write(name, ["un"])
+        with open(grep_cache._path(name), "wb") as handle:
+            handle.write(b"\x1f\x8bnot a gzip stream")
+        grep_cache._reset_process_state()
+        self.assertEqual(grep_cache._read(name), (False, None))
+
+    def test_an_entry_of_the_old_format_is_a_miss(self):
+        name = grep_cache.key("old", "m", [])
+        path = grep_cache._path(name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"format": 2, "value": ["un"]}, handle)
+        self.assertEqual(grep_cache._read(name), (False, None))
+
+    def test_the_process_memo_is_bounded(self):
+        with mock.patch.object(grep_cache, "MEMO_MAX_ENTRIES", 2):
+            for index in range(4):
+                grep_cache._write(grep_cache.key("memo%d" % index, "m", []),
+                                  ["x%d" % index])
+        self.assertLessEqual(grep_cache.stats()["memo_entries"], 2)
+
+    def test_small_writes_do_not_prune_every_time(self):
+        with mock.patch.object(grep_cache, "MAX_BYTES", 10 ** 9), \
+                mock.patch.object(grep_cache, "PRUNE_LARGE_BYTES", 10 ** 9), \
+                mock.patch.object(grep_cache, "PRUNE_PENDING_BYTES", 10 ** 9), \
+                mock.patch.object(grep_cache, "prune",
+                                  wraps=grep_cache.prune) as prune:
+            for index in range(5):
+                grep_cache._write(grep_cache.key("small%d" % index, "m", []),
+                                  ["x%d" % index])
+        self.assertEqual(prune.call_count, 0)      # aucune borne atteinte
+        with mock.patch.object(grep_cache, "MAX_BYTES", 10 ** 9), \
+                mock.patch.object(grep_cache, "PRUNE_LARGE_BYTES", 10 ** 9), \
+                mock.patch.object(grep_cache, "PRUNE_PENDING_BYTES", 1), \
+                mock.patch.object(grep_cache, "prune",
+                                  wraps=grep_cache.prune) as prune:
+            grep_cache._write(grep_cache.key("pending", "m", []), ["x"])
+        self.assertEqual(prune.call_count, 1)      # octets en attente
+
+    def test_a_large_entry_prunes_at_once(self):
+        with mock.patch.object(grep_cache, "MAX_BYTES", 10 ** 9), \
+                mock.patch.object(grep_cache, "PRUNE_LARGE_BYTES", 100), \
+                mock.patch.object(grep_cache, "PRUNE_PENDING_BYTES", 10 ** 9), \
+                mock.patch.object(grep_cache, "prune",
+                                  wraps=grep_cache.prune) as prune:
+            grep_cache._write(grep_cache.key("large", "m", []),
+                              [os.urandom(500).hex()])
+        self.assertEqual(prune.call_count, 1)
+
+    def test_stats_count_hits_misses_and_memo_hits(self):
+        name = grep_cache.key("counted", "m", [])
+        grep_cache._write(name, ["un"])
+        grep_cache._reset_process_state()
+        self.assertTrue(grep_cache._read(name)[0])
+        self.assertFalse(grep_cache._read("0" * 64)[0])
+        self.assertTrue(grep_cache._read(name)[0])
+        counters = grep_cache.stats()
+        self.assertEqual((counters["reads"], counters["hits"],
+                          counters["misses"], counters["memo_hits"]),
+                         (3, 2, 1, 1))
+        self.assertAlmostEqual(counters["hit_rate"], 2 / 3)
+
+    def test_stats_count_cache_lookups(self):
+        calls = []
+
+        def compute():
+            calls.append(1)
+            return ["x"]
+
+        grep_cache._reset_process_state()
+        first = grep_cache.cached(self.repo, self.first, "lookup", [], compute)
+        second = grep_cache.cached(self.repo, self.first, "lookup", [], compute)
+        self.assertEqual((first, second), (["x"], ["x"]))
+        self.assertEqual(calls, [1])
+        counters = grep_cache.stats()
+        self.assertEqual((counters["lookups"], counters["served"],
+                          counters["computed"]), (2, 1, 1))
+        self.assertAlmostEqual(counters["lookup_hit_rate"], 0.5)
 
 
 class SweepDeadlineTest(unittest.TestCase):

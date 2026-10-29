@@ -58,7 +58,8 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    hors délai, échec de job sans test, échec non attribuable ou ambigu, test
    vert en local, erreur de fixture DB en QueryCanceled/timeout) ne retire
    rien : il est consigné au journal du porteur et le pilote est prévenu, une
-   fois.
+   fois. #4221 : un QueryCanceled/lock timeout du **corps** d'un test qui se
+   reproduit au rejeu seul, hors charge, est un rouge réel et retire l'unité.
 5. **Reprise.** Chaque lancement de `paquet-auto.py` laisse d'abord une
    marque « tentative » (étape, tête de départ, hôte:pid, époque du bail) ;
    son achèvement se lit à la tête gelée qui a bougé, son échec à une marque
@@ -77,6 +78,11 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    lancée hors du tic est ainsi « en cours » (`composition en cours
    (hôte:pid)`) au lieu de laisser le tic supprimer son worktree vivant ; le
    verrou tombe avec le processus, une tentative morte reste reprise.
+   #4501 : la vie d'une tentative sur cet hôte se lit au **pid vivant**, jamais
+   à la ligne de commande (une recomposition peut tourner sous un autre nom) ;
+   et si une tête poussée du porteur (gelée, ou vue en avance) a une ci-full en
+   cours, la reprise attend sa conclusion au lieu de recomposer et d'écraser
+   son manifeste.
 6. Un courrier au pilote à chaque étape (tête, unités, écartés, CI).
 
 **Recomposition du pilote** (#4237) : `paquet-horaire.py recompose --carrier N
@@ -146,6 +152,12 @@ OPEN_STATES = ("intake", "build", "qa", "validated", "blocked", "waiting_human")
 #: des raisons de clôture livrée de `work.CLOSE_REASONS`).
 MERGED_STATES = ("merged", "promoted")
 MERGED_CLOSE_REASONS = ("delivered", "done")
+#: #4506 : la note de fusion automatique du porteur porte la tête publiée
+MERGED_NOTE_RE = re.compile(
+    r"^auto-merge merged repo=\S+ pr=\d+ sha=(?P<sha>[0-9a-f]{40})\b")
+#: #4506 : `paquet-auto` gèle lui-même la tête poussée dès la composition (#4304)
+EARLY_PUSH_RE = re.compile(
+    r"^paquet \S+ poussé par scripts/paquet-auto\.py dès la composition\b")
 MARK = "paquet-horaire: "
 MARK_CI = MARK + "ci demandée "
 MARK_RED = MARK + "rouge consigné "
@@ -322,12 +334,48 @@ class Context:
     log: list[str] = field(default_factory=list)
 
     def alive(self, pid: int) -> bool:
-        """Un tic de ce script tourne-t-il encore sous ce pid, sur cet hôte ?"""
+        """Un processus vit-il encore sous ce pid, sur cet hôte ? (#4501)
+
+        La ligne de commande ne prouve rien : une recomposition peut tourner
+        sous un autre nom (copie `scripts/.h12-tick.py`, wrapper de session) et
+        un pid vivant jugé mort fait recomposer le même porteur en parallèle.
+        On lit donc l'état du processus (`/proc/<pid>/stat`, un zombie ne
+        compte pas) ; hors Linux (`/proc` absent), `os.kill(pid, 0)`. Un pid
+        recyclé reste un doute, jamais une fausse mort : le verrou de
+        composition et le bail tranchent.
+        """
+        if pid <= 0:
+            return False
+        if os.path.isdir("/proc"):
+            try:
+                text = Path("/proc/%d/stat" % pid).read_text(
+                    encoding="ascii", errors="replace")
+            except FileNotFoundError:
+                return False
+            except OSError:
+                # procfs lisible en général mais pas pour ce pid (droits,
+                # course) : ne pas conclure à une mort sans le dire.
+                return self._alive_by_signal(pid)
+            # champ 3 = état ; le nom (champ 2) peut contenir espaces et
+            # parenthèses, on coupe après la dernière.
+            try:
+                state = text.rsplit(")", 1)[1].split()[0]
+            except (IndexError, ValueError):
+                return True
+            return state != "Z"
+        return self._alive_by_signal(pid)
+
+    @staticmethod
+    def _alive_by_signal(pid: int) -> bool:
         try:
-            cmdline = Path("/proc/%d/cmdline" % pid).read_bytes()
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
         except OSError:
             return False
-        return b"paquet-horaire" in cmdline
+        return True
 
     def say(self, text: str) -> None:
         self.log.append(text)
@@ -423,6 +471,56 @@ def merged_seen(row: dict) -> bool:
         state == "closed" and str(row.get("close_reason") or "") in MERGED_CLOSE_REASONS)
 
 
+def merged_note(item: dict, sha: str) -> bool:
+    """#4506 : une note `auto-merge merged` porte sur la tête gelée `sha`."""
+    if not sha:
+        return False
+    for ev in item.get("events") or []:
+        match = MERGED_NOTE_RE.match(str(ev.get("note") or ""))
+        if match and match.group("sha") == sha:
+            return True
+    return False
+
+
+def merged_head(ctx: Context, item: dict, sha: str) -> bool:
+    """#4506 : le porteur est-il déjà fusionné dans la cible ?
+
+    `merged_seen` ne lit que l'état du lot ; un porteur fusionné par `ameesh`
+    reste ouvert (qa) jusqu'à sa clôture (hold du pilote, balayage de contenu).
+    La tête gelée ancêtre de `origin/<cible>` ou la note `auto-merge merged`
+    du journal disent la fusion avant l'état.
+    """
+    if merged_seen(item):
+        return True
+    if not sha:
+        return False
+    if merged_note(item, sha):
+        return True
+    result = ctx.git("merge-base", "--is-ancestor", sha, "origin/" + ctx.target)
+    return result.returncode == 0
+
+
+def freeze_foreign(item: dict, since: float) -> bool:
+    """#4506 : le gel postérieur à `since` vient-il d'une autre main ?
+
+    `paquet-auto` gèle lui-même la tête qu'il vient de pousser dès la
+    composition (#4304) ; cette note est la sienne. Un gel postérieur avec une
+    autre note (geste manuel, dépannage après échec) est la main d'un autre.
+    Sans jalon lisible (les bancs peuvent l'omettre, `work show` le porte), on
+    ne conclut pas.
+    """
+    declared = (item.get("freeze") or {}).get("declared") or {}
+    if float(declared.get("at_ts") or 0) <= since:
+        return False
+    ident = int(declared.get("id") or 0)
+    if not ident:
+        return False
+    for milestone in item.get("milestones") or []:
+        if int(milestone.get("id") or 0) == ident:
+            return not EARLY_PUSH_RE.match(str(milestone.get("note") or ""))
+    return False
+
+
 def slot_served(rows: list[dict], now: float, zone: ZoneInfo, project: str,
                 target: str) -> bool:
     """Un porteur horaire créé dans l'heure locale courante consomme-t-il le créneau ?
@@ -475,6 +573,29 @@ def run_for(report: dict, sha: str) -> dict | None:
     """Le run le plus récent de la tête gelée (`ci status` liste du plus récent)."""
     for run in report.get("runs") or []:
         if str(run.get("head_sha") or "").lower() == sha:
+            return run
+    return None
+
+
+def ci_in_progress(ctx: Context, item: dict) -> dict | None:
+    """#4501 : le run en cours de la tête poussée du porteur, ou None.
+
+    La tête poussée est la tête gelée et/ou la tête de branche vue en avance
+    (`branch_head`, relevé partagé) : une poussée plus récente, pas encore
+    gelée, est déjà sous CI. Un porteur dont une de ces têtes est sous ci-full
+    n'est ni recomposé ni réenregistré par un second composeur : la reprise
+    attend la conclusion du run. Une lecture impossible de `ci status` lève
+    (aucun geste), elle ne vaut jamais « aucun run ».
+    """
+    heads = {str(item.get("branch_head") or "").strip().lower(), frozen_sha(item)}
+    heads.discard("")
+    if not heads:
+        return None
+    report = ci_status(ctx, int(item["id"]))
+    for run in report.get("runs") or []:
+        if str(run.get("head_sha") or "").lower() in heads \
+                and str(run.get("status") or "") in (
+                    "running", "queued", "pending", "in_progress"):
             return run
     return None
 
@@ -662,7 +783,15 @@ def classify(run: dict) -> Verdict:
 
 
 def replay_locally(ctx: Context, sha: str, tests: list[str]) -> str:
-    """Rejoue les tests rouges sur la tête gelée ; "" si rouge confirmé."""
+    """Rejoue les tests rouges sur la tête gelée ; "" si rouge confirmé.
+
+    #4221 : un QueryCanceled/lock timeout **du corps d'un test** qui se
+    reproduit à ce rejeu seul, hors charge, est un rouge réel (la ci-full est
+    rouge, le test est attribué, l'unité est retirée). Une erreur de fixture
+    (`setUpClass`/`tearDownClass`), un QueryCanceled de charge qui ne
+    reproduit pas, ou tout autre rejeu non concluant restent non concluants :
+    aucun retrait.
+    """
     if ctx.dry_run:
         return ""
     parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
@@ -676,6 +805,9 @@ def replay_locally(ctx: Context, sha: str, tests: list[str]) -> str:
         if run.green:
             return "vert en local (%d test(s)) : rouge non reproduit" % run.tests
         if run.inconclusive:
+            if not run.timed_out and run.returncode == 1 \
+                    and run.body_cancel_tests() & {str(test) for test in tests}:
+                return ""
             return "rejeu local non concluant (%s)" % run.motive()
         return ""
     finally:
@@ -839,9 +971,16 @@ def compose(ctx: Context, rows: list[dict]) -> str:
                 ctx.note(carrier, "%s%d groupe=%s"
                          % (SECOND_PREFIX, first,
                             ",".join(str(lot) for lot in group)))
-        results.append(attempt(ctx, carrier, name,
-                               Attempt(COMPOSITION, 1, "",
-                                       only=(list(group) if len(groups) == 2 else []))))
+        try:
+            results.append(attempt(ctx, carrier, name,
+                                   Attempt(COMPOSITION, 1, "",
+                                           only=(list(group) if len(groups) == 2 else []))))
+        except HoraireError as exc:
+            # The first carrier's journal already records its attempt. Keep
+            # composing the independent second group; the next tick resumes it.
+            if len(groups) != 2:
+                raise
+            results.append("#%d : %s" % (carrier, exc))
     return "\n".join(results)
 
 
@@ -985,15 +1124,25 @@ def pending(ctx: Context, item: dict, sha: str) -> Attempt | None:
     bougé vers la tête que la tentative a elle-même poussée et gelée avant ses
     tests (#4304 : gel postérieur à la marque, ou tête qu'elle publie), sans
     que cette tête soit finie (`achieved`) : refus de garde après les tests,
-    échec ou arrêt en cours de tests, ou tentative encore vivante.
+    échec ou arrêt en cours de tests, ou tentative encore vivante. Un gel
+    postérieur qu'elle n'a ni publié ni testé et qu'elle n'a pas posé
+    elle-même (#4506) la clôt : c'est la main d'un autre.
     """
     found = attempts(item)
     if found and sha:
-        kept = tested_since(item, found[-1].ts)
-        expected = (found[-1].publish.rsplit("@", 1)[-1]
-                    if found[-1].publish else kept[1] if kept else "")
+        last = found[-1]
+        kept = tested_since(item, last.ts)
+        expected = (last.publish.rsplit("@", 1)[-1]
+                    if last.publish else kept[1] if kept else "")
+        moved = frozen_ts(item) > last.ts > 0
         # Un autre gel ne donne pas à cette tentative le droit de le remplacer.
-        if expected and expected != sha and frozen_ts(item) > found[-1].ts:
+        if moved and expected and expected != sha:
+            return None
+        # #4506 : la tête a bougé après la tentative sans qu'elle l'ait publiée
+        # ni testée, et le gel vient d'une autre main (note du jalon) : il la
+        # clôt, sans la reprendre. Une tentative encore vivante garde la main.
+        if moved and not expected and sha != last.base \
+                and freeze_foreign(item, last.ts) and not running(ctx, last):
             return None
     if found and found[-1].base == sha:
         return found[-1]
@@ -1055,6 +1204,12 @@ def resume(ctx: Context, item: dict, this: Attempt) -> str:
         return "#%d : composition en cours (%s)" % (carrier, holder)
     if running(ctx, this, name):
         return "#%d : %s en cours (%s:%d)" % (carrier, this.step, this.host, this.pid)
+    # #4501 : la tête poussée est sous ci-full ; un second composeur ne
+    # recompose ni ne réenregistre par-dessus (le premier peut encore aboutir).
+    pending_run = ci_in_progress(ctx, item)
+    if pending_run is not None:
+        return "#%d : ci-full en cours sur %s (run %s), reprise suspendue" % (
+            carrier, frozen_sha(item)[:12], pending_run.get("run_id") or "?")
     if this.fenced:
         # #4245 : refus de garde, non concluant : même numéro de tentative,
         # borné par MAX_FENCED ; `--force` ferme la branche et le worktree
@@ -1199,11 +1354,12 @@ def publish(ctx: Context, item: dict) -> str:
     sha = frozen_sha(item)
     if not sha:
         return "#%d sans tête gelée : rien à publier" % carrier
-    if merged_seen(item) or str(item.get("state") or "") == "closed":
+    landed = merged_head(ctx, item, sha)
+    if landed or str(item.get("state") or "") == "closed":
         # #4322 : la ci-full précoce (#4304) a pu fusionner le porteur avant
         # le retour de paquet-auto ; ni verdict ni ci-full sur un porteur clos
         return "#%d déjà %s : rien à publier" % (
-            carrier, "fusionné" if merged_seen(item) else "clos")
+            carrier, "fusionné" if landed else "clos")
     units = composition_units(manifest_at(ctx, item, sha))
     resolutions = [unit for unit in units if unit.resolution]
     lines = ["#%d %s : tête gelée %s, %d unité(s)."
@@ -1241,11 +1397,26 @@ def follow(ctx: Context, item: dict) -> str:
             # verrou du paquet ; ne rien publier, retirer ni recomposer avant.
             return "#%d : composition en cours (%s)" % (carrier, holder)
     sha = frozen_sha(item)
+    if merged_head(ctx, item, sha):
+        # #4506 : un porteur fusionné reste ouvert (qa) le temps de sa clôture
+        # (hold du pilote, balayage) ; le tic n'y recompose ni ne republie.
+        return "#%d : fusionné, rien à faire (tête %s dans %s)" % (
+            carrier, sha[:12] or "aucune", ctx.target)
     left = pending(ctx, item, sha)
     if left is not None:
         return resume(ctx, item, left)
     if not sha:
         return "#%d sans gel ni tentative : rien à faire" % carrier
+    # #4319: an unavailable exemption proof requests the ordinary full-CI
+    # path, on the same carrier. The marker is scoped to its frozen head.
+    requested = any(
+        str(event.get("note") or "").startswith("auto-merge parallel-recompose ")
+        and "sha=%s " % sha in str(event.get("note") or "")
+        for event in item.get("events") or ())
+    if requested:
+        return attempt(ctx, carrier, name,
+                       Attempt(RECOMPOSITION, 1, sha, run_id="parallel-proof",
+                               only=carrier_group(item), force=True))
     noted = marks(item)
     if MARK_CI + sha not in noted:
         return publish(ctx, item)
@@ -1264,7 +1435,8 @@ def follow(ctx: Context, item: dict) -> str:
             verdict = Verdict(False, verdict.lots, verdict.tests, why)
     # #4237 : une recomposition du pilote n'use pas le retrait automatique
     recomposed = len({a.run_id for a in attempts(item)
-                      if a.step == RECOMPOSITION and a.run_id != PILOT_RUN})
+                      if a.step == RECOMPOSITION
+                      and a.run_id not in (PILOT_RUN, "parallel-proof")})
     if verdict.deterministic and recomposed < MAX_RECOMPOSITIONS:
         return recompose(ctx, item, run, verdict)
     reason = verdict.why if not verdict.deterministic else \
@@ -1573,6 +1745,13 @@ def pilot_recompose(ctx: Context, carrier: int, exclude: list[int],
     if left is not None and running(ctx, left):
         raise InputError("#%d : %s en cours (%s:%d), attendre sa fin"
                          % (carrier, left.step, left.host, left.pid))
+    # #4501 : une ci-full tourne sur la tête poussée ; la recomposition
+    # l'écraserait au lieu d'attendre son verdict.
+    run = ci_in_progress(ctx, item)
+    if run is not None:
+        raise InputError(
+            "#%d : ci-full en cours sur %s (run %s), recomposition refusée"
+            % (carrier, sha[:12], run.get("run_id") or "?"))
     ctx.epoch = session_epoch(ctx)
     name = str(item.get("branch") or "")[len(auto.PACKAGE_PREFIX):]
     ctx.say("#%d : recomposition du pilote sans %s" % (

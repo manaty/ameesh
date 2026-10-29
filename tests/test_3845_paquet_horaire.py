@@ -58,6 +58,8 @@ class FakeShell:
         self.auto_rc = 0
         self.added: list[list[str]] = []
         self.clock = NOW
+        #: #4506 : la tête gelée est-elle un ancêtre de origin/<cible> ?
+        self.ancestor = False
 
     def run(self, cmd, *, cwd=None, input_text=None, timeout=0):
         self.calls.append(list(cmd))
@@ -67,6 +69,8 @@ class FakeShell:
         if cmd[0] == "git":
             if "ls-remote" in cmd:
                 return ph.Result(0, "%s\trefs/heads/integration/paquet-h-20261027-03\n" % HEAD)
+            if "merge-base" in cmd and "--is-ancestor" in cmd:
+                return ph.Result(0 if self.ancestor else 1)
             return ph.Result(0)
         if cmd[0] == "ameesh":
             args = cmd[1:]
@@ -141,6 +145,31 @@ class Base(unittest.TestCase):
     def tearDown(self):
         (ph.ready_lots, ph.manifest_at, ph.replay_locally,
          ph.auto.composition_holder) = self._saved
+
+
+class AliveTest(unittest.TestCase):
+    """#4501 : la vie d'une tentative se lit au pid, jamais à la commande."""
+
+    def test_pid_vivant_sous_un_autre_nom_que_le_script(self):
+        # h-12 du 29/10 : la recomposition tournait sous `scripts/.h12-tick.py`,
+        # donc sans « paquet-horaire » dans sa ligne de commande ; le tic l'a
+        # jugée morte et a recomposé le même porteur en parallèle.
+        proc = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.terminate)
+        ctx = ph.Context(repo=ROOT, target="main", project="ameesh",
+                         pilot="mesh-design", actor="mesh-design",
+                         shell=FakeShell(), python="python3")
+        self.assertTrue(ctx.alive(proc.pid))
+        self.assertFalse(ctx.alive(999999999))
+
+    def test_zombie_ou_pid_disparu_n_est_pas_vivant(self):
+        proc = subprocess.Popen(["true"])
+        pid = proc.pid
+        proc.wait()
+        self.assertFalse(ph.Context(repo=ROOT, target="main", project="ameesh",
+                                    pilot="mesh-design", actor="mesh-design",
+                                    shell=FakeShell(), python="python3").alive(pid))
 
 
 class ComposeTest(Base):
@@ -456,6 +485,57 @@ class ResumeTest(Base):
         self.ctx.alive = lambda pid: True
         self.unfrozen(ph.MARK_ATTEMPT + "composition n=1 base=- par=%s:99" % self.ctx.host)
         self.assertIn("en cours", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+
+    def test_tentative_vivante_sous_un_autre_nom_de_script_attend(self):
+        # #4501 : le pid de la tentative est vivant mais sa ligne de commande
+        # ne nomme pas `paquet-horaire` (h-12 : `scripts/.h12-tick.py`) ; le
+        # tic ne recompose pas le même porteur.
+        proc = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.terminate)
+        item = carrier(notes=(ph.MARK_ATTEMPT
+                              + "composition n=1 base=%s par=%s:%d"
+                              % (HEAD, self.ctx.host, proc.pid),))
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        self.assertIn("en cours", ph.tick(self.ctx))
+        self.assertEqual(self.autos(), [])
+
+    def test_ci_full_en_cours_sur_la_tete_gelee_suspend_la_reprise(self):
+        # #4501 : la tentative est morte, mais la tête poussée (gelée) est sous
+        # ci-full ; un second composeur ne recompose pas par-dessus.
+        self.ctx.alive = lambda pid: False
+        item = carrier(notes=(ph.MARK_ATTEMPT + "composition n=1 base=%s par=%s:99"
+                              % (HEAD, self.ctx.host),))
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        self.shell.ci[4000] = {"runs": [dict(red_run(), status="running")]}
+        out = ph.tick(self.ctx)
+        self.assertIn("ci-full en cours", out)
+        self.assertEqual(self.autos(), [])
+        self.assertEqual(self.shell.ran("ci", "run"), [])
+
+    def test_ci_full_en_cours_sur_la_tete_de_branche_vue_suspend_la_reprise(self):
+        # #4501 : une poussée plus récente, pas encore gelée (fenêtre entre
+        # `push` et `frozen`), est déjà sous CI ; la reprise attend.
+        self.ctx.alive = lambda pid: False
+        item = carrier(notes=(ph.MARK_ATTEMPT + "composition n=1 base=%s par=%s:99"
+                              % (HEAD, self.ctx.host),))
+        item["branch_head"] = HEAD2
+        self.shell.items[4000] = item
+        self.shell.lists["qa"] = [item]
+        self.shell.ci[4000] = {"runs": [dict(red_run(), head_sha=HEAD2,
+                                             status="running")]}
+        out = ph.tick(self.ctx)
+        self.assertIn("ci-full en cours", out)
+        self.assertEqual(self.autos(), [])
+
+    def test_recomposition_du_pilote_refusee_pendant_une_ci_full(self):
+        self.shell.items[4000] = carrier()
+        self.shell.ci[4000] = {"runs": [dict(red_run(), status="running")]}
+        with self.assertRaisesRegex(ph.InputError, "ci-full en cours"):
+            ph.pilot_recompose(self.ctx, 4000, [], [])
         self.assertEqual(self.autos(), [])
 
     def test_tentative_morte_sur_cet_hote_reprise(self):

@@ -31,6 +31,7 @@ test_3503_jit  # driver : jit=off dans le paquet de démarrage et le chemin DSN 
 test_3556_auto_take_holds  # stockage : holds pilote ciblés, levée et réveil avant prise automatique (#3556)
 test_3565_hold_race  # stockage : hold/assign relu sous la transaction de prise, proposition filtrée (#3565)
 test_3643_host_critical_names  # stockage : noms critiques du drain lus dans critical_roles du canon (#3643)
+test_4174_project_plan  # storage: project readiness snapshots and conditional dispatch (#4174)
 test_420_qa_role  # SQL: QA role, runner binding and TEMP registry spoofing (#420, #919)
 test_1132_jauges_perimees  # stockage : provenance des relevés (production, source), dédup par fraîcheur, gauge_latest (#1132)
 test_2179_roadmap_cli  # stockage : import transactionnel, clés stables, CAS et filtre projet avant LIMIT (#2179)

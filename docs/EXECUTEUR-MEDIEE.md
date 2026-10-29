@@ -566,8 +566,12 @@ close() -> None
 exécuteurs enrôlés (L110, `LockedIdentity` sur `DbIdentityProvider`), le
 relais de modèle sous `/api/exec/v1/llm/` (L111, `--no-relay` pour s'en
 passer) et, avec `--work-repos`, le dépôt de travail (L113). Il synchronise
-aussi le canon de chaque hôte médié enrôlé (`--canon-sync`, 60 s). Les
-limites de `GET /host` viennent du canon (`resources.host_limits`).
+aussi le canon de chaque hôte médié enrôlé (`--canon-sync`, 60 s). Il fait
+aussi, chaque minute, le passage du scanner de libération d'hôte (#4148) pour
+ses hôtes médiés seulement : un hôte médié n'a pas de base locale, donc le
+retour programmé, le crochet `busy` et la fermeture du retour sont traités
+côté serveur (#4435). Les limites de `GET /host` viennent du canon
+(`resources.host_limits`).
 `--auth-file` (jetons fixes, `stub.StaticAuth`) reste pour les bancs
 d'essai ; il exclut le relais. Le
 serveur utilise la bibliothèque standard (`http.server`) et n'ajoute aucune

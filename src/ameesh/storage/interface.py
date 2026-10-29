@@ -340,7 +340,7 @@ class Agents(Domain):
     def reachability(self) -> list[dict]:
         """#3631 : les seules colonnes qui disent si un relecteur désigné lira
         son courrier — `name`, `aliases`, `retired_ts`, `mode`, `status`,
-        `host`.
+        `status_text` (#4491, préfixe `auth_blocked`), `host`.
 
         La passe de redésignation lit ce fait à chaque synchronisation de
         canon sur chaque exécuteur : `overview()` y joignait le canon, les
@@ -2722,7 +2722,8 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def record_packet(self, package_id: int, *, branch: str, base_sha: str,
                       head_sha: str, units: Sequence[dict], note: str,
-                      actor: str) -> list[dict]:
+                      actor: str,
+                      expect_pushed: str | None = None) -> list[dict]:
         """#2443 : enregistre la composition d'un paquet (lot porteur
         `package_id`, branche `branch`), en remplaçant l'ensemble de ses
         unités, en UNE transaction.
@@ -2732,6 +2733,12 @@ class WorkItems(Domain):
         (l'intégrité référentielle tranche) ; l'événement `note` est écrit au
         journal du porteur dans la même transaction. Rend les lignes relues
         par `packet_members` (ordre de `recorded_at` décroissant).
+
+        #4501 : le porteur est verrouillé (`FOR NO KEY UPDATE`) avant toute
+        lecture de sa tête poussée ; le dernier gel et `branch_head` sont relus
+        **dans cette transaction**, et l'écriture est refusée si la tête
+        poussée n'est ni `head_sha` ni `expect_pushed`. Un gel, un relevé ou un
+        autre enregistrement concurrent est ainsi sérialisé avec l'écriture.
         """
 
     @abc.abstractmethod
@@ -2858,7 +2865,14 @@ class WorkItems(Domain):
         hôtes confondus."""
 
     @abc.abstractmethod
-    def unassigned_lots(self, limit: int) -> list[dict]:
+    def project_plan_rows(self, project: str, *, assignment_id: int | None = None) -> list[dict]:
+        """#4174: open dispatch readiness (bugs and evolutions, not the L119
+        improvement queue), with `footprint_overlap` (#4173); assignment_id
+        limits to target and unassigned bugs."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def unassigned_lots(self, limit: int | None) -> list[dict]:
         """L165 : les lots du projet encore à confier (`intake`, ou `build`
         RENDU à la file par la limite d'en-cours §4 : `RETURNED_NOTE` postérieur
         à la dernière attribution, il garde son état et sa branche —, sans
@@ -2873,6 +2887,7 @@ class WorkItems(Domain):
         `intake`). #3447 : un lot réservé à un exécutant externe
         (`external_executor`) n'est pas offert — le filtre précède le LIMIT,
         comme les dépendances.
+        `limit=None` reads the full queue for project phase selection (#4174).
         #1193: a lot whose explicit prerequisite is not finished is excluded —
         the ready intake never offers a lot that cannot be started.
         #2252 : « finished » veut dire fusionné (`merged`/`promoted`/`closed`) :
@@ -4422,12 +4437,16 @@ class HostLifecycle(Domain):
         """CAS progress against the current host generation."""
 
     @abc.abstractmethod
-    def expire_returns(self, *, open_claims: bool = True) -> list[dict]:
+    def expire_returns(self, *, open_claims: bool = True,
+                       hosts: Sequence[str] | None = None) -> list[dict]:
         """Convert elapsed planned withdrawals to durable return requests.
 
         #4148: `open_claims=False` keeps the claim gate closed so the `busy`
         hook answers first (the runner's path); the default preserves the
         historical direct call, where no adapter is involved.
+
+        #4435: `hosts` restricts the conversion to those hosts (the mediated
+        server expires only the hosts it scans); None keeps every one.
         """
 
     @abc.abstractmethod

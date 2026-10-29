@@ -116,15 +116,26 @@ def check(connector) -> None:
                              % (getattr(connector, "name", "?"), getattr(connector, "dedupe", None)))
 
 
+#: action connectors served by the core itself; every other name comes from the
+#: module registry (the development module declares `git-merge`, L100 T1 #4382)
+CORE_NAMES = ("shell-noop",)
+
+#: connectors `ameesh action propose` accepts (`--connector` choices); the
+#: registry remains authoritative for the implementation
 NAMES = ("shell-noop", "git-merge")
 
 
 def get(name: str, **options) -> Connector:
-    """Instancie un connecteur fourni par ameesh (`shell-noop`, `git-merge`)."""
-    if name == "shell-noop":
+    """Instancie un connecteur d'action : le cœur (`shell-noop`) ou un
+    fournisseur de module lu par le registre (`git-merge`, module `dev`)."""
+    if name in CORE_NAMES:
         from .shell_noop import ShellNoopConnector
         return ShellNoopConnector(**options)
-    if name == "git-merge":
-        from .git_merge import GitMergeConnector
-        return GitMergeConnector(**options)
-    raise ConnectorError("unknown connector: %r (known: %s)" % (name, ", ".join(NAMES)))
+    from ..modules import registry
+    found = registry.action_connectors()
+    entry = found.get(name)
+    if entry is None:
+        raise ConnectorError("unknown connector: %r (known: %s)"
+                             % (name, ", ".join(sorted([*CORE_NAMES, *found]))))
+    _provider, connector = entry
+    return connector(**options)

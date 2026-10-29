@@ -1582,7 +1582,7 @@ class ParallelSecondTest(Journal):
         self.assertEqual([lot for lot, _kw in self.closed], [LOT])
         self.assertIn("lots rendus à la file", self.closed[0][1]["note"])
 
-    def test_an_inconclusive_freeze_check_neither_merges_nor_closes(self):
+    def test_an_inconclusive_freeze_check_requests_full_recomposition(self):
         path, _git, base, _first_head, first_merge, second_head = self.pair()
         self.freeze_ok = ("inconclusive", "freeze checks timed out")
         self.armed(sha=second_head, composition=base)
@@ -1592,6 +1592,7 @@ class ParallelSecondTest(Journal):
         self.assertIn("non concluante", out["why"])
         self.assertEqual(gh.merges(), [])
         self.assertEqual(self.closed, [])
+        self.assertTrue(any(note.startswith("auto-merge parallel-recompose ") for note in self.notes()))
 
     def test_a_red_freeze_check_returns_the_second_to_the_queue(self):
         path, _git, base, _first_head, first_merge, second_head = self.pair()
@@ -1631,7 +1632,7 @@ class ParallelSecondTest(Journal):
         self.assertEqual(gh.merges(), [])
         self.assertEqual([lot for lot, _kw in self.closed], [LOT])
 
-    def test_a_missing_manifest_neither_merges_nor_closes(self):
+    def test_a_missing_manifest_requests_recomposition(self):
         path, git, base, _first_head, first_merge, second_head = self.pair()
         git("checkout", "-q", "packet2")
         (Path(path) / ("reviews/integration-paquet-h-20261020-%04d.md" % LOT)).unlink()
@@ -1648,6 +1649,7 @@ class ParallelSecondTest(Journal):
         self.assertIn("manifeste", out["why"])
         self.assertEqual(gh.merges(), [])
         self.assertEqual(self.closed, [])
+        self.assertTrue(any(note.startswith("auto-merge parallel-recompose ") for note in self.notes()))
 
     def test_a_recorded_proof_does_not_bypass_the_manifest_check(self):
         # La marque « preuve déjà consignée » ne couvre que l'arbre fusionné :

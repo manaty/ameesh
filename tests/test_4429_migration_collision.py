@@ -97,6 +97,7 @@ class MigrationCollisionTest(unittest.TestCase):
         self.store = mock.Mock(work=self.registry, progress=FakeProgress(self.marks, {}))
         self.store.migration_reservations.for_target.side_effect = self.for_target
         self.store.work_dependencies.for_items.return_value = []
+        self.store.work_dependencies.links_for.return_value = []
         patch_families(self)
 
     def lot(self, lot: int, edits: dict, *, created: float | None = None) -> None:

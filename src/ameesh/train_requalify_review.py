@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import re
 
-from . import (assignments, mechanics, merge_queue, resolutions, review_authors, review_lot,
-               review_provenance, storage, train_assembly, work)
+from . import (assignments, mechanics, merge_queue, packet_candidates, resolutions,
+               review_authors, review_lot, review_provenance, storage, train_assembly,
+               work)
 from .train import TrainError
 
 
@@ -39,6 +40,23 @@ def _milestone_receipt(db, number):
         return review_provenance.receipt_for_milestone(db, number)
     except review_provenance.ProvenanceError as exc:
         raise TrainError("reviewed requalification provenance refused: %s" % exc) from exc
+
+
+def _clean_merge_tree(repo, first, second):
+    """The tree a conflict-free merge of two commits produces, or None.
+
+    ``git merge-tree --write-tree`` (git >= 2.38) replays the hosting forge's
+    merge without a working tree. A conflict is not an error: the merge then
+    carries its author's resolution and needs provenance. Any other failure
+    refuses the qualification instead of guessing.
+    """
+    trial = packet_candidates.merge_tree(repo, first, second)
+    if trial["state"] == "conflict":
+        return None
+    if trial["state"] != "clean":
+        raise TrainError("cannot compute the clean canon merge of %s and %s: %s"
+                         % (first[:12], second[:12], trial.get("detail") or "?"))
+    return trial["tree"]
 
 
 def qualify(cfg, db, spec, pin, gate, changed, references):
@@ -95,13 +113,22 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
             commit, *parents = line.split()
             if len(parents) > 1:
                 # A hosting merge whose tree is exactly a parent adds no
-                # content. A conflict resolution does, and needs provenance.
+                # content. So does a clean merge: its tree is the mechanical
+                # result of git merge-tree on its two parents, and the parents'
+                # own commits are qualified below. Only a merge that git cannot
+                # replay (conflict resolution, edited tree) carries content of
+                # its own, and needs provenance. An octopus merge (more than
+                # two parents) is not a hosting-button merge: it keeps needing
+                # provenance unless its tree equals a parent.
                 trees = resolutions._run(spec.canon, "rev-parse", commit + "^{tree}",
                                          *(parent + "^{tree}" for parent in parents))
                 if trees.returncode:
                     raise TrainError("cannot read canon merge trees")
                 tree, *parent_trees = resolutions._text(trees).split()
                 if tree in parent_trees:
+                    continue
+                if (len(parents) == 2
+                        and _clean_merge_tree(spec.canon, parents[0], parents[1]) == tree):
                     continue
             receipt = review_provenance.receipt_for_commit(db, commit)
             family = review_lot.family_of((receipt or {}).get("harness"), families)

@@ -20,7 +20,7 @@ from . import (NAME, _builtin, _check_types, _digest, _distribution, _entry_poin
                _external, _validate_descriptor)
 
 #: Capabilities a module may declare in ``CAPABILITIES``.
-CAPABILITIES = ("lifecycle", "cli", "audit")
+CAPABILITIES = ("lifecycle", "cli", "audit", "workspaces")
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,10 @@ def _capabilities(name, module):
         provided.append("cli")
     if callable(getattr(module, "audit", None)):
         provided.append("audit")
+    if callable(getattr(module, "workspaces", None)):
+        # L101 T4 (#4357): a tooling module owns the workspaces façade; the core
+        # reads it through the registry, never by importing the implementation.
+        provided.append("workspaces")
     declared = getattr(module, "CAPABILITIES", None)
     if declared is None:
         return tuple(provided)
@@ -101,7 +105,7 @@ def discover(*, builtin=True):
     modules, refused = [], []
     builtins = _builtin() if builtin else {}
     for name, module in sorted(builtins.items()):
-        compiled = _validate_descriptor(name, module.descriptor({}))
+        compiled = _validate_descriptor(name, module.descriptor({}), allow_empty=True)
         _check_types(name, module, compiled)
         modules.append(_describe(name, module, compiled, source="builtin",
                                  version=_core_version()))
@@ -125,18 +129,48 @@ def discover(*, builtin=True):
     return Registry(tuple(modules), tuple(refused))
 
 
+def get(name):
+    """A built-in module implementation by name, or None in the bare profile.
+
+    L101 T4 (#4357): the core obtains a built-in module's façade through the
+    registry (``registry.get("dev")``), never by importing the implementation
+    (L97 boundary). Only built-ins are read here: an installed entry point is
+    loaded by discovery and selected by the canon, not by a core runtime path.
+    """
+    return _builtin().get(name)
+
+
 #: L99 T2 (#4350): delivery connectors owned by the core itself (`work.deliver`)
 CORE_CONNECTORS = ("document", "done")
+#: L100 T1 (#4382): action connectors owned by the core itself (`connectors.get`)
+CORE_ACTION_CONNECTORS = ("shell-noop",)
 
 
 def _connector_providers():
-    """Built-in providers of delivery connectors: the lifecycle modules plus the
-    development tooling (`dev`), which is not a lifecycle module. Installed
-    entry points are not read: a delivery path is reviewed core code."""
-    from . import dev
-    providers = dict(_builtin())
-    providers[dev.NAME] = dev
-    return providers
+    """Built-in providers of action and delivery connectors: the lifecycle
+    modules plus the development tooling (`dev`, now a built-in module).
+    Installed entry points are not read: a connector path is reviewed core
+    code."""
+    return dict(_builtin())
+
+
+def action_connectors():
+    """`{name: (provider, connector)}` of the action connectors modules declare
+    in ``ACTION_CONNECTORS``; a name taken twice, or by the core, is refused.
+
+    L100 T1 (#4382): the registry is the core's only way to the development
+    module's action connectors (`git-merge`); the core keeps `shell-noop`."""
+    found = {}
+    for provider, module in sorted(_connector_providers().items()):
+        for name, connector in sorted((getattr(module, "ACTION_CONNECTORS", None)
+                                       or {}).items()):
+            if not NAME.fullmatch(name) or not callable(connector):
+                raise ValueError("module %r: invalid action connector %r"
+                                 % (provider, name))
+            if name in CORE_ACTION_CONNECTORS or name in found:
+                raise ValueError("duplicate action connector: %r" % (name,))
+            found[name] = (provider, connector)
+    return found
 
 
 def delivery_connectors():
@@ -157,8 +191,8 @@ def delivery_connectors():
 
 def merge_connector():
     """Name of the connector of a merge on the target (gate actions, `merged`)."""
-    from . import dev
-    return dev.MERGE_CONNECTOR
+    module = get("dev")
+    return getattr(module, "MERGE_CONNECTOR", "git-merge")
 
 
 def admits(db, project, kind):
