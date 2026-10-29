@@ -66,6 +66,7 @@ from . import persona_memory as memory_mod
 from . import train_events
 from . import events as events_mod, turn_stages
 from . import venv_guard
+from . import workspaces
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, NAME_RE, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
 from .config import fresh_radar, load as load_config
@@ -7248,15 +7249,10 @@ class AgentWorker(threading.Thread):
             return
         try:
             lot = spec.get("lot") or self.agent.get("session_work_item") or None
-            entries = menage_tour.end(lot=str(lot) if lot else None, turn_id=turn_id,
-                                      db=self.db, host=self.runner.host)
-            # conteneurs étiquetés par CE tour, sans lot : supprimés tout de
-            # suite (ceux d'un lot attendent sa fin, au passage périodique)
-            if not menage_tour.off:
-                from . import menage as menage_mod
-                entries += menage_mod.reap_containers(
-                    self.runner.container_runtime(), self.db, self.runner.host,
-                    only_turn=turn_id)["entries"]
+            entries = workspaces.after_turn(
+                menage_tour, lot=str(lot) if lot else None, turn_id=turn_id,
+                db=self.db, host=self.runner.host,
+                runtime=self.runner.container_runtime())
             if entries:
                 storage.of(self.db).housekeeping.log(
                     self.runner.host, entries, actor="runner:%s" % self.runner.runner_id)
@@ -7686,7 +7682,6 @@ class AgentWorker(threading.Thread):
         menage_tour = None
         if not getattr(self.runner, "mediated", False):
             try:
-                from . import menage as menage_mod
                 # session neuve : dossier temporaire vidé — jamais sous le travail
                 # de fond d'un tour précédent encore en délai de grâce
                 fond = getattr(self.runner, "background", None)
@@ -7699,7 +7694,7 @@ class AgentWorker(threading.Thread):
                 # une continuation, pas une vraie session neuve.
                 suite_de_rotation = bool(self.resume_summary) \
                     and (self.resume_origin == "agent" or self.resume_continuation)
-                menage_tour = menage_mod.Turn.begin(
+                menage_tour = workspaces.before_turn(
                     self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
                     new_session=not session and not suite_de_rotation
                     and not (fond and fond.has_jobs(self.name))
@@ -9361,8 +9356,7 @@ class Runner:
         self._container_runtime = containers_mod.Runtime.from_config(cfg)
         #: ménage (L73) : politique de la fiche Host (dernier `canon sync`),
         #: valeurs par défaut tant qu'aucun canon n'est lu
-        from . import menage as menage_mod
-        self._housekeeping = menage_mod.Policy()
+        self._housekeeping = workspaces.default_policy()
         #: L162 : jamais deux passages de ménage à la fois (le périodique, et
         #: celui qu'une pression du tmpfs déclenche tout de suite)
         self._housekeeping_lock = threading.Lock()
@@ -11554,8 +11548,7 @@ class Runner:
     # -- ménage (L73) -----------------------------------------------------
     def housekeeping_policy(self):
         """Politique de ménage de l'hôte (L73) ; défauts sans canon."""
-        from . import menage as menage_mod
-        return getattr(self, "_housekeeping", None) or menage_mod.Policy()
+        return getattr(self, "_housekeeping", None) or workspaces.default_policy()
 
     def agents_in_turn(self) -> set:
         """Agents en tour sur cet exécuteur — et ceux dont le travail de fond
@@ -11594,7 +11587,6 @@ class Runner:
             return False  # mediated executor: no local housekeeping (contract 1.1)
 
         def passage() -> None:
-            from . import menage as menage_mod
             report = self.housekeeping_once()
             if not report:
                 return
@@ -11606,14 +11598,13 @@ class Runner:
                           len(supprimes),
                           " (%s)" % ", ".join(e["path"] for e in supprimes[:5])
                           if supprimes else "",
-                          menage_mod.tmpfs_hint(mesure.get("system_tmp_top") or [],
-                                                self.housekeeping_policy())))
+                          workspaces.tmpfs_pressure(mesure.get("system_tmp_top") or [],
+                                                    self.housekeeping_policy())))
 
         threading.Thread(target=passage, daemon=True, name="menage-tmpfs").start()
         return True
 
     def _housekeeping_pass(self, *, min_interval_s: float = 0.0) -> dict | None:
-        from . import menage as menage_mod
         from . import build_artifacts
         from . import resources as resources_mod
         db = None
@@ -11625,7 +11616,7 @@ class Runner:
                 busy = bool(en_tour) or storage.of(db).hosts.turns_in_progress(self.host) > 0
             except Exception:
                 busy = True
-            report = menage_mod.run_pass(
+            report = workspaces.periodic_pass(
                 self.cfg, db, self.housekeeping_policy(), host=self.host,
                 actor="runner:%s" % self.runner_id, busy=busy, agents_in_turn=en_tour,
                 runtime=self.container_runtime(),
@@ -12207,8 +12198,7 @@ class Runner:
         if sync_gate is not None and complete:
             offer = limits.get("lend")
             sync_gate(bool(offer), offer)
-        from . import menage as menage_mod
-        self._housekeeping = menage_mod.effective(canons, self.host)
+        self._housekeeping = workspaces.policy(canons, self.host)
         lock = getattr(self, "_pressure_lock", None)
         if lock is None:
             self._host_limits = limits
@@ -13386,18 +13376,7 @@ def _attach_tmp_env(cfg: Config, name: str, base_env: dict, holds: list) -> dict
     verrouillé jusqu'à la fin de la session (le verrou est ajouté à `holds`,
     que l'appelant relâche)."""
     try:
-        from . import canon as canon_mod
-        from . import menage as menage_mod
-        try:
-            canons = canon_mod.load_configured(cfg)
-        except Exception:
-            canons = []
-        policy = menage_mod.effective(canons, cfg.host or "")
-        if not policy.redirect or menage_mod.disabled(base_env):
-            return {}
-        hold = menage_mod.hold_tmp(cfg, policy, name, new_session=False)
-        holds.append(hold)
-        return menage_mod.turn_env(cfg, policy, name, base_env, hold=hold)
+        return workspaces.attach_env(cfg, name, base_env, holds)
     except Exception as exc:
         log_async("[%s] attach: temporary directory not redirected (%s)" % (name, exc))
         return {}
