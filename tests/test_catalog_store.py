@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import unittest
 
-from ameesh import storage
+from ameesh import catalog, storage
+from ameesh.discovery.base import ModelSeen, SourceResult
 
 from .support import PgTestCase
 
@@ -64,6 +65,71 @@ class CatalogStoreTest(PgTestCase):
         rows = self.store.show("modele-L14")
         self.assertEqual(rows[0]["source"], SOURCE, "un barème ne vole pas la source")
         self.assertEqual(float(rows[0]["price_input"]), 9.0)
+
+    def test_upsert_models_preserves_the_source_owner(self):
+        """#4312 (N de l'auditeur sur #4291) : une autre source qui revoit le
+        même modèle met à jour ses mesures, jamais la propriété de la ligne.
+        Le retrait d'une source ne voit que ses propres lignes : changer
+        `source` ferait échapper le modèle à celui qui l'a créé."""
+        self.store.upsert_models([{"provider": "anthropic", "model_id": "modele-4312",
+                                   "source": "provider-A", "price_input": 1.0}])
+        self.store.upsert_models([{"provider": "anthropic", "model_id": "modele-4312",
+                                   "source": "provider-B", "price_output": 5.0}])
+        rows = self.store.show("modele-4312")
+        self.assertEqual(rows[0]["source"], "provider-A",
+                         "le second passage ne vole pas la source")
+        self.assertEqual(float(rows[0]["price_input"]), 1.0)
+        self.assertEqual(float(rows[0]["price_output"]), 5.0)
+        self.assertEqual(self.store.active("provider-B"), [],
+                         "provider-B ne peut pas retirer une ligne de provider-A")
+
+    def test_update_prices_then_presence_then_withdrawal(self):
+        """#4312 (B de l'auditeur du 29/10) : une ligne née du barème (source
+        locale) doit être reprise par la source de présence qui la revoit ;
+        sinon `active(source)` ne la voit jamais et le retrait du fournisseur
+        la laisse active. Le prix du barème survit à la reprise."""
+        self.store.update_prices([{"provider": "anthropic",
+                                   "model_id": "modele-4312-prices",
+                                   "price_input": 3.0, "source": "prices"}])
+        self.assertEqual([row["source"] for row in self.store.active("prices")],
+                         ["prices"])
+        self.assertEqual(self.store.active("provider-A"), [],
+                         "une source de présence ne voit pas encore la ligne")
+
+        seen = SourceResult(source="provider-A", complete=True, models=(
+            ModelSeen(provider="anthropic", model_id="modele-4312-prices",
+                      source="provider-A", price_output=7.0),
+            ModelSeen(provider="anthropic", model_id="modele-4312-keep",
+                      source="provider-A"),
+        ))
+        catalog.record(self.store, seen)
+        active = {row["model_id"]: row for row in self.store.active("provider-A")}
+        self.assertEqual(set(active), {"modele-4312-prices", "modele-4312-keep"})
+        self.assertEqual(active["modele-4312-prices"]["source"], "provider-A")
+        self.assertEqual(float(active["modele-4312-prices"]["price_input"]), 3.0)
+        self.assertEqual(float(active["modele-4312-prices"]["price_output"]), 7.0)
+
+        gone = SourceResult(source="provider-A", complete=True, models=(
+            ModelSeen(provider="anthropic", model_id="modele-4312-keep",
+                      source="provider-A"),
+        ))
+        decision = catalog.record(self.store, gone)
+        self.assertEqual([row.model_id for row in decision.to_retire],
+                         ["modele-4312-prices"])
+        self.assertEqual([row["model_id"] for row in self.store.active("provider-A")],
+                         ["modele-4312-keep"])
+        self.assertIsNotNone(self.store.show("modele-4312-prices")[0]["retired_at"])
+
+    def test_upsert_models_takes_an_empty_source_line(self):
+        """#4312 : une ligne sans propriétaire est reprise par la présence."""
+        self.store.upsert_models([{"provider": "anthropic",
+                                   "model_id": "modele-4312-vide", "source": ""}])
+        self.store.upsert_models([{"provider": "anthropic",
+                                   "model_id": "modele-4312-vide",
+                                   "source": "provider-4312-empty"}])
+        self.assertEqual([row["source"] for row in
+                          self.store.active("provider-4312-empty")],
+                         ["provider-4312-empty"])
 
     def test_harnais_et_listing(self):
         self.store.upsert_models([{"provider": "anthropic", "model_id": "modele-L14", "source": SOURCE}])

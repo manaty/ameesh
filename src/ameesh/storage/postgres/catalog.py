@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
+from ...catalog import LOCAL_SOURCE_NAMES
 from .. import interface
 
 def _text_array(values) -> str:
@@ -46,7 +47,18 @@ class Catalog(interface.Catalog):
                     price_input  = coalesce(excluded.price_input,  model_catalog.price_input),
                     price_cached = coalesce(excluded.price_cached, model_catalog.price_cached),
                     price_output = coalesce(excluded.price_output, model_catalog.price_output),
-                    source       = excluded.source,
+                    -- #4312 (N de l'auditeur sur #4291, B de l'auditeur du
+                    -- 29/10) : `source` est la PROPRIÉTÉ de la ligne (le retrait
+                    -- ne voit que les lignes de sa source). Une ligne née d'une
+                    -- source locale (barème, harnais) ou sans source est reprise
+                    -- par la source de présence qui la revoit ; une ligne déjà
+                    -- détenue garde son propriétaire.
+                    source = CASE
+                        WHEN model_catalog.source = ANY(%s::text[])
+                             OR model_catalog.source = ''
+                        THEN excluded.source
+                        ELSE model_catalog.source
+                    END,
                     raw_digest   = coalesce(excluded.raw_digest, model_catalog.raw_digest),
                     last_seen    = now(),
                     retired_at   = NULL
@@ -56,6 +68,7 @@ class Catalog(interface.Catalog):
                     model.get("price_input"), model.get("price_cached"),
                     model.get("price_output"), model.get("source", ""),
                     model.get("raw_digest") or None,
+                    _text_array(LOCAL_SOURCE_NAMES),
                 ),
             )
             count += 1
