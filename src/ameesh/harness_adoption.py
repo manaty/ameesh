@@ -1436,6 +1436,18 @@ def _advance_owner(cfg, db, row, state, report, *, now, actor, dry_run,
             _journal(row, state, "owner decision withdrawn: no adoption", actor=actor)
         return {"lot": row["lot_id"], "result": "refused",
                 "reason": "owner decision withdrawn"}
+    if view.get("state") == "closed":
+        # Enveloppe close sans réponse (transfert, livraison) : personne n'a
+        # refusé — le dire ainsi, jamais « owner did not approve (free text) ».
+        state.update({"stage": "refused",
+                      "reason": "owner decision #%s closed without an answer or withdrawal"
+                                % decision_id})
+        if not dry_run:
+            save(db, row, state)
+            _journal(row, state, "owner decision closed without an answer: no adoption",
+                     actor=actor)
+        return {"lot": row["lot_id"], "result": "refused",
+                "reason": state["reason"]}
     answer = view.get("answer") or {}
     option = answer.get("option")
     if view.get("state") != "answered" or option != "adopt":

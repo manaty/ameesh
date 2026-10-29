@@ -323,7 +323,8 @@ def pending(db, now: float | None = None, *, human: str | None = None) -> list[d
 
 def history(db, now: float | None = None, *, human: str | None = None,
             limit: int = HISTORY_LIMIT) -> list[dict]:
-    """Les demandes closes (répondues, retirées), les plus récentes d'abord."""
+    """Les demandes closes (répondues, retirées ou closes sans réponse), les
+    plus récentes d'abord."""
     rows = [view_of(r, now) for r in storage.of(db).decisions.history(limit=limit)]
     if human:
         rows = [r for r in rows if r["owner"] in (None, human)]
@@ -1363,7 +1364,8 @@ def format_view(view: dict, now: float | None = None) -> list[str]:
 def queue(db, *, human: str | None = None, include_closed: bool = False,
           now: float | None = None) -> dict:
     """Les demandes pour `ameesh decisions` : `pending` (les plus anciennes
-    d'abord) et, avec `include_closed`, `closed` (les plus récentes d'abord)."""
+    d'abord) et, avec `include_closed`, `closed` (les plus récentes d'abord :
+    réponses, retraits et demandes closes sans réponse)."""
     now = time.time() if now is None else float(now)
     return {"pending": pending(db, now, human=human),
             "closed": history(db, now, human=human) if include_closed else []}

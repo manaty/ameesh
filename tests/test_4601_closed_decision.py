@@ -38,6 +38,19 @@ class ClosedDecisionTest(_Base):
         view = decisions.view_of({'id': 1, 'closed_ts': 10, 'payload': {'decision': {}}})
         self.assertEqual(view['state'], 'closed')
 
+    def test_all_section_names_closed_requests(self):
+        """N mty-amh-docs-01 du 29/10 sur #4601 : le titre de section et
+        l'aide de `decisions --all` doivent couvrir les demandes closes sans
+        réponse, pas seulement answered/withdrawn."""
+        view = self.ask()
+        self.db.execute("UPDATE agent_mailbox SET delivered_at = now(),"
+                        " status = 'delivered' WHERE id = %s", (view['id'],))
+        proc = self.mesh("decisions", "--all", env=self.mesh_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("answered, withdrawn or closed without an answer", proc.stdout)
+        proc = self.mesh("decisions", "--help", env=self.mesh_env())
+        self.assertIn("closed without an answer", proc.stdout)
+
     def test_real_answers_and_withdrawals_keep_their_state(self):
         for state, record in (('answered', {'by': 'human:alice', 'text': 'a'}),
                               ('withdrawn', {'by': 'orch'})):
