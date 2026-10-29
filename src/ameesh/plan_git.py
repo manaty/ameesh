@@ -2153,7 +2153,8 @@ def merge_mentioning(repo: str, branch: str, head: str,
 
 def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None = None,
                  seen_at: float | None = None,
-                 since_ts: float | None = None) -> dict:
+                 since_ts: float | None = None,
+                 frozen_sha: str | None = None) -> dict:
     """La branche est-elle entrée dans `target` ? Rend `{merged, how, ref, tip,
     ahead, detail}` ; `ahead` : la pointe a du travail absent de la cible
     (l'appelant la retient comme `branch_head`).
@@ -2164,7 +2165,13 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
     #3326 : `seen_at` est l'instant (horloge de la base) où `branch_head` a
     été enregistré. Une tête qui était déjà dans la cible à cet instant n'a
     aucun commit propre : le reflog des refs de la cible le dit, et la preuve
-    « vu-ancestor » est refusée (`_was_ancestor_at_seen`)."""
+    « vu-ancestor » est refusée (`_was_ancestor_at_seen`).
+
+    #4508 : une tête vue en avance n'est une preuve que si c'est un commit
+    de la branche du lot. Sa base (le commit d'un autre lot) ou la pointe
+    d'un porteur ne la prouvent pas (`_own_commit_evidence`) : la branche
+    locale n'a pas bougé depuis sa création, ou une autre branche porte
+    déjà cette pointe."""
     target = _target_ref(repo, target)
     head = _commit(repo, target)
     if head is None:
@@ -2172,7 +2179,7 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
     tip = _tip(repo, branch)
     out = {"merged": False, "how": None, "ref": None, "tip": tip, "ahead": False}
     found = _branch_probe(repo, branch, target, head, tip, out, seen_head=seen_head,
-                          seen_at=seen_at, since_ts=since_ts)
+                          seen_at=seen_at, since_ts=since_ts, frozen_sha=frozen_sha)
     if found["merged"] and found["how"] != "message":
         # la citation par une fusion de la cible ne dépend pas de la pointe
         return _remote_moved(repo, branch, target, out, found)
@@ -2181,7 +2188,7 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
 
 def _branch_probe(repo: str, branch: str, target: str, head: str, tip: str | None,
                   out: dict, *, seen_head: str | None, seen_at: float | None,
-                  since_ts: float | None) -> dict:
+                  since_ts: float | None, frozen_sha: str | None = None) -> dict:
     # #3326 : la tête vue était-elle déjà une ancêtre de la cible quand le
     # relevé l'a vue ? Sa date de commit ne le dit pas (une avance rapide la
     # rend ancêtre après coup) ; le reflog de la cible, si. Le reflog n'est
@@ -2194,14 +2201,30 @@ def _branch_probe(repo: str, branch: str, target: str, head: str, tip: str | Non
                 repo, seen_head, target, seen_at))
         return bool(stale[0])
 
-    def refusal() -> str | None:
-        if not seen_stale():
+    # #4508 : la tête vue n'est une preuve que si c'est un commit de la
+    # branche — ni sa base (celle d'un autre lot), ni la pointe d'un porteur.
+    own: dict[str, str | None] = {}
+
+    def own_refusal() -> str | None:
+        if not seen_head:
             return None
-        return ("last commit seen ahead (%s) was already an ancestor of %s when the "
-                "sweep saw it: no work of its own" % (seen_head[:12], target))
+        if seen_head not in own:
+            ok, why = _own_commit_evidence(repo, branch, seen_head, target, frozen_sha)
+            own[seen_head] = None if ok else why
+        return own[seen_head]
+
+    def refusal() -> str | None:
+        if seen_stale():
+            return ("last commit seen ahead (%s) was already an ancestor of %s when "
+                    "the sweep saw it: no work of its own" % (seen_head[:12], target))
+        why = own_refusal()
+        if why:
+            return ("last commit seen ahead (%s): %s — no work of its own"
+                    % (seen_head[:12], why))
+        return None
 
     def seen() -> dict | None:
-        if not seen_head or seen_stale():
+        if not seen_head or seen_stale() or own_refusal():
             return None
         found = probe(repo, seen_head, target, lot=branch_lot(branch))
         if found["merged"]:
@@ -2244,7 +2267,8 @@ def _branch_probe(repo: str, branch: str, target: str, head: str, tip: str | Non
             # cite la branche ; sinon le lot ne bouge pas.
             # #3326 : une tête vue alors qu'elle était déjà dans la cible ne
             # prouve rien non plus (cible périmée au relevé).
-            if seen_head and not seen_stale() and _commit(repo, seen_head) == tip:
+            if seen_head and not seen_stale() and not own_refusal() \
+                    and _commit(repo, seen_head) == tip:
                 return dict(out, merged=True, how="ancestor", ref=tip,
                             detail="%s (%s) entered %s through a merge commit; "
                                    "its tip was seen ahead for this lot"
@@ -2775,6 +2799,102 @@ def _was_ancestor_at_seen(repo: str, sha: str, target: str, when) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# #4508 : une tête sans commit propre (la base d'un autre lot) ne prouve rien
+# ---------------------------------------------------------------------------
+#
+# `branch_head` ne vaut que si sa pointe est un commit de la branche du lot.
+# Une branche associée avant son premier commit pointe sur sa base — le
+# commit d'un autre lot, ou celui d'un porteur — et le relevé la voit « en
+# avance » tant que cette base n'a pas atterri. Quand elle atterrit par un
+# autre chemin, l'ascendance semblait prouver la fusion (#4482). Deux
+# lectures, sans écriture :
+#   - le reflog de la branche locale : une branche qui n'a pas bougé depuis
+#     sa création n'a aucun commit propre ;
+#   - les autres refs (locales, `origin/`) : une pointe qui est déjà la
+#     pointe d'une autre branche (celle de l'autre lot, le porteur) est un
+#     commit de cette branche, pas du lot.
+# Sans reflog local ni autre pointe identique (branche connue seulement par
+# `origin/`, clone partiel), rien n'est conclu : le comportement antérieur
+# est gardé, comme pour #3326.
+
+
+def _ref_branch(ref: str) -> str:
+    """Le nom de branche d'une ref (`refs/heads/x`, `refs/remotes/o/x`)."""
+    if ref.startswith("refs/heads/"):
+        return ref[len("refs/heads/"):]
+    prefix = "refs/remotes/"
+    if ref.startswith(prefix):
+        remote, sep, branch = ref[len(prefix):].partition("/")
+        return branch if sep else remote
+    return ref
+
+
+def _branch_creation_commit(repo: str, branch: str) -> str | None:
+    """#4508 : le commit sur lequel la branche LOCALE a été créée (le plus
+    ancien du reflog), ou None sans branche locale/reflog lisible."""
+    if _commit(repo, "refs/heads/" + branch) is None:
+        return None
+    out = _out(repo, "reflog", "show", "--format=%H", "refs/heads/" + branch)
+    for line in reversed((out or "").splitlines()):
+        line = line.strip()
+        if _SHA_RE.match(line):
+            return line
+    return None
+
+
+def _other_ref_at(repo: str, branch: str, sha: str,
+                  target: str | None = None) -> str | None:
+    """#4508 : une autre branche (locale ou `origin/`) a-t-elle `sha` pour
+    pointe ? Rend son nom, ou None. La branche elle-même et la cible
+    examinée sont exclues (la cible porte la pointe par construction quand
+    on conclut), comme les têtes symboliques. Les refs internes d'ameesh
+    (`refs/remotes/ameesh/…`) ne sont pas lues : elles ne disent rien de la
+    propriété d'un commit."""
+    mine = short_branch(branch)
+    wanted = _target_branch(target) if target else ""
+    out = _out(repo, "for-each-ref", "--format=%(objectname) %(refname)",
+               "refs/heads", "refs/remotes/origin")
+    for line in (out or "").splitlines():
+        obj, _sep, ref = line.partition(" ")
+        if obj != sha or not ref:
+            continue
+        name = _ref_branch(ref)
+        if name == mine or name == "HEAD" or integration_branch(name) \
+                or (wanted and name == wanted):
+            # la cible et les refs d'intégration portent la pointe par
+            # construction quand on conclut : elles ne disent rien de sa
+            # propriété. `integration/…` (porteur de paquet) n'en est pas
+            # une : il compte comme une autre branche.
+            continue
+        return short_branch(ref)
+    return None
+
+
+def _own_commit_evidence(repo: str, branch: str, sha: str,
+                         target: str | None = None,
+                         frozen_sha: str | None = None) -> tuple[bool, str]:
+    """#4508 : `sha` est-il un commit propre à `branch` ? Rend (vrai, "") ou
+    (faux, la raison). Le gel du lot est une preuve directe quand il porte
+    `sha` (ou un descendant) : la tête déclarée est bien un travail du lot,
+    même si la branche n'a fait que la pointer. Sinon, deux signes qu'il
+    n'est pas propre : la branche locale n'a pas bougé depuis sa création,
+    ou une autre branche porte déjà cette pointe. Sans signe contraire, le
+    comportement antérieur est gardé (un reflog absent ne prouve pas
+    l'absence de travail)."""
+    frozen_sha = (frozen_sha or "").strip()
+    if frozen_sha and (sha == frozen_sha or _is_ancestor(repo, sha, frozen_sha)):
+        return True, ""
+    base = _branch_creation_commit(repo, branch)
+    if base and base == sha:
+        return False, ("the branch has not advanced since its creation (%s)"
+                       % sha[:12])
+    other = _other_ref_at(repo, branch, sha, target)
+    if other:
+        return False, ("%s is already the tip of %s" % (sha[:12], other))
+    return True, ""
+
+
 def _published_target_state(repo: str, sha: str, target: str,
                             cache: dict) -> tuple[str, str | None]:
     """#3326 : la pointe `sha` est-elle dans la cible publiée ?
@@ -2980,7 +3100,8 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
     elif branch:
         found = branch_probe(repo, branch, target, seen_head=row.get("branch_head"),
                              seen_at=row.get("branch_head_ts"),
-                             since_ts=row.get("created_ts"))
+                             since_ts=row.get("created_ts"),
+                             frozen_sha=freeze_sha)
     if repo not in hashes:
         hashes[repo] = lot_ref_hash(repo)
     if (repo, target) not in merges:
@@ -3483,7 +3604,12 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     branche, une abréviation) est un doute (`doubt`) : aucune ref n'est
     résolue dans ce clone, rien n'est fermé, et l'assigné est prévenu pour
     regeler sur la tête complète. Un gel absent ne bloque pas : la branche ou
-    une citation peuvent encore prouver la livraison."""
+    une citation peuvent encore prouver la livraison.
+
+    #4508 : une pointe qui n'est pas un commit de la branche (sa base, la
+    pointe d'un autre lot ou d'un porteur) n'est pas un travail propre : elle
+    n'est pas enregistrée comme `branch_head`, et la preuve « vu-ancestor »
+    qu'elle porterait est refusée (`_own_commit_evidence`)."""
     from . import fil, registry
 
     st = storage.of(db)
@@ -3746,7 +3872,21 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                         work_mod.attach_implicit_branch(
                             db, lot, branch, actor=actor or "git:%s" % target,
                             source="the merge sweep: lot/%d branch" % lot)
-                    st.work.set_branch_head(lot, branch, found["tip"])
+                    # #4508 : une pointe qui n'est pas un commit de la branche
+                    # (sa base, la pointe d'un autre lot ou d'un porteur) n'est
+                    # pas un travail propre : rien n'est enregistré, le lot
+                    # reste ouvert.
+                    own, why = _own_commit_evidence(
+                        repo, branch, found["tip"], target, frozen_sha)
+                    if not own:
+                        if entry["result"] != "off-target" \
+                                and entry["how"] in (None, "unverified"):
+                            entry["how"] = "no-work"
+                            entry["detail"] = (
+                                "%s (%s): %s — no work of its own; the lot is kept "
+                                "open" % (branch, found["tip"][:12], why))
+                    else:
+                        st.work.set_branch_head(lot, branch, found["tip"])
             results.append(entry)
             continue
         if dry_run:

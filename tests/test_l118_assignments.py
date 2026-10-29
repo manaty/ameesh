@@ -499,6 +499,66 @@ class BranchMergeTest(_Base):
         self.assertEqual(report["results"][0]["how"], "ancestor")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
+    def test_branche_associee_sur_sa_base_avant_son_premier_commit_ne_ferme_pas(self):
+        """#4508 (#4482) : une branche associée au lot avant son premier
+        commit, sur la base d'un AUTRE lot encore hors de la cible, n'a aucun
+        commit propre. Le relevé l'a vue en avance (c'était la base) ; quand
+        cette base entre ensuite dans la cible par un autre chemin, elle ne
+        doit pas fermer le lot. Le premier commit de l'auteur, puis sa fusion,
+        ferment normalement."""
+        # un commit d'un autre lot, pas encore dans develop
+        _git(self.repo, "checkout", "-q", "-b", "autre/lot", "develop")
+        base = self.commit("base-autre-lot")
+        _git(self.repo, "checkout", "-q", "develop")
+        # la branche du lot naît sur cette base, sans commit propre, et le lot
+        # l'associe avant le premier commit (comme #4482 à 08:24).
+        _git(self.repo, "branch", "agent/dev1-base", base)
+        lot = self.lot("agent/dev1-base")
+        first = self.sync()["results"][0]
+        self.assertEqual(first["result"], "open", first)
+        self.assertIn("no work of its own", first["detail"], first)
+        self.assertIsNone(work.get(self.db, lot["id"])["branch_head"])
+        # la base entre dans develop par un commit de fusion qui ne cite pas
+        # la branche du lot : c'est le paquet d'un autre lot, pas une preuve.
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge autre/lot", "autre/lot")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertIn("no work of its own", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+        # le premier commit de l'auteur, vu en avance, puis sa fusion : livré
+        _git(self.repo, "checkout", "-q", "agent/dev1-base")
+        propre = self.commit("propre")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.assertEqual(self.sync()["results"][0]["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["branch_head"], propre)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge agent/dev1-base",
+             "agent/dev1-base")
+        report = self.sync()
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(report["results"][0]["how"], "ancestor")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_tete_sans_commit_propre_enregistree_avant_le_correctif_est_refusee(self):
+        """#4508 : une tête déjà enregistrée (base d'un autre lot, avant le
+        correctif) est refusée par la même lecture : le reflog de la branche
+        locale dit qu'elle n'a pas bougé depuis sa création. Le lot reste
+        ouvert même quand la base entre dans la cible par une fusion."""
+        self.branch("autre/lot", "base-autre-lot")
+        base = _git(self.repo, "rev-parse", "autre/lot")
+        _git(self.repo, "branch", "agent/dev1-base-vue", base)
+        lot = self.lot("agent/dev1-base-vue")
+        # ce que l'ancien relevé avait enregistré : la base, vue en avance
+        storage.of(self.db).work.set_branch_head(
+            lot["id"], "agent/dev1-base-vue", base)
+        # la base entre dans develop par une fusion, puis la branche de
+        # l'autre lot est supprimée : seul le reflog reste
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge autre/lot", "autre/lot")
+        _git(self.repo, "branch", "-q", "-D", "autre/lot")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertIn("no work of its own", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
     def test_tete_hors_premiere_parente_vue_contre_une_cible_perimee_n_est_pas_livree(self):
         """#3326 avec #2543 : une pointe entrée par une fusion (hors première
         parente) ne prouve rien non plus si elle était déjà dans la cible
