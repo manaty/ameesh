@@ -251,6 +251,88 @@ class CreneauxSaturesTest(unittest.TestCase):
         self.assertIn(b"OK", proc.stdout)
 
 
+#: le vrai `ameesh heavy` (`heavy.run`), un créneau, grâces raccourcies
+HEAVY_DRIVER = """\
+import sys, types
+from ameesh import heavy
+heavy.GROUP_GRACE_S = 1.0
+heavy.POLL_S = 0.2
+cfg = types.SimpleNamespace(state_dir=sys.argv[1], max_heavy_suites=1,
+                            heavy_max_seconds=0)
+sys.exit(heavy.run(cfg, sys.argv[2:], nice=0))
+"""
+
+#: la série ignore SIGTERM ; son enfant, dans une autre session (donc un autre
+#: groupe), l'ignore aussi et garde le descripteur du créneau
+SERIE = """\
+trap '' TERM
+echo $$ > leader.pid
+setsid sh -c 'echo $$ > enfant.pid; exec sleep 300' &
+sleep 300 &
+wait
+sleep 300
+"""
+
+
+def _killpg(pgid: int) -> None:
+    with contextlib.suppress(OSError):
+        os.killpg(pgid, 9)
+
+
+class ArbreHeavyTest(unittest.TestCase):
+    """Relectures cx3 (#161273) et dev3 (jalon 24994) : `ameesh heavy` place
+    sa série dans son propre groupe ; tuer la session du wrapper la laissait
+    vivre, avec le créneau. Créneau pris au départ (acquisition retardée),
+    série et enfant de groupes distincts qui ignorent SIGTERM."""
+
+    def setUp(self) -> None:
+        from ameesh import heavy
+        self.heavy = heavy
+        tmp = tempfile.mkdtemp(prefix="paquet-4463-", dir=os.environ.get("TMPDIR"))
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        self.tmp = pathlib.Path(tmp)
+        self.cfg = __import__("types").SimpleNamespace(state_dir=tmp, max_heavy_suites=1)
+        (self.tmp / "driver.py").write_text(HEAVY_DRIVER)
+        grace = mock.patch.object(paquet_auto, "WALL_GRACE_S", 8)
+        grace.start()
+        self.addCleanup(grace.stop)
+
+    def pid(self, name: str) -> int:
+        return int((self.tmp / name).read_text())
+
+    def alive(self, pid: int) -> bool:
+        deadline = time.monotonic() + 3      # le temps d'être récolté
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            time.sleep(0.1)
+        return True
+
+    def test_borne_murale_arrete_l_arbre_et_rend_le_creneau(self) -> None:
+        import sys
+        import threading
+        held = self.heavy.acquire(self.cfg)
+        self.assertIsNotNone(held)
+        threading.Timer(1.0, self.heavy.release, (held[1],)).start()
+        env = dict(os.environ, PYTHONPATH=str(pathlib.Path(__file__).resolve()
+                                              .parents[1] / "src"))
+        start = time.monotonic()
+        proc = paquet_auto.run_walled(
+            [sys.executable, str(self.tmp / "driver.py"), str(self.tmp), "sh", "-c", SERIE],
+            cwd=self.tmp, env=env, wall=3)
+        took = time.monotonic() - start
+        self.assertIsNone(proc)
+        self.assertLess(took, 3 + 8 + 1)
+        leader, enfant = self.pid("leader.pid"), self.pid("enfant.pid")
+        for group in (leader, enfant):   # sans le correctif : rien ne survit au test
+            self.addCleanup(_killpg, group)
+        self.assertFalse(self.alive(leader), "série vivante")
+        self.assertFalse(self.alive(enfant), "enfant d'un autre groupe vivant")
+        self.assertEqual([row["busy"] for row in self.heavy.status(self.cfg)], [False])
+
+
 class CanonTest(unittest.TestCase):
     def test_cle_optionnelle_compilee(self) -> None:
         doc = mechanics.compile_document(

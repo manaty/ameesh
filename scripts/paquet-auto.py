@@ -182,8 +182,9 @@ DEFAULT_PARALLEL = 1
 #: #4271 : code de sortie d'`ameesh heavy` arrêté par sa borne (`heavy.CAPPED_EXIT`)
 HEAVY_CAPPED_EXIT = 124
 #: #4463 : après SIGTERM au temps mural échu, le délai laissé à `ameesh heavy`
-#: pour arrêter le groupe de sa série (`heavy.GROUP_GRACE_S`, 10 s) et sortir
-WALL_GRACE_S = 20
+#: pour arrêter sa série : SIGKILL au groupe après `heavy.GROUP_GRACE_S`
+#: (10 s), puis arrêt de ses autres descendants (SIGTERM, SIGKILL 10 s après)
+WALL_GRACE_S = 30
 FREEZE_TIMEOUT = 600
 GIT_TIMEOUT = 300
 #: #4245 : `RESTART_RESERVE_S` (90 s) de l'élection, plus la lecture
@@ -1602,10 +1603,10 @@ def run_walled(cmd: list[str], *, cwd: Path, env: dict,
                wall: int) -> subprocess.CompletedProcess | None:
     """#4463 : `cmd` borné en temps mural (attente d'un créneau comprise).
 
-    À l'échéance, SIGTERM (relayé par `ameesh heavy` au groupe de la série),
-    puis SIGKILL après `WALL_GRACE_S` ; None si la borne a été atteinte. La
-    commande a sa propre session : le SIGKILL atteint aussi ce qu'elle a lancé
-    dans son groupe, et la lecture des sorties reste bornée."""
+    À l'échéance, SIGTERM : `ameesh heavy` le relaie au groupe de la série,
+    l'escalade en SIGKILL et arrête ses autres descendants avant de rendre le
+    créneau. Au plus `WALL_GRACE_S` après, SIGKILL à la session du wrapper ;
+    None si la borne a été atteinte. La lecture des sorties reste bornée."""
     proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
@@ -1614,22 +1615,22 @@ def run_walled(cmd: list[str], *, cwd: Path, env: dict,
         return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
     except subprocess.TimeoutExpired:
         pass
-    proc.terminate()
+    stop_by = time.monotonic() + WALL_GRACE_S      # une seule grâce en tout
+    with contextlib.suppress(ProcessLookupError):
+        proc.terminate()
     try:
         proc.communicate(timeout=WALL_GRACE_S)
+        return None
     except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        proc.kill()
-        try:
-            proc.communicate(timeout=WALL_GRACE_S)
-        except subprocess.TimeoutExpired:
-            # un descendant hors du groupe tient les tubes : on les lâche
-            for pipe in (proc.stdout, proc.stderr):
-                with contextlib.suppress(OSError):
-                    pipe.close()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=WALL_GRACE_S)
+        pass
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    # un descendant hors de la session peut tenir les tubes : on les lâche
+    for pipe in (proc.stdout, proc.stderr):
+        with contextlib.suppress(OSError):
+            pipe.close()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=max(1.0, stop_by - time.monotonic()))
     return None
 
 
