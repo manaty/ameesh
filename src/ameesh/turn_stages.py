@@ -34,6 +34,21 @@ et la durée de chaque étape, en secondes :
 base, les autres jalons sur celle de l'hôte : un décalage d'horloge déplace
 du temps entre `wake` et l'étape voisine, jamais au-delà ; une étape négative
 est ramenée à zéro.
+
+#3513 demande de nommer les étages « reserve → deliver → harness start →
+pending → grant ». Amesh en mesure trois et les expose en plus des étapes
+séquentielles :
+
+  reserve_s    `due_ts` → `admitted_ts` : attente d'admission (budget, compte,
+               fenêtre courte) puis ouverture atomique du tour ; c'est la
+               somme de `held` et `admit`, sous un seul nom pour le consommateur ;
+  deliver_s    `spawned_ts` → `delivered_ts` : remise des messages après le
+               lancement du harnais (absente pour un message humain, soldé en
+               fin de tour) ;
+  harness start est `spawn` + `harness_start` ; `first_output_ts` est le
+               dernier jalon qu'ameesh voit. `pending` et `grant` appartiennent
+               au consommateur, après `first_output_ts` : il les ajoute à son
+               propre reçu, ameesh ne les invente pas.
 """
 from __future__ import annotations
 
@@ -47,6 +62,13 @@ MAX_IDS = 20
 
 def _overlap(a: float, b: float, c: float, d: float) -> float:
     return max(0.0, min(b, d) - max(a, c))
+
+
+def _gap(start, end) -> float | None:
+    """Écart positif entre deux jalons, ou None si l'un manque."""
+    if start is None or end is None:
+        return None
+    return max(0.0, float(end) - float(start))
 
 
 def _merged(intervals) -> list[tuple[float, float]]:
@@ -89,10 +111,14 @@ def receipt(etapes: dict, retenues=()) -> dict:
     total = max(0.0, float(last) - float(first)) if first and last else None
     reasons = sorted({r[2] for r in retenues if first is None or r[1] > float(first)})
     longest = max(STAGES, key=lambda k: stages[k])
+    reserve = _gap(ts["due_ts"], ts["admitted_ts"])
+    deliver = _gap(ts["spawned_ts"], ts["delivered_ts"])
     return {
         "messages": list(etapes.get("ids") or [])[:MAX_IDS],
         "ts": {k: round(float(v), 3) for k, v in ts.items() if v is not None},
         "stages_s": {k: round(v, 3) for k, v in stages.items()},
+        "reserve_s": round(reserve, 3) if reserve is not None else None,
+        "deliver_s": round(deliver, 3) if deliver is not None else None,
         "total_s": round(total, 3) if total is not None else None,
         "dominant": longest if stages[longest] > 0 else None,
         "held_reasons": reasons if stages["held"] > 0 else [],

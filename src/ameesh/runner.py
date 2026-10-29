@@ -10792,6 +10792,13 @@ class Runner:
             target = payload.get("to")
             with self.lock:
                 worker = self.workers.get(target) if target else None
+            if worker is not None:
+                # #4594 : le signal part AVANT toute lecture en base. Un
+                # `mail.get` sur la connexion partagée peut attendre derrière
+                # des dizaines de passes au repos ; le réveil ne doit pas
+                # dépendre de cette file. Le contrôle d'urgence vient ensuite,
+                # et #2810 couvre la course avec un tour qui a déjà commencé.
+                worker.wake.set()
             if payload.get("restart"):
                 # `ameesh restart` (L26) : le NOTIFY n'est qu'un réveil ; la
                 # demande est relue en base avant d'arrêter quoi que ce soit.
@@ -13171,7 +13178,8 @@ class Runner:
             if not self.did_turn:
                 log_async("no work available")  # chemin de sortie : par la file
             return 0 if self.did_turn else 3
-        self.listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self.listener_thread = threading.Thread(target=self._listen_loop,
+                                                name="listen", daemon=True)
         self.listener_thread.start()
         # Travail de fond des tours (délai de grâce) : l'exécuteur adopte les
         # orphelins de ses tours (codes de sortie), et les suit.
