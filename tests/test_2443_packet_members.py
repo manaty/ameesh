@@ -14,7 +14,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import db as db_mod, packet_head, packet_link, plan_git, storage, work
+from ameesh import (db as db_mod, packet_head, packet_link, plan_git, registry,
+                    storage, work)
 
 from .support import PgTestCase
 from .test_canon import _TmpMixin, git
@@ -235,6 +236,84 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
             {m["head_sha"] for m in
              packet_link.memberships(self.db, package_ids=[porteur["id"]])},
             {head})
+
+    def test_local_composition_head_is_not_recorded_as_pushed(self):
+        """#4562 : une tête locale non poussée n'est pas un relevé de la forge.
+
+        Témoin h-06 du 29/10 : `paquet-auto` compose dans le clone du pilote ;
+        le balayage de l'assigné y voit la pointe locale (unité 7) et
+        l'enregistre comme `branch_head`. Le record de la composition finale
+        est ensuite refusé « already has the pushed head » (#4501), alors que
+        la forge n'a jamais reçu cette pointe. Le relevé ne doit retenir une
+        tête de porteur que si elle est publiée ; le record final, avec le bail
+        de la tête réellement poussée, passe alors.
+        """
+        root = self.make_tmp()
+        bare = os.path.join(root, "acme", "web.git")
+        os.makedirs(os.path.dirname(bare))
+        git(root, "init", "-q", "--bare", bare)
+        # le dépôt de composition garde son origine GitHub (pour `packet
+        # record`) et pousse vers la forge locale par un second remote ; le
+        # clone de l'assigné, lui, lit cette forge locale.
+        git(self.repo, "remote", "add", "forge", bare)
+        git(self.repo, "push", "-q", "forge", "main")
+        sweep = os.path.join(root, "sweep")
+        git(root, "clone", "-q", bare, sweep)
+        registry.upsert(self.db, "dev1", harness="claude", host=self.cfg.host,
+                        cwd=sweep)
+        sha = self.unit_branch("lot/trente-et-un", "src/trente-et-un.py",
+                               "trente et un\n", "trente et un")
+        item = self.lot("trente et un")
+        self.freeze(item, sha)
+        pushed = self.compose("integration/paquet-1", [(item["id"], sha)])
+        porteur = self.carrier()
+        work.assign(self.db, porteur["id"], "dev1", actor="pilote")
+        packet_link.record(self.db, porteur["id"], repo=self.repo,
+                           base=self.base, head=pushed, actor="pilote",
+                           cfg=self.cfg)
+        git(self.repo, "push", "-q", "forge", "integration/paquet-1")
+        work.milestone(self.db, porteur["id"], "frozen", sha=pushed,
+                       actor="pilote", repo=self.repo)
+        git(sweep, "fetch", "-q", "origin")
+        git(sweep, "checkout", "-q", "-B", "integration/paquet-1",
+            "origin/integration/paquet-1")
+        # recomposition locale : la branche repart de la base et avance jusqu'à
+        # une tête intermédiaire (une unité) que la forge ne porte pas encore.
+        git(self.repo, "checkout", "-q", "-B", "integration/paquet-1", self.base)
+        git(self.repo, "merge", "-q", "--no-ff", "-m",
+            "vehicule : #%d %s (recomposition)\n\nameesh-work: %d"
+            % (item["id"], sha[:12], item["id"]), sha)
+        intermediate = git(self.repo, "rev-parse", "HEAD")
+        self.assertNotEqual(intermediate, pushed)
+        git(sweep, "fetch", "-q", self.repo,
+            "integration/paquet-1:refs/ameesh/test/intermediate")
+        git(sweep, "reset", "-q", "--hard", "refs/ameesh/test/intermediate")
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = next(row for row in report["results"]
+                     if int(row["work_item"]) == int(porteur["id"]))
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertEqual(entry["how"], "unpublished", entry)
+        self.assertIn("not published", entry["detail"])
+        self.assertIsNone(work.get(self.db, porteur["id"])["branch_head"])
+        # la composition finale (le manifeste au-dessus de l'unité) s'enregistre
+        # avec le bail de la tête réellement poussée : plus de refus #4501.
+        final = self.commit("reviews/integration-paquet-1.md",
+                            "# paquet\n", "paquet : manifeste final")
+        recorded = packet_link.record(self.db, porteur["id"], repo=self.repo,
+                                      base=self.base, head=final,
+                                      expect_pushed=pushed, actor="pilote",
+                                      cfg=self.cfg)
+        self.assertTrue(recorded["recorded"])
+        self.assertEqual(
+            {member["head_sha"] for member in
+             packet_link.memberships(self.db, package_ids=[porteur["id"]])},
+            {final})
+        # une fois la tête poussée, le balayage la retient de nouveau.
+        git(self.repo, "push", "-q", "--force", "forge", "integration/paquet-1")
+        git(sweep, "fetch", "-q", "origin")
+        git(sweep, "reset", "-q", "--hard", "origin/integration/paquet-1")
+        plan_git.sync_branches(self.db, host=self.cfg.host)
+        self.assertEqual(work.get(self.db, porteur["id"])["branch_head"], final)
 
     def test_record_rechecks_the_pushed_head_under_the_carrier_lock(self):
         """#4501 (B cx3) : un gel qui avance entre la lecture et l'écriture.
