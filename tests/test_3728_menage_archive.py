@@ -136,16 +136,29 @@ class ArchiveThenRemoveTest(_ArchiveRepo):
             self.assertTrue(os.path.isdir(wt))
         self.assertFalse(os.path.exists(self.archives))
 
-    def test_unpushed_commits_kept(self):
+    def test_unpushed_commits_archived_with_the_policy_kept_without(self):
+        """#4442 : la politique déclarée couvre aussi les commits absents de
+        la forge (`HEAD.bundle`) ; sans elle, le worktree reste gardé."""
         wt = self.dirty("lot-9")
         _write(os.path.join(wt, "g.txt"))
         _git("add", "g.txt", cwd=wt)
         _git("commit", "-q", "-m", "local only", cwd=wt)
         _store, entries, plan = self.run_pass(wt, {9: "merged"})
+        self.assertEqual(plan[0]["action"], "retrait", plan)
+        archived, = [e for e in entries if e["action"] == "archived"]
+        self.assertEqual(archived["data"]["commits"], 1)
+        self.assertTrue(os.path.isfile(os.path.join(
+            archived["data"]["archive"], "HEAD.bundle")))
+        self.assertFalse(os.path.exists(wt))
+        # sans politique, rien n'est archivé ni retiré
+        wt2 = self.dirty("lot-19")
+        _write(os.path.join(wt2, "g.txt"))
+        _git("add", "g.txt", cwd=wt2)
+        _git("commit", "-q", "-m", "local only", cwd=wt2)
+        _store, entries, plan = self.run_pass(wt2, {19: "merged"}, archive=False)
         self.assertEqual(plan[0]["action"], "garde", plan)
-        self.assertIn("modified or untracked", plan[0]["detail"])
-        self.assertTrue(os.path.isfile(os.path.join(wt, "g.txt")))
-        self.assertFalse(os.path.exists(self.archives))
+        self.assertIn("commits not pushed", plan[0]["detail"])
+        self.assertTrue(os.path.isfile(os.path.join(wt2, "g.txt")))
 
     def test_recent_end_activity_or_no_policy_kept(self):
         wt = self.dirty("lot-10")
