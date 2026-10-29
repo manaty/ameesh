@@ -18,6 +18,12 @@ REASON_MAX = 2000
 #: plafonnée à 4 h ; à l'échéance, l'exécuteur la lève (`expire`).
 DEFAULT_MAX_S = 4 * 3600.0
 HUMAN_RE = re.compile(r"human:[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}\Z")
+#: #4525 : le sommeil « feuille de route épuisée » est un geste automatique et
+#: déterministe (`file_decoupage._sleep`). Le journal doit le nommer comme tel,
+#: pas comme un geste de l'humain : l'owner reste seulement le principal. Seule
+#: cette identité machine est admise comme acteur non humain ; tous les autres
+#: acteurs non humains restent refusés, et le principal reste humain.
+FILE_DECOUPAGE_ACTOR = "ameesh:file-decoupage"
 
 
 class PauseRefused(ValueError):
@@ -52,11 +58,20 @@ def change(db, name: str, *, paused: bool, reason: str, actor: str,
     l'échéance vaut `now + DEFAULT_MAX_S` et le résultat porte
     `capped=True`. `indefinite` pose une pause sans fin, choix explicite que
     l'alerte `operator_pause_long` signale.
+
+    #4525 : un acteur non humain n'est admis que pour le geste automatique du
+    découpage (`ameesh:file-decoupage`) ; le principal reste un humain (l'owner
+    du sommeil). Une pause d'opérateur ordinaire garde ses deux champs humains.
     """
     principal = actor if principal is None else principal
-    if (not isinstance(actor, str) or not HUMAN_RE.fullmatch(actor)
-            or not isinstance(principal, str) or not HUMAN_RE.fullmatch(principal)):
-        raise PauseRefused("bad_actor", "a human actor and principal are required")
+    actor_ok = (isinstance(actor, str)
+                and (HUMAN_RE.fullmatch(actor)
+                     or actor == FILE_DECOUPAGE_ACTOR))
+    if (not actor_ok or not isinstance(principal, str)
+            or not HUMAN_RE.fullmatch(principal)):
+        raise PauseRefused(
+            "bad_actor", "an actor (human, or %s for the automatic sleep) and a "
+            "human principal are required" % FILE_DECOUPAGE_ACTOR)
     if not isinstance(name, str) or not NAME_RE.fullmatch(name):
         raise PauseRefused("bad_agent", "a valid agent name is required")
     if not isinstance(paused, bool):
