@@ -41,6 +41,7 @@ AGENT_COLUMNS = """
     lease_owner, lease_epoch, runner_seen_host, runner_seen_owner,
     extract(epoch from runner_seen_at)::float8 as runner_seen_ts,
     extract(epoch from lease_wait_since)::float8 as lease_wait_since_ts,
+    extract(epoch from lease_since)::float8 as lease_since_ts,
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
     extract(epoch from created_at)::float8        as created_ts,

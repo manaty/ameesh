@@ -55,6 +55,17 @@ stops depending on the route of whoever happens to hold the lease.
 elect a host that never runs the pass. And the fallback keeps its **last
 executor** while its shared `notify_liveness` beat is fresh, so two routed
 candidates no longer alternate at every capacity tie-break.
+
+#4468: a fresh standing and a published route prove the holder **could** push,
+not that its `alerts` pass runs: a stopped timer (#4437) or a pas hung past
+its systemd timeout (#4469) leaves `notify_ok` true while the shared beat ages.
+The holder therefore keeps the pass only while its own `notify_liveness` beat
+is fresh, or while it has not beaten yet in its current tenure during a
+bounded grace (`HOLDER_NOTIFY_GRACE_S` from `agent_registry.lease_since`).
+Otherwise the other routed candidates take it in the election's order, and the
+holder takes it back as soon as its beat is fresh again (#3568). A holder that
+is the only candidate able to push keeps the pass even without a beat: there
+would be nobody else to run it.
 """
 from __future__ import annotations
 
@@ -70,6 +81,12 @@ from . import storage
 
 #: period of a candidate's self-publication (a runner pass)
 EVAL_INTERVAL_S = 60.0
+#: #4468: how long a holder that has not beaten yet in its current tenure may
+#: keep the alerts pass before the first routed candidate takes it. The alerts
+#: timer runs every 30 s (`role_timers.ALERTS_INTERVAL_S`): four ticks cover a
+#: freshly claimed executor, its first pass and a slow database, without
+#: hiding a holder whose pass never starts.
+HOLDER_NOTIFY_GRACE_S = 120.0
 #: waiting time added per rank before trying to claim
 RANK_DELAY_S = 20.0
 #: the hysteresis margin, in availability points, and how long it must hold
@@ -642,8 +659,40 @@ def candidacy(db, name: str, *, now: float | None = None) -> list[dict]:
     return ordered
 
 
+def _liveness(db, role: Mapping) -> dict[str, float]:
+    """#4468: the latest shared alerts beat per host for the role's human.
+
+    The pass records a `notify_liveness` beat for every human it reaches
+    (`notify_gap.beat`), so every reader sees which host actually ran it.
+    Stale beats are kept: the delegation must tell "has not run the pass in
+    its current tenure" (bounded grace) from "ran and stopped beating"
+    (delegate now). A beat dated a little in the future (host clock) is kept
+    as is; freshness is the caller's rule, as in the deliverability alert.
+    """
+    from . import notify as notify_mod
+    human = notify_mod.normalize_human(role.get("responsible"))
+    if not human:
+        return {}
+    try:
+        rows = storage.of(db).notify_liveness.latest()
+    except Exception:  # noqa: BLE001 - liveness is evidence, never a gate
+        return {}
+    beats: dict[str, float] = {}
+    for row in rows:
+        if str(row.get("human") or "") != human:
+            continue
+        host = str(row.get("host") or "")
+        if not host:
+            continue
+        seen = float(row.get("seen_ts") or 0.0)
+        if seen > beats.get(host, float("-inf")):
+            beats[host] = seen
+    return beats
+
+
 def _last_executor(db, role: Mapping, pool: Sequence[Mapping], *,
-                   now: float) -> Mapping | None:
+                   now: float, beats: Mapping[str, float] | None = None
+                   ) -> Mapping | None:
     """#3575: the freshest routed candidate that already ran the alerts pass.
 
     The pass records a shared `notify_liveness` beat for every human it
@@ -653,33 +702,16 @@ def _last_executor(db, role: Mapping, pool: Sequence[Mapping], *,
     stops two routed fallbacks from alternating at every capacity tie-break,
     each losing its own local notify state. A tie keeps the election's order.
     """
-    from . import notify as notify_mod
     from . import notify_gap
-    human = notify_mod.normalize_human(role.get("responsible"))
-    if not human or not pool:
+    if not pool:
         return None
-    try:
-        rows = storage.of(db).notify_liveness.latest()
-    except Exception:  # noqa: BLE001 - hysteresis is a preference, never a gate
-        return None
+    beats = _liveness(db, role) if beats is None else beats
     limit = float(notify_gap.ALIVE_S)
-    last: dict[str, float] = {}
-    for row in rows:
-        if str(row.get("human") or "") != human:
-            continue
-        seen = float(row.get("seen_ts") or 0.0)
-        # Same freshness rule as the deliverability alert: a beat dated a
-        # little in the future (host clock) still counts, a stale one does not.
-        if seen < now - limit:
-            continue
-        host = str(row.get("host") or "")
-        if seen > last.get(host, float("-inf")):
-            last[host] = seen
     pick = None
     seen = None
     for item in pool:  # election order breaks a tie deterministically
-        at = last.get(str(item.get("host") or ""))
-        if at is None:
+        at = beats.get(str(item.get("host") or ""))
+        if at is None or at < now - limit:
             continue
         if pick is None or at > seen:
             pick, seen = item, at
@@ -701,8 +733,16 @@ def alerts_delegate(db, role: Mapping, *, holder: str | None = None,
     #3575: among those fallbacks, the **last executor** keeps the pass while
     its shared `notify_liveness` beat is fresh and it is still routed
     (:func:`_last_executor`): the capacity tie-break no longer makes two
-    equipped hosts alternate and lose their local notify state each time. The
-    holder's route, when it returns, still takes precedence (#3568).
+    equipped hosts alternate and lose their local notify state each time.
+
+    #4468: the holder's route is not proof that its pass runs. It keeps the
+    pass only while its own beat is fresh, or while it has not beaten yet in
+    its current tenure (``lease_since``, bounded by
+    :data:`HOLDER_NOTIFY_GRACE_S`). A holder whose pass stopped beating is
+    replaced by the other routed candidates, in the same election order; its
+    own beat takes the pass back as soon as it is fresh (#3568). A holder
+    that is the only candidate able to push keeps it even without a beat:
+    standing by would leave nobody to run the pass.
 
     `holder` and `ranked` let a caller that already read them (`status`,
     `role run`) avoid a second, possibly incoherent read; they must come from
@@ -710,6 +750,7 @@ def alerts_delegate(db, role: Mapping, *, holder: str | None = None,
     remote route: the timer then keeps standing by, and the shared
     `notify_undeliverable` alert names the silence.
     """
+    from . import notify_gap
     now = pg.now_ts(db) if now is None else float(now)
     items = list(ranked) if ranked is not None else candidacy(
         db, role.get("name") or "", now=now)
@@ -727,22 +768,54 @@ def alerts_delegate(db, role: Mapping, *, holder: str | None = None,
         return out
     by_host = {item["host"]: item for item in items}
     current = by_host.get(holder) if holder else None
+    beats = _liveness(db, role)
+    alive_s = float(notify_gap.ALIVE_S)
+    beat = beats.get(str(holder)) if holder else None
     if current is not None and current.get("fresh") and current.get("notify_ok"):
-        out.update(delegate=holder, holder_notify_ok=True,
-                   reason="the holder can push")
-        return out
+        if beat is not None and float(beat) >= now - alive_s:
+            out.update(delegate=holder, holder_notify_ok=True,
+                       reason="the holder can push and its alerts pass beats")
+            return out
+        began = role.get("lease_since_ts")
+        try:
+            began = None if began is None else float(began)
+        except (TypeError, ValueError):
+            began = None
+        if (began is not None and now - began <= HOLDER_NOTIFY_GRACE_S
+                and (beat is None or float(beat) < began)):
+            out.update(
+                delegate=holder, holder_notify_ok=True,
+                reason=("the holder can push but has not run the alerts pass "
+                        "yet (%ds of grace left)"
+                        % max(0, int(HOLDER_NOTIFY_GRACE_S - (now - began)))))
+            return out
     usable = [item for item in items
               if item.get("declared") and item.get("fresh") and item.get("notify_ok")]
-    ready = [item for item in usable if item.get("ready")]
-    pool = ready or usable
-    last = _last_executor(db, role, pool, now=now)
+    others = [item for item in usable if item["host"] != holder]
+    ready = [item for item in others if item.get("ready")]
+    pool = ready or others
+    last = _last_executor(db, role, pool, now=now, beats=beats)
     pick = last or (pool or [None])[0]
     if pick is None:
+        if current is not None and current.get("fresh") and current.get("notify_ok"):
+            out.update(delegate=holder, holder_notify_ok=True,
+                       reason=("%s does not prove its alerts pass runs but is "
+                               "the only candidate that can push" % holder))
+            return out
         out["reason"] = ("no fresh candidate can push"
                          + (" (holder %s cannot)" % holder if holder else ""))
         return out
-    reason = ("%s cannot push" % holder if holder
-              else "no live holder")
+    if holder and current is not None and current.get("fresh") \
+            and current.get("notify_ok"):
+        if beat is None:
+            reason = ("%s has not run the alerts pass in its current tenure"
+                      % holder)
+        else:
+            reason = ("%s stopped beating (%ds since its last alerts beat)"
+                      % (holder, max(0, int(now - float(beat)))))
+    else:
+        reason = ("%s cannot push" % holder if holder
+                  else "no live holder")
     if last is not None:
         reason += "; last executor %s stays in charge" % last["host"]
         out["last_executor"] = last["host"]

@@ -258,7 +258,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'retired_at', 'retired_by', 'retired_reason',
         -- #4245 (0503) : lignée de bail au même hôte (un nom d'hôte et une
         -- époque, même nature que `host` et `lease_epoch`, pas de contenu)
-        'lease_lineage_host', 'lease_lineage_epoch'
+        'lease_lineage_host', 'lease_lineage_epoch',
+        -- #4468 (0513) : début de la tenure du bail courant (un instant, même
+        -- nature que `lease_wait_since` et `lease_expires_at`, pas de contenu)
+        'lease_since'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',

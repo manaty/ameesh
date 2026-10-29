@@ -158,10 +158,11 @@ def gaps_for(pending, rows, now: float, *, alive_s: float = ALIVE_S) -> list[dic
         detail = (
             "%s: %d decision request(s) pending (%d overdue, oldest #%d, %s) — "
             "nothing is pushed to %s; the alerts role timer runs on the lease "
-            "holder when it can push, otherwise on the first routed candidate "
-            "(#3568): declare this human's notify route on every candidate and run "
-            "`ameesh role timers --install` there (docs/EXPLOITATION.md, \"Alertes "
-            "poussées\"); the requests stay readable with `ameesh decisions`"
+            "holder while its own liveness beat is fresh, otherwise on the first "
+            "routed candidate (#3568, #4468): declare this human's notify route on "
+            "every candidate and run `ameesh role timers --install` there "
+            "(docs/EXPLOITATION.md, \"Alertes poussées\"); the requests stay "
+            "readable with `ameesh decisions`"
             % (prefix, len(ids), len(overdue), ids[0], _span(age), human))
         out.append({"human": human, "last_host": last_host,
                     "last_seen": last_seen, "last_human": last_human,

@@ -121,6 +121,7 @@ _SCHEMA = "ameesh-role-run/1"
 _READ_SQL = """
     SELECT name, host, releve, candidats, status, responsible,
            lease_owner, lease_epoch,
+           extract(epoch from lease_since)::float8    AS lease_since_ts,
            extract(epoch from lease_expires_at)::float8 AS lease_expires_ts,
            extract(epoch from clock_timestamp())::float8  AS now_ts
       FROM agent_registry
@@ -457,6 +458,7 @@ def _report(row: dict, *, epoch: int | None = None) -> dict:
         "holder": row.get("host") if held else None,
         "owner": row.get("lease_owner"),
         "epoch": row.get("lease_epoch"),
+        "lease_since_ts": row.get("lease_since_ts"),
         "expires_ts": expires,
         "left_s": None if left is None else round(left, 3),
         "stopped": stopped,
@@ -575,7 +577,9 @@ def _alerts_delegation(db, report: dict, *, host: str) -> dict:
     from . import election
     role = {"name": report.get("role"), "releve": report.get("releve"),
             "candidats": list(report.get("candidates") or ()),
-            "responsible": report.get("responsible")}
+            "responsible": report.get("responsible"),
+            # #4468: the holder's current tenure bounds its no-beat grace.
+            "lease_since_ts": report.get("lease_since_ts")}
     decision = election.alerts_delegate(db, role, holder=report.get("holder"))
     decision["this_host"] = host
     return decision
