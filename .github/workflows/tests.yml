@@ -1379,3 +1379,47 @@ jobs:
         run: python -m unittest tests.test_3379_argparse_help -v
       - name: aide de la commande installée
         run: ameesh --help
+
+  # L98 T2b (#4408) : le cœur au profil nu (`AMEESH_MODULES=bare`), sans module
+  # intégré : registre, modules de projet et frontière L97 (test_generic_core),
+  # puis `ameesh modules` et `canon check` sur le canon d'exemple sans
+  # extensions. Profil de CI et de test seulement (décision 2, #4405) ; hors de
+  # l'agrégat requis `tests` : son rouge se voit sur la PR sans retenir le
+  # paquet tant qu'il n'y est pas versé.
+  profil-nu:
+    name: profil nu (modules)
+    needs: plan
+    if: github.event.label.name != 'ci-macos' && needs.plan.outputs.code == 'true'
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      AMEESH_MODULES: bare
+      AMEESH_REQUIRE_DB: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # venv du job : un runner auto-hébergé ne garde rien dans le Python partagé
+      - name: installation
+        run: |
+          python -m venv "$RUNNER_TEMP/nu"
+          "$RUNNER_TEMP/nu/bin/python" -m pip install -q . 'pyyaml>=6'
+      - name: tests au profil nu
+        run: |
+          "$RUNNER_TEMP/nu/bin/python" -m unittest -v tests.test_l98_bare_profile \
+            tests.test_l98_modules_registry tests.test_l317_project_modules \
+            tests.test_generic_core
+      - name: ameesh modules et canon check sur le canon d'exemple
+        run: |
+          set -euo pipefail
+          echo '{}' > "$RUNNER_TEMP/config.json"
+          export AMEESH_CONFIG="$RUNNER_TEMP/config.json"
+          test "$("$RUNNER_TEMP/nu/bin/ameesh" modules)" = "no module"
+          cp -r examples/canon "$RUNNER_TEMP/canon"
+          git -C "$RUNNER_TEMP/canon" init -q
+          git -C "$RUNNER_TEMP/canon" add -A
+          git -C "$RUNNER_TEMP/canon" -c user.name=ci -c user.email=ci@example.invalid commit -qm exemple
+          "$RUNNER_TEMP/nu/bin/ameesh" canon check --canon "$RUNNER_TEMP/canon" --ref HEAD --host banc

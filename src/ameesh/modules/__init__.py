@@ -20,6 +20,10 @@ L98 T2a (#4407): a project's modules resolve from three scopes, widest first:
 module wins its options; a project always wins. The compiled rows remain per
 project, so ``project_modules`` and its SQL guard need no migration.
 
+L98 T2b (#4408): ``AMEESH_MODULES=bare`` is the bare profile at run time: no
+built-in module, the core alone (entry points are still read). It is a CI and
+test profile, never a host option (decision 2, #4405): ``doctor`` refuses it.
+
 L103 T2 (#4396): a valid ``Pipeline`` card of the canon is a declarative module
 (source ``canon``, ``registry.PipelineModule``): the canon may select it by name
 like an installed module. It stores no work item type, is never imported code,
@@ -32,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -45,8 +50,22 @@ ENTRY_POINT_GROUP = "ameesh.modules"
 #: Keys a descriptor must supply; the SQL policy stores all three.
 DESCRIPTOR_KEYS = ("types", "schemas", "rules")
 
+#: L98 T2b (#4408): run-time switch of the module profile (``bare`` or unset).
+PROFILE_ENV = "AMEESH_MODULES"
+PROFILES = ("default", "bare")
+
+
+def profile():
+    """The module profile in force: ``default``, ``bare``, or the unknown value.
+
+    An unknown value keeps the default profile (a typo never strips a host of
+    its modules); ``doctor`` reports it."""
+    return os.environ.get(PROFILE_ENV, "").strip() or "default"
+
 
 def _builtin():
+    if profile() == "bare":
+        return {}
     from . import dev, it
     return {dev.NAME: dev, it.NAME: it}
 
@@ -497,6 +516,17 @@ def doctor_lines(db, canons=()):
     by_name = {module.name: module for module in base[1]}
     refused_by_name = {row["name"]: row for row in refused}
     lines, ok, warnings = [], True, 0
+    # L98 T2b decision 2: the bare profile is for CI and tests; a host running
+    # it has neither housekeeping nor worktrees.
+    current = profile()
+    if current == "bare":
+        ok = False
+        lines.append("modules    : KO — bare profile (%s=bare): CI and test profile "
+                     "only, never a host" % PROFILE_ENV)
+    elif current not in PROFILES:
+        warnings += 1
+        lines.append("warning    : unknown %s=%r, default profile kept"
+                     % (PROFILE_ENV, current))
     resolved = {}
     seen_refused = set()
     for canon in canons:
