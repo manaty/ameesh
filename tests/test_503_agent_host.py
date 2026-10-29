@@ -426,7 +426,11 @@ elif 'restart' in args:
 elif 'show' in args:
     if 'UnitFileState' in args:
         # #4239 : une unité désactivée n'a pas d'exécuteur actif attendu.
-        print('disabled' if (state / ('disabled-' + name)).exists() else 'enabled')
+        # #4437 : une unité masquée encore active ne peut pas être rechargée.
+        if (state / ('masked-' + name)).exists():
+            print('masked')
+        else:
+            print('disabled' if (state / ('disabled-' + name)).exists() else 'enabled')
     elif 'ActiveState' in args:
         if (state / ('failed-' + name)).exists(): print('failed')
         else: print('inactive' if stopped() else 'active')
@@ -764,6 +768,52 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotIn('restart ameesh-runner-agent@stopped.service', self.units())
         self.assertIn('stopped : arrêté dans le registre', p.stdout)
         self.assertIn('déjà arrêtée', p.stdout)
+
+    def test_restart_reloads_a_stopped_disabled_active_unit(self):
+        """#4437 (essai 4 du staging, 29/10) : une persona « stopped by hand »
+        dont l'unité est encore active ET désactivée doit être rechargée par
+        `redemarrer`, pas classée hors périmètre puis rejetée au contrôle."""
+        (self.state / 'disabled-stopped').touch()
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('--user restart ameesh-runner-agent@stopped.service',
+                      self.units())
+        self.assertIn('stopped : arrêté dans le registre — unité redémarrée pour'
+                      ' charger le nouveau code, aucun tour', p.stdout)
+        self.assertNotIn('stopped : unité désactivée', p.stdout)
+        self.assertNotIn('no lease before the restart', p.stdout)
+        self.assertNotIn('stopped : redémarré (était', p.stdout)
+
+    def test_restart_reloads_a_disabled_active_persona(self):
+        """#4239 × #4437 : une unité désactivée encore active n'est pas
+        démarrée si elle est inactive, mais elle est rechargée si elle tourne,
+        avec preuve d'arrêt et sans bail."""
+        agents = [dict(name=n, host='host-agents', mode='execute', status='idle')
+                  for n in ('dev7', 'dev8', 'dev9', 'pilot-resident')]
+        (self.state / 'disabled-pilot-resident').touch()
+        (self.state / 'units-actives').write_text('dev8 dev9 pilot-resident\n')
+        p = self.run_vm('redemarrer', agents=agents)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        unite = 'ameesh-runner-agent@pilot-resident.service'
+        log = self.units().splitlines()
+        self.assertEqual(log.count('--user stop ' + unite), 1)
+        self.assertEqual(log.count('--user start ' + unite), 1)
+        self.assertLess(log.index('--user stop ' + unite),
+                        log.index('--user start ' + unite))
+        self.assertIn('pilot-resident : unité désactivée encore active —'
+                      ' rechargée sur le nouveau code, bail non exigé', p.stdout)
+        self.assertNotIn('WARNING pilot-resident', p.stdout)
+
+    def test_masked_active_unit_is_stopped_not_restarted(self):
+        """Une unité masquée ne peut pas être démarrée : si elle tourne
+        encore, le redémarrage l'arrête au lieu d'échouer sur `start`."""
+        (self.state / 'masked-dev9').touch()
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('--user stop ameesh-runner-agent@dev9.service', self.units())
+        self.assertNotIn('--user start ameesh-runner-agent@dev9.service', self.starts())
+        self.assertIn('dev9 : unité masquée encore active — arrêtée, aucun'
+                      ' exécuteur actif exigé', p.stdout)
 
     def test_restart_stops_proves_then_starts(self):
         """#1152 : l'arrêt (SIGTERM, drainage) précède la preuve du point sûr
@@ -1475,7 +1525,7 @@ class AgentHostTest(unittest.TestCase):
                         log.index('--user start ' + unite))
         self.assertNotIn('--user restart ' + unite, log)
         self.assertIn('mesh-design : unité active hors registre de host-agents'
-                      ' (candidat d\'un rôle élu)', p.stdout)
+                      " (candidat d'un rôle élu ou persona hors périmètre)", p.stdout)
         # Ni drain (la pause viserait la persona sur l'hôte du bail) ni bail.
         self.assertNotIn('mesh-design', self.operateur())
         self.assertNotIn('WARNING mesh-design', p.stdout)
@@ -1517,6 +1567,50 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('mesh-design (unité active hors registre', p.stdout)
         self.assertEqual(p.stdout.count('MainPID vivant sur le venv courant'), 3)
         self.assertIn('contrôles verts', p.stdout)
+
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
+    def test_controler_prouve_le_venv_d_un_arret_actif_sans_bail(self):
+        """#4437 : une persona arrêtée dont l'unité tourne encore est contrôlée
+        sur le venv — même périmètre que redemarrer — mais aucun bail n'est
+        exigé d'une persona arrêtée."""
+        (self.state / 'units-actives').write_text('dev8 dev9 stopped\n')
+        p = self.run_vm('controler')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('stopped (unité active hors registre', p.stdout)
+        self.assertIn('MainPID vivant sur le venv courant', p.stdout)
+        self.assertNotIn('stopped : bail', p.stderr)
+        self.assertIn('contrôles verts', p.stdout)
+
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
+    def test_controler_refuse_un_arret_actif_sur_l_ancien_venv(self):
+        """#4437 : si le redémarrage n'a pas rechargé l'unité d'une persona
+        arrêtée, le contrôle le dit au lieu de l'ignorer."""
+        (self.state / 'units-actives').write_text('dev8 dev9 stopped\n')
+        self._processus_venv(self.venv_current)
+        self._processus_venv(self.venv_old, 'mainpid-stopped')
+        p = self.run_vm('controler')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("stopped : le MainPID vivant n'exécute pas le venv installé",
+                      p.stderr)
+        self.assertNotIn('stopped : bail', p.stderr)
+        self.assertNotIn('contrôles verts', p.stdout)
+
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
+    def test_controler_refuse_un_resident_desactive_actif_sur_l_ancien_venv(self):
+        """#4239 × #4437 : une unité désactivée encore active est contrôlée sur
+        le venv ; seule une unité inactive est hors périmètre."""
+        agents = [dict(name=n, host='host-agents', mode='execute', status='idle')
+                  for n in ('dev7', 'dev8', 'dev9', 'pilot-resident')]
+        (self.state / 'disabled-pilot-resident').touch()
+        (self.state / 'units-actives').write_text('dev8 dev9 pilot-resident\n')
+        self._processus_venv(self.venv_current)
+        self._processus_venv(self.venv_old, 'mainpid-pilot-resident')
+        p = self.run_vm('controler', agents=agents)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("pilot-resident : le MainPID vivant n'exécute pas le venv"
+                      ' installé', p.stderr)
+        self.assertNotIn('pilot-resident : bail', p.stderr)
+        self.assertNotIn('contrôles verts', p.stdout)
 
     def test_restart_without_prior_lease_reports_warning(self):
         p = self.run_vm(scenario='no-lease')
@@ -1600,17 +1694,20 @@ class AgentHostTest(unittest.TestCase):
         agents = [dict(name=n, host='host-agents', mode='execute', status='idle')
                   for n in ('dev7', 'dev8', 'dev9', 'pilot-resident')]
         (self.state / 'disabled-pilot-resident').touch()
+        # #4239 : une unité désactivée et inactive n'a aucun exécuteur attendu ;
+        # #4437 : elle n'est ni démarrée ni contrôlée.
+        (self.state / 'inactive-pilot-resident').touch()
         p = self.run_vm('controler', 'resident-sans-bail', agents=agents)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn('pilot-resident : unité désactivée, aucun exécuteur actif'
-                      ' attendu — hors périmètre', p.stdout)
+                      ' exigé — hors périmètre', p.stdout)
         self.assertNotIn('pilot-resident : unité inactive', p.stderr)
         self.assertNotIn('pilot-resident : bail absent', p.stderr)
         self.assertIn('contrôles verts', p.stdout)
         p = self.run_vm('redemarrer', 'resident-sans-bail', agents=agents)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn('pilot-resident : unité désactivée, aucun exécuteur à'
-                      ' relancer — hors périmètre', p.stdout)
+        self.assertIn('pilot-resident : unité désactivée, aucun exécuteur actif'
+                      ' exigé — hors périmètre', p.stdout)
         self.assertNotIn('--user stop ameesh-runner-agent@pilot-resident.service',
                          self.units())
         self.assertNotIn('--user start ameesh-runner-agent@pilot-resident.service',
