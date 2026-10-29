@@ -29,9 +29,10 @@ le même lot est refusé (une nouvelle évaluation est un nouveau lot).
 Geste de bascule : `agent_registry.harness_bin` pour un harnais, `model` pour
 un modèle. L'exécuteur relit la ligne de l'agent au début de chaque tour ; un
 tour en cours ne change donc jamais de binaire sous lui. Le binaire nommé doit
-exister sur l'hôte (l'exécuteur refuse un binaire absent : hôte non prêt) ;
-l'installation de la nouvelle version reste le fait de l'hôte (L17), ce module
-ne l'exécute pas.
+exister sur l'hôte **et y être déclaré** (#4488 : carte locale des binaires
+installés, `harness_bins` ou `AMEESH_<HARNAIS>_BIN` ; l'exécuteur refuse sinon :
+hôte non prêt) ; l'installation de la nouvelle version reste le fait de l'hôte
+(L17), ce module ne l'exécute pas.
 
   ameesh harness adopt <lot> --report FICHIER|- [--bin [HÔTE=]CHEMIN …]
                             [--agent NOM] [--requester NOM] [--dry-run]
@@ -942,15 +943,15 @@ def _check_bin(path: str | None, *, executable: bool = False) -> str:
     return path
 
 
-def load_bins(report: Report) -> dict:
-    """La carte explicite des binaires installés, par hôte.
+def _bins_table(*, env=None) -> dict:
+    """La carte locale des binaires installés ({harnais: {version: {hôte: chemin}}}).
 
     Fichier `AMEESH_HARNESS_ADOPTION_BINS` ou
-    `~/.config/ameesh/harness-adoption.json` :
-    `{"bins": {"<harnais>": {"<version>": {"<hôte>": "/chemin"}}}}`.
-    Aucun défaut implicite : un hôte absent reste sans chemin (fail-closed).
-    """
-    path = os.environ.get(BINS_ENV) or os.path.expanduser(BINS_FILE)
+    `~/.config/ameesh/harness-adoption.json` ; absent = aucune déclaration.
+    Une carte illisible lève `VeilleError` (fail-closed), jamais un
+    laissez-passer."""
+    env = os.environ if env is None else env
+    path = env.get(BINS_ENV) or os.path.expanduser(BINS_FILE)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -963,6 +964,41 @@ def load_bins(report: Report) -> dict:
     table = data.get("bins", data)
     if not isinstance(table, dict):
         raise VeilleError("harness-adoption bins: `bins` must be an object")
+    return table
+
+
+def declared_binaries(harness: str, host: str, *, env=None) -> set[str]:
+    """Chemins réels des binaires déclarés pour `harness` sur `host` (#4488).
+
+    La carte locale des binaires installés est la liste des exécutables que
+    l'exécuteur peut lancer pour cet hôte, toutes versions confondues : le
+    canari et la bascule visent des chemins qui y sont installés et déclarés.
+    Sans hôte (ou sans carte), rien n'est déclaré."""
+    if not host:
+        return set()
+    versions = _bins_table(env=env).get(harness) or {}
+    if not isinstance(versions, dict):
+        raise VeilleError("harness-adoption bins: harness %r must map versions"
+                          % harness)
+    out: set[str] = set()
+    for hosts in versions.values():
+        if not isinstance(hosts, dict):
+            continue
+        path = hosts.get(host)
+        if isinstance(path, str) and path and os.path.isabs(path):
+            out.add(os.path.realpath(path))
+    return out
+
+
+def load_bins(report: Report) -> dict:
+    """La carte explicite des binaires installés, par hôte.
+
+    Fichier `AMEESH_HARNESS_ADOPTION_BINS` ou
+    `~/.config/ameesh/harness-adoption.json` :
+    `{"bins": {"<harnais>": {"<version>": {"<hôte>": "/chemin"}}}}`.
+    Aucun défaut implicite : un hôte absent reste sans chemin (fail-closed).
+    """
+    table = _bins_table()
     for_version = table.get(report.harness) or {}
     if not isinstance(for_version, dict):
         raise VeilleError("harness-adoption bins: harness %r must map versions"
