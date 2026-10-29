@@ -11480,7 +11480,8 @@ class Runner:
             api.detect_losses(actor=self.runner_id,
                               older_than=int(host_lifecycle.staleness_s(
                                   self.cfg.resource_interval)),
-                              critical=host_lifecycle.critical_names(self.cfg, db))
+                              critical=host_lifecycle.critical_names(self.cfg, db),
+                              released_grace=float(self.cfg.host_release_boot_grace))
             api.expire_returns(open_claims=False)
             controls = api.listing()
             # #3035/#3180: a lost host that publishes fresh readings again is

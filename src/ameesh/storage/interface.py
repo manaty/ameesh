@@ -4272,18 +4272,24 @@ class HostLifecycle(Domain):
 
     @abc.abstractmethod
     def begin_transition(self, host: str, generation: int, state: str, *,
-                         actor: str, stale_after: float, retry_after: float) -> dict | None:
+                         release_epoch: int, actor: str, stale_after: float,
+                         retry_after: float) -> dict | None:
         """Claim the right to call the adapter for one generation and state.
 
         None when the transition already succeeded (journal), when it is not
         due yet, when another live attempt holds it (younger than
-        `stale_after`), or when a failure is younger than `retry_after`.
-        The returned row carries the control fields read under the lock.
+        `stale_after`), when a failure is younger than `retry_after`, or when
+        `release_epoch` moved (a return or a new withdrawal happened): no
+        stale release decision is ever accepted. The state must also be legal
+        for the current row (`busy` only while draining/returning,
+        `draining` only while claims are closed, `idle-drained` only after
+        the `draining` acknowledgement).
         """
 
     @abc.abstractmethod
     def finish_transition(self, host: str, generation: int, state: str, *,
-                          actor: str, detail: dict, error: str | None = None) -> dict | None:
+                          release_epoch: int, actor: str, detail: dict,
+                          error: str | None = None) -> dict | None:
         """Record one adapter transition, success or failure.
 
         Success journals `(host, generation, state)` (idempotent), clears the
@@ -4366,8 +4372,14 @@ class HostLifecycle(Domain):
 
     @abc.abstractmethod
     def detect_losses(self, *, actor: str, older_than: int,
-                      critical: Sequence[str] = ()) -> list[dict]:
-        """Close stale known hosts atomically; loss is not a quiescence proof."""
+                      critical: Sequence[str] = (),
+                      released_grace: float = 900.0) -> list[dict]:
+        """Close stale known hosts atomically; loss is not a quiescence proof.
+
+        #4148: a host that was released and whose `busy` hook answered is
+        booting with stale readings on purpose; it is not lost for
+        `released_grace` seconds (or until a post-ack reading reopens claims).
+        """
 
     @abc.abstractmethod
     def reconcile_loss(self, host: str, *, actor: str, fresh_within: int) -> dict:

@@ -268,6 +268,10 @@ class Config:
     host_release_retry: float = 300.0
     #: quiet time after the last turn before `idle-drained` is proven
     host_release_settle: float = 60.0
+    #: #4148 B1: a released host whose `busy` hook answered is booting; its
+    #: readings are stale on purpose. Loss detection leaves it alone this long
+    #: (or until the first post-ack reading reopens claims), then gives up.
+    host_release_boot_grace: float = 900.0
     #: L242b : part du plafond horaire payé au token du mesh au-delà de
     #: laquelle un agent NON critique s'arrête (décision de mesh-design du
     #: 2026-10-12 : 0.75, soit 15 $ sur 20) ; un critique va jusqu'au plafond
@@ -1025,6 +1029,8 @@ def load(env: dict | None = None) -> Config:
             pick("AMEESH_HOST_RELEASE_RETRY"), cfg.host_release_retry),
         host_release_settle=_as_bounded_positive(
             pick("AMEESH_HOST_RELEASE_SETTLE"), cfg.host_release_settle),
+        host_release_boot_grace=_as_bounded_positive(
+            pick("AMEESH_HOST_RELEASE_BOOT_GRACE"), cfg.host_release_boot_grace),
         critical_agents=_as_names(pick("AMEESH_CRITICAL_AGENTS")) or tuple(
             n.strip() for n in (cfg.critical_agents.split(",")
                                 if isinstance(cfg.critical_agents, str)
@@ -1186,6 +1192,8 @@ def load(env: dict | None = None) -> Config:
         raise SystemExit("invalid AMEESH_HOST_RELEASE_DRAIN_BOUND: 60..86400 seconds expected")
     if cfg.host_release_settle > cfg.host_release_drain_bound:
         raise SystemExit("invalid AMEESH_HOST_RELEASE_SETTLE: beyond the drain bound")
+    if not 60 <= cfg.host_release_boot_grace <= 86400:
+        raise SystemExit("invalid AMEESH_HOST_RELEASE_BOOT_GRACE: 60..86400 seconds expected")
     if cfg.canon_ref.startswith("-"):
         raise SystemExit("invalid AMEESH_CANON_REF: %r" % cfg.canon_ref)
     seen_paths: set[str] = set()

@@ -27,6 +27,9 @@ ALTER TABLE host_lifecycle
     ADD COLUMN hook_state text
         CHECK (hook_state IN ('busy', 'draining', 'idle-drained')),
     ADD COLUMN claims_open boolean NOT NULL DEFAULT true,
+    -- #4148: invalidates in-flight adapter calls when a return is requested;
+    -- a transition started under an older epoch can never be recorded.
+    ADD COLUMN release_epoch bigint NOT NULL DEFAULT 1,
     ADD COLUMN release_generation bigint,
     -- true: ameesh drained the host itself (burst idle), false: an operator did
     ADD COLUMN automatic boolean NOT NULL DEFAULT false,
@@ -38,7 +41,8 @@ ALTER TABLE host_lifecycle
     ADD COLUMN release_error_since timestamptz,
     ADD COLUMN hook_attempt_at timestamptz,
     ADD COLUMN hook_attempt_state text,
-    ADD COLUMN hook_attempt_generation bigint;
+    ADD COLUMN hook_attempt_generation bigint,
+    ADD COLUMN hook_attempt_epoch bigint;
     -- run counts are read from A's host measure (#4147), never persisted here.
 
 UPDATE host_lifecycle
@@ -52,11 +56,12 @@ UPDATE host_lifecycle
 CREATE TABLE host_lifecycle_transitions (
     host text NOT NULL REFERENCES host_lifecycle(host) ON DELETE CASCADE,
     generation bigint NOT NULL,
+    release_epoch bigint NOT NULL DEFAULT 1,
     state text NOT NULL CHECK (state IN ('busy', 'draining', 'idle-drained')),
     actor text NOT NULL,
     detail jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (host, generation, state)
+    PRIMARY KEY (host, generation, release_epoch, state)
 );
 
 CREATE TABLE host_release_locks (

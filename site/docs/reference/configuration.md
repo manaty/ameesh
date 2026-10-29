@@ -77,6 +77,7 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_HOST_RELEASE_DRAIN_BOUND` | `host_release_drain_bound` | 2100 s | a withdrawal that has not reached `idle-drained` after this delay raises `host_release_overdue`; it is never forced |
 | `AMEESH_HOST_RELEASE_RETRY` | `host_release_retry` | 300 s | retry delay after a failed adapter transition |
 | `AMEESH_HOST_RELEASE_SETTLE` | `host_release_settle` | 60 s | quiet time after the last turn before `idle-drained` can be proven |
+| `AMEESH_HOST_RELEASE_BOOT_GRACE` | `host_release_boot_grace` | 900 s | a released host whose `busy` hook answered is booting with stale readings on purpose; loss detection leaves it alone this long (or until the first post-ack reading reopens claims), then gives up |
 | `AMEESH_RESOURCE_INTERVAL` | `resource_interval` | 60 s | host resource reading by the runner (0 = none; see `ameesh hosts`) |
 | `AMEESH_BRANCH_SWEEP_INTERVAL` | `branch_sweep_interval` | 300 s | runner check of lot branches: a lot whose branch is merged into its target is closed (L118; 0 = none) |
 | `AMEESH_RELOCATE` | `relocate` | off | move an agent of a host under pressure to another admitted host, between two turns |

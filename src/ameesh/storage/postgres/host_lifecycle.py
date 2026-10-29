@@ -9,13 +9,14 @@ from .hosts import Hosts
 _ROW = ("host, mode, generation, actor, "
         "extract(epoch from requested_at)::float8 AS requested_ts, "
         "extract(epoch from return_at)::float8 AS return_ts, "
-        "release_state, hook_state, claims_open, release_generation, automatic, "
+        "release_state, hook_state, claims_open, release_epoch, "
+        "release_generation, automatic, "
         "extract(epoch from released_at)::float8 AS released_ts, "
         "release_error, release_error_state, "
         "extract(epoch from release_error_at)::float8 AS release_error_ts, "
         "extract(epoch from release_error_since)::float8 AS release_error_since_ts, "
         "extract(epoch from hook_attempt_at)::float8 AS hook_attempt_ts, "
-        "hook_attempt_state, hook_attempt_generation, "
+        "hook_attempt_state, hook_attempt_generation, hook_attempt_epoch, "
         "extract(epoch from updated_at)::float8 AS updated_ts")
 
 #: #4148: states an adapter can acknowledge, in the strict order of the spec.
@@ -57,9 +58,12 @@ def _release_elected(tx, host):
 
 
 class HostLifecycle(interface.HostLifecycle):
-    def detect_losses(self, *, actor, older_than, critical=()):
+    def detect_losses(self, *, actor, older_than, critical=(), released_grace=900.0):
         if isinstance(older_than, bool) or not isinstance(older_than, int) or older_than < 60:
             raise ValueError("loss threshold must be at least 60 seconds")
+        if isinstance(released_grace, bool) or not isinstance(released_grace, (int, float)) \
+                or not released_grace >= 60:
+            raise ValueError("released grace must be at least 60 seconds")
         # Only hosts with an observed heartbeat qualify. Missing inventory
         # and a fresh runner lease are not evidence of a lost machine.
         # #3631 : the candidate hosts are the registry's (the pass skips a
@@ -79,7 +83,16 @@ class HostLifecycle(interface.HostLifecycle):
             "                    WHERE c.host = h.host"
             "                      AND (c.release_state = 'idle-drained'"
             "                           OR c.hook_attempt_state = 'idle-drained'))"
-            " ORDER BY h.host", (older_than,))
+            # #4148 B1: a released host woken by `busy` is booting; stale
+            # readings are expected until the first post-ack reading.
+            "   AND NOT EXISTS (SELECT 1 FROM host_lifecycle c"
+            "                    WHERE c.host = h.host"
+            "                      AND c.released_at IS NOT NULL"
+            "                      AND c.hook_state = 'busy'"
+            "                      AND NOT c.claims_open"
+            "                      AND c.updated_at > clock_timestamp()"
+            "                          - make_interval(secs => %s))"
+            " ORDER BY h.host", (older_than, released_grace))
         changed = []
         for candidate in candidates:
             host = candidate["host"]
@@ -98,6 +111,17 @@ class HostLifecycle(interface.HostLifecycle):
                             or old.get("hook_attempt_state") == "idle-drained"):
                     # #4148: off by decision, between two readings.
                     continue
+                if old and old.get("released_at") is not None \
+                        and old.get("hook_state") == "busy" \
+                        and not old.get("claims_open"):
+                    # #4148 B1: the boot is bounded by the grace; after it a
+                    # host that still publishes nothing is lost.
+                    now = tx.query(
+                        "SELECT extract(epoch from clock_timestamp())::float8 "
+                        "AS now_ts")[0]["now_ts"]
+                    ack = old.get("updated_ts")
+                    if ack is None or now - float(ack) <= float(released_grace):
+                        continue
                 # Re-read after the gate/agent locks: a heartbeat or renewal
                 # may have committed while this detector was waiting.
                 stale = tx.query(
@@ -111,7 +135,8 @@ class HostLifecycle(interface.HostLifecycle):
                 if not stale:
                     continue
                 if old and old["mode"] == "draining":
-                    row = tx.query("UPDATE host_lifecycle SET mode='lost',actor=%s,return_at=NULL, "
+                    row = tx.query("UPDATE host_lifecycle SET mode='lost',actor=%s,"
+                                   "return_at=NULL,release_epoch=release_epoch+1,"
                                    "updated_at=clock_timestamp() WHERE host=%s RETURNING " + _ROW,
                                    (actor, host))[0]
                 else:
@@ -119,7 +144,8 @@ class HostLifecycle(interface.HostLifecycle):
                         "INSERT INTO host_lifecycle(host,mode,actor) VALUES (%s,'lost',%s) "
                         "ON CONFLICT(host) DO UPDATE SET mode='lost',actor=excluded.actor, "
                         "generation=host_lifecycle.generation+1,requested_at=clock_timestamp(), "
-                        "return_at=NULL,updated_at=clock_timestamp() RETURNING " + _ROW,
+                        "return_at=NULL,release_epoch=host_lifecycle.release_epoch+1,"
+                        "updated_at=clock_timestamp() RETURNING " + _ROW,
                         (host, actor))[0]
                 for agent in agents:
                     tx.execute("INSERT INTO host_lifecycle_agents(host,generation,agent,critical) "
@@ -159,13 +185,14 @@ class HostLifecycle(interface.HostLifecycle):
                 return old
             rows = tx.query(
                 "INSERT INTO host_lifecycle(host,mode,actor,return_at,release_state,"
-                "release_generation,claims_open,automatic) "
+                "release_generation,claims_open,automatic,release_epoch) "
                 "VALUES (%s,'draining',%s,CASE WHEN %s::int IS NULL THEN NULL "
                 "ELSE clock_timestamp()+make_interval(secs=>%s) END,"
-                "'draining',1,false,%s) "
+                "'draining',1,false,%s,1) "
                 "ON CONFLICT(host) DO UPDATE SET mode='draining',actor=excluded.actor, "
                 "generation=host_lifecycle.generation+1,requested_at=clock_timestamp(), "
                 "return_at=excluded.return_at, "
+                "release_epoch=host_lifecycle.release_epoch+1, "
                 # #4148: a new withdrawal closes claims before any adapter
                 # transition; the acknowledged hook state is kept (busy after a
                 # return, idle-drained if the host was released without a busy
@@ -175,7 +202,8 @@ class HostLifecycle(interface.HostLifecycle):
                 "automatic=excluded.automatic,released_at=NULL, "
                 "release_error=NULL,release_error_state=NULL,release_error_at=NULL, "
                 "release_error_since=NULL,hook_attempt_at=NULL,"
-                "hook_attempt_state=NULL,hook_attempt_generation=NULL, "
+                "hook_attempt_state=NULL,hook_attempt_generation=NULL,"
+                "hook_attempt_epoch=NULL, "
                 "updated_at=clock_timestamp() RETURNING " + _ROW,
                 (host, actor, duration, duration, automatic))
             row = rows[0]
@@ -200,7 +228,7 @@ class HostLifecycle(interface.HostLifecycle):
                                  "(`ameesh host reconcile`); a heartbeat does not reopen it")
             rows = tx.query(
                 "UPDATE host_lifecycle SET mode='returning',actor=%s,return_at=NULL, "
-                "claims_open=%s, "
+                "release_epoch=release_epoch+1, claims_open=%s, "
                 # the release state follows the opened gate; a closed return
                 # keeps saying `draining` until the busy hook answers.
                 "release_state=CASE WHEN %s THEN 'busy' ELSE release_state END, "
@@ -250,7 +278,9 @@ class HostLifecycle(interface.HostLifecycle):
                 Hosts._lock_gate(tx, row["host"])
                 updated = tx.query(
                     "UPDATE host_lifecycle SET mode='returning',return_at=NULL, "
-                    # #4148: the busy hook must answer before claims reopen.
+                    # #4148: the busy hook must answer before claims reopen;
+                    # the epoch invalidates any transition decided before.
+                    "release_epoch=release_epoch+1, "
                     "claims_open=CASE WHEN %s THEN true ELSE claims_open END, "
                     "release_state=CASE WHEN %s THEN 'busy' ELSE release_state END, "
                     "updated_at=clock_timestamp() WHERE host=%s AND generation=%s "
@@ -280,10 +310,19 @@ class HostLifecycle(interface.HostLifecycle):
             return bool(rows)
 
     # -- #4148: adapter transitions, journal and scanner lock ---------------
-    def begin_transition(self, host, generation, state, *, actor, stale_after,
-                         retry_after):
-        """Atomically claim one adapter call; see the interface contract."""
+    def begin_transition(self, host, generation, state, *, release_epoch, actor,
+                         stale_after, retry_after):
+        """Atomically claim one adapter call; see the interface contract.
+
+        The conditions are re-evaluated by the UPDATE on the current row, so a
+        return that slipped between the scanner's decision and this call (it
+        bumps `release_epoch` and may reopen claims) is refused: no release
+        decision survives a return, and no return decision survives a new
+        withdrawal."""
         _check_state(state)
+        if isinstance(release_epoch, bool) or not isinstance(release_epoch, int) \
+                or release_epoch < 1:
+            raise ValueError("release_epoch: a positive integer expected")
         stale_after = _positive_seconds(stale_after, "stale_after", minimum=1.0)
         retry_after = _positive_seconds(retry_after, "retry_after")
         if not isinstance(actor, str) or not actor.strip() \
@@ -291,13 +330,14 @@ class HostLifecycle(interface.HostLifecycle):
             raise ValueError("transition actor required")
         rows = self.db.query(
             "UPDATE host_lifecycle c SET hook_attempt_at=clock_timestamp(), "
-            "hook_attempt_state=%s,hook_attempt_generation=c.generation, "
+            "hook_attempt_state=%s,hook_attempt_generation=c.generation,"
+            "hook_attempt_epoch=c.release_epoch, "
             "updated_at=clock_timestamp() "
-            "WHERE c.host=%s AND c.generation=%s "
+            "WHERE c.host=%s AND c.generation=%s AND c.release_epoch=%s "
             "AND c.hook_state IS DISTINCT FROM %s "
             "AND NOT EXISTS (SELECT 1 FROM host_lifecycle_transitions t "
             "                WHERE t.host=c.host AND t.generation=c.generation "
-            "                  AND t.state=%s) "
+            "                  AND t.release_epoch=c.release_epoch AND t.state=%s) "
             "AND (c.hook_attempt_at IS NULL OR c.hook_attempt_at <= "
             "     clock_timestamp()-make_interval(secs=>%s)) "
             # A failed transition is retried after its own delay; a failure of
@@ -305,14 +345,28 @@ class HostLifecycle(interface.HostLifecycle):
             # undrain) must not block the safe `busy` answer.
             "AND (c.release_error_at IS NULL OR c.release_error_state IS DISTINCT FROM %s "
             "     OR c.release_error_at <= clock_timestamp()-make_interval(secs=>%s)) "
+            # The state must be legal for the row read under the same lock.
+            "AND ((%s='busy' AND c.mode IN ('draining','returning')) "
+            "     OR (%s='draining' AND c.mode='draining' AND NOT c.claims_open "
+            "         AND c.release_state <> 'idle-drained') "
+            "     OR (%s='idle-drained' AND c.mode='draining' AND NOT c.claims_open "
+            "         AND c.release_state='draining' AND c.hook_state='draining')) "
             "RETURNING " + _ROW,
-            (state, host, generation, state, state, stale_after, state, retry_after))
+            (state, host, generation, release_epoch, state, state, stale_after,
+             state, retry_after, state, state, state))
         return rows[0] if rows else None
 
-    def finish_transition(self, host, generation, state, *, actor, detail,
-                          error=None):
-        """Journal a successful transition, or keep the previous state on failure."""
+    def finish_transition(self, host, generation, state, *, release_epoch, actor,
+                          detail, error=None):
+        """Journal a successful transition, or keep the previous state on failure.
+
+        A transition whose epoch moved (a return or a new withdrawal) is
+        discarded: its external effect may have happened, but the durable state
+        is the one of the newer decision, and the next pass will call `busy`."""
         _check_state(state)
+        if isinstance(release_epoch, bool) or not isinstance(release_epoch, int) \
+                or release_epoch < 1:
+            raise ValueError("release_epoch: a positive integer expected")
         if not isinstance(actor, str) or not actor.strip() \
                 or any(ord(c) < 32 for c in actor):
             raise ValueError("transition actor required")
@@ -323,13 +377,15 @@ class HostLifecycle(interface.HostLifecycle):
         with self.db.transaction() as tx:
             Hosts._lock_gate(tx, host)
             control = HostLifecycle(tx).get(host)
-            if not control or control["generation"] != generation:
+            if (not control or control["generation"] != generation
+                    or control["release_epoch"] != release_epoch):
                 return None
             if error is not None:
                 text = " ".join(str(error).split())[:500]
                 tx.execute(
                     "UPDATE host_lifecycle SET hook_attempt_at=NULL,"
                     "hook_attempt_state=NULL,hook_attempt_generation=NULL,"
+                    "hook_attempt_epoch=NULL,"
                     "release_error=%s,release_error_state=%s,"
                     "release_error_at=clock_timestamp(),"
                     "release_error_since=coalesce(release_error_since,clock_timestamp()),"
@@ -338,17 +394,21 @@ class HostLifecycle(interface.HostLifecycle):
                 tx.execute(
                     "INSERT INTO ameesh_events(type,object,project,data) "
                     "VALUES ('host.release_failed',%s,NULL,%s::jsonb)",
-                    ("host:" + host, json.dumps({"generation": generation, "state": state,
-                                                 "actor": actor, "error": text},
-                                                sort_keys=True)))
+                    ("host:" + host, json.dumps({"generation": generation,
+                                                 "release_epoch": release_epoch,
+                                                 "state": state, "actor": actor,
+                                                 "error": text}, sort_keys=True)))
             else:
                 tx.execute(
-                    "INSERT INTO host_lifecycle_transitions(host,generation,state,actor,detail) "
-                    "VALUES (%s,%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING",
-                    (host, generation, state, actor, json.dumps(detail, sort_keys=True)))
+                    "INSERT INTO host_lifecycle_transitions(host,generation,"
+                    "release_epoch,state,actor,detail) "
+                    "VALUES (%s,%s,%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING",
+                    (host, generation, release_epoch, state, actor,
+                     json.dumps(detail, sort_keys=True)))
                 tx.execute(
                     "UPDATE host_lifecycle SET hook_state=%s,hook_attempt_at=NULL,"
                     "hook_attempt_state=NULL,hook_attempt_generation=NULL,"
+                    "hook_attempt_epoch=NULL,"
                     "release_error=NULL,release_error_state=NULL,release_error_at=NULL,"
                     "release_error_since=NULL,"
                     "release_state=CASE WHEN %s='busy' THEN 'busy' "
@@ -369,7 +429,7 @@ class HostLifecycle(interface.HostLifecycle):
 
     def transition_journal(self, host):
         rows = self.db.query(
-            "SELECT host,generation,state,actor,detail,"
+            "SELECT host,generation,release_epoch,state,actor,detail,"
             "extract(epoch from created_at)::float8 AS created_ts "
             "FROM host_lifecycle_transitions WHERE host=%s "
             "ORDER BY created_at,state", (host,))
@@ -566,6 +626,7 @@ class HostLifecycle(interface.HostLifecycle):
             # move back before the host is open.
             returned = tx.query(
                 "UPDATE host_lifecycle SET mode='returning',actor=%s,return_at=NULL, "
+                "release_epoch=release_epoch+1, "
                 "updated_at=clock_timestamp() WHERE host=%s AND mode='lost' "
                 "RETURNING host", (actor, host))
             if not returned:

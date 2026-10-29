@@ -385,10 +385,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'host', 'mode', 'generation', 'actor', 'requested_at', 'return_at', 'updated_at',
         -- #4148 : states and evidence of the external release adapter; the
         -- free-text failure stays in the contents role.
-        'release_state', 'hook_state', 'claims_open', 'release_generation',
-        'automatic', 'released_at', 'release_error_state', 'release_error_at',
-        'release_error_since', 'hook_attempt_at', 'hook_attempt_state',
-        'hook_attempt_generation'
+        'release_state', 'hook_state', 'claims_open', 'release_epoch',
+        'release_generation', 'automatic', 'released_at', 'release_error_state',
+        'release_error_at', 'release_error_since', 'hook_attempt_at',
+        'hook_attempt_state', 'hook_attempt_generation', 'hook_attempt_epoch'
     ]),
     ('host_lifecycle_agents', ARRAY[
         'host', 'generation', 'agent', 'critical', 'operation'
@@ -396,7 +396,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- #4148 : one journal line per acknowledged adapter transition; `detail`
     -- (command output) is a content.
     ('host_lifecycle_transitions', ARRAY[
-        'host', 'generation', 'state', 'actor', 'created_at'
+        'host', 'generation', 'release_epoch', 'state', 'actor', 'created_at'
     ]),
     -- #4148 : per-host scanner lock and the reason a scan did not drain.
     ('host_release_locks', ARRAY[

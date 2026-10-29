@@ -285,17 +285,19 @@ def _known_hosts(canons, listing):
 def _run_transition(cfg, api, canons, row, state, *, actor, runner=None,
                     clock=time.time):
     host, generation = row["host"], row["generation"]
+    epoch = int(row.get("release_epoch") or 1)
     previous = row.get("hook_state")
     attempt = api.begin_transition(
-        host, generation, state, actor=actor,
+        host, generation, state, release_epoch=epoch, actor=actor,
         stale_after=float(cfg.lifecycle_hook_timeout) + 120.0,
         retry_after=float(cfg.host_release_retry))
     if attempt is None:
         return None
     command = hook_for(cfg, canons, host)
     if not command:
-        return api.finish_transition(host, generation, state, actor=actor,
-                                     detail={}, error="no lifecycle hook")
+        return api.finish_transition(host, generation, state, release_epoch=epoch,
+                                     actor=actor, detail={},
+                                     error="no lifecycle hook")
     result = run_hook(cfg, command, state, host, generation=generation,
                       runner=runner, clock=clock)
     detail = {"command": result.get("command"), "code": result.get("code"),
@@ -303,8 +305,8 @@ def _run_transition(cfg, api, canons, row, state, *, actor, runner=None,
               "previous_hook_state": previous,
               "stdout": result.get("stdout"), "stderr": result.get("stderr")}
     error = None if result.get("ok") else hook_error(result)
-    return api.finish_transition(host, generation, state, actor=actor,
-                                 detail=detail, error=error)
+    return api.finish_transition(host, generation, state, release_epoch=epoch,
+                                 actor=actor, detail=detail, error=error)
 
 
 def _busy_sample_ok(cfg, api, db, row, *, now):
@@ -316,12 +318,27 @@ def _busy_sample_ok(cfg, api, db, row, *, now):
     withdrawal is enough."""
     requested = resources.finite_float(row.get("requested_ts"))
     journal = api.transition_journal(row["host"])
+    generation = row.get("generation")
     busy = [item for item in journal
-            if item.get("state") == "busy"
-            and item.get("generation") == row.get("generation")]
+            if item.get("state") == "busy" and item.get("generation") == generation]
+    released = [item for item in journal
+                if item.get("state") == "idle-drained"
+                and item.get("generation") == generation]
+    # A migrated `busy` (hook_state busy, never released) is proof enough. A
+    # released host needs a `busy` journal entry newer than its latest release:
+    # an acknowledgement from before that release proves nothing.
+    legacy = (row.get("hook_state") == "busy"
+              and resources.finite_float(row.get("released_ts")) is None)
+    newer_than_release = bool(
+        busy and (not released
+                  or float(busy[-1].get("created_ts") or 0)
+                  > float(released[-1].get("created_ts") or 0)))
+    if not newer_than_release and not legacy:
+        return None
     released_before = bool(busy and (busy[-1].get("detail") or {}).get(
         "previous_hook_state") == "idle-drained")
-    after = (busy[-1].get("created_ts") if released_before else requested)
+    after = (busy[-1].get("created_ts") if released_before
+             else (busy[-1].get("created_ts") if busy else requested))
     return _fresh_reading(cfg, db, row["host"], now=now, after=after)
 
 
@@ -335,7 +352,9 @@ def _advance(cfg, api, db, row, *, controls, listing, canons, holds, known,
         # No adapter: keep the historical L232e behaviour. A return opened by
         # an operator still reopens claims; nothing is released.
         if mode == "returning" and not row.get("claims_open"):
-            api.open_claims(host, row["generation"])
+            # No adapter: a first drain (or a migrated row) has hook_state
+            # NULL; there is no `busy` answer to wait for.
+            api.open_claims(host, row["generation"], require_busy=False)
         return "no hook"
     if mode == "returning":
         if row.get("claims_open"):
@@ -519,6 +538,9 @@ def request_return(cfg, db, host, *, actor, runner=None, now=None, clock=time.ti
         row = api.get(host)
     if row is None or row.get("release_error_ts"):
         return row
+    # B2: never open a claim without a valid `busy` proof. If another
+    # transition (an idle-drained hook) is in flight, begin_transition returns
+    # None and the row stays draining; the scanner retries after it finishes.
     if not _busy_sample_ok(cfg, api, db, row, now=now):
         return row
     if row.get("mode") == "returning":

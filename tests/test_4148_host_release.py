@@ -2,17 +2,19 @@
 """#4148 (B of #3167): strict host release ordering, adapter protocol and runs."""
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from types import SimpleNamespace as NS
 from unittest import mock
 
-from ameesh import (config, host_idle, host_lifecycle, host_release,
-                    registry, storage, work)
+from ameesh import (config, db as db_mod, host_idle, host_lifecycle,
+                    host_release, registry, storage, work)
 
 from .support import PgTestCase
 
@@ -117,7 +119,7 @@ class HostReleaseTest(PgTestCase):
         self.script = os.path.join(self.tmpdir, "hook.py")
         with open(self.script, "w", encoding="utf-8") as fh:
             fh.write(textwrap.dedent("""\
-                import json, os, sys
+                import os, sys, time
                 state, host = sys.argv[1], sys.argv[2]
                 with open(os.environ["HOOK_LOG"], "a", encoding="utf-8") as fh:
                     fh.write("%s %s %s\\n" % (state, host,
@@ -125,11 +127,17 @@ class HostReleaseTest(PgTestCase):
                 fail = os.environ.get("HOOK_FAIL", "")
                 if state in fail.split(","):
                     sys.exit(7)
+                barrier = os.environ.get("HOOK_BARRIER")
+                if barrier and state == "idle-drained":
+                    open(barrier + ".started", "w", encoding="utf-8").close()
+                    while not os.path.exists(barrier + ".release"):
+                        time.sleep(0.05)
                 """))
         self._env = {"HOOK_LOG": self.log}
         self._old = {key: os.environ.get(key)
-                     for key in ("HOOK_LOG", "HOOK_FAIL", "HOOK_RUNS")}
-        for key in ("HOOK_FAIL", "HOOK_RUNS"):
+                     for key in ("HOOK_LOG", "HOOK_FAIL", "HOOK_RUNS",
+                                 "HOOK_BARRIER")}
+        for key in ("HOOK_FAIL", "HOOK_RUNS", "HOOK_BARRIER"):
             os.environ.pop(key, None)
         os.environ.update(self._env)
         self.addCleanup(self._restore_env)
@@ -138,8 +146,8 @@ class HostReleaseTest(PgTestCase):
         self._runs.start()
         self.addCleanup(self._runs.stop)
         self._runs_stopped = False
-        self.cfg = config.Config(
-            host="vm", resource_interval=60, idle_after_s=60,
+        self.cfg = dataclasses.replace(
+            self.cfg, host="vm", resource_interval=60, idle_after_s=60,
             host_release_settle=0, host_release_drain_bound=3600,
             host_release_retry=1, host_release_interval=0,
             lifecycle_hook_timeout=5,
@@ -274,6 +282,117 @@ class HostReleaseTest(PgTestCase):
         self.once(local_host="vm", now=time.time())
         self.assertEqual(self.control()["mode"], "draining")
         self.assertEqual(self.states(), ["draining"])
+
+    def test_released_host_waking_is_not_lost_before_a_post_ack_reading(self):
+        worker = self.add_agent()
+        self.quiet_history()
+        self.once(local_host="vm", now=time.time())
+        self.reading()
+        self.once(now=time.time())
+        self.assertEqual(self.control()["release_state"], "idle-drained")
+        work.add(self.db, title="wake", assignee=worker, app="ameesh")
+        self.once(now=time.time() + 1)
+        self.assertEqual(self.control()["release_state"], "busy")
+        self.assertFalse(self.control()["claims_open"])
+        # The VM is off: its readings go stale while `busy` boots it. This is
+        # not a lost host until the boot grace expires.
+        self.db.execute("UPDATE host_resources SET sampled_at=now()-interval '1 hour' "
+                        "WHERE host='vm'")
+        changed = self.api.host_lifecycle.detect_losses(
+            actor="runner", older_than=180, released_grace=900)
+        self.assertEqual(changed, [])
+        self.assertEqual(self.control()["mode"], "draining")
+        self.db.execute("UPDATE host_lifecycle SET updated_at=now()-interval '2 hours' "
+                        "WHERE host='vm'")
+        changed = self.api.host_lifecycle.detect_losses(
+            actor="runner", older_than=180, released_grace=60)
+        self.assertEqual([row["mode"] for row in changed], ["lost"])
+
+    def test_release_decision_is_refused_after_a_return(self):
+        self.add_agent()
+        self.quiet_history()
+        self.once(local_host="vm", now=time.time())
+        control = self.control()
+        self.assertEqual((control["mode"], control["hook_state"]),
+                         ("draining", "draining"))
+        epoch, generation = control["release_epoch"], control["generation"]
+        # A return slips between the scanner's release decision and its
+        # begin_transition: the decision must not survive the epoch bump.
+        self.api.host_lifecycle.undrain("vm", actor="human:op", claims_open=True)
+        self.assertEqual(self.control()["mode"], "returning")
+        self.assertTrue(self.control()["claims_open"])
+        attempt = self.api.host_lifecycle.begin_transition(
+            "vm", generation, "idle-drained", release_epoch=epoch,
+            actor="runner", stale_after=30, retry_after=0)
+        self.assertIsNone(attempt)
+        states = [row["state"] for row in self.api.host_lifecycle.transition_journal("vm")]
+        self.assertEqual(states, ["draining"])
+
+    def test_return_waits_for_an_in_flight_idle_drained_hook(self):
+        worker = self.add_agent()
+        self.quiet_history()
+        self.once(local_host="vm", now=time.time())
+        control = self.control()
+        self.reading()
+        barrier = os.path.join(self.tmpdir, "barrier")
+        os.environ["HOOK_BARRIER"] = barrier
+        self.addCleanup(lambda: os.environ.pop("HOOK_BARRIER", None))
+        errors = []
+
+        def scan():
+            other = db_mod.connect(self.cfg)
+            try:
+                host_release.once(self.cfg, other, local_host=None,
+                                  actor="runner-thread", now=time.time())
+            except Exception as exc:  # pragma: no cover - surfaced in the test
+                errors.append(exc)
+            finally:
+                other.close()
+
+        thread = threading.Thread(target=scan, daemon=True)
+        thread.start()
+        marker = barrier + ".started"
+        deadline = time.time() + 15
+        while not os.path.exists(marker) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(marker),
+                        "idle-drained hook did not start: %r" % (errors,))
+        # Work arrives and an operator asks for the host back while the
+        # release hook is held: no claim may reopen.
+        work.add(self.db, title="wake", assignee=worker, app="ameesh")
+        host_lifecycle.undrain(self.cfg, self.db, "vm", actor="human:op")
+        control = self.control()
+        self.assertEqual(control["mode"], "draining")
+        self.assertFalse(control["claims_open"])
+        self.assertNotIn("busy", self.states())
+        open(barrier + ".release", "w").close()
+        thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.control()["release_state"], "idle-drained")
+        self.assertFalse(self.control()["claims_open"])
+        # The scanner now answers `busy`; only a post-ack reading reopens.
+        self.once(now=time.time())
+        self.assertEqual(self.control()["mode"], "draining")
+        self.assertFalse(self.control()["claims_open"])
+        self.reading()
+        self.once(now=time.time())
+        self.assertTrue(self.control()["claims_open"])
+        self.assertEqual(self.control()["mode"], "returning")
+        self.assertLess(self.states().index("idle-drained"),
+                        self.states().index("busy"))
+
+    def test_scheduled_return_without_an_adapter_reopens_claims(self):
+        self.add_agent()
+        self.cfg = dataclasses.replace(self.cfg, lifecycle_hooks={})
+        self.api.host_lifecycle.drain("vm", actor="human:op", duration=3600)
+        self.db.execute("UPDATE host_lifecycle SET return_at=now()-interval '1 second' "
+                        "WHERE host='vm'")
+        self.api.host_lifecycle.expire_returns(open_claims=False)
+        self.assertEqual(self.control()["mode"], "returning")
+        self.assertFalse(self.control()["claims_open"])
+        self.once(now=time.time())
+        self.assertTrue(self.control()["claims_open"])
 
     def test_draining_hook_failure_keeps_claims_closed_and_alerts(self):
         self.add_agent()
