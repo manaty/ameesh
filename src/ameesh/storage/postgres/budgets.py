@@ -161,6 +161,18 @@ class Budgets(interface.Budgets):
                 (account, agent, float(usd), at, account, spend_key, at))
         return {"ok": True, "id": int(got[0]["id"]), "usage": usage}
 
+    def account_get(self, spend_key) -> dict | None:
+        """The reservation of this ledger key (the opened-turn snapshot).
+
+        Returns billing_account, usd, period and state, or None. The latest
+        row wins if a ledger key ever names more than one reservation (the
+        repair path deduplicates by key; this read never guesses a state)."""
+        rows = self.db.query(
+            "select billing_account, usd::float8 as usd,"
+            " period::text as period, state from account_reservations"
+            " where spend_key = %s order by id desc limit 1", (spend_key,))
+        return rows[0] if rows else None
+
     def account_settle(self, spend_key, *, state, actor) -> dict | None:
         """Settles the reservation of ONE turn, found by its ledger key.
 
