@@ -454,13 +454,15 @@ class PrefixesBornesTest(unittest.TestCase):
             return self.auto.TestRun(label, list(modules), None,
                                      "did not finish", 1.0, timed_out=True)
 
-        found, why = self.prefixes(replay, deadline=time.monotonic() + 600)
+        found, why, flaky = self.prefixes(replay, deadline=time.monotonic() + 600)
         self.assertEqual(found, {})
+        self.assertEqual(flaky, [])
         self.assertIn("préfixe 1 (#1) non concluant", why)
 
     def test_sans_borne_inchange(self) -> None:
         replay, calls = self.t4217.PrefixReplayTest.replay_at(self, {"préfixe 2 (#2)"})
-        found, why = self.prefixes(replay)
+        found, why, flaky = self.prefixes(replay)
+        self.assertEqual(flaky, [])
         self.assertEqual((list(found), why), ([2], ""))
         self.assertEqual(len(calls), 2)
 
