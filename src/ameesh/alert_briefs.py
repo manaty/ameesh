@@ -513,6 +513,13 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
     sa CI complète, et ne prescrit jamais de réassigner le porteur — il pousse
     le pilote/le composeur à voir le paquet jusqu'à sa fusion.
 
+    #4572 : quand `waiting.candidate` nomme une cause côté auteur
+    (`freeze-not-head`, `conflict`…), le composeur ne peut rien : le geste
+    nomme l'auteur et ce qu'il doit faire (regeler, résoudre le conflit,
+    obtenir l'avis de la remise). Le texte « le composeur le porte » reste
+    réservé au lot réellement prêt (`ready`) ; une lecture incomplète renvoie
+    à la liste calculée sans nommer personne au hasard.
+
     #2378 : de même pour une demande de décision ouverte et échue
     (`waiting.decision`) : le geste est de vérifier l'échéance avec le
     demandeur (renouveler ou retirer la demande) ; le décideur a le rappel de
