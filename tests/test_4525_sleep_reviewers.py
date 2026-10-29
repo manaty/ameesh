@@ -329,6 +329,7 @@ class PauseActorTest(PgTestCase):
         text = alert_briefs._operator_pause(alert)
         self.assertIn("Automatic sleep still in place", text)
         self.assertIn("lifted by the first startable lot", text)
+        self.assertIn("pilot/orchestrator mail", text)
         self.assertNotIn("check with whoever set it", text)
 
     def test_the_normal_operator_pause_alert_keeps_its_maintenance_action(self):

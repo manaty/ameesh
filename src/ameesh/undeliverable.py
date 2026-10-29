@@ -471,11 +471,27 @@ def wake_note(cfg, db, name: str, row: dict) -> list[str]:
     réveil est possible, ou quand aucun n'est attendu : une identité `externe`
     (session humaine) est lue à son prochain tour, et un destinataire arrêté
     est déjà refusé ou averti par l'appelant. Le répertoire réduit du contrat
-    1.1 (pas de `mode`) ne permet pas de juger : on n'avertit pas."""
+    1.1 (pas de `mode`) ne permet pas de juger : on n'avertit pas.
+
+    #4610 : le sommeil automatique du découpage est réveillable pour qu'une
+    attribution passe, mais un courrier ordinaire ne le lève pas ; l'expéditeur
+    reçoit donc un avertissement, comme pour une pause d'opérateur."""
     if "mode" not in row or (row.get("mode") or "execute") == "externe":
         return []
     ok, why, _note = registry.wake_status(db, cfg, name)
     if ok:
+        # #4610 : seuls une attribution, un lot démarrable, un courrier du
+        # pilote ou d'un orchestrateur, ou l'échéance lèvent ce sommeil ; un
+        # message d'un autre expéditeur attend. Le taire ferait croire à un
+        # réveil qui n'arrivera pas.
+        from . import file_decoupage
+        if (row.get("operator_paused")
+                and file_decoupage.is_sleep_reason(row.get("operator_pause_reason"))):
+            return ["%s is under the automatic roadmap sleep: the message is stored, "
+                    "but it does not open a turn by itself; the sleep is lifted by a "
+                    "lot assigned to it, a startable lot in its project, mail from its "
+                    "pilot or an orchestrator, or its deadline; if the request cannot "
+                    "wait, address another agent" % name]
         return []
     if row.get("operator_paused"):
         # #2200 : la pause humaine a sa propre sortie ; « prochain canon sync »
