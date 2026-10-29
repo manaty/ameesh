@@ -58,7 +58,8 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    hors délai, échec de job sans test, échec non attribuable ou ambigu, test
    vert en local, erreur de fixture DB en QueryCanceled/timeout) ne retire
    rien : il est consigné au journal du porteur et le pilote est prévenu, une
-   fois.
+   fois. #4221 : un QueryCanceled/lock timeout du **corps** d'un test qui se
+   reproduit au rejeu seul, hors charge, est un rouge réel et retire l'unité.
 5. **Reprise.** Chaque lancement de `paquet-auto.py` laisse d'abord une
    marque « tentative » (étape, tête de départ, hôte:pid, époque du bail) ;
    son achèvement se lit à la tête gelée qui a bougé, son échec à une marque
@@ -662,7 +663,15 @@ def classify(run: dict) -> Verdict:
 
 
 def replay_locally(ctx: Context, sha: str, tests: list[str]) -> str:
-    """Rejoue les tests rouges sur la tête gelée ; "" si rouge confirmé."""
+    """Rejoue les tests rouges sur la tête gelée ; "" si rouge confirmé.
+
+    #4221 : un QueryCanceled/lock timeout **du corps d'un test** qui se
+    reproduit à ce rejeu seul, hors charge, est un rouge réel (la ci-full est
+    rouge, le test est attribué, l'unité est retirée). Une erreur de fixture
+    (`setUpClass`/`tearDownClass`), un QueryCanceled de charge qui ne
+    reproduit pas, ou tout autre rejeu non concluant restent non concluants :
+    aucun retrait.
+    """
     if ctx.dry_run:
         return ""
     parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
@@ -676,6 +685,9 @@ def replay_locally(ctx: Context, sha: str, tests: list[str]) -> str:
         if run.green:
             return "vert en local (%d test(s)) : rouge non reproduit" % run.tests
         if run.inconclusive:
+            if not run.timed_out and run.returncode == 1 \
+                    and run.body_cancel_tests() & {str(test) for test in tests}:
+                return ""
             return "rejeu local non concluant (%s)" % run.motive()
         return ""
     finally:
