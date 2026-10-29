@@ -211,10 +211,14 @@ if [ -f "$etat" ] && ! en_cours; then
     sujets_vides=0
     [ -z "$nouveaux" ] || sujets_vides=$(printf '%s\n' "$nouveaux" | grep -c '^$' || :)
     perdus= abandonnes=
+    #: #4724 : jamais de tube vers `grep -q` sous pipefail — grep sort au
+    #: premier appariement, printf prend SIGPIPE (141) et le pipeline passe
+    #: pour faux : un sujet présent était classé absent. La chaîne, elle, n'a
+    #: pas de producteur à interrompre.
     while IFS=$'\x1f' read -r sujet corps; do
       [ -n "$sujet" ] || continue
-      printf '%s\n' "$finaux" | grep -Fqx -- "$sujet" && continue
-      if { [ -n "$corps" ] && printf '%s\n' "$nouveaux" | grep -Fqx -- "$corps"; } \
+      grep -Fqx -- "$sujet" <<<"$finaux" && continue
+      if { [ -n "$corps" ] && grep -Fqx -- "$corps" <<<"$nouveaux"; } \
         || [ "$sujets_vides" != 0 ]; then
         perdus+="$sujet"$'\n'
       else
