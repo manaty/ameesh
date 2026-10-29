@@ -58,3 +58,123 @@ begin
     get diagnostics moved = row_count;
     return moved;
 end $$;
+
+-- B1 of the #4299 review: a writer that resolved OLD before the rename commit
+-- must not insert OLD after it. Every rewritten column maps an alias to its
+-- primary at write time, under FOR KEY SHARE of the registry row: the rename
+-- holds FOR UPDATE on it, so a concurrent writer either waits for the commit
+-- and then reads the new primary (rechecked on the updated row), or holds the
+-- row first and the rename, waiting for it, rewrites what it wrote.
+-- FOR KEY SHARE requires UPDATE on the registry: the lookup runs as the
+-- schema owner (as 0427), and only returns a name the resolver already gives.
+create or replace function ameesh_agent_primary_locked(spelling text)
+returns text language plpgsql security definer set search_path from current as $$
+declare primary_name text;
+begin
+    select r.name into primary_name from agent_registry r
+     where r.name = spelling or spelling = any(r.aliases)
+       for key share;
+    return primary_name;
+end $$;
+
+create or replace function ameesh_agent_spelling() returns trigger
+language plpgsql set search_path from current as $$
+declare
+    spec text;
+    col text;
+    rec jsonb := to_jsonb(new);
+    before jsonb := case when tg_op = 'UPDATE' then to_jsonb(old) else '{}'::jsonb end;
+    patch jsonb := '{}'::jsonb;
+    spelling text;
+    primary_name text;
+    names text[];
+begin
+    foreach spec in array string_to_array(tg_argv[0], ' ') loop
+        col := replace(spec, '[]', '');
+        -- an unchanged value is not a new write; null holds no spelling
+        if coalesce(jsonb_typeof(rec -> col), 'null') not in ('string', 'array')
+           or (rec -> col) is not distinct from (before -> col) then
+            continue;
+        end if;
+        if right(spec, 2) = '[]' then
+            select array_agg(coalesce(ameesh_agent_primary_locked(e), e) order by o)
+              into names from jsonb_array_elements_text(rec -> col) with ordinality t(e, o);
+            names := coalesce(names, '{}'::text[]);
+            if to_jsonb(names) is distinct from rec -> col then
+                patch := patch || jsonb_build_object(col, to_jsonb(names));
+            end if;
+        else
+            spelling := rec ->> col;
+            primary_name := ameesh_agent_primary_locked(spelling);
+            if primary_name is not null and primary_name <> spelling then
+                patch := patch || jsonb_build_object(col, primary_name);
+            end if;
+        end if;
+    end loop;
+    if patch <> '{}'::jsonb then
+        new := jsonb_populate_record(new, patch);
+    end if;
+    return new;
+end $$;
+
+-- Same list as agent_rename.REWRITTEN (a test compares them).
+do $$
+declare
+    spec text[];
+begin
+    foreach spec slice 1 in array array[
+        ['account_budgets', 'set_by'],
+        ['account_rate_events', 'agent'],
+        ['account_reservations', 'agent closed_by'],
+        ['account_switches', 'agent'],
+        ['account_turn_slots', 'agent'],
+        ['account_turn_starts', 'agent'],
+        ['agent_lot_sessions', 'agent'],
+        ['agent_mailbox', 'recipient sender'],
+        ['agent_registry', 'created_by operator_pause_by retired_by'],
+        ['agent_watches', 'agent enabled_by'],
+        ['alert_acknowledgements', 'actor'],
+        ['budget_events', 'actor'],
+        ['budget_limits', 'set_by'],
+        ['commitments', 'created_by owner'],
+        ['conversation_heads', 'agent'],
+        ['estimate_references', 'published_by'],
+        ['host_lifecycle', 'actor'],
+        ['housekeeping_log', 'actor agent'],
+        ['integration_train_fires', 'changed_by owner'],
+        ['managed_worktrees', 'agent'],
+        ['merge_locks', 'owner'],
+        ['merge_queue', 'queued_by'],
+        ['notify_briefs', 'recipient'],
+        ['notify_state', 'owner'],
+        ['operator_pause_events', 'actor'],
+        ['persona_sessions', 'persona'],
+        ['provider_account_credits', 'agent'],
+        ['quota_gauge_readings', 'source'],
+        ['review_catch_up', 'actor'],
+        ['session_bindings', 'agent created_by'],
+        ['spend_pending', 'agent'],
+        ['standing_reservations', 'reserved_by'],
+        ['turn_costs', 'agent'],
+        ['turn_resources', 'agent'],
+        ['visibility_checks', 'persona'],
+        ['work_item_delegations', 'delegate delegated_by resolved_by'],
+        ['work_item_dependencies', 'created_by'],
+        ['work_item_estimates', 'estimated_by source'],
+        ['work_item_events', 'actor'],
+        ['work_item_footprints', 'created_by'],
+        ['work_item_links', 'created_by decided_by'],
+        ['work_item_milestones', 'actor'],
+        ['work_items', 'assignee delegated_by estimate_by estimate_source external_executor planned_by reviewer reviewers[] source'],
+        ['work_landings', 'created_by'],
+        ['work_packages', 'planned_by'],
+        ['work_packet_members', 'recorded_by'],
+        ['work_resolutions', 'created_by']] loop
+        execute format('drop trigger if exists ameesh_agent_spelling on %I', spec[1]);
+        execute format('create trigger ameesh_agent_spelling before insert or update of %s on %I'
+                       ' for each row execute function ameesh_agent_spelling(%L)',
+                       (select string_agg(quote_ident(replace(c, '[]', '')), ', ')
+                          from unnest(string_to_array(spec[2], ' ')) c),
+                       spec[1], spec[2]);
+    end loop;
+end $$;

@@ -205,9 +205,21 @@ class AgentRenameTest(PgTestCase):
         journal = self.db.query("SELECT coalesce(max(id), 0) AS n FROM agent_renames")[0]['n']
         result = self.rename('worker', 'new-worker')
         self.assertEqual(result['swept'], {})
-        # A raw write that bypassed the resolver, as in the commit race.
-        self.db.execute("INSERT INTO agent_mailbox (sender, recipient, body)"
-                        " VALUES ('reviewer', 'worker', 'Written under the old spelling')")
+        # A raw write that bypassed the resolver, as in the commit race, is
+        # stored under the primary (B1 of the review).
+        stored = self.db.query("INSERT INTO agent_mailbox (sender, recipient, body)"
+                               " VALUES ('worker', 'worker', 'Written under the old spelling')"
+                               " RETURNING sender, recipient")[0]
+        self.assertEqual((stored['sender'], stored['recipient']), ('new-worker', 'new-worker'))
+        self.assertEqual([m['body'] for m in mail.unread(self.db, 'new-worker')],
+                         ['Written under the old spelling'])
+        # A row written without the trigger (before 0508) is left to the sweep.
+        self.db.execute("ALTER TABLE agent_mailbox DISABLE TRIGGER ameesh_agent_spelling")
+        try:
+            self.db.execute("INSERT INTO agent_mailbox (sender, recipient, body)"
+                            " VALUES ('reviewer', 'worker', 'Written before the trigger')")
+        finally:
+            self.db.execute("ALTER TABLE agent_mailbox ENABLE TRIGGER ameesh_agent_spelling")
         again = self.rename('worker', 'new-worker')
         self.assertTrue(again['already'])
         self.assertEqual(again['swept'], {'agent_mailbox.recipient': 1})
@@ -216,6 +228,65 @@ class AgentRenameTest(PgTestCase):
                                        " WHERE id > %s", (journal,))[0]['n'], 1)
         with self.assertRaises(agent_rename.RenameError):
             agent_rename.sweep(self.db, 'reviewer', 'new-worker')
+
+    def test_every_rewritten_column_is_mapped_at_write_time(self):
+        rows = self.db.query(
+            "SELECT tgrelid::regclass::text AS tbl,"
+            "       convert_from(substring(tgargs from 1 for length(tgargs) - 1), 'UTF8') AS arg"
+            "  FROM pg_trigger WHERE tgname = 'ameesh_agent_spelling'"
+            "   AND tgrelid::regclass::text NOT LIKE '%.%'")
+        mapped = sorted('%s.%s' % (r['tbl'], c) for r in rows for c in r['arg'].split())
+        self.assertEqual(mapped, sorted(agent_rename.REWRITTEN))
+
+    def test_writer_racing_the_rename_lands_on_the_new_primary(self):
+        """B1: the writer resolved OLD before the rename; the rename holds the
+        registry row; the writer's INSERT waits, then stores NEW."""
+        import threading
+        from ameesh import db as db_mod
+        other = db_mod.connect(self.cfg)
+        self.addCleanup(other.close)
+        done = threading.Event()
+        stored = {}
+
+        def write():
+            row = self.db.query("INSERT INTO agent_mailbox (sender, recipient, body)"
+                                " VALUES ('reviewer', 'worker', 'Raced with the rename')"
+                                " RETURNING recipient")[0]
+            stored['recipient'] = row['recipient']
+            done.set()
+
+        with other.transaction() as tx:
+            agent_rename._rename_tx(tx, 'worker', 'new-worker', 'human:owner', 'race test')
+            writer = threading.Thread(target=write)
+            writer.start()
+            self.assertFalse(done.wait(1.5), "the writer must wait for the rename")
+        writer.join(30)
+        self.assertEqual(stored.get('recipient'), 'new-worker')
+        self.assertEqual([m['body'] for m in mail.unread(self.db, 'new-worker')],
+                         ['Raced with the rename'])
+
+    def test_rename_waits_for_a_writer_holding_the_old_row(self):
+        """The other order: the writer locks first, the rename rewrites its row."""
+        import threading
+        from ameesh import db as db_mod
+        other = db_mod.connect(self.cfg)
+        self.addCleanup(other.close)
+        done = threading.Event()
+
+        def rename():
+            self.rename('worker', 'new-worker')
+            done.set()
+
+        with other.transaction() as tx:
+            tx.execute("INSERT INTO agent_mailbox (sender, recipient, body)"
+                       " VALUES ('reviewer', 'worker', 'Written before the rename')")
+            renamer = threading.Thread(target=rename)
+            renamer.start()
+            self.assertFalse(done.wait(1.5), "the rename must wait for the writer")
+        renamer.join(60)
+        self.assertTrue(done.is_set())
+        self.assertEqual([m['body'] for m in mail.unread(self.db, 'new-worker')],
+                         ['Written before the rename'])
 
     def test_journal_is_append_only(self):
         self.rename('worker', 'new-worker')
