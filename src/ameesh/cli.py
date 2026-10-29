@@ -340,6 +340,13 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     kind = "notify"
     urgent = False
     args = list(args)
+    # #4445 : `--` marque la fin des options : ce qui le suit est le corps tel
+    # quel, mis de côté avant toute extraction (un `--urgent` ou un `--cc`
+    # cité dans le corps ne devient jamais un geste).
+    literal_body = None
+    if "--" in args:
+        separator = args.index("--")
+        args, literal_body = args[:separator], args[separator + 1:]
     # L125 : copies sans réveil (--cc NOM[,NOM…], répétable) et accusé (--ack)
     cc: list[str] = []
     while "--cc" in args:
@@ -442,6 +449,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if expires and not sign:
         print("--expires only makes sense with --sign/--key", file=sys.stderr)
         return 2
+    literal = literal_body is not None
+    if literal:
+        args += literal_body
     if len(args) < 2:
         print("usage: agent-mail send <dest|all> <text…|-> [--from NAME] [--lot ID|REF [--assign]] "
               "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]] "
@@ -498,11 +508,6 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         parent_lot = int(number)
     dest = args[0]
     body = args[1:]
-    # #4445 : `--` juste après le destinataire marque la fin des options ; le
-    # reste est le corps tel quel, même s'il commence par `--`.
-    literal = bool(body) and body[0] == "--"
-    if literal:
-        body = body[1:]
     if body == ["-"] and not literal:
         # #3504 : le corps vient de l'entrée standard, pour citer une commande
         # sans que le shell de l'expéditeur ne la lance (heredoc `<<'EOF'`).
@@ -510,7 +515,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         if error:
             print(error, file=sys.stderr)
             return 2
-    elif "-" in body:
+    elif "-" in body and not literal:
         print("`-` reads the whole body on standard input: give it alone after "
               "the recipient (or pass the text as arguments)", file=sys.stderr)
         return 2

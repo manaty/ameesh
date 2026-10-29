@@ -69,3 +69,22 @@ class SendCorpsOptionTest(PgTestCase):
                         env=self.env(AGENT_MAIL_NAME="beta"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self._bodies(), ["rien à faire"])
+
+    def test_options_apres_le_double_tiret_restent_dans_le_corps(self):
+        # B de ameesh-cx3 (gel #24841) : les options étaient extraites de toute
+        # la ligne avant `--` ; `--urgent`, `--cc`, `--lot` cités devenaient
+        # des gestes. Correctif de relecteur d5811e412 réécrit par l'auteur.
+        body = ["--stdin", "--urgent", "--cc", "absent", "--lot", "invalid!", "-"]
+        proc = self.cli("send", "alpha", "--info", "--", *body,
+                        env=self.env(AGENT_MAIL_NAME="beta"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._bodies(), [" ".join(body)])
+        self.assertEqual(int(self.db.query(
+            "SELECT count(*) AS n FROM agent_mailbox")[0]["n"]), 1)
+
+    def test_double_tiret_avant_le_destinataire_suit_posix(self):
+        # `--` clôt les options ; destinataire et corps restent positionnels
+        proc = self.cli("send", "--", "alpha", "--urgent",
+                        env=self.env(AGENT_MAIL_NAME="beta"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._bodies(), ["--urgent"])
