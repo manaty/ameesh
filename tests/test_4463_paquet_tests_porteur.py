@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import pathlib
+import stat
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -48,21 +51,24 @@ class LocalTests:
     def __init__(self, lots=(1, 2, 3), run=_run):
         self.composition = _composition(lots)
         self.calls: list[tuple[str, int]] = []
+        self.walls: list[int | None] = []
         self.lines: list[str] = []
         self.run_fn = run
 
-    def run(self, **kwargs):
-        def fake(_worktree, label, modules, *, timeout, heavy=False):
+    def run(self, parallel=1, which=None, **kwargs):
+        def fake(_worktree, label, modules, *, timeout, heavy=False, wall=None):
             self.calls.append((label, timeout))
+            self.walls.append(wall)
             return self.run_fn(label, modules, timeout=timeout)
 
         with mock.patch.object(paquet_auto, "unit_test_modules",
                                side_effect=lambda _w, unit: ["tests.test_u%d" % unit.lot]), \
                 mock.patch.object(paquet_auto, "contract_modules",
                                   return_value=["tests.test_contrat"]), \
+                mock.patch.object(paquet_auto.shutil, "which", return_value=which), \
                 mock.patch.object(paquet_auto, "run_tests", side_effect=fake):
             return paquet_auto.check_local_tests(
-                pathlib.Path("."), self.composition, timeout=900, parallel=1,
+                pathlib.Path("."), self.composition, timeout=900, parallel=parallel,
                 select=lambda *_: ({}, ""), log=self.lines.append, **kwargs)
 
 
@@ -164,9 +170,18 @@ class BorneTotaleTest(unittest.TestCase):
         self.assertEqual([run.inconclusive for run in runs],
                          [False, False, True, True])
 
+    def test_en_parallele_l_attente_du_creneau_compte_dans_l_echeance(self) -> None:
+        # relecture cx3 : la borne passe en temps mural à chaque série
+        local = LocalTests()
+        local.run(parallel=4, which="/bin/ameesh", deadline=time.monotonic() + 600)
+        self.assertEqual(len(local.walls), 4)
+        self.assertTrue(all(wall is not None and 590 <= wall <= 600
+                            for wall in local.walls), local.walls)
+
     def test_sans_borne_totale_inchange(self) -> None:
         local = LocalTests()
         runs, faulty, _ = local.run()
+        self.assertEqual(local.walls, [None] * 4)
         self.assertEqual(local.calls, [("unité #1", 900), ("unité #2", 900),
                                        ("unité #3", 900), ("contrats", 900)])
         self.assertEqual(faulty, [])
@@ -193,6 +208,47 @@ class BorneTotaleTest(unittest.TestCase):
                     compositions=[_composition((1,))])
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(flux.run(), 0)
+
+
+class CreneauxSaturesTest(unittest.TestCase):
+    """Relecture cx3 : `ameesh heavy` attend un créneau sans borne et ignore
+    SIGTERM tant que sa série n'est pas partie ; le temps mural la borne."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="paquet-4463-", dir=os.environ.get("TMPDIR"))
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        self.tmp = pathlib.Path(tmp)
+        # un faux `ameesh heavy` dont tous les créneaux sont pris
+        self.heavy = self.tmp / "ameesh"
+        self.heavy.write_text("#!/bin/sh\ntrap '' TERM\nsleep 60 &\nwait\nsleep 60\n")
+        self.heavy.chmod(self.heavy.stat().st_mode | stat.S_IEXEC)
+        grace = mock.patch.object(paquet_auto, "WALL_GRACE_S", 1)
+        grace.start()
+        self.addCleanup(grace.stop)
+
+    def test_run_walled_arrete_une_attente_qui_ignore_sigterm(self) -> None:
+        start = time.monotonic()
+        proc = paquet_auto.run_walled([str(self.heavy)], cwd=self.tmp,
+                                      env=dict(os.environ), wall=1)
+        self.assertIsNone(proc)
+        self.assertLess(time.monotonic() - start, 10)
+
+    def test_run_tests_heavy_borne_attente_comprise(self) -> None:
+        start = time.monotonic()
+        with mock.patch.object(paquet_auto.shutil, "which", return_value=str(self.heavy)), \
+                mock.patch.object(paquet_auto, "project_python", return_value="python3"), \
+                mock.patch.object(paquet_auto, "save_test_log", side_effect=lambda run: run):
+            run = paquet_auto.run_tests(self.tmp, "unité #1", ["tests.test_x"],
+                                        timeout=900, heavy=True, wall=1)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertTrue(run.inconclusive)
+        self.assertIn("attente du créneau comprise", run.output)
+
+    def test_run_walled_rend_la_sortie_dans_la_borne(self) -> None:
+        proc = paquet_auto.run_walled(["sh", "-c", "echo OK; exit 1"], cwd=self.tmp,
+                                      env=dict(os.environ), wall=30)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"OK", proc.stdout)
 
 
 class CanonTest(unittest.TestCase):
