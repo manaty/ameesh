@@ -47,7 +47,7 @@ import time
 import urllib.parse
 import urllib.request
 
-from . import harness_versions, storage, work
+from . import harness_adoption, harness_versions, storage, work
 
 #: schéma du rapport de `scan` (`ameesh veille scan --json`)
 SCHEMA = "ameesh-veille/1"
@@ -908,6 +908,16 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
         if dry_run:
             open_lot = work.open_with_source(db, key)
             if open_lot is not None:
+                if harness_adoption.open_adoption_for(db, int(open_lot["id"])):
+                    # #4312 (A x C) : une adoption est en cours sur ce lot ;
+                    # réécrire son objet ferait diverger le titre de la version
+                    # adoptée et le rapport B suivant serait refusé.
+                    actions.append({"harness": source.harness,
+                                    "action": "kept-object",
+                                    "lot": int(open_lot["id"]),
+                                    "reason": "an adoption is in progress; "
+                                              "signal deferred"})
+                    continue
                 marker = _marker(open_lot.get("body") or "")
                 if _keeps_open(marker, obj):
                     actions.append({"harness": source.harness,
@@ -930,6 +940,13 @@ def apply(db, cfg, config: Settings, decisions, *, dry_run: bool = False) -> lis
             with _locked(db, key) as tx:
                 open_lot = work.open_with_source(tx, key)
                 if open_lot is not None:
+                    if harness_adoption.open_adoption_for(tx, int(open_lot["id"])):
+                        actions.append({"harness": source.harness,
+                                        "action": "kept-object",
+                                        "lot": int(open_lot["id"]),
+                                        "reason": "an adoption is in progress; "
+                                                  "signal deferred"})
+                        continue
                     marker = _marker(open_lot.get("body") or "")
                     if _keeps_open(marker, obj):
                         # Un lot ouvert garde son objet : un modèle différent

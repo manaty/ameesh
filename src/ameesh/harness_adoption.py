@@ -640,6 +640,19 @@ def open_adoptions(db, *, project: str | None = None) -> list[dict]:
     return [_row_state(row) for row in rows]
 
 
+def open_adoption_for(db, lot: int) -> dict | None:
+    """L'adoption encore ouverte de ce lot, sinon None.
+
+    #4312 (interaction A/C) : la veille (#4291) ne doit pas réécrire le lot
+    d'évaluation qui porte cette adoption, sinon son titre diverge de la
+    version adoptée et le rapport suivant est refusé (une nouvelle évaluation
+    est un nouveau lot)."""
+    row = load(db, int(lot))
+    if row is None:
+        return None
+    return row if (row.get("state") or {}).get("stage") not in TERMINAL else None
+
+
 def save(db, row: dict, state: dict) -> None:
     state["updated_ts"] = round(time.time(), 3)
     db.execute(
