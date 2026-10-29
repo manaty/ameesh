@@ -1156,10 +1156,10 @@ def keep_composition(candidates: list[Candidate],
     `specs` vient du manifeste gelé de la composition à conserver ;
     `already_discarded` porte les lots déjà écartés (erreurs de la liste
     calculée, `--exclude`, groupe parallèle). Un membre n'est repris que sur sa
-    source composée : une nouvelle tête, un lot sorti de la liste prête ou une
-    unité de résolution est écrit aux écartés pour la coupure suivante, jamais
-    composé ici. Tout lot prêt qui n'était pas dans la composition précédente
-    est nommé de même.
+    source composée : une nouvelle tête, un lot sorti de la liste prête ou les
+    lots d'une unité de résolution sont écrits aux écartés pour la coupure
+    suivante, jamais composés ici. Tout lot prêt qui n'était pas dans la
+    composition précédente est nommé de même.
     """
     by_lot = {candidate.lot: candidate for candidate in candidates}
     members: list[Candidate] = []
@@ -1172,11 +1172,13 @@ def keep_composition(candidates: list[Candidate],
         seen.update(lots)
         if len(lots) != 1:
             # paquet-auto ne compose pas de résolution (jugement humain) ; une
-            # telle unité ne se reprend pas sans la relire.
-            discarded.append(Discarded(
-                lots[0], KEEP_NOT_READY_REASON,
-                "unité de résolution (%s), non reprise par une recomposition"
-                % ", ".join("#%d" % lot for lot in lots)))
+            # telle unité ne se reprend pas sans la relire. Chaque lot de
+            # l'unité est nommé aux écartés : sinon les suivants ne seraient
+            # ni composés ni expliqués au contrôle d'inclusion (#4593).
+            detail = ("unité de résolution (%s), non reprise par une recomposition"
+                      % ", ".join("#%d" % lot for lot in lots))
+            discarded.extend(Discarded(lot, KEEP_NOT_READY_REASON, detail)
+                             for lot in lots)
             continue
         lot = lots[0]
         candidate = by_lot.get(lot)
