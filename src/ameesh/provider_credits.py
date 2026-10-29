@@ -563,26 +563,30 @@ def assess(db, *, now: float | None = None, harness: str | None = None,
             verdict = (_real_verdict(db, row, now)
                        if _source_has_balance(row["harness"])
                        else _projected_verdict(db, row, now))
+            if verdict is None:
+                # plus rien pour juger : aucun signe de manque ne subsiste
+                if row.get("state") == LOW:
+                    if mark_ok(db, row["harness"], row.get("account"), source="assess"):
+                        changed.append(dict(
+                            get(db, row["harness"], row.get("account")) or row,
+                            previous=row.get("state")))
+                continue
+            applied, balance, reference, rate = verdict
+            before = row.get("state")
+            _apply(db, row["harness"], row.get("account"), applied,
+                   balance=balance, reference=reference, rate=rate, now=now,
+                   source=("balance" if _source_has_balance(row["harness"])
+                           else "prepaid"),
+                   host=None)
+            after = get(db, row["harness"], row.get("account"))
+            if after is not None and after.get("state") != before:
+                changed.append(dict(after, previous=before))
         except db_mod.Unavailable:
             raise
         except db_mod.DbError:
+            # une ligne refusée (valeur hors colonne, verrou) n'arrête pas
+            # l'évaluation des autres comptes de la passe (B1 dev2)
             continue
-        if verdict is None:
-            # plus rien pour juger : aucun signe de manque ne subsiste
-            if row.get("state") == LOW:
-                if mark_ok(db, row["harness"], row.get("account"), source="assess"):
-                    changed.append(dict(get(db, row["harness"], row.get("account")) or row,
-                                        previous=row.get("state")))
-            continue
-        applied, balance, reference, rate = verdict
-        before = row.get("state")
-        _apply(db, row["harness"], row.get("account"), applied,
-               balance=balance, reference=reference, rate=rate, now=now,
-               source=("balance" if _source_has_balance(row["harness"]) else "prepaid"),
-               host=None)
-        after = get(db, row["harness"], row.get("account"))
-        if after is not None and after.get("state") != before:
-            changed.append(dict(after, previous=before))
     return changed
 
 

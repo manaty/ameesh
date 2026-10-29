@@ -13,10 +13,13 @@
 --   The declaration is human-only, like a budget cap (`ameesh budget
 --   prepaid set`).
 -- * `balance_usd`, `ratio`, `runway_at`: the last assessment — the projected
---   balance (or the real balance read from the provider, DeepSeek), its share
---   of the prepaid/reference amount (0..1), and the instant the account is
---   projected to run out at the measured spend rate. They are a snapshot for
---   display and alerts, never a secret nor a prompt.
+--   balance (or the real balance read from the provider, DeepSeek), its
+--   balance/reference ratio, and the instant the account is projected to run
+--   out at the measured spend rate. They are a snapshot for display and
+--   alerts, never a secret nor a prompt. The ratio is unbounded on purpose: a
+--   real balance can top the declared prepaid (ratio > 1) and a negative real
+--   balance gives a negative ratio; a `numeric(7, 6)` cap made `mark_ok`
+--   overflow on any ratio above 9.999999 (B1 dev2).
 --
 -- Additive only; a row without a declaration behaves exactly as in 0500 (the
 -- state is driven by failures, a zero balance reading, and the probe).
@@ -25,7 +28,7 @@ alter table provider_account_credits
     add column if not exists prepaid_at timestamptz,
     add column if not exists prepaid_by text,
     add column if not exists balance_usd numeric(14, 6),
-    add column if not exists ratio numeric(7, 6),
+    add column if not exists ratio numeric,
     add column if not exists runway_at timestamptz;
 
 comment on column provider_account_credits.prepaid_usd is

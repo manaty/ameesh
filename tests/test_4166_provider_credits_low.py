@@ -271,6 +271,50 @@ class RealBalanceTest(_LowBase):
         self.assertEqual(self._alerts("provider_credits_exhausted"), [])
         self.assertEqual(self._alerts("provider_credits_low"), [])
 
+    def test_a_ratio_above_the_declared_prepaid_does_not_overflow(self):
+        """B1 dev2 : un solde réel au-dessus du prépayé donne un ratio > 1.
+        La colonne ne plafonne plus à 9.999999, et la passe ne s'arrête pas
+        avant les autres comptes."""
+        self._declare(10.0, harness="deepseek", account="")
+        self._reading(150.0, provider="deepseek")
+        self._declare(100.0, harness="codex", account="primaire")
+        self._prepaid_at(3600)
+        self._spend(85.0)
+        # le poll du solde réel écrit le ratio 15 sans erreur de colonne
+        self.assertIsNot(balance.credit_state(
+            self.db, "deepseek", "",
+            [balance.BalanceReading("deepseek", "USD", 150.0, available=True)]), True)
+        deepseek = self._row("deepseek", "")
+        self.assertEqual(deepseek["state"], "ok")
+        self.assertAlmostEqual(deepseek["ratio"], 15.0, places=3)
+        # la passe complète évalue encore le compte projeté
+        self._assess()
+        self.assertEqual(self._row()["state"], "low")
+        low = self._alerts("provider_credits_low")
+        self.assertEqual([(a["harness"], a["account"]) for a in low],
+                         [("codex", "primaire")])
+
+    def test_one_failing_account_does_not_stop_the_others(self):
+        """B1 dev2 : une ligne refusée par la base (ici simulée) ne doit pas
+        empêcher l'évaluation des comptes suivants."""
+        from ameesh import db as db_mod
+        self._declare(10.0, harness="deepseek", account="")
+        self._reading(150.0, provider="deepseek")
+        self._declare(100.0, harness="openai", account="")
+        self._prepaid_at(3600, harness="openai", account="")
+        self._spend(85.0, harness="openai", account="")
+        real = provider_credits._apply
+
+        def flaky(db, harness, account, verdict, **kwargs):
+            if harness == "deepseek":
+                raise db_mod.DbError("simulated write failure")
+            return real(db, harness, account, verdict, **kwargs)
+
+        with mock.patch.object(provider_credits, "_apply", side_effect=flaky):
+            provider_credits.assess(self.db)
+        self.assertEqual(self._row("openai", "")["state"], "low")
+        self.assertEqual(self._row("deepseek", "")["state"], "ok")
+
 
 class ChooseFallbackTest(_LowBase):
 
