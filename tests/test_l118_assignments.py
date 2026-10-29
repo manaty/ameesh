@@ -559,6 +559,31 @@ class BranchMergeTest(_Base):
         self.assertIn("no work of its own", entry["detail"])
         self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
 
+    def test_reflog_expire_ne_fait_pas_d_un_vrai_commit_une_base(self):
+        """#4508 (B1 cx2) : quand l'entrée de création a expiré, la plus
+        ancienne du reflog est un commit ordinaire ; prendre ce SHA pour la
+        création refuserait à tort un vrai commit. La preuve par la tête vue
+        reste acquise."""
+        t0 = int(time.time())
+        _git(self.repo, "checkout", "-q", "-b", "agent/dev1-expire", "develop")
+        time.sleep(2.1)                    # l'entrée de création date d'avant
+        vrai = self.commit("vrai")
+        _git(self.repo, "checkout", "-q", "develop")
+        lot = self.lot("agent/dev1-expire")
+        cutoff = datetime.datetime.fromtimestamp(
+            t0 + 1, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _git(self.repo, "reflog", "expire", "--expire=" + cutoff,
+             "refs/heads/agent/dev1-expire")
+        # le relevé enregistre le vrai commit (pas de faux « no work »)
+        self.assertEqual(self.sync()["results"][0]["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["branch_head"], vrai)
+        # sa fusion --no-ff, sans citation de la branche, le ferme
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Deliver reviewed packet", "agent/dev1-expire")
+        report = self.sync()
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(report["results"][0]["how"], "ancestor")
+
     def test_tete_hors_premiere_parente_vue_contre_une_cible_perimee_n_est_pas_livree(self):
         """#3326 avec #2543 : une pointe entrée par une fusion (hors première
         parente) ne prouve rien non plus si elle était déjà dans la cible

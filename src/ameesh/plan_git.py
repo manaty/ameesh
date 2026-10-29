@@ -2831,16 +2831,26 @@ def _ref_branch(ref: str) -> str:
 
 
 def _branch_creation_commit(repo: str, branch: str) -> str | None:
-    """#4508 : le commit sur lequel la branche LOCALE a été créée (le plus
-    ancien du reflog), ou None sans branche locale/reflog lisible."""
+    """#4508 : le commit sur lequel la branche LOCALE a été créée, ou None
+    quand le reflog ne le prouve pas.
+
+    Seule une entrée de création explicite (« branch: Created from … ») est
+    retenue : après expiration du reflog, la plus ancienne entrée conservée
+    est un commit ordinaire, et la prendre pour la création ferait passer un
+    vrai commit pour une base (B1 cx2). Sans cette preuve — reflog expiré,
+    branche créée par un fetch, reflog absent — rien n'est conclu."""
     if _commit(repo, "refs/heads/" + branch) is None:
         return None
-    out = _out(repo, "reflog", "show", "--format=%H", "refs/heads/" + branch)
-    for line in reversed((out or "").splitlines()):
-        line = line.strip()
-        if _SHA_RE.match(line):
-            return line
-    return None
+    out = _out(repo, "reflog", "show", "--format=%H%x00%gs",
+               "refs/heads/" + branch)
+    lines = [line for line in (out or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    sha, _sep, subject = lines[-1].partition("\x00")
+    sha = sha.strip()
+    if not _SHA_RE.match(sha) or "created from" not in subject.casefold():
+        return None
+    return sha
 
 
 def _other_ref_at(repo: str, branch: str, sha: str,
