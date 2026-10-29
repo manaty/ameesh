@@ -103,7 +103,7 @@ RERERE_TRAIN = (
 )
 _MARKER_RE = re.compile(rb"^(<{7} |>{7} |={7}$|\|{7} )", re.M)
 #: how far along a lot is, to guess which of two lots merges first
-_STATE_RANK = {lifecycle.QA: 2, lifecycle.IN_PROGRESS: 1}
+_STATE_RANK = {lifecycle.VALIDATED: 3, lifecycle.QA: 2, lifecycle.IN_PROGRESS: 1}
 
 
 class ResolveError(RuntimeError):

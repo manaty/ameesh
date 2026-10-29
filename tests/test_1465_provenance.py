@@ -183,6 +183,38 @@ class PgProvenanceTest(PgTestCase):
                          {key: lu[key] for key in ("id", "actor", "at_ts", "sha", "verdict")})
         self.assertEqual(recu["harness"], "deepseek")
 
+    def _mark(self, lot, kind, sha):
+        """Un jalon et sa preuve exacte, dans la même transaction (0445)."""
+        return storage.of(self.db).work.add_milestone(
+            int(lot["id"]), kind, sha=sha, actor="mty-amh-impl-07",
+            verdict="ok" if kind == "verdict" else None, note="",
+            proof={"sha": sha, "actor": "mty-amh-impl-07", "session": "s-1",
+                   "turn": "t" * 32, "harness": "deepseek"})
+
+    def test_origins_are_the_lots_of_freeze_and_verdict_receipts(self):
+        """#4505 : un gate multi-lots retrouve les lots de ses commits.
+
+        Seuls les jalons de gel/verdict comptent (pas un `merged`), le reçu
+        doit avoir son fait (un sujet orphelin n'est pas une origine), et le
+        résultat est distinct et trié."""
+        other = work.add(self.db, title="un autre lot", app="ameesh",
+                         actor="orchestrateur")
+        third = work.add(self.db, title="un lot livré", app="ameesh",
+                         actor="orchestrateur")
+        first_id, other_id = int(self.lot["id"]), int(other["id"])
+        self._mark(self.lot, "verdict", SHA1)
+        self._mark(other, "frozen", SHA1_FULL)
+        self._mark(third, "merged", SHA256)
+        # une preuve sans fait (jalon absent) n'est pas une origine
+        self._receipt("milestone:999999", SHA256, work_item_id=int(third["id"]))
+        self.assertEqual(self.ops.origins([SHA1, SHA1_FULL, SHA256]),
+                         sorted([first_id, other_id]))
+        # la même origine plusieurs fois ne compte qu'une fois
+        self._mark(self.lot, "verdict", SHA1)
+        self.assertEqual(self.ops.origins([SHA1, SHA1]), [first_id])
+        self.assertEqual(self.ops.origins([]), [])
+        self.assertEqual(self.ops.origins([SHA256]), [])
+
     def test_milestone_proof_must_match_the_mark(self):
         mark = self._verdict()
         # acteur de la preuve différent de l'acteur du jalon : refus

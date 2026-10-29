@@ -1035,9 +1035,8 @@ def apply_env(env: dict, profile: Profile, environ=None) -> None:
     from . import setup_token
     if setup_token.present(profile, environ):
         token, _ = setup_token.read(profile, environ)
-        env.pop("CLAUDE_CONFIG_DIR", None)
+        # Authentication must preserve the selected session directory (#4546).
         env[setup_token.VARIABLE] = token
-        return
     variable = config_env_of(profile.harness)
     if profile.kind == "config_dir":
         if not profile.default and variable:

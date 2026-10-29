@@ -219,6 +219,16 @@ members:
   outside it: move the cards under the scope in the **same** pull request as
   the key.
 
+### Module activation
+
+The same `extensions.ameesh` mapping also enables installed modules at three
+scopes: `modules` (the whole canon), `teams.<team>` (the projects its packages
+and agents carry as `team`) and `projects.<project>`. The narrowest scope that
+names a module gives its options; a project always wins. A malformed or unknown
+activation fails `canon check`; a refused entry point that no scope activates
+is only a warning. `ameesh modules --active` lists the applied project modules
+and `ameesh doctor` checks them against the readable canon.
+
 ## Next
 
 - [Members, agents, hosts, placements](members-agents-hosts.md): the card types.

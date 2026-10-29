@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,6 +28,23 @@ from ameesh import pilot_gesture, registry, role_handover_pg as handover_pg
 from .support import PgTestCase
 from .test_3845_paquet_horaire import Base, carrier, ph
 from .test_l165_ep4_pilot_gesture import IDENTITY_KEYS
+
+
+class _PilotTime:
+    """Le module `time` tel que le voit `pilot_gesture` (#4590).
+
+    `pilot_gesture.time` est le module `time` lui-même : patcher
+    `pilot_gesture.time.sleep` remplacerait `time.sleep` pour tout le
+    processus, donc aussi `db.py` qui attend ses sous-processus avec le pilote
+    psql. Cette vue ne remplace que les noms demandés et délègue le reste au
+    module réel.
+    """
+
+    def __init__(self, **overrides):
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
 
 
 class SameHostLineageTest(PgTestCase):
@@ -74,6 +92,12 @@ class SameHostLineageTest(PgTestCase):
             "SELECT data FROM ameesh_events WHERE type = 'pilot.gesture'"
             " AND object = %s AND data->>'ref' = %s ORDER BY id",
             ("agent:" + self.name, ref))
+
+    @contextlib.contextmanager
+    def pilot_time(self, **overrides):
+        """Remplace `time` pour `pilot_gesture` seul, jamais pour le processus."""
+        with mock.patch.object(pilot_gesture, "time", _PilotTime(**overrides)):
+            yield
 
     def expire(self) -> None:
         self.db.execute("UPDATE agent_registry SET lease_expires_at = clock_timestamp()"
@@ -146,11 +170,11 @@ class SameHostLineageTest(PgTestCase):
                 registry.claim(self.db, self.name, "runner-h1-b", 600, host="h1")
                 handover_pg.clear_restart(self.db, self.name)
 
-        with self.role_env(self.epoch), mock.patch.object(pilot_gesture.time, "sleep", nap):
+        with self.role_env(self.epoch), self.pilot_time(sleep=nap):
             gate = pilot_gesture.gate(self.cfg, self.db, "packet", "record #6")
             gate.hold(self.db)
         self.assertEqual(gate.epoch, self.epoch + 2)
-        self.assertEqual(len(naps), 2)
+        self.assertEqual(naps, [pilot_gesture.RESERVATION_POLL_S] * 2)
 
     def test_reservation_echue_sans_reprise_refuse_borne(self):
         self.assertTrue(handover_pg.reserve_restart(
@@ -158,8 +182,8 @@ class SameHostLineageTest(PgTestCase):
         self.assertTrue(registry.release(self.db, self.name, "runner-h1-a", self.epoch))
         ticks = iter(range(0, 1000, 30))
         with self.role_env(self.epoch), \
-                mock.patch.object(pilot_gesture.time, "sleep", lambda s: None), \
-                mock.patch.object(pilot_gesture.time, "monotonic", lambda: next(ticks)):
+                self.pilot_time(sleep=lambda s: None,
+                                monotonic=lambda: next(ticks)):
             with self.assertRaises(pilot_gesture.GestureRefused) as caught:
                 pilot_gesture.gate(self.cfg, self.db, "packet", "record #7")
         self.assertIn("nobody", str(caught.exception))
@@ -169,8 +193,8 @@ class SameHostLineageTest(PgTestCase):
             self.db, "h2", self.name, 90, owner="runner-h1-a", epoch=self.epoch))
         self.assertTrue(registry.release(self.db, self.name, "runner-h1-a", self.epoch))
         with self.role_env(self.epoch), \
-                mock.patch.object(pilot_gesture.time, "sleep",
-                                  mock.Mock(side_effect=AssertionError("attente"))):
+                self.pilot_time(sleep=mock.Mock(
+                    side_effect=AssertionError("attente"))):
             with self.assertRaises(pilot_gesture.GestureRefused):
                 pilot_gesture.gate(self.cfg, self.db, "packet", "record #8")
 

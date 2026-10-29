@@ -20,7 +20,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import accounts, adapters, cli, mail, registry, reprise
+from ameesh import accounts, adapters, cli, mail, registry, reprise, setup_token
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -459,14 +459,40 @@ class ComptesClaudeTest(_Verifie):
         self.assertIsNone(self._reprise())
         self.assertEqual(registry.get(self.db, "md-sec-x")["session_id"], "claude-sess-1")
 
-    def test_bascule_de_compte_session_de_l_autre_compte_gardee(self):
-        # session ouverte sous le primaire, tour sous le secondaire : elle
-        # existe sous un compte déclaré — jamais effacée (doute)
+    def test_bascule_de_compte_session_de_l_autre_compte_brief(self):
+        # A session stored only under A cannot be resumed under B (#4546).
         _session_claude(self.a, CLAUDE)
         _runner, worker = self._worker("md-bascule", comptes=self.comptes)
         self._avec_session(worker, CLAUDE)
         self.assertTrue(self._tour(worker, "secondaire"))
+        self.assertIsNone(self._reprise())
+        self.assertIn("session %s unknown to the harness" % CLAUDE,
+                      " ".join(self.turns()[-1]["argv"]))
+        self.assertFalse(worker.fast_failure)
+        self.assertEqual(registry.get(self.db, worker.name)["session_id"], "claude-sess-1")
+
+    def test_bascule_vers_compte_sans_stockage_repart_avec_brief(self):
+        os.rmdir(os.path.join(self.b, "projects"))
+        self.test_bascule_de_compte_session_de_l_autre_compte_brief()
+
+    def test_shared_session_store_can_resume(self):
+        os.rmdir(os.path.join(self.b, "projects"))
+        os.symlink(os.path.join(self.a, "projects"), os.path.join(self.b, "projects"))
+        _session_claude(self.a, CLAUDE)
+        _runner, worker = self._worker("md-shared", comptes=self.comptes)
+        self._avec_session(worker, CLAUDE)
+        self.assertTrue(self._tour(worker, "secondaire"))
         self.assertEqual(self._reprise(), CLAUDE)
+
+    def test_setup_token_preserves_secondary_session_directory(self):
+        _session_claude(self.b, CLAUDE)
+        profile = accounts.by_name(accounts.parse(self.comptes)["claude"], "secondaire")
+        setup_token.install(profile, "sk-ant-oat01-" + "x" * 48)
+        _runner, worker = self._worker("md-token", comptes=self.comptes)
+        self._avec_session(worker, CLAUDE)
+        self.assertTrue(self._tour(worker, "secondaire"))
+        self.assertEqual(self._reprise(), CLAUDE)
+        self.assertEqual(self.turns()[-1]["compte"]["CLAUDE_CONFIG_DIR"], self.b)
 
 
 class CodexTest(_Verifie):

@@ -2213,9 +2213,11 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     from . import persona_memory
     from . import canon as canon_mod
     memory_note = ""
+    canons = []
     try:
+        canons = canon_mod.load_configured(cfg)
         policies = [(canon.id, persona_memory.isolation_policy(cfg, canon.registry_canon))
-                    for canon in canon_mod.load_configured(cfg)]
+                    for canon in canons]
     except Exception:  # an unreadable policy never breaks the diagnostic
         policies = []
         memory_note = " [approved canon unreadable; exception not verified]"
@@ -2307,6 +2309,18 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     unread = storage.of(db).mailbox.unread_total()
     print("agents     : %d" % agents)
     print("unread     : %d" % unread)
+    # L98 T2a (#4407): active project modules against the readable canon — an
+    # active module that is not installed (or is refused) is an error; a
+    # descriptor drift or a refused, inactive entry point is a warning.
+    from . import modules as modules_mod
+    modules_ok = True
+    try:
+        modules_ok, module_lines = modules_mod.doctor_lines(db, canons)
+    except Exception as exc:  # a reading never breaks the doctor
+        module_lines = ["modules    : not checked (%s)"
+                        % (" ".join(str(exc).split())[:120],)]
+    for line in module_lines:
+        print(line)
     print(host_measures_line(cfg))
     from . import host_idle, resources, canon as canon_mod
     try:
@@ -2377,6 +2391,9 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     except db_mod.DbError:
         pass
     verdict = 1 if nexlink_ko else 0
+    # L98 T2a: an active module that is not installed (or is refused) is a KO.
+    if not modules_ok:
+        verdict = 1
     # #3745 : un réglage de session que le pool local refuserait (ligne
     # déjà imprimée) casse chaque nouvelle session d'ameesh de l'hôte.
     if not pool_ok:
