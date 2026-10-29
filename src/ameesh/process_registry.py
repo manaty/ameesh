@@ -163,6 +163,7 @@ CORE_STATES = (
     lifecycle.REQUESTED,
     lifecycle.IN_PROGRESS,
     lifecycle.QA,
+    lifecycle.VALIDATED,
     lifecycle.DELIVERY_RECORDED,
     lifecycle.PROMOTED,
     lifecycle.CLOSED,

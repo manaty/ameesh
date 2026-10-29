@@ -463,7 +463,7 @@ def _terminal_at(milestones: list[dict]) -> float | None:
 
 
 #: états d'une vraie reprise de revue : le lot retravaille sa tête
-_OPEN_STATES = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, lifecycle.QA)
+_OPEN_STATES = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, lifecycle.QA, lifecycle.VALIDATED)
 #: états d'une retenue de fermeture : le contenu est déjà dans la cible
 _CLOSURE_STATES = ("blocked", "waiting_human")
 #: états terminaux (le jalon, pas seulement la colonne)
@@ -1871,7 +1871,7 @@ _ITEMS_SQL = f"""
                            AND t.kind IN ('merged', 'closed', 'delivered'))
                   AND (lower(left(e2.note, 21)) LIKE 'hold:%%'
                        OR lower(left(e2.note, 20)) LIKE 'wake:%%'
-                       OR e2.state IN ('{lifecycle.REQUESTED}', '{lifecycle.IN_PROGRESS}', '{lifecycle.QA}'))))
+                       OR e2.state IN ('{lifecycle.REQUESTED}', '{lifecycle.IN_PROGRESS}', '{lifecycle.QA}', '{lifecycle.VALIDATED}'))))
      ORDER BY w.id
      LIMIT %s
 """

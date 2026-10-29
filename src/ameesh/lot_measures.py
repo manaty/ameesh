@@ -74,7 +74,7 @@ PHASES = ("agent", "ci", "review", "human")
 PRIORITY = ("human", "review", "ci", "agent")
 #: states counted as human time, and as review time
 HUMAN_STATES = ("waiting_human",)
-REVIEW_STATES = (lifecycle.QA,)
+REVIEW_STATES = (lifecycle.QA, lifecycle.VALIDATED)
 #: the state that ends a review window (the agent works again)
 WORK_STATES = (lifecycle.IN_PROGRESS,)
 #: size classes on changed lines (insertions + deletions)

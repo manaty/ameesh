@@ -83,6 +83,7 @@ STATE_ORDER = (
     lifecycle.BLOCKED,
     lifecycle.WAITING_HUMAN,
     lifecycle.QA,
+    lifecycle.VALIDATED,
     lifecycle.IN_PROGRESS,
     lifecycle.REQUESTED,
 )
