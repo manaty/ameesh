@@ -296,6 +296,27 @@ class GrepCacheTest(unittest.TestCase):
                 for index in range(5)]
         self.assertEqual(sum(kept), 2)
 
+    def test_each_write_enforces_the_byte_budget_and_keeps_recent_reads(self):
+        names = [grep_cache.key("bounded%d" % i, "m", []) for i in range(3)]
+        with mock.patch.object(grep_cache, "MAX_BYTES", 1000):
+            for name in names[:2]:
+                grep_cache._write(name, ["x" * 300])
+            # La première entrée relue devient la plus récente.
+            os.utime(grep_cache._path(names[0]), (2000000000, 2000000000))
+            grep_cache._write(names[2], ["x" * 600])
+            paths = [grep_cache._path(name) for name in names]
+            self.assertLessEqual(sum(os.path.getsize(p) for p in paths
+                                     if os.path.exists(p)), 1000)
+            self.assertTrue(grep_cache._read(names[0])[0])
+            self.assertFalse(grep_cache._read(names[1])[0])
+            self.assertTrue(grep_cache._read(names[2])[0])
+            # Une seule entrée surdimensionnée ne peut contourner la borne.
+            huge = grep_cache.key("huge", "m", [])
+            grep_cache._write(huge, ["x" * 2000])
+            self.assertFalse(grep_cache._read(huge)[0])
+            self.assertLessEqual(sum(os.path.getsize(p) for p in paths
+                                     if os.path.exists(p)), 1000)
+
 
 class SweepDeadlineTest(unittest.TestCase):
     def setUp(self):
