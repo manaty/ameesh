@@ -356,7 +356,7 @@ class CloseTest(_PlanDb):
         work.move(self.db, a["id"], "build")
         done = work.close_merged(self.db, a["id"], sha=SHA, actor="github:alice",
                                  source="sync-github", pr_ref="acme/web#3")
-        self.assertEqual((done["result"], done["item"]["state"]), ("merged", "merged"))
+        self.assertEqual((done["result"], done["item"]["state"]), ("merged", "delivered"))
         self.assertEqual(done["item"]["pr_ref"], "acme/web#3")
         merged = [m for m in work.milestones(self.db, a["id"]) if m["kind"] == "merged"]
         self.assertEqual(len(merged), 1)
@@ -388,7 +388,7 @@ class GateMergeCloseTest(ActionsBase):
         result = self.execute(action, gh)
         self.assertEqual(result["state"], "confirmed")
         row = work.get(self.db, item["id"])
-        self.assertEqual((row["state"], row["pr_ref"]), ("merged", PR))
+        self.assertEqual((row["state"], row["pr_ref"]), ("delivered", PR))
         merged = [m for m in work.milestones(self.db, item["id"]) if m["kind"] == "merged"][0]
         self.assertEqual(merged["sha"], self.pr()["mergeCommit"]["oid"])
         self.assertEqual(merged["actor"], ALICE)
@@ -404,7 +404,7 @@ class GateMergeCloseTest(ActionsBase):
         from ameesh import actions
         result = actions.reconcile(self.db, action["action_id"], self.gh(view="land"), by=ALICE)
         self.assertEqual(result["state"], "confirmed")
-        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
         # un lot abandonné dont la PR finit fusionnée reste fermé
         other = work.add(self.db, title="abandonné")
         work.close(self.db, other["id"], abandoned=True)
@@ -553,7 +553,7 @@ class GithubTest(_PlanDb):
         report = plan_github.sync_github(self.db, self.gh, REPO)
         self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},
                          {n: "merged"})
-        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["state"], "delivered")
         ms = [m for m in work.milestones(self.db, n) if m["kind"] == "merged"][0]
         self.assertEqual(ms["sha"], SHA)
 
@@ -568,7 +568,7 @@ class GithubTest(_PlanDb):
         report = plan_github.sync_github(self.db, self.gh, REPO)
         self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},
                          {n: "merged"})
-        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["state"], "delivered")
 
     def test_759_branche_declaree_autre_etape_retient_le_lot(self):
         a = work.add(self.db, title="deux PR")
@@ -584,7 +584,7 @@ class GithubTest(_PlanDb):
         report = plan_github.sync_github(self.db, self.gh, REPO)
         self.assertEqual({r["pr"]: r["result"] for r in report["results"]},
                          {"%s#51" % REPO: "stage-merged", "%s#52" % REPO: "merged"})
-        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["state"], "delivered")
 
     def test_759_pr_partielle_ne_ferme_pas_meme_declaree_finale(self):
         # `ameesh-work-partial:` l'emporte : la PR ne livre qu'une partie du
@@ -646,7 +646,7 @@ class GithubTest(_PlanDb):
         self.merged_pr(91, "lot/%d-etape" % n, body="Étape.\n\nameesh-work: %d" % n,
                        merged_at="2030-01-01T00:00:00Z")
         plan_github.sync_github(self.db, self.gh, REPO)
-        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["state"], "delivered")
         self.assertEqual(work.get(self.db, n)["pr_ref"], "%s#91" % REPO)
         work.move(self.db, n, "build", actor="orch",
                   correct="PR d'étape fusionnée trop tôt (#759)")
@@ -661,7 +661,7 @@ class GithubTest(_PlanDb):
         self.merged_pr(92, "lot/%d-etape" % n, body="Fin.\n\nameesh-work: %d" % n,
                        merged_at="2040-01-01T00:00:00Z")
         plan_github.sync_github(self.db, self.gh, REPO)
-        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["state"], "delivered")
         self.assertEqual(work.get(self.db, n)["pr_ref"], "%s#92" % REPO)
 
     def test_1693_stage_reason_annule_toute_fusion_anterieure_a_la_correction(self):
@@ -727,14 +727,14 @@ class GithubTest(_PlanDb):
         self.merged_pr(91, "lot/%d-etape" % n, body="Étape.\n\nameesh-work: %d" % n,
                        merged_at="2030-01-01T00:00:00Z")
         plan_github.sync_github(self.db, self.gh, REPO)
-        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["state"], "delivered")
         work.move(self.db, n, "build", actor="orch", correct="trop tôt (1)")
         self.db.execute("UPDATE work_item_events SET created_at = to_timestamp(2000000000)"
                         " WHERE work_item_id = %s AND state = 'build'", (n,))
         self.merged_pr(92, "lot/%d-etape" % n, body="Fin.\n\nameesh-work: %d" % n,
                        merged_at="2035-01-01T00:00:00Z")
         plan_github.sync_github(self.db, self.gh, REPO)
-        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["state"], "delivered")
         self.assertEqual(work.get(self.db, n)["pr_ref"], "%s#92" % REPO)
         work.move(self.db, n, "build", actor="orch", correct="trop tôt (2)")
         self.db.execute("UPDATE work_item_events SET created_at = to_timestamp(2100000000)"
@@ -747,7 +747,7 @@ class GithubTest(_PlanDb):
         self.merged_pr(93, "lot/%d-etape" % n, body="Vraie fin.\n\nameesh-work: %d" % n,
                        merged_at="2040-01-01T00:00:00Z")
         plan_github.sync_github(self.db, self.gh, REPO)
-        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["state"], "delivered")
         self.assertEqual(work.get(self.db, n)["pr_ref"], "%s#93" % REPO)
 
     def test_1693_le_constat_stage_merged_ne_se_repete_pas_apres_une_note(self):
@@ -780,8 +780,8 @@ class GithubTest(_PlanDb):
         # la fusion de la PR de fiche ferme tous ses lots
         self.merged_pr(95, "lot/cat-export")
         plan_github.sync_github(self.db, self.gh, REPO)
-        self.assertEqual(work.get(self.db, a["id"])["state"], "merged")
-        self.assertEqual(work.get(self.db, b["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, a["id"])["state"], "delivered")
+        self.assertEqual(work.get(self.db, b["id"])["state"], "delivered")
 
     def test_2317_une_pr_de_fiche_avec_ligne_explicite_ne_retient_que_ses_lots(self):
         # #2317 (N7) : la rétention d'une PR ouverte est la SYMÉTRIE de sa
@@ -802,7 +802,7 @@ class GithubTest(_PlanDb):
         self.assertIn("PR ouverte %s#97" % REPO, by_item[a["id"]]["detail"])
         self.assertEqual(by_item[b["id"]]["result"], "merged")
         self.assertEqual(work.get(self.db, a["id"])["state"], "intake")
-        self.assertEqual(work.get(self.db, b["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, b["id"])["state"], "delivered")
 
     def issue(self, prefix: str) -> dict:
         found = self.gh.issue(REPO, prefix)
@@ -1113,7 +1113,7 @@ class PlanCliTest(_PlanDb):
         out = self.mesh("work", "sync-github", "--repo", REPO, env=env)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("1 work item(s) closed", out.stdout)
-        self.assertEqual(work.get(self.db, 1)["state"], "merged")
+        self.assertEqual(work.get(self.db, 1)["state"], "delivered")
         out = self.mesh("work", "project-github", "--repo", REPO, "--json", env=env)
         self.assertEqual(out.returncode, 0, out.stderr)
         report = json.loads(out.stdout)
@@ -1190,7 +1190,7 @@ class ContentMergeTest(_PlanDb):
         self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
         result = self.run_sync()[item["id"]]
         self.assertEqual((result["result"], result["how"]), ("merged", "ancestor"))
-        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
         ms = [m for m in work.milestones(self.db, item["id"]) if m["kind"] == "merged"][0]
         self.assertEqual((ms["sha"], ms["actor"]), (sha, "git:main"))
         # idempotent
@@ -1212,7 +1212,7 @@ class ContentMergeTest(_PlanDb):
         self.assertEqual(self.run_sync()[blocker["id"]]["result"], "merged")
         [row] = mail.unread(self.db, "dev-a")
         self.assertEqual((row["kind"], row["recipient"]), ("event", "dev-a"))
-        self.assertIn("lot #%d is merged" % blocker["id"], row["body"])
+        self.assertIn("lot #%d is delivered" % blocker["id"], row["body"])
         self.assertEqual(mail.message_payload(row)["dependency"]["dependent"],
                          waiting["id"])
 
@@ -1270,7 +1270,7 @@ class ContentMergeTest(_PlanDb):
         git(self.repo, "merge", "-q", "--ff-only", "lot/c")
         result = self.run_sync()[item["id"]]
         self.assertEqual((result["result"], result["how"]), ("merged", "patch-id"))
-        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
         # un lot absorbé par un autre se clôt explicitement, jamais rouvert
         other = self.frozen("absorbé", first)
         work.close(self.db, other["id"], superseded_by=item["id"])
@@ -1298,7 +1298,7 @@ class ContentMergeTest(_PlanDb):
         result = self.run_sync()[item["id"]]
         self.assertEqual((result["result"], result["how"], result["freeze_origin"]),
                          ("merged", "ancestor", "verdict"))
-        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
         self.assertEqual(self.run_sync(), {})
 
     def test_2399_un_avis_sur_une_autre_tete_ne_ferme_pas(self):
@@ -1409,7 +1409,7 @@ class ContentMergeTest(_PlanDb):
         # levée explicite par un pilote : le contenu ferme
         work.note(self.db, item["id"], "unhold: passe faite", actor="human:alice")
         self.assertEqual(self.run_sync()[item["id"]]["result"], "merged")
-        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
 
     def test_2744_un_lot_bloque_pendant_le_releve_n_est_pas_ferme(self):
         """B1 cx2 : qa → blocked pendant les sondes Git. La ligne du début de
@@ -1521,7 +1521,7 @@ class ContentMergeTest(_PlanDb):
         item = self._delivered("sans-hold")
         result = self.run_sync()[item["id"]]
         self.assertEqual((result["result"], result["how"]), ("merged", "ancestor"))
-        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
 
     # -- revue codex1 (750c221), sondes reprises telles quelles -----------------
     def test_seul_le_dernier_gel_compte(self):
@@ -1705,8 +1705,8 @@ class ContentMergeTest(_PlanDb):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("1 work item(s) closed by content", out.stdout)
         self.assertIn("1 work item(s) closed by their merged PR", out.stdout)
-        self.assertEqual(work.get(self.db, by_content["id"])["state"], "merged")
-        self.assertEqual(work.get(self.db, by_pr["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, by_content["id"])["state"], "delivered")
+        self.assertEqual(work.get(self.db, by_pr["id"])["state"], "delivered")
         out = self.mesh("work", "sync-merges", "--git-dir", self.repo, "--target", "absente")
         self.assertEqual(out.returncode, 1)
         self.assertIn("not found", out.stderr)

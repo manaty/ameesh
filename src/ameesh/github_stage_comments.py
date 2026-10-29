@@ -144,9 +144,9 @@ def stages(item, milestones, events, *, receipts=(), closing=None):
         yield key, text
     # Process-backed stages can change without legacy milestones. A validated
     # current core supplies a receipt only when no native milestone exists.
-    if item.get("state") == lifecycle.DELIVERY_RECORDED and "merged" not in kinds:
+    if lifecycle.phase(item) == "merged" and "merged" not in kinds:
         yield "merged", "Merged; delivery confirmation will follow."
-    if item.get("state") == lifecycle.PROMOTED:
+    if lifecycle.phase(item) == "promoted":
         yield "completed", "Completed; release delivery confirmation will follow when available."
     if closing:
         yield "closed", closing

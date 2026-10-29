@@ -75,7 +75,7 @@ class CmdStopReleasesLotsTest(_Base):
         self.assertEqual(runner_mod.cmd_stop(self.cfg, self.db, ["dev1"]), 0)
         self.assertIsNone(work.get(self.db, open_lot["id"])["assignee"])
         item = work.get(self.db, promoted["id"])
-        self.assertEqual((item["state"], item["assignee"]), ("promoted", "auditeur"))
+        self.assertEqual((item["state"], item["assignee"]), ("delivered", "auditeur"))
         journal = self.db.query(
             "SELECT note, actor FROM work_item_events WHERE work_item_id = %s"
             " ORDER BY id DESC LIMIT 1", (open_lot["id"],))[0]
@@ -112,7 +112,7 @@ class SweepHandsPromotedTest(_Base):
         # lot remis à l'auditeur.
         self.assertEqual(done[0].get("assigned_to"), "auditeur")
         item = work.get(self.db, promoted["id"])
-        self.assertEqual((item["state"], item["assignee"]), ("promoted", "auditeur"))
+        self.assertEqual((item["state"], item["assignee"]), ("delivered", "auditeur"))
         note = self.db.query(
             "SELECT note FROM work_item_events WHERE work_item_id = %s"
             " ORDER BY id DESC LIMIT 1", (promoted["id"],))[0]["note"]

@@ -86,7 +86,7 @@ profile, optional local TLS behind a TLS-passthrough gateway, database role):
 | 1. agent-mail on Postgres (`agent_registry`, `agent_mailbox`, migrations, LISTEN/NOTIFY, CLI compatible v0) | **done** — [`docs/V1-MAILBOX-RUNNER.md`](docs/V1-MAILBOX-RUNNER.md) |
 | 2. one runner per machine, 3 harness adapters with session resume, leases, wake on NOTIFY | **done** — same document |
 | 3. owner authority by Ed25519 signature, content- and expiry-bound; two key roles (`owner` = authority, `agent` = provenance only); approvals with single use | **done** on the bench — [`docs/V1-AUTORITE-MESH.md`](docs/V1-AUTORITE-MESH.md); **superseded** for human authority by ameesh-approve receipts (decision 0012), Ed25519 keys remain for agent provenance and tests |
-| 4. `work_items` state machine (intake → build → qa → merged → promoted, + blocked/waiting_human), loop bound, event ledger | **done**; the board stays in git |
+| 4. `work_items` state machine (intake → build → qa → delivered, + blocked/waiting_human; development stages merged → promoted), loop bound, event ledger | **done**; the board stays in git |
 | 5. `mesh list` observability | **done** — `agent-mesh list` / `show`, on `agent_mesh_overview` |
 
 Nothing is wired to the real agents yet: v1 runs on a **test bench** (fake

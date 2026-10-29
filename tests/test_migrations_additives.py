@@ -17,7 +17,11 @@ class NonAdditiveTest(unittest.TestCase):
         # contraintes remplacées, colonnes nullables ou avec défaut
         self.assertEqual(
             {m.label: migrations.non_additive(m) for m in migrations.discover()
-             if migrations.non_additive(m)}, {})
+             if migrations.non_additive(m) and m.version != 518}, {})
+
+    def test_t5_switch_requires_explicit_non_additive_authorization(self):
+        switch = next(m for m in migrations.discover() if m.version == 518)
+        self.assertIn("marked non-additive", migrations.non_additive(switch))
 
     def test_ajouts_additifs(self):
         for sql in (

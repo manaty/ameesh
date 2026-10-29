@@ -107,7 +107,7 @@ class WorkDependencies(Contract):
     @staticmethod
     def _journal(tx, item_id, blocker_id, action, actor):
         tx.execute("INSERT INTO work_item_events(work_item_id, state, note, actor, created_at)"
-                   " SELECT id, state, %s, %s, clock_timestamp() FROM work_items WHERE id = %s",
+                   " SELECT id, CASE WHEN state = 'delivered' THEN coalesce(to_jsonb(work_items)->>'legacy_state', state) ELSE state END, %s, %s, clock_timestamp() FROM work_items WHERE id = %s",
                    ("Dependency %s: lot #%d" % (action, blocker_id), actor, item_id))
         tx.execute("UPDATE work_items SET updated_at = clock_timestamp() WHERE id = %s", (item_id,))
 
@@ -289,7 +289,7 @@ class WorkDependencies(Contract):
     @staticmethod
     def _landing_journal(tx, item_id, note, actor):
         tx.execute("INSERT INTO work_item_events(work_item_id, state, note, actor, created_at)"
-                   " SELECT id, state, %s, %s, clock_timestamp() FROM work_items WHERE id = %s",
+                   " SELECT id, CASE WHEN state = 'delivered' THEN coalesce(to_jsonb(work_items)->>'legacy_state', state) ELSE state END, %s, %s, clock_timestamp() FROM work_items WHERE id = %s",
                    (note, actor, item_id))
         tx.execute("UPDATE work_items SET updated_at = clock_timestamp() WHERE id = %s", (item_id,))
 
