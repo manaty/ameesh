@@ -336,7 +336,12 @@ jobs:
       # et la preuve de fusion.
       mode: ${{ steps.gel.outputs.mode }}
       sha: ${{ steps.gel.outputs.sha }}
+      # #4543 : `base` est la base demandée (description de l'étiquette) ;
+      # `plan_base` est la base de la composition réellement extraite, celle
+      # que le plan diff et lit. Les deux restent tracées, la carte se lit sur
+      # la seconde.
       base: ${{ steps.gel.outputs.base }}
+      plan_base: ${{ steps.gel.outputs.plan_base }}
     steps:
       # #1635 : un lancement à la main publie le check requis `tests` sur le
       # commit lancé (check lié au commit, pas à l'évènement) ; sur la tête
@@ -483,11 +488,15 @@ jobs:
               exit 1
             fi
           fi
-          echo "freeze request: mode=$mode sha=$sha base=$base head=$head label=$label"
+          # #4543 : les deux bases sont tracées — celle de l'étiquette (la
+          # demande) et celle de la composition réellement extraite (le plan,
+          # la carte). Une seule ligne pour la même course.
+          echo "freeze request: mode=$mode sha=$sha base=$base plan_base=$plan_base head=$head label=$label"
           {
             echo "mode=$mode"
             echo "sha=$sha"
             echo "base=$base"
+            echo "plan_base=$plan_base"
           } >> "$GITHUB_OUTPUT"
           {
             echo "AMEESH_CI_MODE=$mode"
@@ -522,10 +531,13 @@ jobs:
         id: client_types
         run: node ui/scripts/gen-api.mjs --check
       # the most recent map of main (a PR reads the caches of its base branch)
+      # #4543 : la clé suit la base du plan (`plan_base`), pas la base
+      # demandée : la carte doit être celle du commit que le plan diff, sinon
+      # la trace du run porte une base et la sélection en lit une autre.
       - uses: actions/cache/restore@v4
         with:
           path: carte/carte.json.gz
-          key: carte-${{ steps.gel.outputs.base || github.event.before || github.sha }}
+          key: carte-${{ steps.gel.outputs.plan_base || github.event.before || github.sha }}
           restore-keys: carte-
       - id: plan
         name: plan of the run
