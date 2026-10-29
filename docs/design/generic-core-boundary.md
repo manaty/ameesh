@@ -138,3 +138,11 @@ constraints, policy and milestone triggers, and the fingerprint index. Tests
 exercise this script and the forward migration on both delivery stages.
 `work promote <id>` delegates to the dev module; the old
 `work move <id> promoted` command remains accepted.
+
+Schedule the dedicated delivery package and schema application in the same
+staging window: a pending non-additive migration stops automatic packet
+composition. Stop all executors before applying 0518, then start only the
+new code. During that window, disable automatic code fallback or couple it
+to the SQL rollback above; reverting code alone is unsafe. An offline host
+must receive the new code before any of its executors starts against the
+switched database.

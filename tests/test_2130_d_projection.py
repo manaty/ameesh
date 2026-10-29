@@ -336,6 +336,8 @@ class _Base(PgTestCase):
         """Le cœur `merged` du flux : l'issue est créée OUVERTE, jamais fermée."""
         lot = self.add()
         self.pin(lot, "staging")
+        row = work.get(self.db, lot["id"])
+        self.assertEqual((row["state"], row["legacy_state"]), ("delivered", "merged"))
         report = self.project()
         self.assertEqual(report["counts"]["created"], 1)
         issue = self.issue("Export CSV")
@@ -354,6 +356,8 @@ class _Base(PgTestCase):
         self.pin(lot, "implementation")
         self.project()
         self.pin(lot, "done")
+        row = work.get(self.db, lot["id"])
+        self.assertEqual((row["state"], row["legacy_state"]), ("delivered", "promoted"))
         report = self.project()
         issue = self.issue("Export CSV")
         self.assertEqual((issue["state"], issue["state_reason"]), ("closed", "completed"))

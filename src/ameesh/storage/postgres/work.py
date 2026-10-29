@@ -1576,7 +1576,7 @@ class WorkItems(interface.WorkItems):
             if marques:
                 tx.query(
                     "INSERT INTO work_item_events (work_item_id, state, note, actor)"
-                    " SELECT id, state, %%s, %%s FROM work_items WHERE id IN (%s)"
+                    " SELECT id, CASE WHEN state = 'delivered' THEN coalesce(to_jsonb(work_items)->>'legacy_state', state) ELSE state END, %%s, %%s FROM work_items WHERE id IN (%s)"
                     " RETURNING id" % ", ".join(["%s"] * len(marques)),
                     tuple([note, agent] + marques))
             return marques
@@ -3223,10 +3223,10 @@ class WorkItems(interface.WorkItems):
         if not names:
             return {}
         rows = self.db.query(
-            f"SELECT assignee, bool_or(legacy_state <> 'promoted') AS open,"
-            f"       bool_or(legacy_state = 'promoted') AS promoted"
+            f"SELECT assignee, bool_or(coalesce(to_jsonb(work_items)->>'legacy_state', state) <> 'promoted') AS open,"
+            f"       bool_or(coalesce(to_jsonb(work_items)->>'legacy_state', state) = 'promoted') AS promoted"
             "  FROM work_items"
-            f" WHERE assignee IN (%s) AND legacy_state NOT IN ('merged', 'closed')"
+            f" WHERE assignee IN (%s) AND coalesce(to_jsonb(work_items)->>'legacy_state', state) NOT IN ('merged', 'closed')"
             " GROUP BY assignee" % ", ".join(["%s"] * len(names)), tuple(names))
         return {row["assignee"]: {"open": bool(row["open"]),
                                   "promoted": bool(row["promoted"])} for row in rows}
@@ -3310,7 +3310,7 @@ class WorkItems(interface.WorkItems):
             limit = "" if dry_run else " FOR NO KEY UPDATE OF w"
             rows = self.db.query(
                 "SELECT %s FROM work_items w"
-                f" WHERE w.assignee = %%s AND w.legacy_state = 'promoted'"
+                f" WHERE w.assignee = %%s AND coalesce(to_jsonb(w)->>'legacy_state', w.state) = 'promoted'"
                 " ORDER BY w.id%s" % (item_columns(self.db, "w"), limit), (agent,))
             for row in rows:
                 if dry_run:
@@ -3319,7 +3319,7 @@ class WorkItems(interface.WorkItems):
                 updated = self.db.query(
                     "UPDATE work_items SET assignee = %%s, updated_at = now(),"
                     "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
-                    f" WHERE id = %%s AND assignee = %%s AND legacy_state = 'promoted'"
+                    f" WHERE id = %%s AND assignee = %%s AND coalesce(to_jsonb(work_items)->>'legacy_state', state) = 'promoted'"
                     " RETURNING %s" % item_columns(self.db),
                     (measure_actor, int(row["id"]), agent))
                 if not updated:

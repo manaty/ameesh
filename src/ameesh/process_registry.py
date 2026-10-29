@@ -1361,7 +1361,7 @@ def _transfer(db: Db, *, work_item_id: int, command_id: str,
 def registry_state(db: Db, work_item_id: int) -> RegistryState:
     """State of a lot's registry: revision, stage, journal version, receipts."""
     rows = db.query(
-        "SELECT id, state, workflow_ref, workflow_stage, workflow_version"
+        "SELECT id, state, to_jsonb(work_items)->>'legacy_state' AS legacy_state, workflow_ref, workflow_stage, workflow_version"
         "  FROM work_items WHERE id = %s", (int(work_item_id),))
     if not rows:
         raise RegistryRefusal("lot-unknown", "lot %s not found" % work_item_id)
@@ -1371,7 +1371,7 @@ def registry_state(db: Db, work_item_id: int) -> RegistryState:
         "SELECT count(*)::int AS n FROM work_item_events"
         " WHERE work_item_id = %s AND command_id IS NOT NULL", (int(work_item_id),))
     return RegistryState(
-        work_item_id=int(work_item_id), state=str(row["state"]),
+        work_item_id=int(work_item_id), state=lifecycle.phase(row),
         workflow_ref=row["workflow_ref"], workflow_stage=row["workflow_stage"],
         workflow_version=int(row["workflow_version"] or 0),
         version=int(version), receipts=int(receipts[0]["n"]))

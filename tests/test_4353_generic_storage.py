@@ -34,6 +34,20 @@ class DeliveryDecisionTest(unittest.TestCase):
 
 
 class GenericDeliveryTest(PgTestCase):
+    def test_phase_readers_and_footprint_journal_preserve_delivery_stage(self):
+        from ameesh import process_registry
+        for stage in ('merged', 'promoted'):
+            with self.subTest(stage=stage):
+                lot = self.lot(stage)
+                self.db.execute("UPDATE work_items SET state = %s WHERE id = %s", (stage, lot))
+                self.assertEqual(process_registry.registry_state(self.db, lot).state, stage)
+                storage.of(self.db).work_footprints.replace(
+                    lot, 'manual', ['src/example.py'], actor='test')
+                event = self.db.query(
+                    'SELECT state FROM work_item_events WHERE work_item_id = %s ORDER BY id DESC LIMIT 1',
+                    (lot,))[0]
+                self.assertEqual(event['state'], stage)
+
     def lot(self, title='generic delivery'):
         return work.add(self.db, title=title, app='demo')['id']
 

@@ -259,7 +259,7 @@ class AllocatorTest(PgTestCase):
         errors = train_migrations.Allocator(self.db).landed(plan, path=self.repo)
         self.assertEqual(errors, [])
         item = work.get(self.db, self.lot["id"])
-        self.assertEqual(item["state"], "merged")
+        self.assertEqual(item["state"], "delivered")
         self.assertEqual((item["migration"], item["migration_landed"]), (None, 517))
         self.assertEqual(_git(self.repo, "rev-parse", "develop"), head)
 
@@ -304,7 +304,7 @@ class AllocatorTest(PgTestCase):
         errors = allocator.landed(plan, path=self.repo)
         self.assertEqual(errors, [])
         item = work.get(self.db, self.lot["id"])
-        self.assertEqual(item["state"], "merged")
+        self.assertEqual(item["state"], "delivered")
         self.assertEqual((item["migration"], item["migration_landed"]), (None, 517))
         self.assertEqual(item["migrations"], [])
         notes = [event["note"] for event in work.events(self.db, self.lot["id"])]
