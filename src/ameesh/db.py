@@ -46,6 +46,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Sequence, Union
 from urllib.parse import unquote, urlsplit
 
+from . import admission_lock
 from . import dsn as dsn_mod
 from .config import Config, mask_dsn
 
@@ -999,7 +1000,10 @@ class PsycopgDriver:
         #: transactions explicites ouvertes : jamais de reconnexion au milieu
         self._tx_depth = 0
         #: #1469 : un seul fil à la fois dans un bloc `transaction()`
-        self._tx_lock = threading.RLock()
+        #: #4602 : priorité aux fils réveillés par du travail et au listener
+        #: (``admission_lock``) ; désactivable, repli sur le RLock d'avant.
+        self._tx_lock = (admission_lock.PriorityRLock()
+                         if admission_lock.enabled() else threading.RLock())
         self._schema_ok: bool | None = None
         #: vérification de schéma différée, jointe à la prochaine requête
         self._schema_pending = False

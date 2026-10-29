@@ -96,6 +96,14 @@ posée d'abord, si bien qu'un tic du détenteur courant reprend une recompositio
 perdue à la relève du bail comme les siennes. Elle ne compte pas dans le
 retrait automatique unique du point 4.
 
+Comme le retrait automatique, elle est **bornée par `--keep-composition`**
+(`this.base`, la tête gelée du paquet rouge) : elle reprend les membres de la
+composition précédente moins les exclus, chacun à sa source composée ; un lot
+prêt entre-temps, un membre regelé ou sorti de la liste prête va à la coupure
+suivante, nommé aux écartés. La **preuve parallèle** (#4319, `parallel-proof`),
+qui rejoue la ci-full ordinaire sur le même porteur, passe par le même chemin
+et la même borne.
+
 #3256 C : quand la médiane d'attente `qa_merge` de la veille dépasse
 `paquet.attente_mediane_s` (bloc du canon compilé, lu avec `ameesh debit
 --json --no-jobs`), le tic ouvre **deux** porteurs dans la même heure. Les
@@ -320,7 +328,8 @@ class Context:
     #: fuseau des coupures, lu au canon compilé (`mechanics.timezone`, #2449)
     zone: ZoneInfo = ZoneInfo("UTC")
     #: #4271 : `packet_tests` du canon compilé (borne d'une série d'unité,
-    #: séries simultanées) ; None : bloc absent, les défauts de paquet-auto
+    #: séries simultanées, #4463 borne totale) ; None : bloc absent, les
+    #: défauts de paquet-auto
     unit_tests: object = None
     now: float = field(default_factory=time.time)
     host: str = field(default_factory=socket.gethostname)
@@ -674,6 +683,12 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
     if ctx.unit_tests is not None:
         cmd += ["--tests-timeout", str(ctx.unit_tests.unit_timeout_seconds),
                 "--tests-parallel", str(ctx.unit_tests.parallel)]
+        total = getattr(ctx.unit_tests, "total_timeout_seconds", None)
+        if total:
+            cmd += ["--tests-budget", str(total)]
+        else:
+            ctx.say("packet_tests.total_timeout_seconds absent du canon "
+                    "compilé : tests par unité sans borne totale (#4463)")
     else:
         ctx.say("packet_tests absent du canon compilé : tests ciblés en série, "
                 "borne par défaut de paquet-auto (#4271)")
