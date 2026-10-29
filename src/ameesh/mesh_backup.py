@@ -17,8 +17,10 @@ Deux précautions, apprises du relevé du 29/10 (#4300) :
   tables lisibles aient un `last_seq_scan` **au moins égal** à T (elles ont pu
   être lues par le dump, puis relues plus tard). Compter les tables relues
   après le dump contre la sauvegarde produisait une fausse alerte chaque
-  matin vers 04:30 (#4609 B) ; un plancher de groupe écarte la petite
-  transaction ordinaire qui, seule, donnerait 100 % (faux vert) ;
+  matin vers 04:30 (#4609 B ; #4618 : 150 tables du dump + 20 relues avant
+  04:30 dans la fenêtre = 88 % sous l'ancien dénominateur) ; un plancher de
+  groupe écarte la petite transaction ordinaire qui, seule, donnerait 100 %
+  (faux vert) ;
 * la fenêtre évaluée est la **dernière fenêtre close** : avant 04:30Z, c'est
   celle de la veille, pour qu'une sauvegarde manquante ne disparaisse pas à
   minuit et ne se relève pas chaque matin. Un groupe plus récent, jusqu'à
