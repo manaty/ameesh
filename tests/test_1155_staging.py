@@ -593,6 +593,39 @@ class StagingTest(unittest.TestCase):
         self.assertTrue(any(t['hote'] == 'ameesh-agents-1' and t['etape'] == 'retour'
                             and t['verdict'] == 'ko' for t in self.traces()))
 
+    def test_sans_retour_stops_without_rollback_and_gives_the_manual_procedure(self):
+        """#4616 : apres une migration non additive, un echec d'hote n'appelle
+        jamais `retour` ; la sequence s'arrete et le pilote recoit la marche
+        manuelle, rollback SQL d'abord, retour de code ensuite."""
+        rollback = 'src/ameesh/migrations/rollback/0518_generic_delivery_state.sql'
+        (self.state / 'scenario').write_text('ko=ameesh-agents-2:controler\n')
+        p = self.run_staging('--sans-retour=' + rollback)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        actions = self.actions()
+        self.assertFalse([a for a in actions if a[1] == 'retour'], actions)
+        self.assertEqual(actions[-1], ('ameesh-agents-2', 'controler'))
+        self.assertNotIn(('ameesh-agents-3', 'installer'), actions)
+        self.assertIn('sequence arretee sur ameesh-agents-2 (retour automatique desactive)',
+                      p.stderr)
+        trace = next(t for t in self.traces() if t['etape'] == 'retour')
+        self.assertEqual((trace['hote'], trace['verdict']), ('ameesh-agents-2', 'desactive'))
+        notifications = [l for l in self.calls() if l.startswith('venv-python - ')]
+        self.assertEqual(len(notifications), 1)
+        self.assertIn('retour automatique desactive', notifications[0])
+        journal = (self.state / 'calls.log').read_text()
+        self.assertLess(journal.index('2. rollback SQL d\'abord'),
+                        journal.index('3. seulement ensuite, retour de code'))
+        self.assertIn(rollback, journal)
+        self.assertIn('vm.sh agents retour', journal)
+
+    def test_sans_retour_is_named_in_the_attestation_request(self):
+        """#4616 : une sequence saine menee avec --sans-retour le dit a actif.py."""
+        p = self.run_vm('--sans-retour')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertIn(' --sans-retour', self.actif_args())
+        p = self.run_staging('--a-blanc', '--sans-retour')
+        self.assertIn('retour automatique desactive', p.stdout)
+
     def test_postponed_health_failure_rolls_back_the_workstation(self):
         (self.state / 'scenario').write_text('ko=sante:pc-smichea\n')
         p = self.run_staging()
