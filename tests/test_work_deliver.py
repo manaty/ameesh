@@ -27,8 +27,14 @@ class ConnectorRegistryTest(unittest.TestCase):
         self.assertEqual(found, {"git-merge": ("dev", dev.deliver_git_merge)})
         self.assertEqual(registry.merge_connector(), "git-merge")
 
-    def test_dev_n_est_pas_un_module_de_cycle_de_vie(self):
-        self.assertNotIn("dev", registry.discover().names())
+    def test_dev_est_un_module_outillage_sans_type_de_lot(self):
+        """L101 T4: `dev` entre dans le registre, mais sans cycle de vie."""
+        found = registry.discover()
+        self.assertIn("dev", found.names())
+        module = found.get("dev")
+        self.assertEqual(module.storage, ())
+        self.assertNotIn("lifecycle", module.capabilities)
+        self.assertIn("workspaces", module.capabilities)
 
     def test_un_nom_pris_deux_fois_est_refuse(self):
         fake = mock.Mock(DELIVERY_CONNECTORS={"done": lambda *a, **k: None})
