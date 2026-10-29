@@ -16,6 +16,7 @@ la nouvelle tête) prouve que l'auteur l'a réécrit. Aucune note n'est lue.
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import (fetch_cache, merge_queue, registry, review_authors,
@@ -296,4 +297,46 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
         self.assertEqual(out, {})
         self.assertTrue(fetch_cache.refused(
             self.repo.root, dummy, state_dir=self.cfg.state_dir))
+
+    def test_a_transport_error_is_not_an_object_refusal(self):
+        # B/P2 cx2 : un 128 de DNS/connexion/auth n'est pas « objet non
+        # servi » ; le cache négatif ne doit pas le figer six heures.
+        sha = "a" * 40
+        transport = SimpleNamespace(
+            returncode=128, stdout=b"",
+            stderr=b"fatal: unable to access: Could not resolve host: forge")
+        refused = SimpleNamespace(
+            returncode=128, stdout=b"",
+            stderr=b"fatal: remote error: upload-pack: not our ref " + sha.encode())
+        with mock.patch.object(review_authors.plan_git, "local_commit",
+                               return_value=None), \
+                mock.patch.object(review_authors.plan_git, "forge_remote",
+                                 return_value="origin"):
+            with mock.patch.object(review_authors.plan_git, "_git",
+                                   return_value=transport):
+                self.assertIsNone(
+                    review_authors._forge_fetch(self.repo.root, sha))
+            with mock.patch.object(review_authors.plan_git, "_git",
+                                   return_value=refused):
+                self.assertFalse(
+                    review_authors._forge_fetch(self.repo.root, sha))
+
+    def test_a_transport_error_can_retry(self):
+        # Panne réseau puis objet récupérable : le premier appel est un doute,
+        # le second réessaie et trouve l'objet.
+        sha = "b" * 40
+        transport = SimpleNamespace(
+            returncode=128, stdout=b"",
+            stderr=b"fatal: unable to access: Could not resolve host: forge")
+        success = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        with mock.patch.object(review_authors.plan_git, "forge_remote",
+                               return_value="origin"), \
+                mock.patch.object(review_authors.plan_git, "local_commit",
+                                  side_effect=[None, None, sha]), \
+                mock.patch.object(review_authors.plan_git, "_git",
+                                  side_effect=[transport, success]):
+            self.assertIsNone(
+                review_authors._forge_fetch(self.repo.root, sha))
+            self.assertTrue(
+                review_authors._forge_fetch(self.repo.root, sha))
 

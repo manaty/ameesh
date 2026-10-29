@@ -3451,11 +3451,13 @@ def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None):
     fetch ne peut pas dépasser son échéance ni `FETCH_TIMEOUT`. Un temps nul
     ne lance aucun fetch.
 
-    Rend `True` (objet lisible), `False` (refus **net** de git fetch, code
-    non nul : le seul cas mémorisable par `fetch_cache`) ou `None` (non
-    lancé, coupé par l'échéance ou par une exception : un doute qui se
-    relit). #4457 B/P2 auditeur : une coupure notée « refusée » pour 6 h
-    effacerait le correcteur de toutes les lectures suivantes.
+    Rend `True` (objet lisible), `False` (refus **explicite de l'objet** :
+    seul cas mémorisable par `fetch_cache`) ou `None` (non lancé, coupé par
+    l'échéance, panne DNS/connexion/authentification/serveur : un doute qui
+    se relit). #4457 B/P2 auditeur : une coupure notée « refusée » pour 6 h
+    effacerait le correcteur de toutes les lectures suivantes ; B/P2 cx2 : un
+    code 128 de transport n'est pas un refus de l'objet, et le cache ne doit
+    pas court-circuiter `recover` après rétablissement de la forge.
     """
     text = plan_git.full_commit_id(sha)
     if not text:
@@ -3479,11 +3481,36 @@ def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None):
     except Exception:  # noqa: BLE001 - forge injoignable ou coupée : doute
         return None
     if proc.returncode != 0:
-        return False
+        return False if _fetch_refused(proc.stderr) else None
     try:
         return bool(plan_git.local_commit(repo, text))
     except Exception:  # noqa: BLE001 - lecture impossible : doute
         return None
+
+
+#: stderr d'un `git fetch` qui refuse **explicitement** l'objet demandé (#4457)
+_FETCH_REFUSAL_MARKERS = (
+    "not our ref",
+    "couldn't find remote ref",
+    "remote ref does not exist",
+    "no such ref",
+    "unadvertised object",
+    "not allowed to request",
+)
+
+
+def _fetch_refused(stderr) -> bool:
+    """Le `git fetch` a-t-il explicitement refusé **cet objet** ? (#4457)
+
+    Un code non nul ne suffit pas : DNS, connexion, authentification et 5xx
+    rendent aussi 128. Seuls les messages qui nomment l'objet absent/non servi
+    autorisent le cache négatif ; une panne reste un doute qui se relit (B/P2
+    cx2 sur la tête 8298ee2e9).
+    """
+    text = (stderr.decode("utf-8", "replace")
+            if isinstance(stderr, (bytes, bytearray)) else str(stderr or ""))
+    low = text.lower()
+    return any(marker in low for marker in _FETCH_REFUSAL_MARKERS)
 
 
 def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list[str]:
