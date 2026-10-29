@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'deploy/mise-a-jour/vm.sh'
 
 SSH = r'''#!/usr/bin/env python3
-import os, signal, subprocess, sys
+import os, signal, subprocess, sys, time
 from pathlib import Path
 if os.environ.get('FAKE_STALL_SSH') \
         and os.environ.get('FAKE_STALL_MATCH', '') in sys.argv[-1]:
@@ -47,6 +47,17 @@ if os.environ.get('FAKE_STALL_SSH') \
 state = Path(os.environ['FAKE_STATE'])
 argv = sys.argv[1:]
 command = argv[-1]
+# #4529 : le transport n'est pas instantané. Sur un hôte chargé, la lecture
+# `list --json` a dépassé la marge locale du banc (1 s) avant que le
+# `timeout` distant n'ait rendu son code : le client tuait le registre, et
+# l'étape échouait au lieu de laisser la persona en l'état. Le scénario
+# `show-lent` rejoue ce délai de façon déterministe ; la marge locale du
+# témoin doit le couvrir (c'est le seul délai ajouté, la lecture `show`
+# reste coupée par sa propre borne).
+if (state / 'scenario').exists() \
+        and (state / 'scenario').read_text().strip() == 'show-lent' \
+        and ' list --json' in command:
+    time.sleep(2.5)
 # The real client swallows its stdin even when the remote command does not
 # read it: a caller that shares its stdin with a `while read` loop loses the
 # rest of the list (#1455). Play that, and forward the bytes like ssh does.
