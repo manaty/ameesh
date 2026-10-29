@@ -63,26 +63,43 @@ class WindowsTest(unittest.TestCase):
         ])
         self.assertEqual([(w["start"], w["end"]) for w in got], [(1000, 2000), (2000, 9000)])
 
-    def test_shift_slot(self):
-        pauses = [{"start": 1000, "end": 3000}, {"start": 3500, "end": 4200}]
-        hourly = lambda at: (int(at) // 600 + 1) * 600  # noqa: E731
-        self.assertEqual(packet_pause.shift_slot(1200, pauses, hourly)[0], 4800)
-        self.assertEqual(packet_pause.shift_slot(600, pauses, hourly), (600, None))
-        self.assertEqual(packet_pause.shift_slot(1200, pauses, lambda at: None)[0], 3000)
+    def test_suspended_start(self):
+        hourly = lambda at: (int(at) // 3600 + 1) * 3600  # noqa: E731
+        # relecture cx3 : pause commencée après le créneau, lot déjà en attente
+        self.assertEqual(packet_pause.suspended_start(
+            3600, [{"start": 4000, "end": 12000}], hourly, 10000)[0], 10000)
+        # levée : 400 s acquis avant la pause, puis depuis le créneau 14400
+        start, crossed = packet_pause.suspended_start(
+            3600, [{"start": 4000, "end": 12000}], hourly, 15000)
+        self.assertEqual(15000 - start, 400 + 600)
+        self.assertEqual(crossed["end"], 12000)
+        # créneau dans la pause, sans cadence : l'horloge repart de la fin
+        start, _ = packet_pause.suspended_start(
+            1200, [{"start": 1000, "end": 3000}], lambda at: None, 3500)
+        self.assertEqual(start, 3000)
+        # pause close avant le départ, ou à venir : rien ne change
+        self.assertEqual(packet_pause.suspended_start(
+            5000, [{"start": 1000, "end": 3000}, {"start": 9000, "end": 9500}],
+            hourly, 8000), (5000.0, None))
 
 
 class SloPauseTest(_Base):
     """Le journal est en ajout seul : la pause est datée de maintenant (T0) et
     le GO posé juste après, l'horloge de la passe avançant ensuite."""
 
-    def go_after(self, *pauses, project="ameesh", target="main"):
+    def go_after(self, *pauses, other=False, target="main", go_s=60):
+        # le journal survit d'un test à l'autre : un projet propre à chacun
+        app = "p4444-%s" % self._testMethodName[-12:]
+        project = app + "-autre" if other else app
+        self.db.execute("UPDATE work_items SET app = %s WHERE id = %s",
+                        (app, self.lot["id"]))
         st = storage.of(self.db)
         t0 = time.time()
         for until, reason in pauses:
             st.events.record(packet_pause.EVENT, packet_pause.key(project, target), project,
                              {"state": "paused", "until": int(t0 + until),
                               "reason": reason, "by": "bureau", "target": target})
-        self.qa_at(t0 + 60)
+        self.qa_at(t0 + go_s)
         return t0
 
     def steps(self, at):
@@ -101,6 +118,13 @@ class SloPauseTest(_Base):
         self.assertEqual(alert["packet_pause"]["reason"], "staging agents-1")
         self.assertIn("after the pause of main", alert["detail"])
 
+    def test_pause_commencee_pendant_l_attente(self):
+        # relecture cx3 : GO 10 min avant le début de la pause ; acquis 600 s
+        t0 = self.go_after((3 * 3600, "staging agents-1"), go_s=-600)
+        self.assertEqual(self.steps(t0 + 2 * 3600), [])
+        self.assertEqual(self.steps(t0 + 3 * 3600 + 900), [])
+        self.assertEqual(self.steps(t0 + 3 * 3600 + 1500), ["verdict_merge"])
+
     def test_sans_pause_le_retard_reste(self):
         t0 = self.go_after()
         self.assertEqual(self.steps(t0 + 7300), ["verdict_merge"])
@@ -110,7 +134,7 @@ class SloPauseTest(_Base):
         self.assertEqual(self.steps(t0 + 7300), ["verdict_merge"])
 
     def test_pause_d_un_autre_projet(self):
-        t0 = self.go_after((9000, "autre"), project="nexlink", target="develop")
+        t0 = self.go_after((9000, "autre"), other=True, target="develop")
         self.assertEqual(self.steps(t0 + 7300), ["verdict_merge"])
 
 

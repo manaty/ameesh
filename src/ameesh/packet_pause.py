@@ -118,8 +118,8 @@ def windows(db, *, project: str) -> list[dict]:
     Each window is ``{"start", "end", "until", "reason", "by", "target"}``:
     it opens at the `paused` event and ends at its deadline, or earlier at the
     next event of the same object (`resumed`, or a renewed pause that opens
-    its own window). The SLO reads them to see that a packet slot falling in
-    a pause composed nothing: the merge waits for the first slot after it.
+    its own window). The SLO reads them to stop the GO → merge clock while
+    no composition runs (`suspended_start`).
     An event without a date opens no window.
     """
     prefix = key(project, "")
@@ -154,20 +154,32 @@ def windows(db, *, project: str) -> list[dict]:
     return out
 
 
-def shift_slot(slot: float, pauses, next_slot) -> tuple[float, dict | None]:
-    """#4444: the first packet slot at or after `slot` outside every pause.
+def suspended_start(start: float, pauses, next_slot, now: float
+                    ) -> tuple[float, dict | None]:
+    """#4444: the equivalent start of a merge wait running from `start`.
 
-    A slot inside a pause composes nothing (the tick skips it); the next
-    composition is `next_slot(end)`, the first slot strictly after the pause.
-    Returns the slot and the last pause it crossed (None when none did).
+    A packet pause stops the clock, whenever it began (before the slot, or
+    while the lot was already waiting for one): no composition runs during
+    it, and the first one after it is `next_slot(end)` (`end` itself when
+    `next_slot` gives nothing). Time accrued before the pause stays accrued.
+    While a pause runs at `now`, the wait is planned: the equivalent start is
+    `now` (nothing elapsed). Returns that start, such that `now - start` is
+    the time counted, and the last pause crossed (None when none was).
     """
+    now = float(now)
+    cursor = float(start)
+    accrued = 0.0
     crossed = None
-    slot = float(slot)
-    for _ in range(len(pauses) + 1):
-        hit = next((w for w in pauses if w["start"] <= slot < w["end"]), None)
-        if hit is None:
-            break
-        crossed = hit
-        after = next_slot(hit["end"])
-        slot = float(after) if after is not None and float(after) > slot else float(hit["end"])
-    return slot, crossed
+    for window in sorted(pauses, key=lambda w: w["start"]):
+        if window["end"] <= cursor or window["start"] >= now or cursor >= now:
+            continue
+        crossed = window
+        if window["end"] > now:
+            return now, window
+        accrued += max(0.0, window["start"] - cursor)
+        after = next_slot(window["end"])
+        cursor = max(cursor, float(after) if after is not None else float(window["end"]))
+    if crossed is None:
+        return float(start), None
+    accrued += max(0.0, now - cursor)
+    return now - accrued, crossed
