@@ -2865,7 +2865,12 @@ class WorkItems(Domain):
         hôtes confondus."""
 
     @abc.abstractmethod
-    def unassigned_lots(self, limit: int) -> list[dict]:
+    def project_plan_rows(self, project: str, *, assignment_id: int | None = None) -> list[dict]:
+        """#4174: open project readiness; assignment_id limits to target and unassigned bugs."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def unassigned_lots(self, limit: int | None) -> list[dict]:
         """L165 : les lots du projet encore à confier (`intake`, ou `build`
         RENDU à la file par la limite d'en-cours §4 : `RETURNED_NOTE` postérieur
         à la dernière attribution, il garde son état et sa branche —, sans
@@ -2880,6 +2885,7 @@ class WorkItems(Domain):
         `intake`). #3447 : un lot réservé à un exécutant externe
         (`external_executor`) n'est pas offert — le filtre précède le LIMIT,
         comme les dépendances.
+        `limit=None` reads the full queue for project phase selection (#4174).
         #1193: a lot whose explicit prerequisite is not finished is excluded —
         the ready intake never offers a lot that cannot be started.
         #2252 : « finished » veut dire fusionné (`merged`/`promoted`/`closed`) :

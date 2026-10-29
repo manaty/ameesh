@@ -3700,6 +3700,50 @@ class WorkItems(interface.WorkItems):
             "   AND starts_with(note, %s)", (float(seconds), note_prefix))
         return int(rows[0]["n"]) if rows else 0
 
+    def project_plan_rows(self, project, *, assignment_id=None) -> list[dict]:
+        """#4174: complete open project snapshot, including every waiting lot."""
+        return self.db.query(
+            "WITH pending_decisions AS MATERIALIZED ("
+            " SELECT DISTINCT btrim(work_item_id) AS lot FROM agent_mailbox"
+            " WHERE delivered_at IS NULL AND kind = 'request'"
+            " AND payload->'decision' IS NOT NULL) "
+            "SELECT w.*, extract(epoch FROM w.created_at)::float8 AS created_ts,"
+            "       extract(epoch FROM w.wake_at)::float8 AS wake_ts,"
+            "       to_char(w.planned_start, 'YYYY-MM-DD') AS planned_start,"
+            "       to_char(w.planned_end, 'YYYY-MM-DD') AS planned_end,"
+            "       to_char(w.planned_delivery, 'YYYY-MM-DD') AS planned_delivery,"
+            "       CASE WHEN w.state = 'build' THEN " + requeued_sql("w") +
+            " ELSE false END AS returned_to_queue,"
+            "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
+            "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
+            "       ARRAY(SELECT d.blocker_id FROM work_item_dependencies d"
+            "             JOIN work_items b ON b.id = d.blocker_id"
+            "             WHERE d.work_item_id = w.id AND NOT " + _not_blocking("b") +
+            "             ORDER BY d.blocker_id) AS blocking_dependencies,"
+            "       ARRAY(SELECT b.id FROM work_item_links l"
+            "             JOIN work_items b ON b.id = CASE WHEN l.work_item_id = w.id"
+            "                  THEN l.other_id ELSE l.work_item_id END"
+            "             WHERE (l.work_item_id = w.id OR l.other_id = w.id)"
+            "               AND l.kind = 'conflicts_with' AND b.state NOT IN " + _CLOSED +
+            "             ORDER BY b.id) AS open_conflicts,"
+            "       (pd.lot IS NOT NULL) AS pending_decision,"
+            # Match the intake footprint guard used by dispatch (#4173).
+            "       (w.state = 'intake' AND " + footprint_overlap_sql("w") + ")"
+            "         AS footprint_overlap,"
+            "       EXISTS (SELECT 1 FROM commitments c WHERE c.work_item_id = w.id"
+            "               AND c.kind = 'decision' AND c.status IN ('proposed', 'open'))"
+            "         AS decision_milestone"
+            " FROM work_items w LEFT JOIN work_packages k ON k.id = w.package_id"
+            " LEFT JOIN work_packages kp ON kp.id = w.package_parent"
+            " LEFT JOIN pending_decisions pd ON pd.lot = w.id::text"
+            " WHERE coalesce(nullif(btrim(w.app), ''), nullif(btrim(w.team), ''),"
+            "                nullif(btrim(k.team), ''), nullif(btrim(kp.team), ''), '') = %s"
+            " AND w.state NOT IN " + _CLOSED + " AND w.type <> 'improvement'"
+            + (" AND (w.id = %s OR (w.type = 'bug' AND w.assignee IS NULL"
+               " AND w.state IN ('intake', 'build')))" if assignment_id is not None else "") +
+            " ORDER BY w.id", REQUEUED_PARAMS + (str(project),) +
+            ((int(assignment_id),) if assignment_id is not None else ()))
+
     def unassigned_lots(self, limit) -> list[dict]:
         # #2252 : seuls les lots dont TOUTES les dépendances sont fusionnées
         # (`merged`/`promoted`/`closed`) sont prenables. La règle est celle de
@@ -3746,7 +3790,8 @@ class WorkItems(interface.WorkItems):
                "          w.created_ts, w.id"
                " LIMIT %s")
         # les deux fragments attendent les mêmes paramètres, dans l'ordre du texte
-        return self.db.query(sql, REQUEUED_PARAMS + REQUEUED_PARAMS + (int(limit),))
+        return self.db.query(sql, REQUEUED_PARAMS + REQUEUED_PARAMS +
+                             (None if limit is None else int(limit),))
 
     def review_proposals(self, limit, *, proposal_prefix, window_s=21600.0) -> list[dict]:
         """#1677 (c) : les lots en `qa` qui attendent un geste de relecture —
