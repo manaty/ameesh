@@ -21,7 +21,10 @@ case "${1:-}" in
     password=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
     # in the job's slice (OFFLOAD_SLICE): the job's memory cap covers the
     # database too, and the end of the job kills it
-    podman run -d --rm --name "$NAME" --label ameesh-offload-job="$OFFLOAD_JOB" \
+    # Image VOLUMEs otherwise allocate a persistent anonymous PGDATA. tmpfs
+    # dies with the container, including when systemd kills the whole slice;
+    # its pages count against the job's memory cap.
+    podman run -d --rm --image-volume=tmpfs --name "$NAME" --label ameesh-offload-job="$OFFLOAD_JOB" \
       ${OFFLOAD_SLICE:+--cgroup-parent "$OFFLOAD_SLICE"} \
       -e POSTGRES_USER="$USER" -e POSTGRES_PASSWORD="$password" -e POSTGRES_DB="$DB" \
       -p 127.0.0.1::5432 "$IMAGE" \
@@ -44,7 +47,7 @@ case "${1:-}" in
     echo "DATABASE_URL=postgresql://$USER:$password@127.0.0.1:$port/$DB"
     ;;
   down)
-    podman rm -f -t 2 "$NAME" >/dev/null 2>&1 || true
+    podman rm -f -v -t 2 "$NAME" >/dev/null 2>&1 || true
     ;;
   *)
     echo "usage: job-postgres up|down" >&2

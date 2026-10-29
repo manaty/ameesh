@@ -2298,6 +2298,8 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     # passé) est un échec du doctor.
     from . import hostcheck
     jit_ko = False
+    for line in hostcheck.inode_lines(resources.disk_paths(cfg)):
+        print(line)
     try:
         for line in hostcheck.jit_lines(db):
             print(line)

@@ -110,6 +110,16 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   * `ameesh`: the same, plus the psycopg venv cached by the hash of
     `pyproject.toml`, for `scripts/test.sh` (which then skips `pg-up.sh`).
 
+  Postgres image volumes use tmpfs: PGDATA disappears when the container
+  stops, including after a killed job, and counts against the job's memory
+  cap. Both the profile's `down` hook and the launcher's `close` remove the
+  container with its volumes. At job open/close, the dedicated job user also
+  reads Podman's volume inventory and removes anonymous unused volumes
+  created more than an hour ago, using `volume rm` without force;
+  volumes referenced by any container and named volumes are preserved.
+  Cleanup failures are reported and do not prevent releasing runtime caps.
+  `ameesh doctor` warns from 80% inode use on the host's watched filesystems.
+
   A profile is JSON: `lockfiles` and `setup` (a cache built once per hash
   of those files, in `$OFFLOAD_CACHE`), `env` (`${OFFLOAD_CACHE}`,
   `${OFFLOAD_WORK}`, `${OFFLOAD_JOB}`, `${HOME}`, `${PATH}` expanded),
