@@ -400,11 +400,17 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
 
 def snapshot(db, *, project: str | None = None, now: float | None = None,
              paid_harnesses=None, max_lots: int = MAX_LOTS, viewer: str | None = None) -> dict:
-    """Lit la base (UNE requête) et rend la vue `ameesh-projects/1`."""
+    """Lit la base (UNE requête) et rend la vue `ameesh-projects/1`. Le
+    courrier d'un humain déclaré n'est pas « non distribuable » (#4519) : il
+    se lit par `ameesh decide` et par le fil."""
     board = storage.of(db).projects.board(max_lots=max_lots)
     for key in ("agents", "lots", "dead_letters", "decisions", "watches"):
         if isinstance(board.get(key), str):      # pilote qui rend le json brut
             board[key] = json.loads(board[key])
+    if board.get("dead_letters"):
+        from . import undeliverable
+        board["dead_letters"] = undeliverable.without_human_boxes(
+            getattr(db, "cfg", None), db, board["dead_letters"])
     if paid_harnesses is None:
         paid_harnesses = _paid_harnesses()
     return build(board, now=now, project=project, paid_harnesses=paid_harnesses,

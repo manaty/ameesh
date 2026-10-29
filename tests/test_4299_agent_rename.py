@@ -191,6 +191,18 @@ class AgentRenameTest(PgTestCase):
         self.assertEqual((receipt['actor'], receipt['milestone']['actor']),
                          ('worker', 'worker'))
 
+    def test_commit_receipts_follow_the_identity(self):
+        # #4457 reads a reviewer's retracted fixes by the (rewritten) verdict
+        # actor; the commit receipt keeps the spelling of its day.
+        from ameesh import storage
+        provenance = storage.of(self.db).provenance
+        provenance.add('commit:' + 'c' * 40, 'c' * 40, 'worker', 's-1', 't' * 32, 'claude')
+        provenance.add('commit:' + 'd' * 40, 'd' * 40, 'reviewer', 's-2', 'u' * 32, 'codex')
+        self.rename('worker', 'new-worker')
+        for spelling in ('new-worker', 'worker'):
+            self.assertEqual([r['sha'] for r in provenance.commits(spelling)], ['c' * 40])
+        self.assertEqual([r['sha'] for r in provenance.commits('reviewer')], ['d' * 40])
+
     def test_strict_verdict_families_survive_the_rename(self):
         # B1 of dev3 on bf63c9d5: the train's strict reader compared the
         # receipt's spelling with the rewritten milestone actor.

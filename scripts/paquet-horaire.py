@@ -49,8 +49,12 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    gelée : un rouge **déterministe** (chaque échec de test propre au paquet
    attribué par #3801 à une seule unité probable, rejoué rouge en local sur la
    tête) retire ces unités ; le paquet est recomposé sans elles
-   (`paquet-auto.py --force --exclude`), **une fois**, et l'auteur de chaque
-   unité retirée reçoit un courrier. Chaque lot retiré repasse en `build`
+   (`paquet-auto.py --force --exclude --keep-composition`), **une fois**, et
+   l'auteur de chaque unité retirée reçoit un courrier. La recomposition
+   reprend les membres de la composition précédente moins les exclus, à leur
+   source composée : un lot prêt entre-temps, un membre regelé (nouvelle tête)
+   ou sorti de la liste prête va à la coupure suivante, nommé aux écartés du
+   manifeste (#4581). Chaque lot retiré repasse en `build`
    avec sa trace (`paquet-horaire: exclu …` : paquet, porteur, run, tests ;
    #4028), sans consommer de boucle d'auteur (#4043) : il attend le correctif
    de son assigné jusqu'à un nouveau gel, et l'alerte SLO vise l'auteur, pas
@@ -58,7 +62,8 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    hors délai, échec de job sans test, échec non attribuable ou ambigu, test
    vert en local, erreur de fixture DB en QueryCanceled/timeout) ne retire
    rien : il est consigné au journal du porteur et le pilote est prévenu, une
-   fois.
+   fois. #4221 : un QueryCanceled/lock timeout du **corps** d'un test qui se
+   reproduit au rejeu seul, hors charge, est un rouge réel et retire l'unité.
 5. **Reprise.** Chaque lancement de `paquet-auto.py` laisse d'abord une
    marque « tentative » (étape, tête de départ, hôte:pid, époque du bail) ;
    son achèvement se lit à la tête gelée qui a bougé, son échec à une marque
@@ -151,6 +156,12 @@ OPEN_STATES = ("intake", "build", "qa", "validated", "blocked", "waiting_human")
 #: des raisons de clôture livrée de `work.CLOSE_REASONS`).
 MERGED_STATES = ("merged", "promoted")
 MERGED_CLOSE_REASONS = ("delivered", "done")
+#: #4506 : la note de fusion automatique du porteur porte la tête publiée
+MERGED_NOTE_RE = re.compile(
+    r"^auto-merge merged repo=\S+ pr=\d+ sha=(?P<sha>[0-9a-f]{40})\b")
+#: #4506 : `paquet-auto` gèle lui-même la tête poussée dès la composition (#4304)
+EARLY_PUSH_RE = re.compile(
+    r"^paquet \S+ poussé par scripts/paquet-auto\.py dès la composition\b")
 MARK = "paquet-horaire: "
 MARK_CI = MARK + "ci demandée "
 MARK_RED = MARK + "rouge consigné "
@@ -464,6 +475,56 @@ def merged_seen(row: dict) -> bool:
         state == "closed" and str(row.get("close_reason") or "") in MERGED_CLOSE_REASONS)
 
 
+def merged_note(item: dict, sha: str) -> bool:
+    """#4506 : une note `auto-merge merged` porte sur la tête gelée `sha`."""
+    if not sha:
+        return False
+    for ev in item.get("events") or []:
+        match = MERGED_NOTE_RE.match(str(ev.get("note") or ""))
+        if match and match.group("sha") == sha:
+            return True
+    return False
+
+
+def merged_head(ctx: Context, item: dict, sha: str) -> bool:
+    """#4506 : le porteur est-il déjà fusionné dans la cible ?
+
+    `merged_seen` ne lit que l'état du lot ; un porteur fusionné par `ameesh`
+    reste ouvert (qa) jusqu'à sa clôture (hold du pilote, balayage de contenu).
+    La tête gelée ancêtre de `origin/<cible>` ou la note `auto-merge merged`
+    du journal disent la fusion avant l'état.
+    """
+    if merged_seen(item):
+        return True
+    if not sha:
+        return False
+    if merged_note(item, sha):
+        return True
+    result = ctx.git("merge-base", "--is-ancestor", sha, "origin/" + ctx.target)
+    return result.returncode == 0
+
+
+def freeze_foreign(item: dict, since: float) -> bool:
+    """#4506 : le gel postérieur à `since` vient-il d'une autre main ?
+
+    `paquet-auto` gèle lui-même la tête qu'il vient de pousser dès la
+    composition (#4304) ; cette note est la sienne. Un gel postérieur avec une
+    autre note (geste manuel, dépannage après échec) est la main d'un autre.
+    Sans jalon lisible (les bancs peuvent l'omettre, `work show` le porte), on
+    ne conclut pas.
+    """
+    declared = (item.get("freeze") or {}).get("declared") or {}
+    if float(declared.get("at_ts") or 0) <= since:
+        return False
+    ident = int(declared.get("id") or 0)
+    if not ident:
+        return False
+    for milestone in item.get("milestones") or []:
+        if int(milestone.get("id") or 0) == ident:
+            return not EARLY_PUSH_RE.match(str(milestone.get("note") or ""))
+    return False
+
+
 def slot_served(rows: list[dict], now: float, zone: ZoneInfo, project: str,
                 target: str) -> bool:
     """Un porteur horaire créé dans l'heure locale courante consomme-t-il le créneau ?
@@ -595,8 +656,13 @@ def manifest_at(ctx: Context, item: dict, sha: str) -> str:
 def paquet_auto(ctx: Context, name: str, carrier: int, *,
                 exclude: list[int] = (), exclude_reasons: list[str] = (),
                 only: list[int] = (), force: bool = False,
-                publish: str = "") -> Result:
-    """`publish` : « réf@sha » de la tête testée (#4237), publiée sans retester."""
+                publish: str = "", keep_composition: str = "") -> Result:
+    """`publish` : « réf@sha » de la tête testée (#4237), publiée sans retester.
+
+    `keep_composition` (#4581) : la tête gelée dont la recomposition reprend
+    les membres, moins les `--exclude` ; les lots prêts depuis vont à la
+    coupure suivante.
+    """
     cmd = [ctx.python, str(SCRIPT_DIR / "paquet-auto.py"), "--repo", str(ctx.repo),
            "--target", ctx.target, "--name", name, "--carrier", str(carrier),
            "--pilot", ctx.pilot, "--from", ctx.actor]
@@ -617,6 +683,8 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
         cmd += ["--exclude", str(lot)]
     for reason in exclude_reasons:
         cmd += ["--exclude-reason", reason]
+    if keep_composition:
+        cmd += ["--keep-composition", keep_composition]
     if ctx.dry_run:
         ctx.say("[essai] %s" % " ".join(cmd))
         return Result(0, "aucun lot prêt : rien à composer (essai)\n", "")
@@ -726,7 +794,15 @@ def classify(run: dict) -> Verdict:
 
 
 def replay_locally(ctx: Context, sha: str, tests: list[str]) -> str:
-    """Rejoue les tests rouges sur la tête gelée ; "" si rouge confirmé."""
+    """Rejoue les tests rouges sur la tête gelée ; "" si rouge confirmé.
+
+    #4221 : un QueryCanceled/lock timeout **du corps d'un test** qui se
+    reproduit à ce rejeu seul, hors charge, est un rouge réel (la ci-full est
+    rouge, le test est attribué, l'unité est retirée). Une erreur de fixture
+    (`setUpClass`/`tearDownClass`), un QueryCanceled de charge qui ne
+    reproduit pas, ou tout autre rejeu non concluant restent non concluants :
+    aucun retrait.
+    """
     if ctx.dry_run:
         return ""
     parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
@@ -740,6 +816,9 @@ def replay_locally(ctx: Context, sha: str, tests: list[str]) -> str:
         if run.green:
             return "vert en local (%d test(s)) : rouge non reproduit" % run.tests
         if run.inconclusive:
+            if not run.timed_out and run.returncode == 1 \
+                    and run.body_cancel_tests() & {str(test) for test in tests}:
+                return ""
             return "rejeu local non concluant (%s)" % run.motive()
         return ""
     finally:
@@ -903,9 +982,16 @@ def compose(ctx: Context, rows: list[dict]) -> str:
                 ctx.note(carrier, "%s%d groupe=%s"
                          % (SECOND_PREFIX, first,
                             ",".join(str(lot) for lot in group)))
-        results.append(attempt(ctx, carrier, name,
-                               Attempt(COMPOSITION, 1, "",
-                                       only=(list(group) if len(groups) == 2 else []))))
+        try:
+            results.append(attempt(ctx, carrier, name,
+                                   Attempt(COMPOSITION, 1, "",
+                                           only=(list(group) if len(groups) == 2 else []))))
+        except HoraireError as exc:
+            # The first carrier's journal already records its attempt. Keep
+            # composing the independent second group; the next tick resumes it.
+            if len(groups) != 2:
+                raise
+            results.append("#%d : %s" % (carrier, exc))
     return "\n".join(results)
 
 
@@ -1018,6 +1104,8 @@ def attempt(ctx: Context, carrier: int, name: str, this: Attempt) -> str:
     result = paquet_auto(ctx, name, carrier, exclude=this.exclude,
                          exclude_reasons=reasons,
                          only=this.only,
+                         keep_composition=(this.base
+                                           if this.step == RECOMPOSITION else ""),
                          force=this.step == RECOMPOSITION or this.n > 1 or this.force)
     return after_compose(ctx, carrier, name, result, this)
 
@@ -1049,15 +1137,25 @@ def pending(ctx: Context, item: dict, sha: str) -> Attempt | None:
     bougé vers la tête que la tentative a elle-même poussée et gelée avant ses
     tests (#4304 : gel postérieur à la marque, ou tête qu'elle publie), sans
     que cette tête soit finie (`achieved`) : refus de garde après les tests,
-    échec ou arrêt en cours de tests, ou tentative encore vivante.
+    échec ou arrêt en cours de tests, ou tentative encore vivante. Un gel
+    postérieur qu'elle n'a ni publié ni testé et qu'elle n'a pas posé
+    elle-même (#4506) la clôt : c'est la main d'un autre.
     """
     found = attempts(item)
     if found and sha:
-        kept = tested_since(item, found[-1].ts)
-        expected = (found[-1].publish.rsplit("@", 1)[-1]
-                    if found[-1].publish else kept[1] if kept else "")
+        last = found[-1]
+        kept = tested_since(item, last.ts)
+        expected = (last.publish.rsplit("@", 1)[-1]
+                    if last.publish else kept[1] if kept else "")
+        moved = frozen_ts(item) > last.ts > 0
         # Un autre gel ne donne pas à cette tentative le droit de le remplacer.
-        if expected and expected != sha and frozen_ts(item) > found[-1].ts:
+        if moved and expected and expected != sha:
+            return None
+        # #4506 : la tête a bougé après la tentative sans qu'elle l'ait publiée
+        # ni testée, et le gel vient d'une autre main (note du jalon) : il la
+        # clôt, sans la reprendre. Une tentative encore vivante garde la main.
+        if moved and not expected and sha != last.base \
+                and freeze_foreign(item, last.ts) and not running(ctx, last):
             return None
     if found and found[-1].base == sha:
         return found[-1]
@@ -1269,11 +1367,12 @@ def publish(ctx: Context, item: dict) -> str:
     sha = frozen_sha(item)
     if not sha:
         return "#%d sans tête gelée : rien à publier" % carrier
-    if merged_seen(item) or str(item.get("state") or "") == "closed":
+    landed = merged_head(ctx, item, sha)
+    if landed or str(item.get("state") or "") == "closed":
         # #4322 : la ci-full précoce (#4304) a pu fusionner le porteur avant
         # le retour de paquet-auto ; ni verdict ni ci-full sur un porteur clos
         return "#%d déjà %s : rien à publier" % (
-            carrier, "fusionné" if merged_seen(item) else "clos")
+            carrier, "fusionné" if landed else "clos")
     units = composition_units(manifest_at(ctx, item, sha))
     resolutions = [unit for unit in units if unit.resolution]
     lines = ["#%d %s : tête gelée %s, %d unité(s)."
@@ -1311,11 +1410,26 @@ def follow(ctx: Context, item: dict) -> str:
             # verrou du paquet ; ne rien publier, retirer ni recomposer avant.
             return "#%d : composition en cours (%s)" % (carrier, holder)
     sha = frozen_sha(item)
+    if merged_head(ctx, item, sha):
+        # #4506 : un porteur fusionné reste ouvert (qa) le temps de sa clôture
+        # (hold du pilote, balayage) ; le tic n'y recompose ni ne republie.
+        return "#%d : fusionné, rien à faire (tête %s dans %s)" % (
+            carrier, sha[:12] or "aucune", ctx.target)
     left = pending(ctx, item, sha)
     if left is not None:
         return resume(ctx, item, left)
     if not sha:
         return "#%d sans gel ni tentative : rien à faire" % carrier
+    # #4319: an unavailable exemption proof requests the ordinary full-CI
+    # path, on the same carrier. The marker is scoped to its frozen head.
+    requested = any(
+        str(event.get("note") or "").startswith("auto-merge parallel-recompose ")
+        and "sha=%s " % sha in str(event.get("note") or "")
+        for event in item.get("events") or ())
+    if requested:
+        return attempt(ctx, carrier, name,
+                       Attempt(RECOMPOSITION, 1, sha, run_id="parallel-proof",
+                               only=carrier_group(item), force=True))
     noted = marks(item)
     if MARK_CI + sha not in noted:
         return publish(ctx, item)
@@ -1334,7 +1448,8 @@ def follow(ctx: Context, item: dict) -> str:
             verdict = Verdict(False, verdict.lots, verdict.tests, why)
     # #4237 : une recomposition du pilote n'use pas le retrait automatique
     recomposed = len({a.run_id for a in attempts(item)
-                      if a.step == RECOMPOSITION and a.run_id != PILOT_RUN})
+                      if a.step == RECOMPOSITION
+                      and a.run_id not in (PILOT_RUN, "parallel-proof")})
     if verdict.deterministic and recomposed < MAX_RECOMPOSITIONS:
         return recompose(ctx, item, run, verdict)
     reason = verdict.why if not verdict.deterministic else \

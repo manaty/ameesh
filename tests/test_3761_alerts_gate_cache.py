@@ -17,6 +17,9 @@ Témoins :
 from __future__ import annotations
 
 import contextlib
+import os
+import shutil
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -167,6 +170,26 @@ class GateCacheTest(unittest.TestCase):
                                return_value="ameesh 1.0+bbbb"):
             second = merge_queue._gate_cache_signature(*args)
         self.assertNotEqual(first, second)
+
+
+class GateCodeFingerprintTest(unittest.TestCase):
+    """#4526 : le code de la porte est celui des modules déplacés, pas l'alias."""
+
+    def test_the_moved_plan_git_module_is_part_of_the_fingerprint(self):
+        self.assertIn("modules/dev/plan_git.py", merge_queue._GATE_CODE_FILES)
+        root = tempfile.mkdtemp(prefix="ameesh-gate-code-")
+        self.addCleanup(shutil.rmtree, root, True)
+        for name in merge_queue._GATE_CODE_FILES:
+            path = os.path.join(root, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("v1")
+        before = merge_queue._gate_code_digest(root)
+        with open(os.path.join(root, "modules/dev/plan_git.py"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("v2")
+        self.assertNotEqual(before, merge_queue._gate_code_digest(root),
+                            "modifier le module déplacé doit changer l'empreinte")
 
 
 class GateCacheWiringTest(unittest.TestCase):

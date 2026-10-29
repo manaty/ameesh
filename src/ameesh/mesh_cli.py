@@ -3337,7 +3337,8 @@ def cmd_set(cfg: Config, args) -> int:
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
                       "permission_mode=auto|acceptEdits|… lot_wake=on|off "
                       "resident=on|off resident_sleep=30m|0 resident_reread_max=50M|0 "
-                      "harness_bin=/absolute/path (empty = host binary)"
+                      "harness_bin=/absolute/path (declared on the host; "
+                      "empty = host binary)"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2

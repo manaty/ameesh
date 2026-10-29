@@ -57,6 +57,7 @@ test_3397_alerts_lenteur  # stockage : index turn_costs du dernier tour (0481), 
 test_3512_slo_merged  # stockage : fusion observée avant état/composition et relecture avant courrier SLO (#3512)
 test_423_agent_aliases  # storage: alias namespace guards, audit, same fenced lease/session and canon sync (#423)
 test_1022_creneau_landed  # storage: une fusion lande le creneau de migration, une liberation sans atterrissage le libere (#1022)
+test_4256_validation_deadlines  # #4256: validation authority, private audit and single-winner escalation (SQL contract)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)

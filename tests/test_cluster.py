@@ -111,6 +111,10 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #4256: private validation authority and per-person audit; owner CLI only.
+    "decision_validations": {"decision_id", "routing", "escalated_at"},
+    "validation_events": {"id", "decision_id", "person", "kind", "occurred_at", "facts", "event_key"},
+    "validation_decision_links": {"source_id", "target_id", "relation", "response_key"},
     # #3963 (0498) : coordination interne de canon sync, sans nouveau GRANT.
     "canon_state": {"sync_claimed_at", "sync_token", "sync_completed_token",
                     "sync_signature"},

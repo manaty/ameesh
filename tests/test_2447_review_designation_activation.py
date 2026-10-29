@@ -2548,7 +2548,7 @@ class FreezeTransactionNetworkTest(_ActivationFixture, PgTestCase):
         prior = self._prior_ghost()
         calls = []
 
-        def forge(repo, sha):
+        def forge(repo, sha, *, timeout=None):
             calls.append((sha, freeze_gate._in_transaction(self.db)))
             return False
 
@@ -2572,7 +2572,7 @@ class FreezeTransactionNetworkTest(_ActivationFixture, PgTestCase):
             calls.append(("prefetch", freeze_gate._in_transaction(db)))
             return []
 
-        def forge(repo, sha):
+        def forge(repo, sha, *, timeout=None):
             calls.append(("forge", freeze_gate._in_transaction(self.db)))
             return False
 

@@ -42,7 +42,10 @@ l'ordre, sans agent :
    fichiers (`packet_red`, #3801) ne désigne plus un voisin ; elle reste la
    lecture des rouges propres et des contrats (#3931). Un rouge voisin
    impossible à situer sur les préfixes n'entraîne **aucun retrait** : le
-   pilote est prévenu et le paquet s'arrête. Un rouge non attribuable garde
+   pilote est prévenu et le paquet s'arrête. Un test rouge sur la tête mais
+   **vert sur tous les préfixes** est instable (#4221) : consigné non
+   concluant, sans retrait, le paquet continue et le pilote est prévenu. Un
+   rouge non attribuable garde
    le geste antérieur : une unité dont le module propre a rougi est retirée,
    un contrat rouge arrête (l'attribution demande un agent). Un run **non
    concluant** (délai, base absente, psql/psycopg indisponible, erreur de
@@ -71,6 +74,13 @@ le motif neutre « exclu par le pilote » est écrit (#4201).
 prêts — celui d'un paquet parallèle. Tout autre lot prêt est écrit aux écartés
 avec le motif « paquet parallèle : autre groupe disjoint », jamais composé
 dans deux paquets.
+
+#4581 : `--keep-composition REF` reprend **les membres** de la composition du
+manifeste gelé à REF, moins les `--exclude`, chacun à sa source composée. Un
+lot prêt depuis cette composition, un membre regelé (nouvelle tête) ou disparu
+de la liste prête n'est pas admis : il est écrit aux écartés avec le motif
+« coupure suivante : … ». Après un rouge, le paquet ne grossit donc plus à
+chaque recomposition, et aucune tête neuve n'entre sans ci de paquet.
 
 #4113 : hors banc sans base, la même garde d’époque que `packet record`
 est relue avant la composition, entre unités, avant chaque série de tests et
@@ -206,6 +216,12 @@ PARALLEL_EXCLUDE_REASON = "paquet parallèle : autre groupe disjoint"
 #: écarté avec ce motif, jamais une erreur qui garde la cible réservée.
 PARALLEL_GROUP_NOT_READY = "paquet parallèle : lot du groupe non prêt"
 PARALLEL_GROUP_GONE = "paquet parallèle : lot du groupe introuvable"
+#: #4581 : motifs écrits par une recomposition qui garde la composition
+#: précédente. Les lots prêts depuis vont au paquet suivant, jamais dans
+#: celui-ci ; un membre regelé n'est pas réadmis sur une tête sans ci de paquet.
+KEEP_READY_REASON = "coupure suivante : recomposition"
+KEEP_REFROZEN_REASON = "coupure suivante : tête regelée"
+KEEP_NOT_READY_REASON = "coupure suivante : membre non prêt"
 #: sorties qui ne prouvent pas un rouge du lot (environnement, base absente)
 #: #4217 : un `tearDownClass`/`setUpClass` en `QueryCanceled` (statement
 #: timeout, base de test chargée) est une panne d'infrastructure, jamais un
@@ -219,6 +235,17 @@ INCONCLUSIVE_RE = re.compile(
     r"ModuleNotFoundError: No module named 'psycopg)",
     re.IGNORECASE,
 )
+#: #4221 : un QueryCanceled ou un lock timeout **reproduit** en rejouant seul,
+#: hors charge, est un rouge réel ; hors rejeu, il reste non concluant.
+CANCEL_MESSAGE_RE = re.compile(
+    r"canceling statement due to (?:statement|lock) timeout|timeout expired",
+    re.IGNORECASE,
+)
+#: #4221 : une erreur levée dans `setUp`/`tearDown` (comme dans
+#: `setUpClass`/`tearDownClass`) est une panne de fixture : non concluante
+#: même rejouée seule. Seul le corps de la méthode de test peut se confirmer.
+FIXTURE_FRAME_RE = re.compile(
+    r"^\s+File .*, line \d+, in (?:setUp|tearDown)\s*$", re.MULTILINE)
 #: le **message** d'une exception d'environnement (sans les noms de types :
 #: un `AssertionError: expected OperationalError` reste un rouge réel, et un
 #: `ValueError: expected QueryCanceled` aussi : le nom psycopg est reconnu par
@@ -403,6 +430,9 @@ class TestRun:
     #: Rouge écarté après rejeu des seuls voisins sur la base (#4048).
     ignored_red: bool = False
     log_path: str = ""
+    #: #4221 : tests rouges sur la tête mais verts sur tous les préfixes de
+    #: l'empilement (instables) : non concluants, ils ne retirent aucune unité.
+    flaky_tests: list[str] = field(default_factory=list)
 
     @property
     def green(self) -> bool:
@@ -443,6 +473,40 @@ class TestRun:
             return True
         return False
 
+    def body_cancel_tests(self) -> set[str]:
+        """#4221 : les tests dont un QueryCanceled/lock timeout est l'exception.
+
+        Seuls les `ERROR:` du **corps** d'un test comptent : une erreur de
+        `setUpClass`/`tearDownClass` reste une panne de fixture, non
+        concluante même rejouée seule. Sert au rejeu hors charge : un même
+        test qui redonne ce QueryCanceled reproduit une erreur déterministe,
+        alors qu'un QueryCanceled de charge ne revient pas.
+        """
+        found: set[str] = set()
+        for match in FAIL_LINE_RE.finditer(self.output or ""):
+            kind, test = match.group(1), match.group(2).strip()
+            if kind != "ERROR" or not test:
+                continue
+            header = match.group(0)
+            if header.startswith("ERROR: setUpClass") \
+                    or header.startswith("ERROR: tearDownClass"):
+                continue
+            rest = (self.output or "")[match.end():]
+            end = BLOCK_END_RE.search(rest)
+            block = rest[:end.start()] if end else rest
+            if FIXTURE_FRAME_RE.search(block):
+                continue
+            exception = last_exception(block)
+            if exception is None:
+                continue
+            name, message = exception
+            short = name.rsplit(".", 1)[-1]
+            if short == "AssertionError":
+                continue
+            if short == "QueryCanceled" or CANCEL_MESSAGE_RE.search(message):
+                found.add(test)
+        return found
+
     @property
     def real_failure(self) -> bool:
         """Un test négatif réel, même mêlé à une erreur d'environnement.
@@ -453,6 +517,8 @@ class TestRun:
         `FAIL + OperationalError` est donc rouge, jamais « non concluant ».
         """
         if self.returncode == 0:
+            return False
+        if self.flaky_tests:
             return False
         if self.timed_out or self.returncode != 1:
             return False
@@ -483,6 +549,8 @@ class TestRun:
 
     @property
     def inconclusive(self) -> bool:
+        if self.flaky_tests:
+            return True
         if self.timed_out or self.returncode not in (0, 1):
             return True
         if self.returncode == 1:
@@ -501,6 +569,10 @@ class TestRun:
 
     def motive(self) -> str:
         """Pourquoi un run est non concluant, en une ligne."""
+        if self.flaky_tests:
+            return ("test(s) rouge(s) sur la tête mais vert(s) sur tous les "
+                    "préfixes (instable) : %s"
+                    % ", ".join(self.flaky_tests[:3]))
         if self.timed_out:
             return "délai dépassé"
         if self.returncode not in (0, 1):
@@ -613,66 +685,20 @@ _PYTHON_OVERRIDE: str | None = None
 
 
 def _supports_psycopg(python: str) -> bool:
-    try:
-        proc = subprocess.run([python, "-c", "import psycopg"],
-                              stdin=subprocess.DEVNULL, capture_output=True,
-                              timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return proc.returncode == 0
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from ameesh.project_python import _supports_psycopg as supports
+    return supports(python)
 
 
 def project_python(worktree: Path) -> str:
-    """Un interpréteur qui porte psycopg, pour les outils de l'arbre.
-
-    Le script lui-même n'a que la bibliothèque standard ; ses enfants
-    (`paquet-candidats`, `paquet-compose`, les tests) importent le projet.
-    Un agent qui lance `python3 scripts/paquet-auto.py` avec le Python du
-    système n'a pas psycopg : on prend le `.venv` de l'arbre, celui du
-    worktree principal, ou le Python du venv d'`ameesh` (le wrapper de la
-    session). À défaut, `sys.executable` : `paquet-candidats` rendra son
-    refus, sans le maquiller.
-    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from ameesh.project_python import project_python as select
     global _PYTHON_INTERPRETER
     if _PYTHON_OVERRIDE:
         return _PYTHON_OVERRIDE
-    if _PYTHON_INTERPRETER:
-        return _PYTHON_INTERPRETER
-    candidates: list[str] = []
-    env = os.environ.get("AMEESH_PYTHON")
-    if env:
-        candidates.append(env)
-    candidates.append(sys.executable)
-    candidates.append(str(worktree / ".venv" / "bin" / "python"))
-    listed = git(worktree, "worktree", "list", "--porcelain", check=False)
-    for line in _decode(listed.stdout).splitlines():
-        if line.startswith("worktree "):
-            candidates.append(str(Path(line[len("worktree "):]) /
-                                 ".venv" / "bin" / "python"))
-    wrapper = shutil.which("ameesh")
-    if wrapper:
-        try:
-            text = Path(wrapper).read_text(encoding="utf-8")
-        except OSError:
-            text = ""
-        match = re.search(r"exec\s+(\S+)/ameesh\b", text)
-        if match:
-            candidates.append(match.group(1) + "/python")
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        if Path(candidate).is_file() and _supports_psycopg(candidate):
-            _PYTHON_INTERPRETER = candidate
-            return candidate
-    _PYTHON_INTERPRETER = sys.executable
+    if not _PYTHON_INTERPRETER:
+        _PYTHON_INTERPRETER = select(worktree)
     return _PYTHON_INTERPRETER
-
-
-# ---------------------------------------------------------------------------
-# Entrées
-# ---------------------------------------------------------------------------
 
 
 def package_branch(name: str) -> str:
@@ -1082,6 +1108,106 @@ def exclude_discards(requested: list[int], reasons: list[str],
             lot, reason or EXCLUDE_DEFAULT_REASON,
             "--exclude, recomposition sans lui"))
     return discards
+
+
+def composition_specs(repo: Path, reference: str, name: str) -> list[tuple[list[int], str]]:
+    """#4581 : la table `## Composition` du manifeste gelé à `reference`."""
+    sha = rev(repo, reference)
+    if sha is None:
+        raise InputError("--keep-composition : référence %r introuvable" % reference)
+    rel = manifest_rel(name)
+    show = git(repo, "show", "%s:%s" % (sha, rel), check=False)
+    if show.returncode != 0:
+        raise InputError(
+            "--keep-composition : manifeste %s illisible sur %s : %s"
+            % (rel, sha[:12], _tail(_decode(show.stderr))))
+    try:
+        return parse_composition_table(_decode(show.stdout))
+    except InputError as error:
+        raise InputError(
+            "--keep-composition : %s illisible sur %s : %s"
+            % (rel, sha[:12], error)) from error
+
+
+def same_source(worktree: Path, composed: str, candidate: str) -> bool:
+    """Le candidat pointe-t-il le commit de la source **composée** ?
+
+    La table `## Composition` écrit la source abrégée (#3629, `--short=12`) ;
+    on la résout donc dans le worktree avant de comparer au SHA complet du
+    candidat. Une source composée absente du clone n'est jamais reprise en
+    silence : elle va à la coupure suivante (l'invariant « second parent de la
+    tête gelée » est ainsi vérifié, pas supposé). Le SHA du candidat est résolu
+    de même quand il est présent.
+    """
+    if not composed or not candidate:
+        return False
+    resolved = rev(worktree, composed)
+    if resolved is None:
+        return False
+    return resolved == (rev(worktree, candidate) or candidate)
+
+
+def keep_composition(candidates: list[Candidate],
+                     specs: list[tuple[list[int], str]], *,
+                     worktree: Path,
+                     already_discarded: set[int]) -> tuple[list[Candidate], list[Discarded]]:
+    """#4581 : restreint la liste prête aux membres de la composition précédente.
+
+    `specs` vient du manifeste gelé de la composition à conserver ;
+    `already_discarded` porte les lots déjà écartés (erreurs de la liste
+    calculée, `--exclude`, groupe parallèle). Un membre n'est repris que sur sa
+    source composée : une nouvelle tête, un lot sorti de la liste prête ou une
+    unité de résolution est écrit aux écartés pour la coupure suivante, jamais
+    composé ici. Tout lot prêt qui n'était pas dans la composition précédente
+    est nommé de même.
+    """
+    by_lot = {candidate.lot: candidate for candidate in candidates}
+    members: list[Candidate] = []
+    discarded: list[Discarded] = []
+    seen: set[int] = set(already_discarded)
+    for lots, source in specs:
+        if any(lot in seen for lot in lots):
+            seen.update(lots)
+            continue
+        seen.update(lots)
+        if len(lots) != 1:
+            # paquet-auto ne compose pas de résolution (jugement humain) ; une
+            # telle unité ne se reprend pas sans la relire.
+            discarded.append(Discarded(
+                lots[0], KEEP_NOT_READY_REASON,
+                "unité de résolution (%s), non reprise par une recomposition"
+                % ", ".join("#%d" % lot for lot in lots)))
+            continue
+        lot = lots[0]
+        candidate = by_lot.get(lot)
+        if candidate is None:
+            discarded.append(Discarded(
+                lot, KEEP_NOT_READY_REASON,
+                "composé %s, plus dans la liste prête" % source[:12]))
+            continue
+        if rev(worktree, source) is None:
+            # la source composée est le second parent d'une fusion de la tête
+            # gelée : absente du clone, elle ne se reprend pas en silence.
+            discarded.append(Discarded(
+                lot, KEEP_NOT_READY_REASON,
+                "source composée %s introuvable dans le clone" % source[:12]))
+            continue
+        if not same_source(worktree, source, candidate.source):
+            discarded.append(Discarded(
+                lot, KEEP_REFROZEN_REASON,
+                "composé %s, tête actuelle %s : pas de ci de paquet sur la "
+                "nouvelle tête" % (source[:12], candidate.source[:12])))
+            continue
+        candidate.source = source
+        members.append(candidate)
+    for candidate in candidates:
+        if candidate.lot in seen:
+            continue
+        seen.add(candidate.lot)
+        discarded.append(Discarded(
+            candidate.lot, KEEP_READY_REASON,
+            "hors de la composition conservée ; non admis, coupure suivante"))
+    return members, discarded
 
 
 def compute_candidates(worktree: Path, target: str, base_sha: str,
@@ -1708,7 +1834,8 @@ def _failure_matches(observed: str, failed: set[str]) -> bool:
 
 def prefix_failures(worktree: Path, composition: Composition,
                     failures: list[dict], *, timeout: int,
-                    replay=None, log=print) -> tuple[dict[int, list[dict]], str]:
+                    replay=None,
+                    log=print) -> tuple[dict[int, list[dict]], str, list[dict]]:
     """#4217 : la première unité où chaque test rouge apparaît.
 
     Rejoue les tests rouges des modules **voisins** sur les préfixes de
@@ -1718,10 +1845,12 @@ def prefix_failures(worktree: Path, composition: Composition,
     le préfixe correspondant le rend rouge ; les préfixes suivants ne le
     rejouent plus.
 
-    Rend `({lot: [échecs]}, "")`, ou `({}, pourquoi)` quand le rejeu ne
-    conclut pas (worktree impossible, run non concluant, test vert sur tous
-    les préfixes) : l'appelant ne retire alors aucune unité. Aucune décision
-    de retrait ici.
+    Rend `({lot: [échecs]}, "", [])`, ou `({}, "", [échecs])` quand des tests
+    restent rouges sur la tête mais verts sur **tous** les préfixes : ce sont
+    des instables (#4221), consignés non concluants, sans retrait. Rend
+    `({}, pourquoi, [])` quand le rejeu ne conclut pas (worktree impossible,
+    run non concluant, rouge sans nom de test) : l'appelant ne retire alors
+    aucune unité. Aucune décision de retrait ici.
     """
     tests: list[dict] = []
     seen: set[str] = set()
@@ -1731,9 +1860,9 @@ def prefix_failures(worktree: Path, composition: Composition,
             seen.add(name)
             tests.append(dict(failure))
     if not tests:
-        return {}, "aucun nom de test à rejouer sur les préfixes"
+        return {}, "aucun nom de test à rejouer sur les préfixes", []
     if not composition.units:
-        return {}, "composition sans unité à rejouer"
+        return {}, "composition sans unité à rejouer", []
     replay = replay or run_tests
     parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
     path = Path(tempfile.mkdtemp(prefix="paquet-auto-prefixe-", dir=str(parent)))
@@ -1744,7 +1873,7 @@ def prefix_failures(worktree: Path, composition: Composition,
     if added.returncode != 0:
         shutil.rmtree(path, ignore_errors=True)
         return {}, ("worktree de préfixe impossible : %s"
-                    % _tail(_decode(added.stderr), 3))
+                    % _tail(_decode(added.stderr), 3)), []
     try:
         unresolved = tests
         found: dict[int, list[dict]] = {}
@@ -1754,19 +1883,19 @@ def prefix_failures(worktree: Path, composition: Composition,
                 if moved.returncode != 0:
                     return {}, ("préfixe %d (#%d) illisible : %s"
                                 % (index, unit.lot,
-                                   _tail(_decode(moved.stderr), 3)))
+                                   _tail(_decode(moved.stderr), 3))), []
                 git(path, "clean", "-fdq", check=False)
             run = replay(path, "préfixe %d (#%d)" % (index, unit.lot),
                          [_failure_name(failure) for failure in unresolved],
                          timeout=timeout)
             if run.inconclusive:
                 return {}, ("préfixe %d (#%d) non concluant : %s"
-                            % (index, unit.lot, run.motive()))
+                            % (index, unit.lot, run.motive())), []
             failed = {entry["test"]
                       for entry in unittest_failures(run.output)}
             if not run.green and not failed:
                 return {}, ("préfixe %d (#%d) rouge sans nom de test"
-                            % (index, unit.lot))
+                            % (index, unit.lot)), []
             still = []
             for failure in unresolved:
                 if _failure_matches(_failure_name(failure), failed):
@@ -1780,11 +1909,11 @@ def prefix_failures(worktree: Path, composition: Composition,
             if not unresolved:
                 break
         if unresolved:
-            return {}, ("test(s) rouge(s) sur la tête mais verts sur tous les "
-                        "préfixes : %s"
-                        % ", ".join(_failure_name(failure)
-                                    for failure in unresolved[:5]))
-        return found, ""
+            # #4221 : verts au rejeu sur tous les préfixes : instables,
+            # l'appelant les consigne non concluants sans arrêter le paquet ;
+            # les tests déjà situés (`found`, B1 cx2) restent retirables.
+            return found, "", unresolved
+        return found, "", []
     finally:
         remove_worktree(worktree, path)
 
@@ -1937,10 +2066,12 @@ def check_local_tests(worktree: Path, composition: Composition, *,
 
     Un rouge de voisin que les préfixes ne permettent pas de situer lève
     `AttributionUnreadable` : aucun retrait automatique, le pilote est
-    prévenu et un agent lit. Un résultat non concluant (délai, base absente,
-    psql/psycopg indisponible, rc inattendu) est **consigné** dans `runs` et
-    ne retire aucune unité : le canon §3 veut qu'il ne retienne ni paquet ni
-    release ; la ci-full tranche.
+    prévenu et un agent lit. Un test rouge sur la tête mais **vert sur tous
+    les préfixes** est instable (#4221) : consigné non concluant dans `runs`
+    (`flaky_tests`), sans retrait, et le paquet continue. Un résultat non
+    concluant (délai, base absente, psql/psycopg indisponible, rc inattendu)
+    est **consigné** dans `runs` et ne retire aucune unité : le canon §3 veut
+    qu'il ne retienne ni paquet ni release ; la ci-full tranche.
     `attribute` est injectable pour les témoins (`attribute_composition`).
 
     #4025 : la série d'une unité joue aussi ses modules voisins
@@ -2078,10 +2209,10 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     prefix_red = [neighbor_tests[name] for name in neighbor_tests
                   if name in prefix_names]
     for lot, owned in owned_by_lot.items():
-        remaining_own = [failure for failure in owned
-                         if _failure_name(failure) not in prefix_names]
-        if remaining_own or lot in unparsed_lots:
-            own[lot] = remaining_own
+        # #4221 (P3) : `prefix_names` exclut déjà `own_names`, donc aucun
+        # échec propre ne peut y figurer ; le filtre `remaining_own` était mort.
+        if owned or lot in unparsed_lots:
+            own[lot] = owned
     modules = contract.modules
     runs.append(contract)
     contract_red = False
@@ -2122,7 +2253,7 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             "(%d test(s), %d unité(s))"
             % (len(prefix_red), len(composition.units)))
         try:
-            found_by_lot, prefix_why = (prefix or prefix_failures)(
+            found_by_lot, prefix_why, flaky = (prefix or prefix_failures)(
                 worktree, composition, prefix_red, timeout=timeout, log=log)
         except AttributionUnreadable:
             raise
@@ -2134,6 +2265,48 @@ def check_local_tests(worktree: Path, composition: Composition, *,
             raise AttributionUnreadable(
                 prefix_why,
                 tests=[_failure_name(failure) for failure in prefix_red])
+        if flaky:
+            # #4221 : rouge sur la tête mais vert sur tous les préfixes =
+            # instable. Consigné non concluant, le paquet continue (canon §3).
+            flaky_names = sorted({_failure_name(failure) for failure in flaky
+                                  if _failure_name(failure)})
+            log("tests voisins : %d test(s) rouge(s) sur la tête mais vert(s) "
+                "sur tous les préfixes (instable) : %s — consigné(s) non "
+                "concluant(s), le paquet continue"
+                % (len(flaky_names), ", ".join(flaky_names[:5])))
+            kept_red: list[tuple[TestRun, list[dict]]] = []
+            for run, found in red:
+                names_here = sorted({_failure_name(failure)
+                                     for failure in found
+                                     if _failure_name(failure) in flaky_names})
+                left = [failure for failure in found
+                        if _failure_name(failure) not in flaky_names]
+                if len(left) == len(found):
+                    kept_red.append((run, found))
+                    continue
+                if left:
+                    # des rouges réels restent dans la même série : la série
+                    # reste rouge, l'instable est consigné à part.
+                    kept_red.append((run, left))
+                    runs.append(TestRun(
+                        label="%s (instable)" % run.label,
+                        modules=sorted({"tests." + str(failure.get("module"))
+                                        for failure in found
+                                        if failure.get("module")
+                                        and _failure_name(failure)
+                                        in names_here}),
+                        returncode=1,
+                        output="tests rouges sur la tête mais verts sur tous "
+                               "les préfixes : %s" % ", ".join(names_here),
+                        seconds=0.0, flaky_tests=names_here,
+                        log_path=run.log_path))
+                else:
+                    run.flaky_tests = names_here
+            red = kept_red
+            if not red:
+                return runs, [], []
+            failures = [failure for failure in failures
+                        if _failure_name(failure) not in flaky_names]
         positions = {unit.lot: index for index, unit in enumerate(
             composition.units, start=1)}
         unknown = [lot for lot in found_by_lot if lot not in positions]
@@ -2240,7 +2413,11 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
     un objet (`#N`) serait relu par le contrôle d'inclusion comme un lot
     attendu. Les objets et les classes restent à la PR et au courrier.
     """
-    lots = len({unit.lot for unit in composition.units})
+    try:
+        admissions = parse_composition_table(table)
+    except InputError:
+        admissions = [([unit.lot], unit.source) for unit in composition.units]
+    lots = len({lot for members, _source in admissions for lot in members})
     lines = [
         "# Paquet %s — composition (§12), sur %s `%s`"
         % (package_branch(name), target, base_sha[:12]),
@@ -2255,8 +2432,9 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
         "| lot | source composée |",
         "|---|---|",
     ]
-    for unit in composition.units:
-        lines.append("| #%d | `%s` |" % (unit.lot, unit.source))
+    for members, source in admissions:
+        for lot in members:
+            lines.append("| #%d | `%s` |" % (lot, source))
     lines += ["", table.rstrip(), ""]
     lines += [
         "## Écartés",
@@ -2702,6 +2880,30 @@ def notify_unattributable(name: str, carrier: int, error,
         log("courrier au pilote non envoyé : %s" % exc)
         return str(exc)
     log("courrier au pilote envoyé (%s)" % pilot)
+    return ""
+
+
+def notify_flaky(name: str, carrier: int, tests: list[str],
+                 *, pilot: str = "mesh-design",
+                 sender: str | None = None, log=print) -> str:
+    """#4221 : un test instable est consigné non concluant, le paquet continue.
+
+    Le canon §3 veut qu'un instable ne retienne ni paquet ni release ; le
+    pilote le sait pour le corriger à part. Un courrier qui ne part pas est
+    consigné, sans arrêter la composition. Rend le motif d'échec.
+    """
+    listed = ", ".join(tests[:5]) or "test(s) non nommé(s)"
+    body = (
+        "#%d paquet %s : test(s) rouge(s) sur la tête mais vert(s) sur tous "
+        "les préfixes de l'empilement (%s) : instable(s), consigné(s) non "
+        "concluant(s) (canon §3) ; aucun retrait pour eux, le paquet "
+        "continue. À corriger à part." % (carrier, name, listed))
+    try:
+        send_mail(pilot, carrier, body, sender)
+    except PaquetAutoError as exc:
+        log("courrier d'instabilité au pilote non envoyé : %s" % exc)
+        return str(exc)
+    log("courrier d'instabilité au pilote envoyé (%s)" % pilot)
     return ""
 
 
@@ -3275,6 +3477,17 @@ def compose_packet(args: argparse.Namespace) -> int:
                     Discarded(candidate.lot, PARALLEL_EXCLUDE_REASON,
                               "--only, second paquet parallèle (#3256 C)")
                     for candidate in outside]
+        # #4581 : une recomposition après un rouge garde les membres de la
+        # composition précédente, moins les exclus, à leur source composée.
+        # Les lots devenus prêts entre-temps vont à la coupure suivante ; ils
+        # sont nommés aux écartés (le contrôle d'inclusion lit ce motif).
+        keep = str(getattr(args, "keep_composition", None) or "")
+        if keep:
+            specs = composition_specs(repo, keep, args.name)
+            candidates, kept_discards = keep_composition(
+                candidates, specs, worktree=worktree,
+                already_discarded={item.lot for item in errors})
+            errors = errors + kept_discards
         for item in errors:
             print("écarté #%d : %s — %s"
                   % (item.lot, item.reason, item.detail), flush=True)
@@ -3404,6 +3617,14 @@ def compose_packet(args: argparse.Namespace) -> int:
                         pilot=getattr(args, "pilot", "mesh-design"),
                         sender=getattr(args, "sender", None))
                 raise
+            flaky = sorted({name for run in runs
+                            for name in getattr(run, "flaky_tests", [])})
+            if flaky and not getattr(args, "local", False):
+                # #4221 : instable consigné non concluant, le paquet continue ;
+                # le pilote le sait même si une recomposition suit.
+                notify_flaky(args.name, args.carrier, flaky,
+                             pilot=getattr(args, "pilot", "mesh-design"),
+                             sender=getattr(args, "sender", None))
             if not faulty:
                 break
             if pushed:
@@ -3585,6 +3806,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="#3256 C : ne composer que ces lots prêts (répétable) ; "
                              "les autres, prêts, sont écrits aux écartés avec le "
                              "motif du paquet parallèle, jamais composés deux fois")
+    parser.add_argument("--keep-composition", default=None, metavar="REF",
+                        help="#4581 : recomposition après un rouge : ne garder "
+                             "que les membres de la composition du manifeste gelé "
+                             "à REF, moins les --exclude, chacun à sa source "
+                             "composée ; un lot prêt depuis, regelé ou disparu va "
+                             "à la coupure suivante (écarté, non composé)")
     parser.add_argument("--replay", default=None, metavar="REF",
                         help="rejouer le manifeste d'une référence et comparer "
                              "les arbres (avec --candidates-json : refuser une "
@@ -3637,6 +3864,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.replay:
             if args.carrier or args.local:
                 raise InputError("--replay : ni --carrier ni --local")
+            if args.keep_composition:
+                raise InputError("--keep-composition ne s'applique pas à --replay")
             if not args.base:
                 raise InputError("--replay exige --base")
             if args.candidates_json:
@@ -3657,9 +3886,11 @@ def main(argv: list[str] | None = None) -> int:
             if not re.fullmatch(r"[0-9a-f]{40}", args.publish_sha or ""):
                 raise InputError("--publish exige --publish-sha : le SHA complet "
                                  "attesté par la marque de tests")
-            if args.local or args.no_packet_record or args.exclude:
+            if args.local or args.no_packet_record or args.exclude \
+                    or args.keep_composition:
                 raise InputError("--publish : ni --local, ni --no-packet-record, "
-                                 "ni --exclude (la tête testée est publiée telle quelle)")
+                                 "ni --exclude, ni --keep-composition (la tête "
+                                 "testée est publiée telle quelle)")
             return publish_tested(args)
         if args.no_packet_record and not args.local:
             raise InputError("--no-packet-record est réservé au banc avec --local")

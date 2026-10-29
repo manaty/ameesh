@@ -68,6 +68,13 @@ n'est ni prêt ni écarté : il porte `error` et il est nommé dans `errors` et
 écarter explicitement chaque lot en erreur : l'omettre en silence reste
 interdit (#3813). Seule une erreur globale (base, cible, base de données,
 inventaire) lève `CandidateError` et rend toute la liste inutilisable.
+
+#4572 : `candidate_refusal` rend le **premier refus côté auteur** d'un seul
+lot (`freeze-not-head`, `conflict`, …), avec le geste attendu, pour les
+lecteurs qui ne composent pas — escalade SLO « review GO → merge » et
+`ameesh debit`. Mêmes codes que `_candidate`, lecture locale des refs du
+dépôt (aucun fetch) ; `ready=True` seulement quand le gel est la tête publiée
+et que la fusion avec la cible est propre.
 """
 from __future__ import annotations
 
@@ -831,6 +838,7 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     # Une panne de lecture ne doit jamais transformer un lot bloqué en prêt.
     try:
         dependencies = work_dependencies.grouped(db, ids)
+        links = work_dependencies.links(db, ids)
     except Exception as exc:  # noqa: BLE001 - inventaire incomplet
         raise CandidateError("cannot read blocking dependencies: %s" % exc) from exc
     unknown = sorted(set(overrides) - set(ids))
@@ -887,7 +895,13 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     _apply_remises(db, candidates, {int(row["id"]): row for row in rows}, marks,
                    remises, remise_error, where=where, package_base=package_base,
                    cfg=cfg, canons=canons)
+    from . import migrations
+    slug = migrations.origin_repo(repo)
+    layout = migrations.layout_for(slug, cfg) if slug else None
     for entry in candidates:
+        entry["conflicts_with"] = sorted({
+            int(link["lot"]) for link in links.get(entry["work_item"], ())
+            if link.get("kind") == "conflicts_with"})
         # Après les remises : ni une résolution de conflit ni une surcharge
         # de hold ne peuvent lever un prérequis encore bloquant.
         entry["dependencies"] = sorted({
@@ -910,6 +924,10 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
         if entry["ready"]:
             try:
                 entry["files"] = changed_files(where, package_base, entry["source"])
+                entry["migration_files"] = [
+                    path for path in entry["files"] if (layout is not None
+                         and path.startswith(layout.directory.rstrip("/") + "/"))
+                    or (path.startswith("deploy/sql/") and path.endswith(".sql"))]
                 _check_migration_coverage(db, entry, repo=where, origin_repo=repo,
                                           base=package_base, target=target_branch, cfg=cfg)
             except CandidateError as exc:
@@ -1183,3 +1201,326 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
         return entry
     entry["ready"] = not entry["causes"] and not entry["error"]
     return entry
+
+
+# --------------------------------------------------------------------------
+# #4572 : la cause côté auteur, pour l'escalade SLO et le débit
+# --------------------------------------------------------------------------
+
+#: #4572 : refus qu'un **auteur** peut lever lui-même, avec le geste attendu.
+#: Le composeur du paquet ne peut rien y faire : il ne compose que `ready`.
+#: Les codes sont ceux de `_candidate` (`inventory`), jamais un vocabulaire
+#: parallèle. Un refus absent de cette table (avis, hold, dépendance, release,
+#: cible) n'est pas une cause d'auteur et n'est pas touché ici.
+AUTHOR_CAUSES = {
+    "freeze-not-head":
+        "freeze again on the published head, then have it reviewed",
+    "freeze-required":
+        "declare the freeze of the published head, then have it reviewed",
+    "freeze-unresolved":
+        "freeze again on a commit of the repository, then have it reviewed",
+    "missing-branch":
+        "give the lot its branch, push it, then freeze",
+    "conflict":
+        "resolve the conflict with the target, then freeze and have it reviewed; "
+        "if a remise on the target is refused, fix it and have the remise reviewed",
+}
+
+
+def author_gesture(code: str) -> str:
+    """#4572 : le geste de l'auteur pour un refus, vide si ce n'est pas le sien."""
+    return AUTHOR_CAUSES.get(str(code or ""), "")
+
+
+def _author_refusal(code: str, detail: str, **extra) -> dict:
+    """Un refus d'auteur, dans la forme que lisent l'escalade et le débit."""
+    out = {"code": code, "detail": detail, "owner": "author",
+           "gesture": author_gesture(code), "ready": False, "unknown": False}
+    out.update(extra)
+    return out
+
+
+def refusal_of(row: dict, *, frozen: str = "", raw_freeze: str = "",
+               published: str = "", published_source: str = "", repo: str = "",
+               target: str = "", base: str = "", remises=()) -> dict:
+    """#4572 : le premier refus **côté auteur** d'un lot, ou son absence.
+
+    Le calcul reste celui de `inventory` (`_candidate`) : mêmes codes, même
+    ordre de lecture (branche, gel, tête publiée, essai de fusion contre la
+    cible). Il ne fait **aucune I/O réseau** et ne compose rien : il lit les
+    refs locales que `candidate_refusal` a résolues. `published` est la tête
+    publiée de la branche (`origin/<branche>`) ; `branch_head` n'est qu'une
+    observation et ne doit pas la remplacer (voir `plan_git.freeze_candidate`).
+    Un `published` vide laisse la tête inconnue : si aucun conflit n'est
+    trouvé, le résultat est `unknown` — on ne dit jamais « prêt » sans preuve.
+
+    `ready=True` seulement quand le gel est la tête publiée et que l'essai de
+    fusion est propre. `unknown=True` quand la lecture n'a pas pu conclure
+    (dépôt absent, gel non résolu, refs manquantes, essai illisible). Aucun
+    code n'est inventé : un refus non nommé ici (avis, hold, release…) laisse
+    `code` vide, `unknown` inchangé.
+
+    `remises` (#2496/#4572) : les remises du lot sur la cible, déjà évaluées
+    (`evaluate_remise`) ou marquées `unreadable` quand leur commit n'est pas
+    local. Une remise propre et couverte rend le lot **prêt** (le composeur
+    peut le porter) ; des remises toutes refusées gardent `conflict` avec
+    leurs motifs ; une remise non lisible ici rend `unknown` — on ne dit
+    jamais « l'auteur doit résoudre » quand une remise peut le porter."""
+    row = row or {}
+    branch = str(row.get("branch") or "").strip()
+    raw = str(raw_freeze or frozen or "").strip()
+    out = {"code": "", "detail": "", "owner": "", "gesture": "",
+           "ready": False, "unknown": False,
+           "published": str(published or ""),
+           "published_source": str(published_source or "")}
+    if not branch:
+        return _author_refusal("missing-branch",
+                               "the lot has no branch to package")
+    if not raw:
+        return _author_refusal("freeze-required",
+                               "the lot declares no freeze")
+    if not plan_git.commit_id(raw):
+        return _author_refusal("freeze-unresolved",
+                               "freeze %r is not a commit id" % raw)
+    if not frozen:
+        out["unknown"] = True
+        return out
+    observed = str(published_source or "") == "observed"
+    if published:
+        if not plan_git.same_commit(frozen, published):
+            return _author_refusal(
+                "freeze-not-head",
+                "freeze %s is not the %s head %s"
+                % (frozen[:12], "observed" if observed else "published",
+                   published[:12]))
+        # Une tête publiée égale au gel autorise l'essai de fusion ; une simple
+        # observation (`branch_head`) ne prouve pas la tête publiée et ne
+        # permettra jamais de conclure « prêt ».
+    if not repo or not base:
+        out["unknown"] = True
+        return out
+    try:
+        merged = merge_tree(repo, base, frozen)
+    except Exception:  # noqa: BLE001 - essai illisible : on ne conclut pas
+        out["unknown"] = True
+        return out
+    if merged.get("state") == "error":
+        out["unknown"] = True
+        return out
+    if merged.get("state") == "conflict":
+        detail = "conflict with %s: %s" % (
+            target or "the target",
+            ", ".join(merged.get("files") or ()) or "files unreadable")
+        files = list(merged.get("files") or ())
+        known = [rem for rem in (remises or ()) if isinstance(rem, dict)]
+        good = [rem for rem in known if rem.get("ok")]
+        if good:
+            # #2496 : une remise propre et couverte est la source du lot ;
+            # le composeur la porte, l'auteur n'a rien à débloquer.
+            chosen = good[0]
+            out["ready"] = True
+            out["source"] = str(chosen.get("sha") or "")
+            out["remise"] = chosen
+            return out
+        unreadable = [rem for rem in known if rem.get("unreadable")]
+        if unreadable:
+            out["unknown"] = True
+            out["detail"] = detail + "; remise(s) unreadable here: " + "; ".join(
+                "%s: %s" % (str(rem.get("ref") or "?").rsplit("/", 1)[-1],
+                            rem.get("unreadable")) for rem in unreadable)
+            return out
+        if known:
+            detail += "; remise(s) refused: " + "; ".join(
+                "%s: %s" % (str(rem.get("ref") or "?").rsplit("/", 1)[-1],
+                            rem.get("why") or "no reason") for rem in known)
+        return _author_refusal("conflict", detail, files=files)
+    if not published or observed:
+        out["unknown"] = True
+        return out
+    out["ready"] = True
+    return out
+
+
+#: #4572 : un SHA complet dans une note de remise.
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def announced_remises(events, lot: int, target: str) -> list[dict]:
+    """Les remises du lot sur `target` annoncées au journal (#4572).
+
+    Un résolveur pousse sa remise et la note : « Remise sur main … poussée :
+    <sha>, ref refs/ameesh/resolutions/<lot>/main-… ». Le journal est la
+    seule trace locale quand le commit n'est pas dans ce dépôt ; on en tire
+    la ref et le SHA complet qui la précède, jamais une conclusion —
+    `evaluate_remise` tranche ensuite si l'objet est là. Lecture seule."""
+    prefix = "%s%d/" % (resolutions.REF_PREFIX, int(lot))
+    found: dict = {}
+    for event in events or ():
+        note = str(event.get("note") or "")
+        for word in note.replace(",", " ").split():
+            ref = word.strip().rstrip(".;:)")
+            if not ref.startswith(prefix):
+                continue
+            tail = ref[len(prefix):]
+            if not (tail.startswith(target + "-")
+                    or tail.startswith("union-%s-" % target)):
+                continue
+            before = note[:note.find(ref)]
+            shas = _FULL_SHA.findall(before)
+            found.setdefault(ref, shas[-1] if shas else "")
+    return [{"ref": ref, "sha": sha} for ref, sha in sorted(found.items())]
+
+
+def local_remises(repo: str, lot: int, target: str) -> list[dict]:
+    """Les refs de remise du lot **déjà présentes** dans `repo` (#4572).
+
+    Aucun fetch, aucun réseau : un clone d'auteur ne suit pas
+    `refs/ameesh/resolutions/*` ; le journal (`announced_remises`) complète.
+    """
+    proc = _git_out(repo, "for-each-ref", "--format=%(objectname)\t%(refname)",
+                    resolutions.REF_PREFIX)
+    if proc.returncode:
+        return []
+    found: dict = {}
+    for line in _text(proc).splitlines():
+        sha, _, ref = line.partition("\t")
+        sha, ref = sha.strip().lower(), ref.strip()
+        if _SHA.fullmatch(sha) and is_remise(ref, lot, target):
+            found[ref] = sha
+    return [{"ref": ref, "sha": sha} for ref, sha in sorted(found.items())]
+
+
+def evaluate_known_remises(db, cfg, row: dict, marks, *, repo: str, target: str,
+                           base: str, frozen: str, remises) -> list[dict]:
+    """#4572 : évalue les remises connues du lot, comme `_apply_remises`.
+
+    Une remise dont le commit n'est pas local, ou dont la lecture échoue, est
+    rendue `unreadable` — l'appelant ne conclut alors pas. Une remise évaluée
+    porte `ok`/`why`/`cover`, la forme d'`evaluate_remise` (#2496). Aucune
+    écriture, aucun fetch."""
+    known = [dict(rem) for rem in remises or () if isinstance(rem, dict)]
+    if not known:
+        return []
+    klass = None
+    canons = None
+    try:
+        canons = work.configured_canons(cfg) if cfg is not None else None
+        klass = lot_class.of_lot(db, int(row["id"]), cfg=cfg,
+                                 item=_class_row(row, target), repo=repo,
+                                 base=base, head=frozen, milestones=list(marks or ()),
+                                 canons=canons)
+    except Exception:  # noqa: BLE001 - classe illisible : remises non concluantes
+        klass = None
+    out: list[dict] = []
+    for rem in known:
+        sha = plan_git.local_commit(repo, rem.get("sha") or rem.get("ref") or "")
+        if not sha:
+            out.append({"ref": rem.get("ref") or "", "sha": rem.get("sha") or "",
+                        "ok": False, "unreadable": "commit not available locally"})
+            continue
+        if klass is None:
+            out.append({"ref": rem.get("ref") or "", "sha": sha, "ok": False,
+                        "unreadable": "review class unreadable"})
+            continue
+        try:
+            result = evaluate_remise(
+                db, _class_row(row, target), list(marks or ()), repo=repo,
+                package_base=base, frozen=frozen, ref=rem.get("ref") or "",
+                sha=sha, klass=klass, cfg=cfg, canons=canons)
+        except Exception as exc:  # noqa: BLE001 - lecture impossible : on ne conclut pas
+            result = {"ok": False, "unreadable": "%s: %s" % (type(exc).__name__, exc)}
+        result["ref"] = rem.get("ref") or ""
+        result["sha"] = sha
+        out.append(result)
+    return out
+
+
+def candidate_refusal(db, cfg, row: dict, marks=None, *, overview=None,
+                      repo: str | None = None, events=None) -> dict:
+    """#4572 : `refusal_of` avec la résolution des refs locales du lot.
+
+    `marks` : les jalons du lot (relus de la base s'ils manquent). `repo` peut
+    être fourni par un appelant qui l'a déjà résolu. Le dépôt est retrouvé par
+    le commit gelé comme dans `merge_queue.review_gate_for_item` (#2559) ;
+    `overview` réutilise les lignes du registre déjà lues par la passe.
+    `published` est la ref `origin/<branche>` du dépôt, jamais `branch_head` ;
+    à défaut de dépôt, `branch_head` ne sert qu'à **nommer** la tête dans le
+    détail (`published_source="observed"`), la conclusion restant `unknown`
+    sans essai de fusion. Lecture seule, aucun fetch, aucune écriture."""
+    row = row or {}
+    if marks is None:
+        marks = storage.of(db).work.milestones(int(row["id"]), None)
+    freeze = plan_git.latest_freeze(list(marks or ()))
+    raw = str((freeze or {}).get("sha") or "").strip()
+    frozen = ""
+    target_name = str(row.get("branch_target") or "").strip()
+    base = ""
+    published = ""
+    source = ""
+    if plan_git.commit_id(raw):
+        if repo is None:
+            try:
+                repo, frozen = lot_class.repo_for_freeze(db, cfg, row, raw,
+                                                         overview=overview)
+            except Exception:  # noqa: BLE001 - dépôt illisible : on ne conclut pas
+                repo, frozen = "", ""
+        else:
+            try:
+                frozen = plan_git.local_commit(repo, raw) or ""
+            except Exception:  # noqa: BLE001 - commit illisible : on ne conclut pas
+                frozen = ""
+    if repo:
+        branch = str(row.get("branch") or "").strip()
+        if branch:
+            try:
+                published = plan_git.local_commit(
+                    repo, "origin/" + merge_queue._remote_branch(branch)) or ""
+            except Exception:  # noqa: BLE001 - ref illisible : tête inconnue
+                published = ""
+            if published:
+                source = "origin"
+        try:
+            target_name = lot_class.default_base(cfg, row, repo) or target_name
+        except Exception:  # noqa: BLE001 - cible illisible : essai sans cible
+            target_name = str(row.get("branch_target") or "").strip()
+        target_name = merge_queue._remote_branch(target_name) or target_name
+        if target_name:
+            try:
+                ref = merge_queue._class_base(repo, target_name)
+                base = (plan_git._commit(repo, ref) or "") if ref else ""
+            except Exception:  # noqa: BLE001 - cible illisible : essai sans base
+                base = ""
+    if not published:
+        observed = str(row.get("branch_head") or "").strip()
+        if observed:
+            published, source = observed, "observed"
+    result = refusal_of(row, frozen=frozen, raw_freeze=raw,
+                        published=published, published_source=source,
+                        repo=repo or "", target=target_name, base=base)
+    if (result.get("code") == "conflict" and repo and frozen
+            and target_name and base):
+        # #2496/#4572 : un conflit n'est pas forcément côté auteur — une
+        # remise propre et couverte sur la cible fait du lot une unité que le
+        # composeur porte. On lit les remises locales et celles annoncées au
+        # journal, puis on les évalue comme `_apply_remises`. Sans objet local
+        # ni raison lisible, `refusal_of` rend `unknown`, jamais « l'auteur
+        # doit résoudre ».
+        known: dict = {rem["ref"]: rem for rem in
+                       local_remises(repo, int(row["id"]), target_name)}
+        if events is None and db is not None:
+            try:
+                events = storage.of(db).progress.lot_events([int(row["id"])])
+            except Exception:  # noqa: BLE001 - journal illisible : pas d'indice
+                events = ()
+        for rem in announced_remises(events, int(row["id"]), target_name):
+            known.setdefault(rem["ref"], rem)
+        if known:
+            evaluated = evaluate_known_remises(
+                db, cfg, row, marks, repo=repo, target=target_name, base=base,
+                frozen=frozen, remises=list(known.values()))
+            if evaluated:
+                result = refusal_of(
+                    row, frozen=frozen, raw_freeze=raw, published=published,
+                    published_source=source, repo=repo, target=target_name,
+                    base=base, remises=evaluated)
+    return result

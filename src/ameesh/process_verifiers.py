@@ -752,6 +752,14 @@ def _observation_proof(command: Command, snapshot: Snapshot, env: str,
         return _refuse("evidence-missing",
                        "observation %s inconnue de la collection collectee"
                        % (ident or "(absente)"), snapshot)
+    # #4425 : une observation revoquee ou remplacee n'est jamais une preuve,
+    # meme si un appelant a construit le snapshot sans passer par le lecteur
+    # fail-closed de B. Un enregistrement sans etat (fixtures historiques) est
+    # lu comme courant.
+    state = _text(observation.get("state"))
+    if state and state != "current":
+        return _refuse("observation-result-mismatch",
+                       "observation %s %s" % (ident, state), snapshot)
     if _text(observation.get("env")) != env:
         return _refuse("observation-result-mismatch",
                        "observation %s hors de l'environnement %s"
@@ -825,6 +833,10 @@ def _check_repair_started(command: Command, snapshot: Snapshot) -> Decision:
         return _refuse("failure-missing",
                        "aucun echec enregistre %s" % (ident or "sur la revision"),
                        snapshot)
+    state = _text(failure.get("state"))
+    if state and state != "current":
+        return _refuse("observation-result-mismatch",
+                       "echec %s %s" % (ident, state), snapshot)
     if _text(failure.get("env")) not in ENVIRONMENTS:
         return _refuse("observation-result-mismatch",
                        "echec %s hors environnement de deploiement" % ident,

@@ -1527,10 +1527,16 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def reserve(self, recipient: str, owner: str | None, epoch: int | None,
                 token: str, *, ids: Sequence[int] | None = None, porteur: str,
-                ttl_seconds: float, limit: int = 200) -> list[dict]:
+                ttl_seconds: float, limit: int = 200,
+                turn_id: str | None = None) -> list[dict]:
         """Réserve atomiquement des non-lus sans réservation active (le
         destinataire est verrouillé dans le registre, le bail (owner, epoch)
-        contrôlé s'il est donné) ; rend les messages réservés sous `token`."""
+        contrôlé s'il est donné) ; rend les messages réservés sous `token`.
+
+        `turn_id` (#2894) : le tour de l'exécuteur qui réserve sa consigne,
+        écrit dans `meta.consigne.turn` (additif) pour relier la remise au
+        document `ameesh-turn-context/1` ; absent pour une réservation de hook.
+        """
 
     @abc.abstractmethod
     def deliver(self, recipient: str, owner: str | None, epoch: int | None,
@@ -2871,7 +2877,9 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def project_plan_rows(self, project: str, *, assignment_id: int | None = None) -> list[dict]:
-        """#4174: open project readiness; assignment_id limits to target and unassigned bugs."""
+        """#4174: open dispatch readiness (bugs and evolutions, not the L119
+        improvement queue), with `footprint_overlap` (#4173); assignment_id
+        limits to target and unassigned bugs."""
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -3882,6 +3890,13 @@ class Decisions(Domain):
     def get(self, decision_id: int) -> dict | None:
         """La demande `decision_id` (en attente ou close), ou None."""
 
+    def repair_forward(self, decision_id: int, *, actor: str) -> dict:
+        """Restore a human decision accidentally forwarded by mail. Atomically
+        lock the original and its copy, refuse answered/withdrawn or chained
+        forwards, withdraw the copy and restore the unchanged original to pending.
+        Raise ValueError when there is no unambiguous repair."""
+        raise NotImplementedError
+
     @abc.abstractmethod
     def pending(self, *, limit: int) -> list[dict]:
         """Les demandes en attente, les plus anciennes d'abord."""
@@ -3900,6 +3915,44 @@ class Decisions(Domain):
         (`answered` | `delivered`), `record` fusionné dans `payload.decision`
         (état, réponse ou retrait). Rend la ligne close, ou None (déjà close,
         inconnue) — rien n'est écrit."""
+
+    def validation_register(self, decision_id: int, *, routing: dict):
+        """#4256: immutable authority snapshot, outside the mediated contract."""
+        raise NotImplementedError
+
+    def validation_route(self, decision_id: int):
+        """Private routing snapshot, or None for a legacy request."""
+        raise NotImplementedError
+
+    def validation_due(self, *, now: float):
+        """All due, pending, not-yet-escalated validations; no queue truncation."""
+        raise NotImplementedError
+
+    def validation_lock(self, decision_id: int):
+        """Lock the decision mailbox row before escalation or a late reply."""
+        raise NotImplementedError
+
+    def validation_escalate(self, decision_id: int, *, recipient: str,
+                            decision: dict, body: str, now: float):
+        """Update a locked, pending decision and record its single escalation."""
+        raise NotImplementedError
+
+    def validation_event(self, decision_id: int, *, person: str, kind: str,
+                         now: float, facts: dict, event_key: str):
+        """Append idempotent private facts; never a work note or thread entry."""
+        raise NotImplementedError
+
+    def validation_history(self, *, person: str):
+        """Private audit rows; caller must verify owner key and human session."""
+        raise NotImplementedError
+
+    def validation_followup(self, decision_id: int, *, followup_id: int, response_key: str):
+        """Record the typed contradiction link under the decision row lock."""
+        raise NotImplementedError
+
+    def validation_followup_id(self, decision_id: int, *, response_key: str):
+        """Existing contradiction follow-up, or None."""
+        raise NotImplementedError
 
     def reply_for(self, decision_id: int, *, sender: str | None = None) -> dict | None:
         """#3892 : le courrier de réponse déjà déposé pour `decision_id`
