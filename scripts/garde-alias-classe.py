@@ -37,16 +37,17 @@ l'hôte. Sans canon configuré, elle refuse plutôt que de supposer une classe.
 En CI, le canon de l'hôte n'est pas lisible (``manaty/home`` est privé) : la
 garde lit une **politique épinglée** versionnée, ``scripts/alias-review-
 classes.json``, générée depuis le canon audité (``--write-policy``). Le gel
-vérifie que ce fichier suit le canon de l'hôte (``--check-policy``) : une
-classe affaiblie ou une politique périmée refuse. La CI ne devine donc
-jamais une classe, et le gel reste la source de vérité.
+vérifie que la classe épinglée de chaque alias n'est pas plus faible que
+celle du canon de l'hôte (``--check-policy``) ; les ``rule`` peuvent bouger
+sans changer la classe sans refuser les gels. La CI ne devine donc jamais
+une classe, et le gel reste la source de vérité.
 
 Usage : scripts/garde-alias-classe.py [--root REPO] [--project ameesh]
         [--canon DIR --ref REV] [--policy FILE]
         [--write-policy FILE | --check-policy FILE]
 Sortie : 0 tous les alias sont couverts, 1 au moins un alias affaiblit la
-classe (ou la politique épinglée est périmée), 2 lecture impossible
-(déclaration, alias, canon ou politique).
+classe (ou la politique épinglée est plus faible que le canon), 2 lecture
+impossible (déclaration, alias, canon ou politique).
 """
 from __future__ import annotations
 
@@ -507,17 +508,25 @@ def pinned_class_of(policy: dict):
 
 
 def policy_gaps(path: str, expected: dict) -> list:
-    """Les chemins dont la politique épinglée diverge du canon lu."""
+    """Les chemins dont la classe épinglée est plus faible que le canon.
+
+    Seule la classe est comparée : le canon ajoute souvent un chemin sans
+    rapport aux règles (le §8 bouge), et une ``rule`` différente sans
+    changement de classe ne doit pas refuser le gel de chaque lot (B/P2
+    auditeur). Les ``rule`` restent dans le fichier pour les messages. Une
+    classe épinglée plus forte que le canon est acceptée : la CI est alors
+    plus stricte que le gel, jamais plus permissive.
+    """
     classes = read_policy(path)["classes"]
     gaps = []
     for source, wanted in sorted(expected["classes"].items()):
         entry = classes.get(source)
-        actual = None
-        if isinstance(entry, dict):
-            actual = {"class": entry.get("class"),
-                      "rule": list(entry.get("rule") or ())}
-        if actual != wanted:
-            gaps.append((source, actual, wanted))
+        pinned = entry.get("class") if isinstance(entry, dict) else None
+        canon = wanted.get("class")
+        if pinned not in RANK or canon not in RANK:
+            gaps.append((source, entry, wanted))
+        elif RANK[pinned] < RANK[canon]:
+            gaps.append((source, entry, wanted))
     return gaps
 
 
@@ -568,10 +577,11 @@ def main(argv=None) -> int:
             return 2
         if gaps:
             for source, actual, wanted in gaps:
-                print("PÉRIMÉE  %s (politique : %s ; canon : %s)"
+                print("AFFAIBLIE  %s (politique : %s ; canon : %s)"
                       % (source, _class_name(actual), _class_name(wanted)))
-            print("garde alias/classe #4521 : politique épinglée périmée (%d "
-                  "chemin(s)) — régénérer : scripts/garde-alias-classe.py --root . "
+            print("garde alias/classe #4521 : politique épinglée plus faible "
+                  "que le canon (%d chemin(s)) — régénérer : "
+                  "scripts/garde-alias-classe.py --root . "
                   "--write-policy %s" % (len(gaps), args.check_policy))
             return 1
         print("garde alias/classe #4521 : politique épinglée à jour (%d chemins, "

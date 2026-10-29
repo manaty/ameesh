@@ -64,8 +64,9 @@ CHECKS = (
     # (les `modules/dev/**` déplacés par L100 tombent au défaut léger).
     ("alias de module #4521", ["scripts/garde-alias-classe.py", "--root", "."]),
     # #4521 B/P1 auditeur : la politique épinglée lue en CI (canon privé
-    # illisible sur un runner) doit suivre le canon de l'hôte ; une politique
-    # périmée ou affaiblie refuse le gel.
+    # illisible sur un runner) ne doit pas être plus faible que le canon de
+    # l'hôte ; une classe épinglée plus faible refuse le gel. Les règles
+    # peuvent bouger sans changer la classe (B/P2 auditeur).
     ("alias de module #4521 (politique épinglée)",
      ["scripts/garde-alias-classe.py", "--root", ".",
       "--check-policy", "scripts/alias-review-classes.json"]),

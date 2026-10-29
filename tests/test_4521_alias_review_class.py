@@ -561,20 +561,46 @@ class CanonReelTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("politique épinglée invalide", proc.stderr)
 
-    def test_politique_epinglee_perimee_refusee(self):
+    def test_politique_epinglee_ignore_une_regle_sans_changement_de_classe(self):
+        """B/P2 auditeur : ajouter un chemin à une règle ne change pas la classe."""
         self.write_canon([["src/ameesh/merge_pr.py",
                            "src/ameesh/modules/dev/merge_pr.py"]])
         policy = self.generate_policy()
-        fresh = self.run_guard(self.config(canon=self.canon),
-                               "--check-policy", policy)
-        self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
-        # le canon se resserre : l'implémentation retombe en light
-        self.write_canon([["src/ameesh/merge_pr.py"]])
-        stale = self.run_guard(self.config(canon=self.canon),
-                               "--check-policy", policy)
-        self.assertEqual(stale.returncode, 1, stale.stdout + stale.stderr)
-        self.assertIn("PÉRIMÉE", stale.stdout)
-        self.assertIn("régénérer", stale.stdout)
+        self.write_canon([["src/ameesh/merge_pr.py",
+                           "src/ameesh/modules/dev/merge_pr.py",
+                           "src/ameesh/exemple_4521.py"]])
+        proc = self.run_guard(self.config(canon=self.canon),
+                              "--check-policy", policy)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("à jour", proc.stdout)
+
+    def test_politique_epinglee_refuse_une_classe_plus_faible(self):
+        """Une classe épinglée plus faible que le canon refuse le gel."""
+        self.write_canon([["src/ameesh/exemple_4521.py"]])
+        policy = self.generate_policy()
+        self.write_canon([["src/ameesh/merge_pr.py"],
+                          ["src/ameesh/exemple_4521.py"]])
+        proc = self.run_guard(self.config(canon=self.canon),
+                              "--check-policy", policy)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("AFFAIBLIE", proc.stdout)
+        self.assertIn("src/ameesh/merge_pr.py", proc.stdout)
+        self.assertIn("régénérer", proc.stdout)
+
+    def test_politique_epinglee_sans_chemin_refusee(self):
+        self.write_canon([["src/ameesh/merge_pr.py",
+                           "src/ameesh/modules/dev/merge_pr.py"]])
+        policy = self.generate_policy()
+        with open(policy, encoding="utf-8") as fh:
+            data = json.load(fh)
+        del data["classes"]["src/ameesh/merge_pr.py"]
+        with open(policy, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        proc = self.run_guard(self.config(canon=self.canon),
+                              "--check-policy", policy)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("src/ameesh/merge_pr.py", proc.stdout)
+        self.assertIn("absent", proc.stdout)
 
     def test_canon_epingle_absent_refuse(self):
         missing = os.path.join(self.root, "canon-absent")
