@@ -203,22 +203,32 @@ def mark_low(db, harness: str, account: str | None, *, reason: str,
              detail: str | None = None, source: str = "assess",
              agent: str | None = None, host: str | None = None,
              balance: float | None = None, ratio: float | None = None,
-             runway_ts: float | None = None) -> bool:
-    """Pose `low` ; vrai sur la transition (depuis `ok` ou `exhausted`)."""
+             runway_ts: float | None = None,
+             allow_from_exhausted: bool = True) -> bool:
+    """Pose `low` ; vrai sur la transition (depuis `ok` ou `exhausted`).
+
+    `allow_from_exhausted=False` (écritures de l'évaluation périodique) ne
+    touche jamais un compte épuisé : seule une sonde ou un relevé de solde
+    réel le rouvre (#4164, B1 cx2/auditeur)."""
     return storage.of(db).provider_credits.mark_low(
         harness, account or "", reason=reason, detail=detail, source=source,
         agent=agent, host=host, balance_usd=balance, ratio=ratio,
-        runway_ts=runway_ts)
+        runway_ts=runway_ts, allow_from_exhausted=allow_from_exhausted)
 
 
 def mark_ok(db, harness: str, account: str | None, *, source: str,
             agent: str | None = None, host: str | None = None,
             balance: float | None = None, ratio: float | None = None,
-            runway_ts: float | None = None) -> bool:
-    """Pose `ok` ; vrai sur la transition depuis `low`/`exhausted`."""
+            runway_ts: float | None = None,
+            allow_from_exhausted: bool = True) -> bool:
+    """Pose `ok` ; vrai sur la transition depuis `low`/`exhausted`.
+
+    `allow_from_exhausted=False` ne rouvre pas un compte épuisé (B1
+    cx2/auditeur) : la sonde et le relevé de solde réel gardent ce droit."""
     return storage.of(db).provider_credits.mark_ok(
         harness, account or "", source=source, agent=agent, host=host,
-        balance_usd=balance, ratio=ratio, runway_ts=runway_ts)
+        balance_usd=balance, ratio=ratio, runway_ts=runway_ts,
+        allow_from_exhausted=allow_from_exhausted)
 
 
 def claim_probe(db, harness: str, account: str | None,
@@ -339,8 +349,13 @@ def _duration(seconds: float) -> str:
 
 def _apply(db, harness: str, account: str | None, verdict: tuple[str, str],
            *, balance: float, reference: float | None, rate: float | None,
-           now: float, source: str, host: str | None) -> bool | None:
-    """Écrit l'état décidé par `_verdict` ; vrai si `exhausted` apparaît."""
+           now: float, source: str, host: str | None,
+           allow_from_exhausted: bool = True) -> bool | None:
+    """Écrit l'état décidé par `_verdict` ; vrai si `exhausted` apparaît.
+
+    `allow_from_exhausted=False` (évaluation périodique) ne rouvre jamais un
+    compte épuisé : une sonde ou un relevé de solde réel concurrent gagne
+    toujours (#4164, B1 cx2/auditeur)."""
     state, detail = verdict
     ratio = (float(balance) / float(reference)
              if reference is not None and reference > 0 else None)
@@ -355,10 +370,11 @@ def _apply(db, harness: str, account: str | None, verdict: tuple[str, str],
     if state == LOW:
         mark_low(db, harness, account, reason=REASON_LOW, detail=detail,
                  source=source, host=host, balance=balance, ratio=ratio,
-                 runway_ts=runway)
+                 runway_ts=runway, allow_from_exhausted=allow_from_exhausted)
         return None
     transition = mark_ok(db, harness, account, source=source, host=host,
-                         balance=balance, ratio=ratio, runway_ts=runway)
+                         balance=balance, ratio=ratio, runway_ts=runway,
+                         allow_from_exhausted=allow_from_exhausted)
     return False if transition else None
 
 
@@ -593,7 +609,8 @@ def assess(db, *, now: float | None = None, harness: str | None = None,
             if verdict is None:
                 # plus rien pour juger : aucun signe de manque ne subsiste
                 if row.get("state") == LOW:
-                    if mark_ok(db, row["harness"], row.get("account"), source="assess"):
+                    if mark_ok(db, row["harness"], row.get("account"),
+                               source="assess", allow_from_exhausted=False):
                         changed.append(dict(
                             get(db, row["harness"], row.get("account")) or row,
                             previous=row.get("state")))
@@ -603,7 +620,7 @@ def assess(db, *, now: float | None = None, harness: str | None = None,
             _apply(db, row["harness"], row.get("account"), applied,
                    balance=balance, reference=reference, rate=rate, now=now,
                    source=("balance" if has_balance else "prepaid"),
-                   host=None)
+                   host=None, allow_from_exhausted=False)
             after = get(db, row["harness"], row.get("account"))
             if after is not None and after.get("state") != before:
                 changed.append(dict(after, previous=before))
@@ -658,6 +675,11 @@ def describe(row: dict | None) -> str:
             parts.append("next probe %s" % _local(row["next_probe_ts"]))
     elif state == LOW and row.get("detail"):
         parts.append(row["detail"])
+    if _probe_after_declaration(row):
+        # N auditeur : la projection n'est plus recalculée tant que l'owner ne
+        # redéclare pas ; le dire là où il lit l'état (budget, show).
+        parts.append("prepaid declaration stale after a successful probe: "
+                     "re-declare to refresh the projection")
     return ", ".join(parts)
 
 

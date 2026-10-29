@@ -93,10 +93,14 @@ class ProviderCredits(interface.ProviderCredits):
         return False
 
     def mark_low(self, harness, account, *, reason, detail, source, agent, host,
-                 balance_usd, ratio, runway_ts) -> bool:
+                 balance_usd, ratio, runway_ts, allow_from_exhausted=True) -> bool:
         releve = (None if balance_usd is None else float(balance_usd),
                   None if ratio is None else float(ratio),
                   None if runway_ts is None else float(runway_ts))
+        # #4166 (B1 cx2/auditeur) : l'évaluation périodique ne rouvre jamais un
+        # compte `exhausted` — seule une sonde ou un relevé de solde réel le
+        # fait ; un mark_exhausted concurrent ne doit pas être écrasé.
+        guard = "" if allow_from_exhausted else " and state <> 'exhausted'"
         inserted = self.db.query(
             "insert into provider_account_credits"
             " (harness, account, state, reason, detail, source, agent, host,"
@@ -115,8 +119,8 @@ class ProviderCredits(interface.ProviderCredits):
             " checked_at = now(), reason = %s, detail = %s, source = %s,"
             " agent = %s, host = %s, balance_usd = %s, ratio = %s,"
             " runway_at = " + _RUNWAY + ", next_probe_at = null"
-            " where harness = %s and account = %s and state <> 'low'"
-            " returning state",
+            " where harness = %s and account = %s and state <> 'low'" + guard
+            + " returning state",
             (reason, detail, source, agent, host, releve[0], releve[1],
              releve[2], releve[2], harness, account or ""))
         if flipped:
@@ -126,24 +130,26 @@ class ProviderCredits(interface.ProviderCredits):
             "update provider_account_credits set checked_at = now(), reason = %s,"
             " detail = %s, source = %s, agent = %s, host = %s, balance_usd = %s,"
             " ratio = %s, runway_at = " + _RUNWAY +
-            " where harness = %s and account = %s",
+            " where harness = %s and account = %s" + guard,
             (reason, detail, source, agent, host, releve[0], releve[1],
              releve[2], releve[2], harness, account or ""))
         return False
 
     def mark_ok(self, harness, account, *, source, agent=None, host=None,
-                balance_usd=None, ratio=None, runway_ts=None) -> bool:
+                balance_usd=None, ratio=None, runway_ts=None,
+                allow_from_exhausted=True) -> bool:
         releve = (None if balance_usd is None else float(balance_usd),
                   None if ratio is None else float(ratio),
                   None if runway_ts is None else float(runway_ts))
+        guard = "" if allow_from_exhausted else " and state <> 'exhausted'"
         rows = self.db.query(
             "update provider_account_credits set state = 'ok', since = now(),"
             " checked_at = now(), source = %s, agent = %s, host = %s,"
             " next_probe_at = null, reason = null, detail = null,"
             " balance_usd = coalesce(%s, balance_usd),"
             " ratio = coalesce(%s, ratio), runway_at = " + _RUNWAY +
-            " where harness = %s and account = %s and state <> 'ok'"
-            " returning state",
+            " where harness = %s and account = %s and state <> 'ok'" + guard
+            + " returning state",
             (source, agent, host, releve[0], releve[1], releve[2], releve[2],
              harness, account or ""))
         if rows:
@@ -153,7 +159,7 @@ class ProviderCredits(interface.ProviderCredits):
             "update provider_account_credits set checked_at = now(),"
             " balance_usd = coalesce(%s, balance_usd),"
             " ratio = coalesce(%s, ratio), runway_at = " + _RUNWAY +
-            " where harness = %s and account = %s",
+            " where harness = %s and account = %s" + guard,
             (releve[0], releve[1], releve[2], releve[2], harness, account or ""))
         return False
 

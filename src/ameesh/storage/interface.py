@@ -1218,20 +1218,28 @@ class ProviderCredits(Domain):
     def mark_low(self, harness: str, account: str, *, reason: str,
                  detail: str | None, source: str, agent: str | None,
                  host: str | None, balance_usd: float | None,
-                 ratio: float | None, runway_ts: float | None) -> bool:
+                 ratio: float | None, runway_ts: float | None,
+                 allow_from_exhausted: bool = True) -> bool:
         """Pose `low` avec le relevé qui l'a décidé. Vrai si c'est une
-        **transition** (depuis `ok` ou `exhausted` : des crédits sont revenus,
-        mais bas) ; un compte déjà `low` garde son `since` (une seule alerte
-        par épisode) et ne voit que son relevé actualisé."""
+        **transition** (depuis `ok` ou, si `allow_from_exhausted`, depuis
+        `exhausted` : des crédits sont revenus, mais bas) ; un compte déjà
+        `low` garde son `since` (une seule alerte par épisode) et ne voit que
+        son relevé actualisé. Avec `allow_from_exhausted=False`, un compte
+        `exhausted` n'est jamais modifié : les écritures de l'évaluation
+        périodique ne rouvrent pas un compte que seule la sonde rouvre
+        (#4164, B1 cx2/auditeur)."""
 
     @abc.abstractmethod
     def mark_ok(self, harness: str, account: str, *, source: str,
                 agent: str | None = None, host: str | None = None,
                 balance_usd: float | None = None, ratio: float | None = None,
-                runway_ts: float | None = None) -> bool:
+                runway_ts: float | None = None,
+                allow_from_exhausted: bool = True) -> bool:
         """Pose `ok` et le relevé éventuel. Vrai si c'est une transition
         depuis `low`/`exhausted` (une seule des écritures concurrentes
-        l'obtient)."""
+        l'obtient). Avec `allow_from_exhausted=False`, un compte `exhausted`
+        n'est jamais rouvert par cette écriture (seule la sonde ou un relevé
+        de solde réel le rouvre)."""
 
     @abc.abstractmethod
     def declare_prepaid(self, harness: str, account: str, *, usd: float,

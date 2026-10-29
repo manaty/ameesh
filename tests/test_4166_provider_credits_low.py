@@ -330,11 +330,51 @@ class RealBalanceTest(_LowBase):
         self.assertEqual(self._row()["state"], "ok")
         self.assertEqual(self._alerts("provider_credits_exhausted"), [])
         self.assertEqual(self._alerts("provider_credits_low"), [])
+        self.assertIn("re-declare", provider_credits.describe(self._row()))
         # une nouvelle déclaration rafraîchit la projection : elle s'applique
         self._declare(10.0, harness="codex", account="primaire")
         self._assess()
         self.assertEqual(self._row()["state"], "ok")
         self.assertAlmostEqual(self._row()["ratio"], 1.0, places=3)
+
+    def test_assess_never_reopens_an_account_exhausted_during_the_pass(self):
+        """B1 cx2/auditeur : un mark_exhausted concurrent entre la lecture et
+        l'écriture d'assess ne doit pas être écrasé (seule la sonde rouvre)."""
+        self._declare(100.0, harness="codex", account="primaire")
+        self._prepaid_at(3600)
+        self._spend(85.0)  # projeté 15 -> low attendu
+        real = provider_credits._apply
+
+        def racing(db, harness, account, verdict, **kwargs):
+            provider_credits.mark_exhausted(db, harness, account,
+                                            reason="concurrent exhaustion")
+            return real(db, harness, account, verdict, **kwargs)
+
+        with mock.patch.object(provider_credits, "_apply", side_effect=racing):
+            provider_credits.assess(self.db)
+        row = self._row()
+        self.assertEqual(row["state"], "exhausted")
+        self.assertIsNotNone(row.get("next_probe_ts"))
+
+    def test_assess_mark_ok_never_reopens_a_concurrent_exhausted(self):
+        """B1 cx2/auditeur : la branche « plus de preuve » ne rouvre pas un
+        compte épuisé entre la lecture et l'écriture."""
+        self._declare(100.0, harness="codex", account="primaire")
+        self._prepaid_at(3600)
+        self._spend(85.0)
+        self._assess()
+        self.assertEqual(self._row()["state"], "low")
+        provider_credits.clear(self.db, "codex", "primaire", actor="human:test")
+        real_ok = provider_credits.mark_ok
+
+        def racing_ok(db, harness, account, **kwargs):
+            provider_credits.mark_exhausted(db, harness, account,
+                                            reason="concurrent exhaustion")
+            return real_ok(db, harness, account, **kwargs)
+
+        with mock.patch.object(provider_credits, "mark_ok", side_effect=racing_ok):
+            provider_credits.assess(self.db)
+        self.assertEqual(self._row()["state"], "exhausted")
 
 
 class ChooseFallbackTest(_LowBase):
