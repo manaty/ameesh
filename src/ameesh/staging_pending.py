@@ -10,6 +10,8 @@ package version number or the lot's branch head.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import datetime
 import json
 import re
@@ -196,7 +198,12 @@ def waiting(db, project, *, active=None) -> dict:
     all_rows = st.work.items(state=None, assignee=None, limit=None)
     rows = {int(r["id"]): r for r in all_rows}
     candidates = [r for r in all_rows
-                  if r.get("state") in ("intake", "build", "qa", "blocked")]
+                  if r.get("state") in (
+                      lifecycle.REQUESTED,
+                      lifecycle.IN_PROGRESS,
+                      lifecycle.QA,
+                      lifecycle.BLOCKED,
+                  )]
     ids = [int(r["id"]) for r in candidates]
     holds = planned_waits.active_holds(
         db, st.progress.lot_hold_events(ids, planned_waits.HOLD_NOTE_PATTERNS))

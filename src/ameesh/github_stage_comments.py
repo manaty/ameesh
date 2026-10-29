@@ -14,6 +14,8 @@ already present are re-read and only missing comments are posted.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import datetime as dt
 import json
 from pathlib import Path
@@ -142,9 +144,9 @@ def stages(item, milestones, events, *, receipts=(), closing=None):
         yield key, text
     # Process-backed stages can change without legacy milestones. A validated
     # current core supplies a receipt only when no native milestone exists.
-    if item.get("state") == "merged" and "merged" not in kinds:
+    if item.get("state") == lifecycle.DELIVERY_RECORDED and "merged" not in kinds:
         yield "merged", "Merged; delivery confirmation will follow."
-    if item.get("state") == "promoted":
+    if item.get("state") == lifecycle.PROMOTED:
         yield "completed", "Completed; release delivery confirmation will follow when available."
     if closing:
         yield "closed", closing

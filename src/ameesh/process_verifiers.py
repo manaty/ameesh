@@ -70,6 +70,8 @@ declare executable sans preuve : ni source simulee, ni installation supposee.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -574,7 +576,7 @@ def _closed(snapshot: Snapshot) -> bool:
     """Lot terminal : `closed` comme `promoted` (N5 de la revue #1924)."""
     if snapshot.item.get("closed_at"):
         return True
-    return _text(snapshot.item.get("state")) in ("closed", "promoted")
+    return _text(snapshot.item.get("state")) in (lifecycle.CLOSED, lifecycle.PROMOTED)
 
 
 #: Jalons qui portent une revision reelle.

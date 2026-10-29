@@ -51,6 +51,8 @@ Safety rules, learned from the false positives of an intake check:
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import hashlib
 import re
 from typing import Optional
@@ -73,7 +75,7 @@ SLACK_S = 300.0
 #: git calls are bounded; `git log -L` is the expensive one
 GIT_TIMEOUT = 30.0
 #: the pass closes only lots that have not started
-CLOSABLE_STATES = ("intake", "blocked")
+CLOSABLE_STATES = (lifecycle.REQUESTED, lifecycle.BLOCKED)
 
 #: verbs that ask for a presence (a lot whose title starts with one of these
 #: and another whose title starts with the opposite verb contradict each other)
@@ -451,21 +453,21 @@ def _contradiction_findings(lots: list[dict]) -> list[dict]:
 # --------------------------------------------------------------------------
 
 def _open_lots(db, project: str) -> list[dict]:
-    return [dict(row) for row in db.query("""
+    return [dict(row) for row in db.query(f"""
         SELECT id, title, body, state, app, assignee, branch, branch_target,
                pr_ref, issue_ref,
                extract(epoch FROM created_at)::float8 AS created_ts
           FROM work_items
-         WHERE app = %s AND state NOT IN ('merged', 'promoted', 'closed')
+         WHERE app = %s AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')
          ORDER BY id
          LIMIT %s""", (project, MAX_LOTS))]
 
 
 def projects(db) -> list[str]:
     """The projects that still have at least one open lot, sorted."""
-    return [str(row["app"]) for row in db.query("""
+    return [str(row["app"]) for row in db.query(f"""
         SELECT DISTINCT app FROM work_items
-         WHERE state NOT IN ('merged', 'promoted', 'closed')
+         WHERE state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')
            AND coalesce(app, '') <> ''
          ORDER BY app""")]
 
@@ -640,7 +642,7 @@ def _po_of(db, cfg, project: str) -> Optional[str]:
 
 
 def _open(item: dict) -> bool:
-    return str(item.get("state") or "") not in ("merged", "promoted", "closed")
+    return str(item.get("state") or "") not in lifecycle.COMPLETED
 
 
 def _refused(finding: dict, reason: str) -> dict:

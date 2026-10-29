@@ -58,6 +58,8 @@ hold its private key.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import argparse
 import getpass
 import json
@@ -346,7 +348,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         for lot in lots:
             if lot.get("assignee") and lot.get("state") not in work.TERMINAL:
                 open_by_agent[lot["assignee"]] = open_by_agent.get(lot["assignee"], 0) + 1
-                if lot.get("state") == "build":
+                if lot.get("state") == lifecycle.IN_PROGRESS:
                     # §4 (owner 14/10/2026) : le compte d'en-cours est tous
                     # projets confondus, comme le plafond lui-même
                     build_by_agent[lot["assignee"]] = build_by_agent.get(lot["assignee"], 0) + 1

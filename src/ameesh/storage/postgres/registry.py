@@ -20,6 +20,8 @@ garanties, inchangées :
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import json
 import re
 from typing import Any, Sequence
@@ -376,7 +378,7 @@ class Agents(interface.Agents):
                              # `promoted`) garde son assigné mais ne retient pas
                              "SELECT id, state FROM work_items"
                              " WHERE assignee = %s"
-                             "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                             f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                              " ORDER BY id",
                              (agent,))]
             blockers += [{"kind": "external_executor", "id": int(lot["id"]),
@@ -384,7 +386,7 @@ class Agents(interface.Agents):
                          for lot in tx.query(
                              "SELECT id, state FROM work_items"
                              " WHERE external_executor = %s"
-                             "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                             f"   AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
                              " ORDER BY id", (agent,))]
             blockers += [{"kind": "watch", "host": watch["host"]}
                          for watch in tx.query(

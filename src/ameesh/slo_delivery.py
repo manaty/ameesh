@@ -2,10 +2,12 @@
 """#3512: read-only completion evidence for delayed merge alerts."""
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 from . import db as db_mod, lot_class, plan_git, storage
 
 #: #3632: a carrier in one of these states has delivered its composed units.
-_DELIVERED_CARRIERS = ("merged", "promoted")
+_DELIVERED_CARRIERS = lifecycle.DELIVERED
 
 
 def _packet_delivery(db, row: dict, marks) -> bool:
@@ -81,7 +83,7 @@ def merge_observed(cfg, db, row: dict, marks=None, *, overview=None) -> bool:
     state correction, fetch of target refs, or inferred packet membership.
     Missing evidence leaves the alert active.
     """
-    if row.get("state") in ("merged", "promoted", "closed"):
+    if row.get("state") in lifecycle.COMPLETED:
         return True
     if db_mod.is_dry_pass(db):
         return False

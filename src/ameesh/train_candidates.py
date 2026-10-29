@@ -7,6 +7,8 @@ before enrollment; no provider or live runner profile is selected here.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import copy
 from dataclasses import asdict
 
@@ -30,7 +32,7 @@ class Inventory:
         # par la même fonction que la porte ; il ne recopie pas la règle.
         candidates = []
         # A UI page limit would silently omit ready lots at the cutoff.
-        for item in (row for state in ("qa", "validated")
+        for item in (row for state in lifecycle.TO_VALIDATE
                      for row in self.ops.items(state=state, assignee=None, limit=None)):
             if item["app"] != self.project.name:
                 continue
@@ -86,7 +88,7 @@ class Preparation:
             raise TrainError("candidate requires a real declared freeze before enrollment")
         item = self.ops.get(candidate["work_item_id"])
         target = merge_queue._remote_branch(self.project.target)
-        if item is None or item["state"] not in ("qa", "validated") or item["app"] != self.project.name \
+        if item is None or item["state"] not in lifecycle.TO_VALIDATE or item["app"] != self.project.name \
                 or not item.get("branch") or item["branch"] != candidate["branch"] \
                 or candidate["target"] != target \
                 or merge_queue._remote_branch(item.get("branch_target") or target) != target:

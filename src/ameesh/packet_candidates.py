@@ -59,6 +59,8 @@ inventaire) lève `CandidateError` et rend toute la liste inutilisable.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import os
 import re
 import subprocess
@@ -534,7 +536,7 @@ def _items(db, app: str) -> list[dict]:
     lots assignés que #2404 a vus omis (le composeur doit voir tous les
     candidats, pas ceux qui restent à prendre).
     """
-    rows = [row for state in ("qa", "validated")
+    rows = [row for state in lifecycle.TO_VALIDATE
             for row in storage.of(db).work.items(state=state, assignee=None, limit=None)]
     return [row for row in rows if (row.get("app") or "") == app]
 

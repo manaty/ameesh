@@ -39,6 +39,8 @@ AGENT_MESH_<HARNESS>_BIN point to fake binaries.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import argparse
 import dataclasses
 import getpass
@@ -2745,7 +2747,7 @@ class AgentWorker(threading.Thread):
             return str(assignes[0]["id"])
         # #408 : les lots en relecture ou en attente d'un humain ne comptent
         # pas ; l'unique lot sur lequel l'agent peut avancer est celui du tour
-        actifs = [a for a in assignes if a.get("state") in ("intake", "build")]
+        actifs = [a for a in assignes if a.get("state") in lifecycle.ACTIVE]
         if len(actifs) == 1:
             return str(actifs[0]["id"])
         return None
@@ -2914,7 +2916,7 @@ class AgentWorker(threading.Thread):
 
     #: états d'un lot FINI (#794) : sa session se ferme, comme la purge le
     #: faisait — fusionné, livré (`promoted`) ou fermé.
-    LOT_FINISHED_STATES = ("merged", "promoted", "closed")
+    LOT_FINISHED_STATES = lifecycle.COMPLETED
 
     def _lot_is_finished(self, lot: str | None) -> bool:
         """Le lot est-il FINI (fusionné, livré, fermé) ? (lecture du registre)

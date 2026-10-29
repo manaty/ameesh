@@ -160,6 +160,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 from .conversations import Conversations
 from .provenance import Provenance
 from .work_dependencies import WorkDependencies
@@ -4831,7 +4833,7 @@ class LotSessions(Domain):
     La session ACTIVE reste au registre (`session_id`, `session_work_item`)."""
 
     #: lots que la règle 1 reprend
-    ACTIONABLE_STATES = ("intake", "build")
+    ACTIONABLE_STATES = lifecycle.ACTIVE
     #: note de lot qui retient le réveil (`ameesh work note N "hold: …"`)
     HOLD_PREFIX = "hold:"
     #: notes du réveil programmé (#2466 : pose, annulation, déclenchement) :

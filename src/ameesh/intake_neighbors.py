@@ -30,6 +30,8 @@ clone local du dépôt, le motif git est dit « non vérifié ».
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import os
 import re
 import unicodedata
@@ -790,14 +792,14 @@ def _in_main(repo: Optional[str], sha: str) -> Optional[bool]:
 def _state_label(repo: Optional[str], item: dict, target: str,
                  merged_sha: str = "") -> str:
     state = str(item.get("state") or "")
-    if state == "promoted":
+    if state == lifecycle.PROMOTED:
         return "livré"
-    if state == "closed":
+    if state == lifecycle.CLOSED:
         reason = str(item.get("close_reason") or "")
         if reason in ("delivered", "done"):
             return "livré"
-        return "closed" + (" (%s)" % reason if reason else "")
-    if state == "merged":
+        return lifecycle.CLOSED + (" (%s)" % reason if reason else "")
+    if state == lifecycle.DELIVERY_RECORDED:
         destination = (item.get("branch_target") or target or "origin/main")
         label = "merged → %s" % destination
         inside = _in_main(repo, merged_sha or str(item.get("branch_head") or ""))
@@ -823,7 +825,7 @@ def _candidate_rows(db, app: str, since_days: int) -> list[dict]:
         "       extract(epoch from updated_at)::float8 AS updated_ts"
         "  FROM work_items"
         " WHERE app = %s"
-        "   AND (state NOT IN ('merged', 'promoted', 'closed')"
+        f"   AND (state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
         "        OR coalesce(closed_at,"
         "                    (SELECT max(m.at) FROM work_item_milestones m"
         "                      WHERE m.work_item_id = work_items.id"
@@ -855,7 +857,7 @@ def neighbors(db, app: str, title: str = "", body: str = "",
         return result
     rows = _candidate_rows(db, app, int(since_days))
     needs_clone = bool(head) or any(
-        str(row.get("state") or "") in ("merged", "promoted") for row in rows)
+        str(row.get("state") or "") in lifecycle.DELIVERED for row in rows)
     clone = resolve_clone(cfg, app, repo) if needs_clone else None
     # La cible n'est utile qu'au `git log <tête>..<cible>` ; l'affichage de
     # l'état d'un voisin se contente de sa `branch_target`.
@@ -880,7 +882,7 @@ def neighbors(db, app: str, title: str = "", body: str = "",
         hits = _git_hits(clone, head, target, mine_paths, set(by_id))
 
     merged = _merged_milestone(
-        db, [int(row["id"]) for row in rows if row.get("state") in ("merged", "promoted")])
+        db, [int(row["id"]) for row in rows if row.get("state") in lifecycle.DELIVERED])
 
     found: list[dict] = []
     for lot_id, row in by_id.items():

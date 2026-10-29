@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L232a storage: reservations, lot-boundary fence and journaled CAS steps."""
+
+from ameesh import work_lifecycle as lifecycle
 import json
 from contextlib import contextmanager
 
@@ -388,7 +390,7 @@ class Handoffs(interface.Handoffs):
                     or agent["lease_owner"] != plan["owner"] or agent["lease_epoch"] != plan["epoch"]):
                 return None
             active_lot = tx.query("SELECT id FROM work_items WHERE assignee=%s"
-                                  " AND state NOT IN ('intake','merged','promoted','closed') LIMIT 1",
+                                  f" AND state NOT IN ('{lifecycle.REQUESTED}','{lifecycle.DELIVERY_RECORDED}','{lifecycle.PROMOTED}','{lifecycle.CLOSED}') LIMIT 1",
                                   (op["agent"],))
             if active_lot and plan.get("reason") not in ("host_drain", "host_return"):
                 return None

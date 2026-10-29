@@ -5,13 +5,15 @@ A quiet instant is not an idle interval. Published samples must cover the
 interval without missing turns or freshness gaps; agent and lot activity can
 only shorten that interval. This module never drains or changes a host.
 """
+
+from ameesh import work_lifecycle as lifecycle
 import datetime
 import time
 
 from . import resources, storage
 from .host_lifecycle import staleness_s
 
-DONE = frozenset(('merged', 'promoted', 'closed'))
+DONE = frozenset(lifecycle.COMPLETED)
 
 
 def project(reading, history, agents, lots, *, now, idle_after_s=1800,
@@ -58,7 +60,7 @@ def project(reading, history, agents, lots, *, now, idle_after_s=1800,
                      {str(ident) for ident in held_lots})
         leases += bool(lot_lease)
         held_actions = sum(lot.get('assignee') == agent.get('name')
-                           and lot.get('state') in ('intake', 'build')
+                           and lot.get('state') in lifecycle.ACTIVE
                            and str(lot.get('planned_start') or '')[:10] <= today
                            and lot.get('id') in held_lots for lot in lots)
         actionable = max(0, int(agent.get('actionable_lots') or 0) - held_actions)

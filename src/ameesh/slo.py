@@ -31,6 +31,8 @@ aucun dépassement n'est notifié à l'owner.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import time
 from typing import Iterable, NamedTuple
 
@@ -188,7 +190,7 @@ def start_ts(events: Iterable[dict]) -> float | None:
     starts = (estimates.START_NOTE, PACKET_COMPOSITION_NOTE)
     stamps = [float(ev["created_ts"]) for ev in events
               if ev.get("created_ts") is not None
-              and (ev.get("state") == "build"
+              and (ev.get("state") == lifecycle.IN_PROGRESS
                    or (ev.get("note") or "").startswith(starts))]
     return min(stamps) if stamps else None
 
@@ -661,7 +663,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     # #3162 : le début mesuré conclut l'étape comme le passage en build, même
     # quand le lot est resté en intake.
     started = start_ts(events)
-    if requested is not None and state not in ("merged", "promoted", "closed"):
+    if requested is not None and state not in lifecycle.COMPLETED:
         step = step_of("intake_started")
         ready = intake_ready_ts(assigned, requested, dependencies, started=started)
         # #2916 : le temps passé sous retenue n'est pas un retard intake ; au
@@ -695,7 +697,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             # #3162 : branche associée ou gel — le lot est commencé, mais son
             # début n'est pas daté : ni retard ni durée inventés (#1982).
             pass
-        elif state == "intake" and now >= float(ready):
+        elif state == lifecycle.REQUESTED and now >= float(ready):
             # prêt, pas encore démarré : le délai court depuis que le lot est
             # prêt. Passé intake sans événement `build` (#1982), la phase est
             # franchie mais non mesurable : aucune ligne, donc aucun retard
@@ -708,14 +710,14 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     # dû. Le retour en build (transition, pas une note) date l'épisode ;
     # l'étape du correctif le mesure et le GO → fusion ne court plus.
     returned = None
-    if (state == "build" and kind == "ok" and verdict is not None
+    if (state == lifecycle.IN_PROGRESS and kind == "ok" and verdict is not None
             and jalons.get("verdict_current", True)):
         latest_build = None
         previous = None
         for ev in sorted(events, key=lambda e: (float(e.get("created_ts") or 0.0),
                                                 int(e.get("id") or 0))):
             seen = ev.get("state")
-            if (seen == "build" and previous != "build"
+            if (seen == lifecycle.IN_PROGRESS and previous != lifecycle.IN_PROGRESS
                     and ev.get("created_ts") is not None):
                 latest_build = float(ev["created_ts"])
             previous = seen
@@ -732,7 +734,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
         returned = None
         fixes = []
 
-    if state == "build" and returned is None and not fixes:
+    if state == lifecycle.IN_PROGRESS and returned is None and not fixes:
         # #3487 : le correctif dû (avis bloquant ou retour en build) a sa
         # propre horloge ; `build_quiet` ne la double pas.
         step = step_of("build_quiet")
@@ -790,7 +792,12 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                             elapsed_s=int(max(0.0, float(merged) - start)),
                             target=target, escalate=not packet, **extra,
                             **parked))
-        elif state not in ("merged", "promoted", "closed", "build"):
+        elif state not in (
+            lifecycle.DELIVERY_RECORDED,
+            lifecycle.PROMOTED,
+            lifecycle.CLOSED,
+            lifecycle.IN_PROGRESS,
+        ):
             # #3487 : revenu en build, le GO ne court plus (cf. plus haut).
             # #3555 : sous retenue, `running_now` arrête l'horloge à l'entrée.
             start = float(verdict)
@@ -828,7 +835,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                 out.append(_row(step, start, now=running_now, critical=critical,
                                 target=target, escalate=not packet, **extra))
 
-    if state not in ("merged", "promoted", "closed"):
+    if state not in lifecycle.COMPLETED:
         step = step_of("green_verdict")
         for review in reviews or ():
             name = str(review.get("name") or "").strip()
@@ -843,7 +850,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             out.append(_row(step, since, now=running_now, critical=critical,
                             reviewer=name, **extra))
 
-    if state not in ("merged", "promoted", "closed") and state not in HOLDS:
+    if state not in lifecycle.COMPLETED and state not in HOLDS:
         step = step_of("blocked_freeze")
         # #3333 : la dernière levée de retenue (état ou hold de pilote), lue
         # une fois pour les trois étapes d'après le gel (#3555).
@@ -874,7 +881,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                             returned=True, **extra))
 
     handover = handover_ts(item, events)
-    if handover is not None and state not in ("merged", "promoted", "closed"):
+    if handover is not None and state not in lifecycle.COMPLETED:
         remaining = HANDOVER_GRACE_S - (now - handover)
         if 0 < remaining <= HANDOVER_GRACE_S:
             for row in out:

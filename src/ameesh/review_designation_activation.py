@@ -74,6 +74,8 @@ alert when no replacement family can be designated.
 """
 from __future__ import annotations
 
+from ameesh import work_lifecycle as lifecycle
+
 import json
 import os
 import re
@@ -973,11 +975,11 @@ def _mark_reviewers(note: str) -> Optional[list]:
 #: from the same rows). Every note comes back as **text** and is parsed in
 #: Python: no note is ever cast by PostgreSQL, so no bad note can abort the
 #: freeze transaction this read runs in.
-_PENDING_FACTS_SQL = """
+_PENDING_FACTS_SQL = f"""
     WITH open_items AS (
         SELECT id, assignee, reviewers, title, state, app
           FROM work_items
-         WHERE state NOT IN ('merged', 'promoted', 'closed')
+         WHERE state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')
     ), latest_freeze AS (
         SELECT DISTINCT ON (m.work_item_id)
                m.work_item_id AS lot, m.id AS freeze_id, m.sha AS sha, m.at AS at
@@ -3775,7 +3777,7 @@ def _retry_notes(db, after: int, *, scan: int = RETRY_SCAN) -> list:
         " JOIN work_items w ON w.id = e.work_item_id"
         " WHERE e.note LIKE %s"
         "   AND e.created_at >= now() - interval '30 days'"
-        "   AND w.state NOT IN ('merged', 'promoted', 'closed')"
+        f"   AND w.state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
         "   AND e.id > %s"
         " ORDER BY e.id ASC LIMIT %s",
         (UNAVAILABLE_PREFIX + "%", int(after), int(scan)))
@@ -4100,7 +4102,7 @@ def _unreachable_lots(db, *, after: int, hosts: Sequence[str],
     params.append(int(scan))
     return db.query(
         "SELECT w.id, w.state, w.reviewers FROM work_items w"
-        " WHERE w.state NOT IN ('merged', 'promoted', 'closed')"
+        f" WHERE w.state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"
         "   AND w.reviewers IS NOT NULL AND cardinality(w.reviewers) > 0"
         "   AND w.id > %s"
         "   AND EXISTS ("
