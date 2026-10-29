@@ -267,7 +267,10 @@ def main(argv):
     if command is None:
         print("module %s has no command" % args.name, file=sys.stderr)
         return 1
-    if any(arg in ("-h", "--help") for arg in option_args):
+    if (any(arg in ("-h", "--help") for arg in option_args)
+            or getattr(registry[args.name], "OWNS_CONNECTION", False)):
+        # L100 T5 (#4386): a module whose commands open their own database
+        # and resolve their own actor (`dev`) gets neither from here.
         return command(None, rest, actor="")
     cfg = config.load()
     db = db_mod.connect(cfg)

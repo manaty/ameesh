@@ -126,8 +126,9 @@ class RegistryTest(unittest.TestCase):
         dev = found.get("dev")
         self.assertIsNotNone(dev)
         self.assertEqual((dev.source, dev.version, dev.cli, dev.entry_point),
-                         ("builtin", version(), None, None))
-        self.assertEqual(dev.capabilities, ("audit", "workspaces"))
+                         ("builtin", version(), "ameesh module dev", None))
+        # L100 T5 (#4386): `dev` serves the `cli` capability.
+        self.assertEqual(dev.capabilities, ("cli", "audit", "workspaces"))
         self.assertEqual(dev.storage, ())
         self.assertEqual(len(dev.descriptor_sha256), 64)
         # The façade the core obtains is the workspaces module, through `dev`.
