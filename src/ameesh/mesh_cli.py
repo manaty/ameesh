@@ -4471,8 +4471,12 @@ def build_parser() -> argparse.ArgumentParser:
     pa_login.add_argument("harness", help="harness: " + ", ".join(login_cli_mod.adapter_names()))
     pa_login.add_argument("account", nargs="?", default=None,
                           help="declared account (default: the harness's primary account)")
-    pa_login.add_argument("--approver", required=True,
+    pa_login.add_argument("--approver", default=None,
                           help="human:<id> who will sign the challenge")
+    pa_login.add_argument("--token-file", metavar="FILE",
+                          help="import a human-issued Claude setup-token (0600 file, or - for stdin)")
+    pa_login.add_argument("--expires-at", type=float, default=None, metavar="UNIX_TIMESTAMP",
+                          help="issuer expiry of an imported setup-token; omitted means unknown")
     pa_login.add_argument("--scope", default="", help="short text shown in the signed summary")
     pa_login.add_argument("--wait", type=float, default=login_cli_mod.TTL_WAIT_S,
                           help="bounded wait for the receipt, in seconds (default 900)")

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import math
 import os
 import stat
 import subprocess
@@ -292,6 +293,11 @@ def _run(cfg: Config, args) -> int:
     from . import login as login_mod
 
     harness = args.harness
+    token_file = getattr(args, "token_file", None)
+    if token_file is not None:
+        return import_setup_token(cfg, args)
+    if getattr(args, "expires_at", None) is not None:
+        raise _error("failed", "--expires-at requires --token-file")
     adapter = login_mod.ADAPTERS.get(harness)
     if adapter is None:
         raise login_mod.LoginError("unsupported_version",
@@ -305,10 +311,17 @@ def _run(cfg: Config, args) -> int:
     # N2 : l'empreinte est lue AVANT que le CLI puisse toucher au foyer ; le
     # verdict sain devra porter une empreinte différente pour valoir « neuf ».
     credential_before = credential_fingerprint(harness, profile, environ=environ)
-    approver = args.approver
+    approver = getattr(args, "approver", None)
+    if not approver:
+        from . import notify
+        approver = notify.parse_config(getattr(cfg, "notify", {}) or {}).default_human
+    if not approver:
+        raise _error("failed", "set --approver human:<id> or notify.default_human")
     who = getattr(args, "by", None) or actor(environ)
     scope = getattr(args, "scope", "") or ""
-    wait = max(0.0, float(getattr(args, "wait", TTL_WAIT_S)))
+    wait = float(getattr(args, "wait", TTL_WAIT_S))
+    if not math.isfinite(wait) or wait < 0 or wait > TTL_WAIT_S:
+        raise _error("failed", "--wait must be between 0 and %d seconds" % TTL_WAIT_S)
     db = db_mod.open_db(cfg)
     supervisor = None
     try:
@@ -335,6 +348,7 @@ def _run(cfg: Config, args) -> int:
                   % (request.login_id, harness, profile.name, cfg.host))
             print("private link (open it, assert WebAuthn, then decide): %s" % request.link)
             print("waiting for the decision (bounded to %d s)…" % int(wait))
+        notify_login(cfg, approver, request)
         policy = actions.policy_from_env()
         try:
             login_mod.wait_for_decision(
@@ -362,3 +376,59 @@ def _run(cfg: Config, args) -> int:
                 supervisor.close()
         finally:
             db.close()
+
+
+def import_setup_token(cfg, args):
+    """Import consent already granted by the human, without launching OAuth."""
+    from types import SimpleNamespace
+    from . import db as db_mod, setup_token
+    if args.harness != "claude":
+        raise _error("failed", "--token-file is only for Claude setup-token; Codex uses device-auth")
+    profile = resolve_profile(cfg, "claude", getattr(args, "account", None))
+    try:
+        content = (sys.stdin.read(setup_token.MAX_BYTES + 1) if args.token_file == "-"
+                   else setup_token.private_read(args.token_file))
+        if len(content) > setup_token.MAX_BYTES:
+            raise setup_token.TokenError("token input too large")
+        setup_token.install(profile, content,
+                            expires_at=getattr(args, "expires_at", None))
+    except (setup_token.TokenError, ValueError):
+        raise _error("failed", "setup-token import refused: private OAuth token and valid expiry required") from None
+    db = db_mod.open_db(cfg)
+    try:
+        state = health_report(db, cfg, profile,
+                              SimpleNamespace(harness="claude", account=profile.name))
+    finally:
+        db.close()
+    if getattr(args, "json", False):
+        print(json.dumps({"harness": "claude", "account": profile.name,
+                          "host": cfg.host, "state": state or "unknown"}))
+    else:
+        print("setup-token installed for claude/%s on %s; health: %s"
+              % (profile.name, cfg.host, state or "unknown"))
+    return 0 if state == "healthy" else 1
+
+
+def notify_login(cfg, approver, request):
+    """Push a link to the private challenge, never the bearer URL/device code.
+
+    Device codes must remain behind the existing authenticated approval view;
+    notification transports and their logs are not credential stores.
+    """
+    from . import notify
+    ncfg = notify.parse_config(getattr(cfg, "notify", {}) or {})
+    channels = ncfg.channels_for(approver)
+    if not channels:
+        print("login notification unavailable: no approver channel; use the private link",
+              file=sys.stderr)
+        return
+    sender = notify.Sender(timeout=ncfg.timeout)
+    message = notify.Message("Account login consent required",
+                            "%s/%s on %s: %s" % (request.harness, request.account,
+                                                  request.host, request.link))
+    for channel in channels:
+        try:
+            sender.send(channel, message)
+        except Exception:
+            # A channel may echo its request body in an exception: never print it.
+            print("login notification delivery failed; use the private link", file=sys.stderr)
