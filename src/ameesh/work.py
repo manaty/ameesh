@@ -106,6 +106,7 @@ TRANSITIONS = {
     lifecycle.PROMOTED: set(),
     lifecycle.CLOSED: set(),
     lifecycle.BLOCKED: {
+        lifecycle.VALIDATED,
         lifecycle.REQUESTED,
         lifecycle.IN_PROGRESS,
         lifecycle.QA,
@@ -113,6 +114,7 @@ TRANSITIONS = {
         lifecycle.WAITING_HUMAN,
     },
     lifecycle.WAITING_HUMAN: {
+        lifecycle.VALIDATED,
         lifecycle.REQUESTED,
         lifecycle.IN_PROGRESS,
         lifecycle.QA,
@@ -1732,6 +1734,10 @@ def _review_item(cfg, db: Db, item_id: int, actor: str | None, *,
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    if item["state"] == lifecycle.VALIDATED:
+        raise WorkError(
+            "lot %s is validated: move it to qa before changing reviewers "
+            "(ameesh work move %s qa)" % (item_id, item_id))
     if item["state"] != lifecycle.QA:
         raise WorkError(
             "lot %s is %s, not qa: designate the reviewer on the entry to the "
@@ -1754,6 +1760,10 @@ def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str, *,
         if latest is not None and latest["state"] == lifecycle.QA:
             raise WorkError("reviewer refused: %s now holds lot #%s — a reviewer "
                             "reviews another agent's work" % (value, item_id))
+        if latest is not None and latest["state"] == lifecycle.VALIDATED:
+            raise WorkError(
+                "lot %s became validated: move it to qa before changing reviewers "
+                "(ameesh work move %s qa)" % (item_id, item_id))
         raise WorkError("lot %s left qa in the meantime: retry" % item_id)
     return row
 
