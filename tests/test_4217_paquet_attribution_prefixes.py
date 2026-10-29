@@ -326,7 +326,8 @@ class ComposePacketPilotMailTest(unittest.TestCase):
             carrier=99, base=None, local=False, no_packet_record=True,
             keep_worktree=False, keep_failed_hours=24.0, force=False,
             tests_timeout=10, pilot="pilote", sender="mesh-design")
-        with mock.patch.object(paquet_auto, "fresh_base",
+        with mock.patch.object(paquet_auto, "PackageLock"), \
+                mock.patch.object(paquet_auto, "fresh_base",
                                return_value="a" * 40), \
                 mock.patch.object(paquet_auto, "prune_stale_worktrees",
                                   return_value=[]), \
@@ -340,6 +341,21 @@ class ComposePacketPilotMailTest(unittest.TestCase):
                                   return_value=composition), \
                 mock.patch.object(paquet_auto, "run_freeze_checks",
                                   return_value=(0, "ok", 0.1)), \
+                mock.patch.object(paquet_auto, "composition_table",
+                                  return_value="# table\n"), \
+                mock.patch.object(paquet_auto, "build_manifest",
+                                  return_value="manifeste\n"), \
+                mock.patch.object(paquet_auto, "write_manifest",
+                                  return_value="b" * 40), \
+                mock.patch.object(paquet_auto, "run_inclusion",
+                                  return_value=(0, "inclusion : vert\n")), \
+                mock.patch.object(paquet_auto, "push_branch"), \
+                mock.patch.object(paquet_auto, "ensure_pull_request",
+                                  return_value=(1, "url")), \
+                mock.patch.object(paquet_auto, "freeze_carrier",
+                                  return_value="gelé"), \
+                mock.patch.object(paquet_auto, "request_full_ci",
+                                  return_value="ci"), \
                 mock.patch.object(paquet_auto, "check_local_tests",
                                   side_effect=error), \
                 mock.patch.object(paquet_auto, "send_mail") as send:
