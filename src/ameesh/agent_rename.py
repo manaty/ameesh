@@ -34,6 +34,7 @@ import os
 import re
 
 from . import agent_names, storage, work
+from .storage.postgres import catalog as _catalog
 from .config import Config
 
 RENAMED_EVENT = "agent.renamed"
@@ -220,8 +221,10 @@ def _rename_tx(tx, old: str, new: str, who: str, reason: str) -> dict:
         "SELECT DISTINCT w.id FROM provenance_receipts p"
         "  LEFT JOIN work_item_milestones m ON p.subject = 'milestone:' || m.id"
         "  JOIN work_items w ON w.id = coalesce(p.work_item_id, m.work_item_id)"
-        " WHERE p.actor = ANY(%s) AND w.state = ANY(%s)"
-        " ORDER BY w.id LIMIT 6", (spellings, list(work.OPEN_STATES)))
+        " WHERE p.actor = ANY(%s::text[]) AND w.state = ANY(%s::text[])"
+        " ORDER BY w.id LIMIT 6",
+        # literals, not lists: the psql driver cannot bind a Python list
+        (_catalog._text_array(spellings), _catalog._text_array(work.OPEN_STATES)))
     if pending:
         raise RenameError("agent rename refused: %s has signed proofs on unmerged lots "
                           "(%s): rename once they are merged or closed"

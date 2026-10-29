@@ -96,7 +96,10 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
     for mark in sorted(marks, key=lambda m: (m["at_ts"], m["id"])):
         receipt = selected.get(mark["id"]) or _milestone_receipt(
             db, mark["id"])
-        if (receipt and receipt["commit"] == gate and receipt["actor"] == mark["actor"]
+        # #4299: a rename rewrites the milestone actor, never the receipt.
+        if (receipt and receipt["commit"] == gate
+                and (receipt["actor"] == mark["actor"]
+                     or storage.of(db).agents.same_identity(receipt["actor"], mark["actor"]))
                 and (receipt.get("milestone") or {}).get("verdict") == mark["verdict"]):
             latest[mark["actor"]] = mark
     current = [mark for mark in latest.values() if mark["id"] in selected]
