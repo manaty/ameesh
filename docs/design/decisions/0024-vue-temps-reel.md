@@ -43,8 +43,7 @@ and train candidates, carriers and planned landings. A new freeze or verdict
 returns an existing validated lot to `qa`.
 
 It does not create validated lots: review verdicts keep writing `qa`, and
-manual `qa → validated` is unavailable. The writer follows in lot #4426, in a subsequent release,
+manual `qa → validated` is unavailable. The writer follows in a subsequent release,
 after staging has established a compatible reader and rollback baseline.
 During that transition, package readers still qualify legacy `qa` lots with
-the full exact-head review gate. The first writer implementation is retained
-in commit `91d9f3e28191a8b47f353599632d6b7b718368a0` for the follow-up.
+the full exact-head review gate.
