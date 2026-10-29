@@ -1810,6 +1810,7 @@ class AgentHostTest(unittest.TestCase):
             self.assertIn('--user start ameesh-runner-agent@%s.service' % name,
                           self.units())
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_transient_empty_registry_is_reread_by_controler(self):
         """#4373 : la relecture vaut aussi pour l'étape controler."""
         p = self.run_vm('controler', scenario='list-vide-puis-ok')
