@@ -993,8 +993,7 @@ def stacked_parents(db, item: Mapping, repo: str, head: str) -> list[dict]:
     bloqué reste dans le périmètre de l'enfant.
     """
     lot = int((item or {}).get("id") or 0)
-    head_full = plan_git.local_commit(repo, str(head or ""))
-    if not lot or not head_full:
+    if not lot:
         return []
     from . import freeze_stack
 
@@ -1002,6 +1001,16 @@ def stacked_parents(db, item: Mapping, repo: str, head: str) -> list[dict]:
     try:
         candidates = freeze_stack.candidates(db, lot)
     except Exception:  # noqa: BLE001 - graphe illisible : aucun parent retiré
+        return []
+    # #4478 : sans parent candidat, aucune sonde git n'est nécessaire. La
+    # résolution locale de `head` ouvre un dépôt d'objets temporaire
+    # (`plan_git.local_commit`) : la faire pour tout lot changeait le compte
+    # des temporaires d'un post sans radar (#1761, test_l160e) sans rien
+    # prouver de plus.
+    if not candidates:
+        return []
+    head_full = plan_git.local_commit(repo, str(head or ""))
+    if not head_full:
         return []
     parents: list[dict] = []
     for candidate in candidates or ():
