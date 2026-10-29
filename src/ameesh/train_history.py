@@ -137,17 +137,15 @@ class Recorded:
                 self.db, item, freeze, self.families,
                 provider=self.provider, strict=True,
                 families_out=reference_families)
-            # #4478 : les commits d'un parent d'empilement (prérequis déclaré
-            # ou membre du paquet) ont été relus sur sa propre tête ; ils ne
-            # sont pas des auteurs de l'enfant.
-            parent_heads = review_authors.stacked_parent_heads(
-                self.db, item, self.path, head)
+            # #4478 : le train ne reçoit ni `cfg` ni la porte du parent ; il
+            # garde donc la lecture complète (les commits d'un parent empilé
+            # comptent) : l'admission d'un lot empilé ne prouve pas la porte
+            # du parent, elle attend sa fusion.
             authors, unknown = review_authors.authors(
                 self.db, item, freeze, commits, self.path, self.families,
                 reference=reference, reference_families=reference_families,
                 provider=self.provider, strict=True,
-                base=base, head=head, target=base,
-                admitted_heads=parent_heads)
+                base=base, head=head, target=base)
             if unknown:
                 raise TrainError("unknown historical author for commit %s" % unknown[0])
             # #3584 : un auteur prouvé sous plusieurs familles n'est pas sans

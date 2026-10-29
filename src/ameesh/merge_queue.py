@@ -644,6 +644,54 @@ def _exact_verdict_receipt(db, mark) -> dict | None:
         return None
 
 
+def _admitted_stacked_parents(db, cfg, item, repo, frozen) -> tuple[str, ...]:
+    """Les têtes parentes d'empilement dont la propre porte est satisfaite.
+
+    #4478 : un lot empilé ne relit pas les commits de son parent **relu**.
+    Encore faut-il que le parent ait passé sa propre porte sur cette tête
+    exacte : les dépendances ne bornent que la prise, pas la fusion, et rien
+    n'empêche l'enfant de fusionner avant son parent. Un parent jamais relu,
+    ou bloqué, reste donc dans le périmètre de l'enfant : ses auteurs comptent
+    (le §2 interdit à leur famille de relire l'enfant), comme pour une tête qui
+    n'est pas `admitted_heads` du même véhicule (#3513).
+
+    La porte du parent se lit comme celle des membres d'un paquet : sa classe
+    sur sa propre cible, ses avis sur sa tête, et une provenance effectivement
+    lue (`attribution_read`, #3513). Une lecture impossible ne l'admet pas :
+    le doute conserve les auteurs. Rend les SHA admis, les plus proches
+    d'abord (l'ordre de `review_authors.stacked_parents`)."""
+    if db is None or cfg is None or not repo or not item:
+        return ()
+    from . import lot_class, review_authors
+
+    admitted: list[str] = []
+    for parent in review_authors.stacked_parents(db, item, repo, frozen):
+        lot = int((parent or {}).get("lot") or 0)
+        sha = str((parent or {}).get("frozen") or "").strip()
+        if not lot or not sha:
+            continue
+        try:
+            row = work.get(db, lot)
+            if row is None:
+                continue
+            marks = storage.of(db).work.milestones(lot, None)
+            target = lot_class.default_base(cfg, row, repo)
+            base = _class_base(repo, target) if target else None
+            base_sha = plan_git._commit(repo, base) if base else None
+            klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo,
+                                     head=sha, milestones=marks,
+                                     base=target, base_sha=base_sha)
+            if not klass or (klass.get("doubt") and not klass.get("files")):
+                continue
+            gate = review_gate(db, marks, sha, repo=repo, klass=klass,
+                               item=row, cfg=cfg, target=base_sha or target)
+        except Exception:  # noqa: BLE001 - porte du parent illisible : non admis
+            continue
+        if gate.get("ok") and gate.get("attribution_read"):
+            admitted.append(sha)
+    return tuple(admitted)
+
+
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None, families=None, required=None, family_of=None,
                 authors=None, authors_complete=False, cfg=None, project=None,
@@ -1083,14 +1131,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             out["production_scope_error"] = publication_error
         inherited = tuple((vehicle or {}).get("admitted_heads") or ())
         from . import review_authors
-        # #4478 : les têtes gelées des parents d'empilement sont hors du
-        # périmètre de relecture de l'enfant, comme celles des membres admis
-        # (#3513) : leurs commits ont été relus dans le parent. La porte et sa
-        # trace de provenance partent donc de la même borne.
+        # #4478 : une tête de parent d'empilement n'est hors du périmètre de
+        # relecture de l'enfant que si sa **propre** porte est satisfaite sur
+        # cette tête exacte, comme les `admitted_heads` des membres d'un même
+        # véhicule (#3513). Un parent jamais relu ou bloqué reste compté :
+        # l'enfant ne peut pas le faire atterrir sans une relecture
+        # indépendante de sa famille d'auteur.
         stacked = tuple(
             {"head": sha, "reason": "stacked-parent", "ref": "parent"}
-            for sha in (review_authors.stacked_parent_heads(db, item, repo, frozen)
-                        if db is not None and repo and item else ()))
+            for sha in _admitted_stacked_parents(db, cfg, item, repo, frozen))
         scopes = (tuple(admitted_heads) + inherited + stacked
                   + ((production,) if production else ()))
         if scopes and repo:
@@ -1879,8 +1928,12 @@ def _freeze_milestone(marks, frozen, repo: str | None = None):
 
 def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
                       *, target_repo: str | None = None, queue: bool = False,
-                      klass=None, marks=None):
+                      klass=None, marks=None, cfg=None):
     """(auteurs `{name, family}`, familles) pour la porte des avis (#1515 N1).
+
+    `cfg` est nécessaire pour admettre les têtes d'un parent d'empilement
+    (#4478) : seule une tête dont la propre porte est satisfaite sort de la
+    lecture ; sans `cfg`, aucune ne l'est (le doute garde les auteurs).
 
     Les auteurs de **contenu** sont ceux du lecteur partagé (#2681,
     `review_authors.reading`) : reçus exacts, familles **historiques** du
@@ -1982,11 +2035,12 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
             add(name)
     else:
         # #4478 : un lot empilé sur la tête gelée d'un parent (prérequis
-        # déclaré ou membre du paquet) ne relit pas les commits du parent ; sa
-        # famille d'auteur n'est pas une famille de cette tête, et la porte ne
-        # peut pas lui opposer un avis rendu par une autre famille. La borne
-        # s'applique aussi aux fusions du parent.
-        parent_heads = review_authors.stacked_parent_heads(db, item, repo, frozen)
+        # déclaré ou membre du paquet) ne relit pas les commits de ce parent
+        # **s'il a passé sa propre porte**. Un parent jamais relu ou bloqué
+        # reste dans le delta : sa famille d'auteur compte, et la porte ne peut
+        # pas lui opposer un avis de cette famille. La borne s'applique aussi
+        # aux fusions du parent.
+        parent_heads = _admitted_stacked_parents(db, cfg, item, repo, frozen)
         commits = _delta_commits(repo, item, frozen, base=base, base_repo=base_repo,
                                  target=target, target_repo=target_repo, queue=queue,
                                  exclude=parent_heads)
@@ -2636,7 +2690,7 @@ def _readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
             try:
                 authors, families = _complete_authors(
                     db, row, tip, where, target, target_repo=repo,
-                    queue=(where != repo), klass=klass, marks=marks)
+                    queue=(where != repo), klass=klass, marks=marks, cfg=cfg)
             except _ProvenanceError as exc:
                 raise QueueError(
                     "lot #%d: the complete authors of the lot cannot be established "
