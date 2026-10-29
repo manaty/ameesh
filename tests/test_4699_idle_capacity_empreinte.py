@@ -12,8 +12,10 @@ propose pas de l'attribuer.
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from ameesh import storage, sous_utilisation, work
+from ameesh.storage.postgres.operations import Operations
 
 from .test_l94_underuse import _Base
 
@@ -98,6 +100,29 @@ class IdleCapacityEmpreinteTest(_Base):
         self.assertIn("Waiting for a prerequisite: #%d waits on the footprint of #%d"
                       % (recouvert["id"], occupe["id"]), brief)
         self.assertIn("Give them work tied to a lot", brief)
+
+    def test_un_lot_apres_les_500_premiers_est_vu(self):
+        # #4717 : l'alerte lit tous les lots ouverts, comme le débit
+        # (`open_lots_activity(None)`) ; un plafond à 500 laissait l'occupant
+        # d'un lot démarrable au-delà invisible (#3185).
+        self.agent("dev1")
+        self.agent("dev2")
+        lots = [{"id": i, "state": "intake", "app": "ameesh",
+                 "type": "evolution", "assignee": "dev2"}
+                for i in range(1, 501)]
+        lots.append({"id": 501, "state": "intake", "app": "ameesh",
+                     "type": "evolution", "assignee": None})
+        seen = {}
+        original = Operations.open_lots_activity
+
+        def read(operations, limit):
+            seen["limit"] = limit
+            return original(operations, limit) if limit is not None else lots
+
+        with mock.patch.object(Operations, "open_lots_activity", read):
+            alerte = self.alerte()
+        self.assertIsNone(seen["limit"])
+        self.assertEqual(alerte["startable_lots"], [501])
 
 
 if __name__ == "__main__":
