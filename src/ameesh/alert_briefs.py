@@ -757,7 +757,19 @@ def _budget_pause_long(alert: dict) -> str:
 
 def _operator_pause(alert: dict) -> str:
     """#3961 : une pause opérateur qui dure (un agent, ou la plupart des
-    agents d'un hôte). Aux orchestrateurs de l'équipe et aux auditeurs."""
+    agents d'un hôte). Aux orchestrateurs de l'équipe et aux auditeurs.
+
+    #4525 : le sommeil automatique du découpage (`SLEEP_REASON`) n'est pas une
+    maintenance. L'alerte le reconnaît et dit qu'il est levé au premier lot
+    démarrable, sans demander à l'owner de mettre fin à une maintenance.
+    """
+    from . import file_decoupage
+    if alert.get("sleep") or file_decoupage.is_sleep_reason(alert.get("reason")):
+        return ("Automatic sleep still in place: %s. This is the automatic sleep of an "
+                "exhausted roadmap, not a maintenance: it is lifted by the first startable "
+                "lot of the project, and at the latest when its deadline expires. No "
+                "operator action is expected; the owner is not asked to end any "
+                "maintenance." % (alert.get("detail") or "?"))
     return ("Operator pause still in place: %s. Expected action: check with whoever set it "
             "(ameesh show <agent>) whether the maintenance is over; if so, lift it "
             "(ameesh resume <agent> --operator --reason <reason>), otherwise hand the "
