@@ -3904,9 +3904,15 @@ def _unreachable_reviewer(row: Optional[Mapping], closed_hosts: set) -> str:
 
     The evidence is the one agent-mail uses for a lost recipient
     (`alert_briefs._unavailable`, #3036): the host's claims are closed, or the
-    agent is stopped/dead or no longer run by the executor. A missing lease is
-    deliberately not read: an idle reviewer is woken by the request mail. A
-    pause is not read either — the agent comes back and its seat is not lost.
+    agent is stopped/dead/blocked or no longer run by the executor. A missing
+    lease is deliberately not read: an idle reviewer is woken by the request
+    mail. A budget/operator pause is not read either — the agent comes back and
+    its seat is not lost. #4491: a long `blocked` pause (the runner's marked
+    authentication, host, database or account block) and an `auth_blocked`
+    text are lost seats, like a closed host, and are handed to `reseat`
+    (dropped when the kept seats cover the reviews, otherwise replaced by an
+    available agent). The account's short-window pause stays a live seat
+    (#3876), hence `is_blocked_pause` rather than the bare `blocked` status.
     """
     if row is None:
         return "absent from the registry"
@@ -3920,6 +3926,13 @@ def _unreachable_reviewer(row: Optional[Mapping], closed_hosts: set) -> str:
     # qu'un statut non vivant ne soit ni désigné ni laissé en siège mort.
     if status in rd.NON_LIVE_STATUS:
         return "status %s" % status
+    text = str(row.get("status_text") or "").strip().lower()
+    # #4491 : le préfixe est nommé, comme pour « accounts : » (#3973), même
+    # quand le statut n'a pas encore été rafraîchi en `blocked`.
+    if text.startswith(rd.AUTH_BLOCKED_PREFIX):
+        return "authentication blocked"
+    if rd.is_blocked_pause(row):
+        return "status blocked"
     host = str(row.get("host") or "").strip()
     if host and host in closed_hosts:
         return "host %s: claims closed" % host
@@ -4083,8 +4096,8 @@ def _unreachable_lots(db, *, after: int, hosts: Sequence[str],
     unnested, so a name absent from the registry is seen even beside a live
     one — the former `r.name = ANY(w.reviewers)` join kept the live row and
     never produced the missing one. A name is reachable when a registry row
-    (or one of its aliases) is `execute`, not `stopped`/`dead`, on a host
-    whose claims are open.
+    (or one of its aliases) is `execute`, not `stopped`/`dead`/`blocked` and
+    not under an `auth_blocked` text (#4491), on a host whose claims are open.
 
     The window is ordered by lot id and starts after `after`; the caller
     wraps to 0 at the end and persists the last examined id, so a backlog of
@@ -4109,7 +4122,8 @@ def _unreachable_lots(db, *, after: int, hosts: Sequence[str],
         "       SELECT 1 FROM agent_registry r"
         "       WHERE (r.name = rv.name"
         "              OR rv.name = ANY(coalesce(r.aliases, '{}'::text[])))"
-        "         AND r.status NOT IN ('stopped', 'dead')"
+        "         AND r.status NOT IN ('stopped', 'dead', 'blocked')"
+        "         AND coalesce(r.status_text, '') NOT LIKE 'auth_blocked%%'"
         "         AND r.mode = 'execute'"
         + host_sql +
         "     )"
@@ -4120,6 +4134,12 @@ def _unreachable_lots(db, *, after: int, hosts: Sequence[str],
 #: #3367 : the journal reason of a reseat whose kept seats cover every opinion
 COVERED_WHY = ("unreachable seat(s) dropped: the kept seats cover the required"
                " review(s)")
+#: #4491 : the journal reason of a reseat whose dead seat is dropped because
+#: the merge gate is already open on the frozen head (the two families of the
+#: report had rendered their `ok`; only the blocked seat stayed in the
+#: designation). Removing it does not withdraw an opinion and sends no mail.
+GATE_COVERED_WHY = ("unreachable seat(s) dropped: the required reviews are already"
+                    " ok on the frozen head")
 
 
 class _SeatsMoved(Exception):
@@ -4267,6 +4287,29 @@ def _reseat_alert(db, item: Mapping, freeze: Mapping, notify: str,
               after_commit=threads)
 
 
+def _gate_open(cfg, db, lot: int, freeze: Mapping) -> bool:
+    """#4491: is the merge gate already open on this frozen head?
+
+    The report's two lots had their two independent `ok` on the head while the
+    only remaining seat was a blocked reviewer: the seat no longer held a
+    review, it only kept `progress` in "waiting: verdict by <blocked>". The
+    gate is the reference for that fact — it proves the opinions independent,
+    with their exact receipts (#1468/#2928) — so this helper reuses it instead
+    of re-reading verdicts locally. An unreadable gate is `False`: the caller
+    replaces the seat as before, never drops it on a doubt.
+    """
+    from . import merge_queue
+    try:
+        item = work.get(db, int(lot))
+        if not item:
+            return False
+        marks = storage.of(db).work.milestones(int(lot), None) or ()
+        gate = merge_queue.review_gate_for_item(db, cfg, item, marks)
+    except Exception:  # noqa: BLE001 - an unreadable gate is not an admission
+        return False
+    return bool(isinstance(gate, Mapping) and gate.get("ok"))
+
+
 def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
            dead: Sequence[tuple], mark_id: int,
            excluded: Sequence[str] = ()) -> dict:
@@ -4278,7 +4321,10 @@ def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
     someone else. Here the `kept` seats count like manual seats, only the
     missing ones are selected and mailed, and the new mark names the kept
     seats then the replacements. When the kept seats already cover the
-    required opinions, the dead seats are simply dropped (no mail).
+    required opinions, the dead seats are simply dropped (no mail). #4491: the
+    same drop happens when the **merge gate is already open** on the head —
+    the missing opinions were rendered by other agents, and the blocked seat
+    must not keep the lot waiting; this case sends no mail either.
 
     #3685: `excluded` names the seats the mark records but the pilot removed.
     They are never candidates again, even when the same mark has a dead seat to
@@ -4318,17 +4364,29 @@ def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
                 candidates=[candidate for candidate in inputs.candidates
                             if str(getattr(candidate, "name", "") or "").strip()
                             not in excluded_names])
+        # #4491: the required opinions may already be rendered on this head by
+        # other agents (the report: two families ok, only the blocked seat
+        # left). The gate is the reference; when it is open the dead seat is
+        # dropped, not replaced, and no request is mailed.
+        gate_open = _gate_open(cfg, db, int(lot), freeze)
         with db.transaction() as tx:
             port = _ReseatPort(pg.PgPort(tx, after_commit=threads, at_freeze=False),
                                kept=kept, mark_id=mark_id,
                                dead=[name for name, _why in dead or ()],
                                excluded=sorted(excluded_names))
-            out = _selection(inputs, port, kept=port.kept)
-            if out.get("state") == "manual" and port.kept:
+            if gate_open:
+                out = {"state": "manual", "freeze": freeze,
+                       "required": int(getattr(inputs.policy, "required", 0) or 0),
+                       "reviewers": [], "missing": 0, "why": GATE_COVERED_WHY}
+            else:
+                out = _selection(inputs, port, kept=port.kept)
+            if out.get("state") == "manual" and (port.kept or gate_open):
                 out = port.commit(
                     int(lot), freeze=out.get("freeze") or freeze,
                     required=int(out.get("required") or 0), state=rd.DESIGNATED,
-                    reviewers=(), missing=0, why=COVERED_WHY, authors=inputs.authors,
+                    reviewers=(), missing=0,
+                    why=GATE_COVERED_WHY if gate_open else COVERED_WHY,
+                    authors=inputs.authors,
                     policy_ref=inputs.policy.ref, notify=inputs.notify, messages=(),
                     unknown_authors=inputs.unknown_authors)
             if out.get("state") == rd.DESIGNATED:
@@ -4396,6 +4454,14 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     #3369 : in a sensitive class a seat is kept only on a verdict that carries
     the exact #1465 receipt the gate requires; a waiting outcome writes its
     journal note under the lot lock, so two concurrent hosts alert once.
+
+    #4491 : a long `blocked` reviewer (the runner's marked authentication,
+    host, database or account pause) and a row whose `status_text` starts with
+    `auth_blocked` are unreachable like a stopped agent: the seat is dropped
+    when the kept seats cover the required reviews, otherwise replaced by an
+    available agent. The freeze selection reads the same `is_blocked_pause`
+    and `auth_blocked` prefix, so the two never disagree; the account's
+    short-window pause keeps its seat on both sides (#3876).
 
     The pass reads only machine evidence (registry, host lifecycle, journal)
     and never raises: the runner logs the summary. It does not touch a manual

@@ -338,7 +338,7 @@ class Agents(Domain):
     def reachability(self) -> list[dict]:
         """#3631 : les seules colonnes qui disent si un relecteur désigné lira
         son courrier — `name`, `aliases`, `retired_ts`, `mode`, `status`,
-        `host`.
+        `status_text` (#4491, préfixe `auth_blocked`), `host`.
 
         La passe de redésignation lit ce fait à chaque synchronisation de
         canon sur chaque exécuteur : `overview()` y joignait le canon, les
