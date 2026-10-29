@@ -113,6 +113,25 @@ class ProjectionTest(unittest.TestCase):
         detail = mesh_backup.alert_detail(result, 0.9)
         self.assertIn("below the 5-table floor", detail)
 
+    def test_faux_vert_les_tables_jamais_scannees_comptent_dans_le_total(self):
+        """B/P2 cx2 : 3 tables scannées ensemble et 97 jamais scannées après
+        une remise à zéro ne doivent pas verdir la base."""
+        result = mesh_backup.project(rows(*([ts(3, 35)] * 3), *([None] * 97)),
+                                     NOW)
+        self.assertFalse(result["ok"])
+        self.assertEqual((result["tables"], result["never_scanned"]), (100, 97))
+        self.assertEqual((result["shared"], result["covered"]), (3, 3))
+        self.assertAlmostEqual(result["share"], 0.03)
+        self.assertIn("97 never scanned", mesh_backup.alert_detail(result, 0.9))
+
+    def test_quelques_tables_jamais_scannees_ne_bloquent_pas_un_dump(self):
+        """Une poignée de tables NULL (créées après le dump, non scannées)
+        reste sous la tolérance de 10 %."""
+        result = mesh_backup.project(rows(*([DUMP] * 150), *([None] * 3)), NOW)
+        self.assertTrue(result["ok"])
+        self.assertEqual((result["tables"], result["never_scanned"]), (153, 3))
+        self.assertAlmostEqual(result["share"], 150 / 153)
+
     def test_un_groupe_au_plancher_sans_couverture_alerte(self):
         """Une transaction incomplète : 89 tables lues, 11 restées avant T."""
         result = mesh_backup.project(rows(*([DUMP] * 89), *([ts(2)] * 11)), NOW)

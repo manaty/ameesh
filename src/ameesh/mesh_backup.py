@@ -97,13 +97,20 @@ def project(rows, now, *, window=DEFAULT_WINDOW, min_share=DEFAULT_MIN_SHARE,
     avancé toutes les tables hors de cette fenêtre. Un dump plus récent prouve
     au moins autant ; sans cela, l'alerte se lèverait chaque matin de 03:35 à
     04:30Z (B/P2 de l'auditeur, 29/10).
+
+    Une table jamais scannée (`last_seq_scan` NULL, par exemple après une
+    remise à zéro des statistiques) compte dans `tables` et jamais dans
+    `covered` : elle ne peut pas provenir du dump, et un petit groupe de
+    tables scannées ne doit pas verdir la base (B/P2 de relecture).
     """
     start_us, end_us = window_bounds(now, window)
     now_us = int(float(now) * MICROSECONDS)
     instants: Counter = Counter()
     values = []
     in_window = 0
+    total = 0
     for row in rows or ():
+        total += 1
         value = row.get("last_seq_scan_us")
         if value is None:
             continue
@@ -113,9 +120,9 @@ def project(rows, now, *, window=DEFAULT_WINDOW, min_share=DEFAULT_MIN_SHARE,
             instants[value] += 1
         if start_us <= value < end_us:
             in_window += 1
-    total = len(values)
+    never_scanned = total - len(values)
     # plancher du groupe : au moins 2 tables, et `min_group_share` des tables
-    # lisibles ; jamais plus que le nombre de tables (petite base).
+    # éligibles ; jamais plus que le nombre de tables (petite base).
     floor = min(total, max(2, math.ceil(float(min_group_share) * total))) if total else 0
     share_floor = float(min_share)
     best = None       # groupe au-dessus du plancher, couverture la plus haute
@@ -144,6 +151,7 @@ def project(rows, now, *, window=DEFAULT_WINDOW, min_share=DEFAULT_MIN_SHARE,
         "window_start": start_us / MICROSECONDS,
         "window_end": end_us / MICROSECONDS,
         "tables": total,
+        "never_scanned": never_scanned,
         "in_window": in_window,
         "shared": group,
         "covered": covered,
@@ -171,38 +179,38 @@ def alert_detail(result, min_share, min_group_share=DEFAULT_MIN_GROUP_SHARE):
     elif result["instant_us"] >= result["window_end"] * MICROSECONDS:
         seen = (
             "the largest candidate after the judged window is at %s: %d of the "
-            "%d readable tables, covering %d of them (%.0f %% against a %.0f %% "
+            "%d tables, covering %d of them (%.0f %% against a %.0f %% "
             "floor; group floor %d); it does not prove the judged window"
             % (_instant(result["instant_us"]), result["shared"],
                result["tables"], result["covered"], 100 * result["share"],
                100 * float(min_share), result["min_group"]))
     elif result["shared"] < result["min_group"]:
         seen = (
-            "the largest group inside %s..%s is %d of the %d readable tables, "
+            "the largest group inside %s..%s is %d of the %d tables, "
             "all at %s, below the %d-table floor for a full-dump transaction"
             % (start, end, result["shared"], result["tables"],
                _instant(result["instant_us"]), result["min_group"]))
     else:
         seen = (
             "the largest transaction inside %s..%s read %d tables at %s; only "
-            "%d of the %d readable tables have last_seq_scan at or after it "
+            "%d of the %d tables have last_seq_scan at or after it "
             "(%.0f %% against a %.0f %% floor)"
             % (start, end, result["shared"], _instant(result["instant_us"]),
                result["covered"], result["tables"], 100 * result["share"],
                100 * float(min_share)))
     return (
-        "mesh database backup not seen: %s (%d readable tables in "
-        "pg_stat_user_tables). The daily pg_dump reads every table in one "
-        "transaction, so after it every table's last_seq_scan is at or after the "
-        "dump instant; tables re-read later only move forward. A group of tables "
-        "sharing one microsecond instant marks that transaction; the group floor "
-        "rejects a small ordinary transaction. "
+        "mesh database backup not seen: %s (%d tables in pg_stat_user_tables, "
+        "%d never scanned and counted as not read). The daily pg_dump reads every "
+        "table in one transaction, so after it every table's last_seq_scan is at "
+        "or after the dump instant; tables re-read later only move forward. A "
+        "group of tables sharing one microsecond instant marks that transaction; "
+        "the group floor rejects a small ordinary transaction. "
         "Check: psql \"$AMEESH_DSN\" -Atc \"SELECT last_seq_scan, count(*) FROM "
         "pg_stat_user_tables GROUP BY 1 ORDER BY 2 DESC LIMIT 5\" (the mesh DSN "
         "is `dsn` in the ameesh config). Statistics reset at server start: check "
         "`pg_postmaster_start_time()` too. This proves the read only, not that the "
         "dump file was written nor that it was copied to S3 (#4300)."
-        % (seen, result["tables"]))
+        % (seen, result["tables"], result["never_scanned"]))
 
 
 def alerts(db, now, *, window=DEFAULT_WINDOW, min_share=DEFAULT_MIN_SHARE,
@@ -226,6 +234,7 @@ def alerts(db, now, *, window=DEFAULT_WINDOW, min_share=DEFAULT_MIN_SHARE,
         alert_detail(result, floor, min_group_share),
         window_start=result["window_start"], window_end=result["window_end"],
         tables=result["tables"], in_window=result["in_window"],
+        never_scanned=result["never_scanned"],
         shared=result["shared"], covered=result["covered"],
         min_group=result["min_group"],
         instant=(_instant(result["instant_us"])
