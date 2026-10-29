@@ -139,12 +139,13 @@ including B0b setup and the #3456 auto-take) is outside the window.
 
 ## R1 bis — Claude resident, protocol (planned 2026-10-28)
 
-**Status: prepared, not run.** This is the follow-up R1 left open: the Claude
-resident stayed outside R1, so the Claude liveness probe, the one-hour cache
-and Claude's cost over a day are still unmeasured. The run starts no earlier
-than **2026-10-28T06:00:00Z**, the reset of the `tertiaire` Claude account's
-seven-day window (`resets_at=1793167200` in `ameesh accounts list`); the test
-agent's first turn must open its session after that reset, on a free account.
+**Status: run 2026-10-28/29; result below.** This is the follow-up R1 left
+open: the Claude resident stayed outside R1, so the Claude liveness probe, the
+one-hour cache and Claude's cost over a day were still unmeasured. The run was
+planned to start no earlier than **2026-10-28T06:00:00Z**, the reset of the
+`tertiaire` Claude account's seven-day window (`resets_at=1793167200` in
+`ameesh accounts list`); the test agent's first turn opened its session after
+that reset, on a free account.
 
 ### Device and account
 
@@ -248,6 +249,93 @@ window; they restart the runners and are recorded as lease epochs and
 incidents, not imputed. The pilot stops only if a resident group outlives its
 lease or a resident survives a cut.
 
+## Result — Claude resident, 2026-10-28/29 (R1 bis)
+
+**Window.** T0 = 2026-10-28T06:34:36Z. B6 was due at T0+24 h
+(2026-10-29T06:34:36Z); its turn started at 06:35:26Z and its report was sent
+at 06:36:11Z, so the 24 h window is nominal (24 h 00 min 50 s to the B6 turn).
+B7 ran at 06:42:07Z. The B6 cost query ran inside its own turn and picked its
+own ledger row (1.028904 USD): the **T0→B6-start window is 10 turns,
+5.431180 USD, 2,257,632 cached input**. The B6 turn (a new session, below)
+costs 1.028904 USD; the B7 one-per-event turn 0.1624 USD; the 06:36 package
+notice turn 0.3988 USD. Total T0→B7, all measured turns, **7.021284 USD**.
+
+**Staging and host.** ameesh-agents-1. At T0 `venv-courant -> venv-4c58991`
+(ameesh 1.26.0, h-03, mtime 06:05:27Z), runner start 06:27:52Z, Claude
+2.1.309, `ameesh doctor` OK. Staging **v1.27.0** (`venv-03dab6e`, attestation
+`03dab6e829e6-3hotes-2reporte`) was deployed at 13:29Z during the window; the
+test runner was retired at 13:08Z for the staging pre-check and restored at
+14:59Z, then restarted at 15:01:04Z (lease epoch 7). B6/B7 ran on v1.27.0.
+
+**Account.** The original session ran on `secondaire` (63% seven_day at T0);
+`secondaire` reached its seven-day cap (92%) during the window and the B6 new
+session opened on `primaire`. No overage. `session_account` is `secondaire` for
+the original session and `primaire` for the B6/B7 session.
+
+**Coverage.** 10 turns in the T0→B6 window: B1, B2, the 07:16 idle resume, B3,
+B4, B5, B5b, B5c, B5d and the 18:45 package-notice turn. The B6 turn, the 06:36
+#4349 package-notice turn and B7 are outside the window. B5d (the one-per-event
+fallback after the silent resident) is 2.292943 USD, 42% of the window; the
+18:45 package turn 1.030526 USD; the 07:16 idle turn 0.073578 USD.
+
+### Measurements
+
+| Point | Measurement | Source |
+|---|---|---|
+| Memory, awake | 144 awake sampler samples; RSS min 12 / median 258 / max 317 MB; the 12 MB is a one-sample transient (pid 342035, 08:34:14Z); resident-only min 253 / median 259 / max 317 MB; `MemAvailable` 14.1–27.2 GiB | sampler |
+| Memory, asleep | 1,268 empty-pid samples in 1,412 lines, 11 empty runs, longest 499 min; sleep cycles `asleep after 1800s` at 07:46:39 (B2+30 min), 09:21:13 (B4+30 min) and 19:15:09 (18:45+30 min); the longest empty run is the post-B5d dormancy after the probe failure, not a sleep cycle | sampler, journal |
+| Cost over a day | **5.431180 USD over 10 turns** (T0→B6 start; 2,257,632 cached); B6 1.028904; B7 0.1624; the 06:36 package turn 0.3988; total all measured turns 7.021284; B5d 2.292943, 18:45 1.030526, 07:16 0.073578 | `cost turns`, ledger |
+| Cache on spaced turns | read/creation, all creation in the 1 h cache: B1 122,533/7,773; B2 144,973/6,455; 07:16 160,770/3,339; B3 176,545/9,574; B4 (57 min) 211,878/12,778; B5 (70 min) 185,878/79,668; B5b 296,968/15,439; B5c 334,234/7,834; B5d 480,406/10,500; 18:45 (8 h 28) 143,447/122,760; B6 new session (11 h 50) 11,843/124,236 | events, ledger |
+| Latency | checkpoint turns 14–57 s from `started_ts` to `recorded_ts`: B1 32 s, B2 33, B3 46, B4 42, B5 57, B5b 55, B5c 26, B5d 56; B6 21; B7 19 | `cost turns` |
+| Liveness and silence | B5c SIGSTOP at 10:13:53Z; 10:14:08 `resident silent between turns: no answer to the liveness probe (failure 1 in a row): one turn per event for 60s`; 10:14:12 `resident process stopped (silent between turns: no answer to the liveness probe) after 2 turn(s)`; pid 979016 gone; B5d served without it; no other silent/probe line | journal |
+| Lease | epoch 1 (B1) → 3 (B3b controlled restart, 07:53:56Z) → 5 (B5b controlled restart, 10:03:42Z) → 7 (restore and runner restart, 15:01:04Z); old pids dead; the original session `09a18e15` kept until B6; the B6 turn opened `ef183ea7` (see Findings) | journal, `ameesh show` |
+| Return | `resident=off` at 06:36:17Z; `cat resident` off; B7 at 06:42:07Z: one-per-event, no resident process; sampler stopped; runner stop scheduled 120 s after B7 | `ameesh show`, B7 |
+
+### Findings
+
+- **Mechanism works.** The resident served the checkpoint turns, slept and
+  woke (`asleep after 1800s` at 07:46:39, 09:21:13 and 19:15:09), stayed at
+  253–317 MB RSS, and no process outlived its lease (epochs 1→3→5→7; old pids
+  dead). The B3b restart at 07:53:56 was the idle-nudge fix (the runner's
+  20 min inactivity nudge was resetting the sleep timer); B5b was the planned
+  lease test. The original session `09a18e15` was kept until B6.
+- **The Claude liveness probe is answered.** The controlled SIGSTOP of the
+  resident at 10:13:53 was caught by the between-turns probe at 10:14:08, which
+  logged `resident silent between turns: no answer to the liveness probe
+  (failure 1 in a row): one turn per event for 60s`, stopped the process at
+  10:14:12 (`resident process stopped (silent between turns...) after 2
+  turn(s)`), and served B5d one-per-event without the silent process. The
+  `liveness probe failed` line itself is not emitted on a silent driver (the
+  driver returns false without an exception); the `resident silent…` line is
+  the evidence. This is the question R1 left open.
+- **The one-hour cache.** Under 1 h (B4, 57 min) the creation is 12,778 tokens;
+  over 1 h (B5, 70 min) it is 79,668 (~6.2×) while the read drops from 211,878
+  to 185,878. The 18:45 turn after 8 h 28 creates 122,760 tokens. The creation
+  jumps past 1 h; the read stays high, so the finding is that the one-hour
+  cache is partially effective, not that everything expired. The B6 24 h
+  control is a new session (11,843 read / 124,236 creation, the fresh system
+  and context), not the original session's 24 h gap: it does not answer the
+  24 h point.
+- **Cost.** 5.431180 USD over the 10 window turns, B6 1.028904, B7 0.1624, the
+  06:36 package turn 0.3988; total 7.021284. The B5d one-per-event fallback
+  after the silent resident (2.292943) is the largest single turn and 42% of
+  the window; the B6 new session (1.028904) is the second. No overage.
+- **Session loss at B6.** The B6 turn started a new session `ef183ea7` on
+  `primaire` instead of resuming `09a18e15` on `secondaire` after 11 h 50 min
+  of dormancy and the staging stop/restore. The 24 h cache control is
+  therefore a fresh-session control, not the original session; the 1 h cache
+  data (B4/B5), the probe and the cost are measured. The cause is the
+  environment (the session was not resumed), not a probe or lease failure.
+- **Incidents counted, not imputed.** 07:16 idle resume 0.073578 USD; 18:45
+  package notices #4342/#4292 1.030526 USD; 06:36 #4349 package notice
+  0.3988 USD; B3b/B5b controlled restarts; staging v1.27.0 retire/restore and
+  runner restart; the 12 MB transient pid 342035; the B6 session loss and the
+  account switch. The package notices are not the pilot's.
+- **Limits.** One test agent, one host, staging; the cost is comparable only
+  to a same-size session (the study's warning); the B6 24 h cache control is
+  a new session; the package-notice contamination; the account switch; the
+  session loss. No conclusion beyond the measured turns.
+
 ## State
 
 T1/T2 are merged and active in staging (`771e447`, h-19; main `47bf1fe68` after
@@ -255,5 +343,12 @@ h-20). `resident=off`; the resident process is stopped (`resident process
 stopped (resident=off)` at 2026-10-26T04:45:30Z); B7 proved one-per-event with
 no resident process; the sampler is stopped and the test agent's runner is
 stopped after B7 (the ephemeral expires 2026-10-27 02:18Z). No resident agent
-remains. R1 bis (Claude) is prepared for after 2026-10-28T06:00:00Z; its
-protocol is above and its result will be added here.
+remains.
+
+R1 bis (Claude) ran 2026-10-28/29: **10 turns T0→B6 start, 5.431180 USD**
+(2,257,632 cached), B6 1.028904, B7 0.1624; `resident=off`; B7 proved
+one-per-event with no resident process; the sampler and the test agent's
+runner are stopped (the ephemeral expires 2026-10-30 06:27Z). The original
+session was lost at B6 (new session `ef183ea7`, account `primaire`): the 24 h
+cache control is a new session, while the 1 h cache data are B4/B5. No
+resident agent remains.
