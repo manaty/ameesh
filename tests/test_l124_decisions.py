@@ -648,7 +648,7 @@ class IdentiteTest(_Base):
         proc = self.mesh("decide", "show", "1", env=self.mesh_env())
         self.assertIn("answered by human:alice (cli)", proc.stdout)
         proc = self.mesh("decisions", "--all", env=self.mesh_env())
-        self.assertIn("answered or withdrawn requests", proc.stdout)
+        self.assertIn("answered, withdrawn or closed without an answer", proc.stdout)
 
 
 # ==========================================================================
