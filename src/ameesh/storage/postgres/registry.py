@@ -899,7 +899,7 @@ class Leases(interface.Leases):
             WITH verrou AS (
                 SELECT name, host, session_id, lease_owner, lease_epoch
                   FROM agent_registry WHERE name = %s FOR UPDATE
-            ), p AS (SELECT %s::text AS brief)
+            ), p AS (SELECT %s::text AS brief), acquired AS (
             UPDATE agent_registry AS r
                SET lease_owner      = %s,
                    lease_expires_at = clock_timestamp() + make_interval(secs => %s),
@@ -1025,6 +1025,17 @@ class Leases(interface.Leases):
                       __TAKEOVER__ AS elected,
                       extract(epoch from r.session_reset_at)::float8 as session_reset_ts,
                       extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
+            ), settled AS (
+                -- #4443: the acquired epoch fences the previous logical turn.
+                -- Keep known orphan resources for physical review on their host.
+                UPDATE turn_resources t
+                   SET status = 'done', ended_at = coalesce(t.ended_at, now())
+                  FROM acquired a
+                 WHERE t.agent = a.name AND t.host <> a.host
+                   AND t.status = 'running'
+                RETURNING t.turn_id
+            )
+            SELECT * FROM acquired
         """
         # `__TAKEOVER__` porte lui-même `__H__` : le remplacer AVANT l'hôte.
         sql = sql.replace("__TAKEOVER__", takeover)

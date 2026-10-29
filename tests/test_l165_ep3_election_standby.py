@@ -94,6 +94,21 @@ class ElectionClaimTest(_ElectionCase):
         # Le brief n'est PAS la consigne : il ouvre la session comme résumé.
         self.assertNotIn("BRIEF-EP3", row["pending_prompt"])
 
+    def test_cross_host_claim_settles_previous_running_turn(self):
+        self.sync_both()
+        self.hold_atelier(expire=False)
+        turns = storage.of(self.db).turn_resources
+        turns.open_turn("previous-host-turn", "relecteur", "atelier", pgid=42, label="old")
+        self.assertIsNone(registry.claim(self.db, "relecteur", "runner-banc", 600,
+                                        host="banc", election_brief="BRIEF"))
+        self.assertEqual(turns.get("previous-host-turn")["status"], "running")
+        self.db.execute("UPDATE agent_registry SET lease_expires_at = now() - interval '1 second'"
+                        " WHERE name = 'relecteur'")
+        lease = registry.claim(self.db, "relecteur", "runner-banc", 600,
+                               host="banc", election_brief="BRIEF")
+        self.assertTrue(lease["elected"])
+        self.assertEqual(turns.get("previous-host-turn")["status"], "done")
+
     def test_meme_hote_garde_la_session_et_ignore_le_brief(self):
         self.sync_both()
         self.hold_atelier()

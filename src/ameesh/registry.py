@@ -178,6 +178,11 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float, *,
     (EvalPlanQual ne réévalue pas un `WHERE` sans nouvelle version — grille
     codex3).
 
+    #4443 : une acquisition solde atomiquement les lignes de tour encore
+    `running` de cette persona sur les autres hôtes : l’époque acquise
+    clôt leur tour logique. Les ressources déjà `orphan` restent à vérifier
+    physiquement sur leur hôte.
+
     L46 : un agent `externe` n'est jamais réclamé (ni par `claimable`, ni par
     `claim`), même avec une session et du courrier en attente.
 
