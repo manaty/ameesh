@@ -279,8 +279,9 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
     def test_only_a_clean_refusal_is_cached(self):
         # B/P2 auditeur : un fetch non lancé ou coupé (None) ne doit pas être
         # mémorisé « refusé » pour 6 h ; un code non nul (False) l'est.
-        # #4679 : l'objet introuvable n'est plus une absence silencieuse ; il
-        # reste un doute, quel que soit le cache (qui ne change pas de sens).
+        # #4679 : un reçu introuvable sans rattachement de lot ne prouve rien
+        # sur cette tête : il ne fait pas de son acteur un correcteur (le gel
+        # le dit à part, `unattached`). Le cache garde son sens.
         head_b = self._only_absent_receipt()
         dummy = "%040x" % 0x44570000
         with mock.patch.object(review_authors, "_forge_fetch", return_value=None):
@@ -288,7 +289,7 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
                 self.db, work.get(self.db, self.lot),
                 {"id": 999999, "sha": head_b}, self.repo.root,
                 head=head_b, fetch=True)
-        self.assertEqual(out["cx3"]["unresolved"], dummy)
+        self.assertEqual(out, {})
         self.assertFalse(fetch_cache.refused(
             self.repo.root, dummy, state_dir=self.cfg.state_dir))
         with mock.patch.object(review_authors, "_forge_fetch", return_value=False):
@@ -296,7 +297,7 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
                 self.db, work.get(self.db, self.lot),
                 {"id": 999999, "sha": head_b}, self.repo.root,
                 head=head_b, fetch=True)
-        self.assertEqual(out["cx3"]["unresolved"], dummy)
+        self.assertEqual(out, {})
         self.assertTrue(fetch_cache.refused(
             self.repo.root, dummy, state_dir=self.cfg.state_dir))
 

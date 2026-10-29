@@ -1256,7 +1256,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           base: str = "", policy_ref: str = "", notify: str = "",
           unknown_authors: Iterable = (), families,
           already: Iterable = (), fixers: Iterable = (), required: Optional[int] = None,
-          advances: Optional[Mapping] = None, held: Iterable = ()) -> dict:
+          advances: Optional[Mapping] = None, held: Iterable = (),
+          doubts: Iterable = ()) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
     `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
@@ -1289,6 +1290,10 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     A fixer row with an empty family is a **personal** exclusion only
     (`test_only`, #3518, or a rewritten correction, #4457): its family remains
     eligible and another agent of it may be designated.
+    `doubts` (#4679 B/P2) names unresolved correction receipts **without any
+    lot attachment**: they prove nothing about this head, so they exclude
+    nobody; the designation's `why` says them, so the freeze still reports
+    what could not be resolved.
 
     `advances` maps a family to its advance over the plan pace, in points
     (`review_pace`, #2668), or to a `{scope: advance}` mapping whose scoped
@@ -1389,6 +1394,30 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         selection = select(required=required, authors=authors, candidates=candidates,
                            families=families, already=already, fixers=fixers,
                            advances=advances, automatic=previous)
+    # #4679 B/P2 : un reçu de correctif introuvable **sans rattachement de lot**
+    # ne prouve rien sur cette tête. Il n'entre ni dans `fixers` ni dans la
+    # porte ; le gel le dit, pour que l'objet absent ne disparaisse pas en
+    # silence. Un acteur déjà correcteur de la tête n'est pas répété.
+    excluded = {str((row or {}).get("name") or "").strip().casefold()
+                for row in fixers or () if isinstance(row, Mapping)}
+    reported = []
+    for row in doubts or ():
+        if not isinstance(row, Mapping):
+            continue
+        name = str(row.get("name") or "").strip()
+        sha = str(row.get("sha") or "").strip()
+        if name and sha and name.casefold() not in excluded:
+            reported.append((name, sha))
+    if reported:
+        unique = sorted(set(reported))
+        selection = dict(selection)
+        note = ("%d unresolved correction receipt(s) without a lot attachment"
+                " ignored, no exclusion: %s%s"
+                % (len(unique),
+                   ", ".join("%s %s" % (name, sha[:12]) for name, sha in unique[:4]),
+                   ", …" if len(unique) > 4 else ""))
+        selection["why"] = ("%s; %s" % (selection["why"], note)
+                            if selection.get("why") else note)
     if (existing is not None and existing.get("state") == WAITING
             and selection["state"] == WAITING
             and {str(row.get("name") or "") for row in selection["reviewers"]}

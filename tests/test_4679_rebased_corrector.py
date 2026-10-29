@@ -9,13 +9,15 @@ désignation suivante redésignait le correcteur, en silence.
 
 Un doute n'est pas une absence : l'acteur reste exclu **par son nom**, sa
 famille demeure éligible (un autre agent relit, canon §2), et le gel dit le
-doute avec le SHA irrécupérable. Le reçu sans lot est rattaché au lot de son
-tour (`turn_costs.work_item_id`) quand ce rattachement existe : un reçu d'un
-autre lot ne peut pas exclure un relecteur de celui-ci.
+doute avec le SHA irrécupérable — pour un reçu **rattaché à ce lot**. Un reçu
+sans rattachement de lot ne prouve rien sur cette tête : il est dit au gel,
+sans exclure son acteur (B/P2 auditeur). Le reçu sans lot est rattaché au lot
+de son tour (`turn_costs.work_item_id`) quand ce rattachement existe : un reçu
+d'un autre lot ne peut pas exclure un relecteur de celui-ci.
 """
 from __future__ import annotations
 
-from ameesh import (merge_queue, plan_git, registry, review_authors,
+from ameesh import (merge_queue, plan_git, registry,
                     review_designation as rd, work)
 
 from .support import PgTestCase
@@ -154,14 +156,35 @@ class RebasedCorrectorDoubtTest(_ActivationFixture, PgTestCase):
             ("milestone:%d" % int(mark["id"]), self.frozen, mark["actor"],
              "s-" + harness, "t", harness, self.lot))
 
-    def test_an_unknown_turn_is_still_a_doubt(self):
-        # Sans rattachement de lot (tour absent du grand livre), le doute ne
-        # disparaît pas : il exclut et se dit, plutôt que de redésigner.
-        self._prepare_doubt(receipt_turn="tour-inconnu")
-        item = work.get(self.db, self.lot)
-        freeze = {"id": 999999, "sha": self.frozen}
-        out = review_authors._rewritten_after_freeze(
-            self.db, item, freeze, self.repo.root, head=self.frozen,
-            fetch=False)
-        self.assertIn("cx3", out)
-        self.assertIn("unresolved", out["cx3"])
+    def test_an_unattached_receipt_is_reported_but_does_not_exclude(self):
+        # B/P2 auditeur : un reçu introuvable **sans** rattachement (tour
+        # absent du grand livre) ne prouve rien sur cette tête. Il ne fait pas
+        # de son acteur un correcteur ; le gel le dit, avec le SHA absent.
+        _head_a, local, _pushed, head_b = self._prepare_doubt(
+            receipt_turn="tour-inconnu")
+        _mark, out = self.freeze()          # F2
+        self.assertNotIn("cx3", out.get("fixers") or [])
+        self.assertIn("without a lot attachment", out["why"])
+        self.assertIn(local[:12], out["why"])
+        self.assertNotIn("excluded by doubt", out["why"].lower())
+        # La porte ne rejette plus son avis comme celui d'un correcteur : il
+        # est retenu (premier avis, famille codex), puis r1 (claude).
+        for actor, harness in (("cx3", "codex"), ("r1", "claude"),
+                               ("r2", "codex")):
+            mark = work.milestone(self.db, self.lot, "verdict", sha=head_b,
+                                  actor=actor, verdict="ok")
+            self.verdict_receipt(mark, harness)
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/mail.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/*"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        gate = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), head_b,
+            repo=self.repo.root, klass=klass, item=work.get(self.db, self.lot),
+            required=2, families=FAMILIES)
+        self.assertFalse(gate.get("error"), gate)
+        self.assertNotIn("cx3", gate["corrections"])
+        self.assertNotIn("cx3", [entry["actor"] for entry in gate["rejected"]])
+        self.assertIn("cx3", [entry["actor"] for entry in gate["accepted"]])

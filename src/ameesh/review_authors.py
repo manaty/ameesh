@@ -4266,7 +4266,8 @@ REWRITTEN_SCAN_BUDGET_S = 60.0
 
 def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                             repo: str, *, head: str = "", strict: bool = False,
-                            fetch: bool = True, recover=None) -> dict[str, dict]:
+                            fetch: bool = True, recover=None,
+                            unattached: Optional[list] = None) -> dict[str, dict]:
     """Les correctifs de relecteur **retirés** après leur gel (#4457).
 
     Un relecteur désigné corrige lui-même au premier tour (canon §2) : son
@@ -4300,11 +4301,13 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     contraire une lecture des reçus qui échoue, comme le reste de la
     provenance. `recover`/`fetch` rapatrient l'objet du commit retiré quand
     le clone de lecture ne l'a pas (clone scratch de `merge-pr`). Un objet
-    irrécupérable est un **doute** (#4679) : l'acteur reste exclu par son nom,
-    `unresolved` porte le SHA absent, et le gel le dit — on ne redésigne pas
-    en silence. Un reçu rattaché à un autre lot (`work_item_id`, ou le tour lu
-    dans `turn_costs`) ne concerne pas cette tête et est écarté ; un reçu sans
-    aucun rattachement reste un doute (l'attribution ne se devine pas).
+    irrécupérable **rattaché à ce lot** est un doute (#4679) : l'acteur reste
+    exclu par son nom, `unresolved` porte le SHA absent, et le gel le dit — on
+    ne redésigne pas en silence. Un reçu rattaché à un autre lot (`work_item_id`,
+    ou le tour lu dans `turn_costs`) ne concerne pas cette tête et est écarté ;
+    un reçu **sans aucun rattachement** ne prouve rien sur ce lot : il n'exclut
+    pas son acteur, et `unattached` reçoit sa trace pour que le gel le dise
+    (#4679 B/P2 auditeur : sept exclusions sans fondement en 48 h).
     """
     item = dict(item or {})
     if db is None or not repo or packet_composer(item):
@@ -4341,7 +4344,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
 
         `work_item_id` est NULL sur un reçu de commit du hook post-commit ; la
         ligne `turn_costs` du tour le porte alors. Toute lecture impossible
-        rend None : le doute, jamais une attribution devinée."""
+        rend None : l'attribution ne se devine pas, et un reçu sans lot
+        n'exclut personne (il est dit au gel, `unattached`)."""
         work_item = (receipt or {}).get("work_item_id")
         if work_item is not None:
             try:
@@ -4353,7 +4357,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             return None
         try:
             return storage.of(db).turn_costs.work_item_of_turn(turn)
-        except Exception:  # noqa: BLE001 - lecture impossible : doute
+        except Exception:  # noqa: BLE001 - lecture impossible : pas de lot
             return None
 
     check()
@@ -4403,8 +4407,19 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     #: #4679 : acteur -> reçu dont l'objet est introuvable. Ce n'est pas une
     #: absence : la topologie manque, le correcteur peut être l'auteur du
     #: commit local réécrit avant son push. On l'exclut par son nom et le gel
-    #: dit le doute.
+    #: dit le doute — mais **seulement** si le reçu est rattaché à ce lot.
     doubt: dict[str, dict] = {}
+    #: #4679 B/P2 auditeur : reçu introuvable **sans lot** (tour absent du
+    #: grand livre, ou plusieurs lots) : il ne prouve rien sur cette tête.
+    #: On le dit au gel (`unattached`) sans exclure son acteur.
+    ignored: dict[tuple[str, str], dict] = {}
+
+    def finish(result: dict) -> dict:
+        """Ajoute la trace des reçus sans lot au retour (#4679 B/P2)."""
+        if unattached is not None:
+            unattached.extend(ignored[key] for key in sorted(ignored))
+        return result
+
     for key in sorted(wanted):
         for freeze_id, freeze_sha, verdict_at, actor in wanted[key]:
             since = max(0.0, verdict_at - REWRITTEN_BEFORE_S)
@@ -4425,7 +4440,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 check()
                 for name, row in doubt.items():
                     out.setdefault(name, row)
-                return out
+                return finish(out)
             # #4457 (gel #25249) : une seule sonde `cat-file --batch-check`
             # pour tous les reçus, au lieu d'un processus git par SHA ; les
             # 500 reçus du témoin passent de ~40 s à moins d'une seconde.
@@ -4482,14 +4497,19 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     # #4679 : le reçu peut nommer le commit **local** d'avant
                     # un rebase/amend, jamais poussé : aucun clone ne le
                     # servira, et le commit poussé n'a pas de reçu. L'ignorer
-                    # redésignait le correcteur en silence. Le reçu de ce lot
-                    # (ou sans rattachement) est un doute ; un reçu d'un autre
-                    # lot ne dit rien de cette tête.
+                    # redésignait le correcteur en silence. Seul le reçu
+                    # **rattaché à ce lot** est un doute : un reçu d'un autre
+                    # lot ne dit rien de cette tête, et un reçu sans aucun
+                    # rattachement ne prouve rien (B/P2 auditeur) — il est dit
+                    # au gel, jamais exclu.
                     related = receipt_lot(receipt)
-                    if related is None or related == lot:
+                    if related == lot:
                         doubt.setdefault(key, {
                             "name": actor, "family": "", "families": [],
                             "unresolved": sha, "freeze": freeze_id})
+                    elif related is None and unattached is not None:
+                        ignored.setdefault((key, sha), {
+                            "name": actor, "sha": sha, "freeze": freeze_id})
                     continue
                 check()
                 if _is_ancestor(repo, full, head_sha) is True:
@@ -4510,7 +4530,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     # le doute ne complète que les acteurs sans preuve.
     for name, row in doubt.items():
         out.setdefault(name, row)
-    return out
+    return finish(out)
 
 
 def reading(db, item: Mapping, milestone: Optional[Mapping],
@@ -4524,7 +4544,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             exclusions_out: Optional[list] = None,
             commits_out: Optional[dict] = None,
             fetch: bool = True,
-            milestone_proof: Optional[Mapping] = None) -> tuple[list, list, list]:
+            milestone_proof: Optional[Mapping] = None,
+            doubts_out: Optional[list] = None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `milestone_proof` (#3948) est la preuve du jalon lue hors transaction,
@@ -4582,7 +4603,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     autre agent relit (canon §2). #4679 : si le reçu ne nomme que le commit
     **local** d'avant un rebase/amend, l'objet est introuvable ; le doute
     garde l'exclusion (`unresolved` nomme le SHA) et le gel le dit, au lieu de
-    redésigner en silence.
+    redésigner en silence. Ce doute ne vaut que pour un reçu **rattaché à ce
+    lot** (`work_item_id` ou tour) : un reçu sans rattachement ne prouve rien
+    ici, `doubts_out` reçoit sa trace (`{name, sha, freeze}`) pour que le gel
+    le dise, sans exclure son acteur (#4679 B/P2 auditeur).
     #3335 : cette promotion et la trace « correcteur » suivent la survie du
     contenu (#3220). Un correctif de relecteur dont aucune ligne significative
     ne subsiste plus dans la tête n'exclut plus sa famille ; une ligne qui
@@ -4920,9 +4944,11 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     # reste exclu par son nom, sans famille (le §2 laisse un autre agent de la
     # même famille relire). Une trace de correcteur survivante garde, elle, sa
     # famille : ne jamais l'effacer.
+    unattached: list = []
     for row in _rewritten_after_freeze(
             db, item, milestone, repo, head=head, strict=strict,
-            fetch=fetch, recover=recover).values():
+            fetch=fetch, recover=recover,
+            unattached=(unattached if doubts_out is not None else None)).values():
         key = str(row.get("name") or "").strip().lower()
         if not key or key in corrector_rows:
             continue
@@ -4931,6 +4957,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                                "rewritten": str(row.get("rewritten") or ""),
                                "unresolved": str(row.get("unresolved") or ""),
                                "freeze": int(row.get("freeze") or 0)}
+    if doubts_out is not None:
+        # #4679 B/P2 : reçus introuvables sans lot, à dire au gel — jamais des
+        # correcteurs : ils n'entrent ni dans `corrector_rows` ni dans la porte.
+        doubts_out.extend(unattached)
     correctors = []
     for row in corrector_rows.values():
         entry = {"name": row["name"], "family": row["family"]}
