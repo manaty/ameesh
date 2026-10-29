@@ -4880,7 +4880,8 @@
     "paid_lines",
     "session_total",
     "spent_between",
-    "unpriced"
+    "unpriced",
+    "work_item_of_turn"
    ],
    "turn_resources": [
     "attach_cgroup",

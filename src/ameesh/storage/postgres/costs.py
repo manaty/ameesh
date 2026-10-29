@@ -61,6 +61,26 @@ class TurnCosts(interface.TurnCosts):
             " order by recorded_at asc, id asc limit 1", (agent, float(ts)))
         return rows[0] if rows else None
 
+    def work_item_of_turn(self, turn_id) -> int | None:
+        """#4679 : le lot attribué au tour, ou None.
+
+        Le hook post-commit écrit un reçu de commit sans lot ; la ligne du
+        grand livre porte le lot servi par le tour. Une attribution ambiguë
+        (plusieurs lots distincts pour le même identifiant) n'est pas devinée
+        et rend None."""
+        text = str(turn_id or "").strip()
+        if not text:
+            return None
+        rows = self.db.query(
+            "select distinct work_item_id from turn_costs"
+            " where turn_id = %s and work_item_id is not null", (text,))
+        if len(rows) == 1:
+            try:
+                return int(rows[0]["work_item_id"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        return None
+
     def session_total(self, agent, session) -> dict | None:
         """#4448 : la mesure de rotation d'une session, relue du grand livre.
 

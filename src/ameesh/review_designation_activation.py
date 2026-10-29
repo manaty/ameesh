@@ -229,6 +229,9 @@ class Inputs:
     #: sur une cible ou une frise qui a bougé. Le plancher d'avis est relu à
     #: part, sous le même verrou.
     basis: dict = field(default_factory=dict)
+    #: #4679 B/P2 : reçus de correctifs introuvables **sans rattachement de
+    #: lot** ({name, sha, freeze}) : le gel les dit, ils n'excluent personne.
+    doubts: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -1756,12 +1759,15 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     # du parent (gelé et relu sur sa propre tête) ; la provenance inconnue d'un
     # commit du parent ne bloque donc pas l'enfant.
     parent_heads = _declared_parent_heads(db, item, repo, frozen_sha)
+    #: #4679 B/P2 : reçus de correctifs introuvables sans lot — dits au gel,
+    #: jamais des correcteurs (la porte ne les lit pas).
+    doubts: list = []
     authors, unknown, correctors = review_authors.reading(
         db, item, freeze, commits, repo, families=policy.families, trace=True,
         base=start, head=frozen_sha, target=read_target,
         commits_out=author_commits, fetch=fetch,
         admitted_heads=parent_heads,
-        milestone_proof=milestone_proof)
+        milestone_proof=milestone_proof, doubts_out=doubts)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, correctors=correctors,
@@ -1771,7 +1777,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                                              correctors=correctors),
                   advances=_advances(db), author_commits=author_commits,
                   unreadable=tuple(unreadable),
-                  basis=_prepared_basis(item, target, latest))
+                  basis=_prepared_basis(item, target, latest), doubts=doubts)
 
 
 @dataclass(frozen=True)
@@ -2662,7 +2668,7 @@ def _selection(inputs: Inputs, port, *, force: bool = False,
         notify=inputs.notify, unknown_authors=inputs.unknown_authors,
         families=inputs.policy.families,
         already=list(inputs.manual_seats) + [dict(seat) for seat in kept or ()],
-        fixers=inputs.correctors, held=held,
+        fixers=inputs.correctors, held=held, doubts=inputs.doubts,
         required=inputs.policy.required, advances=inputs.advances)
 
 
