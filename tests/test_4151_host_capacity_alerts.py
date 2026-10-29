@@ -21,6 +21,12 @@ class CapacityAlertsTest(unittest.TestCase):
                          runs=0, runs_source='aucune interface de déclaration',
                          cost_eur_h=0.08, unknown=[]), **extra)
 
+    def reading(self, **extra):
+        return dict(dict(sampled_ts=NOW, turns_in_progress=0, cpu_count=8,
+                         mem_total_bytes=16000, mem_available_bytes=12000,
+                         app_cpu=0.25, cgroup={'container': False,
+                                               'limits_readable': True}), **extra)
+
     def alerts(self, footprints=None, **kw):
         return subject.project(footprints or {'burst': self.footprint()},
                                [dict(name='worker', host='burst')], now=NOW,
@@ -91,6 +97,45 @@ class CapacityAlertsTest(unittest.TestCase):
         alerts = subject.project(footprints, listing, now=NOW)
         alert, = [a for a in alerts if a['type'] == 'baseline_oversized']
         self.assertEqual(alert['burst_candidates'], ['b'])
+
+    def test_election_is_skipped_when_oversized_is_impossible(self):
+        # Only two of the three readings can prove idle, and baseline_hosts=2:
+        # baseline_oversized cannot fire, so the 30 s alert pass must not pay
+        # the leader/reserve election.
+        store = mock.MagicMock()
+        store.work.items.return_value = []
+        store.hosts.since.return_value = [dict(self.reading(), sampled_ts=t)
+                                         for t in range(7600, NOW + 1, 60)]
+        listing = [dict(name=h, host=h, status='idle', lease_live=True,
+                        session_lot_state=None, actionable_lots=0, unread=0,
+                        passive_unread=0, status_since_ts=7000, last_turn_ts=7000)
+                   for h in ('a', 'b')]
+        canon = NS(hosts=[NS(title=h, fiche=NS(data={'capacity': 'baseline'}))
+                          for h in ('a', 'b')])
+        readings = {h: self.reading() for h in ('a', 'b')}
+        readings['busy'] = self.reading(turns_in_progress=1)
+        with mock.patch.object(storage, 'of', return_value=store), \
+                mock.patch('ameesh.host_lifecycle.critical_names') as critical, \
+                mock.patch('ameesh.election.status') as elected:
+            footprints = host_idle.snapshot(config.Config(resource_interval=60), 'db',
+                                             [canon], readings, now=NOW, listing=listing)
+        critical.assert_not_called()
+        elected.assert_not_called()
+        self.assertFalse(any(fp['baseline_guard'] for fp in footprints.values()))
+
+    def test_lifecycle_read_failure_keeps_the_underuse_pass(self):
+        store = mock.MagicMock()
+        store.host_lifecycle.listing.side_effect = RuntimeError('db unavailable')
+        listing = [dict(name='worker', host='burst')]
+        with mock.patch.object(storage, 'of', return_value=store), \
+                mock.patch.object(host_idle, 'snapshot',
+                                  return_value={'burst': self.footprint()}) as snapshot:
+            out = subject.alerts(config.Config(), 'db', listing, NOW, canons=[],
+                                 readings={'burst': self.reading()})
+        self.assertEqual([a['type'] for a in out], ['host_idle_reserved'])
+        self.assertEqual(snapshot.call_args.kwargs['listing'], listing)
+        store.host_lifecycle.drain.assert_not_called()
+        store.host_lifecycle.undrain.assert_not_called()
 
     def test_keys_stay_stable_when_bounded_idle_window_advances(self):
         alert, = self.alerts()

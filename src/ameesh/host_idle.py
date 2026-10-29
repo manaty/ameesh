@@ -218,11 +218,15 @@ def snapshot(cfg, db, canons, readings, *, now=None, listing=None):
     capacity, costs = capacities(canons, names, protected=protected,
                                  baseline_hosts=cfg.baseline_hosts)
     # Ordinary views need elections only for an underspecified baseline
-    # (#4178). A supplied listing also serves the A3 alert projection: its
-    # reclassification proposals must retain guards even with a full baseline.
-    if agents is not None and (listing is not None or
-                              sum(v == 'baseline' for v in capacity.values())
-                              < cfg.baseline_hosts):
+    # (#4178). The A3 alert projection also needs guards only while
+    # baseline_oversized is possible: more hosts than the baseline can still
+    # prove idle. Below that, no reclassification proposal can name a
+    # candidate and the election would be discarded (seconds per 30 s pass).
+    underspecified = (sum(v == 'baseline' for v in capacity.values())
+                      < cfg.baseline_hosts)
+    oversized_possible = (listing is not None
+                          and len(candidates) > cfg.baseline_hosts)
+    if agents is not None and (underspecified or oversized_possible):
         from . import election, host_lifecycle
         try:
             # #4377: the canons of this view, when every configured canon is
