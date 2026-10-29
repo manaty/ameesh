@@ -78,7 +78,7 @@ PAYLOAD_KEY = "decision"
 #: nature de la ligne de demande et du courrier de réponse (`agent_mailbox.kind`)
 KIND = "request"
 REPLY_KIND = "reply"
-STATES = ("pending", "answered", "withdrawn")
+STATES = ("pending", "answered", "withdrawn", "closed")
 #: canaux d'une réponse (`signed` : signée par la clé du propriétaire)
 CHANNELS = ("cli", "chat", "signed")
 CHANNEL_LABELS = {"cli": "cli", "chat": "chat", "signed": "signed"}
@@ -265,7 +265,11 @@ def view_of(row: dict, now: float | None = None) -> dict:
     d = _payload(row)
     created = float(row.get("created_ts") or 0.0)
     closed = row.get("closed_ts")
-    state = d.get("state") or ("pending" if closed is None else "answered")
+    state = d.get("state") or "pending"
+    # Mail delivery/old forwards can close the envelope without a decision.
+    # A delivery timestamp proves closure, never an owner's answer.
+    if closed is not None and state == "pending":
+        state = "closed"
     due = d.get("due_ts")
     due = float(due) if due is not None else None
     lot = d.get("lot")
@@ -866,6 +870,8 @@ def verify_proof(db, view: dict) -> tuple[bool, str]:
 
 
 def _closed_reason(view: dict) -> str:
+    if view["state"] == "closed":
+        return "decision #%d closed without an answer or withdrawal" % view["id"]
     if view["state"] == "withdrawn":
         who = (view.get("withdrawn") or {}).get("by") or view.get("requester")
         return "decision #%d withdrawn by %s" % (view["id"], who)
@@ -1303,6 +1309,9 @@ def format_view(view: dict, now: float | None = None) -> list[str]:
             answer.get("by"), CHANNEL_LABELS.get(answer.get("channel"), "?"),
             _local(answer.get("ts") or view.get("closed_ts") or now),
             fil.excerpt(answer.get("text") or "", 200)))
+    elif view["state"] == "closed":
+        lines.append("      closed on %s without an answer or withdrawal" %
+                     _local(view["closed_ts"]))
     else:
         withdrawn = view.get("withdrawn") or {}
         lines.append("      withdrawn by %s on %s%s" % (
