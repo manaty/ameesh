@@ -51,6 +51,7 @@ DEAD_LETTERS_SQL = """
       FROM agent_mailbox m
       LEFT JOIN agent_registry r ON r.name = m.recipient
      WHERE m.delivered_at IS NULL
+       AND left(m.recipient, 6) <> 'human:'
        AND (r.name IS NULL OR r.status = 'stopped')
        -- L124 : une demande de décision attend un humain (`human:<id>`),
        -- jamais un agent : elle n'est pas en souffrance
@@ -571,6 +572,9 @@ class Mailbox(interface.Mailbox):
         # destinataire, ne suit pas), puis l'original remis et noté. Un
         # message pris entre-temps par une remise (verrou de ligne, WHERE
         # réévalué) n'est pas renvoyé.
+        if old.startswith("human:"):
+            raise interface.MailboxRefused(
+                "%s is a human mailbox: use ameesh decisions, not forward" % old)
         with self.db.transaction() as tx:
             # L976 (R2 delta codex3, B1 résiduel) : le verrou par nom est pris
             # AVANT toute lecture du registre, et les chemins de création
@@ -615,6 +619,7 @@ class Mailbox(interface.Mailbox):
             ids = sorted(int(row["id"]) for row in tx.query(
                 "SELECT m.id FROM agent_mailbox m"
                 " WHERE m.recipient = %%s AND m.delivered_at IS NULL"
+                "   AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)"
                 "   AND NOT (%s)"
                 " ORDER BY m.id FOR UPDATE" % _RESERVED_SQL, (old,)))
             if not ids:
@@ -672,6 +677,7 @@ class Mailbox(interface.Mailbox):
              " WHERE name = %%s FOR SHARE) ")
         where = """
              WHERE m.recipient = %%s
+               AND left(m.recipient, 6) <> 'human:'
                AND m.delivered_at IS NULL
                AND m.created_at <= to_timestamp(%%s)
                AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)

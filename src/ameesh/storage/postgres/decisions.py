@@ -72,6 +72,56 @@ class Decisions(interface.Decisions):
             (int(decision_id),))
         return rows[0] if rows else None
 
+    def repair_forward(self, decision_id, *, actor):
+        # #4571: no approval or answer is created. Row locks serialize this
+        # repair with close/forward; ambiguous or already answered copies stay put.
+        with self.db.transaction() as tx:
+            rows = tx.query("SELECT id, recipient, kind, payload, meta, status, delivered_at"
+                            " FROM agent_mailbox WHERE id = %s FOR UPDATE",
+                            (int(decision_id),))
+            if not rows:
+                raise ValueError("decision not found")
+            original = rows[0]
+            decision = (original["payload"] or {}).get("decision")
+            forwarded = (original["meta"] or {}).get("forwarded") or {}
+            copy_id = forwarded.get("message_id")
+            if (original["kind"] != "request" or not isinstance(decision, dict)
+                    or not original["recipient"].startswith("human:")
+                    or not copy_id or original["status"] != "delivered"
+                    or original["delivered_at"] is None):
+                raise ValueError("not an accidentally forwarded human decision")
+            copies = tx.query("SELECT id, recipient, kind, payload, meta, status"
+                              " FROM agent_mailbox WHERE id = %s FOR UPDATE", (copy_id,))
+            if not copies:
+                raise ValueError("forwarded decision copy not found")
+            copy = copies[0]
+            origin = (copy["meta"] or {}).get("forwarded_from") or {}
+            for row in (original, copy):
+                content = (row["payload"] or {}).get("decision") or {}
+                if (content.get("state", "pending") != "pending"
+                        or content.get("answer") or content.get("withdrawn")
+                        or row["status"] == "answered"):
+                    raise ValueError("decision or copy was already answered or withdrawn")
+            if (copy["kind"] != "request" or copy["payload"] != original["payload"]
+                    or origin.get("message_id") != int(decision_id)
+                    or origin.get("agent") != original["recipient"]
+                    or forwarded.get("to") != copy["recipient"]
+                    or (copy["meta"] or {}).get("forwarded")):
+                raise ValueError("forward chain or changed copy: repair refused")
+            record = json.dumps({"state": "withdrawn", "withdrawn": {
+                "by": actor, "why": "accidental forward repaired; original #%d restored"
+                % int(decision_id)}})
+            tx.execute("UPDATE agent_mailbox SET status = 'delivered', delivered_at = now(),"
+                       " payload = jsonb_set(payload, '{decision}',"
+                       " (payload->'decision') || %s::jsonb),"
+                       " meta = meta - 'consigne' WHERE id = %s", (record, copy_id))
+            tx.execute("UPDATE agent_mailbox SET status = 'pending', delivered_at = NULL,"
+                       " meta = (meta - 'forwarded') || jsonb_build_object("
+                       " 'forward_repaired', jsonb_build_object('copy', %s::bigint,"
+                       " 'by', %s::text, 'ts', extract(epoch from now()))) WHERE id = %s",
+                       (copy_id, actor, int(decision_id)))
+            return {"decision": int(decision_id), "withdrawn_copy": int(copy_id)}
+
     def pending(self, *, limit) -> list[dict]:
         return self.db.query(
             "SELECT %s FROM agent_mailbox WHERE delivered_at IS NULL AND %s"
