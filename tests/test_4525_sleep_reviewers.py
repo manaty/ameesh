@@ -87,13 +87,15 @@ class SleepSparesTest(PgTestCase):
             "SELECT note FROM work_item_events WHERE work_item_id = %s ORDER BY id",
             (int(lot),))]
 
-    def qa_lot(self, *, assignee="author", reviewers=None, author_family="deepseek"):
+    def qa_lot(self, *, assignee="author", reviewers=None, author_family="deepseek",
+               author_rows=None, sha=None):
         """Un lot gelé en qa, avec sa marque de désignation (auteurs lisibles)."""
+        sha = sha or "a" * 40
         lot = work.add(self.db, title="gel en attente", app="ameesh",
                        assignee=assignee, actor="author")
         lot_id = int(lot["id"])
         work.move(self.db, lot_id, "build", actor="author")
-        freeze = work.milestone(self.db, lot_id, "frozen", sha="a" * 40,
+        freeze = work.milestone(self.db, lot_id, "frozen", sha=sha,
                                 actor="author")
         if str(self.db.query("SELECT state FROM work_items WHERE id = %s",
                              (lot_id,))[0]["state"]) != "qa":
@@ -104,8 +106,9 @@ class SleepSparesTest(PgTestCase):
             "reviewers": [],
             "missing": 1,
             "why": "test freeze waiting for a reviewer",
-            "authors": [{"name": assignee, "family": author_family}],
-            "freeze": {"id": int(freeze["id"]), "sha": "a" * 40},
+            "authors": (author_rows if author_rows is not None
+                        else [{"name": assignee, "family": author_family}]),
+            "freeze": {"id": int(freeze["id"]), "sha": sha},
             "unknown_authors": [],
             "policy_ref": "test",
             "sent": [],
@@ -165,6 +168,22 @@ class SleepSparesTest(PgTestCase):
         self.assertTrue(any(note.startswith("sleep exempted: codex3:")
                             and "only eligible reviewer of family codex" in note
                             for note in self.notes(split)))
+
+    def test_two_pending_freezes_keep_a_reviewer_each(self):
+        # B/P2 du second tour cx2 : deux gels excluent des noms différents de
+        # la même famille ; garder un seul max global laisserait l'un des deux
+        # gels sans relecteur.
+        split = self.make_split()
+        self.qa_lot(author_rows=[{"name": "codex3", "family": ""}], sha="a" * 40)
+        self.qa_lot(author_rows=[{"name": "codex2", "family": ""}], sha="b" * 40)
+        work.note(self.db, split, "roadmap: épuisée ameesh (test)", actor="pilote")
+        out = self.run_pass(1900)
+        sleep = next(g for g in out if g["kind"] == "sleep")
+        by_agent = {row["agent"]: row for row in sleep["agents"]}
+        # A (codex3 exclu) garde codex2 ; B (codex2 exclu) garde codex3.
+        self.assertFalse(by_agent["codex2"]["slept"])
+        self.assertFalse(by_agent["codex3"]["slept"])
+        self.assertTrue(by_agent["codex1"]["slept"])
 
     def test_without_a_pending_freeze_every_reviewer_can_sleep(self):
         split = self.make_split()

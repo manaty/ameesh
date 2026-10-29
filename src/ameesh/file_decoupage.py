@@ -348,7 +348,9 @@ def _reviewer_spares(db, project: str, lots: list, listing: list, *,
       (le calcul partagé #3033 : le gel, la désignation et l'absence de
       verdict de ce relecteur sur cette tête) ;
     * `keep` : `{nom: (famille, lot)}` pour le **dernier relecteur
-      disponible** d'une famille qui peut encore relire un gel en attente.
+      disponible** d'une famille qui peut encore relire **un gel en attente**.
+      Le calcul est fait gel par gel : deux gels peuvent exclure des noms
+      différents de la même famille et avoir besoin de relecteurs différents.
       Les lots ouverts en `qa` portent un gel ; les auteurs de ce gel (lus à
       la marque de désignation, `frozen_authors`) et leur famille sont
       inéligibles. Un agent d'une famille dont il ne reste que lui est
@@ -419,7 +421,12 @@ def _reviewer_spares(db, project: str, lots: list, listing: list, *,
     waiting = [lot for lot in lots or ()
                if str((lot or {}).get("state") or "") == "qa"
                and projects_mod.lot_project(lot or {}) == project]
-    eligible: dict = {}  # famille -> {nom: lot}
+    # Un représentant par (gel, famille), pas un représentant global : deux
+    # gels peuvent exclure des noms différents de la même famille (auteurs,
+    # correcteurs) et avoir besoin de relecteurs différents. Agréger les noms
+    # puis garder le max global laisserait l'un des gels sans relecteur
+    # (B/P2 de la relecture cx2, second tour #4525).
+    keep: dict = {}
     for lot in waiting:
         lot = lot or {}
         try:
@@ -452,17 +459,16 @@ def _reviewer_spares(db, project: str, lots: list, listing: list, *,
             if name:
                 forbidden_names.add(name)
             forbidden_families.update(rd.proven_families(author))
+        by_family: dict = {}  # famille -> noms éligibles sur CE gel
         for name, candidate in by_name.items():
             if name in forbidden_names or candidate.family in forbidden_families:
                 continue
-            eligible.setdefault(candidate.family, {}).setdefault(name, lot_id)
-
-    keep: dict = {}
-    for family, names in eligible.items():
-        # Le nom le plus grand est le représentant stable de la famille : les
-        # autres membres peuvent dormir, le dernier reste disponible.
-        name = max(names)
-        keep[name] = (family, names[name])
+            by_family.setdefault(candidate.family, set()).add(name)
+        for family, names in by_family.items():
+            # Le nom le plus grand est le représentant stable de la famille
+            # pour ce gel : les autres membres peuvent dormir.
+            name = max(names)
+            keep.setdefault(name, (family, lot_id))
     return pending, keep, None
 
 
