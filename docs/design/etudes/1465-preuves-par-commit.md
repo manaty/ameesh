@@ -223,3 +223,49 @@ consolidation sur cible avancée, réécriture réelle, changement sans rapport,
 ensembles de familles ambigus, correctif déplacé vers un autre chemin,
 gel absent récupéré par SHA — avec et sans correcteur — et absence non
 récupérable refusée).
+
+## 8. Auteur hors runner sans ameesh local : l'attestation signée (#4485)
+
+Une session de gouvernance peut tourner sur un hôte **sans ameesh** (le bureau
+sur `bureau-goal`) et n'appeler ameesh que par ssh : aucun PID local n'y est
+vérifiable, et la liaison de session de #3985 ne peut pas couvrir ses commits.
+Deux voies étaient possibles : installer ameesh et un accès direct à la base
+sur l'hôte (nouvelle surface d'exploitation, à décider par l'owner), ou faire
+attester le commit par une **clé `owner`**, que le bureau détient déjà par la
+délégation du §10.
+
+La seconde est retenue : elle ne demande ni nouvel hôte ni nouvelle voie base,
+elle couvre aussi un commit de l'owner, et elle s'appuie sur l'approbation
+Ed25519 existante (`mesh_approvals` : clé owner, échéance, consommation unique).
+Le texte signé est canonique — JSON trié, version, SHA complet, acteur, session,
+harnais, hôte, lot — et son sha256 est l'empreinte de l'approbation
+(`action = provenance`, `artifact_kind = commit`) ; le texte est conservé dans
+le `meta` de l'approbation pour l'audit.
+
+`ameesh provenance record --signed` :
+
+- résout le commit dans un dépôt (`--repo`), **pas nécessairement HEAD** : il a
+  été créé sur l'autre hôte ;
+- vérifie que l'acteur est `externe`, sans bail vivant, que le registre lui
+  connaît le même harnais et que ce harnais est une famille du canon ;
+- signe une approbation (`--key`, clé en 0600 ou `/dev/stdin`, `--as` le
+  détenteur) ou consomme une approbation déjà signée (`--approval`) ; une
+  approbation non valide, révoquée, expirée, déjà consommée ou couvrant un autre
+  texte est refusée ;
+- écrit le reçu en ajout seul, avec `turn = "signed:<approbation>"` : le gel lit
+  la famille comme pour un tour, sans la confondre avec un tour managé.
+
+Ce n'est pas une preuve d'ascendance : c'est une attestation d'autorité, et le
+garde reste « pas de signature valide, pas de reçu ». La création hors tour
+n'est pas attestée par les hooks (absents sur l'hôte) ; c'est la signature qui
+couvre le SHA exact. Le correctif d'environnement de #4485 (un nom annoncé est
+couvert par une liaison valide, au lieu de la masquer) reste utile pour l'option
+« ameesh installé » et pour toute session liée dont le shell a gardé un nom.
+
+Témoins : `tests/test_4485_signed_provenance.py` (preuve par clé ou approbation
+pré-signée, lecture de la famille au gel, commit non-HEAD, commit d'auteur Git
+humain, refus d'un agent execute ou sous bail, harnais divergent ou hors canon,
+clé de rôle agent, clé révoquée, approbation d'un autre texte ou déjà
+consommée) et les trois témoins #4485 de
+`tests/test_3985_bound_session_provenance.py` (nom annoncé couvert par une
+liaison, jamais une autre).

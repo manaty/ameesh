@@ -220,6 +220,19 @@ def _session_binding(cfg: Config, db, harness: str | None,
     return Binding(name=row["agent"], source="session", session=row, ok=True)
 
 
+def resolve_session_binding(cfg: Config, db, *, harness: str | None = None,
+                            session_id: str | None = None) -> Binding:
+    """La liaison de session de CE processus, **sans** partir d'AGENT_MAIL_NAME.
+
+    #4485 : `resolve_binding` lit d'abord `AGENT_MAIL_NAME` et, quand ce nom est
+    posé, ne consulte jamais la liaison. Une session liée dont le shell porte
+    encore un nom annoncé (le bureau) restait donc « auto-déclarée » malgré une
+    liaison valide. La provenance hors tour lit la liaison par cette voie, puis
+    exige que le nom annoncé soit celui de la liaison (`_bound_session`).
+    """
+    return _session_binding(cfg, db, harness, session_id)
+
+
 def workstream_of(name: str, cfg: Config) -> str:
     for _path, alias, workstream in aliases(cfg):
         if alias == name:

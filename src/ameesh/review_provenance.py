@@ -39,6 +39,17 @@ suivent ce chemin : un commit de résolution créé dans une session liée a un
 reçu exact, et le gel en lit la famille. Sans liaison vérifiable, rien n'est
 écrit : le commit reste « origine inconnue », jamais deviné.
 
+Une session de gouvernance peut aussi tourner sur un hôte **sans ameesh** (le
+bureau sur `bureau-goal`), d'où elle appelle ameesh par ssh : aucun PID local
+n'y est vérifiable, et la liaison de session ne peut pas la couvrir (#4485).
+Hors tour, une clé `owner` (le propriétaire, ou son délégataire du §10) peut
+alors **signer une attestation du commit** : SHA complet, acteur, session,
+harnais, hôte et lot. `record --signed` vérifie la signature, la consomme et
+écrit le reçu (`turn = "signed:<approbation>"`). Ce n'est pas une preuve
+d'ascendance : c'est une attestation d'autorité, et le garde reste le même —
+pas de signature valide, pas de reçu. L'acteur doit être `externe` au registre,
+sans bail vivant, sous le harnais que le registre lui connaît.
+
 Un commit n'est enregistrable que s'il a été **créé dans ce tour** : le hook
 `pre-commit` écrit avant le commit une attestation (identité du tour, HEAD et
 arbre de départ, aléa), puis le hook `post-commit` écrit le **fait de création**
@@ -51,6 +62,7 @@ puis B1 cx2/Codex, 15/10 12:12).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -67,6 +79,17 @@ ABBREV = re.compile(r"[0-9a-f]{7,64}")
 #: préfixe du `turn` d'un reçu écrit par une session liée hors tour : le reçu
 #: dit ainsi qu'il ne vient pas d'un tour managé (`AMEESH_TURN_ID`).
 SESSION_TURN_PREFIX = "session:"
+
+#: #4485 : préfixe du `turn` d'un reçu écrit hors tour sur une attestation
+#: signée par une clé `owner` — l'approbation consommée le suit.
+SIGNED_TURN_PREFIX = "signed:"
+#: action et type d'artefact de l'approbation qui porte l'attestation signée.
+SIGNED_ACTION = "provenance"
+SIGNED_KIND = "commit"
+#: version du texte canonique signé ; la changer invalide les anciennes preuves.
+SIGNED_VERSION = 1
+#: un nom d'hôte dans l'attestation : simple et borné (jamais une option).
+HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 
 
 class ProvenanceError(Exception):
@@ -186,13 +209,18 @@ def _bound_session(db, *, actor: str = "", cfg=None) -> dict:
     harnais de la liaison doit être celui que le registre lui connaît : deux
     sources qui divergent ne prouvent rien. Le `turn` rendu est synthétique
     (`session:<id>`) — un reçu de session ne se fait jamais passer pour un tour
-    managé."""
+    managé.
+
+    #4485 : la liaison est lue **même si `AGENT_MAIL_NAME` est posé**. Ce nom
+    annoncé ne prouve rien à lui seul ; quand il est fourni (`actor`), il doit
+    être celui de la liaison, sinon on refuse. C'était l'écart du bureau : un
+    shell portant encore le nom annoncé masquait une liaison valide."""
     from . import config as config_mod
     from . import identity as identity_mod
     from . import registry
     cfg = cfg or getattr(db, "cfg", None) or config_mod.load()
     try:
-        binding = identity_mod.resolve_binding(cfg, db)
+        binding = identity_mod.resolve_session_binding(cfg, db)
     except Exception as exc:  # noqa: BLE001 - liaison illisible : origine inconnue
         raise ProvenanceError(
             "no managed turn (AMEESH_TURN_ID): outside a turn, and the session "
@@ -257,21 +285,38 @@ def _identity(environ=None, *, actor: str = "", db=None, cfg=None) -> dict:
     `actor` n'est qu'une **attente** : quand il est fourni, il doit être celui
     du tour (`AGENT_MAIL_NAME`, posé par le runner) ou de la session liée — un
     tour ne signe pas la preuve d'un autre agent (écart relevé par la relecture
-    cx3, 15/10 04:27)."""
+    cx3, 15/10 04:27).
+
+    #4485 : hors tour, un nom annoncé (`AGENT_MAIL_NAME`) ne dispense pas de
+    lire la liaison de session ; il doit au contraire **être couvert** par
+    elle. Un shell qui a gardé le nom du bureau masquait une liaison valide et
+    faisait échouer toute provenance."""
     env = os.environ if environ is None else environ
     turn_actor = str(env.get("AGENT_MAIL_NAME") or "").strip()
     who = str(actor or turn_actor).strip()
     turn = str(env.get("AMEESH_TURN_ID") or "").strip()
     harness = str(env.get("AMEESH_HARNESS") or "").strip().lower()
     if not turn:
-        if turn_actor or env.get("AMEESH_RUNNER_ID") or env.get("AGENT_MESH_RUNNER_ID"):
-            # Un nom d'agent sans tour n'est pas une preuve : la voie « session
-            # liée » ne remplace pas un tour managé annoncé par l'environnement.
+        announced = bool(turn_actor or env.get("AMEESH_RUNNER_ID")
+                         or env.get("AGENT_MESH_RUNNER_ID"))
+        if db is not None:
+            try:
+                # Le nom annoncé (s'il existe) doit être celui de la liaison :
+                # une liaison valide le couvre, une autre identité le refuse.
+                return _bound_session(db, actor=who, cfg=cfg)
+            except ProvenanceError as exc:
+                if announced:
+                    raise ProvenanceError(
+                        "no managed turn (AMEESH_TURN_ID): outside a turn, an "
+                        "agent identity is announced but nothing proves it (%s)"
+                        % exc) from exc
+                raise
+        if announced:
+            # Un nom d'agent sans tour n'est pas une preuve, et sans base la
+            # voie « session liée » ne peut pas le couvrir.
             raise ProvenanceError(
                 "no managed turn (AMEESH_TURN_ID): outside a turn, an agent "
                 "identity is announced but nothing proves it")
-        if db is not None:
-            return _bound_session(db, actor=actor, cfg=cfg)
         raise ProvenanceError("no managed turn (AMEESH_TURN_ID): outside a turn")
     if not who:
         raise ProvenanceError("no agent identity (AGENT_MAIL_NAME)")
@@ -310,6 +355,223 @@ def capture(environ=None, *, actor: str = "", families, db=None, cfg=None) -> di
         raise ProvenanceError("unknown harness %r (expected %s)"
                               % (ident["harness"], ", ".join(sorted(families))))
     return ident
+
+
+# --------------------------------------------------------------------------
+# #4485 : provenance signée d'un auteur hors runner, sans ameesh local
+# --------------------------------------------------------------------------
+#
+# Un commit créé sur un hôte où ameesh n'est pas installé (le bureau sur
+# bureau-goal) n'a ni tour managé ni PID local à faire vérifier : la liaison de
+# session de #3985 ne peut pas le couvrir. La preuve est alors une **attestation
+# signée par une clé `owner`** (le propriétaire ou son délégataire, canon §10).
+# Elle couvre le SHA complet, l'acteur, la session, le harnais, l'hôte et le lot.
+# `record_signed_commit` vérifie la signature, la consomme et écrit le reçu ; le
+# `turn` synthétique `signed:<approbation>` dit qu'il ne vient pas d'un tour
+# managé. Sans signature valide, rien n'est écrit.
+
+def signed_statement(*, commit, actor: str, session: str, harness: str,
+                     host: str, lot=None) -> str:
+    """Le texte canonique que la clé `owner` signe pour un commit (#4485).
+
+    Le SHA complet lie le contenu ; acteur, session, harnais et hôte disent
+    l'origine ; le lot (facultatif) rattache la preuve sans la conditionner.
+    JSON trié sans espace : la même entrée rend toujours les mêmes octets, donc
+    la même empreinte signée. `version` permet d'invalider un ancien format.
+    """
+    fields = {
+        "version": SIGNED_VERSION,
+        "commit": full_sha(commit),
+        "actor": str(actor or "").strip(),
+        "session": str(session or "").strip(),
+        "harness": str(harness or "").strip().lower(),
+        "host": str(host or "").strip(),
+        "lot": int(lot) if lot is not None else 0,
+    }
+    return json.dumps(fields, sort_keys=True, separators=(",", ":"))
+
+
+def signed_digest(**fields) -> str:
+    """L'empreinte sha256 de `signed_statement` : la valeur que l'approbation signe."""
+    return hashlib.sha256(
+        signed_statement(**fields).encode("utf-8")).hexdigest()
+
+
+def _signed_identity(db, *, actor, session, harness, host, families) -> dict:
+    """L'identité d'un auteur signé, contrôlée comme une session externe.
+
+    L'acteur doit être au registre en mode `externe` (liste d'admission : mode
+    absent = `execute`), sans bail vivant — sinon le tour managé est la preuve,
+    pas une signature — et sous le harnais que le registre lui connaît. Le
+    harnais doit être une famille du canon. L'hôte est un nom borné : il ne
+    prouve rien à lui seul, il est couvert par la signature avec le reste."""
+    from . import agent_names
+    from . import registry
+    from . import session_bindings
+    name = agent_names.resolve(str(actor or "").strip(), db=db,
+                               operation="review_provenance.signed")
+    session = str(session or "").strip()
+    harness = str(harness or "").strip().lower()
+    host = str(host or "").strip()
+    if not (name and session and harness and host):
+        raise ProvenanceError(
+            "a signed receipt requires an actor, a session, a harness and a host")
+    if not session_bindings.SESSION_RE.match(session):
+        raise ProvenanceError("invalid session id: %r" % session)
+    if harness not in session_bindings.HARNESSES:
+        raise ProvenanceError("invalid harness: %r (%s)"
+                              % (harness, "|".join(session_bindings.HARNESSES)))
+    if not HOST_RE.fullmatch(host):
+        raise ProvenanceError("invalid host: %r" % host)
+    if not families:
+        raise ProvenanceError("no model families: the canon cannot be read")
+    if harness not in families:
+        raise ProvenanceError("unknown harness %r (expected %s)"
+                              % (harness, ", ".join(sorted(families))))
+    reg = registry.get(db, name) or {}
+    if not reg:
+        raise ProvenanceError("signed author %s is absent from the registry" % name)
+    if str(reg.get("mode") or "execute").strip() != "externe":
+        raise ProvenanceError(
+            "%s is an execute agent (runner-driven): a signed statement cannot "
+            "prove a family outside a managed turn" % name)
+    if session_bindings.lease_holder(db, name):
+        raise ProvenanceError(
+            "%s holds a live lease (runner-driven): its turns are the proof, "
+            "not a signed statement" % name)
+    declared = str(reg.get("harness") or "").strip().lower()
+    if declared and declared != harness:
+        raise ProvenanceError(
+            "agent %s is registered under %r but the signed statement declares %r"
+            % (name, declared, harness))
+    return {"actor": name, "session": session, "harness": harness, "host": host}
+
+
+def _approval_row(db, approval_id, digest: str) -> dict:
+    """L'approbation `approval_id`, si elle couvre exactement `digest`."""
+    try:
+        wanted = int(approval_id)
+    except (TypeError, ValueError) as exc:
+        raise ProvenanceError("approval id expected, got %r" % (approval_id,)) from exc
+    rows = storage.of(db).approvals.recent(
+        action=SIGNED_ACTION, artifact_hash=digest, limit=20)
+    for row in rows or ():
+        if int(row["id"]) == wanted:
+            return row
+    raise ProvenanceError(
+        "approval #%s does not cover this signed statement (%s)"
+        % (wanted, digest[:12]))
+
+
+def record_signed_commit(db, sha, *, actor: str, session: str, harness: str,
+                         host: str, families, lot=None,
+                         approval_id: int | None = None,
+                         approver: str = "", key_path: str = "",
+                         cwd: str | None = None,
+                         expires: str | None = None) -> dict:
+    """Écrit la provenance signée d'un commit, hors tour et sans PID local.
+
+    #4485 : la preuve n'est pas l'ascendance du processus, mais une attestation
+    d'autorité. `key_path` signe une approbation neuve (clé `owner`) et la
+    consomme dans le même geste ; `approval_id` consomme une approbation déjà
+    signée (elle doit couvrir le même texte canonique). Dans les deux cas, une
+    seule écriture : la première preuve du commit fait foi, une identité
+    divergente est refusée. Le commit peut être n'importe quel objet du dépôt
+    (`cwd`), pas seulement HEAD : il a été créé sur un autre hôte.
+
+    Ne jamais appeler sans `families` issues de `compiled_families` (ou du canon
+    épinglé du banc) : une famille supposée n'est pas une preuve."""
+    from . import authority, signing
+    from . import work as work_mod
+    full = resolve_commit(sha, cwd=cwd)
+    if full is None:
+        raise ProvenanceError(
+            "commit %r does not resolve to a commit in %s (fetch it first)"
+            % (sha, cwd or os.getcwd()))
+    ident = _signed_identity(
+        db, actor=actor, session=session, harness=harness, host=host,
+        families=families)
+    statement = signed_statement(
+        commit=full, actor=ident["actor"], session=ident["session"],
+        harness=ident["harness"], host=ident["host"], lot=lot)
+    digest = hashlib.sha256(statement.encode("utf-8")).hexdigest()
+    subject = subject_of_commit(full)
+    existing = storage.of(db).provenance.get(subject)
+    if existing is not None:
+        if (existing["actor"] == ident["actor"]
+                and existing["session"] == ident["session"]
+                and existing["harness"] == ident["harness"]):
+            return dict(existing, recorded=False)
+        raise ProvenanceError(
+            "%s: already recorded for %s/%s, not %s/%s"
+            % (subject, existing["actor"], existing["session"],
+               ident["actor"], ident["session"]))
+    work_item_id = None
+    if lot is not None:
+        item = work_mod.get(db, int(lot))
+        if item is None:
+            raise ProvenanceError("work item #%s not found" % lot)
+        work_item_id = int(item["id"])
+    if approval_id is not None and key_path:
+        raise ProvenanceError("--key and --approval are mutually exclusive")
+    if approval_id is None and not key_path:
+        raise ProvenanceError(
+            "a signed receipt requires --key (sign now) or --approval ID")
+    if key_path:
+        if not approver:
+            raise ProvenanceError("--key requires --as <owner>")
+        try:
+            seed = signing.read_private(os.path.expanduser(key_path))
+        except (OSError, ValueError) as exc:
+            raise ProvenanceError("cannot read the signing key: %s" % exc) from exc
+        try:
+            built = authority.create_approval(
+                db, seed, approver=approver, action=SIGNED_ACTION,
+                artifact_kind=SIGNED_KIND, artifact_hash=digest,
+                ttl=authority.parse_ttl(expires),
+                meta={"statement": statement, "host": ident["host"],
+                      "lot": work_item_id or 0, "source": "provenance --signed"})
+        except authority.AuthorityError as exc:
+            raise ProvenanceError(str(exc)) from exc
+        approval_id = int(built["id"])
+    row = _approval_row(db, approval_id, digest)
+    if (str(row.get("action") or "") != SIGNED_ACTION
+            or str(row.get("artifact_kind") or "") != SIGNED_KIND):
+        raise ProvenanceError(
+            "approval #%s is not a signed provenance statement" % approval_id)
+    if str(row.get("decision") or "") != "approved":
+        # Un refus signé est une signature valide (authority.build_approval
+        # accepte `rejected`) : la décision portée par la ligne et signée dans
+        # son payload doit être « approved ». Sinon le refus deviendrait une
+        # preuve de provenance (B P1 de la relecture cx3, #4485).
+        raise ProvenanceError(
+            "approval #%s is %r, not an approved statement"
+            % (approval_id, row.get("decision") or "?"))
+    if str(row.get("artifact_hash") or "").lower() != digest:
+        raise ProvenanceError(
+            "approval #%s does not cover this signed statement" % approval_id)
+    verdict = authority.verify_approval(db, row)
+    if not verdict.ok:
+        raise ProvenanceError(
+            "approval #%s is not valid: %s" % (approval_id, verdict.reason))
+    if not authority.consume_approval(db, int(approval_id),
+                                      "provenance:%s" % full):
+        raise ProvenanceError(
+            "approval #%s was already consumed" % approval_id)
+    receipt = storage.of(db).provenance.add(
+        subject, full, ident["actor"], ident["session"],
+        SIGNED_TURN_PREFIX + str(approval_id), ident["harness"],
+        work_item_id=work_item_id)
+    if not receipt.get("recorded"):
+        if (receipt["actor"] == ident["actor"]
+                and receipt["session"] == ident["session"]
+                and receipt["harness"] == ident["harness"]):
+            return receipt
+        raise ProvenanceError(
+            "%s: already recorded for %s/%s, not %s/%s"
+            % (subject, receipt["actor"], receipt["session"],
+               ident["actor"], ident["session"]))
+    return receipt
 
 
 def live_session(db, actor: str, *, harness: str = "") -> str:
@@ -911,6 +1173,33 @@ def build_parser():
     rec.add_argument("--lot", type=int, default=None, help="attach to a work item")
     rec.add_argument("--quiet", action="store_true")
     rec.add_argument("--json", action="store_true")
+    # #4485 : provenance hors runner, attestée par une clé owner (bureau/owner
+    # sur un hôte sans ameesh ni PID local). Les champs sont signés ensemble.
+    rec.add_argument("--signed", action="store_true",
+                     help="owner-signed provenance, outside a managed turn")
+    rec.add_argument("--actor", default="", help="signed actor (external agent)")
+    rec.add_argument("--session", default="", help="signed harness session id")
+    rec.add_argument("--harness", default="", help="signed harness (claude|codex|deepseek)")
+    rec.add_argument("--host", default="", help="host where the signed session ran")
+    rec.add_argument("--repo", default=".", help="repository holding the commit")
+    rec.add_argument("--key", default="",
+                     help="owner private key file to sign now (0600, /dev/stdin allowed)")
+    rec.add_argument("--as", dest="as_agent", default="",
+                     help="owner key holder name (with --key)")
+    rec.add_argument("--approval", type=int, default=None,
+                     help="already-signed approval id (instead of --key)")
+    rec.add_argument("--expires", default=None,
+                     help="lifetime of the approval created with --key (24h default)")
+    stmt = sub.add_parser(
+        "statement",
+        help="print the canonical signed statement and its digest (#4485)")
+    stmt.add_argument("--commit", required=True)
+    stmt.add_argument("--actor", required=True)
+    stmt.add_argument("--session", required=True)
+    stmt.add_argument("--harness", required=True)
+    stmt.add_argument("--host", required=True)
+    stmt.add_argument("--lot", type=int, default=None)
+    stmt.add_argument("--json", action="store_true")
     inst = sub.add_parser("install", help="install the provenance hooks")
     inst.add_argument("--repo", default=".", help="repository (default: cwd)")
     inst.add_argument("--json", action="store_true")
@@ -932,6 +1221,21 @@ def main(argv: list[str] | None = None) -> int:
     import json
     import sys
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    if args.command == "statement":
+        fields = dict(commit=args.commit, actor=args.actor, session=args.session,
+                      harness=args.harness, host=args.host, lot=args.lot)
+        try:
+            text = signed_statement(**fields)
+            digest = signed_digest(**fields)
+        except ProvenanceError as exc:
+            print("provenance refused: %s" % exc, file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps({"statement": text, "digest": digest}))
+        else:
+            print("statement: %s" % text)
+            print("digest   : %s" % digest)
+        return 0
     if args.command == "install":
         out = install_hook(args.repo)
         if args.json:
@@ -968,6 +1272,29 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     db = _connect()
     try:
+        if args.command == "record" and args.signed:
+            if not (args.actor and args.session and args.harness and args.host):
+                print("error: --signed requires --actor, --session, --harness "
+                      "and --host", file=sys.stderr)
+                return 2
+            if bool(args.key) == (args.approval is not None):
+                print("error: --signed requires exactly one of --key or --approval",
+                      file=sys.stderr)
+                return 2
+            row = record_signed_commit(
+                db, args.commit, actor=args.actor, session=args.session,
+                harness=args.harness, host=args.host,
+                families=compiled_families(db), lot=args.lot,
+                approval_id=args.approval, approver=args.as_agent,
+                key_path=args.key, cwd=os.path.abspath(args.repo),
+                expires=args.expires)
+            if args.json:
+                print(json.dumps(row, default=str))
+            elif not args.quiet:
+                print("provenance recorded (signed): %s by %s in %s, turn %s"
+                      % (row["subject"], row["actor"], row["session"],
+                         row["turn"]))
+            return 0
         if args.command == "record":
             identity = capture(families=compiled_families(db), db=db)
             if "session" not in identity:
