@@ -162,7 +162,10 @@ def receipt_for_milestone(db, milestone_id) -> dict | None:
     row = storage.of(db).provenance.milestone(subject)
     if row is None:
         return None
-    if str(row["mark_actor"]).strip().casefold() != str(row["actor"]).strip().casefold():
+    # #4299: after a rename the milestone names the new primary and the
+    # immutable receipt the old spelling, now an alias of the same identity.
+    if (str(row["mark_actor"]).strip().casefold() != str(row["actor"]).strip().casefold()
+            and not row.get("same_identity")):
         raise ProvenanceError(
             "%s: proof actor %r differs from the milestone actor %r"
             % (subject, row["actor"], row["mark_actor"]))

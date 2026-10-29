@@ -4970,7 +4970,11 @@ def verdict_families(db, marks, families, *, provider=None,
             receipt = None
         if receipt is not None:
             if strict:
-                if str(receipt.get("actor") or "").strip().lower() != key:
+                # #4299 : le reçu signé garde la graphie d'avant un renommage,
+                # le jalon porte la nouvelle ; même fiche du registre = même acteur.
+                proof_actor = str(receipt.get("actor") or "").strip()
+                if (proof_actor.lower() != key
+                        and not storage.of(db).agents.same_identity(proof_actor, actor)):
                     raise review_provenance.ProvenanceError(
                         "historical verdict receipt names different facts: milestone:%s"
                         % mark["id"])

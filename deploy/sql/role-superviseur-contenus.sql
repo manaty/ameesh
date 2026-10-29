@@ -78,6 +78,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('work_item_events', ARRAY[
         'note'
     ]),
+    -- L243b step 3 (0516, #4299): motif libre d'un renommage d'agent
+    ('agent_renames', ARRAY['reason']),
     ('work_item_milestones', ARRAY[
         'note'
     ]),
