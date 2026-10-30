@@ -76,7 +76,7 @@ class PreparationTest(unittest.TestCase):
                 groups=[dict(name='executor', gid=1001)], source='administrator fixture', observed_at=2000000000),
             choices=dict(account_ids={name: dict(uid=980 + index, gid=980 + index)
                                       for index, name in enumerate(prepare.NAMES)}, controllers=controllers,
-                         restart_seconds=30, probe_seconds=30,
+                         restart_seconds=30, probe_seconds=30, manager=dict(kind='system'),
                          execution=dict(state='/home/executor/state', config='/home/executor/config.json',
                              release_store='/opt/ameesh-release/store', roots=['/home/executor/work'],
                              tools=['git'], secrets=[], scope='system')))
@@ -99,6 +99,7 @@ class PreparationTest(unittest.TestCase):
         value = json.loads((release_dir / 'plan.json').read_text())
         prepare.release.validate(value['plan'])
         self.assertEqual(value['plan']['runtime_tree_sha256'], prepare.runtime.inventory(release_dir / 'runtime')['digest'])
+        self.assertEqual(value['plan']['policy']['manager'], {'kind': 'system'})
         self.assertEqual(value['plan']['source_tree_sha256'], prepare.runtime.inventory(release_dir / 'sources')['digest'])
         prepare.seal.validate(value['runtime_seal'])
         documents = self.output / 'documents'
@@ -237,6 +238,7 @@ class PreparationTest(unittest.TestCase):
     def test_real_user_unit_uses_shared_consumer_validator(self):
         self.request['observation']['unit'] = 'ameesh-runner-agent@canary.service'
         self.request['choices']['execution']['scope'] = 'user'
+        self.request['choices']['manager'] = dict(kind='user', account='executor')
         # Before #4765 this must refuse rather than invent an alias. When that
         # dependency is integrated the same test verifies the full output.
         try:
@@ -250,6 +252,16 @@ class PreparationTest(unittest.TestCase):
         execution = json.loads((self.output / 'documents/execution.json').read_text())
         self.assertEqual(execution['accounts']['canary']['unit'], 'ameesh-runner-agent@canary.service')
         self.assertEqual(manifest['observation']['unit'], execution['accounts']['canary']['unit'])
+
+    def test_manager_is_explicit_closed_and_matches_observed_executor(self):
+        for manager in (None, {}, {'kind': 'user'}, {'kind': 'system', 'account': 'executor'},
+                        {'kind': 'user', 'account': 'other'}, {'kind': 'user', 'account': 'executor'},
+                        {'kind': 'invented'}):
+            changed = copy.deepcopy(self.request)
+            changed['choices']['manager'] = manager
+            with self.subTest(manager=manager), self.assertRaises(ValueError):
+                self.assemble(changed)
+            self.assertFalse(self.output.exists())
 
 
 if __name__ == '__main__':

@@ -10,7 +10,8 @@ account, home, uid, gid, unit, users, groups, source, observed_at. users and
 groups are complete numeric/name inventories, not lists of proposed free IDs.
 choices contains account_ids (release/handoff/secrets), controllers (the same
 three names, each with source and public_key_file), restart_seconds and
-probe_seconds and execution (state/config/release_store/roots/tools/secrets/scope).
+probe_seconds, manager and execution (state/config/release_store/roots/tools/secrets/scope).
+manager is explicitly {"kind":"system"} or {"kind":"user","account":"…"}.
 Keys are PUBLIC Ed25519 keys in owned 0600 files; no private
 key, credential or implicit CIDR is accepted. The registry is checked live.
 
@@ -53,7 +54,7 @@ NAMES = ('release', 'handoff', 'secrets')
 REQUEST = {'version', 'host', 'agent', 'sha', 'operation', 'expires_at', 'observation', 'choices'}
 OBSERVATION = {'host', 'machine_id', 'host_key_sha256', 'account', 'home', 'uid', 'gid',
                'unit', 'users', 'groups', 'source', 'observed_at'}
-CHOICES = {'account_ids', 'controllers', 'restart_seconds', 'probe_seconds', 'execution'}
+CHOICES = {'account_ids', 'controllers', 'restart_seconds', 'probe_seconds', 'execution', 'manager'}
 EXECUTION = {'state', 'config', 'release_store', 'roots', 'tools', 'secrets', 'scope'}
 ADMIN_CODE = '/opt/ameesh-admin/backend'
 
@@ -148,7 +149,16 @@ def validate(request, db, *, now):
     if any(item['name'] in {'ameesh-' + name for name in NAMES}
            for item in observed['users'] + observed['groups']):
         raise PreparationError('delegated account or group already exists')
-    policy = dict(host=request['host'], units=[observed['unit']],
+    manager = choices['manager']
+    if not isinstance(manager, dict) or manager.get('kind') not in ('system', 'user'):
+        raise PreparationError('explicit restart manager required')
+    exact(manager, {'kind'} if manager['kind'] == 'system' else {'kind', 'account'})
+    if manager['kind'] == 'user' and manager['account'] != observed['account']:
+        raise PreparationError('restart manager account differs from observed executor')
+    execution_choices = exact(choices['execution'], EXECUTION)
+    if manager['kind'] != execution_choices['scope']:
+        raise PreparationError('restart manager differs from execution scope')
+    policy = dict(host=request['host'], units=[observed['unit']], manager=manager,
                   controller_unit='ameesh-release-controller.service',
                   restart_seconds=choices['restart_seconds'])
     # This calls the shared consumer validators and the real registry. #4765
@@ -158,7 +168,6 @@ def validate(request, db, *, now):
                        seconds=choices['probe_seconds'], policy=policy)
     if turn['unit'] != observed['unit']:
         raise PreparationError('observed runner unit mismatch')
-    execution_choices = exact(choices['execution'], EXECUTION)
     execution = dict(host=request['host'], accounts={request['agent']: dict(
         account=observed['account'], home=observed['home'], unit=observed['unit'],
         scope=execution_choices['scope'])},
