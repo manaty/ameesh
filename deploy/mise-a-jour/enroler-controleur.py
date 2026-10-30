@@ -111,10 +111,12 @@ def document(data):
 
 
 def question(operation, bundle, expires_at, *, stop=False):
-    if (type(expires_at) is not int or expires_at != bundle['expires_at']
+    if (type(expires_at) is not int or expires_at <= 0
+            or (not stop and expires_at != bundle['expires_at'])
             or operation != bundle['operation']):
         raise EnrollmentError('exact authority window required')
-    text = (STOP_PREFIX if stop else PREFIX) + canonical(bundle)
+    payload = dict(bundle, enrollment_expires_at=bundle['expires_at'], expires_at=expires_at) if stop else bundle
+    text = (STOP_PREFIX if stop else PREFIX) + canonical(payload)
     if len(text) > admin.bootstrap.signed.decisions.MAX_QUESTION:
         raise EnrollmentError('enrollment signing question exceeds decision limit')
     return text
@@ -292,7 +294,7 @@ class Enrollment:
                                        public_key=public, public_key_sha256=sha(public.encode())))
             return dict(public_key=public, public_key_sha256=sha(public.encode()))
 
-    def inputs(self, operation):
+    def inputs(self, operation, *, allow_expired=False):
         stage = self.stage(operation)
         runtime.trusted(stage)
         if not stage.is_dir() or stat.S_IMODE(stage.stat().st_mode) != 0o700:
@@ -302,7 +304,8 @@ class Enrollment:
         spec = document(read(stage / 'input.json'))
         if (not isinstance(spec, dict) or set(spec) != {'version', 'expires_at'}
                 or type(spec['version']) is not int or spec['version'] != 1
-                or type(spec['expires_at']) is not int or spec['expires_at'] <= self.clock()):
+                or type(spec['expires_at']) is not int
+                or (not allow_expired and spec['expires_at'] <= self.clock())):
             raise EnrollmentError('exact unexpired input required')
         self.validate(data)
         self.transport_key(operation, data)
@@ -424,8 +427,8 @@ class Enrollment:
             admin.Backend.write(target, canonical(bundle))
         return dict(bundle=bundle, question=question(operation, bundle, spec['expires_at']), options=OPTIONS)
 
-    def load(self, operation):
-        stage, spec, data, values = self.inputs(operation)
+    def load(self, operation, *, allow_expired=False):
+        stage, spec, data, values = self.inputs(operation, allow_expired=allow_expired)
         bundle = document(read(stage / 'bundle.json'))
         if bundle != self.bundle(operation, spec, data, values):
             raise EnrollmentError('frozen enrollment changed')
@@ -435,7 +438,7 @@ class Enrollment:
     def apply(self, operation, decision, *, stop=False):
         # Permanent inode also fences native bootstrap and sealed invocations.
         with seal.locked(self.path(LOCK), exclusive=True, uid=os.geteuid()):
-            stage, bundle, values = self.load(operation)
+            stage, bundle, values = self.load(operation, allow_expired=stop)
             authority_type = SignedStopAuthority if stop else SignedEnrollmentAuthority
             authority = authority_type(self.backend.db, decision, operation, bundle, clock=self.clock)
             digest = protocol.identity(bundle)
@@ -549,7 +552,9 @@ def main(argv=None):
                 or args[0] not in ('key-question', 'keygen', 'prepare', 'enroll', 'stop-question', 'stop')
                 or (args[0] in ('keygen', 'enroll', 'stop') and
                     (len(args) != 4 or args[2] != '--decision' or not args[3].isdigit()))
-                or (args[0] in ('key-question', 'prepare', 'stop-question') and len(args) != 2)):
+                or (args[0] in ('key-question', 'prepare') and len(args) != 2)
+                or (args[0] == 'stop-question' and len(args) != 2 and
+                    (args[2] != '--expires-at' or not args[3].isdigit()))):
             raise EnrollmentError('root key-question|keygen|prepare|enroll|stop-question|stop OPERATION [--decision N] required')
         os.umask(0o077)
         os.environ.clear()
@@ -569,8 +574,11 @@ def main(argv=None):
         elif args[0] == 'prepare':
             result = tool.prepare(args[1])
         elif args[0] == 'stop-question':
-            _, bundle, _ = tool.load(args[1])
-            result = dict(question=question(args[1], bundle, bundle['expires_at'], stop=True), options=STOP_OPTIONS)
+            _, bundle, _ = tool.load(args[1], allow_expired=True)
+            expires = int(args[3]) if len(args) == 4 else bundle['expires_at']
+            if expires <= tool.clock():
+                raise EnrollmentError('fresh stop decision window required; use --expires-at UNIX_SECONDS')
+            result = dict(question=question(args[1], bundle, expires, stop=True), options=STOP_OPTIONS)
         else:
             result = tool.apply(args[1], int(args[3]), stop=args[0] == 'stop')
         print(canonical(result))

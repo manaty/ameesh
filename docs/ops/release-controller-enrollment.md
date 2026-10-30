@@ -205,3 +205,18 @@ nommément avant demande de signature ; réduire le périmètre de la politique.
 La sonde de lecture privée exige le code 1 de `test -r` sans aucune sortie :
 un diagnostic de `runuser` ne prouve pas l'isolation. Les refus propres à
 l'enrôleur sont rendus par leur libellé ; les autres exceptions restent masquées.
+
+L'arrêt peut recevoir une fenêtre signée neuve après expiration de l'enrôlement :
+`stop-question OPERATION --expires-at UNIX_SECONDS` lie cette nouvelle échéance
+au bundle original et conserve `enrollment_expires_at` dans la question. Cette
+signature n'autorise que `stop` et ne prolonge ni l'enrôlement, ni le démarrage.
+Les documents, la clé, les reçus et l'identité de l'instance restent vérifiés.
+
+Avant la continuation de bootstrap, le backend administratif doit être
+réenrôlé avec le code intégrant `decisions.require_current` de #4991. Un backend
+ancien ne connaît pas la supersession : une décision remplacée y resterait
+exécutable. La nouvelle demande indique `--supersedes ID --supersedes-option
+install` ; seule la réponse signée `install` active le remplacement. La
+continuation doit vérifier les deux liens effectifs réciproques, puis rapprocher
+les anciens reçus sans les réécrire. Ce prérequis ne constitue pas une
+revendication de livraison de la continuation.

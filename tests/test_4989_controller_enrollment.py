@@ -223,6 +223,21 @@ class EnrollmentTest(unittest.TestCase):
         with self.assertRaisesRegex(enroll.EnrollmentError, 'decision limit'):
             enroll.question(self.operation, oversized, oversized['expires_at'])
 
+    def test_stop_uses_a_new_window_without_renewing_enrollment(self):
+        prepared = self.prepare()
+        self.apply()
+        old_expiry = prepared['bundle']['expires_at']
+        self.engine.clock = lambda: old_expiry + 1
+        with self.assertRaisesRegex(enroll.EnrollmentError, 'unexpired'):
+            self.apply()
+        fresh = old_expiry + 600
+        text = enroll.question(self.operation, prepared['bundle'], fresh, stop=True)
+        scope = json.loads(text[len(enroll.STOP_PREFIX):])
+        self.assertEqual(scope['enrollment_expires_at'], old_expiry)
+        self.assertEqual(scope['expires_at'], fresh)
+        self.assertEqual(self.apply(stop=True)['outcome'], 'stopped')
+        self.assertEqual(json.loads((self.stage / 'bundle.json').read_text()), prepared['bundle'])
+
     def test_missing_signature_has_no_effect_and_drift_refuses_before_start(self):
         self.prepare()
         self.allow.validate.return_value = False
@@ -424,6 +439,21 @@ class SignedAuthorityTest(support.PgTestCase):
         self.now -= 601
         authority.revoke_key(self.db, 'fixture-owner')
         self.assertFalse(adapter.validate('fixture-enrollment', digest, 'start'))
+
+    def test_fresh_signed_stop_after_original_enrollment_expired(self):
+        self.bundle['expires_at'] = int(self.now) - 1
+        fresh = int(self.now) + 300
+        view = decisions.ask(self.cfg, self.db, requester='fixture-controller', lot=str(self.lot['id']),
+            question=enroll.question('fixture-enrollment', self.bundle, fresh, stop=True),
+            options=['%s=%s' % (value['key'], value['label']) for value in enroll.STOP_OPTIONS],
+            needs_signature=True)
+        self.sign(view, 'stop')
+        digest = enroll.protocol.identity(self.bundle)
+        adapter = self.adapter(view, stop=True)
+        self.assertTrue(adapter.validate('fixture-enrollment', digest, 'stop'))
+        self.assertFalse(self.adapter(view).validate('fixture-enrollment', digest, 'start'))
+        self.now = fresh + 1
+        self.assertFalse(adapter.validate('fixture-enrollment', digest, 'stop'))
 
     def test_key_generation_signature_does_not_authorize_enrollment(self):
         view = decisions.ask(self.cfg, self.db, requester='fixture-controller', lot=str(self.lot['id']),
