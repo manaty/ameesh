@@ -172,6 +172,51 @@ class Decisions(interface.Decisions):
             (str(lot).strip(),))
 
     def close(self, decision_id, *, status, record) -> dict | None:
+        from ... import decisions
+        if set(record or {}) - {"state", "answer", "withdrawn"}:
+            raise decisions.DecisionError("decision closure cannot change the signed request")
+        # #4991: close and replace are one transaction, including on a
+        # mediated executor. Lock both rows in id order; two replacements of
+        # one authority cannot both win. Existing answers remain immutable.
+        request = self.get(decision_id)
+        target = ((request or {}).get("payload") or {}).get("decision", {}).get("supersedes")
+        if status != "answered" or target is None:
+            return self._close(decision_id, status=status, record=record)
+        if type(target) is not int or not 0 < target < int(decision_id):
+            raise decisions.DecisionError("supersedes must name an earlier answered decision")
+        with self.db.transaction() as tx:
+            tx.query("SELECT id FROM agent_mailbox WHERE id IN (%s, %s) ORDER BY id FOR UPDATE",
+                     (target, int(decision_id)))
+            repository = type(self)(tx)
+            current = repository.get(decision_id)
+            if not current or current.get("closed_ts") is not None:
+                return None
+            if (current["payload"]["decision"].get("supersedes") != target
+                    or record.get("state") != "answered"):
+                raise decisions.DecisionError("supersession request changed")
+            old = repository.get(target)
+            old_view = decisions.view_of(old) if old else None
+            if not old_view or old_view["state"] != "answered":
+                raise decisions.DecisionError("supersedes requires an answered decision; pending uses withdraw")
+            decisions.require_current(old_view)
+            closed = repository._close(decision_id, status=status, record=record)
+            view = decisions.view_of(closed)
+            if ((view.get("answer") or {}).get("channel") != "signed"
+                    or view.get("needs_signature") is not True
+                    or not decisions.verify_proof(tx, view, live=True)[0]):
+                raise decisions.DecisionError("supersession requires a valid signed answer")
+            tx.execute("UPDATE agent_mailbox SET payload = jsonb_set(payload,"
+                       " '{decision,superseded_by}', to_jsonb(%s::bigint)) WHERE id = %s",
+                       (int(decision_id), target))
+            answer = view["answer"]
+            tx.execute("INSERT INTO decision_supersessions"
+                       " (supersedes, superseded_by, person, occurred_at, proof)"
+                       " VALUES (%s, %s, %s, to_timestamp(%s), %s::jsonb)",
+                       (target, int(decision_id), answer["by"], answer["ts"],
+                        json.dumps(answer["proof"])))
+            return closed
+
+    def _close(self, decision_id, *, status, record):
         # Une seule instruction : la condition (encore en attente) et
         # l'écriture ne se séparent pas — deux réponses, un seul gagnant.
         rows = self.db.query(

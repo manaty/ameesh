@@ -47,6 +47,11 @@ class BootstrapTest(unittest.TestCase):
         self.root=Path(self.temp.name)/'journal'
         self.bundle=bundle(); self.host=Host(); self.authority=Authority()
         self.authority.denied=set()
+        # These synthetic bundles carry no seal. The test must not discover
+        # a real host enrollment and attempt to acquire its root-only lock.
+        absent=Path(self.temp.name)/'absent-seal.json'
+        patcher=mock.patch.object(bootstrap.delegation,'SEAL_DOCUMENT',str(absent))
+        patcher.start(); self.addCleanup(patcher.stop)
     def run_bootstrap(self,operation='bootstrap-fixture',review=None):
         return bootstrap.run(self.root,operation,review or self.bundle,
                              authority=self.authority,adapter=self.host)
@@ -109,6 +114,22 @@ class BootstrapTest(unittest.TestCase):
 
 
 class SignedBootstrapTest(support.PgTestCase):
+    def test_signed_supersession_refuses_every_old_step_including_enable(self):
+        self.sign()
+        old=decisions.get(self.db,self.view['id'])
+        new=decisions.ask(self.cfg,self.db,requester='fixture-controller',lot=str(self.lot['id']),
+            question=old['question'],options=['%s=%s'%(item['key'],item['label']) for item in bootstrap.OPTIONS],
+            supersedes=old['id'])
+        self.assertTrue(self.valid('enable'))
+        self.sign(view=new)
+        for step in bootstrap.STEPS:
+            self.assertFalse(self.valid(step),step)
+        with self.assertRaisesRegex(bootstrap.BootstrapError,'superseded by decision #%d'%new['id']):
+            bootstrap._run(Path(self.tmp)/'superseded',self.operation,self.bundle,
+                          authority=self.adapter,adapter=Host())
+        replacement=bootstrap.SignedBootstrapAuthority(self.db,new['id'],self.operation,self.bundle,clock=lambda:self.now)
+        self.assertTrue(replacement.validate(self.operation,replacement.scopes['enable'],'enable'))
+
     def setUp(self):
         super().setUp()
         self.now=time.time(); self.bundle=bundle(); self.operation='bootstrap-fixture'; self.seed=b'\x42'*32

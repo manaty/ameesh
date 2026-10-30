@@ -17,6 +17,20 @@ SPEC.loader.exec_module(release)
 
 
 class ReleaseAuthorityTest(PgTestCase):
+    def test_signed_supersession_refuses_old_controller_with_replacement_id(self):
+        self.signed_answer()
+        new=decisions.ask(self.cfg,self.db,requester='fixture-controller',lot=str(self.lot['id']),
+            question=self.view['question'],options=['%s=%s'%(item['key'],item['label']) for item in release.OPTIONS],
+            supersedes=self.view['id'])
+        self.assertTrue(self.validate())
+        self.sign_view(new,'apply')
+        for step in release.STEPS:
+            self.assertFalse(self.validate(step),step)
+        from tests.test_l232b_release_controller import controller, Host
+        with self.assertRaisesRegex(controller.ControllerError,'superseded by decision #%d'%new['id']):
+            controller.run(Path(self.tmp)/'superseded','test-release',self.manifest,
+                           authority=self.adapter,adapter=Host())
+
     def setUp(self):
         super().setUp()
         self.now = time.time()

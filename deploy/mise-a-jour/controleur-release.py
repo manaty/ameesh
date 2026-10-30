@@ -103,9 +103,13 @@ def load(path):
 
 def checked(method, *args):
     try:
-        return method(*args) is True
+        allowed = method(*args) is True
     except Exception:
         raise ControllerError('authority or fence verification unavailable') from None
+    reason = getattr(getattr(method, '__self__', None), 'denial_reason', None)
+    if not allowed and reason:
+        raise ControllerError(reason)
+    return allowed
 
 
 def run(root, operation, manifest, *, authority, adapter):
