@@ -68,6 +68,10 @@ command = command.replace('/home/ameesh/.local/share/ameesh/venv/bin/python', os
 # remplacés, donc cette passe ne les touche plus).
 command = command.replace('/home/ameesh/.local/share/ameesh', os.environ['FAKE_SHARE'])
 command = command.replace('$HOME/.config/ameesh/env', str(state / 'runner.env'))
+# The administrator helper arrives on stdin. Keep its guest paths inside
+# the fake remote host too, even when the test runner has a real guest.
+stdin = stdin.replace('/usr/local/lib/ameesh-guest', str(state / 'guest-lib'))
+stdin = stdin.replace('/etc/ameesh-guest/offload.json', str(state / 'guest-config.json'))
 env = dict(os.environ, FAKE_REMOTE='1')
 sys.exit(subprocess.run(['bash', '-c', command], env=env, input=stdin, text=True).returncode)
 '''
@@ -1668,6 +1672,15 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('runtime invité non prouvé', p.stderr)
         self.assertIn('bail', p.stderr)
         self.assertNotIn('contrôles verts', p.stdout)
+
+    def test_check_guest_runtime_reads_only_the_fake_remote_host(self):
+        # An incomplete guest on the simulated remote host must be detected,
+        # independently of the guest installed on the machine running tests.
+        (self.state / 'guest-config.json').write_text('{}')
+        p = self.run_vm('controler')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn(str(self.state / 'guest-lib'), p.stderr)
+        self.assertIn('runtime invité différent', p.stderr)
 
     def test_check_uses_database_clock(self):
         p = self.run_vm('controler', 'db-ahead')
