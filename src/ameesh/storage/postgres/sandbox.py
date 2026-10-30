@@ -1,0 +1,301 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Dormant sandbox persistence boundary (#2202 S1).
+
+Only the runner calls these functions. Each lifecycle operation locks the
+correlation then the registry, and owns one transaction, on either DB driver.
+No admission, supervisor, external write route or runtime activation lives here.
+S3 supplies the settlement callback (tx, admission, outcome); it must settle
+account AND tranche in that transaction. Missing settlement fails closed.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+
+from ... import jcs
+
+TERMINAL = frozenset(('succeeded', 'failed', 'cancelled', 'expired', 'lost'))
+MAX_RESULT_BYTES = 65536
+
+
+class Refusal(ValueError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+def _refuse(code):
+    raise Refusal(code)
+
+
+def _locked(tx, turn_id):
+    rows = tx.query('select * from sandbox_turns where turn_id = %s for update',
+                    (turn_id,))
+    if not rows:
+        _refuse('unknown-turn')
+    return rows[0]
+
+
+def _live(tx, row, owner, epoch):
+    rows = tx.query('select name from agent_registry where name = %s'
+                    ' and lease_owner = %s and lease_epoch = %s'
+                    ' and lease_expires_at > clock_timestamp() for update',
+                    (row['agent'], owner, epoch))
+    # Check the clock again AFTER acquiring a contended registry lock.
+    if (row['owner'] != owner or row['lease_epoch'] != epoch or not rows
+            or not tx.query('select name from agent_registry where name = %s'
+                            ' and lease_expires_at > clock_timestamp()',
+                            (row['agent'],))):
+        _refuse('stale')
+
+
+def _revoked(row):
+    if row['cancel_requested_at'] or row['state'] in ('cancelling', 'cancelled'):
+        _refuse('revoked')
+
+
+def _late(tx, row):
+    if row['state'] in TERMINAL or tx.query(
+            'select 1 as late from sandbox_turns where turn_id = %s'
+            ' and deadline_ts <= clock_timestamp()', (row['turn_id'],)):
+        _refuse('late')
+
+
+def ameesh_turn_close(tx, name, owner, epoch, *, status, status_text, error,
+                      cost_usd, sandbox_turn_id=None):
+    """Internal shared close; caller holds the sandbox/registry locks.
+
+    Sandbox completion is called only after its unique result insertion. A
+    local close cannot bypass the result boundary, even on a terminal row.
+    """
+    if sandbox_turn_id is None:
+        tx.query('select name from agent_registry where name = %s for update', (name,))
+    if sandbox_turn_id is None and tx.query(
+            'select turn_id from sandbox_turns where agent = %s'
+            " and owner = %s and lease_epoch = %s"
+            " and (state not in ('succeeded','failed','cancelled','expired','lost')"
+            " or turn_id = (select turn_id from turn_resources where agent = %s"
+            " order by started_at desc, id desc limit 1)) limit 1",
+            (name, owner, epoch, name)):
+        _refuse('wrong-completion')
+    return bool(tx.query(
+        'update agent_registry set status = %s,'
+        ' status_text = coalesce(%s, status_text), last_error = %s,'
+        ' current_prompt = null, turns = turns + 1,'
+        ' spent_usd = spent_usd + coalesce(%s, 0), last_turn_at = now(),'
+        ' last_seen = now(), updated_at = now()'
+        ' where name = %s and lease_owner = %s and lease_epoch = %s returning name',
+        (status, status_text, error, cost_usd, name, owner, epoch)))
+
+
+def ameesh_sandbox_bind(db, turn_id, owner, epoch, job_uid):
+    with db.transaction() as tx:
+        row = _locked(tx, turn_id)
+        _revoked(row)
+        _live(tx, row, owner, epoch)
+        _late(tx, row)
+        if not isinstance(job_uid, str) or not job_uid:
+            _refuse('missing')
+        if row['job_uid'] and row['job_uid'] != job_uid:
+            _refuse('job-conflict')
+        if not row['job_uid']:
+            tx.query("select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || %s, 0))",
+                     ('sandbox-job:' + job_uid,))
+            if tx.query('select turn_id from sandbox_turns where job_uid = %s',
+                        (job_uid,)):
+                _refuse('job-conflict')
+            tx.execute("update sandbox_turns set job_uid = %s, state = 'bound'"
+                       ' where turn_id = %s', (job_uid, turn_id))
+        return {'turn_id': turn_id, 'job_uid': job_uid}
+
+
+def _canonical(result):
+    try:
+        raw = jcs.canonicalize(result, doubles=True)
+    except (jcs.JcsError, TypeError, ValueError, OverflowError, RecursionError):
+        _refuse('missing')
+    if len(raw) > MAX_RESULT_BYTES or not isinstance(result, dict):
+        _refuse('missing')
+    return raw, 'sha256:' + hashlib.sha256(raw).hexdigest()
+
+
+def _validate(row, result):
+    if (result.get('scope') != row['scope']
+            or result.get('scope_digest') != row['scope_digest']):
+        _refuse('scope-mismatch')
+    required = ('schema', 'turn_id', 'epoch', 'result_id', 'outcome', 'verdict',
+                'findings', 'evidence', 'usage', 'cost', 'sandbox_session',
+                'source', 'finished_at')
+    if any(key not in result for key in required):
+        _refuse('missing')
+    if result['schema'] != 'ameesh-sandbox-result/1':
+        _refuse('contract-mismatch')
+    if result['turn_id'] != row['turn_id'] or result['epoch'] != row['lease_epoch']:
+        _refuse('stale')
+    if (not row['job_uid'] or not isinstance(result['result_id'], str)
+            or not result['result_id'] or not isinstance(result['usage'], dict)):
+        _refuse('missing')
+    allowed = set(required) | {'scope', 'scope_digest', 'tools', 'capabilities', 'image_digest'}
+    if set(result) - allowed:
+        _refuse('missing')
+    if result.get('image_digest', row['image_digest']) != row['image_digest']:
+        _refuse('source-mismatch')
+    if not isinstance(result['cost'], dict) or set(result['cost']) != {'usd'}:
+        _refuse('missing')
+    if type(result['cost']['usd']) not in (int, float) or result['cost']['usd'] < 0:
+        _refuse('missing')
+    if not all(isinstance(result[key], str) and result[key]
+               for key in ('outcome', 'verdict', 'finished_at')):
+        _refuse('missing')
+    limits = row['limits']
+    for counter in ('turns', 'tool_calls', 'seconds', 'model_calls'):
+        value = result['usage'].get(counter)
+        if type(value) is not int or value < 0:
+            _refuse('missing')
+        bound = limits.get(counter, limits.get('turn_seconds') if counter == 'seconds' else None)
+        if bound is not None and value > bound:
+            _refuse('limit-exceeded')
+    for key in ('tools', 'capabilities'):
+        declared = result.get(key, [])
+        admitted = limits.get(key, [])
+        if isinstance(admitted, dict):
+            admitted = [name for name, enabled in admitted.items() if enabled is True]
+        if key == 'capabilities' and isinstance(declared, dict):
+            if any(type(value) is not bool for value in declared.values()):
+                _refuse('missing')
+            declared = [name for name, enabled in declared.items() if enabled]
+        if (not isinstance(declared, list) or any(not isinstance(v, str) for v in declared)):
+            _refuse('missing')
+        if not set(declared) <= set(admitted):
+            _refuse('profile-refused')
+    if limits.get('session', 'none') == 'none' and result['sandbox_session'] is not None:
+        _refuse('profile-refused')
+    if (not isinstance(result['source'], dict)
+            or result['source'].get('contract') != row['source'].get('contract')):
+        _refuse('contract-mismatch')
+    if result['source'] != row['source']:
+        _refuse('source-mismatch')
+    # Keep bounded references and summaries, never arbitrary transcript blobs.
+    for field, required_fields, allowed_fields in (
+            ('findings', {'severity', 'code', 'summary'},
+             {'severity', 'code', 'summary', 'path', 'line', 'url'}),
+            ('evidence', {'kind'}, {'kind', 'head', 'name', 'conclusion', 'url', 'path', 'line'})):
+        entries = result[field]
+        if not isinstance(entries, list) or len(entries) > 128:
+            _refuse('missing')
+        for entry in entries:
+            if (not isinstance(entry, dict) or not required_fields <= set(entry)
+                    or set(entry) - allowed_fields):
+                _refuse('missing')
+            for key, value in entry.items():
+                if key == 'line':
+                    if type(value) is not int or value < 1:
+                        _refuse('missing')
+                elif not isinstance(value, str) or len(value) > 4096:
+                    _refuse('missing')
+
+
+def _finish(tx, row, *, settle, outcome, cost_usd=None, close_registry=True):
+    # No callback means S3 is not installed; roll back rather than returning a
+    # receipt whose two reservations were not settled atomically.
+    if settle is None:
+        raise RuntimeError('sandbox settlement boundary unavailable')
+    settled = settle(tx, row, outcome)
+    if settled is not None:
+        cost_usd = settled.get('usd')
+    if close_registry:
+        paused = tx.query('select operator_paused from agent_registry where name = %s',
+                          (row['agent'],))[0]['operator_paused']
+        if not ameesh_turn_close(
+                tx, row['agent'], row['owner'], row['lease_epoch'],
+                status='queued' if paused else 'idle', status_text=None, error=None,
+                cost_usd=cost_usd, sandbox_turn_id=row['turn_id']):
+            _refuse('stale')
+    tx.execute('delete from spend_pending where agent = %s and turn_id = %s',
+               (row['agent'], row['turn_id']))
+    tx.execute("update turn_resources set status = 'done', ended_at = clock_timestamp()"
+               ' where agent = %s and turn_id = %s', (row['agent'], row['turn_id']))
+
+
+def ameesh_sandbox_complete(db, turn_id, owner, epoch, result, *, settle=None):
+    with db.transaction() as tx:
+        row = _locked(tx, turn_id)
+        _revoked(row)
+        _live(tx, row, owner, epoch)
+        raw, digest = _canonical(result)
+        result = json.loads(raw)
+        stored = tx.query('select result_sha256, receipt from sandbox_results'
+                          ' where turn_id = %s', (turn_id,))
+        if stored:
+            if stored[0]['result_sha256'] != digest:
+                _refuse('duplicate')
+            return dict(stored[0]['receipt'], replayed=True)
+        _late(tx, row)
+        _validate(row, result)
+        # Serialize the global id check across distinct turn row locks.
+        tx.query("select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || %s, 0))",
+                 ('sandbox-result:' + result['result_id'],))
+        if tx.query('select turn_id from sandbox_results where result_id = %s',
+                    (result['result_id'],)):
+            _refuse('duplicate')
+        receipt = dict(schema='ameesh-sandbox-receipt/1', turn_id=turn_id,
+                       epoch=epoch, scope=row['scope'], scope_digest=row['scope_digest'],
+                       result_id=result['result_id'], result_sha256=digest,
+                       job=dict(namespace=row['namespace'], name=row['job_name'],
+                                uid=row['job_uid']), source=row['source'], replayed=False)
+        tx.execute('insert into sandbox_results (turn_id, epoch, result_id,'
+                   ' result_sha256, payload, receipt) values (%s, %s, %s, %s, %s::jsonb, %s::jsonb)',
+                   (turn_id, epoch, result['result_id'], digest, raw.decode(), json.dumps(receipt)))
+        _finish(tx, row, settle=settle, outcome='succeeded')
+        tx.execute("update sandbox_turns set state = 'succeeded', result_id = %s,"
+                   ' result_sha256 = %s, sandbox_session = %s, completed_at = clock_timestamp()'
+                   ' where turn_id = %s',
+                   (result['result_id'], digest, result['sandbox_session'], turn_id))
+        tx.execute("insert into ameesh_events (type, object, data)"
+                   " values ('sandbox.result', %s, %s::jsonb)",
+                   ('turn:' + turn_id, json.dumps({'turn_id': turn_id, 'result_id': result['result_id']})))
+        return receipt
+
+
+def ameesh_sandbox_cancel(db, turn_id, owner, epoch, *, observed=False,
+                          orphaned=False, settle=None, recovery=False,
+                          terminal_state='cancelled'):
+    """Fence, then record trusted supervisor observation (never user input).
+
+    Even intent may hide a created Job after a lost create response. Absence
+    must be observed explicitly; a null UID alone never proves no Job exists.
+    recovery is reserved to the trusted orphan sweep: it fences the OLD row,
+    observes/settles it, and never changes the current registry turn or lease.
+    """
+    with db.transaction() as tx:
+        row = _locked(tx, turn_id)
+        if recovery:
+            if row['owner'] != owner or row['lease_epoch'] != epoch:
+                _refuse('stale')
+            if not (observed or orphaned):
+                raise ValueError('recovery requires an observation or orphan report')
+        else:
+            _live(tx, row, owner, epoch)
+        if row['result_id']:
+            _refuse('already-completed')
+        if row['state'] in TERMINAL:
+            _refuse('not-cancellable')
+        if observed and orphaned:
+            raise ValueError('observation and orphaned are mutually exclusive')
+        if terminal_state not in ('cancelled', 'expired', 'lost'):
+            raise ValueError('invalid observation state')
+        if terminal_state != 'cancelled' and not recovery:
+            raise ValueError('expiry/loss observation is reserved to recovery')
+        state = terminal_state if observed else ('orphaned' if orphaned else 'cancelling')
+        if observed:
+            _finish(tx, row, settle=settle, outcome=state, close_registry=not recovery)
+        tx.execute('update sandbox_turns set cancel_requested_at ='
+                   ' coalesce(cancel_requested_at, clock_timestamp()), state = %s,'
+                   ' cancel_observed_at = case when %s then clock_timestamp()'
+                   ' else cancel_observed_at end, completed_at = case when %s'
+                   ' then clock_timestamp() else completed_at end where turn_id = %s',
+                   (state, observed, observed, turn_id))
+        tx.execute("insert into ameesh_events (type, object, data)"
+                   " values ('sandbox.cancel', %s, %s::jsonb)",
+                   ('turn:' + turn_id, json.dumps({'turn_id': turn_id, 'state': state})))
+        return {'turn_id': turn_id, 'state': state}
