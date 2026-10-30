@@ -135,6 +135,28 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(result["state"], "completed")
         self.assertEqual(self.calls[0][1]["STAGING_PREVIOUS_RUN"], "failed-a")
 
+    def test_blocked_running_can_be_replaced_only_with_quiescence(self):
+        self.request.update(state="running", blocked_reason="would roll back active content",
+                            host="host-a", run="blocked-a")
+        queued = executor.submit(self.db, self.cfg, self.options, "b" * 40)
+        self.assertEqual(queued["previous_run"], "blocked-a")
+        self.assertNotIn("blocked_reason", queued)
+        self.options.pop("quiescence_probe")
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"], "blocked")
+        self.assertEqual(self.calls, [])
+        queued = executor.submit(self.db, self.cfg, self.options, "c" * 40)
+        self.assertEqual(queued["previous_run"], "blocked-a")
+        self.assertEqual(queued["previous_host"], "host-a")
+        self.options["quiescence_probe"] = ["prove-stopped"]
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"], "completed")
+        self.assertEqual(self.calls[0][1]["STAGING_PREVIOUS_RUN"], "blocked-a")
+
+    def test_blocked_pending_without_attempt_can_be_replaced(self):
+        self.request["blocked_reason"] = "candidate would roll back active content"
+        queued = executor.submit(self.db, self.cfg, self.options, "b" * 40)
+        self.assertEqual(queued["sha"], "b" * 40)
+        self.assertNotIn("previous_run", queued)
+
     def test_submit_idempotent_and_does_not_replace_unfinished_commit(self):
         current = executor.submit(self.db, self.cfg, self.options, "a" * 40)
         self.assertEqual(current["request"], "request-1")

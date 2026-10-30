@@ -40,6 +40,13 @@ class WatchTest(unittest.TestCase):
         new_success = row(3, run="new", state="completed", sha="b" * 40)
         self.assertEqual(staging_watch.findings([failed, new_success], now=250), [])
 
+    def test_later_partial_corrective_commit_resolves_failed_run(self):
+        failed = row(1, state="failed")
+        success = row(2, run="new", state="partial", sha="b" * 40)
+        self.assertEqual(staging_watch.findings([failed, success], now=250), [])
+        success["data"]["notify"] = "other-pilot"
+        self.assertEqual(len(staging_watch.findings([failed, success], now=250)), 1)
+
     def test_unattested_success_is_not_a_completed_run(self):
         self.assertEqual(len(staging_watch.findings(
             [row(state="unattested")], now=150)), 1)

@@ -60,7 +60,7 @@ def findings(rows: list[dict], *, now: float) -> list[dict]:
     # an earlier failure, including when it deploys a corrective commit.
     completed = {}
     for run, data in latest.items():
-        if data.get("state") == "completed":
+        if data.get("state") in ("completed", "partial"):
             scope = data.get("notify", "")
             completed[scope] = max(completed.get(scope, 0), ids[run])
     for run, data in latest.items():

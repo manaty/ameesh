@@ -90,12 +90,17 @@ def submit(db, cfg, options, sha, *, included=()):
         if previous and previous["state"] in ("pending", "running"):
             if previous["sha"] == sha:
                 return previous
-            raise RuntimeError("an unfinished staging request already exists")
+            if not previous.get("blocked_reason"):
+                raise RuntimeError("an unfinished staging request already exists")
         data = dict(request=uuid.uuid4().hex, sha=sha, state="pending",
                     included=[int(lot) for lot in included], notify=options["role"],
                     deadline=time.time() + options.get("start_timeout_s", 300))
-        if previous and previous.get("run") and previous["state"] not in ("completed", "partial"):
-            data.update(previous_host=previous["host"], previous_run=previous["run"])
+        if previous and previous["state"] not in ("completed", "partial"):
+            if previous.get("run"):
+                data.update(previous_host=previous["host"], previous_run=previous["run"])
+            elif previous.get("previous_run"):
+                data.update(previous_host=previous["previous_host"],
+                            previous_run=previous["previous_run"])
         _record(db, options["key"], data, lease=lease)
         return data
     finally:
