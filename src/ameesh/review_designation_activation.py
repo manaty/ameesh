@@ -1065,7 +1065,9 @@ def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, li
     dev1 removed, dev2 designated) is no longer one. Only a verdict naming the
     frozen head discharges it, full or abbreviated SHA, the `_same_freeze`
     rule; a `blocked` verdict counts, the reviewer has rendered it. A closed,
-    merged or promoted lot owes nothing. `designated_ts` is when the agent was
+    merged or promoted lot owes nothing. A validated lot owes no further
+    review, even if a surplus designated seat has no verdict (#4851).
+    `designated_ts` is when the agent was
     designated for this head (latest of the freeze, the mark naming them, a
     manual designation after the mark): the start of the §9 clock.
 
@@ -1139,7 +1141,12 @@ def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, li
                             row.get("verdict_ts") or ()))
         rendered = [(actor, sha) for actor, sha, _kind, _at in verdicts]
         seen: set = set()
-        for raw in row.get("reviewers") or ():
+        # #4851: validation has already established the review quorum. Keep
+        # the lot's assignment and fix debts, but discharge surplus reviews
+        # for every reader (queue, designation load and SLO) together.
+        pending_seats = (() if row.get("state") == lifecycle.VALIDATED
+                         else row.get("reviewers") or ())
+        for raw in pending_seats:
             name = str(raw or "").strip()
             if name in ("", "-none") or name in seen:
                 continue

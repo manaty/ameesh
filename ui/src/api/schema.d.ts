@@ -479,6 +479,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/requests/{request}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One mailbox request's observation: delivery state and turn (#2167) */
+        get: operations["requests_request"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/threads/{project}": {
         parameters: {
             query?: never;
@@ -509,6 +526,23 @@ export interface paths {
         put?: never;
         /** Publier dans le fil du lot */
         post: operations["post_threads_project_lot"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/turns/{turn}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One turn's observation: state, agent, lease and accounting (#2167) */
+        get: operations["turns_turn"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -727,6 +761,78 @@ export interface components {
             schema: "ameesh-timeline/1";
             truncated?: Record<string, never>;
             window: Record<string, never>;
+        };
+        "ameesh-turn-observation-1": {
+            accounting: {
+                ledger: {
+                    billing_account: string | null;
+                    model: string | null;
+                    recorded_ts: number;
+                    source: string | null;
+                    spend_key: string | null;
+                    turn_id: string | null;
+                    usd: number;
+                } | null;
+                marker: {
+                    created_ts: number;
+                    model: string | null;
+                    turn_id: string | null;
+                } | null;
+                reservation: {
+                    billing_account: string;
+                    period: string;
+                    state: string;
+                    usd: number;
+                } | null;
+                spend_key: string | null;
+                /** @enum {unknown} */
+                state: "settled" | "pending" | "none" | "unknown" | "kept" | "released";
+            };
+            agent: {
+                budget_usd: number | null;
+                harness: string | null;
+                last_turn_ts: number | null;
+                model: string | null;
+                name: string;
+                session_id: string | null;
+                spent_usd: number | null;
+                status: string;
+                status_since_ts: number | null;
+                status_text: string | null;
+                turn_in_progress: boolean;
+                turns: number;
+            };
+            by: {
+                request?: number | null;
+                turn?: string | null;
+            };
+            lease: {
+                epoch: number | null;
+                expires_ts: number | null;
+                live: boolean;
+                owner: string | null;
+            };
+            observed_ts: number;
+            quiescent: boolean;
+            request: {
+                agent: string;
+                created_ts: number;
+                delivered_ts: number | null;
+                delivered_turn_id: string | null;
+                id: number;
+                /** @enum {unknown} */
+                state: "pending" | "delivered" | "withdrawn";
+            } | null;
+            /** @constant */
+            schema: "ameesh-turn-observation/1";
+            turn: {
+                ended_ts: number | null;
+                id: string;
+                started_ts: number | null;
+                /** @enum {unknown} */
+                state: "starting" | "running" | "ended" | "orphan" | "unknown";
+                work_item_id: string | null;
+            } | null;
         };
     };
     responses: never;
@@ -2879,6 +2985,64 @@ export interface operations {
             };
         };
     };
+    requests_request: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                request: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One mailbox request's observation: delivery state and turn (#2167) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-turn-observation-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
     threads_project: {
         parameters: {
             query?: {
@@ -3209,6 +3373,64 @@ export interface operations {
             };
             /** @description key already used for another request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    turns_turn: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                turn: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One turn's observation: state, agent, lease and accounting (#2167) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-turn-observation-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
