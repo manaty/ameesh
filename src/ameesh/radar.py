@@ -353,7 +353,9 @@ def parse_settings(raw) -> Settings:
             if not isinstance(text, str):
                 raise SettingsError("%s.%s: text expected" % (where, key))
             texts[key] = text.strip().strip("/")
-        width = value.get("migrations_width") or 0
+        width = value.get("migrations_width")
+        if width is None:
+            width = 0
         if isinstance(width, bool) or not isinstance(width, int) or not 0 <= width <= 9:
             raise SettingsError("%s.migrations_width: digits of a migration number (1-9) "
                                 "expected" % where)
