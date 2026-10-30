@@ -163,6 +163,15 @@ class TurnCosts(interface.TurnCosts):
             # L80b (0472) : les messages servis par ce tour, en JSON array.
             cols.append("inputs")
             values.append(json.dumps([str(i) for i in inputs], ensure_ascii=False))
+        if source == "relay" and turn_id:
+            reservations = self.db.query(
+                "select r.billing_account from tranche_reservations r"
+                " join sandbox_turns s on s.spend_key = r.spend_key"
+                " where s.turn_id = %s and s.agent = %s and s.owner = %s"
+                " and s.lease_epoch = %s", (turn_id, agent, lease_owner, lease_epoch))
+            if reservations:
+                cols.append("billing_account")
+                values.append(reservations[0]["billing_account"])
         suffix = ""
         if spend_key is not None:
             # L60 (migration 0041) : un marqueur comptable n'écrit qu'une ligne,

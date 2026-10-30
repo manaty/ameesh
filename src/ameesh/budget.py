@@ -436,6 +436,8 @@ def add_parsers(sub) -> None:
     pr = bsub.add_parser("release", help="#1469: release a kept account reservation "
                          "(uncertain turn checked by a human)")
     pr.add_argument("reservation", type=int)
+    from . import tranche_budget
+    tranche_budget.add_parser(bsub)
     # #4166 : prépayé déclaré d'un compte fournisseur sans API de solde
     ppre = bsub.add_parser(
         "prepaid", help="#4166: prepaid amount of a provider account (no balance "
@@ -475,6 +477,9 @@ def cmd_budget(cfg: Config, args: argparse.Namespace) -> int:
             else:
                 print(format_status(data))
             return 0
+        if what == "tranche":
+            from . import tranche_budget
+            return tranche_budget.command(cfg, db, args)
         if what == "prepaid":
             return _cmd_prepaid(cfg, db, args)
         if what == "release" or getattr(args, "account", None):
