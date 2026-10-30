@@ -221,10 +221,20 @@ def _reasons_uniques(*groups) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _background_admission_error(name, exc):
-    """Skip this pass without killing its thread; the main loop stays strict."""
-    log_async("%s: writer admission refused (%s): %s" %
-              (name, type(exc).__name__, " ".join(str(exc).split())[:240]))
+def _background_admission_error(process, name, exc):
+    """Report admission state changes, keeping auxiliary threads retryable."""
+    states = getattr(process, '_writer_admission_states', None)
+    if states is None:
+        states = process._writer_admission_states = {}
+    state = type(exc) if exc is not None else None
+    previous = states.get(name)
+    if state != previous:
+        states[name] = state
+        if exc is None:
+            log_async("%s: writer admission recovered" % name)
+        else:
+            log_async("%s: writer admission refused (%s): %s" %
+                      (name, type(exc).__name__, " ".join(str(exc).split())[:240]))
     return False if name == 'canon_sync_once' else 0 if name == 'balance_once' else None
 
 

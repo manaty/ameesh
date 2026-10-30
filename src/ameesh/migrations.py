@@ -603,10 +603,12 @@ def writer_tick(method=None, *, on_admission_error=None):
             return method(self, *args, **kwargs)
         try:
             require_compatible_writer(self.db)
-        except DbError as exc:
+        except (Unavailable, IncompatibleSchema) as exc:
             if on_admission_error is None:
                 raise
-            return on_admission_error(method.__name__, exc)
+            return on_admission_error(self, method.__name__, exc)
+        if on_admission_error is not None:
+            on_admission_error(self, method.__name__, None)
         token = _ACTIVE_WRITER_TICKS.set(active + (key,))
         try:
             return method(self, *args, **kwargs)

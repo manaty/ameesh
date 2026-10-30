@@ -63,15 +63,22 @@ class SchemaGuardTest(unittest.TestCase):
         service.db = db_mod.connect(self.cfg)
         self.addCleanup(service.db.close)
         service._db_lock = threading.Lock()
-        service._route = mock.Mock(side_effect=relay.Refused(404, 'not_found_error', 'test'))
+        service._route = mock.Mock(return_value=('deepseek', 'v1/messages'))
+        service._authenticate = mock.Mock(side_effect=relay.Refused(401, 'authentication_error', 'test'))
         service._error = mock.Mock()
-        service.handle(mock.Mock())
+        service.handle(mock.Mock(command="POST"))
         service._route.assert_called_once()
         self.mark_unknown()
-        service._route.reset_mock()
-        service.handle(mock.Mock())
-        service._route.assert_not_called()
+        service._authenticate.reset_mock()
+        service.handle(mock.Mock(command="POST"))
+        service._authenticate.assert_not_called()
         self.assertEqual(service._error.call_args.args[1].status, 503)
+        # GET /models is explicitly read-only and reaches authentication.
+        before = db_mod.TRACE.round_trips
+        service.handle(mock.Mock(command='GET'))
+        service._authenticate.assert_called_once()
+        self.assertEqual(db_mod.TRACE.round_trips, before)
+        self.assertEqual(service._error.call_args.args[1].status, 401)
 
     def test_unknown_non_additive_refuses_process_start_on_both_drivers(self):
         self.mark_unknown()
@@ -425,3 +432,47 @@ class BackgroundAdmissionTest(unittest.TestCase):
             self.assertEqual(writes, [])
             process.pass_once()
             self.assertEqual(writes, ['passed'])
+
+    def test_only_guard_errors_are_tolerated_and_state_changes_are_logged(self):
+        process = SimpleNamespace(db=object())
+        body = mock.Mock()
+        @migrations.writer_tick(on_admission_error=runner._background_admission_error)
+        def tick(self):
+            body()
+        with mock.patch.object(migrations, 'require_compatible_writer', side_effect=[
+                db_mod.Unavailable('offline'), db_mod.Unavailable('offline'),
+                migrations.IncompatibleSchema('future'), migrations.IncompatibleSchema('future'),
+                None, None]), mock.patch.object(runner, 'log_async') as journal:
+            for _ in range(6):
+                tick(process)
+            self.assertEqual(journal.call_count, 3)
+            self.assertEqual(body.call_count, 2)
+        with mock.patch.object(migrations, 'require_compatible_writer', side_effect=db_mod.DbError('other')):
+            with self.assertRaises(db_mod.DbError):
+                tick(process)
+        with mock.patch.object(migrations, 'require_compatible_writer'):
+            body.side_effect = db_mod.Unavailable('body error')
+            with self.assertRaises(db_mod.Unavailable):
+                tick(process)
+
+    def test_main_sweep_stays_strict_on_incompatible_schema(self):
+        process = SimpleNamespace(db=object())
+        with mock.patch.object(migrations, 'require_compatible_writer',
+                               side_effect=migrations.IncompatibleSchema('future')):
+            with self.assertRaises(migrations.IncompatibleSchema):
+                runner.Runner.sweep(process)
+
+    def test_main_loop_exits_before_sweep_when_schema_changes(self):
+        process = mock.MagicMock()
+        process.once = False
+        process.revoked = False
+        process.mail_batch = 1
+        process.db_retry_max = 1
+        process.stop.is_set.return_value = False
+        with mock.patch.object(migrations, 'require_compatible_writer',
+                               side_effect=[None, migrations.IncompatibleSchema('future')]), \
+                mock.patch.object(runner.threading, 'Thread'), \
+                mock.patch.object(runner, 'log'), mock.patch.object(runner, 'log_async'):
+            self.assertEqual(runner.Runner.run(process), 1)
+        process.sweep.assert_not_called()
+        process.shutdown.assert_called_once()
