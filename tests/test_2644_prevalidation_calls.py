@@ -875,6 +875,43 @@ class FreezeJournalTest(unittest.TestCase):
                                    outcome="run-incomplete"), sha="c" * 40)
         self.assertEqual(len(self.notes), 2, self.notes)
 
+    def test_a_new_run_incomplete_list_at_a_later_head_is_visible(self):
+        # #4769 : la cause reste dédupliquée, mais une liste de modules
+        # différente écrit sa ligne à la tête qui la porte.
+        self.freeze(returns=report(ok=False, causes=("run-incomplete",),
+                                   outcome="run-incomplete",
+                                   missing=("test_a", "test_b")), sha="a" * 40)
+        self.assertEqual(len(self.notes), 1, self.notes)
+        # Même liste dans un autre ordre, autre tête : rien de neuf.
+        self.freeze(returns=report(ok=False, causes=("run-incomplete",),
+                                   outcome="run-incomplete",
+                                   missing=("test_b", "test_a")), sha="b" * 40)
+        self.assertEqual(len(self.notes), 1, self.notes)
+        self.freeze(returns=report(ok=False, causes=("run-incomplete",),
+                                   outcome="run-incomplete",
+                                   missing=("test_a", "test_c")), sha="c" * 40)
+        self.assertEqual(len(self.notes), 2, self.notes)
+        self.assertIn("tête cccccccccccc", self.notes[1])
+        self.assertIn("test_c", self.notes[1])
+
+    def test_a_run_incomplete_list_that_returns_is_visible_again(self):
+        ab = report(ok=False, causes=("run-incomplete",),
+                    outcome="run-incomplete", missing=("test_a", "test_b"))
+        ac = report(ok=False, causes=("run-incomplete",),
+                    outcome="run-incomplete", missing=("test_a", "test_c"))
+        self.freeze(returns=ab, sha="a" * 40)
+        self.freeze(returns=ac, sha="b" * 40)
+        self.freeze(returns=ab, sha="d" * 40)
+        self.assertEqual(len(self.notes), 3, self.notes)
+        self.assertIn("tête dddddddddddd", self.notes[2])
+
+    def test_run_incomplete_without_a_module_list_stays_deduplicated(self):
+        self.freeze(returns=report(ok=False, causes=("run-incomplete",),
+                                   outcome="run-incomplete"), sha="a" * 40)
+        self.freeze(returns=report(ok=False, causes=("run-incomplete",),
+                                   outcome="run-incomplete"), sha="b" * 40)
+        self.assertEqual(len(self.notes), 1, self.notes)
+
     def test_green_and_red_notes_stay_one_per_head(self):
         self.freeze(returns=report(), sha="a" * 40)
         self.freeze(returns=report(), sha="b" * 40)
