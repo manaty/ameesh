@@ -42,8 +42,8 @@ def in_flight(rows: list[dict], *, exempt=()) -> dict:
     The deadline is an alert threshold, never a proof of stop: nothing ends
     a manual `staging.sh` at `STAGING_TIMEOUT_S`, so a late run still blocks
     (review cx1/docs-01). Only a terminal snapshot or an explicit `exempt`
-    releases it: the caller's own run, or a previous run whose stop was
-    proved (the executor's quiescence probe, or the operator's check).
+    releases it: a previous run whose stop was proved (the executor's
+    quiescence probe, or the operator's check).
     """
     latest = {}
     for row in sorted(rows, key=lambda row: int(row["id"]), reverse=True):
@@ -97,13 +97,19 @@ def record(db, snapshot: dict, *, exclusive: bool = False,
         if len(rows) >= LIMIT:
             # Unobservable is refused like busy: no host is modified.
             raise Busy("staging history truncated; exclusivity unobservable")
-        others = in_flight(rows, exempt={run, *supersede})
+        # A start is a new run: an identifier already in the log (inherited
+        # or reused `STAGING_RUN_ID`, even with a proved stop) never passes,
+        # else two launchers sharing it would both start (review cx3/qa-01).
+        # Progress updates of the started run use `exclusive=False`.
+        if any((r.get("data") or {}).get("run") == run for r in rows):
+            raise Busy("staging run identifier already used: " + run)
+        others = in_flight(rows, exempt=set(supersede))
         if others:
             raise Busy("staging sequence already running: " + ", ".join(others))
         # A superseded run was proved stopped: close it as failed, in the
         # same transaction, so it blocks no later start. The alerts pass
         # keeps reporting it until a successful run settles it.
-        for old in in_flight(rows, exempt={run}):
+        for old in in_flight(rows):
             if old in supersede:
                 st.events.record(EVENT, "staging-run:" + old, None,
                                  dict(in_flight(rows)[old], state="failed"))

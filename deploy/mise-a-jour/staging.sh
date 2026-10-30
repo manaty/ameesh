@@ -993,6 +993,8 @@ fi
 # alerte mais ne prouve aucun arret. STAGING_PREVIOUS_RUN nomme une sequence
 # dont l'arret est prouve (sonde de quiescence de l'executant, ou l'operateur
 # qui l'a verifie) : elle est close en `failed` et ne bloque plus.
+# Un identifiant deja present au journal (STAGING_RUN_ID herite ou reutilise)
+# est refuse de meme : un debut est toujours une nouvelle sequence.
 rc_suivi=0
 publier_suivi running --exclusive \
   ${STAGING_PREVIOUS_RUN:+--supersede "$STAGING_PREVIOUS_RUN"} || rc_suivi=$?

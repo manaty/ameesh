@@ -101,6 +101,32 @@ class ExclusiveRecordTest(unittest.TestCase):
         self.start("host-c-run")
         self.assertEqual(staging_watch.findings(self.log.rows, now=time.time()), [])
 
+    def test_shared_run_id_on_two_hosts_is_refused(self):
+        # Two manual launchers inherit the same STAGING_RUN_ID (review cx3/qa-01).
+        self.start("shared-env-run")
+        with self.assertRaises(staging_watch.Busy):
+            self.start("shared-env-run")
+        # Even naming itself as proved stopped does not reopen the identifier.
+        with self.assertRaises(staging_watch.Busy):
+            self.start("shared-env-run", supersede=["shared-env-run"])
+        self.assertEqual(len(self.log.rows), 1)
+        # Its progress updates are not starts.
+        staging_watch.record(self.log, dict(row(0, "shared-env-run")["data"]))
+        self.assertEqual(len(self.log.rows), 2)
+
+    def test_finished_run_id_is_not_reused(self):
+        self.start("old")
+        staging_watch.record(self.log, dict(row(0, "old", state="completed")["data"]))
+        with self.assertRaises(staging_watch.Busy):
+            self.start("old")
+        self.start("fresh")
+
+    def test_takeover_with_new_id_after_quiescence(self):
+        self.start("stalled")
+        self.start("takeover", supersede=["stalled"])
+        states = {r["data"]["run"]: r["data"]["state"] for r in self.log.latest_type()}
+        self.assertEqual(states, {"stalled": "failed", "takeover": "running"})
+
     def test_truncated_history_is_refused_as_busy(self):
         self.log.rows = [dict(id=i, object="staging-run:%d" % i, data=row(0, str(i), state="completed")["data"])
                          for i in range(staging_watch.LIMIT)]

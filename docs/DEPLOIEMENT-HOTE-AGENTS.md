@@ -760,7 +760,10 @@ pour une séquence dont l'arrêt est prouvé : l'exécutant la pose après sa
 sonde de quiescence ; l'opérateur qui relance à la main, ou qui débloque la
 release synchrone (elle attend en `ReleaseBusy` d'ici là), ne la pose
 qu'après la même vérification. La séquence remplacée est alors close en
-`failed`, dans la même transaction.
+`failed`, dans la même transaction. Un début est toujours une nouvelle
+séquence : un identifiant déjà présent dans le journal (`STAGING_RUN_ID`
+hérité ou réutilisé, même terminé) est refusé en 75, sinon deux lanceurs qui
+le partagent passeraient tous deux.
 
 Le retour du premier hôte puis la reprise par un second candidat sont
 testés avec des hôtes simulés. La qualification physique et la mise en place
