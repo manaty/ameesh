@@ -1042,6 +1042,14 @@ class Events(Domain):
         retention index; `days` is the durability the caller needs, never a
         substitute for an absent event."""
 
+    def latest_type(self, type: str, days: int, limit: int) -> list[dict]:
+        """Newest snapshot per object, newest first, bounded by objects.
+
+        Unlike recent_type, a chatty object cannot hide an interrupted one.
+        A driver without this capability must refuse instead of truncating.
+        """
+        raise NotImplementedError("latest event per object is unavailable")
+
     @abc.abstractmethod
     def readable(self, position: tuple, limit: int) -> tuple[list[dict], str | None, tuple]:
         """The reader's order: (the events after `position` = (tx, id) whose
