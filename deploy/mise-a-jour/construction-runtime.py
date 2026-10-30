@@ -61,7 +61,7 @@ PYTHON = Path('/usr/bin/python3')
 GIT = Path('/usr/bin/git')
 SCRIPT_PREAMBLE = (
     b'#!/bin/sh\n'
-    b"'''exec' \"$(dirname \"$(command -v \"$0\" || printf '%s' \"$0\")\")/python\" \"$0\" \"$@\"\n"
+    b"'''exec' \"$(dirname \"$(readlink -f \"$(command -v \"$0\" || printf '%s' \"$0\")\")\")/python\" \"$0\" \"$@\"\n"
     b"' '''\n"
 )
 PINS_NAME = 'deploy/mise-a-jour/runtime-pins.txt'
