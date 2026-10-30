@@ -273,21 +273,27 @@ class BindingRecoveryTest(unittest.TestCase):
 
     def test_lifecycle_pass_retries_an_empty_binding(self):
         runner = object.__new__(Runner)
+        runner.db = object()
         runner._lifecycle_factory = None
         with mock.patch.object(runner, "_bind_lifecycle") as bind, \
+                mock.patch("ameesh.migrations.require_compatible_writer") as admission, \
                 mock.patch("ameesh.runner.storage.of", side_effect=ValueError), \
                 mock.patch("ameesh.runner.log_async"):
             runner.host_lifecycle_once(object())
         bind.assert_called_once_with()
+        admission.assert_called_once_with(runner.db)
 
     def test_lifecycle_pass_keeps_an_active_binding(self):
         runner = object.__new__(Runner)
+        runner.db = object()
         runner._lifecycle_factory = object()
         with mock.patch.object(runner, "_bind_lifecycle") as bind, \
+                mock.patch("ameesh.migrations.require_compatible_writer") as admission, \
                 mock.patch("ameesh.runner.storage.of", side_effect=ValueError), \
                 mock.patch("ameesh.runner.log_async"):
             runner.host_lifecycle_once(object())
         bind.assert_not_called()
+        admission.assert_called_once_with(runner.db)
 
     def test_relocation_readiness_value_error_keeps_source(self):
         worker = SimpleNamespace(

@@ -76,8 +76,9 @@ class TestAllersRetours(PgTestCase):
     def _borne(self, trace: dict, bound: int, connects: int = 1) -> None:
         # #4975 process admission is one fixed read per CLI connection, not
         # one guard per mutation. Keep the existing workload budgets intact.
+        # psql traces wrap this SELECT in the JSON result envelope.
         admissions = [sql for sql in trace['statements']
-                      if sql == 'SELECT version, name, checksum FROM schema_non_additive_migrations ORDER BY version']
+                      if 'SELECT version, name, checksum FROM schema_non_additive_migrations ORDER BY version' in sql]
         self.assertEqual(len(admissions), 1, trace['statements'])
         bound += 1
         if self.db.name == "psql":
