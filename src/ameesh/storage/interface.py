@@ -776,6 +776,18 @@ class TurnCosts(Domain):
         premier écrit APRÈS l'instant du gel. Lecture seule."""
 
     @abc.abstractmethod
+    def work_item_of_turn(self, turn_id: str) -> int | None:
+        """#4679 : le lot que le grand livre attribue au tour `turn_id`, ou None.
+
+        Un reçu de commit du hook post-commit ne connaît pas son lot
+        (`work_item_id` NULL), mais la ligne `turn_costs` du tour le porte. La
+        lecture de provenance s'en sert pour ne pas exclure un relecteur sur un
+        reçu d'un autre lot. Aucune ligne, identifiant vide, ou plusieurs lots
+        distincts pour le même tour : None — un doute, jamais une attribution
+        devinée."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def insert(self, *, agent: str, harness: str, turn: str | None, model: str | None,
                session: str | None, usd: float, input_tokens: int,
                cached_input_tokens: int, output_tokens: int, cum_usd: float | None,

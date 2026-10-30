@@ -101,6 +101,24 @@ class ProjectionTest(unittest.TestCase):
         self.assertEqual(result["covered"], 271)
         self.assertEqual(result["share"], 1.0)
 
+    def test_faux_positif_auditeur_20_tables_relues_dans_la_fenetre(self):
+        """#4618, N P2 auditeur : à 04:30:30, 150 tables au dump et 20 relues
+        à 03:50Z, encore dans la fenêtre. L'ancien dénominateur « tables
+        encore dans la fenêtre » donnait 150/170 = 88 % < 90 % : une fausse
+        alerte quotidienne qui s'éteint quand ces tables sortent de la
+        fenêtre. Une table relue après T a pu être lue par le dump : la
+        couverture est 170/170 et le seuil ne la compte plus contre lui."""
+        re_read = ts(3, 50)
+        result = mesh_backup.project(
+            rows(*([DUMP] * 150), *([re_read] * 20)), ts(4, 30, 30) / 1000000)
+        self.assertTrue(result["ok"])
+        self.assertEqual((result["tables"], result["in_window"], result["shared"]),
+                         (170, 170, 150))
+        self.assertEqual((result["covered"], result["share"]), (170, 1.0))
+        self.assertEqual(result["instant_us"], DUMP)
+        # l'ancien calcul (part des tables encore dans la fenêtre) était rouge
+        self.assertLess(150 / result["in_window"], 0.9)
+
     def test_faux_vert_un_petit_groupe_seul_ne_prouve_pas_le_dump(self):
         """Sans dump, 3 tables d'une même transaction ne font pas 100 %."""
         result = mesh_backup.project(rows(*([ts(3, 35)] * 3),

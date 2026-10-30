@@ -513,6 +513,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # #4521 (revue cx2, B/P2 ; B/P1 auditeur) : la garde des alias
+      # `sys.modules` tourne aussi en CI, sur l'arbre testé, dans `plan` dont
+      # l'échec rougit l'agrégat requis `tests`. Le canon `manaty/home` est
+      # privé, donc illisible depuis un runner : l'étape lit la politique
+      # épinglée `scripts/alias-review-classes.json`, générée depuis le canon
+      # audité et vérifiée au gel contre le canon de l'hôte
+      # (`--check-policy`). Un chemin absent, une classe inconnue ou une
+      # politique illisible refusent (code 2) ; un alias dont l'implémentation
+      # est plus légère que son ancien chemin refuse la CI (code 1). Jamais de
+      # vert muet.
+      - name: garde alias/classe (#4521)
+        run: python3 scripts/garde-alias-classe.py --root . --project ameesh --policy scripts/alias-review-classes.json
       - name: lancement à la main sur la tête d'une PR ouverte (#1635)
         if: github.event_name == 'workflow_dispatch'
         env:

@@ -299,8 +299,13 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   var TOKEN_KEY = "ameesh-progress-token", TOKEN = "";
   var D = JSON.parse(document.getElementById("data").textContent || "null");
   var TABS = [["overview", "Overview"], ["versions", "Versions"], ["gantt", "Gantt"],
-              ["lots", "Work items"], ["agents", "Agents"], ["budget", "Budget"],
+              ["lots", null], ["agents", "Agents"], ["budget", "Budget"],
               ["decisions", "Decisions"]];
+  // L102 T3 (#4393) : le nom d'une tâche dans le vocabulaire du module actif,
+  // lu dans l'instantané (`vocabulary`) ; sans lui, celui du cœur (CORE)
+  var CORE_W = {singular: "tâche", plural: "tâches", title: "Tâche", title_plural: "Tâches", abbreviation: "tâche(s)"};
+  function W() { var v = D && D.vocabulary; return v && v.singular ? v : CORE_W; }
+  function tabLabel(t) { return t[0] === "lots" ? W().title_plural : t[1]; }
   var LOT_FR = {active: "active", review: "in review", blocked: "blocked", approved: "approved", merged: "merged", closed: "closed"};
   var LOT_ICON = {active: "▶", review: "◐", blocked: "■", approved: "✓", merged: "●", closed: "✕"};
   var LOT_ORDER = {blocked: 0, review: 1, approved: 2, active: 3, merged: 4, closed: 5};
@@ -711,7 +716,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   var asof = document.getElementById("asof"), status = document.getElementById("refresh-status");
   var panels = {};
   TABS.forEach(function (t) {
-    var b = el("button", "tab", t[1]);
+    var b = el("button", "tab", tabLabel(t));
     b.type = "button"; b.id = "tab-" + t[0];
     b.setAttribute("role", "tab"); b.setAttribute("aria-controls", "panel-" + t[0]);
     b.addEventListener("click", function () { S.tab = t[0]; saveHash(); renderAll(); });
@@ -813,7 +818,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       var b = document.getElementById("tab-" + t[0]), on = t[0] === S.tab;
       b.setAttribute("aria-selected", on ? "true" : "false");
       b.tabIndex = on ? 0 : -1;
-      b.textContent = t[1];
+      b.textContent = tabLabel(t);
       if (badges[t[0]]) b.appendChild(el("span", "badge" + (t[0] === "decisions" ? " hot" : ""), badges[t[0]]));
       panels[t[0]].hidden = !on;
     });
@@ -922,7 +927,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       return "waiting for packet merge #" + wait.vehicle
         + (wait.branch ? " (" + wait.branch + ")" : "");
     }
-    return "waiting on lots " + (wait.lots || []).map(function (id) { return "#" + id; }).join(", ");
+    return "waiting on " + W().plural + " " + (wait.lots || []).map(function (id) { return "#" + id; }).join(", ");
   }
   function lotWaitLabel(lot) {
     return [plannedWaitLabel(lot), lot.waiting_for && lot.waiting_for.label].filter(Boolean).join(" · ");
@@ -968,7 +973,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   var MODALS = {
     lot: function (id, box) {
       var lot = lotById(id);
-      if (!lot) { box.appendChild(el("p", "empty", "Work item #" + id + " is not in this snapshot (outside the window or the project).")); return "Work item #" + id; }
+      if (!lot) { box.appendChild(el("p", "empty", W().title + " #" + id + " is not in this snapshot (outside the window or the project).")); return W().title + " #" + id; }
       var m = lot.milestones || {}, head = el("div", "line");
       head.appendChild(lotChip(lot));
       if (lot.stale) head.appendChild(el("span", "chip st-stale", "‖ stale " + dur(lot.stale.idle_s)));
@@ -1027,15 +1032,15 @@ p.summary { font-size: .86rem; margin: 6px 0; }
         ["payment", PAY_FR[a.payment] || a.payment],
         ["reason", a.reason || ((a.state === "paused" || a.state === "stopped") ? a.status_text : null)],
         ["current turn", a.turn ? (a.turn.task || a.turn.label || "turn") : (a.task || null)],
-        ["current work item", lot],
-        ["on its task for", a.on_task_since_ts ? dur(D.generated_ts - a.on_task_since_ts) : null],
+        ["current " + W().singular, lot],
+        ["on its " + W().singular + " for", a.on_task_since_ts ? dur(D.generated_ts - a.on_task_since_ts) : null],
         ["latest progress", a.last_update ? a.last_update.text + " (" + ago(a.last_update.ts) + ")" : null],
         ["24 h", a.usd_24h !== undefined ? usd(a.usd_24h) + (a.turns_24h !== undefined ? " · " + a.turns_24h + " turn(s)" : "") : null],
         ["unread", a.unread]]));
       section(box, "Conversation");
       box.appendChild(agentConversation(name));
       var mine = (D.lots || []).filter(function (l) { return l.assignee === name && !l.closed && l.state !== "merged"; });
-      if (mine.length) { section(box, "Open work items"); mine.forEach(function (l) { lotLine(box, l); }); }
+      if (mine.length) { section(box, "Open " + W().plural); mine.forEach(function (l) { lotLine(box, l); }); }
       return name;
     },
     milestone: function (id, box) {
@@ -1044,7 +1049,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       var counted = (ms.lots_total || 0) - (ms.lots_abandoned || 0);
       box.appendChild(dl([["date", ms.date || "no date"], ["owner", ms.responsible],
                           ["state", ms.status], ["canon", ms.canon_ref],
-                          ["progress", ms.lots_merged + "/" + counted + " work item(s) merged"
+                          ["progress", ms.lots_merged + "/" + counted + " " + W().abbreviation + " merged"
                             + (ms.progress !== null && ms.progress !== undefined ? " (" + Math.round(ms.progress * 100) + "%)" : "")]]));
       box.appendChild(bar(ms.progress, Math.round((ms.progress || 0) * 100) + "% merged"));
       var epics = (D.epics || []).filter(function (e) { return e.milestone === id; });
@@ -1076,7 +1081,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       box.appendChild(opts);
       var lot = d.lot ? link("#" + d.lot + (d.lot_title ? " " + d.lot_title : ""), function () { openModal("lot", d.lot); }) : null;
       box.appendChild(dl([["why", d.why], ["requested by", d.requester], ["for", d.owner || "any human"],
-                          ["project", d.project], ["work item", lot], ["requested", ago(d.created_ts)],
+                          ["project", d.project], [W().singular, lot], ["requested", ago(d.created_ts)],
                           ["due", d.due_ts ? hm(d.due_ts) : "none"],
                           ["signature", d.needs_signature ? "required" : null]]));
       section(box, "Answer");
@@ -1192,7 +1197,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       }
       if (!n.notes && (n.merged_lots || []).length) {
         var ml = el("details", "vthemes"), msum = el("summary", null,
-          "Merged lots · " + n.merged_lots.length), mul = el("ul");
+          "Merged " + W().plural + " · " + n.merged_lots.length), mul = el("ul");
         n.merged_lots.forEach(function (l) {
           var li = el("li");
           li.appendChild(link("#" + l.id + " " + l.title, function () {
@@ -1229,7 +1234,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
           c.agents_working + "/" + c.agents_active + " agent(s) working"));
         card.appendChild(head);
         var stats = el("div", "stats");
-        [[c.lots_open, "open work items", null, "lots"], [c.lots_merged_in_window, "merged (window)", null, "lots"],
+        [[c.lots_open, "open " + W().plural, null, "lots"], [c.lots_merged_in_window, "merged (window)", null, "lots"],
          [c.decisions_pending, "pending decisions", c.decisions_pending ? "hot" : null, "decisions"],
          [usd(c.spend_24h_usd), "spend 24 h", null, "budget"]].forEach(function (x) {
           var t = el("button", "stat" + (x[2] ? " " + x[2] : "")); t.type = "button";
@@ -1291,7 +1296,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
         line.appendChild(link(w.text, w.open));
         wbox.appendChild(line);
       });
-      if (watch.length > 6) wbox.appendChild(el("div", "meta", "+ " + (watch.length - 6) + " more: Work items and Decisions tabs"));
+      if (watch.length > 6) wbox.appendChild(el("div", "meta", "+ " + (watch.length - 6) + " more: " + W().title_plural + " and Decisions tabs"));
       box.appendChild(wbox);
     },
     versions: function (box) {
@@ -1329,15 +1334,15 @@ p.summary { font-size: .86rem; margin: 6px 0; }
     },
     lots: function (box) {
       var sc = scoped();
-      var cutLabels = {lots: "work items", actions: "actions"};
+      var cutLabels = {lots: W().plural, actions: "actions"};
       Object.keys(D.truncated || {}).forEach(function (k) {
         var c = D.truncated[k];
         box.appendChild(el("p", "trunc", "⚠ Truncated: " + c.shown + " " + (cutLabels[k] || k)
           + " shown of " + c.total + " (limit " + c.limit + ")."));
       });
       table(box, {
-        view: "lots", label: "work items", rows: sc.lots, allLabel: "merged and closed",
-        empty: "No work item matches.",
+        view: "lots", label: W().plural, rows: sc.lots, allLabel: "merged and closed",
+        empty: "No " + W().singular + " matches.",
         hidden: function (l) { return !!l.closed || l.state === "merged"; },
         text: function (l) { return ["#" + l.id, l.title, l.project, l.assignee, l.epic, LOT_FR[l.state], lotWaitLabel(l)].join(" "); },
         order: function (a, b) {
@@ -1375,7 +1380,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
             var s = el("span"); s.appendChild(chip(a.state, AG_FR, AG_ICON));
             if (a.since_ts) s.appendChild(el("span", "meta", " " + dur(D.generated_ts - a.since_ts)));
             return s; }},
-          {label: "current work item", cls: "wide", key: function (a) { return a.lot ? a.lot.id : null; },
+          {label: "current " + W().singular, cls: "wide", key: function (a) { return a.lot ? a.lot.id : null; },
            cell: function (a) { return a.lot ? "#" + a.lot.id + " " + (a.lot.title || "") : (a.task || (a.turn && a.turn.task) || "—"); }},
           {label: "latest progress", key: function (a) { return a.last_update ? a.last_update.ts : null; }, desc: true,
            cell: function (a) { return a.last_update ? ago(a.last_update.ts) : "—"; }},
@@ -1407,7 +1412,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
             if (d.overdue) s.appendChild(el("span", "chip st-late", "past due"));
             s.appendChild(document.createTextNode(" " + d.question)); return s; }},
           {label: "project", key: function (d) { return d.project || ""; }, cell: function (d) { return d.project; }},
-          {label: "work item", n: true, key: function (d) { return d.lot; }, cell: function (d) { return d.lot ? "#" + d.lot : "—"; }},
+          {label: W().singular, n: true, key: function (d) { return d.lot; }, cell: function (d) { return d.lot ? "#" + d.lot : "—"; }},
           {label: "requested by", key: function (d) { return d.requester || ""; }, cell: function (d) { return d.requester; }},
           {label: "waiting", n: true, desc: true, key: function (d) { return d.age_s; }, cell: function (d) { return dur(d.age_s); }},
           {label: "due", n: true, key: function (d) { return d.due_ts; }, cell: function (d) { return d.due_ts ? hm(d.due_ts) : "—"; }}
@@ -1804,7 +1809,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
         row.appendChild(head);
         row.appendChild(track([{mark: true, at: dayTs(c.due) + 43200, cls: c.fulfilled ? "done" : "due", title: "due " + dm(c.due)}]));
         var det = el("div", "rm-detail", ["due " + dm(c.due), c.owner || "", c.project ? "project " + c.project : "",
-          c.lot ? "task #" + c.lot : "", c.depends_on.length ? "depends on " + c.depends_on.join(", ") : ""]
+          c.lot ? W().singular + " #" + c.lot : "", c.depends_on.length ? "depends on " + c.depends_on.join(", ") : ""]
           .filter(Boolean).join(" · "));
         source(det, c.source);
         row.appendChild(det); gc.appendChild(row);
@@ -1826,8 +1831,8 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       });
     }
     if (!groups.length)
-      box.appendChild(el("p", "empty", tasks.length ? "Every task is delivered or abandoned; tick the box above to see them."
-        : "Nothing to plan: no open task, no planned date, no commitment."));
+      box.appendChild(el("p", "empty", tasks.length ? "Every " + W().singular + " is delivered or abandoned; tick the box above to see them."
+        : "Nothing to plan: no open " + W().singular + ", no planned date, no commitment."));
     var anyClosed = groups.some(function (g) { return !g.det.open; });
     all.textContent = anyClosed ? "expand all" : "collapse all";
     all.addEventListener("click", function () {

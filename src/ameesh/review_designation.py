@@ -755,6 +755,25 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
     names, forbidden = families_of(authors)
     fixer_names = names_of(fixers)
+    #: #4679 : un correcteur dont le commit local (avant rebase/amend) est
+    #: introuvable reste exclu par son nom ; le gel dit le doute et le SHA,
+    #: au lieu de le redésigner en silence.
+    fixer_doubts: dict[str, str] = {}
+    for row in fixers or ():
+        if isinstance(row, Mapping) and row.get("unresolved"):
+            name = str(row.get("name") or "").strip()
+            if name:
+                fixer_doubts[name] = str(row.get("unresolved") or "").strip()
+
+    def excluded_fixers_text() -> str:
+        text = ", ".join(sorted(fixer_names))
+        if fixer_doubts:
+            text += (" (unresolved correction: %s — commit not recoverable,"
+                     " excluded by doubt)" % ", ".join(
+                         "%s %s" % (name, sha[:12])
+                         for name, sha in sorted(fixer_doubts.items())))
+        return text
+
     forbidden = forbidden | families_of(fixers)[1]
     seats = manual_seats(already, authors=authors, fixers=fixers, families=families)
     kept = automatic_seats(automatic, authors=authors, fixers=fixers,
@@ -856,7 +875,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
             missing_why += (" (already designated: %s)"
                             % ", ".join(row["name"] for row in kept))
         if fixer_names:
-            missing_why += " (corrector(s) excluded: %s)" % ", ".join(sorted(fixer_names))
+            missing_why += " (corrector(s) excluded: %s)" % excluded_fixers_text()
         out.update({
             "state": WAITING,
             "missing": remaining - len(chosen),
@@ -868,7 +887,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     if kept:
         why += " (kept %d already designated for this freeze)" % len(kept)
     if fixer_names:
-        why += " (corrector(s) excluded: %s)" % ", ".join(sorted(fixer_names))
+        why += " (corrector(s) excluded: %s)" % excluded_fixers_text()
     if pace:
         reading = ["%s %+.0f pt" % (c.family.strip().lower(), _advance_of(c, pace) * 100)
                    for c in chosen if c.family.strip().lower() in pace]
@@ -1237,7 +1256,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           base: str = "", policy_ref: str = "", notify: str = "",
           unknown_authors: Iterable = (), families,
           already: Iterable = (), fixers: Iterable = (), required: Optional[int] = None,
-          advances: Optional[Mapping] = None, held: Iterable = ()) -> dict:
+          advances: Optional[Mapping] = None, held: Iterable = (),
+          doubts: Iterable = ()) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
     `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
@@ -1270,6 +1290,10 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     A fixer row with an empty family is a **personal** exclusion only
     (`test_only`, #3518, or a rewritten correction, #4457): its family remains
     eligible and another agent of it may be designated.
+    `doubts` (#4679 B/P2) names unresolved correction receipts **without any
+    lot attachment**: they prove nothing about this head, so they exclude
+    nobody; the designation's `why` says them, so the freeze still reports
+    what could not be resolved.
 
     `advances` maps a family to its advance over the plan pace, in points
     (`review_pace`, #2668), or to a `{scope: advance}` mapping whose scoped
@@ -1370,6 +1394,30 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         selection = select(required=required, authors=authors, candidates=candidates,
                            families=families, already=already, fixers=fixers,
                            advances=advances, automatic=previous)
+    # #4679 B/P2 : un reçu de correctif introuvable **sans rattachement de lot**
+    # ne prouve rien sur cette tête. Il n'entre ni dans `fixers` ni dans la
+    # porte ; le gel le dit, pour que l'objet absent ne disparaisse pas en
+    # silence. Un acteur déjà correcteur de la tête n'est pas répété.
+    excluded = {str((row or {}).get("name") or "").strip().casefold()
+                for row in fixers or () if isinstance(row, Mapping)}
+    reported = []
+    for row in doubts or ():
+        if not isinstance(row, Mapping):
+            continue
+        name = str(row.get("name") or "").strip()
+        sha = str(row.get("sha") or "").strip()
+        if name and sha and name.casefold() not in excluded:
+            reported.append((name, sha))
+    if reported:
+        unique = sorted(set(reported))
+        selection = dict(selection)
+        note = ("%d unresolved correction receipt(s) without a lot attachment"
+                " ignored, no exclusion: %s%s"
+                % (len(unique),
+                   ", ".join("%s %s" % (name, sha[:12]) for name, sha in unique[:4]),
+                   ", …" if len(unique) > 4 else ""))
+        selection["why"] = ("%s; %s" % (selection["why"], note)
+                            if selection.get("why") else note)
     if (existing is not None and existing.get("state") == WAITING
             and selection["state"] == WAITING
             and {str(row.get("name") or "") for row in selection["reviewers"]}
