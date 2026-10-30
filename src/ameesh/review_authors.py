@@ -2886,9 +2886,13 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
     if not repo or not rev:
         return None
     flag = "-a" if binary else "-I"
+    targeted = (len(wanted) <= TREE_LINES_WHOLE_MAX
+                and all("\n" not in line and "\x00" not in line
+                        for line in wanted))
     sweep = active_sweep()
     if sweep is not None:
-        sweep.check("git grep -h %s -G -f - %s" % (flag, rev))
+        sweep.check("git grep -h %s %s -f - %s" %
+                    (flag, "-F" if targeted else "-G", rev))
     patterns = sorted(wanted)
 
     def matches():
@@ -2931,9 +2935,7 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
 
     # Un motif multiligne ou à NUL ne peut pas passer par `-f -` : la lecture
     # complète reste alors la seule forme exacte.
-    if (len(wanted) <= TREE_LINES_WHOLE_MAX
-            and all("\n" not in line and "\x00" not in line
-                    for line in wanted)):
+    if targeted:
         # Le mode et les motifs entrent dans la clé : deux demandes
         # différentes ne se remplacent plus l'une l'autre (#4913).
         found = grep_cache.cached(repo, str(rev), "tree-match" + flag,
