@@ -186,6 +186,27 @@ class TestTrace(unittest.TestCase):
         trace.reset()
         self.assertEqual(trace.snapshot()["round_trips"], 0)
 
+    def test_runner_longue_duree_garde_un_historique_borne(self):
+        trace = db_mod.Trace()
+        for index in range(100_000):
+            trace.trip("SELECT %d %s" % (index, "x" * 200))
+        snapshot = trace.snapshot()
+        self.assertEqual(snapshot["round_trips"], 100_000)
+        self.assertEqual(len(snapshot["statements"]), 1024)
+        self.assertTrue(snapshot["statements"][0].startswith("SELECT 98976 "))
+        self.assertTrue(snapshot["statements"][-1].startswith("SELECT 99999 "))
+        self.assertTrue(all(len(sql) <= 160 for sql in snapshot["statements"]))
+        # Le format JSON consommé par le banc reste une liste, indépendante
+        # du tampon ; reset conserve sa borne pour les passages suivants.
+        self.assertEqual(json.loads(json.dumps(snapshot)), snapshot)
+        trace.reset()
+        self.assertEqual(trace.snapshot(), {"connects": 0, "round_trips": 0,
+                                            "statements": []})
+        self.assertEqual(len(snapshot["statements"]), 1024)
+        for _ in range(2048):
+            trace.trip("SELECT 1")
+        self.assertEqual(len(trace.snapshot()["statements"]), 1024)
+
 
 class _FausseBase:
     """Une base en mémoire : compte les échanges, rend des lignes fixes."""

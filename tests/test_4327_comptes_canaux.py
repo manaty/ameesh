@@ -427,7 +427,8 @@ class SignedChannelRefusalTest(Fixture,support.PgTestCase):
 
     def sign(self,view=None,text='install'):
         view=view or self.view
-        digest=decisions.answer_digest(view,text,text,'human:fixture-owner')
+        option=decisions.match_option(view,text)
+        digest=decisions.answer_digest(view,text,option,'human:fixture-owner')
         authority.create_approval(self.db,self.seed,approver='fixture-owner',action=decisions.APPROVAL_ACTION,
             artifact_kind=decisions.APPROVAL_KIND,artifact_hash=digest,ttl=(self.now+900)-time.time())
         decisions.answer(self.cfg,self.db,view['id'],text,human='human:fixture-owner',channel='cli',signed=True)
@@ -486,6 +487,38 @@ class SignedChannelRefusalTest(Fixture,support.PgTestCase):
         self.assertTrue(self.path(HANDOFF_KEY).exists())
         self.assertEqual(self.backend.revoke(self.operation,view['id'])['outcome'],'revoked')
         self.assertFalse(self.path(HANDOFF_KEY).exists()); self.assertFalse(self.path(SECRETS_KEY).exists())
+
+    def test_bureau_mention_installs_then_revokes_the_real_channels(self):
+        # #4788: channel install and revoke are the same bounded native forms
+        # as decisions.match_option; the full signed text stays recorded.
+        install='install — saisi par le bureau, délégation §10'
+        self.sign(self.view,install)
+        answer=decisions.get(self.db,self.view['id'])['answer']
+        self.assertEqual((answer['text'],answer['option']),(install,'install'))
+        self.assertEqual(self.backend.install(self.operation,self.view['id'],authority=self.signed())['outcome'],
+                         'installed')
+        self.assertTrue(self.path(HANDOFF_KEY).exists())
+        text=self.backend.revoke_question(self.operation,int(self.now)+600)['question']
+        view=self.ask(text,channels.REVOKE_OPTIONS)
+        revoke='revoke — saisi par le bureau, délégation §10'
+        self.sign(view,revoke)
+        self.assertEqual((decisions.get(self.db,view['id'])['answer']['text'],
+                          decisions.get(self.db,view['id'])['answer']['option']),(revoke,'revoke'))
+        self.assertEqual(self.backend.revoke(self.operation,view['id'],
+                                             authority=self.signed(view=view,revoke=True))['outcome'],'revoked')
+        self.assertFalse(self.path(HANDOFF_KEY).exists()); self.assertFalse(self.path(SECRETS_KEY).exists())
+
+    def test_foreign_or_free_mention_never_authorizes_the_channels(self):
+        cases=('install — saisi par le bureau',
+               'install, mais seulement après la revue',
+               'install — Réponse de l\'owner relayée par le bureau, source x',
+               'install — réponse de l\'owner relayée par le bureau, source -x')
+        for text in cases:
+            with self.subTest(text=text):
+                view=self.ask(channels.question(self.operation,self.bundle,expires_at=int(self.now)+600),
+                              channels.OPTIONS)
+                self.sign(view,text)
+                self.assert_refused(view['id'],self.signed(view=view))
 
     def test_revoked_owner_key_refuses_install_and_rollback(self):
         self.sign()

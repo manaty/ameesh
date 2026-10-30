@@ -209,6 +209,9 @@ class Trace:
     `AMEESH_DB_TRACE=FICHIER` (ou `stderr`) : à la sortie du processus, une
     ligne JSON `{"connects", "round_trips", "statements"}` y est ajoutée — c'est
     ce que lisent les tests qui bornent le nombre de requêtes d'une commande.
+    Les compteurs couvrent toute la vie du processus ; seules les 1024
+    dernières instructions sont conservées, y compris dans un runner qui
+    reste vivant plusieurs jours (#4801).
     """
 
     def __init__(self) -> None:
@@ -217,7 +220,7 @@ class Trace:
     def reset(self) -> None:
         self.connects = 0
         self.round_trips = 0
-        self.statements: list[str] = []
+        self.statements: deque[str] = deque(maxlen=1024)
 
     def connect(self) -> None:
         self.connects += 1
