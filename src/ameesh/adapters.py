@@ -35,7 +35,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Sequence
 
-from . import harnesses, platform
+from . import context_metrics, harnesses, platform
 from .harnesses import DescriptorError, HarnessDescriptor, Setting
 
 # Consigne d'un tour déclenché par du courrier : le CONTENU des messages est
@@ -1002,18 +1002,26 @@ def usage_tokens(usage: Mapping | None) -> tuple[int, int, int]:
     soit le harnais (L60) : Claude (`input_tokens`, `cache_read_input_tokens`),
     Codex (`input_tokens`, `cached_input_tokens`), DeepSeek et ACP
     (`inputTokens`, `cacheReadTokens`, `outputTokens`). Une valeur absente ou
-    illisible compte zéro."""
+    illisible compte zéro.
 
-    def lu(*keys: str) -> int:
-        for key in keys:
-            value = (usage or {}).get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return max(int(value), 0)
-        return 0
+    Lecture des clés : `context_metrics.usage_fields` (une seule table pour le
+    chemin legacy et pour le contrat `ameesh-context/1`, qui publie l'absence
+    en `None` et raison). Le cache écrit (`cache_creation_input_tokens`) n'est
+    pas dans ce triplet : voir `cache_write_tokens`."""
+    champs = context_metrics.usage_fields(usage)
+    return (champs.input_tokens or 0,
+            champs.cache_read_tokens or 0,
+            champs.output_tokens or 0)
 
-    return (lu("input_tokens", "inputTokens"),
-            lu("cache_read_input_tokens", "cached_input_tokens", "cacheReadTokens"),
-            lu("output_tokens", "outputTokens"))
+
+def cache_write_tokens(usage: Mapping | None) -> int:
+    """Jetons d'entrée **écrits** en cache par un appel (Claude seulement).
+
+    L'écriture de cache appartient au contexte du dernier appel (`C_last`) et
+    au grand livre (`cache_write_tokens`), jamais à la relecture du tour
+    (`R_turn`, contrat `ameesh-context/1` §2.2). Un harnais sans champ
+    d'écriture rend 0, comme avant ce correctif."""
+    return context_metrics.usage_fields(usage).cache_write_tokens or 0
 
 
 def reread_tokens(harness: str, usage: Mapping | None) -> int:
@@ -1022,7 +1030,11 @@ def reread_tokens(harness: str, usage: Mapping | None) -> int:
     Même mesure que le grand livre (`TurnUsage.reread_tokens`, L60) : Codex
     compte déjà le cache dans l'entrée, les autres harnais à part. C'est la
     relecture CUMULÉE d'un tour, pas la taille du contexte d'un appel : le
-    plafond de contexte se mesure avec `context_tokens` (#2336)."""
+    plafond de contexte se mesure avec `context_tokens` (#2336).
+
+    Convention `ameesh-context/1` (§2.2) : le cache **écrit** n'est pas une
+    relecture et n'entre jamais dans `R_turn` ; `context_tokens` seul le
+    compte. Cette fonction garde la valeur legacy à l'identique."""
     entree, cache, _sortie = usage_tokens(usage)
     if harness == "codex":
         return max(entree, cache)
@@ -1037,15 +1049,14 @@ def context_tokens(harness: str, usage: Mapping | None) -> int:
     entrée neuve + entrée relue en cache + entrée écrite en cache (Claude), ou
     l'entrée seule quand le harnais y compte déjà le cache (Codex). La somme
     des appels d'un tour n'est PAS une taille de contexte : elle dépend du
-    nombre d'étapes, pas de la session (#2336)."""
+    nombre d'étapes, pas de la session (#2336).
+
+    C'est `C_last` du contrat `ameesh-context/1` (§2.2) ; `None`/`0` legacy
+    n'est pas requalifié ici : la valeur reste celle des décisions."""
     entree, cache, _sortie = usage_tokens(usage)
     if harness == "codex":
         return max(entree, cache)
-    ecrits = 0
-    value = (usage or {}).get("cache_creation_input_tokens")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        ecrits = max(int(value), 0)
-    return entree + cache + ecrits
+    return entree + cache + cache_write_tokens(usage)
 
 
 class AcpStream(StreamReader):
