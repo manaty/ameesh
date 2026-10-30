@@ -222,8 +222,9 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual(self.provider.list('reviewers'), [])
 
     def test_iso_timestamp_handoff_is_supported(self):
-        self.row['deadline_ts'] = '1970-01-01T00:03:20+00:00'
-        self.assertEqual(self.step().kind, 'bound')
+        for value in ('1970-01-01T00:03:20+00:00', '1970-01-01T00:03:20Z'):
+            self.row['deadline_ts'] = value
+            self.assertEqual(self.step().kind, 'bound')
 
     def test_bound_uid_disappears_is_never_replaced(self):
         self.bind()

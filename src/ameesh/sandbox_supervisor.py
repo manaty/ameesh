@@ -55,7 +55,7 @@ class Observation:
 def _deadline(value):
     # Both storage drivers and the private JSON handoff return ISO timestamps.
     if isinstance(value, str):
-        value = datetime.fromisoformat(value)
+        value = datetime.fromisoformat(value[:-1] + '+00:00' if value.endswith('Z') else value)
     if isinstance(value, datetime) and value.tzinfo is None:
         raise ValueError('sandbox timestamps must carry a timezone')
     return value.timestamp() if isinstance(value, datetime) else float(value)
