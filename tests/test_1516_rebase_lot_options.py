@@ -25,9 +25,10 @@ PERDU = "un sujet a pu passer en corps"
 ABANDON = "abandon volontaire"
 
 
-def _git(depot: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+def _git(depot: str, *args: str, check: bool = True,
+         input: str | None = None) -> subprocess.CompletedProcess:
     proc = subprocess.run(["git", "-C", depot, *args], capture_output=True, text=True,
-                          env=GIT_ENV)
+                          env=GIT_ENV, input=input)
     if check and proc.returncode:
         raise AssertionError("git %s : %s" % (" ".join(args), proc.stderr or proc.stdout))
     return proc
@@ -66,6 +67,16 @@ class RebaseLotOptionsTest(unittest.TestCase):
         """main avance sur un fichier que le lot ne touche pas : aucun conflit."""
         _git(self.depot, "checkout", "-q", "main")
         self._commit("m.txt", "m\n", "main avance")
+        _git(self.depot, "checkout", "-q", "lot")
+
+    def _main_longue(self, taille: int = 2 * 1024 * 1024) -> None:
+        """main avance d'un sujet plus long que la capacité d'un tube : la
+        sortie de `git log --format=%s` dépasse alors ce qu'un tube peut
+        contenir, donc `printf` ne peut pas finir avant que `grep -q` ne sorte
+        au premier appariement — la course #4724 devient déterministe."""
+        _git(self.depot, "checkout", "-q", "main")
+        _git(self.depot, "commit", "-q", "--allow-empty", "-F", "-",
+             input="m" * taille)
         _git(self.depot, "checkout", "-q", "lot")
 
     def _lot_simple(self) -> None:
@@ -135,6 +146,19 @@ class RebaseLotOptionsTest(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertIn("#1 vide", self._sujets())
                 self.assertNotIn(ABANDON, proc.stderr)
+
+    def test_sujet_present_en_tete_n_est_pas_absent_sur_un_long_historique(self) -> None:
+        """#4724 : `printf | grep -q` sous pipefail — `grep -q` sort au premier
+        appariement, `printf` prend SIGPIPE (141) et pipefail fait passer le
+        pipeline pour faux : un sujet présent est classé absent. Avec un
+        `finaux` plus long que la capacité d'un tube, « #2 reel » est en tête
+        et la course devient déterministe."""
+        self._lot_vide()
+        self._main_longue()
+        proc = self._lancer("bash", LANCEUR, "--keep-empty", "main")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("#2 reel", self._sujets())
+        self.assertNotIn(ABANDON, proc.stderr)
 
     def test_no_keep_empty_abandonne_le_commit_vide_sans_perte(self) -> None:
         """--no-keep-empty abandonne le commit vide : pas une perte (sortie 0)."""

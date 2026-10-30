@@ -14,6 +14,7 @@ ameesh work footprint 212 --set src/ameesh/backlog.py docs
 ameesh work footprint 212 --estimate           # re-estimate from the title and body
 ameesh work footprint 212 --refresh            # refine from the branch's actual diff
 ameesh work footprint 212 --clear              # drop the estimate (diff rows stay)
+ameesh work footprint 212 --clear-diff         # drop wrong diff rows (pilot gesture)
 ```
 
 ## Sources
@@ -34,13 +35,28 @@ The footprint is the union of three sources (`work_item_footprints`, 0502):
   rows under the correction); `--clear` then `--estimate` re-estimates.
 - `diff`: the files the lot's branch actually changes since its base on the
   target (`git diff --name-only --no-renames target...head`: a renamed file
-  keeps both its old and new paths). Refreshed when the lot is frozen (frozen
-  head; a failure is a warning, never a failed freeze) and by `--refresh`
-  (branch head).
+  keeps both its old and new paths). The base is the lot's `branch_target`,
+  else the target its project declares (`radar.projects.<p>.target`: `develop`
+  for Nexlink), else the repository's default branch (`origin/HEAD`). A lot
+  without an explicit target is never diffed against the forge's default
+  branch alone when the project declares an integration target (#4733: `main`
+  gave 354 paths for the 29 real ones, and `--refresh` recomputed them).
+  Refreshed when the lot is frozen (frozen head; a failure is a warning, never
+  a failed freeze) and by `--refresh` (branch head). `--refresh` reads the
+  target's **published** tip first (read-only: `ls-remote` then the exact
+  commit, no ref moved; a mute forge falls back to the clone's ref) and says
+  when the base is only the clone's last fetch, instead of passing it for the
+  target of the day.
 
 Without a local clone, a bare file name cited at intake (`foo.py`) stays at the
 repository root and may be narrower than the real path (`src/foo.py`):
 `--set` or the diff refresh corrects it.
+
+A `diff` computed on a wrong base is replaced by the next `--refresh` (or
+freeze) once the target is right. When the branch or the target can no longer
+be read, a pilot drops the stale rows with `--clear-diff`: the intake/manual
+estimate stays, the overlap disappears with the false files. `--set` and
+`--clear` never touch the diff rows.
 
 Every change writes one line in the lot's journal (`Footprint (source): …`).
 

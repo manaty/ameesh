@@ -387,7 +387,7 @@ class DelegationSecretsTest(unittest.TestCase):
                           ' -I -B /opt/ameesh-release/lib/hote-secrets.py'])
         restart = restart_delegation.render(dict(self.plan, policy=dict(
             host='fixture-host', units=['ameesh-runner@fixture.service'],
-            controller_unit='ameesh-release-controller.service', restart_seconds=5)))['files']
+            controller_unit='ameesh-release-controller.service', manager={'kind':'system'},restart_seconds=5)))['files']
         # aucun fichier commun : installer ou révoquer l'un ne touche pas l'autre.
         self.assertFalse(set(files) & set(restart))
         for item in files.values():

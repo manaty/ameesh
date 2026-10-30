@@ -993,6 +993,10 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
     inconnue, un sha différent ou une preuve Git absente laissent la relecture
     due.
 
+    #4747 : un porteur de paquet (`integration/**`) n'ouvre rien — ses unités
+    ont leurs avis sur leur tête gelée, et son éventuel delta propre de
+    résolution a passé la porte avant la fusion (§12).
+
     La création et la marque au journal de `lot` sont **une seule écriture**
     (revue #544 r1) : un échec de la marque annule la création, donc un nouvel
     appel ne peut pas ouvrir un second lot de relecture. La marque de journal
@@ -1034,6 +1038,17 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
     recursion = _review_recursion(item)
     if recursion:
         out["why"] = recursion
+        return out
+    # #4747 : un porteur de paquet (`integration/**`) n'a pas de delta propre à
+    # relire après fusion — ses unités ont leurs avis sur leur tête gelée, et
+    # son éventuel delta de résolution a passé la porte avant la fusion (§12).
+    # Lui ouvrir une relecture dépensait un tour de relecteur par paquet léger
+    # fusionné (#4742 ouvert sur le porteur #4739).
+    from . import packet_reviews
+    if packet_reviews.is_vehicle(item):
+        out["why"] = ("véhicule de paquet (%s) : les avis portent sur les membres "
+                      "(§12) — pas de relecture après fusion"
+                      % (item.get("branch") or "integration/**"))
         return out
     ref = ref_of(lot)
     ops = storage.of(db).work

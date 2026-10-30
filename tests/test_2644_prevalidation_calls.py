@@ -807,6 +807,125 @@ class FreezeTest(unittest.TestCase):
         self.assertEqual(outcome["state"], "unavailable")
 
 
+class FreezeJournalTest(unittest.TestCase):
+    """#4758 : une note d'indisponibilité par lot et par cause, pas par tête.
+
+    ``once=True`` ne déduplique que le texte exact ; le SHA ou le chemin du
+    dépôt change à chaque gel. La clé stable testée ici est le couple
+    (lot, cause), lue dans le journal du lot comme le fait ``_journal``.
+    """
+
+    def setUp(self):
+        self.item = {"id": 4758, "app": "nexlink", "assignee": "dev",
+                     "branch": "lot/4758-x", "branch_target": "develop"}
+        self.notes = []
+        self.patches = [
+            mock.patch("ameesh.work.get", return_value=self.item),
+            mock.patch("ameesh.work.note",
+                       side_effect=lambda db, lot, text, **kw: self.notes.append(text)),
+            mock.patch("ameesh.work.events_noted", side_effect=self.events_noted),
+        ]
+        for patch in self.patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def events_noted(self, db, lot, prefix, since_ts=0.0):
+        return [{"note": text} for text in self.notes if text.startswith(prefix)]
+
+    def freeze(self, *, returns=None, raises=None, sha="a" * 40):
+        target = (mock.patch.object(calls, "run", return_value=returns)
+                  if raises is None else
+                  mock.patch.object(calls, "run", side_effect=raises))
+        with mock.patch.object(calls, "repository", return_value="/repo"), \
+                mock.patch.object(calls, "target_base", return_value="b" * 40), \
+                target:
+            return calls.after_freeze(None, object(), 4758, sha)
+
+    def test_two_tooling_missing_freezes_at_two_heads_write_one_note(self):
+        # Témoin du lot : deux gels nexlink (deux SHA) → une seule note.
+        first = pv.PrevalidationError(
+            "tooling-missing",
+            "scripts/test-plan.py, scripts/test-parts.py absent de /repo au SHA "
+            "aaaaaaaaaaaa : le projet nexlink n'outille pas la prévalidation")
+        second = pv.PrevalidationError(
+            "tooling-missing",
+            "scripts/test-plan.py, scripts/test-parts.py absent de /repo au SHA "
+            "bbbbbbbbbbbb : le projet nexlink n'outille pas la prévalidation")
+        self.freeze(raises=first, sha="a" * 40)
+        self.freeze(raises=second, sha="b" * 40)
+        self.assertEqual(len(self.notes), 1, self.notes)
+        self.assertIn("aaaaaaaaaaaa", self.notes[0])
+
+    def test_a_new_cause_keeps_its_own_note(self):
+        self.freeze(raises=pv.PrevalidationError("tooling-missing", "sans plan"))
+        self.freeze(raises=pv.PrevalidationError("no-vm", "vm absente"), sha="b" * 40)
+        self.assertEqual(len(self.notes), 2, self.notes)
+        self.assertTrue(self.notes[0].startswith(
+            "prevalidation unavailable: tooling-missing"))
+        self.assertTrue(self.notes[1].startswith("prevalidation unavailable: no-vm"))
+
+    def test_unavailable_reports_are_deduplicated_by_cause(self):
+        self.freeze(returns=report(ok=False, causes=("no-vm",), outcome="no-vm"),
+                    sha="a" * 40)
+        self.freeze(returns=report(ok=False, causes=("no-vm",), outcome="no-vm"),
+                    sha="b" * 40)
+        self.assertEqual(len(self.notes), 1, self.notes)
+        self.assertIn("tête aaaaaaaaaaaa", self.notes[0])
+        self.freeze(returns=report(ok=False, causes=("run-incomplete",),
+                                   outcome="run-incomplete"), sha="c" * 40)
+        self.assertEqual(len(self.notes), 2, self.notes)
+
+    def test_a_new_run_incomplete_list_at_a_later_head_is_visible(self):
+        # #4769 : la cause reste dédupliquée, mais une liste de modules
+        # différente écrit sa ligne à la tête qui la porte.
+        self.freeze(returns=report(ok=False, causes=("run-incomplete",),
+                                   outcome="run-incomplete",
+                                   missing=("test_a", "test_b")), sha="a" * 40)
+        self.assertEqual(len(self.notes), 1, self.notes)
+        # Même liste dans un autre ordre, autre tête : rien de neuf.
+        self.freeze(returns=report(ok=False, causes=("run-incomplete",),
+                                   outcome="run-incomplete",
+                                   missing=("test_b", "test_a")), sha="b" * 40)
+        self.assertEqual(len(self.notes), 1, self.notes)
+        self.freeze(returns=report(ok=False, causes=("run-incomplete",),
+                                   outcome="run-incomplete",
+                                   missing=("test_a", "test_c")), sha="c" * 40)
+        self.assertEqual(len(self.notes), 2, self.notes)
+        self.assertIn("tête cccccccccccc", self.notes[1])
+        self.assertIn("test_c", self.notes[1])
+
+    def test_a_run_incomplete_list_that_returns_is_visible_again(self):
+        ab = report(ok=False, causes=("run-incomplete",),
+                    outcome="run-incomplete", missing=("test_a", "test_b"))
+        ac = report(ok=False, causes=("run-incomplete",),
+                    outcome="run-incomplete", missing=("test_a", "test_c"))
+        self.freeze(returns=ab, sha="a" * 40)
+        self.freeze(returns=ac, sha="b" * 40)
+        self.freeze(returns=ab, sha="d" * 40)
+        self.assertEqual(len(self.notes), 3, self.notes)
+        self.assertIn("tête dddddddddddd", self.notes[2])
+
+    def test_run_incomplete_without_a_module_list_stays_deduplicated(self):
+        self.freeze(returns=report(ok=False, causes=("run-incomplete",),
+                                   outcome="run-incomplete"), sha="a" * 40)
+        self.freeze(returns=report(ok=False, causes=("run-incomplete",),
+                                   outcome="run-incomplete"), sha="b" * 40)
+        self.assertEqual(len(self.notes), 1, self.notes)
+
+    def test_green_and_red_notes_stay_one_per_head(self):
+        self.freeze(returns=report(), sha="a" * 40)
+        self.freeze(returns=report(), sha="b" * 40)
+        self.freeze(returns=report(ok=False, causes=("run-red",),
+                                   failed=("tests.test_x",)), sha="c" * 40)
+        self.assertEqual(len(self.notes), 3, self.notes)
+
+    def test_an_unreadable_journal_key_still_writes_the_note(self):
+        with mock.patch("ameesh.work.events_noted",
+                        side_effect=RuntimeError("journal illisible")):
+            self.freeze(raises=pv.PrevalidationError("tooling-missing", "sans plan"))
+        self.assertEqual(len(self.notes), 1, self.notes)
+
+
 class GatePacketTest(unittest.TestCase):
     def packet(self, **run_kw):
         with mock.patch.object(calls, "repository", return_value="/repo"), \

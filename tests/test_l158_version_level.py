@@ -306,6 +306,63 @@ class VersionLevelTest(unittest.TestCase):
         self._commit("1.2.3", "by name")
         self.assertEqual(vl.level("case-base", "HEAD")[0], "patch")
 
+    def test_a_command_moved_to_a_module_through_a_deprecated_alias_stays_present(self):
+        # #4719: `ameesh.merge_pr` is only `sys.modules[__name__] = _moved`
+        # (#4382); the parser its callers register is the real module's, so
+        # `work merge-pr` and its options are not a removal.
+        self._git("checkout", "-q", "-B", "case", "v1.2.3")
+        self._write("src/ameesh/cli.py",
+                    'def build(sub):\n    work = sub.add_parser("work")\n'
+                    '    p = work.add_parser("merge-pr")\n'
+                    '    p.add_argument("--head", required=True)\n')
+        self._commit("1.2.3", "before the move")
+        self._git("tag", "-f", "moved-base")
+        self._write("src/ameesh/modules/dev/__init__.py", "")
+        self._write("src/ameesh/modules/dev/merge_pr.py",
+                    'def add_parser(work, func):\n'
+                    '    p = work.add_parser("merge-pr", aliases=["mp"])\n'
+                    '    p.add_argument("--head", required=True)\n')
+        self._write("src/ameesh/merge_pr.py",
+                    'import sys\n\nfrom .modules.dev import merge_pr as _merge_pr\n\n'
+                    'sys.modules[__name__] = _merge_pr\n')
+        self._write("src/ameesh/cli.py",
+                    'def build(sub):\n    from . import merge_pr\n'
+                    '    work = sub.add_parser("work")\n'
+                    '    merge_pr.add_parser(work, None)\n')
+        self._commit("1.2.3", "moved")
+        surface = vl.surface("HEAD")
+        self.assertIn("work merge-pr", surface["command"])
+        self.assertIn("work mp", surface["command"])
+        self.assertIn("work merge-pr --head", surface["option"])
+        floor, reasons = vl.level("moved-base", "HEAD")
+        self.assertEqual(floor, "minor")  # the new alias; the move adds no break
+        self.assertNotIn("command work merge-pr removed", reasons)
+
+    def test_a_command_dropped_from_the_module_it_moved_to_is_a_break(self):
+        # the deprecated alias must not hide a real removal (#4719)
+        self._git("checkout", "-q", "-B", "case", "v1.2.3")
+        self._write("src/ameesh/cli.py",
+                    'def build(sub):\n    work = sub.add_parser("work")\n'
+                    '    p = work.add_parser("merge-pr")\n'
+                    '    p.add_argument("--head", required=True)\n')
+        self._commit("1.2.3", "before the move")
+        self._git("tag", "-f", "dropped-base")
+        self._write("src/ameesh/modules/dev/__init__.py", "")
+        self._write("src/ameesh/modules/dev/merge_pr.py",
+                    'def add_parser(work, func):\n'
+                    '    p = work.add_parser("other")\n    p.add_argument("--head")\n')
+        self._write("src/ameesh/merge_pr.py",
+                    'import sys\n\nfrom .modules.dev import merge_pr as _merge_pr\n\n'
+                    'sys.modules[__name__] = _merge_pr\n')
+        self._write("src/ameesh/cli.py",
+                    'def build(sub):\n    from . import merge_pr\n'
+                    '    work = sub.add_parser("work")\n'
+                    '    merge_pr.add_parser(work, None)\n')
+        self._commit("1.2.3", "moved and dropped")
+        floor, reasons = vl.level("dropped-base", "HEAD")
+        self.assertEqual(floor, "major")
+        self.assertIn("command work merge-pr removed", reasons)
+
     def test_modules_reached_by_dotted_name_reexport_or_local_import(self):
         # r5: `import ameesh.plan_cli` then its full name; a helper a module
         # imports and hands on; an import inside a function binds only there

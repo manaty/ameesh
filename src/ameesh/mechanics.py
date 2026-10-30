@@ -312,7 +312,13 @@ class QueueFill:
     #4610 : `wake_mail_s` est la fenêtre (secondes) du courrier récent d'un
     orchestrateur ou du pilote qui retient un agent au moment du sommeil.
     `None` (clé absente du canon) : la même durée que `repos_s`, pour que le
-    bloc `file` existant garde son sens sans nouvelle clé obligatoire."""
+    bloc `file` existant garde son sens sans nouvelle clé obligatoire.
+
+    #4619 : facultative ne veut pas dire déployable tout de suite — la clé
+    n'entre au canon qu'une fois que tous les hôtes lisent ce code. Un hôte
+    d'une version antérieure l'ignorerait et garderait `repos_s` : son
+    sommeil changerait sans le savoir. Le déploiement de la clé suit donc la
+    généralisation du lecteur, pas l'inverse."""
 
     repos_part: float
     repos_s: int

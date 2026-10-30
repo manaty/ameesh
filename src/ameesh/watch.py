@@ -95,6 +95,10 @@ FIRING_TIMEOUT_S = 300
 IDENTITY_ENV = "AGENT_MAIL_NAME"
 #: the slug of a wake names its units and its state file
 WAKE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+#: #4755: the exec line of a wake unit (`watch fire --agent A --wake S`)
+LEGACY_FIRE_RE = re.compile(
+    r"\bwatch fire --agent (?P<agent>\S+) --wake (?P<slug>[a-z0-9][a-z0-9-]{0,40})\s*$",
+    re.M)
 #: a wake fires at least this far in the future
 MIN_WAKE_S = 10
 #: the identity witness reads the installed unit back through these two
@@ -308,11 +312,86 @@ def parse_wake_deadline(text: str | None, at: str | None, *,
     return reference + delay
 
 
+#: #4754 : un venv versionné de la bascule (`venv-<sha7>`, #1969), que son
+#: ménage (#3792) retire une fois quitté : une unité ne doit jamais le nommer.
+VERSIONED_VENV_RE = re.compile(r"^venv-[0-9a-f]{7,40}$")
+#: le lien de la version vivante, voisin de tout venv versionné (bascule.py)
+CURRENT_VENV = "venv-courant"
+#: un chemin absolu vers un binaire d'un venv versionné, dans une ligne d'unité
+VERSIONED_BINARY_RE = re.compile(r"/[^\s\"']*/venv-[0-9a-f]{7,40}/bin/[A-Za-z0-9_.+-]+")
+
+
+def stable_binary(binary: str, home: str | None = None) -> str:
+    """#4754 : le chemin à écrire dans une unité pour `binary`. Un binaire d'un
+    venv versionné (`…/venv-<sha7>/bin/<nom>`) devient celui du lien vivant
+    voisin (`…/venv-courant/bin/<nom>`), sinon `~/.local/bin/<nom>` ; le
+    ménage des venv retirerait sinon le chemin figé (203/EXEC). Un autre
+    chemin, ou faute de chemin stable exécutable, est rendu tel quel."""
+    bin_dir = os.path.dirname(binary)
+    venv = os.path.dirname(bin_dir)
+    if os.path.basename(bin_dir) != "bin" or not VERSIONED_VENV_RE.match(os.path.basename(venv)):
+        return binary
+    name = os.path.basename(binary)
+    home = home or os.path.expanduser("~")
+    for candidate in (os.path.join(os.path.dirname(venv), CURRENT_VENV, "bin", name),
+                      os.path.join(home, ".local", "bin", name)):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return binary
+
+
 def _ameesh_binary() -> str:
     found = shutil.which("ameesh")
     if found:
-        return os.path.abspath(found)
+        return stable_binary(os.path.abspath(found))
     return os.path.join(os.path.expanduser("~"), ".local", "bin", "ameesh")
+
+
+def repin_units(directory: str, *, run: Callable = subprocess.run, dry_run: bool = False,
+                home: str | None = None) -> list[dict]:
+    """#4754 : réécrit l'`ExecStart` des unités de veille et de réveil
+    d'ameesh (`ameesh-watch-*`, `ameesh-wake-*`) qui nomment encore un binaire
+    de venv versionné, écrites avant `stable_binary` : une veille dont le venv
+    a été retiré échoue en 203/EXEC à chaque tir sans que rien ne le dise.
+    Rend une entrée par unité (`path`, `before`, `after`) ; à blanc, n'écrit
+    rien. Un seul `daemon-reload` après les réécritures."""
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    fixed = []
+    for name in names:
+        if not name.endswith(".service") or not name.startswith((UNIT_PREFIX, WAKE_PREFIX)):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        lines, before, after = [], [], []
+        for line in text.splitlines(keepends=True):
+            if line.startswith("ExecStart="):
+                for old in VERSIONED_BINARY_RE.findall(line):
+                    new = stable_binary(old, home=home)
+                    if new != old:
+                        line = line.replace(old, new)
+                        before.append(old)
+                        after.append(new)
+            lines.append(line)
+        if not before:
+            continue
+        fixed.append({"path": path, "before": before, "after": after})
+        if dry_run:
+            continue
+        tmp = os.path.join(directory, "." + name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("".join(lines))
+        os.replace(tmp, path)
+    if fixed and not dry_run:
+        _systemctl_quiet(run, "daemon-reload")
+    return fixed
 
 
 def _env_binary() -> str:
@@ -371,6 +450,60 @@ def _disarm(directory: str, agent: str, slug: str, run: Callable) -> None:
                               wake_env_name(agent, slug),
                               wake_name(agent, slug, "wake.json")])
     _systemctl_quiet(run, "daemon-reload")
+
+
+def _legacy_wake_name(agent: str, slug: str, suffix: str) -> str:
+    """#4755: the name a wake carried before #1039 (`ameesh-watch-<agent>-<slug>`)."""
+    return "%s%s-%s.%s" % (UNIT_PREFIX, agent, slug, suffix)
+
+
+def _legacy_wake_of(directory: str, name: str) -> tuple[str, str] | None:
+    """(agent, slug) when the service `name` is a wake armed before #1039, read
+    from its exec line; None otherwise. The name alone does not tell: it is
+    also the periodic watch of an agent called `<agent>-<slug>` (#1039), whose
+    service runs `watch send`, never `watch fire`."""
+    if not (name.startswith(UNIT_PREFIX) and name.endswith(".service")):
+        return None
+    try:
+        with open(os.path.join(directory, name), encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    found = LEGACY_FIRE_RE.search(text)
+    if not found or _legacy_wake_name(found["agent"], found["slug"], "service") != name:
+        return None
+    return found["agent"], found["slug"]
+
+
+def _disarm_legacy(directory: str, agent: str, slug: str, run: Callable) -> bool:
+    """Stops and removes the wake `<slug>` of `agent` armed under the prefix
+    before #1039, if its service is one; True when it was removed."""
+    if _legacy_wake_of(directory, _legacy_wake_name(agent, slug, "service")) != (agent, slug):
+        return False
+    _systemctl_quiet(run, "stop", _legacy_wake_name(agent, slug, "timer"))
+    _remove_files(directory, [_legacy_wake_name(agent, slug, suffix)
+                              for suffix in ("service", "timer", "env", "wake.json")])
+    _systemctl_quiet(run, "daemon-reload")
+    return True
+
+
+def prune_legacy_wakes(directory: str, run: Callable) -> list[str]:
+    """#4755: removes the wakes armed before #1039 left on this host. Their
+    firing looks for the state under the new prefix, never finds it and, under
+    `Restart=on-failure`, restarts every 2 min forever (8622 restarts of
+    `ameesh-watch-deepseek1-1369-m24h.service` since 2026-10-18). Their
+    deadline passed long ago: the stale message is not sent. The names of
+    the wakes removed."""
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    removed = []
+    for name in names:
+        pair = _legacy_wake_of(directory, name)
+        if pair and _disarm_legacy(directory, pair[0], pair[1], run):
+            removed.append(name[:-len(".service")])
+    return removed
 
 
 def _systemctl(run: Callable, *args: str) -> None:
@@ -671,6 +804,7 @@ def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
         raise WatchError("wake deadline elapsed before arming: choose a future --at")
     directory = unit_dir(env)
     os.makedirs(directory, exist_ok=True)
+    prune_legacy_wakes(directory, run)
     source = os.environ if env is None else env
     path = source.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
     files = wake_units(agent, slug, delay_s, _ameesh_binary(), path, directory,
@@ -774,6 +908,14 @@ def fire(cfg: Config, db, agent: str, slug: str, *,
     try:
         with open(state_path, encoding="utf-8") as fh:
             state = json.load(fh)
+    except FileNotFoundError:
+        # #4755: no state, nothing to send — and a failure would restart the
+        # unit every 2 min forever (`Restart=on-failure`): the wake disarms
+        # itself, under either prefix, and the firing succeeds.
+        legacy = _disarm_legacy(directory, agent, slug, run)
+        _disarm(directory, agent, slug, run)
+        return ("wake %s of %s: no state left (%s), nothing sent; its units are removed"
+                % (slug, agent, "armed before #1039" if legacy else "already fired or cancelled"))
     except (OSError, ValueError) as exc:
         raise WatchError("wake %s of %s: no readable wake (%s)"
                          % (slug, agent, exc)) from exc

@@ -63,6 +63,8 @@ class ScalewayRetentionTest(unittest.TestCase):
         self.assertIn('SYNTHETIC-SECRET', config.read_text())
         self.assertEqual(args[args.index('--proto') + 1], '=https')
         self.assertEqual(args[args.index('--max-filesize') + 1], '4096')
+        self.assertEqual(args[args.index('-H') + 1],
+                         'x-amz-content-sha256: ' + backend.EMPTY_SHA256)
         url = urlsplit(args[-1])
         self.assertEqual(url.hostname, 'fixture-private.s3.fr-par.scw.cloud')
         self.assertEqual(url.path, '/test-host/old.dump')

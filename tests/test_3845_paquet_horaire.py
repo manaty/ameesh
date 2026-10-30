@@ -54,6 +54,7 @@ class FakeShell:
         self.lists: dict[str, list] = {}
         self.items: dict[int, dict] = {}
         self.ci: dict[int, dict] = {}
+        self.agents: list[dict] = []
         self.auto_out = "manifeste reviews/x.md : tête %s\n" % HEAD
         self.auto_rc = 0
         self.added: list[list[str]] = []
@@ -74,6 +75,8 @@ class FakeShell:
             return ph.Result(0)
         if cmd[0] == "ameesh":
             args = cmd[1:]
+            if args[:1] == ["list"]:
+                return ph.Result(0, json.dumps(self.agents))
             if args[:2] == ["work", "list"]:
                 state = args[args.index("--state") + 1] if "--state" in args else ""
                 return ph.Result(0, json.dumps(self.lists.get(state, [])))
@@ -145,6 +148,19 @@ class Base(unittest.TestCase):
     def tearDown(self):
         (ph.ready_lots, ph.manifest_at, ph.replay_locally,
          ph.auto.composition_holder) = self._saved
+
+
+class RecomposeCloneTest(Base):
+    """#4562 : la recomposition n'écrit pas dans le clone d'un agent."""
+
+    def test_recomposition_refuse_le_dossier_de_travail_d_un_agent(self):
+        self.shell.items[4000] = carrier()
+        self.shell.agents = [{"name": "mty-amh-impl-02", "host": self.ctx.host,
+                              "cwd": str(ROOT)}]
+        with self.assertRaisesRegex(ph.InputError, "dossier de travail"):
+            ph.pilot_recompose(self.ctx, 4000, [], [])
+        self.assertFalse([c for c in self.shell.calls
+                          if "paquet-auto.py" in " ".join(c)])
 
 
 class AliveTest(unittest.TestCase):
@@ -263,6 +279,9 @@ class ComposeTest(Base):
         add = self.shell.ran("work", "add")[0]
         self.assertIn("integration/paquet-h-20261027-04", add)
         self.assertEqual(add[add.index("--title") + 1][:31], "Paquet horaire h-20261027-04 — ")
+        # #4667 : le corps du porteur ne cite pas le script par son chemin —
+        # l'empreinte d'intake inférée de cette citation le faisait naître libre.
+        self.assertNotIn("scripts/paquet-horaire.py", add[add.index("--body") + 1])
         auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
         self.assertNotIn("--force", auto)
         # #4581 : une composition neuve n'est pas une recomposition ; elle ne

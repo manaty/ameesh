@@ -104,7 +104,11 @@ attribué, ou qui reçoit un courrier non lu de son pilote ou d'un
 orchestrateur, n'est pas endormi ; s'il l'était déjà, la pause est levée à
 l'arrivée du lot ou du courrier, avec l'acteur et la raison au journal de la
 pause. La fenêtre du courrier récent est `file.wake_mail_s` (secondes), à
-défaut `file.repos_s`.
+défaut `file.repos_s` ; la même fenêtre s'applique au sommeil et à la levée
+(#4619). `file.wake_mail_s` reste **facultative** : elle n'entre au canon
+qu'une fois que tous les hôtes lisent ce code — un hôte d'une version
+antérieure ignorerait la clé et garderait `file.repos_s`, changeant son
+sommeil sans le savoir (#4619).
 
 **La dernière note du pilote fait foi (#4623)** : une note
 `roadmap: rouverte <projet>` postérieure à la dernière `roadmap: épuisée

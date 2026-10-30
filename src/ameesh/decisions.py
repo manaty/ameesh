@@ -17,7 +17,8 @@ migration 0515; ``decide validation-history`` requires the owner's key.
         the owner answers (a HUMAN identity only); the answer goes to the
         requester by mail (it wakes them up), to the thread and to the work item;
   ameesh decide withdraw <id> [--why "…"] [--json]     the requester withdraws their request;
-  ameesh decide repair-forward <id> [--json]           restore an accidentally forwarded request;
+  ameesh decide repair-forward <id> [--json]           restore an accidentally forwarded request
+        (a copy already withdrawn by its requester is kept: its trace stays);
   ameesh decide show <id> [--json]                     a request, its answer, its proof;
   ameesh decisions [--all] [--for human:ID] [--json]   the queue, across all projects
         (served by `actions_cli`, together with gated actions).
@@ -479,6 +480,10 @@ def request_text(decision: dict, *, requester: str, owner: str | None,
     validation = decision.get("validation") or {}
     due_label = validation.get("due_local") or (_local(decision["due_ts"]) if decision.get("due_ts") else None)
     tail = ["Deadline: %s (%s)." % (due_label, validation.get("timezone", "local"))] if due_label else []
+    if validation.get("status") == "escalated":
+        # #4542 : le remplaçant doit savoir pourquoi la demande lui arrive échue.
+        tail.insert(0, "ESCALATED: no answer from the first validator by the deadline; "
+                       "you are the substitute.")
     if validation.get("defaulted"):
         tail.append("Default: one business day.")
     lines.extend(validation.get("links") or [])
@@ -1225,6 +1230,7 @@ def withdraw(cfg: Config, db, decision_id: int, *, requester: str, why: str | No
         try:
             with db.transaction() as tx:
                 view, lot, closed = close_and_release(tx)
+                validations.withdrawn(tx, view, by=requester, now=now)
         except _DecisionRace:
             latest = get(db, decision_id, now)
             raise DecisionError(_closed_reason(latest) if latest else
@@ -1242,13 +1248,19 @@ def withdraw(cfg: Config, db, decision_id: int, *, requester: str, why: str | No
 # vues : alertes, en-tête de `ameesh projects`, file de `ameesh decisions`
 # --------------------------------------------------------------------------
 
+def escalated(view: dict) -> bool:
+    """#4542 : la demande a été escaladée au remplaçant après son échéance."""
+    return (view.get("validation") or {}).get("status") == "escalated"
+
+
 def describe(view: dict, limit: int = 220) -> str:
     """Une ligne : numéro, demandeur, question, options, recommandation."""
     options = " ; ".join("%s) %s" % (o["key"], fil.excerpt(o["label"], 40))
                          for o in view.get("options") or ())
-    return "decision #%d from %s for %s: \"%s\"%s%s — answer: ameesh decide %d <option> " \
+    return "decision #%d from %s for %s%s: \"%s\"%s%s — answer: ameesh decide %d <option> " \
            "(or ameesh chat)" % (
                view["id"], view.get("requester"), _owner_label(view.get("owner")),
+               " (escalated)" if escalated(view) else "",
                fil.excerpt(view.get("question") or "", limit),
                " — %s" % options if options else "",
                "; recommended: %s" % view["recommend"] if view.get("recommend") else "",
@@ -1319,6 +1331,8 @@ def format_view(view: dict, now: float | None = None) -> list[str]:
         flags.append("URGENT")
     if view.get("overdue"):
         flags.append("OVERDUE")
+    if escalated(view):
+        flags.append("ESCALATED")
     if view.get("needs_signature"):
         flags.append("signature required")
     head = "#%d  %s ago · %s · work item #%s \"%s\" · from %s → %s%s" % (
@@ -1586,6 +1600,9 @@ def cmd_repair_forward(cfg: Config, argv: list[str]) -> int:
         db.close()
     if args.json:
         _dump(result)
+    elif result.get("copy_already_withdrawn"):
+        print("decision #%d restored to pending; copy #%d was already withdrawn (kept)" %
+              (result["decision"], result["withdrawn_copy"]))
     else:
         print("decision #%d restored to pending; copy #%d withdrawn" %
               (result["decision"], result["withdrawn_copy"]))

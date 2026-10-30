@@ -111,6 +111,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    events          record after readable waiting bounds count_before prune
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
                    stale_running churn
+   turn_observation read
    housekeeping    log recent summary last_measure register_worktree worktrees
                    set_worktree_status set_worktree_attribution
 
@@ -774,6 +775,18 @@ class TurnCosts(Domain):
         `harness`, `session`, `recorded_ts` (epoch) ; ou None. `cost.record`
         écrit la ligne d'un tour à sa fin : le tour qui a posé un gel est le
         premier écrit APRÈS l'instant du gel. Lecture seule."""
+
+    @abc.abstractmethod
+    def work_item_of_turn(self, turn_id: str) -> int | None:
+        """#4679 : le lot que le grand livre attribue au tour `turn_id`, ou None.
+
+        Un reçu de commit du hook post-commit ne connaît pas son lot
+        (`work_item_id` NULL), mais la ligne `turn_costs` du tour le porte. La
+        lecture de provenance s'en sert pour ne pas exclure un relecteur sur un
+        reçu d'un autre lot. Aucune ligne, identifiant vide, ou plusieurs lots
+        distincts pour le même tour : None — un doute, jamais une attribution
+        devinée."""
+        raise NotImplementedError
 
     @abc.abstractmethod
     def insert(self, *, agent: str, harness: str, turn: str | None, model: str | None,
@@ -3892,9 +3905,12 @@ class Decisions(Domain):
 
     def repair_forward(self, decision_id: int, *, actor: str) -> dict:
         """Restore a human decision accidentally forwarded by mail. Atomically
-        lock the original and its copy, refuse answered/withdrawn or chained
-        forwards, withdraw the copy and restore the unchanged original to pending.
-        Raise ValueError when there is no unambiguous repair."""
+        lock the original and its copy and restore the unchanged original to
+        pending. A pending copy is withdrawn; a copy its requester already
+        withdrew keeps its withdrawal trace (#4576). Refuses an original
+        answered or withdrawn at its origin, an answered copy, a changed copy
+        and a forwarding chain. Raise ValueError when there is no unambiguous
+        repair."""
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -4842,6 +4858,35 @@ class Housekeeping(Domain):
         ligne, ou None."""
 
 
+class TurnObservation(Domain):
+    """Les faits d'un tour ou d'une requête remise (#2167, lot #4831).
+
+    Une seule lecture, sans écriture : le domaine métier
+    (`ameesh.turn_observation`) en déduit l'état du tour, la comptabilité et
+    la quiescence. Aucun contenu de message n'est rendu : la lecture ne
+    sélectionne ni corps ni `payload`."""
+
+    @abc.abstractmethod
+    def read(self, *, turn: str | None = None, request: int | None = None) -> dict | None:
+        """Les faits d'un tour (`turn`) ou d'un message de la boîte (`request`).
+
+        Rend `{"request": ligne|None, "turn": {"id", "resource", "marker",
+        "ledger"}, "open_reservation": ligne|None, "agent": ligne}` ;
+        `request` est la ligne de la boîte (destinataire, état, `created_ts`,
+        `delivered_ts`, `delivered_turn_id`, `withdrawn`), `resource`/`marker`/
+        `ledger` les lignes `turn_resources`, `spend_pending` et `turn_costs`
+        du tour (ou None), `open_reservation` la réservation ouverte de
+        l'agent quand le tour n'a ni marqueur ni grand livre (#2166 : la clé
+        du tour a disparu avec le marqueur), `agent` la ligne du registre.
+        None si la cible n'existe pas (message inconnu, tour sans aucun fait,
+        ou agent absent du registre).
+
+        Une requête n'est pas un tour : un message non remis rend
+        `"turn": {"id": None, ...}` et reste observable (l'agent est son
+        destinataire)."""
+        raise NotImplementedError
+
+
 class Visibility(Domain):
     """Cache court de la règle de visibilité (0029) : le responsable et les
     administrateurs d'un hôte doivent avoir accès au dépôt de mémoire de la
@@ -5513,6 +5558,7 @@ class Storage(abc.ABC):
     hosts: HostResources
     host_lifecycle: HostLifecycle
     turn_resources: TurnResources
+    turn_observation: TurnObservation
     visibility: Visibility
     housekeeping: Housekeeping
     session_bindings: SessionBindings

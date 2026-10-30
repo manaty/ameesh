@@ -462,7 +462,23 @@ def registry_rows(db, names: list[str]) -> dict:
         return {name: directory.get(name) for name in names}
 
 
-def wake_note(cfg, db, name: str, row: dict) -> list[str]:
+def _mail_lifts_sleep(cfg, db, row: dict, sender: str) -> bool:
+    """#4619 : ce courrier lèverait-il le sommeil automatique du destinataire ?
+
+    Même règle que le découpage (#4610) : le courrier du pilote d'un projet de
+    l'agent ou d'un orchestrateur déclaré lève le sommeil, celui d'un autre
+    expéditeur attend. Une lecture en échec ne promet pas un réveil : on
+    avertit, comme le sommeil qui ne se lève pas non plus dans ce cas."""
+    from . import file_decoupage
+    try:
+        listing = registry.overview(db)
+        senders, error = file_decoupage.mail_lifters(cfg, db, listing, row)
+    except Exception:  # noqa: BLE001 - le doute laisse l'avertissement
+        return False
+    return not error and sender in senders
+
+
+def wake_note(cfg, db, name: str, row: dict, *, sender: str | None = None) -> list[str]:
     """#858 : avertissement d'un destinataire inscrit mais NON réveillable à
     l'instant (profil divergé en attente du prochain canon sync, responsable
     manquant, éphémère échu…). Le message est déposé quand même — c'est lui le
@@ -475,7 +491,11 @@ def wake_note(cfg, db, name: str, row: dict) -> list[str]:
 
     #4610 : le sommeil automatique du découpage est réveillable pour qu'une
     attribution passe, mais un courrier ordinaire ne le lève pas ; l'expéditeur
-    reçoit donc un avertissement, comme pour une pause d'opérateur."""
+    reçoit donc un avertissement, comme pour une pause d'opérateur.
+
+    #4619 : l'avertissement tient compte de l'expéditeur — le courrier du
+    pilote ou d'un orchestrateur lève le sommeil, donc il ne s'avertit pas
+    lui-même d'un réveil qui n'aura pas lieu."""
     if "mode" not in row or (row.get("mode") or "execute") == "externe":
         return []
     ok, why, _note = registry.wake_status(db, cfg, name)
@@ -487,6 +507,8 @@ def wake_note(cfg, db, name: str, row: dict) -> list[str]:
         from . import file_decoupage
         if (row.get("operator_paused")
                 and file_decoupage.is_sleep_reason(row.get("operator_pause_reason"))):
+            if sender and _mail_lifts_sleep(cfg, db, row, sender):
+                return []
             return ["%s is under the automatic roadmap sleep: the message is stored, "
                     "but it does not open a turn by itself; the sleep is lifted by a "
                     "lot assigned to it, a startable lot in its project, mail from its "
@@ -542,7 +564,7 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
     if row.get("retired_ts"):
         raise Refused(retired_text(row, sender=False))
     if row.get("status") != "stopped":
-        return wake_note(cfg, db, dest, row)
+        return wake_note(cfg, db, dest, row, sender=sender)
     if not queue:
         raise Refused(stopped_recipient_text(db, row, now))
     return ["%s is stopped (%s): message queued until it resumes (ameesh resume %s) "

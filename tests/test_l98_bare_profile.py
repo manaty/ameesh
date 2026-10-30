@@ -9,6 +9,7 @@ test_l317_project_modules and test_generic_core under the switch.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 import shutil
@@ -35,8 +36,12 @@ def profile(value):
     return mock.patch.dict(os.environ, env, clear=True)
 
 
+@contextlib.contextmanager
 def no_entry_points():
-    return mock.patch("ameesh.modules._entry_points", return_value=())
+    # registry imports _entry_points by name: patch both bindings (#4625).
+    with mock.patch("ameesh.modules._entry_points", return_value=()), \
+            mock.patch("ameesh.modules.registry._entry_points", return_value=()):
+        yield
 
 
 class SwitchTest(unittest.TestCase):

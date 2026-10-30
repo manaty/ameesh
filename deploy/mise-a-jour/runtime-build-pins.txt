@@ -1,0 +1,6 @@
+# Épinglage de l'outillage de construction de la roue ameesh (#4778).
+# setuptools est installé dans l'environnement de construction dédié, jamais
+# dans le runtime ; la roue du projet est construite sans isolation de build
+# (`--no-build-isolation`) avec exactement cette version.
+setuptools==84.2.1 \
+    --hash=sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2

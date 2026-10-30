@@ -45,6 +45,13 @@ class _Cfg:
     def __init__(self, state_dir: str):
         self.state_dir = state_dir
         self.host = "pc"
+        # #4609 : `exploitation.alerts` lit la fenêtre et la part de la
+        # sauvegarde du mesh. Valeurs par défaut de `config.Config`
+        # (03:30-04:30 UTC, 90 %, groupe 5 %), pour que la doublure reste un
+        # config crédible sans dépendre de l'environnement du banc.
+        self.mesh_backup_window = (12600, 16200)
+        self.mesh_backup_min_share = 0.9
+        self.mesh_backup_min_group_share = 0.05
 
 
 def _write(path: str, size: int, age_s: float = 0.0) -> None:
@@ -820,6 +827,12 @@ class MenageDbTest(PgTestCase):
         super().setUp()
         for table in ("housekeeping_log", "managed_worktrees", "host_resources"):
             self.db.execute("DELETE FROM %s" % table)
+        # #4754 : le passage de la CLI re-épingle les unités de veille de
+        # l'hôte ; un test n'en lit ni n'en réécrit aucune réelle.
+        units = tempfile.mkdtemp(prefix="units-", dir=self.tmp)
+        patcher = mock.patch.dict(os.environ, {"AMEESH_SYSTEMD_USER_DIR": units})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.cfgl = _Cfg(self.state)
         self.cfgl.host = self.cfg.host
 

@@ -33,7 +33,9 @@ file. Ce module est ce geste, déterministe (§7 du canon), joué par la passe
   courrier non lu de son pilote ou d'un orchestrateur, n'est pas endormi (le
   courrier compte s'il a moins de `file.wake_mail_s`, à défaut `file.repos_s`,
   secondes) ; la pause est levée dès qu'un de ces deux événements arrive,
-  avec l'acteur et la raison au journal de la pause.
+  avec l'acteur et la raison au journal de la pause. #4619 : la même fenêtre
+  de courrier s'applique au sommeil et à la levée, et le journal nomme le lot
+  réellement actionnable, pas seulement un lot assigné.
 * **#4623, la dernière note fait foi** : une note `roadmap: rouverte <projet>`
   postérieure à la dernière `roadmap: épuisée <projet>` désarme le sommeil et
   lève les dormeurs du projet dans la même passe (le geste est journalisé sur
@@ -90,6 +92,12 @@ SLEEP_LIFT_PREFIX = "automatic sleep lifted:"
 #: #4610 : courriers relus par agent pour retrouver le dernier envoi du pilote
 #: ou d'un orchestrateur (les plus récents d'abord, `mail.history`)
 MAIL_HISTORY_LIMIT = 200
+#: #4619 : non-lus actifs relus en plus de l'historique (du plus ancien au plus
+#: récent, `mail.unread_active`) : un courrier pertinent plus vieux que les
+#: derniers courriers lus ou passifs ne doit pas être masqué. L'opération est
+#: au contrat médié (contrairement à `mail.unread`), donc le repli garde la
+#: même lecture sur un exécuteur médié.
+MAIL_UNREAD_LIMIT = 200
 #: état du notifieur : `{projet: début de la condition}`
 STATE_KEY = "queue_fill"
 
@@ -171,19 +179,22 @@ def wakeable(listing: list, canons, *, configured: bool) -> list:
 
 
 def measure(listing: list, lots: list, waits: dict, now: float, canons, *,
-            configured: bool) -> dict:
+            configured: bool, footprint: dict | None = None) -> dict:
     """`{projet: Measure}` pour chaque projet d'au moins un agent réveillable.
 
     Au repos : `idle_agents` (sans lot actionnable, #1677). Démarrable : un
     lot ouvert sans assigné ni exécutant externe, hors file d'amélioration,
-    qu'aucune attente planifiée ne retient (`split_startable`)."""
+    qu'aucune attente planifiée ne retient et que la garde d'empreinte
+    n'occupe pas (`split_startable`, #3185/#4699) ; `footprint` est la
+    lecture partagée `sous_utilisation.footprint_blockers` (#4717)."""
     from . import projects as projects_mod
     pool = wakeable(listing, canons, configured=configured)
     names = {row["name"] for row in pool}
     idle = {row["name"] for row in su.idle_agents(listing, now, 0.0, waiting_free=True,
                                                   actionable_idle=True)
             if row["name"] in names}
-    startable, _blocked = su.split_startable(su.waiting_project_lots(lots), waits)
+    startable, _blocked = su.split_startable(su.waiting_project_lots(lots), waits,
+                                             footprint)
     out: dict = {}
     for row in pool:
         for project in projects_mod.agent_projects(row):
@@ -502,6 +513,12 @@ def _reviewer_spares(db, project: str, lots: list, listing: list, *,
         closed = alert_briefs.claims_closed_hosts(db)
     except Exception:  # noqa: BLE001 - hôte inconnu : ne ferme rien
         closed = set()
+    # #4779 : un profil de relecture illisible (capacités ou rôles absents du
+    # registre) n'est pas une preuve de capacité : l'agent n'entre pas dans le
+    # vivier des relecteurs, exactement comme la désignation le refuse. Le
+    # doute est borné à cet agent : un seul profil illisible ne rend pas toute
+    # l'exemption illisible et ne bloque pas le sommeil des autres (régression
+    # test_4610) ; la trace du refus est celle du gel (`prepare`).
     try:
         candidates = [c for c in rd.candidates_from_registry(
             listing or (), project=project, families=families, closed_hosts=closed)
@@ -639,22 +656,43 @@ def _senders(cfg, db, listing, projects, *, canons=None) -> tuple:
     return names, None
 
 
+def mail_lifters(cfg, db, listing, row, *, canons=None) -> tuple:
+    """#4619 : les expéditeurs dont le courrier lève le sommeil de cet agent.
+
+    Même règle que le sommeil et la levée (#4610) : orchestrateurs déclarés et
+    pilotes des projets de l'agent. Rend `(noms, erreur)`."""
+    from . import projects as projects_mod
+    return _senders(cfg, db, listing, projects_mod.agent_projects(row),
+                    canons=canons)
+
+
 def _recent_mail(db, name: str, *, now: float, senders, window_s=None) -> tuple:
     """#4610 : les courriers NON LUS de `senders`, les plus récents d'abord.
 
-    `window_s` borne l'âge (None : aucune borne, pour la levée). `mail.history`
-    lit les derniers courriers : un agent en sommeil peut accumuler plus de
-    `UNREAD_LIMIT` non-lus, que `mail.unread` (du plus ancien au plus récent)
-    ne montrerait pas. Un message passif (copie, accusé) ne réveille pas.
-    Rend `(messages, erreur)`.
+    `window_s` borne l'âge (None : aucune borne). Deux lectures se complètent
+    (#4619) : `mail.unread_active` montre les non-lus qui ouvrent un tour, du
+    plus ancien au plus récent, qu'un flot de courrier lu ou passif plus récent
+    ne masque pas ; `mail.history` montre les derniers courriers, qu'un agent en
+    sommeil peut accumuler au-delà de `UNREAD_LIMIT` non-lus. L'union est
+    dédoublonnée et triée du plus récent au plus ancien. Un message passif
+    (copie, accusé) ne réveille pas. Rend `(messages, erreur)` ; une lecture en
+    échec n'endort ni ne réveille.
     """
     from . import mail
+    rows = []
     try:
-        rows = mail.history(db, name, limit=MAIL_HISTORY_LIMIT)
+        rows.extend(mail.history(db, name, limit=MAIL_HISTORY_LIMIT) or ())
+        rows.extend(mail.unread_active(db, name, limit=MAIL_UNREAD_LIMIT) or ())
     except Exception as exc:  # noqa: BLE001 - une lecture en échec n'endort pas
         return [], "%s: %s" % (type(exc).__name__, str(exc)[:160])
+    seen = set()
     out = []
-    for row in rows or ():
+    for row in rows:
+        key = row.get("id")
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
         if row.get("delivered_ts") is not None:
             continue
         if str(row.get("sender") or "").strip() not in senders:
@@ -666,6 +704,8 @@ def _recent_mail(db, name: str, *, now: float, senders, window_s=None) -> tuple:
             if created is None or now - float(created) > float(window_s):
                 continue
         out.append(row)
+    out.sort(key=lambda row: (float(row.get("created_ts") or 0.0),
+                              int(row.get("id") or 0)), reverse=True)
     return out, None
 
 
@@ -683,7 +723,6 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
     geste : le relevé de la passe peut précéder l'attribution ou le courrier.
     """
     from . import agent_pause
-    from . import projects as projects_mod
     out = []
     reason = SLEEP_REASON % project
     pending, keep, unreadable = _reviewer_spares(
@@ -722,15 +761,18 @@ def _sleep(db, project: str, item: Measure, by_name: dict, now: float, *,
             continue
         row = fresh.get(name) or by_name.get(name) or {}
         if int(row.get("actionable_lots") or 0) > 0:
-            lot_id = row.get("assigned_lot_id")
+            # #4619 : `assigned_lot_id` est le lot assigné le plus récemment
+            # touché, pas forcément actionnable (prévu plus tard, en attente) ;
+            # le journal nomme le lot que l'agent doit réellement prendre.
+            lot_id = row.get("actionable_lot_id")
             why = ("assigned actionable lot #%s" % lot_id if lot_id
                    else "actionable work due")
             out.append({"agent": name, "slept": False, "why": why})
             _journal_exemption(db, split_id, name, why)
             continue
         if int(row.get("unread") or 0):
-            senders, mail_error = _senders(
-                cfg, db, listing, projects_mod.agent_projects(row), canons=canons)
+            senders, mail_error = mail_lifters(cfg, db, listing, row,
+                                               canons=canons)
             if mail_error:
                 why = "mail exemptions unreadable: %s" % mail_error
                 out.append({"agent": name, "slept": False, "why": why})
@@ -797,7 +839,8 @@ def _wake(db, project: str, listing: list, *, reason: str | None = None) -> list
     return out
 
 
-def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None) -> list:
+def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None,
+               mail_window_s=None) -> list:
     """#4610 : lève le sommeil dès qu'un lot actionnable est attribué à l'agent
     ou qu'un courrier non lu de son pilote ou d'un orchestrateur arrive.
 
@@ -806,9 +849,12 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None) -> list:
     lifted: … » qui nomme la cause. Seule la pause du sommeil automatique est
     levée (`expect_reason`), jamais une pause d'opérateur. Une lecture en
     échec laisse la pause en place : le passage suivant réessaie.
+
+    #4619 : la levée applique la même fenêtre de courrier que le sommeil
+    (`mail_window_s`) — sinon un dormeur qui ne lit pas son courrier
+    oscillerait entre sommeil et levée à chaque passe.
     """
     from . import agent_pause
-    from . import projects as projects_mod
     woken: dict = {}
     for row in listing:
         name = str(row.get("name") or "").strip()
@@ -817,15 +863,18 @@ def _wake_work(db, listing: list, now: float, *, cfg=None, canons=None) -> list:
             continue
         why = None
         if int(row.get("actionable_lots") or 0) > 0:
-            lot_id = row.get("assigned_lot_id")
+            # #4619 : le lot assigné le plus récemment touché n'est pas
+            # forcément actionnable ; le journal nomme celui qui l'est.
+            lot_id = row.get("actionable_lot_id")
             why = ("assigned actionable lot #%s" % lot_id if lot_id
                    else "actionable work due")
         elif int(row.get("unread") or 0):
-            senders, mail_error = _senders(
-                cfg, db, listing, projects_mod.agent_projects(row), canons=canons)
+            senders, mail_error = mail_lifters(cfg, db, listing, row,
+                                               canons=canons)
             if mail_error:
                 continue
-            recent, mail_error = _recent_mail(db, name, now=now, senders=senders)
+            recent, mail_error = _recent_mail(db, name, now=now, senders=senders,
+                                              window_s=mail_window_s)
             if mail_error or not recent:
                 continue
             why = "unread mail from %s" % recent[0].get("sender")
@@ -898,7 +947,14 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
     listing = st.operations.listing() if listing is None else listing
     lots = st.operations.open_lots_activity(None)
     waits = planned_waits.read(db, lots, now=now) if lots else {}
-    measures = measure(listing, lots, waits, now, canons, configured=configured)
+    # #4717 : le déclencheur de découpage applique la même garde d'empreinte
+    # que le débit (#4561) et `idle_capacity` (#4699) — une seule lecture
+    # partagée, jamais une copie. Un lot recouvert par un lot en cours n'est
+    # pas un lot démarrable offert aux agents au repos.
+    footprint = (su.footprint_blockers(db, su.waiting_project_lots(lots), lots)
+                 if lots else {})
+    measures = measure(listing, lots, waits, now, canons, configured=configured,
+                       footprint=footprint)
     due, since = held(measures, state.get(STATE_KEY) or {}, now,
                       settings.repos_part, settings.repos_s)
     state[STATE_KEY] = since
@@ -908,7 +964,8 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
     # découpage encore ouvert : elle se fait à chaque passe, pour tous les
     # dormeurs du sommeil automatique.
     if not dry_run:
-        out.extend(_wake_work(db, listing, now, cfg=cfg, canons=canons))
+        out.extend(_wake_work(db, listing, now, cfg=cfg, canons=canons,
+                              mail_window_s=settings.mail_window()))
     # #4623 : un projet dont tous les exécutants dorment n'a plus de mesure
     # (`measure` écarte les pauses). Il doit rester dans la passe, sinon la
     # note de réouverture ne serait jamais lue et les dormeurs jamais levés.

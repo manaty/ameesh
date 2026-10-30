@@ -94,7 +94,10 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
 la main : la marque « tentative » (hôte, pid, époque de la session, motifs) est
 posée d'abord, si bien qu'un tic du détenteur courant reprend une recomposition
 perdue à la relève du bail comme les siennes. Elle ne compte pas dans le
-retrait automatique unique du point 4.
+retrait automatique unique du point 4. `--repo` est le clone **dédié** du
+composeur (comme le tic), jamais le dossier de travail d'un agent : la branche
+locale `integration/**` y serait lue par le balayage de l'assigné comme une
+tête de la forge (#4562).
 
 Comme le retrait automatique, elle est **bornée par `--keep-composition`**
 (`this.base`, la tête gelée du paquet rouge) : elle reprend les membres de la
@@ -344,6 +347,9 @@ class Context:
     #: #4361 : la pause active de la cible (`packet_pause`), None sans pause ;
     #: None ici : aucune lecture (tests)
     pause_of: object = None
+    #: #4562 : le clone de recomposition a déjà été vérifié (jamais le dossier
+    #: de travail d'un agent) ; la CLI le vérifie avant `check_fresh`
+    clone_checked: bool = False
     log: list[str] = field(default_factory=list)
 
     def alive(self, pid: int) -> bool:
@@ -938,7 +944,10 @@ def _create_carrier(ctx: Context, name: str, group: list[int], *,
         "--estimate", CARRIER_ESTIMATE,
         "--estimate-source", CARRIER_ESTIMATE_SOURCE,
         "--source", "paquet-horaire (#3845), minuterie",
-        "--body", "Paquet horaire composé sans agent par scripts/paquet-horaire.py "
+        # #4667 : le corps ne cite plus le script par son chemin — une
+        # empreinte d'intake inférée de cette citation faisait naître le
+        # porteur libre (le véhicule n'a pas de delta propre).
+        "--body", "Paquet horaire composé sans agent par le composeur horaire "
                   "(#3845) : %d lot(s) prêt(s) à la lecture (%s).%s"
                   % (len(group), ", ".join("#%d" % lot for lot in group), detail),
         "--actor", ctx.actor, what="création du porteur")
@@ -1756,12 +1765,58 @@ def session_epoch(ctx: Context) -> int:
         raise HoraireError("époque illisible : %r" % result.stdout[-200:]) from None
 
 
+def assigned_clone(ctx: Context) -> str:
+    """#4562 : le nom de l'agent dont `ctx.repo` est le dossier de travail, ou "".
+
+    Une recomposition compose dans le clone qu'on lui donne. Lancée dans le
+    clone d'un agent, `paquet-auto` y laisse une branche `integration/**`
+    locale avant de la pousser : le balayage de cet agent la lit, l'enregistre
+    comme tête vue en avance, et la garde #4501 la prend ensuite pour une tête
+    poussée. Le clone dédié du composeur (`AMEESH_PAQUET_REPO`, comme le tic)
+    n'appartient à aucun agent ; lui seul est admis.
+    """
+    result = ctx.must("list", "--json", what="liste des agents")
+    rows = _json(result, "liste des agents")
+    if not isinstance(rows, list):
+        raise HoraireError("liste des agents : liste JSON attendue")
+    repo = os.path.realpath(str(ctx.repo))
+    host = str(ctx.host or "")
+    for row in rows:
+        row_host = str(row.get("host") or "")
+        if host and row_host and row_host != host:
+            continue
+        cwd = str(row.get("cwd") or "").strip()
+        if not cwd:
+            continue
+        if os.path.realpath(os.path.expanduser(cwd)) == repo:
+            return str(row.get("name") or "?")
+    return ""
+
+
+def refuse_agent_clone(ctx: Context) -> None:
+    """#4562 : refuse un `--repo` qui est le dossier de travail d'un agent."""
+    if ctx.clone_checked:
+        return
+    holder = assigned_clone(ctx)
+    if not holder:
+        ctx.clone_checked = True
+        return
+    raise InputError(
+        "--repo %s est le dossier de travail de l'agent %s ; une "
+        "recomposition y laisserait une branche locale non poussée que le "
+        "balayage lirait comme tête de la forge (#4562). Lance-la depuis "
+        "le clone dédié du composeur (AMEESH_PAQUET_REPO, "
+        "~/ameesh-composeur) ou laisse le tic recomposer."
+        % (ctx.repo, holder))
+
+
 def pilot_recompose(ctx: Context, carrier: int, exclude: list[int],
                     reasons: list[str]) -> str:
     """#4237 : la recomposition du pilote, marquée comme celles du tic."""
     if reasons and len(reasons) != len(exclude):
         raise InputError("--exclude-reason : %d motif(s) pour %d --exclude"
                          % (len(reasons), len(exclude)))
+    refuse_agent_clone(ctx)
     item = show(ctx, carrier)
     if not (item.get("state") in OPEN_STATES
             and is_carrier(item, ctx.project, ctx.target) and is_hourly(item)
@@ -1985,6 +2040,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "recompose":
             # geste explicite du pilote (#4237) : la pause (#4361) ne vise que le tic
+            refuse_agent_clone(ctx)
             check_fresh(ctx)
             align_schema(ctx)
             print(pilot_recompose(ctx, args.carrier, args.exclude, args.exclude_reason),

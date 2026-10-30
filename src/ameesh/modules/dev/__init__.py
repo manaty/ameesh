@@ -65,14 +65,15 @@ OWNS_CONNECTION = True
 
 USAGE = """usage: ameesh module dev {%s} …
 
-  sync-merges     close the work items whose frozen content is merged (git, L29)
-  sync-github     close the work items whose PR is merged (GitHub read-only)
-  project-github  one GitHub issue per work item of a project (L126)
-  merge-pr        merge a lot's PR without the gh API (REL-11)
+  sync-merges     close the %s whose frozen content is merged (git, L29)
+  sync-github     close the %s whose PR is merged (GitHub read-only)
+  project-github  one GitHub issue per %s of a project (L126)
+  merge-pr        merge a %s's PR without the gh API (REL-11)
   review-class    review class of a change (0018)
 
 Aliases without a removal date (L104): ameesh work sync-merges | sync-github |
-project-github | merge-pr, ameesh review-class.""" % ",".join(COMMANDS)
+project-github | merge-pr, ameesh review-class.""" % (
+    ",".join(COMMANDS), DEV.plural, DEV.plural, DEV.noun, DEV.noun)
 
 
 def main(db, argv, *, actor):

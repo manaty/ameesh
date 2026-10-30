@@ -27,6 +27,13 @@ class BackupError(ValueError):
     pass
 
 
+# SigV4 signe le corps sous ce nom d'en-tête. curl 7.88 (Debian 12) le signe
+# quand on le lui donne, mais ne l'ajoute jamais seul ; Scaleway refuse alors
+# la requête (HTTP 400 Required header missing). Chaque requête nomme donc son
+# empreinte : celle du fichier pour un PUT, celle du corps vide pour un GET.
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+
+
 def run(args, *, env=None, timeout=1800):
     # A driver diagnostic may repeat its DSN, password or upload credentials.
     # Report only the process, its timeout or exit status, and never its stderr.
@@ -421,10 +428,12 @@ def upload(archive, host, *, receipt=None, credentials=None, staging=None):
         info = archive.parent.stat()
         if info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise BackupError("private owned receipt directory required")
-        sha = digest(archive)
     # The caller provides on-disk staging; never fall back to a shared tmpfs.
     staging_root = private_parent(Path(staging) if staging is not None else Path(os.environ["TMPDIR"]),
                                   "upload staging directory")
+    # The payload hash is signed under x-amz-content-sha256; it is also the
+    # value the optional receipt pins, so one pass serves both.
+    sha = digest(archive)
     with tempfile.TemporaryDirectory(prefix="backup-upload-", dir=staging_root) as workspace:
         curl_config = Path(workspace) / "curl.conf"
         with curl_config.open("x") as stream:
@@ -437,7 +446,9 @@ def upload(archive, host, *, receipt=None, credentials=None, staging=None):
             descriptor = os.open(headers, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(descriptor)
         run(["curl", "--disable", "--config", str(curl_config), "--fail", "--silent", "--show-error", "--retry", "3",
-             "--proto", "=https", *extra, "--upload-file", str(archive), "--aws-sigv4", "aws:amz:" + region + ":s3",
+             "--proto", "=https", *extra, "--upload-file", str(archive),
+             "-H", "x-amz-content-sha256: " + sha,
+             "--aws-sigv4", "aws:amz:" + region + ":s3",
              "https://" + bucket + ".s3." + region + ".scw.cloud/" + host + "/" + archive.name], env=env)
         if receipt is not None:
             version_id = header_version(headers)
@@ -517,7 +528,9 @@ def retrieve(credentials, host, name, sha256, output, *, version_id=None):
         # No redirects: a recovery object is bound to this exact HTTPS origin
         # and key, and authentication must never be forwarded elsewhere.
         run(["curl", "--disable", "--config", str(curl_config), "--fail", "--silent", "--show-error",
-             "--retry", "3", "--proto", "=https", "--aws-sigv4", "aws:amz:" + region + ":s3",
+             "--retry", "3", "--proto", "=https",
+             "-H", "x-amz-content-sha256: " + EMPTY_SHA256,
+             "--aws-sigv4", "aws:amz:" + region + ":s3",
              *extra, "--output", str(archive), url], env=env)
         if version_id is not None and header_version(headers) != version_id:
             raise BackupError("retrieved object version mismatch")

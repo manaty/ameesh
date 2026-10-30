@@ -167,12 +167,12 @@ class SSHTransportTest(unittest.TestCase):
                     host.fail.add('health')
                 authority = controller_fixture.Authority()
                 policy = dict(host='fixture-host',units=self.manifest['units'],
-                    controller_unit='ameesh-release-controller.service',restart_seconds=5)
+                    controller_unit='ameesh-release-controller.service',manager={'kind':'system'},restart_seconds=5)
                 manifest = dict(self.manifest,policy=restart_fixture.helper.policy_id(policy))
                 system = restart_fixture.System()
                 states = {}
                 system.state = lambda job: states.get(job,'absent')
-                def submit(job, units, seconds):
+                def submit(job, units, seconds, *, manager):
                     system.submissions.append((job,units,seconds))
                     states[job] = 'success'
                 system.submit = submit

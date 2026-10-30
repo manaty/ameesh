@@ -354,17 +354,24 @@ test (three messages → three notifications) caught the bug.
   explicitly configured threshold is kept, and with no turn cap
   (`turn_max_seconds=0`) the configured threshold applies alone
   ([EXPLOITATION.md](EXPLOITATION.md#plafonds-pendant-le-tour-l105)).
-  The size is read
-  from the usage in each harness's stream (keys normalized by
-  `adapters.usage_tokens`; DeepSeek publishes usage per step). **Context
-  ceiling (L60)**: if the context of the last model call (the session size:
-  input + cache read + cache written) exceeds `AMEESH_CONTEXT_MAX_TOKENS`
+  The size is the session's cumulative `input_tokens + output_tokens` over
+  its turns, read from the usage in each harness's stream (keys normalized by
+  `adapters.usage_tokens`; DeepSeek publishes usage per step). The cache
+  convention is **not uniform** (#4448): Codex's input already includes
+  cached tokens, while Claude and DeepSeek report cached input separately and
+  written cache is excluded, so the same token count does not mean the same
+  thing across harnesses — hence the per-harness thresholds compiled from the
+  canon. **Context
+  ceiling (L60)**: if the context of the last model call (fresh input + cache
+  read + cache written) reaches `AMEESH_CONTEXT_MAX_TOKENS`
   tokens (default 15 M, adjustable per agent with `ameesh set <agent>
   context_max_tokens=…`), the same rotation takes place before the next turn,
   with no minimum number of turns. The sum of a turn's re-reads is not the
   measure (#2336): it grows with the number of steps of the turn, not with the
-  session (see
-  [EXPLOITATION.md](EXPLOITATION.md#plafond-de-contexte-l60)).
+  session. Without a per-call reading (a turn closed before its result, a
+  restarted worker), a non-Codex session falls back to the last recorded
+  turn's re-read, while Codex does not (#2932); see
+  [EXPLOITATION.md](EXPLOITATION.md#plafond-de-contexte-l60).
 * **Moved working directory (0018)**: at registration, the git identity of the
   directory (common repository + branch) is written to
   `<état>/<agent>/worktree.json`. If the cwd has disappeared, a **unique** candidate
@@ -512,13 +519,16 @@ to an agent. Read their queue with `ameesh decisions`.
 
 To repair a human decision accidentally forwarded by an older version, a bound
 agent runs `ameesh decide repair-forward <original-id>`. The command atomically
-restores the original to pending and withdraws its copy, retaining the original
-question, owner and signature requirements. It refuses answered or withdrawn
-requests, changed copies and forwarding chains; it never creates an answer or
-approval. The audit remains in the original message metadata.
+restores the original to pending, retaining its question, owner and signature
+requirements, and withdraws its copy. A copy the requester already withdrew is
+accepted and left untouched, so its withdrawal trace is kept (#4576). It refuses
+a request answered or withdrawn at its origin, an answered copy, changed copies
+and forwarding chains; it never creates an answer or approval. The audit remains
+in the original message metadata.
 
 Details:
-[EXPLOITATION.md](EXPLOITATION.md), "Courrier en souffrance" (undeliverable mail).
+[EXPLOITATION.md](EXPLOITATION.md), "Décisions du propriétaire" and "Courrier en
+souffrance" (undeliverable mail).
 
 **Hooks: write first, mark after.** The JSON is written to stdout and
 flushed (`flush`) *before* marking the messages delivered; if the harness has closed its

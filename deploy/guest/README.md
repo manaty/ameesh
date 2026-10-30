@@ -117,6 +117,21 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   reads Podman's volume inventory and removes anonymous unused volumes
   created more than an hour ago, using `volume rm` without force;
   volumes referenced by any container and named volumes are preserved.
+  Successful removals are logged by name on the launcher's stderr.
+
+  Updating the Python package alone does **not** update these root-owned
+  scripts. `deploy/mise-a-jour/vm.sh` now refreshes the existing guest runtime
+  during `installer` and `retour`, and checks its SHA256 against the installed
+  source tree during `controler`. This copies only the forced command,
+  Postgres hook and (when already provisioned) the job launcher pair. It does
+  not provision a guest or change its keys, profiles, configuration, users or
+  firewall. A partial or unsafe installation fails explicitly. To refresh an
+  existing guest separately, run as administrator from a trusted checkout:
+
+  ```sh
+  python3 deploy/mise-a-jour/guest-runtime.py /path/to/exact/staging/tree
+  python3 deploy/mise-a-jour/guest-runtime.py /path/to/exact/staging/tree --check
+  ```
   Cleanup failures are reported and do not prevent releasing runtime caps.
   `ameesh doctor` warns from 80% inode use on the host's watched filesystems.
 

@@ -551,6 +551,8 @@ class ProgressPgTest(PgTestCase):
 
         snap = progress.snapshot(self.db, self.cfg, since="24h", book=self._book())
         self.assertEqual(snap["schema"], "ameesh-progress/1")
+        # L102 T3 (#4393) : le vocabulaire du module actif (dev : « lot »)
+        self.assertEqual(snap["vocabulary"]["singular"], "lot")
         lots = {l["title"]: l for l in snap["lots"]}
         self.assertNotIn("vieux lot", lots)
         self.assertEqual(lots["lot actif"]["state"], "active")

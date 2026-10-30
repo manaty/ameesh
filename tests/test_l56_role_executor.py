@@ -33,6 +33,40 @@ ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-executor.sql")
 MODULE_WRITERS_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('ameesh-role-module-writers', 0))"
 
 
+def _database_admin(cfg):
+    """Connexion d'administration sans `statement_timeout` (#4822).
+
+    Un CREATE/DROP DATABASE déclenche un checkpoint immédiat ; sur un banc
+    chargé il dépasse le délai d'instruction de la suite (30 s). Un DROP
+    annulé laisse alors la base invalide (`datconnlimit = -2`) et l'autovacuum
+    du banc s'arrête (#4680). Le test ne supprime que sa propre base : la
+    connexion qui porte le geste ne doit avoir aucune borne d'instruction,
+    y compris un délai hérité du rôle, de la base, de `PGOPTIONS` ou du DSN
+    (`db.execute_without_statement_timeout`).
+    """
+    return db_mod.connect(dataclasses.replace(cfg, statement_timeout_ms=0))
+
+
+def _create_database(cfg, database: str) -> None:
+    admin = _database_admin(cfg)
+    try:
+        db_mod.execute_without_statement_timeout(
+            admin, "CREATE DATABASE %s TEMPLATE template0"
+            % db_mod.quote_ident(database))
+    finally:
+        admin.close()
+
+
+def _drop_database(cfg, database: str) -> None:
+    admin = _database_admin(cfg)
+    try:
+        db_mod.execute_without_statement_timeout(
+            admin, "DROP DATABASE IF EXISTS %s WITH (FORCE)"
+            % db_mod.quote_ident(database))
+    finally:
+        admin.close()
+
+
 class RoleExecutorTest(PgTestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -40,8 +74,10 @@ class RoleExecutorTest(PgTestCase):
         # Database ACL tests must not change PUBLIC privileges in the shared bench.
         cls.admin_db = cls.db
         cls.database = "t_executor_db_" + uuid.uuid4().hex[:8]
-        cls.admin_db.execute("CREATE DATABASE %s TEMPLATE template0" % db_mod.quote_ident(cls.database))
+        # Le cleanup est posé AVANT la création : un CREATE annulé peut lui
+        # aussi laisser une base invalide, que ce geste retire (#4822).
         cls.addClassCleanup(cls.drop_database)
+        _create_database(cls.cfg, cls.database)
         parts = urllib.parse.urlsplit(TEST_DSN)
         if not parts.scheme.startswith("postgres"):
             raise AssertionError("Executor tests require a PostgreSQL URL DSN")
@@ -80,7 +116,7 @@ class RoleExecutorTest(PgTestCase):
         if cls.db is not cls.admin_db:
             cls.db.close()
         try:
-            cls.admin_db.execute("DROP DATABASE %s" % db_mod.quote_ident(cls.database))
+            _drop_database(cls.admin_db.cfg, cls.database)
         finally:
             cls.admin_db.close()
 
@@ -113,6 +149,18 @@ class RoleExecutorTest(PgTestCase):
         return subprocess.run(["psql", self.host_dsn(), "-X", "-At",
                                "-v", "ON_ERROR_STOP=1", "-c", sql],
                               capture_output=True, text=True, timeout=30, env=env)
+
+    def test_drop_database_does_not_inherit_the_statement_timeout(self):
+        """#4822 : un DROP annulé par le délai de la suite laissait la base
+        invalide (`datconnlimit = -2`). Avec 1 ms, le geste serait annulé ;
+        la connexion d'administration le remplace par 0 et la base part."""
+        database = "t_executor_db_" + uuid.uuid4().hex[:8]
+        _create_database(self.admin_db.cfg, database)
+        self.addCleanup(_drop_database, self.admin_db.cfg, database)
+        _drop_database(dataclasses.replace(self.admin_db.cfg,
+                                           statement_timeout_ms=1), database)
+        self.assertEqual(self.db.query(
+            "SELECT 1 FROM pg_database WHERE datname = %s", (database,)), [])
 
     def test_host_reads_and_writes_data(self):
         cfg = dataclasses.replace(self.cfg, dsn=self.host_dsn())
@@ -1041,6 +1089,59 @@ class RoleExecutorTest(PgTestCase):
             for role in (executor, other, creator):
                 self.db.execute('DROP OWNED BY %s' % q(role))
                 self.db.execute('DROP ROLE %s' % q(role))
+
+    def test_execute_grant_skips_a_function_owned_by_another_role(self):
+        """#4806 : sur un hôte où une extension (pg_stat_statements) laisse
+        dans le schéma une fonction appartenant à un autre rôle que le
+        migrationowner, `GRANT EXECUTE ON ALL FUNCTIONS` échouait en
+        « permission denied for function » et annulait toute la phase rôle.
+        Le droit se borne aux fonctions applicatives du propriétaire : l'objet
+        étranger n'est ni un motif d'échec ni un droit accordé."""
+        q = db_mod.quote_ident
+        suffix = uuid.uuid4().hex[:8]
+        creator, other, executor = ("t_creator_" + suffix, "t_other_" + suffix,
+                                    "t_exec_" + suffix)
+        schema = "t_owned_" + suffix
+        foreign = "pg_stat_statements_reset_" + suffix
+        helper = "app_helper_" + suffix
+        old_owner = self.db.query(
+            "SELECT pg_get_userbyid(datdba) AS name FROM pg_database WHERE datname = %s",
+            (self.database,))[0]["name"]
+        for role in (creator, other, executor):
+            self.db.execute("CREATE ROLE %s NOLOGIN" % q(role))
+        try:
+            self.db.execute("ALTER DATABASE %s OWNER TO %s" % (q(self.database), q(creator)))
+            self.db.execute("CREATE SCHEMA %s AUTHORIZATION pg_database_owner" % q(schema))
+            with self.db.transaction() as tx:
+                tx.execute("SET LOCAL ROLE %s" % q(creator))
+                tx.execute("CREATE TABLE %s.agent_registry (id serial PRIMARY KEY)" % q(schema))
+                tx.execute("CREATE FUNCTION %s.%s() RETURNS int LANGUAGE sql AS 'SELECT 1'"
+                           % (q(schema), q(helper)))
+            # L'objet étranger est créé par le superutilisateur puis possédé par
+            # un autre rôle : le propriétaire du schéma ne peut pas l'accorder.
+            self.db.execute("CREATE FUNCTION %s.%s() RETURNS boolean LANGUAGE sql"
+                            " AS 'SELECT true'" % (q(schema), q(foreign)))
+            self.db.execute("ALTER FUNCTION %s.%s() OWNER TO %s"
+                            % (q(schema), q(foreign), q(other)))
+            for name in (helper, foreign):
+                self.db.execute("REVOKE ALL ON FUNCTION %s.%s() FROM PUBLIC, %s"
+                                % (q(schema), q(name), q(executor)))
+            result = self.run_script(executor, schema=schema, applying_role=creator)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(self.db.query(
+                "SELECT has_function_privilege(%s, %s, 'EXECUTE') AS p",
+                (executor, "%s.%s()" % (q(schema), q(helper))))[0]["p"],
+                "la fonction applicative du propriétaire reste exécutable")
+            self.assertFalse(self.db.query(
+                "SELECT has_function_privilege(%s, %s, 'EXECUTE') AS p",
+                (executor, "%s.%s()" % (q(schema), q(foreign))))[0]["p"],
+                "la fonction d'un autre propriétaire n'est pas accordée")
+        finally:
+            self.db.execute("ALTER DATABASE %s OWNER TO %s" % (q(self.database), q(old_owner)))
+            self.db.execute("DROP SCHEMA IF EXISTS %s CASCADE" % q(schema))
+            for role in (executor, other, creator):
+                self.db.execute("DROP OWNED BY %s" % q(role))
+                self.db.execute("DROP ROLE %s" % q(role))
 
     def test_future_objects_receive_data_grants(self):
         self.db.execute("CREATE TABLE executor_future (id bigserial PRIMARY KEY, body text)")

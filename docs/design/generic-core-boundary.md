@@ -78,9 +78,10 @@ tooling provider in `DELIVERY_CONNECTORS` and read through
 declared merge, `work merged`) or `{action}` (a merge confirmed by the gate).
 L101 tranche 4 (#4357) integrates `dev` on the Module interface: `discover()`
 lists it as a built-in tooling module with the `workspaces` capability and no
-work item type. It is always active, and the canon still cannot select it (a
-descriptor without types is refused in a project policy) until L98 T2 defines
-activation by federation or host. The core obtains the workspaces façade
+work item type. It is always active, and the canon cannot select it (a
+descriptor without types is refused in a project policy). Project policy
+activation applies to modules with work item types. The core obtains the
+workspaces façade
 through `registry.get("dev")`; its `audit` hook delegates the `canon check`
 workspace findings (`host-work-dir-*`, `host-workspaces-unknown`) under the
 Module interface. Those settings are host-scoped, so `modules.audit` runs the
@@ -112,12 +113,24 @@ are `sys.modules` aliases of the same module object, so importers and tests
 patching a module global by the old name keep working;
 `tests/test_l100_dev_aliases.py` pins identity and patching for both. Those two
 aliases are the only new direct module imports outside `modules/`, declared as
-exceptions in `tests/test_generic_core.py` until L104 removes them.
+exceptions in `tests/test_generic_core.py` until a separately reviewed
+compatibility cleanup removes them.
 
-The boundary check preserves the current runtime behavior. Module activation,
-renamed persisted states, validation as a stored state, extraction of development
-and forge tooling, vocabulary selection and declarative pipelines are subsequent
-parts of the generic-core transition.
+Installed module activation is compiled from `extensions.ameesh.modules`,
+`teams.<team>.modules` and `projects.<project>.modules` in the trusted canon.
+The narrowest scope that names a module supplies its options; project wins over
+team and federation. `canon sync` applies these policies to `project_modules`;
+`ameesh modules --active` reads the applied rows (or compiles the local canon
+when no database is reachable), while `doctor` compares declarations, installed
+descriptors and applied policies. Discovery remains separate from activation.
+The standard profile includes the always-active `dev` tooling provider, whose
+CLI is available through `ameesh module dev`; existing command aliases are
+retained. The bare profile has neither built-ins nor external entry points,
+and workspace operations without `dev` are no-ops.
+
+The site's [Core and modules](../../site/docs/concepts/core-and-modules.md)
+page describes this installed-module architecture. Removal of compatibility
+adapters remains separate work.
 
 L99 tranche 5 (#4353, owner decision #164165, signed approval #167) stores
 both development delivery phases under `state = delivered`. Unpinned dev

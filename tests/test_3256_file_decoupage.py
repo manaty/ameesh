@@ -28,7 +28,10 @@ def agent(name, *, idle=True, project="ameesh", **extra):
     row = {"name": name, "mode": "execute", "status": "idle", "lease_live": True,
            "lease_owner": "runner:h1", "unread": 0, "assigned_lot_id": None,
            "active_lots": 0, "actionable_lots": 0 if idle else 1,
-           "projects": [project], "responsible": "human:alice"}
+           "projects": [project], "responsible": "human:alice",
+           # #4779 : profil de relecteur prouvé (capacité `propose`, un rôle).
+           "capabilities": ["read", "report-drift", "propose"],
+           "roles": ["implementation"]}
     row.update(extra)
     return row
 
@@ -39,9 +42,16 @@ def team(idle: int, busy: int, project="ameesh", prefix="dev"):
                for i in range(busy)])
 
 
+def _footprint(db, item, *paths):
+    """#4717 : l'empreinte déclarée du lot, comme `work assign` la lit."""
+    storage.of(db).work_footprints.replace(int(item["id"]), "manual",
+                                           list(paths), actor="test")
+
+
 class MeasureTest(unittest.TestCase):
-    def measures(self, listing, lots=(), waits=None):
-        return fd.measure(listing, list(lots), waits or {}, 1000.0, [], configured=False)
+    def measures(self, listing, lots=(), waits=None, footprint=None):
+        return fd.measure(listing, list(lots), waits or {}, 1000.0, [],
+                          configured=False, footprint=footprint)
 
     def test_critical_external_and_ephemeral_agents_are_not_wakeable(self):
         listing = team(1, 1) + [agent("auditeur"), agent("chat", mode="externe"),
@@ -63,6 +73,16 @@ class MeasureTest(unittest.TestCase):
                             waits={2: {"what": "dependency", "lots": [9]}})
         self.assertEqual(out["ameesh"].startable, [1])
         self.assertEqual(out["nexlink"].startable, [3])
+
+    def test_a_lot_held_by_the_footprint_is_not_startable(self):
+        # #4717 : la garde d'empreinte (#3185) s'applique au déclencheur de
+        # découpage comme au débit (#4561) : un lot recouvert par un lot en
+        # cours n'est pas un lot démarrable offert aux agents au repos.
+        lots = [{"id": 1, "state": "intake", "app": "ameesh", "type": "evolution"},
+                {"id": 2, "state": "intake", "app": "ameesh", "type": "evolution"}]
+        out = self.measures(team(1, 0), lots,
+                            footprint={2: [{"id": 9, "state": "build"}]})
+        self.assertEqual(out["ameesh"].startable, [1])
 
 
 class HeldTest(unittest.TestCase):
@@ -188,6 +208,21 @@ class PassTest(PgTestCase):
         self.run_pass(0)
         self.assertEqual(self.run_pass(3600), [])
         self.assertEqual(self.split_lots(), [])
+
+    def test_a_covered_lot_does_not_hold_the_split(self):
+        # #4717, témoin de bout en bout : un lot d'intake recouvert par un lot
+        # en cours n'est pas démarrable ; le projet n'a donc aucun lot
+        # démarrable et le découpage se déclenche comme si la file était vide.
+        occupe = work.add(self.db, title="occupe", app="ameesh", actor="test")
+        self.db.execute("UPDATE work_items SET state = 'build', assignee = 'devb0'"
+                        " WHERE id = %s", (occupe["id"],))
+        recouvert = work.add(self.db, title="recouvert", app="ameesh", actor="test")
+        _footprint(self.db, occupe, "src/ameesh/x.py")
+        _footprint(self.db, recouvert, "src/ameesh/x.py")
+        self.run_pass(0)
+        out = self.run_pass(1800)
+        self.assertEqual([g["kind"] for g in out], ["split"])
+        self.assertEqual(len(self.split_lots()), 1)
 
     def test_no_split_under_twenty_percent(self):
         listing = team(1, 9)

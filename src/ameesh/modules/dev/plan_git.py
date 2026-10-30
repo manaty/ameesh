@@ -1847,6 +1847,10 @@ DEFAULT_TARGETS = ("origin/main", "main", "origin/master", "master")
 INTEGRATION_BRANCHES = ("develop", "main", "master")
 #: #746 : préfixes d'intégration admis (`release/1.10.0`)
 INTEGRATION_PREFIXES = ("release/",)
+#: #4562 : une branche de porteur de paquet (`packet_link.PACKET_PREFIX`).
+#: Sa tête n'est une observation de la forge que si elle y est publiée : la
+#: composition de `paquet-auto` crée la branche locale avant de la pousser.
+PACKET_BRANCH_PREFIX = "integration/"
 #: #746 : refs d'intégration essayées au plus par dépôt et par relevé
 MAX_TARGET_CANDIDATES = 8
 #: une ligne `ameesh-work: <id>` désigne un lot précis (message d'un commit de
@@ -2983,6 +2987,46 @@ def _published_target_state(repo: str, sha: str, target: str,
     return "absent", None
 
 
+def _published_branch_state(repo: str, branch: str, tip: str,
+                            cache: dict) -> tuple[str, str | None]:
+    """#4562 : la pointe d'une branche de porteur est-elle publiée sur la forge ?
+
+    `branch_head` est une observation de la forge, pas d'un clone. Pour une
+    branche `integration/**`, `paquet-auto` crée la branche et avance sa tête
+    **localement** avant de la pousser : un balayage qui lit le clone d'un
+    agent y verrait une tête non publiée, l'enregistrerait comme « vue en
+    avance », et la garde #4501 la prendrait ensuite pour une tête poussée.
+
+    `git ls-remote` une fois par relevé et par (dépôt, branche) via `cache`.
+    Rend `("published", ref)`, `("unpublished", pourquoi)` (la forge ne porte
+    pas cette pointe), ou `("unknown", pourquoi)` (forge illisible, sans
+    remote) : l'appelant n'enregistre que `published`.
+    """
+    key = (repo, branch, "branch")
+    if key not in cache:
+        cache[key] = _remote_head(repo, branch)
+    kind, value = cache[key]
+    if kind == "local":
+        return "unknown", "no origin remote: the branch head is not published"
+    if kind == "absent":
+        return "unpublished", "origin has no branch %s" % branch
+    if kind == "error":
+        return "unknown", value
+    if same_commit(value, tip):
+        return "published", "origin/" + branch
+    # Une pointe plus ancienne, déjà poussée puis dépassée sur la forge, est
+    # publiée elle aussi : on ne l'enregistre que si elle est sur la chaîne
+    # de la tête distante, avec son commit présent au clone.
+    remote = _commit(repo, value)
+    if remote is None:
+        _fetch_missing(repo, value, branch)
+        remote = _commit(repo, value)
+    if remote is not None and _is_ancestor(repo, tip, remote):
+        return "published", "origin/" + branch
+    return "unpublished", ("origin/%s is at %s, not the local head %s"
+                           % (branch, str(value)[:12], str(tip)[:12]))
+
+
 def _content_ancestor(repo: str, sha: str, target: str, *,
                       at_ts: float | None = None, absent=()) -> bool:
     """#1005 : le commit gelé est-il ancêtre de la cible ? C'est la preuve par
@@ -3897,29 +3941,48 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                             "cannot be read (%s)"
                             % (branch, found["tip"][:12], target, detail))
                 elif not dry_run:
-                    # #346 r2 : une pointe inchangée relevée avant la fusion
-                    # partielle l'est de nouveau, puisqu'elle est encore là
-                    if implicit:
-                        # L118b : la branche implicite devient celle du lot (journal) ;
-                        # #2102 : sauf détachement ou branche posés pendant le relevé
-                        work_mod.attach_implicit_branch(
-                            db, lot, branch, actor=actor or "git:%s" % target,
-                            source="the merge sweep: lot/%d branch" % lot)
-                    # #4508 : une pointe qui n'est pas un commit de la branche
-                    # (sa base, la pointe d'un autre lot ou d'un porteur) n'est
-                    # pas un travail propre : rien n'est enregistré, le lot
-                    # reste ouvert.
-                    own, why = _own_commit_evidence(
-                        repo, branch, found["tip"], target, frozen_sha)
-                    if not own:
-                        if entry["result"] != "off-target" \
-                                and entry["how"] in (None, "unverified"):
-                            entry["how"] = "no-work"
-                            entry["detail"] = (
-                                "%s (%s): %s — no work of its own; the lot is kept "
-                                "open" % (branch, found["tip"][:12], why))
-                    else:
-                        st.work.set_branch_head(lot, branch, found["tip"])
+                    # #4562 : pour un porteur de paquet (`integration/**`), une
+                    # tête locale non poussée n'est pas un relevé de la forge.
+                    # `paquet-auto` crée et avance la branche dans le clone
+                    # avant de la pousser ; l'enregistrer ferait croire à la
+                    # garde #4501 que cette tête est déjà poussée.
+                    record_head = True
+                    if str(branch).startswith(PACKET_BRANCH_PREFIX):
+                        published, why = _published_branch_state(
+                            repo, branch, found["tip"], fresh_heads)
+                        if published != "published":
+                            record_head = False
+                            entry["how"] = ("unpublished" if published == "unpublished"
+                                            else "unverified")
+                            if entry["result"] != "off-target":
+                                entry["detail"] = (
+                                    "%s (%s) is not recorded as seen ahead: its "
+                                    "head is not published on the forge (%s)"
+                                    % (branch, found["tip"][:12], why))
+                    if record_head:
+                        # #346 r2 : une pointe inchangée relevée avant la fusion
+                        # partielle l'est de nouveau, puisqu'elle est encore là
+                        if implicit:
+                            # L118b : la branche implicite devient celle du lot (journal) ;
+                            # #2102 : sauf détachement ou branche posés pendant le relevé
+                            work_mod.attach_implicit_branch(
+                                db, lot, branch, actor=actor or "git:%s" % target,
+                                source="the merge sweep: lot/%d branch" % lot)
+                        # #4508 : une pointe qui n'est pas un commit de la branche
+                        # (sa base, la pointe d'un autre lot ou d'un porteur) n'est
+                        # pas un travail propre : rien n'est enregistré, le lot
+                        # reste ouvert.
+                        own, why = _own_commit_evidence(
+                            repo, branch, found["tip"], target, frozen_sha)
+                        if not own:
+                            if entry["result"] != "off-target" \
+                                    and entry["how"] in (None, "unverified"):
+                                entry["how"] = "no-work"
+                                entry["detail"] = (
+                                    "%s (%s): %s — no work of its own; the lot is kept "
+                                    "open" % (branch, found["tip"][:12], why))
+                        else:
+                            st.work.set_branch_head(lot, branch, found["tip"])
             results.append(entry)
             continue
         if dry_run:

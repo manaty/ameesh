@@ -229,6 +229,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "merge_blocked",
                  # #194 r6: a PR merged into a wrong base, or not checked
                  "land_uncertain", "db_connections_high",
+                 # #4609 : la sauvegarde quotidienne de la base du mesh n'a pas
+                 # lu la base dans sa fenêtre — le propriétaire doit le savoir
+                 "mesh_backup_unseen",
                  # #513 : la dépense comptée s'écarte des soldes (barème faux)
                  "budget_drift",
                  # #532: a local PgBouncer pool queues its mesh clients
@@ -277,6 +280,7 @@ TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per
 #: libellés lisibles des types (R12 : un humain lit ces messages)
 TYPE_LABELS = {
     "db_connections_high": "database connection capacity",
+    "mesh_backup_unseen": "mesh database backup not seen",
     "pgbouncer_pool_waiting": "local PgBouncer clients waiting",
     "pgbouncer_console_unreadable": "local PgBouncer console unreadable",
     "stopped_with_mail": "agent stopped with mail",

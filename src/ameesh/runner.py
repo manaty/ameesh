@@ -11960,7 +11960,9 @@ class Runner:
                 # libère les caches au lieu d'attendre le quota.
                 free_target=int((self._host_limits or {}).get("min_disk_free") or 0),
                 # L230: the worktrees are walked at most every few hours
-                artifact_scan=build_artifacts.due(time.time()))
+                artifact_scan=build_artifacts.due(time.time()),
+                # #4754 : les unités de veille de l'hôte, re-épinglées
+                units_dir=workspaces.host_units_dir())
             self.expire_threads_once(db)
             self.sweep_dead_letters_once(db)
             faits = [e for e in report["entries"] if e["kind"] != "mesure"]

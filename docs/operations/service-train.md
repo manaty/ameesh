@@ -229,6 +229,22 @@ fichiers de garde intacts ; un retour arrière exige une requalification relue.
 Un changement de `mode`, de `canon`, de dépôt ou de cible exige toujours un
 redémarrage ; seul l'épinglage est relu.
 
+Si la plage modifie les fichiers de garde, utiliser `requalify --reviewed
+--lot <lot> --review milestone:<id>` (option `--review` répétable). Des avis
+sur la porte finale qualifient toute la plage. Quand les PR successives ont
+des auteurs de plusieurs familles, fournir les avis de chaque PR qui modifie
+un fichier de garde, ainsi qu'un avis actuel du pilote sur la porte finale.
+Les références intermédiaires activent la qualification par premier parent :
+chaque PR conserve ses propres auteurs et avis indépendants, sans cumuler les
+familles des auteurs des autres PR. Une fusion propre peut reprendre les
+avis sur sa tête de PR exacte ; une fusion modifiée ou conflictuelle exige
+des avis sur le commit de fusion. L'épingle doit appartenir à cette chaîne
+de premiers parents. Les oppositions sur les têtes ou leurs fusions restent
+bloquantes ; les règles de la plage restent un plancher. Toutes les preuves
+sont vérifiées avant la première écriture et gardées dans la trace de
+requalification. `--dry-run` vérifie ces mêmes conditions sans déplacer
+l'épingle.
+
 Quand le commit est le même et que seules les autres lectures des règles
 diffèrent (`gate_rules_gap`), il n'y a aucun commit à requalifier : aligner les
 sources de la porte sur le canon épinglé (références configurées,
