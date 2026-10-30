@@ -93,10 +93,10 @@ class LinuxAccounts:
             return True
 
     def create_group(self,gid,name=NAME):
-        self.command(['/usr/bin/groupadd','--system','--gid',str(gid),name])
+        self.command(['/usr/sbin/groupadd','--system','--gid',str(gid),name])
 
     def create_account(self,uid,gid,name=NAME,home=HOME):
-        self.command(['/usr/bin/useradd','--system','--uid',str(uid),'--gid',str(gid),
+        self.command(['/usr/sbin/useradd','--system','--uid',str(uid),'--gid',str(gid),
                       '--home-dir',home,'--no-create-home','--no-log-init',
                       '--shell','/bin/sh','--password','*',name])
 
