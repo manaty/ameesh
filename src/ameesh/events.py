@@ -15,6 +15,9 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
   turn.stages          the stage receipt of a mail turn: per-stage timestamps
                        and durations from the message to the harness's first
                        output (#3218, written by the runner, `turn_stages`)
+  turn.context         the labelled context measures of a turn
+                       (`ameesh-context/1`) next to its legacy counters and
+                       the close/rotation values (#4870, observation only)
   agent.updated        another change of status, lease, mode or stop reason
   agent.moved          a manual move of a `releve: hote` agent to another
                        admitted host (#3299, written with the move)
@@ -84,7 +87,8 @@ import time
 from . import storage
 
 CHANNEL = "ameesh_events"
-TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages", "agent.updated",
+TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages",
+         "turn.context", "agent.updated",
          "agent.moved",
          "cost.recorded", "thread.entry", "decision.created", "decision.closed",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",

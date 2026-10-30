@@ -46,7 +46,7 @@ un zéro de sortie n'est **pas** une mesure d'``O_last`` (contrat §2.2).
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 SCHEMA = "ameesh-context/1"
@@ -89,6 +89,10 @@ REASON_NO_SESSION = "no_session"
 REASON_SESSION_MISMATCH = "session_mismatch"
 REASON_CALL_ID_UNKNOWN = "call_id_unknown"
 REASON_CALL_BOUND_REACHED = "call_bound_reached"
+#: #4870 : une collecte de tour perdue (worker mort, réparation par un autre)
+#: laisse un trou dans `R_session` ; la base reste inconnue, jamais un total
+#: supposé reconstruit.
+REASON_COLLECTION_LOST = "collection_lost"
 
 #: une valeur de flux est un entier positif ; au-delà, un flux pathologique ne
 #: fait pas grossir la mémoire du tour (contrat §2.2, budget de performance).
@@ -446,11 +450,16 @@ class TurnNormalizer:
                  turn: str | None = None, model: str | None = None,
                  mode: str | None = None, role: str | None = None,
                  source: str = SOURCE_STREAM, session_reread: int | None = None,
+                 session_reread_quality: str = MEASURED,
+                 session_reread_reasons: Iterable[str] = (),
                  cumulative: Mapping | None = None,
                  reread_source: str = "auto", max_calls: int = MAX_CALLS):
         if reread_source not in ("auto", "calls", "totals"):
             raise ContextMetricsError(
                 "reread_source must be auto, calls or totals")
+        if session_reread_quality not in QUALITIES:
+            raise ContextMetricsError(
+                "session_reread_quality must be one of %s" % ", ".join(QUALITIES))
         self.convention = convention(harness)
         self.harness = self.convention.harness
         self.session = str(session) if session else None
@@ -460,6 +469,12 @@ class TurnNormalizer:
         self.role = role
         self.source = source
         self.session_reread = session_reread
+        #: qualité et raisons de la base ``R_session`` : une base partielle
+        #: (trou dans un tour précédent) ne devient jamais ``measured`` après
+        #: l'ajout d'un tour complet (#4870, B cx1). ``None`` = inconnue.
+        self.session_reread_quality = session_reread_quality
+        self.session_reread_reasons = tuple(str(r) for r in
+                                            (session_reread_reasons or ()))
         self.reread_source = reread_source
         self.max_calls = max(1, int(max_calls))
         self._calls: list[CallMeasure] = []
@@ -643,6 +658,13 @@ class TurnNormalizer:
         r_turn = principal["R_turn"]
         if self.session is not None and not self._session_mismatch \
                 and r_turn.value is not None and self.session_reread is not None:
+            # La base garde la qualité du cumul : un tour partiel laisse la
+            # session partielle pour les tours suivants du même normalisateur.
+            self.session_reread_quality = MEASURED if (
+                self.session_reread_quality in (MEASURED, DERIVED)
+                and r_turn.quality in (MEASURED, DERIVED)) else PARTIAL
+            self.session_reread_reasons = _reasons(
+                self.session_reread_reasons, r_turn.reasons)
             self.session_reread += int(r_turn.value)
 
         all_measures = list(principal.values())
@@ -785,7 +807,9 @@ class TurnNormalizer:
         if self.session is None:
             return Measure(None, UNKNOWN, (REASON_NO_SESSION,), "session", "none")
         if self.session_reread is None:
-            return Measure(None, UNKNOWN, (REASON_SESSION_BASELINE_UNKNOWN,),
+            return Measure(None, UNKNOWN,
+                           _reasons((REASON_SESSION_BASELINE_UNKNOWN,),
+                                    self.session_reread_reasons),
                            "session", SOURCE_LEDGER)
         if r_turn.value is None:
             # §2.1 : sans tour mesuré, R_session est null, jamais le seul cumul
@@ -793,9 +817,14 @@ class TurnNormalizer:
             return Measure(None, UNKNOWN,
                            _reasons((REASON_TURN_NOT_MEASURED,), r_turn.reasons),
                            "session", SOURCE_LEDGER)
-        quality = MEASURED if r_turn.quality == MEASURED else PARTIAL
+        # Une base partielle le reste : la somme est un minorant nommé, jamais
+        # un total « measured » parce que le tour courant, lui, est complet.
+        quality = MEASURED if (self.session_reread_quality in (MEASURED, DERIVED)
+                               and r_turn.quality in (MEASURED, DERIVED)) \
+            else PARTIAL
+        reasons = _reasons(self.session_reread_reasons, r_turn.reasons)
         return Measure(int(self.session_reread) + int(r_turn.value), quality,
-                       r_turn.reasons, "session", SOURCE_LEDGER)
+                       reasons, "session", SOURCE_LEDGER)
 
 
 def normalize_turn(harness: str | None, events, **kwargs) -> dict:
