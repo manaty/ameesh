@@ -2,10 +2,12 @@
 
 The design of ameesh is written down in the repository, under
 [`docs/design/`](https://github.com/manaty/ameesh/tree/main/docs/design).
-These documents are **in French**.
+The specification and decision records are **in French**; some architecture
+documents are in English.
 
 | Document | Content |
 |---|---|
+| [`generic-core-boundary.md`](https://github.com/manaty/ameesh/blob/main/docs/design/generic-core-boundary.md) | core responsibilities, module registry, activation and the bare profile |
 | [`specification.md`](https://github.com/manaty/ameesh/blob/main/docs/design/specification.md) | the v1 specification: scope, architecture, canon, execution, threads, actions and gate, receipts, ameesh-approve, storage, security guarantees, lot plan |
 | [`exigences.md`](https://github.com/manaty/ameesh/blob/main/docs/design/exigences.md) | the requirements |
 | [`decisions/`](https://github.com/manaty/ameesh/tree/main/docs/design/decisions) | the owner's decisions, one file each (OKF `Decision` cards) |
