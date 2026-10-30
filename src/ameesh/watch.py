@@ -95,6 +95,10 @@ FIRING_TIMEOUT_S = 300
 IDENTITY_ENV = "AGENT_MAIL_NAME"
 #: the slug of a wake names its units and its state file
 WAKE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+#: #4755: the exec line of a wake unit (`watch fire --agent A --wake S`)
+LEGACY_FIRE_RE = re.compile(
+    r"\bwatch fire --agent (?P<agent>\S+) --wake (?P<slug>[a-z0-9][a-z0-9-]{0,40})\s*$",
+    re.M)
 #: a wake fires at least this far in the future
 MIN_WAKE_S = 10
 #: the identity witness reads the installed unit back through these two
@@ -448,6 +452,60 @@ def _disarm(directory: str, agent: str, slug: str, run: Callable) -> None:
     _systemctl_quiet(run, "daemon-reload")
 
 
+def _legacy_wake_name(agent: str, slug: str, suffix: str) -> str:
+    """#4755: the name a wake carried before #1039 (`ameesh-watch-<agent>-<slug>`)."""
+    return "%s%s-%s.%s" % (UNIT_PREFIX, agent, slug, suffix)
+
+
+def _legacy_wake_of(directory: str, name: str) -> tuple[str, str] | None:
+    """(agent, slug) when the service `name` is a wake armed before #1039, read
+    from its exec line; None otherwise. The name alone does not tell: it is
+    also the periodic watch of an agent called `<agent>-<slug>` (#1039), whose
+    service runs `watch send`, never `watch fire`."""
+    if not (name.startswith(UNIT_PREFIX) and name.endswith(".service")):
+        return None
+    try:
+        with open(os.path.join(directory, name), encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    found = LEGACY_FIRE_RE.search(text)
+    if not found or _legacy_wake_name(found["agent"], found["slug"], "service") != name:
+        return None
+    return found["agent"], found["slug"]
+
+
+def _disarm_legacy(directory: str, agent: str, slug: str, run: Callable) -> bool:
+    """Stops and removes the wake `<slug>` of `agent` armed under the prefix
+    before #1039, if its service is one; True when it was removed."""
+    if _legacy_wake_of(directory, _legacy_wake_name(agent, slug, "service")) != (agent, slug):
+        return False
+    _systemctl_quiet(run, "stop", _legacy_wake_name(agent, slug, "timer"))
+    _remove_files(directory, [_legacy_wake_name(agent, slug, suffix)
+                              for suffix in ("service", "timer", "env", "wake.json")])
+    _systemctl_quiet(run, "daemon-reload")
+    return True
+
+
+def prune_legacy_wakes(directory: str, run: Callable) -> list[str]:
+    """#4755: removes the wakes armed before #1039 left on this host. Their
+    firing looks for the state under the new prefix, never finds it and, under
+    `Restart=on-failure`, restarts every 2 min forever (8622 restarts of
+    `ameesh-watch-deepseek1-1369-m24h.service` since 2026-10-18). Their
+    deadline passed long ago: the stale message is not sent. The names of
+    the wakes removed."""
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    removed = []
+    for name in names:
+        pair = _legacy_wake_of(directory, name)
+        if pair and _disarm_legacy(directory, pair[0], pair[1], run):
+            removed.append(name[:-len(".service")])
+    return removed
+
+
 def _systemctl(run: Callable, *args: str) -> None:
     """`systemctl --user …`; WatchError when it fails."""
     try:
@@ -746,6 +804,7 @@ def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
         raise WatchError("wake deadline elapsed before arming: choose a future --at")
     directory = unit_dir(env)
     os.makedirs(directory, exist_ok=True)
+    prune_legacy_wakes(directory, run)
     source = os.environ if env is None else env
     path = source.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
     files = wake_units(agent, slug, delay_s, _ameesh_binary(), path, directory,
@@ -849,6 +908,14 @@ def fire(cfg: Config, db, agent: str, slug: str, *,
     try:
         with open(state_path, encoding="utf-8") as fh:
             state = json.load(fh)
+    except FileNotFoundError:
+        # #4755: no state, nothing to send — and a failure would restart the
+        # unit every 2 min forever (`Restart=on-failure`): the wake disarms
+        # itself, under either prefix, and the firing succeeds.
+        legacy = _disarm_legacy(directory, agent, slug, run)
+        _disarm(directory, agent, slug, run)
+        return ("wake %s of %s: no state left (%s), nothing sent; its units are removed"
+                % (slug, agent, "armed before #1039" if legacy else "already fired or cancelled"))
     except (OSError, ValueError) as exc:
         raise WatchError("wake %s of %s: no readable wake (%s)"
                          % (slug, agent, exc)) from exc
