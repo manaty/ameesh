@@ -321,6 +321,17 @@ Credential values, authorized-key options/comments, shell text and arbitrary
 paths are refused. Every output file has a fixed destination, ownership, mode,
 content and SHA-256; the complete review inventory has its own digest.
 
+The restart policy requires an explicit closed `manager` object: either
+`{"kind":"system"}` or `{"kind":"user","account":"ameesh"}`. The account must
+match `[a-z_][a-z0-9_-]{0,31}`. Missing or unknown fields are refused; existing
+inventories must be regenerated and approved with the new policy digest.
+One manager applies to every runner in that policy, independently of unit names.
+For a user manager the root helper uses fixed `systemctl --machine=<account>@.host
+--user show|restart` arguments. It inspects the returned cgroup under `user.slice`
+with the same subtree/orphan checks as system runners. The transient action job,
+its state observation and durable receipt remain in the system manager. Neither
+manager nor account can be supplied by the SSH request.
+
 The public-key file is root-owned 0644 so the dedicated SSH account can read it;
 the enclosing root-owned directory must be searchable. Enrollment, database,
 operation and journal files remain root-private. Both the key and account force
