@@ -8,7 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ameesh import release_cutoff, staging_executor as executor, staging_watch
+from ameesh import (release_cutoff, role_run, staging_executor as executor,
+                    staging_watch)
 
 
 def running(run, deadline=600):
@@ -30,7 +31,9 @@ class ExecutorTest(unittest.TestCase):
         self.cfg = types.SimpleNamespace(host="host-a")
         self.request = dict(request="request-1", sha="a" * 40, state="pending")
         self.proofs = []
+        self.attested = []
         self.calls = []
+        self.renewals = []
         self.held = False
         #: #4885: sequences of other paths in the shared progress log
         self.foreign = []
@@ -40,12 +43,17 @@ class ExecutorTest(unittest.TestCase):
             record=self.record, recent_type=self.recent,
             latest_type=lambda *a: self.foreign),
             work=types.SimpleNamespace(land_lock=lambda *a, **kw: 1))
+        def renewing(lease, execution, stop):
+            self.renewals.append(stop)
+            stop.wait(5)
         patches = [
             mock.patch.object(executor.storage, "of", return_value=store),
             mock.patch.object(executor.role_run, "live", side_effect=lambda *_: dict(
                 held=True, holder=self.cfg.host)),
             mock.patch.object(executor, "ExecutionLease"),
             mock.patch.object(executor.role_run, "_AlertsExecution"),
+            mock.patch.object(executor.role_run, "_watch_alerts_lease",
+                              side_effect=renewing),
             mock.patch.object(executor.role_run, "_run_under_lease", side_effect=self.run_child),
             mock.patch.object(executor.subprocess, "run"),
             mock.patch.object(release_cutoff, "_worktree", return_value=("folder", "tree")),
@@ -57,6 +65,7 @@ class ExecutorTest(unittest.TestCase):
         executor.ExecutionLease.return_value.acquire.return_value = 1
         executor.ExecutionLease.return_value.remaining.return_value = 60
         executor.ExecutionLease.return_value.epoch = 1
+        executor.ExecutionLease.return_value.ttl = 60.0
         executor.role_run._AlertsExecution.return_value.lost.is_set.return_value = False
 
     def record(self, kind, key, project, data):
@@ -67,9 +76,11 @@ class ExecutorTest(unittest.TestCase):
     def recent(self, kind, days, limit, object=None):
         if kind == executor.EVENT:
             return [dict(data=self.request)] if self.request else []
+        if kind == release_cutoff.STAGING_EVENT:
+            return self.attested
         return self.proofs
 
-    def run_child(self, argv, env, *_):
+    def run_child(self, argv, env, *_args, **_kwargs):
         self.calls.append((argv, env))
         if argv[0] == "bash":
             self.proofs = [dict(data=dict(state="completed"))]
@@ -98,7 +109,7 @@ class ExecutorTest(unittest.TestCase):
 
     def test_negative_probe_never_starts_deployment(self):
         self.request.update(state="running", host="host-a", run="attempt-a")
-        executor.role_run._run_under_lease.side_effect = lambda *a: (1, False)
+        executor.role_run._run_under_lease.side_effect = lambda *a, **k: (1, False)
         result = executor.tick(self.db, self.cfg, self.options)
         self.assertEqual(result["state"], "blocked")
         release_cutoff._worktree.assert_not_called()
@@ -117,7 +128,7 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_partial_success_does_not_require_quiescence_on_next_request(self):
-        def partial(*args):
+        def partial(*args, **kwargs):
             self.proofs = [dict(data=dict(state="partial"))]
             return 0, False
         executor.role_run._run_under_lease.side_effect = partial
@@ -133,8 +144,72 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(calls[1].args[0][3], "merge-base")
 
     def test_zero_exit_without_attestation_is_failed(self):
-        executor.role_run._run_under_lease.side_effect = lambda *a: (0, False)
+        executor.role_run._run_under_lease.side_effect = lambda *a, **k: (0, False)
         self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"], "failed")
+
+    def test_missing_terminal_snapshot_is_settled_by_the_attestation(self):
+        def child(*args, **kwargs):
+            self.proofs = []
+            self.attested = [dict(id=5, data=dict(sha="a" * 40))]
+            return 0, False
+        executor.role_run._run_under_lease.side_effect = child
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"],
+                         "completed")
+
+    def test_attestation_older_than_the_attempt_does_not_settle_it(self):
+        def child(*args, **kwargs):
+            self.proofs = []
+            self.attested = [dict(id=1, data=dict(sha="a" * 40))]
+            return 0, False
+        executor.role_run._run_under_lease.side_effect = child
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"],
+                         "failed")
+
+    def test_one_renewal_loop_covers_prelaunch_and_child(self):
+        self.request.update(state="running", host="host-a", run="attempt-a")
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"],
+                         "completed")
+        self.assertEqual(len(self.renewals), 1)
+        self.assertTrue(self.renewals[0].is_set())
+        self.assertEqual(executor.role_run._run_under_lease.call_count, 2)
+        for call in executor.role_run._run_under_lease.call_args_list:
+            self.assertIs(call.kwargs.get("watch"), False)
+
+    def test_record_renewal_extends_the_local_deadline(self):
+        executor.tick(self.db, self.cfg, self.options)
+        executor.ExecutionLease.return_value.note_renewed.assert_called()
+
+    def test_retained_worktree_is_removed_only_after_proven_stop(self):
+        self.request.update(state="running", host="host-a", run="attempt-a")
+        with mock.patch.object(executor, "_drop_retained") as retained:
+            result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "completed")
+        retained.assert_any_call(str(self.root.resolve()), "attempt-a")
+        self.request.update(state="running", host="host-a", run="attempt-a")
+        executor.role_run._run_under_lease.side_effect = lambda *a, **k: (1, False)
+        with mock.patch.object(executor, "_drop_retained") as retained:
+            result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "blocked")
+        retained.assert_not_called()
+
+    def test_worktree_is_named_after_the_attempt_run(self):
+        result = executor.tick(self.db, self.cfg, self.options)
+        prefix = release_cutoff._worktree.call_args.kwargs["prefix"]
+        self.assertEqual(prefix, executor._worktree_prefix(result["run"]))
+        self.assertTrue(prefix.startswith(executor.WORKTREE_PREFIX))
+
+    def test_retained_trees_are_scanned_by_run_prefix(self):
+        base = self.root / "base"
+        (base / "repo").mkdir(parents=True)
+        kept = base / ("ameesh-release-staging-deadbeef-1234")
+        (kept / "worktree").mkdir(parents=True)
+        other = base / "ameesh-release-staging-cafe-1234"
+        (other / "worktree").mkdir(parents=True)
+        with mock.patch.object(release_cutoff, "_drop_worktree") as drop:
+            executor._drop_retained(str(base / "repo"), "deadbeef")
+        drop.assert_called_once_with(str(base / "repo"), str(kept),
+                                     str(kept / "worktree"))
+        self.assertTrue(other.is_dir())
 
     def test_resubmitting_failed_attempt_keeps_quiescence_requirement(self):
         self.request.update(state="failed", host="host-a", run="failed-a")
@@ -208,7 +283,7 @@ class ExecutorTest(unittest.TestCase):
             self.db, self.cfg, self.options)["state"], "completed")
 
     def test_child_refused_at_start_requeues_request(self):
-        def busy(argv, env, *_):
+        def busy(argv, env, *_, **__):
             self.calls.append((argv, env))
             return staging_watch.BUSY, False
         executor.role_run._run_under_lease.side_effect = busy
@@ -239,6 +314,18 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(env["STAGING_RUN_ID"], result["run"])
         self.assertNotIn("STAGING_PREVIOUS_RUN", env)
         self.assertNotIn("STAGING_PREVIOUS_HOST", env)
+
+
+class LeaseNoteTest(unittest.TestCase):
+    def test_a_caller_renewal_extends_the_local_deadline(self):
+        lease = role_run._AlertsLease(None, "pilot", "host-a")
+        lease.epoch = 7
+        lease.deadline = time.monotonic() + 1
+        started = time.monotonic()
+        self.assertTrue(lease.note_renewed(7, started))
+        self.assertGreater(lease.remaining(), 40)
+        # A renewal of another holder's epoch never extends ours.
+        self.assertFalse(lease.note_renewed(8, started))
 
 
 if __name__ == '__main__':

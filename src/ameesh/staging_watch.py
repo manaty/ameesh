@@ -4,6 +4,9 @@
 Each event is a complete small snapshot. The independent alerts pass needs
 neither the launcher's filesystem nor its process. A deadline is fixed at
 start; progress never extends it, so even a live but stuck launcher is seen.
+The shared `staging.attested` proof settles a run whose last snapshot
+publication failed (#4898 N2). Request history is read per key: only a later
+completed deployment settles an earlier failure, never a partial one.
 No command, environment, arbitrary log output or credential is journaled.
 """
 from __future__ import annotations
@@ -18,6 +21,9 @@ from ameesh import storage
 
 EVENT = "staging.sequence"
 LIMIT = 1000
+#: Per request key, enough history to expose an older failure behind a later
+#: partial or in-flight request. The object list itself is bounded by LIMIT.
+HISTORY_LIMIT = 200
 TERMINAL = frozenset(("completed", "partial", "failed", "unattested"))
 #: exit code of a refused exclusive start, as the local flock of staging.sh
 BUSY = 75
@@ -116,8 +122,25 @@ def record(db, snapshot: dict, *, exclusive: bool = False,
         return st.events.record(EVENT, "staging-run:" + run, None, data)
 
 
-def findings(rows: list[dict], *, now: float) -> list[dict]:
-    """Latest snapshot of every run; no success inferred from process exit."""
+def _attested_ids(rows) -> dict[str, int]:
+    """Newest shared attestation id per commit (actif.py writes one per sha)."""
+    out = {}
+    for row in rows or ():
+        data = row.get("data") or {}
+        sha = data.get("sha")
+        if isinstance(sha, str) and len(sha) == 40:
+            out[sha] = max(out.get(sha, 0), int(row.get("id") or 0))
+    return out
+
+
+def findings(rows: list[dict], *, now: float, attested=()) -> list[dict]:
+    """Latest snapshot of every run; no success inferred from process exit.
+
+    `attested` carries the shared `staging.attested` events: a successful
+    sequence whose last snapshot publication failed must not be alerted as
+    interrupted (#4898 N2). An attestation settles a run only when it was
+    written after that run's snapshot.
+    """
     latest = {}
     ids = {}
     for row in sorted(rows, key=lambda row: int(row["id"]), reverse=True):
@@ -125,17 +148,21 @@ def findings(rows: list[dict], *, now: float) -> list[dict]:
         if isinstance(data, dict) and data.get("run"):
             latest.setdefault(data["run"], data)
             ids.setdefault(data["run"], int(row["id"]))
+    proofs = _attested_ids(attested)
     out = []
     # Only a complete deployment by the same staging authority settles an
     # earlier failure. A partial run may omit the host that failed.
     completed = {}
     for run, data in latest.items():
-        if data.get("state") == "completed":
+        if (data.get("state") == "completed"
+                or proofs.get(data.get("sha"), 0) > ids[run]):
             scope = data.get("notify", "")
             completed[scope] = max(completed.get(scope, 0), ids[run])
     for run, data in latest.items():
         state = data.get("state")
-        if state in ("completed", "partial") or completed.get(data.get("notify", ""), 0) > ids[run]:
+        if (state in ("completed", "partial")
+                or completed.get(data.get("notify", ""), 0) > ids[run]
+                or proofs.get(data.get("sha"), 0) > ids[run]):
             continue
         if state == "running" and now < float(data["deadline"]):
             continue
@@ -158,36 +185,96 @@ def findings(rows: list[dict], *, now: float) -> list[dict]:
     return out
 
 
+def request_findings(rows: list[dict], *, now: float, attested=()) -> list[dict]:
+    """One alert per request key for the newest failure still unsettled.
+
+    Reading only the latest request per key hid an earlier failed or blocked
+    request behind a later partial one (#4898, P3/N3). History is read here;
+    only a later *completed* deployment, or a shared attestation of the same
+    commit, settles an earlier failure - a partial run may omit the failed
+    host.
+    """
+    proofs = _attested_ids(attested)
+    by_key = {}
+    for row in rows:
+        data = row.get("data")
+        key = row.get("object")
+        if isinstance(data, dict) and key:
+            by_key.setdefault(key, []).append(row)
+    out = []
+    for key in sorted(by_key):
+        group = sorted(by_key[key], key=lambda row: int(row.get("id") or 0),
+                       reverse=True)
+        completed = max((int(row["id"]) for row in group
+                         if (row.get("data") or {}).get("state") == "completed"),
+                        default=0)
+        unsettled = []
+        for row in group:
+            data = row["data"]
+            ident = int(row.get("id") or 0)
+            state = data.get("state")
+            late = (state in ("pending", "running")
+                    and now >= data.get("deadline", float("inf")))
+            if ident <= completed or proofs.get(data.get("sha"), 0) > ident:
+                continue
+            if state in ("completed", "partial"):
+                continue
+            if state == "failed" or data.get("blocked_reason") or late:
+                unsettled.append((row, late))
+        if not unsettled:
+            continue
+        row, late = unsettled[0]
+        data = row["data"]
+        later = sum(1 for other in group
+                    if int(other.get("id") or 0) > int(row.get("id") or 0))
+        detail = ("Staging request %s (%s) blocked: %s; reprise refusée avant "
+                  "preuve d'arrêt et accès de déploiement sur le candidat élu."
+                  % (data.get("request"), str(data.get("sha") or "")[:12],
+                     data.get("blocked_reason")
+                     or ("deadline exceeded" if late else "failed")))
+        if later:
+            detail += (" %d demande(s) ultérieure(s), partielle(s) ou en cours, "
+                       "ne soldent pas cet échec : seul un déploiement completed "
+                       "le solde." % later)
+        out.append(dict(schema="ameesh-alert/1", type="staging_interrupted",
+                        agent=None, since=None, value=None, threshold=None,
+                        reason=key, urgent=True,
+                        orchestrators=([data["notify"]]
+                                       if data.get("notify") else []),
+                        detail=detail))
+    return out
+
+
 def alerts(db, *, now: float) -> list[dict]:
     # Do not swallow a read failure: the caller must keep the alert family
     # unreadable instead of resolving an existing alert through absence.
-    rows = storage.of(db).events.latest_type(EVENT, 60, LIMIT)
+    events = storage.of(db).events
+    rows = events.latest_type(EVENT, 60, LIMIT)
     if len(rows) >= LIMIT:
         raise RuntimeError("staging history truncated; resolution unobservable")
-    out = findings(rows, now=now)
-    requests = storage.of(db).events.latest_type("staging.request", 60, LIMIT)
-    if len(requests) >= LIMIT:
+    from . import release_cutoff
+    attested = events.latest_type(release_cutoff.STAGING_EVENT, 60, LIMIT)
+    if len(attested) >= LIMIT:
+        raise RuntimeError("staging attestations truncated; resolution unobservable")
+    # The latest request per key only names the keys; the read of the history
+    # itself is per key, on the partial (type, object, id) index. Reading one
+    # latest row per key was the bug: a later partial hid an older failure
+    # (#4898, P3/N3).
+    latest_requests = events.latest_type("staging.request", 60, LIMIT)
+    if len(latest_requests) >= LIMIT:
         raise RuntimeError("staging requests truncated; resolution unobservable")
-    seen = set()
-    for row in sorted(requests, key=lambda row: int(row.get("id", 0)), reverse=True):
-        key = row["object"]
-        if key in seen:
+    requests = []
+    for row in latest_requests:
+        key = row.get("object")
+        if not key:
             continue
-        seen.add(key)
-        data = row["data"]
-        state = data.get("state")
-        late = state in ("pending", "running") and now >= data.get("deadline", float("inf"))
-        if state in ("completed", "partial") or not (late or data.get("blocked_reason") or state == "failed"):
-            continue
-        out.append(dict(schema="ameesh-alert/1", type="staging_interrupted", agent=None, since=None,
-                        value=None, threshold=None, reason=key,
-                        urgent=True, orchestrators=[data["notify"]],
-                        detail="Staging request %s (%s) blocked: %s; "
-                               "reprise refusée avant preuve d'arrêt et accès "
-                               "de déploiement sur le candidat élu."
-                               % (data["request"], data["sha"][:12],
-                                  data.get("blocked_reason") or ("deadline exceeded" if late else "failed"))))
-    return out
+        history = events.recent_type("staging.request", 60, HISTORY_LIMIT,
+                                     object=key)
+        if len(history) >= HISTORY_LIMIT:
+            raise RuntimeError("staging requests truncated; resolution unobservable")
+        requests.extend(history)
+    return (findings(rows, now=now, attested=attested)
+            + request_findings(requests, now=now, attested=attested))
 
 
 def main(argv=None) -> int:
