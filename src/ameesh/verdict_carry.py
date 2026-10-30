@@ -919,6 +919,11 @@ def _carried_blocked_on_freeze(marks, freeze) -> bool:
     return bool(merge_queue.blocked_verdicts(marks or (), frozen))
 
 
+def _host(db) -> str:
+    """L'hôte du passage, pour compter les essais de reprise par hôte (#4834)."""
+    return str(getattr(getattr(db, "cfg", None), "host", "") or "").strip()
+
+
 def promote_carried(db, lot: int, *, freeze=None) -> dict:
     """La transition de quorum d'un verdict reporté, comme pour un avis rendu.
 
@@ -947,6 +952,18 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
     freeze = freeze or latest
     if not _carried_ok_on_freeze(marks, freeze):
         return {"result": "idle", "detail": "no carried ok verdict on the frozen head"}
+    # #4834 : un hôte sans dépôt local ne peut pas conclure la porte. Il ne
+    # doit ni écrire de marque ni consommer d'essai (le budget est par hôte) :
+    # le prochain passage d'un hôte qui résout le gel fera la transition.
+    from . import lot_class
+    try:
+        repo, _resolved = lot_class.repo_for_freeze(
+            db, getattr(db, "cfg", None), row, _norm(freeze.get("sha")))
+    except Exception:  # noqa: BLE001 - une sonde ratée ne conclut pas
+        repo = ""
+    if not repo:
+        return {"result": "no-repository",
+                "detail": "the frozen head is unreadable from this host"}
 
     def _attempt():
         work.move(db, lot, "validated", actor=work.SYSTEM_SENDER,
@@ -981,11 +998,13 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
     why = ("%s: %s" % (type(exc).__name__, exc) if not isinstance(exc, work.WorkError)
            else str(exc))
     freeze_id = int((freeze or {}).get("id") or 0)
+    host = _host(db)
     try:
-        # Le compte est celui de **ce** gel : une panne réparée sur un gel
-        # suivant ne doit pas hériter des essais du précédent.
+        # Le compte est celui de **ce** gel et de **cet** hôte : une panne
+        # réparée ailleurs ne doit pas épuiser le budget local.
         seen = storage.of(db).work.events_noted(
-            "%s freeze #%d " % (PENDING, freeze_id), 0.0, ids=[int(lot)])
+            "%s freeze #%d host %s " % (PENDING, freeze_id, host),
+            0.0, ids=[int(lot)])
         attempts = len(seen)
     except Exception:  # noqa: BLE001 - lecture impossible : on s'arrête
         attempts = PENDING_ATTEMPTS
@@ -996,8 +1015,9 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
                  else "no further retry")
         storage.of(db).work.note(
             lot, "qa",
-            "%s freeze #%d — %s — attempt %d/%d, %s (#4834)"
-            % (PENDING, freeze_id, why[:200], attempts + 1, PENDING_ATTEMPTS, retry),
+            "%s freeze #%d host %s — %s — attempt %d/%d, %s (#4834)"
+            % (PENDING, freeze_id, host, why[:200], attempts + 1,
+               PENDING_ATTEMPTS, retry),
             work.SYSTEM_SENDER)
     except Exception:  # noqa: BLE001 - une note ne retient jamais la passe
         pass
@@ -1141,6 +1161,7 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
             str(entry.get("note") or ""))
     wanted = []
     pending_quorum = []
+    host = _host(db)
     for row in rows:
         lot = int(row["id"])
         lot_marks = marks.get(lot, [])
@@ -1149,10 +1170,11 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
             continue
         if pending(lot_marks, freeze.get("sha")):
             wanted.append(lot)
-        label = "%s freeze #%d " % (PENDING, int(freeze.get("id") or 0))
+        label = "%s freeze #%d host %s " % (
+            PENDING, int(freeze.get("id") or 0), host)
         attempts = sum(1 for note in pending_notes.get(lot, ())
                        if note.startswith(label))
-        if (0 < attempts < PENDING_ATTEMPTS
+        if (attempts < PENDING_ATTEMPTS
                 and str(row.get("state") or "") == "qa"
                 and _carried_ok_on_freeze(lot_marks, freeze)
                 and not _carried_blocked_on_freeze(lot_marks, freeze)):

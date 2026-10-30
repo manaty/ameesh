@@ -429,6 +429,31 @@ class CarriedFreezeTest(_Fixture):
         self.assertEqual(len(self.notes(verdict_carry.PENDING)),
                          verdict_carry.PENDING_ATTEMPTS)
 
+    def test_a_blind_host_spends_no_attempt_and_a_repo_host_promotes(self):
+        # #4834 (B de l'auditeur) : un hôte qui ne résout pas le gel ne peut
+        # pas conclure la porte ; il ne doit ni écrire de marque ni consommer
+        # d'essai. Un passage d'un hôte qui a le dépôt fait la transition.
+        self._reviewed_freeze()
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+        blind = mock.patch.object(lot_class, "repo_for_freeze",
+                                  return_value=("", ""))
+        with blind:
+            carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                          repo=self.repo.root)
+        self.assertEqual(carried["result"], "carried", carried)
+        self.assertEqual(self.notes(verdict_carry.PENDING), [])
+        with mock.patch.object(lot_class, "repo_for_freeze",
+                               return_value=("", "")):
+            report = verdict_carry.run_pass(self.cfg, self.db)
+        self.assertEqual([r for r in report if r["lot"] == self.lot], [])
+        self.assertEqual(self.notes(verdict_carry.PENDING), [])
+        # l'hôte qui a le dépôt reprend sans essai préalable et promeut
+        report = verdict_carry.run_pass(self.cfg, self.db)
+        self.assertEqual([r["result"] for r in report if r["lot"] == self.lot],
+                         ["validated"], report)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+
     def test_another_pending_verdict_does_not_starve_the_quorum_retry(self):
         # #4834 : un verdict encore reportable sur une autre tête ne doit pas
         # faire oublier la transition de quorum déjà en attente sur ce gel.
