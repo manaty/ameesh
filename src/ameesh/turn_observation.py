@@ -141,6 +141,15 @@ def _agent_block(row: dict) -> dict:
     }
 
 
+def _reservation_block(row: dict) -> dict:
+    return {
+        "billing_account": row.get("billing_account"),
+        "usd": row.get("usd"),
+        "period": row.get("period"),
+        "state": row.get("state"),
+    }
+
+
 def _ledger_block(row: dict) -> dict:
     return {
         "turn_id": row.get("turn_id"),
@@ -155,8 +164,16 @@ def _ledger_block(row: dict) -> dict:
 
 def _accounting(db, turn: dict | None, open_reservation: dict | None = None) -> dict:
     if turn is None:
-        return {"state": "none", "spend_key": None, "marker": None,
-                "reservation": None, "ledger": None}
+        # No delivery turn: no turn accounting. An open reservation of the
+        # agent is still an open accounting state that the contract forbids
+        # reading as `none` (a reservation without marker or ledger is
+        # `unknown`, never quiescent).
+        if open_reservation is None:
+            return {"state": "none", "spend_key": None, "marker": None,
+                    "reservation": None, "ledger": None}
+        return {"state": "unknown", "spend_key": open_reservation.get("spend_key"),
+                "marker": None, "reservation": _reservation_block(open_reservation),
+                "ledger": None}
     marker = turn.get("marker")
     ledger = turn.get("ledger")
     spend_key = (ledger or {}).get("spend_key") or (marker or {}).get("spend_key")
@@ -192,12 +209,8 @@ def _accounting(db, turn: dict | None, open_reservation: dict | None = None) -> 
             "model": marker.get("model"),
             "turn_id": marker.get("turn_id"),
         },
-        "reservation": None if reservation is None else {
-            "billing_account": reservation.get("billing_account"),
-            "usd": reservation.get("usd"),
-            "period": reservation.get("period"),
-            "state": reservation.get("state"),
-        },
+        "reservation": (None if reservation is None
+                        else _reservation_block(reservation)),
         "ledger": None if ledger is None else _ledger_block(ledger),
     }
 

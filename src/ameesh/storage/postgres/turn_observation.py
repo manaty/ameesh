@@ -127,7 +127,7 @@ class TurnObservation(interface.TurnObservation):
         # the agent's unique open reservation is the only fact left that says
         # accounting is still open (see OPEN_RESERVATION_SQL).
         open_reservation = None
-        if turn_id and marker is None and ledger is None:
+        if marker is None and ledger is None:
             rows = self.db.query(OPEN_RESERVATION_SQL, (agent_name,))
             open_reservation = rows[0] if rows else None
         return {

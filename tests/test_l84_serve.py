@@ -691,6 +691,16 @@ class TurnObservationTest(PgTestCase):
         self.assertEqual(document["accounting"]["state"], "unknown")
         self.assertFalse(document["quiescent"])
 
+        # A pending request (no delivery turn) has no turn accounting, but
+        # the agent's open reservation is still an open state: `unknown`,
+        # never quiescent (study §3: a reservation without marker or ledger).
+        pending = self.request(agent=agent)
+        document = turn_observation.observe(self.db, request=pending)
+        self.assertEqual(document["request"]["state"], "pending")
+        self.assertIsNone(document["turn"])
+        self.assertEqual(document["accounting"]["state"], "unknown")
+        self.assertFalse(document["quiescent"])
+
     def test_quiescent_allowlist_rejects_unknown_states(self):
         # #2167 (N from review): an accounting state outside the explicit
         # allowlist — pending, unknown, or a value a future version adds —
