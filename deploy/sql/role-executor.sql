@@ -39,11 +39,30 @@ SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I T
               :'schema', :'role') \gexec
 SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA %I TO %I',
               :'schema', :'role') \gexec
-SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO %I', :'schema', :'role') \gexec
+-- #4806 : le GRANT global `ON ALL FUNCTIONS IN SCHEMA` échouait sur les
+-- fonctions d'extension qui ne nous appartiennent pas (`pg_stat_statements_reset`
+-- appartient à postgres, pas au migrationowner) : « permission denied for
+-- function », et toute la phase rôle annulée. Le droit d'exécution se borne aux
+-- fonctions applicatives du migrationowner, hors objets d'extension et hors
+-- SECURITY DEFINER.
+SELECT format('GRANT EXECUTE ON ROUTINE %I.%I(%s) TO %I',
+              n.nspname, p.proname, pg_get_function_identity_arguments(p.oid), :'role')
+  FROM pg_proc p
+  JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = :'schema'
+   AND p.proowner = current_user::regrole
+   AND NOT p.prosecdef
+   AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                    WHERE d.classid = 'pg_proc'::regclass
+                      AND d.objid = p.oid
+                      AND d.deptype = 'e')
+ ORDER BY p.oid
+\gexec
 -- L244 (#420): ameesh_module_agent is SECURITY DEFINER (it takes the shared
--- lock on the registry for the isolated module roles). The executor group is
--- granted EXECUTE by the blanket line above but must never hold it: the audit
--- below flags any executable SECURITY DEFINER function, and rightly so.
+-- lock on the registry for the isolated module roles). The bounded grant above
+-- never gives EXECUTE on it; this REVOKE keeps the guarantee against an older
+-- blanket grant, and the audit below flags any executable SECURITY DEFINER
+-- function, and rightly so.
 SELECT format('REVOKE EXECUTE ON FUNCTION %I.ameesh_module_agent(text) FROM %I',
               :'schema', :'role')
  WHERE EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
