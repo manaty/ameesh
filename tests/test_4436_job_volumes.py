@@ -82,6 +82,16 @@ class JobVolumesTest(unittest.TestCase):
                 self.launcher.prune_job_volumes()
                 self.assertEqual(run.call_count, 1)
 
+    def test_successful_prune_logs_only_confirmed_removed_names(self):
+        inventory = [{"Name": "orphan", "Anonymous": True,
+                      "CreatedAt": "2020-01-01T00:00:00Z"}]
+        with mock.patch.object(self.launcher, "podman_cleanup", side_effect=[
+                json.dumps(inventory), "orphan\nunexpected private output\n"]), \
+                mock.patch.object(self.launcher.sys, "stderr") as stderr:
+            self.launcher.prune_job_volumes()
+        stderr.write.assert_called_once_with(
+            "ameesh-job-launcher: removed 1 stale anonymous volume(s): orphan\n")
+
     def test_postgres_hooks_pass_tmpfs_and_remove_volumes_even_if_absent(self):
         # Execute both actual hooks with a recording Podman, including down
         # returning 'container absent'. PGDATA is never requested as a volume.

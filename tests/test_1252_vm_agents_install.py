@@ -457,6 +457,8 @@ class VmAgentsHarness(unittest.TestCase):
         # l'installe dans son dépôt d'origine comme les autres pièces.
         shutil.copy2(ROOT / 'deploy/mise-a-jour/bascule.py',
                      self.origin / 'deploy/mise-a-jour/bascule.py')
+        shutil.copy2(ROOT / 'deploy/mise-a-jour/guest-runtime.py',
+                     self.origin / 'deploy/mise-a-jour/guest-runtime.py')
         # #3311 : vm.sh lit ce helper sur stdin pour prouver le venv du MainPID.
         shutil.copy2(ROOT / 'deploy/mise-a-jour/venv-processus.py',
                      self.origin / 'deploy/mise-a-jour/venv-processus.py')
