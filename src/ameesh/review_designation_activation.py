@@ -4729,11 +4729,33 @@ def _same_family_replacement(inputs: "Inputs", family: str,
     return eligible[0].name
 
 
+def _reachable_recipient(db, name: str) -> bool:
+    """A registry row that is not retired: agent-mail can deposit (#4757)."""
+    if not name:
+        return False
+    row = registry.get(db, name)
+    return row is not None and not rd.is_retired(row)
+
+
+def _manual_reseat_recipient(db, designator: str, notify: str) -> str:
+    """The designator of the seat, else the live pilot, else nobody (#4757).
+
+    A retired agent reads as absent: `mail.send` would refuse it."""
+    for name in (designator, notify):
+        if _reachable_recipient(db, str(name or "").strip()):
+            return str(name).strip()
+    return ""
+
+
 def _manual_reseat_alert(db, item: Mapping, freeze: Mapping, recipient: str,
-                         moves: Sequence[tuple], threads: list) -> None:
-    """Tells the designator what the pass did with its manual seat (#4757)."""
-    if not recipient or registry.get(db, recipient) is None:
-        return
+                         moves: Sequence[tuple], threads: list) -> str:
+    """Tells the designator what the pass did with its manual seat (#4757).
+
+    Best effort, under a savepoint: a refused deposit never rolls back the
+    seat moves nor the once-per-freeze note. Returns why the mail was not
+    deposited, or ""."""
+    if not recipient:
+        return "no reachable designator or pilot"
     from . import mail
 
     lot = int((item or {}).get("id") or 0)
@@ -4756,13 +4778,24 @@ def _manual_reseat_alert(db, item: Mapping, freeze: Mapping, recipient: str,
         "This pass runs once per freeze. To choose another reviewer:",
         "  ameesh work reviewer %d <agent>" % lot,
     ])
-    mail.send(db, SENDER, recipient, body, work_item_id=str(lot),
-              payload={"review_designation": {
-                  "lot": lot, "freeze": int((freeze or {}).get("id") or 0),
-                  "sha": str((freeze or {}).get("sha") or ""),
-                  "manual_reseat": [{"name": name, "replacement": replacement}
-                                    for name, _why, _family, replacement, _kept in moves]}},
-              after_commit=threads)
+    queued = len(threads)
+    db.execute("SAVEPOINT review_designation_manual_reseat_mail")
+    try:
+        mail.send(db, SENDER, recipient, body, work_item_id=str(lot),
+                  payload={"review_designation": {
+                      "lot": lot, "freeze": int((freeze or {}).get("id") or 0),
+                      "sha": str((freeze or {}).get("sha") or ""),
+                      "manual_reseat": [{"name": name, "replacement": replacement}
+                                        for name, _why, _family, replacement, _kept in moves]}},
+                  after_commit=threads)
+    except Exception as exc:  # noqa: BLE001 - a mail never undoes the seat
+        db.execute("ROLLBACK TO SAVEPOINT review_designation_manual_reseat_mail")
+        db.execute("RELEASE SAVEPOINT review_designation_manual_reseat_mail")
+        del threads[queued:]
+        return "mail to %s refused: %s: %s" % (recipient, type(exc).__name__,
+                                               str(exc)[:200])
+    db.execute("RELEASE SAVEPOINT review_designation_manual_reseat_mail")
+    return ""
 
 
 def reseat_manual(cfg, db, lot: int, *, freeze: Mapping,
@@ -4780,7 +4813,10 @@ def reseat_manual(cfg, db, lot: int, *, freeze: Mapping,
     gets the usual request and the removed seat's undelivered request is
     settled. Without a same-family reviewer whose independence is proven, the
     seat stays. Either way the attempt is journaled once per freeze under the
-    lot lock, and the designator (else the pilot) gets one mail (5). A lot
+    lot lock, and the designator (else the pilot; a retired one reads as
+    absent) gets one mail (5), best effort: a refused deposit is noted and
+    never undoes the move. The assignee is never a replacement (#705), and a
+    refused designation keeps that seat only. A lot
     that left `qa`, a newer freeze, a seat no longer dead, or an attempt
     already noted writes nothing (`stale`).
     """
@@ -4824,6 +4860,11 @@ def reseat_manual(cfg, db, lot: int, *, freeze: Mapping,
                         and _designation_authority(tx, (event or {}).get("actor")):
                     taken.add(note[len("reviewer "):-len(" removed")].strip())
             item = work.get(tx, lot) or {"id": lot, "title": "", "state": lifecycle.QA}
+            # The assignee can never review its own lot (#705): it is not a
+            # replacement, read under the lock like the column.
+            assignee = str(item.get("assignee") or "").strip()
+            if assignee:
+                taken.add(assignee)
             listing = storage.of(tx).agents.reachability()
             if not listing:
                 return outcome("unavailable", "registry unreadable or empty")
@@ -4841,18 +4882,18 @@ def reseat_manual(cfg, db, lot: int, *, freeze: Mapping,
                 designator = _manual_designator(tx, lot, name)
                 if replacement:
                     taken.add(replacement)
-                    # Add before removing: the column is never empty, and a
-                    # refused write (the replacement now holds the lot) rolls
-                    # the whole attempt back, nothing noted: the next pass
-                    # retries.
+                    # Add before removing: the column is never empty. A
+                    # refused write (nothing written, #705) keeps this seat
+                    # like a missing replacement; the other seats still move.
                     if storage.of(tx).work.designate_reviewer(
                             lot, replacement, actor=SENDER,
                             event="reviewer %s designated" % replacement) is None:
-                        raise work.WorkError("reviewer %s refused on lot #%d"
-                                             % (replacement, lot))
-                    storage.of(tx).work.designate_reviewer(
-                        lot, name, actor=SENDER, remove=True,
-                        event="reviewer %s removed" % name)
+                        kept = "replacement %s refused" % replacement
+                        replacement = None
+                    else:
+                        storage.of(tx).work.designate_reviewer(
+                            lot, name, actor=SENDER, remove=True,
+                            event="reviewer %s removed" % name)
                 moves.append((name, why, family, replacement, kept, designator))
             if not moves:
                 return outcome("stale", "no manual seat is dead under the lock")
@@ -4867,12 +4908,17 @@ def reseat_manual(cfg, db, lot: int, *, freeze: Mapping,
                 SENDER)
             by_recipient: dict = {}
             for name, why, family, replacement, kept, designator in moves:
-                recipient = designator if registry.get(tx, designator or "") \
-                    else inputs.notify
+                recipient = _manual_reseat_recipient(tx, designator, inputs.notify)
                 by_recipient.setdefault(recipient, []).append(
                     (name, why, family, replacement, kept))
             for recipient, told in by_recipient.items():
-                _manual_reseat_alert(tx, item, freeze, recipient, told, threads)
+                refused = _manual_reseat_alert(tx, item, freeze, recipient, told, threads)
+                if refused:
+                    storage.of(tx).work.note(
+                        lot, lifecycle.QA,
+                        "%s designator not told (%s): %s"
+                        % (prefix, ", ".join(name for name, *_rest in told), refused),
+                        SENDER)
         _drain(db, threads)
     except (rd.DesignationError, work.WorkError) as exc:
         return outcome("unavailable", str(exc))

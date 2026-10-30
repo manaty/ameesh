@@ -334,6 +334,104 @@ class ManualSeatReseatTest(_ActivationFixture, PgTestCase):
         self.assertEqual(report["manual_reseated"], 1, report)
         self.assertEqual(self._column(), ["r1", "r2", "r3"])
 
+    def _retire(self, name):
+        self.db.execute("UPDATE agent_registry SET retired_at = now()"
+                        " WHERE name = %s", (name,))
+
+    def test_l_assigne_n_est_jamais_le_remplacant(self):
+        # r5 (claude) tient le lot : seul candidat claude, il ne relit pas
+        # son propre lot (#705) ; le siège reste, noté et signalé.
+        self._agent("r5", "claude")
+        self._manual()
+        self.db.execute("UPDATE work_items SET assignee = 'r5' WHERE id = %s",
+                        (self.lot,))
+        self.db.execute("UPDATE agent_registry SET operator_paused = true"
+                        " WHERE name = 'pilot'")
+        self._pause()
+        self._age()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["manual_kept"], 1, report)
+        self.assertFalse(report.get("errors"), report)
+        self.assertEqual(self._column(), ["m1", "r1", "r2"])
+        notes = self.notes(act.MANUAL_RESEAT_PREFIX)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("kept: no claude reviewer available", notes[0])
+        self.assertEqual(len(self._alerts()), 1)
+
+    def test_deux_sieges_l_assigne_n_annule_pas_l_autre_remplacement(self):
+        self._agent("r3", "claude")
+        self._agent("r5", "claude")
+        self._manual("m1")
+        self._agent("m2", "claude")
+        storage.of(self.db).work.designate_reviewer(
+            self.lot, "m2", actor="human:smichea", event="reviewer m2 designated")
+        self.db.execute("UPDATE work_items SET assignee = 'r5' WHERE id = %s",
+                        (self.lot,))
+        self.db.execute("UPDATE agent_registry SET operator_paused = true"
+                        " WHERE name = 'pilot'")
+        self._pause("m1")
+        self._pause("m2")
+        self._age()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertFalse(report.get("errors"), report)
+        self.assertEqual(report["manual_reseated"], 1, report)
+        self.assertEqual(self._column(), ["m2", "r1", "r2", "r3"])
+        notes = self.notes(act.MANUAL_RESEAT_PREFIX)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("m1 (status blocked) → r3", notes[0])
+        self.assertIn("m2 (status blocked) kept", notes[0])
+
+    def test_pilote_retire_le_siege_bouge_quand_meme(self):
+        # m1 désigné par un humain : le repli est le pilote, retiré ; aucun
+        # courrier ne peut partir, le remplacement et la note restent.
+        self._agent("r3", "claude")
+        self._manual()
+        self._retire("pilot")
+        self._pause()
+        self._age()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertFalse(report.get("errors"), report)
+        self.assertEqual(report["manual_reseated"], 1, report)
+        self.assertEqual(self._column(), ["r1", "r2", "r3"])
+        notes = self.notes(act.MANUAL_RESEAT_PREFIX)
+        self.assertEqual(len(notes), 2, notes)
+        self.assertTrue(any("designator not told" in n for n in notes), notes)
+        self.assertFalse(self._alerts())
+        again = act.reassign_unreachable(self.cfg, self.db)
+        self.assertFalse(again.get("errors"), again)
+        self.assertEqual(len(self.notes(act.MANUAL_RESEAT_PREFIX)), 2)
+
+    def test_designateur_retire_le_courrier_va_au_pilote(self):
+        self._agent("d1", "codex")
+        self._retire("d1")
+        self.assertEqual(act._manual_reseat_recipient(self.db, "d1", "pilot"), "pilot")
+        self.assertEqual(act._manual_reseat_recipient(self.db, "r2", "pilot"), "r2")
+        self._retire("pilot")
+        self.assertEqual(act._manual_reseat_recipient(self.db, "d1", "pilot"), "")
+        self.assertEqual(act._manual_reseat_recipient(self.db, "human:smichea", "pilot"), "")
+
+    def test_un_courrier_refuse_n_annule_pas_le_remplacement(self):
+        from ameesh import mail
+        self._agent("r3", "claude")
+        self._manual()
+        self._pause()
+        self._age()
+        real = mail.send
+
+        def send(db, sender, recipient, body, **kw):
+            if "manual_reseat" in ((kw.get("payload") or {})
+                                   .get("review_designation") or {}):
+                raise RuntimeError("refused")
+            return real(db, sender, recipient, body, **kw)
+
+        with mock.patch.object(mail, "send", send):
+            report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertFalse(report.get("errors"), report)
+        self.assertEqual(report["manual_reseated"], 1, report)
+        self.assertEqual(self._column(), ["r1", "r2", "r3"])
+        self.assertTrue(any("designator not told" in n
+                            for n in self.notes(act.MANUAL_RESEAT_PREFIX)))
+
 
 if __name__ == "__main__":
     import unittest
