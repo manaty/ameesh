@@ -354,9 +354,14 @@ test (three messages → three notifications) caught the bug.
   explicitly configured threshold is kept, and with no turn cap
   (`turn_max_seconds=0`) the configured threshold applies alone
   ([EXPLOITATION.md](EXPLOITATION.md#plafonds-pendant-le-tour-l105)).
-  The size is read
-  from the usage in each harness's stream (keys normalized by
-  `adapters.usage_tokens`; DeepSeek publishes usage per step). **Context
+  The size is the session's cumulative `input_tokens + output_tokens` over
+  its turns, read from the usage in each harness's stream (keys normalized by
+  `adapters.usage_tokens`; DeepSeek publishes usage per step). The cache
+  convention is **not uniform** (#4448): Codex's input already includes
+  cached tokens, while Claude and DeepSeek report cached input separately and
+  written cache is excluded, so the same token count does not mean the same
+  thing across harnesses — hence the per-harness thresholds compiled from the
+  canon. **Context
   ceiling (L60)**: if the context of the last model call (the session size:
   input + cache read + cache written) exceeds `AMEESH_CONTEXT_MAX_TOKENS`
   tokens (default 15 M, adjustable per agent with `ameesh set <agent>

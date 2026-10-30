@@ -28,8 +28,9 @@ Long sessions degrade. The project's rule (design decision 0025) is:
 3. **Orchestrators** keep a long session, rotated with a resume summary when it
    grows, plus written state (memory, log) that survives the loss of the
    session.
-4. The size of the context re-read per turn is watched; a session that misses
-   instructions is rotated without waiting.
+4. The size of the **session** is watched — the sum of its turns' input and
+   output tokens, not the context re-read per turn (#4448) — so a session that
+   misses instructions is rotated without waiting.
 
 ## How ameesh applies it
 
@@ -42,17 +43,24 @@ session_policy=…` (default `AMEESH_SESSION_POLICY`, `par-lot`):
 | `taille` | rotation on size and turn duration only: for orchestrators, which receive messages from every lot |
 | `jamais` | no rotation |
 
-The `session_too_big` alert (`ameesh alerts`) watches the tokens re-read per
-turn, and `ameesh restart <agent> --brief FILE` starts a fresh session on a
-brief at any time. See [Operate agents](../guides/operate-agents.md).
+The `session_too_big` alert (`ameesh alerts`) watches the session's cumulative
+tokens (`input_tokens + output_tokens` over its turns, with the per-harness
+cache convention; #4448) against the same threshold as the rotation, and
+`ameesh restart <agent> --brief FILE` starts a fresh session on a brief at any
+time. See [Operate agents](../guides/operate-agents.md).
 
 ## Rotation with a resume summary
 
-Whatever the policy (except `jamais`), when a session exceeds `AMEESH_SESSION_MAX_TOKENS` (default 150 000) or a turn
-lasted more than `AMEESH_SESSION_MAX_TURN_SECONDS` (default 3 600 s; the
-threshold is floored at twice the effective turn cap, `turn_max_seconds`
-included, and without a turn cap the configured threshold applies alone), after at
-least `AMEESH_SESSION_MIN_TURNS` turns (default 3) and **never during a turn**:
+Whatever the policy (except `jamais`), when the session's cumulative tokens
+(`input_tokens + output_tokens` over its turns, #4448) exceed its rotation
+threshold — compiled from the applied canon (`session.max_tokens` and
+`session.max_tokens_by_harness`), with the executor's common
+`AMEESH_SESSION_MAX_TOKENS` (default 150 000) as fallback — or a turn lasted
+more than `AMEESH_SESSION_MAX_TURN_SECONDS` (default 3 600 s; the threshold
+is floored at twice the effective turn cap, `turn_max_seconds` included, and
+without a turn cap the configured threshold applies alone), after at
+least `AMEESH_SESSION_MIN_TURNS` turns (default 3) and **never during a
+turn**:
 
 1. a summary turn is played in the current session;
 2. the summary is written to the readable thread;
