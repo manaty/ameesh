@@ -978,7 +978,7 @@ def _read_git(repo, *args, **kwargs):
         sweep.deadline.remaining() if heavy and sweep is not None else limit))
     kwargs["deadline"] = _read_bound(None if heavy else limit)
     try:
-        if heavy:
+        if heavy or args[0] == "merge-tree":
             with _local_object_repo(repo) as (reader, env):
                 kwargs["env_extra"] = {**kwargs.get("env_extra", {}), **env}
                 return plan_git._git(reader, *args, **kwargs)
@@ -994,7 +994,7 @@ def _read_out(repo, *args):
             proc = _read_git(repo, *args)
             return proc.stdout.decode("utf-8", "replace").strip() if not proc.returncode else None
         return plan_git._out(repo, *args, deadline=_read_bound(plan_git.PROBE_TIMEOUT_S))
-    except canon.GitError:
+    except (canon.GitError, canon.GitDeadline, plan_git.MergeProbeError):
         return None
     finally:
         sweep = active_sweep()
@@ -3392,7 +3392,14 @@ def _freeze_content_preserved(repo: str, freeze_sha: str, head_sha: str,
     if head_tree == freeze_tree:
         return True
     if base:
-        merged = _merged_tree(repo, freeze_sha, base)
+        try:
+            merged = _merged_tree(repo, freeze_sha, base)
+        except (canon.GitError, canon.GitDeadline, plan_git.MergeProbeError):
+            return True
+        finally:
+            sweep = active_sweep()
+            if sweep is not None:
+                sweep.check("merge-tree preservation")
         if merged is not None and merged == head_tree:
             return True
     return False

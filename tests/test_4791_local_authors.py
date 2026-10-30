@@ -170,3 +170,43 @@ class LocalAuthorsTest(unittest.TestCase):
                 merge_queue._attribution_on_freeze(
                     object(), [], self.head, repo=self.repo,
                     klass={"base_sha": self.head}, item={"id": 4791})
+
+    def test_short_probe_failures_are_doubt_with_budget_remaining(self):
+        for command in ("merge-base", "rev-parse", "rev-list", "ls-tree"):
+            for error in (canon.GitDeadline, authors.plan_git.MergeProbeError):
+                with self.subTest(command=command, error=error.__name__), \
+                        authors.sweep_deadline(15) as sweep, mock.patch.object(
+                            authors.plan_git, "_out", side_effect=error("probe failed")):
+                    self.assertIsNone(authors._read_out(self.repo, command, "HEAD"))
+                    self.assertFalse(sweep.tripped)
+
+    def test_real_probe_deadline_keeps_freeze_authors(self):
+        with authors.sweep_deadline(15) as sweep, mock.patch.object(
+                authors.plan_git, "PROBE_TIMEOUT_S", 1e-9):
+            self.assertIsNone(authors._read_out(self.repo, "merge-base", self.head, self.head))
+            self.assertTrue(authors._freeze_content_preserved(
+                self.repo, self.head, self.head, base=self.head))
+            self.assertFalse(sweep.tripped)
+
+    def test_read_out_preserves_exhausted_sweep(self):
+        with authors.sweep_deadline(0) as sweep:
+            with self.assertRaises(authors.SweepDeadline):
+                authors._read_out(self.repo, "rev-parse", "HEAD")
+            self.assertTrue(sweep.tripped)
+
+    def test_merge_tree_probe_failure_keeps_freeze_authors(self):
+        for error in (canon.GitDeadline, authors.plan_git.MergeProbeError):
+            with self.subTest(error=error.__name__), authors.sweep_deadline(15), \
+                    mock.patch.object(authors, "_tree_of", side_effect=["head", "freeze"]), \
+                    mock.patch.object(authors, "_merged_tree", side_effect=error("probe failed")):
+                self.assertTrue(authors._freeze_content_preserved(
+                    self.repo, self.head, self.head, base=self.head))
+
+    def test_merge_tree_reads_without_remote(self):
+        original = authors.plan_git._git
+        with mock.patch.object(authors.plan_git, "_git", wraps=original) as calls:
+            self.assertEqual(authors._merged_tree(self.repo, self.head, self.head),
+                             self.git("rev-parse", "HEAD^{tree}"))
+        call = next(call for call in calls.call_args_list if "merge-tree" in call.args)
+        self.assertNotEqual(call.args[0], self.repo)
+        self.assertIn("GIT_OBJECT_DIRECTORY", call.kwargs["env_extra"])
