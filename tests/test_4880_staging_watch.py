@@ -40,12 +40,16 @@ class WatchTest(unittest.TestCase):
         new_success = row(3, run="new", state="completed", sha="b" * 40)
         self.assertEqual(staging_watch.findings([failed, new_success], now=250), [])
 
-    def test_later_partial_corrective_commit_resolves_failed_run(self):
-        failed = row(1, state="failed")
-        success = row(2, run="new", state="partial", sha="b" * 40)
-        self.assertEqual(staging_watch.findings([failed, success], now=250), [])
-        success["data"]["notify"] = "other-pilot"
-        self.assertEqual(len(staging_watch.findings([failed, success], now=250)), 1)
+    def test_partial_subset_keeps_other_host_failure_until_completed(self):
+        failed = row(1, state="failed", hosts={
+            "vm-2": {"stage": "installer", "verdict": "ko"}})
+        partial = row(2, run="subset", state="partial", sha="b" * 40,
+                      hosts={"vm-1": {"stage": "sante", "verdict": "ok"}})
+        self.assertEqual(len(staging_watch.findings([failed, partial], now=250)), 1)
+        completed = row(3, run="full", state="completed", sha="c" * 40)
+        self.assertEqual(staging_watch.findings([failed, partial, completed], now=250), [])
+        completed["data"]["notify"] = "other-pilot"
+        self.assertEqual(len(staging_watch.findings([failed, partial, completed], now=250)), 1)
 
     def test_unattested_success_is_not_a_completed_run(self):
         self.assertEqual(len(staging_watch.findings(

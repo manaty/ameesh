@@ -56,11 +56,11 @@ def findings(rows: list[dict], *, now: float) -> list[dict]:
             latest.setdefault(data["run"], data)
             ids.setdefault(data["run"], int(row["id"]))
     out = []
-    # A later successful deployment by the same staging authority settles
-    # an earlier failure, including when it deploys a corrective commit.
+    # Only a complete deployment by the same staging authority settles an
+    # earlier failure. A partial run may omit the host that failed.
     completed = {}
     for run, data in latest.items():
-        if data.get("state") in ("completed", "partial"):
+        if data.get("state") == "completed":
             scope = data.get("notify", "")
             completed[scope] = max(completed.get(scope, 0), ids[run])
     for run, data in latest.items():
