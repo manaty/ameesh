@@ -25,7 +25,12 @@ name grammar. `ameesh canon check` compiles the block and reports
 `pipeline-*` findings: an error fails the check but blocks no agent;
 `ameesh canon show --json` lists the cards under `pipelines`. The path rule is
 the one of `processus/`: `pipelines/` at the root of the bundle, or under a
-folder of the declared ameesh scope.
+folder of the declared ameesh scope. A valid card is also a module of source
+`canon` (selected by its `name` in
+`extensions.ameesh.projects.<project>.modules`), and
+`ameesh module <name> adopt|advance|hold|release` drives a lot pinned on it.
+The repository ships the acme and after-sales support examples under
+`examples/pipelines/`; see [Write a Pipeline](../guides/write-a-pipeline.md).
 
 ## Where ameesh reads it
 
