@@ -537,6 +537,38 @@ def review_requests(db: Db, recipient: str, lot: int | str) -> list[dict]:
     return storage.of(db).mailbox.review_requests(recipient, str(int(lot)))
 
 
+def settle_review_requests(db: Db, recipient: str, lot: int | str) -> list[int]:
+    """#4779 : solde les demandes de relecture encore non remises d'un siège.
+
+    Le retrait d'un siège (`work reviewer <lot> <agent> --remove`) rend caduque
+    la demande déposée chez le relecteur : sans ce règlement, le message reste
+    en tête de sa boîte et le premier tour du canari de #4770 aurait ouvert une
+    relecture que plus personne n'attend. Le message est marqué remis, comme
+    une demande à échéance (`request_expires_ts`, `drop_expired`) : il reste
+    dans l'historique et dans le fil, aucun tour ne démarre. Rend les ids
+    effectivement vus non remis (vide si le siège n'avait aucune demande).
+    """
+    rows = review_requests(db, recipient, lot)
+    ids = []
+    for row in rows or ():
+        # Une demande de décision (`payload.decision`) est un `request` lié au
+        # lot, pas une demande de relecture : la solder retirerait une question
+        # posée à l'owner. Seules les charges de relecture comptent.
+        payload = message_payload(row)
+        if not isinstance(payload, dict) or not (
+                "review_request" in payload or "review_designation" in payload):
+            continue
+        if row.get("id") is not None and row.get("delivered_ts") is None:
+            ids.append(int(row["id"]))
+    if not ids:
+        return []
+    if not mark_delivered(db, ids):
+        # Toutes les demandes ont été remises entre la lecture et l'écriture :
+        # un tour les a prises, il n'y a rien à solder ni à tracer.
+        return []
+    return ids
+
+
 def delivered_for_lot(db: Db, recipient: str, lot, limit: int) -> list[dict]:
     """#2539 : les derniers messages déjà remis de ce lot, filtrés dans la
     requête (destinataire + lot), sans fenêtre de temps. Non admis en mode

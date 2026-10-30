@@ -1384,6 +1384,16 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
                         continue
                     family = mine_family
             kind = "correction" if correction else "review"
+            # #4779 (B1 dev4) : une relecture proposée désigne son relecteur
+            # (#705) ; sa fiche doit donc prouver la capacité `propose` et un
+            # rôle, comme une désignation manuelle (`check_reviewer`) et la
+            # sélection au gel. Sans ce garde, un canari `[read]` / `roles: []`
+            # recevait la proposition et occupait le siège sans pouvoir rendre
+            # d'avis (test_1677).
+            if kind == "review":
+                eligible, _reason = rd.reviewer_eligibility(reg)
+                if not eligible:
+                    continue
             payload = {"review_proposal": {"lot": lot, "agent": name, "kind": kind}}
             message_id = None
             if not dry_run:

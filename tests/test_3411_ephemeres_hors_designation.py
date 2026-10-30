@@ -32,11 +32,13 @@ AUTHOR = [{"name": "mty-amh-impl-02", "family": "deepseek"}]
 
 
 def row(name, *, ephemeral=False, expires=None, harness="claude", team="ameesh",
-        status="idle", mode="execute", text=""):
+        status="idle", mode="execute", text="",
+        capabilities=("read", "report-drift", "propose"), roles=("implementation",)):
     """Une ligne du registre telle que `registry.overview` la rend."""
     return {"name": name, "team": team, "harness": harness, "session_harness": "",
             "status": status, "mode": mode, "status_text": text,
-            "ephemeral": ephemeral, "ephemeral_expires_ts": expires}
+            "ephemeral": ephemeral, "ephemeral_expires_ts": expires,
+            "capabilities": list(capabilities), "roles": list(roles)}
 
 
 def candidates(rows, *, loads=None):

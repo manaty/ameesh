@@ -338,6 +338,12 @@ class RetireTest(PgTestCase):
     def test_designation_never_picks_a_retired_agent(self):
         registry.upsert(self.db, "reviewer", harness="codex", host=self.cfg.host,
                         cwd=self.tmp)
+        # #4779 : un relecteur doit prouver `propose` et un rôle ; la fiche du
+        # test est écrite directement au registre (pas de canon).
+        self.db.execute(
+            "UPDATE agent_registry SET capabilities ="
+            " ARRAY['read','report-drift','propose'], roles = ARRAY['implementation']"
+            " WHERE name = 'reviewer'")
         self.retire("reviewer")
         rows = [r for r in registry.overview(self.db) if r["name"] == "reviewer"]
         self.assertTrue(rd.is_retired(rows[0]))

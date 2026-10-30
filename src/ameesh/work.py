@@ -1681,6 +1681,19 @@ def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
                 raise WorkError("reviewer refused: %s is retired (ameesh agent retire, "
                                 "#3460): name an active reviewer"
                                 % (row.get("name") or name))
+            # #4779 : la fiche doit prouver la capacité `propose` et un rôle.
+            # Un canari `[read]` / `roles: []` retenait la porte sans pouvoir
+            # rendre d'avis ; une capacité absente du registre est un doute,
+            # pas une preuve, et la désignation est refusée de même.
+            from . import review_designation
+            eligible, reason = review_designation.reviewer_eligibility(row)
+            if not eligible:
+                raise WorkError(
+                    "reviewer refused: %s cannot review (canon §2, #4779): %s; "
+                    "a reviewer's card must carry the `propose` capacity and at "
+                    "least one role" % (
+                        row.get("name") or name,
+                        review_designation.PROFILE_REASONS.get(reason, reason)))
             return row.get("name") or name
         # Doublure de registre (tests #705 r2 N2) : pas un mapping, on garde
         # l'orthographe demandée, comme avant #423.
@@ -1860,6 +1873,46 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str, *,
     return {"reviewer_request_message_id": message_id}
 
 
+def _settle_reviewer_requests(cfg, db, item: dict, reviewer: str,
+                              who: str) -> list[int]:
+    """#4779 : solde les demandes de relecture d'un siège qu'on retire.
+
+    Le retrait d'un siège rend caduque la demande déposée chez le relecteur :
+    sans ce règlement, elle reste en tête de sa boîte et le prochain tour du
+    relecteur ouvre une relecture que plus personne n'attend (cas du canari
+    `handoff-canary-3392` sur #4770). Le message est marqué remis, comme une
+    demande à échéance (`mail.settle_review_requests`), et une trace part au
+    fil du lot — sans destinataire réveillé. Rend les ids soldés.
+    """
+    from . import fil, mail
+
+    name = str(reviewer or "").strip()
+    if not name:
+        return []
+    try:
+        ids = mail.settle_review_requests(db, name, int(item["id"]))
+    except Exception as exc:  # noqa: BLE001 - le retrait doit dire l'échec
+        raise WorkError("review request settlement failed for %s (lot #%s): %s"
+                        % (name, item.get("id"), exc)) from exc
+    if not ids:
+        return []
+    text = (
+        "Demande(s) de relecture réglée(s) — siège retiré.\n\n"
+        "Le siège de %s sur le lot #%s a été retiré (geste de %s). Les demandes "
+        "encore non remises (%s) sont soldées sans tour, comme une demande à "
+        "échéance (`request_expires_ts`) : aucun avis n'est attendu de ce siège."
+        % (name, item.get("id"), who or SYSTEM_SENDER,
+           ", ".join("#%d" % int(i) for i in ids)))
+    if cfg is not None:
+        # `fil.record` ne lève jamais : une trace manquante ne perd pas le
+        # règlement, le message reste dans la boîte et son fil est réessayé
+        # par l'index au prochain passage.
+        fil.record(cfg, db, sender=SYSTEM_SENDER, recipients=[name], text=text,
+                   project=str(item.get("app") or ""), lot=int(item["id"]),
+                   meta={"review_request_settled": [int(i) for i in ids]})
+    return ids
+
+
 def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
                        actor: str | None = None, remove: bool = False) -> dict:
     """#2076 : ajoute ou retire un relecteur d'un lot **déjà en `qa`**.
@@ -1873,20 +1926,47 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
     sur la ligne rendue (`reviewer_warning`), la désignation est conservée.
     La désignation dépose aussi un `request` lié au lot (#2478) : le relecteur
     est réveillé, son runner ouvre un tour ; une remise en échec est un
-    avertissement (`reviewer_request_warning`), la désignation reste écrite."""
+    avertissement (`reviewer_request_warning`), la désignation reste écrite.
+
+    #4779 : un retrait règle les demandes de relecture encore non remises du
+    siège (`reviewer_settled`, trace au fil du lot), même sur un lot sorti de
+    `qa` ou dont le siège a déjà disparu : c'est le rejeu qui solde la demande
+    caduque d'un canari. Hors `qa`, rien n'est écrit au siège et la ligne rend
+    `reviewer_changed=False`.
+    """
+    if remove:
+        # #4779 : le retrait règle d'abord les demandes de relecture encore
+        # non remises chez l'agent, même quand le lot a quitté `qa` ou que le
+        # siège n'y est déjà plus (le rejeu du cas réel #4770 doit solder le
+        # message du canari). Aucune écriture de siège hors de `qa` : la ligne
+        # rendue le dit (`reviewer_changed=False`).
+        who = corrector(cfg, db, actor, what="designation", auditor=True)
+        item = get(db, item_id)
+        if item is None:
+            raise WorkError("lot %s not found" % item_id)
+        # A former reviewer can still be withdrawn after leaving the registry.
+        name = (reviewer or "").strip()
+        if not name:
+            raise WorkError("empty reviewer")
+        settled = _settle_reviewer_requests(cfg, db, item, name, who)
+        if item["state"] != lifecycle.QA:
+            row = dict(item)
+            row["reviewer_changed"] = False
+            row["reviewer_settled"] = settled
+            return row
+        row = _write_reviewer(db, item_id, name, who, "reviewer %s removed" % name,
+                              remove=True)
+        row["reviewer_settled"] = settled
+        return row
     who, item = _review_item(cfg, db, item_id, actor, auditor=True)
-    # A former reviewer can still be withdrawn after leaving the registry.
-    name = (reviewer or "").strip() if remove else check_reviewer_choice(
-        db, item, reviewer, cfg=cfg)
+    name = check_reviewer_choice(db, item, reviewer, cfg=cfg)
     if not name:
         raise WorkError("empty reviewer")
-    warning = "" if remove else reviewer_family_warning(db, item, name)
-    row = _write_reviewer(db, item_id, name, who, "reviewer %s %s" % (
-        name, "removed" if remove else "designated"), remove=remove)
+    warning = reviewer_family_warning(db, item, name)
+    row = _write_reviewer(db, item_id, name, who, "reviewer %s designated" % name)
     if warning:
         row["reviewer_warning"] = warning
-    if not remove:
-        row.update(_reviewer_request(db, item, name, who, cfg=cfg))
+    row.update(_reviewer_request(db, item, name, who, cfg=cfg))
     return row
 
 
@@ -1898,8 +1978,19 @@ def clear_reviewer(cfg, db: Db, item_id: int, *, actor: str | None = None) -> di
     retombe dans l'attente réelle d'un relecteur — « verdict d'un relecteur
     (non désigné) » — et l'alerte redemande d'en désigner un : c'est le geste
     inverse de `waive_review`, pour une désignation posée à tort."""
-    who, _item = _review_item(cfg, db, item_id, actor, auditor=True)
-    return _write_reviewer(db, item_id, "", who, "reviewer designation removed")
+    who, item = _review_item(cfg, db, item_id, actor, auditor=True)
+    # #4779 : chaque siège retiré solde sa demande encore non remise. On règle
+    # avant l'écriture : si celle-ci échoue, un nouveau `--remove` retrouve les
+    # noms dans la colonne et rejoue le règlement (idempotent).
+    from .work_reviewers import designated
+
+    settled: list = []
+    for name in designated(item):
+        settled.extend(_settle_reviewer_requests(cfg, db, item, name, who))
+    row = _write_reviewer(db, item_id, "", who, "reviewer designation removed")
+    if settled:
+        row["reviewer_settled"] = settled
+    return row
 
 
 def waive_review(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict:

@@ -28,7 +28,10 @@ SPLIT = "file-decoupage:ameesh"
 def agent(name, project="ameesh", **extra):
     row = {"name": name, "mode": "execute", "status": "idle", "lease_live": True,
            "lease_owner": "runner:%s" % name, "unread": 0, "assigned_lot_id": None,
-           "active_lots": 0, "actionable_lots": 0, "projects": [project]}
+           "active_lots": 0, "actionable_lots": 0, "projects": [project],
+           # #4779 : profil de relecteur prouvé (capacité `propose`, un rôle).
+           "capabilities": ["read", "report-drift", "propose"],
+           "roles": ["implementation"]}
     row.update(extra)
     return row
 

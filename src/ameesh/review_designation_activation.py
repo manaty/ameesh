@@ -111,6 +111,10 @@ MANUAL_PREFIX = "review-designation-manual:"
 #: journal prefix of an unreadable mark ignored by the reviewer load (#3047):
 #: the line names the offending lot and the id of the note it ignored
 UNREADABLE_PREFIX = "review-designation-unreadable:"
+#: journal prefix of a reviewer profile that cannot be read (#4779):
+#: `<agent>:<reason>:`. One note per (agent, reason) on the lot: the refusal
+#: is a fact, and a replay must not write it again.
+PROFILE_UNREADABLE_PREFIX = "review-profile-unreadable:"
 #: the first release that carries `ameesh work reviewers` (#2447)
 RECOVERY_FROM = "1.12.0"
 #: why a light lot keeps no pre-merge reviewer (canon §2, full table)
@@ -1342,6 +1346,49 @@ def _note_unreadable(db, lot: int, state: str,
             continue
 
 
+def _note_profile_unreadable(db, lot: int, state: str,
+                             unreadable: Sequence[tuple]) -> None:
+    """Journal an unreadable reviewer profile once, without failing a freeze.
+
+    #4779: a registry row whose `capabilities` or `roles` cannot be read is
+    not evidence that the agent may review — the candidacy is refused. The
+    doubt is written on the lot being designated, deduplicated by
+    `(agent, reason)`, so a replay or a second freeze does not repeat it. The
+    write is best effort, under a savepoint when a transaction is open: a
+    failed trace must never abort the freeze it explains.
+    """
+    if not unreadable:
+        return
+    in_tx = db_mod.in_transaction(db)
+    for name, reason in unreadable:
+        name = str(name or "").strip()
+        reason = str(reason or "").strip()
+        if not name or reason not in rd.UNREADABLE_PROFILE_REASONS:
+            continue
+        prefix = "%s%s:%s:" % (PROFILE_UNREADABLE_PREFIX, name, reason)
+        text = ("%s reviewer %s refused as candidate: %s (canon §2, #4779)"
+                % (prefix, name, rd.PROFILE_REASONS.get(reason, reason)))
+        try:
+            if storage.of(db).work.events_noted(prefix, 0.0, ids=[int(lot)]):
+                continue
+        except Exception:  # noqa: BLE001 - no duplicate proof: write the trace
+            pass
+        try:
+            if in_tx:
+                db.execute("SAVEPOINT review_designation_profile_trace")
+            try:
+                storage.of(db).work.note(int(lot), state, text, SENDER)
+            except Exception:  # noqa: BLE001 - a trace never blocks a freeze
+                if in_tx:
+                    db.execute("ROLLBACK TO SAVEPOINT review_designation_profile_trace")
+                    db.execute("RELEASE SAVEPOINT review_designation_profile_trace")
+                continue
+            if in_tx:
+                db.execute("RELEASE SAVEPOINT review_designation_profile_trace")
+        except Exception:  # noqa: BLE001 - best effort only
+            continue
+
+
 def _advances(db) -> dict:
     """The raw plan advance of each family, from the shared gauge history (#2668).
 
@@ -1382,7 +1429,8 @@ def _notify(cfg, db, project: str, listing: Sequence[Mapping]) -> str:
 
 
 def _candidates(listing: Sequence[Mapping], *, loads: Mapping, project: str, families,
-                pilot: str, closed_hosts: Sequence[str] = ()) -> list:
+                pilot: str, closed_hosts: Sequence[str] = (),
+                unreadable_profiles: Optional[list] = None) -> list:
     """The project's candidates, its pilot removed.
 
     The project's agents plus the agents of another team that declare it under
@@ -1390,11 +1438,15 @@ def _candidates(listing: Sequence[Mapping], *, loads: Mapping, project: str, fam
     with the others, so the two roles never collapse into one mail — even when
     the pilot's card would make it a candidate. `closed_hosts` (#3328) is the
     host liveness evidence: an agent on a `draining`/`lost` host is not a
-    candidate, like any recipient agent-mail cannot reach.
+    candidate, like any recipient agent-mail cannot reach. #4779: an agent
+    whose card does not prove the `propose` capacity and a role is not a
+    candidate; an unreadable profile is reported through
+    `unreadable_profiles` so the caller journals the doubt.
     """
     candidates = rd.candidates_from_registry(listing, loads=loads, project=project,
                                              families=families,
-                                             closed_hosts=closed_hosts)
+                                             closed_hosts=closed_hosts,
+                                             unreadable_profiles=unreadable_profiles)
     if pilot:
         candidates = [candidate for candidate in candidates if candidate.name != pilot]
     return candidates
@@ -1470,8 +1522,13 @@ def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
     author's family, does not prove independence: the seat remains missing and
     is designated automatically. A corrector cannot count its own seat either
     (#2739/#2888): a corrector is an author of this head, so its family is
-    forbidden like any author's and its name does not cover a seat. The list is
-    ordered like the column.
+    forbidden like any author's and its name does not cover a seat. #4779
+    (B1 cx2): a manual seat whose card does not prove the `propose` capacity
+    and a role covers nothing either — otherwise a canary designated before
+    the guard, or by a path that did not read it, would keep the automatic
+    selection from naming a real reviewer and the gate would stay held. The
+    seat stays in the column (a pilot gesture); only its counting stops. The
+    list is ordered like the column.
     """
     forbidden_names, forbidden_families = rd.families_of(authors)
     _names, corrector_families = rd.families_of(correctors)
@@ -1483,6 +1540,12 @@ def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
     for name in manual or ():
         name = str(name or "").strip()
         row = rows.get(name) or {}
+        # #4779 (B1 cx2) : un siège manuel sans `propose` ou sans rôle ne
+        # couvre aucun avis, sinon le filtre serait contourné par un siège
+        # posé avant la garde (le siège reste dans la colonne).
+        eligible, _reason = rd.reviewer_eligibility(row)
+        if not eligible:
+            continue
         family = rd.live_family(row, families=families)
         if (not name or name in forbidden_names or not family
                 or family in covered):
@@ -1741,11 +1804,20 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     # (#3036). Une lecture en échec ne ferme aucun hôte : on ne devine pas
     # qu'un hôte est mort, et le doute ne désigne personne d'autre.
     closed_hosts = alert_briefs.claims_closed_hosts(db)
+    # #4779 : un profil de relecture illisible (capacités ou rôles) n'est pas
+    # une preuve ; la candidature est refusée et le doute journalisé, même
+    # quand la note de charge est différée (`note_unreadable=False`) : ce n'est
+    # pas la même lecture et une donnée absente ne doit pas disparaître.
+    profile_unreadable: list = []
     candidates = _candidates(listing, loads=_loads(db, unreadable=unreadable),
                              project=project, families=families, pilot=notify,
-                             closed_hosts=closed_hosts)
+                             closed_hosts=closed_hosts,
+                             unreadable_profiles=profile_unreadable)
     if unreadable and note_unreadable:
         _note_unreadable(db, int(lot), str(item.get("state") or ""), unreadable)
+    if profile_unreadable:
+        _note_profile_unreadable(db, int(lot), str(item.get("state") or ""),
+                                 profile_unreadable)
     # #3948 : capturée AVANT la lecture des auteurs, la marque doit être
     # antérieure à ce que cette lecture voit ; sinon un gel arrivé entre les
     # deux serait réputé déjà lu et ses auteurs manqueraient. La borne est

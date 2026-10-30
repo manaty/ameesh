@@ -396,12 +396,14 @@ class PropositionTest(_Prise):
         """B4 : une capacité exigée s'applique aussi à la relecture."""
         self.auteur(team="ameesh")
         lot = self.qa("relire", branch="lot/a-relire", app="ameesh")
-        self.capacite(lot["id"], "propose")
+        # Le profil de relecture (propose + rôle) est acquis par la fixture ;
+        # la capacité exigée ici est distincte pour éprouver `lot_fits` seul.
+        self.capacite(lot["id"], "read")
         self.agent("codex1", harness="codex", team="ameesh")
         self.assertEqual(self.take(), [], "capacité exigée absente")
 
         self.agent("codex2", harness="codex", team="ameesh",
-                   capabilities=["propose"])
+                   capabilities=["propose", "read"])
         out = self.take()
         self.assertEqual([(t["kind"], t["agent"], t["item"]["id"]) for t in out],
                          [("review", "codex2", lot["id"])])
@@ -439,6 +441,27 @@ class PropositionTest(_Prise):
             "un relecteur désigné écarte le lot des propositions")
         self.assertEqual(self.take(), [])
         self.assertEqual(len(self.mails("codex1")), 1, "aucune double proposition")
+
+    def test_une_relecture_ecarte_une_fiche_sans_propose(self):
+        """#4779 (B1 dev4) : la voie des relectures proposées applique le
+        garde de fiche — un canari `[read]` / `roles: []` ne reçoit pas le
+        siège, et le lot reste disponible pour un relecteur éligible."""
+        self.auteur()
+        lot = self.qa("relire", branch="lot/a-relire")
+        self.agent("canari", harness="codex", team="nexlink",
+                   capabilities=["read"], roles=[])
+
+        self.assertEqual(self.take(), [], "fiche sans propose : aucune proposition")
+        self.assertEqual(self.mails("canari"), [])
+        self.assertFalse(work.get(self.db, lot["id"])["reviewer"])
+        self.assertEqual(storage.of(self.db).work.review_proposals(
+            5, proposal_prefix=backlog.REVIEW_PROPOSAL_NOTE)[0]["id"], lot["id"],
+            "le lot n'a pas été consommé par l'agent écarté")
+
+        self.agent("codex1", harness="codex", team="nexlink")
+        out = self.take()
+        self.assertEqual([(t["kind"], t["agent"]) for t in out], [("review", "codex1")])
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "codex1")
 
     def test_une_correction_ne_touche_pas_au_relecteur(self):
         """#1738 (N7) : une correction proposée ne désigne personne — le champ

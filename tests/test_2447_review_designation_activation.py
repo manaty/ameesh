@@ -163,6 +163,22 @@ class _Canon:
         return self.commit
 
 
+def register_agent(db, name, **kwargs):
+    """#4779 : enregistre un agent de test avec un profil de relecteur prouvé.
+
+    Le registre porte `capabilities` et `roles` depuis `canon sync` ; une fiche
+    de test sans ces champs ne prouve pas la capacité `propose` et ne serait
+    plus candidate. Le helper les pose après l'inscription, pour tous les
+    agents du fichier (auteurs et pilotes compris, sans effet sur eux).
+    """
+    row = registry.upsert(db, name, **kwargs)
+    db.execute(
+        "UPDATE agent_registry SET capabilities ="
+        " ARRAY['read','report-drift','propose'], roles = ARRAY['implementation']"
+        " WHERE name = %s", (row["name"],))
+    return row
+
+
 class _ActivationFixture:
     """A frozen lot, a canon, a registry with two independent families."""
 
@@ -174,6 +190,16 @@ class _ActivationFixture:
         # #2668: the gauge history is shared by the mesh; a test must not
         # inherit another test's plan pace (or the host's live readings)
         self.db.execute("DELETE FROM quota_gauge_readings")
+        # #4779 : les agents de ces témoins sont des relecteurs : une ligne
+        # neuve du registre de test reçoit le profil que `canon sync` écrit en
+        # production (capacité `propose`, un rôle). Les témoins du refus
+        # posent explicitement l'absence.
+        self.db.execute(
+            "ALTER TABLE agent_registry ALTER COLUMN capabilities SET DEFAULT"
+            " ARRAY['read','report-drift','propose']::text[]")
+        self.db.execute(
+            "ALTER TABLE agent_registry ALTER COLUMN roles SET DEFAULT"
+            " ARRAY['implementation']::text[]")
         self.repo = _Repo(os.path.join(self.tmp, "depot"))
         # `mail.py` reste sensible hors du périmètre critique : #1515 y a fait
         # entrer `work.py`, qui servait de chemin neutre à ces témoins.
@@ -185,10 +211,14 @@ class _ActivationFixture:
         self.cfg = dataclasses.replace(self.cfg, canon=self.canon.root, canon_ref="HEAD")
         for name, harness in (("author", "deepseek"), ("r1", "claude"),
                               ("r2", "codex"), ("pilot", "claude")):
-            registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
+            register_agent(self.db, name, harness=harness, host=self.cfg.host,
                             cwd=self.repo.root, status="idle")
-            self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
-                            (name,))
+            # #4779 : les relecteurs de test portent la capacité `propose` et
+            # un rôle, comme les agents du canon.
+            self.db.execute(
+                "UPDATE agent_registry SET team = 'ameesh', capabilities ="
+                " ARRAY['read','report-drift','propose'], roles = ARRAY['implementation']"
+                " WHERE name = %s", (name,))
         self.item = work.add(self.db, title="Désignation au gel", app="ameesh",
                              assignee="author")
         self.lot = int(self.item["id"])
@@ -273,7 +303,7 @@ class FreezeIntakeTest(_ActivationFixture, PgTestCase):
                         (self.lot,))
 
     def test_intake_freeze_enters_qa_and_designates_live_reviewers(self):
-        registry.upsert(self.db, "dead-reviewer", harness="codex", host=self.cfg.host,
+        register_agent(self.db, "dead-reviewer", harness="codex", host=self.cfg.host,
                         cwd=self.repo.root, status="dead")
         self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
                         ("dead-reviewer",))
@@ -470,7 +500,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.frozen = self.repo.commit("another lot")
         self.receipts()
         for name in ("r1", "r2"):
-            registry.upsert(self.db, name, harness="deepseek")
+            register_agent(self.db, name, harness="deepseek")
         _, again = self.freeze()
         self.assertEqual(again["state"], rd.WAITING, again)
         self.assertEqual(designated(work.get(self.db, self.lot)), [])
@@ -483,14 +513,14 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         # column; F1's delayed sync re-registered r1,r2 for the head of F2.
         # A replay of a freeze that is no longer the latest writes nothing.
         for name in ("r1", "r2"):
-            registry.upsert(self.db, name, harness="deepseek")
+            register_agent(self.db, name, harness="deepseek")
         first_sha = self.frozen
         first, waiting = self.freeze()
         self.assertEqual(waiting["state"], rd.WAITING, waiting)
         self.assertEqual(designated(work.get(self.db, self.lot)), [])
         # capacity is back, but the head moves before the delayed recovery sync
         for name, harness in (("r1", "claude"), ("r2", "codex")):
-            registry.upsert(self.db, name, harness=harness)
+            register_agent(self.db, name, harness=harness)
         self.repo.write("src/ameesh/work.py", "new head\n")
         self.frozen = self.repo.commit("new head")
         self.receipts()
@@ -511,11 +541,11 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         # The paths that erase the column are gated too: an old freeze whose
         # evidence is now unavailable must not clear the new head's reviewers.
         for name in ("r1", "r2"):
-            registry.upsert(self.db, name, harness="deepseek")
+            register_agent(self.db, name, harness="deepseek")
         first, waiting = self.freeze()
         self.assertEqual(waiting["state"], rd.WAITING, waiting)
         for name, harness in (("r1", "claude"), ("r2", "codex")):
-            registry.upsert(self.db, name, harness=harness)
+            register_agent(self.db, name, harness=harness)
         self.repo.write("src/ameesh/work.py", "new head\n")
         self.frozen = self.repo.commit("new head")
         self.receipts()
@@ -567,11 +597,11 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         # The mark, the mails and the column are one transaction: a failure in
         # the column write cannot leave a designation that is only half visible.
         for name in ("r1", "r2"):
-            registry.upsert(self.db, name, harness="deepseek")
+            register_agent(self.db, name, harness="deepseek")
         _, waiting = self.freeze()
         self.assertEqual(waiting["state"], rd.WAITING, waiting)
         for name, harness in (("r1", "claude"), ("r2", "codex")):
-            registry.upsert(self.db, name, harness=harness)
+            register_agent(self.db, name, harness=harness)
         marked = len(self.marks())
         mailed = len(self.mailbox())
         with mock.patch.object(act, "_sync_reviewers",
@@ -595,7 +625,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         # (`at_freeze=False`), as before the recovery moved into one
         # transaction: only the freeze hook turns it into a waiting mark.
         for name in ("r1", "r2"):
-            registry.upsert(self.db, name, harness="deepseek")
+            register_agent(self.db, name, harness="deepseek")
         work.milestone(self.db, self.lot, "frozen", sha=self.frozen, actor="author",
                        on_frozen=lambda tx, milestone, threads: None,
                        after_commit=[])
@@ -680,7 +710,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
 
     def test_no_reviewer_free_is_an_explicit_wait_and_a_capacity_alert(self):
         for name in ("r1", "r2"):
-            registry.upsert(self.db, name, harness="deepseek")
+            register_agent(self.db, name, harness="deepseek")
         _, out = self.freeze()
         self.assertEqual(out["state"], rd.WAITING, out)
         self.assertEqual(out["reviewers"], [])
@@ -1115,7 +1145,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
     def test_a_manual_reviewer_of_the_author_family_does_not_count(self):
         # Le manuel r1 tourne en realite sous deepseek, la famille de l'auteur :
         # il ne couvre aucun siege, les deux avis automatiques partent.
-        registry.upsert(self.db, "r3", harness="claude", host=self.cfg.host,
+        register_agent(self.db, "r3", harness="claude", host=self.cfg.host,
                         cwd=self.repo.root, status="idle")
         self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = 'r3'")
         work.move(self.db, self.lot, "qa")
@@ -1533,7 +1563,7 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
     LOST = "pc-smichea"
 
     def _agent(self, name, harness):
-        registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
+        register_agent(self.db, name, harness=harness, host=self.cfg.host,
                         cwd=self.repo.root, status="idle")
         self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
                         (name,))
@@ -2285,7 +2315,7 @@ class PendingLoadTest(_ActivationFixture, PgTestCase):
         # journal mark names the retained load.
         for _ in range(5):
             self.pending_lot("r1")
-        registry.upsert(self.db, "r1b", harness="claude", host=self.cfg.host,
+        register_agent(self.db, "r1b", harness="claude", host=self.cfg.host,
                         cwd=self.repo.root, status="idle")
         self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = 'r1b'")
         self.db.execute("UPDATE agent_registry SET status = 'stopped' WHERE name = 'r2'")
@@ -2504,7 +2534,7 @@ class ActivationCliTest(_ActivationFixture, PgTestCase):
         # #3685 : le pilote a retiré r1 ; `--apply` affichait « designated:
         # r1 », repris de la marque. La sortie nomme la marque historique et la
         # désignation vivante, jamais le siège retiré comme redésigné.
-        registry.upsert(self.db, "r3", harness="claude", host=self.cfg.host,
+        register_agent(self.db, "r3", harness="claude", host=self.cfg.host,
                         cwd=self.repo.root, status="idle")
         self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
                         ("r3",))

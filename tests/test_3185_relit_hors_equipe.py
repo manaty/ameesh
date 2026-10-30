@@ -36,9 +36,12 @@ review_policies:
 """
 
 
-def row(name, *, team="nexlink", harness="deepseek", session="", relit=None):
+def row(name, *, team="nexlink", harness="deepseek", session="", relit=None,
+        capabilities=("read", "report-drift", "propose"), roles=("implementation",)):
+    """#4779 : une ligne de relecteur porte sa capacité `propose` et un rôle."""
     return {"name": name, "team": team, "harness": harness, "session_harness": session,
-            "status": "idle", "mode": "execute", "status_text": "", "relit": relit}
+            "status": "idle", "mode": "execute", "status_text": "", "relit": relit,
+            "capabilities": list(capabilities), "roles": list(roles)}
 
 
 #: le registre nexlink du 23/10 : codex, claude* en DeepSeek, pilote claude
@@ -175,8 +178,11 @@ class RelitSyncTest(_CanonDbCase):
                              (name,))[0]["relit"]
 
     def test_sync_writes_relit_and_the_overview_exposes_it(self):
+        # #4779 : une fiche de relecteur porte un rôle, sans quoi elle n'est
+        # plus candidate même si `relit` déclare le projet.
         write(self.root, "agents/orchestre.md",
-              orchestre(team="acme-api", relit=["acme-web"]))
+              orchestre(team="acme-api", relit=["acme-web"],
+                        roles=["orchestrateur"]))
         self.sync()
         self.assertEqual(list(self.relit("orchestre")), ["acme-web"])
         self.assertEqual(self.actions(self.sync())["orchestre"], "inchangé")
