@@ -11,6 +11,9 @@ Task-oriented pages. Each one uses only commands that exist in the CLI; see the
 - [Write a Process card](write-a-process.md): the working rules injected into
   briefs, and the executable `workflow:` block (stages, grouped transitions,
   guards, work types, projection, admission pin, check command).
+- [Write a Pipeline](write-a-pipeline.md): a pipeline declared as canon data
+  (`pipelines/*.md`), its declarative module, adoption and native commands,
+  with the acme and after-sales support examples.
 - [Run the demo](run-the-demo.md): the v1 scenario on the bench, step by step.
 - [Switch from a v0 setup](switch-from-v0.md): move a running team of agents to
   ameesh, one reversible step at a time; upgrade an existing installation.

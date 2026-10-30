@@ -582,8 +582,13 @@ class Leases(Domain):
     @abc.abstractmethod
     def end_turn(self, name: str, owner: str, epoch: int, *, status: str,
                  status_text: str | None, error: str | None,
-                 cost_usd: float | None) -> bool:
-        """Clôt un tour seulement si le bail est encore détenu."""
+                 cost_usd: float | None, turn_id: str | None = None) -> bool:
+        """Clôt un tour seulement si le bail est encore détenu.
+
+        ``turn_id`` est l'identité du tour local fermé : elle fend la clôture
+        générique d'un tour sandbox (#4881). Absente, seul un tour sandbox
+        vivant sur le même bail refuse.
+        """
 
 
 class Catalog(Domain):
@@ -768,6 +773,18 @@ class TurnCosts(Domain):
         définition du compteur vivant de l'exécuteur (#4448 B), et non les
         seuls succès. C'est la même mesure que ce compteur, relue pour
         l'alerte `session_too_big`."""
+
+    @abc.abstractmethod
+    def session_reread(self, agent: str, session: str) -> dict | None:
+        """CTX-02b : le cumul des entrées relues des tours d'une session —
+        `tokens` (entrée + cache **lu**, cache écrit exclu ; Codex compte déjà
+        le cache dans son entrée), `turns` (tous les tours inscrits),
+        `last_ts` (instant du dernier tour inscrit, epoch ; pour vérifier
+        qu'aucun tour n'a été écrit depuis une qualité publiée) ; ou None si
+        aucun tour. Lecture seule, base de `R_session` pour la publication
+        `ameesh-context/1` : elle ne change aucune décision ni la ligne du
+        grand livre. Plusieurs harnais dans une session (anomalie) : chaque
+        ligne suit sa propre convention de cache."""
 
     @abc.abstractmethod
     def first_after(self, agent: str, ts: float) -> dict | None:

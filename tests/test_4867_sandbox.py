@@ -134,6 +134,7 @@ class SandboxTest(PgTestCase):
         for code, change in (
                 ('scope-mismatch', lambda r: r.update(scope_digest='wrong')),
                 ('missing',lambda r: r['usage'].pop('tool_calls')),
+                ('missing',lambda r: r['usage'].update(tokens=1)),
                 ('limit-exceeded',lambda r: r['usage'].update(tool_calls=11)),
                 ('profile-refused',lambda r: r.update(tools=['deploy'])),
                 ('profile-refused',lambda r: r.update(capabilities={'deploy':True})),
@@ -145,6 +146,12 @@ class SandboxTest(PgTestCase):
             with self.subTest(code=code):
                 result = copy.deepcopy(self.result()); change(result)
                 self.refusal(code,self.complete,result)
+        # §9 precedence: a wrong echoed epoch beats a wrong scope (#4881).
+        stale = self.result()
+        stale['epoch'] = 8
+        stale['scope'] = dict(self.scope, pr=99)
+        stale['scope_digest'] = 'wrong'
+        self.refusal('stale', self.complete, stale)
         self.refusal('missing', self.complete, {'bad':float('nan')})
         self.db.execute("update agent_registry set lease_expires_at = now() - interval '1 second' where name = 'sand'")
         self.refusal('stale',self.complete)
@@ -196,13 +203,67 @@ class SandboxTest(PgTestCase):
         else:
             self.assertEqual(self.db.query('select count(*) as n from sandbox_results')[0]['n'],1)
 
-    def test_generic_close_after_result_requires_a_new_local_turn(self):
+    def test_generic_close_refuses_a_sandbox_turn_by_identity(self):
         self.bind(); self.complete()
         self.refusal('wrong-completion',registry.end_turn,self.db,'sand','runner',7,
-                     status='idle',status_text=None,error=None,cost_usd=None)
-        self.db.execute("insert into turn_resources (turn_id,agent,host) values ('local-2','sand','host')")
+                     status='idle',status_text=None,error=None,cost_usd=None,
+                     turn_id='turn-1')
+
+    def test_generic_close_of_an_unattached_local_turn_is_allowed(self):
+        # The local turn's turn_resources row may be missing (the runner never
+        # fails a turn for that); closing it must not depend on the ledger's
+        # latest row (#4881, auditor N).
+        self.bind(); self.complete()
+        self.assertFalse(self.db.query(
+            "select * from turn_resources where turn_id = 'local-2'"))
         self.assertTrue(registry.end_turn(self.db,'sand','runner',7,status='idle',
-                                         status_text=None,error=None,cost_usd=None))
+                                         status_text=None,error=None,cost_usd=None,
+                                         turn_id='local-2'))
+
+    def test_sandbox_session_is_typed_when_the_profile_admits_one(self):
+        # The admission snapshot is immutable: re-create the fixture row rather
+        # than update its limits, as the production guard demands.
+        row = self.db.query('select * from sandbox_turns')[0]
+        row['limits'] = dict(row['limits'], session='reviewer')
+        self.db.execute('delete from sandbox_turns')
+        self.db.execute('insert into sandbox_turns select * from'
+                        ' jsonb_populate_record(null::sandbox_turns, %s::jsonb)',
+                        (json.dumps(row),))
+        self.bind()
+        wrong = self.result(); wrong['sandbox_session'] = 42
+        self.refusal('missing', self.complete, wrong)
+        good = self.result(); good['sandbox_session'] = 'reviewer-session-1'
+        self.complete(good)
+        self.assertEqual(self.db.query(
+            'select sandbox_session from sandbox_turns')[0]['sandbox_session'],
+            'reviewer-session-1')
+
+    def test_cancel_event_uses_the_design_name(self):
+        self.bind()
+        before = self.db.query("select count(*) as n from ameesh_events"
+                               " where type = 'sandbox.cancelled'")[0]['n']
+        sandbox.ameesh_sandbox_cancel(self.db,'turn-1','runner',7)
+        sandbox.ameesh_sandbox_cancel(self.db,'turn-1','runner',7,observed=True,
+                                      settle=self.settle)
+        after = self.db.query("select count(*) as n from ameesh_events"
+                              " where type = 'sandbox.cancelled'")[0]['n']
+        self.assertEqual(after, before + 2)
+        self.assertFalse(self.db.query(
+            "select * from ameesh_events where type = 'sandbox.cancel'"))
+
+    def test_stale_lease_wins_over_the_stored_result(self):
+        # §4 steps 2-3 and §9: revocation and a stale lease are the authority;
+        # a stored result is replayed only while this owner/epoch holds the
+        # lease. Pinned, not reversed: the design's order is fixed (#4881).
+        self.bind()
+        self.complete()
+        self.db.execute("update agent_registry set lease_expires_at ="
+                        " now() - interval '1 second' where name = 'sand'")
+        self.refusal('stale', self.complete)
+        self.refusal('stale', sandbox.ameesh_sandbox_cancel, self.db,
+                     'turn-1', 'runner', 7)
+        self.assertEqual(self.db.query(
+            'select count(*) as n from sandbox_results')[0]['n'], 1)
 
     def test_admission_snapshot_cannot_be_rewritten(self):
         with self.assertRaises(Exception):

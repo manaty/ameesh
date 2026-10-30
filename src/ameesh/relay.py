@@ -854,6 +854,15 @@ class Relay:
         turn = identity.turn or self._turn_header(handler)
         session = (handler.headers.get("x-deepseek-harness-session-id") or "").strip()
         session = session if _TURN_RE.match(session or "-") else ""
+        relay_request = None
+        if identity.turn:
+            from .storage.postgres.turn_admission import relay_begin, Refusal
+            from . import db as db_mod
+            try:
+                with self._db_lock:
+                    relay_request = relay_begin(self.db, identity)
+            except (Refusal, db_mod.DbError):
+                raise Refused(503, "api_error", "turn accounting unavailable") from None
         conn = self._connection(base)
         reached = False
         status = 0
@@ -901,7 +910,7 @@ class Relay:
             if reached and status == 200:
                 billed = settle(meter.usage, request_bytes, int(body.get("max_tokens") or 0))
                 self._record(identity, provider, billed, turn, session or None,
-                             started=started)
+                             started=started, relay_request=relay_request)
 
     def _pipe_stream(self, handler, response, meter: UsageMeter) -> None:
         sent = 0
@@ -937,7 +946,8 @@ class Relay:
 
     # -- grand livre --------------------------------------------------------
     def _record(self, identity: Identity, provider: str, usage: Usage, turn: str | None,
-                session: str | None, started: float | None = None) -> None:
+                session: str | None, started: float | None = None,
+                relay_request: str | None = None) -> None:
         harness = PROVIDERS[provider]["harness"]
         row = {"agent": identity.agent, "harness": harness, "turn": turn,
                "model": usage.model or None, "session": session,
@@ -947,7 +957,8 @@ class Relay:
                "cached_input_tokens": usage.cache_read_tokens,
                "output_tokens": usage.output_tokens,
                "executor": identity.executor, "lease_owner": identity.lease_owner,
-               "lease_epoch": int(identity.lease_epoch)}
+               "lease_epoch": int(identity.lease_epoch), "turn_id": identity.turn,
+               "relay_request": relay_request}
         if not self._write(row):
             self._unrecorded.append(row)
             log.error("relais : dépense de %s non écrite (%.6f $) : gardée en mémoire",
@@ -957,15 +968,29 @@ class Relay:
         from . import db as db_mod
         try:
             with self._db_lock:
-                storage.of(self.db).turn_costs.insert(
-                    agent=row["agent"], harness=row["harness"], turn=row["turn"],
-                    model=row["model"], session=row["session"], usd=row["usd"],
-                    input_tokens=row["input_tokens"],
-                    cached_input_tokens=row["cached_input_tokens"],
-                    output_tokens=row["output_tokens"], cum_usd=None, cum_input_tokens=None,
-                    cum_cached_input_tokens=None, cum_output_tokens=None,
-                    source="relay", executor=row["executor"],
-                    lease_owner=row["lease_owner"], lease_epoch=row["lease_epoch"])
+                with self.db.transaction() as tx:
+                    if row.get("relay_request"):
+                        markers = tx.query('select state from tranche_relay_requests'
+                                           ' where id = %s and turn_id = %s for update',
+                                           (row['relay_request'], row['turn_id']))
+                        if not markers:
+                            raise db_mod.DbError('relay accounting marker missing')
+                        if markers[0]['state'] == 'recorded':
+                            return True
+                    storage.of(tx).turn_costs.insert(
+                        agent=row["agent"], harness=row["harness"], turn=row["turn"],
+                        model=row["model"], session=row["session"], usd=row["usd"],
+                        input_tokens=row["input_tokens"],
+                        cached_input_tokens=row["cached_input_tokens"],
+                        output_tokens=row["output_tokens"], cum_usd=None, cum_input_tokens=None,
+                        cum_cached_input_tokens=None, cum_output_tokens=None,
+                        source="relay", executor=row["executor"],
+                        lease_owner=row["lease_owner"], lease_epoch=row["lease_epoch"],
+                        turn_id=row.get("turn_id"))
+                    if row.get("relay_request"):
+                        tx.execute("update tranche_relay_requests set state = 'recorded',"
+                                   " recorded_at = clock_timestamp() where id = %s and turn_id = %s",
+                                   (row["relay_request"], row["turn_id"]))
             return True
         except db_mod.DbError:
             return False
