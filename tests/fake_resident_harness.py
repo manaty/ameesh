@@ -29,9 +29,10 @@ received), `FAKE_CLAUDE_QUEUE=1` (an input written during a turn is not
 injected: it opens the next harness turn, as when it arrives just after the
 last tool call), `FAKE_CLAUDE_PUSH_AFTER` (seconds after an `initialize`
 answer before the harness pushes its `system/commands_changed` event, as the
-real CLI does asynchronously — #1337), `FAKE_CODEX_STEER_REFUSE=1`
-(`turn/steer` always refused), `FAKE_START_DELAY` (seconds before answering
-`initialize`).
+real CLI does asynchronously — #1337), `FAKE_CLAUDE_MODEL_USAGE` (JSON
+`modelUsage` map, CTX-03), `FAKE_COMPACT_NO_POST=1` (a compaction boundary
+without an after, CTX-03), `FAKE_CODEX_STEER_REFUSE=1` (`turn/steer` always
+refused), `FAKE_START_DELAY` (seconds before answering `initialize`).
 """
 from __future__ import annotations
 
@@ -170,15 +171,18 @@ class Claude:
     def compact(self) -> None:
         """L81 (étude §6.2): the boundary a native `/compact` produces —
         `pre_tokens`/`post_tokens`, unless `FAKE_COMPACT_SKIP=1` (a harness
-        that reports none) or `FAKE_COMPACT_POST` forces the after."""
+        that reports none), `FAKE_COMPACT_NO_POST=1` (an after never
+        published, CTX-03) or `FAKE_COMPACT_POST` forces the after."""
         if os.environ.get("FAKE_COMPACT_SKIP") == "1":
             return
         pre = int(os.environ.get("FAKE_COMPACT_PRE")
                   or os.environ.get("FAKE_CLAUDE_CONTEXT") or "240")
         post = int(os.environ.get("FAKE_COMPACT_POST") or max(pre // 5, 1))
+        meta = {"trigger": "manual", "pre_tokens": pre}
+        if os.environ.get("FAKE_COMPACT_NO_POST") != "1":
+            meta["post_tokens"] = post
         out({"type": "system", "subtype": "compact_boundary", "session_id": self.session,
-             "compact_metadata": {"trigger": "manual", "pre_tokens": pre,
-                                  "post_tokens": post}})
+             "compact_metadata": meta})
 
     def turn(self, first: dict) -> None:
         out({"type": "system", "subtype": "init", "session_id": self.session,
@@ -246,7 +250,11 @@ class Claude:
         usage = self.call_usage()
         extra = {}
         window = os.environ.get("FAKE_CLAUDE_WINDOW")
-        if window:
+        if os.environ.get("FAKE_CLAUDE_MODEL_USAGE"):
+            # CTX-03: an explicit `modelUsage` map (e.g. an auxiliary model
+            # first, then the principal announced by the init event).
+            extra["modelUsage"] = json.loads(os.environ["FAKE_CLAUDE_MODEL_USAGE"])
+        elif window:
             extra["modelUsage"] = {"fake-model": {"contextWindow": int(window)}}
         if interrupted:
             out({"type": "result", "subtype": "error_during_execution", "is_error": True,

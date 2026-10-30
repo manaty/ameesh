@@ -65,7 +65,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from . import __version__, acp, adapters, harness_versions
+from . import __version__, acp, adapters, context_profile, harness_versions
 from .adapters import HarnessAdapter
 
 #: start of the harness up to an open session (hooks, MCP servers, login)
@@ -191,8 +191,11 @@ class TurnResult:
     `context_window` when the harness gives them. `cost`: USD of the turn
     when it can be told apart from the session's cumulative cost
     (`cost_total`). `compact`: the native compaction the harness reported in
-    the turn (`{"pre": …, "post": …}`, tokens before and after; L81), None
-    when it reported none."""
+    the turn (`{"pre": …, "post": …, "quality": …, "reasons": […]}`; L81),
+    None when it reported none; a missing `post` keeps the before and marks
+    the measure `partial` (CTX-03). `profile`: the observed
+    `ameesh-context/1` window of the effective model (CTX-03, observation
+    only), empty when no model was announced."""
 
     status: str
     final: str = ""
@@ -210,6 +213,10 @@ class TurnResult:
     cost_total: float | None = None
     duration_s: float = 0.0
     compact: dict | None = None
+    #: CTX-03: observed `ameesh-context/1` profile (effective model, runtime
+    #: window, quality and reasons). Observation only: the maintenance
+    #: decision still reads `usage["context_window"]` (legacy).
+    profile: dict = field(default_factory=dict)
 
 
 class Turn:
@@ -475,6 +482,13 @@ class ResidentDriver:
         self._interrupting = False
         self._closed = False
         self._dead: str | None = None
+        #: CTX-03: the effective model the harness announced (session event,
+        #: result); never the requested `model` above.
+        self._announced_model: str | None = None
+        #: CTX-03: observed profile of the session, invalidated on a model
+        #: switch. Kept apart from `_window`, which decision code still reads:
+        #: CTX-03 observes, it does not change a rotation/compaction decision.
+        self._profile: context_profile.Window | None = None
         self._reset_turn()
 
     # -- environment -------------------------------------------------------
@@ -721,6 +735,9 @@ class ResidentDriver:
 
     def _emit(self, raw: dict, parsed: dict) -> None:
         self.last_activity = time.monotonic()
+        if parsed.get("model"):
+            # CTX-03: the model the harness announces is the effective one.
+            self._announced_model = str(parsed["model"])
         callback = self.on_event
         if callback is None:
             return
@@ -749,7 +766,8 @@ class ResidentDriver:
                 inputs=tuple(i for i in current.inputs if i not in self._unconfirmed),
                 cost=self._cost, cost_total=self._cost_total,
                 duration_s=round(time.monotonic() - current.started, 3),
-                compact=dict(self._compact) if self._compact else None)
+                compact=dict(self._compact) if self._compact else None,
+                profile=self._profile.to_dict() if self._profile is not None else {})
             self._turn = None
             self._followups.clear()
             self._unconfirmed.clear()
@@ -1151,20 +1169,14 @@ class ClaudeStreamJson(ResidentDriver):
     def _on_compact(self, event: dict) -> None:
         """L81 (étude §6.2) : la compaction native rapportée par le harnais —
         ses jetons avant/après ; le contexte mesuré suit l'après, pour que la
-        décision d'entretien ne redemande pas une compaction sans fin."""
-        meta = event.get("compact_metadata")
-        if not isinstance(meta, dict):
-            meta = event
+        décision d'entretien ne redemande pas une compaction sans fin.
 
-        def token(*names) -> int | None:
-            for name in names:
-                value = meta.get(name)
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    return int(value)
-            return None
-
-        compact = {"pre": token("pre_tokens", "preTokens", "pre"),
-                   "post": token("post_tokens", "postTokens", "post")}
+        CTX-03 : la mesure porte aussi sa qualité. Sans `post_tokens`,
+        l'après reste `None` (marqué `partial`) et le contexte garde l'avant :
+        le contrat interdit d'inventer la mesure d'après.
+        """
+        measured = context_profile.compaction(event)
+        compact = measured.to_dict()
         with self._lock:
             self._compact = compact
             if compact["post"] is not None:
@@ -1178,7 +1190,8 @@ class ClaudeStreamJson(ResidentDriver):
                         _number(usage.get("output_tokens")))
         # L81 (étude §6.1) : la fenêtre du modèle, donnée par `modelUsage`
         # (Claude Code) ; sans elle la décision de compaction ne peut se
-        # prendre sur la part du contexte.
+        # prendre sur la part du contexte. Ce chemin de décision legacy est
+        # conservé tel quel : CTX-03 observe à côté, sans changer un seuil.
         model_usage = event.get("modelUsage")
         if isinstance(model_usage, dict):
             for entry in model_usage.values():
@@ -1188,6 +1201,12 @@ class ClaudeStreamJson(ResidentDriver):
                     with self._lock:
                         self._window = window
                     break
+        # CTX-03 : le profil observé résout le modèle principal annoncé et sa
+        # fenêtre ; une entrée auxiliaire en tête ne peut plus la fournir.
+        observed = context_profile.from_model_usage(
+            model_usage, announced=self._announced_model)
+        with self._lock:
+            self._profile = context_profile.advance(self._profile, observed)
         with self._lock:
             total = event.get("total_cost_usd")
             if isinstance(total, (int, float)) and not isinstance(total, bool):
@@ -1486,8 +1505,16 @@ class CodexAppServer(ResidentDriver):
             total = usage.get("total") if isinstance(usage.get("total"), dict) else {}
             with self._lock:
                 self._context = call["input_tokens"]
-                if _number(usage.get("modelContextWindow")):
-                    self._window = _number(usage.get("modelContextWindow"))
+                window = _number(usage.get("modelContextWindow"))
+                if window:
+                    # legacy decision path, unchanged
+                    self._window = window
+                    # CTX-03: observed window, tied to the announced model
+                    self._profile = context_profile.advance(
+                        self._profile,
+                        context_profile.from_runtime_window(
+                            window, model=self._announced_model,
+                            source=context_profile.SOURCE_CODEX))
                 if total:
                     # L80a: cumulative usage of the thread, for the ledger's
                     # baseline; `last` above remains this turn's measure.
@@ -1692,7 +1719,14 @@ class AcpResident(ResidentDriver):
                 self._context = client.max_used
                 self._usage["input_tokens"] += client.max_used
             if client.size is not None:
+                # legacy decision path, unchanged
                 self._window = client.size
+                # CTX-03: observed window, tied to the announced model
+                self._profile = context_profile.advance(
+                    self._profile,
+                    context_profile.from_runtime_window(
+                        client.size, model=self._announced_model,
+                        source=context_profile.SOURCE_ACP))
             if client._last_cost is not None:
                 # cumulative over the session: this prompt's cost is the
                 # difference with the reading before it (codex r1, #325), as
