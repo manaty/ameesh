@@ -299,8 +299,13 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
         state = release_cutoff.load_state(cfg)
         slot = release_cutoff.project_state(state, project.name)
         text = str(exc)
-        rules, _source = release_cutoff.compiled_rules(cfg, project.name)
-        cutoff_at, _label = release_cutoff.cutoff_slot(rules, now)
+        try:
+            rules, _source = release_cutoff.compiled_rules(cfg, project.name)
+            cutoff_at, _label = release_cutoff.cutoff_slot(rules, now)
+        except release_cutoff.ReleaseError:
+            # A missing calendar can itself be the failure being reported.
+            # Keep the previous once-per-error behavior until it is readable.
+            cutoff_at, _label = None, ""
         if (slot.get("last_error") == text
                 and slot.get("last_error_cutoff") == cutoff_at):
             return
@@ -318,8 +323,9 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
             report = {"schema": release_cutoff.SCHEMA, "result": "refused",
                       "project": project.name, "cutoff_at": cutoff_at,
                       "label": _label, "completed_at": now, "message": text}
-            report["report_path"] = release_cutoff.write_report(
-                cfg, project, dict(report, version="refused"))
+            if cutoff_at is not None:
+                report["report_path"] = release_cutoff.write_report(
+                    cfg, project, dict(report, version="refused"))
             release_cutoff.send_report(cfg, db, project, body, report, urgent=True)
     except Exception:  # a report never masks the original error
         pass

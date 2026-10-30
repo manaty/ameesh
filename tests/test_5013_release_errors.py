@@ -25,6 +25,20 @@ class ErrorReportTest(unittest.TestCase):
             self.assertEqual(slot["last_error_cutoff"], 200)
 
 
+    def test_unreadable_calendar_still_reports_the_original_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = config.Config(state_dir=folder)
+            project = release_cutoff.ProjectRelease(
+                name="ameesh", repo=folder, target="main", report="bureau")
+            with mock.patch.object(release_cutoff, "compiled_rules",
+                                   side_effect=release_cutoff.ReleaseError("no calendar")), \
+                    mock.patch.object(release_cutoff, "send_report") as send:
+                for now in (101, 102):
+                    release._report_error(cfg, object(), project,
+                                          release_cutoff.ReleaseError("no calendar"), now)
+                send.assert_called_once()
+                self.assertEqual(send.call_args.args[4]["message"], "no calendar")
+
     def test_late_tick_keeps_the_failure_from_its_window(self):
         from types import SimpleNamespace
         for error_at, expected in ((101, True), (99, False)):
