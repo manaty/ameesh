@@ -944,7 +944,10 @@ def _create_carrier(ctx: Context, name: str, group: list[int], *,
         "--estimate", CARRIER_ESTIMATE,
         "--estimate-source", CARRIER_ESTIMATE_SOURCE,
         "--source", "paquet-horaire (#3845), minuterie",
-        "--body", "Paquet horaire composé sans agent par scripts/paquet-horaire.py "
+        # #4667 : le corps ne cite plus le script par son chemin — une
+        # empreinte d'intake inférée de cette citation faisait naître le
+        # porteur libre (le véhicule n'a pas de delta propre).
+        "--body", "Paquet horaire composé sans agent par le composeur horaire "
                   "(#3845) : %d lot(s) prêt(s) à la lecture (%s).%s"
                   % (len(group), ", ".join("#%d" % lot for lot in group), detail),
         "--actor", ctx.actor, what="création du porteur")

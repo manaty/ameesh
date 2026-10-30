@@ -279,6 +279,9 @@ class ComposeTest(Base):
         add = self.shell.ran("work", "add")[0]
         self.assertIn("integration/paquet-h-20261027-04", add)
         self.assertEqual(add[add.index("--title") + 1][:31], "Paquet horaire h-20261027-04 — ")
+        # #4667 : le corps du porteur ne cite pas le script par son chemin —
+        # l'empreinte d'intake inférée de cette citation le faisait naître libre.
+        self.assertNotIn("scripts/paquet-horaire.py", add[add.index("--body") + 1])
         auto = [c for c in self.shell.calls if "paquet-auto.py" in " ".join(c)][0]
         self.assertNotIn("--force", auto)
         # #4581 : une composition neuve n'est pas une recomposition ; elle ne
