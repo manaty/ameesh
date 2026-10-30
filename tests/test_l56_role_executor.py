@@ -678,6 +678,40 @@ class RoleExecutorTest(PgTestCase):
             db.close()
             self.db.execute('DROP SCHEMA %s CASCADE' % q(schema))
 
+    def test_schema_guard_migration_revokes_creation_time_executor_defaults(self):
+        import shutil
+        from pathlib import Path
+        import tempfile
+        q = db_mod.quote_ident
+        schema = 't_guard_upgrade_' + uuid.uuid4().hex[:8]
+        self.db.execute('CREATE SCHEMA %s' % q(schema))
+        cfg = dataclasses.replace(self.cfg, schema=schema)
+        db = db_mod.connect(cfg)
+        try:
+            db.execute('ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT SELECT,INSERT,UPDATE,DELETE,'
+                       'TRUNCATE,REFERENCES,TRIGGER ON TABLES TO %s'
+                       % (q(schema),q(self.role)))
+            db.execute('ALTER DEFAULT PRIVILEGES IN SCHEMA %s GRANT UPDATE ON TABLES TO PUBLIC'
+                       % q(schema))
+            with tempfile.TemporaryDirectory() as directory:
+                shutil.copy(Path(REPO,'src/ameesh/migrations/0524_schema_write_guard.sql'), directory)
+                migrations.migrate(db, directory)
+            for relation in ('schema_non_additive_migrations',):
+                for privilege in ('INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER'):
+                    self.assertFalse(db.query('SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                        (self.role,schema+'.'+relation,privilege))[0]['allowed'])
+                self.assertTrue(db.query('SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                    (self.role,schema+'.'+relation,'SELECT'))[0]['allowed'])
+            result = self.run_script(self.role)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for privilege in ('SELECT', 'INSERT', 'UPDATE', 'DELETE'):
+                self.assertEqual(self.db.query('SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                    (self.role,self.schema+'.schema_non_additive_migrations',privilege))[0]['allowed'],
+                    privilege == 'SELECT')
+        finally:
+            db.close()
+            self.db.execute('DROP SCHEMA %s CASCADE' % q(schema))
+
     def test_executor_reads_review_catch_up_without_writes(self):
         """#1448 N1 : la borne d'activation du rattrapage après fusion (0438)
         est lisible par l'exécuteur, mais aucun rôle exécuteur ne la déplace."""

@@ -113,6 +113,11 @@ class ListenerErrorTest(unittest.TestCase):
 class RunnerPruneTest(unittest.TestCase):
     """The runner prunes at most once an hour, never in dry run."""
 
+    def setUp(self):
+        admission = mock.patch('ameesh.migrations.require_compatible_writer')
+        admission.start()
+        self.addCleanup(admission.stop)
+
     def fake(self, **kw):
         fields = dict(db=object(), dry_run=False, _events_pruned_at=None,
                       _events_prune_error=None)

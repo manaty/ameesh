@@ -291,7 +291,7 @@ class SynchronisationBorneeTest(_DeuxCanons):
 
 class ExecuteurTest(_DeuxCanons):
     def runner_pass(self, cfg) -> bool:
-        fake = types.SimpleNamespace(cfg=cfg, host=HOST)
+        fake = types.SimpleNamespace(db=self.db, cfg=cfg, host=HOST)
         return runner_mod.Runner.canon_sync_once(fake)
 
     def cfg2(self, *, second=None):
@@ -446,7 +446,7 @@ class CompatibiliteUnCanonTest(_DeuxCanons):
     def test_un_canon_rien_ne_change(self):
         cfg = dataclasses.replace(self.cfg, canon=self.a, extra_canons=())
         self.assertTrue(runner_mod.Runner.canon_sync_once(
-            types.SimpleNamespace(cfg=cfg, host=HOST)))
+            types.SimpleNamespace(db=self.db, cfg=cfg, host=HOST)))
         self.assertEqual([(s["canon"], s["status"]) for s in canon_sync.states(self.db, HOST)],
                          [("", "ok")])
         self.assertEqual({r["canon"] for r in self.db.query("SELECT canon FROM agent_registry")},

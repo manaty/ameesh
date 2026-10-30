@@ -7,6 +7,25 @@ CREATE TABLE schema_non_additive_migrations (
     checksum text NOT NULL
 );
 
+-- Revoke creation-time default writer grants.
+DO $marker_acl$
+DECLARE item record;
+BEGIN
+    FOR item IN SELECT DISTINCT c.relname,acl.grantee,acl.privilege_type
+                  FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                  CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) acl
+                 WHERE n.nspname=current_schema()
+                   AND c.relname = 'schema_non_additive_migrations'
+                   AND acl.grantee<>c.relowner
+                   AND acl.privilege_type<>'SELECT' LOOP
+        EXECUTE format('REVOKE %s ON %I.%I FROM %s',
+                       item.privilege_type,
+                       current_schema(),item.relname,
+                       CASE WHEN item.grantee=0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(item.grantee)) END);
+    END LOOP;
+END
+$marker_acl$;
+
 -- Isolated services already provisioned in this schema predate this table.
 -- Do not attach ACLs merely because a service group exists in another schema.
 -- Only the migration owner may change its compatibility inventory.
