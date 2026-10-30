@@ -102,6 +102,31 @@ class SelectionProfileTest(unittest.TestCase):
         self.assertEqual(refused, [])
 
 
+class ManualSeatProfileTest(unittest.TestCase):
+    """Un siège manuel sans `propose`/rôle ne couvre aucun avis (B1 cx2)."""
+
+    def seats(self, *manual):
+        rows = [agent_row("canary", harness="claude", capabilities=("read",), roles=()),
+                agent_row("no-role", harness="claude", roles=None),
+                agent_row("reviewer", harness="claude")]
+        return act._manual_seats(
+            list(manual), rows,
+            authors=[{"name": "author", "family": "deepseek"}],
+            families=FAMILIES)
+
+    def test_a_read_only_manual_seat_covers_nothing(self):
+        self.assertEqual([s["name"] for s in self.seats("canary", "reviewer")],
+                         ["reviewer"])
+
+    def test_a_manual_seat_without_roles_covers_nothing(self):
+        self.assertEqual([s["name"] for s in self.seats("no-role", "reviewer")],
+                         ["reviewer"])
+
+    def test_a_propose_manual_seat_still_covers(self):
+        self.assertEqual([s["name"] for s in self.seats("reviewer")],
+                         ["reviewer"])
+
+
 class ProfilePgTest(PgTestCase):
     """Le refus manuel et le règlement de la demande, sur une vraie base."""
 
@@ -238,6 +263,25 @@ class ProfileJournalTest(_ActivationFixture, PgTestCase):
         self.assertTrue(notes, self.notes())
         self.assertTrue(any("r1" in note and rd.CAPABILITIES_UNREADABLE in note
                             for note in notes), notes)
+
+
+class ManualCanaryFreezeTest(_ActivationFixture, PgTestCase):
+    """Le siège manuel d'un canari ne couvre aucun avis au gel (B1 cx2)."""
+
+    def test_a_manual_read_only_seat_does_not_cover_a_required_opinion(self):
+        registry.upsert(self.db, "canary", harness="claude", host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        self.db.execute(
+            "UPDATE agent_registry SET team = 'ameesh', capabilities ="
+            " ARRAY['read'], roles = ARRAY[]::text[] WHERE name = 'canary'")
+        self.db.execute("UPDATE work_items SET reviewers = ARRAY['canary']"
+                        " WHERE id = %s", (self.lot,))
+        _row, out = self.freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        names = sorted(str((r or {}).get("name") or "")
+                       for r in out.get("reviewers") or ())
+        self.assertEqual(names, ["r1", "r2"], out)
+        self.assertNotIn("canary", names)
 
 
 if __name__ == "__main__":

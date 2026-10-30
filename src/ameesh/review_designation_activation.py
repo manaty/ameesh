@@ -1522,8 +1522,13 @@ def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
     author's family, does not prove independence: the seat remains missing and
     is designated automatically. A corrector cannot count its own seat either
     (#2739/#2888): a corrector is an author of this head, so its family is
-    forbidden like any author's and its name does not cover a seat. The list is
-    ordered like the column.
+    forbidden like any author's and its name does not cover a seat. #4779
+    (B1 cx2): a manual seat whose card does not prove the `propose` capacity
+    and a role covers nothing either — otherwise a canary designated before
+    the guard, or by a path that did not read it, would keep the automatic
+    selection from naming a real reviewer and the gate would stay held. The
+    seat stays in the column (a pilot gesture); only its counting stops. The
+    list is ordered like the column.
     """
     forbidden_names, forbidden_families = rd.families_of(authors)
     _names, corrector_families = rd.families_of(correctors)
@@ -1535,6 +1540,12 @@ def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
     for name in manual or ():
         name = str(name or "").strip()
         row = rows.get(name) or {}
+        # #4779 (B1 cx2) : un siège manuel sans `propose` ou sans rôle ne
+        # couvre aucun avis, sinon le filtre serait contourné par un siège
+        # posé avant la garde (le siège reste dans la colonne).
+        eligible, _reason = rd.reviewer_eligibility(row)
+        if not eligible:
+            continue
         family = rd.live_family(row, families=families)
         if (not name or name in forbidden_names or not family
                 or family in covered):
