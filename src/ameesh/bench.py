@@ -704,10 +704,12 @@ def purge_invalid_databases(db, *,
     """Purge les bases de test invalides laissées par un DROP annulé (#4822).
 
     Le DROP qui a produit l'état invalide a été coupé par son
-    `statement_timeout` pendant le checkpoint. La passe se connecte donc avec
-    `statement_timeout_ms = 0` et retire chaque base par
+    `statement_timeout` pendant le checkpoint. La passe retire chaque base par
     ``DROP DATABASE IF EXISTS … WITH (FORCE)``, comme la purge du banc de
-    #1992 : le délai de la suite ne doit pas reproduire l'état qu'il répare.
+    #1992, sur une connexion dont le délai est explicitement mis à zéro
+    (`db.execute_without_statement_timeout`) : le délai de la suite — ou un
+    délai hérité du rôle, de la base, de `PGOPTIONS` ou du DSN — ne doit pas
+    reproduire l'état qu'il répare.
 
     Seuls les noms des bases jetables de la suite et de ses scripts sont
     visés (`TEST_DATABASE_RE`) ; une base invalide étrangère est gardée.
@@ -743,8 +745,9 @@ def purge_invalid_databases(db, *,
                 kept.append((name, "purge budget exceeded"))
                 continue
             try:
-                admin.execute("DROP DATABASE IF EXISTS %s WITH (FORCE)"
-                              % db_mod.quote_ident(name))
+                db_mod.execute_without_statement_timeout(
+                    admin, "DROP DATABASE IF EXISTS %s WITH (FORCE)"
+                    % db_mod.quote_ident(name))
             except db_mod.DbError as exc:
                 kept.append((name, _short_reason(exc)))
                 continue

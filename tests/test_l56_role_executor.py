@@ -40,7 +40,9 @@ def _database_admin(cfg):
     chargé il dépasse le délai d'instruction de la suite (30 s). Un DROP
     annulé laisse alors la base invalide (`datconnlimit = -2`) et l'autovacuum
     du banc s'arrête (#4680). Le test ne supprime que sa propre base : la
-    connexion qui porte le geste ne doit avoir aucune borne d'instruction.
+    connexion qui porte le geste ne doit avoir aucune borne d'instruction,
+    y compris un délai hérité du rôle, de la base, de `PGOPTIONS` ou du DSN
+    (`db.execute_without_statement_timeout`).
     """
     return db_mod.connect(dataclasses.replace(cfg, statement_timeout_ms=0))
 
@@ -48,8 +50,9 @@ def _database_admin(cfg):
 def _create_database(cfg, database: str) -> None:
     admin = _database_admin(cfg)
     try:
-        admin.execute("CREATE DATABASE %s TEMPLATE template0"
-                      % db_mod.quote_ident(database))
+        db_mod.execute_without_statement_timeout(
+            admin, "CREATE DATABASE %s TEMPLATE template0"
+            % db_mod.quote_ident(database))
     finally:
         admin.close()
 
@@ -57,8 +60,9 @@ def _create_database(cfg, database: str) -> None:
 def _drop_database(cfg, database: str) -> None:
     admin = _database_admin(cfg)
     try:
-        admin.execute("DROP DATABASE IF EXISTS %s WITH (FORCE)"
-                      % db_mod.quote_ident(database))
+        db_mod.execute_without_statement_timeout(
+            admin, "DROP DATABASE IF EXISTS %s WITH (FORCE)"
+            % db_mod.quote_ident(database))
     finally:
         admin.close()
 

@@ -289,6 +289,37 @@ def startup_options(cfg: Config, existing: str = "") -> str:
     return " ".join(parts)
 
 
+def execute_without_statement_timeout(db, sql: str) -> None:
+    """Exécute une instruction avec `statement_timeout = 0` explicite (#4822).
+
+    `statement_timeout_ms = 0` à la connexion veut dire « l'application n'en
+    pose pas » : il ne neutralise pas un délai hérité du rôle, de la base, de
+    `PGOPTIONS` ou du paramètre `options=` du DSN. Un geste qui ne doit pas
+    être annulé (le checkpoint d'un DROP DATABASE) pose donc le zéro dans la
+    session elle-même :
+
+    * psycopg garde la session : `SET statement_timeout = 0`, puis
+      l'instruction ;
+    * le pilote psql ouvre un processus par `execute` : un `SET` séparé serait
+      perdu. Les deux instructions partent dans un même `psql -f -`, qui
+      autocommit chacune (aucun bloc de transaction autour de DROP DATABASE).
+
+    Le délai client du pilote psql, borné par la configuration, est retiré
+    pour la même raison. ``sql`` est une instruction unique.
+    """
+    if getattr(db, "name", "") == "psql":
+        # le client doit attendre aussi longtemps que le serveur : le
+        # checkpoint d'un DROP peut durer plusieurs minutes.
+        db._client_timeout = None
+        proc = db._run(["-f", "-"],
+                       stdin="SET statement_timeout = 0;\n%s;\n" % sql)
+        if proc.returncode != 0:
+            raise db._fail(proc)
+        return
+    db.execute("SET statement_timeout = 0")
+    db.execute(sql)
+
+
 def dsn_has_options(dsn: str) -> bool:
     """Le DSN fixe-t-il déjà `options` (il primerait sur PGOPTIONS) ?"""
     if "://" in dsn:
