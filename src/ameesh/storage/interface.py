@@ -769,6 +769,16 @@ class TurnCosts(Domain):
         l'alerte `session_too_big`."""
 
     @abc.abstractmethod
+    def session_reread(self, agent: str, session: str) -> dict | None:
+        """CTX-02b : le cumul des entrées relues des tours d'une session —
+        `tokens` (entrée + cache **lu**, cache écrit exclu ; Codex compte déjà
+        le cache dans son entrée), `turns` (tous les tours inscrits) ; ou None
+        si aucun tour. Lecture seule, base de `R_session` pour la publication
+        `ameesh-context/1` : elle ne change aucune décision ni la ligne du
+        grand livre. Plusieurs harnais dans une session (anomalie) : chaque
+        ligne suit sa propre convention de cache."""
+
+    @abc.abstractmethod
     def first_after(self, agent: str, ts: float) -> dict | None:
         """#1777 : la première ligne écrite de `agent` à `ts` (epoch) ou après :
         `harness`, `session`, `recorded_ts` (epoch) ; ou None. `cost.record`
