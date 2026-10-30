@@ -964,6 +964,10 @@ def lot_takeable(item: dict, today: str | None = None, *, holds=None,
         return False
     if (item.get("external_executor") or "").strip():
         return False
+    # #4756 : le lot de découpage est un geste du pilote, jamais pris au repos.
+    from .file_decoupage import is_split_lot
+    if is_split_lot(item):
+        return False
     if item.get("state") == lifecycle.IN_PROGRESS and not item.get("returned_to_queue"):
         return False
     if _hold_blocks(item, (holds or {}).get(int(item.get("id") or 0)), now):
