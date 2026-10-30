@@ -17,7 +17,8 @@ migration 0515; ``decide validation-history`` requires the owner's key.
         the owner answers (a HUMAN identity only); the answer goes to the
         requester by mail (it wakes them up), to the thread and to the work item;
   ameesh decide withdraw <id> [--why "…"] [--json]     the requester withdraws their request;
-  ameesh decide repair-forward <id> [--json]           restore an accidentally forwarded request;
+  ameesh decide repair-forward <id> [--json]           restore an accidentally forwarded request
+        (a copy already withdrawn by its requester is kept: its trace stays);
   ameesh decide show <id> [--json]                     a request, its answer, its proof;
   ameesh decisions [--all] [--for human:ID] [--json]   the queue, across all projects
         (served by `actions_cli`, together with gated actions).
@@ -1586,6 +1587,9 @@ def cmd_repair_forward(cfg: Config, argv: list[str]) -> int:
         db.close()
     if args.json:
         _dump(result)
+    elif result.get("copy_already_withdrawn"):
+        print("decision #%d restored to pending; copy #%d was already withdrawn (kept)" %
+              (result["decision"], result["withdrawn_copy"]))
     else:
         print("decision #%d restored to pending; copy #%d withdrawn" %
               (result["decision"], result["withdrawn_copy"]))

@@ -3904,9 +3904,12 @@ class Decisions(Domain):
 
     def repair_forward(self, decision_id: int, *, actor: str) -> dict:
         """Restore a human decision accidentally forwarded by mail. Atomically
-        lock the original and its copy, refuse answered/withdrawn or chained
-        forwards, withdraw the copy and restore the unchanged original to pending.
-        Raise ValueError when there is no unambiguous repair."""
+        lock the original and its copy and restore the unchanged original to
+        pending. A pending copy is withdrawn; a copy its requester already
+        withdrew keeps its withdrawal trace (#4576). Refuses an original
+        answered or withdrawn at its origin, an answered copy, a changed copy
+        and a forwarding chain. Raise ValueError when there is no unambiguous
+        repair."""
         raise NotImplementedError
 
     @abc.abstractmethod
