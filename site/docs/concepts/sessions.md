@@ -16,15 +16,18 @@ permission mode (`ameesh set <agent> permission_mode=…`, or
 `AMEESH_CLAUDE_PERMISSION_MODE`), `auto` by default, with `acceptEdits` as
 fallback when the installed binary does not accept the chosen mode (L223).
 
-## Rule: one fresh session per lot
+<a id="one-fresh-session-per-lot"></a>
+
+## Rule: one fresh session per work item
 
 Long sessions degrade. The project's rule (design decision 0025) is:
 
-1. **Build and review agents open a fresh session for each lot**, started with
+1. **Build and review agents open a fresh session for each work item**, started with
    a self-contained brief (state, scope, rules, known defects). The session is
-   **kept until the lot is merged**, reviews and fixes included, then dropped.
-2. **Reviewers** open a fresh session per reviewed lot, kept for re-freezes of
-   the same lot.
+   **kept through completion**, reviews and fixes included, then dropped.
+   For development lots, the rule keeps the session until integration (`merged`).
+2. **Reviewers** open a fresh session per reviewed work item, kept for re-freezes of
+   the same work item.
 3. **Orchestrators** keep a long session, rotated with a resume summary when it
    grows, plus written state (memory, log) that survives the loss of the
    session.
@@ -38,8 +41,8 @@ session_policy=…` (default `AMEESH_SESSION_POLICY`, `par-lot`):
 
 | Policy | Effect |
 |---|---|
-| `par-lot` | a fresh session when the lot of the turn differs from the session's lot, opened on a resume summary; rotation on size and turn duration stays as a safeguard |
-| `taille` | rotation on size and turn duration only: for orchestrators, which receive messages from every lot |
+| `par-lot` | a fresh session when the work item of the turn differs from the session's work item, opened on a resume summary; rotation on size and turn duration stays as a safeguard |
+| `taille` | rotation on size and turn duration only: for orchestrators, which receive messages from every work item |
 | `jamais` | no rotation |
 
 The **size rotation** (L11) compares `S_hist` — the sum of the session's
@@ -89,7 +92,7 @@ never a prompt such as "resume session X":
   move, the runner rotates at the first turn with a summary written under the
   account of origin; otherwise (or with `--fresh`) the fresh session opens on
   a **deterministic resume brief** that ameesh builds without calling a model
-  (identity and role, open lots and what they wait for, recent thread
+  (identity and role, open work items and what they wait for, recent thread
   exchanges, unread count, path of the old transcript).
 
 See [Operate agents](../guides/operate-agents.md#adopt-an-interactive-session-ameesh-adopt).
@@ -132,3 +135,5 @@ ameesh set <agent> model=<model> effort=<effort> tier=<tier>   # an empty value 
 
 The change takes effect at the **next turn**. The canon carries defaults and
 caps; `ameesh set` writes execution state.
+
+See [Work lifecycle](work-lifecycle.md) for core states and development stages.
