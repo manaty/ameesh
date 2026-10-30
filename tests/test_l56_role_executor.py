@@ -419,6 +419,33 @@ class RoleExecutorTest(PgTestCase):
                         self.assertTrue(self.db.query(
                             "SELECT has_table_privilege(%s, %s, 'SELECT') AS p",
                             (writer_role, "%s.work_migration_reservations" % q(self.schema),))[0]["p"])
+                # #4975: additive migration also upgrades already-installed
+                # service groups; the role script must preserve read-only ACLs.
+                with open(os.path.join(migrations.MIGRATIONS_DIR,
+                          '0524_schema_write_guard.sql'), encoding='utf-8') as marker_file:
+                    marker_sql = marker_file.read()
+                for fixed, scoped in (("ameesh_it_proof", proof), ("ameesh_it_qa", qa)):
+                    marker_sql = marker_sql.replace(fixed, scoped)
+                with db_mod.schema_guard_bypass(self.db):
+                    self.db.execute('DROP TABLE schema_non_additive_migrations')
+                    self.db.script(marker_sql)
+                for _ in range(2):
+                    for writer_role in names:
+                        row = self.db.query(
+                            "SELECT has_table_privilege(%s, 'schema_non_additive_migrations', 'SELECT') AS reads, "
+                            "has_table_privilege(%s, 'schema_non_additive_migrations', 'INSERT,UPDATE,DELETE') AS writes",
+                            (writer_role, writer_role))[0]
+                        self.assertTrue(row['reads'], writer_role)
+                        self.assertFalse(row['writes'], writer_role)
+                    proc = run_writers()
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.db.execute('GRANT UPDATE ON schema_non_additive_migrations TO PUBLIC')
+                try:
+                    proc = run_writers()
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertIn('must not change the schema compatibility inventory', proc.stderr)
+                finally:
+                    self.db.execute('REVOKE UPDATE ON schema_non_additive_migrations FROM PUBLIC')
                 # This class has a private database: never mutate shared bench ACLs.
                 for grantee in (*names, "PUBLIC"):
                     with self.subTest(temp_grantee=grantee):

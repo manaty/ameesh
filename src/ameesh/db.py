@@ -365,7 +365,8 @@ def execute_without_statement_timeout(db, sql: str) -> None:
       autocommit chacune (aucun bloc de transaction autour de DROP DATABASE).
 
     Le délai client du pilote psql, borné par la configuration, est retiré
-    pour la même raison. ``sql`` est une instruction unique.
+    pour la même raison. ``sql`` est une instruction unique CREATE DATABASE
+    ou DROP DATABASE ; les écritures du schéma applicatif restent gardées.
     """
     if (not single_statement(sql)
             or not re.match(r"^\s*(?:CREATE|DROP)\s+DATABASE\b", sql, re.I)):

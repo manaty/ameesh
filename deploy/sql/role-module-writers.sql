@@ -22,7 +22,7 @@ SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I T
 -- #2274: the review catch-up activation bound is the owner's alone
 -- (migration 0438); canon sync must not move it.
 SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.%I FROM ameesh_canon_sync', :'schema', name)
-  FROM unnest(ARRAY['review_catch_up','host_release_operations','host_release_fences','host_release_fence_receipts']) name
+  FROM unnest(ARRAY['schema_non_additive_migrations','review_catch_up','host_release_operations','host_release_fences','host_release_fence_receipts']) name
  WHERE to_regclass(format('%I.%I', :'schema', name)) IS NOT NULL \gexec
 SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %I TO ameesh_canon_sync', :'schema') \gexec
 SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
@@ -34,6 +34,9 @@ SELECT format('GRANT SELECT ON %I.work_items, %I.project_modules, %I.work_module
 -- (`work.get`); the isolated writers read the lot through that projection.
 SELECT format('GRANT SELECT ON %I.work_migration_reservations TO ameesh_it_proof, ameesh_it_qa', :'schema')
  WHERE to_regclass(format('%I.work_migration_reservations', :'schema')) IS NOT NULL \gexec
+-- #4975: all isolated writers read the compatibility marker; none writes it.
+SELECT format('GRANT SELECT ON %I.schema_non_additive_migrations TO ameesh_canon_sync, ameesh_it_proof, ameesh_it_qa', :'schema')
+ WHERE to_regclass(format('%I.schema_non_additive_migrations', :'schema')) IS NOT NULL \gexec
 -- SELECT FOR NO KEY UPDATE needs UPDATE on at least one column.
 SELECT format('GRANT UPDATE (id) ON %I.work_items TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
 SELECT format('GRANT INSERT ON %I.work_module_milestones TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
@@ -92,6 +95,13 @@ BEGIN
     END IF;
     IF has_table_privilege('ameesh_it_qa', 'project_modules', 'INSERT,UPDATE,DELETE') THEN
         RAISE EXCEPTION 'QA writer must not change module policies, including PUBLIC grants';
+    END IF;
+    IF to_regclass('schema_non_additive_migrations') IS NOT NULL AND EXISTS (
+        SELECT 1 FROM pg_roles writer_group
+         WHERE writer_group.rolname IN ('ameesh_canon_sync', 'ameesh_it_proof', 'ameesh_it_qa')
+           AND has_table_privilege(writer_group.oid, 'schema_non_additive_migrations', 'INSERT,UPDATE,DELETE')
+    ) THEN
+        RAISE EXCEPTION 'module writers must not change the schema compatibility inventory';
     END IF;
     -- #2274: the catch-up bound is owner-only; a write left to canon sync
     -- would let the sync service move the review horizon.

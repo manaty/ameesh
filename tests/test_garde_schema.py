@@ -5,21 +5,32 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import io
+import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
 import uuid
 
 from ameesh import cli, db as db_mod, migrations
-from .support import child_env
+from .support import child_env, REQUIRE_DB
 from ameesh import config
+
+
+HAVE_PSYCOPG = importlib.util.find_spec('psycopg') is not None
+DRIVERS = ('psycopg', 'psql') if HAVE_PSYCOPG else ('psql',)
 
 
 class SchemaGuardTest(unittest.TestCase):
     def setUp(self):
         self.schema = 't_schema_guard_' + uuid.uuid4().hex[:12]
         self.cfg = config.load(env=child_env(AMEESH_SCHEMA=self.schema))
-        self.admin = db_mod.connect(self.cfg, driver='psycopg')
+        try:
+            self.admin = db_mod.connect(self.cfg)
+        except db_mod.Unavailable as exc:
+            if not REQUIRE_DB:
+                self.skipTest(str(exc))
+            raise
+        self.addCleanup(self.cleanup)
         with db_mod.schema_guard_bypass(self.admin):
             self.admin.script('CREATE SCHEMA %s; SET search_path TO %s;'
                               'CREATE TABLE schema_migrations (version integer PRIMARY KEY, '
@@ -30,11 +41,10 @@ class SchemaGuardTest(unittest.TestCase):
                               % (self.schema, self.schema))
             self.admin.script(Path(migrations.MIGRATIONS_DIR,
                                    '0524_schema_write_guard.sql').read_text())
-        self.addCleanup(self.cleanup)
 
     def cleanup(self):
         with db_mod.schema_guard_bypass(self.admin):
-            self.admin.execute('DROP SCHEMA %s CASCADE' % self.schema)
+            self.admin.execute('DROP SCHEMA IF EXISTS %s CASCADE' % self.schema)
         self.admin.close()
 
     def mark_unknown(self, *, additive=False):
@@ -46,7 +56,7 @@ class SchemaGuardTest(unittest.TestCase):
                                    'VALUES (9999, %s, %s)', ('future', 'f' * 64))
 
     def test_persistent_timer_and_executor_connections_refuse_all_write_paths(self):
-        for driver in ('psycopg', 'psql'):
+        for driver in DRIVERS:
             with self.subTest(driver=driver):
                 writer = db_mod.connect(self.cfg, driver=driver)
                 self.addCleanup(writer.close)
@@ -73,6 +83,7 @@ class SchemaGuardTest(unittest.TestCase):
                     self.admin.execute('DELETE FROM schema_non_additive_migrations')
                     self.admin.execute('DELETE FROM schema_migrations')
 
+    @unittest.skipUnless(HAVE_PSYCOPG, 'psycopg-specific transaction/round-trip contract')
     def test_writer_keeps_migration_excluded_until_commit(self):
         writer = db_mod.connect(self.cfg, driver='psycopg')
         self.addCleanup(writer.close)
@@ -86,6 +97,7 @@ class SchemaGuardTest(unittest.TestCase):
             self.assertTrue(observer.query('SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS ok',
                                            (migrations._LOCK,))[0]['ok'])
 
+    @unittest.skipUnless(HAVE_PSYCOPG, 'psycopg-specific transaction/round-trip contract')
     def test_savepoint_recovery_keeps_driver_transaction_usable(self):
         for driver in ('psycopg',):
             writer = db_mod.connect(self.cfg, driver=driver)
@@ -100,6 +112,7 @@ class SchemaGuardTest(unittest.TestCase):
             finally:
                 writer.close()
 
+    @unittest.skipUnless(HAVE_PSYCOPG, 'psycopg-specific transaction/round-trip contract')
     def test_guard_does_not_add_round_trips(self):
         writer = db_mod.connect(self.cfg, driver='psycopg')
         try:
@@ -120,6 +133,7 @@ class SchemaGuardTest(unittest.TestCase):
                                                      'UPDATE guard_writes SET n = 99')
         self.assertEqual(self.admin.query('SELECT n FROM guard_writes'), [{'n': 0}])
 
+    @unittest.skipUnless(HAVE_PSYCOPG, 'psycopg-specific transaction/round-trip contract')
     def test_savepoint_rollback_requires_fresh_compatibility_check(self):
         writer = db_mod.connect(self.cfg, driver='psycopg')
         try:
@@ -141,9 +155,52 @@ class SchemaGuardTest(unittest.TestCase):
         self.assertEqual(rows, [{'name': payload}])
         self.assertEqual(self.admin.query('SELECT n FROM guard_writes'), [{'n': 0}])
 
+    def test_restricted_writer_only_needs_marker_read_permission(self):
+        role = 't_guard_writer_' + uuid.uuid4().hex[:12]
+        q = db_mod.quote_ident
+        self.admin.execute('CREATE ROLE %s NOLOGIN' % q(role))
+        def drop_role():
+            with db_mod.schema_guard_bypass(self.admin):
+                self.admin.execute('DROP OWNED BY %s' % q(role))
+                self.admin.execute('DROP ROLE %s' % q(role))
+        self.addCleanup(drop_role)
+        self.admin.execute('GRANT USAGE ON SCHEMA %s TO %s' % (q(self.schema), q(role)))
+        self.admin.execute('GRANT INSERT ON agent_registry TO %s' % q(role))
+        for driver in DRIVERS:
+            with self.subTest(driver=driver):
+                writer = db_mod.connect(self.cfg, driver=driver)
+                try:
+                    with self.assertRaisesRegex(db_mod.DbError, 'permission denied'):
+                        with writer.transaction() as tx:
+                            with db_mod.schema_guard_bypass(writer):
+                                tx.execute('SET LOCAL ROLE %s' % q(role))
+                            tx.execute("INSERT INTO agent_registry VALUES ('refused')")
+                    self.admin.execute('GRANT SELECT ON schema_non_additive_migrations TO %s' % q(role))
+                    with writer.transaction() as tx:
+                        with db_mod.schema_guard_bypass(writer):
+                            tx.execute('SET LOCAL ROLE %s' % q(role))
+                        tx.execute("INSERT INTO agent_registry VALUES ('accepted')")
+                    self.assertFalse(self.admin.query(
+                        "SELECT has_table_privilege(%s, 'schema_non_additive_migrations', "
+                        "'INSERT,UPDATE,DELETE') AS p", (role,))[0]['p'])
+                    self.mark_unknown()
+                    with self.assertRaises(migrations.IncompatibleSchema):
+                        with writer.transaction() as tx:
+                            with db_mod.schema_guard_bypass(writer):
+                                tx.execute('SET LOCAL ROLE %s' % q(role))
+                            tx.execute("INSERT INTO agent_registry VALUES ('incompatible')")
+                finally:
+                    writer.close()
+                with db_mod.schema_guard_bypass(self.admin):
+                    self.admin.execute('DELETE FROM schema_non_additive_migrations')
+                    self.admin.execute('DELETE FROM schema_migrations')
+                    self.admin.execute('REVOKE SELECT ON schema_non_additive_migrations FROM %s' % q(role))
+        self.assertEqual(self.admin.query('SELECT name FROM agent_registry'),
+                         [{'name': 'accepted'}] * len(DRIVERS))
+
     def test_additive_ahead_is_accepted(self):
         self.mark_unknown(additive=True)
-        for driver in ('psycopg', 'psql'):
+        for driver in DRIVERS:
             writer = db_mod.connect(self.cfg, driver=driver)
             try:
                 writer.execute('UPDATE guard_writes SET n = 3')
