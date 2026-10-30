@@ -416,6 +416,12 @@ class VmAgentsHarness(unittest.TestCase):
         # plus_ancien, old, target.
         self.origin = self.root / 'origin'
         self._build_origin()
+        # #4798 : l'hôte du banc peut porter un invité réel
+        # (/usr/local/lib/ameesh-guest, root). Le faux SSH exécute la commande
+        # distante en uid 1001 : le vrai helper, root-only, refuserait et la
+        # suite serait rouge sur un hôte d'agents. Le runtime du banc est donc
+        # absent ; le helper réel a son propre module (test_4793_guest_runtime).
+        self._isoler_runtime_invite()
         self.plus_ancien = self.git(self.origin, 'rev-parse', 'HEAD~2')
         self.old = self.git(self.origin, 'rev-parse', 'HEAD~1')
         self.target = self.git(self.origin, 'rev-parse', 'HEAD')
@@ -469,6 +475,16 @@ class VmAgentsHarness(unittest.TestCase):
             subprocess.run(['git', '-C', str(self.origin), 'add', '.'], check=True)
             subprocess.run(['git', '-C', str(self.origin), '-c', 'user.email=t@invalid',
                             '-c', 'user.name=test', 'commit', '-q', '-m', nom], check=True)
+
+    def _isoler_runtime_invite(self):
+        """#4798 : aucun invité de l'hôte ne doit être exécuté par le banc."""
+        helper = self.origin / 'deploy/mise-a-jour/guest-runtime.py'
+        if helper.exists():
+            helper.write_text(
+                '#!/usr/bin/env python3\n'
+                "# #4798 : banc : l'hôte de test n'a pas d'invité à rafraîchir.\n"
+                'import json\n'
+                'print(json.dumps({"guest": "absent", "files": []}))\n')
 
     def _clone_at_old(self, at=None):
         if self.src.exists():
