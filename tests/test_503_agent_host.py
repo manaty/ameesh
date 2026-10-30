@@ -68,6 +68,10 @@ command = command.replace('/home/ameesh/.local/share/ameesh/venv/bin/python', os
 # remplacés, donc cette passe ne les touche plus).
 command = command.replace('/home/ameesh/.local/share/ameesh', os.environ['FAKE_SHARE'])
 command = command.replace('$HOME/.config/ameesh/env', str(state / 'runner.env'))
+# The administrator helper arrives on stdin. Keep its guest paths inside
+# the fake remote host too, even when the test runner has a real guest.
+stdin = stdin.replace('/usr/local/lib/ameesh-guest', str(state / 'guest-lib'))
+stdin = stdin.replace('/etc/ameesh-guest/offload.json', str(state / 'guest-config.json'))
 env = dict(os.environ, FAKE_REMOTE='1')
 sys.exit(subprocess.run(['bash', '-c', command], env=env, input=stdin, text=True).returncode)
 '''
@@ -538,6 +542,12 @@ class AgentHostTest(unittest.TestCase):
             (venv / 'bin').mkdir(parents=True)
             (venv / 'bin/python').symlink_to(sys.executable)
         (self.share / 'venv-courant').symlink_to(self.venv_current.name)
+        # The guest runtime check resolves the source tree from the installed
+        # package metadata, just as a real versioned venv does.
+        metadata = self.venv_current / 'lib/python3/site-packages/ameesh-1.dist-info'
+        metadata.mkdir(parents=True)
+        (metadata / 'direct_url.json').write_text(json.dumps(
+            {'url': 'file:///home/ameesh/.local/share/ameesh/src-aaa1111'}))
         self.config = self.root / 'bascule.env'
         self.config.write_text('AGENTS_SSH=root@vm.invalid\nHOTE_AGENTS=host-agents\nPERSONAS_VM=obsolete\n')
         for name, source in [('ssh', SSH), ('runuser', RUNUSER), ('ameesh', AMEESH),
@@ -1653,6 +1663,24 @@ class AgentHostTest(unittest.TestCase):
         p = self.run_vm('controler', 'foreign-owner')
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('bail', p.stderr)
+
+    def test_missing_runtime_commit_reports_failure_and_checks_leases(self):
+        for metadata in self.venv_current.glob('lib/python*/site-packages/*/direct_url.json'):
+            metadata.unlink()
+        p = self.run_vm('controler', 'foreign-owner')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('runtime invité non prouvé', p.stderr)
+        self.assertIn('bail', p.stderr)
+        self.assertNotIn('contrôles verts', p.stdout)
+
+    def test_check_guest_runtime_reads_only_the_fake_remote_host(self):
+        # An incomplete guest on the simulated remote host must be detected,
+        # independently of the guest installed on the machine running tests.
+        (self.state / 'guest-config.json').write_text('{}')
+        p = self.run_vm('controler')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn(str(self.state / 'guest-lib'), p.stderr)
+        self.assertIn('runtime invité différent', p.stderr)
 
     def test_check_uses_database_clock(self):
         p = self.run_vm('controler', 'db-ahead')
