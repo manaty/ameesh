@@ -143,3 +143,17 @@ class ValidatedWritersTest(PgTestCase):
         self.read.side_effect = reassign_during_gate
         self.mark()
         self.assertEqual(self.current_state(), "qa")
+
+    def test_concurrent_reviewer_designation_invalidates_the_quorum(self):
+        # #5016 (revue auditeur) : une désignation de relecteur retire la
+        # dispense `-none` en qa, sans jalon ; la porte calculée avec la
+        # dispense ne doit pas promouvoir le lot.
+        self.db.execute(
+            "UPDATE work_items SET reviewer = '-none' WHERE id = %s", (self.lot,))
+        def designate_during_gate(*args, **kwargs):
+            self.db.execute(
+                "UPDATE work_items SET reviewer = 'reader' WHERE id = %s", (self.lot,))
+            return {"ok": True}
+        self.read.side_effect = designate_during_gate
+        self.mark()
+        self.assertEqual(self.current_state(), "qa")

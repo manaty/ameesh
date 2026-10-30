@@ -66,11 +66,13 @@ _COLUMNS_TEMPLATE = """
 REVIEWER_NONE = "-none"
 
 #: #5016 : les seuls champs de la ligne du lot dont la porte des avis dépend
-#: (dépôt, cible, auteurs, véhicule de paquet). Une note concurrente ne déplace
+#: (dépôt, cible, auteurs, véhicule de paquet) et la dispense de re-verdict
+#: (`reviewer`/`reviewers`, lue par `_waiver`). Une note concurrente ne déplace
 #: que `updated_at` et le journal : comparer la ligne entière annulait un
 #: quorum déjà acquis, sans réessai, et laissait le lot en qa.
 _GATE_ITEM_FIELDS = ("id", "app", "type", "assignee", "package_id",
-                     "branch", "branch_target", "pr_ref")
+                     "branch", "branch_target", "pr_ref", "reviewer",
+                     "reviewers")
 
 
 def _gate_item(item) -> dict:
