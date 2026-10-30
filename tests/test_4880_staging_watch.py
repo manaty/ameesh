@@ -155,6 +155,38 @@ class WatchTest(unittest.TestCase):
         self.assertTrue(alert["urgent"])
         self.assertIn("deadline exceeded", alert["detail"])
 
+    def test_a_request_line_is_judged_by_its_newest_snapshot(self):
+        pending = request_row(1, "same-request", state="pending", deadline=300)
+        running = request_row(2, "same-request", state="running", deadline=7200)
+        # The initial pending line expires at 300 s, the running one at the
+        # deployment timeout: the same request must not alert at 1000 s.
+        self.assertEqual(self.alerts(requests=[running, pending], now=1000), [])
+        late = request_row(2, "same-request", state="running", deadline=900)
+        alert, = self.alerts(requests=[late, pending], now=1000)
+        self.assertIn("deadline exceeded", alert["detail"])
+        # A partial terminal snapshot supersedes the late running one.
+        partial = request_row(3, "same-request", state="partial", deadline=900)
+        self.assertEqual(self.alerts(requests=[partial, late, pending], now=1000), [])
+
+    def test_busy_key_escalates_history_instead_of_blinding_alerts(self):
+        completed = request_row(204, "new", sha="b" * 40, state="completed")
+        old = [request_row(i, "old-%d" % i, sha="c" * 40, state="partial")
+               for i in range(1, 204)]
+        rows = [completed] + old
+        calls = []
+
+        def recent(kind, days, limit, object=None):
+            calls.append(limit)
+            return rows[:limit]
+
+        with mock.patch.object(staging_watch.storage, "of") as factory:
+            factory.return_value.events.latest_type.side_effect = [
+                [], [], [completed]]
+            factory.return_value.events.recent_type.side_effect = recent
+            self.assertEqual(staging_watch.alerts(None, now=250), [])
+        self.assertEqual(calls, [staging_watch.HISTORY_LIMIT,
+                                 staging_watch.HISTORY_LIMIT * 2])
+
 
 class KilledSequenceTest(unittest.TestCase):
     def setUp(self):

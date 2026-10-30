@@ -21,9 +21,11 @@ from ameesh import storage
 
 EVENT = "staging.sequence"
 LIMIT = 1000
-#: Per request key, enough history to expose an older failure behind a later
-#: partial or in-flight request. The object list itself is bounded by LIMIT.
+#: Per request key, the first history read. The pass escalates (doubling) when
+#: the window is full, so a busy key never makes the alert family unreadable;
+#: the read is bounded by HISTORY_MAX.
 HISTORY_LIMIT = 200
+HISTORY_MAX = 10000
 TERMINAL = frozenset(("completed", "partial", "failed", "unattested"))
 #: exit code of a refused exclusive start, as the local flock of staging.sh
 BUSY = 75
@@ -203,8 +205,21 @@ def request_findings(rows: list[dict], *, now: float, attested=()) -> list[dict]
             by_key.setdefault(key, []).append(row)
     out = []
     for key in sorted(by_key):
-        group = sorted(by_key[key], key=lambda row: int(row.get("id") or 0),
-                       reverse=True)
+        # One request is one uuid: its pending, running and terminal rows are
+        # snapshots of the SAME request. Only the newest snapshot speaks for
+        # it. Considering each row separately made the initial pending line
+        # expire at its 300 s start deadline while the request was still
+        # running healthily (the deployment deadline is set on the running
+        # line) — a false urgent alert after 5 minutes, permanent after a
+        # partial (#4898 B1).
+        newest = {}
+        for row in by_key[key]:
+            request = row["data"].get("request")
+            ident = int(row.get("id") or 0)
+            if request not in newest or ident > int(newest[request].get("id") or 0):
+                newest[request] = row
+        group = sorted(newest.values(),
+                       key=lambda row: int(row.get("id") or 0), reverse=True)
         completed = max((int(row["id"]) for row in group
                          if (row.get("data") or {}).get("state") == "completed"),
                         default=0)
@@ -268,10 +283,17 @@ def alerts(db, *, now: float) -> list[dict]:
         key = row.get("object")
         if not key:
             continue
-        history = events.recent_type("staging.request", 60, HISTORY_LIMIT,
-                                     object=key)
-        if len(history) >= HISTORY_LIMIT:
-            raise RuntimeError("staging requests truncated; resolution unobservable")
+        # Escalate the window instead of refusing when a busy key grows: a
+        # fixed 200-row read made the whole alert family unreadable after
+        # about a month of normal releases (#4898 B2). At the cap the newest
+        # rows are still read; only history older than the cap is not.
+        limit = HISTORY_LIMIT
+        while True:
+            history = events.recent_type("staging.request", 60, limit,
+                                         object=key)
+            if len(history) < limit or limit >= HISTORY_MAX:
+                break
+            limit = min(limit * 2, HISTORY_MAX)
         requests.extend(history)
     return (findings(rows, now=now, attested=attested)
             + request_findings(requests, now=now, attested=attested))
