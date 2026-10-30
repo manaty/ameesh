@@ -114,7 +114,10 @@ def question(operation, bundle, expires_at, *, stop=False):
     if (type(expires_at) is not int or expires_at != bundle['expires_at']
             or operation != bundle['operation']):
         raise EnrollmentError('exact authority window required')
-    return (STOP_PREFIX if stop else PREFIX) + canonical(bundle)
+    text = (STOP_PREFIX if stop else PREFIX) + canonical(bundle)
+    if len(text) > admin.bootstrap.signed.decisions.MAX_QUESTION:
+        raise EnrollmentError('enrollment signing question exceeds decision limit')
+    return text
 
 
 class SignedEnrollmentAuthority(admin.bootstrap.SignedBootstrapAuthority):
@@ -173,7 +176,7 @@ class System:
                                  '/usr/bin/test', '-r', str(path)],
                                 capture_output=True, timeout=30,
                                 env={'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C'})
-        if result.returncode != 1:
+        if result.returncode != 1 or result.stdout or result.stderr:
             raise EnrollmentError('transport key isolation probe refused')
 
     def state(self):
@@ -419,7 +422,7 @@ class Enrollment:
                 raise EnrollmentError('prepared bundle changed')
         else:
             admin.Backend.write(target, canonical(bundle))
-        return dict(bundle=bundle, question=question(operation, bundle, spec['expires_at']))
+        return dict(bundle=bundle, question=question(operation, bundle, spec['expires_at']), options=OPTIONS)
 
     def load(self, operation):
         stage, spec, data, values = self.inputs(operation)
@@ -560,18 +563,21 @@ def main(argv=None):
         tool = Enrollment(native)
         if args[0] == 'key-question':
             scope = tool.key_scope(args[1])
-            result = dict(scope=scope, question=KEY_PREFIX + canonical(scope))
+            result = dict(scope=scope, question=KEY_PREFIX + canonical(scope), options=KEY_OPTIONS)
         elif args[0] == 'keygen':
             result = tool.keygen(args[1], int(args[3]))
         elif args[0] == 'prepare':
             result = tool.prepare(args[1])
         elif args[0] == 'stop-question':
             _, bundle, _ = tool.load(args[1])
-            result = dict(question=question(args[1], bundle, bundle['expires_at'], stop=True))
+            result = dict(question=question(args[1], bundle, bundle['expires_at'], stop=True), options=STOP_OPTIONS)
         else:
             result = tool.apply(args[1], int(args[3]), stop=args[0] == 'stop')
         print(canonical(result))
         return 0
+    except EnrollmentError as error:
+        print(canonical(dict(error=str(error))), file=sys.stderr)
+        return 2
     except Exception:
         # No secret-bearing JSON, DSN, stdout/stderr or exception is printed.
         print('{"error":"controller_enrollment_unavailable"}', file=sys.stderr)

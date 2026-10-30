@@ -42,7 +42,7 @@ ses documents et ne révoque pas une clé.
 Le nouveau plan conserve `controller_key` et `controller_source` pour le bureau
 et ajoute `local_transport`, objet contenant seulement `controller_key` et
 `controller_source`. La deuxième clé doit être distincte et sa source une seule
-adresse IPv4 `/32` ou IPv6 `/128`, mesurée par le bureau. Le rendu produit
+adresse IPv4 `/32` ou IPv6 `/128`, mesurée par le bureau et différente de la source du bureau. Le rendu produit
 exactement deux lignes `restrict,from=...,command=...` vers le même wrapper.
 La question de bootstrap lie aussi la source locale et le digest de sa publique ;
 la validation de la configuration effective SSH porte sur les deux sources.
@@ -197,3 +197,11 @@ readiness native et preuve du verrou inchangé. Aucun contenu privé. Le bureau
 relève aussi le refus de lecture de la clé par le compte des agents, en succès
 comme en refus de l'opération de clé. La qualification réelle suit le staging ;
 les tests locaux simulent services et credentials et ne la prouvent pas.
+
+Les sorties `prepare`, `key-question` et `stop-question` fournissent aussi les
+options exactes à transmettre à la décision, libellés compris. Une question
+d'enrôlement dépassant la limite native de 4 000 caractères est refusée
+nommément avant demande de signature ; réduire le périmètre de la politique.
+La sonde de lecture privée exige le code 1 de `test -r` sans aucune sortie :
+un diagnostic de `runuser` ne prouve pas l'isolation. Les refus propres à
+l'enrôleur sont rendus par leur libellé ; les autres exceptions restent masquées.

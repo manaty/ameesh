@@ -35,7 +35,8 @@ class LocalTransportTest(unittest.TestCase):
             delegation.question(bundle)
 
     def test_refuse_duplicate_key_broad_source_options_and_unknown_fields(self):
-        for local in (dict(self.local,controller_key=self.plan['controller_key']),
+        for local in (dict(self.local,controller_source=self.plan['controller_source']),
+                      dict(self.local,controller_key=self.plan['controller_key']),
                       dict(self.local,controller_source='127.0.0.0/8'),
                       dict(self.local,controller_source='::/0'),
                       dict(self.local,controller_key=self.local['controller_key']+' comment'),

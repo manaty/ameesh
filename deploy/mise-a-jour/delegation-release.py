@@ -162,6 +162,8 @@ def transport_entries(plan):
         network=ipaddress.ip_network(local['controller_source'],strict=True)
         if network.prefixlen!=network.max_prefixlen:
             raise DelegationError('one measured local transport source required')
+        if local['controller_source']==plan['controller_source']:
+            raise DelegationError('distinct local transport source required')
         if local['controller_key']==plan['controller_key']:
             raise DelegationError('distinct local transport key required')
         entries.append(dict(local))

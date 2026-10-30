@@ -39,6 +39,20 @@ class RealTransportKeyTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(path.with_name('identity.pub').stat().st_mode),0o600)
 
 
+class ProbeIsolationTest(unittest.TestCase):
+    def test_runuser_failure_cannot_prove_unreadability(self):
+        import subprocess
+        system = enroll.System()
+        with mock.patch.object(enroll.runtime, 'trusted'), mock.patch('subprocess.run') as run:
+            for code, out, err in ((0, b'', b''), (1, b'', b'runuser: user missing'),
+                                   (2, b'', b''), (1, b'unexpected', b'')):
+                run.return_value = subprocess.CompletedProcess([], code, out, err)
+                with self.subTest(code=code, err=err), self.assertRaises(enroll.EnrollmentError):
+                    system.probe_key(Path('/private/identity'), 'missing-executor')
+            run.return_value = subprocess.CompletedProcess([], 1, b'', b'')
+            system.probe_key(Path('/private/identity'), 'executor')
+
+
 class System:
     def __init__(self):
         self.active = False
@@ -202,6 +216,13 @@ class EnrollmentTest(unittest.TestCase):
         self.assertTrue(self.path(enroll.CONFIG + '/database.json').exists())
         self.assertEqual(self.path(enroll.LOCK).stat().st_ino, self.lock_inode)
 
+    def test_signing_options_and_named_oversized_question(self):
+        prepared = self.prepare()
+        self.assertEqual(prepared['options'], enroll.OPTIONS)
+        oversized = dict(prepared['bundle'], padding='x' * 4000)
+        with self.assertRaisesRegex(enroll.EnrollmentError, 'decision limit'):
+            enroll.question(self.operation, oversized, oversized['expires_at'])
+
     def test_missing_signature_has_no_effect_and_drift_refuses_before_start(self):
         self.prepare()
         self.allow.validate.return_value = False
@@ -298,7 +319,7 @@ class EnrollmentTest(unittest.TestCase):
             self.assertEqual(enroll.main(['enroll', '../unsafe', '--decision', 'bad']), 2)
         text = ''.join(call.args[0] for call in output.write.call_args_list if call.args)
         self.assertNotIn('synthetic-secret', text)
-        self.assertIn('controller_enrollment_unavailable', text)
+        self.assertIn('OPERATION [--decision N] required', text)
 
     def test_separately_signed_fresh_key_is_never_regenerated_or_exported(self):
         path = self.stage / 'transport/identity'
@@ -340,7 +361,7 @@ class EnrollmentTest(unittest.TestCase):
         for code in (0, 1, 2):
             with self.subTest(code=code), \
                     mock.patch.object(enroll.runtime, 'trusted'), \
-                    mock.patch.object(subprocess, 'run', return_value=SimpleNamespace(returncode=code)) as run:
+                    mock.patch.object(subprocess, 'run', return_value=SimpleNamespace(returncode=code, stdout=b'', stderr=b'')) as run:
                 if code == 1:
                     enroll.System().probe_key(Path('/private/identity'), 'executor')
                 else:
