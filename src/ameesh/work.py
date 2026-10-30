@@ -666,7 +666,7 @@ def add(
                         "input")
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.add")
-    if footprint is None:
+    if footprint is None and not _is_vehicle_branch(branch):
         from . import work_footprints
         footprint = work_footprints.estimate_for_creation(
             cfg if cfg is not None else getattr(db, "cfg", None),
@@ -751,6 +751,16 @@ def _decision_lot(db: Db, *, title: str, requester: str, app: str, cfg=None) -> 
                    source="decision", app=app, cfg=cfg, team_queue=False)
 
 
+def _is_vehicle_branch(branch) -> bool:
+    """#4667 : la branche d'un lot est-elle celle d'un véhicule de paquet
+    (`integration/**`, §11 bis) ? Un véhicule n'a pas de delta propre : il
+    n'entre pas dans l'en-cours d'un agent (#540) et ne porte aucune
+    empreinte d'intake (#3185)."""
+    from . import packet_guard
+
+    return bool((branch or "").strip()) and packet_guard.is_packet_branch(branch)
+
+
 def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             body="", issue_ref=None, workstream=None, assignee=None, budget_usd=None,
             actor="", package=None, externe=False, cfg=None, branch=None,
@@ -784,6 +794,7 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             raise WorkError("--parent-lot: a positive lot number")
         if get(db, parent_lot) is None:
             raise WorkError("parent lot #%d not found" % parent_lot)
+    vehicle = _is_vehicle_branch(branch)
     fence = None
     if assignee:
         # L165 (EP4) : créer un lot déjà attribué est une attribution (le
@@ -799,7 +810,9 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         # L46 : l'assigné enregistré est celui que la garde a normalisé
         check = check_assignee(db, assignee, externe=externe, cfg=cfg)
         assignee = check["assignee"]
-        queued = check if team_queue else None
+        # #4667 : un véhicule de paquet n'est pas un lot de travail : il ne
+        # prend pas la place du seul lot non démarré de l'agent (#540).
+        queued = check if team_queue and not vehicle else None
     elif externe:
         raise WorkError("--externe without assignee: nothing to force")
     external_executor = (external_executor or "").strip() or None
@@ -813,6 +826,11 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         external_executor = check_external_executor(db, external_executor, cfg=cfg)
     fiche = _package(db, package) if package else None
     branch, branch_target = _branch_args(branch, branch_target)
+    if _is_vehicle_branch(branch):
+        # #4667 : le corps d'un porteur cite souvent le script qui le compose ;
+        # une empreinte d'intake inférée de ce texte est fausse (le véhicule
+        # n'a pas de delta propre) et refusait son attribution (#3185).
+        footprint = []
     created = ("created" + (" (plan: %s)" % package if package else "")
                + ("; estimate: %s" % span(minutes * 60) if minutes else "")
                + ("; reserved to external executor %s" % external_executor
@@ -2244,8 +2262,12 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         if item.get("delegated_by") and item.get("due_ts") else "")
     if reason:
         note += "; %s (pilot, %s): %s" % (WIP_EXCEPTION_MARK, actor or UNKNOWN_ACTOR, reason)
-    queued = _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
-                          % (check["assignee"], previous or "nobody"))
+    # #4667 : un véhicule de paquet (`integration/**`) n'entre pas dans
+    # l'en-cours d'un agent — le geste explicite qui l'attribue ne le met pas
+    # non plus dans la file d'équipe (#540).
+    queued = (None if _is_vehicle_branch(branch or item.get("branch"))
+              else _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
+                                % (check["assignee"], previous or "nobody")))
     # L165 (EP4) : l'attribution est un geste du pilote hors base (elle
     # réveille un autre agent). Le bail élu est vérifié et journalisé dans la
     # même transaction que l'écriture ; un acteur humain ou un exécuteur sans
