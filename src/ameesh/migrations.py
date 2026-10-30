@@ -10,6 +10,8 @@ Le verrou et les écritures partagent la même transaction et connexion.
 from __future__ import annotations
 
 import hashlib
+import functools
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -541,7 +543,7 @@ def incompatible_migrations(db, directory: str = MIGRATIONS_DIR) -> list[dict]:
     """Read-only, uncached: long-lived timers must see a new incompatibility."""
     if not marker_available(db):
         return []  # deployment of the additive marker has not happened yet
-    known = {m.version: m.checksum for m in discover(directory)}
+    known = known_writer_migrations(directory)
     return [row for row in db.query(
         "SELECT version, name, checksum FROM schema_non_additive_migrations ORDER BY version"
     ) if known.get(int(row["version"])) != row["checksum"]]
@@ -554,3 +556,35 @@ def require_compatible_writer(db, directory: str = MIGRATIONS_DIR) -> None:
         raise IncompatibleSchema(
             "writes refused: database has non-additive migration(s) unknown to this code: "
             + labels + "; upgrade this executor/CLI before writing")
+
+
+@functools.lru_cache(maxsize=16)
+def known_writer_migrations(directory: str = MIGRATIONS_DIR) -> dict[int, str]:
+    """Code inventory is immutable for a versioned process; DB inventory isn't."""
+    return {m.version: m.checksum for m in discover(directory)}
+
+
+@functools.lru_cache(maxsize=16)
+def writer_guard_sql(directory: str = MIGRATIONS_DIR) -> str:
+    """Server-side refusal, sent WITH the mutation in one atomic SQL message.
+
+    The marker may not exist during bootstrap. The PL/pgSQL relation reference
+    is prepared only in the branch where it exists. No definer rights, stored
+    function, or persistent session compatibility cache is involved.
+    """
+    known = _lit(json.dumps(known_writer_migrations(directory)))
+    return """DO $ameesh_writer_guard$
+DECLARE incompatible text;
+BEGIN
+    PERFORM pg_advisory_xact_lock_shared(hashtext(%s));
+    IF to_regclass('schema_non_additive_migrations') IS NOT NULL THEN
+        SELECT string_agg(lpad(version::text, 4, '0') || '_' || name, ', ' ORDER BY version)
+          INTO incompatible FROM schema_non_additive_migrations
+         WHERE (%s::jsonb ->> version::text) IS DISTINCT FROM checksum;
+        IF incompatible IS NOT NULL THEN
+            RAISE EXCEPTION USING ERRCODE = 'AM497', MESSAGE =
+                'writes refused: database has non-additive migration(s) unknown to this code: '
+                || incompatible || '; upgrade this executor/CLI before writing';
+        END IF;
+    END IF;
+END $ameesh_writer_guard$;""" % (_lit(_LOCK), known)

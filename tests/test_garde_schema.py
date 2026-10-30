@@ -59,6 +59,8 @@ class SchemaGuardTest(unittest.TestCase):
                                          'RETURNING n) SELECT * FROM changed'),
                     lambda: writer.script('UPDATE guard_writes SET n = 2;'),
                     lambda: writer.query_batch([('UPDATE guard_writes SET n = 2 RETURNING n', ())]),
+                    lambda: writer.query_batch([('UPDATE guard_writes SET n = 2 RETURNING n', ()),
+                                                ('UPDATE guard_writes SET n = 3 RETURNING n', ())]),
                 ):
                     with self.assertRaisesRegex(migrations.IncompatibleSchema, '9999_future'):
                         mutation()
@@ -97,6 +99,47 @@ class SchemaGuardTest(unittest.TestCase):
                     tx.execute('UPDATE guard_writes SET n = 5')
             finally:
                 writer.close()
+
+    def test_guard_does_not_add_round_trips(self):
+        writer = db_mod.connect(self.cfg, driver='psycopg')
+        try:
+            before = db_mod.TRACE.round_trips
+            writer.execute('UPDATE guard_writes SET n = %s', (3,))
+            self.assertEqual(db_mod.TRACE.round_trips - before, 1)
+            before = db_mod.TRACE.round_trips
+            with writer.transaction() as tx:
+                tx.execute('UPDATE guard_writes SET n = %s', (4,))
+                tx.execute('UPDATE guard_writes SET n = %s', (5,))
+            self.assertEqual(db_mod.TRACE.round_trips - before, 2)
+        finally:
+            writer.close()
+
+    def test_database_administration_exemption_is_scoped(self):
+        with self.assertRaisesRegex(db_mod.DbError, 'only accepts'):
+            db_mod.execute_without_statement_timeout(self.admin,
+                                                     'UPDATE guard_writes SET n = 99')
+        self.assertEqual(self.admin.query('SELECT n FROM guard_writes'), [{'n': 0}])
+
+    def test_savepoint_rollback_requires_fresh_compatibility_check(self):
+        writer = db_mod.connect(self.cfg, driver='psycopg')
+        try:
+            with self.assertRaises(migrations.IncompatibleSchema):
+                with writer.transaction() as tx:
+                    tx.execute('SAVEPOINT before_guard')
+                    tx.execute('UPDATE guard_writes SET n = 8')
+                    tx.execute('ROLLBACK TO SAVEPOINT before_guard')
+                    self.mark_unknown()
+                    tx.execute('UPDATE guard_writes SET n = 9')
+            self.assertEqual(self.admin.query('SELECT n FROM guard_writes'), [{'n': 0}])
+        finally:
+            writer.close()
+
+    def test_combined_guard_keeps_values_as_parameters(self):
+        payload = "quote'; UPDATE guard_writes SET n = 99; -- $ameesh_writer_guard$ %s"
+        rows = self.admin.query('INSERT INTO agent_registry (name) VALUES (%s) RETURNING name',
+                                (payload,))
+        self.assertEqual(rows, [{'name': payload}])
+        self.assertEqual(self.admin.query('SELECT n FROM guard_writes'), [{'n': 0}])
 
     def test_additive_ahead_is_accepted(self):
         self.mark_unknown(additive=True)
