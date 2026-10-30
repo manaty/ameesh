@@ -100,7 +100,7 @@ class MergedCommandTest(_Base):
             sha = self.proof(lot)
             done = work.merged(self.db, lot["id"], sha=sha.upper(), actor="claude1", repo=self.repo,
                                note="fusion locale sur develop")
-            self.assertEqual((done["result"], done["item"]["state"]), ("merged", "merged"),
+            self.assertEqual((done["result"], done["item"]["state"]), ("merged", "delivered"),
                              state)
             jalon = self.merged_milestone(lot["id"])
             self.assertEqual((jalon["sha"], jalon["actor"]), (sha, "claude1"))
@@ -139,7 +139,7 @@ class MergedCommandTest(_Base):
         proc = self.mesh("work", "merged", str(lot["id"]), "--sha", SHA,
                          env=self.env(AGENT_MAIL_NAME="claude1"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("already merged", proc.stdout)
+        self.assertIn("already delivered", proc.stdout)
         proc = self.mesh("work", "merged", str(lot["id"]))          # --sha obligatoire
         self.assertEqual(proc.returncode, 2)
 
@@ -213,7 +213,7 @@ class CorrectionTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("correction recorded in the log, by orch", proc.stdout)
         item = work.get(self.db, self.lot["id"])
-        self.assertEqual(item["state"], "merged")
+        self.assertEqual(item["state"], "delivered")
         self.assertIsNone(item["closed_ts"])
         event = work.events(self.db, self.lot["id"])[0]
         self.assertEqual((event["state"], event["actor"]), ("merged", "orch"))
@@ -242,7 +242,7 @@ class CorrectionTest(_Base):
             proc = self.correct(*extra, **env)
             self.assertEqual(proc.returncode, 1, (extra, env, proc.stdout))
             self.assertIn(attendu, proc.stderr, (extra, env))
-        self.assertEqual(work.get(self.db, self.lot["id"])["state"], "promoted")
+        self.assertEqual(work.get(self.db, self.lot["id"])["state"], "delivered")
         # seules corrections possibles : promoted → merged et merged → build
         autre = work.add(self.db, title="autre")
         with self.assertRaises(work.WorkError) as ctx:
@@ -278,7 +278,7 @@ class CorrectionTest(_Base):
         # et le lot repart dans la machine à états
         self.assertEqual(work.move(self.db, lot["id"], "qa")["state"], "qa")
         # la vraie fusion écrit SON jalon, daté par elle
-        self.assertEqual(work.move(self.db, lot["id"], "merged")["state"], "merged")
+        self.assertEqual(work.move(self.db, lot["id"], "merged")["state"], "delivered")
         jalons = [m for m in work.milestones(self.db, lot["id"])
                   if m["kind"] == "merged"]
         self.assertEqual(len(jalons), 2)
@@ -560,7 +560,7 @@ class MergeSweepTest(_Base):
         report = self.sync()
         self.assertEqual(report["merged"], 1)
         item = work.get(self.db, lot["id"])
-        self.assertEqual(item["state"], "merged")
+        self.assertEqual(item["state"], "delivered")
         jalon = self.merged_milestone(lot["id"])
         self.assertEqual(jalon["sha"], sha)
         self.assertIn("merge sweep, merge commit of develop that carries "
@@ -628,7 +628,7 @@ class MergeSweepTest(_Base):
         self.merge("feature/paquet-positif-avant-sans", "paquet : #%d livré sans (#%d)"
                    % (livre["id"], exclu["id"]))
         self.sync()
-        self.assertEqual(work.get(self.db, livre["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, livre["id"])["state"], "delivered")
         self.assertEqual(work.get(self.db, exclu["id"])["state"], "intake")
 
     def test_diese_retire_apres_le_numero_ne_ferme_pas_le_lot(self):
@@ -841,7 +841,7 @@ class MergeSweepTest(_Base):
         self.merge("lot/%d-bon" % lot2["id"],
                    "Merge pull request #4 from manaty/lot/%d-bon" % lot2["id"])
         self.sync(pr_body=lambda repo, num: "")
-        self.assertEqual(work.get(self.db, lot2["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot2["id"])["state"], "delivered")
 
     def test_r1_fusion_locale_partielle_retient_la_branche_implicite(self):
         # P2 : `ameesh-work-partial` dans le message d'une fusion locale
@@ -925,7 +925,7 @@ class MergeSweepTest(_Base):
             self.sync(pr_body=lire)
             self.sync(pr_body=lire)
         self.assertEqual(lus, [30, 31])
-        self.assertEqual(work.get(self.db, b["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, b["id"])["state"], "delivered")
         self.assertEqual(work.get(self.db, a["id"])["state"], "intake")
 
     def test_r2_seule_la_derniere_fusion_partielle_compte(self):
@@ -1173,7 +1173,7 @@ class MergeSweepTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("(no branch)", proc.stdout)
         self.assertIn("CLOSED", proc.stdout)
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     # --- #1825 : une fusion annulée par un revert n'est pas une livraison ---
 
@@ -1202,7 +1202,7 @@ class MergeSweepTest(_Base):
         report = self.sync()
         self.assertEqual(report["merged"], 1)
         self.assertEqual(self.merged_milestone(n)["sha"], tip)
-        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["state"], "delivered")
 
     def test_1825_revert_d_un_autre_lot_ne_retient_pas(self):
         """Un revert étranger ne retient pas un lot livré avant lui."""
@@ -1216,7 +1216,7 @@ class MergeSweepTest(_Base):
         report = {r["work_item"]: r for r in self.sync()["results"]}
         self.assertEqual(report[premier["id"]]["result"], "merged")
         self.assertEqual(report[second["id"]]["result"], "open")
-        self.assertEqual(work.get(self.db, premier["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, premier["id"])["state"], "delivered")
         self.assertEqual(work.get(self.db, second["id"])["state"], "intake")
 
     def test_1825_fusion_citante_annulee_ne_ferme_pas(self):
@@ -1320,7 +1320,7 @@ class RealTargetTest(_Base):
         self.assertEqual(entry["target"], "origin/develop")
         self.assertEqual(entry["off_target"], "origin/main")
         self.assertIn("ameesh.target", entry["detail"])
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
         jalon = self.merged_milestone(lot["id"])
         self.assertEqual(jalon["sha"], sha)
         self.assertIn("origin/develop", jalon["note"])
@@ -1424,7 +1424,7 @@ class RealTargetTest(_Base):
                          "le lot suivant, sans cible, est livré sur develop : "
                          "la liste des candidats ne doit pas être figée par le "
                          "lot précédent, qui déclarait origin/develop")
-        self.assertEqual(work.get(self.db, suivant["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, suivant["id"])["state"], "delivered")
 
 
 class ContentDeliveryTest(_Base):
@@ -1538,7 +1538,7 @@ class ContentDeliveryTest(_Base):
         self.assertEqual(entry["off_target"], "origin/main")
         self.assertEqual(entry["how"], "content-ancestor")
         self.assertEqual(lus, [627])   # le corps de la PR PORTEUSE est lu (B2)
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
         jalon = self.merged_milestone(lot["id"])
         self.assertEqual(jalon["sha"], sha)
         self.assertIn("origin/develop", jalon["note"])
@@ -1606,7 +1606,7 @@ class ContentDeliveryTest(_Base):
                           or "Livraison complète.")["results"][0]
         self.assertEqual(lus, [627])
         self.assertEqual((entry["result"], entry["how"]), ("merged", "content-ancestor"))
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
         self.assertEqual(self.merged_milestone(lot["id"])["sha"], sha)
 
     def test_1005_fusion_imbriquee_porteur_illisible_retient(self):
@@ -1654,7 +1654,7 @@ class ContentDeliveryTest(_Base):
         entry = self.sync(pr_body=lambda repo, num: lus.append(num) or "x")["results"][0]
         self.assertEqual(lus, [])
         self.assertEqual((entry["result"], entry["how"]), ("merged", "content-ancestor"))
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def test_1005_avance_rapide_ferme_sans_lecture(self):
         """B2 R2 contrôle : une avance rapide reste fermée, même quand la
@@ -1675,7 +1675,7 @@ class ContentDeliveryTest(_Base):
             entry = self.sync(pr_body=lambda repo, num: lus.append(num) or "x")["results"][0]
         self.assertEqual(lus, [])
         self.assertEqual((entry["result"], entry["how"]), ("merged", "content-ancestor"))
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def test_1005_porteur_hors_fenetre_lecture_reste_ouvert(self):
         """B2 R2 : la fenêtre de lecture de la chaîne première-parente est
@@ -1702,7 +1702,7 @@ class ContentDeliveryTest(_Base):
                           or "Livraison complète.")["results"][0]
         self.assertEqual(lus, [627])
         self.assertEqual(entry["result"], "merged")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def test_1005_regel_concurrent_ne_ferme_pas(self):
         """B1 : un gel déclaré pendant le relevé (après la lecture, avant
@@ -1764,7 +1764,7 @@ class ContentDeliveryTest(_Base):
         self.assertEqual((entry["result"], entry["how"]), ("merged", "ancestor"))
         self.assertEqual(entry["target"], "origin/develop")
         self.assertEqual(entry["off_target"], "origin/main")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
         jalon = self.merged_milestone(lot["id"])
         self.assertEqual((jalon["sha"], jalon["actor"]), (sha, "git:origin/develop"))
 
@@ -1793,7 +1793,7 @@ class ContentDeliveryTest(_Base):
         self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
         entry = plan_git.sync_merges(self.db, self.repo)["results"][0]
         self.assertEqual((entry["result"], entry["how"]), ("merged", "patch-id"))
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     # --- #1825 : une fusion annulée par un revert n'est pas une livraison ---
 
@@ -1827,7 +1827,7 @@ class ContentDeliveryTest(_Base):
         self.publish_develop()
         entry = self.sync(pr_body=lambda repo, num: "Livraison complète.")["results"][0]
         self.assertEqual((entry["result"], entry["how"]), ("merged", "content-ancestor"))
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def test_1825_revert_direct_du_gel_ne_ferme_pas(self):
         """Poussée directe du gel sur develop, puis revert de ce commit : le
@@ -1886,7 +1886,7 @@ class ContentDeliveryTest(_Base):
         proc = self.mesh("work", "sync-merges", "--git-dir", self.repo)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("closed by content", proc.stdout)
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     # --- #1776 : le gel vide et le paquet imbriqué, jugés par le contenu ---
 

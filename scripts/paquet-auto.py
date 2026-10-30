@@ -105,6 +105,16 @@ des tests : chaque série est bornée au temps restant, celles qui ne partent
 plus avant l'échéance sont non concluantes (canon §3) et le tic suivant peut
 partir.
 
+#4887 : sous cette borne, la première série ne mange plus le temps des autres.
+Chaque série ne reçoit que sa part des vagues restantes (`series_share`) :
+toutes les unités commencent, leurs modules directs (propres et voisins joués)
+passent avant l'échéance, les contrats en dernier. Le corps de la PR dit, lot
+par lot, si ses modules directs ont été joués jusqu'au bout (`_direct_lines`) ;
+une série coupée n'en revendique aucun (#4814). Le contrôle rapide du job plan
+« types clients à jour » passe avant la poussée et la demande de CI : le vrai
+`gen-api --check` si Node et les dépendances sont là, sinon la garde
+déterministe « OpenAPI changé sans schéma » (#4831).
+
 #4237 : un refus de geste (bail relevé, `GestureRefused`) **après des tests
 verts** ne perd plus le paquet : depuis #4304, la tête est déjà poussée,
 enregistrée et gelée avant ses tests ; sa fin (corps de PR, note, ci-full,
@@ -323,10 +333,14 @@ BLOCK_END_RE = re.compile(r"^=+$", re.MULTILINE)
 STRONG_EVIDENCE = 4
 #: l'outil qui rend l'attribution `packet_red` d'un rouge de composition
 ATTRIBUTION_SCRIPT = "scripts/paquet-attribution.py"
-#: #4025 : budget, en secondes (durées psycopg de la carte), des modules que
-#: la carte d'impact ajoute à une unité ; les modules `support`, déterministes,
-#: ne sont pas plafonnés
+#: #4025 : budget, en secondes (durées du pilote, `tests/parts/durees.json`),
+#: des modules voisins ajoutés à une unité ; #4814 : les modules `support`
+#: y entrent aussi, avant ceux de la carte
 IMPACT_BUDGET_S = 180
+#: #4887 : le contrôle « types clients à jour » du job plan, avant la CI
+CLIENT_SPEC = "docs/api/openapi-v1.json"
+CLIENT_SCHEMA = "ui/src/api/schema.d.ts"
+CLIENT_GEN = "ui/scripts/gen-api.mjs"
 #: un en-tête d'échec unittest (`FAIL: test (tests.test_x.T.t)`) ; une ligne
 #: `FAIL:` produite par le test lui-même n'a pas ce nom pointé et est ignorée
 FAIL_LINE_RE = re.compile(
@@ -462,10 +476,21 @@ class TestRun:
     #: #4221 : tests rouges sur la tête mais verts sur tous les préfixes de
     #: l'empilement (instables) : non concluants, ils ne retirent aucune unité.
     flaky_tests: list[str] = field(default_factory=list)
+    #: #4887 : les modules directs de l'unité (ses propres tests et ses voisins
+    #: sélectionnés), tels que la série devait les jouer ; vide pour les contrats.
+    direct: list[str] = field(default_factory=list)
+    #: #4887 : rouges de voisins conservés faute de rejeu de base concluant ;
+    #: consignés non attribués, la ci-full tranche.
+    unattributed: list[str] = field(default_factory=list)
 
     @property
     def green(self) -> bool:
         return self.returncode == 0
+
+    @property
+    def finished(self) -> bool:
+        """#4814/#4887 : la série est allée au bout de ses modules."""
+        return not self.timed_out and self.returncode in (0, 1)
 
     def _summary(self) -> dict[str, int]:
         found = FAILED_SUMMARY_RE.search(self.output)
@@ -1689,9 +1714,14 @@ def _mtime(path: Path) -> float:
 
 
 def save_test_log(run: TestRun) -> TestRun:
-    """Preuve locale privée, hors arbre jetable ; 48 h et 100 séries au plus.
+    """Preuve locale privée, hors arbre jetable ; 48 h et 500 séries au plus.
 
-    Au mieux : un journal impossible à écrire ne change rien à la série."""
+    #4887 : 100 séries ne gardaient pas les journaux d'une composition d'une
+    heure (h-10 : 5 sur 10 avaient disparu au moment de la mesure) ; 500
+    laissent le temps de lire un rouge sans grossir (quelques dizaines de Ko
+    par série). Au mieux : un journal impossible à écrire ne change rien à la
+    série.
+    """
     try:
         return _save_test_log(run)
     except Exception as exc:  # noqa: BLE001 — la preuve ne retient pas la série
@@ -1705,7 +1735,7 @@ def _save_test_log(run: TestRun) -> TestRun:
     files = sorted(root.glob("series-*.log"), key=_mtime, reverse=True)
     cutoff = time.time() - 48 * 3600
     for index, path in enumerate(files):
-        if index >= 99 or _mtime(path) < cutoff:
+        if index >= 499 or _mtime(path) < cutoff:
             path.unlink(missing_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="series-",
                                      suffix=".log", dir=root, delete=False) as log:
@@ -1842,6 +1872,117 @@ def run_freeze_checks(worktree: Path, *, timeout: int) -> tuple[int, str, float]
     proc = run_command([project_python(worktree), str(script)], cwd=worktree,
                        timeout=timeout, env=python_env(worktree))
     return proc.returncode, _output(proc), time.monotonic() - start
+
+
+def _changed_paths(worktree: Path, base_sha: str) -> list[str] | None:
+    """#4887 : les chemins changés par la composition, ou None (diff illisible)."""
+    if not base_sha:
+        return None
+    proc = git(worktree, "diff", "--name-only", base_sha, check=False)
+    if proc.returncode != 0:
+        return None
+    return [line.strip() for line in _decode(proc.stdout).splitlines()
+            if line.strip()]
+
+
+def _client_node_modules(worktree: Path, repo: Path | None) -> tuple[Path | None, bool]:
+    """#4887 : les `node_modules` de `ui/`, dans l'arbre ou prêtés par le clone.
+
+    Rend `(chemin, posé)`, `posé` disant qu'un lien a été créé dans le worktree
+    jetable et doit être retiré après le contrôle.
+    """
+    direct = worktree / "ui" / "node_modules"
+    if (direct / "openapi-typescript").is_dir():
+        return direct, False
+    if repo is not None:
+        source = repo / "ui" / "node_modules"
+        if (source / "openapi-typescript").is_dir():
+            link = worktree / "ui" / "node_modules"
+            if not os.path.lexists(link):
+                link.symlink_to(source.resolve(), target_is_directory=True)
+                return link, True
+    return None, False
+
+
+def _client_culprits(worktree: Path, units) -> list[int]:
+    """#4887 : les unités qui changent l'OpenAPI sans le schéma généré."""
+    out: list[int] = []
+    for unit in units or ():
+        proc = git(worktree, "diff", "--name-only", unit.commit + "^1",
+                   unit.commit, check=False)
+        if proc.returncode != 0:
+            continue
+        files = {line.strip() for line in _decode(proc.stdout).splitlines()
+                 if line.strip()}
+        if CLIENT_SPEC in files and CLIENT_SCHEMA not in files:
+            out.append(unit.lot)
+    return out
+
+
+def check_client_types(worktree: Path, base_sha: str, *,
+                       repo: Path | None = None, units=(),
+                       timeout: int = GIT_TIMEOUT) -> tuple[bool, str]:
+    """#4887 : le contrôle rapide du job plan (`types clients à jour`) avant la CI.
+
+    h-10 a perdu sa CI sur `ui/src/api/schema.d.ts` périmé (#4831) : le job
+    `plan` le refuse, mais le composeur ne le voyait qu'après la poussée. Ici :
+
+    * le vrai `node ui/scripts/gen-api.mjs --check` tourne quand `node` et
+      `openapi-typescript` sont disponibles (le clone dédié peut prêter ses
+      `ui/node_modules` au worktree jetable) ; lui seul **bloque** une
+      composition, sur une preuve de types périmés ;
+    * sans eux, le contrôle est **non concluant** : il est dit, avec l'indice
+      « OpenAPI changé sans schéma » et l'unité qui le porte, mais il ne bloque
+      pas (§3) — un reformatage JSON ou un `info.version` peut laisser les
+      types identiques (cx1, #4887) ; la CI tranche.
+    """
+    script = worktree / CLIENT_GEN
+    if not script.is_file():
+        return True, "types clients : pas de générateur dans l'arbre, contrôle sauté"
+    changed = _changed_paths(worktree, base_sha)
+    if changed is None:
+        return True, ("types clients : diff de la composition illisible, "
+                      "contrôle non concluant (la CI tranche)")
+    if CLIENT_SPEC not in changed and CLIENT_SCHEMA not in changed:
+        return True, "types clients : inchangés"
+    if "ui/package.json" in changed or "ui/package-lock.json" in changed:
+        # les dépendances du générateur ont bougé : le node_modules prêté par
+        # le clone n'est plus celui de l'arbre composé.
+        return True, ("types clients : non concluant (dépendances ui modifiées, "
+                      "node_modules du clone peut être périmé) ; la CI tranche")
+    node = shutil.which("node")
+    modules, linked = _client_node_modules(worktree, repo)
+    try:
+        if node and modules is not None:
+            try:
+                proc = run_command([node, CLIENT_GEN, "--check"], cwd=worktree,
+                                   timeout=timeout)
+            except PaquetAutoError as exc:
+                return True, ("types clients : contrôle non concluant (%s) ; "
+                              "la CI tranche" % _one_line(str(exc))[:160])
+            text = _output(proc)
+            if proc.returncode == 0:
+                return True, "types clients : à jour (`gen-api --check`)"
+            if re.search(r"ERR_MODULE_NOT_FOUND|Cannot find module", text):
+                pass        # dépendances incomplètes : garde déterministe
+            else:
+                return False, ("types clients périmés (`gen-api --check`, rc %d) : %s"
+                               % (proc.returncode, _one_line(text)[:240]))
+        if CLIENT_SPEC in changed and CLIENT_SCHEMA not in changed:
+            culprits = _client_culprits(worktree, units)
+            hint = ((" ; indice : unité(s) #"
+                     + ", #".join(str(lot) for lot in culprits))
+                    if culprits else "")
+            return True, (
+                "types clients : non concluant (node/node_modules absent) ; "
+                "`%s` change sans `%s`%s ; la CI tranche (#4831)"
+                % (CLIENT_SPEC, CLIENT_SCHEMA, hint))
+        return True, ("types clients : non concluant (node/node_modules absent) ; "
+                      "la CI tranche")
+    finally:
+        if linked and modules is not None:
+            with contextlib.suppress(OSError):
+                modules.unlink()
 
 
 def unittest_failures(output: str) -> list[dict]:
@@ -2169,11 +2310,41 @@ def series_timeout(timeout: int, deadline: float | None) -> int | None:
     return min(timeout, left) if left > 0 else None
 
 
+def series_share(timeout: int, deadline: float | None, pending: int,
+                 parallel: int = 1, reserve: int = 0) -> int | None:
+    """#4887 : la part d'une série dans la borne totale ; None si échue.
+
+    h-10 : dix séries, deux créneaux, 1800 s. La première série pouvait prendre
+    jusqu'à 1200 s (`packet_tests.unit_timeout_seconds`) et la deuxième le
+    reste : les huit autres ne partaient jamais, et leurs rouges déterministes
+    n'étaient vus qu'en CI. Ici chaque série ne reçoit que sa part des vagues
+    restantes (`pending` séries pas encore parties, celle-ci comprise, divisé
+    par `parallel` séries à la fois) : toutes les unités commencent avant
+    l'échéance, la borne totale restant la même. `reserve` garde de quoi
+    rejouer un rouge de voisin sur la base et sur les préfixes : sans elle, la
+    part des séries consomme tout et le rejeu est coupé, le vrai rouge reste
+    sans attribution (h-10, `test_2442`). Une part arrondie vaut au moins une
+    seconde ; `timeout` reste le plafond de la série.
+    """
+    if deadline is None:
+        return timeout
+    left = int(deadline - time.monotonic())
+    if left <= 0:
+        return None
+    width = max(1, int(parallel))
+    waves = max(1, (max(1, pending) + width - 1) // width)
+    usable = left - max(0, int(reserve))
+    if usable <= 0:
+        return None
+    return max(1, min(timeout, left, usable // waves))
+
+
 def budget_spent(label: str, modules: list[str]) -> TestRun:
     """#4463 : une série qui ne part plus, l'échéance totale passée (§3)."""
     return TestRun(label=label, modules=list(modules), returncode=None,
                    output="borne totale des tests par unité atteinte : série "
-                          "non jouée (#4463)", seconds=0.0, timed_out=True)
+                          "non jouée (#4463)", seconds=0.0, timed_out=True,
+                   direct=list(modules))
 
 
 
@@ -2267,14 +2438,20 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         planned.append((unit, proper, added, modules))
 
     def bounded(label: str, modules: list[str]) -> TestRun:
-        limit = series_timeout(timeout, deadline)
+        limit, here = next_share()
         if limit is None:
             log("tests %s : borne totale atteinte, série non jouée (non "
                 "concluant)" % label)
             return budget_spent(label, modules)
+        if deadline is not None:
+            log("tests %s : part de %d s sur la borne totale (%d série(s) à "
+                "partir, %d à la fois)" % (label, limit, here,
+                                           max(1, parallel)))
         # sous l'échéance, attente du créneau comprise (relecture cx3)
         walled = {"wall": limit} if deadline is not None else {}
-        return run_tests(worktree, label, modules, timeout=limit, **slots, **walled)
+        run = run_tests(worktree, label, modules, timeout=limit, **slots, **walled)
+        run.direct = list(modules)
+        return run
 
     def unit_job(label: str, modules: list[str]):
         return lambda: bounded(label, modules)
@@ -2284,15 +2461,36 @@ def check_local_tests(worktree: Path, composition: Composition, *,
 
     jobs = [unit_job("unité #%d" % unit.lot, modules)
             for unit, _proper, _added, modules in planned] + [contract_job]
+    # #4887 : la part de chaque série est calculée au départ, pas à la
+    # composition : une série qui finit tôt rend sa part aux suivantes. Une
+    # réserve reste pour le rejeu d'un rouge de voisin (base, préfixes), sans
+    # quoi la part des séries le coupe et le vrai rouge n'est pas attribué.
+    remaining = {"left": len(jobs)}
+    remaining_lock = threading.Lock()
+    reserve = 0
+    if deadline is not None:
+        total = max(0, int(deadline - time.monotonic()))
+        reserve = min(300, max(30, total // 5))
+        log("tests ciblés : réserve de %d s sur la borne totale pour les "
+            "rejeux base/préfixes (#4887)" % reserve)
+
+    def next_share() -> tuple[int | None, int]:
+        with remaining_lock:
+            here = max(1, remaining["left"])
+            remaining["left"] = max(0, remaining["left"] - 1)
+        return series_share(timeout, deadline, here, parallel, reserve), here
+
     if slots:
         log("tests ciblés : %d série(s), %d à la fois, créneaux `ameesh heavy`, "
-            "borne %d s par série" % (len(jobs), min(parallel, len(jobs)), timeout))
+            "borne %d s par série, part de la borne totale (#4887)"
+            % (len(jobs), min(parallel, len(jobs)), timeout))
     results = _run_series(jobs, parallel=parallel, guard=guard)
     contract = results.pop()
     pending: list[tuple[Unit, TestRun, list[dict], set[str], set[str],
                         set[str]]] = []
     for (unit, proper, added, modules), run in zip(planned, results):
         run.added = added
+        run.direct = list(modules)
         runs.append(run)
         if run.inconclusive:
             log("tests unité #%d : NON CONCLUANT (%s) — consigné, le paquet "
@@ -2321,6 +2519,12 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         if guard is not None:
             guard()
         limit = series_timeout(timeout, deadline)
+        if limit is not None and deadline is not None:
+            # #4887 : garder la moitié du temps restant au rejeu des préfixes,
+            # qui attribue le rouge ; un rejeu de base coupé reste non concluant
+            # et le rouge est conservé (voir plus bas).
+            left = max(1, int(deadline - time.monotonic()))
+            limit = min(limit, max(30, left // 2))
         walled = {"wall": limit} if deadline is not None and limit else {}
         at_base = (None if limit is None else
                    (on_base or base_failures)(worktree, base_sha, neighbor_red,
@@ -2331,12 +2535,22 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     neighbor_tests: dict[str, dict] = {}
     owned_by_lot: dict[int, list[dict]] = {}
     unparsed_lots: set[int] = set()
+    unattributed: set[str] = set()
     for unit, run, found, _proper, mine, neighbor in pending:
         kept = []
+        unread: list[dict] = []
         for failure in found:
-            if failure.get("module") in neighbor \
-                    and (at_base is None or failure["test"] in at_base):
-                continue
+            if failure.get("module") in neighbor:
+                if at_base is None:
+                    # #4887 (auditeur B) : sans rejeu de base concluant, le
+                    # préfixe 1 ne peut pas distinguer un rouge préexistant
+                    # d'un rouge de u1 ; on conserve le rouge mais on ne
+                    # l'attribue pas (la ci-full tranche).
+                    kept.append(failure)
+                    unread.append(failure)
+                    continue
+                if failure["test"] in at_base:
+                    continue
             kept.append(failure)
         owned = [failure for failure in kept
                  if failure.get("module") not in neighbor
@@ -2345,14 +2559,22 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         if not found:
             unparsed_lots.add(unit.lot)
         for failure in kept:
-            if failure.get("module") in neighbor:
+            if failure.get("module") in neighbor and not unread:
                 neighbor_tests.setdefault(_failure_name(failure), failure)
+        if unread:
+            names = sorted({_failure_name(failure) for failure in unread
+                            if _failure_name(failure)})
+            run.unattributed = names
+            unattributed.update(names)
+            log("tests unité #%d : %d rouge(s) de voisin conservé(s), rejeu de "
+                "base non concluant — non attribué(s), la ci-full tranche : %s"
+                % (unit.lot, len(names), ", ".join(names[:5])))
         if kept or not found:
             red.append((run, kept))
         else:
             run.ignored_red = True
-            log("tests unité #%d : rouge des seuls voisins, aussi rouges sur la "
-                "base ou non rejoués — sans effet" % unit.lot)
+            log("tests unité #%d : rouge des seuls voisins, aussi rouge(s) sur "
+                "la base — sans effet" % unit.lot)
     own_names = {_failure_name(failure) for failures in owned_by_lot.values()
                  for failure in failures}
     prefix_names = {name for name in neighbor_tests
@@ -2484,7 +2706,8 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                           % (positions.get(lot, 0), lot)],
                 attributed=True, proof="prefixes"))
     remaining = [failure for failure in failures
-                 if _failure_name(failure) not in prefix_names]
+                 if _failure_name(failure) not in prefix_names
+                 and _failure_name(failure) not in unattributed]
     designated: list[Removal] = []
     if remaining:
         if all(found for _run, found in red):
@@ -2623,6 +2846,8 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
     ]
     if tests is None:
         lines.append(TESTS_PARALLEL_LINE)
+        lines.append("- Modules directs par lot : lus au corps de la PR après "
+                     "les tests (#4887).")
         tests = []
     else:
         lines.append("- Tests locaux : %s." % _tests_summary(tests))
@@ -2634,6 +2859,14 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
             "Non concluants (canon §3 : ne retiennent ni paquet ni release) :",
             "",
         ] + inconclusive
+    unattributed = _unattributed_lines(tests)
+    if unattributed:
+        lines += [
+            "",
+            "Rouges de voisins non attribués (rejeu de base non concluant, "
+            "#4887) :",
+            "",
+        ] + unattributed
     lines += [
         "",
         "- `scripts/paquet-inclusion.py` : exécuté sur cette tête après le "
@@ -2651,9 +2884,14 @@ def _tests_summary(tests: list[TestRun]) -> str:
               and not run.ignored_red)
     ignored = sum(1 for run in tests if run.ignored_red)
     inconclusive = sum(1 for run in tests if run.inconclusive)
-    return ("%d séries, %d modules, %d tests exécutés, %d échec(s), "
-            "%d run(s) rouge(s) sans effet, %d non concluant(s), %d sauté(s) : %s"
-            % (len(tests), len(modules), total, red, ignored, inconclusive, skipped,
+    # #4814 : une série arrêtée par sa borne n'a joué aucun de ses modules
+    # jusqu'au bout ; le rapport ne les compte plus comme joués
+    finished = {module for run in tests if run.finished for module in run.modules}
+    return ("%d séries, %d modules dont %d joués jusqu'au bout, %d tests "
+            "exécutés, %d échec(s), %d run(s) rouge(s) sans effet, "
+            "%d non concluant(s), %d sauté(s) : %s"
+            % (len(tests), len(modules), len(finished), total, red, ignored,
+               inconclusive, skipped,
                ", ".join("`%s`" % module for module in modules) or "aucun"))
 
 
@@ -2678,6 +2916,43 @@ def _neighbor_lines(composition: Composition, tests: list[TestRun]) -> list[str]
     return lines
 
 
+def _direct_lines(composition: Composition, tests: list[TestRun]) -> list[str]:
+    """#4887 : par lot, ses modules directs et s'ils ont été joués.
+
+    Les modules directs d'une unité sont ceux de sa série : ses propres tests
+    et les voisins que la sélection lui a donnés. Une série coupée par sa part
+    de borne n'en a joué aucun jusqu'au bout (#4814) : le manifeste le dit lot
+    par lot, au lieu de ne compter que les modules de la tête.
+    """
+    by_label = {run.label: run for run in tests}
+    rows: list[str] = []
+    for unit in composition.units:
+        run = by_label.get("unité #%d" % unit.lot)
+        direct = list(run.direct or run.modules) if run is not None else []
+        if run is None:
+            state = "aucun module"
+        elif run.finished:
+            state = "oui (%d/%d)" % (len(direct), len(direct))
+        else:
+            state = "non (série coupée après %.0f s%s)" % (
+                run.seconds,
+                ", %d test(s)" % run.tests if run.tests else "")
+        rows.append("| #%d | %d | %s |" % (unit.lot, len(direct), state))
+    return ["", "Modules directs par lot (#4887) :", "",
+            "| lot | modules directs | joués jusqu'au bout |", "|---|---|---|"] + rows
+
+
+def _direct_note(composition: Composition, tests: list[TestRun]) -> str:
+    """#4887 : les lots dont la série de modules directs n'est pas allée au bout."""
+    by_label = {run.label: run for run in tests}
+    missing = [unit.lot for unit in composition.units
+               if (run := by_label.get("unité #%d" % unit.lot)) is not None
+               and not run.finished]
+    if not missing:
+        return "modules directs : tous joués jusqu'au bout"
+    return "modules directs non joués : " + ", ".join("#%d" % lot for lot in missing)
+
+
 def _inconclusive_lines(tests: list[TestRun]) -> list[str]:
     """Une ligne par run non concluant : module, motif, extrait (canon §3)."""
     lines: list[str] = []
@@ -2685,10 +2960,28 @@ def _inconclusive_lines(tests: list[TestRun]) -> list[str]:
         if not run.inconclusive:
             continue
         modules = ", ".join(run.modules) or "aucun module"
-        lines.append("- NON CONCLUANT : %s — modules %s — %s — extrait : %s%s"
+        spent = ("%.0f s de série" % run.seconds) if run.seconds else ""
+        tests_run = ("%d test(s) exécuté(s)" % run.tests) if run.tests else ""
+        detail = " ; ".join(part for part in (spent, tests_run) if part)
+        lines.append("- NON CONCLUANT : %s — modules %s — %s%s — extrait : %s%s"
                      % (run.label.replace("#", ""), modules, run.motive(),
+                        (" (%s)" % detail) if detail else "",
                         _one_line(run.excerpt())[:240],
                         (" — journal local : " + run.log_path) if run.log_path else ""))
+    return lines
+
+
+def _unattributed_lines(tests: list[TestRun]) -> list[str]:
+    """#4887 : les rouges de voisins conservés faute de rejeu de base concluant."""
+    lines: list[str] = []
+    for run in tests:
+        if not run.unattributed:
+            continue
+        lines.append("- NON ATTRIBUÉ (#4887) : %s — rouges de voisin : %s — "
+                     "rejeu de base non concluant, la ci-full tranche%s"
+                     % (run.label.replace("#", ""), ", ".join(run.unattributed),
+                        (" — journal local : " + run.log_path)
+                        if run.log_path else ""))
     return lines
 
 
@@ -3146,6 +3439,8 @@ def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
     else:
         lines.append("- Tests locaux : %s." % _tests_summary(tests))
         lines += ["  " + line for line in _inconclusive_lines(tests)]
+        lines += ["  " + line for line in _unattributed_lines(tests)]
+        lines += _direct_lines(composition, tests)
     lines += [
         "- Contrôle d'inclusion : %s." % ("vert" if inclusion_rc == 0 else "à lire"),
         "- Freeze-checks : vert (%.1f s)." % freeze_seconds,
@@ -3171,12 +3466,17 @@ def mail_body(*, name: str, target: str, base_sha: str, carrier: int,
     non_section = ("Non concluants (canon §3, consignés) :\n"
                    + "\n".join("  " + line for line in inconclusive)) \
         if inconclusive else "Non concluants : aucun."
+    unattributed = _unattributed_lines(tests)
+    if unattributed:
+        non_section += ("\nRouges de voisins non attribués (#4887) :\n"
+                        + "\n".join("  " + line for line in unattributed))
     return """\
 Paquet {name} composé sans agent : tête `{head}` sur {target} `{base}` (branche `{branch}`, {pr}).
 
 - Unités ({n}) : {units}.
 - Écartés ({d}) : {discarded}.
 - Tests locaux : {tests}.
+- {direct_note}
 - {non_section}
 - Inclusion : {inclusion}.
 - Gel : `ameesh work milestone` posé sur la tête dès la poussée, ci-full demandée (#4304) ; manifeste `{manifest}`.
@@ -3186,7 +3486,8 @@ Paquet {name} composé sans agent : tête `{head}` sur {target} `{base}` (branch
         name=name, head=head, target=target, base=base_sha[:12],
         branch=branch, pr=pr, n=len(composition.units), units=units,
         d=len(composition.discarded), discarded=discarded,
-        tests=_tests_summary(tests), non_section=non_section,
+        tests=_tests_summary(tests), direct_note=_direct_note(composition, tests),
+        non_section=non_section,
         inclusion="vert" if inclusion_rc == 0 else "à lire",
         manifest=manifest_rel(name),
     )
@@ -3771,6 +4072,13 @@ def compose_packet(args: argparse.Namespace) -> int:
                     "freeze-checks rouge sur la tête composée :\n%s"
                     % _tail(freeze_output))
             print("freeze-checks : vert (%.1f s)" % freeze_seconds, flush=True)
+            client_ok, client_note = check_client_types(
+                worktree, base_sha, repo=repo, units=composition.units)
+            print("types clients : %s" % client_note, flush=True)
+            if not client_ok:
+                raise PaquetAutoError(
+                    "types clients rouges sur la tête composée, avant la CI : %s"
+                    % client_note)
             table = composition_table(worktree, base_sha)
             manifest_text = build_manifest(
                 name=args.name, target=args.target, base_sha=base_sha,
@@ -3962,9 +4270,10 @@ def compose_packet(args: argparse.Namespace) -> int:
                 worktree, branch, args.target, title(), body(runs))
         print(note_carrier(
             worktree, args.carrier,
-            "paquet %s : tests par unité %s sur la tête poussée %s (%s) ; "
+            "paquet %s : tests par unité %s sur la tête poussée %s (%s) ; %s ; "
             "inclusion verte ; manifeste %s"
-            % (args.name, tests_note, head[:12], _tests_summary(runs), rel)),
+            % (args.name, tests_note, head[:12], _tests_summary(runs),
+               _direct_note(composition, runs), rel)),
             flush=True)
         mail = mail_body(name=args.name, target=args.target, base_sha=base_sha,
                          carrier=args.carrier, head=head, branch=branch,

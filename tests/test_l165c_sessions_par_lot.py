@@ -394,6 +394,20 @@ class StockageTest(_Base):
         self.assertNotIn(lot, [r["id"] for r in self.st.actionable("aw")],
                          "le témoin wake: ne lève pas la retenue hold:")
 
+    def test_wake_consumed_after_merge_keeps_event_phase(self):
+        self.bail("aw-race")
+        lot = work.add(self.db, title="fusion pendant réveil", assignee="aw-race",
+                       force=_FORCE)["id"]
+        now = time.time()
+        work.schedule_wake(self.db, lot, now - 1, text="reprise", actor="aw-race")
+        taken = self.st.claim_wake("aw-race", lot, now)
+        self.assertIsNotNone(taken)
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s", (lot,))
+        self.assertTrue(self.st.consume_wake("aw-race", lot, taken["wake_ts"]))
+        event = work.events(self.db, lot)[0]
+        self.assertTrue(event["note"].startswith("wake: scheduled wake delivered"))
+        self.assertEqual(event["state"], "merged")
+
     def test_reveil_programme_waiting_human_est_du(self):
         """#640 : l'agent en hold sur un lot waiting_human est réveillé à
         l'échéance, sans dépendre de la règle 1 ni d'une décision lue."""

@@ -378,7 +378,7 @@ class QaEvidenceTest(PgTestCase):
             work.move(self.db, self.lot, "promoted")
         self.assertIn("qa", str(caught.exception))
         self.qa()
-        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
+        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "delivered")
 
     def test_blocked_verdict_keeps_the_gate_closed_until_a_later_ok(self):
         self.deliver()
@@ -388,7 +388,7 @@ class QaEvidenceTest(PgTestCase):
         with self.assertRaises(db_mod.DbError):
             work.move(self.db, self.lot, "promoted")
         self.qa()
-        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
+        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "delivered")
 
     def test_ok_then_blocked_keeps_the_gate_closed(self):
         """R2 #420 (B1) : c'est le DERNIER verdict qui décide, pas un ok ancien."""
@@ -400,7 +400,7 @@ class QaEvidenceTest(PgTestCase):
         with self.assertRaises(db_mod.DbError):
             work.move(self.db, self.lot, "promoted")
         self.qa()  # un ok ultérieur rouvre la porte
-        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
+        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "delivered")
 
     def test_a_new_declaration_invalidates_the_verdict_even_for_same_bytes(self):
         self.deliver()
@@ -412,7 +412,7 @@ class QaEvidenceTest(PgTestCase):
         with self.assertRaises(db_mod.DbError):
             work.move(self.db, self.lot, "promoted")
         self.qa()
-        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
+        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "delivered")
 
     def test_a_return_to_the_old_digest_is_still_a_new_delivery(self):
         self.deliver()
@@ -429,7 +429,7 @@ class QaEvidenceTest(PgTestCase):
         with self.assertRaises(db_mod.DbError):
             work.move(self.db, self.lot, "promoted")
         self.qa()
-        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
+        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "delivered")
 
     def test_the_verdict_must_match_the_current_delivery(self):
         self.deliver()
@@ -444,7 +444,7 @@ class QaEvidenceTest(PgTestCase):
         self.deliver()
         self.prove()
         self.go_and_merge()
-        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
+        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "delivered")
 
     # -- CLI --------------------------------------------------------------
 
@@ -543,7 +543,7 @@ class QaEvidenceTest(PgTestCase):
             ModuleStore(tx).replace("", modules.declarations(federation(require_qa=["promoted"])))
         findings = [f for f in modules.audit(self.db) if f["rule"] in ("missing_qa", "stale_qa")]
         self.assertEqual([(f["rule"], f["lot"], f["lot_state"]) for f in findings],
-                         [("missing_qa", self.lot, "promoted")])
+                         [("missing_qa", self.lot, "delivered")])
         self.qa()
         self.assertEqual([f for f in modules.audit(self.db) if f["rule"] in ("missing_qa", "stale_qa")],
                          [])

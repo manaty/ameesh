@@ -50,7 +50,8 @@ class WorkTest(PgTestCase):
         self.assertEqual(item["type"], "evolution")
         for state in ("build", "qa", "merged", "promoted"):
             item = work.move(self.db, item["id"], state, actor="deepseek7")
-        self.assertEqual(item["state"], "promoted")
+        self.assertEqual(item["state"], "delivered")
+        self.assertEqual(item["legacy_state"], "promoted")
         self.assertIsNotNone(item["closed_ts"])
         self.assertEqual(work.list_items(self.db, state="promoted")[0]["id"], item["id"])
 
@@ -68,7 +69,8 @@ class WorkTest(PgTestCase):
             work.move(self.db, item["id"], "build")  # déjà (état inchangé)
         promoted = work.move(self.db, work.move(
             self.db, work.move(self.db, item["id"], "qa")["id"], "merged")["id"], "promoted")
-        self.assertEqual(promoted["state"], "promoted")
+        self.assertEqual(promoted["state"], "delivered")
+        self.assertEqual(promoted["legacy_state"], "promoted")
         with self.assertRaises(work.WorkError):
             work.move(self.db, item["id"], "blocked")  # terminal
 

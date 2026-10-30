@@ -416,6 +416,12 @@ class VmAgentsHarness(unittest.TestCase):
         # plus_ancien, old, target.
         self.origin = self.root / 'origin'
         self._build_origin()
+        # #4798 : l'hôte du banc peut porter un invité réel
+        # (/usr/local/lib/ameesh-guest, root). Le faux SSH exécute la commande
+        # distante en uid 1001 : le vrai helper, root-only, refuserait et la
+        # suite serait rouge sur un hôte d'agents. Le runtime du banc est donc
+        # absent ; le helper réel a son propre module (test_4793_guest_runtime).
+        self._isoler_runtime_invite()
         self.plus_ancien = self.git(self.origin, 'rev-parse', 'HEAD~2')
         self.old = self.git(self.origin, 'rev-parse', 'HEAD~1')
         self.target = self.git(self.origin, 'rev-parse', 'HEAD')
@@ -457,6 +463,8 @@ class VmAgentsHarness(unittest.TestCase):
         # l'installe dans son dépôt d'origine comme les autres pièces.
         shutil.copy2(ROOT / 'deploy/mise-a-jour/bascule.py',
                      self.origin / 'deploy/mise-a-jour/bascule.py')
+        shutil.copy2(ROOT / 'deploy/mise-a-jour/guest-runtime.py',
+                     self.origin / 'deploy/mise-a-jour/guest-runtime.py')
         # #3311 : vm.sh lit ce helper sur stdin pour prouver le venv du MainPID.
         shutil.copy2(ROOT / 'deploy/mise-a-jour/venv-processus.py',
                      self.origin / 'deploy/mise-a-jour/venv-processus.py')
@@ -469,6 +477,16 @@ class VmAgentsHarness(unittest.TestCase):
             subprocess.run(['git', '-C', str(self.origin), 'add', '.'], check=True)
             subprocess.run(['git', '-C', str(self.origin), '-c', 'user.email=t@invalid',
                             '-c', 'user.name=test', 'commit', '-q', '-m', nom], check=True)
+
+    def _isoler_runtime_invite(self):
+        """#4798 : aucun invité de l'hôte ne doit être exécuté par le banc."""
+        helper = self.origin / 'deploy/mise-a-jour/guest-runtime.py'
+        if helper.exists():
+            helper.write_text(
+                '#!/usr/bin/env python3\n'
+                "# #4798 : banc : l'hôte de test n'a pas d'invité à rafraîchir.\n"
+                'import json\n'
+                'print(json.dumps({"guest": "absent", "files": []}))\n')
 
     def _clone_at_old(self, at=None):
         if self.src.exists():
@@ -918,6 +936,24 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
 
     # -- journal de récupération : relance d'installer (B1) ------------------
+    def test_guest_refresh_failure_keeps_recovery_target_until_successful_retour(self):
+        helper = self.origin / 'deploy/mise-a-jour/guest-runtime.py'
+        original = helper.read_text()
+        helper.write_text('raise SystemExit("guest refresh failed")\n')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('runtime invité non mis à jour', p.stderr)
+        self.assertIn('sha=' + self.old,
+                      (self.parts / 'installation-en-cours').read_text())
+        # The Python install succeeded; recovery must still choose the code
+        # left before the guest failure, and retry the guest before restart.
+        self.assertEqual(self.head(self.src), self.target)
+        helper.write_text(original)
+        r = self.run_vm('retour')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertFalse((self.parts / 'installation-en-cours').exists())
+
     def test_install_refuses_while_a_recovery_journal_exists(self):
         (self.parts / 'installation-en-cours').write_text(
             'sha=%s\ninstantane=src-%s\ncible=%s\n'

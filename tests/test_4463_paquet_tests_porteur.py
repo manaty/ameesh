@@ -164,8 +164,11 @@ class BorneTotaleTest(unittest.TestCase):
         local = LocalTests(run=slow)
         with mock.patch.object(paquet_auto.time, "monotonic", side_effect=lambda: clock[0]):
             runs, faulty, _ = local.run(deadline=1000.0 + 600)
-        # 1re série : min(900, 600) ; 2e : 200 s restants ; ensuite plus rien
-        self.assertEqual(local.calls, [("unité #1", 600), ("unité #2", 200)])
+        # #4887 : 4 séries, une à la fois, 120 s réservés aux rejeux : chacune
+        # reçoit sa part (480/4 puis 80/3) ; la 1re consomme 400 s, la 2e
+        # dépasse l'échéance, ensuite plus rien. La borne reste le temps
+        # restant, resserrée par la part et la réserve.
+        self.assertEqual(local.calls, [("unité #1", 120), ("unité #2", 26)])
         self.assertEqual(faulty, [])
         self.assertEqual([run.inconclusive for run in runs],
                          [False, False, True, True])
@@ -175,7 +178,7 @@ class BorneTotaleTest(unittest.TestCase):
         local = LocalTests()
         local.run(parallel=4, which="/bin/ameesh", deadline=time.monotonic() + 600)
         self.assertEqual(len(local.walls), 4)
-        self.assertTrue(all(wall is not None and 590 <= wall <= 600
+        self.assertTrue(all(wall is not None and 470 <= wall <= 480
                             for wall in local.walls), local.walls)
 
     def test_sans_borne_totale_inchange(self) -> None:
