@@ -60,6 +60,7 @@ test_1022_creneau_landed  # storage: une fusion lande le creneau de migration, u
 test_4256_validation_deadlines  # #4256: validation authority, private audit and single-winner escalation (SQL contract)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_4989_controller_enrollment  # signed independent controller/key enrollment, exact payload and bounded stop authority
+test_4989_transport_delegation  # exact two-key release transport and effective SSH validation for both sources
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_705_reviewer_designated  # stockage : relecteur désigné (colonne 0421, lectures avant migration, alerte stale_lot) (#705)

@@ -97,19 +97,20 @@ class LinuxHost(account.LinuxAccounts):
         if sshd is None:
             raise InstallError('enrolled SSH daemon unavailable')
         runtime.trusted(sshd)
-        address=str(ipaddress.ip_network(bundle['plan']['controller_source']).network_address)
-        args=[sshd,'-T','-C','user=ameesh-release,host='+bundle['host']+',addr='+address]
-        text=self.command(args)
-        if not text:
-            # Some enrolled OpenSSH builds require -G as well to print config.
-            text=self.command([sshd,'-T','-G',*args[2:]])
-        lines=text.lower().splitlines()
-        expected=['forcecommand '+bootstrap.delegation.WRAPPER,
-            'authorizedkeysfile /etc/ameesh-release/authorized_keys','authorizedkeyscommand none',
-            'authenticationmethods publickey','passwordauthentication no','kbdinteractiveauthentication no',
-            'disableforwarding yes','permittty no','permituserrc no','maxsessions 1']
-        if any(item not in lines for item in expected):
-            raise InstallError('effective SSH delegation mismatch')
+        for entry in bootstrap.delegation.transport_entries(bundle['plan']):
+            address=str(ipaddress.ip_network(entry['controller_source']).network_address)
+            args=[sshd,'-T','-C','user=ameesh-release,host='+bundle['host']+',addr='+address]
+            text=self.command(args)
+            if not text:
+                # Some enrolled OpenSSH builds require -G as well to print config.
+                text=self.command([sshd,'-T','-G',*args[2:]])
+            lines=text.lower().splitlines()
+            expected=['forcecommand '+bootstrap.delegation.WRAPPER,
+                'authorizedkeysfile /etc/ameesh-release/authorized_keys','authorizedkeyscommand none',
+                'authenticationmethods publickey','passwordauthentication no','kbdinteractiveauthentication no',
+                'disableforwarding yes','permittty no','permituserrc no','maxsessions 1']
+            if any(item not in lines for item in expected):
+                raise InstallError('effective SSH delegation mismatch')
         # Never reload a daemon or enable a service from this validation call.
         return True
 

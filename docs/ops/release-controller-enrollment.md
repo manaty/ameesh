@@ -7,7 +7,7 @@ admet la fabrique complète, puis démarre une seule unité. Le service produit
 lui-même `readiness.json`. Une valeur déposée par un opérateur ne constitue pas
 une preuve de disponibilité.
 
-## État du pilote et topologie à régler
+## État du pilote et topologie retenue
 
 Au constat bureau du 30 octobre 2026, 19:36 UTC, lot #4989
 ([ticket #3736](https://github.com/manaty/ameesh/issues/3736)), les sept documents,
@@ -28,12 +28,25 @@ dispatcher exige encore le manifeste signé et l'intent du contrôleur.
 Le bootstrap #169540 ne couvre pas cette nouvelle clé : ses octets signés
 n'autorisent que la clé du bureau depuis `78.232.62.207/32`. Ajouter une clé
 locale ou modifier cette source requiert un nouveau bundle/mandat ; reprendre
-l'ancien `enable` ne doit pas écraser une délégation plus récente. Le bureau et
-le pilote doivent fixer cette succession avant toute installation. Les clés de
+l'ancien `enable` ne doit pas écraser une délégation plus récente. L'arbitrage
+mesh-design du 30 octobre, consigné à 19:59, impose l'ordre suivant : génération
+locale signée, nouveau bundle et décision de remplacement signée, documents et
+démarrage, validation réelle, puis activation des deux clés. La supersession
+native relève du compagnon #4991 ; la continuation de bootstrap relève de #4989.
+Ces deux mécanismes doivent être livrés avant la reprise réelle. Les clés de
 bureau-goal restent sur cet hôte. La nouvelle privée reste hors sauvegarde ;
 sa perte impose un réenrôlement. La révocation dans les destinations relève du
 mandat de délégation correspondant ; l'arrêt du service décrit ici conserve
 ses documents et ne révoque pas une clé.
+
+Le nouveau plan conserve `controller_key` et `controller_source` pour le bureau
+et ajoute `local_transport`, objet contenant seulement `controller_key` et
+`controller_source`. La deuxième clé doit être distincte et sa source une seule
+adresse IPv4 `/32` ou IPv6 `/128`, mesurée par le bureau. Le rendu produit
+exactement deux lignes `restrict,from=...,command=...` vers le même wrapper.
+La question de bootstrap lie aussi la source locale et le digest de sa publique ;
+la validation de la configuration effective SSH porte sur les deux sources.
+Un ancien plan sans `local_transport` conserve son rendu à une clé.
 
 ## Inventaire privé et sources
 

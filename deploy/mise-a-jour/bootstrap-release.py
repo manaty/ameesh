@@ -73,6 +73,10 @@ def question(operation,bundle, *, expires_at):
         directories_digest=protocol.identity(bundle['directories']),services=bundle['services'],
         revoke_digest=protocol.identity(bundle['revoke']),
         scopes=scopes(operation,bundle),steps=list(ACTIONS),expires_at=expires_at)
+    if 'local_transport' in bundle['plan']:
+        value['local_transport']=dict(
+            source=bundle['plan']['local_transport']['controller_source'],
+            key_sha256=protocol.identity(bundle['plan']['local_transport']['controller_key']))
     return PREFIX+json.dumps(value,sort_keys=True,separators=(',',':'))
 
 
