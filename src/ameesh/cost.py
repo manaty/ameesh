@@ -535,11 +535,12 @@ class TurnUsage:
     def reread_tokens(self) -> int:
         """Jetons d'entrée **relus** par le tour, cache compris (L60).
 
-        Mesure du coût du tour et de l'alerte `session_too_big` : chaque étape
-        d'un tour relit tout le contexte de la session. Ce n'est pas la taille
-        du contexte — le plafond de contexte mesure le dernier appel (#2336).
-        Codex compte déjà l'entrée en cache dans `input_tokens` ; les autres
-        harnais la comptent à part."""
+        Mesure du coût du tour : chaque étape d'un tour relit tout le contexte
+        de la session. Ce n'est pas la taille du contexte — le plafond de
+        contexte mesure le dernier appel (#2336) — ni la mesure de l'alerte
+        `session_too_big`, qui lit `S_hist` de la session (`session_total`,
+        #4448). Codex compte déjà l'entrée en cache dans `input_tokens` ; les
+        autres harnais la comptent à part."""
         if self.harness == "codex":
             return max(int(self.input_tokens), int(self.cached_input_tokens))
         return int(self.input_tokens) + int(self.cached_input_tokens)

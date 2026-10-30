@@ -2505,6 +2505,9 @@ class Notifier:
                 # preuve de résolution.
                 continue
             observer = entry["alert"].get("observation_host")
+            if (entry["alert"].get("type") == "staging_interrupted"
+                    and "staging.sequence" in unreadable):
+                continue
             if (availability.GATE_FAMILY in unreadable
                     and entry["alert"].get("type") in availability.ALERT_TYPES
                     and observer in (None, getattr(self.cfg, "host", None))):
@@ -2599,7 +2602,7 @@ class Notifier:
                 else:
                     self._retry(entry, "raised", now)
             entry.update(severity=level, ack_subjects=subjects)
-        self._brief_agents(db, current, router, now)
+        self._brief_agents(db, current, router, now, unreadable=unreadable)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
             if (entry["alert"].get("type") == "slo_breach" and entry.get("human")
@@ -3126,7 +3129,8 @@ class Notifier:
         self._attempt(entry, "raised", now)
 
     # -- agents qui peuvent agir (L132) ---------------------------------------
-    def _brief_agents(self, db, current: list, router: Router, now: float) -> None:
+    def _brief_agents(self, db, current: list, router: Router, now: float,
+                      *, unreadable=()) -> None:
         """`idle_capacity`, `stale_lot`, `plan_underused`, `mail_undeliverable` :
         courrier `event` aux orchestrateurs et à l'auditeur, avec l'action
         attendue (`alert_briefs` ; `stale_lot` excepté pour l'auditeur, L713 :
@@ -3154,6 +3158,8 @@ class Notifier:
         for key in list(sent):
             if key not in alive:
                 entry = sent[key]
+                if entry.get("type") == "staging_interrupted" and "staging.sequence" in unreadable:
+                    continue
                 if entry.get("type") == "idle_capacity" and now - float(entry["sent_ts"]) \
                         < alert_briefs.REMIND_AFTER_S:
                     # #2602: brief gaps in available capacity are not a fresh
@@ -3180,8 +3186,7 @@ class Notifier:
                             and item.get("assignee") == entry.get("agent") \
                             and item.get("state") not in (
                                 lifecycle.CLOSED,
-                                lifecycle.DELIVERY_RECORDED,
-                                lifecycle.PROMOTED,
+                                *lifecycle.DELIVERED,
                             ):
                         continue
                 del sent[key]

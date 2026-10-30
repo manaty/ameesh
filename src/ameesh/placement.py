@@ -23,8 +23,10 @@ Le SQL est dans le stockage (`storage.of(db).placements`, spec §10).
 """
 from __future__ import annotations
 
+import math
+import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import canon as canon_mod
 from . import storage
@@ -383,3 +385,298 @@ def annotate(db: Db, rows: list[dict]) -> list[dict]:
         for key in RECORDED_KEYS:
             row[key] = found.get(key)
     return rows
+
+
+# ==========================================================================
+# #2202 S2 : admission d'un tour en bac à sable (profil Agent + placement Host)
+# ==========================================================================
+#
+# Le profil et le placement sont des cartes du canon, pas une seconde
+# autorité : le bureau relit le canon PR et `admitted_ref` en est la preuve.
+# Cette section ne lit que le canon chargé À LA RÉVISION AUDITÉE
+# (`last_good_commit`) et rend l'instantané que `sandbox_turns` conserve :
+# références et empreintes des deux cartes, limites, image, fournisseur et
+# espace de noms. La fraîcheur de `canon_state` est vérifiée par
+# `canon_fresh` ; une carte révoquée ou modifiée est vue par `sandbox_recheck`.
+
+#: fenêtre de resynchronisation du canon par le coureur (§6) : un état plus
+#: vieux refuse les NOUVEAUX tours, il ne change pas les limites d'un tour en
+#: cours.
+SANDBOX_CANON_MAX_AGE = 300.0
+
+#: valeurs de l'instantané qui forment la BORNE du tour : si l'une change au
+#: nouveau `last_good_commit`, le tour en cours doit être annulé (les
+#: références changent à chaque commit, les empreintes seulement si la carte
+#: change).
+SANDBOX_GRANT_FIELDS = ("profile", "tranche", "limits", "image_digest", "provider",
+                        "namespace", "credential", "session")
+
+
+@dataclass
+class SandboxAdmission:
+    """Admission calculée d'un couple (agent, hôte) pour un tour en bac à sable.
+
+    `ok` faux : `refusal` porte le code fermé (`profile-refused`) et
+    `diagnostic` la raison lisible. `ok` vrai : l'instantané est complet et
+    peut être écrit tel quel dans `sandbox_turns` (`limits` compris).
+    """
+
+    agent: str
+    host: str
+    ok: bool
+    diagnostic: str = ""
+    refusal: str = ""
+    profile: str = ""
+    profile_ref: str = ""
+    profile_digest: str = ""
+    placement_ref: str = ""
+    placement_digest: str = ""
+    canon_ref: str = ""
+    admitted_ref: str = ""
+    host_admitted_ref: str = ""
+    tranche: str | None = None
+    limits: dict = field(default_factory=dict)
+    image_digest: str = ""
+    #: référence épinglée complète, pour le Job du superviseur (le tableau
+    #: `sandbox_turns` ne garde que `image_digest`)
+    image: str = ""
+    provider: str = ""
+    namespace: str = ""
+    #: défauts du Job de l'hôte, recopiés dans l'instantané (S4 les lit sans
+    #: relire le canon)
+    active_deadline_seconds: int = 0
+    ttl_seconds_after_finished: int = 0
+    tools: list[str] = field(default_factory=list)
+    capabilities: dict[str, bool] = field(default_factory=dict)
+    session: str = ""
+    credential: str = ""
+
+    def to_dict(self) -> dict:
+        return {"agent": self.agent, "host": self.host, "ok": self.ok,
+                "diagnostic": self.diagnostic, "refusal": self.refusal,
+                "profile": self.profile, "profile_ref": self.profile_ref,
+                "profile_digest": self.profile_digest,
+                "placement_ref": self.placement_ref,
+                "placement_digest": self.placement_digest,
+                "canon_ref": self.canon_ref, "admitted_ref": self.admitted_ref,
+                "host_admitted_ref": self.host_admitted_ref,
+                "tranche": self.tranche, "limits": dict(self.limits),
+                "image_digest": self.image_digest, "image": self.image,
+                "provider": self.provider,
+                "namespace": self.namespace, "tools": list(self.tools),
+                "active_deadline_seconds": self.active_deadline_seconds,
+                "ttl_seconds_after_finished": self.ttl_seconds_after_finished,
+                "capabilities": dict(self.capabilities), "session": self.session,
+                "credential": self.credential}
+
+
+def sandbox_admission(canon: Canon, agent: str, host: str, *,
+                      canon_ref: str | None = None,
+                      reserve_usd: float | None = None) -> SandboxAdmission:
+    """Admission d'un tour en bac à sable, fail closed ([] = aucune admission).
+
+    `canon_ref` est la révision auditée (`canon_state.last_good_commit`) : le
+    canon doit avoir été chargé à ce commit, jamais à la référence configurée
+    qui peut être en avance. Sans `canon_ref`, le commit de la source racine
+    est utilisé (banc, outil) ; une source non git est refusée. `reserve_usd`
+    est le `reserve_usd` du profil de compte : `usd_per_turn` doit y tenir,
+    sinon le compte et la tranche ne bornent pas le même montant (§6).
+    """
+    verdict = SandboxAdmission(agent=str(agent), host=str(host), ok=False)
+
+    def refuse(message: str, reason: str = "profile-refused") -> SandboxAdmission:
+        verdict.refusal = reason
+        verdict.diagnostic = message
+        return verdict
+
+    if not canon.readable:
+        return refuse("the canon is not readable: no sandbox admission")
+    if canon.untrusted:
+        return refuse("the canon is not an approved git source: no sandbox admission")
+    commit = str(canon.sources[0].commit or "") if canon.sources else ""
+    if not commit:
+        return refuse("the canon has no committed revision: no sandbox admission")
+    pinned = str(canon_ref if canon_ref is not None else commit).strip().lower()
+    if not pinned:
+        return refuse("no pinned canon revision (`last_good_commit`): no sandbox admission")
+    if pinned != commit:
+        return refuse("the canon is loaded at %s but the pinned revision is %s: read the "
+                      "canon at `last_good_commit`" % (commit[:12], pinned[:12]))
+
+    from .agent_names import resolve
+    try:
+        name = resolve(agent, canon=canon)
+    except ValueError as exc:
+        return refuse(str(exc))
+    verdict.agent = name
+    cards = [a for a in canon.agents if a.title == name]
+    if len(cards) != 1:
+        return refuse("Agent card %s is declared %d times: ambiguous sandbox profile"
+                      % (name, len(cards)))
+    card = cards[0]
+    profile = card.sandbox
+    if profile is None:
+        return refuse("agent %s has no `sandbox` block" % name)
+    verdict.profile = profile.profile
+    verdict.admitted_ref = profile.admitted_ref
+    verdict.tranche = profile.tranche
+    verdict.tools = list(card.tools or [])
+    verdict.capabilities = dict(profile.capabilities)
+    verdict.session = profile.session
+    verdict.credential = profile.credential
+    if profile.status != "admitted":
+        return refuse("sandbox profile %r of %s is %s, not admitted"
+                      % (profile.profile, name, profile.status or "undeclared"))
+    problems = canon_mod.sandbox_profile_problems(profile)
+    if problems:
+        return refuse("; ".join(problems))
+
+    hosts = [h for h in canon.hosts if h.title == host]
+    if len(hosts) != 1:
+        return refuse("Host card %s is declared %d times: ambiguous sandbox placement"
+                      % (host, len(hosts)))
+    host_card = hosts[0]
+    block = host_card.policy.sandbox
+    if block is None:
+        return refuse("host %s has no `policy.sandbox` placement" % host)
+    verdict.host_admitted_ref = block.admitted_ref
+    if profile.profile not in block.allowed_profiles:
+        return refuse("sandbox profile %r is not in `allowed_profiles` of %s (%s)"
+                      % (profile.profile, host,
+                         ", ".join(block.allowed_profiles) or "none"))
+    problems = canon_mod.sandbox_placement_problems(block,
+                                                    max_agents=host_card.policy.max_agents)
+    if problems:
+        return refuse("; ".join(problems))
+    if block.job.active_deadline_seconds < profile.limits.job_seconds:
+        return refuse("`activeDeadlineSeconds` %d of %s is shorter than the profile's "
+                      "`job_seconds` %d" % (block.job.active_deadline_seconds, host,
+                                            profile.limits.job_seconds))
+
+    # Le placement ordinaire (fiche Placement + politique de l'hôte) reste la
+    # première porte : un profil sandbox ne contourne ni `max_agents` ni un
+    # harnais/fournisseur/modèle refusé.
+    ordinary = evaluate(canon, name, host)
+    if not ordinary.ok:
+        return refuse("placement refused: %s" % (ordinary.diagnostic or "no admission"))
+
+    if reserve_usd is not None:
+        try:
+            reserve = float(reserve_usd)
+        except (TypeError, ValueError):
+            return refuse("the account `reserve_usd` is unreadable: %r" % (reserve_usd,))
+        if not math.isfinite(reserve) or reserve <= 0:
+            return refuse("the account `reserve_usd` is not a positive finite number: %r"
+                          % (reserve_usd,))
+        if profile.limits.usd_per_turn > reserve:
+            return refuse("`usd_per_turn` %s exceeds the account `reserve_usd` %s"
+                          % (profile.limits.usd_per_turn, reserve))
+
+    try:
+        verdict.profile_digest = canon_mod.card_digest(card.fiche)
+        verdict.placement_digest = canon_mod.card_digest(host_card.fiche)
+    except canon_mod.CanonError as exc:
+        return refuse(str(exc))
+
+    verdict.profile_ref = card.fiche.ref
+    verdict.placement_ref = host_card.fiche.ref
+    verdict.canon_ref = pinned
+    verdict.limits = {
+        "turns": profile.limits.turns,
+        "max_attempts": profile.limits.max_attempts,
+        "tool_calls": profile.limits.tool_calls,
+        "turn_seconds": profile.limits.turn_seconds,
+        "job_seconds": profile.limits.job_seconds,
+        "context_tokens": profile.limits.context_tokens,
+        "usd_per_turn": profile.limits.usd_per_turn,
+        # défauts du Job de l'hôte (S4 les lit dans l'instantané)
+        "active_deadline_seconds": block.job.active_deadline_seconds,
+        "ttl_seconds_after_finished": block.job.ttl_seconds_after_finished,
+        # ce que `ameesh_sandbox_complete` contrôle dans le résultat (§4)
+        "tools": list(card.tools or []),
+        "capabilities": dict(profile.capabilities),
+        "session": profile.session,
+    }
+    verdict.image_digest = block.image_digest
+    verdict.image = block.image
+    verdict.provider = block.provider
+    verdict.namespace = block.namespace
+    verdict.active_deadline_seconds = block.job.active_deadline_seconds
+    verdict.ttl_seconds_after_finished = block.job.ttl_seconds_after_finished
+    verdict.ok = True
+    verdict.diagnostic = "admitted (profile %s, placement %s)" % (profile.profile, host)
+    return verdict
+
+
+def canon_fresh(state: dict | None, *, now: float | None = None,
+                max_age: float = SANDBOX_CANON_MAX_AGE) -> tuple[bool, str]:
+    """Le `canon_state` d'un hôte autorise-t-il un NOUVEAU tour ? (§6)
+
+    `status = 'ok'`, un `last_good_commit`, et un `checked_at` dans la fenêtre
+    de resynchronisation. Un état absent, illisible, en erreur ou trop vieux
+    ne refuse que les nouveaux tours : un tour en cours garde l'instantané de
+    son admission.
+    """
+    if state is None:
+        return False, "no canon state recorded for this host"
+    status = str(state.get("status") or "")
+    if status != "ok":
+        return False, "canon state is %r" % (status or "unknown",)
+    try:
+        checked = float(state.get("checked_ts"))
+    except (TypeError, ValueError):
+        return False, "canon state has no readable `checked_at`"
+    current = time.time() if now is None else float(now)
+    age = current - checked
+    if age > max_age:
+        return False, ("canon checked %ds ago, outside the %ds freshness window"
+                       % (int(age), int(max_age)))
+    if not str(state.get("last_good_commit") or "").strip():
+        return False, "canon state has no `last_good_commit`"
+    return True, ""
+
+
+@dataclass
+class SandboxDrift:
+    """Effet d'une nouvelle révision du canon sur un tour déjà admis.
+
+    `same` : rien n'a changé ; `cosmetic` : l'empreinte a changé mais aucune
+    borne du tour n'a bougé (la description, la preuve d'admission…) ;
+    `changed` : une borne du tour a changé, l'instantané ne s'applique plus et
+    le tour doit être annulé ; `revoked` : le profil/placement n'est plus admis
+    du tout.
+    """
+
+    verdict: str
+    diagnostic: str = ""
+    admission: SandboxAdmission | None = None
+    changed: list[str] = field(default_factory=list)
+
+
+def sandbox_recheck(canon: Canon, admitted: SandboxAdmission, *,
+                    canon_ref: str | None = None) -> SandboxDrift:
+    """Relit les deux cartes au nouveau `last_good_commit` (§6).
+
+    Appelé à la resynchronisation de 300 s : une révocation ou une borne
+    modifiée demande l'annulation du tour ; un simple changement de commentaire
+    ou de preuve ne l'annule pas. Le résultat n'écrit rien et ne change jamais
+    l'instantané : la décision d'annuler est celle de l'appelant.
+    """
+    if not isinstance(admitted, SandboxAdmission) or not admitted.ok:
+        return SandboxDrift("revoked", "the turn has no admitted snapshot")
+    current = sandbox_admission(canon, admitted.agent, admitted.host, canon_ref=canon_ref)
+    if not current.ok:
+        return SandboxDrift("revoked",
+                            "the grant no longer holds: %s"
+                            % (current.diagnostic or "refused"), admission=current)
+    if (current.profile_digest == admitted.profile_digest
+            and current.placement_digest == admitted.placement_digest):
+        return SandboxDrift("same", "", admission=current)
+    changed = [name for name in SANDBOX_GRANT_FIELDS
+               if getattr(current, name) != getattr(admitted, name)]
+    if not changed:
+        return SandboxDrift("cosmetic",
+                            "the card digest changed without touching the grant",
+                            admission=current)
+    return SandboxDrift("changed", "the grant changed: %s" % ", ".join(changed),
+                        admission=current, changed=changed)

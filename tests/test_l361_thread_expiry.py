@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import types
+import tracemalloc
 import unittest
 from unittest import mock
 
@@ -80,6 +81,21 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(first.ts, second.ts)
         last = self.expire()["last"]
         self.assertEqual((last.id, last.text), (ids[2], "second"))
+
+    def test_expiry_memory_does_not_materialize_all_retained_bodies(self):
+        # A project's daily expiry runs in the long-lived runner, even when
+        # nothing expires. Its temporary allocations must not multiply the
+        # size of a large retained thread (#4809).
+        self.post(*(entry("x" * 65536, 1) for _ in range(64)))
+        size = os.path.getsize(self.path)
+        tracemalloc.start()
+        try:
+            report = self.expire()
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((report["dropped"], report["kept"]), (0, 64))
+        self.assertLess(peak, 3 * size)
 
     def census_complet(self):
         """Le tuple du census complet — (entrées gardées, ligne d'index de la

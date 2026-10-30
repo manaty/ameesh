@@ -75,62 +75,17 @@ SYSTEM_SENDER = "ameesh"
 MANUAL_REVIEW_START_RE = re.compile(r"^\s*R[12]\b", re.IGNORECASE)
 MANUAL_REVIEW_TITLE_RE = re.compile(r"^\s*R[12]\b[^:—–#]*#\s*(\d+)\b", re.IGNORECASE)
 MAX_QA_LOOPS = 2
-FORWARD = {
-    lifecycle.REQUESTED: (lifecycle.IN_PROGRESS,),
-    lifecycle.IN_PROGRESS: (lifecycle.QA,),
-    lifecycle.QA: (lifecycle.VALIDATED, lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
-    lifecycle.VALIDATED: (lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
-    lifecycle.DELIVERY_RECORDED: (lifecycle.PROMOTED,),
-    lifecycle.PROMOTED: (),
-    lifecycle.CLOSED: (),
-}
+# The development module owns its stages and compatibility transitions.
+from .modules import registry as _module_registry
 
-#: transitions autorisées, attentes comprises
-TRANSITIONS = {
-    lifecycle.REQUESTED: {lifecycle.IN_PROGRESS, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
-    lifecycle.IN_PROGRESS: {lifecycle.QA, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
-    lifecycle.QA: {
-        lifecycle.VALIDATED,
-        lifecycle.DELIVERY_RECORDED,
-        lifecycle.IN_PROGRESS,
-        lifecycle.BLOCKED,
-        lifecycle.WAITING_HUMAN,
-    },
-    lifecycle.VALIDATED: {
-        lifecycle.QA,
-        lifecycle.DELIVERY_RECORDED,
-        lifecycle.IN_PROGRESS,
-        lifecycle.BLOCKED,
-        lifecycle.WAITING_HUMAN,
-    },
-    lifecycle.DELIVERY_RECORDED: {lifecycle.PROMOTED, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
-    lifecycle.PROMOTED: set(),
-    lifecycle.CLOSED: set(),
-    lifecycle.BLOCKED: {
-        lifecycle.VALIDATED,
-        lifecycle.REQUESTED,
-        lifecycle.IN_PROGRESS,
-        lifecycle.QA,
-        lifecycle.DELIVERY_RECORDED,
-        lifecycle.WAITING_HUMAN,
-    },
-    lifecycle.WAITING_HUMAN: {
-        lifecycle.VALIDATED,
-        lifecycle.REQUESTED,
-        lifecycle.IN_PROGRESS,
-        lifecycle.QA,
-        lifecycle.DELIVERY_RECORDED,
-        lifecycle.BLOCKED,
-    },
-}
-#: corrections d'un état posé par erreur (`move(..., correct=…)`) : (depuis,
-#: vers). Un `promoted` à tort revient en `merged` ; un `merged` à tort (une
-#: PR d'étape fermée trop tôt, #759) revient en `build` ; ensuite, les
-#: transitions habituelles (merged → blocked → …) s'appliquent.
-CORRECTIONS = {
-    (lifecycle.PROMOTED, lifecycle.DELIVERY_RECORDED),
-    (lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
-}
+
+def __getattr__(name):
+    # Compatibility exports are resolved only when development tooling uses
+    # them. Importing the generic core must also work in the bare profile.
+    if name in {"FORWARD", "TRANSITIONS", "CORRECTIONS"}:
+        return getattr(_module_registry.development_workflow(), name)
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
+
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
@@ -1695,6 +1650,19 @@ def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
                 raise WorkError("reviewer refused: %s is retired (ameesh agent retire, "
                                 "#3460): name an active reviewer"
                                 % (row.get("name") or name))
+            # #4779 : la fiche doit prouver la capacité `propose` et un rôle.
+            # Un canari `[read]` / `roles: []` retenait la porte sans pouvoir
+            # rendre d'avis ; une capacité absente du registre est un doute,
+            # pas une preuve, et la désignation est refusée de même.
+            from . import review_designation
+            eligible, reason = review_designation.reviewer_eligibility(row)
+            if not eligible:
+                raise WorkError(
+                    "reviewer refused: %s cannot review (canon §2, #4779): %s; "
+                    "a reviewer's card must carry the `propose` capacity and at "
+                    "least one role" % (
+                        row.get("name") or name,
+                        review_designation.PROFILE_REASONS.get(reason, reason)))
             return row.get("name") or name
         # Doublure de registre (tests #705 r2 N2) : pas un mapping, on garde
         # l'orthographe demandée, comme avant #423.
@@ -1874,6 +1842,46 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str, *,
     return {"reviewer_request_message_id": message_id}
 
 
+def _settle_reviewer_requests(cfg, db, item: dict, reviewer: str,
+                              who: str) -> list[int]:
+    """#4779 : solde les demandes de relecture d'un siège qu'on retire.
+
+    Le retrait d'un siège rend caduque la demande déposée chez le relecteur :
+    sans ce règlement, elle reste en tête de sa boîte et le prochain tour du
+    relecteur ouvre une relecture que plus personne n'attend (cas du canari
+    `handoff-canary-3392` sur #4770). Le message est marqué remis, comme une
+    demande à échéance (`mail.settle_review_requests`), et une trace part au
+    fil du lot — sans destinataire réveillé. Rend les ids soldés.
+    """
+    from . import fil, mail
+
+    name = str(reviewer or "").strip()
+    if not name:
+        return []
+    try:
+        ids = mail.settle_review_requests(db, name, int(item["id"]))
+    except Exception as exc:  # noqa: BLE001 - le retrait doit dire l'échec
+        raise WorkError("review request settlement failed for %s (lot #%s): %s"
+                        % (name, item.get("id"), exc)) from exc
+    if not ids:
+        return []
+    text = (
+        "Demande(s) de relecture réglée(s) — siège retiré.\n\n"
+        "Le siège de %s sur le lot #%s a été retiré (geste de %s). Les demandes "
+        "encore non remises (%s) sont soldées sans tour, comme une demande à "
+        "échéance (`request_expires_ts`) : aucun avis n'est attendu de ce siège."
+        % (name, item.get("id"), who or SYSTEM_SENDER,
+           ", ".join("#%d" % int(i) for i in ids)))
+    if cfg is not None:
+        # `fil.record` ne lève jamais : une trace manquante ne perd pas le
+        # règlement, le message reste dans la boîte et son fil est réessayé
+        # par l'index au prochain passage.
+        fil.record(cfg, db, sender=SYSTEM_SENDER, recipients=[name], text=text,
+                   project=str(item.get("app") or ""), lot=int(item["id"]),
+                   meta={"review_request_settled": [int(i) for i in ids]})
+    return ids
+
+
 def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
                        actor: str | None = None, remove: bool = False) -> dict:
     """#2076 : ajoute ou retire un relecteur d'un lot **déjà en `qa`**.
@@ -1887,20 +1895,47 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
     sur la ligne rendue (`reviewer_warning`), la désignation est conservée.
     La désignation dépose aussi un `request` lié au lot (#2478) : le relecteur
     est réveillé, son runner ouvre un tour ; une remise en échec est un
-    avertissement (`reviewer_request_warning`), la désignation reste écrite."""
+    avertissement (`reviewer_request_warning`), la désignation reste écrite.
+
+    #4779 : un retrait règle les demandes de relecture encore non remises du
+    siège (`reviewer_settled`, trace au fil du lot), même sur un lot sorti de
+    `qa` ou dont le siège a déjà disparu : c'est le rejeu qui solde la demande
+    caduque d'un canari. Hors `qa`, rien n'est écrit au siège et la ligne rend
+    `reviewer_changed=False`.
+    """
+    if remove:
+        # #4779 : le retrait règle d'abord les demandes de relecture encore
+        # non remises chez l'agent, même quand le lot a quitté `qa` ou que le
+        # siège n'y est déjà plus (le rejeu du cas réel #4770 doit solder le
+        # message du canari). Aucune écriture de siège hors de `qa` : la ligne
+        # rendue le dit (`reviewer_changed=False`).
+        who = corrector(cfg, db, actor, what="designation", auditor=True)
+        item = get(db, item_id)
+        if item is None:
+            raise WorkError("lot %s not found" % item_id)
+        # A former reviewer can still be withdrawn after leaving the registry.
+        name = (reviewer or "").strip()
+        if not name:
+            raise WorkError("empty reviewer")
+        settled = _settle_reviewer_requests(cfg, db, item, name, who)
+        if item["state"] != lifecycle.QA:
+            row = dict(item)
+            row["reviewer_changed"] = False
+            row["reviewer_settled"] = settled
+            return row
+        row = _write_reviewer(db, item_id, name, who, "reviewer %s removed" % name,
+                              remove=True)
+        row["reviewer_settled"] = settled
+        return row
     who, item = _review_item(cfg, db, item_id, actor, auditor=True)
-    # A former reviewer can still be withdrawn after leaving the registry.
-    name = (reviewer or "").strip() if remove else check_reviewer_choice(
-        db, item, reviewer, cfg=cfg)
+    name = check_reviewer_choice(db, item, reviewer, cfg=cfg)
     if not name:
         raise WorkError("empty reviewer")
-    warning = "" if remove else reviewer_family_warning(db, item, name)
-    row = _write_reviewer(db, item_id, name, who, "reviewer %s %s" % (
-        name, "removed" if remove else "designated"), remove=remove)
+    warning = reviewer_family_warning(db, item, name)
+    row = _write_reviewer(db, item_id, name, who, "reviewer %s designated" % name)
     if warning:
         row["reviewer_warning"] = warning
-    if not remove:
-        row.update(_reviewer_request(db, item, name, who, cfg=cfg))
+    row.update(_reviewer_request(db, item, name, who, cfg=cfg))
     return row
 
 
@@ -1912,8 +1947,19 @@ def clear_reviewer(cfg, db: Db, item_id: int, *, actor: str | None = None) -> di
     retombe dans l'attente réelle d'un relecteur — « verdict d'un relecteur
     (non désigné) » — et l'alerte redemande d'en désigner un : c'est le geste
     inverse de `waive_review`, pour une désignation posée à tort."""
-    who, _item = _review_item(cfg, db, item_id, actor, auditor=True)
-    return _write_reviewer(db, item_id, "", who, "reviewer designation removed")
+    who, item = _review_item(cfg, db, item_id, actor, auditor=True)
+    # #4779 : chaque siège retiré solde sa demande encore non remise. On règle
+    # avant l'écriture : si celle-ci échoue, un nouveau `--remove` retrouve les
+    # noms dans la colonne et rejoue le règlement (idempotent).
+    from .work_reviewers import designated
+
+    settled: list = []
+    for name in designated(item):
+        settled.extend(_settle_reviewer_requests(cfg, db, item, name, who))
+    row = _write_reviewer(db, item_id, "", who, "reviewer designation removed")
+    if settled:
+        row["reviewer_settled"] = settled
+    return row
 
 
 def waive_review(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict:
@@ -2279,7 +2325,9 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     # #4667 : un véhicule de paquet (`integration/**`) n'entre pas dans
     # l'en-cours d'un agent — le geste explicite qui l'attribue ne le met pas
     # non plus dans la file d'équipe (#540).
-    queued = (None if _is_vehicle_branch(branch or item.get("branch"))
+    # #4756 : le lot de découpage non plus — c'est un geste du pilote.
+    from .file_decoupage import is_split_lot
+    queued = (None if _is_vehicle_branch(branch or item.get("branch")) or is_split_lot(item)
               else _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
                                 % (check["assignee"], previous or "nobody")))
     # L165 (EP4) : l'attribution est un geste du pilote hors base (elle
@@ -4061,7 +4109,7 @@ def get(db: Db, item_id: int) -> dict | None:
 
 
 def _canonical_state(state: str) -> str:
-    """#4349 : l'orthographe persistée v1 d'un état (v1 ou alias générique),
+    """#4353 : l'orthographe persistée d'un état (v1 ou alias générique),
     sinon `WorkError` nommant les orthographes acceptées."""
     from .work_lifecycle import ACCEPTED_STATES, canonical
     try:
@@ -4075,7 +4123,7 @@ def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
                limit: int = 50) -> list[dict]:
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.list_items")
-    if state:
+    if state and state not in ("merged", "promoted"):
         state = _canonical_state(state)
     return storage.of(db).work.items(state=state, assignee=assignee, limit=limit)
 
@@ -4148,7 +4196,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
 
     `state` accepte l'orthographe v1 et le nom générique du cycle de vie
     (#4349 : `in_progress` pour `build`, `to_validate` pour `qa`…)."""
-    state = _canonical_state(state)
+    try:
+        state = lifecycle.phase_name(state)
+    except ValueError as exc:
+        raise WorkError(str(exc)) from None
     if package_exclusion and correct is not None:
         raise WorkError("--package-exclusion and --correct are distinct gestures")
     if package_exclusion and state != lifecycle.IN_PROGRESS:
@@ -4186,7 +4237,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         # registre (process_registry), qui vérifie la garde côté serveur et
         # écrit le reçu dans la même transaction.
         raise _pinned_transition_error(item_id, pinned)
-    current = item["state"]
+    workflow = _module_registry.development_workflow()
+    transitions = workflow.TRANSITIONS
+    corrections = workflow.CORRECTIONS
+    current = lifecycle.phase(item)
     if current == state:
         raise WorkError("lot %s already in %s" % (item_id, state))
     if reviewer is not None:
@@ -4200,12 +4254,12 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         reason = (correct or "").strip()
         if not reason:
             raise WorkError("--correct: the reason for the correction is required")
-        if (current, state) not in CORRECTIONS:
+        if (current, state) not in corrections:
             raise WorkError(
                 "correction refused: %s → %s (possible corrections: %s; otherwise the "
                 "transitions allowed from %s: %s)"
-                % (current, state, ", ".join("%s → %s" % c for c in sorted(CORRECTIONS)),
-                   current, ", ".join(sorted(TRANSITIONS[current])) or "none"))
+                % (current, state, ", ".join("%s → %s" % c for c in sorted(corrections)),
+                   current, ", ".join(sorted(transitions[current])) or "none"))
         text = "correction: %s → %s — %s%s" % (
             current, state, reason, " (%s)" % note.strip() if note and note.strip() else "")
         row = storage.of(db).work.move(item_id, state, current=current, loops=0, note=text,
@@ -4217,12 +4271,12 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
                 raise _pinned_transition_error(item_id, pinned)
             raise WorkError("lot %s moved in the meantime: retry" % item_id)
         return row
-    if state not in TRANSITIONS[current]:
+    if state not in transitions[current]:
         raise WorkError(
             "transition refused: %s → %s (allowed from %s: %s)%s"
-            % (current, state, current, ", ".join(sorted(TRANSITIONS[current])) or "none",
+            % (current, state, current, ", ".join(sorted(transitions[current])) or "none",
                " — state set by mistake: ameesh work move %s %s --correct \"reason\""
-               % (item_id, state) if (current, state) in CORRECTIONS else ""))
+               % (item_id, state) if (current, state) in corrections else ""))
     if state == "validated":
         from . import merge_queue
         gate = merge_queue.review_gate_for_item(
@@ -4507,3 +4561,45 @@ def durations(row: dict) -> list[tuple[str, float | None]]:
     ne sont pas des durées, et les confondre afficherait « 1s » pour un verdict.
     """
     return [(label, row.get(key)) for label, key in MILESTONE_DURATIONS]
+
+
+def promote(db: Db, item_id: int, *, note: str = "", actor: str = "") -> dict:
+    """Promote a development delivery using its module's workflow."""
+    return _module_registry.development_workflow().promote(
+        db, item_id, note=note, actor=actor)
+
+
+def adopt_workflow(db, item_id: int, *, module: str, spec, actor: str) -> dict:
+    """First pin only: lock, authority, activation and initial core, then journal.
+
+    No receipt or revision transfer: subsequent revisions use #4007.
+    """
+    from . import process_registry as registry
+    registry._validate_spec(spec)
+    with db.transaction() as tx:
+        store = storage.of(tx).work
+        row = store.lock(item_id)
+        if row is None:
+            raise WorkError('pipeline-lot-unknown: %s' % item_id)
+        row = store.get(item_id)  # the locked row plus the workflow pin columns
+        registry._validate_authority(registry.Authority(actor, source='explicit'))
+        registry._check_authority(tx, registry.Authority(actor, source='explicit'))
+        if actor != row.get('assignee') and not claims_pilot(db.cfg, tx, actor):
+            raise WorkError('pipeline-authority: only the assignee or pilot can adopt')
+        if row.get('workflow_ref'):
+            raise WorkError('pipeline-already-pinned: use revision transfer')
+        phase = lifecycle.phase(row)
+        if row['state'] in lifecycle.COMPLETED:
+            raise WorkError('pipeline-terminal: completed work item')
+        store.lock_workflow_activation(row.get('app') or row.get('workstream') or '')
+        if not _module_registry.enabled(tx, row.get('app') or row.get('workstream') or '', module):
+            raise WorkError('pipeline-module-inactive: %s' % module)
+        if row.get('type') not in spec.types:
+            raise WorkError('pipeline-type: work item type is not covered by the card')
+        if spec.core_of(spec.initial) != phase:
+            raise WorkError('pipeline-stage-mismatch: initial stage must match current core')
+        store.adopt_workflow(item_id, ref=spec.workflow_ref,
+                             version=spec.workflow_version, stage=spec.initial,
+                             state=row['state'], actor=actor)
+        return {'work_item_id': int(item_id), 'workflow_ref': spec.workflow_ref,
+                'workflow_version': spec.workflow_version, 'workflow_stage': spec.initial}

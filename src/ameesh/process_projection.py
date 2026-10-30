@@ -12,9 +12,10 @@ Rules
 -----
 * A pinned lot's ``work_items.state`` is a **core**, or a hold (``blocked``,
   ``waiting_human``) that keeps the stage. The core comes from the artifact
-  (``stage.core``), never from the legacy state: since the row does not carry
-  the pre-hold core, a hold is read from the artifact, and outside a hold the
-  row core must agree with it (``projection-core-mismatch``).
+  (``stage.core``). For a stored ``delivered`` row, the compatibility phase
+  retained in ``legacy_state`` is compared with that historical artifact core.
+  A hold is read from the artifact; outside a hold the row phase must agree
+  with it (``projection-core-mismatch``).
 * A lot closed by the native path (``work close``: the row is ``closed`` while
   the stage's core is not) is decided by its native ``close_reason``:
   ``delivered`` completes it (#988, delivered outside the target),
@@ -46,6 +47,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 from .process_workflow import CompiledWorkflow
+from . import work_lifecycle
 
 #: Native holds: they keep the stage, and therefore the artifact's core.
 HOLDS = ("blocked", "waiting_human")
@@ -127,7 +129,7 @@ def project_issue(item: Mapping[str, Any], mapping: ProcessMapping | None) -> Pr
     if not label:
         raise ProjectionRefusal("projection-label-missing", "$.labels",
                                 "no admitted board label for stage %r" % stage)
-    state = str(item.get("state") or "").strip()
+    state = work_lifecycle.phase(item)
     if state in HOLDS or state == core:
         pass                        # the artifact's core decides the issue
     elif state == "closed":

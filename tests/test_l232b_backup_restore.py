@@ -34,14 +34,21 @@ class BackupRestoreTest(unittest.TestCase):
                 raise
             self.skipTest("test database absent")
         self.addCleanup(self.admin.close)
+        # #4822 : un CREATE/DROP DATABASE déclenche un checkpoint ; sans ce
+        # réglage, le statement_timeout du rôle pourrait l'annuler et laisser
+        # une base invalide (datconnlimit = -2), que la suite purge ensuite.
+        self.admin.execute("SET statement_timeout = 0")
         server_major = int(self.admin.execute("SHOW server_version_num").fetchone()[0]) // 10000
         client_major = int(subprocess.check_output(["pg_dump", "--version"], text=True).split()[2].split(".")[0])
         if client_major < server_major:
             self.skipTest("pg_dump must support the test server's PostgreSQL version")
         self.database = "ameesh_backup_test_" + uuid.uuid4().hex
-        self.admin.execute(sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(sql.Identifier(self.database)))
+        # Le cleanup est posé avant la création : une création annulée peut
+        # laisser une base invalide que ce DROP FORCE retire.
         self.addCleanup(lambda: self.admin.execute(
-            sql.SQL("DROP DATABASE {}").format(sql.Identifier(self.database))))
+            sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(
+                sql.Identifier(self.database))))
+        self.admin.execute(sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(sql.Identifier(self.database)))
         self.source_dsn = make_conninfo(**dict(self.parameters, dbname=self.database))
         with psycopg.connect(self.source_dsn) as source:
             source.execute("CREATE SCHEMA mesh_fixture")

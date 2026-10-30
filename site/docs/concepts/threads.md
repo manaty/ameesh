@@ -16,9 +16,9 @@ One Markdown file per thread, under `AMEESH_THREADS` (default
 - The **project** is the sender's team or project, else the recipient's, else
   `AMEESH_PROJECT`, else `default`. For an agent declared in the canon, it is
   its `team`. Since L118c (#496), a message sent **with `--lot`** is filed in
-  the **lot's project thread** (`work_items.app`), not the sender's or the
+  the **work item's project thread** (`work_items.app`), not the sender's or the
   recipient's; the fallbacks above are unchanged.
-- The **lot** is the message's `--lot`; without one, the message goes to the
+- The **work item** is the message's `--lot`; without one, the message goes to the
   project's thread.
 
 Besides messages, action transitions (proposed, approval requested, approved,

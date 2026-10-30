@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from unittest import mock
 
 from ameesh import db as db_mod
@@ -162,6 +163,9 @@ class _Fixture(PgTestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        # la mémoire des portes fermées est celle du processus (#4849)
+        verdict_carry._closed_gates.clear()
+        self.addCleanup(verdict_carry._closed_gates.clear)
         self.db.execute("DELETE FROM turn_costs")
         self.db.execute("DELETE FROM provenance_receipts")
         self.db.execute("DELETE FROM canon_state")
@@ -171,12 +175,24 @@ class _Fixture(PgTestCase):
         # Le lot est créé sans canon (le contrôle d'assignation exigerait un
         # responsable humain), puis la connexion relit la canon pour le gel.
         setup = self.db
+        # #4779 : les relecteurs ajoutés par les témoins (rev3, rev4, …) et
+        # inscrits par `registry.upsert` reçoivent le profil que `canon sync`
+        # écrit en production. Les témoins du refus posent l'absence.
+        setup.execute(
+            "ALTER TABLE agent_registry ALTER COLUMN capabilities SET DEFAULT"
+            " ARRAY['read','report-drift','propose']::text[]")
+        setup.execute(
+            "ALTER TABLE agent_registry ALTER COLUMN roles SET DEFAULT"
+            " ARRAY['implementation']::text[]")
         for name, harness in (("author", "deepseek"), ("rev1", "claude"),
                               ("rev2", "codex"), ("pilot", "claude")):
             registry.upsert(setup, name, harness=harness, host=self.cfg.host,
                             cwd=self.repo.root, status="idle")
-            setup.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
-                          (name,))
+            # #4779 : profil de relecteur prouvé (capacité `propose`, un rôle).
+            setup.execute(
+                "UPDATE agent_registry SET team = 'ameesh', capabilities ="
+                " ARRAY['read','report-drift','propose'], roles = ARRAY['implementation']"
+                " WHERE name = %s", (name,))
         self.item = work.add(setup, title="Désignation au gel", app="ameesh",
                              assignee="author", branch="lot/9-x",
                              branch_target="main")
@@ -346,6 +362,174 @@ class CarriedFreezeTest(_Fixture):
         self.assertEqual(shown.returncode, 0, shown.stdout + shown.stderr)
         self.assertIn("designation: kept from carried verdicts (rev1, rev2)",
                       shown.stdout)
+        # #4834 : la transition de quorum des avis reportés est appliquée et
+        # le journal la porte — le lot ne reste pas en qa faute d'écrivain.
+        self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+        self.assertTrue(self.notes("qa → validated — carried review quorum"))
+
+    def test_a_transient_gate_read_is_retried_by_the_executor_pass(self):
+        # #4834 : une lecture de porte ratée au report ne doit pas laisser le
+        # lot en qa pour toujours. L'échec est journalisé une fois, et le
+        # passage de l'exécuteur applique la transition dès que la porte se lit.
+        self._reviewed_freeze()
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+        real = merge_queue.review_gate_for_item
+        state = {"down": True}
+
+        def flaky(*args, **kwargs):
+            if state["down"]:
+                raise RuntimeError("temporary gate read failure")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(merge_queue, "review_gate_for_item",
+                               side_effect=flaky):
+            carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                          repo=self.repo.root)
+        self.assertEqual(carried["result"], "carried", carried)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
+        self.assertTrue(self.notes(verdict_carry.PENDING))
+        state["down"] = False
+        report = verdict_carry.run_pass(self.cfg, self.db)
+        mine = [r for r in report if r["lot"] == self.lot]
+        self.assertEqual([r["result"] for r in mine], ["validated"], report)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+        self.assertTrue(self.notes("qa → validated — carried review quorum"))
+        # une fois validé, le passage ne réécrit rien
+        self.assertEqual([r for r in verdict_carry.run_pass(self.cfg, self.db)
+                          if r["lot"] == self.lot], [])
+
+    def test_a_closed_gate_is_read_once_until_the_lot_moves(self):
+        # Une porte lisiblement fermée (un avis sur deux) est le cours normal
+        # du qa : aucune marque de panne, aucun essai. #4849 : le passage la
+        # lit une fois, puis ne la relit que si le lot bouge (le verdict qui
+        # manque la rouvrira aussi par le chemin #4423).
+        _, outcome = self.freeze(self.repo.reviewed)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        self.verdict("rev1", self.repo.reviewed)
+        self.db.execute("DELETE FROM agent_mailbox")
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+        carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                      repo=self.repo.root)
+        self.assertEqual(carried["result"], "carried", carried)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
+        self.assertEqual(self.notes(verdict_carry.PENDING), [])
+        real = merge_queue.review_gate_for_item
+        with mock.patch.object(merge_queue, "review_gate_for_item",
+                               side_effect=real) as gate_read:
+            self.assertEqual([r for r in verdict_carry.run_pass(self.cfg, self.db)
+                              if r["lot"] == self.lot], [])
+            once = gate_read.call_count  # la lecture du passage qui la ferme
+            self.assertGreater(once, 0)
+            for _ in range(3):
+                self.assertEqual([r for r in verdict_carry.run_pass(self.cfg, self.db)
+                                  if r["lot"] == self.lot], [])
+            self.assertEqual(gate_read.call_count, once)
+            # le délai passé, la porte est relue une fois
+            with mock.patch.object(verdict_carry.time, "time",
+                                   return_value=time.time()
+                                   + verdict_carry.CLOSED_RECHECK_S + 1):
+                verdict_carry.run_pass(self.cfg, self.db)
+            self.assertEqual(gate_read.call_count, 2 * once)
+        self.assertEqual(self.notes(verdict_carry.PENDING), [])
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
+        # le verdict qui manque rouvre la porte : le lot passe en validated
+        self.verdict("rev2", frozen)
+        verdict_carry.run_pass(self.cfg, self.db)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+
+    def test_the_retry_of_a_transient_gate_read_is_bounded(self):
+        # Une panne qui ne se répare pas ne relit pas la porte indéfiniment :
+        # cinq essais, puis le lot reste en qa et l'état parle (l'alerte de lot
+        # et l'auditeur prennent le relais).
+        self._reviewed_freeze()
+        self.freeze(self.repo.merge_target())
+
+        def down(*args, **kwargs):
+            raise RuntimeError("temporary gate read failure")
+
+        with mock.patch.object(merge_queue, "review_gate_for_item",
+                               side_effect=down):
+            verdict_carry.carry(self.cfg, self.db, self.lot, repo=self.repo.root)
+            self.assertEqual(len(self.notes(verdict_carry.PENDING)), 1)
+            for _ in range(verdict_carry.PENDING_ATTEMPTS - 1):
+                verdict_carry.run_pass(self.cfg, self.db)
+        self.assertEqual(len(self.notes(verdict_carry.PENDING)),
+                         verdict_carry.PENDING_ATTEMPTS)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
+        # épuisé : le passage ne relit plus la porte pour ce lot
+        with mock.patch.object(merge_queue, "review_gate_for_item",
+                               side_effect=down) as gate_read:
+            self.assertEqual([r for r in verdict_carry.run_pass(self.cfg, self.db)
+                              if r["lot"] == self.lot], [])
+            self.assertEqual(gate_read.call_count, 0)
+        self.assertEqual(len(self.notes(verdict_carry.PENDING)),
+                         verdict_carry.PENDING_ATTEMPTS)
+
+    def test_a_blind_host_spends_no_attempt_and_a_repo_host_promotes(self):
+        # #4834 (B de l'auditeur) : un hôte qui ne peut pas lire la porte ne
+        # doit ni écrire de marque ni consommer d'essai. Un passage d'un hôte
+        # qui a le dépôt fait la transition. Un `repo_for_freeze` vide ne
+        # suffit pas à simuler l'hôte aveugle : la classe du lot peut encore
+        # résoudre le dépôt par son cache ; la porte est donc explicitement
+        # illisible dans les deux passages aveugles.
+        self._reviewed_freeze()
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+        with mock.patch.object(lot_class, "repo_for_freeze",
+                               return_value=("", "")), \
+                mock.patch.object(merge_queue, "review_gate_for_item",
+                                  return_value=None):
+            carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                          repo=self.repo.root)
+        self.assertEqual(carried["result"], "carried", carried)
+        self.assertEqual(self.notes(verdict_carry.PENDING), [])
+        with mock.patch.object(lot_class, "repo_for_freeze",
+                               return_value=("", "")), \
+                mock.patch.object(merge_queue, "review_gate_for_item",
+                                  return_value=None):
+            report = verdict_carry.run_pass(self.cfg, self.db)
+        self.assertEqual([r for r in report if r["lot"] == self.lot], [])
+        self.assertEqual(self.notes(verdict_carry.PENDING), [])
+        # l'hôte qui a le dépôt reprend sans essai préalable et promeut
+        report = verdict_carry.run_pass(self.cfg, self.db)
+        self.assertEqual([r["result"] for r in report if r["lot"] == self.lot],
+                         ["validated"], report)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+
+    def test_another_pending_verdict_does_not_starve_the_quorum_retry(self):
+        # #4834 : un verdict encore reportable sur une autre tête ne doit pas
+        # faire oublier la transition de quorum déjà en attente sur ce gel.
+        self._reviewed_freeze()
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+
+        def down(*args, **kwargs):
+            raise RuntimeError("temporary gate read failure")
+
+        with mock.patch.object(merge_queue, "review_gate_for_item",
+                               side_effect=down):
+            verdict_carry.carry(self.cfg, self.db, self.lot, repo=self.repo.root)
+        self.assertTrue(self.notes(verdict_carry.PENDING))
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
+        # rev3 a voté sur la tête relue : `pending()` reste non vide, alors que
+        # les verdicts reportés de rev1/rev2 attendent déjà leur transition.
+        # L'INSERT direct évite `_sync_validation` (#4423), qui validerait le
+        # lot ici et retirerait le cas que ce test couvre.
+        self.db.execute(
+            "INSERT INTO work_item_milestones"
+            " (work_item_id, kind, sha, actor, verdict, note, at)"
+            " VALUES (%s, 'verdict', %s, 'rev3', 'ok', '', now())",
+            (self.lot, self.repo.reviewed))
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
+        with mock.patch.object(verdict_carry, "carry",
+                               return_value={"lot": self.lot, "result": "not-carried"}):
+            with mock.patch.object(verdict_carry, "_carried_pending", return_value=False):
+                report = verdict_carry.run_pass(self.cfg, self.db)
+        self.assertIn("validated",
+                      [r["result"] for r in report if r["lot"] == self.lot], report)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
 
     def test_a_pending_reviewer_of_the_previous_freeze_stays_designated(self):
         # B/P1 de dev1 : rev2 n'a pas encore voté au gel précédent. Le gel
@@ -497,6 +681,27 @@ class LateCarryTest(_Fixture):
         self.assertEqual(again["state"], "carried", again)
         self.assertEqual(self.designated(), ["rev1", "rev2"])
         self.assertEqual(self.review_mail(), [])
+
+    def test_a_late_carry_promotes_and_drops_the_selected_seat(self):
+        # #4834 / #4715 : la désignation a tourné au gel (rev3/rev4, faute de
+        # plan) puis le report tardif a rendu leurs verdicts à rev1/rev2. Le
+        # lot doit passer en validated sans attendre le siège de rev3, et la
+        # transition de quorum doit être au journal.
+        self._old_reviewers()
+        self.alternate_reviewers()
+        frozen = self.repo.merge_target()
+        with mock.patch.object(act, "carried_plan", return_value=None):
+            _, outcome = self.freeze(frozen)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        self.assertEqual([r["name"] for r in outcome["reviewers"]], ["rev3", "rev4"])
+        carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                      repo=self.repo.root)
+        self.assertEqual(carried["result"], "carried", carried)
+        self.assertEqual(sorted(self.designated()), ["rev1", "rev2"])
+        self.assertNotIn("rev3", self.designated())
+        self.assertTrue(self.gate(frozen)["ok"], self.gate(frozen)["why"])
+        self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+        self.assertTrue(self.notes("qa → validated — carried review quorum"))
 
     def test_a_force_designation_after_a_carried_mark_wins(self):
         self._old_reviewers()

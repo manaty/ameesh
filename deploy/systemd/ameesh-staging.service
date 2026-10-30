@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Install on EVERY configured candidate; execution follows the shared role
+# and execution leases, not this host's timer. No agent turn is the launcher.
+[Unit]
+Description=ameesh elected staging executor (#4880)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Slice=app.slice
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/ameesh/env
+ExecStart=%h/.local/share/ameesh/venv/bin/python3 -m ameesh.staging_executor --config %h/.config/ameesh/staging-executor.json tick
+TimeoutStartSec=4h
+KillMode=control-group
+# NoNewPrivileges is deliberately absent: vm.sh uses local sudo on candidates
+# that deploy themselves. Credential placement is a separate operator action.

@@ -51,7 +51,8 @@ AGENT_COLUMNS = """
     extract(epoch from created_at)::float8        as created_ts,
     extract(epoch from last_turn_at)::float8      as last_turn_ts,
     extract(epoch from last_event_at)::float8     as last_event_ts,
-    responsible, team, projects, provider, credential_mode, capabilities, canon_ref, canon,
+    responsible, team, projects, provider, credential_mode, capabilities, roles,
+    canon_ref, canon,
     -- L165 (EP1) : relève (`hote`/`election`) et hôtes candidats d'un rôle élu
     releve, candidats,
     ephemeral, created_by, priority, admitted_hosts, admitted_tags, memory_repository,
@@ -577,6 +578,9 @@ class Agents(interface.Agents):
                    public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
                    passive_unread,
                    responsible, team, projects, provider, credential_mode, capabilities,
+                   -- #4779 : les rôles déclarés, requis pour la désignation des
+                   -- relecteurs (la vue les porte depuis 0483)
+                   roles,
                    canon_ref,
                    ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
                    mode, stop_reason, canon,
@@ -1473,24 +1477,11 @@ class Leases(interface.Leases):
 
     def end_turn(self, name, owner, epoch, *, status, status_text, error,
                  cost_usd) -> bool:
-        rows = self.db.query(
-            """
-            UPDATE agent_registry
-               SET status      = %s,
-                   status_text = coalesce(%s, status_text),
-                   last_error  = %s,
-                   current_prompt = NULL,
-                   turns       = turns + 1,
-                   spent_usd   = spent_usd + coalesce(%s, 0),
-                   last_turn_at = now(),
-                   last_seen   = now(),
-                   updated_at  = now()
-             WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
-            RETURNING name
-            """,
-            (status, status_text, error, cost_usd, name, owner, epoch),
-        )
-        return bool(rows)
+        from .sandbox import ameesh_turn_close
+        with self.db.transaction() as tx:
+            return ameesh_turn_close(
+                tx, name, owner, epoch, status=status, status_text=status_text,
+                error=error, cost_usd=cost_usd)
 
 
 # --------------------------------------------------------------------------

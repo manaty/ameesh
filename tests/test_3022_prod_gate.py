@@ -136,7 +136,7 @@ class ProdGateCloseTest(_PlanDb):
         # la release porte le correctif sur main : le lot se ferme, la note le dit
         self.release()
         self.assertEqual(self.run_sync()[item["id"]]["result"], "merged")
-        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
         merged = [m for m in work.milestones(self.db, item["id"]) if m["kind"] == "merged"]
         self.assertIn("porte de production : présent sur main (ancestor",
                       merged[0]["note"])
@@ -145,7 +145,7 @@ class ProdGateCloseTest(_PlanDb):
         self.configured.side_effect = AssertionError("canon read for an unmarked lot")
         item = self.on_develop("ordinaire")
         self.assertEqual(self.run_sync()[item["id"]]["result"], "merged")
-        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
 
     def test_sans_branche_de_prod_declaree_la_fermeture_est_refusee(self):
         item = self.on_develop("autre", app="ameesh", mark="porte du relais")

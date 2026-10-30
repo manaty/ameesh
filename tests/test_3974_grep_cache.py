@@ -107,8 +107,13 @@ class GrepCacheTest(unittest.TestCase):
         self.assertEqual(value, set())
         self.assertEqual(launched, 0)
 
-    def test_another_tree_greps_again_but_other_patterns_share_the_tree(self):
-        self.counted(review_authors._tree_lines, self.repo, self.first, ["un = 1"])
+    def test_a_bounded_request_is_cached_by_patterns_not_by_tree(self):
+        # #4913 : une demande bornée ne cache que les lignes trouvées. Deux
+        # demandes différentes ne se remplacent donc plus l'une l'autre, mais
+        # la même demande sur le même arbre reste servie.
+        _value, launched = self.counted(review_authors._tree_lines, self.repo,
+                                        self.first, ["un = 1"])
+        self.assertEqual(launched, 1)
         self.write("b.py", "un = 1\n")
         second = self.commit()
         value, launched = self.counted(review_authors._tree_lines, self.repo,
@@ -116,11 +121,57 @@ class GrepCacheTest(unittest.TestCase):
         self.assertEqual((value, launched), ({"un = 1"}, 1))
         value, launched = self.counted(review_authors._tree_lines, self.repo,
                                        self.first, ["trois = 3", "absente"])
+        self.assertEqual((value, launched), ({"trois = 3"}, 1))
+        value, launched = self.counted(review_authors._tree_lines, self.repo,
+                                       self.first, ["absente", "trois = 3"])
         self.assertEqual((value, launched), ({"trois = 3"}, 0))
+        value, launched = self.counted(review_authors._tree_lines, self.repo,
+                                       self.first, ["un = 1"])
+        self.assertEqual((value, launched), ({"un = 1"}, 0))
         # le mode binaire (-a) n'est pas le mode texte (-I)
         _value, launched = self.counted(review_authors._tree_lines, self.repo,
                                         self.first, ["un = 1"], binary=True)
         self.assertEqual(launched, 1)
+
+    def test_a_large_request_still_shares_the_whole_tree(self):
+        # Au-delà du seuil, #4475 reste : l'arbre entier est lu une fois et
+        # sert les autres motifs.
+        with mock.patch.object(review_authors, "TREE_LINES_WHOLE_MAX", 1):
+            _value, launched = self.counted(review_authors._tree_lines,
+                                            self.repo, self.first,
+                                            ["un = 1", "deux = 2"])
+            self.assertEqual(launched, 1)
+            value, launched = self.counted(review_authors._tree_lines,
+                                           self.repo, self.first,
+                                           ["trois = 3", "absente"])
+        self.assertEqual((value, launched), ({"trois = 3"}, 0))
+
+    def test_targeted_and_whole_tree_read_the_same_lines(self):
+        self.write("c.py", "    copie = 1\nprefixcopie = 2\n")
+        tree = self.commit()
+        wanted = ["copie = 1", "copie", "prefixcopie = 2"]
+        with mock.patch.object(review_authors, "TREE_LINES_WHOLE_MAX", 0):
+            whole = review_authors._tree_lines(self.repo, tree, wanted)
+        with mock.patch.object(review_authors, "TREE_LINES_WHOLE_MAX", 512):
+            targeted = review_authors._tree_lines(self.repo, tree, wanted)
+        self.assertEqual(targeted, whole)
+        self.assertEqual(targeted, {"copie = 1", "prefixcopie = 2"})
+
+    def test_a_bounded_request_caches_only_the_matched_lines(self):
+        # Témoin #4913 : un arbre de 2 000 lignes ne laisse pas une entrée de
+        # 2 000 lignes quand une seule est demandée.
+        self.write("big.py", "\n".join("ligne %d" % index
+                                       for index in range(2000)) + "\n")
+        tree = self.commit()
+        self.assertEqual(
+            review_authors._tree_lines(self.repo, tree, ["ligne 1999"]),
+            {"ligne 1999"})
+        entries = [name for _root, _dirs, files in os.walk(
+            os.path.join(self.tmp, "cache"))
+            for name in files if name.endswith(".json")]
+        self.assertEqual(len(entries), 1)
+        name = entries[0][:-len(".json")]
+        self.assertEqual(grep_cache._read(name)[1], ["ligne 1999"])
 
     def test_old_pattern_limited_entries_do_not_hide_other_lines(self):
         grep_cache.cached(self.repo, self.first, "lines-I", ["un = 1"],
@@ -328,6 +379,24 @@ class GrepCacheTest(unittest.TestCase):
             self.assertLessEqual(sum(os.path.getsize(p) for p in paths
                                      if os.path.exists(p)), 1500)
 
+    def test_an_entry_over_max_entry_bytes_is_not_published(self):
+        # #4913 : une entrée trop grosse ne prend pas la place des lectures
+        # utiles ; la valeur reste rendue à l'appelant, qui recalculera.
+        name = grep_cache.key("cap", "m", [])
+        with mock.patch.object(grep_cache, "MAX_ENTRY_BYTES", 128):
+            grep_cache._write(name, [os.urandom(600).hex()])
+        self.assertFalse(grep_cache._read(name)[0])
+        self.assertEqual(grep_cache.stats()["oversized"], 1)
+        calls = []
+        big = [os.urandom(600).hex()]
+        with mock.patch.object(grep_cache, "MAX_ENTRY_BYTES", 128):
+            first = grep_cache.cached(self.repo, self.first, "cap-cached",
+                                      ["x"], lambda: calls.append(1) or big)
+            second = grep_cache.cached(self.repo, self.first, "cap-cached",
+                                       ["x"], lambda: calls.append(1) or big)
+        self.assertEqual((first, second), (big, big))
+        self.assertEqual(calls, [1, 1])    # non publiée : recalculée
+
     def test_a_second_read_is_served_from_process_memory(self):
         name = grep_cache.key("memo", "m", [])
         with mock.patch.object(grep_cache, "MAX_BYTES", 10 ** 9):
@@ -482,7 +551,7 @@ class SweepDeadlineTest(unittest.TestCase):
                 with self.assertRaises(review_authors.SweepDeadline) as caught:
                     review_authors._tree_lines(self.tmp, self.head, ["un = 1"])
         self.assertIn("lot #42", str(caught.exception))
-        self.assertIn("git grep -h -I -G -f - %s" % self.head, str(caught.exception))
+        self.assertIn("git grep -h -I -F -f - %s" % self.head, str(caught.exception))
         self.assertTrue(sweep.tripped.startswith("git grep"))
         self.assertEqual(_greps(run), 0)
 
@@ -507,7 +576,7 @@ class SweepDeadlineTest(unittest.TestCase):
                 merge_queue.readiness(None, 3974, self.tmp)
         text = str(caught.exception)
         self.assertIn("lot #3974", text)
-        self.assertIn("git grep -h -I -G -f -", text)
+        self.assertIn("git grep -h -I -F -f -", text)
 
     def test_a_deadline_read_as_doubt_still_refuses(self):
         def swallowed(*_args, **_kwargs):

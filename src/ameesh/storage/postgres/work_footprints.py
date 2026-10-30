@@ -144,7 +144,7 @@ class WorkFootprints(Contract):
             # pris avant la ligne du lot comme elles : une empreinte ne change
             # pas entre leur contrôle et leur écriture (B2 de la relecture).
             tx.execute(_GRAPH_LOCK)
-            rows = tx.query("SELECT id, state FROM work_items WHERE id = %s"
+            rows = tx.query("SELECT id, CASE WHEN state = 'delivered' THEN coalesce(to_jsonb(work_items)->>'legacy_state', state) ELSE state END AS state FROM work_items WHERE id = %s"
                             " FOR NO KEY UPDATE", (int(item_id),))
             if not rows:
                 return None

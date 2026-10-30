@@ -367,7 +367,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         except mechanics.MechanicsError:
             cap = None
         for lot in lots:
-            if lot.get("assignee") and lot.get("state") not in work.TERMINAL:
+            if lot.get("assignee") and work_lifecycle.phase(lot) not in ("promoted", "closed"):
                 open_by_agent[lot["assignee"]] = open_by_agent.get(lot["assignee"], 0) + 1
                 if lot.get("state") == lifecycle.IN_PROGRESS:
                     # §4 (owner 14/10/2026) : le compte d'en-cours est tous
@@ -2565,6 +2565,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         row["label"], row.get("file")
                         or "<migrations>/%s_<name>.sql" % row["label"]))
             return 0
+        if args.work_command == "promote":
+            item = work.promote(db, args.id, note=_note_arg(args.note), actor=args.actor)
+            print("lot #%d → %s (%s)" % (item["id"], item["state"],
+                                        item.get("legacy_state") or "promoted"))
+            return 0
         if args.work_command == "move":
             note = _note_arg(args.note)
             if args.device:
@@ -2647,12 +2652,20 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print(('%s #%d: reviewer %s was not designated: nothing removed (state %s, by %s)') % (v.noun, item["id"], args.agent, item["state"], args.actor or "the bound identity"))
                 else:
                     print(('%s #%d: reviewer %s removed (state %s, by %s)') % (v.noun, item["id"], args.agent, item["state"], args.actor or "the bound identity"))
+                # #4779 : les demandes encore non remises du siège sont soldées
+                # sans tour ; le dire, même quand le siège n'était déjà plus là.
+                _settled = item.get("reviewer_settled") or []
+                if _settled:
+                    print(('%s #%d: %d pending review request(s) settled without a turn: %s') % (v.noun, item["id"], len(_settled), ", ".join("#%d" % int(i) for i in _settled)))
             elif args.remove:
                 item = work.clear_reviewer(cfg, db, args.id, actor=args.actor)
                 if item.get("reviewer_changed") is False:
                     print(('%s #%d: no reviewer designation to remove (state %s, by %s)') % (v.noun, item["id"], item["state"], args.actor or "the bound identity"))
                 else:
                     print(('%s #%d: reviewer designation removed (state %s, by %s)') % (v.noun, item["id"], item["state"], args.actor or "the bound identity"))
+                _settled = item.get("reviewer_settled") or []
+                if _settled:
+                    print(('%s #%d: %d pending review request(s) settled without a turn: %s') % (v.noun, item["id"], len(_settled), ", ".join("#%d" % int(i) for i in _settled)))
             elif args.no_verdict:
                 item = work.waive_review(cfg, db, args.id, actor=args.actor)
                 print(('%s #%d: verdict not required (state %s, by %s)') % (v.noun, item["id"], item["state"], args.actor or "the bound identity"))
@@ -4032,6 +4045,11 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     from . import migration_reservations
     migration_reservations.add_options(pw_mig)
     pw_mig.set_defaults(func=cmd_work)
+    pw_promote = work_sub.add_parser("promote", help="record a development delivery promotion")
+    pw_promote.add_argument("id", type=int)
+    pw_promote.add_argument("--note", default="")
+    pw_promote.add_argument("--actor", default="")
+    pw_promote.set_defaults(func=cmd_work)
     pw_move = work_sub.add_parser("move")
     pw_move.add_argument("id", type=int)
     pw_move.add_argument("state", choices=list(work_lifecycle.ACCEPTED_STATES),
@@ -4541,6 +4559,9 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
 
     from . import veille_cli
     veille_cli.add_parsers(sub)
+
+    from . import turn_observe
+    turn_observe.add_parsers(sub)
 
     p_review = sub.add_parser(
         "review-class", help="review class of a change (0018): light, normal, sensitive")

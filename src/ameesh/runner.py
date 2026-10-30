@@ -763,8 +763,9 @@ class AgentWorker(threading.Thread):
         self.summary_display: list[str] = []
         self._summary_chars = 0
         #: L60 : jetons d'entrée relus (cache compris) par le dernier tour
-        #: inscrit au grand livre, et sa session — mesure de coût et de
-        #: l'alerte `session_too_big`, pas du plafond (#2336)
+        #: inscrit au grand livre, et sa session — mesure de coût, pas du
+        #: plafond (#2336) ni de l'alerte `session_too_big`, qui lit `S_hist`
+        #: de la session (`session_total`, #4448)
         self.last_turn_reread = 0
         self.last_turn_reread_session: str | None = None
         #: L217 : relevé du flux du dernier tour, fil principal (somme des
@@ -2266,13 +2267,14 @@ class AgentWorker(threading.Thread):
         La mesure est celle du plafond du tour (L217b) : le contexte du
         dernier appel du fil principal, relevé dans le flux, ou pour Codex,
         qui ne publie son usage qu'en fin de tour, dans le journal de session
-        du fil (#2932) ; à défaut, celle de l'alerte `session_too_big` (entrée
-        + entrée relue en cache du dernier tour inscrit au grand livre), sauf
-        pour Codex : sans relevé d'appel (journal illisible, worker relancé),
-        il ne tourne pas sur cette somme (#2932). Chaque étape d'un tour relit
-        tout le contexte : une session qui grossit coûte de plus en plus cher
-        à chaque tour, et l'alerte seule n'y changeait rien. La somme des
-        appels d'un tour n'est pas la taille de la session (#2336).
+        du fil (#2932) ; à défaut, la somme des relectures du dernier tour
+        inscrit au grand livre (`last_turn_reread`), sauf pour Codex : sans
+        relevé d'appel (journal illisible, worker relancé), il ne tourne pas
+        sur cette somme (#2932). Chaque étape d'un tour relit tout le
+        contexte : une session qui grossit coûte de plus en plus cher à
+        chaque tour, et l'alerte seule n'y changeait rien. La somme des
+        appels d'un tour n'est pas la taille de la session (#2336) ; l'alerte
+        `session_too_big` lit, elle, `S_hist` de la session (#4448).
         Ni minimum de tours, ni rotation pendant un tour ; la politique
         `jamais` s'en dispense ; il faut une session courante, et que le
         relevé soit bien celui de cette session.

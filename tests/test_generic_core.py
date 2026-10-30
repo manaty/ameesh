@@ -180,19 +180,23 @@ class GenericCoreTest(unittest.TestCase):
         self.assertIn('registry.get("dev")', source)
         self.assertEqual(scan_python(source, "workspaces.py")["module-import"], 0)
 
-    def test_legacy_terminal_and_completed_semantics_remain_distinct(self):
-        self.assertEqual(work.STATES, ("intake", "build", "qa", "validated", "merged", "promoted",
+    def test_delivery_core_keeps_generic_state_groups(self):
+        self.assertEqual(work.STATES, ("intake", "build", "qa", "validated", "delivered",
                                        "blocked", "waiting_human", "closed"))
-        self.assertEqual(work.TERMINAL, ("promoted", "closed"))
-        self.assertEqual(work.COMPLETED, ("merged", "promoted", "closed"))
+        self.assertEqual(work_lifecycle.canonical("merged"), "delivered")
+        self.assertEqual(work_lifecycle.canonical("promoted"), "delivered")
         self.assertEqual(work.DELIVERED, work.MERGED_STATES)
         self.assertEqual(work.ACTIVE, ("intake", "build"))
         self.assertEqual(work.WAITING, {"blocked", "waiting_human"})
         self.assertEqual(work.TO_VALIDATE, ("qa", "validated"))
+
+    @support.needs_builtin_modules
+    def test_delivery_core_preserves_development_stage_transitions(self):
         self.assertEqual(registry.merge_connector(), "git-merge")
-        for state in work.TERMINAL:
-            self.assertFalse(work.TRANSITIONS[state])
-        self.assertIn(work_lifecycle.PROMOTED, work.TRANSITIONS[work_lifecycle.DELIVERY_RECORDED])
+        self.assertFalse(work.TRANSITIONS["promoted"])
+        self.assertIn("promoted", work.TRANSITIONS["merged"])
+        self.assertEqual(registry.development_workflow().STAGES,
+                         {"merged": "delivered", "promoted": "delivered"})
 
 
 if __name__ == "__main__":

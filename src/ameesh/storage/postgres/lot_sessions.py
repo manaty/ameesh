@@ -119,9 +119,9 @@ class LotSessions(interface.LotSessions):
         from ...planned_waits import HOLD_NOTE_PATTERNS   # tardif : pas de cycle
         today = today or _dt.date.today().isoformat()
         lift = HOLD_NOTE_PATTERNS[1]
-        return self.db.query(
+        rows = self.db.query(
             f"""
-            SELECT w.id, w.title, w.state, w.priority,
+            SELECT w.id, w.title, w.state, w.priority, w.source AS roadmap_source,
                    extract(epoch from greatest(w.updated_at, w.branch_head_at, ev.at, mb.at)
                            )::float8 AS activity_ts,
                    coalesce(l.wakes, 0)::bigint AS wakes,
@@ -173,6 +173,25 @@ class LotSessions(interface.LotSessions):
             """,
             (name, today, self.HOLD_PREFIX, self.WAKE_PREFIX,
              HOLD_NOTE_WHITESPACE, lift))
+        # #4901 : la note du pilote peut lever le hold SQL ci-dessus tout en
+        # déclarant la feuille de route épuisée. Le lot reste ouvert, mais ne
+        # doit plus réveiller le pilote par la règle 1. Même lecture que le
+        # sommeil : dernière note du projet, dans l'ordre du journal.
+        from ... import file_decoupage
+        from .work import WorkItems
+        projects = {}
+        for row in rows:
+            source = row.pop("roadmap_source", None) or ""
+            if source.startswith(file_decoupage.SOURCE_PREFIX):
+                projects[row["id"]] = source[len(file_decoupage.SOURCE_PREFIX):]
+        if not projects:
+            return rows
+        notes = {item_id: [] for item_id in projects}
+        for event in WorkItems(self.db).events_noted(
+                file_decoupage.ROADMAP_PREFIX, 0, ids=list(projects)):
+            notes[event["work_item_id"]].append(event)
+        return [row for row in rows if row["id"] not in projects or
+                not file_decoupage.exhausted(notes[row["id"]], projects[row["id"]])]
 
     def note_wake(self, name, lot, activity_ts):
         rows = self.db.query(
@@ -248,7 +267,9 @@ class LotSessions(interface.LotSessions):
                 " WHERE id = %s AND assignee = %s"
                 "   AND abs(extract(epoch from wake_at) - %s::float8) < 0.001"
                 "   AND wake_claim_at IS NOT NULL"
-                " RETURNING id, state", (int(lot), name, float(wake_ts)))
+                " RETURNING id, CASE WHEN state = 'delivered' THEN"
+                " coalesce(to_jsonb(work_items)->>'legacy_state', state)"
+                " ELSE state END AS state", (int(lot), name, float(wake_ts)))
             if not rows:
                 return False
             tx.execute(

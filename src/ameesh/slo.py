@@ -1112,8 +1112,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                             target=target, escalate=not packet, **extra,
                             **parked))
         elif state not in (
-            lifecycle.DELIVERY_RECORDED,
-            lifecycle.PROMOTED,
+            *lifecycle.DELIVERED,
             lifecycle.CLOSED,
             lifecycle.IN_PROGRESS,
         ):

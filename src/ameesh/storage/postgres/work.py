@@ -44,6 +44,7 @@ _COLUMNS_TEMPLATE = """
     id, type, source, app, title, body, issue_ref, workstream, state, assignee,
     __REVIEWER__,
     __EXTERNAL__,
+    __LIFECYCLE__,
     loops, budget_usd, spent_usd, package_id, package_parent, pr_ref, close_reason,
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
@@ -187,6 +188,8 @@ def item_columns(db, ref: str | None = None, *, row_json: str | None = None) -> 
     return (_COLUMNS_TEMPLATE
             .replace("__REVIEWER__", reviewer + ", " + reviewers)
             .replace("__EXTERNAL__", external)
+            .replace("__LIFECYCLE__", "%s->>'legacy_state' AS legacy_state, "
+                     "%s->>'workflow_stage' AS workflow_stage" % (doc, doc))
             .replace("__WAKE__", wake)
             .replace("__MIGRATIONS__", migrations))
 
@@ -397,6 +400,7 @@ def _effective_merged(alias: str) -> str:
 #: font foi ; `verdicts` et `blocked_verdicts` comptent les tours de revue.
 _DELAYS_SELECT = """
     SELECT w.id AS work_item_id, w.state, w.assignee, w.title,
+           to_jsonb(w)->>'legacy_state' AS legacy_state,
            extract(epoch FROM w.created_at)::float8 AS created_ts,
            extract(epoch FROM w.updated_at)::float8 AS updated_ts,
            extract(epoch FROM req.at)::float8 AS requested_ts,
@@ -816,6 +820,19 @@ class WorkItems(interface.WorkItems):
             (int(item_id),))
         return rows[0] if rows else None
 
+    def lock_workflow_activation(self, project):
+        self.db.execute(
+            "SELECT pg_advisory_xact_lock_shared(hashtext('ameesh-module-project'),"
+            " hashtext(%s))", (project,))
+
+    def adopt_workflow(self, item_id, *, ref, version, stage, state, actor):
+        self.db.execute(
+            "UPDATE work_items SET workflow_ref = %s, workflow_version = %s,"
+            " workflow_stage = %s, updated_at = now() WHERE id = %s",
+            (ref, int(version), stage, int(item_id)))
+        self._event(int(item_id), state,
+                    "pipeline adopted: %s version %s stage %s" % (ref, version, stage), actor)
+
     def get(self, item_id) -> dict | None:
         # #1922/B5 : `workflow_ref` (0452) est porté par la lecture, comme
         # `reviewer` (#705) l'est par `item_columns` — `to_jsonb` rend '' sur
@@ -841,7 +858,8 @@ class WorkItems(interface.WorkItems):
         sql = "SELECT %s FROM work_items WHERE true" % item_columns(self.db, "work_items")
         params: list = []
         if state:
-            sql += " AND state = %s"
+            sql += (" AND coalesce(to_jsonb(work_items)->>'legacy_state', state) = %s"
+                    if state in ("merged", "promoted") else " AND state = %s")
             params.append(state)
         if assignee:
             sql += " AND assignee = %s"
@@ -1001,7 +1019,11 @@ class WorkItems(interface.WorkItems):
                    started_at = CASE WHEN %s IN ('build', 'qa')
                                      THEN coalesce(started_at, now()) ELSE started_at END
                    __WAIVER__
-             WHERE id = %s AND state = %s AND __UNPINNED__ __HELD__
+             WHERE id = %s AND %s IN (
+                 state, CASE WHEN state = 'delivered'
+                             THEN coalesce(to_jsonb(work_items)->>'legacy_state', state)
+                             ELSE state END)
+               AND __UNPINNED__ __HELD__
             RETURNING __COLUMNS__
             """.replace("__COLUMNS__", item_columns(self.db)).replace(
                 "__UNPINNED__", _UNPINNED).replace("__HELD__", _HELD if held else "")
@@ -1037,7 +1059,7 @@ class WorkItems(interface.WorkItems):
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), state, note, actor)
-            if state in lifecycle.COMPLETED:
+            if lifecycle.canonical(state) in lifecycle.COMPLETED:
                 self._release_migration(tx, item_id, rows[0],
                                         why="état %s" % state, actor=actor)
             return rows[0]
@@ -1615,7 +1637,7 @@ class WorkItems(interface.WorkItems):
             if marques:
                 tx.query(
                     "INSERT INTO work_item_events (work_item_id, state, note, actor)"
-                    " SELECT id, state, %%s, %%s FROM work_items WHERE id IN (%s)"
+                    " SELECT id, CASE WHEN state = 'delivered' THEN coalesce(to_jsonb(work_items)->>'legacy_state', state) ELSE state END, %%s, %%s FROM work_items WHERE id IN (%s)"
                     " RETURNING id" % ", ".join(["%s"] * len(marques)),
                     tuple([note, agent] + marques))
             return marques
@@ -1946,7 +1968,7 @@ class WorkItems(interface.WorkItems):
               JOIN LATERAL (SELECT p.state FROM work_item_events p
                              WHERE p.work_item_id = c.work_item_id AND p.id < c.id
                              ORDER BY p.id DESC LIMIT 1) prev ON true
-             WHERE c.state = '{lifecycle.IN_PROGRESS}' AND prev.state = '{lifecycle.DELIVERY_RECORDED}'
+             WHERE c.state = '{lifecycle.IN_PROGRESS}' AND prev.state IN ('merged', 'delivered')
             """ + borne + """
              GROUP BY c.work_item_id
             """,
@@ -3262,10 +3284,10 @@ class WorkItems(interface.WorkItems):
         if not names:
             return {}
         rows = self.db.query(
-            f"SELECT assignee, bool_or(state <> '{lifecycle.PROMOTED}') AS open,"
-            f"       bool_or(state = '{lifecycle.PROMOTED}') AS promoted"
+            f"SELECT assignee, bool_or(coalesce(to_jsonb(work_items)->>'legacy_state', state) <> 'promoted') AS open,"
+            f"       bool_or(coalesce(to_jsonb(work_items)->>'legacy_state', state) = 'promoted') AS promoted"
             "  FROM work_items"
-            f" WHERE assignee IN (%s) AND state NOT IN ('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.CLOSED}')"
+            f" WHERE assignee IN (%s) AND coalesce(to_jsonb(work_items)->>'legacy_state', state) NOT IN ('merged', 'closed')"
             " GROUP BY assignee" % ", ".join(["%s"] * len(names)), tuple(names))
         return {row["assignee"]: {"open": bool(row["open"]),
                                   "promoted": bool(row["promoted"])} for row in rows}
@@ -3349,7 +3371,7 @@ class WorkItems(interface.WorkItems):
             limit = "" if dry_run else " FOR NO KEY UPDATE OF w"
             rows = self.db.query(
                 "SELECT %s FROM work_items w"
-                f" WHERE w.assignee = %%s AND w.state = '{lifecycle.PROMOTED}'"
+                f" WHERE w.assignee = %%s AND coalesce(to_jsonb(w)->>'legacy_state', w.state) = 'promoted'"
                 " ORDER BY w.id%s" % (item_columns(self.db, "w"), limit), (agent,))
             for row in rows:
                 if dry_run:
@@ -3358,7 +3380,7 @@ class WorkItems(interface.WorkItems):
                 updated = self.db.query(
                     "UPDATE work_items SET assignee = %%s, updated_at = now(),"
                     "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
-                    f" WHERE id = %%s AND assignee = %%s AND state = '{lifecycle.PROMOTED}'"
+                    f" WHERE id = %%s AND assignee = %%s AND coalesce(to_jsonb(work_items)->>'legacy_state', state) = 'promoted'"
                     " RETURNING %s" % item_columns(self.db),
                     (measure_actor, int(row["id"]), agent))
                 if not updated:
@@ -3568,7 +3590,8 @@ class WorkItems(interface.WorkItems):
                 rows = tx.query(
                     f"""
                     UPDATE work_items
-                       SET state = '{lifecycle.DELIVERY_RECORDED}', updated_at = now(), closed_at = NULL,
+                       SET state = '{lifecycle.DELIVERY_RECORDED}', workflow_stage = 'merged',
+                           legacy_state = 'merged', updated_at = now(), closed_at = NULL,
                            pr_ref = coalesce(nullif(%s, ''), pr_ref),
                            migration_landed = coalesce(%s, migration_landed),
                            migration_landed_repo = coalesce(%s, migration_landed_repo)
@@ -4392,8 +4415,13 @@ class WorkItems(interface.WorkItems):
             " ORDER BY start_ts, tc.id", (int(item_id),))
 
     def _event(self, item_id, state, note, actor) -> None:
+        # Historical journals and signed receipts retain their stage vocabulary.
+        # A note on a delivered core must not erase the merge/promotion phase
+        # from the previous-event checks used for merge annulment and SLOs.
         self.db.execute(
             "INSERT INTO work_item_events (work_item_id, state, note, actor) "
-            "VALUES (%s, %s, %s, %s)",
-            (item_id, state, note or "", actor or ""),
+            "SELECT id, CASE WHEN %s = 'delivered' THEN "
+            "coalesce(to_jsonb(work_items)->>'legacy_state', state) ELSE %s END, %s, %s "
+            "FROM work_items WHERE id = %s",
+            (state, state, note or "", actor or "", item_id),
         )

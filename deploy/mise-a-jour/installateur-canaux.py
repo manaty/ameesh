@@ -82,7 +82,8 @@ class LinuxChannels(installer.LinuxHost):
             raise InstallError('enrolled SSH daemon unavailable')
         runtime.trusted(sshd)
         for name,channel in sorted(delegation.CHANNELS.items()):
-            self.command(['/usr/bin/visudo','-c','-f','/etc/sudoers.d/'+channel['account']])
+            runtime.trusted('/usr/sbin/visudo')
+            self.command(['/usr/sbin/visudo','-c','-f','/etc/sudoers.d/'+channel['account']])
             source=bundle['plan']['channels'][name]['controller_source']
             address=str(ipaddress.ip_network(source).network_address)
             args=[sshd,'-T','-C','user='+channel['account']+',host='+bundle['host']+',addr='+address]

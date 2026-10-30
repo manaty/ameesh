@@ -27,17 +27,25 @@ class _Base(PgTestCase):
         self.now = time.time()
 
     def agent(self, name, harness="claude", *, status="idle", since_s=2 * HEURE, team=None,
-              capabilities=None, host=None, responsible="human:proprio"):
+              capabilities=None, roles=None, host=None, responsible="human:proprio"):
         registry.upsert(self.db, name, harness=harness, host=host or self.cfg.host)
         self.db.execute(
             "UPDATE agent_registry SET status = %s, lease_owner = %s,"
             " lease_expires_at = now() + interval '1 hour', responsible = %s, team = %s"
             " WHERE name = %s",
             (status, "runner-%s@h" % name, responsible, team, name))
-        if capabilities:
-            self.db.execute("UPDATE agent_registry SET capabilities = %s::text[]"
-                            " WHERE name = %s",
-                            ("{" + ",".join(capabilities) + "}", name))
+        # #4779 : une relecture proposée désigne son relecteur ; la fiche de
+        # test doit prouver `propose` et un rôle, comme `canon sync` en
+        # production. Un témoin qui veut une autre fiche (canari read-only,
+        # absence de rôle) passe capabilities/roles explicitement.
+        if capabilities is None:
+            capabilities = ("propose",)
+        if roles is None:
+            roles = ("implementation",)
+        self.db.execute("UPDATE agent_registry SET capabilities = %s::text[],"
+                        " roles = %s::text[] WHERE name = %s",
+                        ("{" + ",".join(capabilities) + "}",
+                         "{" + ",".join(roles) + "}", name))
         self.db.execute("UPDATE agent_registry SET status_since = now() - make_interval("
                         "secs => %s), last_turn_at = now() - make_interval(secs => %s)"
                         " WHERE name = %s", (since_s, since_s, name))

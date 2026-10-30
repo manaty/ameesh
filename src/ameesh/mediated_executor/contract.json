@@ -4519,7 +4519,8 @@
    "notify_liveness": "notifier liveness and off-notifier brief claims (#3007): mesh server only",
    "fingerprints": "failure fingerprints watch (#3885): mesh server only, read by the elected role",
    "provider_credits": "crédits du compte fournisseur (#4164) : état partagé du compte, tenu par les runners du mesh ; l'exécuteur médié passe par le relais",
-   "veille": "relevé propre à la veille (#4291) : serveur seulement, l'appareil ne lit ni n'écrit le relevé"
+   "veille": "relevé propre à la veille (#4291) : serveur seulement, l'appareil ne lit ni n'écrit le relevé",
+   "turn_observation": "observation des tours et des requêtes (#2167) : document du serveur pour /api/v1, jamais servi à l'exécuteur médié"
   },
   "operations": {
    "account_windows": [
@@ -4910,6 +4911,7 @@
    "work": [
     "add",
     "add_milestone",
+    "adopt_workflow",
     "assign",
     "assign_capped",
     "assignment_events",
@@ -4957,6 +4959,7 @@
     "link_package",
     "lock",
     "lock_deep_analysis",
+    "lock_workflow_activation",
     "log_review_attempt",
     "mark_started",
     "measure",
@@ -5111,6 +5114,9 @@
    "veille": [
     "readings",
     "record_readings"
+   ],
+   "turn_observation": [
+    "read"
    ]
   }
  },

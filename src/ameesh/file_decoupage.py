@@ -122,6 +122,13 @@ def source_of(project: str) -> str:
     return SOURCE_PREFIX + project
 
 
+def is_split_lot(item: dict | None) -> bool:
+    """#4756 : un lot de découpage (`file-decoupage:<projet>`) est un geste du
+    pilote : hors file d'équipe (#540) à son attribution, jamais pris par un
+    exécutant au repos (L165)."""
+    return str((item or {}).get("source") or "").startswith(SOURCE_PREFIX)
+
+
 def title_of(project: str, count: int) -> str:
     return ("Découper la feuille de route de %s : des lots démarrables pour %d agent(s)"
             % (project, count))
@@ -392,7 +399,33 @@ def _create(cfg, db, project: str, item: Measure, since_ts: float, now: float, *
             work.assign(db, lot, pilot, actor=actor)
         except Exception as exc:  # noqa: BLE001 - le lot reste ouvert, le pilote le voit
             out["assign_error"] = "%s: %s" % (type(exc).__name__, str(exc)[:160])
+        else:
+            # #4756 : une attribution sans erreur qui n'a pas posé l'assigné
+            # (file d'équipe, #540) est aussi un refus.
+            row = work.get(db, lot) or {}
+            if (row.get("assignee") or "").strip() != pilot:
+                out["assign_error"] = "not assigned (now: %s)" % (
+                    (row.get("assignee") or "").strip() or "nobody")
+    if out.get("assign_error"):
+        _tell_refusal(db, lot, project, pilot, out["assign_error"], actor=actor)
     return out
+
+
+def _tell_refusal(db, lot: int, project: str, pilot: str | None, why: str, *,
+                  actor: str) -> None:
+    """#4756 : un refus d'attribution du lot de découpage est dit au pilote
+    (courrier et journal du lot) au lieu de rester dans le rendu du passage ;
+    sans pilote, le journal le dit et le repli de l'auditeur suit."""
+    from . import mail
+    text = ("lot de découpage #%d de %s non attribué au pilote %s : %s"
+            % (lot, project, pilot or "(aucun)", why))
+    if pilot:
+        mail.send(db, actor, pilot,
+                  "%s. Prenez-le (ameesh work assign %d %s) ou dites qui le prend ; "
+                  "il n'est pas pris par un exécutant au repos (#4756)."
+                  % (text, lot, pilot),
+                  work_item_id=str(lot), idempotency_key="file-decoupage-refus-%d" % lot)
+    work.note(db, lot, text, actor=actor)
 
 
 #: la note d'attribution d'un lot qui n'avait pas d'assigné (`work.assign`)
@@ -513,6 +546,12 @@ def _reviewer_spares(db, project: str, lots: list, listing: list, *,
         closed = alert_briefs.claims_closed_hosts(db)
     except Exception:  # noqa: BLE001 - hôte inconnu : ne ferme rien
         closed = set()
+    # #4779 : un profil de relecture illisible (capacités ou rôles absents du
+    # registre) n'est pas une preuve de capacité : l'agent n'entre pas dans le
+    # vivier des relecteurs, exactement comme la désignation le refuse. Le
+    # doute est borné à cet agent : un seul profil illisible ne rend pas toute
+    # l'exemption illisible et ne bloque pas le sommeil des autres (régression
+    # test_4610) ; la trace du refus est celle du gel (`prepare`).
     try:
         candidates = [c for c in rd.candidates_from_registry(
             listing or (), project=project, families=families, closed_hosts=closed)

@@ -670,3 +670,81 @@ croissance. Le budget théorique de la recette ne plafonne donc pas la flotte
 déployée. Cette modification n’installe aucun pool et ne redimensionne aucune
 installation ; une installation ultérieure exige de vérifier aussi les
 connexions directes et les autres clients du serveur.
+
+### Suivi indépendant et exécutant élu du staging (#4880)
+
+Avant toute modification d'hôte, `staging.sh` écrit un événement partagé
+`staging.sequence`, avec un identifiant d'exécution et une échéance fixe
+(`STAGING_TIMEOUT_S`, 7200 secondes par défaut). Chaque étape publie la
+dernière étape et le verdict par hôte ; les sorties, commandes et secrets
+restent hors de ce suivi. La passe ordinaire d'alertes lit ces événements
+depuis la base : un lanceur tué, figé ou privé de réseau n'a pas besoin de
+survivre pour que le dépassement soit signalé au pilote. Une sortie sans
+attestation reste `unattested`, jamais `completed`. Un sous-ensemble demandé
+explicitement se termine `partial`, sans prétendre attester le mesh.
+
+Le chemin avec relève utilise `ameesh.staging_executor` : la demande vit dans
+`staging.request`, et un service utilisateur dédié l'exécute depuis un arbre
+git du commit exact. L'agent qui soumet la demande ne lance aucun SSH de
+déploiement dans son tour. Installer `deploy/systemd/ameesh-staging.service`
+et `.timer` sur **chaque candidat**, avec une configuration privée
+`~/.config/ameesh/staging-executor.json`, par exemple :
+
+```json
+{
+  "key": "mesh-staging",
+  "project": "ameesh",
+  "role": "mesh-design",
+  "candidates": ["candidat-a", "candidat-b"],
+  "repo": "/chemin/du/clone-dedie",
+  "target": "origin/main",
+  "bascule_env": "/chemin/prive/bascule.env",
+  "arguments": ["--sans-poste"],
+  "timeout_s": 7200,
+  "start_timeout_s": 300,
+  "quiescence_probe": ["/chemin/prive/prouver-arret-staging"]
+}
+```
+
+Les candidats sont des noms d'hôtes de configuration, jamais des constantes
+du code. Ils doivent avoir le même `key`, le même rôle élu, accès à la base,
+un clone dédié contenant le commit demandé et les accès de déploiement
+validés (`bascule*.env`, clés et droits nécessaires). Cette documentation
+ne place aucun secret et ne prouve pas que ces accès existent.
+
+La minuterie passe chaque minute ; seul l'hôte qui détient le bail vivant
+du rôle commence une tentative. Un second bail partagé, renouvelé avec une
+échéance monotone locale, protège l'exécution pendant un changement de rôle.
+Une demande en attente qui n'est pas prise dans `start_timeout_s`, un refus
+de reprise ou un échec lève une alerte urgente au pilote.
+
+Le programme `quiescence_probe` doit vérifier **et terminer si nécessaire**
+l'ancien exécutant et ses opérations distantes, y compris les unités
+transitoires du poste. Il reçoit `STAGING_PREVIOUS_HOST` et
+`STAGING_PREVIOUS_RUN`, et ne rend zéro qu'après preuve de leur arrêt. Un
+PID local absent ou un bail expiré ne suffit pas : les SSH et unités
+distantes peuvent survivre. Sans programme, avec un résultat négatif, ou
+avec des accès manquants, la reprise refuse toute modification et publie
+son blocage. L'arbre source d'une exécution qui perd son bail est conservé.
+
+Une fois la configuration et les accès approuvés, l'opérateur active les
+services sur les candidats et soumet un SHA complet :
+
+```sh
+systemctl --user enable --now ameesh-staging.timer
+python3 -m ameesh.staging_executor \
+  --config "$HOME/.config/ameesh/staging-executor.json" submit SHA_COMPLET
+```
+
+`ameesh-staging.service` est une unité `app.slice`, hors du cgroup du tour.
+Vérifier son `ControlGroup`, son journal et les événements partagés lors de
+la qualification réelle. Pour la release automatique, renseigner
+`release.projects.<projet>.staging_executor` avec le chemin de ce JSON : la
+coupure soumet la même demande et attend l'attestation partagée au prochain
+passage. Sans cette option, le chemin historique reste synchrone dans
+`ameesh-release.service` et bénéficie du suivi indépendant de `staging.sh`.
+
+Le retour du premier hôte puis la reprise par un second candidat sont
+testés avec des hôtes simulés. La qualification physique et la mise en place
+des accès sur plusieurs hôtes restent des opérations distinctes : ne pas
+confondre ces tests avec une relève effectivement installée.

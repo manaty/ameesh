@@ -56,7 +56,7 @@ REWRITTEN = (
     "merge_queue.queued_by", "notify_briefs.recipient", "notify_state.owner",
     "operator_pause_events.actor", "persona_sessions.persona", "provider_account_credits.agent",
     "provider_account_credits.prepaid_by", "repository_footprint_policies.updated_by",
-    "review_catch_up.actor", "session_bindings.agent",
+    "review_catch_up.actor", "sandbox_turns.agent", "session_bindings.agent",
     "session_bindings.created_by", "spend_pending.agent", "standing_reservations.reserved_by",
     "turn_costs.agent", "turn_resources.agent", "visibility_checks.persona",
     "work_item_delegations.delegate", "work_item_delegations.delegated_by",
@@ -95,6 +95,7 @@ KEPT = (
     "key_events.holder", "key_events.name", "key_holders.name", "mesh_approvals.approver",
     "mesh_approvals.consumed_by", "mesh_consumed_nonces.approver",
     "mesh_consumed_nonces.consumed_by", "provenance_receipts.actor", "schema_migrations.name",
+    "sandbox_turns.owner",  # Runner lease owner, never an agent identity.
     "standing_approvals.approver", "standing_approvals.registered_by",
     "standing_approvals.revoked_by", "turn_cost_corrections.actor",
     "work_module_milestones.actor",

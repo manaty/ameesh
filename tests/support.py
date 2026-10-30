@@ -673,16 +673,19 @@ class ThreadLeakMixin:
 
 
 def _bench_upkeep(db) -> None:
-    """Purge les schémas t_* orphelins, une fois par processus de suite.
+    """Purge les schémas t_* orphelins et les bases de test invalides.
 
-    Le banc est partagé par tous les agents de l'hôte (`scripts/pg-up.sh`) :
-    une exécution tuée laisse son schéma. La passe est bornée (âge, sessions,
-    verrou court) et ne fait jamais échouer un test. #3735 B/P1 : la passe
-    **ordinaire** ne purge que les schémas dont le marqueur prouve un
-    propriétaire mort ; les schémas **sans marqueur** (suite legacy) restent
-    gardés — leur processus Python survit au redémarrage du postmaster et le
-    code ne peut pas prouver son arrêt ; leur purge est un geste d'opérateur
-    explicite (`--admit-unmarked`), après arrêt de toute suite.
+    Une passe par processus de suite. Le banc est partagé par tous les agents
+    de l'hôte (`scripts/pg-up.sh`) : une exécution tuée laisse son schéma.
+    La passe est bornée (âge, sessions, verrou court) et ne fait jamais
+    échouer un test. #3735 B/P1 : la passe **ordinaire** ne purge que les
+    schémas dont le marqueur prouve un propriétaire mort ; les schémas
+    **sans marqueur** (suite legacy) restent gardés — leur processus Python
+    survit au redémarrage du postmaster et le code ne peut pas prouver son
+    arrêt ; leur purge est un geste d'opérateur explicite
+    (`--admit-unmarked`), après arrêt de toute suite. #4822 : une base de
+    test laissée invalidée (`datconnlimit = -2`) par un DROP DATABASE annulé
+    pendant son checkpoint est retirée, sinon elle bloque l'autovacuum.
     """
     global BENCH_UPKEEP_DONE
     if BENCH_UPKEEP_DONE:
@@ -690,14 +693,23 @@ def _bench_upkeep(db) -> None:
     if os.environ.get("AMEESH_BENCH_UPKEEP", "1").lower() in ("0", "false", "no", "off"):
         BENCH_UPKEEP_DONE = True
         return
+    # #4822 d'abord : une base invalide bloque l'autovacuum et ne se répare
+    # que par ce DROP ; la purge des schémas peut ensuite prendre son budget.
+    try:
+        invalid = bench_mod.purge_invalid_databases(db)
+    except Exception:  # noqa: BLE001 — un ménage de banc ne juge jamais un test
+        invalid = None
     try:
         result = bench_mod.purge_orphans(db)
     except Exception:  # noqa: BLE001 — un ménage de banc ne juge jamais un test
-        return
+        result = None
     BENCH_UPKEEP_DONE = True
-    if result.dropped:
+    if result is not None and result.dropped:
         print("banc : %d schéma(s) t_* orphelin(s) purgé(s)" % len(result.dropped),
               file=sys.stderr)
+    if invalid is not None and invalid.dropped:
+        print("banc : %d base(s) de test invalide(s) purgée(s)"
+              % len(invalid.dropped), file=sys.stderr)
 
 
 class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
@@ -909,4 +921,15 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
                 args.append(flag)
             elif value is not None:
                 args += [flag, str(value)]
-        return self.runner(*args)
+        proc = self.runner(*args)
+        if proc.returncode == 0:
+            # #4779 : `agent-runner register` n'écrit pas le profil de fiche
+            # (`capabilities`, `roles`), que `canon sync` pose en production.
+            # Les agents de test sont des relecteurs ; les témoins qui veulent
+            # une fiche read-only ou sans rôle écrasent la ligne ensuite.
+            self.db.execute(
+                "UPDATE agent_registry SET capabilities ="
+                " ARRAY['read','report-drift','propose'], roles = ARRAY['implementation']"
+                " WHERE name = (SELECT ameesh_resolve_agent_name(%s, %s))",
+                (name, "tests.support.register"))
+        return proc

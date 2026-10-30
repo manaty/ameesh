@@ -38,6 +38,7 @@ from .mailbox import Mailbox
 from .notify_liveness import NotifyLiveness
 from .menage import Housekeeping
 from .operations import Operations
+from .turn_observation import TurnObservation
 from .packages import WorkPackages
 from .placement import Placements
 from .prevalidation import PrevalidationReports
@@ -111,6 +112,7 @@ class PostgresStorage(interface.Storage):
         self.hosts = Hosts(db)
         self.host_lifecycle = HostLifecycle(db)
         self.turn_resources = TurnResources(db)
+        self.turn_observation = TurnObservation(db)
         self.visibility = Visibility(db)
         self.housekeeping = Housekeeping(db)
         self.session_bindings = SessionBindings(db)

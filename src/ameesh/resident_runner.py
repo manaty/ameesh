@@ -254,7 +254,12 @@ def usage_event(protocol: str, result: "resident.TurnResult", *,
 
     `inputs` (L80b) are the message ids the turn actually served — the spec's
     messages and the accepted steers, never a correlation uuid: the ledger
-    line then answers "what did this turn cost, for which messages?"."""
+    line then answers "what did this turn cost, for which messages?".
+
+    `profile` (CTX-03) is the observed `ameesh-context/1` window of the
+    effective model and `compact` the native compaction of the turn (with its
+    quality: a missing `post` is `partial`). Both are observation only: the
+    ledger keeps reading `usage`."""
     if protocol in NATIVE_USAGE:
         return None
     event = {
@@ -265,6 +270,10 @@ def usage_event(protocol: str, result: "resident.TurnResult", *,
         "turn": turn or "",
         "status": result.status,
     }
+    if result.profile:
+        event["profile"] = dict(result.profile)
+    if result.compact:
+        event["compact"] = dict(result.compact)
     if inputs:
         event["inputs"] = [str(i) for i in inputs if i is not None]
     if result.usage_total:

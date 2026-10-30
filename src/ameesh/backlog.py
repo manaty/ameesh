@@ -999,6 +999,10 @@ def lot_takeable(item: dict, today: str | None = None, *, holds=None,
         return False
     if (item.get("external_executor") or "").strip():
         return False
+    # #4756 : le lot de découpage est un geste du pilote, jamais pris au repos.
+    from .file_decoupage import is_split_lot
+    if is_split_lot(item):
+        return False
     if item.get("state") == lifecycle.IN_PROGRESS and not item.get("returned_to_queue"):
         return False
     if _hold_blocks(item, (holds or {}).get(int(item.get("id") or 0)), now):
@@ -1419,6 +1423,16 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
                         continue
                     family = mine_family
             kind = "correction" if correction else "review"
+            # #4779 (B1 dev4) : une relecture proposée désigne son relecteur
+            # (#705) ; sa fiche doit donc prouver la capacité `propose` et un
+            # rôle, comme une désignation manuelle (`check_reviewer`) et la
+            # sélection au gel. Sans ce garde, un canari `[read]` / `roles: []`
+            # recevait la proposition et occupait le siège sans pouvoir rendre
+            # d'avis (test_1677).
+            if kind == "review":
+                eligible, _reason = rd.reviewer_eligibility(reg)
+                if not eligible:
+                    continue
             payload = {"review_proposal": {"lot": lot, "agent": name, "kind": kind}}
             message_id = None
             if not dry_run:

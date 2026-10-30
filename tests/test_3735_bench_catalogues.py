@@ -247,13 +247,19 @@ class BenchCataloguesTest(PgTestCase):
         try:
             with mock.patch.object(
                     support.bench_mod, "purge_orphans",
-                    return_value=bench_mod.Purge(0, (), ())) as purge:
+                    return_value=bench_mod.Purge(0, (), ())) as purge, \
+                    mock.patch.object(
+                        support.bench_mod, "purge_invalid_databases",
+                        return_value=bench_mod.InvalidPurge(0, (), ())) as invalid:
                 support._bench_upkeep(self.db)
         finally:
             support.BENCH_UPKEEP_DONE = True
         purge.assert_called_once()
         self.assertIs(purge.call_args.args[0], self.db)
         self.assertFalse(purge.call_args.kwargs.get("admit_unmarked", False))
+        # #4822 : la même passe retire les bases de test invalides.
+        invalid.assert_called_once()
+        self.assertIs(invalid.call_args.args[0], self.db)
 
     def test_legacy_process_survives_a_restart_and_requeries(self) -> None:
         """Le cas du verdict codex : le processus legacy survit au restart.

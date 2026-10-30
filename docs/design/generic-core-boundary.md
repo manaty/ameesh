@@ -14,8 +14,9 @@ Readers should use these groups rather than repeat storage spellings:
 - `TO_VALIDATE`: work awaiting validation.
 - `DELIVERED`: delivery recorded or promoted.
 - `COMPLETED`: delivered work and explicitly closed work.
-- `TERMINAL`: states without further normal transitions. A recorded delivery
-  can still be promoted, so it is completed without being terminal.
+- `TERMINAL`: completed core outcomes (`delivered`, `closed`), including the
+  historical promotion spelling for compatibility. Development transitions
+  inside a delivered core are governed by its module stage.
 
 The legacy `closed` state also covers delivery outside the target and completed
 review missions. Its close reason must be checked before treating it as an
@@ -57,15 +58,21 @@ module; a declarative module is the one module without types a project may
 select (an installed one, and the always-active `dev`, still may not). A card
 never shadows an installed name.
 
-L99 tranche 1 adds the generic lifecycle names as accepted aliases:
-`requested` (intake), `in_progress` (build), `to_validate` (qa), `validated`
-(merged) and `delivered` (promoted); `blocked`, `waiting_human` and `closed`
-keep the same spelling. `work_lifecycle.ALIASES` names every accepted spelling,
-`canonical()` returns the persisted v1 one and `lifecycle_name()` the generic
-one. `work move`, `work list --state` and the lots API filter accept either
-spelling, and `work show` and `--json` carry a derived `lifecycle` field
-beside `state`. Storage does not change: the v1 spellings stay persisted
-until the storage switch.
+The generic lifecycle is requested → in_progress → to_validate → validated →
+delivered. The first three names accept the stored spellings `intake`, `build`
+and `qa`; `validated` remains distinct from delivery. `blocked`, `waiting_human`
+and `closed` retain their spelling. `work_lifecycle.ALIASES` lists accepted
+names, `canonical()` returns the stored core and `lifecycle_name()` the generic
+name. State arguments accept both vocabularies; work output adds `lifecycle`.
+Development stages `merged` and `promoted` share the stored core `delivered`,
+with `workflow_stage` and `legacy_state` preserving their meaning (details below).
+
+The core vocabulary (`vocab.CORE`) names a work item “tâche”; the development
+module declares “lot”. `vocab.active()` reads the discovered, always-active
+module implementations and falls back to CORE. Display vocabulary leaves
+commands, option names, JSON keys and identifiers unchanged. The English site
+uses “work item” for the core and “lot” for development; see
+[Work lifecycle](../../site/docs/concepts/work-lifecycle.md).
 
 L99 tranche 2 (#4350) makes `work.deliver(db, id, connector=…, evidence=…,
 actor=…)` the single delivery verb. The core owns two connectors: `document`
@@ -93,7 +100,7 @@ the same rule stay two alerts. The bare profile has no
 entry points cannot declare connectors, and a name declared twice or taken by
 the core is refused. `registry.merge_connector()` replaces
 `work_lifecycle.delivery_connector()`. The lot journal names the connector
-(`[via <connector>]`); storage is unchanged. Tranche 2b (#4366)
+(`[via <connector>]`). Tranche 2b (#4366)
 routes the merges observed by the sweeps and the packet and merge-queue paths
 (`plan_git`, `plan_github`, `packet_close`, `merge_pr`, `fire`) through the
 same verb, with a third `git-merge` evidence `{seen: <source>, sha, pr}`; a
@@ -128,5 +135,46 @@ retained. The bare profile has neither built-ins nor external entry points,
 and workspace operations without `dev` are no-ops.
 
 The site's [Core and modules](../../site/docs/concepts/core-and-modules.md)
-page describes this installed-module architecture. Changes to persisted state
-spellings and removal of compatibility adapters remain separate work.
+page describes this installed-module architecture. Removal of compatibility
+adapters remains separate work.
+
+L99 tranche 5 (#4353, owner decision #164165, signed approval #167) stores
+both development delivery phases under `state = delivered`. Unpinned dev
+lots use the existing `workflow_stage` for `merged` or `promoted`;
+`legacy_state` carries the compatibility spelling. Pinned Process lots keep
+their admitted revision and arbitrary stage names: signed artifacts and
+receipts are not rewritten. Old Process cores remain interpreted under
+their original terminal and projection rules.
+
+The dev module declares these two stages and their compatibility transition
+maps through `registry.development_workflow()`. A core alone does not tell
+whether a development lot can still be promoted: use `work_lifecycle.phase`
+for that distinction. New core filters select both stages; the old `merged`
+and `promoted` filters continue selecting their individual stages. Public
+GitHub labels and closure text retain their phase-specific wording.
+
+Migration 0518 is explicitly non-additive. Stop executors before applying it
+and restart them after commit, as required by the signed decision. Do not
+roll back the code against the switched database alone: the old executor
+cannot read the new core. The disposable Postgres witness reconstructs the
+pre-switch constraints/functions, applies the migration in a transaction,
+rolls it back and verifies the original rows and milestones, then applies it
+again. Historical events stay intact; the migration adds no synthetic
+milestone or process receipt.
+
+The explicit operator rollback is
+`src/ameesh/migrations/rollback/0518_generic_delivery_state.sql`; it is outside
+automatic migration discovery. With executors stopped, execute its SQL in one
+transaction before restoring the previous code. It restores stage spellings,
+constraints, policy and milestone triggers, and the fingerprint index. Tests
+exercise this script and the forward migration on both delivery stages.
+`work promote <id>` delegates to the dev module; the old
+`work move <id> promoted` command remains accepted.
+
+Schedule the dedicated delivery package and schema application in the same
+staging window: a pending non-additive migration stops automatic packet
+composition. Stop all executors before applying 0518, then start only the
+new code. During that window, disable automatic code fallback or couple it
+to the SQL rollback above; reverting code alone is unsafe. An offline host
+must receive the new code before any of its executors starts against the
+switched database.

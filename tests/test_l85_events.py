@@ -270,6 +270,39 @@ class EventLogPgTest(PgTestCase):
         self.assertGreater(second, first)
         self.assertEqual(store.recent_type("staging.attested", 0, 10), [])
 
+    def test_latest_type_keeps_interrupted_object_among_chatty_progress(self):
+        store = storage.of(self.db).events
+        kind = "staging.sequence"
+        store.record(kind, "interrupted", None, {"state": "running"})
+        store.record(kind, "chatty", None, {"state": "running"})
+        store.record(kind, "chatty", None, {"state": "completed"})
+        rows = store.latest_type(kind, 1, 10)
+        self.assertEqual([r["object"] for r in rows], ["chatty", "interrupted"])
+        self.assertEqual(rows[0]["data"]["state"], "completed")
+        self.assertEqual(len(store.latest_type(kind, 1, 1)), 1)
+        self.assertEqual(store.latest_type(kind, 0, 10), [])
+
+    def test_stale_staging_executor_cannot_replace_successor_request(self):
+        from ameesh import staging_executor
+        store = storage.of(self.db)
+        key = "staging-execution:fixture"
+        old = store.work.land_lock(key, "old", 30)
+        self.assertIsNotNone(old)
+        self.assertTrue(store.work.land_unlock(key, "old", old))
+        new = store.work.land_lock(key, "new", 30)
+        self.assertIsNotNone(new)
+        lease = types.SimpleNamespace(key=key, owner="old", ttl=30, epoch=old,
+                                      remaining=lambda: 20)
+        store.events.record("staging.request", "staging-request:fixture", None,
+                            {"state": "completed", "host": "new"})
+        with self.assertRaisesRegex(RuntimeError, "lease lost"):
+            staging_executor._record(self.db, "fixture", {"state": "running", "host": "old"},
+                                     lease=lease)
+        rows = store.events.recent_type("staging.request", 1, 1,
+                                        object="staging-request:fixture")
+        self.assertEqual(rows[0]["data"]["host"], "new")
+        store.work.land_unlock(key, "new", new)
+
     def test_staging_attestation_round_trips_to_release_cutoff(self):
         """#3981 : la preuve compacte deposee par actif.py est exactement ce
         que release_cutoff relit sur le poste, sans ssh."""

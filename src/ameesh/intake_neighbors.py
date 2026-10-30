@@ -811,15 +811,15 @@ def _in_main(repo: Optional[str], sha: str) -> Optional[bool]:
 
 def _state_label(repo: Optional[str], item: dict, target: str,
                  merged_sha: str = "") -> str:
-    state = str(item.get("state") or "")
-    if state == lifecycle.PROMOTED:
+    state = lifecycle.phase(item)
+    if state == "promoted":
         return "livré"
     if state == lifecycle.CLOSED:
         reason = str(item.get("close_reason") or "")
         if reason in ("delivered", "done"):
             return "livré"
         return lifecycle.CLOSED + (" (%s)" % reason if reason else "")
-    if state == lifecycle.DELIVERY_RECORDED:
+    if state == "merged":
         destination = (item.get("branch_target") or target or "origin/main")
         label = "merged → %s" % destination
         inside = _in_main(repo, merged_sha or str(item.get("branch_head") or ""))
@@ -839,7 +839,7 @@ def _candidate_rows(db, app: str, since_days: int) -> list[dict]:
     if not app:
         return []
     return db.query(
-        "SELECT id, title, body, state, close_reason, branch_target, branch_head,"
+        "SELECT id, title, body, state, legacy_state, workflow_stage, close_reason, branch_target, branch_head,"
         "       issue_ref,"
         "       extract(epoch from closed_at)::float8 AS closed_ts,"
         "       extract(epoch from updated_at)::float8 AS updated_ts"
