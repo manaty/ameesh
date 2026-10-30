@@ -51,7 +51,8 @@ AGENT_COLUMNS = """
     extract(epoch from created_at)::float8        as created_ts,
     extract(epoch from last_turn_at)::float8      as last_turn_ts,
     extract(epoch from last_event_at)::float8     as last_event_ts,
-    responsible, team, projects, provider, credential_mode, capabilities, canon_ref, canon,
+    responsible, team, projects, provider, credential_mode, capabilities, roles,
+    canon_ref, canon,
     -- L165 (EP1) : relève (`hote`/`election`) et hôtes candidats d'un rôle élu
     releve, candidats,
     ephemeral, created_by, priority, admitted_hosts, admitted_tags, memory_repository,
@@ -577,6 +578,9 @@ class Agents(interface.Agents):
                    public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
                    passive_unread,
                    responsible, team, projects, provider, credential_mode, capabilities,
+                   -- #4779 : les rôles déclarés, requis pour la désignation des
+                   -- relecteurs (la vue les porte depuis 0483)
+                   roles,
                    canon_ref,
                    ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
                    mode, stop_reason, canon,

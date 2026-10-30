@@ -171,12 +171,24 @@ class _Fixture(PgTestCase):
         # Le lot est créé sans canon (le contrôle d'assignation exigerait un
         # responsable humain), puis la connexion relit la canon pour le gel.
         setup = self.db
+        # #4779 : les relecteurs ajoutés par les témoins (rev3, rev4, …) et
+        # inscrits par `registry.upsert` reçoivent le profil que `canon sync`
+        # écrit en production. Les témoins du refus posent l'absence.
+        setup.execute(
+            "ALTER TABLE agent_registry ALTER COLUMN capabilities SET DEFAULT"
+            " ARRAY['read','report-drift','propose']::text[]")
+        setup.execute(
+            "ALTER TABLE agent_registry ALTER COLUMN roles SET DEFAULT"
+            " ARRAY['implementation']::text[]")
         for name, harness in (("author", "deepseek"), ("rev1", "claude"),
                               ("rev2", "codex"), ("pilot", "claude")):
             registry.upsert(setup, name, harness=harness, host=self.cfg.host,
                             cwd=self.repo.root, status="idle")
-            setup.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
-                          (name,))
+            # #4779 : profil de relecteur prouvé (capacité `propose`, un rôle).
+            setup.execute(
+                "UPDATE agent_registry SET team = 'ameesh', capabilities ="
+                " ARRAY['read','report-drift','propose'], roles = ARRAY['implementation']"
+                " WHERE name = %s", (name,))
         self.item = work.add(setup, title="Désignation au gel", app="ameesh",
                              assignee="author", branch="lot/9-x",
                              branch_target="main")

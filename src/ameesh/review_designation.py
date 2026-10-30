@@ -57,6 +57,29 @@ NONE = "none"
 REQUEST_KIND = "request"
 #: a harness that is not a model family (registry without a session)
 PLACEHOLDER_FAMILIES = frozenset(("", "none", "other", "unknown", "inconnu"))
+#: #4779: what a card must prove before its agent can be a reviewer. The
+#: `propose` capacity is the ability to produce a change and a verdict; an
+#: empty `roles` list means the card gives the agent no mandate at all. A
+#: canary (`capabilities: [read]`, `roles: []`) was designated at a freeze and
+#: held the merge gate of #4770 without any possible opinion. The registry
+#: copies both fields from the card (`canon_sync`); a row without them is not
+#: a proof — the candidacy is refused and the doubt is journaled.
+REVIEWER_CAPABILITY = "propose"
+#: why a row cannot be an automatic or manual reviewer (#4779)
+CAPABILITIES_UNREADABLE = "capabilities-unreadable"
+NO_PROPOSE = "no-propose"
+ROLES_UNREADABLE = "roles-unreadable"
+NO_ROLES = "no-roles"
+#: the reasons that are a **read failure**, not a clean refusal: they are
+#: journaled (an absent/unreadable field is not evidence of anything)
+UNREADABLE_PROFILE_REASONS = frozenset((CAPABILITIES_UNREADABLE, ROLES_UNREADABLE))
+#: the human-readable explanation of each refusal reason
+PROFILE_REASONS = {
+    CAPABILITIES_UNREADABLE: "its `capabilities` are absent or unreadable in the registry",
+    NO_PROPOSE: "it does not carry the `propose` capacity",
+    ROLES_UNREADABLE: "its `roles` are unreadable in the registry",
+    NO_ROLES: "it declares no role",
+}
 #: the registry states of an agent that no longer lives: the lease reaper
 #: writes `dead`, and a `stopped` agent waits for a human. Read by the
 #: automatic designation (#3415) and by the reassignment scan of
@@ -408,9 +431,61 @@ def is_retired(row: Optional[Mapping]) -> bool:
     return bool((row or {}).get("retired_ts"))
 
 
+def _array_values(value) -> Optional[list[str]]:
+    """The values of a registry text array, or None when it cannot be read.
+
+    psycopg returns a list; a stored dump may carry the `{a,b}` text form.
+    A scalar is a one-value array, as canon `_list` accepts a string too.
+    Any other type is unreadable: the caller must not guess from it.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{") and text.endswith("}"):
+            text = text[1:-1]
+        return [part.strip().strip('"') for part in text.split(",") if part.strip()]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        # un élément NULL d'un tableau Postgres n'est pas un rôle
+        return [str(part).strip() for part in value if part is not None]
+    return None
+
+
+def reviewer_eligibility(row: Mapping) -> tuple[bool, str]:
+    """#4779: does this registry row's card allow the agent to review?
+
+    `(True, "")` when the card proves both the `propose` capacity and at least
+    one role, otherwise `(False, reason)` with a reason from `PROFILE_REASONS`.
+
+    A missing/unreadable `capabilities` field is a **read failure**, not a
+    refusal: the caller journals it (`UNREADABLE_PROFILE_REASONS`). A readable
+    list without `propose` is a clean refusal. `roles` NULL means the card
+    declares none (canon `_roles` returns None when the key is absent) and is
+    a clean refusal too; only a non-array value is a read failure.
+    """
+    caps = (row or {}).get("capabilities")
+    if caps is None:
+        return False, CAPABILITIES_UNREADABLE
+    values = _array_values(caps)
+    if values is None:
+        return False, CAPABILITIES_UNREADABLE
+    if REVIEWER_CAPABILITY not in {value.strip().lower() for value in values}:
+        return False, NO_PROPOSE
+    roles = (row or {}).get("roles")
+    if roles is None:
+        return False, NO_ROLES
+    values = _array_values(roles)
+    if values is None:
+        return False, ROLES_UNREADABLE
+    if not [value for value in values if value]:
+        return False, NO_ROLES
+    return True, ""
+
+
 def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping] = None,
                              project: str = "", families,
-                             closed_hosts: Iterable[str] = ()) -> list[Candidate]:
+                             closed_hosts: Iterable[str] = (),
+                             unreadable_profiles: Optional[list] = None) -> list[Candidate]:
     """The candidates of a project: real family, availability, caller's charge.
 
     `loads` maps a name to the agent's charge (`review_designation_activation.
@@ -429,6 +504,10 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
     exclusions (authors, correctors, the project's pilot) stay the caller's.
     #3411: an ephemeral agent is never a candidate (`is_ephemeral`).
     #3460: nor is a retired agent (`is_retired`).
+    #4779: nor is an agent whose card does not prove the `propose` capacity
+    and a role (`reviewer_eligibility`). An unreadable capability/roles field
+    is not a proof: the candidacy is refused and the caller can journal it
+    through `unreadable_profiles` (a list of `(name, reason)`).
     """
     loads = loads or {}
     wanted = (project or "").strip()
@@ -442,6 +521,11 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
             continue
         name = str((row or {}).get("name") or "").strip()
         if not name:
+            continue
+        eligible, reason = reviewer_eligibility(row)
+        if not eligible:
+            if reason in UNREADABLE_PROFILE_REASONS and unreadable_profiles is not None:
+                unreadable_profiles.append((name, reason))
             continue
         try:
             load = int(loads.get(name, 0))

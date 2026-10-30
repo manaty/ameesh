@@ -31,9 +31,13 @@ RULES = {"rules": [
 
 
 def row(name, *, team="ameesh", harness="deepseek", session="", status="idle",
-        mode="execute", text=""):
+        mode="execute", text="", capabilities=("read", "report-drift", "propose"),
+        roles=("implementation",)):
+    """Une ligne de registre de relecteur (#4779 : capacité `propose` et rôle)."""
     return {"name": name, "team": team, "harness": harness, "session_harness": session,
-            "status": status, "mode": mode, "status_text": text}
+            "status": status, "mode": mode, "status_text": text,
+            "capabilities": list(capabilities),
+            "roles": None if roles is None else list(roles)}
 
 
 def candidates(*rows, project="ameesh", loads=None):

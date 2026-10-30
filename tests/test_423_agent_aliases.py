@@ -21,6 +21,12 @@ class AgentAliasTest(PgTestCase):
         self.db.execute('TRUNCATE agent_name_resolutions RESTART IDENTITY')
         registry.upsert(self.db, 'worker', host=self.cfg.host, harness='codex')
         registry.upsert(self.db, 'reviewer', host=self.cfg.host, harness='codex')
+        # #4779 : les fiches de test portent `propose` et un rôle, comme les
+        # agents du canon ; sans quoi la désignation manuelle est refusée.
+        self.db.execute(
+            "UPDATE agent_registry SET capabilities ="
+            " ARRAY['read','report-drift','propose'], roles = ARRAY['implementation']"
+            " WHERE name IN ('worker', 'reviewer')")
         self.db.execute("UPDATE agent_registry SET aliases = ARRAY['old-worker', 'another-name'] "
                         "WHERE name = 'worker'")
 

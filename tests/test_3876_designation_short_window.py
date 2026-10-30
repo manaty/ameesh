@@ -21,10 +21,12 @@ from ameesh import account_window, budget
 from ameesh import review_designation as rd
 
 
-def row(name, *, harness="codex", text="", status="blocked"):
+def row(name, *, harness="codex", text="", status="blocked",
+        capabilities=("read", "report-drift", "propose"), roles=("implementation",)):
     return {"name": name, "team": "ameesh", "harness": harness,
             "session_harness": "", "status": status, "mode": "execute",
-            "status_text": text, "operator_paused": False}
+            "status_text": text, "operator_paused": False,
+            "capabilities": list(capabilities), "roles": list(roles)}
 
 
 def short_reasons(now):

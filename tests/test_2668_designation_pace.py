@@ -25,9 +25,12 @@ SHA = "a" * 40
 
 
 def row(name, *, team="ameesh", harness="deepseek", session="", status="idle",
-        mode="execute", text="", model=""):
+        mode="execute", text="", model="", capabilities=("read", "report-drift", "propose"),
+        roles=("implementation",)):
+    """#4779 : une ligne de relecteur porte sa capacité `propose` et un rôle."""
     return {"name": name, "team": team, "harness": harness, "session_harness": session,
-            "status": status, "mode": mode, "status_text": text, "model": model}
+            "status": status, "mode": mode, "status_text": text, "model": model,
+            "capabilities": list(capabilities), "roles": list(roles)}
 
 
 def candidates(*rows, loads=None):

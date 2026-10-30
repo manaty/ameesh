@@ -2638,12 +2638,20 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print(('%s #%d: reviewer %s was not designated: nothing removed (state %s, by %s)') % (v.noun, item["id"], args.agent, item["state"], args.actor or "the bound identity"))
                 else:
                     print(('%s #%d: reviewer %s removed (state %s, by %s)') % (v.noun, item["id"], args.agent, item["state"], args.actor or "the bound identity"))
+                # #4779 : les demandes encore non remises du siège sont soldées
+                # sans tour ; le dire, même quand le siège n'était déjà plus là.
+                _settled = item.get("reviewer_settled") or []
+                if _settled:
+                    print(('%s #%d: %d pending review request(s) settled without a turn: %s') % (v.noun, item["id"], len(_settled), ", ".join("#%d" % int(i) for i in _settled)))
             elif args.remove:
                 item = work.clear_reviewer(cfg, db, args.id, actor=args.actor)
                 if item.get("reviewer_changed") is False:
                     print(('%s #%d: no reviewer designation to remove (state %s, by %s)') % (v.noun, item["id"], item["state"], args.actor or "the bound identity"))
                 else:
                     print(('%s #%d: reviewer designation removed (state %s, by %s)') % (v.noun, item["id"], item["state"], args.actor or "the bound identity"))
+                _settled = item.get("reviewer_settled") or []
+                if _settled:
+                    print(('%s #%d: %d pending review request(s) settled without a turn: %s') % (v.noun, item["id"], len(_settled), ", ".join("#%d" % int(i) for i in _settled)))
             elif args.no_verdict:
                 item = work.waive_review(cfg, db, args.id, actor=args.actor)
                 print(('%s #%d: verdict not required (state %s, by %s)') % (v.noun, item["id"], item["state"], args.actor or "the bound identity"))
