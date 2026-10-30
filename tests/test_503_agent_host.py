@@ -538,6 +538,12 @@ class AgentHostTest(unittest.TestCase):
             (venv / 'bin').mkdir(parents=True)
             (venv / 'bin/python').symlink_to(sys.executable)
         (self.share / 'venv-courant').symlink_to(self.venv_current.name)
+        # The guest runtime check resolves the source tree from the installed
+        # package metadata, just as a real versioned venv does.
+        metadata = self.venv_current / 'lib/python3/site-packages/ameesh-1.dist-info'
+        metadata.mkdir(parents=True)
+        (metadata / 'direct_url.json').write_text(json.dumps(
+            {'url': 'file:///home/ameesh/.local/share/ameesh/src-aaa1111'}))
         self.config = self.root / 'bascule.env'
         self.config.write_text('AGENTS_SSH=root@vm.invalid\nHOTE_AGENTS=host-agents\nPERSONAS_VM=obsolete\n')
         for name, source in [('ssh', SSH), ('runuser', RUNUSER), ('ameesh', AMEESH),
@@ -1653,6 +1659,15 @@ class AgentHostTest(unittest.TestCase):
         p = self.run_vm('controler', 'foreign-owner')
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('bail', p.stderr)
+
+    def test_missing_runtime_commit_reports_failure_and_checks_leases(self):
+        for metadata in self.venv_current.glob('lib/python*/site-packages/*/direct_url.json'):
+            metadata.unlink()
+        p = self.run_vm('controler', 'foreign-owner')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('runtime invité non prouvé', p.stderr)
+        self.assertIn('bail', p.stderr)
+        self.assertNotIn('contrôles verts', p.stdout)
 
     def test_check_uses_database_clock(self):
         p = self.run_vm('controler', 'db-ahead')

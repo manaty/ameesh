@@ -1827,10 +1827,13 @@ controler_agents() {
   etape "code installé sur $HOTE_AGENTS"
   releve_agents || { echo "relevé du code impossible" >&2; echec=1; }
   local runtime_sha
-  runtime_sha=$(installe_agents) || return 1
-  [[ $runtime_sha =~ ^[0-9a-fA-F]{7,40}$ ]] || return 1
-  runtime_invite ssh_agents "/home/ameesh/.local/share/ameesh/src-${runtime_sha:0:7}" --check \
-    || { echo "runtime invité différent du code installé" >&2; echec=1; }
+  if runtime_sha=$(installe_agents) && [[ $runtime_sha =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+    runtime_invite ssh_agents "/home/ameesh/.local/share/ameesh/src-${runtime_sha:0:7}" --check \
+      || { echo "runtime invité différent du code installé" >&2; echec=1; }
+  else
+    echo "runtime invité non prouvé : commit du venv installé absent ou invalide" >&2
+    echec=1
+  fi
   noms=$(agents_du_registre avec-arretes) || return 1
   while IFS= read -r p; do
     etape "$p"
