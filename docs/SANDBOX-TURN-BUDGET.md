@@ -67,7 +67,9 @@ The runner remembers the last trusted selector, including “no tranche”, per
 (canon id, agent) in process memory. During an unreadable, missing, ambiguous or
 untrusted canon revision, a remembered ordinary agent keeps account admission;
 a remembered tranche participant refuses with `profile-refused`. Freshness is
-required only for participants. A recovered trusted profile replaces the memory.
+required only for participants. A trusted read requires a nonempty pinned commit
+and a source loaded at that commit; an unpinned read never replaces memory.
+A recovered trusted profile replaces the memory.
 On restart without memory, an unavailable canon refuses if any tranche row
 exists, including a closed row. Only an entirely empty `tranche_limits` table
 allows a logged fallback to account admission. The accepted risk is limited to

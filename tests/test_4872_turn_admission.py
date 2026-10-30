@@ -351,6 +351,34 @@ class TurnAdmissionTest(PgTestCase):
                     old.assert_called_once_with(self.db, 'ordinary', profile, 'key')
                     admit.assert_not_called()
 
+    def test_unpinned_canon_preserves_trusted_selector_memory(self):
+        from ameesh import turn_budget
+        cfg = dataclasses.replace(self.cfg, canon='/canon')
+        loaded = SimpleNamespace(owns=lambda _: True, readable=True, untrusted=False,
+                                 sources=[SimpleNamespace(commit='a' * 40)],
+                                 agent=lambda _: SimpleNamespace(sandbox=None))
+        memory = {(None, 'participant'): 'migration', (None, 'ordinary'): None}
+        for state in (None, {}, dict(status='ok', checked_ts=time.time())):
+            with self.subTest(state=state), \
+                 mock.patch('ameesh.canon.load_configured', return_value=[loaded]), \
+                 mock.patch('ameesh.canon_sync.state', return_value=state):
+                before = dict(memory)
+                self.refusal('profile-refused', turn_budget.local_tranche,
+                             cfg, self.db, 'participant', memory=memory)
+                self.assertIsNone(turn_budget.local_tranche(
+                    cfg, self.db, 'ordinary', memory=memory))
+                self.refusal('profile-refused', turn_budget.local_tranche,
+                             cfg, self.db, 'unknown', memory=memory)
+                self.assertEqual(memory, before)
+        self.db.execute('delete from tranche_events')
+        self.db.execute('delete from tranche_limits')
+        with mock.patch('ameesh.canon.load_configured', return_value=[loaded]), \
+             mock.patch('ameesh.canon_sync.state', return_value=None), \
+             self.assertLogs('ameesh.turn_budget', level='WARNING'):
+            self.assertIsNone(turn_budget.local_tranche(
+                cfg, self.db, 'unknown', memory=memory))
+        self.assertNotIn((None, 'unknown'), memory)
+
     def test_selector_memory_incident_and_recovery(self):
         from ameesh import turn_budget
         cfg = dataclasses.replace(self.cfg, canon='/canon')

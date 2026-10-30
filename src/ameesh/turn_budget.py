@@ -25,9 +25,12 @@ def local_tranche(cfg, db, agent, *, canon_id=None, memory=None):
         loaded = matches[0]
         state = canon_sync.state(db, cfg.host, loaded)
         pinned = str((state or {}).get('last_good_commit') or '')
-        if pinned and (not loaded.sources or loaded.sources[0].commit != pinned):
+        if not pinned:
+            raise Refusal('profile-refused')
+        if not loaded.sources or loaded.sources[0].commit != pinned:
             loaded = canon.load(loaded.root, ref=pinned, default=loaded.is_default)
-        if not loaded.readable or loaded.untrusted:
+        if (not loaded.readable or loaded.untrusted or not loaded.sources
+                or loaded.sources[0].commit != pinned):
             raise Refusal('profile-refused')
         card = loaded.agent(agent)
         profile = card.sandbox if card else None
