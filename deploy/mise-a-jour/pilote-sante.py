@@ -29,8 +29,10 @@ Evidence, all read around the call:
 - nothing of the probe is left running.
 
 The enrolled `turn.json` document carries exact keys `agent`, `unit`, `account`,
-`home` and `seconds`; the runner unit must be the enrolled agent's own unit and
-the account a plain login name. `validate_enrollment` is the single validator of
+`home` and `seconds`; the runner unit must be the enrolled agent's own unit, in
+either of its two deployed spellings (`ameesh-runner-agent@<agent>.service`, the
+user template, or `ameesh-runner@<agent>.service`, the system template), and the
+account a plain login name. `validate_enrollment` is the single validator of
 that document, so an operator entry that assembles an enrollment is judged by
 exactly the rules the controller enforces. Document bodies, provider text and
 session identifiers never enter an error or a receipt.
@@ -58,19 +60,31 @@ TURNS = ("SELECT turn_id, status, started_at, ended_at FROM turn_resources"
 RUNNING = ("SELECT count(*) AS running FROM turn_resources"
            " WHERE agent = %s AND status = 'running'")
 MARKER = "SELECT clock_timestamp() AS now"
+#: The two deployed spellings of an agent's own runner unit. The user template
+#: (`ameesh-runner-agent@`) is the one installed on the mesh hosts; the system
+#: template (`ameesh-runner@`) remains valid on an L55 server. No other name is
+#: a runner unit of this agent.
+RUNNER_UNITS = ('ameesh-runner@%s.service', 'ameesh-runner-agent@%s.service')
 
 
 class TurnError(ValueError):
     pass
 
 
+def runner_units(agent):
+    """The exact runner units of `agent`, in both deployed spellings only."""
+    if not isinstance(agent, str) or AGENT.fullmatch(agent) is None:
+        return ()
+    return tuple(template % agent for template in RUNNER_UNITS)
+
+
 def validate_enrollment(enrollment):
     """Exact enrolled probe document (`turn.json`), validated once for everyone.
 
     Keys are exactly `agent`, `unit`, `account`, `home` and `seconds`; the unit
-    is the agent's own runner unit and the deadline is bounded (5 to 120
-    seconds). Returns a copy, so a caller cannot keep a handle on the values
-    the controller later reads.
+    is the agent's own runner unit, in either deployed spelling, and the
+    deadline is bounded (5 to 120 seconds). Returns a copy, so a caller cannot
+    keep a handle on the values the controller later reads.
     """
     if (not isinstance(enrollment, dict)
             or set(enrollment) != {'agent', 'unit', 'account', 'home', 'seconds'}):
@@ -79,7 +93,7 @@ def validate_enrollment(enrollment):
     account, home, seconds = enrollment['account'], enrollment['home'], enrollment['seconds']
     if not isinstance(agent, str) or AGENT.fullmatch(agent) is None:
         raise TurnError('invalid probe agent')
-    if unit != 'ameesh-runner@' + agent + '.service':
+    if unit not in runner_units(agent):
         raise TurnError('invalid probe runner unit')
     if not isinstance(account, str) or ACCOUNT.fullmatch(account) is None:
         raise TurnError('invalid probe account')
