@@ -884,9 +884,10 @@ class JsonReportTest(unittest.TestCase):
         with mock.patch.object(
                 ci, "status_of",
                 lambda db, item_id, limit=5: {"id": item_id, "runs": []}), \
-                mock.patch("ameesh.db.open_db", lambda cfg: None), \
-                contextlib.redirect_stdout(out):
-            code = ci.cmd_ci(cfg, args)
+                mock.patch("ameesh.db.open_db", lambda cfg: None):
+            # #4736 : la vue va sur ce flux, jamais sur le `sys.stdout` global
+            # qu'un fil d'un autre test du même processus peut écrire.
+            code = ci.cmd_ci(cfg, args, out=out)
         return code, json.loads(out.getvalue())
 
     def test_json_porte_les_lectures_partagees(self):
@@ -905,6 +906,43 @@ class JsonReportTest(unittest.TestCase):
         code, report = self._run(SimpleNamespace(state_dir=None))
         self.assertEqual(code, 0)
         self.assertEqual(report["github_reads"], {"quota": {}, "counters": {}})
+
+    def test_un_fil_ecrivant_sur_stdout_ne_pollue_pas_la_capture(self):
+        """#4736 : témoin du « Extra data: line 1 column 3 » de la CI.
+
+        `redirect_stdout` est global au processus : un fil laissé vivant par
+        un test voisin peut écrire un JSON vide pendant que la commande rend
+        sa vue. Ici l'écrivain est certain (il précède la fin de `status_of`)
+        et la vue, passée par `out`, reste un JSON lisible ; le bruit atterrit
+        sur le stdout global, comme en CI."""
+        args = SimpleNamespace(json=True, id=7, limit=5)
+        out, bruit = io.StringIO(), io.StringIO()
+        ecrit, fini = threading.Event(), threading.Event()
+
+        def ecrivain():
+            ecrit.wait(10)
+            print("{}")
+            fini.set()
+
+        def status_of(db, item_id, limit=5):
+            ecrit.set()
+            self.assertTrue(fini.wait(10), "l'écrivain concurrent n'a pas écrit")
+            return {"id": item_id, "runs": []}
+
+        fil = threading.Thread(target=ecrivain)
+        fil.start()
+        try:
+            with mock.patch.object(ci, "status_of", status_of), \
+                    mock.patch("ameesh.db.open_db", lambda cfg: None), \
+                    contextlib.redirect_stdout(bruit):
+                code = ci.cmd_ci(SimpleNamespace(state_dir=None), args, out=out)
+        finally:
+            fil.join(10)
+        self.assertFalse(fil.is_alive())
+        self.assertEqual(code, 0)
+        self.assertEqual(bruit.getvalue(), "{}\n")       # le bruit est bien passé
+        self.assertEqual(json.loads(out.getvalue())["github_reads"],
+                         {"quota": {}, "counters": {}})
 
 
 class RateLimitedPropagationTest(unittest.TestCase):

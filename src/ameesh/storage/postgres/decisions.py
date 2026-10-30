@@ -50,6 +50,22 @@ PENDING_BOARD_SQL = """
 """
 
 
+def _same_forwarded_decision(original_payload, copy_payload, *, withdrawn_copy) -> bool:
+    """La copie porte la demande de l'original, au retrait près (#4576)."""
+    def content(payload):
+        payload = dict(payload or {})
+        decision = dict(payload.get("decision") or {})
+        if withdrawn_copy:
+            # A withdrawal only adds these two keys; every other field — the
+            # question, the options, the deadline, the signature requirement —
+            # must still be the original's.
+            decision.pop("state", None)
+            decision.pop("withdrawn", None)
+        payload["decision"] = decision
+        return payload
+    return content(original_payload) == content(copy_payload)
+
+
 class Decisions(interface.Decisions):
 
     def create(self, *, sender, recipient, body, payload, work_item_id, host) -> dict:
@@ -73,8 +89,8 @@ class Decisions(interface.Decisions):
         return rows[0] if rows else None
 
     def repair_forward(self, decision_id, *, actor):
-        # #4571: no approval or answer is created. Row locks serialize this
-        # repair with close/forward; ambiguous or already answered copies stay put.
+        # #4571/#4576: no approval or answer is created. Row locks serialize this
+        # repair with close/forward; ambiguous or answered copies stay put.
         with self.db.transaction() as tx:
             rows = tx.query("SELECT id, recipient, kind, payload, meta, status, delivered_at"
                             " FROM agent_mailbox WHERE id = %s FOR UPDATE",
@@ -87,40 +103,57 @@ class Decisions(interface.Decisions):
             copy_id = forwarded.get("message_id")
             if (original["kind"] != "request" or not isinstance(decision, dict)
                     or not original["recipient"].startswith("human:")
-                    or not copy_id or original["status"] != "delivered"
-                    or original["delivered_at"] is None):
+                    or not copy_id or original["delivered_at"] is None):
                 raise ValueError("not an accidentally forwarded human decision")
+            if original["status"] != "delivered":
+                raise ValueError("decision was already answered or withdrawn")
             copies = tx.query("SELECT id, recipient, kind, payload, meta, status"
                               " FROM agent_mailbox WHERE id = %s FOR UPDATE", (copy_id,))
             if not copies:
                 raise ValueError("forwarded decision copy not found")
             copy = copies[0]
             origin = (copy["meta"] or {}).get("forwarded_from") or {}
-            for row in (original, copy):
-                content = (row["payload"] or {}).get("decision") or {}
-                if (content.get("state", "pending") != "pending"
-                        or content.get("answer") or content.get("withdrawn")
-                        or row["status"] == "answered"):
-                    raise ValueError("decision or copy was already answered or withdrawn")
-            if (copy["kind"] != "request" or copy["payload"] != original["payload"]
+            original_content = (original["payload"] or {}).get("decision") or {}
+            copy_content = (copy["payload"] or {}).get("decision") or {}
+            # The original was closed by the forward, never answered or withdrawn:
+            # reopening one of those is out of scope.
+            if ((original_content.get("state") or "pending") != "pending"
+                    or original_content.get("answer") or original_content.get("withdrawn")):
+                raise ValueError("decision was already answered or withdrawn")
+            copy_state = copy_content.get("state") or "pending"
+            # A copy the requester already withdrew is repairable (#4576): its
+            # withdrawal record is both the proof that it cannot answer and the
+            # audit this command must keep. An answered copy still refuses.
+            if (copy_state not in ("pending", "withdrawn")
+                    or copy_content.get("answer") or copy["status"] == "answered"
+                    or (copy_state == "withdrawn" and not copy_content.get("withdrawn"))):
+                raise ValueError("decision or copy was already answered or withdrawn")
+            if (copy["kind"] != "request"
+                    or not _same_forwarded_decision(original["payload"], copy["payload"],
+                                                    withdrawn_copy=copy_state == "withdrawn")
                     or origin.get("message_id") != int(decision_id)
                     or origin.get("agent") != original["recipient"]
                     or forwarded.get("to") != copy["recipient"]
                     or (copy["meta"] or {}).get("forwarded")):
                 raise ValueError("forward chain or changed copy: repair refused")
-            record = json.dumps({"state": "withdrawn", "withdrawn": {
-                "by": actor, "why": "accidental forward repaired; original #%d restored"
-                % int(decision_id)}})
-            tx.execute("UPDATE agent_mailbox SET status = 'delivered', delivered_at = now(),"
-                       " payload = jsonb_set(payload, '{decision}',"
-                       " (payload->'decision') || %s::jsonb),"
-                       " meta = meta - 'consigne' WHERE id = %s", (record, copy_id))
+            already_withdrawn = copy_state == "withdrawn"
+            if not already_withdrawn:
+                record = json.dumps({"state": "withdrawn", "withdrawn": {
+                    "by": actor, "why": "accidental forward repaired; original #%d restored"
+                    % int(decision_id)}})
+                tx.execute("UPDATE agent_mailbox SET status = 'delivered', delivered_at = now(),"
+                           " payload = jsonb_set(payload, '{decision}',"
+                           " (payload->'decision') || %s::jsonb),"
+                           " meta = meta - 'consigne' WHERE id = %s", (record, copy_id))
             tx.execute("UPDATE agent_mailbox SET status = 'pending', delivered_at = NULL,"
                        " meta = (meta - 'forwarded') || jsonb_build_object("
                        " 'forward_repaired', jsonb_build_object('copy', %s::bigint,"
                        " 'by', %s::text, 'ts', extract(epoch from now()))) WHERE id = %s",
                        (copy_id, actor, int(decision_id)))
-            return {"decision": int(decision_id), "withdrawn_copy": int(copy_id)}
+            result = {"decision": int(decision_id), "withdrawn_copy": int(copy_id)}
+            if already_withdrawn:
+                result["copy_already_withdrawn"] = True
+            return result
 
     def pending(self, *, limit) -> list[dict]:
         return self.db.query(

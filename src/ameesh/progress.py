@@ -1387,7 +1387,7 @@ def format_text(snap: dict, width: int | None = None) -> str:
             line(" · ".join(extra), "    ")
         if lot.get("planned_wait"):
             from .work_dependencies import wait_label
-            line(wait_label(lot["planned_wait"]), "    ")
+            line(wait_label(lot["planned_wait"], words.plural), "    ")
         if lot.get("waiting_for"):
             line("waiting for: %s" % lot["waiting_for"]["label"], "    ")
         if lot.get("delegation"):
