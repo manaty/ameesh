@@ -323,9 +323,9 @@ BLOCK_END_RE = re.compile(r"^=+$", re.MULTILINE)
 STRONG_EVIDENCE = 4
 #: l'outil qui rend l'attribution `packet_red` d'un rouge de composition
 ATTRIBUTION_SCRIPT = "scripts/paquet-attribution.py"
-#: #4025 : budget, en secondes (durées psycopg de la carte), des modules que
-#: la carte d'impact ajoute à une unité ; les modules `support`, déterministes,
-#: ne sont pas plafonnés
+#: #4025 : budget, en secondes (durées du pilote, `tests/parts/durees.json`),
+#: des modules voisins ajoutés à une unité ; #4814 : les modules `support`
+#: y entrent aussi, avant ceux de la carte
 IMPACT_BUDGET_S = 180
 #: un en-tête d'échec unittest (`FAIL: test (tests.test_x.T.t)`) ; une ligne
 #: `FAIL:` produite par le test lui-même n'a pas ce nom pointé et est ignorée
@@ -2651,9 +2651,15 @@ def _tests_summary(tests: list[TestRun]) -> str:
               and not run.ignored_red)
     ignored = sum(1 for run in tests if run.ignored_red)
     inconclusive = sum(1 for run in tests if run.inconclusive)
-    return ("%d séries, %d modules, %d tests exécutés, %d échec(s), "
-            "%d run(s) rouge(s) sans effet, %d non concluant(s), %d sauté(s) : %s"
-            % (len(tests), len(modules), total, red, ignored, inconclusive, skipped,
+    # #4814 : une série arrêtée par sa borne n'a joué aucun de ses modules
+    # jusqu'au bout ; le rapport ne les compte plus comme joués
+    finished = {module for run in tests if not run.timed_out
+                and run.returncode in (0, 1) for module in run.modules}
+    return ("%d séries, %d modules dont %d joués jusqu'au bout, %d tests "
+            "exécutés, %d échec(s), %d run(s) rouge(s) sans effet, "
+            "%d non concluant(s), %d sauté(s) : %s"
+            % (len(tests), len(modules), len(finished), total, red, ignored,
+               inconclusive, skipped,
                ", ".join("`%s`" % module for module in modules) or "aucun"))
 
 
