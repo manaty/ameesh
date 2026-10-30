@@ -20,6 +20,7 @@ MÊME passkey :
   canon.
 """
 from __future__ import annotations
+from unittest import mock
 
 import dataclasses
 import json
@@ -379,7 +380,7 @@ class ApproveParCanonTest(_Authentificateurs):
 
 class ConfianceParCanonTest(_Authentificateurs):
     def runner_pass(self, cfg) -> bool:
-        return runner_mod.Runner.canon_sync_once(types.SimpleNamespace(cfg=cfg, host=HOST))
+        return runner_mod.Runner.canon_sync_once(types.SimpleNamespace(cfg=cfg, host=HOST, db=self.db))
 
     def cfg2(self, *, ref_a: str = "origin/main", ref_b: str = "origin/main",
              b: str | None = None, untrusted_b: bool = False):
@@ -390,6 +391,7 @@ class ConfianceParCanonTest(_Authentificateurs):
     def auth_states(self) -> dict:
         return {s["canon"]: s["auth_status"] for s in canon_sync.states(self.db, HOST)}
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_ref_de_confiance_de_chaque_canon(self):
         cfg = self.cfg2(ref_a="origin/main", ref_b="")
         b = canon.from_config(cfg, entry=cfg.extra_canons[0])
@@ -412,6 +414,7 @@ class ConfianceParCanonTest(_Authentificateurs):
                          [("", "config"), (ID_B, "config")])
         self.assertEqual({k[0] for k in self.live()}, {"", ID_B})
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_mauvaise_ref_d_un_canon_n_affecte_pas_l_autre(self):
         self.assertTrue(self.runner_pass(self.cfg2()))
         before = self.live()
@@ -426,6 +429,7 @@ class ConfianceParCanonTest(_Authentificateurs):
         self.assertEqual({k: v for k, v in after.items() if k[0] == ID_B},
                          {k: v for k, v in before.items() if k[0] == ID_B})
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_canon_non_approuve_n_ecrit_pas_son_registre(self):
         # B lu depuis ses fichiers de travail (copie hors git, `untrusted`)
         copy = os.path.join(self.make_tmp(), "b-travail")

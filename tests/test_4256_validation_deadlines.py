@@ -350,10 +350,11 @@ class ValidationTest(PgTestCase):
         self.assertNotIn("Invalid/PrivateTimezone", " ".join(logs.output))
         self.assertIsNone(storage.of(self.db).decisions.validation_route(first["id"]).get("escalated_to"))
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_runner_notifier_safety_brief_survives_sweep_failure(self):
         from types import SimpleNamespace
         from ameesh import notify_gap, runner
-        fake = SimpleNamespace(cfg=self.cfg, dry_run=False, mediated=False)
+        fake = SimpleNamespace(cfg=self.cfg, dry_run=False, mediated=False, db=None)
         report = {"sent": [], "failed": []}
         with mock.patch.object(vd, "sweep", side_effect=RuntimeError("private payload")), \
                 mock.patch.object(notify_gap, "brief_once", return_value=report) as brief, \

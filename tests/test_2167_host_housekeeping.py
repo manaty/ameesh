@@ -29,10 +29,11 @@ class HostPassTest(unittest.TestCase):
         return housekeeping.run_pass(self.cfg, object(), self.policy,
                                      host="pc", actor="test", **kwargs)
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_two_runners_share_one_pass_with_the_cli(self):
         def make_runner():
             return types.SimpleNamespace(
-                _housekeeping_lock=threading.Lock(),
+                db=None, _housekeeping_lock=threading.Lock(),
                 _housekeeping_pass=lambda **kwargs: self.passage(**kwargs))
 
         first, second = make_runner(), make_runner()

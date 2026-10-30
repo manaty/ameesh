@@ -476,3 +476,13 @@ class BackgroundAdmissionTest(unittest.TestCase):
             self.assertEqual(runner.Runner.run(process), 1)
         process.sweep.assert_not_called()
         process.shutdown.assert_called_once()
+
+
+class MediatedAdmissionTest(unittest.TestCase):
+    def test_remote_db_uses_server_admission_without_sql(self):
+        from ameesh.storage.remote.client import RemoteDb
+        cfg = dataclasses.replace(config.Config(), backend='mediated')
+        db = RemoteDb(cfg, mock.Mock())
+        with mock.patch.object(db, 'query', side_effect=AssertionError('client SQL')) as query:
+            migrations.require_compatible_writer(db)
+        query.assert_not_called()

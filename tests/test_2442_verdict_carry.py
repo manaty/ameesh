@@ -405,13 +405,14 @@ class ExecutorPassTest(unittest.TestCase):
 
     def test_carried_is_logged_and_a_repeated_error_once(self):
         from ameesh import config, runner
-        fake = types.SimpleNamespace(cfg=config.Config(), dry_run=False, runner_id="r")
+        fake = types.SimpleNamespace(cfg=config.Config(), dry_run=False, runner_id="r", db=None)
         carried = {"lot": 7, "result": "carried", "target": "main", "tip": A,
                    "carried": [{"actor": "rev1", "verdict": "ok", "from": B}]}
         error = {"lot": 8, "result": "error", "detail": "target main not found on origin"}
         quiet = {"lot": 9, "result": "no-repository", "detail": "x"}
-        with mock.patch.object(verdict_carry, "run_pass",
-                               return_value=[carried, error, quiet]) as run_pass, \
+        with mock.patch("ameesh.migrations.require_compatible_writer"), \
+                mock.patch.object(verdict_carry, "run_pass",
+                                  return_value=[carried, error, quiet]) as run_pass, \
                 mock.patch.object(runner, "fresh_radar", side_effect=lambda cfg: cfg), \
                 mock.patch.object(runner, "log_async") as log:
             runner.Runner.carry_once(fake, None)
