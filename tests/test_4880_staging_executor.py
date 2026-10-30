@@ -11,10 +11,10 @@ from unittest import mock
 from ameesh import release_cutoff, staging_executor as executor, staging_watch
 
 
-def running(run):
-    """#4885: a sequence of another path, in flight before its deadline."""
+def running(run, deadline=600):
+    """#4885: a sequence of another path, in flight (deadline relative)."""
     return dict(id=1, data=dict(run=run, sha="a" * 40, state="running",
-                                started=1, deadline=time.time() + 600))
+                                started=1, deadline=time.time() + deadline))
 
 
 class ExecutorTest(unittest.TestCase):
@@ -216,6 +216,20 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(result["state"], "blocked")
         self.assertEqual(self.request["state"], "pending")
         self.assertNotIn("run", self.request)
+
+    def test_late_sequence_of_another_path_still_blocks(self):
+        self.foreign = [running("manual", deadline=-60)]
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"], "blocked")
+        release_cutoff._worktree.assert_not_called()
+
+    def test_truncated_history_waits_instead_of_failing(self):
+        self.foreign = [running("x-%d" % i, deadline=-1) for i in range(staging_watch.LIMIT)]
+        for i, r in enumerate(self.foreign):
+            r["data"]["state"] = "completed"
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("truncated", self.request["blocked_reason"])
+        self.assertEqual(self.request["state"], "pending")
 
 
 if __name__ == '__main__':

@@ -21,49 +21,77 @@ def row(ident, run, state="running", deadline=None):
 
 
 class InFlightTest(unittest.TestCase):
-    def test_running_before_deadline_blocks_unless_exempt(self):
+    def test_late_run_still_blocks_until_terminal_or_exempt(self):
         now = time.time()
         rows = [row(1, "a"), row(2, "late", deadline=now - 1),
                 row(3, "done"), row(4, "done", state="completed")]
-        self.assertEqual(staging_watch.in_flight(rows, now=now), ["a"])
-        self.assertEqual(staging_watch.in_flight(rows, now=now, exempt={"a"}), [])
+        self.assertEqual(list(staging_watch.in_flight(rows)), ["a", "late"])
+        self.assertEqual(list(staging_watch.in_flight(rows, exempt={"a", "late"})), [])
+
+
+class SharedLog:
+    """One shared `staging.sequence` log, seen by two launcher hosts."""
+    def __init__(self):
+        self.rows = []
+        self.tx = mock.Mock()
+
+    def transaction(self):
+        return nullcontext(self.tx)
+
+    def latest_type(self, *a):
+        latest = {}
+        for r in self.rows:
+            latest[r["object"]] = r
+        return list(latest.values())
+
+    def record(self, kind, obj, project, data):
+        self.rows.append(dict(id=len(self.rows) + 1, object=obj, data=data))
+        return len(self.rows)
 
 
 class ExclusiveRecordTest(unittest.TestCase):
     def setUp(self):
-        self.rows = []
-        self.written = []
-        self.tx = mock.Mock()
-        self.db = types.SimpleNamespace(transaction=lambda: nullcontext(self.tx))
-        store = types.SimpleNamespace(events=types.SimpleNamespace(
-            latest_type=lambda *a: self.rows,
-            record=lambda *a: self.written.append(a) or 7))
+        self.log = SharedLog()
+        store = types.SimpleNamespace(events=self.log)
         patch = mock.patch.object(staging_watch.storage, "of", return_value=store)
         patch.start()
         self.addCleanup(patch.stop)
-        self.snapshot = row(0, "mine")["data"]
 
-    def test_start_refused_while_another_path_runs(self):
-        self.rows = [row(1, "manual")]
+    def start(self, run, deadline=None, **kw):
+        snapshot = row(0, run, deadline=deadline)["data"]
+        return staging_watch.record(self.log, snapshot, exclusive=True, **kw)
+
+    def test_live_launcher_past_deadline_refuses_second_host(self):
+        # Host A: a manual launcher still alive after its deadline.
+        self.start("host-a-run", deadline=time.time() + 1)
+        self.log.rows[-1]["data"]["deadline"] = time.time() - 60
+        # Host B (manual or elected) is refused before any mutation.
         with self.assertRaises(staging_watch.Busy):
-            staging_watch.record(self.db, self.snapshot, exclusive=True)
-        self.assertEqual(self.written, [])
-        self.assertIn("pg_advisory_xact_lock", self.tx.query.call_args.args[0])
+            self.start("host-b-run")
+        self.assertEqual(len(self.log.rows), 1)
+        self.assertIn("pg_advisory_xact_lock", self.log.tx.query.call_args.args[0])
+        # The deadline still alerts the pilot.
+        self.assertEqual(len(staging_watch.findings(self.log.rows, now=time.time())), 1)
 
-    def test_own_run_and_proved_stopped_run_do_not_block(self):
-        self.rows = [row(1, "mine"), row(2, "old")]
-        staging_watch.record(self.db, self.snapshot, exclusive=True, supersede=["old"])
-        self.assertEqual(len(self.written), 1)
+    def test_proved_stop_supersedes_and_closes_old_run(self):
+        self.start("host-a-run")
+        self.start("host-b-run", supersede=["host-a-run"])
+        states = {r["data"]["run"]: r["data"]["state"] for r in self.log.latest_type()}
+        self.assertEqual(states, {"host-a-run": "failed", "host-b-run": "running"})
+        # Once B ends, A no longer blocks a third start.
+        staging_watch.record(self.log, dict(row(0, "host-b-run", state="completed")["data"]))
+        self.start("host-c-run")
+        self.assertEqual(staging_watch.findings(self.log.rows, now=time.time()), [])
 
     def test_cli_exits_busy_without_writing(self):
-        self.rows = [row(1, "manual")]
+        self.start("manual")
         import json
         with mock.patch("ameesh.config.load"), \
              mock.patch("ameesh.db.connect", return_value=mock.Mock(
-                 transaction=self.db.transaction)):
-            code = staging_watch.main([json.dumps(self.snapshot), "--exclusive"])
+                 transaction=self.log.transaction)):
+            code = staging_watch.main([json.dumps(row(0, "mine")["data"]), "--exclusive"])
         self.assertEqual(code, staging_watch.BUSY)
-        self.assertEqual(self.written, [])
+        self.assertEqual(len(self.log.rows), 1)
 
 
 class StagingScriptExclusiveTest(unittest.TestCase):

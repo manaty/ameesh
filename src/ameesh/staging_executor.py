@@ -154,12 +154,16 @@ def tick(db, cfg, options) -> dict:
         # release, another host) holds no execution lease. Its shared
         # progress does: wait for it, without host operation. staging.sh
         # repeats the check atomically when it starts (exit BUSY).
+        # A late run still blocks: its deadline proves no stop.
         previous = request.get("previous_run") or request.get("run")
-        others = staging_watch.in_flight(
-            storage.of(db).events.latest_type(staging_watch.EVENT, 60, staging_watch.LIMIT),
-            now=time.time(), exempt={previous} if previous else ())
-        if others:
-            reason = "another staging sequence running: " + ", ".join(others)
+        rows = storage.of(db).events.latest_type(
+            staging_watch.EVENT, 60, staging_watch.LIMIT)
+        others = staging_watch.in_flight(rows, exempt={previous} if previous else ())
+        reason = ("staging history truncated; exclusivity unobservable"
+                  if len(rows) >= staging_watch.LIMIT else
+                  "another staging sequence running: " + ", ".join(others)
+                  if others else None)
+        if reason:
             if request.get("blocked_reason") == reason:
                 return {"state": "blocked", "reason": reason}
             return blocked(reason)

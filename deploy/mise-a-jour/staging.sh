@@ -133,9 +133,9 @@
 # Un seul operateur a la fois : un second passage sort en 75 (verrou
 # ~/.local/state/ameesh/mise-a-jour/staging.lock) sans rien modifier. Entre
 # hotes et voies (executant elu, main, release), le debut exclusif dans le
-# journal partage `staging.sequence` sort aussi en 75 (#4885) ;
-# STAGING_PREVIOUS_RUN=<run> leve ce refus pour une sequence dont l'arret
-# est prouve.
+# journal partage `staging.sequence` sort aussi en 75 (#4885), meme apres
+# l'echeance de l'autre sequence ; STAGING_PREVIOUS_RUN=<run> leve ce refus
+# pour une sequence dont l'arret est prouve.
 #
 # Traces : une ligne JSON par evenement (date, hote, etape, verdict, sha,
 # precedent, detail) dans ~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl ;
@@ -988,11 +988,11 @@ fi
 # comme tous les autres, et n'est jamais un `retour`.
 # #4885 : le verrou flock ne vaut que pour cet hote. Le debut est exclusif
 # dans le journal partage : refuse (75, rien n'est modifie) tant qu'une autre
-# sequence est en cours avant son echeance, quelle que soit sa voie
-# (executant elu #4880, lancement a la main, release synchrone).
-# STAGING_PREVIOUS_RUN nomme une sequence dont l'arret est prouve (sonde de
-# quiescence de l'executant, ou l'operateur qui l'a verifie) : elle ne
-# bloque pas sa reprise.
+# sequence est `running`, quelle que soit sa voie (executant elu #4880,
+# lancement a la main, release synchrone), meme apres son echeance : celle-ci
+# alerte mais ne prouve aucun arret. STAGING_PREVIOUS_RUN nomme une sequence
+# dont l'arret est prouve (sonde de quiescence de l'executant, ou l'operateur
+# qui l'a verifie) : elle est close en `failed` et ne bloque plus.
 rc_suivi=0
 publier_suivi running --exclusive \
   ${STAGING_PREVIOUS_RUN:+--supersede "$STAGING_PREVIOUS_RUN"} || rc_suivi=$?

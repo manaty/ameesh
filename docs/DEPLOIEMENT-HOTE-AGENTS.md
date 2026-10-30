@@ -749,14 +749,18 @@ Les deux voies ne se chevauchent pas (#4885). Le verrou `flock` de
 l'exécutant élu ; le début de **chaque** séquence (exécutant élu, lancement à
 la main depuis n'importe quel hôte, release synchrone) passe donc par une
 écriture exclusive du premier événement `staging.sequence`, sous verrou
-consultatif de la base : tant qu'une autre séquence est `running` avant son
-échéance, `staging.sh` sort en 75 sans rien modifier, et l'exécutant élu
-publie l'attente (`another staging sequence running`, alerte au pilote) sans
-geste d'hôte, puis reprend la demande au passage suivant. Une séquence
-interrompue cesse de bloquer à son échéance ; avant, seule
-`STAGING_PREVIOUS_RUN=<run>` lève le refus, pour une séquence dont l'arrêt
-est prouvé (l'exécutant la pose après sa sonde de quiescence ; l'opérateur
-qui relance à la main ne la pose qu'après la même vérification).
+consultatif de la base : tant qu'une autre séquence est `running`,
+`staging.sh` sort en 75 sans rien modifier, et l'exécutant élu publie
+l'attente (`another staging sequence running`, alerte au pilote) sans geste
+d'hôte, puis reprend la demande au passage suivant. L'échéance d'une
+séquence alerte le pilote mais ne libère pas l'exclusion : rien ne termine un
+`staging.sh` lancé à la main à cette échéance, et il peut encore modifier
+des hôtes. Seuls un état terminal ou `STAGING_PREVIOUS_RUN=<run>` la lèvent,
+pour une séquence dont l'arrêt est prouvé : l'exécutant la pose après sa
+sonde de quiescence ; l'opérateur qui relance à la main, ou qui débloque la
+release synchrone (elle attend en `ReleaseBusy` d'ici là), ne la pose
+qu'après la même vérification. La séquence remplacée est alors close en
+`failed`, dans la même transaction.
 
 Le retour du premier hôte puis la reprise par un second candidat sont
 testés avec des hôtes simulés. La qualification physique et la mise en place

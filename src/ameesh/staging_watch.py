@@ -13,7 +13,6 @@ import json
 import math
 import re
 import sys
-import time
 
 from ameesh import storage
 
@@ -28,21 +27,22 @@ class Busy(RuntimeError):
     """#4885: another staging sequence is in flight in the shared log."""
 
 
-def in_flight(rows: list[dict], *, now: float, exempt=()) -> list[str]:
-    """Runs whose latest snapshot is `running` before its fixed deadline.
+def in_flight(rows: list[dict], *, exempt=()) -> dict:
+    """Runs whose latest snapshot is `running`, by run, with that snapshot.
 
-    `exempt` names the caller's own run and a previous run whose stop was
-    proved (quiescence probe or operator): neither blocks a new start. A run
-    past its deadline no longer blocks either; the alerts pass reports it.
+    The deadline is an alert threshold, never a proof of stop: nothing ends
+    a manual `staging.sh` at `STAGING_TIMEOUT_S`, so a late run still blocks
+    (review cx1/docs-01). Only a terminal snapshot or an explicit `exempt`
+    releases it: the caller's own run, or a previous run whose stop was
+    proved (the executor's quiescence probe, or the operator's check).
     """
     latest = {}
     for row in sorted(rows, key=lambda row: int(row["id"]), reverse=True):
         data = row.get("data") or {}
         if isinstance(data, dict) and data.get("run"):
             latest.setdefault(data["run"], data)
-    return sorted(run for run, data in latest.items()
-                  if run not in exempt and data.get("state") == "running"
-                  and now < float(data.get("deadline") or 0))
+    return {run: data for run, data in sorted(latest.items())
+            if run not in exempt and data.get("state") == "running"}
 
 
 def record(db, snapshot: dict, *, exclusive: bool = False,
@@ -84,9 +84,16 @@ def record(db, snapshot: dict, *, exclusive: bool = False,
         rows = st.events.latest_type(EVENT, 60, LIMIT)
         if len(rows) >= LIMIT:
             raise RuntimeError("staging history truncated; exclusivity unobservable")
-        others = in_flight(rows, now=time.time(), exempt={run, *supersede})
+        others = in_flight(rows, exempt={run, *supersede})
         if others:
             raise Busy("staging sequence already running: " + ", ".join(others))
+        # A superseded run was proved stopped: close it as failed, in the
+        # same transaction, so it blocks no later start. The alerts pass
+        # keeps reporting it until a successful run settles it.
+        for old in in_flight(rows, exempt={run}):
+            if old in supersede:
+                st.events.record(EVENT, "staging-run:" + old, None,
+                                 dict(in_flight(rows)[old], state="failed"))
         return st.events.record(EVENT, "staging-run:" + run, None, data)
 
 
