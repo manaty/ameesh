@@ -927,6 +927,11 @@ def _host(db) -> str:
 def promote_carried(db, lot: int, *, freeze=None) -> dict:
     """La transition de quorum d'un verdict reporté, comme pour un avis rendu.
 
+    La porte est lue **avant** le geste d'écriture, avec la même lecture que la
+    garde de `work.move` : une porte ouverte appelle la validation ordinaire ;
+    une porte lisiblement fermée est le `qa` normal ; une porte illisible ne
+    conclut pas et ne consomme aucun essai.
+
     Après la copie des verdicts — un INSERT direct, qui ne passe donc pas par
     `add_milestone` ni par `_sync_validation` (#4423) — le lot doit passer en
     `validated` dès que la porte est ouverte. L'écriture reste celle d'une
@@ -952,51 +957,67 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
     freeze = freeze or latest
     if not _carried_ok_on_freeze(marks, freeze):
         return {"result": "idle", "detail": "no carried ok verdict on the frozen head"}
-    # #4834 : un hôte sans dépôt local ne peut pas conclure la porte. Il ne
-    # doit ni écrire de marque ni consommer d'essai (le budget est par hôte) :
-    # le prochain passage d'un hôte qui résout le gel fera la transition.
+    # #4834 : la porte est lue avec la même lecture que la garde de
+    # `work.move`, **avant** le geste d'écriture. Un hôte sans dépôt local ne
+    # peut pas conclure la porte : il ne doit ni écrire de marque ni consommer
+    # d'essai (le budget est par hôte) ; le prochain passage d'un hôte qui
+    # résout le gel fera la transition.
     from . import lot_class
-    try:
-        repo, _resolved = lot_class.repo_for_freeze(
-            db, getattr(db, "cfg", None), row, _norm(freeze.get("sha")))
-    except Exception:  # noqa: BLE001 - une sonde ratée ne conclut pas
-        repo = ""
-    if not repo:
-        return {"result": "no-repository",
-                "detail": "the frozen head is unreadable from this host"}
+    frozen = _norm(freeze.get("sha"))
+
+    def _read_gate():
+        try:
+            found = merge_queue.review_gate_for_item(
+                db, getattr(db, "cfg", None), row, marks)
+        except Exception as caught:  # noqa: BLE001 - une lecture ratée ne conclut pas
+            return None, caught
+        return found, None
 
     def _attempt():
         work.move(db, lot, "validated", actor=work.SYSTEM_SENDER,
                   note="qa → validated — carried review quorum (#4423)")
 
-    exc = None
-    try:
-        _attempt()
-        return {"result": "validated"}
-    except Exception as caught:  # noqa: BLE001 - classée ci-dessous
-        exc = caught
-    # La lecture qui a échoué est refaite une fois, hors du geste d'écriture :
-    # elle dit si la porte est fermée pour une raison durable, lisible et
-    # normale, ou si la lecture elle-même n'a pas conclu (panne passagère).
-    try:
-        gate = merge_queue.review_gate_for_item(
-            db, getattr(db, "cfg", None), row, marks)
-    except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
-        gate = None
-    if isinstance(gate, dict) and gate.get("ok") and not gate.get("error"):
-        # La porte est ouverte : la première tentative a échoué sur autre
-        # chose (course, transaction). Un second essai borné, puis la reprise.
+    gate, gate_exc = _read_gate()
+    if isinstance(gate, dict) and not gate.get("error"):
+        if not gate.get("ok"):
+            # Porte lisible et fermée : avis manquant ou bloquant. Le lot
+            # reste en `qa` par la règle ordinaire ; le prochain verdict le
+            # promouvra, sans bruit ni reprise.
+            return {"result": "closed", "detail": gate.get("why") or ""}
+        exc = None
         try:
             _attempt()
             return {"result": "validated"}
-        except Exception as caught:  # noqa: BLE001 - reprise au passage suivant
+        except Exception as caught:  # noqa: BLE001 - classée ci-dessous
             exc = caught
-    elif isinstance(gate, dict) and not gate.get("error"):
-        # Porte lisible et fermée : avis manquant ou bloquant. Le lot reste en
-        # `qa` par la règle ordinaire ; le prochain verdict le promouvra.
-        return {"result": "closed", "detail": gate.get("why") or ""}
+        # La porte est ouverte mais l'écriture a échoué (course, transaction).
+        # Une seconde lecture bornée dit si elle l'est encore : un second
+        # essai, sinon la reprise au passage suivant.
+        gate2, gate2_exc = _read_gate()
+        if isinstance(gate2, dict) and gate2.get("ok") and not gate2.get("error"):
+            try:
+                _attempt()
+                return {"result": "validated"}
+            except Exception as caught:  # noqa: BLE001 - reprise au passage suivant
+                exc = caught
+        elif isinstance(gate2, dict) and not gate2.get("error"):
+            return {"result": "closed", "detail": gate2.get("why") or ""}
+        elif gate2_exc is not None:
+            exc = gate2_exc
+    else:
+        exc = gate_exc
+    # La porte n'a pas conclu : sans dépôt local, cet hôte ne peut rien
+    # affirmer et ne doit pas consommer le budget d'un autre hôte.
+    try:
+        repo, _resolved = lot_class.repo_for_freeze(
+            db, getattr(db, "cfg", None), row, frozen)
+    except Exception:  # noqa: BLE001 - une sonde ratée ne conclut pas
+        repo = ""
+    if not repo:
+        return {"result": "no-repository",
+                "detail": "the frozen head is unreadable from this host"}
     why = ("%s: %s" % (type(exc).__name__, exc) if not isinstance(exc, work.WorkError)
-           else str(exc))
+           else str(exc)) if exc is not None else "the review gate is unreadable"
     freeze_id = int((freeze or {}).get("id") or 0)
     host = _host(db)
     try:

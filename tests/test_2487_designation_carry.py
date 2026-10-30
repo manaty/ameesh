@@ -430,21 +430,27 @@ class CarriedFreezeTest(_Fixture):
                          verdict_carry.PENDING_ATTEMPTS)
 
     def test_a_blind_host_spends_no_attempt_and_a_repo_host_promotes(self):
-        # #4834 (B de l'auditeur) : un hôte qui ne résout pas le gel ne peut
-        # pas conclure la porte ; il ne doit ni écrire de marque ni consommer
-        # d'essai. Un passage d'un hôte qui a le dépôt fait la transition.
+        # #4834 (B de l'auditeur) : un hôte qui ne peut pas lire la porte ne
+        # doit ni écrire de marque ni consommer d'essai. Un passage d'un hôte
+        # qui a le dépôt fait la transition. Un `repo_for_freeze` vide ne
+        # suffit pas à simuler l'hôte aveugle : la classe du lot peut encore
+        # résoudre le dépôt par son cache ; la porte est donc explicitement
+        # illisible dans les deux passages aveugles.
         self._reviewed_freeze()
         frozen = self.repo.merge_target()
         self.freeze(frozen)
-        blind = mock.patch.object(lot_class, "repo_for_freeze",
-                                  return_value=("", ""))
-        with blind:
+        with mock.patch.object(lot_class, "repo_for_freeze",
+                               return_value=("", "")), \
+                mock.patch.object(merge_queue, "review_gate_for_item",
+                                  return_value=None):
             carried = verdict_carry.carry(self.cfg, self.db, self.lot,
                                           repo=self.repo.root)
         self.assertEqual(carried["result"], "carried", carried)
         self.assertEqual(self.notes(verdict_carry.PENDING), [])
         with mock.patch.object(lot_class, "repo_for_freeze",
-                               return_value=("", "")):
+                               return_value=("", "")), \
+                mock.patch.object(merge_queue, "review_gate_for_item",
+                                  return_value=None):
             report = verdict_carry.run_pass(self.cfg, self.db)
         self.assertEqual([r for r in report if r["lot"] == self.lot], [])
         self.assertEqual(self.notes(verdict_carry.PENDING), [])
