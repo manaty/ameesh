@@ -97,6 +97,13 @@ policy decides:
   every other lot of the repository, and while it is waiting every lot in
   progress holds it.
 
+A change of the unknown footprint policy applies at once, in the same
+transaction and under the guard's lock, to the open lots of the repository:
+`repository` puts the marker on every open lot without any footprint row
+(unknown under `open`, or created before #4818; packet vehicles excepted) and
+opens an unknown analysis for the runner to retry; `open` removes the
+`intake` markers (a `.` set by `--set` stays). Each lot gets a journal line.
+
 The runner retries an unknown analysis every 30 min (up to 5 lots per pass),
 on a host that has a clone of the repository. The first diff refresh
 replaces the marker: a branch's real diff is the known footprint.
@@ -108,7 +115,9 @@ progress assigned to its host's agents as soon as the branch is **pushed**:
 when `origin/<branch>` exists in the host's clone (a `git push` updates it
 locally, with no call to the forge) and no diff was read, or it was read on
 another head. The base is the clone's ref of the target. At most 5 lots are
-refreshed per pass. The diff refresh on freeze and on `--refresh` is
+refreshed per pass, among at most 100 candidates read through a cursor: the
+next pass resumes after the last lot inspected and wraps at the end, so a
+first push is never stuck behind lots already up to date. The diff refresh on freeze and on `--refresh` is
 unchanged.
 
 ## Repository policy (#4818)

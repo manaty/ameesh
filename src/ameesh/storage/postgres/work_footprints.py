@@ -220,8 +220,61 @@ class WorkFootprints(Contract):
                        (str(app), after["unknown_policy"], after["max_in_flight"],
                         _text_array(after["shared_paths"]), actor))
             before["shared_paths"] = sorted(before.get("shared_paths") or ())
+            marked = []
+            if after["unknown_policy"] != before["unknown_policy"]:
+                marked = self._apply_unknown(tx, str(app), after["unknown_policy"], actor)
             return {"app": str(app), "before": before, "after": after,
-                    "changed": before != after}
+                    "changed": before != after, "lots": marked}
+
+    @staticmethod
+    def _apply_unknown(tx, app, policy, actor):
+        """B3 de cx1 : la politique s'applique à l'état inconnu EFFECTIF, dans
+        la transaction et sous le verrou de la garde. `repository` pose le
+        marqueur `.` (source `intake`) sur chaque lot ouvert du dépôt sans
+        aucune ligne d'empreinte (analyse inconnue sous `open`, ou lot d'avant
+        #4818), véhicules exceptés, et leur ouvre une analyse inconnue que
+        l'exécuteur retente ; `open` retire les marqueurs `intake` (un `.`
+        posé à la main reste). Une ligne de journal par lot. Rend les lots."""
+        if policy == "repository":
+            rows = tx.query(
+                "SELECT w.id, w.state FROM work_items w"
+                " WHERE btrim(w.app) = %s AND w.state NOT IN " + _DONE_SQL +
+                "   AND w.type <> 'improvement' AND NOT " + _VEHICLE.format(o="w") +
+                "   AND NOT EXISTS (SELECT 1 FROM work_item_footprints f"
+                "                    WHERE f.work_item_id = w.id)"
+                " ORDER BY w.id FOR NO KEY UPDATE OF w", (app,))
+            note = ("Footprint (intake): . — unknown footprint held as the whole "
+                    "repository (policy repository)")
+            for row in rows:
+                tx.execute("INSERT INTO work_item_footprints(work_item_id, source, path,"
+                           " created_by) VALUES (%s, 'intake', '.', %s)"
+                           " ON CONFLICT DO NOTHING", (int(row["id"]), actor))
+                # une analyse inconnue datée d'hier : la reprise de l'exécuteur
+                # la prend à sa prochaine passe
+                tx.execute("INSERT INTO work_item_impact_analyses(work_item_id, status,"
+                           " reason, policy, analyzed_by, analyzed_at, attempts)"
+                           " VALUES (%s, 'unknown', 'no footprint when the repository"
+                           " policy became repository', 'repository', %s,"
+                           " clock_timestamp() - interval '1 day', 0)"
+                           " ON CONFLICT (work_item_id) DO UPDATE SET status = 'unknown',"
+                           " policy = 'repository',"
+                           " analyzed_at = clock_timestamp() - interval '1 day'",
+                           (int(row["id"]), actor))
+        else:
+            rows = tx.query(
+                "SELECT w.id, w.state FROM work_items w"
+                " WHERE btrim(w.app) = %s AND EXISTS (SELECT 1 FROM work_item_footprints f"
+                "   WHERE f.work_item_id = w.id AND f.source = 'intake' AND f.path = '.')"
+                " ORDER BY w.id FOR NO KEY UPDATE OF w", (app,))
+            note = "Footprint (intake): unknown footprint released (policy open)"
+            for row in rows:
+                tx.execute("DELETE FROM work_item_footprints WHERE work_item_id = %s"
+                           " AND source = 'intake' AND path = '.'", (int(row["id"]),))
+        for row in rows:
+            tx.execute("INSERT INTO work_item_events(work_item_id, state, note, actor,"
+                       " created_at) VALUES (%s, %s, %s, %s, clock_timestamp())",
+                       (int(row["id"]), row["state"], note, actor))
+        return [int(row["id"]) for row in rows]
 
     def record_analysis(self, item_id, analysis, *, actor):
         import json as _json
@@ -293,14 +346,14 @@ class WorkFootprints(Contract):
             f" WHERE a.status = 'unknown' AND w.state = '{lifecycle.REQUESTED}'"
             "   AND coalesce(btrim(w.app), '') <> ''")})
 
-    def refresh_candidates(self, *, limit, assignees=None):
-        app_filter = ""
-        params: tuple = ()
+    def refresh_candidates(self, *, limit, assignees=None, after_id=0):
+        app_filter = " AND w.id > %s"
+        params: tuple = (int(after_id or 0),)
         if assignees is not None:
             wanted = sorted({str(a).strip() for a in assignees if str(a or "").strip()})
             if not wanted:
                 return []
-            app_filter = (" AND w.assignee IN (" + ", ".join(["%s"] * len(wanted)) + ")")
+            app_filter += (" AND w.assignee IN (" + ", ".join(["%s"] * len(wanted)) + ")")
             params += tuple(wanted)
         return self.db.query(
             "SELECT w.id, w.app, w.branch, w.branch_target, w.assignee, w.state,"

@@ -12194,7 +12194,9 @@ class Runner:
             if self.agents_filter is not None:
                 names &= set(self.agents_filter)
             report = work_footprints.run_pass(
-                self.cfg, db, actor="runner %s" % self.runner_id, agents=names)
+                self.cfg, db, actor="runner %s" % self.runner_id, agents=names,
+                cursor=getattr(self, "_footprint_cursor", 0))
+            self._footprint_cursor = int(report.get("cursor") or 0)
         except Exception as exc:  # jamais fatal pour l'exécuteur
             report = {"refreshed": [], "analyzed": [],
                       "errors": ["%s: %s" % (type(exc).__name__, exc)]}

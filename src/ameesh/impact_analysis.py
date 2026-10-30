@@ -72,11 +72,15 @@ def identifiers(text: str) -> list[str]:
     les `snake_case` du texte courant. Un chemin de fichier n'en est pas un
     (il est déjà cité)."""
     from . import intake_neighbors
-    cited = {c["git_path"] for c in intake_neighbors.cited_paths(text)}
+    cited = set()
+    for c in intake_neighbors.cited_paths(text):
+        name = c["git_path"].rsplit("/", 1)[-1]
+        cited |= {c["git_path"], name, name.rsplit(".", 1)[0]}
     out: list[str] = []
 
     def keep(token: str) -> None:
         token = token.strip("._-")
+        # le nom d'un fichier cité n'est pas un identifiant : il est déjà cité
         if len(token) < 4 or token in out or token in cited:
             return
         out.append(token)
@@ -122,6 +126,51 @@ def _grep(git, repo: str, ref: str, budget: _Budget, *args: str) -> Optional[lis
     return _lines(proc, ref)
 
 
+def _tree(git, repo: str, ref: str, budget: _Budget, trees: dict) -> Optional[list[str]]:
+    """Les fichiers de `ref`, lus une fois par analyse ; None si le budget
+    est épuisé avant la lecture."""
+    if ref not in trees:
+        if not budget.take():
+            return None
+        try:
+            listing = git(repo, "ls-tree", "-r", "--name-only", ref,
+                          timeout=max(0.1, budget.deadline.remaining()))
+            trees[ref] = _lines(listing, ref)
+        except Exception:  # noqa: BLE001 - arbre illisible : rien à résoudre
+            trees[ref] = []
+    return trees[ref]
+
+
+def _resolve_cited(git, repo: str, ref: str, path: str, budget: _Budget,
+                   trees: dict) -> Optional[str]:
+    """Le chemin réel d'un fichier cité à `ref`, ou None — la règle de
+    `intake_neighbors._resolve_git_path` (chemin exact, sinon l'unique
+    fichier de ce nom, la casse en dernier recours), mais chaque appel git
+    passe par le budget partagé et le temps qui lui reste (B1 de cx1)."""
+    if not budget.take():
+        return None
+    try:
+        proc = git(repo, "rev-parse", "--verify", "--quiet", "%s:%s" % (ref, path),
+                   timeout=max(0.1, budget.deadline.remaining()))
+    except Exception:  # noqa: BLE001 - dépôt illisible
+        return None
+    if proc is not None and proc.returncode == 0:
+        return path
+    if "/" in path:
+        return None
+    files = _tree(git, repo, ref, budget, trees)
+    if not files:
+        return None
+    basename = path.rsplit("/", 1)[-1]
+    exact = [f for f in files if f.rsplit("/", 1)[-1] == basename]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        return None
+    folded = [f for f in files if f.rsplit("/", 1)[-1].casefold() == basename.casefold()]
+    return folded[0] if len(folded) == 1 else None
+
+
 def analyze(text: str, *, repo: Optional[str], ref: str = "", title: str = "",
             budget_s: float = BUDGET_S, max_git_calls: int = MAX_GIT_CALLS,
             git: Optional[Callable] = None, clock=time.monotonic) -> dict:
@@ -149,11 +198,8 @@ def analyze(text: str, *, repo: Optional[str], ref: str = "", title: str = "",
     trees: dict = {}
     for cited in intake_neighbors.cited_paths(text):
         path = cited["git_path"]
-        if usable and budget.take():
-            try:
-                path = intake_neighbors._resolve_git_path(repo, ref, path, trees) or path
-            except Exception:  # noqa: BLE001 - le chemin cité reste tel quel
-                pass
+        if usable:
+            path = _resolve_cited(git, repo, ref, path, budget, trees) or path
         add(path, "high", "cited")
     weak: list[dict] = []
     if usable:
@@ -175,13 +221,8 @@ def analyze(text: str, *, repo: Optional[str], ref: str = "", title: str = "",
                     add(hit, "medium", "identifier %s" % ident)
         words = sorted(w for w in intake_neighbors.significant_words(title or "")
                        if len(w) >= MIN_WEAK_WORD)
-        if words and ref not in trees and budget.take():
-            try:
-                listing = git(repo, "ls-tree", "-r", "--name-only", ref,
-                              timeout=max(0.1, budget.deadline.remaining()))
-                trees[ref] = _lines(listing, ref)
-            except Exception:  # noqa: BLE001 - pas de devinette sans arbre
-                trees[ref] = []
+        if words:
+            _tree(git, repo, ref, budget, trees)
         files = [f for f in trees.get(ref) or () if not _is_test(f)]
         for word in words:
             hits = [f for f in files

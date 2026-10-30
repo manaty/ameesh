@@ -46,6 +46,8 @@ DEFAULT_UNKNOWN_POLICY = "open"
 RETRY_AFTER_S = 1800
 #: au plus tant de lots par passe de l'exécuteur, par geste (analyse, diff)
 PASS_LIMIT = 5
+#: au plus tant de candidats au diff inspectés par passe (curseur, B2 de cx1)
+PASS_SCAN = 100
 
 
 def normalize(path: str) -> Optional[str]:
@@ -432,7 +434,8 @@ def _published_tip(clone: str, branch: str) -> str:
 
 
 def run_pass(cfg, db, *, actor: str, agents=None, limit: int = PASS_LIMIT,
-             retry_after_s: float = RETRY_AFTER_S) -> dict:
+             retry_after_s: float = RETRY_AFTER_S, cursor: int = 0,
+             scan: int = PASS_SCAN) -> dict:
     """Une passe bornée, jamais fatale :
 
     * **refresh au premier push** : un lot occupant dont la branche est
@@ -440,25 +443,33 @@ def run_pass(cfg, db, *, actor: str, agents=None, limit: int = PASS_LIMIT,
       n'a jamais été lu, ou l'a été sur une autre tête, voit ses lignes
       `diff` réécrites (base : ref locale de la cible, aucun appel à la
       forge). Avec `agents`, seuls les lots de ces assignés (ceux de l'hôte,
-      dont le clone porte la branche) ;
+      dont le clone porte la branche). La lecture avance par curseur
+      (`cursor` → `out["cursor"]`) : au plus `scan` candidats par passe, le
+      suivant reprend après le dernier inspecté et revient au début en fin de
+      liste — un premier push n'attend jamais derrière des lots à jour (B2
+      de cx1) ;
     * **analyse inconnue retentée** : au plus `limit` lots `intake` dont la
       dernière analyse est inconnue depuis `retry_after_s` sont réanalysés
       (prise exclusive : deux exécuteurs ne le font pas ensemble) ; une
       empreinte manuelle n'est jamais réécrite.
 
-    Rend `{refreshed: [...], analyzed: [...], errors: [...]}`."""
-    out: dict = {"refreshed": [], "analyzed": [], "errors": []}
+    Rend `{refreshed: [...], analyzed: [...], errors: [...], cursor}`."""
+    out: dict = {"refreshed": [], "analyzed": [], "errors": [], "cursor": 0}
     store = storage.of(db).work_footprints
     try:
         candidates = store.refresh_candidates(
-            limit=max(limit * 20, 50),
+            limit=scan, after_id=cursor,
             assignees=sorted(agents) if agents is not None else None)
     except Exception as exc:  # noqa: BLE001 - base sans 0519 : rien à faire
         out["errors"].append("refresh candidates: %s" % exc)
         candidates = []
+    # une page incomplète est la fin de la liste : la passe suivante reprend
+    # au début ; sinon après le dernier candidat inspecté
+    out["cursor"] = int(candidates[-1]["id"]) if len(candidates) >= scan else 0
     done = 0
     for row in candidates:
         if done >= limit:
+            out["cursor"] = int(row["id"]) - 1
             break
         try:
             clone, _target = _clone_and_target(cfg, row)
@@ -710,6 +721,12 @@ def run_policy(cfg, db, args) -> int:
         result = storage.of(db).work_footprints.set_policy(
             args.app.strip(), actor=actor, unknown_policy=args.unknown_policy,
             max_in_flight=args.max_in_flight, clear_cap=args.no_cap, shared_paths=shared)
+        if result.get("lots") and not args.json:
+            print("%s: unknown footprint %s on %d open lot(s): %s" % (
+                args.app.strip(),
+                "held as the whole repository" if result["after"]["unknown_policy"]
+                == "repository" else "released",
+                len(result["lots"]), ", ".join("#%d" % i for i in result["lots"][:20])))
         if result["changed"]:
             from . import events
             try:

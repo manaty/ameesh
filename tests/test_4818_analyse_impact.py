@@ -118,6 +118,31 @@ class AnalyseTest(unittest.TestCase):
         self.assertIn("budget exhausted", analysis["reason"])
         self.assertEqual(git.calls, [])
 
+    def test_les_chemins_cites_passent_par_le_budget(self):
+        """B1 de cx1 : la résolution d'un chemin cité (rev-parse, puis ls-tree
+        pour un nom seul) passe par le git injecté et le budget partagé."""
+        git = _FakeGit(self.FILES)
+        analysis = ia.analyze("voir work_footprints.py et b.py", repo="/r", ref="REF",
+                              git=git)
+        self.assertEqual([c[0] for c in git.calls], ["rev-parse", "ls-tree", "rev-parse"])
+        self.assertEqual(analysis["git_calls"], len(git.calls))
+        self.assertEqual([p["path"] for p in analysis["paths"]],
+                         ["src/ameesh/work_footprints.py", "src/b.py"])
+        for budget in (0, 1, 2):
+            git = _FakeGit(self.FILES)
+            analysis = ia.analyze("voir work_footprints.py, b.py et `run_pass`",
+                                  repo="/r", ref="REF", git=git, max_git_calls=budget)
+            self.assertLessEqual(len(git.calls), budget)
+            self.assertEqual(analysis["git_calls"], len(git.calls))
+
+    def test_l_echeance_borne_les_chemins_cites(self):
+        ticks = iter([0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+        git = _FakeGit(self.FILES)
+        analysis = ia.analyze("voir a.py et b.py", repo="/r", ref="REF", git=git,
+                              budget_s=1.0, clock=lambda: next(ticks, 10.0))
+        self.assertEqual(git.calls, [])
+        self.assertEqual(sorted(p["path"] for p in analysis["paths"]), ["a.py", "b.py"])
+
     def test_sans_clone_seuls_les_chemins_cites(self):
         analysis = ia.analyze("voir src/x.py et `unassigned_lots`", repo=None)
         self.assertEqual(analysis["paths"],
@@ -260,6 +285,41 @@ class GardeTest(_Empreintes):
         self.policy(clear_cap=True)
         work.assign(self.db, lots[1]["id"], "human:autre", actor="test")
 
+    def test_changement_de_politique_sur_les_lots_deja_crees(self):
+        """B3 de cx1 : open → repository marque les lots ouverts sans empreinte
+        (inconnue sous open, ou d'avant #4818), repository → open les libère ;
+        manuel et diff ne bougent pas."""
+        occupant = self.lot("occupant")
+        self.footprint(occupant, "src/a.py")
+        self.give(occupant)
+        libre = self.lot("libre, sans empreinte")
+        connu = self.lot("connu")
+        self.footprint(connu, "docs/x.md")
+        vehicule = self.lot("paquet", branch="integration/paquet-h-2")
+        result = self.policy(unknown_policy="repository")
+        self.assertEqual(result["lots"], [libre["id"]])
+        self.assertEqual(fp.paths_of(self.db, libre["id"]), ["."])
+        self.assertEqual(fp.paths_of(self.db, vehicule["id"]), [])
+        self.assertEqual(fp.paths_of(self.db, connu["id"]), ["docs/x.md"])
+        with self.assertRaises(work.WorkError):
+            work.assign(self.db, libre["id"], "human:autre", actor="test")
+        analysis = storage.of(self.db).work_footprints.analyses([libre["id"]])[libre["id"]]
+        self.assertEqual((analysis["status"], analysis["policy"]), ("unknown", "repository"))
+        notes = [e["note"] for e in self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s ORDER BY id",
+            (libre["id"],))]
+        self.assertIn("policy repository", notes[-1])
+        # un `.` posé à la main n'est pas un marqueur de politique
+        manuel = self.lot("manuel")
+        fp.set_paths(self.db, manuel["id"], ["."], actor="human:proprio")
+        result = self.policy(unknown_policy="open")
+        self.assertEqual(result["lots"], [libre["id"]])
+        self.assertEqual(fp.paths_of(self.db, libre["id"]), [])
+        self.assertEqual(fp.paths_of(self.db, manuel["id"]), ["."])
+        work.assign(self.db, libre["id"], "human:autre", actor="test")
+        # sans changement de politique, rien n'est touché
+        self.assertEqual(self.policy(max_in_flight=3)["lots"], [])
+
     def test_politique_par_defaut_et_journal(self):
         self.assertEqual(fp.policy_of(self.db, "nexlink")["unknown_policy"], "open")
         result = self.policy(unknown_policy="repository", max_in_flight=4)
@@ -340,6 +400,42 @@ class PassePushTest(PgTestCase):
                                      agents={"autre"})["refreshed"], [])
         fp.run_pass(self.cfg, self.db, actor="runner", agents={"agent1"})
         self.assertEqual(fp.paths_of(self.db, item["id"]), ["src/feature.py", "src/more.py"])
+
+    def test_le_curseur_atteint_les_lots_au_dela_de_la_page(self):
+        """B2 de cx1 : des candidats déjà à jour en tête de liste ne cachent
+        pas un premier push plus loin."""
+        lots = []
+        for i in range(3):
+            branch = "lot/%d-c" % i
+            item = work.add(self.db, title="lot %d" % i, app="tpk", branch=branch,
+                            cfg=self.cfg)
+            self.db.execute("UPDATE work_items SET assignee = 'agent1', state = 'build'"
+                            " WHERE id = %s", (item["id"],))
+            self.repo.git("checkout", "-q", "main")
+            self.repo.git("checkout", "-qb", branch)
+            self.repo.write("src/c%d.py" % i, "x\n")
+            self.repo.commit("lot %d" % i)
+            lots.append(item)
+        for item in lots[:2]:
+            self.repo.git("push", "-q", "origin", item["branch"])
+        first = fp.run_pass(self.cfg, self.db, actor="runner", scan=2)
+        self.assertEqual([r["lot"] for r in first["refreshed"]],
+                         [lots[0]["id"], lots[1]["id"]])
+        self.assertEqual(first["cursor"], lots[1]["id"])
+        self.repo.git("push", "-q", "origin", lots[2]["branch"])
+        second = fp.run_pass(self.cfg, self.db, actor="runner", scan=2,
+                             cursor=first["cursor"])
+        self.assertEqual([r["lot"] for r in second["refreshed"]], [lots[2]["id"]])
+        self.assertEqual(second["cursor"], 0)
+        self.assertEqual(fp.paths_of(self.db, lots[2]["id"]), ["src/c2.py"])
+        # plafond par passe : la passe suivante reprend sur le lot non lu
+        self.db.execute("DELETE FROM work_item_footprints WHERE source = 'diff'")
+        capped = fp.run_pass(self.cfg, self.db, actor="runner", limit=1, scan=10)
+        self.assertEqual([r["lot"] for r in capped["refreshed"]], [lots[0]["id"]])
+        self.assertEqual(capped["cursor"], lots[1]["id"] - 1)
+        after = fp.run_pass(self.cfg, self.db, actor="runner", limit=1, scan=10,
+                            cursor=capped["cursor"])
+        self.assertEqual([r["lot"] for r in after["refreshed"]], [lots[1]["id"]])
 
     def test_analyse_avec_clone_et_reprise_des_inconnues(self):
         known = work.add(self.db, title="Accélérer `hot_path`", app="tpk", cfg=self.cfg)

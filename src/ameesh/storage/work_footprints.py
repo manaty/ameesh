@@ -48,7 +48,10 @@ class WorkFootprints(abc.ABC):
                    max_in_flight: int | None = None, clear_cap: bool = False,
                    shared_paths: Sequence[str] | None = None) -> dict:
         """Pose la politique du dépôt sous le verrou de la garde ; un champ
-        absent garde sa valeur. Rend `{app, before, after, changed}`."""
+        absent garde sa valeur. Un changement de `unknown_policy` s'applique
+        dans la même transaction aux lots ouverts d'empreinte inconnue
+        (marqueur `.` posé ou retiré). Rend `{app, before, after, changed,
+        lots}`."""
 
     @abc.abstractmethod
     def record_analysis(self, item_id: int, analysis: dict, *, actor: str) -> dict | None:
@@ -73,7 +76,9 @@ class WorkFootprints(abc.ABC):
 
     @abc.abstractmethod
     def refresh_candidates(self, *, limit: int,
-                           assignees: Sequence[str] | None = None) -> list[dict]:
+                           assignees: Sequence[str] | None = None,
+                           after_id: int = 0) -> list[dict]:
         """Les lots occupants qui portent une branche (de ces assignés, avec
-        `assignees`) : `id, app, branch, branch_target, assignee, state,
+        `assignees`), d'identifiant supérieur à `after_id`, par identifiant
+        croissant : `id, app, branch, branch_target, assignee, state,
         diff_head, has_diff`."""
