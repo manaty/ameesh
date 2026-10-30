@@ -277,6 +277,12 @@ if os.environ.get("FAKE_BUILD_FAILS"):
     sys.exit(2)
 assert "--assets" in args
 out = opt("--output")
+# construction-runtime.py refuses a group/world-writable ancestor (#4786 B1)
+up = os.path.dirname(os.path.abspath(out))
+while up.startswith(os.environ["HOME"]):
+    if os.stat(up).st_mode & 0o022:
+        sys.exit("output parent must not be group/world writable")
+    up = os.path.dirname(up)
 os.mkdir(out)
 files = {"ameesh-1.2.0-py3-none-any.whl": "wheel of " + opt("--sha")}
 for name in ("runtime-pins.txt", "runtime-build-pins.txt"):
@@ -325,6 +331,17 @@ with open(os.path.join(out, "SHA256SUMS"), "w") as fh:
         done = self.run_script("publier", self.v100)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.gh()["releases"]["v1.0.0"]["assets"], {})
+
+    def test_4786_a_group_writable_cache_does_not_stop_the_build(self):
+        # umask 002 : ~/.cache 0775 sur un hôte standard (relecture #27073, B1)
+        cache = os.path.join(self.tmp, ".cache")
+        os.makedirs(cache)
+        os.chmod(cache, 0o775)
+        sha = self.with_pins()
+        done = self.run_script("publier", sha)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(self.gh()["releases"]["v1.2.0"]["assets"]), 4)
+        self.assertEqual([n for n in os.listdir(self.tmp) if "actifs" in n], [])
 
     def test_4786_dry_run_names_the_assets_without_building(self):
         sha = self.with_pins()

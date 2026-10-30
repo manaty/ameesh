@@ -941,10 +941,10 @@ publier() {
       if a_blanc; then
         echo "actifs : roue ameesh, runtime-pins.txt, runtime-build-pins.txt, SHA256SUMS (construits à la publication)"
       else
-        # sous le HOME : construction-runtime.py refuse un parent ouvert en
-        # écriture au groupe ou à tous (/tmp)
-        mkdir -p -m 700 "$HOME/.cache/ameesh"
-        temp=$(mktemp -d "$HOME/.cache/ameesh/actifs.XXXXXX")
+        # directement sous le HOME : construction-runtime.py refuse un
+        # ancêtre ouvert en écriture au groupe ou à tous (/tmp, un ~/.cache
+        # 0775 sous umask 002)
+        temp=$(mktemp -d "$HOME/.ameesh-actifs.XXXXXX")
         # shellcheck disable=SC2064
         trap "rm -rf -- '$temp'" EXIT
         construire_actifs "$sha" "$temp/actifs" || exit 1
