@@ -8170,17 +8170,20 @@ class AgentWorker(threading.Thread):
         # elle, jamais par agent) ; refusée, le tour ne part pas et le
         # marqueur est retiré. Un résumé de bascule peut imposer l'ancien
         # compte : réserver celui appliqué au harnais (`compte`).
-        if account_budget.billing_of(compte):
-            marqueur = self._compta_travail or {}
-            refus = account_budget.reserve(
-                self.db, self.name, compte,
-                self._spend_key(events_start, marqueur))
-            if refus:
-                registry.pending_spend_clear(self.db, self.name,
-                                             marqueur)  # rien n'est parti
-                self._compta_travail = None
-                self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
-                return False
+        from . import turn_budget
+        marqueur = self._compta_travail or {}
+        refus = turn_budget.reserve_local(
+            self.cfg, self.db, self.name, compte,
+            self._spend_key(events_start, marqueur), turn_id,
+            canon_id=self._canon_id(),
+            retry=spec.get("prompt") == adapters.RETRY_PROMPT,
+            memory=self.runner._tranche_selectors)
+        if refus:
+            registry.pending_spend_clear(self.db, self.name,
+                                         marqueur)  # rien n'est parti
+            self._compta_travail = None
+            self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
+            return False
 
         # #2894 (TPK #2167 A1) : le document de tour, écrit après le marqueur
         # comptable et la réservation de compte (l'état ouvert au lancement),
@@ -9722,6 +9725,7 @@ class Runner:
         except ValueError as exc:
             raise SystemExit("agent-runner: %s" % exc) from exc
         self.cfg = cfg
+        self._tranche_selectors = {}  # (canon_id, agent): last trusted tranche selector
         #: #1466 : options de ligne de commande (hôte, bail, sondage, réveil),
         #: décidées au démarrage. Elles ne se relisent pas — comme tous les
         #: champs hors `RELOADABLE_FIELDS` — et sont gardées ici pour la trace
