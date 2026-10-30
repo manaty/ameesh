@@ -292,15 +292,19 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
 
 def _report_error(cfg, db, project, exc, now: float) -> None:
     """Mail a definitive error once; transient errors go to the journal only."""
-    from . import mail, release_cutoff
+    from . import release_cutoff
     if isinstance(exc, release_cutoff.TransientReleaseError):
         return
     try:
         state = release_cutoff.load_state(cfg)
         slot = release_cutoff.project_state(state, project.name)
         text = str(exc)
-        if slot.get("last_error") == text:
+        rules, _source = release_cutoff.compiled_rules(cfg, project.name)
+        cutoff_at, _label = release_cutoff.cutoff_slot(rules, now)
+        if (slot.get("last_error") == text
+                and slot.get("last_error_cutoff") == cutoff_at):
             return
+        slot["last_error_cutoff"] = cutoff_at
         slot["last_error"] = text
         slot["last_error_at"] = now
         release_cutoff.save_state(cfg, state)
@@ -311,8 +315,12 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
                     "Release %s NON faite : %s\n\nAucun tag, aucun déploiement. "
                     "Corrige la cause ; le prochain tick réessaiera tant que la "
                     "coupure est dans sa fenêtre." % (project.name, text))
-            mail.send(db, work.SYSTEM_SENDER, project.report, body,
-                      kind="event", payload={"release_error": text, "urgent": True})
+            report = {"schema": release_cutoff.SCHEMA, "result": "refused",
+                      "project": project.name, "cutoff_at": cutoff_at,
+                      "label": _label, "completed_at": now, "message": text}
+            report["report_path"] = release_cutoff.write_report(
+                cfg, project, dict(report, version="refused"))
+            release_cutoff.send_report(cfg, db, project, body, report, urgent=True)
     except Exception:  # a report never masks the original error
         pass
 
