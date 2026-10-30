@@ -460,5 +460,63 @@ class BuildTest(unittest.TestCase):
             self.assertTrue(patched.called)
 
 
+class ReleaseAssetsTest(unittest.TestCase):
+    """#4786 : wheel, pin files and SHA256SUMS published with the release."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.output = self.root / 'out'
+
+    def test_commit_epoch_reads_the_object_store_not_the_checkout(self):
+        repo, git = make_repo(self.root)
+        sha = git('rev-parse', 'HEAD')
+        (repo / 'src' / 'value.txt').write_text('dirty checkout\n')
+        git('checkout', '-q', '-b', 'other')
+        self.assertEqual(build.commit_epoch(repo, sha), int(git('show', '-s', '--format=%ct', sha)))
+        with self.assertRaises(build.BuildError):
+            build.commit_epoch(repo, 'f' * 40)
+        with self.assertRaisesRegex(build.BuildError, '40-hex'):
+            build.commit_epoch(repo, 'HEAD')
+
+    def test_assets_are_the_wheel_both_pin_files_and_their_sums(self):
+        repo, git = make_repo(self.root)
+        sha = git('rev-parse', 'HEAD')
+
+        def venv(path, *, python, with_pip, env):
+            (Path(path) / 'bin').mkdir(parents=True)
+
+        def wheel(tools, source, wheelhouse, *, env):
+            path = Path(wheelhouse) / 'ameesh-1.0-py3-none-any.whl'
+            path.write_bytes(b'wheel bytes')
+            return {'path': path, 'name': path.name, 'version': '1.0',
+                    'sha256': hashlib.sha256(b'wheel bytes').hexdigest()}
+
+        with mock.patch.object(build.runtime, 'trusted', side_effect=lambda path: Path(path)), \
+                mock.patch.object(build, 'create_venv', side_effect=venv), \
+                mock.patch.object(build, 'install_build_pins') as pins, \
+                mock.patch.object(build, 'build_wheel', side_effect=wheel):
+            digests = build.release_assets(repo, sha, self.output)
+        self.assertTrue(pins.called)
+        self.assertEqual(sorted(p.name for p in self.output.iterdir()),
+                         ['SHA256SUMS', 'ameesh-1.0-py3-none-any.whl',
+                          'runtime-build-pins.txt', 'runtime-pins.txt'])
+        self.assertEqual((self.output / 'runtime-pins.txt').read_bytes(),
+                         (ROOT / 'deploy/mise-a-jour/runtime-pins.txt').read_bytes())
+        self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o755)
+        sums = (self.output / 'SHA256SUMS').read_text()
+        self.assertEqual(sums, ''.join('%s  %s\n' % (digests[n], n) for n in sorted(digests)))
+        checked = subprocess.run(['sha256sum', '--strict', '-c', 'SHA256SUMS'],
+                                 cwd=self.output, capture_output=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_existing_output_refused_before_any_effect(self):
+        repo, git = make_repo(self.root)
+        self.output.mkdir()
+        with self.assertRaisesRegex(build.BuildError, 'new output'):
+            build.release_assets(repo, git('rev-parse', 'HEAD'), self.output)
+
+
 if __name__ == '__main__':
     unittest.main()

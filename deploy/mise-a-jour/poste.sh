@@ -44,7 +44,9 @@
 #   publier      étiquette annotée v<version> sur REF (un commit de main, la
 #                version de son pyproject.toml), poussée, puis release GitHub
 #                (notes : docs/versions/<version>.md de main, sinon la PR qui a
-#                fusionné ce commit) ;
+#                fusionné ce commit) ; actifs : la roue, runtime-pins.txt,
+#                runtime-build-pins.txt et SHA256SUMS du commit, construits
+#                avant l'étiquette (#4786 ; aucun avant runtime-pins.txt) ;
 #                idempotent, jamais une étiquette déplacée (L138)
 #   rattraper    « publier » pour chaque version de l'historique de main
 #                (premier parent) qui n'a pas encore d'étiquette ou de release ;
@@ -897,10 +899,22 @@ derniere_version() {  # la plus haute version étiquetée sur le distant (v1.2.3
   awk '{ print $2 }' <<<"$DISTANTES" | sed -n 's/^v\([0-9].*\)$/\1/p' | sort -V | tail -1
 }
 
+# actifs de la release du commit $1 (#4786) dans le répertoire $2 (neuf) : la
+# roue ameesh construite depuis ce commit, runtime-pins.txt,
+# runtime-build-pins.txt et SHA256SUMS, provenance publiée du runtime root du
+# handoff (construction-runtime.py --assets, même roue et mêmes épinglages)
+construire_actifs() {
+  python3 "$ICI/construction-runtime.py" --assets --clone "$DEPOT" --sha "$1" --output "$2" \
+    || { echo "actifs de ${1:0:7} non construits : pas de release" >&2; return 1; }
+  ( cd "$2" && sha256sum --quiet --strict -c SHA256SUMS ) \
+    || { echo "SHA256SUMS de ${1:0:7} ne vérifie pas ses actifs : pas de release" >&2; return 1; }
+}
+
 # publier REF [VERSION] : VERSION, la version attendue (rattraper) ; un écart
 # avec pyproject.toml de REF arrête tout
 publier() {
   local ref=${1:-HEAD} attendue=${2:-} sha version tag distant ici notes plus_haute publiee
+  local temp actifs=()
   lire_distant
   sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}")
   version=$(version_de "$sha")
@@ -921,6 +935,22 @@ publier() {
     # les notes sont lues et validées avant tout effet de bord : pas
     # d'étiquette poussée sans release possible (#348 r1)
     notes=$(notes_de "$version" "$sha") || exit 1
+    # les actifs aussi, avant l'étiquette ; une version antérieure à #4778
+    # (sans runtime-pins.txt) n'en a pas
+    if git -C "$DEPOT" cat-file -e "$sha:deploy/mise-a-jour/runtime-pins.txt" 2>/dev/null; then
+      if a_blanc; then
+        echo "actifs : roue ameesh, runtime-pins.txt, runtime-build-pins.txt, SHA256SUMS (construits à la publication)"
+      else
+        # directement sous le HOME : construction-runtime.py refuse un
+        # ancêtre ouvert en écriture au groupe ou à tous (/tmp, un ~/.cache
+        # 0775 sous umask 002)
+        temp=$(mktemp -d "$HOME/.ameesh-actifs.XXXXXX")
+        # shellcheck disable=SC2064
+        trap "rm -rf -- '$temp'" EXIT
+        construire_actifs "$sha" "$temp/actifs" || exit 1
+        actifs=("$temp"/actifs/*)
+      fi
+    fi
   fi
   if [ -n "$distant" ]; then
     [ "$distant" = "$sha" ] || { echo "$tag est déjà posée sur ${distant:0:7}, pas ${sha:0:7} : une étiquette publiée ne se déplace pas (une nouvelle version passe par un nouveau numéro dans pyproject.toml)" >&2; exit 1; }
@@ -950,7 +980,8 @@ publier() {
     sed 's/^/  | /' <<<"$notes"
   else
     gh release create "$tag" -R "$(depot_github)" --verify-tag --title "ameesh $tag" \
-      --notes "$notes" --latest="$([ "$plus_haute" = "$version" ] && echo true || echo false)"
+      --notes "$notes" --latest="$([ "$plus_haute" = "$version" ] && echo true || echo false)" \
+      "${actifs[@]}"
   fi
 }
 

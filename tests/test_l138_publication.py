@@ -30,7 +30,10 @@ if args[:2] == ["release", "view"]:
     save(); sys.exit(0 if args[2] in state["releases"] else 1)
 if args[:2] == ["release", "create"]:
     latest = [a for a in args if a.startswith("--latest=")][0].split("=", 1)[1]
-    state["releases"][args[2]] = {"notes": opt("--notes"), "latest": latest}
+    files = [a for a in args[3:] if os.path.isfile(a)]
+    state["releases"][args[2]] = {"notes": opt("--notes"), "latest": latest,
+                                  "assets": {os.path.basename(f): open(f).read()
+                                             for f in files}}
     save(); sys.exit(0)
 if args[:2] == ["pr", "view"]:
     save()
@@ -82,7 +85,7 @@ class PublicationTest(unittest.TestCase):
         self.state = os.path.join(self.tmp, "gh.json")
         self.gh({"releases": {}, "prs": {}, "pulls": {}})
         self.env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"],
-                        FAKE_GH_STATE=self.state, GIT_CONFIG_GLOBAL="/dev/null",
+                        FAKE_GH_STATE=self.state, HOME=self.tmp, GIT_CONFIG_GLOBAL="/dev/null",
                         GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
 
@@ -263,6 +266,106 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual({t: r["latest"] for t, r in releases.items()},
                          {"v1.0.0": "false", "v1.1.0": "true"})
         self.assertEqual(set(self.remote_tags()), {"v1.0.0", "v1.1.0"})
+
+
+    # #4786 : la provenance du runtime publiée en actifs de la release
+    FAKE_BUILD = r'''#!/usr/bin/env python3
+import hashlib, os, subprocess, sys
+args = sys.argv[1:]
+opt = lambda n: args[args.index(n) + 1]
+if os.environ.get("FAKE_BUILD_FAILS"):
+    sys.exit(2)
+assert "--assets" in args
+out = opt("--output")
+# construction-runtime.py refuses a group/world-writable ancestor (#4786 B1)
+up = os.path.dirname(os.path.abspath(out))
+while up.startswith(os.environ["HOME"]):
+    if os.stat(up).st_mode & 0o022:
+        sys.exit("output parent must not be group/world writable")
+    up = os.path.dirname(up)
+os.mkdir(out)
+files = {"ameesh-1.2.0-py3-none-any.whl": "wheel of " + opt("--sha")}
+for name in ("runtime-pins.txt", "runtime-build-pins.txt"):
+    files[name] = subprocess.run(["git", "-C", opt("--clone"), "show",
+                                  opt("--sha") + ":deploy/mise-a-jour/" + name],
+                                 check=True, capture_output=True, text=True).stdout
+sums = ""
+for name in sorted(files):
+    with open(os.path.join(out, name), "w") as fh:
+        fh.write(files[name])
+    digest = hashlib.sha256(files[name].encode()).hexdigest()
+    if os.environ.get("FAKE_BUILD_BAD_SUMS") and name == "runtime-pins.txt":
+        digest = "0" * 64
+    sums += "%s  %s\n" % (digest, name)
+with open(os.path.join(out, "SHA256SUMS"), "w") as fh:
+    fh.write(sums)
+'''
+
+    def with_pins(self):
+        builder = os.path.join(self.repo, "deploy", "mise-a-jour", "construction-runtime.py")
+        with open(builder, "w", encoding="utf-8") as fh:
+            fh.write(self.FAKE_BUILD)
+        self.write("deploy/mise-a-jour/runtime-pins.txt", "psutil==1 --hash=sha256:%s\n" % ("a" * 64))
+        self.write("deploy/mise-a-jour/runtime-build-pins.txt", "setuptools==1\n")
+        _git(self.repo, "add", "deploy/mise-a-jour/runtime-pins.txt",
+             "deploy/mise-a-jour/runtime-build-pins.txt")
+        sha = self.version("1.2.0", "ameesh 1.2.0 (#8)")
+        self.push()
+        self.pr(8, sha)
+        # the pins of the commit, not of the working tree
+        self.write("deploy/mise-a-jour/runtime-pins.txt", "unreviewed\n")
+        return sha
+
+    def test_4786_assets_of_the_commit_are_attached(self):
+        sha = self.with_pins()
+        done = self.run_script("publier", sha)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        assets = self.gh()["releases"]["v1.2.0"]["assets"]
+        self.assertEqual(sorted(assets), ["SHA256SUMS", "ameesh-1.2.0-py3-none-any.whl",
+                                          "runtime-build-pins.txt", "runtime-pins.txt"])
+        self.assertEqual(assets["ameesh-1.2.0-py3-none-any.whl"], "wheel of " + sha)
+        self.assertIn("psutil==1", assets["runtime-pins.txt"])
+        self.assertEqual(len(assets["SHA256SUMS"].splitlines()), 3)
+        # a version before #4778 (no runtime-pins.txt) has no asset
+        self.pr(5, self.v100)
+        done = self.run_script("publier", self.v100)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.gh()["releases"]["v1.0.0"]["assets"], {})
+
+    def test_4786_a_group_writable_cache_does_not_stop_the_build(self):
+        # umask 002 : ~/.cache 0775 sur un hôte standard (relecture #27073, B1)
+        cache = os.path.join(self.tmp, ".cache")
+        os.makedirs(cache)
+        os.chmod(cache, 0o775)
+        sha = self.with_pins()
+        done = self.run_script("publier", sha)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(len(self.gh()["releases"]["v1.2.0"]["assets"]), 4)
+        self.assertEqual([n for n in os.listdir(self.tmp) if "actifs" in n], [])
+
+    def test_4786_dry_run_names_the_assets_without_building(self):
+        sha = self.with_pins()
+        env_fail = dict(self.env, FAKE_BUILD_FAILS="1")
+        done = subprocess.run(["bash", os.path.join(self.repo, "deploy", "mise-a-jour", "poste.sh"),
+                               "publier", sha], capture_output=True, text=True,
+                              env=dict(env_fail, A_BLANC="1"), timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("actifs : roue ameesh", done.stdout)
+        self.assertEqual(self.gh()["releases"], {})
+
+    def test_4786_failed_or_unverified_assets_stop_before_the_tag(self):
+        sha = self.with_pins()
+        for flag, why in (("FAKE_BUILD_FAILS", "non construits"),
+                          ("FAKE_BUILD_BAD_SUMS", "ne vérifie pas")):
+            done = subprocess.run(["bash", os.path.join(self.repo, "deploy", "mise-a-jour",
+                                                        "poste.sh"), "publier", sha],
+                                  capture_output=True, text=True,
+                                  env=dict(self.env, **{flag: "1"}), timeout=120)
+            self.assertNotEqual(done.returncode, 0, flag)
+            self.assertIn(why, done.stderr)
+            self.assertNotIn("v1.2.0", self.remote_tags())
+            self.assertEqual(_git(self.repo, "tag", "-l", "v1.2.0"), "")
+            self.assertEqual(self.gh()["releases"], {})
 
 
 if __name__ == "__main__":
