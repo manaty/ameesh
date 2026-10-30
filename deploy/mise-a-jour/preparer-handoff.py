@@ -24,6 +24,7 @@ as argv arrays with host/account; they are never run. Installation of the
 administrator backend itself remains a separately reviewed administrator step.
 """
 import argparse
+import base64
 import importlib.util
 import json
 import os
@@ -185,7 +186,8 @@ def validate(request, db, *, now):
                          source_tree_sha256='0' * 64, controller_source=value['source'], controller_key=key)
         release.validate_access(candidate)
         access[name] = dict(controller_source=value['source'], controller_key=key)
-    if len({item['controller_key'] for item in access.values()}) != len(NAMES):
+    if len({base64.b64decode(item['controller_key'].split()[1], validate=True)
+            for item in access.values()}) != len(NAMES):
         raise PreparationError('three distinct controller public keys required')
     return policy, turn, access, execution
 
@@ -225,7 +227,7 @@ def staging_script(manifest, output):
                     host_key_sha256=manifest['observation']['host_key_sha256'],
                     payload=str(output / 'payload'), files=manifest['payload_inventory'],
                     directories=manifest['payload_directories'],
-                    operations=[item['operation'] for item in manifest['commands']])
+                    operations=list(dict.fromkeys(item['operation'] for item in manifest['commands'])))
     return '''#!/usr/bin/python3
 # SPDX-License-Identifier: AGPL-3.0-only
 # Generated preparation, for administrator review. Staging only.
@@ -429,6 +431,7 @@ def assemble(request, repository, runtime_source, output, *, db, now=None):
                             'Administrator verifies the attributed observation against the live host, full account inventories and exact unused IDs.',
                             'Administrator separately enrolls the measured backend sources outside agent-writable paths at ' + ADMIN_CODE + ', backend.json and its existing private controller config.',
                             'Administrator verifies payload hashes, machine-id, pinned host key and source path before staging; no command here was executed.',
+                            'Administrator provides /var/lib/ameesh-release-bootstrap as an existing root-owned directory without group/other write; staging refuses an absent or untrusted root.',
                             'Existing runtime, lib and store must be absent; the bootstrap creates an empty initial store.',
                             'Release bootstrap precedes channel bootstrap; each prepare renders a separate question for a scoped signature.',
                             'execution.json and local.json are prepared for a separate reviewed enrollment; bootstrap does not install them.',

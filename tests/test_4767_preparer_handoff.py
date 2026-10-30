@@ -2,6 +2,7 @@
 """Real Git objects and disposable payloads; no accounts, root or services."""
 from tests import support
 import base64
+import builtins
 import copy
 import importlib.util
 import json
@@ -10,7 +11,9 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -171,6 +174,77 @@ class PreparationTest(unittest.TestCase):
             self.assertEqual(inventory['host'], 'fixture-host')
             self.assertEqual(inventory['machine_id'], 'a' * 32)
         self.assertFalse((stage / '.admin').exists())
+
+    def test_generated_staging_executes_both_operations_once_and_keeps_exact_bytes(self):
+        manifest = self.assemble()
+        self.assertEqual([item['operation'] for item in manifest['commands']],
+                         ['fixture-release', 'fixture-canaux'])
+        # Exercise the defensive deduplication too: operation lists can contain
+        # more than one command record without replaying mkdir on the stage.
+        manifest['commands'] *= 2
+        host = self.root / 'staging-host'
+        stage = host / 'var/lib/ameesh-release-bootstrap'
+        stage.mkdir(parents=True, mode=0o700)
+        (host / 'etc/ssh').mkdir(parents=True)
+        (host / 'etc/machine-id').write_text('a' * 32)
+        public_key = (self.root / 'release.pub').read_text()
+        (host / 'etc/ssh/ssh_host_ed25519_key.pub').write_text(public_key)
+        manifest['observation']['host_key_sha256'] = prepare.backend.hashlib.sha256(
+            base64.b64decode(public_key.split()[1])).hexdigest()
+        source = prepare.staging_script(manifest, self.output)
+        original_path = Path
+        original_lstat = Path.lstat
+
+        def mapped_path(*parts):
+            value = original_path(*parts)
+            if str(value) in ('/var/lib/ameesh-release-bootstrap', '/etc/machine-id',
+                              '/etc/ssh/ssh_host_ed25519_key.pub'):
+                return host / str(value).lstrip('/')
+            return value
+
+        def owned_lstat(value, *args, **kwargs):
+            info = original_lstat(value, *args, **kwargs)
+            fields = list(info)
+            fields[4] = 0  # Only fixture ownership substitutes for root.
+            if original_path(value) in host.parents:
+                fields[0] &= ~0o022  # Shared test ancestors, not host dirs.
+            return os.stat_result(fields)
+
+        original_import = builtins.__import__
+
+        def mapped_import(name, *args, **kwargs):
+            if name == 'pathlib':
+                return SimpleNamespace(Path=mapped_path)
+            return original_import(name, *args, **kwargs)
+
+        # Execute the actual generated source, with only fixed system paths,
+        # root identity and fixture ownership remapped. File opens, copying,
+        # modes, hashes, fsync and exclusive creation remain real.
+        with mock.patch('builtins.__import__', side_effect=mapped_import), \
+                mock.patch.object(Path, 'lstat', owned_lstat), mock.patch('os.geteuid', return_value=0), \
+                mock.patch.object(sys, 'argv', ['stage-administrateur.py']), mock.patch('builtins.print'):
+            namespace = {}
+            exec(compile(source, '<generated staging>', 'exec'), namespace)
+            self.assertEqual(namespace['PLAN']['operations'], ['fixture-release', 'fixture-canaux'])
+            with self.assertRaises(FileExistsError):
+                exec(compile(source, '<generated staging>', 'exec'), {})
+        for name, expected in manifest['payload_inventory'].items():
+            target = stage / name
+            self.assertEqual(target.read_bytes(), (self.output / 'payload' / name).read_bytes())
+            self.assertEqual(target.stat().st_mode & 0o777, expected['mode'])
+        self.assertTrue((stage / 'fixture-release/plan.json').exists())
+        self.assertTrue((stage / 'fixture-canaux/plan.json').exists())
+
+    def test_same_public_key_blob_with_alternate_base64_is_not_distinct(self):
+        key = (self.root / 'release.pub').read_text()
+        alternate = key + '='
+        self.assertNotEqual(key, alternate)
+        self.assertEqual(base64.b64decode(key.split()[1], validate=True),
+                         base64.b64decode(alternate.split()[1], validate=True))
+        (self.root / 'handoff.pub').write_text(alternate)
+        with self.assertRaisesRegex(ValueError, 'distinct controller'):
+            self.assemble()
+        self.assertFalse(self.output.exists())
 
     def test_occupied_ids_and_names_duplicate_keys_and_public_key_protection(self):
         variants = []
