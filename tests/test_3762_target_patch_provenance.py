@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -78,19 +79,44 @@ class TargetPatchTest(unittest.TestCase):
         self.assertEqual(self.remaining([fix]), [fix])
 
     def test_patch_read_failure_keeps_corrector(self):
-        with mock.patch.object(plan_git, "_patch_ids", side_effect=RuntimeError):
+        with mock.patch.object(review_authors, "_read_patch_ids", side_effect=RuntimeError):
             self.assertEqual(self.remaining([self.original]), [self.original])
 
     def test_candidate_read_failure_keeps_corrector(self):
-        read = plan_git._patch_ids
+        read = review_authors._read_patch_ids
 
         def fail_candidate(repo, *args):
             if "--no-walk" in args:
                 raise RuntimeError("unreadable candidate")
             return read(repo, *args)
 
-        with mock.patch.object(plan_git, "_patch_ids", side_effect=fail_candidate):
+        with mock.patch.object(review_authors, "_read_patch_ids", side_effect=fail_candidate):
             self.assertEqual(self.remaining([self.original]), [self.original])
+
+    def test_local_target_log_failure_keeps_corrector(self):
+        self._local_read_failure_keeps_corrector(
+            lambda args: args[0] == 'log' and '-p' in args and '--no-walk' not in args)
+
+    def test_local_candidate_log_failure_keeps_corrector(self):
+        self._local_read_failure_keeps_corrector(
+            lambda args: args[0] == 'log' and '--no-walk' in args)
+
+    def test_local_patch_id_failure_keeps_corrector(self):
+        self._local_read_failure_keeps_corrector(lambda args: args[0] == 'patch-id')
+
+    def _local_read_failure_keeps_corrector(self, fails):
+        read = review_authors._read_git
+        failed = []
+
+        def fail(repo, *args, **kwargs):
+            if fails(args):
+                failed.append(args)
+                return subprocess.CompletedProcess(args, 1, b'', b'unreadable local object')
+            return read(repo, *args, **kwargs)
+
+        with mock.patch.object(review_authors, '_read_git', side_effect=fail):
+            self.assertEqual(self.remaining([self.original]), [self.original])
+        self.assertTrue(failed, 'the failure must reach the local reader')
 
     def test_empty_commit_keeps_author(self):
         self.repo.git("checkout", "-q", "-b", "empty", self.original)
