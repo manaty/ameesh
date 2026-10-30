@@ -406,6 +406,10 @@ def _create(cfg, db, project: str, item: Measure, since_ts: float, now: float, *
             if (row.get("assignee") or "").strip() != pilot:
                 out["assign_error"] = "not assigned (now: %s)" % (
                     (row.get("assignee") or "").strip() or "nobody")
+    else:
+        # #4965 : sans pilote, l'attribution n'est pas tentée ; le refus est
+        # tout de même dit au journal du lot, avec sa raison.
+        out["assign_error"] = "aucun pilote disponible"
     if out.get("assign_error"):
         _tell_refusal(db, lot, project, pilot, out["assign_error"], actor=actor)
     return out
