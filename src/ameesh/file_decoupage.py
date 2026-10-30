@@ -514,19 +514,17 @@ def _reviewer_spares(db, project: str, lots: list, listing: list, *,
     except Exception:  # noqa: BLE001 - hôte inconnu : ne ferme rien
         closed = set()
     # #4779 : un profil de relecture illisible (capacités ou rôles absents du
-    # registre) n'est pas une preuve de capacité. Le sommeil ne retire alors
-    # personne : sans vivier prouvé, épargner est la seule lecture sûre.
-    profile_unreadable: list = []
+    # registre) n'est pas une preuve de capacité : l'agent n'entre pas dans le
+    # vivier des relecteurs, exactement comme la désignation le refuse. Le
+    # doute est borné à cet agent : un seul profil illisible ne rend pas toute
+    # l'exemption illisible et ne bloque pas le sommeil des autres (régression
+    # test_4610) ; la trace du refus est celle du gel (`prepare`).
     try:
         candidates = [c for c in rd.candidates_from_registry(
-            listing or (), project=project, families=families, closed_hosts=closed,
-            unreadable_profiles=profile_unreadable)
+            listing or (), project=project, families=families, closed_hosts=closed)
             if c.available and c.family]
     except Exception:  # noqa: BLE001 - pas de vivier : rien à épargner en plus
         candidates = []
-    if profile_unreadable:
-        return pending, {}, ("reviewer profile unreadable: " + ", ".join(
-            "%s (%s)" % (name, reason) for name, reason in profile_unreadable))
     by_name = {c.name: c for c in candidates}
     # Le pilote du projet reçoit l'alerte de capacité, il n'est pas un siège de
     # relecture : la désignation l'exclut (`_candidates`), le sommeil doit donc
