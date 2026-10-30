@@ -953,6 +953,85 @@ ameesh models discover [--source anthropic|deepseek|harness|openai|prices]
                        [--dry-run] [--notify AGENT] [--sender NAME]
 ```
 
+## Version watch: `ameesh veille`
+
+```
+ameesh veille scan [--dry-run] [--json] [--no-probe] [--harness ID]…
+```
+
+`#3264 A` / `#4291`: once a day (`ameesh-veille.timer`), `scan` reads the
+harness versions installed on this host (as `ameesh harness versions` does),
+the versions published upstream (npm `dist-tags` and `time`, or the
+repository's releases), the models served by the provider and the identifier
+actually billed in `turn_costs.model`, then keeps **one** open evaluation lot
+per harness. A newer version replaces that lot's object instead of opening a
+second one; an object already evaluated (merged or closed lot) is not
+reopened. Only stable and `rc` versions count — alpha, beta and equivalent
+pre-releases are ignored — and only a version newer than the newest installed
+version on any host is considered; a version gap between hosts is written in
+the lot. A provider recommendation ("version X or later") makes the lot P1,
+otherwise P2. Nothing is hard-coded per client: harnesses, npm package,
+repository, changelog and provider come from `veille.sources` in the mesh's
+configuration (see `docs/design/3264-veille-versions.md`); `veille.host`
+designates the one host that reconciles lots, the other hosts only recording
+their installed versions.
+
+`--dry-run` reads and decides without writing a version reading or a lot;
+`--no-probe` skips re-reading the installed versions of this host; `--harness`
+(repeatable) limits the scan to the declared harnesses. `--json` prints an
+`ameesh-veille/1` report (`enabled`, `reconciled`, `sources`, `actions`,
+`errors`). With no `veille.sources`, it prints `veille: off` and exits 0; a
+host that is not `veille.host` prints `veille: probe only` after recording its
+versions. Exit 0 otherwise, 1 when the report carries an error (an unreadable
+source stays visible in the timer's journal and is retried on the next pass),
+2 on a usage error.
+
+## Comparative replay: `ameesh replay`
+
+```
+ameesh replay bench --project P [--repo R] [--json]
+ameesh replay run --project P [--harness H] [--evaluate harness|model] [options]
+ameesh replay report FILE [--json] [--note]
+```
+
+`#3264 B` / L15: the comparative benchmark behind the version watch. `bench`
+selects, read-only, the last three delivered lots of the project — one per
+class (light, normal, sensitive), the next delivered lot filling a missing
+class — with their frozen base and tests; a lot without a provable frozen
+base, of class release, or with a doubtful diff is rejected with its reason on
+stderr, never guessed.
+
+`run` replays each lot twice, in an isolated tree (`git archive` of the frozen
+base, no remote, no history or branches, no DSN, state or mailbox; the dsh
+home is a copy without hooks), varying only the **evaluated parameter**:
+`--evaluate harness` uses two binaries at the same model, effort and turn cap;
+`--evaluate model` uses one binary with two model ids at the same effort and
+turn cap. It measures cost (input, cache and output tokens priced by
+`cost.py`), duration and turn count, runs the real lot's tests (the files its
+diff added or modified, plus the neighbouring modules of the impact map when a
+safe plan exists), and has a reviewer of another family grade the two
+anonymous submissions from 0 to 10 and list the defects — the reviewer sees
+neither version, cost, duration nor folder label. `--reviewer` names that
+harness; the plan is set by `--old-binary`/`--new-binary`,
+`--old-model`/`--new-model`, `--model`, `--effort`, `--turn-cap`,
+`--test-cap`, `--review-cap`, `--test-command`, `--map`, `--lots`,
+`--work-root`, `--report`, `--dsh-home`, `--env-file`, `--max-runs`,
+`--max-reviews` and `--budget-usd`. `--resume` continues an existing report
+only when the full plan identity matches (binaries, models, effort, bench,
+reviewer, caps) and refuses to relabel measurements produced under other
+conditions; `--keep` keeps the replay trees. The conclusion is **better** (no
+measure worse, at least one better), **equivalent** (cost and duration within
+±10 %, grade within ±1 point) or **regression**; a replay that fails the real
+lot's tests is never an adoption. The bench writes no note and no milestone:
+the evaluation agent cites the report in its lot's note.
+
+`report` reads an `ameesh-replay-report/1` report and prints its table and
+conclusion; `--note` prints the replay note (report path and SHA-256), `--json`
+the full report. `run` exits 3 when the conclusion is `incomplete` (replays or
+reviews still missing), 1 on a named refusal or an unreachable database, 2 on
+a usage error (`--resume` without `--report`, no subcommand); `bench` and
+`report` exit 0, 1 on a named refusal or an unreachable database.
+
 ## Schema, diagnosis, v0 bridge
 
 ```
