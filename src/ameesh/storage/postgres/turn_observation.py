@@ -13,15 +13,36 @@ from __future__ import annotations
 from .. import interface
 
 #: une requête de la boîte : les métadonnées seules. `meta.consigne.turn`
-#: (#2894) est le tour de la réservation qui a remis le message ; il n'est
-#: retenu que pour un message effectivement remis (`delivered_at` non nul).
+#: (#2894) est écrit à la RÉSERVATION du message, avant toute remise : il ne
+#: devient le tour de remise que si `delivered_at` existe et que le message
+#: n'a pas été retiré avant remise (`meta.retire`). Sinon il vaut NULL, et la
+#: requête n'a pas de tour (étude l2894 §3 : « null otherwise »).
 REQUEST_SQL = """
     SELECT id, recipient, status,
            extract(epoch from created_at)::float8 AS created_ts,
            extract(epoch from delivered_at)::float8 AS delivered_ts,
-           meta->'consigne'->>'turn' AS delivered_turn_id,
+           CASE WHEN delivered_at IS NOT NULL
+                     AND NOT coalesce((meta ? 'retire'), false)
+                THEN meta->'consigne'->>'turn' END AS delivered_turn_id,
            coalesce((meta ? 'retire'), false) AS withdrawn
       FROM agent_mailbox WHERE id = %s
+"""
+
+#: La réservation ouverte de l'agent, quand le tour n'a ni marqueur ni ligne
+#: de grand livre. L'index partiel `account_reservations_open_agent` (0443)
+#: n'en admet qu'UNE par agent : ce n'est pas un choix parmi plusieurs. Une
+#: réservation d'un tour antérieur est passée `kept` par la réservation du
+#: tour suivant (`account_reserve`), et une réservation d'un tour postérieur
+#: rend `quiescent` faux par `turn_in_progress` ; la lire est donc la lecture
+#: fail-closed que demande #2166 (§3 : « a reservation without marker or
+#: ledger → unknown, never silently done »).
+OPEN_RESERVATION_SQL = """
+    SELECT billing_account, usd::float8 AS usd, period::text AS period, state,
+           spend_key, agent,
+           extract(epoch from created_at)::float8 AS created_ts
+      FROM account_reservations
+     WHERE agent = %s AND state = 'open'
+     ORDER BY id DESC LIMIT 1
 """
 
 #: la ressource du tour (`running`, `done`, `orphan`), absente d'un tour qui
@@ -101,9 +122,18 @@ class TurnObservation(interface.TurnObservation):
         rows = self.db.query(AGENT_SQL, (agent_name,))
         if not rows:
             return None
+        agent = rows[0]
+        # #2166: without marker or ledger the turn's own `spend_key` is lost;
+        # the agent's unique open reservation is the only fact left that says
+        # accounting is still open (see OPEN_RESERVATION_SQL).
+        open_reservation = None
+        if turn_id and marker is None and ledger is None:
+            rows = self.db.query(OPEN_RESERVATION_SQL, (agent_name,))
+            open_reservation = rows[0] if rows else None
         return {
             "request": message,
             "turn": {"id": turn_id, "resource": resource,
                      "marker": marker, "ledger": ledger},
-            "agent": rows[0],
+            "open_reservation": open_reservation,
+            "agent": agent,
         }

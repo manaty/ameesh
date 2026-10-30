@@ -4871,12 +4871,15 @@ class TurnObservation(Domain):
         """Les faits d'un tour (`turn`) ou d'un message de la boîte (`request`).
 
         Rend `{"request": ligne|None, "turn": {"id", "resource", "marker",
-        "ledger"}, "agent": ligne}` ; `request` est la ligne de la boîte
-        (destinataire, état, `created_ts`, `delivered_ts`,
-        `delivered_turn_id`, `withdrawn`), `resource`/`marker`/`ledger` les
-        lignes `turn_resources`, `spend_pending` et `turn_costs` du tour (ou
-        None), `agent` la ligne du registre. None si la cible n'existe pas
-        (message inconnu, tour sans aucun fait, ou agent absent du registre).
+        "ledger"}, "open_reservation": ligne|None, "agent": ligne}` ;
+        `request` est la ligne de la boîte (destinataire, état, `created_ts`,
+        `delivered_ts`, `delivered_turn_id`, `withdrawn`), `resource`/`marker`/
+        `ledger` les lignes `turn_resources`, `spend_pending` et `turn_costs`
+        du tour (ou None), `open_reservation` la réservation ouverte de
+        l'agent quand le tour n'a ni marqueur ni grand livre (#2166 : la clé
+        du tour a disparu avec le marqueur), `agent` la ligne du registre.
+        None si la cible n'existe pas (message inconnu, tour sans aucun fait,
+        ou agent absent du registre).
 
         Une requête n'est pas un tour : un message non remis rend
         `"turn": {"id": None, ...}` et reste observable (l'agent est son

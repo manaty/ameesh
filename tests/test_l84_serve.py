@@ -570,6 +570,34 @@ class TurnObservationTest(PgTestCase):
         self.assertIsNone(document["request"]["delivered_ts"])
         self.assertIsNone(document["request"]["delivered_turn_id"])
 
+    def test_pending_or_withdrawn_request_never_names_its_reserved_turn(self):
+        # `meta.consigne.turn` is written at RESERVATION, before delivery
+        # (mailbox.reserve). Only a delivered message names its delivery
+        # turn; a pending (turn failed before delivery) or withdrawn (the
+        # reservation expired) message must render `turn: null`.
+        agent = self.agent()
+        turn_id = self.turn("running", agent)
+        pending = self.request(agent=agent)
+        token = mail.new_token()
+        mail.reserve(self.db, agent, None, None, token, ids=[pending],
+                     porteur="test", turn_id=turn_id)
+        document = turn_observation.observe(self.db, request=pending)
+        self.assertEqual(document["request"]["state"], "pending")
+        self.assertIsNone(document["request"]["delivered_turn_id"])
+        self.assertIsNone(document["turn"])
+
+        withdrawn = self.request(agent=agent)
+        token = mail.new_token()
+        mail.reserve(self.db, agent, None, None, token, ids=[withdrawn],
+                     porteur="test", turn_id=turn_id)
+        self.db.execute(
+            "UPDATE agent_mailbox SET delivered_at = now(), status = 'delivered',"
+            " meta = meta || '{\"retire\": {}}'::jsonb WHERE id = %s", (withdrawn,))
+        document = turn_observation.observe(self.db, request=withdrawn)
+        self.assertEqual(document["request"]["state"], "withdrawn")
+        self.assertIsNone(document["request"]["delivered_turn_id"])
+        self.assertIsNone(document["turn"])
+
     def test_turn_states(self):
         agent = self.agent()
         running = self.turn("running", agent)
@@ -632,6 +660,47 @@ class TurnObservationTest(PgTestCase):
         self.assertEqual(document["accounting"]["state"], "pending")
         self.assertIsNone(document["accounting"]["ledger"])
         self.assertFalse(document["quiescent"])
+
+    def test_reservation_alone_is_unknown_and_not_quiescent(self):
+        # #2166/review: a settlement can fail after the marker is cleared
+        # (`_annule_tour_avant_lancement` clears it, then settle(released) may
+        # raise). The turn then has no marker and no ledger; the agent's unique
+        # open reservation is the only remaining fact. It must read `unknown`,
+        # never `none`, and never be quiescent (study l2894 §3, Guarantees).
+        agent = self.agent("orphan-reservation")
+        turn_id = self.turn("done", agent)
+        key = "%s:1:2026-10-30T07:00:00.000000Z" % agent
+        self.db.execute(
+            "INSERT INTO account_reservations (billing_account, agent, usd,"
+            " period, state, spend_key) VALUES ('acct', %s, 2.0, current_date,"
+            " 'open', %s)", (agent, key))
+        document = turn_observation.observe(self.db, turn=turn_id)
+        self.assertEqual(document["turn"]["state"], "ended")
+        self.assertEqual(document["accounting"]["state"], "unknown")
+        self.assertEqual(document["accounting"]["spend_key"], key)
+        self.assertEqual(document["accounting"]["reservation"]["state"], "open")
+        self.assertIsNone(document["accounting"]["ledger"])
+        self.assertIsNone(document["accounting"]["marker"])
+        self.assertFalse(document["quiescent"])
+
+        # The same reservation is visible through a request that names a turn
+        # whose facts are gone: the turn is unknown, not silently `none`.
+        message = self.request(agent=agent, delivered=True, turn_id=uuid.uuid4().hex)
+        document = turn_observation.observe(self.db, request=message)
+        self.assertEqual(document["turn"]["state"], "unknown")
+        self.assertEqual(document["accounting"]["state"], "unknown")
+        self.assertFalse(document["quiescent"])
+
+    def test_quiescent_allowlist_rejects_unknown_states(self):
+        # #2167 (N from review): an accounting state outside the explicit
+        # allowlist — pending, unknown, or a value a future version adds —
+        # can never make a turn quiescent.
+        for state in ("settled", "released", "kept", "none"):
+            self.assertTrue(turn_observation.is_quiescent("idle", state, False), state)
+        for state in ("pending", "unknown", "future-state"):
+            self.assertFalse(turn_observation.is_quiescent("idle", state, False), state)
+        self.assertFalse(turn_observation.is_quiescent("running", "settled", False))
+        self.assertFalse(turn_observation.is_quiescent("idle", "settled", True))
 
     def test_turn_in_progress_requires_a_live_lease_on_a_running_agent(self):
         agent = self.agent("busy", status="running")

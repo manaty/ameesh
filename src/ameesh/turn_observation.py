@@ -24,7 +24,10 @@ Derived states (the contract):
 * `accounting.state`, in this order: a ledger row → `settled`, but a
   reservation `kept` or `released` wins (terminal outcome); else a marker →
   `pending`; else a reservation alone → `unknown` (never silently `done`);
-  else `none`.
+  else `none`. Without marker or ledger, the reservation read is the agent's
+  unique open one (`account_reservations_open_agent`): the turn's own key
+  died with its marker, and that is the only fact left that says accounting
+  is still open.
 * `quiescent`: the exact conjunction over the **explicit allowlist**
   `settled|released|kept|none`: agent `idle`, accounting in that allowlist,
   and no turn in progress. `pending`, `unknown` and any future enum are not
@@ -50,6 +53,19 @@ QUIESCENT_ACCOUNTING = frozenset(("settled", "released", "kept", "none"))
 
 class Unknown(LookupError):
     """The observed target does not exist (404, never an empty document)."""
+
+
+def is_quiescent(agent_status: str, accounting_state: str,
+                 turn_in_progress: bool) -> bool:
+    """The exact conjunction of the contract (study l2894 §3).
+
+    The accounting side is an **allowlist**: a state outside
+    `QUIESCENT_ACCOUNTING` — `pending`, `unknown`, or any value a future
+    version adds — is never quiescent, even when the agent is idle.
+    """
+    return (agent_status == "idle"
+            and accounting_state in QUIESCENT_ACCOUNTING
+            and not turn_in_progress)
 
 
 def _request_block(row: dict | None) -> dict | None:
@@ -137,14 +153,25 @@ def _ledger_block(row: dict) -> dict:
     }
 
 
-def _accounting(db, turn: dict | None) -> dict:
+def _accounting(db, turn: dict | None, open_reservation: dict | None = None) -> dict:
     if turn is None:
         return {"state": "none", "spend_key": None, "marker": None,
                 "reservation": None, "ledger": None}
     marker = turn.get("marker")
     ledger = turn.get("ledger")
     spend_key = (ledger or {}).get("spend_key") or (marker or {}).get("spend_key")
-    reservation = account_budget.reservation(db, spend_key) if spend_key else None
+    if spend_key:
+        reservation = account_budget.reservation(db, spend_key)
+    else:
+        # #2166: the turn's own key died with the marker (a settlement can
+        # fail after the marker is cleared). The agent's open reservation is
+        # still the exact fact that accounting is open: the schema allows one
+        # open reservation per agent, and a later turn reserves by marking the
+        # previous one `kept` first. Reading it is fail-closed, never a guess
+        # among several; `turn_in_progress` keeps a later live turn visible.
+        reservation = open_reservation
+        if reservation is not None:
+            spend_key = reservation.get("spend_key")
     if ledger is not None:
         state = "settled"
         # a kept/released reservation is terminal and wins over "settled":
@@ -192,11 +219,10 @@ def observe(db, *, turn: str | None = None, request: int | None = None,
     request_block = _request_block(facts["request"])
     turn_block = _turn_block(facts["turn"])
     agent_block = _agent_block(facts["agent"])
-    accounting = _accounting(db, facts["turn"])
+    accounting = _accounting(db, facts["turn"], facts.get("open_reservation"))
     agent = facts["agent"]
-    quiescent = (agent_block["status"] == "idle"
-                 and accounting["state"] in QUIESCENT_ACCOUNTING
-                 and not agent_block["turn_in_progress"])
+    quiescent = is_quiescent(agent_block["status"], accounting["state"],
+                             agent_block["turn_in_progress"])
     return {
         "schema": SCHEMA,
         "observed_ts": observed_ts,
