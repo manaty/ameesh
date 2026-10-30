@@ -1352,6 +1352,9 @@ def _packet_proof_gate(rollup) -> tuple:
     prouvé : il se consigne au lieu de bloquer, comme tout autre check.
     #3209 : la suite sautée parce qu'une PR porte la tête
     (`radar.packet_suite_covered`) n'a rien à consigner.
+    #4812 : le portier annulé par `ci run --full` au profit du run de la PR
+    (#2876), dont l'agrégat `tests` est vert, non plus
+    (`radar.packet_portier_replaced`).
     Rend `(gaps, consigned)`."""
     from . import radar
     gaps, consigned = [], []
@@ -1361,7 +1364,8 @@ def _packet_proof_gate(rollup) -> tuple:
         state = _rollup_state(entry) or "?"
         result = radar.check_result(entry)
         if result == radar.CI_INCONCLUSIVE_RESULT:
-            if radar.packet_suite_covered(entry, entries):
+            if radar.packet_suite_covered(entry, entries) \
+                    or radar.packet_portier_replaced(entry, entries, rollup):
                 continue
             consigned.append("%s (%s)" % (name, state))
         elif result != radar.CI_GREEN_RESULT:

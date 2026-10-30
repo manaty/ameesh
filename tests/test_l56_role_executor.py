@@ -1042,6 +1042,59 @@ class RoleExecutorTest(PgTestCase):
                 self.db.execute('DROP OWNED BY %s' % q(role))
                 self.db.execute('DROP ROLE %s' % q(role))
 
+    def test_execute_grant_skips_a_function_owned_by_another_role(self):
+        """#4806 : sur un hôte où une extension (pg_stat_statements) laisse
+        dans le schéma une fonction appartenant à un autre rôle que le
+        migrationowner, `GRANT EXECUTE ON ALL FUNCTIONS` échouait en
+        « permission denied for function » et annulait toute la phase rôle.
+        Le droit se borne aux fonctions applicatives du propriétaire : l'objet
+        étranger n'est ni un motif d'échec ni un droit accordé."""
+        q = db_mod.quote_ident
+        suffix = uuid.uuid4().hex[:8]
+        creator, other, executor = ("t_creator_" + suffix, "t_other_" + suffix,
+                                    "t_exec_" + suffix)
+        schema = "t_owned_" + suffix
+        foreign = "pg_stat_statements_reset_" + suffix
+        helper = "app_helper_" + suffix
+        old_owner = self.db.query(
+            "SELECT pg_get_userbyid(datdba) AS name FROM pg_database WHERE datname = %s",
+            (self.database,))[0]["name"]
+        for role in (creator, other, executor):
+            self.db.execute("CREATE ROLE %s NOLOGIN" % q(role))
+        try:
+            self.db.execute("ALTER DATABASE %s OWNER TO %s" % (q(self.database), q(creator)))
+            self.db.execute("CREATE SCHEMA %s AUTHORIZATION pg_database_owner" % q(schema))
+            with self.db.transaction() as tx:
+                tx.execute("SET LOCAL ROLE %s" % q(creator))
+                tx.execute("CREATE TABLE %s.agent_registry (id serial PRIMARY KEY)" % q(schema))
+                tx.execute("CREATE FUNCTION %s.%s() RETURNS int LANGUAGE sql AS 'SELECT 1'"
+                           % (q(schema), q(helper)))
+            # L'objet étranger est créé par le superutilisateur puis possédé par
+            # un autre rôle : le propriétaire du schéma ne peut pas l'accorder.
+            self.db.execute("CREATE FUNCTION %s.%s() RETURNS boolean LANGUAGE sql"
+                            " AS 'SELECT true'" % (q(schema), q(foreign)))
+            self.db.execute("ALTER FUNCTION %s.%s() OWNER TO %s"
+                            % (q(schema), q(foreign), q(other)))
+            for name in (helper, foreign):
+                self.db.execute("REVOKE ALL ON FUNCTION %s.%s() FROM PUBLIC, %s"
+                                % (q(schema), q(name), q(executor)))
+            result = self.run_script(executor, schema=schema, applying_role=creator)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(self.db.query(
+                "SELECT has_function_privilege(%s, %s, 'EXECUTE') AS p",
+                (executor, "%s.%s()" % (q(schema), q(helper))))[0]["p"],
+                "la fonction applicative du propriétaire reste exécutable")
+            self.assertFalse(self.db.query(
+                "SELECT has_function_privilege(%s, %s, 'EXECUTE') AS p",
+                (executor, "%s.%s()" % (q(schema), q(foreign))))[0]["p"],
+                "la fonction d'un autre propriétaire n'est pas accordée")
+        finally:
+            self.db.execute("ALTER DATABASE %s OWNER TO %s" % (q(self.database), q(old_owner)))
+            self.db.execute("DROP SCHEMA IF EXISTS %s CASCADE" % q(schema))
+            for role in (executor, other, creator):
+                self.db.execute("DROP OWNED BY %s" % q(role))
+                self.db.execute("DROP ROLE %s" % q(role))
+
     def test_future_objects_receive_data_grants(self):
         self.db.execute("CREATE TABLE executor_future (id bigserial PRIMARY KEY, body text)")
         try:
