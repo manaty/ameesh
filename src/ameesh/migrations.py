@@ -117,7 +117,7 @@ class Layout:
 
 
 #: dépôts connus ; un autre se déclare dans `radar.projects.<p>` (`github`,
-#: `migrations`) de la configuration de l'hôte
+#: `migrations`, `migrations_width`) de la configuration de l'hôte
 LAYOUTS = {
     AMEESH_REPO: Layout(AMEESH_REPO, REPO_PATH, 4),
     "manaty/nexlink": Layout("manaty/nexlink", "supabase/migrations", 3),
@@ -136,8 +136,14 @@ def layout_for(repo: str, cfg=None) -> Layout | None:
     known = LAYOUTS.get(repo)
     for project in _radar_projects(cfg):
         if repo_key(project.github) == repo and project.migrations:
-            return Layout(repo, project.migrations, known.width if known else 4)
+            return Layout(repo, project.migrations, width_of(project, known))
     return known
+
+
+def width_of(project, known: Layout | None = None) -> int:
+    """#4750 : la largeur déclarée (`migrations_width`), sinon celle du dépôt
+    connu, sinon 4."""
+    return (getattr(project, "migrations_width", 0) or (known.width if known else 4))
 
 
 def _radar_projects(cfg) -> list:
