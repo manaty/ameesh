@@ -66,8 +66,13 @@ class SignedDecisionAuthority:
         if not view or view.get('state') != 'answered' or view.get('needs_signature') is not True:
             return False
         answer = view.get('answer') or {}
-        if (answer.get('option') != 'apply' or answer.get('text') != 'apply'
-                or answer.get('channel') != 'signed' or view.get('options') != OPTIONS):
+        # #4788: the signed text names the option through the bounded native
+        # forms of decisions.match_option (raw key or the two signer-owner.sh
+        # mentions). The full text stays recorded and digested; a free prefix
+        # or an extra explanation never becomes the option.
+        if (view.get('options') != OPTIONS or answer.get('option') != 'apply'
+                or answer.get('channel') != 'signed'
+                or decisions.match_option(view, answer.get('text') or '') != 'apply'):
             return False
         text = view.get('question') or ''
         if not text.startswith(PREFIX):
