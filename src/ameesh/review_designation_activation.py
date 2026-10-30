@@ -1999,7 +1999,7 @@ def _note_in_transaction(tx, lot: int, text: str) -> None:
         "BEGIN "
         "PERFORM 1 FROM work_items WHERE id = %(lot)d FOR NO KEY UPDATE; "
         "INSERT INTO work_item_events (work_item_id, state, note, actor) "
-        "SELECT w.id, w.state, v_note, %(actor)s FROM work_items w "
+        "SELECT w.id, CASE WHEN w.state = 'delivered' THEN coalesce(to_jsonb(w)->>'legacy_state', w.state) ELSE w.state END, v_note, %(actor)s FROM work_items w "
         "WHERE w.id = %(lot)d AND NOT EXISTS (SELECT 1 FROM work_item_events e "
         "WHERE e.work_item_id = w.id AND e.note = v_note); "
         "IF FOUND THEN "

@@ -409,3 +409,11 @@ def main(argv):
             print("%-16s refused: %s" % (row["name"], row["error"]))
     return 1 if registry.refused else 0
 
+
+
+def development_workflow():
+    """The built-in dev module's workflow, without importing it in the core."""
+    provider = get("dev")
+    if provider is None:
+        raise ValueError("development workflow requires the dev module")
+    return provider.workflow()

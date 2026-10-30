@@ -676,7 +676,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('work_items', ARRAY[
         'id', 'type', 'source', 'app', 'title', 'issue_ref', 'workstream',
-        'state', 'assignee', 'loops', 'budget_usd', 'spent_usd',
+        'state', 'legacy_state', 'assignee', 'loops', 'budget_usd', 'spent_usd',
         'created_at', 'updated_at', 'closed_at',
         'package_id', 'package_parent', 'pr_ref', 'close_reason', 'superseded_by',
         -- L40 (0031) : délégation à échéance en cours (pas de contenu)

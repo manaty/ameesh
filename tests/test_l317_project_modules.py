@@ -528,7 +528,7 @@ class LifecycleGateTest(PgTestCase):
         work.milestone(self.db, self.lot, "verdict", verdict="ok",
                        sha="a" * 40)
         self.assertEqual(work.merged(self.db, self.lot, sha="a" * 40)["result"], "merged")
-        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
+        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "delivered")
 
     def test_work_move_and_raw_storage_cannot_bypass_gate(self):
         work.move(self.db, self.lot, "build")

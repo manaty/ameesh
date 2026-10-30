@@ -248,7 +248,9 @@ class LotSessions(interface.LotSessions):
                 " WHERE id = %s AND assignee = %s"
                 "   AND abs(extract(epoch from wake_at) - %s::float8) < 0.001"
                 "   AND wake_claim_at IS NOT NULL"
-                " RETURNING id, state", (int(lot), name, float(wake_ts)))
+                " RETURNING id, CASE WHEN state = 'delivered' THEN"
+                " coalesce(to_jsonb(work_items)->>'legacy_state', state)"
+                " ELSE state END AS state", (int(lot), name, float(wake_ts)))
             if not rows:
                 return False
             tx.execute(

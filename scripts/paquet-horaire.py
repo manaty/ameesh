@@ -165,7 +165,7 @@ CARRIER_BRANCH_PREFIX = "integration/paquet"
 OPEN_STATES = ("intake", "build", "qa", "validated", "blocked", "waiting_human")
 #: #4171 : fusion vue d'un porteur (miroir de `work_lifecycle.DELIVERED` et
 #: des raisons de clôture livrée de `work.CLOSE_REASONS`).
-MERGED_STATES = ("merged", "promoted")
+MERGED_STATES = ("merged", "promoted", "delivered")
 MERGED_CLOSE_REASONS = ("delivered", "done")
 #: #4506 : la note de fusion automatique du porteur porte la tête publiée
 MERGED_NOTE_RE = re.compile(

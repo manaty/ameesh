@@ -210,7 +210,7 @@ def set_floor(cfg, db, lot: int, floor: int, *, reason: str = "",
                        (int(lot),))
             tx.execute("INSERT INTO work_item_events (work_item_id, state, note, actor, evidence)"
                        " VALUES (%s, %s, %s, %s, %s::jsonb)",
-                       (int(lot), item["state"], text, who, json.dumps(evidence)))
+                       (int(lot), lifecycle.phase(item), text, who, json.dumps(evidence)))
             tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s", (int(lot),))
     if complete:
         # #3557 : une recharge de la même valeur retente aussi la complétion

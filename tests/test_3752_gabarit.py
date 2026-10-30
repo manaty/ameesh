@@ -184,8 +184,8 @@ class GabaritTest(PgTestCase):
     def test_une_migration_ajoutee_ou_modifiee_invalide_le_gabarit(self):
         copie = tempfile.mkdtemp(prefix="ameesh-gabarit-")
         self.addCleanup(shutil.rmtree, copie, True)
-        for name in os.listdir(migrations.MIGRATIONS_DIR):
-            shutil.copy(os.path.join(migrations.MIGRATIONS_DIR, name), copie)
+        for migration in migrations.discover(migrations.MIGRATIONS_DIR):
+            shutil.copy(migration.path, copie)
         base = gabarit.empreinte(self.db)
         self.assertEqual(gabarit.empreinte(self.db, copie), base)
         derniere = max(m.version for m in migrations.discover(copie))

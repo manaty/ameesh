@@ -234,7 +234,8 @@ class AuditEvidenceTest(PgTestCase):
                 tx.execute("ALTER TABLE work_items DISABLE TRIGGER ameesh_module_work_guard")
                 tx.execute("UPDATE work_items SET state = %s WHERE id = %s", (state, self.lot))
                 tx.execute("ALTER TABLE work_items ENABLE TRIGGER ameesh_module_work_guard")
-            self.assertEqual(self.findings()[0]["lot_state"], state)
+            self.assertEqual(self.findings()[0]["lot_state"], "delivered")
+            self.assertEqual(work.get(self.db, self.lot)["legacy_state"], state)
 
     def test_notifier_delivers_human_channel_and_events_once_then_resolves(self):
         for name in ("orch", "auditeur"):
