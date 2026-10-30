@@ -89,18 +89,23 @@ def probe(*, db, host, agent, account, home, seconds, policy):
     The document is the one `HealthTurn` reads. The probe must exist in the
     registry on this exact host and its own runner unit must belong to the
     enrolled restart policy, so a release can restart what the health step then
-    probes. An unreadable or divergent registry refuses; nothing is fabricated.
+    probes. The unit is the one enrolled in `policy['units']` for this agent,
+    never one fabricated here: none, or both deployed spellings at once,
+    refuses. An unreadable or divergent registry refuses; nothing is fabricated.
     """
-    document=probe_document(dict(agent=agent,unit='ameesh-runner@'+str(agent)+'.service',
-                                 account=account,home=home,seconds=seconds))
     try:
         delegation.restart.validate_policy(policy)
     except delegation.restart.HelperError:
         raise OperatorError('invalid restart policy') from None
     if policy['host']!=host:
         raise OperatorError('probe policy host mismatch')
-    if document['unit'] not in policy['units']:
-        raise OperatorError('probe runner unit outside the enrolled policy')
+    enrolled=[unit for unit in policy['units'] if unit in pilot.runner_units(agent)]
+    if not enrolled:
+        raise OperatorError('probe runner unit is not enrolled for this agent')
+    if len(enrolled)>1:
+        raise OperatorError('ambiguous enrolled probe runner units for this agent')
+    document=probe_document(dict(agent=agent,unit=enrolled[0],
+                                 account=account,home=home,seconds=seconds))
     if not callable(getattr(db,'query',None)):
         raise OperatorError('enrolled probe registry required')
     try:
