@@ -130,6 +130,34 @@ class PipelineCliTest(PgTestCase):
         self.run_cli('adopt', self.lot)
         self.run_cli('advance', self.lot, '--to', 'backlog', '--guard', 'planning')
 
+    def test_resolution_ignores_replace_refs_and_git_environment(self):
+        self.path.write_text(carte(name='replacement'))
+        self.git('add', '.')
+        self.git('-c', 'user.name=test', '-c', 'user.email=test@example.org',
+                 'commit', '-qm', 'replacement card')
+        replacement = self.git('rev-parse', 'HEAD').strip()
+        self.git('replace', self.sha, replacement)
+        self.assertIn('replacement', self.git('show', self.sha + ':pipelines/delivery.md'))
+        pipeline_cli._compiled.cache_clear()
+        canon._content_cache_clear(str(self.repo))
+        with mock.patch.dict('os.environ', {
+                'GIT_DIR': str(self.repo / 'missing.git'),
+                'GIT_OBJECT_DIRECTORY': str(self.repo / 'missing-objects'),
+                'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.bare',
+                'GIT_CONFIG_VALUE_0': 'true'}):
+            self.assertEqual(pipeline_cli.pipeline_at(self.ref, cfg=self.cfg)[1], self.spec)
+        self.run_cli('adopt', self.lot)
+
+    def test_resolution_normalizes_card_name(self):
+        for name, expected in [('" delivery "', 'delivery'), (123, '123')]:
+            with self.subTest(name=name):
+                self.path.write_text(carte(name=name))
+                self.git('add', '.')
+                self.git('-c', 'user.name=test', '-c', 'user.email=test@example.org',
+                         'commit', '-qm', 'normalized name')
+                ref = 'acme:pipelines/delivery.md@' + self.git('rev-parse', 'HEAD').strip()
+                self.assertEqual(pipeline_cli.pipeline_at(ref, cfg=self.cfg)[0], expected)
+
     def test_module_dispatch_discovers_card(self):
         with mock.patch('ameesh.config.load', return_value=self.cfg), \
              mock.patch('ameesh.db.connect', return_value=self.db), \

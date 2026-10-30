@@ -7,7 +7,6 @@ from functools import lru_cache
 import json
 from pathlib import PurePosixPath
 import re
-import subprocess
 import sys
 import uuid
 
@@ -18,16 +17,16 @@ from .process_workflow import WorkflowRefusal
 @lru_cache(maxsize=128)
 def _compiled(repo, ref, path, commit, version):
     try:
-        result = subprocess.run(
-            ['git', '-C', repo, 'show', '%s:%s' % (commit, path)],
-            capture_output=True, check=True, timeout=30)
-        text = result.stdout.decode('utf-8')
+        content = canon.git_read(repo, commit, path)
+        if content is None:
+            raise ValueError('pinned card is unreadable')
+        text = content.decode('utf-8')
         block = process_card.pipeline_of_page(text)
         spec, encoding = process_card.compile_block(block, ref=ref, version=version)
         data = canon.load_yaml(canon.split_frontmatter(text))
-        name = data.get('name') or PurePosixPath(path).stem
+        name = canon._text(data.get('name')) or PurePosixPath(path).stem
         return name, spec, encoding
-    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError) as exc:
+    except (OSError, canon.GitError, UnicodeError, ValueError) as exc:
         raise work.WorkError('pipeline-unreadable: %s' % ref) from exc
 
 
