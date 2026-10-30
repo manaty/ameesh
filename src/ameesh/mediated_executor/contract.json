@@ -4879,6 +4879,7 @@
     "ledger",
     "models_used",
     "paid_lines",
+    "session_reread",
     "session_total",
     "spent_between",
     "unpriced",
