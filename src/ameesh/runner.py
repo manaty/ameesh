@@ -210,6 +210,16 @@ def _sans_raison(observation: dict | None) -> dict | None:
             if key != "reason"}
 
 
+def _reasons_uniques(*groups) -> tuple[str, ...]:
+    """Union ordonnée de raisons, sans doublon (état de session CTX-02b)."""
+    out: list[str] = []
+    for group in groups:
+        for reason in group or ():
+            if reason and reason not in out:
+                out.append(reason)
+    return tuple(out)
+
+
 #: délai borné accordé au fil `journal` pour vider sa file à l'arrêt
 JOURNAL_CLOSE_TIMEOUT = 2.0
 EXIT_REVOKED = 6
@@ -810,7 +820,16 @@ class AgentWorker(threading.Thread):
         #: puis tenue à jour par l'observation du tour.
         self._context_session_id: str | None = None
         self._context_session_reread: int | None = None
+        #: Qualité et raisons de cette base : un tour partiel laisse la
+        #: session partielle, un tour sans mesure l'invalide (#4870, B cx1).
+        self._context_session_quality: str = context_metrics.UNKNOWN
+        self._context_session_reasons: tuple[str, ...] = ()
         self._context_baseline: int | None = None
+        self._context_baseline_quality: str = context_metrics.UNKNOWN
+        self._context_baseline_reasons: tuple[str, ...] = ()
+        #: Une collecte perdue avant qu'une session ne soit connue : la
+        #: prochaine base reste inconnue jusqu'à une session neuve explicite.
+        self._context_session_lost: str | None = None
         #: CTX-02b : motif de clôture observé (L105) et dernière rotation
         #: réussie, publiés avec le tour — jamais lus par une décision.
         self._turn_close_observation: dict | None = None
@@ -2116,6 +2135,7 @@ class AgentWorker(threading.Thread):
         self._resume_drop()
         self.session_turns = 0
         self.session_tokens = 0.0
+        self._context_session_forget()
         self.last_turn_reread = 0
         self.last_turn_context = None
         self.nudged = False
@@ -2278,43 +2298,130 @@ class AgentWorker(threading.Thread):
 
         Une session neuve part de zéro ; une session reprise est relue du
         grand livre **une fois** (puis tenue à jour par l'observation), et reste
-        inconnue si la lecture échoue — jamais un zéro supposé. Observation
+        inconnue si la lecture échoue — jamais un zéro supposé. Une base
+        partielle garde sa qualité et ses raisons ; une collecte perdue la rend
+        inconnue jusqu'à une session neuve explicite (#4870, B cx1). Observation
         seule : aucune décision ne lit cette valeur.
         """
         if not session:
+            if self._context_session_lost is not None:
+                # La collecte perdue peut appartenir à la session qui s'ouvre :
+                # aucune base mesurée n'est supposée.
+                self._context_baseline = None
+                self._context_baseline_quality = context_metrics.UNKNOWN
+                self._context_baseline_reasons = (self._context_session_lost,)
+                return None
+            self._context_session_reread = 0
+            self._context_session_quality = context_metrics.MEASURED
+            self._context_session_reasons = ()
             self._context_baseline = 0
+            self._context_baseline_quality = context_metrics.MEASURED
+            self._context_baseline_reasons = ()
             return 0
+        if self._context_session_lost is not None:
+            if self._context_session_id in (None, session):
+                self._context_session_id = session
+                self._context_baseline = None
+                self._context_baseline_quality = context_metrics.UNKNOWN
+                self._context_baseline_reasons = (self._context_session_lost,)
+                return None
+            # La perte concernait une autre session : celle-ci repart propre.
+            self._context_session_lost = None
         if self._context_session_id == session:
             self._context_baseline = self._context_session_reread
+            self._context_baseline_quality = self._context_session_quality
+            self._context_baseline_reasons = self._context_session_reasons
             return self._context_session_reread
         value = cost_mod.session_reread(self.db, self.name, session)
         self._context_session_id = session
         self._context_session_reread = value
+        self._context_session_quality = (context_metrics.MEASURED
+                                         if value is not None
+                                         else context_metrics.UNKNOWN)
+        self._context_session_reasons = ()
         self._context_baseline = value
+        self._context_baseline_quality = self._context_session_quality
+        self._context_baseline_reasons = self._context_session_reasons
         return value
+
+    def _context_session_forget(self) -> None:
+        """Oublie la base ``R_session`` : session neuve explicite (rotation,
+        redémarrage, élection). Un trou d'une ancienne session ne contamine
+        jamais la nouvelle."""
+        self._context_session_id = None
+        self._context_session_reread = None
+        self._context_session_quality = context_metrics.UNKNOWN
+        self._context_session_reasons = ()
+        self._context_baseline = None
+        self._context_baseline_quality = context_metrics.UNKNOWN
+        self._context_baseline_reasons = ()
+        self._context_session_lost = None
+
+    def _invalidate_context_session(self, session: str | None,
+                                    reasons) -> None:
+        """Marque la base d'une session inconnue après un trou de collecte.
+
+        La valeur d'avant n'est pas conservée comme si la session était
+        complète : le cumul est inconnu, avec ses raisons. Sans session connue,
+        la prochaine base reste inconnue jusqu'à une session neuve explicite.
+        """
+        self._context_session_id = session or None
+        self._context_session_reread = None
+        self._context_session_quality = context_metrics.UNKNOWN
+        self._context_session_reasons = _reasons_uniques(reasons)
+        if not session:
+            self._context_session_lost = (self._context_session_reasons
+                                          or (context_metrics.REASON_COLLECTION_LOST,))[0]
+        else:
+            self._context_session_lost = None
 
     def _remember_context_session(self, document: dict, session: str | None) -> None:
         """Reporte le ``R_turn`` publié sur la base ``R_session`` de la session.
 
         Le normalisateur a déjà ajouté ce tour à sa propre base ; on tient la
-        même valeur pour le tour suivant **sans relire le grand livre**. Une
-        base inconnue le reste (aucune somme partielle publiée comme un total).
+        même valeur pour le tour suivant **sans relire le grand livre**. La
+        qualité et les raisons de la base sont conservées : une base partielle
+        ne devient jamais ``measured`` parce que le tour courant est complet.
+        Un ``R_turn`` absent (ou un relevé d'une autre session) **invalide** la
+        base : un trou ne se comble pas par une somme supposée.
         """
         if not session:
             return
+        reasons = tuple(document.get("reasons") or ())
         measures = document.get("measures")
-        value = measures.get("R_turn", {}).get("value") \
-            if isinstance(measures, dict) else None
-        if value is None or self._context_baseline is None:
-            return
-        # Un relevé d'une autre session (mismatch du flux) n'alimente jamais la
-        # base de la session demandée : la mesure est partielle et le reste.
+        measure = measures.get("R_turn") if isinstance(measures, dict) else None
         if document.get("session") != session \
-                or context_metrics.REASON_SESSION_MISMATCH in (
-                    document.get("reasons") or ()):
+                or context_metrics.REASON_SESSION_MISMATCH in reasons \
+                or not isinstance(measure, dict):
+            self._invalidate_context_session(
+                session, (context_metrics.REASON_SESSION_MISMATCH,))
             return
+        value = measure.get("value")
+        turn_reasons = tuple(measure.get("reasons") or ())
+        if value is None:
+            self._invalidate_context_session(
+                session, _reasons_uniques(
+                    (context_metrics.REASON_TURN_NOT_MEASURED,), turn_reasons))
+            return
+        if self._context_baseline is None:
+            # Un trou antérieur : la somme de ce tour ne le reconstruit pas.
+            self._context_session_id = session
+            self._context_session_reread = None
+            self._context_session_quality = context_metrics.UNKNOWN
+            self._context_session_reasons = _reasons_uniques(
+                self._context_baseline_reasons, turn_reasons)
+            return
+        quality = context_metrics.MEASURED if (
+            self._context_baseline_quality in (context_metrics.MEASURED,
+                                               context_metrics.DERIVED)
+            and measure.get("quality") in (context_metrics.MEASURED,
+                                           context_metrics.DERIVED)) \
+            else context_metrics.PARTIAL
         self._context_session_id = session
         self._context_session_reread = int(self._context_baseline) + int(value)
+        self._context_session_quality = quality
+        self._context_session_reasons = _reasons_uniques(
+            self._context_baseline_reasons, turn_reasons)
 
     def _codex_last_call_context(self, thread: str | None) -> int | None:
         """#2932 : le contexte du dernier appel d'un fil Codex, lu dans son
@@ -2469,6 +2576,7 @@ class AgentWorker(threading.Thread):
         self._resume_drop()
         self.session_turns = 0
         self.session_tokens = 0.0
+        self._context_session_forget()
         if not brief.strip():
             log_async("[%s] elected on %s: no persisted resume brief; new session "
                       "opens without one" % (self.name, self.runner.host))
@@ -2791,6 +2899,7 @@ class AgentWorker(threading.Thread):
         self.agent = registry.get(self.db, self.name) or self.agent
         self.session_turns = 0
         self.session_tokens = 0.0
+        self._context_session_forget()
         self.last_turn_reread = 0
         self.last_turn_reread_session = None
         self.last_turn_context = self.last_turn_context_session = None
@@ -3316,6 +3425,7 @@ class AgentWorker(threading.Thread):
     def _reset_session_counts(self) -> None:
         self.session_turns = 0
         self.session_tokens = 0.0
+        self._context_session_forget()
         self.last_turn_reread = 0
         self.last_turn_reread_session = None
         self.last_turn_context = self.last_turn_context_session = None
@@ -3684,6 +3794,7 @@ class AgentWorker(threading.Thread):
             self.agent = registry.get(self.db, self.name) or self.agent
             self.session_turns = 0
             self.session_tokens = 0.0
+            self._context_session_forget()
             suite = "new session opened on the resume brief"
         log_async("[%s] %s: %s" % (self.name, motif, suite))
         self._fil_note(note.replace("{suite}", suite),
@@ -4649,7 +4760,11 @@ class AgentWorker(threading.Thread):
         document = self._context_observation
         if document is None:
             # Tour réparé par un autre worker (la mesure du flux est perdue) :
-            # on ne publie pas une observation inventée.
+            # on ne publie pas une observation inventée, et la session garde le
+            # trou — `R_session` reste inconnue au lieu d'une somme supposée.
+            self._invalidate_context_session(
+                travail.get("session") or self._context_session_id,
+                (context_metrics.REASON_COLLECTION_LOST,))
             return
         try:
             legacy = {
@@ -4692,6 +4807,11 @@ class AgentWorker(threading.Thread):
         except Exception as exc:  # noqa: BLE001 — observation jamais fatale
             log_async("[%s] context observation not published (%s)"
                       % (self.name, " ".join(str(exc).split())[:160]))
+            # L'événement manque : le trou est dit, la base ne continue pas
+            # comme si le tour avait été publié.
+            self._invalidate_context_session(
+                document.get("session") or self._context_session_id,
+                (context_metrics.REASON_COLLECTION_LOST,))
         finally:
             self._context_observation = None
             self._turn_close_observation = None
@@ -8287,7 +8407,9 @@ class AgentWorker(threading.Thread):
             normalizer = context_metrics.TurnNormalizer(
                 harness, session=session, turn=turn_id, model=model or None,
                 mode="resident" if rp is not None else "non-resident",
-                session_reread=self._context_baseline)
+                session_reread=self._context_baseline,
+                session_reread_quality=self._context_baseline_quality,
+                session_reread_reasons=self._context_baseline_reasons)
             with open(events_path, "a", encoding="utf-8") as events:
                 for raw in flux:
                     line = raw.rstrip("\n")
@@ -8581,6 +8703,9 @@ class AgentWorker(threading.Thread):
                 log_async("[%s] context observation not published (%s)"
                           % (self.name, " ".join(str(exc).split())[:160]))
                 self._context_observation = None
+                self._invalidate_context_session(
+                    session_new or session or self._context_session_id,
+                    (context_metrics.REASON_COLLECTION_LOST,))
         self.last_turn_seconds = duration
         # L217 : fil principal et sous-agents, mesurés à part dans le flux
         self.last_turn_main_reread = relus
