@@ -1,0 +1,186 @@
+# Enrôler le contrôleur de release indépendant
+
+Cette opération administrative complète le bootstrap ; elle ne remplace ni sa
+signature, ni les décisions de release que le contrôleur exécutera ensuite.
+`enroler-controleur.py` publie sept documents privés à des destinations fixes,
+admet la fabrique complète, puis démarre une seule unité. Le service produit
+lui-même `readiness.json`. Une valeur déposée par un opérateur ne constitue pas
+une preuve de disponibilité.
+
+## État du pilote et topologie à régler
+
+Au constat bureau du 30 octobre 2026, 19:36 UTC, lot #4989
+([ticket #3736](https://github.com/manaty/ameesh/issues/3736)), les sept documents,
+les références de sauvegarde, la clé privée et les known_hosts dédiés sont
+absents sur agents-3. Les fichiers `turn.json`, le sceau, le verrou permanent et
+l'unité proviennent du bootstrap signé #169540. L'installation est retenue à
+`validate`, avant `enable` ; aucun démarrage réussi n'est établi.
+
+L'arbitrage mesh-design du 30 octobre, consigné au lot à 19:38, demande une
+**nouvelle clé de transport locale**, jamais une copie des trois clés de
+bureau-goal. Sa génération et sa délégation sont des opérations
+administratives distinctes à signer : `keygen` génère la nouvelle privée
+localement, puis `prepare` inclut seulement sa publique et son empreinte dans
+le mandat d'enrôlement. L'outil n'édite aucun `authorized_keys`. Les destinations doivent autoriser la nouvelle clé
+avec `restrict`, une source mesurée et la commande forcée existante, dont le
+dispatcher exige encore le manifeste signé et l'intent du contrôleur.
+
+Le bootstrap #169540 ne couvre pas cette nouvelle clé : ses octets signés
+n'autorisent que la clé du bureau depuis `78.232.62.207/32`. Ajouter une clé
+locale ou modifier cette source requiert un nouveau bundle/mandat ; reprendre
+l'ancien `enable` ne doit pas écraser une délégation plus récente. Le bureau et
+le pilote doivent fixer cette succession avant toute installation. Les clés de
+bureau-goal restent sur cet hôte. La nouvelle privée reste hors sauvegarde ;
+sa perte impose un réenrôlement. La révocation dans les destinations relève du
+mandat de délégation correspondant ; l'arrêt du service décrit ici conserve
+ses documents et ne révoque pas une clé.
+
+## Inventaire privé et sources
+
+Les sept fichiers sont des JSON UTF-8 réguliers, à lien unique, `root:root
+0600`, sous `/etc/ameesh-release`. Tous leurs parents sont root, sans lien ni
+écriture de tiers. Les documents sources ont les mêmes protections dans
+`/var/lib/ameesh-release-enrollment/OPERATION`, répertoire `root:root 0700`.
+Aucun contenu privé ne va dans Git, une PR, un ticket, une sortie ou un courrier.
+
+| Document | Champs exacts et provenance à préparer par le bureau |
+| --- | --- |
+| `enrollment.json` | `host`, `machine_id` mesurés ; `policy` relue (host, unités, gestionnaire system/user explicite, unité contrôleur, délai) ; `database` identifiant logique de la base. La politique inclut l'unité propre au canari de `turn.json`. |
+| `database.json` | `backend="postgres"`, `dsn`, `schema` ; connexion indépendante explicitement enrôlée, jamais une configuration ambiante ou un profil d'exécuteur promu implicitement. Le bureau indique la source privée et les droits accordés, sans valeur dans les traces publiques. |
+| `service.json` | `runtime_tree_sha256`, `source_tree_sha256` des arbres root immuables déjà publiés. Aucune reconstruction ou modification de ces arbres par l'enrôleur. |
+| `card.json` | `units`, `properties`, `guard`, `seconds` selon `verification-release.validate_card` ; propriétés provenant d'un relevé effectif relu, pas d'une supposition sur une unité système ou utilisateur. |
+| `destinations.json` | Table bornée nom → destination sous `/etc/systemd/system/` ou `/etc/ameesh/`, distincte et validée par `configuration-release.validate_destinations`. Le mandat autorise cet inventaire, pas une publication de configuration de release. |
+| `transport.json` | `host`, `address`, `port`, `user="ameesh-release"`, `host_key_alias`, `known_hosts`, `known_hosts_sha256`, `identity_file`, `seconds` ; endpoint réel et clé hôte vérifiée par un canal indépendant, nouvelle privée locale et connue seulement de root. Fichiers de clé et known_hosts déjà protégés, root 0600. Pas de copie depuis bureau-goal. |
+| `backup.json` | `dsn` identité de sauvegarde de la **même cible** que `database.json` ; `restore_dsn` identité de restauration ; `retention_seconds`, `restore_capacity`, `remote` (`null` ou `host`, `upload_credentials`, `restore_credentials`). Origine de chaque identité et chaque fichier credential à documenter dans l'inventaire privé, jamais leur valeur. |
+
+`turn.json` reste le document existant, validé par `pilote-sante` ; le mandat
+lie son empreinte et ne le remplace pas. `restore_capacity` référence
+l'attestation fraîche du producteur pour la cible de restauration ; l'enrôleur
+n'en fabrique pas. Les credentials distants, s'ils sont utilisés, proviennent
+des identités upload et restore distinctes déjà enrôlées.
+
+Le contrôle ne crée ni compte SQL ni compte Unix, ne copie aucun secret depuis
+une autre machine et ne choisit aucun credential absent. Le dossier de stage,
+les known_hosts et les identités DB/restauration sont
+préparés par le bureau sous leurs mandats propres ; la clé utilise la phase
+signée ci-dessous. **Leur absence est un refus
+nommé dans le plan de travail, pas une raison de fabriquer une readiness.**
+
+## Génération locale séparément signée
+
+Le bureau prépare d'abord le stage 0700 et `input.json` 0600, avec les seuls
+champs `version=1` et `expires_at`. `key-question OPERATION` produit une question
+préfixée `Approve generating this host-local release transport key below:`,
+liée à l'opération, l'hôte, la machine, la clé hôte, le digest du code, la fenêtre,
+l'empreinte du turn et le compte/UID non privilégié de l'exécuteur.
+Les options sont `keygen` et `leave`. Après décision signée, exécuter
+`keygen OPERATION --decision N` avec le runtime isolé et l'enrôleur installés.
+
+La privée neuve est créée uniquement dans
+`/var/lib/ameesh-release-enrollment/OPERATION/transport/identity`, root 0600,
+parent root 0700. La génération utilise `ssh-keygen` Ed25519 sans passphrase ;
+un intent durable précède l'appel. La publique est dérivée de la privée par
+le binaire fixe et seule elle, avec son SHA256, est retournée. Une sonde
+`runuser --user COMPTE -- test -r CHEMIN` doit renvoyer le refus de lecture par
+le compte des agents, en succès comme en refus de génération. Un résultat
+incertain n'est jamais régénéré ou supprimé automatiquement. Une reprise
+complète revalide la signature et la publique sans remplacer la privée.
+
+Le mandat d'enrôlement et la délégation de destination utilisent cette publique ;
+la privée ne quitte pas son hôte et ce stage est exclu des sauvegardes. Sa
+présence sans reçu de génération complet est refusée. La génération ne publie
+ni délégation ni secret de base, et ne démarre aucun service.
+
+## Préparation protégée
+
+Après livraison du code par paquet et staging, le bureau installe l'enrôleur et
+ses compagnons root, hors checkout agent, puis enrôle leur digest dans
+`/etc/ameesh-admin/backend.json` sous une décision exacte comme celle du backend
+administrateur. La présence d'un fichier Python root ne suffit pas : le digest
+du répertoire de code doit être celui enrôlé. Les arbres déjà publiés ne sont
+jamais enrichis sur place.
+
+Le bureau prépare les sept JSON source avec le même `input.json` et la même
+fenêtre que la génération ; tous sont 0600 dans le stage 0700 de l'opération.
+Les valeurs privées viennent des références recensées ci-dessus. Aucune
+commande ne reçoit DSN, mot de passe ou clé en argument.
+
+Depuis le runtime isolé root déjà publié, avec `-I -B`, exécuter l'enrôleur
+installé root, en lui passant `prepare OPERATION`. Aucun argument ne sélectionne
+une destination, un programme, une unité ou une racine alternative. La sortie
+contient le bundle et la question exacte ; `bundle.json` est conservé dans le
+stage. Le bundle lie : opération, hôte, machine-id, clé hôte, digest du backend,
+expiration, politique, arbres, empreintes des sept fichiers, publique/empreinte de la clé locale, empreinte du turn,
+unité exacte et cinq répertoires privés fixes. Aucun corps de document privé
+n'apparaît dans cette sortie.
+
+La préparation refuse une unité différente, un arbre writable ou différent,
+un fichier existant à écraser, une clé/known_hosts absente ou non protégée,
+un turn hors politique, une sauvegarde d'une autre base, un service déjà actif,
+une file d'opérations non vide ou une réservation de release en cours.
+
+## Mandat exact et exécution
+
+Le texte à signer est **exactement** le champ `question` produit par `prepare` :
+
+```text
+Approve the exact independent release controller enrollment below:
+<JSON canonique du bundle produit sur l'hôte>
+```
+
+Les options sont celles de `enroler-controleur.OPTIONS` (`enroll`, `leave`). Le
+bureau crée la demande `ameesh decide ask --needs-signature` sur le lot ; il
+utilise la question sauvegardée sans la réécrire ni en modifier les octets.
+Le signataire doit couvrir toute la fenêtre `expires_at`. Un courrier, une
+réponse non signée ou l'ancienne décision de bootstrap ne vaut pas ce mandat.
+
+Après vérification de la signature, le bureau appelle le même enrôleur root et
+le même runtime `-I -B`, arguments `enroll OPERATION --decision N`. L'outil :
+
+1. Acquiert exclusivement le **verrou permanent existant** du sceau, sans le
+   créer, remplacer, tronquer ni supprimer ; revalide le bundle et l'autorité.
+2. Publie chaque fichier absent en 0600, intent durable avant écriture et reçu
+   après fsync. Une reprise ne réécrit pas un fichier déjà conforme ; un résultat
+   partiel ou divergent reste à réconcilier. Aucun ancien journal de bootstrap
+   n'est édité.
+3. Prépare ou vérifie les seuls répertoires privés fixes : opérations,
+   controller, configuration, backup, retention. Aucune correction de mode ou
+   propriétaire d'un répertoire préexistant n'est tentée.
+4. Ouvre la connexion indépendante installée et appelle la fabrique du **code
+   immuable publié**, `HostFactory.admit`, avec toutes ses capacités ; tout
+   manque refuse le démarrage.
+5. Recharge systemd et démarre uniquement `ameesh-release-controller.service`,
+   sans l'activer au boot. Un intent de start incertain ne déclenche pas un
+   second start : la reprise observe la même instance ou demande réconciliation.
+6. Attend au plus 30 secondes la vraie readiness, liée à l'hôte, aux arbres,
+   au boot et à l'InvocationID active dans `system.slice`. Le reçu conserve cette
+   instance ; une instance différente n'est pas adoptée comme la précédente.
+
+La publication des documents et le démarrage ne constituent pas une release :
+la file doit être vide et chaque futur job exige sa propre décision signée.
+Le pilote #3392 ne reprend que sous le mandat de bootstrap approprié, après
+preuve native d'admission et contrôle de sa délégation effective.
+
+## Retour arrière et preuves
+
+`stop-question OPERATION` rend une **autre** question, préfixée
+`Approve stopping this exact enrolled release controller below:` et contenant
+le même bundle. Les options distinctes sont `stop` et `leave`. Une nouvelle
+décision signée autorise `stop OPERATION --decision N`, dans la fenêtre du
+bundle. La signature enroll ne peut pas autoriser stop, ni inversement.
+
+L'arrêt refuse une file non vide, une réservation ou une instance différente
+de celle enregistrée. Il arrête cette seule unité, vérifie inactive et conserve
+les documents, le journal de reprise, les arbres, le verrou et tous les journaux
+natifs. Il ne révoque pas une clé chez une destination ; cette révocation exige
+l'opération de délégation distincte. Un start dont aucune instance n'a pu être
+observée reste uncertain : conserver l'intent et faire signer un mandat de
+réconciliation précis, sans suppression manuelle de journaux.
+
+Dans le lot : lien de la décision et validité réelle, empreinte du bundle,
+identités de l'hôte et du backend, hashes/modes/propriétaires des documents,
+résultat d'admission, LoadState/ActiveState/Slice/MainPID/InvocationID, boot,
+readiness native et preuve du verrou inchangé. Aucun contenu privé. Le bureau
+relève aussi le refus de lecture de la clé par le compte des agents, en succès
+comme en refus de l'opération de clé. La qualification réelle suit le staging ;
+les tests locaux simulent services et credentials et ne la prouvent pas.
