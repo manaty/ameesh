@@ -582,8 +582,13 @@ class Leases(Domain):
     @abc.abstractmethod
     def end_turn(self, name: str, owner: str, epoch: int, *, status: str,
                  status_text: str | None, error: str | None,
-                 cost_usd: float | None) -> bool:
-        """Clôt un tour seulement si le bail est encore détenu."""
+                 cost_usd: float | None, turn_id: str | None = None) -> bool:
+        """Clôt un tour seulement si le bail est encore détenu.
+
+        ``turn_id`` est l'identité du tour local fermé : elle fend la clôture
+        générique d'un tour sandbox (#4881). Absente, seul un tour sandbox
+        vivant sur le même bail refuse.
+        """
 
 
 class Catalog(Domain):

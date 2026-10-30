@@ -62,22 +62,35 @@ def _late(tx, row):
 
 
 def ameesh_turn_close(tx, name, owner, epoch, *, status, status_text, error,
-                      cost_usd, sandbox_turn_id=None):
+                      cost_usd, sandbox_turn_id=None, turn_id=None):
     """Internal shared close; caller holds the sandbox/registry locks.
 
     Sandbox completion is called only after its unique result insertion. A
     local close cannot bypass the result boundary, even on a terminal row.
+
+    The generic close is fenced by the identity of the turn it closes
+    (``turn_id``), never by the latest ``turn_resources`` row (#4881): a local
+    turn whose resource row could not be attached must still close, and a
+    terminal sandbox turn stays bound to its own ``turn_id``. Without an
+    identity (legacy caller) only a live sandbox turn on the same lease
+    refuses, which fails closed without guessing.
     """
     if sandbox_turn_id is None:
         tx.query('select name from agent_registry where name = %s for update', (name,))
-    if sandbox_turn_id is None and tx.query(
-            'select turn_id from sandbox_turns where agent = %s'
-            " and owner = %s and lease_epoch = %s"
-            " and (state not in ('succeeded','failed','cancelled','expired','lost')"
-            " or turn_id = (select turn_id from turn_resources where agent = %s"
-            " order by started_at desc, id desc limit 1)) limit 1",
-            (name, owner, epoch, name)):
-        _refuse('wrong-completion')
+    if sandbox_turn_id is None:
+        blocked = False
+        if turn_id is not None:
+            blocked = bool(tx.query(
+                'select turn_id from sandbox_turns where turn_id = %s',
+                (turn_id,)))
+        if not blocked:
+            blocked = bool(tx.query(
+                'select turn_id from sandbox_turns where agent = %s'
+                " and owner = %s and lease_epoch = %s"
+                " and state not in ('succeeded','failed','cancelled','expired','lost')"
+                ' limit 1', (name, owner, epoch)))
+        if blocked:
+            _refuse('wrong-completion')
     return bool(tx.query(
         'update agent_registry set status = %s,'
         ' status_text = coalesce(%s, status_text), last_error = %s,'
@@ -120,6 +133,12 @@ def _canonical(result):
 
 
 def _validate(row, result):
+    # §9 fixed precedence: a wrong echoed turn/epoch is `stale`, before the
+    # scope comparison (#4881). Keep `missing` for an absent field.
+    if ('turn_id' in result and 'epoch' in result
+            and (result['turn_id'] != row['turn_id']
+                 or result['epoch'] != row['lease_epoch'])):
+        _refuse('stale')
     if (result.get('scope') != row['scope']
             or result.get('scope_digest') != row['scope_digest']):
         _refuse('scope-mismatch')
@@ -130,10 +149,12 @@ def _validate(row, result):
         _refuse('missing')
     if result['schema'] != 'ameesh-sandbox-result/1':
         _refuse('contract-mismatch')
-    if result['turn_id'] != row['turn_id'] or result['epoch'] != row['lease_epoch']:
-        _refuse('stale')
     if (not row['job_uid'] or not isinstance(result['result_id'], str)
             or not result['result_id'] or not isinstance(result['usage'], dict)):
+        _refuse('missing')
+    # The result payload is bounded and sanitised: exactly the four admitted
+    # counters, never an arbitrary envelope (#4881).
+    if set(result['usage']) != {'turns', 'tool_calls', 'seconds', 'model_calls'}:
         _refuse('missing')
     allowed = set(required) | {'scope', 'scope_digest', 'tools', 'capabilities', 'image_digest'}
     if set(result) - allowed:
@@ -170,6 +191,12 @@ def _validate(row, result):
             _refuse('profile-refused')
     if limits.get('session', 'none') == 'none' and result['sandbox_session'] is not None:
         _refuse('profile-refused')
+    # When the profile admits a session, the identifier is a string or null;
+    # a non-string must refuse as `missing`, never reach the text column and
+    # fail in the driver (#4881, auditor N).
+    session = result['sandbox_session']
+    if session is not None and (not isinstance(session, str) or not session):
+        _refuse('missing')
     if (not isinstance(result['source'], dict)
             or result['source'].get('contract') != row['source'].get('contract')):
         _refuse('contract-mismatch')
@@ -222,6 +249,10 @@ def ameesh_sandbox_complete(db, turn_id, owner, epoch, result, *, settle=None):
     with db.transaction() as tx:
         row = _locked(tx, turn_id)
         _revoked(row)
+        # §4 steps 2-3 and §9: revocation and a stale lease win over the
+        # stored-result path. A replay is `replayed` only while this owner and
+        # epoch still hold the lease; changing that order would reverse the
+        # design's fixed precedence (#4881, pinned by the tests).
         _live(tx, row, owner, epoch)
         raw, digest = _canonical(result)
         result = json.loads(raw)
@@ -297,6 +328,6 @@ def ameesh_sandbox_cancel(db, turn_id, owner, epoch, *, observed=False,
                    ' then clock_timestamp() else completed_at end where turn_id = %s',
                    (state, observed, observed, turn_id))
         tx.execute("insert into ameesh_events (type, object, data)"
-                   " values ('sandbox.cancel', %s, %s::jsonb)",
+                   " values ('sandbox.cancelled', %s, %s::jsonb)",
                    ('turn:' + turn_id, json.dumps({'turn_id': turn_id, 'state': state})))
         return {'turn_id': turn_id, 'state': state}

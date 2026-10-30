@@ -108,7 +108,7 @@
      "inge-front"
     ],
     "available": true,
-    "contract_version": "1.9.0"
+    "contract_version": "1.10.0"
    }
   }
  },
@@ -121,7 +121,7 @@
    "status": 200,
    "body": {
     "schema": "ameesh-exec-health/1",
-    "contract": "1.9.0",
+    "contract": "1.10.0",
     "server_ts": 1791640000.12
    }
   }

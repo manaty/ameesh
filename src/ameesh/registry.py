@@ -792,10 +792,15 @@ def end_turn(
     status_text: str | None = None,
     error: str | None = None,
     cost_usd: float | None = None,
+    turn_id: str | None = None,
 ) -> bool:
-    """Clôt un tour *seulement si le bail est encore détenu* (fencing)."""
+    """Clôt un tour *seulement si le bail est encore détenu* (fencing).
+
+    ``turn_id`` nomme le tour local fermé ; il permet de refuser la clôture
+    générique d'un tour sandbox par identité (#4881).
+    """
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.end_turn")
     return storage.of(db).leases.end_turn(name, owner, epoch, status=status,
                                           status_text=status_text, error=error,
-                                          cost_usd=cost_usd)
+                                          cost_usd=cost_usd, turn_id=turn_id)
