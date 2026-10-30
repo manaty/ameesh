@@ -34,7 +34,7 @@ receipts with ameesh.
 
 | Term | Meaning |
 |---|---|
-| **canon** | the federated OKF repositories describing teams, members, hosts, placements, lots and decisions |
+| **canon** | the federated OKF repositories describing teams, members, hosts, placements, work items and decisions |
 | **member** | a human (`human:<id>`) or an agent (`agent:<id>`) |
 | **card** | the declaration of a member, a host or a placement in the canon |
 | **host** | a machine or a cluster, with a responsible human and a policy |
@@ -42,11 +42,12 @@ receipts with ameesh.
 | **work item** | a unit of work (`work_items` in the database; the CLI retains the options `--lot`, `--new-lot`), called a **lot** by the development module |
 | **action** | an effect on the outside world, classed `read`, `reversible`, `irreversible` or `costly` |
 | **receipt** | the signed proof that a human approved one attempt of an action |
-| **thread** | the readable sequence of messages of a lot or a project |
+| **thread** | the readable sequence of messages of a work item or a project |
 
 ## Pages
 
 - [Core and modules](core-and-modules.md)
+- [Work lifecycle](work-lifecycle.md)
 - [The canon](canon.md)
 - [Members, agents, hosts, placements](members-agents-hosts.md)
 - [Runner and leases](runner-and-leases.md)
