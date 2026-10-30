@@ -14,7 +14,8 @@ mécanique, ce que l'outillage exécute sans agent :
   exclues des prises lot/backlog et transferts build de pause budget jusqu’à
   la date ISO incluse (fuseau du canon),
   sans fermer les propositions de relecture/correction ; absent ou expiré :
-  aucune exclusion ; canon illisible : passage arrêté comme le plafond §4.
+  aucune exclusion ; canon illisible : passage arrêté à la première prise
+  tentée, comme le plafond §4.
 - `build.max_in_build` : le plafond de lots en développement par agent ;
 - `ci.packet`, `ci.incident_label`, `ci.environment_red`, `ci.faulty_lot` :
   une suite par paquet, l'étiquette qui autorise exceptionnellement la CI d'un

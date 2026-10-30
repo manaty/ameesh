@@ -1589,24 +1589,22 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
 
     take_documents = []
 
-    def candidates(threshold: float, skip=(), waiting_free: bool = False,
-                   take_work: bool = True) -> list:
-        # #5005 : une même politique épinglée pour toutes les prises du passage.
-        # Aucun repli si le canon est illisible (#2451). Les propositions
-        # review/correction ne sont pas des prises de travail neuf.
-        if take_work and not take_documents:
+    def take_allowed(row) -> bool:
+        # #5005 : lecture au même point que cap(), à la première prise
+        # tentée ; aucun accès pour un passage vide ou un simple avis.
+        if not take_documents:
             from . import mechanics
             take_documents.append(mechanics.configured(cfg))
-        document = take_documents[0] if take_work else None
-        excluded = document.auto_take_excluded_families(now) if document else ()
+        document = take_documents[0]
+        from .review_lot import family_of
+        return family_of(row.get("harness"), document.families) not in (
+            document.auto_take_excluded_families(now))
+
+    def candidates(threshold: float, skip=(), waiting_free: bool = False) -> list:
         out = []
         for row in sous_utilisation.idle_agents(listing, now, threshold,
                                                 waiting_free=waiting_free,
                                                 actionable_idle=True):
-            if excluded:
-                from .review_lot import family_of
-                if family_of(row.get("harness"), document.families) in excluded:
-                    continue
             # #804 : un exécuteur ne fait prendre que ses propres agents ; les
             # autres restent dans `listing` pour les gardes et l'avertissement.
             if agents is not None and row["name"] not in agents:
@@ -1662,6 +1660,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if not lots or len(taken) >= lot_room or lot_place() <= 0:
                 break
             if not within_budget(row):
+                continue
+            if not take_allowed(row):
                 continue
             # §4 canon : plafond de lots en build par agent — la prise
             # automatique refuse au-delà (le témoin concurrent est dans
@@ -1780,8 +1780,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
 
         taken.extend(_propose_reviews(
             db, st, listing,
-            pool=candidates(idle_s, skip=set(orchestras), waiting_free=True,
-                            take_work=False),
+            pool=candidates(idle_s, skip=set(orchestras), waiting_free=True),
             room=proposal_room, dry_run=dry_run, canons=canons,
             skip=set(orchestras), within_budget=within_budget, wakeable=wakeable,
             cfg=cfg, now=now))
@@ -1799,6 +1798,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         if not queue or len(taken) >= room or place() <= 0:
             break
         if not within_budget(row):
+            continue
+        if not take_allowed(row):
             continue
         # §4 : le plafond de lots en build vaut aussi pour la file
         if st.work.count_builds(row["name"]) >= cap():

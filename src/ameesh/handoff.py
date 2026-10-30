@@ -378,11 +378,9 @@ def budget_handoff(cfg, db, *, now: float | None = None,
     # preneur n'a de lot (`idle_agents`)
     from . import mechanics
     from .review_lot import family_of
-    document = mechanics.configured(cfg)
-    excluded_families = document.auto_take_excluded_families(now)
+    take_documents = []
     targets = sorted((row for row in sous_utilisation.idle_agents(listing, now, idle_s)
                       if row.get("harness") in TARGET_HARNESSES
-                      and family_of(row.get("harness"), document.families) not in excluded_families
                       and row["name"] not in orchestras),
                      key=lambda r: (sous_utilisation.idle_since(r), r["name"]))
     if budget_check is None:
@@ -479,6 +477,14 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                                         auditor=row["name"] in auditors,
                                         card=auditors.get(row["name"]),
                                         others=listing, db=db):
+                    continue
+                # Politique requise seulement pour un transfert build réel,
+                # jamais pour rendre un intake ou sans cible admissible.
+                if not take_documents:
+                    take_documents.append(mechanics.configured(cfg))
+                document = take_documents[0]
+                if family_of(row.get("harness"), document.families) in (
+                        document.auto_take_excluded_families(now)):
                     continue
                 target = row
                 break

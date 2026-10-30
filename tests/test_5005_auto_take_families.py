@@ -84,6 +84,23 @@ class BudgetHandoffTest(_Handoff):
                                  ["deepseek1"])
                 self.assertEqual(self.assignee(lot), "claude1")
 
+    def test_intake_return_does_not_read_take_policy(self):
+        self.team()
+        lot = self.lot("intake")
+        with patch.object(mechanics, "configured", side_effect=AssertionError("unneeded read")) as read, patch.object(
+                handoff, "lot_git", return_value=GIT_OK):
+            out = self.hand()
+        read.assert_not_called()
+        self.assertEqual([(r["item"]["id"], r["agent"]) for r in out], [(lot["id"], None)])
+
+    def test_build_without_target_does_not_read_take_policy(self):
+        self.team()
+        lot = self.lot("build", state="build", branch="lot/build")
+        with patch.object(mechanics, "configured", side_effect=AssertionError("unneeded read")) as read:
+            self.assertEqual(self.hand(budget_check=lambda name: "budget exhausted"), [])
+        read.assert_not_called()
+        self.assertEqual(self.assignee(lot), "claude1")
+
     def test_unreadable_canon_prevents_handoff(self):
         self.team()
         lot = self.lot("build", state="build", branch="lot/build")
@@ -133,6 +150,30 @@ class AutoTakeTest(lots._Lots):
             with self.assertRaises(mechanics.MechanicsError):
                 self.take()
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+
+    def test_no_take_attempt_does_not_read_policy(self):
+        self.agent("eligible", team="nexlink")
+        lot = self.lot("travail neuf")
+        for options in ({"listing": []}, {"budget_check": lambda name: "exhausted"},
+                        {"agents": set()}, {"lot_max_per_hour": 0}):
+            with self.subTest(options=options), patch.object(
+                    mechanics, "configured", side_effect=AssertionError("unneeded read")) as read:
+                self.assertEqual(self.take(review_max_per_hour=0, **options), [])
+                read.assert_not_called()
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+
+    def test_empty_pass_does_not_read_policy(self):
+        self.agent("eligible", team="nexlink")
+        with patch.object(mechanics, "configured", side_effect=AssertionError("unneeded read")) as read:
+            self.assertEqual(self.take(review_max_per_hour=0), [])
+        read.assert_not_called()
+
+    def test_policy_is_read_once_for_multiple_candidate_pools(self):
+        self.agent("excluded", harness="deepseek", team="nexlink")
+        self.lot("travail neuf")
+        with patch.object(mechanics, "configured", return_value=document()) as read:
+            self.assertEqual(self.take(review_max_per_hour=0, agents=None), [])
+        read.assert_called_once_with(self.cfg)
 
     def test_proposal_pool_keeps_excluded_family(self):
         self.policy()
