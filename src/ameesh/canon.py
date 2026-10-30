@@ -47,9 +47,11 @@ import dataclasses
 import datetime as _dt
 import fnmatch
 import hashlib
+import math
 import os
 import posixpath
 import re
+import stat
 import subprocess
 import threading
 from collections import defaultdict
@@ -203,6 +205,42 @@ NAMING_SEGMENT_RE = re.compile(r"^[a-z0-9]{2,6}\Z")
 #: L243 (#468) : le numéro de séquence, deux chiffres puis trois après 99.
 NAMING_SEQ_RE = re.compile(r"^[0-9]{2,}\Z")
 NAMING_FIELDS = ("org", "projects", "roles")
+
+# -- #2202 S2 : blocs `sandbox` des cartes Agent et Host ----------------------
+# Le profil est une ADMISSION (le canon PR relu par le bureau ; `admitted_ref`
+# en est la preuve) et le placement est le modèle de Job de l'hôte. Les deux
+# blocs sont facultatifs : une carte sans eux ne peut simplement pas lancer de
+# tour en bac à sable. Le canon ne pose aucune signature : il DÉCLARE la
+# décision, le coureur la lit.
+SANDBOX_STATUSES = ("admitted", "revoked")
+#: seul chemin de modèle admis dans le pilote : le relais, jamais une clé
+#: fournisseur dans le Job (§1, décision #120571 point 3)
+SANDBOX_CREDENTIALS = ("relay",)
+#: un relecteur borné n'a pas de session conservée entre tentatives (§6)
+SANDBOX_SESSIONS = ("none",)
+#: les quatre capacités d'un relecteur borné, toutes fausses (§6)
+SANDBOX_CAPABILITIES = ("merge", "fix", "deploy", "publish")
+SANDBOX_LIMIT_KEYS = ("turns", "max_attempts", "tool_calls", "turn_seconds",
+                      "job_seconds", "context_tokens", "usd_per_turn")
+SANDBOX_JOB_KEYS = ("activeDeadlineSeconds", "backoffLimit",
+                    "ttlSecondsAfterFinished", "automountServiceAccountToken")
+#: fournisseur de Jobs admis (§1) ; le fournisseur factice des tests n'est pas
+#: une carte du canon
+SANDBOX_PROVIDERS = ("kubernetes",)
+#: nom de profil : minuscules, chiffres, `.` `_` `-` (64 caractères au plus)
+SANDBOX_PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
+#: libellé DNS-1123 d'un namespace Kubernetes
+SANDBOX_NAMESPACE_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?\Z")
+#: image épinglée par empreinte : `repository@sha256:<64 hexadécimaux>` (§6)
+SANDBOX_IMAGE_RE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}\Z")
+#: preuve d'admission : un canon PR/une décision (`owner/repo#123`) ou une
+#: référence de fiche (`membre:chemin@commit`)
+SANDBOX_REF_RE = re.compile(
+    r"^(?:[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*#[0-9]+"
+    r"|#?[0-9]+"
+    r"|[A-Za-z0-9][A-Za-z0-9._/-]*:[^\s@]+@[0-9a-f]{7,64})\Z")
+#: racines partagées qu'un kubeconfig privé ne peut pas habiter
+SANDBOX_SHARED_ROOTS = ("/tmp", "/var/tmp", "/dev/shm")
 
 
 class CanonError(ValueError):
@@ -901,6 +939,99 @@ class Member:
 
 
 @dataclass
+class SandboxLimits:
+    """#2202 S2 : les limites d'un relecteur borné (`sandbox.limits`).
+
+    Toutes les valeurs sont positives ; `job_seconds` doit dépasser
+    `turn_seconds` (le Job survit au tour, le superviseur le supprime à
+    l'échéance). Les valeurs de la qualification IMA #837 sont des exemples,
+    jamais des constantes compilées.
+    """
+
+    turns: int
+    max_attempts: int
+    tool_calls: int
+    turn_seconds: float
+    job_seconds: int
+    context_tokens: int
+    usd_per_turn: float
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+@dataclass
+class SandboxProfile:
+    """#2202 S2 : le bloc `sandbox` d'une carte Agent (profil admis).
+
+    Le bureau relit le canon PR ; `admitted_ref` en est la preuve et `status`
+    la transforme en révocation sans seconde autorité. Le bloc est une
+    admission, pas une signature : le coureur le lit et ne l'invente jamais.
+    """
+
+    profile: str
+    admitted_ref: str
+    status: str
+    credential: str
+    session: str
+    capabilities: dict[str, bool]
+    limits: SandboxLimits
+    #: enveloppe de tranche (ligne posée par un humain, §8) ; None = aucune
+    tranche: str | None = None
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+@dataclass
+class SandboxJob:
+    """#2202 S2 : les défauts du Job Kubernetes déclarés par l'hôte (§6)."""
+
+    active_deadline_seconds: int
+    backoff_limit: int
+    ttl_seconds_after_finished: int
+    automount_service_account_token: bool
+
+    def to_dict(self) -> dict:
+        return {"activeDeadlineSeconds": self.active_deadline_seconds,
+                "backoffLimit": self.backoff_limit,
+                "ttlSecondsAfterFinished": self.ttl_seconds_after_finished,
+                "automountServiceAccountToken": self.automount_service_account_token}
+
+
+@dataclass
+class SandboxPlacement:
+    """#2202 S2 : le bloc `policy.sandbox` d'une carte Host (placement).
+
+    L'hôte porte ce que le Job ne peut pas porter lui-même : le fournisseur,
+    le kubeconfig privé, l'image épinglée et les défauts du Job. Une image sans
+    empreinte est refusée : un tag mutable n'est pas une isolation.
+    """
+
+    provider: str
+    kubeconfig: str
+    namespace: str
+    image: str
+    allowed_profiles: list[str]
+    max_concurrent_jobs: int
+    admitted_ref: str
+    job: SandboxJob
+
+    @property
+    def image_digest(self) -> str:
+        """L'empreinte épinglée (`sha256:…`) de l'image, ou la valeur brute."""
+        return self.image.rsplit("@", 1)[-1]
+
+    def to_dict(self) -> dict:
+        return {"provider": self.provider, "kubeconfig": self.kubeconfig,
+                "namespace": self.namespace, "image": self.image,
+                "allowed_profiles": list(self.allowed_profiles),
+                "max_concurrent_jobs": self.max_concurrent_jobs,
+                "admitted_ref": self.admitted_ref,
+                "job": self.job.to_dict()}
+
+
+@dataclass
 class Agent:
     title: str
     responsible: str | None
@@ -943,6 +1074,9 @@ class Agent:
     #: #3185: the other projects whose lots this agent may review (`relit:`),
     #: beside its own; only declared projects (`validate`). None: none.
     relit: list[str] | None = None
+    #: #2202 S2 : le profil de relecteur borné (`sandbox:`), None = aucun tour
+    #: en bac à sable pour cet agent.
+    sandbox: SandboxProfile | None = None
 
     @property
     def is_persona(self) -> bool:
@@ -999,6 +1133,16 @@ class HostPolicy:
     #: `<command> busy|draining|idle-drained <host>` and never touches the
     #: cluster or the cloud itself. None = no adapter, so no automatic release.
     lifecycle_hook: str | None = None
+    #: #2202 S2 : le placement de Job (`policy.sandbox`), None = l'hôte ne
+    #: reçoit aucun tour en bac à sable.
+    sandbox: SandboxPlacement | None = None
+
+    def to_dict(self) -> dict:
+        """Politique sérialisable (`canon show --json`) : le bloc sandbox est
+        un objet, jamais une dataclass brute."""
+        out = dict(self.__dict__)
+        out["sandbox"] = self.sandbox.to_dict() if self.sandbox is not None else None
+        return out
 
     def work_dir(self, project: str | None, agent: str | None = None) -> str | None:
         """Dossier de travail d'un agent (et de son projet) sur cet hôte, ou None.
@@ -1468,7 +1612,7 @@ class Canon:
                            admins=h.admins, occupants=h.occupants,
                            unavailable_until=h.unavailable_until,
                            unavailable_reason=h.unavailable_reason,
-                           policy=h.policy.__dict__.copy(), **fiche(h.fiche))
+                           policy=h.policy.to_dict(), **fiche(h.fiche))
                       for h in self.hosts],
             "agents": [dict(title=a.title, aliases=a.aliases or [], type=a.fiche.type, responsible=a.responsible, team=a.team,
                             capabilities=a.capabilities, harness=a.harness, model=a.model,
@@ -1478,6 +1622,7 @@ class Canon:
                             budget_usd_per_day=a.budget_usd_per_day, tools=a.tools,
                             reviewers=a.reviewers, priority=a.priority,
                             memory_repository=a.memory_repository,
+                            sandbox=a.sandbox.to_dict() if a.sandbox is not None else None,
                             hosts=[p.host for p in self.placements_of(a.title)],
                             **fiche(a.fiche))
                        for a in self.agents],
@@ -1656,9 +1801,185 @@ def placement_violations(agent: Any, host: Any, placement: Any = None) -> list[s
     return out
 
 
-# ==========================================================================
-# git : lecture par les objets, jamais par l'arbre de travail
-# ==========================================================================
+# -- #2202 S2 : contrôles des blocs `sandbox` ---------------------------------
+# Une seule source pour les contrôles : l'analyse de la carte les enregistre
+# comme constats, l'admission les rejoue sur l'objet déjà lu (défense en
+# profondeur : un appelant qui n'a pas lancé `canon check` ne peut pas admettre
+# un bloc invalide).
+
+def _positive_finite(value: Any) -> float | None:
+    """Le nombre comme float fini > 0, ou None (booléens, inf, débordement)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
+def sandbox_limits_problems(limits: SandboxLimits) -> list[str]:
+    """Raisons pour lesquelles `sandbox.limits` est refusé ([] = valide)."""
+    out: list[str] = []
+    for name in ("turns", "max_attempts", "tool_calls", "job_seconds", "context_tokens"):
+        value = getattr(limits, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            out.append("`sandbox.limits.%s`: positive integer expected" % name)
+    for name in ("turn_seconds", "usd_per_turn"):
+        if _positive_finite(getattr(limits, name)) is None:
+            out.append("`sandbox.limits.%s`: positive finite number expected" % name)
+    if not out and limits.job_seconds <= limits.turn_seconds:
+        out.append("`sandbox.limits.job_seconds` (%s) must be greater than `turn_seconds` "
+                   "(%s): the Job survives the turn" % (limits.job_seconds,
+                                                        limits.turn_seconds))
+    return out
+
+
+def sandbox_profile_problems(profile: SandboxProfile) -> list[str]:
+    """Raisons pour lesquelles un profil de relecteur est refusé (§6).
+
+    Un relecteur borné est relay-only, sans session conservée et sans aucune
+    des quatre capacités merge/fix/deploy/publish ; ces règles ne sont pas des
+    réglages, elles sont la borne.
+    """
+    out: list[str] = []
+    if not profile.profile or not SANDBOX_PROFILE_RE.match(profile.profile):
+        out.append("`sandbox.profile`: non-empty lowercase name expected (letters, "
+                   "digits, `.`, `_`, `-`, 64 characters at most)")
+    if not profile.admitted_ref or not profile.admitted_ref.strip():
+        out.append("`sandbox.admitted_ref`: the bureau-reviewed canon PR/decision "
+                   "reference is required")
+    if profile.status not in SANDBOX_STATUSES:
+        out.append("`sandbox.status`: %s expected, not %r"
+                   % (" or ".join(SANDBOX_STATUSES), profile.status))
+    if profile.credential not in SANDBOX_CREDENTIALS:
+        out.append("`sandbox.credential`: %s required for an admitted sandbox (a Job "
+                   "never holds a provider key)" % " or ".join(SANDBOX_CREDENTIALS))
+    if profile.session not in SANDBOX_SESSIONS:
+        out.append("`sandbox.session`: `none` required for a bounded reviewer")
+    for name in SANDBOX_CAPABILITIES:
+        if profile.capabilities.get(name) is not False:
+            out.append("`sandbox.capabilities.%s`: false required for a bounded "
+                       "reviewer" % name)
+    out += sandbox_limits_problems(profile.limits)
+    return out
+
+
+def kubeconfig_problem(path: str) -> str | None:
+    """Pourquoi un chemin de kubeconfig n'est pas privé, ou None (§6).
+
+    Le canon vérifie la FORME partout et les droits réels quand le fichier est
+    présent : la carte peut être relue sur un poste qui n'a pas le kubeconfig
+    de l'hôte, mais un fichier lisible par le groupe ou les autres comptes est
+    toujours refusé."""
+    if not isinstance(path, str) or not path.strip():
+        return "non-empty path expected"
+    if path != path.strip():
+        return "path without surrounding spaces expected"
+    if not os.path.isabs(path):
+        return "absolute path expected"
+    if path == "/" or any(part in ("", ".", "..") for part in path.split("/")[1:]):
+        return "a normalized absolute path is expected (no `.` or `..`)"
+    for root in SANDBOX_SHARED_ROOTS:
+        if path == root or path.startswith(root + "/"):
+            return "a private path is required (not under %s)" % root
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None             # absent ici : seule la forme est vérifiable
+    if stat.S_ISLNK(info.st_mode):
+        return "a regular private file expected, not a symlink"
+    if not stat.S_ISREG(info.st_mode):
+        return "regular file expected"
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        return "file owned by another user"
+    if info.st_mode & 0o077:
+        return "private file expected (0600, got %o)" % (info.st_mode & 0o777)
+    return None
+
+
+def sandbox_placement_problems(placement: SandboxPlacement,
+                               *, max_agents: int | None = None) -> list[str]:
+    """Raisons pour lesquelles un placement de Job est refusé (§6)."""
+    out: list[str] = []
+    if placement.provider not in SANDBOX_PROVIDERS:
+        out.append("`policy.sandbox.provider`: %s expected, not %r"
+                   % (" or ".join(SANDBOX_PROVIDERS), placement.provider))
+    problem = kubeconfig_problem(placement.kubeconfig)
+    if problem:
+        out.append("`policy.sandbox.kubeconfig`: %s" % problem)
+    if (not placement.namespace or len(placement.namespace) > 63
+            or not SANDBOX_NAMESPACE_RE.match(placement.namespace)):
+        out.append("`policy.sandbox.namespace`: DNS-1123 label expected (lowercase "
+                   "letters, digits and `-`, 63 characters at most)")
+    if not placement.image or not SANDBOX_IMAGE_RE.match(placement.image):
+        out.append("`policy.sandbox.image`: a digest-shaped image is required "
+                   "(`repository@sha256:<64 hex>`), not a mutable tag")
+    if not placement.admitted_ref or not placement.admitted_ref.strip():
+        out.append("`policy.sandbox.admitted_ref`: the bureau-reviewed canon "
+                   "PR/decision reference is required")
+    for name in placement.allowed_profiles:
+        if not isinstance(name, str) or not SANDBOX_PROFILE_RE.match(name):
+            out.append("`policy.sandbox.allowed_profiles`: invalid profile name %r" % (name,))
+    if max_agents is None:
+        out.append("`policy.max_agents` is required beside `policy.sandbox`: the Job "
+                   "slots are bounded by the host's agent bound")
+    elif isinstance(max_agents, bool) or not isinstance(max_agents, int) or max_agents < 1:
+        out.append("`policy.max_agents`: positive integer required beside "
+                   "`policy.sandbox`")
+    elif (isinstance(placement.max_concurrent_jobs, bool)
+          or not isinstance(placement.max_concurrent_jobs, int)
+          or placement.max_concurrent_jobs < 1):
+        out.append("`policy.sandbox.max_concurrent_jobs`: positive integer expected")
+    elif placement.max_concurrent_jobs > max_agents:
+        out.append("`policy.sandbox.max_concurrent_jobs` (%d) must not exceed "
+                   "`policy.max_agents` (%d)" % (placement.max_concurrent_jobs, max_agents))
+    job = placement.job
+    if isinstance(job.active_deadline_seconds, bool) \
+            or not isinstance(job.active_deadline_seconds, int) \
+            or job.active_deadline_seconds < 1:
+        out.append("`policy.sandbox.job.activeDeadlineSeconds`: positive integer expected")
+    if job.backoff_limit != 0:
+        out.append("`policy.sandbox.job.backoffLimit`: 0 required (a single-use Job)")
+    if isinstance(job.ttl_seconds_after_finished, bool) \
+            or not isinstance(job.ttl_seconds_after_finished, int) \
+            or job.ttl_seconds_after_finished < 1:
+        out.append("`policy.sandbox.job.ttlSecondsAfterFinished`: positive integer "
+                   "expected (the adoption window)")
+    if job.automount_service_account_token is not False:
+        out.append("`policy.sandbox.job.automountServiceAccountToken`: false required "
+                   "(the Job has no kube token)")
+    return out
+
+
+def _card_jsonable(value: Any) -> Any:
+    """Frontmatter rendu JSON-safe pour l'empreinte (dates PyYAML, tuples)."""
+    if isinstance(value, dict):
+        return {str(key): _card_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_card_jsonable(item) for item in value]
+    if isinstance(value, (_dt.date, _dt.datetime)):
+        return value.isoformat()
+    return value
+
+
+def card_digest(fiche: Fiche) -> str:
+    """Empreinte stable du contenu d'une carte Agent/Host (§6).
+
+    `sha256(JCS(frontmatter))` : deux lectures du même contenu, à deux commits
+    différents, donnent la même empreinte ; une modification d'une carte
+    quelconque du canon ne la change pas. C'est l'empreinte que l'admission
+    enregistre (`profile_digest`/`placement_digest`) et que la resynchronisation
+    relit au nouveau `last_good_commit`."""
+    from . import jcs
+    try:
+        canonical = jcs.canonicalize(_card_jsonable(fiche.data), doubles=True)
+    except (jcs.JcsError, ValueError, TypeError) as exc:
+        raise CanonError("card %s cannot be canonicalized: %s" % (fiche.path, exc)) from exc
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
 
 #: variables qui redirigeraient git vers un autre dépôt, index ou objet
 _GIT_ENV_DROP = (
@@ -3702,11 +4023,101 @@ class _Loader:
             releve=releve,
             candidats=candidats,
             relit=relit,
+            sandbox=self._sandbox_profile(fiche, where, subject),
         ))
 
     def _build_persona(self, fiche: Fiche, where: dict) -> None:
         """L51: read a `Persona` card like an `Agent` card (0029, 0032)."""
         self._build_agent(fiche, where)
+
+    # -- #2202 S2 : blocs `sandbox` ------------------------------------------
+    def _sandbox_profile(self, fiche: Fiche, where: dict,
+                         subject: dict) -> SandboxProfile | None:
+        """Lit `sandbox:` d'une carte Agent (None si le bloc est absent).
+
+        La lecture ne décide pas : elle construit l'objet et laisse
+        `sandbox_profile_problems` dire ce qui est refusé, la même fonction
+        que l'admission rejoue. Un bloc structurellement illisible ne donne
+        aucun profil (fail closed)."""
+        raw = fiche.data.get("sandbox")
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            self.add("agent-sandbox-invalid", ERROR, "`sandbox`: mapping expected",
+                     **where, **subject)
+            return None
+        for key in sorted(set(map(str, raw)) - {"profile", "admitted_ref", "status",
+                                                "tranche", "credential", "session",
+                                                "capabilities", "limits"}):
+            self.add("agent-sandbox-unknown", WARNING,
+                     "`sandbox.%s`: unknown key (ignored)" % key, **where, **subject)
+        capabilities = {name: False for name in SANDBOX_CAPABILITIES}
+        caps_raw = raw.get("capabilities")
+        if caps_raw is not None:
+            if not isinstance(caps_raw, dict):
+                self.add("agent-sandbox-invalid", ERROR,
+                         "`sandbox.capabilities`: mapping expected", **where, **subject)
+            else:
+                for name, value in caps_raw.items():
+                    name = str(name)
+                    if name not in capabilities:
+                        self.add("agent-sandbox-unknown", WARNING,
+                                 "`sandbox.capabilities.%s`: unknown capability (ignored)"
+                                 % name, **where, **subject)
+                    elif not isinstance(value, bool):
+                        self.add("agent-sandbox-invalid", ERROR,
+                                 "`sandbox.capabilities.%s`: boolean expected" % name,
+                                 **where, **subject)
+                    else:
+                        capabilities[name] = value
+        limits = self._sandbox_limits(raw.get("limits"), where, subject)
+        if limits is None:
+            return None
+        admitted_ref = _text(raw.get("admitted_ref")) or ""
+        profile = SandboxProfile(
+            profile=_text(raw.get("profile")) or "",
+            admitted_ref=admitted_ref,
+            status=(_text(raw.get("status")) or "").strip().lower(),
+            tranche=_text(raw.get("tranche")),
+            credential=(_text(raw.get("credential")) or "").strip().lower(),
+            session=(_text(raw.get("session")) or "").strip().lower(),
+            capabilities=capabilities,
+            limits=limits,
+        )
+        for problem in sandbox_profile_problems(profile):
+            self.add("agent-sandbox-invalid", ERROR, problem, **where, **subject)
+        if admitted_ref and not SANDBOX_REF_RE.match(admitted_ref):
+            self.add("agent-sandbox-ref-weak", WARNING,
+                     "`sandbox.admitted_ref` %r does not look like a canon PR/decision "
+                     "reference (`owner/repo#123`, `#123` or `card@commit`): the "
+                     "bureau's evidence must be citable" % admitted_ref,
+                     **where, **subject)
+        return profile
+
+    def _sandbox_limits(self, raw, where: dict,
+                        subject: dict) -> SandboxLimits | None:
+        """Les sept limites, toutes requises ; None si le bloc est illisible."""
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            self.add("agent-sandbox-invalid", ERROR, "`sandbox.limits`: mapping expected",
+                     **where, **subject)
+            return None
+        for key in sorted(set(map(str, raw)) - set(SANDBOX_LIMIT_KEYS)):
+            self.add("agent-sandbox-unknown", WARNING,
+                     "`sandbox.limits.%s`: unknown key (ignored)" % key, **where, **subject)
+        values: dict[str, Any] = {key: 0 for key in SANDBOX_LIMIT_KEYS}
+        for key in SANDBOX_LIMIT_KEYS:
+            value = raw.get(key)
+            if key in ("turn_seconds", "usd_per_turn"):
+                number = _positive_finite(value)
+                if number is not None:
+                    values[key] = number
+            else:
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    continue
+                values[key] = value
+        return SandboxLimits(**values)
 
     def _build_host(self, fiche: Fiche, where: dict) -> None:
         subject = {"host": fiche.title}
@@ -3796,6 +4207,8 @@ class _Loader:
             # L101 : espace de travail et ménage, forme canonique
             # `policy.workspaces` ; les anciennes clés restent lues en alias.
             self._host_workspaces(raw, policy, where, subject)
+            # #2202 S2 : le placement de Job, quand l'hôte en déclare un
+            policy.sandbox = self._host_sandbox(raw, policy, where, subject)
         tags = self._list(fiche, "tags", where, "host-tags-invalid", **subject)
         admins = self._list(fiche, "admins", where, "host-admins-invalid", **subject)
         occupants = self._list(fiche, "occupants", where, "host-occupants-invalid", **subject)
@@ -4033,6 +4446,100 @@ class _Loader:
                          "`%s.%s`: unknown key (ignored)" % (path, key),
                          **where, **subject)
             policy.housekeeping = parsed or None
+
+    # -- #2202 S2 : placement de Job (`policy.sandbox`) ----------------------
+    def _host_sandbox(self, raw: dict, policy: HostPolicy, where: dict,
+                      subject: dict) -> SandboxPlacement | None:
+        """Lit `policy.sandbox` d'une carte Host (None si le bloc est absent).
+
+        Comme pour le profil, la lecture construit l'objet ; les contrôles
+        sont `sandbox_placement_problems`, rejoués à l'admission."""
+        sandbox = raw.get("sandbox")
+        if sandbox is None:
+            return None
+        if not isinstance(sandbox, dict):
+            self.add("host-sandbox-invalid", ERROR, "`policy.sandbox`: mapping expected",
+                     **where, **subject)
+            return None
+        for key in sorted(set(map(str, sandbox)) - {"provider", "kubeconfig", "namespace",
+                                                    "image", "allowed_profiles",
+                                                    "max_concurrent_jobs", "admitted_ref",
+                                                    "job"}):
+            self.add("host-sandbox-unknown", WARNING,
+                     "`policy.sandbox.%s`: unknown key (ignored)" % key,
+                     **where, **subject)
+        allowed_raw = sandbox.get("allowed_profiles")
+        if allowed_raw is None:
+            allowed: list[str] = []
+        elif isinstance(allowed_raw, str):
+            allowed = [allowed_raw.strip()]
+        elif isinstance(allowed_raw, list) and all(isinstance(v, str) for v in allowed_raw):
+            allowed = [v.strip() for v in allowed_raw if v.strip()]
+        else:
+            self.add("host-sandbox-invalid", ERROR,
+                     "`policy.sandbox.allowed_profiles`: list of profile names expected",
+                     **where, **subject)
+            allowed = []
+        if not allowed:
+            self.add("host-sandbox-empty", WARNING,
+                     "`policy.sandbox.allowed_profiles` is empty: no sandbox profile can "
+                     "be admitted on this host", **where, **subject)
+        max_jobs = sandbox.get("max_concurrent_jobs")
+        if isinstance(max_jobs, bool) or not isinstance(max_jobs, int):
+            max_jobs = 0
+        admitted_ref = _text(sandbox.get("admitted_ref")) or ""
+        job = self._sandbox_job(sandbox.get("job"), where, subject)
+        if job is None:
+            return None
+        placement = SandboxPlacement(
+            provider=(_text(sandbox.get("provider")) or "").strip().lower(),
+            kubeconfig=_text(sandbox.get("kubeconfig")) or "",
+            namespace=_text(sandbox.get("namespace")) or "",
+            image=_text(sandbox.get("image")) or "",
+            allowed_profiles=list(dict.fromkeys(allowed)),
+            max_concurrent_jobs=max_jobs,
+            admitted_ref=admitted_ref,
+            job=job,
+        )
+        for problem in sandbox_placement_problems(placement, max_agents=policy.max_agents):
+            self.add("host-sandbox-invalid", ERROR, problem, **where, **subject)
+        if admitted_ref and not SANDBOX_REF_RE.match(admitted_ref):
+            self.add("host-sandbox-ref-weak", WARNING,
+                     "`policy.sandbox.admitted_ref` %r does not look like a canon "
+                     "PR/decision reference (`owner/repo#123`, `#123` or `card@commit`): "
+                     "the bureau's evidence must be citable" % admitted_ref,
+                     **where, **subject)
+        return placement
+
+    def _sandbox_job(self, raw, where: dict, subject: dict) -> SandboxJob | None:
+        """Les défauts du Job Kubernetes, tous requis ; None si illisible."""
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            self.add("host-sandbox-invalid", ERROR, "`policy.sandbox.job`: mapping "
+                     "expected", **where, **subject)
+            return None
+        for key in sorted(set(map(str, raw)) - set(SANDBOX_JOB_KEYS)):
+            self.add("host-sandbox-unknown", WARNING,
+                     "`policy.sandbox.job.%s`: unknown key (ignored)" % key,
+                     **where, **subject)
+        active = raw.get("activeDeadlineSeconds")
+        if isinstance(active, bool) or not isinstance(active, int):
+            active = 0
+        #: absent = le défaut Kubernetes (6), donc refusé : un Job à reprises
+        backoff = raw.get("backoffLimit")
+        if isinstance(backoff, bool) or not isinstance(backoff, int):
+            backoff = 6
+        ttl = raw.get("ttlSecondsAfterFinished")
+        if isinstance(ttl, bool) or not isinstance(ttl, int):
+            ttl = 0
+        #: absent = monté par défaut par Kubernetes : fail closed
+        automount = raw.get("automountServiceAccountToken")
+        if not isinstance(automount, bool):
+            automount = True
+        return SandboxJob(active_deadline_seconds=active, backoff_limit=backoff,
+                          ttl_seconds_after_finished=ttl,
+                          automount_service_account_token=automount)
 
     def _build_placement(self, fiche: Fiche, where: dict) -> None:
         subject = {"agent": _text(fiche.data.get("agent")) or fiche.title}
@@ -4798,6 +5305,7 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                             "%s on %s: %s" % (agent.title, host.title, reason), f,
                             agent=agent.title)
                 _check_work_dir(add, agent, host, placement)
+                _check_sandbox(add, agent, host, placement)
     for name, group in by_agent.items():
         if len(group) > 1:
             for placement in group:
@@ -4955,6 +5463,46 @@ def _check_work_dir(add, agent: Agent, host: Host, placement: Placement) -> None
             "%s on %s: no working directory — declare `policy.workspaces.dirs`, "
             "`roots` or `root` in the host card" % (agent.title, host.title),
             host.fiche, agent=agent.title, host=host.title)
+
+
+def _check_sandbox(add, agent: Agent, host: Host, placement: Placement) -> None:
+    """#2202 S2 : le profil d'un agent et le placement de son hôte s'accordent.
+
+    Trois constats, sur l'admission qui porte le couple (agent, hôte) :
+
+    - `placement-sandbox-missing` (avertissement) : l'agent a un profil mais
+      l'hôte ne déclare pas de `policy.sandbox` — aucune admission de tour en
+      bac à sable sur cet hôte, l'agent peut continuer ses tours normaux ;
+    - `placement-sandbox-profile-not-allowed` (erreur) : l'hôte n'admet pas ce
+      profil dans `allowed_profiles` ;
+    - `placement-sandbox-job-too-short` (erreur) : l'`activeDeadlineSeconds`
+      du Job est plus court que le `job_seconds` du profil — le Job mourrait
+      avant la borne déclarée.
+    """
+    profile = agent.sandbox
+    if profile is None:
+        return
+    where = placement.fiche
+    if host.policy.sandbox is None:
+        add("placement-sandbox-missing", WARNING,
+            "%s has a sandbox profile but %s declares no `policy.sandbox`: no sandbox "
+            "turn is admitted on this host" % (agent.title, host.title), where,
+            agent=agent.title, host=host.title)
+        return
+    block = host.policy.sandbox
+    if profile.profile not in block.allowed_profiles:
+        add("placement-sandbox-profile-not-allowed", ERROR,
+            "sandbox profile %r of %s is not in `allowed_profiles` of %s (%s)"
+            % (profile.profile, agent.title, host.title,
+               ", ".join(block.allowed_profiles) or "none"), where,
+            agent=agent.title, host=host.title)
+    if block.job.active_deadline_seconds < profile.limits.job_seconds:
+        add("placement-sandbox-job-too-short", ERROR,
+            "`policy.sandbox.job.activeDeadlineSeconds` (%d) of %s is shorter than the "
+            "profile's `job_seconds` (%d) of %s: the Job would die before its bound"
+            % (block.job.active_deadline_seconds, host.title,
+               profile.limits.job_seconds, agent.title), where,
+            agent=agent.title, host=host.title)
 
 
 def _validate_packages(canon: Canon, add) -> None:

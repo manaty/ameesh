@@ -250,6 +250,78 @@ seulement ignoré, et un hôte sans dossier déclaré donne `host-work-dir-missi
 qu'après que `canon check` ne rapporte plus aucun `admission-cwd-inherited`
 sur les canons connus.
 
+**Blocs `sandbox`** (TPK #2202, tranche S2) — un tour en bac à sable externe se
+déclare sur les cartes existantes, jamais sur une nouvelle autorité : le
+**profil** sur l'`Agent`, le **placement de Job** sur l'`Host`. Le bureau relit
+le canon PR ; `admitted_ref` en est la preuve et `status: revoked` révoque sans
+seconde signature. Aucun des deux blocs n'est requis : une carte sans eux ne
+lance simplement aucun tour en bac à sable. Une image sans empreinte, un Job à
+reprises ou un modèle hors relais ne sont jamais admis.
+
+```yaml
+# Agent — profil d'un relecteur borné
+sandbox:
+  profile: tpk-reviewer-2026-10      # minuscules, 64 caractères au plus
+  admitted_ref: "thepackengers/home#239"   # PR/décision relue par le bureau
+  status: admitted                   # admitted | revoked
+  tranche: tpk-migration-2026-10     # enveloppe de tranche (ligne humaine)
+  credential: relay                  # seul chemin admis : aucune clé au Job
+  session: none                      # relecteur borné : aucune session gardée
+  capabilities: {merge: false, fix: false, deploy: false, publish: false}
+  limits:
+    turns: 1                         # tours de harnais DANS un Job
+    max_attempts: 2                  # tentatives de la famille de reprise
+    tool_calls: 200
+    turn_seconds: 900                # borne du tour
+    job_seconds: 1200                # > turn_seconds : le Job survit au tour
+    context_tokens: 131072
+    usd_per_turn: 2                  # <= reserve_usd du profil de compte
+```
+
+```yaml
+# Host — placement de Job, sous policy:
+max_agents: 3
+sandbox:
+  provider: kubernetes
+  kubeconfig: /etc/ameesh/kubeconfig.d/tpk-stg   # chemin privé (0600)
+  namespace: reviewers
+  image: ghcr.io/acme/reviewer@sha256:<64 hex>   # image épinglée, jamais un tag
+  allowed_profiles: [tpk-reviewer-2026-10]
+  max_concurrent_jobs: 3             # <= max_agents
+  admitted_ref: "thepackengers/home#239"
+  job:
+    activeDeadlineSeconds: 1200      # >= job_seconds du profil
+    backoffLimit: 0                  # Job à usage unique
+    ttlSecondsAfterFinished: 3600    # fenêtre d'adoption
+    automountServiceAccountToken: false
+```
+
+`canon check` refuse (`agent-sandbox-invalid`, `host-sandbox-invalid`) un
+profil non relay-only, une session conservée, une capacité vraie, une limite
+non positive ou `job_seconds <= turn_seconds`, une image sans empreinte, un
+kubeconfig non absolu ou non privé, un namespace hors DNS-1123, un
+`max_concurrent_jobs` au-dessus de `max_agents`, un Job à reprises ou avec le
+jeton de compte de service monté. Il refuse aussi un couple profil/placement
+incohérent : profil absent d'`allowed_profiles`
+(`placement-sandbox-profile-not-allowed`), `activeDeadlineSeconds` plus court
+que le `job_seconds` du profil (`placement-sandbox-job-too-short`) ; un agent
+à profil sur un hôte sans placement est un avertissement
+(`placement-sandbox-missing`). Les clés inconnues sont des avertissements
+(`agent-sandbox-unknown`, `host-sandbox-unknown`) ; une preuve d'admission qui
+ne ressemble pas à une référence citable est signalée
+(`agent-sandbox-ref-weak`, `host-sandbox-ref-weak`).
+
+L'admission d'un tour (`placement.sandbox_admission`) relit le canon **à la
+révision auditée** (`canon_state.last_good_commit`), exige un
+`canon_state.status = ok` frais (fenêtre de resynchronisation de 300 s,
+`placement.canon_fresh`) et rend l'instantané que `sandbox_turns` conserve :
+références et empreintes `sha256` des deux cartes, limites, image, fournisseur
+et namespace ; `usd_per_turn` doit tenir dans le `reserve_usd` du compte. À la
+resynchronisation, `placement.sandbox_recheck` relit les cartes : une
+révocation ou une borne modifiée (`changed`) demande l'annulation du tour, un
+changement cosmétique (`cosmetic`) ne l'annule pas, et l'instantané d'un tour
+en cours n'est jamais réécrit.
+
 **`type: Member`** (humains) — `title: smichea`, `roles: [...]`,
 `authenticators:` liste d'empreintes de clés publiques enrôlées (C7).
 `deputies:` and `superiors:` (L51, 0032 §2, 0033 §7): lists of `human:<id>`
@@ -378,7 +450,13 @@ en repli (`admission-cwd-inherited`, L35), agent admis sans dossier de travail
 sur un hôte (`host-work-dir-missing`, L35), `workspaces.dirs` vers un agent inconnu
 (`host-work-dir-agent-unknown`, L35), étiquette
 d'admission qui ne correspond à aucun hôte (`admission-tag-unknown`), clé de
-`policy.resources` inconnue. Sortie lisible et `--json` (code, gravité,
+`policy.resources` inconnue. Blocs `sandbox` (§4.2) : erreurs
+`agent-sandbox-invalid`, `host-sandbox-invalid`,
+`placement-sandbox-profile-not-allowed`, `placement-sandbox-job-too-short` ;
+avertissements `placement-sandbox-missing`, `host-sandbox-empty`,
+`agent-sandbox-unknown`, `host-sandbox-unknown`, `agent-sandbox-ref-weak`,
+`host-sandbox-ref-weak`.
+Sortie lisible et `--json` (code, gravité,
 fichier, explication), sur le modèle du validateur OKF Federation.
 
 **Règle de visibilité** (0029, L31) : une persona ne tourne sur un hôte que si
