@@ -209,20 +209,26 @@ class VoisinNonRejoueTest(unittest.TestCase):
                 log=calls.append)
         return runs, faulty, removals, calls
 
-    def test_base_non_concluante_garde_le_rouge_et_rejoue(self) -> None:
-        replayed = []
-
-        def prefix(*args, **kwargs):
-            replayed.append(args[2])
-            return {}, "", []
+    def test_base_non_concluante_garde_le_rouge_sans_attribuer(self) -> None:
+        # Auditeur B : le préfixe 1 ne distingue pas un rouge préexistant d'un
+        # rouge de u1 ; sans base concluante, le rouge est conservé mais aucun
+        # retrait n'est fait (la ci-full tranche, §3).
+        def prefix(*_args, **_kwargs):
+            raise AssertionError("rejeu des préfixes sans base concluante")
 
         runs, faulty, removals, lines = self.check(
             lambda *_a, **_k: None, prefix)
         unit = [run for run in runs if run.label == "unité #1"][0]
         self.assertFalse(unit.ignored_red)
-        self.assertTrue(replayed)
+        self.assertEqual(unit.unattributed,
+                         ["tests.test_neighbor.T.test_neighbor"])
         self.assertEqual(faulty, [])
+        self.assertEqual(removals, [])
         self.assertFalse(any("sans effet" in line for line in lines))
+        self.assertIn("NON ATTRIBUÉ", "\n".join(
+            paquet_auto._unattributed_lines(runs)))
+        self.assertIn("1 échec(s), 0 run(s) rouge(s) sans effet",
+                      paquet_auto._tests_summary(runs))
 
     def test_rouge_aussi_sur_la_base_reste_sans_effet(self) -> None:
         replayed = []
@@ -300,7 +306,9 @@ class TypesClientsTest(unittest.TestCase):
         self.git("commit", "-qm", message)
         return self.git("rev-parse", "HEAD")
 
-    def test_openapi_sans_schema_refuse_avant_la_ci(self) -> None:
+    def test_openapi_sans_schema_est_non_concluant_sans_node(self) -> None:
+        # cx1 B1/P2 : un reformatage JSON ou un info.version peut laisser les
+        # types identiques ; sans gen-api --check, on consigne, on ne bloque pas.
         self.write(paquet_auto.CLIENT_SPEC,
                    '{"openapi": "3.1.0", "paths": {"/x": {}}}\n')
         unit_sha = self.commit("openapi seul")
@@ -308,9 +316,9 @@ class TypesClientsTest(unittest.TestCase):
             ok, note = paquet_auto.check_client_types(
                 self.repo, self.base, repo=self.repo,
                 units=[paquet_auto.Unit(7, self.base, unit_sha)])
-        self.assertFalse(ok)
-        self.assertIn("sans `ui/src/api/schema.d.ts`", note)
-        self.assertIn("npm run gen", note)
+        self.assertTrue(ok)
+        self.assertIn("non concluant", note)
+        self.assertIn("la CI tranche", note)
         self.assertIn("#7", note)
 
     def test_openapi_et_schema_acceptes_sans_node(self) -> None:
@@ -322,7 +330,17 @@ class TypesClientsTest(unittest.TestCase):
             ok, note = paquet_auto.check_client_types(
                 self.repo, self.base, repo=self.repo)
         self.assertTrue(ok)
-        self.assertIn("non vérifiés", note)
+        self.assertIn("non concluant", note)
+
+    def test_dependances_ui_modifiees_ne_bloquent_pas(self) -> None:
+        self.write("ui/package-lock.json", "{}\n")
+        self.write(paquet_auto.CLIENT_SPEC,
+                   '{"openapi": "3.1.0", "paths": {"/x": {}}}\n')
+        self.commit("dépendances ui")
+        ok, note = paquet_auto.check_client_types(
+            self.repo, self.base, repo=self.repo)
+        self.assertTrue(ok)
+        self.assertIn("dépendances ui modifiées", note)
 
     def test_le_vrai_gen_api_est_lu_quand_node_est_la(self) -> None:
         self.write(paquet_auto.CLIENT_SPEC,

@@ -348,14 +348,16 @@ class LocalNeighborsTest(unittest.TestCase):
             composition=self.composition, table="## Composition\n",
             tests=runs, freeze_seconds=0.0)
         self.assertIn("0 échec(s), 1 run(s) rouge(s) sans effet", manifest)
-        # base non concluante : le rouge n'est pas jeté ; le rejeu des préfixes
-        # ne le situe pas, il reste consigné (canon §3), sans retrait.
+        # base non concluante : le rouge n'est ni jeté ni attribué (le préfixe
+        # 1 ne distingue pas un rouge préexistant, #4887) ; aucun retrait.
         _calls, (runs, faulty, _removals) = self.run_check(
             {1: [support]}, dict(results), at_base=None,
-            prefix=lambda *_a, **_k: ({}, "", []))
+            prefix=lambda *_a, **_k: self.fail(
+                "rejeu des préfixes sans base concluante"))
         self.assertEqual(faulty, [])
         self.assertFalse(runs[0].green)
         self.assertFalse(runs[0].ignored_red)
+        self.assertTrue(runs[0].unattributed)
         manifest = paquet_auto.build_manifest(
             name="banc", target="main", base_sha="4" * 40, carrier=99,
             composition=self.composition, table="## Composition\n",

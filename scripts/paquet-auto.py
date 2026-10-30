@@ -479,6 +479,9 @@ class TestRun:
     #: #4887 : les modules directs de l'unité (ses propres tests et ses voisins
     #: sélectionnés), tels que la série devait les jouer ; vide pour les contrats.
     direct: list[str] = field(default_factory=list)
+    #: #4887 : rouges de voisins conservés faute de rejeu de base concluant ;
+    #: consignés non attribués, la ci-full tranche.
+    unattributed: list[str] = field(default_factory=list)
 
     @property
     def green(self) -> bool:
@@ -1926,13 +1929,12 @@ def check_client_types(worktree: Path, base_sha: str, *,
 
     * le vrai `node ui/scripts/gen-api.mjs --check` tourne quand `node` et
       `openapi-typescript` sont disponibles (le clone dédié peut prêter ses
-      `ui/node_modules` au worktree jetable) ;
-    * sans eux, la garde déterministe refuse une composition qui change l'OpenAPI
-      sans le schéma généré — le cas #4831 ; un contrôle qui ne peut pas lire
-      (node absent, diff illisible, délai) ne bloque pas (§3), il est dit.
-
-    Rend `(ok, note)` ; `ok=False` est un négatif déterministe et arrête la
-    composition avant la poussée et la demande de CI.
+      `ui/node_modules` au worktree jetable) ; lui seul **bloque** une
+      composition, sur une preuve de types périmés ;
+    * sans eux, le contrôle est **non concluant** : il est dit, avec l'indice
+      « OpenAPI changé sans schéma » et l'unité qui le porte, mais il ne bloque
+      pas (§3) — un reformatage JSON ou un `info.version` peut laisser les
+      types identiques (cx1, #4887) ; la CI tranche.
     """
     script = worktree / CLIENT_GEN
     if not script.is_file():
@@ -1943,6 +1945,11 @@ def check_client_types(worktree: Path, base_sha: str, *,
                       "contrôle non concluant (la CI tranche)")
     if CLIENT_SPEC not in changed and CLIENT_SCHEMA not in changed:
         return True, "types clients : inchangés"
+    if "ui/package.json" in changed or "ui/package-lock.json" in changed:
+        # les dépendances du générateur ont bougé : le node_modules prêté par
+        # le clone n'est plus celui de l'arbre composé.
+        return True, ("types clients : non concluant (dépendances ui modifiées, "
+                      "node_modules du clone peut être périmé) ; la CI tranche")
     node = shutil.which("node")
     modules, linked = _client_node_modules(worktree, repo)
     try:
@@ -1963,15 +1970,15 @@ def check_client_types(worktree: Path, base_sha: str, *,
                                % (proc.returncode, _one_line(text)[:240]))
         if CLIENT_SPEC in changed and CLIENT_SCHEMA not in changed:
             culprits = _client_culprits(worktree, units)
-            suffix = ((" ; unité(s) à régénérer ou retirer : "
-                       + ", ".join("#%d" % lot for lot in culprits))
-                      if culprits else "")
-            return False, (
-                "types clients périmés : `%s` change sans `%s` ; lancer "
-                "`npm run gen` dans ui/ (#4831)%s"
-                % (CLIENT_SPEC, CLIENT_SCHEMA, suffix))
-        return True, ("types clients : non vérifiés (node/node_modules absent), "
-                      "garde déterministe verte ; la CI tranche")
+            hint = ((" ; indice : unité(s) #"
+                     + ", #".join(str(lot) for lot in culprits))
+                    if culprits else "")
+            return True, (
+                "types clients : non concluant (node/node_modules absent) ; "
+                "`%s` change sans `%s`%s ; la CI tranche (#4831)"
+                % (CLIENT_SPEC, CLIENT_SCHEMA, hint))
+        return True, ("types clients : non concluant (node/node_modules absent) ; "
+                      "la CI tranche")
     finally:
         if linked and modules is not None:
             with contextlib.suppress(OSError):
@@ -2528,12 +2535,22 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     neighbor_tests: dict[str, dict] = {}
     owned_by_lot: dict[int, list[dict]] = {}
     unparsed_lots: set[int] = set()
+    unattributed: set[str] = set()
     for unit, run, found, _proper, mine, neighbor in pending:
         kept = []
+        unread: list[dict] = []
         for failure in found:
-            if failure.get("module") in neighbor \
-                    and at_base is not None and failure["test"] in at_base:
-                continue
+            if failure.get("module") in neighbor:
+                if at_base is None:
+                    # #4887 (auditeur B) : sans rejeu de base concluant, le
+                    # préfixe 1 ne peut pas distinguer un rouge préexistant
+                    # d'un rouge de u1 ; on conserve le rouge mais on ne
+                    # l'attribue pas (la ci-full tranche).
+                    kept.append(failure)
+                    unread.append(failure)
+                    continue
+                if failure["test"] in at_base:
+                    continue
             kept.append(failure)
         owned = [failure for failure in kept
                  if failure.get("module") not in neighbor
@@ -2542,8 +2559,16 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         if not found:
             unparsed_lots.add(unit.lot)
         for failure in kept:
-            if failure.get("module") in neighbor:
+            if failure.get("module") in neighbor and not unread:
                 neighbor_tests.setdefault(_failure_name(failure), failure)
+        if unread:
+            names = sorted({_failure_name(failure) for failure in unread
+                            if _failure_name(failure)})
+            run.unattributed = names
+            unattributed.update(names)
+            log("tests unité #%d : %d rouge(s) de voisin conservé(s), rejeu de "
+                "base non concluant — non attribué(s), la ci-full tranche : %s"
+                % (unit.lot, len(names), ", ".join(names[:5])))
         if kept or not found:
             red.append((run, kept))
         else:
@@ -2681,7 +2706,8 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                           % (positions.get(lot, 0), lot)],
                 attributed=True, proof="prefixes"))
     remaining = [failure for failure in failures
-                 if _failure_name(failure) not in prefix_names]
+                 if _failure_name(failure) not in prefix_names
+                 and _failure_name(failure) not in unattributed]
     designated: list[Removal] = []
     if remaining:
         if all(found for _run, found in red):
@@ -2833,6 +2859,14 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
             "Non concluants (canon §3 : ne retiennent ni paquet ni release) :",
             "",
         ] + inconclusive
+    unattributed = _unattributed_lines(tests)
+    if unattributed:
+        lines += [
+            "",
+            "Rouges de voisins non attribués (rejeu de base non concluant, "
+            "#4887) :",
+            "",
+        ] + unattributed
     lines += [
         "",
         "- `scripts/paquet-inclusion.py` : exécuté sur cette tête après le "
@@ -2934,6 +2968,20 @@ def _inconclusive_lines(tests: list[TestRun]) -> list[str]:
                         (" (%s)" % detail) if detail else "",
                         _one_line(run.excerpt())[:240],
                         (" — journal local : " + run.log_path) if run.log_path else ""))
+    return lines
+
+
+def _unattributed_lines(tests: list[TestRun]) -> list[str]:
+    """#4887 : les rouges de voisins conservés faute de rejeu de base concluant."""
+    lines: list[str] = []
+    for run in tests:
+        if not run.unattributed:
+            continue
+        lines.append("- NON ATTRIBUÉ (#4887) : %s — rouges de voisin : %s — "
+                     "rejeu de base non concluant, la ci-full tranche%s"
+                     % (run.label.replace("#", ""), ", ".join(run.unattributed),
+                        (" — journal local : " + run.log_path)
+                        if run.log_path else ""))
     return lines
 
 
@@ -3391,6 +3439,7 @@ def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
     else:
         lines.append("- Tests locaux : %s." % _tests_summary(tests))
         lines += ["  " + line for line in _inconclusive_lines(tests)]
+        lines += ["  " + line for line in _unattributed_lines(tests)]
         lines += _direct_lines(composition, tests)
     lines += [
         "- Contrôle d'inclusion : %s." % ("vert" if inclusion_rc == 0 else "à lire"),
@@ -3417,6 +3466,10 @@ def mail_body(*, name: str, target: str, base_sha: str, carrier: int,
     non_section = ("Non concluants (canon §3, consignés) :\n"
                    + "\n".join("  " + line for line in inconclusive)) \
         if inconclusive else "Non concluants : aucun."
+    unattributed = _unattributed_lines(tests)
+    if unattributed:
+        non_section += ("\nRouges de voisins non attribués (#4887) :\n"
+                        + "\n".join("  " + line for line in unattributed))
     return """\
 Paquet {name} composé sans agent : tête `{head}` sur {target} `{base}` (branche `{branch}`, {pr}).
 
