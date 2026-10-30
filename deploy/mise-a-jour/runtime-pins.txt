@@ -1,0 +1,16 @@
+# Épinglage du runtime de bootstrap (#4778) : dépendances installées dans le
+# venv construit par construction-runtime.py, versions exactes et empreintes
+# SHA-256 des roues. `pip install --require-hashes --only-binary=:all:` refuse
+# toute autre version, toute source (sdist) et tout artefact non listé.
+#
+# Cible de construction : CPython 3.12, Linux x86_64 (VM d'agents du mesh).
+# Une autre ABI ou une autre architecture doit être revue ici, pas résolue
+# implicitement : l'absence de roue compatible fait échouer la construction.
+psycopg[binary]==3.3.6 \
+    --hash=sha256:a1db9f7148b06a28606767efaca51fa6f9398c5c0a3810519be69d7000bdb631
+psycopg-binary==3.3.6 \
+    --hash=sha256:1679a1cb93fbe5a6d1fd58d82cbddcc6fcb8c61446ba7cae6eb2a7b19bc585de
+psutil==7.2.2 \
+    --hash=sha256:076a2d2f923fd4821644f5ba89f059523da90dc9014e85f8e45a5774ca5bc6f9
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8

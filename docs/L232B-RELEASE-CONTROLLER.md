@@ -389,6 +389,19 @@ This pins supplied trees, **not completeness of external Python/ELF dependencies
 independently pinned immutable toolchain closure remains an administrator admission
 prerequisite. Tests use synthetic executable bytes, not a production interpreter.
 
+`construction-runtime.py` builds the supplied `runtime` tree, outside root and
+in a new directory, from one exact SHA: a fresh `/usr/bin/python3` venv, the
+ameesh wheel built from a `git archive` of that commit, and its dependency
+closure (`psycopg[binary]`, `psutil`) installed with
+`--require-hashes --only-binary=:all:` from `runtime-pins.txt`; the build
+backend is pinned separately in `runtime-build-pins.txt`. The clone must be
+clean and at exactly that SHA. The command writes a provenance receipt (SHA,
+both pin digests, Python version, wheel digest and measured tree digest) beside
+the read-only runtime, and never installs a root artifact or publishes
+anything. The administrator still reviews the closure and stages the measured
+tree root-owned (`runtime-release.py` requires the staged tree to belong to the
+installing root), not with the builder's ownership.
+
 `compte-release.py` creates the dedicated group/account with exact numeric ids,
 no home creation or supplementary groups, a fixed forced-command shell and an
 impossible password sentinel. Shadow values are not persisted. Group/user intents
