@@ -740,8 +740,9 @@ def human_account(row: Any) -> str:
 
 
 #: L514: payload keys of a message the sender marked as a review verdict
-#: (`agent-mail send --verdict`) or an arbitration (`--arbitration`)
-MID_TURN_KEYS = ("verdict", "arbitration")
+#: (`agent-mail send --verdict`) or an arbitration (`--arbitration`); #5006:
+#: the notice of a reassignment to the previous assignee (`work.assign`)
+MID_TURN_KEYS = ("verdict", "arbitration", "reassigned")
 
 
 def mid_turn(row: Any) -> bool:
