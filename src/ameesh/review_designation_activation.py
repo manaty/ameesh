@@ -70,7 +70,10 @@ an older pilot installation is no obstacle. #3328: the same runner pass
 reattributes a seat whose designated reviewer became unreachable (host closed,
 stopped/dead): the same freeze is replayed with the host evidence, the move is
 journaled once per (freeze, unreachable names), and the pilot gets the capacity
-alert when no replacement family can be designated.
+alert when no replacement family can be designated. #4757 (decision
+mesh-design of 30/10 14:4xZ, amending #3328): a **manual** seat unreachable
+past its §9 `green_verdict` deadline, without a verdict on the head, goes to a
+reviewer of the same family, once per freeze (`reseat_manual`).
 """
 from __future__ import annotations
 
@@ -94,6 +97,7 @@ from . import lot_class, mechanics, plan_git, registry, review
 from . import review_designation as rd
 from . import review_designation_pg as pg
 from . import review_authors, review_floor, review_target, storage, work
+from . import slo as slo_mod
 
 #: the sender of the journal notes and automatic mails
 SENDER = pg.SENDER
@@ -4076,10 +4080,11 @@ def _unreachable_reviewer(row: Optional[Mapping], closed_hosts: set) -> str:
     (`alert_briefs._unavailable`, #3036): the host's claims are closed, or the
     agent is stopped/dead/blocked or no longer run by the executor. A missing
     lease is deliberately not read: an idle reviewer is woken by the request
-    mail. A budget/operator pause is not read either — the agent comes back and
-    its seat is not lost. #4491: a `blocked` pause with a **named long cause**
-    (authentication, exhausted provider credits, host not ready, account
-    block) and an `auth_blocked` text are lost seats, like a closed host, and
+    mail. An operator pause (the registry column) is not read either — the
+    agent comes back and its seat is not lost. #4491: a `blocked` pause with a
+    **named long cause** (authentication, exhausted provider credits, host not
+    ready, account block, a budget gauge pause `budget : …`, whatever its
+    « until » hour) and an `auth_blocked` text are lost seats, like a closed host, and
     are handed to `reseat` (dropped when the kept seats cover the reviews,
     otherwise replaced by an available agent). The account's short-window
     pause (#3876) and the end-of-turn failure marker / `429` episode (#1268,
@@ -4596,6 +4601,268 @@ def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
         return unchanged("unavailable", str(exc))
 
 
+#: #4757 : journal prefix of the manual seats a pass examined on a freeze
+#: (`<lot>:<freeze>:`). The prefix carries no name: decision mesh-design of
+#: 30/10 14:4xZ allows **one** attempt per freeze, whatever its outcome.
+MANUAL_RESEAT_PREFIX = "review-designation-manual-reseat:"
+
+
+def _manual_reseat_prefix(lot: int, freeze_id: int) -> str:
+    return "%s%d:%d:" % (MANUAL_RESEAT_PREFIX, int(lot), int(freeze_id))
+
+
+def _manual_designator(db, lot: int, name: str) -> str:
+    """Who wrote the latest `reviewer <name> designated` line (#4757), or "".
+
+    The same authority as `_manual_designations`: a free note copying the
+    words is not a designation, and its writer is not told anything."""
+    line = "reviewer %s designated" % name
+    try:
+        events = storage.of(db).work.events_noted(line, 0.0, ids=[int(lot)]) or []
+    except Exception:  # noqa: BLE001 - unreadable journal: no designator
+        return ""
+    best = (0, "")
+    for event in events:
+        if str((event or {}).get("note") or "").strip() != line:
+            continue
+        actor = str((event or {}).get("actor") or "").strip()
+        if not _designation_authority(db, actor):
+            continue
+        try:
+            row_id = int((event or {}).get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if row_id > best[0]:
+            best = (row_id, actor)
+    return best[1]
+
+
+def _dead_manual_seats(cfg, db, item: Mapping, freeze: Mapping, mark: Optional[tuple],
+                       by_name: Mapping, closed: set, *,
+                       now: Optional[float] = None) -> list:
+    """The manual seats the pass may hand over (#4757), `[(name, why)]`.
+
+    Decision mesh-design of 30/10 14:4xZ, conditions 1 to 3: the reviewer is
+    unreachable for `_unreachable_reviewer` (the `blocked` budget pause
+    included, its « until » hour never read), the §9 `green_verdict` deadline
+    has passed since the designation on this head (the latest of the freeze
+    and the manual line, the start `_owed_read` gives the §9 clock), and the
+    reviewer has no verdict on the frozen head. A name the effective
+    automatic mark carries is the automatic seat's business (`reseat`).
+    """
+    lot = int((item or {}).get("id") or 0)
+    names = _manual(db, item)
+    if not names:
+        return []
+    automatic = {str((row or {}).get("name") or "").strip()
+                 for row in ((mark[2] if mark else None) or {}).get("reviewers") or ()}
+    lines = _manual_designations(db, lot)
+    if lines is None:
+        return []
+    step = slo_mod.step_of("green_verdict")
+    target = slo_mod.target_s(
+        step, critical=int((item or {}).get("priority") or 0) == 1)
+    now = time.time() if now is None else float(now)
+    try:
+        frozen_at = float((freeze or {}).get("at_ts") or 0.0)
+    except (TypeError, ValueError):
+        return []
+    dead: list = []
+    voters = None
+    for name in names:
+        if name in automatic or name not in lines:
+            continue
+        why = _unreachable_reviewer(by_name.get(name), closed)
+        if not why:
+            continue
+        since = max(frozen_at, float(lines[name][1] or 0.0))
+        if not since or now - since < target:
+            continue
+        if voters is None:
+            voters = _head_voters(cfg, db, lot, str((freeze or {}).get("sha") or ""),
+                                  by_name)
+        if _acquired(name, voters, by_name):
+            continue
+        dead.append((name, why))
+    return dead
+
+
+def _same_family_replacement(inputs: "Inputs", family: str,
+                             taken: set) -> Optional[str]:
+    """An available candidate of `family` for a manual seat (#4757), or None.
+
+    Condition 4 of the decision: the manual choice serves the family coverage
+    first, so the replacement is of the **same** family, never another one.
+    The authors and correctors of the head, the seats already in the column
+    and the pilot's removals are excluded; the least loaded then the name
+    decide, like the selection inside a family."""
+    forbidden = set(taken) | rd.names_of(inputs.authors) | rd.names_of(inputs.correctors)
+    family = str(family or "").strip().lower()
+    eligible = [candidate for candidate in inputs.candidates or ()
+                if candidate.eligible(forbidden_names=forbidden,
+                                      forbidden_families=set(),
+                                      families={family})]
+    if not family or not eligible:
+        return None
+    eligible.sort(key=lambda c: (c.load, c.name))
+    return eligible[0].name
+
+
+def _manual_reseat_alert(db, item: Mapping, freeze: Mapping, recipient: str,
+                         moves: Sequence[tuple], threads: list) -> None:
+    """Tells the designator what the pass did with its manual seat (#4757)."""
+    if not recipient or registry.get(db, recipient) is None:
+        return
+    from . import mail
+
+    lot = int((item or {}).get("id") or 0)
+    lines = []
+    for name, why, family, replacement in moves:
+        if replacement:
+            lines.append("- %s (%s, family %s) → %s, same family."
+                         % (name, why, family or "?", replacement))
+        else:
+            lines.append("- %s (%s, family %s): no available reviewer of that"
+                         " family, the seat is kept." % (name, why, family or "?"))
+    body = "\n".join([
+        "Unreachable manual reviewer seat past its review deadline (canon §2, §9;"
+        " #4757, decision mesh-design 30/10).",
+        "",
+        "Lot: #%s \"%s\"" % (lot, " ".join(str((item or {}).get("title") or "").split())),
+        "- Freeze: frozen milestone %s." % _freeze_label(freeze),
+        *lines,
+        "",
+        "This pass runs once per freeze. To choose another reviewer:",
+        "  ameesh work reviewer %d <agent>" % lot,
+    ])
+    mail.send(db, SENDER, recipient, body, work_item_id=str(lot),
+              payload={"review_designation": {
+                  "lot": lot, "freeze": int((freeze or {}).get("id") or 0),
+                  "sha": str((freeze or {}).get("sha") or ""),
+                  "manual_reseat": [{"name": name, "replacement": replacement}
+                                    for name, _why, _family, replacement in moves]}},
+              after_commit=threads)
+
+
+def reseat_manual(cfg, db, lot: int, *, freeze: Mapping, dead: Sequence[tuple],
+                  listing: Sequence[Mapping] = (),
+                  excluded: Sequence[str] = ()) -> dict:
+    """Hands the dead manual seats of a freeze to their family (#4757).
+
+    Decision mesh-design of 30/10 14:4xZ, amending #3328 (which left every
+    manual seat to the pilot): `dead` comes from `_dead_manual_seats`
+    (conditions 1 to 3). Each seat goes to an available reviewer of the
+    **same** family (4), written like the pilot's gesture (`reviewer X
+    designated` by the system, then `reviewer X removed`) so the replacement
+    stays a manual seat across freezes; the replacement gets the usual
+    request and the removed seat's undelivered request is settled. Without a
+    same-family reviewer the seat stays. Either way the attempt is journaled
+    once per freeze under the lot lock, and the designator (else the pilot)
+    gets one mail (5). A lot that left `qa`, a newer freeze, a seat the pilot
+    already moved, or an attempt already noted writes nothing (`stale`).
+    """
+    freeze = dict(freeze or {})
+    lot = int(lot)
+    freeze_id = int(freeze.get("id") or 0)
+
+    def outcome(state: str, why: str, **extra) -> dict:
+        return {"state": state, "freeze": freeze, "why": why, **extra}
+
+    threads = _threads()
+    moves: list = []
+    try:
+        inputs = prepare(cfg, db, lot, freeze=freeze)
+        if isinstance(inputs, Unavailable):
+            return outcome("unavailable", inputs.why)
+        families = inputs.policy.families
+        rows = {str((row or {}).get("name") or "").strip(): row
+                for row in listing or ()}
+        with db.transaction() as tx:
+            locked = tx.query(
+                "SELECT state, reviewers FROM work_items WHERE id = %s"
+                " FOR NO KEY UPDATE", (lot,))
+            if not locked or locked[0].get("state") != lifecycle.QA:
+                return outcome("stale", "lot #%d is not in qa" % lot)
+            latest = _latest_freeze(tx, lot)
+            if latest is None or int(latest["id"]) != freeze_id:
+                return outcome("stale", "freeze #%d is no longer the latest" % freeze_id)
+            prefix = _manual_reseat_prefix(lot, freeze_id)
+            if storage.of(tx).work.events_noted(
+                    prefix, float(freeze.get("at_ts") or 0.0), ids=[lot]):
+                return outcome("stale", "already examined on freeze #%d" % freeze_id)
+            column = [str(name or "").strip() for name in locked[0].get("reviewers") or ()]
+            taken = set(column) | {str(name or "").strip() for name in excluded or ()}
+            # A pilot's removal on this freeze stays respected: the removed
+            # name is never brought back as a replacement.
+            for event in storage.of(tx).work.events_noted(
+                    "reviewer ", float(freeze.get("at_ts") or 0.0), ids=[lot]) or ():
+                note = str((event or {}).get("note") or "").strip()
+                if note.endswith(" removed"):
+                    taken.add(note[len("reviewer "):-len(" removed")].strip())
+            item = work.get(tx, lot) or {"id": lot, "title": "", "state": lifecycle.QA}
+            for name, why in dead or ():
+                if name not in column:
+                    continue
+                # The reachability rows carry no harness (#3631): the family
+                # is read on the full registry row, like the selection's.
+                family = rd.live_family(registry.get(tx, name) or rows.get(name) or {},
+                                        families=families)
+                replacement = _same_family_replacement(inputs, family, taken)
+                designator = _manual_designator(tx, lot, name)
+                if replacement:
+                    taken.add(replacement)
+                    # Add before removing: the column is never empty, and a
+                    # refused write (the replacement now holds the lot) rolls
+                    # the whole attempt back, nothing noted: the next pass
+                    # retries.
+                    if storage.of(tx).work.designate_reviewer(
+                            lot, replacement, actor=SENDER,
+                            event="reviewer %s designated" % replacement) is None:
+                        raise work.WorkError("reviewer %s refused on lot #%d"
+                                             % (replacement, lot))
+                    storage.of(tx).work.designate_reviewer(
+                        lot, name, actor=SENDER, remove=True,
+                        event="reviewer %s removed" % name)
+                moves.append((name, why, family, replacement, designator))
+            if not moves:
+                return outcome("stale", "the manual seats moved during the pass")
+            storage.of(tx).work.note(
+                lot, lifecycle.QA,
+                "%s manual seat(s) unreachable past the review deadline: %s"
+                % (prefix, "; ".join(
+                    "%s (%s) %s" % (name, why,
+                                    "→ %s" % replacement if replacement
+                                    else "kept: no %s reviewer available"
+                                    % (family or "known-family"))
+                    for name, why, family, replacement, _who in moves)),
+                SENDER)
+            by_recipient: dict = {}
+            for name, why, family, replacement, designator in moves:
+                recipient = designator if registry.get(tx, designator or "") \
+                    else inputs.notify
+                by_recipient.setdefault(recipient, []).append(
+                    (name, why, family, replacement))
+            for recipient, told in by_recipient.items():
+                _manual_reseat_alert(tx, item, freeze, recipient, told, threads)
+        _drain(db, threads)
+    except (rd.DesignationError, work.WorkError) as exc:
+        return outcome("unavailable", str(exc))
+    item = work.get(db, lot) or {"id": lot}
+    for name, _why, _family, replacement, _who in moves:
+        if not replacement:
+            continue
+        work._reviewer_request(db, item, replacement, SENDER, cfg=cfg)
+        work._settle_reviewer_requests(cfg, db, item, name, SENDER)
+    replaced = [(name, replacement) for name, _w, _f, replacement, _d in moves
+                if replacement]
+    return outcome(rd.DESIGNATED if replaced else rd.WAITING,
+                   "manual seat(s) reseated" if replaced
+                   else "no same-family replacement",
+                   replaced=replaced,
+                   kept=[name for name, _w, _f, replacement, _d in moves
+                         if not replacement])
+
+
 def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     """Replays the designation of a lot whose reviewer became unreachable.
 
@@ -4635,15 +4902,25 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     and `auth_blocked` prefix, so the two never disagree; the account's
     short-window pause keeps its seat on both sides (#3876).
 
+    #4757 (decision mesh-design of 30/10 14:4xZ, amending the #3328 contract
+    that left every manual seat to the pilot): on a lot in `qa`, a **manual**
+    seat whose reviewer is unreachable, whose §9 `green_verdict` deadline has
+    passed since its designation on the head and who has no verdict on it is
+    handed to an available reviewer of the **same** family (`reseat_manual`),
+    once per freeze, journaled, with a mail to its designator; without such a
+    reviewer the seat stays and the designator is told. The automatic seats
+    of the same lot are then examined as before.
+
     The pass reads only machine evidence (registry, host lifecycle, journal)
     and never raises: the runner logs the summary. It does not touch a manual
-    designation, a name the pilot already removed from the reviewer column, a
+    designation before its deadline, a name the pilot already removed from the reviewer column, a
     carried verdict mark, a waiting mark, or a lot where the mark belongs to an
     older freeze. A registry or journal read failure skips the pass instead of
     moving seats on a doubt.
     """
     out = {"examined": 0, "reassigned": 0, "waiting": 0, "retried": 0,
-           "exhausted": 0, "skipped": 0, "errors": [], "summary": ""}
+           "exhausted": 0, "skipped": 0, "manual_reseated": 0, "manual_kept": 0,
+           "errors": [], "summary": ""}
     try:
         limit = max(0, int(limit))
     except (TypeError, ValueError):
@@ -4721,6 +4998,30 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
             freeze_id = int(freeze.get("id") or 0)
             mark = _effective_mark(db, lot, freeze_id,
                                    since_ts=float(freeze.get("at_ts") or 0.0))
+            # #4757 : the manual seats first, once per freeze; the automatic
+            # seats of the same lot follow in this pass.
+            if state == lifecycle.QA and not storage.of(db).work.events_noted(
+                    _manual_reseat_prefix(lot, freeze_id),
+                    float(freeze.get("at_ts") or 0.0), ids=[lot]):
+                item = work.get(db, lot) or {}
+                manual_dead = _dead_manual_seats(
+                    cfg, db, item, freeze, mark, by_name, closed)
+                if manual_dead:
+                    attempted += 1
+                    moved = reseat_manual(
+                        cfg, db, lot, freeze=freeze, dead=manual_dead,
+                        listing=listing,
+                        excluded=_removed_seats_from_mark(
+                            (mark[2] if mark else None) or {},
+                            row.get("reviewers") or ()))
+                    moved_state = str(moved.get("state") or "")
+                    if moved_state == rd.DESIGNATED:
+                        out["manual_reseated"] += 1
+                    elif moved_state == rd.WAITING:
+                        out["manual_kept"] += 1
+                    elif moved_state == "unavailable":
+                        out["errors"].append("#%d manual: %s"
+                                             % (lot, moved.get("why")))
             if mark is None or mark[1] != "designation" \
                     or str((mark[2] or {}).get("state") or "") != rd.DESIGNATED:
                 out["skipped"] += 1
@@ -4828,7 +5129,8 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     if last > cursor or cursor == 0:
         _write_cursor(cfg, REASSIGN_CURSOR, last)
     out["summary"] = ("%d examined: %d reassigned, %d waiting, %d retried,"
-                      " %d exhausted, %d skipped"
+                      " %d exhausted, %d skipped; manual: %d reseated, %d kept"
                       % (out["examined"], out["reassigned"], out["waiting"],
-                         out["retried"], out["exhausted"], out["skipped"]))
+                         out["retried"], out["exhausted"], out["skipped"],
+                         out["manual_reseated"], out["manual_kept"]))
     return out
