@@ -1477,24 +1477,11 @@ class Leases(interface.Leases):
 
     def end_turn(self, name, owner, epoch, *, status, status_text, error,
                  cost_usd) -> bool:
-        rows = self.db.query(
-            """
-            UPDATE agent_registry
-               SET status      = %s,
-                   status_text = coalesce(%s, status_text),
-                   last_error  = %s,
-                   current_prompt = NULL,
-                   turns       = turns + 1,
-                   spent_usd   = spent_usd + coalesce(%s, 0),
-                   last_turn_at = now(),
-                   last_seen   = now(),
-                   updated_at  = now()
-             WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
-            RETURNING name
-            """,
-            (status, status_text, error, cost_usd, name, owner, epoch),
-        )
-        return bool(rows)
+        from .sandbox import ameesh_turn_close
+        with self.db.transaction() as tx:
+            return ameesh_turn_close(
+                tx, name, owner, epoch, status=status, status_text=status_text,
+                error=error, cost_usd=cost_usd)
 
 
 # --------------------------------------------------------------------------
