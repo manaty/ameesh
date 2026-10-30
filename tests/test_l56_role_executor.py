@@ -33,6 +33,36 @@ ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-executor.sql")
 MODULE_WRITERS_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('ameesh-role-module-writers', 0))"
 
 
+def _database_admin(cfg):
+    """Connexion d'administration sans `statement_timeout` (#4822).
+
+    Un CREATE/DROP DATABASE déclenche un checkpoint immédiat ; sur un banc
+    chargé il dépasse le délai d'instruction de la suite (30 s). Un DROP
+    annulé laisse alors la base invalide (`datconnlimit = -2`) et l'autovacuum
+    du banc s'arrête (#4680). Le test ne supprime que sa propre base : la
+    connexion qui porte le geste ne doit avoir aucune borne d'instruction.
+    """
+    return db_mod.connect(dataclasses.replace(cfg, statement_timeout_ms=0))
+
+
+def _create_database(cfg, database: str) -> None:
+    admin = _database_admin(cfg)
+    try:
+        admin.execute("CREATE DATABASE %s TEMPLATE template0"
+                      % db_mod.quote_ident(database))
+    finally:
+        admin.close()
+
+
+def _drop_database(cfg, database: str) -> None:
+    admin = _database_admin(cfg)
+    try:
+        admin.execute("DROP DATABASE IF EXISTS %s WITH (FORCE)"
+                      % db_mod.quote_ident(database))
+    finally:
+        admin.close()
+
+
 class RoleExecutorTest(PgTestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -40,8 +70,10 @@ class RoleExecutorTest(PgTestCase):
         # Database ACL tests must not change PUBLIC privileges in the shared bench.
         cls.admin_db = cls.db
         cls.database = "t_executor_db_" + uuid.uuid4().hex[:8]
-        cls.admin_db.execute("CREATE DATABASE %s TEMPLATE template0" % db_mod.quote_ident(cls.database))
+        # Le cleanup est posé AVANT la création : un CREATE annulé peut lui
+        # aussi laisser une base invalide, que ce geste retire (#4822).
         cls.addClassCleanup(cls.drop_database)
+        _create_database(cls.cfg, cls.database)
         parts = urllib.parse.urlsplit(TEST_DSN)
         if not parts.scheme.startswith("postgres"):
             raise AssertionError("Executor tests require a PostgreSQL URL DSN")
@@ -80,7 +112,7 @@ class RoleExecutorTest(PgTestCase):
         if cls.db is not cls.admin_db:
             cls.db.close()
         try:
-            cls.admin_db.execute("DROP DATABASE %s" % db_mod.quote_ident(cls.database))
+            _drop_database(cls.admin_db.cfg, cls.database)
         finally:
             cls.admin_db.close()
 
@@ -113,6 +145,18 @@ class RoleExecutorTest(PgTestCase):
         return subprocess.run(["psql", self.host_dsn(), "-X", "-At",
                                "-v", "ON_ERROR_STOP=1", "-c", sql],
                               capture_output=True, text=True, timeout=30, env=env)
+
+    def test_drop_database_does_not_inherit_the_statement_timeout(self):
+        """#4822 : un DROP annulé par le délai de la suite laissait la base
+        invalide (`datconnlimit = -2`). Avec 1 ms, le geste serait annulé ;
+        la connexion d'administration le remplace par 0 et la base part."""
+        database = "t_executor_db_" + uuid.uuid4().hex[:8]
+        _create_database(self.admin_db.cfg, database)
+        self.addCleanup(_drop_database, self.admin_db.cfg, database)
+        _drop_database(dataclasses.replace(self.admin_db.cfg,
+                                           statement_timeout_ms=1), database)
+        self.assertEqual(self.db.query(
+            "SELECT 1 FROM pg_database WHERE datname = %s", (database,)), [])
 
     def test_host_reads_and_writes_data(self):
         cfg = dataclasses.replace(self.cfg, dsn=self.host_dsn())
