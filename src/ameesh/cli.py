@@ -68,7 +68,8 @@
   agent-mail status "<current work>"             status text (registry + terminal title); the status stays the runner's
   agent-mail hook <claude|codex|deepseek>        hook: reads the JSON on stdin, delivers the unread
   agent-mail statusline                          Claude Code status bar: [workspace/name] work · directory
-  agent-mail migrate [--dry-run | --additive-only]  applies the versioned migrations
+  agent-mail migrate [--dry-run | --additive-only] [--allow-live-executors REASON]
+                                                 applies the versioned migrations
   agent-mail doctor [--notify-test | --probe | --harness]  diagnostics: driver, schema, migrations, LISTEN/NOTIFY and the OS desktop channel (L66); host harnesses (L106)
                                                  (--probe: lightweight container probe)
 
@@ -1999,12 +2000,13 @@ def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
     return 0
 
 
-def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False) -> int:
+def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
+                allow_live_executors: str | None = None) -> int:
     """`--dry-run` : migrations manquantes, additives ou non, sans rien écrire.
     `--additive-only` : n'applique rien (code 3) si l'une d'elles n'est pas
     additive — c'est le garde de « migrer avant d'installer » (L151)."""
     try:
-        db = db_mod.connect(cfg)
+        db = db_mod.connect(cfg, writer=False)
     except db_mod.Unavailable as exc:
         print("migration failed: %s" % exc, file=sys.stderr)
         return 1
@@ -2033,7 +2035,8 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False)
             if refused:
                 print("nothing applied (--additive-only)", file=sys.stderr)
                 return 3
-        done = migrations.migrate(db, log=lambda line: print(line), additive_only=additive_only)
+        done = migrations.migrate(db, log=lambda line: print(line), additive_only=additive_only,
+                                  allow_live_executors=allow_live_executors)
     except migrations.NonAdditiveMigration as exc:
         print(str(exc), file=sys.stderr)
         return 3
@@ -2055,7 +2058,7 @@ def cmd_probe(cfg: Config) -> int:
     sonde de conteneur appelée toutes les quelques secondes. Une ligne, code 0
     (OK) ou 1 (KO)."""
     try:
-        db = db_mod.connect(cfg)
+        db = db_mod.connect(cfg, writer=False)
     except db_mod.Unavailable as exc:
         # #3745 : le refus d'un pgbouncer n'est pas une migration manquante
         hint = ("; a pgbouncer refuses an ameesh session setting: add it to its "
@@ -2193,7 +2196,7 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         # L106 : binaires des harnais et unités d'exécuteur de l'hôte
         from . import hostcheck
         try:
-            db = db_mod.connect(cfg)
+            db = db_mod.connect(cfg, writer=False)
         except db_mod.Unavailable as exc:
             print("database   : unreachable (%s) — harnesses checked without the agents" % exc)
             return hostcheck.cmd_harness(cfg)
@@ -2287,7 +2290,7 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         print(line)
     started = time.monotonic()
     try:
-        db = db_mod.connect(cfg)
+        db = db_mod.connect(cfg, writer=False)
     except db_mod.Unavailable as exc:
         print("driver     : none (%s)" % exc)
         print("verdict    : KO — the CLI would fall back to the files %s" % cfg.v0_state)
@@ -2503,8 +2506,19 @@ def main(argv: list[str] | None = None) -> int:
         if command == "hook":
             return cmd_hook(cfg, rest[0] if rest else "?")
         if command == "migrate":
+            allowed = {'--dry-run', '--additive-only', '--allow-live-executors'}
+            reason = None
+            if '--allow-live-executors' in rest:
+                index = rest.index('--allow-live-executors')
+                if index + 1 >= len(rest) or not rest[index + 1].strip() or rest[index + 1].startswith('--'):
+                    raise ValueError('--allow-live-executors requires a nonempty reason')
+                reason = rest[index + 1]
+                rest = rest[:index] + rest[index + 2:]
+            if any(arg not in allowed - {'--allow-live-executors'} for arg in rest):
+                raise ValueError('unknown migrate option')
             return cmd_migrate(cfg, dry_run="--dry-run" in rest,
-                               additive_only="--additive-only" in rest)
+                               additive_only="--additive-only" in rest,
+                               allow_live_executors=reason)
         if command == "doctor":
             return cmd_doctor(cfg, notify_test="--notify-test" in rest,
                               probe="--probe" in rest, harness="--harness" in rest,

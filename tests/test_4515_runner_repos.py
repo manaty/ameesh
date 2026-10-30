@@ -113,7 +113,8 @@ class PorteFermee(unittest.TestCase):
                     "expire_operator_pauses_once", "lift_device_gates_once",
                     "prune_events_once", "_note_gate_wait"):
             setattr(runner, nom, mock.Mock())
-        with mock.patch.object(runner_mod.registry, "reap", return_value=[]):
+        with mock.patch.object(runner_mod.registry, "reap", return_value=[]), \
+                mock.patch.object(runner_mod.migrations, "require_compatible_writer"):
             runner.sweep()
             self.assertTrue(all(w.wake.is_set() for w in workers))
             for w in workers:
@@ -133,7 +134,9 @@ class CourrierDuMaillage(unittest.TestCase):
         ici = _Worker()
         fake = types.SimpleNamespace(lock=threading.RLock(), workers={"ici": ici},
                                      wake_all=threading.Event())
-        Runner.dispatch(fake, {"channel": "agent_mail", "payload": json.dumps(payload)})
+        fake.db = object()
+        with mock.patch.object(runner_mod.migrations, "require_compatible_writer"):
+            Runner.dispatch(fake, {"channel": "agent_mail", "payload": json.dumps(payload)})
         return ici, fake
 
     def test_courrier_pour_un_agent_servi_ailleurs(self):

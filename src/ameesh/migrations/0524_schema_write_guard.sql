@@ -20,4 +20,10 @@ BEGIN
     LOOP
         EXECUTE format('GRANT SELECT ON schema_non_additive_migrations TO %I', writer_role);
     END LOOP;
+    IF EXISTS (
+        SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_release_controller'
+          AND has_table_privilege(oid, to_regclass('host_release_operations'), 'INSERT')
+    ) THEN
+        GRANT SELECT ON schema_non_additive_migrations TO ameesh_release_controller;
+    END IF;
 END $writer_roles$;

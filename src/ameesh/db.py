@@ -194,66 +194,6 @@ class SchemaMissing(DbError):
     """La base répond mais les tables agent-mesh ne sont pas migrées."""
 
 
-# #4975: guard every driver mutation, including RETURNING and mutating CTEs.
-# State is per thread AND connection: an executor's other thread is never
-# exempted while the migration worker operates on its own connection.
-_SCHEMA_GUARD_STATE = threading.local()
-_TRANSACTION_CONTROL = re.compile(
-    r"^\s*(?:SAVEPOINT\b|RELEASE\s+(?:SAVEPOINT\s+)?|ROLLBACK\s+TO\b)", re.I)
-
-
-@contextlib.contextmanager
-def schema_guard_bypass(db):
-    """Internal migration-worker exemption; never used by application writers."""
-    owner = getattr(db, "driver", db)
-    active = getattr(_SCHEMA_GUARD_STATE, "active", None)
-    if active is None:
-        active = _SCHEMA_GUARD_STATE.active = set()
-    key = id(owner)
-    nested = key in active
-    active.add(key)
-    try:
-        yield
-    finally:
-        if not nested:
-            active.remove(key)
-
-
-def _guard_statement(method):
-    @functools.wraps(method)
-    def guarded(self, sql, *args, **kwargs):
-        owner = getattr(self, "driver", self)
-        active = getattr(_SCHEMA_GUARD_STATE, "active", ())
-        if (id(owner) in active
-                or (_TRANSACTION_CONTROL.match(sql) and single_statement(sql))
-                or (method.__name__ == "query" and pure_read(sql)
-                    and single_statement(sql))):
-            if (_TRANSACTION_CONTROL.match(sql)
-                    and sql.lstrip().upper().startswith("ROLLBACK")
-                    and isinstance(self, PsycopgDriver)):
-                self._schema_guard_checked = False
-            return method(self, sql, *args, **kwargs)
-        if isinstance(self, PsycopgDriver):
-            return self._guarded_call(method, sql, *args, **kwargs)
-        if isinstance(self, _PsqlTransaction) and self._schema_guard_checked:
-            return method(self, sql, *args, **kwargs)
-        from . import migrations
-        with schema_guard_bypass(owner):
-            # Shared with other writers, exclusive against migrate(). Keep
-            # the lock from inventory check through the mutation's COMMIT.
-            context = (contextlib.nullcontext(self) if isinstance(self, _PsqlTransaction)
-                       else self.transaction())
-            with context as tx:
-                tx.query("SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
-                         (migrations._LOCK,))
-                migrations.require_compatible_writer(tx)
-                tx._schema_guard_checked = True
-                if tx is self:
-                    return method(self, sql, *args, **kwargs)
-                return getattr(tx, method.__name__)(sql, *args, **kwargs)
-    return guarded
-
-
 # --------------------------------------------------------------------------
 # compteur d'allers-retours (L61)
 # --------------------------------------------------------------------------
@@ -365,12 +305,8 @@ def execute_without_statement_timeout(db, sql: str) -> None:
       autocommit chacune (aucun bloc de transaction autour de DROP DATABASE).
 
     Le délai client du pilote psql, borné par la configuration, est retiré
-    pour la même raison. ``sql`` est une instruction unique CREATE DATABASE
-    ou DROP DATABASE ; les écritures du schéma applicatif restent gardées.
+    pour la même raison. ``sql`` est une instruction unique.
     """
-    if (not single_statement(sql)
-            or not re.match(r"^\s*(?:CREATE|DROP)\s+DATABASE\b", sql, re.I)):
-        raise DbError("unbounded administration only accepts a single CREATE/DROP DATABASE")
     if getattr(db, "name", "") == "psql":
         # le client doit attendre aussi longtemps que le serveur : le
         # checkpoint d'un DROP peut durer plusieurs minutes.
@@ -380,11 +316,8 @@ def execute_without_statement_timeout(db, sql: str) -> None:
         if proc.returncode != 0:
             raise db._fail(proc)
         return
-    # Database-level administration is outside the application's schema.
-    # CREATE/DROP DATABASE must execute in autocommit, never a guard block.
-    with schema_guard_bypass(db):
-        db.execute("SET statement_timeout = 0")
-        db.execute(sql)
+    db.execute("SET statement_timeout = 0")
+    db.execute(sql)
 
 
 def dsn_has_options(dsn: str) -> bool:
@@ -674,7 +607,6 @@ class PsqlDriver:
                        constraint=name, sql=sql, elapsed_ms=elapsed_ms)
 
     # -- interface ---------------------------------------------------------
-    @_guard_statement
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
         started = time.monotonic()
         proc = self._run(["-c", _json_query(bind(sql, params))])
@@ -714,7 +646,6 @@ class PsqlDriver:
             out += [[_normalize_row(row) for row in (rows or [])] for rows in results]
         return out
 
-    @_guard_statement
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         started = time.monotonic()
         proc = self._run(["-c", bind(sql, params)])
@@ -723,7 +654,6 @@ class PsqlDriver:
                              elapsed_ms=(time.monotonic() - started) * 1000.0)
         return 0
 
-    @_guard_statement
     def script(self, sql: str) -> None:
         proc = self._run(["-1", "-f", "-"], stdin=sql)
         if proc.returncode != 0:
@@ -774,14 +704,12 @@ class _PsqlTransaction:
         self._depth = 0
         self._seq = 0
         self._token = "__ameesh_tx_%s" % os.urandom(8).hex()
-        self._schema_guard_checked = False
 
     # -- cycle de vie ------------------------------------------------------
     def __enter__(self) -> "_PsqlTransaction":
         if self.proc is not None:
             self._depth += 1
             return self
-        self._schema_guard_checked = False
         self._err = tempfile.TemporaryFile()
         TRACE.connect()
         try:
@@ -892,7 +820,6 @@ class _PsqlTransaction:
             self._buf += chunk
 
     # -- interface ---------------------------------------------------------
-    @_guard_statement
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
         return _parse_json_rows(self._run(_json_query(bind(sql, params))).strip())
 
@@ -900,12 +827,10 @@ class _PsqlTransaction:
         """Dans une transaction ouverte : séquentiel, sur la même session."""
         return [self.query(sql, params) for sql, params in map(_batch_item, items)]
 
-    @_guard_statement
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         self._run(bind(sql, params))
         return 0
 
-    @_guard_statement
     def script(self, sql: str) -> None:
         """Run raw multi-statement SQL on this transaction's backend.
 
@@ -1108,7 +1033,6 @@ class PsycopgDriver:
         self._reconnect_lock = threading.Lock()
         #: transactions explicites ouvertes : jamais de reconnexion au milieu
         self._tx_depth = 0
-        self._schema_guard_checked = False
         #: #1469 : un seul fil à la fois dans un bloc `transaction()`
         #: #4602 : priorité aux fils réveillés par du travail et au listener
         #: (``admission_lock``) ; désactivable, repli sur le RLock d'avant.
@@ -1256,59 +1180,7 @@ class PsycopgDriver:
         self._schema_pending = False
         return True
 
-    @_serial
-    def _guarded_call(self, method, sql, params=()):
-        """One exchange: server refusal and mutation in one implicit transaction.
-
-        ClientCursor adapts parameters client-side, so PostgreSQL accepts the
-        multi-statement simple-query message. No string interpolation of user
-        parameters, and no result is returned before all statements finish.
-        An existing explicit transaction checks once and keeps the shared lock.
-        """
-        from . import migrations
-        self._live()
-        if self._schema_missing:
-            raise SchemaMissing(_schema_message(self))
-        prefix = ""
-        probe = self._schema_pending
-        if probe:
-            prefix += _SCHEMA_PROBE + ";\n"
-            self._schema_pending = False
-        checked = self._tx_depth and self._schema_guard_checked
-        if not checked:
-            prefix += migrations.writer_guard_sql() + "\n"
-        combined = prefix + sql
-        TRACE.trip(sql + (" ;; schema write guard" if not checked else ""))
-        started = time.monotonic()
-        try:
-            with self._psycopg.ClientCursor(self.conn) as cur:
-                cur.execute(combined, tuple(params) if params else None)
-                if probe:
-                    self._schema_ok = bool(cur.fetchone()["ok"])
-                    if not self._schema_ok:
-                        self._schema_missing = True
-                        raise SchemaMissing(_schema_message(self))
-                    cur.nextset()
-                if not checked:
-                    cur.nextset()  # skip the DO guard's result
-                    if self._tx_depth:
-                        self._schema_guard_checked = True
-                # query() accepts a single mutation; script() may contain more.
-                if method.__name__ == "script":
-                    return None
-                if method.__name__ == "execute":
-                    return cur.rowcount
-                return [_normalize_row(dict(row)) for row in cur.fetchall()]
-        except DbError:
-            raise
-        except Exception as exc:
-            if getattr(exc, "sqlstate", None) == "AM497":
-                raise migrations.IncompatibleSchema(str(exc).split("\n", 1)[0]) from exc
-            raise _map_error(exc, sql=sql,
-                             elapsed_ms=(time.monotonic() - started) * 1000.0) from exc
-
     # -- interface ---------------------------------------------------------
-    @_guard_statement
     @_serial
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
         self._live()
@@ -1349,15 +1221,13 @@ class PsycopgDriver:
                 probe = self._deferred(items[0][0])
         if len(items) == 1 and not probe:
             return [self.query(*items[0])]
-        if not self._pipeline_ok() or any(not pure_read(sql) or not single_statement(sql)
-                                          for sql, _ in items):
+        if not self._pipeline_ok() or any(not single_statement(sql) for sql, _ in items):
             if probe:
                 self._schema_pending = True
                 self._settle_schema()
             return [self.query(sql, params) for sql, params in items]
         return self._run_batch(items, probe=probe, fetch=True)
 
-    @_guard_statement
     @_serial
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         self._live()
@@ -1376,7 +1246,6 @@ class PsycopgDriver:
             raise _map_error(exc, sql=sql,
                              elapsed_ms=(time.monotonic() - started) * 1000.0) from exc
 
-    @_guard_statement
     @_serial
     def script(self, sql: str) -> None:
         self._live()
@@ -1410,23 +1279,14 @@ class PsycopgDriver:
                 raise SchemaMissing(_schema_message(self))
             if self._schema_pending:
                 self._settle_schema()
-            prior_checked = self._schema_guard_checked
-            if not self._tx_depth:
-                self._schema_guard_checked = False
             self._tx_depth += 1
             try:
                 with self.conn.transaction():
                     yield self
             except self._psycopg.Error as exc:
-                self._schema_guard_checked = prior_checked
                 raise _map_error(exc) from exc
-            except BaseException:
-                self._schema_guard_checked = prior_checked
-                raise
             finally:
                 self._tx_depth -= 1
-                if not self._tx_depth:
-                    self._schema_guard_checked = False
 
     def listen(self, channels: Iterable[str]) -> "Listener":
         try:
@@ -1619,7 +1479,7 @@ def explain(exc: BaseException, limit: int = 160) -> str:
 # fabrique
 # --------------------------------------------------------------------------
 
-def connect(cfg: Config, driver: str | None = None) -> PsqlDriver | PsycopgDriver:
+def connect(cfg: Config, driver: str | None = None, *, writer: bool = True) -> PsqlDriver | PsycopgDriver:
     """Ouvre une connexion. Lève `Unavailable` si la base (ou le pilote) manque.
 
     L109 : `backend: mediated` (exécuteur médié, session du harnais dans la
@@ -1635,17 +1495,33 @@ def connect(cfg: Config, driver: str | None = None) -> PsqlDriver | PsycopgDrive
     errors: list[str] = []
     if wanted in ("auto", "psycopg"):
         try:
-            return PsycopgDriver(cfg)
+            return _writer_connection(PsycopgDriver(cfg), writer=writer)
         except Unavailable as exc:
             errors.append(str(exc))
             if wanted == "psycopg":
                 raise
     if wanted in ("auto", "psql"):
         try:
-            return PsqlDriver(cfg)
+            return _writer_connection(PsqlDriver(cfg), writer=writer)
         except Unavailable as exc:
             errors.append(str(exc))
     raise Unavailable("; ".join(errors) or "no Postgres driver available")
+
+
+def _writer_connection(db, *, writer: bool):
+    """Process admission; diagnostics/migration opt out explicitly.
+
+    No per-statement guard, SQL classification or transaction lock. Long-lived
+    processes must also call require_compatible_writer at their tick boundary.
+    """
+    if writer and not getattr(db.cfg, 'read_only', False):
+        from .migrations import require_compatible_writer
+        try:
+            require_compatible_writer(db)
+        except BaseException:
+            db.close()
+            raise
+    return db
 
 
 def _schema_message(db) -> str:

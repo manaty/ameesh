@@ -68,6 +68,7 @@ from . import account_window
 from . import provider_credits
 from . import persona_memory as memory_mod
 from . import train_events
+from . import migrations
 from . import turn_context
 from . import events as events_mod, turn_stages
 from . import venv_guard
@@ -1101,6 +1102,7 @@ class AgentWorker(threading.Thread):
 
         def call() -> None:
             try:
+                migrations.require_compatible_writer(self.db)
                 result["expires"] = registry.renew(
                     self.db, self.name, self.runner.runner_id, self.epoch,
                     self.runner.lease_ttl)
@@ -6775,6 +6777,7 @@ class AgentWorker(threading.Thread):
             return spec
         return dict(spec, turn_id=uuid.uuid4().hex)
 
+    @migrations.writer_tick
     def run_turn(self, spec: dict) -> bool | None:
         """Un tour (voir `_run_turn_or_defer`).
 
@@ -9543,6 +9546,7 @@ class AgentWorker(threading.Thread):
         self.ensure_peek()
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
+            migrations.require_compatible_writer(self.db)
             self._apply_pending_config()  # avant les gardes de rotation et de prise
             # #1270 B1 : pas de tentative avant l'échéance de reprise durable ;
             # un réveil déjà posé ne fait pas repartir le tour plus tôt.
@@ -9601,6 +9605,14 @@ class AgentWorker(threading.Thread):
         self.ensure_peek()
         try:
             while not self.stopping.is_set() and not self.runner.stop.is_set():
+                try:
+                    migrations.require_compatible_writer(self.db)
+                except migrations.IncompatibleSchema as exc:
+                    log_async("[%s] %s" % (self.name, exc))
+                    break
+                except db_mod.Unavailable as exc:
+                    self._panne_de_base(exc, "schema admission")
+                    continue
                 # #4602 : la passe qui suit un réveil de travail passe avant
                 # les passes de sondage des autres agents ; la classe est
                 # consommée par cette passe (une nouvelle notification la
@@ -10341,6 +10353,7 @@ class Runner:
     #: l'hystérésis lit une heure ; l'historique garde deux jours
     ROLE_PRUNE_EVERY_S = 6 * 3600.0
 
+    @migrations.writer_tick
     def role_evaluation_once(self) -> int | None:
         """Publie le score de cet hôte pour chaque rôle élu dont il est candidat.
 
@@ -10675,6 +10688,7 @@ class Runner:
             host_gate_mod.SlotPool.release(self._gate_slots.pop(name, None))
 
     # -- réclamation -------------------------------------------------------
+    @migrations.writer_tick
     def expire_operator_pauses_once(self) -> list[dict]:
         """#3961 (issue #3014) : les pauses opérateur échues, à chaque passe.
 
@@ -10714,6 +10728,7 @@ class Runner:
                 log_async("[%s] thread unavailable: %s" % (row["agent"], exc))
         return done
 
+    @migrations.writer_tick
     def expire_delegations_once(self) -> list[dict]:
         """L40 (0030, point 5) : les délégations échues, à chaque passe.
 
@@ -10752,6 +10767,7 @@ class Runner:
                              " [dry-run]" if row.get("dry_run") else ""))
         return done
 
+    @migrations.writer_tick
     def lift_device_gates_once(self, now: float | None = None) -> list[dict]:
         """#3070 (canon §12) : les lots `blocked` dont la seule attente est une
         séance sur un appareil déclaré indisponible en sortent, avec la trace
@@ -10791,6 +10807,7 @@ class Runner:
                           % (row["lot"], row["state"], device_gates.TRACE, row["verify"]))
         return done
 
+    @migrations.writer_tick
     def prune_events_once(self, now: float | None = None) -> int | None:
         """L85 : rétention du journal `ameesh_events` (0033 §9), au plus une
         fois par heure et par exécuteur, bornée (`PRUNE_MAX_BATCHES` lots,
@@ -10902,6 +10919,7 @@ class Runner:
                 take.get("agent"), (take.get("item") or {}).get("id"), take.get("kind")))
         return taken
 
+    @migrations.writer_tick
     def release_stopped_lots_once(self) -> list[dict]:
         """#753 : un agent arrêté ne garde pas ses lots. À chaque passe qui
         atteint la reprise — après les gardes secteur/drainage/code périmé
@@ -11008,6 +11026,7 @@ class Runner:
             out.extend(done)
         return out
 
+    @migrations.writer_tick
     def sweep(self) -> None:
         self.report_liveness()
         self.role_evaluation_once()  # L165 (EP2) : score des candidats de l'hôte
@@ -11506,6 +11525,7 @@ class Runner:
         log_async("[%s] deferred: shared database admission (queued %.1fs)"
                   % (name, waited))
 
+    @migrations.writer_tick
     def dispatch(self, item: dict) -> None:
         """Réveille (ou préempte) le worker visé, **signal avant journal**.
 
@@ -11881,6 +11901,7 @@ class Runner:
         log_async("shutdown: %d lease(s) returned, %d turn(s)" % (len(workers), self.turns))
 
     # -- canon sync (spec §4.4) --------------------------------------------
+    @migrations.writer_tick
     def canon_sync_once(self) -> bool:
         """Un `canon sync` de l'hôte ; ne lève jamais, ne tue jamais un tour.
 
@@ -12153,6 +12174,7 @@ class Runner:
         self.canon_thread.start()
 
     # -- solde des fournisseurs payés au token (L26) ------------------------
+    @migrations.writer_tick
     def balance_once(self, sources=None, min_interval_s: float = 0.0) -> int:
         """Relève le solde de chaque source configurée ; ne lève jamais.
 
@@ -12215,6 +12237,7 @@ class Runner:
         threading.Thread(target=boucle, daemon=True, name="solde").start()
 
     # -- ressources de l'hôte (L31, 0028) -----------------------------------
+    @migrations.writer_tick
     def resource_once(self) -> dict | None:
         """Relève et publie les ressources de l'hôte ; ne lève jamais.
 
@@ -12247,6 +12270,7 @@ class Runner:
                 except Exception:
                     pass
 
+    @migrations.writer_tick
     def host_lifecycle_once(self, db) -> None:
         """Drive durable requests with the enrolled helper, or record its named gap."""
         from . import handoffs, host_lifecycle
@@ -12291,6 +12315,7 @@ class Runner:
         except (db_mod.DbError, handoffs.HandoffError, ValueError):
             log_async("host lifecycle: request remains pending; helper or prerequisites unavailable")
 
+    @migrations.writer_tick
     def host_release_once(self, *, scan_local=True, complete=False) -> None:
         """#4148: one release-scanner pass (adapter transitions, auto drain).
 
@@ -12399,6 +12424,7 @@ class Runner:
                        if worker.is_alive() and getattr(worker, "proc", None) is not None}
         return en_tour | self.background.agents()
 
+    @migrations.writer_tick
     def housekeeping_once(self, *, min_interval_s: float = 0.0) -> dict | None:
         """Un passage de ménage (L73) ; ne lève jamais.
 
@@ -12508,6 +12534,7 @@ class Runner:
                                               row["work_item_id"]))
         return purges
 
+    @migrations.writer_tick
     def expire_threads_once(self, db, now: float | None = None,
                             clock: float | None = None) -> list | None:
         """L361: thread retention (0033 §9), at most once a day, from the
@@ -12561,6 +12588,7 @@ class Runner:
             if created is not None:      # only the connection opened here
                 created.close()
 
+    @migrations.writer_tick
     def sweep_dead_letters_once(self, db, now: float | None = None,
                                 clock: float | None = None) -> dict | None:
         """L976 : le courrier en souffrance (destinataire arrêté ou inconnu)
@@ -12595,6 +12623,7 @@ class Runner:
                       % (action["old"], action["new"], action["reason"].splitlines()[0]))
         return report
 
+    @migrations.writer_tick
     def notify_health_once(self, db=None, now: float | None = None) -> dict | None:
         """#3007 : dit, depuis cet hôte, si un notificateur vivant couvre les
         humains qui ont des décisions en attente, et briefe les agents.
@@ -12638,6 +12667,7 @@ class Runner:
                       % (entry.get("recipient") or "?", entry.get("error")))
         return report
 
+    @migrations.writer_tick
     def branch_sweep_once(self) -> dict | None:
         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
         cet hôte (et, avec `--agents`, parmi eux) : une branche fusionnée dans
@@ -12686,6 +12716,7 @@ class Runner:
                 except Exception:
                     pass
 
+    @migrations.writer_tick
     def footprint_once(self, db) -> None:
         """#4818 : l'empreinte suit le travail réel — le diff d'une branche
         poussée par un agent de cet hôte remplace l'estimation dès le premier
@@ -12718,6 +12749,7 @@ class Runner:
             log_async(line)
         self._footprint_errors = errors
 
+    @migrations.writer_tick
     def carry_once(self, db) -> None:
         """#2442 : reporte sur la tête gelée les verdicts d'une tête dont elle
         n'est qu'un réalignement mécanique sur la cible, avant le passage du
@@ -12742,6 +12774,7 @@ class Runner:
             log_async(line)
         self._carry_errors = errors
 
+    @migrations.writer_tick
     def packet_sweep_once(self, db) -> None:
         """#2426 : ferme les lots unitaires des paquets fusionnés.
 
@@ -12787,6 +12820,7 @@ class Runner:
                         project.name, entry["work_item"], entry["detail"],
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
 
+    @migrations.writer_tick
     def fire_once(self, db) -> None:
         """#1374 : le passage du feu du pilote — arme l'auto-fusion des lots
         couverts par le gel courant et dont les portes sont vertes, invalide un
@@ -12824,6 +12858,7 @@ class Runner:
         except Exception as exc:  # jamais fatal pour l'exécuteur
             log_async("fire pass failed (%s: %s)" % (type(exc).__name__, exc))
 
+    @migrations.writer_tick
     def measure_once(self, db) -> None:
         """L157c: measures the lots delivered since the last sweep (phases,
         merged diff) with the repositories of this host. Never raises."""
@@ -12842,6 +12877,7 @@ class Runner:
         except Exception as exc:  # never fatal for the runner
             log_async("work item measures failed (%s: %s)" % (type(exc).__name__, exc))
 
+    @migrations.writer_tick
     def radar_once(self, db) -> None:
         """L160b : un passage du radar de conflits, après le relevé des
         branches, sur l'hôte qui déclare `radar.projects` : journal, et
@@ -12874,6 +12910,7 @@ class Runner:
                 log_async(message)
             self._radar_error = message
 
+    @migrations.writer_tick
     def incident_once(self, db) -> None:
         """#1681 : ouvre les incidents des exécutions terminales rouges de la
         branche d'intégration (develop Nexlink, main ameesh), à la source
@@ -13529,6 +13566,7 @@ class Runner:
                 and r.get("status") != "stopped"
                 and (self.agents_filter is None or r["name"] in self.agents_filter)]
 
+    @migrations.writer_tick
     def harness_versions_once(self, now: float | None = None) -> list[dict] | None:
         """L120: read and record the version of the harnesses this runner
         serves, at most every `PROBE_INTERVAL_S`; never raises. Read only:
@@ -13556,6 +13594,7 @@ class Runner:
                 except Exception:
                     pass
 
+    @migrations.writer_tick
     def account_claims_once(self) -> None:
         """#313/#2580 (décision 0033) : revendique, dans le registre de
         l'hôte, les identifiants des comptes de cette configuration, puis
@@ -13970,6 +14009,7 @@ class Runner:
         # #4602 : le fil principal de l'exécuteur est ordinaire ; une classe
         # posée par un test ou un appelant ne doit pas survivre à l'entrée.
         admission_lock.reset()
+        migrations.require_compatible_writer(self.db)
         log("starting: host %s, runner %s, driver %s, schema %s, mail "
             "batch %ds (L125); config %s" % (self.host, self.runner_id, self.db.name,
                                              self.cfg.schema, int(self.mail_batch),
@@ -14017,6 +14057,16 @@ class Runner:
         code = 0
         try:
             while not self.stop.is_set():
+                try:
+                    migrations.require_compatible_writer(self.db)
+                except migrations.IncompatibleSchema as exc:
+                    log_async(str(exc))
+                    code = 1
+                    break
+                except db_mod.Unavailable as exc:
+                    log_async("schema admission unavailable: %s" % exc)
+                    self.stop.wait(reprise.echec())
+                    continue
                 if self._sigterm_drained():
                     log_async("retrait terminé après SIGTERM : arrêt")
                     break

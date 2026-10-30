@@ -426,9 +426,8 @@ class RoleExecutorTest(PgTestCase):
                     marker_sql = marker_file.read()
                 for fixed, scoped in (("ameesh_it_proof", proof), ("ameesh_it_qa", qa)):
                     marker_sql = marker_sql.replace(fixed, scoped)
-                with db_mod.schema_guard_bypass(self.db):
-                    self.db.execute('DROP TABLE schema_non_additive_migrations')
-                    self.db.script(marker_sql)
+                self.db.execute('DROP TABLE schema_non_additive_migrations')
+                self.db.script(marker_sql)
                 for _ in range(2):
                     for writer_role in names:
                         row = self.db.query(
@@ -858,6 +857,23 @@ class RoleExecutorTest(PgTestCase):
                 result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
                     '-v','role='+controller,'-f',str(sql)], env=env, text=True,capture_output=True,timeout=60)
                 self.assertEqual(result.returncode,0,result.stderr)
+            # Upgrade an already-provisioned controller, then reapply its
+            # contract. Process admission must run AS controller.
+            marker_sql = Path(migrations.MIGRATIONS_DIR,
+                              '0524_schema_write_guard.sql').read_text().replace(
+                                  'ameesh_release_controller', controller)
+            self.db.execute('DROP TABLE schema_non_additive_migrations')
+            self.db.script(marker_sql)
+            for _ in range(2):
+                permissions = self.db.query(
+                    "SELECT has_table_privilege(%s, 'schema_non_additive_migrations', 'SELECT') AS reads, "
+                    "has_table_privilege(%s, 'schema_non_additive_migrations', 'INSERT,UPDATE,DELETE') AS writes",
+                    (controller, controller))[0]
+                self.assertTrue(permissions['reads'])
+                self.assertFalse(permissions['writes'])
+                result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                    '-v','role='+controller,'-f',str(sql)], env=env, text=True,capture_output=True,timeout=60)
+                self.assertEqual(result.returncode,0,result.stderr)
             registry.upsert(self.db,'release-worker',harness='other',host='synthetic-host')
             self.assertTrue(self.db.query(
                 'SELECT has_table_privilege(%s,%s,%s) AS allowed',
@@ -880,6 +896,7 @@ class RoleExecutorTest(PgTestCase):
                 (old_decision, new_decision))
             with self.db.transaction() as tx:
                 tx.execute('SET LOCAL ROLE %s' % q(controller))
+                migrations.require_compatible_writer(tx)
                 tx.query('SELECT name FROM agent_registry WHERE name=%s FOR UPDATE',('release-worker',))
                 tx.execute('INSERT INTO host_release_operations(operation,host,manifest_digest) VALUES (%s,%s,%s)',
                            ('controller-fixture','synthetic-host','a'*64))
