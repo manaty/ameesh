@@ -179,19 +179,22 @@ def wakeable(listing: list, canons, *, configured: bool) -> list:
 
 
 def measure(listing: list, lots: list, waits: dict, now: float, canons, *,
-            configured: bool) -> dict:
+            configured: bool, footprint: dict | None = None) -> dict:
     """`{projet: Measure}` pour chaque projet d'au moins un agent réveillable.
 
     Au repos : `idle_agents` (sans lot actionnable, #1677). Démarrable : un
     lot ouvert sans assigné ni exécutant externe, hors file d'amélioration,
-    qu'aucune attente planifiée ne retient (`split_startable`)."""
+    qu'aucune attente planifiée ne retient et que la garde d'empreinte
+    n'occupe pas (`split_startable`, #3185/#4699) ; `footprint` est la
+    lecture partagée `sous_utilisation.footprint_blockers` (#4717)."""
     from . import projects as projects_mod
     pool = wakeable(listing, canons, configured=configured)
     names = {row["name"] for row in pool}
     idle = {row["name"] for row in su.idle_agents(listing, now, 0.0, waiting_free=True,
                                                   actionable_idle=True)
             if row["name"] in names}
-    startable, _blocked = su.split_startable(su.waiting_project_lots(lots), waits)
+    startable, _blocked = su.split_startable(su.waiting_project_lots(lots), waits,
+                                             footprint)
     out: dict = {}
     for row in pool:
         for project in projects_mod.agent_projects(row):
@@ -938,7 +941,14 @@ def run(cfg, db, *, now: float | None = None, state: dict | None = None,
     listing = st.operations.listing() if listing is None else listing
     lots = st.operations.open_lots_activity(None)
     waits = planned_waits.read(db, lots, now=now) if lots else {}
-    measures = measure(listing, lots, waits, now, canons, configured=configured)
+    # #4717 : le déclencheur de découpage applique la même garde d'empreinte
+    # que le débit (#4561) et `idle_capacity` (#4699) — une seule lecture
+    # partagée, jamais une copie. Un lot recouvert par un lot en cours n'est
+    # pas un lot démarrable offert aux agents au repos.
+    footprint = (su.footprint_blockers(db, su.waiting_project_lots(lots), lots)
+                 if lots else {})
+    measures = measure(listing, lots, waits, now, canons, configured=configured,
+                       footprint=footprint)
     due, since = held(measures, state.get(STATE_KEY) or {}, now,
                       settings.repos_part, settings.repos_s)
     state[STATE_KEY] = since
