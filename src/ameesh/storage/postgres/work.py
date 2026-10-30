@@ -534,6 +534,20 @@ def _lock_migration_writer(tx, item_id, proposed=None):
     return True
 
 
+def _unknown_marker(tx, item, footprint, unknown):
+    """#4818 : l'empreinte d'intake d'un lot de la file dont l'analyse est
+    inconnue — la politique de son dépôt, lue dans la transaction de création
+    (verrou de la garde tenu par l'appelant), posée sur `item`
+    (`footprint_policy`) ; sous `repository`, le marqueur `.` (dépôt entier)."""
+    paths = list(footprint or ())
+    if unknown:
+        from .work_footprints import unknown_policy_sql
+        item["footprint_policy"] = unknown_policy_sql(tx, item["id"])
+        if not paths and item["footprint_policy"] == "repository":
+            paths = ["."]
+    return paths
+
+
 class WorkItems(interface.WorkItems):
 
     @_retry_deadlock
@@ -3652,8 +3666,14 @@ class WorkItems(interface.WorkItems):
     def backlog_add(self, *, title, body, source, expected_value, value_score, priority,
                     team, required_capabilities, package_id, package_parent, note,
                     actor, app="", estimate_minutes=None, estimate_source=None,
-                    estimate_by=None, change_size=None, footprint=None) -> dict:
+                    estimate_by=None, change_size=None, footprint=None,
+                    footprint_unknown=False) -> dict:
         with self.db.transaction() as tx:
+            if footprint_unknown:
+                # #4818 (B2 de cx3) : la politique se lit et le marqueur
+                # s'écrit dans la transaction de création, sous le verrou de
+                # la garde — aucune prise ne voit le lot sans son marqueur
+                tx.execute(_DEPENDENCIES_LOCK)
             # #4117 : l'estimation (et sa ligne d'historique) est posée avec la
             # création, comme `work.add` (L157) ; jamais après.
             by = (estimate_by or actor or "") if estimate_minutes else None
@@ -3680,6 +3700,8 @@ class WorkItems(interface.WorkItems):
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             # #4186 : la file d'amélioration n'oublie plus l'empreinte — la
             # ligne de panier l'unionne avec celles des lignes précédentes.
+            item = dict(item)
+            footprint = _unknown_marker(tx, item, footprint, footprint_unknown)
             WorkItems(tx)._intake_footprint(int(item["id"]), footprint, actor)
             return item
 
@@ -3687,12 +3709,17 @@ class WorkItems(interface.WorkItems):
                            team, required_capabilities, package_id, package_parent, note,
                            actor, app="", estimate_minutes=None, estimate_source=None,
                            estimate_by=None, change_size=None,
-                           estimate_required=False, footprint=None) -> dict:
+                           estimate_required=False, footprint=None,
+                           footprint_unknown=False) -> dict:
         caps = _catalog._text_array(required_capabilities) if required_capabilities else None
         # #4117 : l'estimation ne s'applique qu'au panier OUVERT par cet ajout ;
         # une ligne ajoutée à un panier existant ne le réestime pas.
         by = (estimate_by or actor or "") if estimate_minutes else None
         with self.db.transaction() as tx:
+            if footprint_unknown:
+                # #4818 (B1 de cx3) : comme `backlog_add`, le verrou de la
+                # garde avant celui du panier et la ligne du lot
+                tx.execute(_DEPENDENCIES_LOCK)
             # #2584 : un seul écrivain par clé de panier — deux ajouts
             # simultanés n'ouvrent jamais deux paniers du même chantier.
             tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
@@ -3749,7 +3776,10 @@ class WorkItems(interface.WorkItems):
                                             estimate_by or actor)
             WorkItems(tx)._event(item_id, "intake", note, actor)
             # #4186 : l'union des chemins des lignes du panier, jamais un
-            # remplacement — une ligne ajoutée à un panier ouvert l'élargit.
+            # remplacement — une ligne ajoutée à un panier ouvert l'élargit ;
+            # une ligne inconnue sous `repository` y ajoute le marqueur.
+            policy = {"id": item_id}
+            footprint = _unknown_marker(tx, policy, footprint, footprint_unknown)
             WorkItems(tx)._intake_footprint(item_id, footprint, actor)
             rows = tx.query(
                 "SELECT " + item_columns(self.db) + ","
@@ -3761,6 +3791,8 @@ class WorkItems(interface.WorkItems):
             item = dict(rows[0])
             item["basket_lines"] = int(item.get("basket_lines") or 0)
             item["basket_opened"] = opened
+            if "footprint_policy" in policy:
+                item["footprint_policy"] = policy["footprint_policy"]
             return item
 
     def backlog(self, *, open_only, limit, ready_only=False) -> list[dict]:

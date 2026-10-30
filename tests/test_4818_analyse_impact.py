@@ -532,6 +532,66 @@ class RelectureTroisTest(_Empreintes):
         self.footprint(attente, "docs/y.md")
         self.assertEqual(store.cap_reached(attente["id"]), {"cap": 1, "in_flight": 1})
 
+    def rules(self):
+        return mock.patch.object(backlog, "rules", return_value=backlog.Rules(
+            lot_min_value=30, timezone="Europe/Paris", commit="c" * 40))
+
+    def test_un_panier_vague_porte_le_marqueur(self):
+        # B1 de cx3 sur d68ca19 : la route du panier pose le marqueur et
+        # l'analyse comme un lot direct ; une ligne connue ne les efface pas
+        self.policy(unknown_policy="repository")
+        self.occupant()
+        with self.rules():
+            panier = backlog.add(self.db, title="panier vague", expected_value="gain",
+                                 value_score=10, app="nexlink", actor="test",
+                                 cfg=self.cfg, new_project=True, chantier="ch",
+                                 estimate="1h")
+        self.assertTrue(panier["basket"])
+        self.assertEqual(fp.paths_of(self.db, panier["id"]), ["."])
+        store = storage.of(self.db).work_footprints
+        analysis = store.analyses([panier["id"]])[panier["id"]]
+        self.assertEqual((analysis["status"], analysis["policy"]), ("unknown", "repository"))
+        with self.assertRaises(work.WorkError):
+            work.assign(self.db, panier["id"], "human:autre", actor="test")
+        with self.rules():
+            ligne = backlog.add(self.db, title="ligne précise", expected_value="gain",
+                                body="corrige src/c.py", value_score=10, app="nexlink",
+                                actor="test", cfg=self.cfg, chantier="ch")
+        self.assertEqual(ligne["id"], panier["id"])
+        self.assertEqual(fp.paths_of(self.db, panier["id"]), [".", "src/c.py"])
+        self.assertEqual(store.analyses([panier["id"]])[panier["id"]]["status"], "unknown")
+        self.db.execute("UPDATE work_item_impact_analyses SET analyzed_at = analyzed_at"
+                        " - interval '1 hour' WHERE work_item_id = %s", (panier["id"],))
+        self.assertEqual([r["work_item_id"] for r in store.claim_unknown(
+            retry_after_s=60, limit=5)], [panier["id"]])
+
+    def test_une_prise_juste_apres_la_creation_voit_le_marqueur(self):
+        # B2 de cx3 sur d68ca19 : une prise sur une AUTRE connexion, juste
+        # après le commit de la création, voit déjà le marqueur
+        self.policy(unknown_policy="repository")
+        self.occupant()
+        real = WorkItems.backlog_add
+        seen = {}
+
+        def create_then_take(this, **kw):
+            item = real(this, **kw)
+            other = db_mod.connect(self.cfg)
+            try:
+                work.assign(other, item["id"], "human:autre", actor="test")
+                seen["taken"] = True
+            except work.WorkError as exc:
+                seen["refused"] = str(exc)
+            finally:
+                other.close()
+            return item
+        with self.rules(), mock.patch.object(WorkItems, "backlog_add", create_then_take):
+            item = backlog.add(self.db, title="amélioration vague", expected_value="gain",
+                               value_score=40, app="nexlink", actor="test", cfg=self.cfg,
+                               new_project=True, estimate="1h")
+        self.assertNotIn("taken", seen)
+        self.assertIn("(unknown footprint: whole repository)", seen["refused"])
+        self.assertIsNone(work.get(self.db, item["id"])["assignee"])
+
     def test_un_vehicule_n_est_pas_un_candidat_au_refresh(self):
         vehicule = self.lot("paquet", branch="integration/paquet-h-3")
         lot = self.lot("lot", branch="lot/9-x")

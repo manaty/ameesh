@@ -668,19 +668,12 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
                 "; %s" % introduced if introduced else ""),
             actor=actor, app=project, estimate_minutes=minutes,
             estimate_source=estimate_source, estimate_by=estimate_by,
-            change_size=size or None, footprint=footprint)
-        if impact and item and item.get("id"):
-            if impact.get("unknown"):
-                # un lot de la file est du code, pris par `auto_take` comme un
-                # autre (B de cx1 sur 176dc95) : la politique du dépôt, lue
-                # sous le verrou de la garde, lui pose le marqueur comme à
-                # `work.add`
-                written = storage.of(db).work_footprints.replace(
-                    int(item["id"]), "intake", [], actor=actor or "ameesh",
-                    unknown=True, unless_manual=True)
-                work_footprints.settle(impact, (written or {}).get("policy"))
-            work_footprints.record_analysis(db, int(item["id"]), impact,
-                                            actor=actor or "ameesh")
+            change_size=size or None, footprint=footprint,
+            # un lot de la file est du code, pris par `auto_take` comme un
+            # autre (B de cx1 sur 176dc95) : la politique du dépôt est lue et
+            # le marqueur posé DANS la transaction de création (B2 de cx3)
+            footprint_unknown=bool(impact and impact.get("unknown")))
+        _record_impact(db, item, impact, actor)
         return item
     label, fiche = _chantier(chantier, fiche, reviewed, project)
     day = _basket_day(rule, now)
@@ -706,13 +699,39 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
             actor=actor, app=project, estimate_minutes=minutes,
             estimate_source=estimate_source, estimate_by=estimate_by,
             change_size=size or None, footprint=footprint,
+            # B1 de cx3 : la ligne inconnue marque le panier comme un lot direct
+            footprint_unknown=bool(impact and impact.get("unknown")),
             # La garde est lue SOUS le verrou du panier : une ligne ajoutée à
             # un panier déjà ouvert ne crée pas de lot et n'est pas refusée.
             estimate_required=estimates.is_agent(db, creator or actor))
     except interface.BasketEstimateRequired:
         raise estimates.EstimateError(
             estimates.REQUIRED % (creator or actor, "add --estimate 2h")) from None
+    if impact and not impact.get("unknown") and not item.get("basket_opened"):
+        # une ligne connue n'efface pas l'inconnue d'une ligne précédente :
+        # le panier reste à reprendre (son corps entier est réanalysé)
+        from . import impact_analysis, work_footprints
+        before = storage.of(db).work_footprints.analyses([int(item["id"])])
+        if (before.get(int(item["id"])) or {}).get("status") == "unknown":
+            impact = dict(impact, status="unknown", unknown=True,
+                          reason="an earlier basket line has an unknown footprint")
+            # le marqueur de la ligne précédente est déjà au panier ; la
+            # politique ne sert ici qu'à la ligne de journal
+            impact["policy"] = work_footprints.policy_of(db, project)["unknown_policy"]
+            impact["note"] = impact_analysis.note(impact)
+    _record_impact(db, item, impact, actor)
     return dict(item, basket=True)
+
+
+def _record_impact(db: Db, item: dict, impact: dict | None, actor: str) -> None:
+    """#4818 : l'analyse d'impact du lot créé (ou du panier), avec la
+    politique appliquée par le stockage à sa création."""
+    if not impact or not item or not item.get("id"):
+        return
+    from . import work_footprints
+    if impact.get("unknown") and item.get("footprint_policy"):
+        work_footprints.settle(impact, item["footprint_policy"])
+    work_footprints.record_analysis(db, int(item["id"]), impact, actor=actor or "ameesh")
 
 
 def items(db: Db, *, open_only: bool = True, limit: int = 100) -> list:

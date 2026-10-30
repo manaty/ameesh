@@ -2835,7 +2835,8 @@ class WorkItems(Domain):
                     package_parent: str | None, note: str, actor: str,
                     app: str = "", estimate_minutes: int | None = None,
                     estimate_source: str | None = None, estimate_by: str | None = None,
-                    change_size: str | None = None, footprint: list | None = None) -> dict:
+                    change_size: str | None = None, footprint: list | None = None,
+                    footprint_unknown: bool = False) -> dict:
         """Crée un élément de la file : un lot `improvement` en `intake`, sans
         assigné, et sa première ligne de journal ; rend le lot.
 
@@ -2844,7 +2845,10 @@ class WorkItems(Domain):
         que le lot et sa ligne d'historique (`work_item_estimates`), comme
         `work.add` (L157) ; `estimate_by` vaut `actor` quand il est omis.
         #4186 : `footprint` (chemins normalisés) est l'empreinte d'intake,
-        écrite avec la création."""
+        écrite avec la création. #4818 : `footprint_unknown` (analyse
+        inconnue) fait lire la politique du dépôt dans la même transaction,
+        sous le verrou de la garde : le lot rendu porte `footprint_policy`,
+        et le marqueur `.` sous `repository`."""
 
     @abc.abstractmethod
     def backlog_basket_add(self, *, key: str, title: str, expected_value: str, line: str,
@@ -2856,7 +2860,8 @@ class WorkItems(Domain):
                            estimate_by: str | None = None,
                            change_size: str | None = None,
                            estimate_required: bool = False,
-                           footprint: list | None = None) -> dict:
+                           footprint: list | None = None,
+                           footprint_unknown: bool = False) -> dict:
         """#2584 (canon §2 l.129) : ajoute une ligne au panier ouvert `key`
         d'un chantier, ou ouvre ce panier ; rend le panier.
 
@@ -2884,7 +2889,9 @@ class WorkItems(Domain):
 
         #4186 : `footprint` est l'union des chemins cités par cette ligne avec
         ceux déjà connus du panier (jamais un remplacement) ; l'empreinte est
-        écrite avec la création de la ligne."""
+        écrite avec la création de la ligne. #4818 : `footprint_unknown`,
+        comme `backlog_add` — sous `repository`, le marqueur `.` s'unionne
+        aux chemins des lignes précédentes, dans la transaction de la ligne."""
 
     @abc.abstractmethod
     def backlog(self, *, open_only: bool, limit: int,

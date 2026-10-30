@@ -110,7 +110,11 @@ closed (not retried).
 to the pilot (`source = decision`), a roadmap-cutting lot
 (`file-decoupage:…`) — never get the marker, are neither counted nor held
 by the in-flight cap, and are not refreshed at push. An improvement backlog
-lot is code, taken like any other: it follows the common rule.
+lot is code, taken like any other: it follows the common rule. A basket
+line takes the marker too, united with the earlier lines' paths, and a known
+line does not clear the unknown analysis of an earlier one. On every creation
+path the policy is read and the marker written in the creation's own
+transaction, under the guard's lock: no take sees the lot without it.
 
 A change of the unknown footprint policy applies at once, in the same
 transaction and under the guard's lock, to the open lots of the repository:
