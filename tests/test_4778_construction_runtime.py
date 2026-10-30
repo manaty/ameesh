@@ -355,6 +355,13 @@ class TreeTest(unittest.TestCase):
         with self.assertRaisesRegex(build.BuildError, 'hardlink'):
             build.sanitize(self.runtime)
 
+    def test_sanitize_refuses_a_file_from_another_uid(self):
+        # mesh-design #167612: the runtime tree must belong entirely to the
+        # operator running the assembler; no root or other-account file.
+        with mock.patch.object(build.os, 'geteuid', return_value=os.geteuid() + 1):
+            with self.assertRaisesRegex(build.BuildError, 'owned by the builder'):
+                build.sanitize(self.runtime)
+
 
 class BuildTest(unittest.TestCase):
     def setUp(self):
