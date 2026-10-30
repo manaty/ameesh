@@ -1476,12 +1476,12 @@ class Leases(interface.Leases):
         return bool(rows)
 
     def end_turn(self, name, owner, epoch, *, status, status_text, error,
-                 cost_usd) -> bool:
+                 cost_usd, turn_id=None) -> bool:
         from .sandbox import ameesh_turn_close
         with self.db.transaction() as tx:
             return ameesh_turn_close(
                 tx, name, owner, epoch, status=status, status_text=status_text,
-                error=error, cost_usd=cost_usd)
+                error=error, cost_usd=cost_usd, turn_id=turn_id)
 
 
 # --------------------------------------------------------------------------

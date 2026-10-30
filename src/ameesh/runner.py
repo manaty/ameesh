@@ -617,6 +617,10 @@ class AgentWorker(threading.Thread):
         self.name = agent["name"]
         self.epoch = int(lease["lease_epoch"])
         self.agent = agent
+        #: identité du tour courant, allouée au lancement du harnais (#2894) ;
+        #: la clôture générique la reçoit pour fendre un tour sandbox par
+        #: identité (#4881).
+        self._turn_id: str | None = None
         self.wake = threading.Event()
         #: #4602 : un signal de travail (courrier) a réveillé ce worker ; sa
         #: prochaine passe d'admission base passe avant les sondages au repos.
@@ -5666,7 +5670,7 @@ class AgentWorker(threading.Thread):
             self.db, self.name, self.runner.runner_id, self.epoch,
             status="blocked", status_text=self._auth_status,
             error="%s relay server credential failing" % auth_failure.STATUS_PREFIX,
-            cost_usd=cost)
+            cost_usd=cost, turn_id=self._turn_id)
         self.last_activity = time.monotonic()
         self._turn_end_mono = self.last_activity  # #3451
         return True
@@ -8924,7 +8928,8 @@ class AgentWorker(threading.Thread):
                     "end of turn", registry.end_turn,
                     self.db, self.name, self.runner.runner_id, self.epoch,
                     status="blocked", status_text=self.HOST_STATUS,
-                    error="%s : %s" % (self.HOST_ERROR, hote), cost_usd=cost)
+                    error="%s : %s" % (self.HOST_ERROR, hote), cost_usd=cost,
+                    turn_id=self._turn_id)
                 self.last_activity = time.monotonic()
                 self._turn_end_mono = self.last_activity  # #3451
                 if not self._power_texte:
@@ -8955,7 +8960,8 @@ class AgentWorker(threading.Thread):
                     "end of turn", registry.end_turn,
                     self.db, self.name, self.runner.runner_id, self.epoch,
                     status="blocked", status_text=texte,
-                    error="%s %s" % (auth_failure.STATUS_PREFIX, raison_auth), cost_usd=cost)
+                    error="%s %s" % (auth_failure.STATUS_PREFIX, raison_auth), cost_usd=cost,
+                    turn_id=self._turn_id)
                 self.last_activity = time.monotonic()
                 self._turn_end_mono = self.last_activity  # #3451
                 self._auth_note(nom_harnais, account, raison_auth, texte, turn=True)
@@ -8986,7 +8992,7 @@ class AgentWorker(threading.Thread):
                     self.db, self.name, self.runner.runner_id, self.epoch,
                     status="blocked", status_text=texte,
                     error="%s %s" % (provider_credits.STATUS_PREFIX, raison_credits),
-                    cost_usd=cost)
+                    cost_usd=cost, turn_id=self._turn_id)
                 self.last_activity = time.monotonic()
                 self._turn_end_mono = self.last_activity  # #3451
                 if transition or not sonde:
@@ -9110,6 +9116,7 @@ class AgentWorker(threading.Thread):
             self.db, self.name, self.runner.runner_id, self.epoch,
             status=status, status_text=texte_fin,
             error=error, cost_usd=cost,
+            turn_id=self._turn_id,
         )
         self.last_activity = time.monotonic()
         self._turn_end_mono = self.last_activity  # #3451
