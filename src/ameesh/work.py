@@ -75,62 +75,12 @@ SYSTEM_SENDER = "ameesh"
 MANUAL_REVIEW_START_RE = re.compile(r"^\s*R[12]\b", re.IGNORECASE)
 MANUAL_REVIEW_TITLE_RE = re.compile(r"^\s*R[12]\b[^:—–#]*#\s*(\d+)\b", re.IGNORECASE)
 MAX_QA_LOOPS = 2
-FORWARD = {
-    lifecycle.REQUESTED: (lifecycle.IN_PROGRESS,),
-    lifecycle.IN_PROGRESS: (lifecycle.QA,),
-    lifecycle.QA: (lifecycle.VALIDATED, lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
-    lifecycle.VALIDATED: (lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
-    lifecycle.DELIVERY_RECORDED: (lifecycle.PROMOTED,),
-    lifecycle.PROMOTED: (),
-    lifecycle.CLOSED: (),
-}
-
-#: transitions autorisées, attentes comprises
-TRANSITIONS = {
-    lifecycle.REQUESTED: {lifecycle.IN_PROGRESS, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
-    lifecycle.IN_PROGRESS: {lifecycle.QA, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
-    lifecycle.QA: {
-        lifecycle.VALIDATED,
-        lifecycle.DELIVERY_RECORDED,
-        lifecycle.IN_PROGRESS,
-        lifecycle.BLOCKED,
-        lifecycle.WAITING_HUMAN,
-    },
-    lifecycle.VALIDATED: {
-        lifecycle.QA,
-        lifecycle.DELIVERY_RECORDED,
-        lifecycle.IN_PROGRESS,
-        lifecycle.BLOCKED,
-        lifecycle.WAITING_HUMAN,
-    },
-    lifecycle.DELIVERY_RECORDED: {lifecycle.PROMOTED, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
-    lifecycle.PROMOTED: set(),
-    lifecycle.CLOSED: set(),
-    lifecycle.BLOCKED: {
-        lifecycle.VALIDATED,
-        lifecycle.REQUESTED,
-        lifecycle.IN_PROGRESS,
-        lifecycle.QA,
-        lifecycle.DELIVERY_RECORDED,
-        lifecycle.WAITING_HUMAN,
-    },
-    lifecycle.WAITING_HUMAN: {
-        lifecycle.VALIDATED,
-        lifecycle.REQUESTED,
-        lifecycle.IN_PROGRESS,
-        lifecycle.QA,
-        lifecycle.DELIVERY_RECORDED,
-        lifecycle.BLOCKED,
-    },
-}
-#: corrections d'un état posé par erreur (`move(..., correct=…)`) : (depuis,
-#: vers). Un `promoted` à tort revient en `merged` ; un `merged` à tort (une
-#: PR d'étape fermée trop tôt, #759) revient en `build` ; ensuite, les
-#: transitions habituelles (merged → blocked → …) s'appliquent.
-CORRECTIONS = {
-    (lifecycle.PROMOTED, lifecycle.DELIVERY_RECORDED),
-    (lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
-}
+# The development module owns its stages and compatibility transitions.
+from .modules import registry as _module_registry
+_dev_workflow = _module_registry.development_workflow()
+FORWARD = _dev_workflow.FORWARD
+TRANSITIONS = _dev_workflow.TRANSITIONS
+CORRECTIONS = _dev_workflow.CORRECTIONS
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
@@ -4136,7 +4086,7 @@ def get(db: Db, item_id: int) -> dict | None:
 
 
 def _canonical_state(state: str) -> str:
-    """#4349 : l'orthographe persistée v1 d'un état (v1 ou alias générique),
+    """#4353 : l'orthographe persistée d'un état (v1 ou alias générique),
     sinon `WorkError` nommant les orthographes acceptées."""
     from .work_lifecycle import ACCEPTED_STATES, canonical
     try:
@@ -4150,7 +4100,7 @@ def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
                limit: int = 50) -> list[dict]:
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.list_items")
-    if state:
+    if state and state not in ("merged", "promoted"):
         state = _canonical_state(state)
     return storage.of(db).work.items(state=state, assignee=assignee, limit=limit)
 
@@ -4223,7 +4173,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
 
     `state` accepte l'orthographe v1 et le nom générique du cycle de vie
     (#4349 : `in_progress` pour `build`, `to_validate` pour `qa`…)."""
-    state = _canonical_state(state)
+    try:
+        state = lifecycle.phase_name(state)
+    except ValueError as exc:
+        raise WorkError(str(exc)) from None
     if package_exclusion and correct is not None:
         raise WorkError("--package-exclusion and --correct are distinct gestures")
     if package_exclusion and state != lifecycle.IN_PROGRESS:
@@ -4261,7 +4214,7 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         # registre (process_registry), qui vérifie la garde côté serveur et
         # écrit le reçu dans la même transaction.
         raise _pinned_transition_error(item_id, pinned)
-    current = item["state"]
+    current = lifecycle.phase(item)
     if current == state:
         raise WorkError("lot %s already in %s" % (item_id, state))
     if reviewer is not None:
@@ -4582,3 +4535,9 @@ def durations(row: dict) -> list[tuple[str, float | None]]:
     ne sont pas des durées, et les confondre afficherait « 1s » pour un verdict.
     """
     return [(label, row.get(key)) for label, key in MILESTONE_DURATIONS]
+
+
+def promote(db: Db, item_id: int, *, note: str = "", actor: str = "") -> dict:
+    """Promote a development delivery using its module's workflow."""
+    return _module_registry.development_workflow().promote(
+        db, item_id, note=note, actor=actor)

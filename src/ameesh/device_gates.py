@@ -53,7 +53,7 @@ TRACE = "qualification physique reportée"
 #: titre des lots de vérification : ils attendent l'appareil, jamais levés
 VERIFY_TITLE = "Vérification au retour"
 #: états où le lot revient ; tout autre état d'avant `blocked` revient en build
-RETURN_STATES = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, lifecycle.QA, lifecycle.VALIDATED, lifecycle.DELIVERY_RECORDED)
+RETURN_STATES = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, lifecycle.QA, lifecycle.VALIDATED, "merged")
 ACTOR = "device-gates"
 #: borne de la lecture des lots `blocked` d'une passe
 BLOCKED_LIMIT = 1000

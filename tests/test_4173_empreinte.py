@@ -300,7 +300,7 @@ class ProprieteTest(_Empreintes):
         rows = self.db.query(
             "SELECT w.id, w.app, f.path FROM work_items w"
             "  JOIN work_item_footprints f ON f.work_item_id = w.id"
-            " WHERE w.state NOT IN ('merged', 'promoted', 'closed')"
+            " WHERE w.state NOT IN ('merged', 'promoted', 'delivered', 'closed')"
             "   AND (w.assignee IS NOT NULL OR w.state <> 'intake')")
         for left, right in itertools.combinations(rows, 2):
             if left["id"] != right["id"] and left["app"] == right["app"]:

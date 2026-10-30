@@ -47,3 +47,13 @@ To be encoded in ameesh as requirements:
 - The risk class of a change is computed from the files touched
   and the canon policy; it also feeds the gate (a "light" merge
   can be a `reversible` action).
+
+# L99 T5 — persisted delivery core (#4353)
+
+Implementation of signed owner decision #164165 (29 October 2026,
+approval #167): `merged` and `promoted` persist as `delivered`, with the
+existing workflow stage and `legacy_state` preserving their distinction.
+The dev module owns promotion and correction transitions. Historical
+milestones, signed Process artifacts and public GitHub vocabulary keep
+their contracts. Migration and rollback are qualified in a disposable
+Postgres schema; the storage switch precedes executor restart.

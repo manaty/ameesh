@@ -462,7 +462,7 @@ class Operations(interface.Operations):
     #: migration. `released_by` en écarte les dépendants pinnés, dont la
     #: retenue ne tombe que par une commande `release` du registre.
     _LOTS_ACTIVITY = """
-            SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
+            SELECT w.id, w.title, w.state, to_jsonb(w)->>'legacy_state' AS legacy_state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
                    to_jsonb(w)->>'external_executor' AS external_executor,
                    -- #2335 : l'appartenance à un paquet se lit sur le porteur
@@ -519,8 +519,10 @@ class Operations(interface.Operations):
             (int(limit) if limit is not None else None,))
 
     def state_lots_activity(self, state, limit) -> list[dict]:
+        predicate = ("coalesce(to_jsonb(w)->>'legacy_state', w.state) = %s"
+                     if state in ("merged", "promoted") else "w.state = %s")
         return self._lots_activity(
-            "w.state = %s",
+            predicate,
             (state, int(limit) if limit is not None else None))
 
     def build_lots_activity(self, limit) -> list[dict]:
@@ -530,7 +532,7 @@ class Operations(interface.Operations):
         ouverts."""
         return self.db.query(
             f"""
-            SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
+            SELECT w.id, w.title, w.state, to_jsonb(w)->>'legacy_state' AS legacy_state, w.assignee, w.package_id, w.type,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(

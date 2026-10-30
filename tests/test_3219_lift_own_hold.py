@@ -314,7 +314,7 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
         self.assertEqual(self._active(item), {})
         result = self._sync()[item["id"]]
         self.assertEqual(result["result"], "merged")
-        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
         # la levée est déjà au journal ; la note de fusion n'a pas à la refaire
         closure = next(n for n in self._notes(item) if n.startswith("merge seen"))
         self.assertNotIn("levée du hold", closure)
@@ -332,7 +332,7 @@ class ContentSweepAfterOwnLiftTest(PgTestCase):
         self.assertIn("levée du hold de l'assigné dev-a", dry["detail"])
         result = self._sync()[item["id"]]
         self.assertEqual(result["result"], "merged")
-        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
         closure = next(n for n in self._notes(item) if n.startswith("merge seen"))
         self.assertIn("levée du hold de l'assigné dev-a", closure)
         self.assertIn("j'attends le paquet 1900", closure)

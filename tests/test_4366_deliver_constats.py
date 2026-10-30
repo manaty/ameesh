@@ -76,7 +76,7 @@ class ObservedMergeTest(PgTestCase):
                             evidence={"seen": "sync-github", "sha": SHA, "pr": "o/r#7"},
                             actor="t")
         self.assertEqual(done["result"], "merged")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
         self.assertIn("merge seen by sync-github — o/r#7 (commit %s) [via git-merge]"
                       % SHA[:12], self.notes(lot["id"]))
         again = work.deliver(self.db, lot["id"], connector="git-merge",
