@@ -24,7 +24,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 PREAMBLE = ('#!/bin/sh\n'
-            "'''exec' \"$(dirname \"$(command -v \"$0\" || printf '%s' \"$0\")\")/python\" \"$0\" \"$@\"\n"
+            "'''exec' \"$(dirname \"$(readlink -f \"$(command -v \"$0\" || printf '%s' \"$0\")\")\")/python\" \"$0\" \"$@\"\n"
             "' '''\n")
 
 
@@ -206,6 +206,18 @@ class ScriptTest(unittest.TestCase):
         observed = subprocess.run(['demo', 'path'], check=True, capture_output=True,
                                   text=True, env={'PATH': path}).stdout.strip()
         self.assertEqual(observed, 'ok path')
+        # Un lien hors du runtime trouve encore le python à côté du script réel.
+        links = Path(temp.name) / 'links'
+        links.mkdir()
+        (links / 'demo').symlink_to(script)
+        observed = subprocess.run([str(links / 'demo'), 'link'], check=True,
+                                  capture_output=True, text=True,
+                                  env={'PATH': '/usr/bin:/bin'}).stdout.strip()
+        self.assertEqual(observed, 'ok link')
+        observed = subprocess.run(['demo', 'linked-path'], check=True,
+                                  capture_output=True, text=True,
+                                  env={'PATH': str(links) + ':/usr/bin:/bin'}).stdout.strip()
+        self.assertEqual(observed, 'ok linked-path')
 
     def test_record_hash_is_updated_after_rebase(self):
         temp = tempfile.TemporaryDirectory()
