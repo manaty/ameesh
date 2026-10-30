@@ -359,8 +359,8 @@ def _dispatch(argv: list[str] | None) -> int:
         print("ameesh %s" % version())
         return 0
     if command == "turn" and rest[:1] == ["current"]:
-        from . import cli
-        return cli.cmd_turn_current(rest[1:])
+        from . import turn_context
+        return turn_context.cmd_current(rest[1:])
     if command == "mail":
         from . import cli
         return cli.main(rest)

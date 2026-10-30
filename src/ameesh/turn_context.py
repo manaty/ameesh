@@ -415,3 +415,42 @@ def verify(document: dict, db) -> None:
     marker = registry.pending_spend_get(db, name)
     if not marker or marker.get("turn_id") != document["turn"]["id"]:
         raise ContextError("stale-turn")
+
+def cmd_current(argv: list[str]) -> int:
+    """Reference reader for the supported per-turn authorization contract."""
+    import argparse
+    import sys
+    from . import turn_context
+    parser = argparse.ArgumentParser(prog="ameesh turn current")
+    parser.add_argument("--local", action="store_true",
+                        help="skip the database recheck (file and identity checks still apply)")
+    parser.add_argument("--expect-turn", help="captured turn id required when reusing authorization")
+    parser.add_argument("--json", action="store_true")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code)
+    try:
+        document = turn_context.current(expect_turn=args.expect_turn)
+        if not args.local:
+            from . import config as config_mod, backend as backend_mod
+            try:
+                cfg = config_mod.load()
+            except (ValueError, OSError):
+                print("turn current: invalid-configuration", file=sys.stderr)
+                return 2
+            bk, _ = backend_mod.open_backend(cfg)
+            if bk.kind != "pg":
+                raise turn_context.ContextError("database-unavailable")
+            turn_context.verify(document, bk.db)
+    except turn_context.ContextError as exc:
+        print("turn current: %s" % exc, file=sys.stderr)
+        return 3
+    except Exception:
+        print("turn current: verification-unavailable", file=sys.stderr)
+        return 3
+    if args.json:
+        print(json.dumps(document, ensure_ascii=False))
+    else:
+        print("%s %s" % (document["turn"]["agent"], document["turn"]["id"]))
+    return 0

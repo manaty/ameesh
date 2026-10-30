@@ -515,7 +515,7 @@ class TurnCurrentTest(unittest.TestCase):
         self.assertNotIn("secret-dsn", err)
 
     def test_usage_errors(self):
-        with mock.patch("ameesh.cli.config_mod.load", side_effect=ValueError("secret-path")):
+        with mock.patch("ameesh.config.load", side_effect=ValueError("secret-path")):
             code, out, err = self.call()
         self.assertEqual((code, out), (2, ""))
         self.assertNotIn("secret-path", err)

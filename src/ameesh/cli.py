@@ -2477,44 +2477,6 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
 # entrée
 # --------------------------------------------------------------------------
 
-def cmd_turn_current(argv: list[str]) -> int:
-    """Reference reader for the supported per-turn authorization contract."""
-    import argparse
-    from . import turn_context
-    parser = argparse.ArgumentParser(prog="ameesh turn current")
-    parser.add_argument("--local", action="store_true",
-                        help="skip the database recheck (file and identity checks still apply)")
-    parser.add_argument("--expect-turn", help="captured turn id required when reusing authorization")
-    parser.add_argument("--json", action="store_true")
-    try:
-        args = parser.parse_args(argv)
-    except SystemExit as exc:
-        return int(exc.code)
-    try:
-        document = turn_context.current(expect_turn=args.expect_turn)
-        if not args.local:
-            try:
-                cfg = config_mod.load()
-            except (ValueError, OSError):
-                print("turn current: invalid-configuration", file=sys.stderr)
-                return 2
-            bk, _ = backend_mod.open_backend(cfg)
-            if bk.kind != "pg":
-                raise turn_context.ContextError("database-unavailable")
-            turn_context.verify(document, bk.db)
-    except turn_context.ContextError as exc:
-        print("turn current: %s" % exc, file=sys.stderr)
-        return 3
-    except Exception:
-        print("turn current: verification-unavailable", file=sys.stderr)
-        return 3
-    if args.json:
-        print(json.dumps(document, ensure_ascii=False))
-    else:
-        print("%s %s" % (document["turn"]["agent"], document["turn"]["id"]))
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] in ("-h", "--help"):
