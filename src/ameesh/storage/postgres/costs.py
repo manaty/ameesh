@@ -85,13 +85,17 @@ class TurnCosts(interface.TurnCosts):
         """#4448 : la mesure de rotation d'une session, relue du grand livre.
 
         Même somme que les compteurs en mémoire de l'exécuteur : l'entrée et
-        la sortie de chaque tour, cache compris (Codex compte déjà le cache
-        dans l'entrée). `turns` compte **tous** les tours inscrits, réussis ou
-        non : c'est la définition du compteur vivant (`session_turns`), pas les
-        seuls succès — sinon l'alerte et la rotation divergent (B cx3). Le
-        harnais et l'instant sont ceux du dernier tour de la session, pour
-        choisir la surcharge compilée du bon harnais. Aucun tour : None (pas
-        une session à zéro par défaut).
+        la sortie de chaque tour (`input_tokens + output_tokens`). Le cache
+        n'est donc inclus que là où `input_tokens` le contient déjà : Codex
+        compte son entrée en cache dans `input_tokens`, Claude et DeepSeek la
+        publient à part (`cached_input_tokens`) et le cache écrit n'est pas
+        inclus — la convention est hétérogène selon le harnais (§5.3 du
+        contrat `ameesh-context/1`). `turns` compte **tous** les tours
+        inscrits, réussis ou non : c'est la définition du compteur vivant
+        (`session_turns`), pas les seuls succès — sinon l'alerte et la
+        rotation divergent (B cx3). Le harnais et l'instant sont ceux du
+        dernier tour de la session, pour choisir la surcharge compilée du bon
+        harnais. Aucun tour : None (pas une session à zéro par défaut).
         """
         rows = self.db.query(
             "select coalesce(sum(input_tokens + output_tokens), 0)::bigint as tokens,"

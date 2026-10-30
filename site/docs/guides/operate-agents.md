@@ -132,7 +132,7 @@ ameesh cost balance [--provider deepseek] [--record] [--since 7d] [--json]   # a
 
 ```bash
 ameesh alerts [--follow] [--json] [--interval 30] [--long-turn 1800]
-              [--idle-mail 300] [--dead-grace 30] [--session-tokens 15000000]
+              [--idle-mail 300] [--dead-grace 30] [--session-tokens N]
               [--stale-lot 21600] [--orphan-lot 1800] [--delegation-grace 300]
 ```
 
@@ -143,7 +143,7 @@ One JSON object per line (`ameesh-alert/1`):
 | `long_turn` | a running turn longer than the threshold |
 | `idle_with_mail` | an idle agent with unread mail older than the threshold |
 | `dead_runner` | a lease expired without renewal, beyond the grace period |
-| `session_too_big` | tokens re-read at the last turn of the current session above the threshold (default 15 M) |
+| `session_too_big` | cumulative tokens of the current session (`input_tokens + output_tokens` over its turns; per-harness cache convention, #4448) at or above the threshold of the last turn's harness, compiled from the canon (`session.max_tokens*`; the executor's common 150 000 is the fallback), with at least `AMEESH_SESSION_MIN_TURNS` turns (default 3) and no turn in progress; silent once the session has rotated |
 | `stale_lot` | an unmerged lot without activity for the threshold (default 6 h), with what it waits for: verdict, correction, merge or a human decision |
 | `host_pressure` | a reading of the host crosses a limit of its `policy.resources` (v1.3.0); fields `host`, `critical`, `breaches` |
 | `orphan_resource` | a resource of a turn (process group, labelled container) that outlives its turn, or that a dead runner left behind (v1.3.0); it is reported, never removed |

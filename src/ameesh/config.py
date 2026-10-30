@@ -329,7 +329,15 @@ class Config:
     #: tous les comptes du sien tourne, dans l'ordre (un harnais au forfait,
     #: puis un harnais à clé d'API), par rotation avec résumé. Vide : aucun.
     critical_fallback_harnesses: tuple[str, ...] = ("codex", "deepseek")
-    #: rotation de session (0018) : taille de contexte et latence des tours
+    #: rotation de session (L11, #4448) : garde de **taille de session**, la
+    #: somme `input_tokens + output_tokens` des tours (`S_hist`), pas une
+    #: fenêtre de contexte ni un budget de relecture. La convention de cache
+    #: est hétérogène selon le harnais (Codex compte le cache dans son entrée,
+    #: Claude/DeepSeek le publient à part ; le cache écrit n'est pas inclus).
+    #: Seuil commun de repli : le canon (`session.max_tokens*`) donne le seuil
+    #: du harnais du dernier tour quand il est présent. `0` n'est pas une
+    #: extinction (le canon refuse 0 ; la comparaison `>=` ferait tourner au
+    #: minimum de tours), contrairement à `context_max_tokens`.
     session_max_tokens: float = 150000.0
     #: #706 : au-dessus du plafond de tour par défaut (1800 s).
     session_max_turn_seconds: float = 3600.0
