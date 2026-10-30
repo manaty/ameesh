@@ -263,6 +263,16 @@ Each successful command prints its receipt as JSON. `advance` accepts
 an idempotent replay (the same command id and the same intent are replayed,
 never applied twice).
 
+A request can stop from `new`, `triage`, `draft` or `approval`:
+
+```bash
+ameesh module support-work-delivery advance 42 --to closed --guard stop_work --ref reason=abandoned
+# Or supersede it with an existing, distinct lot:
+ameesh module support-work-delivery advance 42 --to closed --guard stop_work --ref reason=superseded --ref superseded_by=43
+```
+
+Both commands produce a receipt and project the issue as `closed/not_planned`.
+
 `adopt` rules:
 
 * only the lot's **assignee** or the pilot may adopt it;
