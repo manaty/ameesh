@@ -2311,7 +2311,9 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     # #4667 : un véhicule de paquet (`integration/**`) n'entre pas dans
     # l'en-cours d'un agent — le geste explicite qui l'attribue ne le met pas
     # non plus dans la file d'équipe (#540).
-    queued = (None if _is_vehicle_branch(branch or item.get("branch"))
+    # #4756 : le lot de découpage non plus — c'est un geste du pilote.
+    from .file_decoupage import is_split_lot
+    queued = (None if _is_vehicle_branch(branch or item.get("branch")) or is_split_lot(item)
               else _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
                                 % (check["assignee"], previous or "nobody")))
     # L165 (EP4) : l'attribution est un geste du pilote hors base (elle

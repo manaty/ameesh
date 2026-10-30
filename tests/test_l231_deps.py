@@ -596,7 +596,9 @@ class ReviewFixesTests(_Base):
 
         def unknown(_p):
             raise deps.platform.NotAvailable("holders", "test")
-        self.assertEqual(deps.gc_node_modules(self.cache, now=later, holders=unknown), [])
+        kept = deps.gc_node_modules(self.cache, now=later, holders=unknown)
+        self.assertEqual(kept[0]["action"], "kept")
+        self.assertIn("file holders unreadable", kept[0]["detail"])
         self.assertTrue(os.path.isdir(entry))
         self.assertEqual(len(deps.gc_node_modules(self.cache, now=later,
                                                   holders=lambda _p: [])), 1)

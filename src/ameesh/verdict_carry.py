@@ -85,6 +85,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from typing import Mapping, Optional
 
 from . import merge_queue, plan_git, storage, work
@@ -885,6 +886,12 @@ PENDING = "carried quorum pending:"
 #: une panne de lecture se retente ce nombre de fois, puis le lot reste qa
 #: (l'alerte de lot en qa et l'auditeur prennent le relais, #4834)
 PENDING_ATTEMPTS = 5
+#: une porte lue fermée n'est relue qu'après ce délai, sauf si le lot bouge
+#: (jalon, ligne) : le canon peut changer le plancher sans toucher au lot
+CLOSED_RECHECK_S = 1800
+#: #4849 : lot → (empreinte, instant) de la dernière porte lue fermée par ce
+#: processus. Sans essai ni note : une porte fermée n'est pas une panne.
+_closed_gates: dict[int, tuple] = {}
 
 
 def _carried_ok_on_freeze(marks, freeze) -> list[dict]:
@@ -941,10 +948,11 @@ def promote_carried(db, lot: int, *, freeze=None) -> dict:
     (lecture en échec, provenance non concluante) est une panne passagère :
     une ligne `carried quorum pending:` la dit à chaque essai (5 au plus), et
     `run_pass` retente. Une porte **lisible et fermée** (avis manquant,
-    bloquant) est le cours normal du `qa` : aucun retry, aucun bruit — le
-    verdict suivant la rouvrira. Sans cette distinction, une lecture ratée
-    laissait le lot en `qa` pour toujours : le report avait déjà marqué ses
-    verdicts « décidés », aucun écrivain ne revenait. Rend
+    bloquant) est le cours normal du `qa` : ni note ni essai — le verdict
+    suivant la rouvrira, et `run_pass` ne la relit que si le lot bouge
+    (#4849). Sans cette distinction, une lecture ratée laissait le lot en `qa`
+    pour toujours : le report avait déjà marqué ses verdicts « décidés »,
+    aucun écrivain ne revenait. Rend
     `{result: validated|pending|closed|exhausted|idle, detail}` ; ne lève
     jamais."""
     row = work.get(db, lot)
@@ -1150,6 +1158,19 @@ def _carried_pending(db, lot: int, freeze: dict) -> bool:
         return False
 
 
+def _gate_print(row: Mapping, lot_marks, freeze: Mapping) -> tuple:
+    """Ce qui peut rouvrir une porte fermée sans passer par `_sync_validation` :
+    un jalon (verdict, gel), la ligne du lot (relecteurs, état)."""
+    last = max((int(mark.get("id") or 0) for mark in lot_marks or ()), default=0)
+    return (int(freeze.get("id") or 0), last, row.get("updated_ts"),
+            json.dumps(row.get("reviewers"), sort_keys=True, default=str))
+
+
+def _recently_closed(lot: int, print_: tuple, now: float) -> bool:
+    seen = _closed_gates.get(lot)
+    return bool(seen and seen[0] == print_ and now - seen[1] < CLOSED_RECHECK_S)
+
+
 def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[dict]:
     """Un passage sur les lots ouverts dont la tête gelée attend un verdict
     qu'une tête précédente porte (`pending`). Le tri sans git écarte tous les
@@ -1161,7 +1182,9 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
     écrivain ne revient et le lot ne passe jamais en `validated`. Le tri est
     encore sans git (marques en base) : seuls les lots qui portent un `ok`
     reporté sur leur dernière tête gelée coûtent une lecture de porte.
-    Ne lève jamais pour un lot."""
+    #4849 : une porte lue fermée (`closed`) n'est pas relue à chaque passage :
+    ce processus s'en souvient, sans essai ni note, tant que le lot ne bouge
+    pas et au plus `CLOSED_RECHECK_S`. Ne lève jamais pour un lot."""
     st = storage.of(db)
     rows = [r for r in st.work.open_for_sweep(limit)
             if r.get("state") not in tuple(work.MERGED_STATES) + ("closed",)]
@@ -1170,12 +1193,11 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
     marks: dict = {}
     for mark in st.progress.lot_milestones([int(r["id"]) for r in rows]):
         marks.setdefault(int(mark["work_item_id"]), []).append(mark)
-    # #4834 : seuls les lots dont une transition de quorum reportée a déjà
-    # échoué faute de lecture sont retentés (marque `carried quorum pending:`),
-    # dans la limite d'essais de **leur** gel. Une porte lisiblement fermée
-    # n'est pas une panne : elle ne se retente pas, et une panne qui dure laisse
-    # le lot en `qa` (visible par l'état) plutôt que de relire la porte à
-    # chaque passage.
+    # #4834 : un lot en `qa` qui porte un `ok` reporté sur son gel est repris,
+    # même sans essai écrit. Une panne de lecture (`carried quorum pending:`)
+    # se retente dans la limite d'essais de **son** gel et de cet hôte, puis
+    # le lot reste en `qa` (visible par l'état). #4849 : une porte lisiblement
+    # fermée n'est pas une panne ; elle n'est relue que si le lot a bougé.
     pending_notes: dict[int, list[str]] = {}
     for entry in st.work.events_noted(PENDING, 0.0, ids=[int(r["id"]) for r in rows]):
         pending_notes.setdefault(int(entry["work_item_id"]), []).append(
@@ -1183,6 +1205,8 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
     wanted = []
     pending_quorum = []
     host = _host(db)
+    now = time.time()
+    eligible: set = set()
     for row in rows:
         lot = int(row["id"])
         lot_marks = marks.get(lot, [])
@@ -1199,7 +1223,12 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
                 and str(row.get("state") or "") == "qa"
                 and _carried_ok_on_freeze(lot_marks, freeze)
                 and not _carried_blocked_on_freeze(lot_marks, freeze)):
-            pending_quorum.append((lot, freeze))
+            eligible.add(lot)
+            print_ = _gate_print(row, lot_marks, freeze)
+            if not _recently_closed(lot, print_, now):
+                pending_quorum.append((lot, freeze, print_))
+    for lot in set(_closed_gates) - eligible:
+        _closed_gates.pop(lot, None)
     if not wanted and not pending_quorum:
         return []
     out = []
@@ -1231,7 +1260,7 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
                 result["designation"] = str((fixed or {}).get("state") or "")
             except Exception as exc:  # noqa: BLE001 - la passe suivante retente
                 result["designation"] = "error: %s" % (type(exc).__name__,)
-    for lot, freeze in pending_quorum:
+    for lot, freeze, print_ in pending_quorum:
         if lot in handled:
             continue
         if dry_run:
@@ -1242,6 +1271,10 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
         if result["result"] == "validated":
             out.append({"lot": lot, "result": "validated",
                         "detail": "carried review quorum on the frozen head (#4423)"})
+        if result["result"] == "closed":
+            _closed_gates[lot] = (print_, now)
+        else:
+            _closed_gates.pop(lot, None)
         # `pending` est déjà dit une fois au journal du lot par
         # `promote_carried` ; le passage suivant le retente sans bruit.
     return out

@@ -3551,7 +3551,9 @@ def measure(cfg, policy: Policy, budget: PassBudget | None = None) -> dict:
             if name != MARKER and os.path.isdir(full) and not os.path.islink(full):
                 agents[name] = size_of(full, budget=budget)
     caches: dict = {}
-    for name, _vars in cache_names(policy):
+    from . import deps as deps_mod
+    # Shared installs occupy the cache even when linking is disabled.
+    for name in [n for n, _vars in cache_names(policy)] + [deps_mod.NM_DIR]:
         if budget is not None and budget.expired():
             budget.timed_out = True
             break                      # #3802: a bounded host pass

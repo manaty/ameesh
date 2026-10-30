@@ -328,6 +328,35 @@ class StockageTest(_Base):
         self.assertFalse(ids & set(mecaniques), "note mécanique : retenue gardée")
         self.assertEqual(ids, {par_l_assigne, par_un_agent, par_l_owner})
 
+    def test_decoupage_epuise_ne_reveille_plus_le_pilote(self):
+        """#4901 : épuisée ne réveille pas ; rouverte réarme la règle 1."""
+        self.bail("pilote4901")
+        lot = work.add(self.db, title="Découper la feuille de route",
+                       source="file-decoupage:ameesh", app="ameesh",
+                       assignee="pilote4901", force=_FORCE)["id"]
+        work.move(self.db, lot, "build")
+        work.note(self.db, lot, "hold: feuille de route vide", actor="pilote4901")
+        work.note(self.db, lot, "roadmap: épuisée ameesh", actor="pilote4901")
+        self.assertNotIn(lot, {r["id"] for r in self.st.actionable("pilote4901")})
+        # Une note ordinaire et une réouverture d'un autre projet ne changent
+        # pas la dernière déclaration qui nomme ameesh.
+        work.note(self.db, lot, "état confirmé", actor="pilote4901")
+        work.note(self.db, lot, "roadmap: rouverte autre", actor="pilote4901")
+        self.assertNotIn(lot, {r["id"] for r in self.st.actionable("pilote4901")})
+        work.note(self.db, lot, "roadmap: rouverte ameesh", actor="pilote4901")
+        rows = self.st.actionable("pilote4901")
+        self.assertIn(lot, {r["id"] for r in rows})
+        self.assertNotIn("roadmap_source", rows[0])
+        work.note(self.db, lot, "roadmap: épuisée ameesh", actor="pilote4901")
+        self.assertNotIn(lot, {r["id"] for r in self.st.actionable("pilote4901")})
+
+    def test_note_epuisee_ne_suspend_pas_un_lot_ordinaire(self):
+        self.bail("agent4901")
+        lot = work.add(self.db, title="Travail ordinaire", app="ameesh",
+                       assignee="agent4901", force=_FORCE)["id"]
+        work.note(self.db, lot, "roadmap: épuisée ameesh", actor="agent4901")
+        self.assertIn(lot, {r["id"] for r in self.st.actionable("agent4901")})
+
     def test_note_d_un_autre_agent_ne_leve_pas_la_retenue(self):
         """#4162 : la note ordinaire d'un autre agent après un `hold:` ne
         réveille pas l'assigné (même lecture que `planned_waits.active_holds`) ;

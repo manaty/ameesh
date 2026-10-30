@@ -198,6 +198,9 @@
         turn_grace_seconds=20m|0
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
+  ameesh turn observe (--turn ID | --request ID) [--json]
+        #2167: a supervisor's read of one turn or request: states, accounting,
+        `quiescent` (schema ameesh-turn-observation/1); never writes, exit 3 if unknown;
   ameesh veille scan [--dry-run] [--json] [--no-probe] [--harness ID]
         #3264 A: daily watch of harness/model versions; one evaluation {work} per
         harness, priority 1 on a vendor recommendation (config `veille.sources`);
@@ -262,6 +265,8 @@ MESH_COMMANDS = (
     "harness",
     # #3264 A : veille quotidienne des versions (`ameesh veille scan`)
     "veille",
+    # #2167 B2 : observation d'un tour ou d'une requête (`ameesh turn observe`)
+    "turn",
     # L30 : comptes multiples par fournisseur (`ameesh accounts list|use|auto`)
     "accounts",
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)

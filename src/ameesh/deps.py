@@ -1233,7 +1233,7 @@ def _mtime(path: str) -> float:
 
 
 def _gc_reason(entry: str, *, now: float, idle: float, worktrees, holders,
-               write: bool) -> str | None:
+               write: bool, kept: list | None = None) -> str | None:
     """Why `entry` can go, or None to keep it. Read again under the lock
     before any deletion: never trusts an earlier listing."""
     marker = read_marker(entry)
@@ -1265,7 +1265,11 @@ def _gc_reason(entry: str, *, now: float, idle: float, worktrees, holders,
         why = "partial fill (no %s)" % COMPLETE
     try:
         users = holders(entry)
-    except platform.NotAvailable:
+    except platform.NotAvailable as exc:
+        if kept is not None:
+            kept.append({"kind": "deps", "action": "kept", "path": entry,
+                         "bytes": int((marker or {}).get("bytes") or 0),
+                         "detail": "file holders unreadable: %s" % exc})
         return None                        # cannot tell: kept (fail-closed)
     if users:
         return None                        # a dev server, a test run…
@@ -1373,8 +1377,8 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
     executable, mapped file: `platform.holders`), never while its lock is
     held (a fill, through npm and its scripts, or a link being made). Links
     are the recorded ones plus those found in `worktrees` (an iterable of
-    worktree tops, or a callable returning one, called only if an entry is a
-    candidate). Lock files are never deleted: two fillers always lock the same
+    worktree tops, or a callable returning one, also used for the bounded
+    broken-link scan). Lock files are never deleted: two fillers lock the same
     inode. Returns housekeeping log lines (`kind` "deps").
 
     `budget` (#3802), a `housekeeping.PassBudget`: the loop stops at its next
@@ -1430,7 +1434,7 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
                             else "pass budget reached")})
             break
         why = _gc_reason(entry, now=now, idle=idle, worktrees=found, holders=holders,
-                         write=not dry_run)
+                         write=not dry_run, kept=out)
         if why is None:
             continue
         size = int(item["marker"].get("bytes") or 0)
@@ -1444,7 +1448,7 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
             continue                       # being filled or linked right now
         try:
             why = _gc_reason(entry, now=now, idle=idle, worktrees=tops(), holders=holders,
-                             write=True)
+                             write=True, kept=out)
             if why is None:
                 continue
             if exhausted():
@@ -1461,6 +1465,24 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
         finally:
             lock.close()
         out.append(dict(line, detail=why))
+    seen_links = set()
+    for top in tops():
+        if exhausted():
+            break
+        for directory in _walk(top, SEARCH_DEPTH):
+            if exhausted():
+                break
+            link = os.path.join(directory, NODE_MODULES)
+            if link not in seen_links and os.path.islink(link) and not os.path.exists(link):
+                try:
+                    target = os.readlink(link)
+                except OSError:
+                    continue               # link removed concurrently
+                seen_links.add(link)
+                out.append({"kind": "deps", "action": "kept", "path": link,
+                            "bytes": 0, "detail": "broken node_modules link: %s" %
+                            target})
+
     return out
 
 

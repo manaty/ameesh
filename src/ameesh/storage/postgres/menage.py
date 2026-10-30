@@ -42,6 +42,66 @@ def _data(row: dict) -> dict:
     return row
 
 
+def _latest_by_path_sql(kind: str, *, host: str | None = None,
+                        since_s: float | None = None,
+                        actions: list[str] | None = None) -> tuple[str, tuple]:
+    """Le SQL de `latest_by_path` et ses paramètres (une seule requête).
+
+    `actions` : les chemins candidats sont ceux qui portent une de ces
+    actions ; la dernière ligne de chacun (toutes actions confondues) fait
+    foi. La lecture part alors de l'index (kind, action, host, path, at desc)
+    — chercher ces candidats dans tout le journal coûtait 15-18 s par lecture
+    (#4888) — puis relit la ligne retenue par l'index
+    (kind, host, path, at desc, id desc). Sans `actions`, la lecture reste le
+    `DISTINCT ON` borné par `since_s` de #2851.
+    """
+    window = ""
+    if since_s is not None:
+        window = " AND at >= now() - make_interval(secs => %s)"
+    if actions is not None:
+        marks = ", ".join(["%s"] * len(actions))
+        candidates = "SELECT DISTINCT host, path FROM housekeeping_log WHERE kind = %s"
+        params: list = [kind]
+        if host:
+            candidates += " AND host = %s"
+            params.append(host)
+        candidates += window
+        if since_s is not None:
+            params.append(float(since_s))
+        candidates += " AND action IN (" + marks + ")"
+        params.extend(str(action) for action in actions)
+        latest = "l.kind = %s AND l.host = p.host AND l.path = p.path"
+        params.append(kind)
+        if since_s is not None:
+            latest += " AND l.at >= now() - make_interval(secs => %s)"
+            params.append(float(since_s))
+        sql = ("SELECT " + LOG_COLUMNS_ALIASED + " FROM (" + candidates + ") p"
+               " CROSS JOIN LATERAL ("
+               "   SELECT l.* FROM housekeeping_log l WHERE " + latest +
+               "   ORDER BY l.at DESC, l.id DESC LIMIT 1) l"
+               " ORDER BY l.host, l.path")
+        return sql, tuple(params)
+    where, params = " WHERE kind = %s", [kind]
+    if host:
+        where += " AND host = %s"
+        params.append(host)
+    if since_s is not None:
+        # #2851 : une alerte qui ignore de toute façon les lignes plus
+        # vieilles ne doit pas trier tout le journal de rétention.
+        where += window
+        params.append(float(since_s))
+    # #3631 : les identifiants de la dernière ligne de chaque (hôte, chemin)
+    # se lisent dans l'index (kind, host, path, at DESC, id DESC) — sans
+    # tri ni accès au tas — et seule la ligne retenue est relue. L'ancien
+    # DISTINCT ON sur la table entière ramenait 200 Mo par appel.
+    sql = ("SELECT " + LOG_COLUMNS_ALIASED + " FROM housekeeping_log l"
+           " JOIN (SELECT DISTINCT ON (host, path) host, path, id"
+           "         FROM housekeeping_log" + where +
+           "        ORDER BY host, path, at DESC, id DESC) u ON u.id = l.id"
+           " ORDER BY l.host, l.path")
+    return sql, tuple(params)
+
+
 class Housekeeping(interface.Housekeeping):
 
     def log(self, host, entries, *, actor) -> int:
@@ -81,48 +141,14 @@ class Housekeeping(interface.Housekeeping):
 
     def latest_by_path(self, host, kind, *, since_s=None,
                        only_paths_with=None) -> list[dict]:
-        where, params = " WHERE kind = %s", [kind]
-        window = ""
-        if host:
-            where += " AND host = %s"
-            params.append(host)
-        if since_s is not None:
-            # #2851 : une alerte qui ignore de toute façon les lignes plus
-            # vieilles ne doit pas trier tout le journal de rétention.
-            window = " AND at >= now() - make_interval(secs => %s)"
-            where += window
-            params.append(float(since_s))
+        actions = None
         if only_paths_with is not None:
             actions = [str(action) for action in only_paths_with]
             if not actions:
                 return []
-            # #2851 : les chemins qui portent une de ces actions, puis la
-            # dernière ligne de chacun — toutes actions et tous âges confondus.
-            # Le filtre des candidats passe en SQL : sans lui, le DISTINCT ON
-            # triait les 4 000 chemins `tmp` du journal pour n'en garder
-            # qu'une poignée, et un `unowned` suivi d'un `deleted` restait
-            # alerté faute de relire la dernière action.
-            sub_where, sub_params = "kind = %s", [kind]
-            if host:
-                sub_where += " AND host = %s"
-                sub_params.append(host)
-            sub_where += window
-            sub_params.extend([float(since_s)] if since_s is not None else [])
-            marks = ", ".join(["%s"] * len(actions))
-            where += (" AND (host, path) IN (SELECT host, path FROM housekeeping_log"
-                      " WHERE " + sub_where + " AND action IN (" + marks + "))")
-            params.extend(sub_params + actions)
-        # #3631 : les identifiants de la dernière ligne de chaque (hôte, chemin)
-        # se lisent dans l'index (kind, host, path, at DESC, id DESC) — sans
-        # tri ni accès au tas — et seule la ligne retenue est relue. L'ancien
-        # DISTINCT ON sur la table entière ramenait 200 Mo par appel.
-        rows = self.db.query(
-            "SELECT " + LOG_COLUMNS_ALIASED + " FROM housekeeping_log l"
-            " JOIN (SELECT DISTINCT ON (host, path) host, path, id"
-            "         FROM housekeeping_log" + where +
-            "        ORDER BY host, path, at DESC, id DESC) u ON u.id = l.id"
-            " ORDER BY l.host, l.path", tuple(params))
-        return [_data(dict(r)) for r in rows]
+        sql, params = _latest_by_path_sql(kind, host=host, since_s=since_s,
+                                          actions=actions)
+        return [_data(dict(r)) for r in self.db.query(sql, params)]
 
     def summary(self, host, since_s) -> list[dict]:
         # #2617: an unattributed /tmp entry is signaled again every 12 h; in
