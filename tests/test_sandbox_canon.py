@@ -465,6 +465,17 @@ class SandboxAgreementTest(SandboxCase):
         self.assertIn("placement-sandbox-missing", codes(findings, canon.WARNING))
         self.assertNoError(findings)
 
+    def test_erreur_bloque_l_agent_et_l_hote(self):
+        # un constat d'agent ferme sa réclamation ; un constat d'hôte ferme
+        # les agents qui y sont placés (canon.blocking)
+        self.write("agents/tpk-reviewer.md", agent_card(turns=0))
+        _, findings = self.load()
+        self.assertTrue(canon.blocking(findings).by_agent.get("tpk-reviewer"))
+        self.write("agents/tpk-reviewer.md", agent_card())
+        self.write("hotes/tpk-stg-reviewers.md", host_card(image="ghcr.io/x:tag"))
+        _, findings = self.load()
+        self.assertTrue(canon.blocking(findings).by_host.get("tpk-stg-reviewers"))
+
 
 # ==========================================================================
 # empreinte de carte
