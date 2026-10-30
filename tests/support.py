@@ -15,7 +15,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import traceback
 import types
 import unittest
 from unittest import mock
@@ -593,6 +595,81 @@ class SensitiveGlobalsMixin:
             super().tearDownClass()
         finally:
             verify_sensitive_globals(cls)
+
+
+#: #4740 : temps laissé à un fil créé par un test pour rendre la main après
+#: ses cleanups. Un fil encore vivant au-delà a survécu à son test : son
+#: écriture peut atterrir dans la capture `redirect_stdout` d'un test voisin.
+THREAD_LEAK_GRACE_S = 1.0
+
+
+def _live_threads_since(before: frozenset) -> list:
+    """Les fils vivants créés depuis `before` (hors fil courant).
+
+    `before` garde les objets `Thread`, pas leurs identifiants : un fil mort
+    peut libérer son objet et un nouveau fil réutiliser son adresse ; la
+    comparaison par objet ne confond pas les deux."""
+    current = threading.current_thread()
+    return [thread for thread in threading.enumerate()
+            if thread is not current and thread.is_alive()
+            and thread not in before]
+
+
+def _thread_stack(thread) -> str:
+    """Pile du fil, pour nommer l'endroit qui l'a lancé dans l'échec."""
+    frame = sys._current_frames().get(thread.ident)
+    if frame is None:
+        return ""
+    return "".join(traceback.format_stack(frame)[-6:])
+
+
+class ThreadLeakMixin:
+    """#4740 : échoue le test qui laisse un fil vivant après ses cleanups.
+
+    Le témoin de #4736 (`test_l848_github_quota.JsonReportTest`) écrit « {} »
+    depuis un fil : mal joint, ce fil survit à son test et son écriture tombe
+    dans le `redirect_stdout` global d'un test voisin (« Extra data »). La
+    classe vérifie, après les cleanups du test, qu'aucun fil créé pendant le
+    test ne vit encore ; elle laisse `thread_leak_grace_s` aux fils qui
+    s'arrêtent sur un tick (veilleurs) avant de nommer les survivants.
+
+    Un test qui crée un fil doit le joindre avant sa fin, ou lui faire écrire
+    un flux dédié. Une sous-classe qui redéfinit `setUp` doit appeler
+    `super().setUp()` ; placer ce mixin avant la classe de base.
+    """
+
+    thread_leak_grace_s = THREAD_LEAK_GRACE_S
+
+    def setUp(self) -> None:
+        self._threads_before = frozenset(threading.enumerate())
+        super().setUp()
+        self.addCleanup(self._assert_no_surviving_thread)
+
+    def _assert_no_surviving_thread(self) -> None:
+        before = getattr(self, "_threads_before", None)
+        if before is None:
+            return
+        deadline = time.monotonic() + max(0.0, float(self.thread_leak_grace_s))
+        while True:
+            survivors = _live_threads_since(before)
+            if not survivors:
+                return
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            for thread in survivors:
+                thread.join(min(0.05, max(0.0, left)))
+        details = ", ".join(
+            "%s (daemon=%s, ident=%s)" % (thread.name, thread.daemon, thread.ident)
+            for thread in survivors)
+        stacks = "\n".join(_thread_stack(thread) for thread in survivors)
+        raise AssertionError(
+            "#4740 : %s.%s a laissé %d fil(s) vivant(s) après ses cleanups : %s. "
+            "Joindre le fil avant la fin du test, ou lui faire écrire un flux "
+            "dédié : un fil survivant écrit dans la capture stdout d'un test "
+            "voisin.\n%s"
+            % (type(self).__module__, type(self).__qualname__,
+               len(survivors), details, stacks))
 
 
 def _bench_upkeep(db) -> None:
