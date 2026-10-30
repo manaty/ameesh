@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import agent_names, agent_rename, authority, mail, registry, work
+from ameesh import agent_names, agent_rename, authority, mail, registry, storage, work
 from .support import PgTestCase
 
 # Column names that hold an agent spelling somewhere in the schema; each such
@@ -112,6 +112,25 @@ class AgentRenameTest(PgTestCase):
             # past the allowlist, the unknown executor is refused as revoked
             with self.assertRaises(refused):
                 provider.issue_session_token(principal, fence)
+
+    def test_rename_moves_the_impact_analysis_authors(self):
+        # #4818 (0519): the last analysis and the footprint policy name their
+        # author; like the estimates, they follow the renamed identity.
+        item = work.add(self.db, title='Analysed lot', app='demo', actor='worker',
+                        estimate='1h', cfg=self.cfg)
+        storage.of(self.db).work_footprints.set_policy(
+            'demo-4299', actor='worker', unknown_policy='open')
+
+        result = self.rename('worker', 'new-worker')
+
+        self.assertEqual(result['rewritten']['work_item_impact_analyses.analyzed_by'], 1)
+        self.assertEqual(result['rewritten']['repository_footprint_policies.updated_by'], 1)
+        self.assertEqual(self.db.query(
+            "SELECT analyzed_by FROM work_item_impact_analyses WHERE work_item_id = %s",
+            (item['id'],))[0]['analyzed_by'], 'new-worker')
+        self.assertEqual(self.db.query(
+            "SELECT updated_by FROM repository_footprint_policies WHERE app = 'demo-4299'"
+        )[0]['updated_by'], 'new-worker')
 
     def test_rename_moves_the_same_identity_and_keeps_old_as_alias(self):
         claimed = registry.claim(self.db, 'worker', 'runner-test', 120)

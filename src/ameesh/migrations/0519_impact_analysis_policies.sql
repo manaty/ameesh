@@ -44,3 +44,14 @@ CREATE TABLE IF NOT EXISTS work_item_impact_analyses (
 
 CREATE INDEX IF NOT EXISTS work_item_impact_analyses_unknown
     ON work_item_impact_analyses (analyzed_at) WHERE status = 'unknown';
+
+-- #4299 : leurs auteurs suivent un renommage d'agent, à l'écriture aussi.
+DROP TRIGGER IF EXISTS ameesh_agent_spelling ON repository_footprint_policies;
+CREATE TRIGGER ameesh_agent_spelling
+    BEFORE INSERT OR UPDATE OF updated_by ON repository_footprint_policies
+    FOR EACH ROW EXECUTE FUNCTION ameesh_agent_spelling('updated_by');
+
+DROP TRIGGER IF EXISTS ameesh_agent_spelling ON work_item_impact_analyses;
+CREATE TRIGGER ameesh_agent_spelling
+    BEFORE INSERT OR UPDATE OF analyzed_by ON work_item_impact_analyses
+    FOR EACH ROW EXECUTE FUNCTION ameesh_agent_spelling('analyzed_by');
