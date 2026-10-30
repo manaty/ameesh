@@ -273,10 +273,12 @@ def _clone_ref(cfg, item: dict, repo: Optional[str] = None) -> tuple:
 def analyze_lot(cfg, db, item: dict, repo: Optional[str] = None, **budget) -> dict:
     """#4818 : l'analyse d'impact d'un lot (créé ou à créer : `app`, `title`,
     `body`, `branch_target`), en lecture seule et bornée
-    (`impact_analysis.analyze`). Rend l'analyse avec `footprint` — les chemins
-    à écrire en `intake` : sa surface connue, sinon le marqueur `.` si la
-    politique du dépôt est prudente, sinon rien — `policy` et `note`, la
-    ligne de journal. Ne lève jamais : un échec est une analyse inconnue."""
+    (`impact_analysis.analyze`). Rend l'analyse avec `footprint` (sa surface
+    connue, vide si inconnue), `unknown`, `policy` et `note`, la ligne de
+    journal. La politique lue ici n'est qu'indicative : le marqueur `.` d'une
+    analyse inconnue est décidé là où elle s'écrit, sous le verrou de la
+    garde, sur la politique du moment (`settle`, B3 de cx1). Ne lève jamais :
+    un échec est une analyse inconnue."""
     from . import impact_analysis
     text = "%s\n%s" % (item.get("title") or "", item.get("body") or "")
     try:
@@ -292,14 +294,23 @@ def analyze_lot(cfg, db, item: dict, repo: Optional[str] = None, **budget) -> di
     policy = (policy_of(db, item.get("app") or "")["unknown_policy"]
               if db is not None else DEFAULT_UNKNOWN_POLICY)
     analysis["policy"] = policy
-    if analysis["status"] == "known":
-        analysis["footprint"] = sorted({p["path"] for p in analysis["paths"]})
-    elif policy == "repository":
-        analysis["footprint"] = [WHOLE_REPOSITORY]
-    else:
-        analysis["footprint"] = []
+    analysis["unknown"] = analysis["status"] != "known"
+    analysis["footprint"] = sorted({p["path"] for p in analysis["paths"]})
     analysis["note"] = impact_analysis.note(analysis)
     return analysis
+
+
+def settle(analysis: dict | None, policy: str | None) -> None:
+    """L'analyse prend la politique APPLIQUÉE à sa persistance (lue sous le
+    verrou de la garde par le stockage) : le marqueur `.` d'une inconnue sous
+    `repository`, et sa ligne de journal recalculée."""
+    from . import impact_analysis
+    if not analysis or not policy:
+        return
+    analysis["policy"] = policy
+    if analysis.get("unknown"):
+        analysis["footprint"] = [WHOLE_REPOSITORY] if policy == "repository" else []
+    analysis["note"] = impact_analysis.note(analysis)
 
 
 def analyze_for_creation(cfg, db, *, app: str = "", title: str = "", body: str = "",
@@ -348,8 +359,11 @@ def record_estimate(db, cfg, item: dict, *, actor: str, repo: Optional[str] = No
     if any(str(row.get("source")) == "manual" for row in rows):
         return None
     analysis = analyze_lot(cfg, db, item, repo)
-    storage.of(db).work_footprints.replace(
-        int(item["id"]), "intake", analysis["footprint"], actor=actor)
+    # le calcul (git) se fait hors verrou ; la politique se relit à l'écriture
+    written = storage.of(db).work_footprints.replace(
+        int(item["id"]), "intake", analysis["footprint"], actor=actor,
+        unknown=bool(analysis.get("unknown")))
+    settle(analysis, (written or {}).get("policy"))
     record_analysis(db, int(item["id"]), analysis, actor=actor)
     return analysis
 

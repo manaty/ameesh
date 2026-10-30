@@ -11,13 +11,15 @@ class WorkFootprints(abc.ABC):
     @abc.abstractmethod
     def replace(self, item_id: int, source: str, paths: Sequence[str], *,
                 actor: str, head: str | None = None,
-                replaces: Sequence[str] = ()) -> dict | None:
+                replaces: Sequence[str] = (), unknown: bool = False) -> dict | None:
         """Remplace, en une transaction, les lignes `source` (et `replaces`)
         du lot par `paths` (normalisés par l'appelant), et journalise une
         ligne si l'empreinte change. None si le lot n'existe pas.
 
-        Rend `{paths, changed}` : l'empreinte entière (toutes sources) après
-        l'écriture, et si elle a changé."""
+        Rend `{paths, changed, policy}` : l'empreinte entière (toutes
+        sources) après l'écriture, si elle a changé, et — avec `unknown` (une
+        analyse d'impact inconnue, `paths` vide) — la politique du dépôt lue
+        sous le verrou, qui y pose le marqueur `.` si elle vaut `repository`."""
 
     @abc.abstractmethod
     def for_items(self, item_ids: Sequence[int]) -> list[dict]:

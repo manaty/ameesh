@@ -1895,10 +1895,13 @@ class WorkItems(Domain):
             mark_item_id: int | None = None, mark_note: str = "",
             parent_lot: int | None = None, unique_ref: bool = False,
             external_executor: str | None = None,
-            footprint: list | None = None) -> dict:
+            footprint: list | None = None, footprint_unknown: bool = False) -> dict:
         """#4173 : `footprint`, l'empreinte d'intake écrite avec le lot ; un lot
         créé attribué dont elle chevauche celle d'un lot en cours du même dépôt
-        lève `FootprintOverlap` (rien n'est écrit).
+        lève `FootprintOverlap` (rien n'est écrit). #4818 : avec
+        `footprint_unknown` (analyse d'impact inconnue), la politique du dépôt
+        est lue sous le verrou de la garde et le marqueur `.` posé si elle vaut
+        `repository` ; le lot rendu porte `footprint_policy`.
 
         Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité

@@ -861,8 +861,10 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             unique_ref=unique_ref, external_executor=external_executor,
             # #4173 : l'empreinte d'intake est écrite par la création même ;
             # attribuée, celle-ci est refusée si elle chevauche un lot en cours
-            # (`FootprintOverlap`, rien n'est écrit).
-            **({"footprint": list(footprint)} if footprint else {}))
+            # (`FootprintOverlap`, rien n'est écrit). #4818 : une analyse
+            # inconnue prend la politique lue sous le verrou, à l'écriture.
+            **({"footprint": list(footprint)} if footprint else {}),
+            **({"footprint_unknown": True} if impact and impact.get("unknown") else {}))
 
     if fence is None:
         item = create(db)
@@ -871,8 +873,10 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             fence.hold(tx)
             item = create(tx)
     if impact:
-        # #4818 : une ligne de journal par estimation, et la dernière analyse
+        # #4818 : une ligne de journal par estimation, et la dernière analyse,
+        # avec la politique appliquée à l'écriture
         from . import work_footprints
+        work_footprints.settle(impact, item.get("footprint_policy"))
         work_footprints.record_analysis(db, int(item["id"]), impact, actor=actor)
 
     if item.get("queued_behind") is not None:

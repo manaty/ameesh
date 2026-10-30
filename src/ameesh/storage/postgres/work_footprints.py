@@ -101,11 +101,21 @@ def held_sql(alias: str) -> str:
     return "(" + overlap_exists_sql(alias) + " OR " + cap_reached_sql(alias) + ")"
 
 
+def unknown_policy_sql(tx, item_id) -> str:
+    """La politique d'empreinte inconnue du dépôt du lot (`open` sans ligne),
+    lue dans la transaction de l'appelant, qui tient le verrou de la garde."""
+    rows = tx.query("SELECT p.unknown_policy FROM work_items w"
+                    " JOIN repository_footprint_policies p ON p.app = btrim(w.app)"
+                    " WHERE w.id = %s", (int(item_id),))
+    return str(rows[0]["unknown_policy"]) if rows else "open"
+
+
 class WorkFootprints(Contract):
     def __init__(self, db):
         self.db = db
 
-    def replace(self, item_id, source, paths, *, actor, head=None, replaces=()):
+    def replace(self, item_id, source, paths, *, actor, head=None, replaces=(),
+                unknown=False):
         sources = sorted({str(source)} | {str(s) for s in replaces})
         wanted = sorted({str(p) for p in paths})
         with self.db.transaction() as tx:
@@ -117,6 +127,14 @@ class WorkFootprints(Contract):
                             " FOR NO KEY UPDATE", (int(item_id),))
             if not rows:
                 return None
+            policy = None
+            if unknown:
+                # B3 de cx1 : la politique du dépôt est relue SOUS le verrou de
+                # `set_policy` — une bascule entre le calcul et l'écriture
+                # n'est jamais perdue, dans un sens comme dans l'autre.
+                policy = unknown_policy_sql(tx, item_id)
+                if not wanted and policy == "repository":
+                    wanted = ["."]
             before = self._paths(tx, item_id)
             tx.execute("DELETE FROM work_item_footprints WHERE work_item_id = %s"
                        " AND source IN (" + ", ".join(["%s"] * len(sources)) + ")",
@@ -143,7 +161,7 @@ class WorkFootprints(Contract):
                                 ", ".join(after) or "none"), actor))
                 tx.execute("UPDATE work_items SET updated_at = clock_timestamp()"
                            " WHERE id = %s", (int(item_id),))
-            return {"paths": after, "changed": changed}
+            return {"paths": after, "changed": changed, "policy": policy}
 
     @staticmethod
     def _paths(tx, item_id):

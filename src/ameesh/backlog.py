@@ -670,6 +670,13 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
             estimate_source=estimate_source, estimate_by=estimate_by,
             change_size=size or None, footprint=footprint)
         if impact and item and item.get("id"):
+            if impact.get("unknown"):
+                # un lot de la file d'amélioration n'est pas dispatché : la
+                # politique du dépôt ne lui pose pas de marqueur (comme
+                # `set_policy`, qui l'exclut)
+                work_footprints.settle(impact, "open")
+                impact["note"] = impact["note"].replace(
+                    "(policy open)", "(improvement backlog, not dispatched)")
             work_footprints.record_analysis(db, int(item["id"]), impact,
                                             actor=actor or "ameesh")
         return item

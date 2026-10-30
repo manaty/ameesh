@@ -623,7 +623,7 @@ class WorkItems(interface.WorkItems):
             estimate_source=None, change_size=None, queued_note=None,
             forced_note=None, mark_item_id=None, mark_note="",
             parent_lot=None, unique_ref=False, external_executor=None,
-            footprint=None) -> dict:
+            footprint=None, footprint_unknown=False) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
         #540 : `queued_note` (voir l'interface).
@@ -674,9 +674,10 @@ class WorkItems(interface.WorkItems):
                 # commit du premier, voit sa ligne.
                 tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
                          "lower(%s), 0))", (issue_ref,))
-            if assignee and (footprint or str(app or "").strip()):
+            if (assignee and (footprint or str(app or "").strip())) or footprint_unknown:
                 # #4818 : le plafond de lots en vol garde aussi une création
-                # attribuée sans empreinte
+                # attribuée sans empreinte ; une analyse inconnue relit la
+                # politique sous ce verrou, celui de `set_policy` (B3 de cx1)
                 tx.execute(_DEPENDENCIES_LOCK)
             # #540 : lignes de lots d'abord, par identifiant croissant, puis
             # le verrou d'agent de `_pending` — même ordre que `assign`.
@@ -748,6 +749,11 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._estimate_row(int(item["id"]), estimate_minutes,
                                             estimate_source, actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            if footprint_unknown:
+                from .work_footprints import unknown_policy_sql
+                item["footprint_policy"] = unknown_policy_sql(tx, item["id"])
+                if not footprint and item["footprint_policy"] == "repository":
+                    footprint = ["."]
             if footprint:
                 WorkItems(tx)._intake_footprint(item["id"], footprint, actor)
                 if assignee:

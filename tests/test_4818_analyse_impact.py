@@ -22,9 +22,10 @@ import dataclasses
 import os
 import subprocess
 import unittest
+from unittest import mock
 
-from ameesh import (debit, exploitation, impact_analysis as ia, project_plan, slo,
-                    storage, work, work_footprints as fp)
+from ameesh import (db as db_mod, debit, exploitation, impact_analysis as ia,
+                    project_plan, slo, storage, work, work_footprints as fp)
 from ameesh.storage.postgres.work import WorkItems
 
 from .support import PgTestCase
@@ -327,6 +328,79 @@ class GardeTest(_Empreintes):
         again = self.policy(unknown_policy="repository")
         self.assertFalse(again["changed"])
         self.assertEqual(again["after"]["max_in_flight"], 4)
+
+
+class EntrelacementTest(_Empreintes):
+    """B3 (2e tour) de cx1 : une bascule de politique entre le calcul de
+    l'analyse (hors verrou, git) et son écriture n'est jamais perdue — la
+    politique est relue à l'écriture, sous le verrou de `set_policy`."""
+
+    def switch_during_analysis(self, function, policy):
+        """Fait basculer la politique, sur une AUTRE connexion, juste après le
+        calcul de l'analyse et avant son écriture."""
+        real = getattr(fp, function)
+
+        def analyze_then_switch(*args, **kw):
+            analysis = real(*args, **kw)
+            other = db_mod.connect(self.cfg)
+            try:
+                storage.of(other).work_footprints.set_policy(
+                    "nexlink", actor="human:proprio", unknown_policy=policy)
+            finally:
+                other.close()
+            return analysis
+        return mock.patch.object(fp, function, side_effect=analyze_then_switch)
+
+    def occupant(self):
+        item = self.lot("occupant")
+        self.footprint(item, "src/a.py")
+        self.give(item)
+        return item
+
+    def test_reestimation_open_puis_repository(self):
+        self.occupant()
+        libre = self.lot("vague")
+        self.assertEqual(fp.paths_of(self.db, libre["id"]), [])
+        with self.switch_during_analysis("analyze_lot", "repository"):
+            analysis = fp.record_estimate(self.db, self.cfg, work.get(self.db, libre["id"]),
+                                          actor="test")
+        self.assertEqual(analysis["policy"], "repository")
+        self.assertEqual(fp.paths_of(self.db, libre["id"]), ["."])
+        self.assertIn("whole repository", analysis["note"])
+        with self.assertRaises(work.WorkError):
+            work.assign(self.db, libre["id"], "human:autre", actor="test")
+
+    def test_reestimation_repository_puis_open(self):
+        storage.of(self.db).work_footprints.set_policy(
+            "nexlink", actor="human:proprio", unknown_policy="repository")
+        self.occupant()
+        libre = self.lot("vague", cfg=self.cfg)
+        self.assertEqual(fp.paths_of(self.db, libre["id"]), ["."])
+        with self.switch_during_analysis("analyze_lot", "open"):
+            analysis = fp.record_estimate(self.db, self.cfg, work.get(self.db, libre["id"]),
+                                          actor="test")
+        self.assertEqual(analysis["policy"], "open")
+        self.assertEqual(fp.paths_of(self.db, libre["id"]), [])
+        work.assign(self.db, libre["id"], "human:autre", actor="test")
+
+    def test_creation_open_puis_repository(self):
+        self.occupant()
+        with self.switch_during_analysis("analyze_for_creation", "repository"):
+            item = work.add(self.db, title="vague", app="nexlink", cfg=self.cfg)
+        self.assertEqual(fp.paths_of(self.db, item["id"]), ["."])
+        analysis = storage.of(self.db).work_footprints.analyses([item["id"]])[item["id"]]
+        self.assertEqual(analysis["policy"], "repository")
+        with self.assertRaises(work.WorkError):
+            work.assign(self.db, item["id"], "human:autre", actor="test")
+
+    def test_creation_repository_puis_open(self):
+        storage.of(self.db).work_footprints.set_policy(
+            "nexlink", actor="human:proprio", unknown_policy="repository")
+        self.occupant()
+        with self.switch_during_analysis("analyze_for_creation", "open"):
+            item = work.add(self.db, title="vague", app="nexlink", cfg=self.cfg)
+        self.assertEqual(fp.paths_of(self.db, item["id"]), [])
+        work.assign(self.db, item["id"], "human:autre", actor="test")
 
 
 class CreationTest(_Empreintes):

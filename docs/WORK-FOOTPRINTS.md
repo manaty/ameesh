@@ -97,6 +97,12 @@ policy decides:
   every other lot of the repository, and while it is waiting every lot in
   progress holds it.
 
+The analysis (git) runs outside any lock; the marker is decided where the
+analysis is written — the creation, `--estimate`, the runner's retry — on
+the policy read under the guard's lock, the lock of a policy change: a
+switch between the computation and the write is never lost, in either
+direction. A lot of the improvement backlog (not dispatched) gets no marker.
+
 A change of the unknown footprint policy applies at once, in the same
 transaction and under the guard's lock, to the open lots of the repository:
 `repository` puts the marker on every open lot without any footprint row
