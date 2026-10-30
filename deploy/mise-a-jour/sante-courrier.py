@@ -107,7 +107,7 @@ agent-mail send {nom} --ack {jeton}
 
 
 def personas(db, hote: str | None = None) -> list[dict]:
-    """Non-stopped execute personas, on ``hote`` (all hosts when None).
+    """Non-stopped, non-retired execute personas, on ``hote`` (all hosts when None).
 
     Sorted by host then name: the auto probe target is deterministic, whether
     the host is the one measured or the pool of the other hosts.
@@ -116,13 +116,15 @@ def personas(db, hote: str | None = None) -> list[dict]:
     out = [r for r in rows
            if (hote is None or r.get("host") == hote)
            and (r.get("mode") or "execute") == "execute"
-           and r.get("status") != "stopped"]
+           and r.get("status") != "stopped"
+           and not r.get("retired_ts")]
     return sorted(out, key=lambda r: (r.get("host") or "", r["name"]))
 
 
 def driven(row: dict, now: float) -> bool:
     """A live lease: a runner holds this persona right now."""
-    return bool(row.get("lease_owner")) and float(row.get("lease_expires_ts") or 0) > now
+    return (not row.get("retired_ts") and bool(row.get("lease_owner"))
+            and float(row.get("lease_expires_ts") or 0) > now)
 
 
 def libre(row: dict) -> bool:
@@ -201,7 +203,7 @@ def sans_executeur(db, rows: list[dict], souffrance: float, now: float) -> list[
     """
     out = []
     for row in rows:
-        if humain_sans_executeur(row):
+        if row.get("retired_ts") or humain_sans_executeur(row):
             continue
         statut = row.get("status") or "idle"
         if row.get("operator_paused") or statut in ("stopped", "dead"):
@@ -296,7 +298,7 @@ def canal_humain(db, hote: str, now: float,
     out = []
     fallback = None
     for row in rows:
-        if not humain_sans_executeur(row):
+        if row.get("retired_ts") or not humain_sans_executeur(row):
             continue
         messages = mail.unread_active(db, row["name"])
         if not messages:
