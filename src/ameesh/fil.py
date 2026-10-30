@@ -1006,7 +1006,11 @@ class FileTransport:
                     # pas le dater, il reste, et tout ce qui le suit
                     cut = rest + len(foreign) - len(foreign.lstrip())
                     break
-            kept = parse(data[cut:], base=cut + shift, key=thread.key)
+            # #4809 : la marche connaît déjà le nombre d'entrées. Décoder
+            # tous leurs corps gonfle inutilement le RSS du ménage quotidien,
+            # même quand aucune entrée n'expire. Seul l'index a besoin du
+            # contenu de l'entrée la plus récente, après une expiration.
+            kept = found[dropped:]
             report.update(kept=len(kept), shift=shift)
             if not dropped:
                 return report
@@ -1030,7 +1034,7 @@ class FileTransport:
             # à égalité d'horodatage, la dernière écrite (comme l'index)
             report.update(dropped=dropped, shift=note["shift"], before=note["before"],
                           end=note["end"],
-                          last=max(reversed(kept), key=lambda e: e.ts) if kept else None)
+                          last=_latest_entry(data, kept, shift, thread.key))
             if dry_run:
                 return report
             self._sweep_temporaries(dir_fd, thread)
