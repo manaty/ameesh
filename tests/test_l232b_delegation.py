@@ -26,7 +26,7 @@ class DelegationTest(unittest.TestCase):
                 host_key_sha256='b'*64,runtime_tree_sha256='c'*64,
                 source_tree_sha256='d'*64,
                 policy=dict(host='fixture-host',units=['ameesh-runner@fixture.service'],
-                    controller_unit='ameesh-release-controller.service',restart_seconds=5))
+                    controller_unit='ameesh-release-controller.service',manager={'kind':'system'},restart_seconds=5))
 
     def test_render_is_pure_deterministic_and_hashes_every_exact_file(self):
         with mock.patch('subprocess.run',side_effect=AssertionError('host execution refused')):

@@ -40,11 +40,11 @@ class System:
         self.submissions = []
     def boot(self):
         return self.boot_id
-    def quiet(self,units):
+    def quiet(self,units, *, manager):
         return self.drained
     def state(self,job):
         return self.action
-    def submit(self,job,units,seconds):
+    def submit(self,job,units,seconds, *, manager):
         self.submissions.append((job,units,seconds))
         self.action = 'success'
         if self.fail_reply:
@@ -56,7 +56,7 @@ class RestartHelperTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.policy = dict(host='enrolled-host',units=['ameesh-runner@test.service'],
-                           controller_unit='ameesh-release-controller.service',restart_seconds=5)
+                           controller_unit='ameesh-release-controller.service',manager={'kind':'system'},restart_seconds=5)
         manifest = dict(host='enrolled-host',commit='a'*40,release='a'*40+'-'+'b'*64,
                         database='mesh-test',units=self.policy['units'],
                         policy=helper.policy_id(self.policy),rollback_until=2000000000)
@@ -127,7 +127,7 @@ class RestartHelperTest(unittest.TestCase):
         self.assertEqual(self.system.submissions,[])
 
     def test_revocation_after_slow_cgroup_observation_prevents_submission(self):
-        def observe(units):
+        def observe(units, *, manager):
             self.authority.allowed = False
             return True
         self.system.quiet = observe
@@ -150,11 +150,84 @@ class RestartHelperTest(unittest.TestCase):
         system = helper.Systemd(cgroups=root)
         response = 'LoadState=loaded\nMainPID=42\nControlGroup=/system.slice/ameesh-runner@test.service\n'
         with mock.patch.object(system,'run',return_value=response):
-            self.assertTrue(system.quiet(self.policy['units']))
+            self.assertTrue(system.quiet(self.policy['units'], manager=self.policy['manager']))
             child = group/'child'
             child.mkdir()
             (child/'cgroup.procs').write_text('99\n')
-            self.assertFalse(system.quiet(self.policy['units']))
+            self.assertFalse(system.quiet(self.policy['units'], manager=self.policy['manager']))
+
+    def test_manager_is_explicit_closed_and_account_is_strict(self):
+        helper.validate_policy(self.policy)
+        helper.validate_policy(dict(self.policy, manager={'kind':'user','account':'ameesh'}))
+        missing = dict(self.policy)
+        del missing['manager']
+        with self.assertRaises(helper.HelperError):
+            helper.validate_policy(missing)
+        for manager in (None, 'system', {}, {'kind':'system','account':'ameesh'},
+                        {'kind':'user'}, {'kind':'user','account':['ameesh']},
+                        {'kind':'user','account':'ameesh','extra':True}):
+            with self.subTest(manager=manager), self.assertRaises(helper.HelperError):
+                helper.validate_policy(dict(self.policy,manager=manager))
+        for account in ('', '-root', 'a@host', 'a/b', 'a b', 'a\n', 'Ameesh', 'é', 'a'*33):
+            with self.subTest(account=account), self.assertRaises(helper.HelperError):
+                helper.validate_policy(dict(self.policy,manager={'kind':'user','account':account}))
+
+    def test_user_cgroup_subtree_and_fixed_manager_commands(self):
+        manager = {'kind':'user','account':'ameesh'}
+        unit = 'ameesh-runner-agent@test.service'
+        root = Path(self.temp.name)/'user-cgroups'
+        relative = 'user.slice/user-1000.slice/user@1000.service/app.slice/'+unit
+        group = root/relative
+        group.mkdir(parents=True)
+        (group/'cgroup.procs').write_text('42\n')
+        system = helper.Systemd(cgroups=root)
+        response = 'LoadState=loaded\nMainPID=42\nControlGroup=/'+relative+'\n'
+        with mock.patch.object(system,'run',return_value=response) as run:
+            self.assertTrue(system.quiet([unit],manager=manager))
+            run.assert_called_once_with(['/usr/bin/systemctl','--machine=ameesh@.host',
+                '--user','show',unit,'--property=LoadState,MainPID,ControlGroup'])
+            child = group/'orphan'
+            child.mkdir()
+            (child/'cgroup.procs').write_text('99\n')
+            self.assertFalse(system.quiet([unit],manager=manager))
+        for selected, target in ((manager, ['--machine=ameesh@.host','--user']),
+                                 ({'kind':'system'}, [])):
+            with mock.patch.object(system,'run') as run:
+                system.submit('action.service',[unit],5,manager=selected)
+                run.assert_called_once_with(['/usr/bin/systemd-run','--quiet','--no-block',
+                    '--unit=action.service','--property=Type=oneshot',
+                    '--property=RemainAfterExit=yes','--property=TimeoutStartSec=5s',
+                    '--property=Slice=system.slice','--','/usr/bin/systemctl',
+                    *target,'restart','--',unit])
+
+    def test_manager_cannot_be_overridden_by_ssh_request(self):
+        self.request['manager'] = {'kind':'user','account':'other'}
+        with self.assertRaisesRegex(helper.HelperError,'request'):
+            self.perform()
+        self.assertEqual(self.system.submissions,[])
+
+    def test_systemd_environment_stays_scrubbed(self):
+        system = helper.Systemd()
+        with mock.patch.object(helper.subprocess,'run',return_value=
+                mock.Mock(stdout='',stderr='')) as run:
+            system.submit('action.service',self.policy['units'],5,
+                          manager={'kind':'user','account':'ameesh'})
+            self.assertEqual(run.call_args.kwargs['env'],
+                             {'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C'})
+            self.assertNotIn('shell',run.call_args.kwargs)
+
+    def test_enrolled_user_manager_reaches_boundary_and_submission(self):
+        policy = dict(self.policy,manager={'kind':'user','account':'ameesh'})
+        engine = helper.RestartHelper(Path(self.temp.name)/'user-journal',policy,
+            authority=self.authority,fence=self.fence,system=self.system)
+        request = dict(self.request,manifest=dict(self.request['manifest'],policy=helper.policy_id(policy)))
+        request['manifest_digest'] = helper.protocol.identity(request['manifest'])
+        with mock.patch.object(self.system,'quiet',return_value=True) as quiet, \
+                mock.patch.object(self.system,'submit',wraps=self.system.submit) as submit:
+            self.assertEqual(engine.perform('restart',request),dict(request,ok=True))
+            self.assertTrue(quiet.called)
+            self.assertEqual(quiet.call_args.kwargs,{'manager':policy['manager']})
+            self.assertEqual(submit.call_args.kwargs,{'manager':policy['manager']})
 
     def test_transient_job_result_needs_invocation_and_successful_exit(self):
         system = helper.Systemd()

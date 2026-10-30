@@ -28,10 +28,11 @@ def policy_id(policy):
 
 
 def validate_policy(policy):
-    if not isinstance(policy, dict) or set(policy) != {'host','units','controller_unit','restart_seconds'}:
+    if not isinstance(policy, dict) or set(policy) != {'host','units','controller_unit','restart_seconds','manager'}:
         raise HelperError('invalid restart policy')
     if not isinstance(policy['host'], str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', policy['host']):
         raise HelperError('invalid enrolled host')
+    validate_manager(policy['manager'])
     units = policy['units']
     if (not isinstance(units, list) or not 1 <= len(units) <= 64 or len(set(units)) != len(units)
             or any(not isinstance(u,str) or not re.fullmatch(r'ameesh-runner(?:-agent)?@[A-Za-z0-9][A-Za-z0-9_.-]{0,100}\.service',u) for u in units)):
@@ -40,6 +41,27 @@ def validate_policy(policy):
             or policy['controller_unit'] in units or type(policy['restart_seconds']) is not int
             or not 5 <= policy['restart_seconds'] <= 300):
         raise HelperError('invalid independent restart controller')
+
+
+def validate_manager(manager):
+    """One explicitly enrolled manager; never inferred from a runner name."""
+    if not isinstance(manager, dict):
+        raise HelperError('invalid enrolled manager')
+    if manager == {'kind': 'system'}:
+        return
+    if (set(manager) == {'kind', 'account'} and manager['kind'] == 'user'
+            and isinstance(manager['account'], str)
+            and re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', manager['account'])):
+        return
+    raise HelperError('invalid enrolled manager')
+
+
+def runner_systemctl(manager):
+    validate_manager(manager)
+    args = ['/usr/bin/systemctl']
+    if manager['kind'] == 'user':
+        args += ['--machine=' + manager['account'] + '@.host', '--user']
+    return args
 
 
 class Systemd:
@@ -70,11 +92,11 @@ class Systemd:
             raise HelperError('boot identity unavailable')
         return value
 
-    def quiet(self, units):
+    def quiet(self, units, *, manager):
         # A runner daemon may remain, but neither a harness child nor an orphan
         # in its cgroup subtree may survive a restart boundary.
         for unit in units:
-            text = self.run(['/usr/bin/systemctl','show',unit,'--property=LoadState,MainPID,ControlGroup'])
+            text = self.run(runner_systemctl(manager) + ['show',unit,'--property=LoadState,MainPID,ControlGroup'])
             fields = dict(line.split('=',1) for line in text.splitlines() if '=' in line)
             if fields.get('LoadState') != 'loaded' or not fields.get('MainPID','').isdigit():
                 raise HelperError('runner cgroup identity unavailable')
@@ -122,11 +144,11 @@ class Systemd:
                 return 'failure'
         raise HelperError('restart action outcome uncertain')
 
-    def submit(self, job, units, seconds):
+    def submit(self, job, units, seconds, *, manager):
         self.run(['/usr/bin/systemd-run','--quiet','--no-block','--unit='+job,
                   '--property=Type=oneshot','--property=RemainAfterExit=yes',
                   '--property=TimeoutStartSec='+str(seconds)+'s',
-                  '--property=Slice=system.slice','--','/usr/bin/systemctl','restart','--',*units])
+                  '--property=Slice=system.slice','--',*runner_systemctl(manager),'restart','--',*units])
 
 
 class RestartHelper:
@@ -157,7 +179,7 @@ class RestartHelper:
     def _boundary(self, request, *, guarded=False):
         self._authority(request)
         if ((not guarded and self.fence.fenced(request) is not True)
-                or self.system.quiet(request['manifest']['units']) is not True):
+                or self.system.quiet(request['manifest']['units'], manager=self.policy['manager']) is not True):
             raise HelperError('live drained host boundary required')
         # A slow database/cgroup observation cannot extend execution authority.
         self._authority(request)
@@ -192,7 +214,8 @@ class RestartHelper:
                         record = {'request':request,'job':job,'boot':self.system.boot(),'receipt':None}
                         protocol.save(path,record)
                         self._boundary(request,guarded=True)
-                        self.system.submit(job,request['manifest']['units'],self.policy['restart_seconds'])
+                        self.system.submit(job,request['manifest']['units'],self.policy['restart_seconds'],
+                                           manager=self.policy['manager'])
                 # Never resubmit an existing intent. An absent service can mean
                 # loss before launch OR removal after completion; neither proves
                 # it is safe to restart twice. Root reconciliation is required.
