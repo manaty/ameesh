@@ -225,7 +225,8 @@ class LocalNeighborsTest(unittest.TestCase):
                    paquet_auto.Unit(2, "b", "2" * 40)],
             discarded=[], head="3" * 40)
 
-    def run_check(self, neighbors, results, at_base=frozenset(), prefix_map=None):
+    def run_check(self, neighbors, results, at_base=frozenset(), prefix_map=None,
+                  prefix=None):
         calls = []
         replayed = []
 
@@ -261,7 +262,8 @@ class LocalNeighborsTest(unittest.TestCase):
                 log=lambda _line: None,
                 attribute=lambda *_a: {"status": "ok", "tests": []},
                 select=lambda *_a: (neighbors, "carte d'impact `abc` (lue)"),
-                base_sha="4" * 40, on_base=fake_base, prefix=fake_prefix)
+                base_sha="4" * 40, on_base=fake_base,
+                prefix=prefix or fake_prefix)
         self.replayed = replayed
         return calls, out
 
@@ -321,29 +323,44 @@ class LocalNeighborsTest(unittest.TestCase):
             }, prefix_map={"tests.test_l165b_agents_libres.T.test_x": 2})
         self.assertEqual(faulty, [2])
 
-    def test_voisin_rouge_aussi_sur_la_base_ne_designe_personne(self) -> None:
-        # h-42 : test_1651_ci_parts rouge par l'hôte (bwrap), vert en CI
+    def test_voisin_rouge_aussi_sur_la_base_ou_non_rejoue(self) -> None:
+        # h-42 : test_1651_ci_parts rouge par l'hôte (bwrap), vert en CI.
+        # #4887 (h-10) : un rejeu de base non concluant (None) ne vaut plus
+        # « sans effet » — le rouge de voisin est conservé et rejoué ; seul un
+        # rouge aussi constaté sur la base est écarté.
         support = {"module": "tests.test_1651_ci_parts", "reason": "support",
                    "files": ["tests/test_1467_train.py"]}
         name = "tests.test_1651_ci_parts.T.test_x"
-        for at_base in ({name}, None):
-            with self.subTest(at_base=at_base):
-                _calls, (runs, faulty, _removals) = self.run_check(
-                    {1: [support]}, {
-                        "unité #1": lambda m: _red("unité #1", m,
-                                                   "tests.test_1651_ci_parts"),
-                        "unité #2": lambda m: _green("unité #2", m),
-                        "contrats": lambda m: _green("contrats", m),
-                    }, at_base=at_base)
-                self.assertEqual(self.replayed, [["tests.test_1651_ci_parts"]])
-                self.assertEqual(faulty, [])
-                self.assertFalse(runs[0].green)
-                self.assertTrue(runs[0].ignored_red)
-                manifest = paquet_auto.build_manifest(
-                    name="banc", target="main", base_sha="4" * 40, carrier=99,
-                    composition=self.composition, table="## Composition\n",
-                    tests=runs, freeze_seconds=0.0)
-                self.assertIn("0 échec(s), 1 run(s) rouge(s) sans effet", manifest)
+        results = {
+            "unité #1": lambda m: _red("unité #1", m,
+                                       "tests.test_1651_ci_parts"),
+            "unité #2": lambda m: _green("unité #2", m),
+            "contrats": lambda m: _green("contrats", m),
+        }
+        _calls, (runs, faulty, _removals) = self.run_check(
+            {1: [support]}, dict(results), at_base={name})
+        self.assertEqual(self.replayed, [["tests.test_1651_ci_parts"]])
+        self.assertEqual(faulty, [])
+        self.assertFalse(runs[0].green)
+        self.assertTrue(runs[0].ignored_red)
+        manifest = paquet_auto.build_manifest(
+            name="banc", target="main", base_sha="4" * 40, carrier=99,
+            composition=self.composition, table="## Composition\n",
+            tests=runs, freeze_seconds=0.0)
+        self.assertIn("0 échec(s), 1 run(s) rouge(s) sans effet", manifest)
+        # base non concluante : le rouge n'est pas jeté ; le rejeu des préfixes
+        # ne le situe pas, il reste consigné (canon §3), sans retrait.
+        _calls, (runs, faulty, _removals) = self.run_check(
+            {1: [support]}, dict(results), at_base=None,
+            prefix=lambda *_a, **_k: ({}, "", []))
+        self.assertEqual(faulty, [])
+        self.assertFalse(runs[0].green)
+        self.assertFalse(runs[0].ignored_red)
+        manifest = paquet_auto.build_manifest(
+            name="banc", target="main", base_sha="4" * 40, carrier=99,
+            composition=self.composition, table="## Composition\n",
+            tests=runs, freeze_seconds=0.0)
+        self.assertIn("1 échec(s), 0 run(s) rouge(s) sans effet", manifest)
 
     def test_rouge_mixte_garde_l_echec_propre(self) -> None:
         support = {"module": "tests.test_voisin", "reason": "support",
