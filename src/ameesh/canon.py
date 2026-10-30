@@ -944,8 +944,8 @@ class SandboxLimits:
 
     Toutes les valeurs sont positives ; `job_seconds` doit dépasser
     `turn_seconds` (le Job survit au tour, le superviseur le supprime à
-    l'échéance). Les valeurs de la qualification IMA #837 sont des exemples,
-    jamais des constantes compilées.
+    l'échéance). Les valeurs d'une qualification réelle (#837) sont des
+    exemples, jamais des constantes compilées.
     """
 
     turns: int
