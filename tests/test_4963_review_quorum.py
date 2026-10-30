@@ -36,6 +36,17 @@ class UnavailableDesignationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(designated(work.get(self.db, self.lot)), before)
         self.assertFalse([n for n in self.notes() if 'cleared (previous head)' in n])
 
+    def test_same_head_refreeze_keeps_seats_when_selection_fails(self):
+        previous, _ = self.freeze()
+        before = designated(work.get(self.db, self.lot))
+        self.assertTrue(before)
+        with mock.patch.object(act, '_selection', side_effect=RuntimeError('selection failed')):
+            current, _ = self.freeze()
+        self.assertNotEqual(previous['id'], current['id'])
+        self.assertEqual(previous['sha'], current['sha'])
+        self.assertEqual(designated(work.get(self.db, self.lot)), before)
+        self.assertFalse([n for n in self.notes() if 'cleared (previous head)' in n])
+
     def test_old_seat_cleanup_names_the_old_freeze(self):
         previous, _ = self.freeze()
         self.repo.write('src/ameesh/mail.py', 'new content\n')
