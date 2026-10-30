@@ -158,11 +158,13 @@ class PublicationRobustnessTest(unittest.TestCase):
     """La publication ne retient jamais un tour et ne republie pas un trou."""
 
     def test_sans_observation_rien_n_est_ecrit(self):
-        worker = object.__new__(AgentWorker)
+        worker = _context_worker()
         worker._context_observation = None
         with mock.patch("ameesh.runner.events_mod.record") as record:
-            AgentWorker._publier_contexte(worker, mock.Mock(), {})
+            AgentWorker._publier_contexte(worker, mock.Mock(),
+                                          {"session": "s", "turn": "consigne"})
         record.assert_not_called()
+        self.assertIsNone(worker._context_session_reread)
 
     def test_un_echec_d_ecriture_est_avale(self):
         document = observe_all(DEEPSEEK, "deepseek_stream.jsonl",
@@ -192,6 +194,159 @@ class PublicationRobustnessTest(unittest.TestCase):
                 session="ctx-dsh-1"), {"turn": "consigne", "turn_id": "t1",
                                        "created_ts": 1.0})
         self.assertIsNone(worker._context_observation)
+
+
+def _context_worker() -> AgentWorker:
+    """Un worker minimal pour la machine d'état de la base R_session."""
+    worker = object.__new__(AgentWorker)
+    # AgentWorker hérite de Thread : les méthodes exercées ici ne lisent que
+    # `name`, pas l'état du fil (jamais démarré).
+    worker._initialized = True
+    worker._name = "agent-contexte"
+    worker.db = None
+    worker._context_session_id = None
+    worker._context_session_reread = None
+    worker._context_session_quality = context_metrics.UNKNOWN
+    worker._context_session_reasons = ()
+    worker._context_baseline = None
+    worker._context_baseline_quality = context_metrics.UNKNOWN
+    worker._context_baseline_reasons = ()
+    worker._context_session_lost = None
+    return worker
+
+
+def _turn_document(session: str, value, quality: str, reasons=()) -> dict:
+    return {"session": session, "reasons": list(reasons),
+            "measures": {"R_turn": {"value": value, "quality": quality,
+                                    "reasons": list(reasons)}}}
+
+
+class SessionBaselineQualityTest(unittest.TestCase):
+    """La qualité d'une base partielle ne se perd pas dans le normalisateur."""
+
+    def test_base_partielle_reste_partielle_apres_un_tour_complet(self):
+        normalizer = context_metrics.TurnNormalizer(
+            "deepseek", session="s", session_reread=100,
+            session_reread_quality=context_metrics.PARTIAL,
+            session_reread_reasons=("input_unknown",))
+        normalizer.call({"inputTokens": 20, "cacheReadTokens": 10,
+                         "outputTokens": 1}, "c1")
+        measure = normalizer.finish()["measures"]["R_session"]
+        self.assertEqual(measure["value"], 130)
+        self.assertEqual(measure["quality"], context_metrics.PARTIAL)
+        self.assertIn("input_unknown", measure["reasons"])
+
+    def test_base_inconnue_garde_ses_raisons(self):
+        normalizer = context_metrics.TurnNormalizer(
+            "deepseek", session="s", session_reread=None,
+            session_reread_reasons=(context_metrics.REASON_COLLECTION_LOST,))
+        normalizer.call({"inputTokens": 20, "cacheReadTokens": 10,
+                         "outputTokens": 1}, "c1")
+        measure = normalizer.finish()["measures"]["R_session"]
+        self.assertIsNone(measure["value"])
+        self.assertEqual(measure["quality"], context_metrics.UNKNOWN)
+        self.assertIn(context_metrics.REASON_SESSION_BASELINE_UNKNOWN,
+                      measure["reasons"])
+        self.assertIn(context_metrics.REASON_COLLECTION_LOST, measure["reasons"])
+
+    def test_qualite_de_base_invalide_refusee(self):
+        with self.assertRaises(context_metrics.ContextMetricsError):
+            context_metrics.TurnNormalizer(
+                "deepseek", session="s", session_reread=1,
+                session_reread_quality="presque")
+
+
+class ContextSessionStateTest(unittest.TestCase):
+    """La base du worker : partiel→complet, absent→complet, collecte perdue."""
+
+    def setUp(self):
+        self.worker = _context_worker()
+        patcher = mock.patch("ameesh.runner.cost_mod.session_reread",
+                             return_value=100)
+        self.addCleanup(patcher.stop)
+        self.session_reread = patcher.start()
+
+    def test_partiel_puis_complet_reste_partiel(self):
+        self.assertEqual(self.worker._context_session_baseline("s"), 100)
+        self.worker._remember_context_session(
+            _turn_document("s", 20, context_metrics.PARTIAL, ("input_unknown",)),
+            "s")
+        self.assertEqual(self.worker._context_session_reread, 120)
+        self.assertEqual(self.worker._context_session_quality,
+                         context_metrics.PARTIAL)
+        # tour 2 complet : la base partielle le reste, avec sa raison
+        self.assertEqual(self.worker._context_session_baseline("s"), 120)
+        self.worker._remember_context_session(
+            _turn_document("s", 30, context_metrics.MEASURED), "s")
+        self.assertEqual(self.worker._context_session_reread, 150)
+        self.assertEqual(self.worker._context_session_quality,
+                         context_metrics.PARTIAL)
+        self.assertIn("input_unknown", self.worker._context_session_reasons)
+
+    def test_normalisateur_r_session_apres_partiel_puis_complet(self):
+        # Sonde B1 : base 100, tour 1 partiel (20), tour 2 complet (30).
+        self.assertEqual(self.worker._context_session_baseline("s"), 100)
+        first = context_metrics.TurnNormalizer(
+            "deepseek", session="s",
+            session_reread=self.worker._context_baseline,
+            session_reread_quality=self.worker._context_baseline_quality,
+            session_reread_reasons=self.worker._context_baseline_reasons)
+        first.call({"inputTokens": 20, "outputTokens": 1}, "c1")
+        document = first.finish()
+        self.assertEqual(document["measures"]["R_session"]["value"], 120)
+        self.assertEqual(document["measures"]["R_session"]["quality"],
+                         context_metrics.PARTIAL)
+        self.worker._remember_context_session(document, "s")
+
+        second = context_metrics.TurnNormalizer(
+            "deepseek", session="s",
+            session_reread=self.worker._context_session_baseline("s"),
+            session_reread_quality=self.worker._context_session_quality,
+            session_reread_reasons=self.worker._context_session_reasons)
+        second.call({"inputTokens": 30, "cacheReadTokens": 0,
+                     "outputTokens": 1}, "c2")
+        measure = second.finish()["measures"]["R_session"]
+        self.assertEqual(measure["value"], 150)
+        self.assertEqual(measure["quality"], context_metrics.PARTIAL)
+        self.assertIn("cache_read_unknown", measure["reasons"])
+
+    def test_absent_invalide_la_base(self):
+        self.assertEqual(self.worker._context_session_baseline("s"), 100)
+        self.worker._remember_context_session(
+            _turn_document("s", None, context_metrics.UNKNOWN, ("no_call",)), "s")
+        self.assertIsNone(self.worker._context_session_reread)
+        self.assertEqual(self.worker._context_session_quality,
+                         context_metrics.UNKNOWN)
+        self.assertIn("no_call", self.worker._context_session_reasons)
+        # un tour complet suivant ne reconstruit pas un trou : la base reste
+        # inconnue, avec la raison du trou
+        self.assertIsNone(self.worker._context_session_baseline("s"))
+        self.worker._remember_context_session(
+            _turn_document("s", 30, context_metrics.MEASURED), "s")
+        self.assertIsNone(self.worker._context_session_reread)
+        self.assertEqual(self.worker._context_session_quality,
+                         context_metrics.UNKNOWN)
+
+    def test_collecte_perdue_invalide_la_base(self):
+        self.assertEqual(self.worker._context_session_baseline("s"), 100)
+        self.worker._context_observation = None
+        AgentWorker._publier_contexte(self.worker, mock.Mock(),
+                                      {"session": "s", "turn": "consigne"})
+        self.assertIsNone(self.worker._context_session_reread)
+        self.assertEqual(self.worker._context_session_quality,
+                         context_metrics.UNKNOWN)
+        self.assertIn(context_metrics.REASON_COLLECTION_LOST,
+                      self.worker._context_session_reasons)
+        self.assertIsNone(self.worker._context_session_baseline("s"))
+
+    def test_session_neuve_explicite_repart_de_zero(self):
+        self.worker._invalidate_context_session(
+            None, (context_metrics.REASON_COLLECTION_LOST,))
+        self.assertIsNone(self.worker._context_session_baseline(None))
+        self.worker._context_session_forget()
+        self.assertEqual(self.worker._context_session_baseline(None), 0)
+        self.assertEqual(self.worker._context_baseline_quality,
+                         context_metrics.MEASURED)
 
 
 class SessionRereadTest(PgTestCase):
