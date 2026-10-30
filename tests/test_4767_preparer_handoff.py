@@ -2,6 +2,7 @@
 """Real Git objects and disposable payloads; no accounts, root or services."""
 from tests import support
 import base64
+import binascii
 import builtins
 import copy
 import importlib.util
@@ -239,10 +240,18 @@ class PreparationTest(unittest.TestCase):
         key = (self.root / 'release.pub').read_text()
         alternate = key + '='
         self.assertNotEqual(key, alternate)
-        self.assertEqual(base64.b64decode(key.split()[1], validate=True),
-                         base64.b64decode(alternate.split()[1], validate=True))
+        # Python 3.12.15+ and 3.14 refuse excess padding under validate=True
+        # (#4795): the alternate spelling is then rejected outright, which is
+        # equally safe; older versions decode it to the same blob.
+        try:
+            decoded = base64.b64decode(alternate.split()[1], validate=True)
+        except binascii.Error:
+            expected = ''
+        else:
+            self.assertEqual(base64.b64decode(key.split()[1], validate=True), decoded)
+            expected = 'distinct controller'
         (self.root / 'handoff.pub').write_text(alternate)
-        with self.assertRaisesRegex(ValueError, 'distinct controller'):
+        with self.assertRaisesRegex(ValueError, expected):
             self.assemble()
         self.assertFalse(self.output.exists())
 
