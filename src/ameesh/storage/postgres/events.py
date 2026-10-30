@@ -46,6 +46,19 @@ class Events(interface.Events):
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
 
+    def latest_type(self, type, days, limit) -> list:
+        # Explicit predicate also works with generic prepared plans: a bound
+        # `type` alone cannot imply the partial staging-progress index.
+        staging = (" and type in ('staging.sequence', 'staging.request')"
+                   if type in ("staging.sequence", "staging.request") else "")
+        return self.db.query(
+            "select * from (select distinct on (object) " + _COLUMNS
+            + " from ameesh_events where type = %s"
+            + staging
+            + " and created_at > now() - make_interval(days => %s::int)"
+              " order by object, id desc) latest order by id desc limit %s",
+            (type, int(days), int(limit)))
+
     def readable(self, position, limit) -> tuple:
         # ONE statement, so ONE snapshot: the rows and the bounds agree (with
         # two snapshots, a transaction ending in between hid both).

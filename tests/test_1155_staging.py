@@ -61,6 +61,10 @@ if [ "$(basename "$0")" = vm.sh ]; then
   fi
 fi
 action=${1:-}
+if grep -qx "kill=$host:$action" "$state/scenario" 2>/dev/null; then
+  kill -KILL "$PPID"
+  exit 0
+fi
 # #4416 : un nouveau timer du canon manque jusqu'a l'installation explicite.
 if grep -qx 'nouveau-timer' "$state/scenario" 2>/dev/null && [ "$host" != manaty-mesh-1 ]; then
   case "$action" in
@@ -92,6 +96,10 @@ state=${FAKE_STATE:?}
 printf 'stub %s %s\n' "$0" "$*" >> "$state/calls.log"
 printf 'venv-python %s\n' "$*" >> "$state/calls.log"
 if [ "${1:-}" = "-" ]; then exit 0; fi   # notification
+if [[ "${1:-}" = */staging_watch.py ]]; then
+  printf '%s\n' "$2" >> "$state/staging-snapshots.jsonl"
+  exit 0
+fi
 code=$(sed -n 's/^code-sonde=//p' "$state/scenario" 2>/dev/null | head -1)
 if [ -n "$code" ]; then
   # #3976 : la sonde n'a pas pu tourner (127 : outil absent ; 3 : base
@@ -170,6 +178,7 @@ case "$*" in
     source=$(cat)
     printf 'ssh-python %s\n' "$*" >> "$FAKE_STATE/calls.log"
     case "$source" in
+      *'EVENT = "staging.sequence"'*) exit 0 ;;
       *"def attestation_partagee"*)
         # #3981 : actif.py tourne la-bas, avec le journal recopie
         printf 'ssh-actif %s\n' "$*" >> "$FAKE_STATE/calls.log"
@@ -267,6 +276,9 @@ class StagingTest(unittest.TestCase):
         self.script_dir.mkdir(parents=True)
         for name in ('staging.sh', 'sante-courrier.py', 'actif.py'):
             (self.script_dir / name).write_text((DEPLOY / name).read_text())
+        source = self.repo / 'src/ameesh'
+        source.mkdir(parents=True)
+        shutil.copy2(ROOT / 'src/ameesh/staging_watch.py', source)
         for name, source in (('vm.sh', STUB), ('poste.sh', STUB)):
             path = self.script_dir / name
             path.write_text(source)
@@ -670,7 +682,9 @@ class StagingTest(unittest.TestCase):
             ('ameesh-agents-1', 'verifier'),
             ('ameesh-agents-2', 'verifier'),
         ])
-        self.assertNotIn('venv-python', ' '.join(self.calls()))
+        self.assertFalse([line for line in self.calls()
+                          if line.startswith('venv-python ')
+                          and 'staging_watch.py' not in line])
 
     def test_migrations_failure_installs_nothing(self):
         (self.state / 'scenario').write_text('ko=pc-smichea:migrer\n')
@@ -1065,7 +1079,8 @@ class StagingTest(unittest.TestCase):
         # #3981 : actif.py tourne aussi par ssh, mais c'est un autre outil ;
         # les temoins de sonde comptent les seules sondes de courrier.
         return [l for l in self.calls()
-                if l.startswith('ssh-python ') and '--journal' not in l]
+                if l.startswith('ssh-python ') and '--journal' not in l
+                and '"run":' not in l]
 
     def ssh_actif(self):
         return [l for l in self.calls() if l.startswith('ssh-actif ')]

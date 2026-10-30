@@ -1072,6 +1072,7 @@ class ProjectRelease:
     target: str = "main"
     remote: str = "origin"
     staging: str = "deploy/mise-a-jour/staging.sh"
+    staging_executor: str = ""
     report: str = "smichea"
     github: str = ""
     window_s: float = WINDOW_S
@@ -1087,7 +1088,7 @@ class ProjectRelease:
         if not isinstance(entry, dict):
             raise ReleaseError("release.projects.%s: an object is required" % name)
         unknown = set(entry) - {"repo", "target", "remote", "staging", "report",
-                                "github", "window_s", "staging_timeout_s",
+                                "github", "window_s", "staging_timeout_s", "staging_executor",
                                 "lock_ttl_s", "lock_wait_s", "version_bump", "model"}
         if unknown:
             raise ReleaseError("release.projects.%s: unknown key(s) %s"
@@ -1134,6 +1135,7 @@ class ProjectRelease:
         return cls(
             name=name, repo=repo, target=target.strip(), remote=str(entry.get("remote", "origin")),
             staging=staging,
+            staging_executor=str(entry.get("staging_executor") or ""),
             report=str(report), github=str(entry.get("github", "") or ""),
             window_s=number("window_s", WINDOW_S),
             staging_timeout_s=number("staging_timeout_s", STAGING_TIMEOUT_S),
@@ -2152,6 +2154,20 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 *, state_dir: str, timeout_s: float | None = None,
                 db=None) -> dict:
     """Run `staging.sh` from a worktree of the release commit, under its lock."""
+    if project.staging_executor:
+        from . import config, staging_executor
+        if db is None:
+            raise TransientReleaseError("elected staging requires the shared database")
+        options = staging_executor.settings(os.path.expanduser(project.staging_executor))
+        if options["project"] != project.name:
+            raise ReleaseError("staging executor configuration belongs to another project")
+        try:
+            request = staging_executor.submit(db, config.load(), options, release_sha,
+                                             included=included)
+        except RuntimeError as exc:
+            raise ReleaseBusy(str(exc)) from exc
+        return {"exit": 75, "duration_s": 0.0, "log": "", "summary": [],
+                "attestation": None, "request": request["request"]}
     relative = project.staging
     if os.path.isabs(relative):
         relative = os.path.relpath(relative, project.repo)
@@ -2175,7 +2191,9 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
             try:
                 proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT, text=True,
-                                        env=dict(os.environ), start_new_session=True)
+                                        env=dict(os.environ, STAGING_TIMEOUT_S=str(
+                                            timeout_s or project.staging_timeout_s)),
+                                        start_new_session=True)
             except OSError as exc:
                 raise ReleaseError("staging could not start: %s" % exc) from exc
             try:

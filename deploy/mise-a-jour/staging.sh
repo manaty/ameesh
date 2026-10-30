@@ -158,6 +158,7 @@ VM_SH="$ICI/vm.sh"
 POSTE_SH="$ICI/poste.sh"
 SONDE_PY="$ICI/sante-courrier.py"
 ACTIF_PY="$ICI/actif.py"
+SUIVI_PY="$DEPOT/src/ameesh/staging_watch.py"
 PARTAGE="$HOME/.local/share/ameesh"
 VENV="$PARTAGE/venv"
 AMEESH="$VENV/bin/ameesh"
@@ -550,8 +551,15 @@ fi
 # et la topologie doit primer sur d'eventuels AGENTS_SSH/HOTE_AGENTS restes
 # dans le fichier prive.
 nettoyer() {
+  local rc=$?
+  if [ "${SUIVI_DEMARRE:-0}" = 1 ]; then
+    # EXIT is best effort only. SIGKILL or a dead launcher is detected by
+    # the independent alerts pass from the already committed deadline.
+    publier_suivi failed || true
+  fi
   local f
   for f in ${FICHIER_HOTE[@]+"${FICHIER_HOTE[@]}"}; do rm -f "$f"; done
+  return "$rc"
 }
 trap nettoyer EXIT
 for nom in "${HOTES[@]}"; do
@@ -587,6 +595,9 @@ if rapport:
 with open(path, "a", encoding="utf-8") as fh:
     fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 PY
+  if [ "${SUIVI_DEMARRE:-0}" = 1 ]; then
+    publier_suivi running
+  fi
 }
 
 # --- gestes par hote ------------------------------------------------------
@@ -912,6 +923,34 @@ etape "plan staging : ${HOTES[*]} ; cible $SHA_TRAVE"
 for nom in "${HOTES[@]}"; do
   printf '  %-16s %-8s %s\n' "$nom" "$(mode_de "$nom")" "${CIBLE[$nom]}"
 done
+# #4880: a committed start must exist BEFORE any host mutation. Unlike the
+# local flock and EXIT trap this evidence survives SIGKILL of the launcher.
+SUIVI_RUN=${STAGING_RUN_ID:-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')}
+SUIVI_DEBUT=$(date +%s)
+SUIVI_DELAI=${STAGING_TIMEOUT_S:-7200}
+SUIVI_DEMARRE=0
+publier_suivi() {
+  local etat=$1 instantane
+  instantane=$(python3 - "$JOURNAL" "$SUIVI_RUN" "$SHA" "$SUIVI_DEBUT" \
+    "$SUIVI_DELAI" "$NOTIF_STAGING" "$etat" "$DEPUIS" <<'PY'
+import json, sys
+path, run, sha, start, duration, notify, state, since = sys.argv[1:]
+duration = float(duration)
+if not 0 < duration < float('inf'):
+    raise SystemExit('STAGING_TIMEOUT_S must be finite and positive')
+hosts = {}
+with open(path, encoding='utf-8') as stream:
+    for line in stream:
+        row = json.loads(line)
+        if row.get('sha') == sha and row.get('ts', '') >= since:
+            hosts[row['hote']] = {'stage': row['etape'], 'verdict': row['verdict']}
+print(json.dumps(dict(run=run, sha=sha, started=float(start),
+                     deadline=float(start)+duration, state=state,
+                     hosts=hosts, notify=notify)))
+PY
+  ) || return
+  py_sequence "$SUIVI_PY" "$instantane"
+}
 if [ "$POSTE_ABSENT" = 1 ]; then
   printf '  %-16s %-8s %s\n' pc-smichea absent "reporte — $POSTE_RAISON"
 fi
@@ -938,6 +977,8 @@ fi
 # La preuve d'absence du poste precede toute mutation : actif.py exige cet
 # evenement pour attester les quatre VM sans lui. Il porte le commit vise,
 # comme tous les autres, et n'est jamais un `retour`.
+publier_suivi running
+SUIVI_DEMARRE=1
 if [ "$POSTE_ABSENT" = 1 ]; then
   trace pc-smichea absent reporte "$POSTE_RAISON"
   echo "  pc-smichea : absent (reporte) — $POSTE_RAISON"
@@ -1132,6 +1173,8 @@ else
     "$VENV/bin/python" "$ACTIF_PY" --journal "$JOURNAL_ACTIF" "${ARGS_ACTIF[@]}" || rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
+    publier_suivi unattested
+    SUIVI_DEMARRE=0
     if [ "$rc" -eq 5 ]; then
       echo "signal actif ambigu (emission anterieure non prouvee, aucun renvoi automatique) : attestation $ATTESTATION_ACTIF a verifier, journal $JOURNAL_ACTIF a relayer a la main" >&2
     elif [ "$OUTILS_DISTANTS" = 1 ]; then
@@ -1140,4 +1183,13 @@ else
       echo "signal actif non emis (rc=$rc) : journal $JOURNAL_ACTIF a relayer a la main" >&2
     fi
   fi
+fi
+
+if [ "$SUIVI_DEMARRE" = 1 ]; then
+  if [ "$SEQUENCE_COMPLETE" = 1 ]; then
+    publier_suivi completed
+  else
+    publier_suivi partial
+  fi
+  SUIVI_DEMARRE=0
 fi

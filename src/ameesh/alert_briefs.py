@@ -44,7 +44,7 @@ import time
 from . import sous_utilisation, vocab, work_lifecycle as lifecycle
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
-BRIEFED_TYPES = ("host_idle_reserved", "baseline_oversized", "host_release_failed",
+BRIEFED_TYPES = ("staging_interrupted", "host_idle_reserved", "baseline_oversized", "host_release_failed",
                  "host_release_overdue", "host_release_no_runs",
                  "host_release_canon_unreadable", "idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
                  "waiting_without_question", "module_deviation",
@@ -1131,7 +1131,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     else:
         extra: dict[str, str] = {}
         no_reviewer = False
-        if kind == "stale_lot":
+        if kind == "staging_interrupted":
+            text = alert["detail"]
+            teams = set()
+        elif kind == "stale_lot":
             waiting = alert.get("waiting") or {}
             reviewer = waiting.get("who") if waiting.get("what") == "verdict" else None
             # #705 : en qa, l'attente est celle du relecteur DÉSIGNÉ ; sans
