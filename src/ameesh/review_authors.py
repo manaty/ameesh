@@ -1533,6 +1533,76 @@ def _outside_delivered(repo: str, target: str, commit: str, landing,
         return False
 
 
+#: #4858 : une seule lecture `rev-list --ancestry-path` prouve quelles têtes
+#: de gel contiennent le commit inconnu (#4825 : 256 candidats, 2 841 appels
+#: git, 149 s). La preuve est locale et bornée ; au-delà (ou si elle échoue)
+#: l'inconnu reste inconnu, jamais deviné.
+CONTAINMENT_TIMEOUT = 30.0
+#: #4858 : au plus ce nombre de gels sources sont relus en profondeur pour un
+#: commit inconnu. La mesure de #4825 en lisait 12 pour une attribution et 11
+#: par inconnu, après 256 candidats ; le plafond empêche le coût de croître
+#: avec les gels de l'application. Au-delà, l'inconnu reste inconnu : une
+#: borne ne retire ni n'ajoute jamais un auteur sans preuve.
+MAX_ATTRIBUTION_SOURCES = 32
+
+
+def _containing_heads(repo: str, commit: str, heads: Sequence[str], *,
+                      cache: Optional[dict] = None) -> Optional[set]:
+    """Les têtes qui contiennent `commit`, en **une** lecture git (#4858).
+
+    `rev-list --ancestry-path ^commit <têtes>` ne rend que les commits sur un
+    chemin d'ascendance entre le commit et une tête : l'intersection avec les
+    têtes demandées est exactement l'ensemble des têtes dont l'historique
+    contient le commit. La forme par candidat lançait un processus git par
+    tête (256 par commit inconnu sur #4825) ; celle-ci en lance un seul. Les
+    objets absents sont filtrés localement (`_present_commits`, sans fetch
+    paresseux) : une tête absente n'est jamais tenue pour contenante. `None`
+    quand la preuve est illisible : l'appelant laisse l'inconnu inchangé.
+    """
+    full = plan_git.full_commit_id(commit)
+    if not full and repo and commit:
+        try:
+            full = _read_local_commit(repo, str(commit)) or ""
+        except Exception:  # noqa: BLE001 - forme illisible : pas de preuve
+            full = ""
+    if not repo or not full:
+        return None
+    wanted = list(dict.fromkeys(
+        value for value in (plan_git.full_commit_id(head) for head in heads or ())
+        if value))
+    if not wanted:
+        return set()
+    cache = {} if cache is None else cache
+    key = ("containing-heads", repo, full, tuple(wanted))
+    if key in cache:
+        return cache[key]
+    found = None
+    try:
+        present = _present_commits(repo, [full, *wanted],
+                                   timeout=CONTAINMENT_TIMEOUT)
+        if present and full in present:
+            heads_present = [head for head in wanted if head in present]
+            if heads_present:
+                proc = plan_git._git(
+                    repo, "rev-list", "--ancestry-path", "^" + full,
+                    *heads_present, timeout=CONTAINMENT_TIMEOUT,
+                    deadline=_read_bound(CONTAINMENT_TIMEOUT),
+                    env_extra=canon.NO_LAZY_FETCH)
+                if proc.returncode == 0:
+                    reached = set(proc.stdout.decode("utf-8", "replace").split())
+                    found = {head for head in heads_present if head in reached}
+                    # `git rev-list ^C C` élague la tête égale au commit : une
+                    # gelée sur ce commit même le contient évidemment.
+                    if full in wanted:
+                        found.add(full)
+            else:
+                found = set()
+    except Exception:  # noqa: BLE001 - preuve illisible : l'inconnu demeure
+        found = None
+    cache[key] = found
+    return found
+
+
 def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
                                   commit: str, repo: str, families, *,
                                   provider=None, cache: dict, target: str = ""):
@@ -1540,7 +1610,11 @@ def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
 
     Only exact membership and recorded provenance count. Re-read the exact
     commit using the other lot's historical reference; no recursive carry.
-    Bounded/missing/unreadable candidates leave the unknown unchanged.
+    The freeze heads that contain the commit are proved by one batched
+    `rev-list` (#4858), the source item and receipt are read once per source,
+    and at most `MAX_ATTRIBUTION_SOURCES` sources are deeply re-read. Missing,
+    unreadable or beyond-the-bound candidates leave the unknown unchanged:
+    the result never gains an author without recorded proof.
     """
     lot = int(item.get("id") or 0)
     app = str(item.get("app") or "")
@@ -1552,6 +1626,7 @@ def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
         key = ("other-freezes", app, lot, float(at_ts))
         if key not in cache:
             cache[key] = port.earlier_freezes(app, lot, float(at_ts))
+        sources = []
         for source in cache[key] or ():
             source_lot = int(source.get("work_item_id") or 0)
             source_sha = plan_git.full_commit_id(source.get("sha"))
@@ -1559,19 +1634,41 @@ def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
             if (not source_lot or source_lot == lot or not source_sha
                     or stamp is None or float(stamp) > float(at_ts)):
                 continue
-            if _is_ancestor(repo, commit, source_sha) is not True:
+            sources.append((source, source_lot, source_sha))
+        containing = _containing_heads(
+            repo, commit, [source_sha for _source, _lot, source_sha in sources],
+            cache=cache)
+        if containing is None:
+            return None
+        examined = 0
+        for source, source_lot, source_sha in sources:
+            if source_sha not in containing:
                 continue
-            source_item = port.get(source_lot)
+            if examined >= MAX_ATTRIBUTION_SOURCES:
+                break                     # borne : l'inconnu reste inconnu
+            examined += 1
+            item_key = ("source-item", source_lot)
+            if item_key not in cache:
+                cache[item_key] = port.get(source_lot)
+            source_item = cache[item_key]
             if (not source_item or source_item.get("app") != app
                     or packet_composer(source_item)):
                 continue
             # The source range is above its common baseline with the exact
             # target. A baseline ancestor is never attributed by this proof.
-            start = _read_out(repo, "merge-base", target, source_sha) if target else None
-            if not start or _is_ancestor(repo, commit, start) is not False:
+            start_key = ("source-start", str(target), source_sha)
+            if start_key not in cache:
+                cache[start_key] = (_read_out(repo, "merge-base", target,
+                                              source_sha) if target else None)
+            start = cache[start_key]
+            if not start or _is_ancestor(repo, commit, start, cache) is not False:
                 continue
             # Freeze receipt pins the source head.
-            receipt = _milestone_receipt(provider, db, int(source["id"]), strict=True)
+            receipt_key = ("source-receipt", int(source["id"]))
+            if receipt_key not in cache:
+                cache[receipt_key] = _milestone_receipt(
+                    provider, db, int(source["id"]), strict=True)
+            receipt = cache[receipt_key]
             if not receipt or receipt.get("commit") != source_sha:
                 continue
             known, written, corrections, unknown = _prior_reading(
