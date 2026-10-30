@@ -749,6 +749,31 @@ def _disarm_auto(slug: str, status: dict, *, gh) -> tuple:
 
 def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
                    project, target: str, base_sha: str | None = None) -> tuple:
+    """#4804 : pré-lecture et porte partagent une seule échéance d'auteurs."""
+    import contextlib
+    from . import review_authors
+
+    lot = int(row["id"])
+    outer = review_authors.active_sweep()
+    scope = (contextlib.nullcontext(outer) if outer is not None else
+             review_authors.sweep_deadline(merge_queue.AUTHORS_SWEEP_BUDGET_S,
+                                          "lot #%d" % lot))
+    klass = {"class": "sensitive", "doubt": True}
+    with scope as sweep:
+        try:
+            result = _ready_verdicts(cfg, db, row, marks, repo=repo,
+                                     project=project, target=target, base_sha=base_sha)
+            klass = result[2]
+        except review_authors.SweepDeadline as exc:
+            return False, "lot #%d: lecture d'auteurs non concluante: %s" % (lot, exc), klass
+        if sweep.tripped or sweep.deadline.expired():
+            return False, ("lot #%d: lecture d'auteurs non concluante: budget exhausted "
+                           "at %s" % (lot, sweep.tripped or "attribution")), klass
+    return result
+
+
+def _ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
+                    project, target: str, base_sha: str | None = None) -> tuple:
     """La première porte, celle qui ne doit rien déclencher (#1374, B) : la
     classe du lot et les **avis requis** sur la tête gelée, comptés et
     indépendants (`merge_queue.review_gate`). Rend `(ok, raison, classe)`.
