@@ -453,6 +453,11 @@ class DedupTest(unittest.TestCase):
         self.assertEqual(result["counts"]["dropped"], 1)
         self.assertTrue(result["partial"])
         self.assertIn("call_bound_reached", result["reasons"])
+        # le dernier appel retenu n'est plus forcément le dernier du tour
+        self.assertEqual(result["measures"]["C_last"]["quality"], "partial")
+        self.assertIn("call_bound_reached",
+                      result["measures"]["C_last"]["reasons"])
+        self.assertEqual(result["measures"]["R_turn"]["quality"], "partial")
 
 
 class SessionTest(unittest.TestCase):
@@ -466,6 +471,14 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(result["counts"]["calls"], 0)
         self.assertTrue(result["partial"])
         self.assertIn("session_mismatch", result["reasons"])
+
+    def test_sans_tour_mesure_r_session_reste_nulle(self):
+        normalizer = context_metrics.TurnNormalizer(
+            "deepseek", session="s", session_reread=100)
+        measures = normalizer.finish()["measures"]
+        self.assertIsNone(measures["R_session"]["value"])
+        self.assertEqual(measures["R_session"]["quality"], "unknown")
+        self.assertIn("turn_not_measured", measures["R_session"]["reasons"])
 
     def test_base_de_session_non_declaree_reste_inconnue(self):
         normalizer = context_metrics.TurnNormalizer("deepseek", session="s")

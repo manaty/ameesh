@@ -622,6 +622,13 @@ class TurnNormalizer:
         self._interrupted = bool(interrupted)
         principal = self._principal_measures()
         subagents = self._subagent_measures()
+        if self._dropped:
+            # la borne a écarté des appels : le dernier appel retenu n'est plus
+            # forcément le dernier du tour, et les sommes sont des minorants.
+            principal = {key: value.degraded(REASON_CALL_BOUND_REACHED)
+                         for key, value in principal.items()}
+            subagents = {key: value.degraded(REASON_CALL_BOUND_REACHED)
+                         for key, value in subagents.items()}
         if self._interrupted:
             principal = {key: value.degraded(REASON_TURN_INTERRUPTED)
                          for key, value in principal.items()}
@@ -781,7 +788,9 @@ class TurnNormalizer:
             return Measure(None, UNKNOWN, (REASON_SESSION_BASELINE_UNKNOWN,),
                            "session", SOURCE_LEDGER)
         if r_turn.value is None:
-            return Measure(self.session_reread, PARTIAL,
+            # §2.1 : sans tour mesuré, R_session est null, jamais le seul cumul
+            # des tours précédents présenté comme la session courante.
+            return Measure(None, UNKNOWN,
                            _reasons((REASON_TURN_NOT_MEASURED,), r_turn.reasons),
                            "session", SOURCE_LEDGER)
         quality = MEASURED if r_turn.quality == MEASURED else PARTIAL
