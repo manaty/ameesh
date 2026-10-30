@@ -1,10 +1,10 @@
 ---
 type: Study
 title: "#1408 — externally managed, versioned persona memory projections: an opt-in managed mode without a second writer"
-description: "Design note (lot #4516, owner decision #164208), revised after the review of 29/10 (mty-amh-docs-01): what the native persona memory does today and what it lacks; an opt-in `managed` mode where an admitted external memory service supplies an audience-authorised, immutable projection; separate bindings (persona, verified requesters, session, harness, host, projection); a session pinned to one requester set; idempotent attach; global revocation separate from session rotation, marked centrally and authorised; observations as proposals with receipts; a complete-or-not session-set observation; refusal/capability matrix; nine proposed lots of at most one day; questions for the owner. No code, no real service."
+description: "Design note (lot #4516, owner decision #164208), revised after the reviews of mty-amh-docs-01 (29/10) and ameesh-dev3 (30/10): what the native persona memory does today and what it lacks; an opt-in `managed` mode where an admitted external memory service supplies an audience-authorised, immutable projection; separate bindings (persona, verified requesters, session, harness, host, projection); a session pinned to one requester set; idempotent attach; global revocation separate from session rotation, marked centrally and authorised; observations as proposals with receipts; a complete-or-not session-set observation; refusal/capability matrix; ten proposed lots of at most one day; questions for the owner. No code, no real service."
 status: draft
 tags: [persona, memoire, projection, audience, revocation, session, vie-privee, identite, opt-in]
-generated: { by: "ameesh-dev7/claude-opus-5-5", at: "2026-10-30T01:30:00Z" }
+generated: { by: "ameesh-dev7/claude-opus-5-5", at: "2026-10-30T01:30:23Z" }
 sources:
   - { resource: "manaty/ameesh#1408", title: "Support externally managed, versioned persona memory projections (16/10/2026, with the two clarifications of the same day)" }
   - { resource: "manaty/ameesh#1379", title: "Contact/workflow delivery thread (A+B), out of scope here" }
@@ -55,7 +55,7 @@ managed mode:
    the last transition to zero sessions. It never infers this from
    `persona_sessions`.
 
-Nine lots of at most one day each (about 58 agent hours), all
+Ten lots of at most one day each (about 64 agent hours), all
 **sensitive** (privacy, identity, rights, concurrency). Owner objective
 (decision #164208): finish the Nexlink and ameesh roadmaps first. So this
 note proposes these lots **unscheduled (P2)**, after an independent review
@@ -157,7 +157,8 @@ memory:
 * **Placement is local and does not call the service.** A managed persona
   is placeable on a host only if the host is in the card's
   `admitted_hosts`, has the service section with a readable token file, and
-  passes every current rule (admission; the isolation check of §3). The
+  passes the current placement rules (host admission). The isolation check
+  stays a **load** check, as today (§3, step 0), not a placement rule. The
   audience is not a placement question: it is decided per load (§3), by the
   service. So a service outage never makes a placement inadmissible, and
   `on_unavailable` governs the load, not the placement. The forge
@@ -209,8 +210,23 @@ humans. So the audience is fixed **per session**, on the requester set:
   the audience for it (typically what all of them may see); ameesh does not
   split or reorder the queue for this.
 
+* **mid-turn human mail obeys the same pin.** Today a human message can
+  reach a running turn: delivery at the safe point (`mail.mid_turn`,
+  `mail.py:715-722`) and the urgent steer into the resident
+  (`_preempt_resident`/`_steer_human`, `runner.py:1780-1885`), gated by
+  `interrupt_allowed` (`runner.py:4056-4094`), which checks the
+  `local_account`, not the audience. For a managed session, both paths
+  accept a message only if its requester is in the pinned set; any other
+  human message is **deferred** to the next turn, whose set then differs,
+  so the runner rotates before serving it. The turn context exposes the
+  pinned set and `requester_key` so that the mid-turn hook can decide the
+  same way and the audit shows what the session was allowed to hear.
+
 Test cases: second human in the same session; a turn with requests from
-two humans; `null` (event, wake) then a human, and a human then `null`.
+two humans; `null` (event, wake) then a human, and a human then `null`;
+an urgent message from a second human during the first human's turn (no
+steer, rotation before the second human's turn); a mid-turn hook message
+from a human outside the set (deferred).
 
 ## 3. Loading an immutable projection
 
@@ -220,10 +236,15 @@ At session start (activation, rotation, new lot session), and only then:
    admitted exception), the load is refused with `memory-isolation` and
    handled like an unavailable service (`postpone` or `run-without`), never
    silently: the turn context and the lot journal say so.
-1. `POST /v1/projections` with the bindings and an `Idempotency-Key` =
-   `persona:session:requester_key:turn_id`.
-2. The answer is `{projection_id, version, digest (sha256 of content),
-   content (UTF-8 Markdown), audience_ref, expires_at, admission_epoch}`.
+1. The runner allocates a `load_id` (the future `persona_projection_loads`
+   row), then sends `POST /v1/projections` with the bindings, the `load_id`
+   and an `Idempotency-Key` = `persona:session:requester_key:turn_id`. The
+   service keeps the `load_id`: it is the handle of every later rotation
+   (§4).
+2. The answer is `{load_id (echoed), projection_id, version, digest (sha256
+   of content), content (UTF-8 Markdown), audience_ref, expires_at,
+   admission_epoch}`. A re-sent request with the same key gets the same
+   answer and the same `load_id`.
    The runner refuses an answer whose digest does not match, whose size is
    above the bound, which has no version, or in which the existing
    `SECRET_PATTERNS` match.
@@ -241,17 +262,23 @@ At session start (activation, rotation, new lot session), and only then:
    transcript still holds it, which is why retirement (§5) deals with
    transcripts.
 5. A `persona_projection_loads` row records the load in the same
-   transaction as `begin_turn`: `load_id`, persona, session, turn, host,
+   transaction as `begin_turn`, **before** launch: `load_id`, persona,
+   session (null until known), turn, host,
    harness, `requester_key`, projection_id, version, digest,
    `audience_ref`, `expires_at`, `admission_epoch`, loaded_at, state
    (`loaded | retiring | retired`), retired_at, retire_reason,
-   retire_receipt. The `host` column is what tells §5 and §7 where a
+   retire_receipt, and `admission` (MemoryService card commit, Host card
+   commit). The harness session id is only known after launch
+   (`current_session`/`_note_session`, `runner.py:902-990`): `_note_session`
+   fills it in. The `host` column is what tells §5 and §7 where a
    transcript lives (`agent_lot_sessions` has none). `turn-context.json`
-   names the projection (`{id, version, digest}`), never its content.
+   names the projection (`{load_id, id, version, digest}`) and the session's
+   `requester_key` and requester set, never the content.
 6. **Expiry** (`expires_at`) is not revocation: the model already holds the
    content, and stopping the turn would not withdraw it. A projection that
    expires during a turn lets the turn finish; the session is then rotated
-   before any next turn. A revocation (§5) stops the turn at once.
+   before any next turn. A revocation (§5) stops the turn within one
+   heartbeat interval (§5.2).
 
 **Context slot states** (2nd clarification), per harness session:
 
@@ -269,7 +296,12 @@ is a new load, never a reuse.
 
 A harness cannot unload part of its context. A **refresh is a rotation of
 one session**: `POST /v1/rotate {persona, load_id, reason}`, scoped to that
-load. The runner ends the session at a safe point between two turns, the
+load (the service holds `load_id` from the attach, §3). The answers are
+`rotating` or `rotated` with the receipt; a re-issue after a lost answer
+gets the same receipt; a load that is already `retiring`/`retired` (rotated
+or revoked earlier) answers `already-retired` with its existing receipt;
+an unknown `load_id` or one of another persona answers `unknown-load`. The
+runner ends the session at a safe point between two turns, the
 session goes through the retirement steps of §5 (central mark, then local
 withdrawal), and a new session opens with a new load. Reusing a resident
 session is refused. Other sessions holding the same projection are **not**
@@ -294,11 +326,17 @@ Two operations, with different scopes:
 
 Both are rights gestures. They are accepted from:
 
-* the **admitted MemoryService** of that persona, with the ameesh API
-  token named on its card: a server-side token with the single scope
-  `memory:retire:<service>`, limited to personas whose card names that
-  service, stored hashed on the server, issued and revoked like the other
-  API tokens;
+* the **admitted MemoryService** of that persona, with a **new kind of
+  token**. Today the API has a single Bearer token in a 0600 file
+  (`serve.py:1546-1555`), neither hashed, scoped nor per caller, and
+  `executor_tokens` (`0063_executor_identity.sql:74-88`) is hashed and
+  revocable but reserved to executors, without scope. M5 adds a
+  `memory_service_tokens` table (sha256 of the token, service name, single
+  scope `memory:retire`, created_at, expires_at, revoked_at), an `ameesh
+  memory token issue|rotate|revoke <service>` reserved to human admins
+  (the token is shown once and handed to the service out of band), and the
+  check on the revoke/rotate routes: the token's service must be the one
+  named by the persona's card **at the time of the call**;
 * a **human member** with the admin role, through `ameesh memory revoke` /
   `rotate` under their proven identity.
 
@@ -307,31 +345,58 @@ including the persona itself. Every call, accepted or refused, is
 journaled: actor, token id or member, operation, expected identity, result,
 receipt.
 
+**Change of service or of mode.** When the canon sync sees a persona's
+`memory.service` change, or its mode leave `managed`, ameesh itself revokes
+every load not yet `retired` (actor `canon`, reason `admission-changed`);
+the old service's token no longer matches the card and can no longer act
+on that persona. No new load is made until those loads are `retiring`.
+Revoking the MemoryService card does the same for all its personas, and
+revokes its tokens.
+
 ### 5.2 Central first, local second
 
 The server cannot stop a process or delete a file on a host. So:
 
 1. **central mark**, on the server, in the **same transaction** as the
-   accepted request: the loads go to `retiring`, and each session id goes
-   into `revoked_sessions` (session, harness, persona, reason, at). This
-   table is read on **every** resume path, whatever host asks:
-   `_session_connue`, the parked-session resume and `lot_sessions.switch`,
-   `ameesh adopt`, and the relay to another harness. A revoked id is never
-   passed to `--resume`. Since the mark is central and written before any
-   host acts, a host that takes over the lease after the holder went down
-   cannot resume the session, even if the holder never applied its local
-   steps;
-2. **signal**: the server sends a `memory-revoked` event to the persona
-   (existing mail/event path). The runner of the host named in the load
-   also reads `revoked_sessions` before every turn and on heartbeat, so a
-   lost event delays the local steps but not the fence;
-3. **local steps**, by the runner of the host named in the load: stop a
-   running turn of that session (the L498 cgroup kill), then withdraw the
+   accepted request. There are two fences, because the harness session id
+   is only known after launch (§3, step 5):
+   * the **load fence**: the `persona_projection_loads` rows go to
+     `retiring`. This covers a first load whose session id is not yet
+     known. The runner reads the state of its current `load_id` just before
+     launch and on every heartbeat;
+   * the **resume fence**: each session id already known goes into
+     `revoked_sessions` (session, harness, persona, reason, at). When
+     `_note_session` later learns the id of a load that is already
+     `retiring`, it writes the id into `revoked_sessions` in the same
+     transaction. This table is read on **every** resume path, whatever
+     host asks: `_session_connue`, the parked-session resume and
+     `lot_sessions.switch`, `ameesh adopt`, and the relay to another
+     harness. A revoked id is never passed to `--resume`.
+
+   Since both marks are central and written before any host acts, a host
+   that takes over the lease after the holder went down cannot resume the
+   session, even if the holder never applied its local steps.
+   **Fail closed**: for a persona in managed mode, a fence that cannot be
+   read (database or API unreachable) means no resume and no launch; the
+   turn is postponed. This is the opposite of today's rule for an
+   unverifiable session store, where `_session_connue` keeps the session in
+   doubt (`runner.py:3597`); that rule stays for native personas;
+2. **signal and stop**: the server sends a `memory-revoked` event to the
+   persona (existing mail/event path), which wakes its runner. The
+   runner's **heartbeat thread**, which already stops the turn's group when
+   the lease is lost (`stop_group_now`, `runner.py:1050-1105`), reads the
+   load fence at each beat and calls `stop_group_now("memory revoked")`
+   for a `retiring` load. The delay between the central mark and the stop
+   is therefore bounded by **one heartbeat interval** (plus the event, if
+   it arrives earlier); the qualification measures it. A lost event delays
+   nothing beyond that bound;
+3. **local steps**, by the runner of the host named in the load: once the
+   turn is stopped (step 2), withdraw the
    transcript from the harness store (Claude `projects/…/<id>.jsonl`,
    Codex/dsh `sessions/…`) according to Q1. A host that is down applies
    them **before any turn** when it comes back. What happens to the mail of
    a stopped turn follows the existing behaviour of an interrupted turn;
-   M6 checks and tests it, and adds no requeue mechanism;
+   M7 checks and tests it, and adds no requeue mechanism;
 4. **receipt**: `{persona, operation, expected, loads:[{load_id, session,
    host, central: marked, local: pending|done|failed, transcript:
    withdrawn|absent|failed, turn_stopped}], at}`. A load is `retired` only
@@ -354,6 +419,9 @@ ameesh memory propose --key <K> [--kind fact|preference|correction] < body.md
 ameesh memory receipt <K>
 ```
 
+* The CLI finds its load through `AMEESH_TURN_CONTEXT`, whose `projection`
+  field carries the `load_id` (§3, step 5); without a turn context, or with
+  a load that is not `loaded`, it refuses (`projection-retired`).
 * The proposal goes into a `memory_proposals` outbox (persona, session,
   turn, load_id, requester_key, key, body digest, state
   `pending → submitted → acknowledged | refused`, receipt). The insert is
@@ -377,12 +445,26 @@ ameesh memory receipt <K>
 
 ```json
 {"schema": "ameesh-memory-sessions/1", "observed_at": 1761772800.0,
- "admission": "<commit>", "completeness": "complete|partial|unknown",
- "sessions": [{"session": "…", "host": "…",
+ "admission": {"service_card": "<commit>", "admission_epoch": 12},
+ "completeness": "complete|partial|unknown",
+ "sessions": [{"load_id": "…", "session": "…", "host": "…",
                "state": "running|parked|ended|retiring",
-               "projection": {"id": "…", "version": 7}}],
+               "projection": {"id": "…", "version": 7},
+               "admission": {"service_card": "<commit>", "host_card": "<commit>",
+                             "admission_epoch": 12}}],
+ "other_admissions": [{"admission_epoch": 11, "loads": 2}],
  "last_zero_at": 1761771000.0, "last_zero_seq": 41}
 ```
+
+* **Admission scope** (1st clarification: "scoped to the persona/admission
+  version"). Each load records the admission it was made under: the
+  MemoryService card commit, the Host card commit, and the service's
+  `admission_epoch`. The consumer asks for one admission
+  (`?admission_epoch=N`; default: the current one). `sessions` lists only
+  the loads of that admission; loads of other admissions still holding a
+  transcript are **counted** in `other_admissions`, never mixed in.
+  `last_zero_*` is per persona and admission. The top-level `admission`
+  names the admission observed.
 
 * The set is **every session whose transcript may still hold an admitted
   projection**: every load not yet `retired`, whatever the session's state
@@ -390,23 +472,25 @@ ameesh memory receipt <K>
   normally is retired like a rotation (reason `ended`, transcript withdrawn
   per Q1); until its local part is done, it stays in the set. The set is
   never read from `persona_sessions`, whose writes are best-effort.
-* The **host universe** is the set of hosts named by those loads. The
+* The **host universe** is the set of hosts named by the loads of the
+  observed admission. The
   observation is `complete` only if every one of them has a fresh runner
   heartbeat and no pending local step older than that heartbeat. Otherwise
   `partial` (some hosts are stale) or `unknown` (the database or the API
   cannot be read). An empty set that is not `complete` is **not** a zero.
 * `last_zero_at`/`last_zero_seq` is written in the same transaction as the
-  last load of the set becoming `retired`. Its monotonic sequence lets the
+  last load of the set (that admission) becoming `retired`. Its monotonic sequence lets the
   consumer tell a new closure from an old one. Batching and the "final
   flush" policy stay with the consumer.
 
 ## 8. Mediated executor
 
 The mediated executor has no SQL. Managed mode needs three exec-API
-operations in the closed contract: `memory.load` (record and recheck),
+operations in the closed contract: `memory.load` (record, recheck and
+read the load fence),
 `memory.retire_local` (the local steps of §5.2) and `memory.propose`. The
 projection request itself goes from the executor's host to the service:
-the content never passes through the ameesh server. Until that lot (M9), a
+the content never passes through the ameesh server. Until that lot (M10), a
 managed persona is **not placeable** on a mediated executor. It is refused
 at placement, not silently degraded as native memory is today.
 
@@ -417,7 +501,7 @@ at placement, not silently degraded as native memory is today.
 | card with `managed` and `repository` | `canon check` error | `memory-mode-conflict` |
 | host without the service's section or token | not placeable | `memory-service-unconfigured` |
 | host not in the card's `admitted_hosts` | not placeable | `memory-service-host-refused` |
-| mediated executor (before M9) | not placeable | `memory-managed-unsupported` |
+| mediated executor (before M10) | not placeable | `memory-managed-unsupported` |
 | another active persona may share the UID, no admitted exception | no load; `postpone` or `run-without`, said in the turn context and journal (never silent) | `memory-isolation` |
 | harness adapter without a private prompt channel | no load; `postpone` or `run-without` | `memory-prompt-channel` |
 | service unreachable at session start | `on_unavailable: postpone`: turn postponed, request kept, retried with backoff; `run-without`: session opens `clean`, and the turn context says so | `memory-service-unavailable` |
@@ -425,6 +509,7 @@ at placement, not silently degraded as native memory is today.
 | persona identity not proven by the lease | no request sent | `memory-identity-unproven` |
 | requester unverified or absent | sent as `verified:false` / empty set; the service decides | — |
 | turn's requester set differs from the session's | rotation before the turn | `requester-set-changed` |
+| mid-turn or urgent human message from outside the pinned set | not delivered, not steered; deferred to the next turn (rotation) | `requester-outside-set` |
 | digest mismatch, oversize, secret pattern | load refused, nothing reaches the model | `memory-projection-invalid` |
 | revoked between fetch and launch | launch cancelled | `memory-revoked-before-launch` |
 | projection expired during a turn | turn finishes; rotation before the next turn | `memory-projection-expired` |
@@ -432,6 +517,11 @@ at placement, not silently degraded as native memory is today.
 | attach while another projection or set is loaded | refused | `occupied` |
 | revocation of an older version only | no effect | `superseded` |
 | revoke/rotate by an agent, a persona or another service | refused, journaled | `memory-retire-forbidden` |
+| rotate of a load already rotated or revoked | no effect, existing receipt | `already-retired` |
+| rotate of an unknown load or another persona's | refused | `unknown-load` |
+| revocation during the first turn, session id not yet known | turn stopped within one heartbeat (load fence); id fenced when learnt | `retire-incomplete` until done |
+| persona's service changed or mode left `managed` | every unretired load revoked by ameesh; no new load until then | `admission-changed` |
+| load or resume fence unreadable (managed persona) | no resume, no launch; turn postponed (fail closed) | `memory-fence-unreadable` |
 | a local step failed or the host is down | load stays `retiring`; the central fence holds | `retire-incomplete` |
 | resume of a revoked session, on any host or harness | refused, new session | `session-revoked` |
 | native command on a managed persona | refused | `managed-mode` |
@@ -461,7 +551,19 @@ delivered first (M1):
 * requester set: second human in the same session, a turn with two
   humans, `null` then a human, a human then `null` (each rotates);
 * duplicate and lost answer for a load, a proposal, a rotation and a
-  revocation (same key, same receipt);
+  revocation (same key, same receipt); rotation of an already-rotated load
+  (`already-retired`);
+* revocation during the first turn, before the session id is known: the
+  turn stops within one heartbeat, the load stays `retiring`, the id is
+  fenced when `_note_session` learns it, no resume; the delay is measured;
+* fences unreadable for a managed persona: no resume, no launch;
+* an urgent message from a second human during the first human's turn:
+  no steer, rotation before the second human's turn; a mid-turn hook
+  message from outside the set is deferred;
+* service change on the card: old loads revoked by ameesh, the old
+  service's token refused; token issued, rotated, revoked, expired;
+* observation scoped to an admission, with loads of an older admission
+  counted in `other_admissions`;
 * revoke/rotate by an agent, by the persona, by a token of another service
   (refused, journaled);
 * rights lost between fetch and launch; projection expired during a turn;
@@ -478,33 +580,35 @@ delivered first (M1):
 * the session-set observation with one stale host (`partial`), a session
   ended but not yet withdrawn (still in the set), the empty set when
   complete, and `last_zero_seq` that goes up once per closure;
-* the mediated executor: refused at placement before M9, and the three
-  operations after M9.
+* the mediated executor: refused at placement before M10, and the three
+  operations after M10.
 
 # Proposed lots (after review and owner decision)
 
 All are **sensitive** (§1: privacy, identity, rights, SQL, concurrency):
 another family's review; **two families** for M2 (admission, placement),
-M4 (identity, audience), M5 (rights, tokens) and M6 (deletion on the host).
-Estimates are in agent hours, to be re-estimated by the bureau.
+M4 (identity, audience), M5 (rights, tokens), M6 (fences) and M7 (deletion
+on the host). Estimates are in agent hours, to be re-estimated by the
+bureau.
 
 | Lot | Scope | Estimate |
 |---|---|---|
 | M1 | contract `ameesh-memory-projection/1` and matrix in `docs/`; fake service for the tests; consumer guide | 5 h |
 | M2 | `memory.mode`/`service`/`on_unavailable` on the Agent card, MemoryService card, `canon check`; native paths refuse `managed-mode`; `config.json` section and 0600 token; local placement check and codes | 6 h |
-| M3 | optional `requests[].requester {member, verified}` in `ameesh-turn-context/1` (additive, `sender` unchanged); turn requester set and `requester_key` | 4 h |
-| M4 | service client, load, digest/size/secret checks, isolation as a load refusal, recheck before launch, private prompt channel per adapter; migration `persona_projection_loads`; pinning and rotation on set change and expiry; turn-context `projection` field | 8 h |
-| M5 | revoke/rotate API and CLI, service token scope and authorisation, audit journal; central mark `revoked_sessions` read by every resume path (`_session_connue`, parked resume, `lot_sessions.switch`, `adopt`, harness relay); receipt (central part) | 8 h |
-| M6 | local steps on the host: `memory-revoked` event, check before every turn and on heartbeat, turn stop, transcript withdrawal per harness (per Q1), local part of the receipt, application on return; behaviour of the stopped turn's mail checked | 8 h |
-| M7 | `memory_proposals` outbox, `ameesh memory propose/receipt`, idempotent delivery, body erased after acknowledgement | 7 h |
-| M8 | session-set observation (CLI, API route, OpenAPI), host universe from the loads, completeness by heartbeats and pending local steps, `last_zero_seq` | 6 h |
-| M9 | exec-API operations `memory.load`/`retire_local`/`propose`, managed placement on a mediated executor | 6 h |
+| M3 | optional `requests[].requester {member, verified}` in `ameesh-turn-context/1` (additive, `sender` unchanged); turn requester set, `requester_key`, pinned set in the turn context | 4 h |
+| M4 | service client, `load_id` allocation, load, digest/size/secret checks, isolation as a load refusal, recheck before launch, private prompt channel per adapter; migration `persona_projection_loads`; pinning, mid-turn and steer gating, rotation on set change and expiry; turn-context `projection` field | 8 h |
+| M5 | `memory_service_tokens` (issue, rotate, revoke, expiry), revoke/rotate API and CLI with their authorisation and answers, audit journal, automatic revocation on service or mode change | 8 h |
+| M6 | central fences: load state read before launch and by the heartbeat thread (stop within one beat), `revoked_sessions` written at revocation and by `_note_session`, read by every resume path, fail closed for managed personas; receipt (central part) | 6 h |
+| M7 | local steps on the host: `memory-revoked` event, transcript withdrawal per harness (per Q1), local part of the receipt, application on return; behaviour of the stopped turn's mail checked | 8 h |
+| M8 | `memory_proposals` outbox, `ameesh memory propose/receipt` (load from the turn context), idempotent delivery, body erased after acknowledgement | 7 h |
+| M9 | session-set observation (CLI, API route, OpenAPI), admission scope, host universe from the loads, completeness by heartbeats and pending local steps, `last_zero_seq` | 6 h |
+| M10 | exec-API operations `memory.load`/`retire_local`/`propose`, managed placement on a mediated executor | 6 h |
 
-Order: M1 → M2 → M3 → M4 → M5 → M6 → (M7, M8 in parallel); M9 only if a
-consumer runs on a mediated executor. M4 depends on M3 for the requester
-set; M5 and M6 are split so that no lot exceeds one day. Total about 58 h
-(52 h without M9). The consumer adapter stays on the consumer's side,
-against M1.
+Order: M1 → M2 → M3 → M4 → M5 → M6 → M7 → (M8, M9 in parallel); M10 only
+if a consumer runs on a mediated executor. M4 depends on M3 for the
+requester set; M5, M6 and M7 are split so that no lot exceeds one day.
+Total about 64 h (58 h without M10). The consumer adapter stays on the
+consumer's side, against M1.
 
 # Questions for the owner
 
@@ -524,7 +628,7 @@ against M1.
 4. **Q4, isolation**: is "no other active persona on the host" (current
    rule) enough for a first managed consumer, or must L155 layer 1 (one
    Unix user per persona) come first?
-5. **Q5, sequencing**: keep M1-M9 unscheduled (P2) until the Nexlink and
+5. **Q5, sequencing**: keep M1-M10 unscheduled (P2) until the Nexlink and
    ameesh roadmaps are finished (recommended, per the objective in
    #164208), or schedule them now for the consumer?
 6. **Q6, admission of a MemoryService**: confirm that each service is
@@ -550,7 +654,10 @@ against M1.
 
 # State
 
-Draft, revised after the blocked review of 29/10 (mty-amh-docs-01, freeze
-#26650): points 1 to 15 and the minor remarks are addressed above. No code,
-no service and no real data were used. Lots M1-M9 are proposals: none is
-created before the review and the owner's decision on Q1-Q6.
+Draft, revised after two blocked reviews: mty-amh-docs-01 on
+`8cb416f92203` (freeze #26650, 15 points) and ameesh-dev3 on
+`35997929a92f` (freeze #26788, 6 points and remarks: first-load fence,
+`load_id` for the service, mid-turn mail, isolation as a load check, a new
+token kind, admission scope of the observation, fail closed, stop bound).
+No code, no service and no real data were used. Lots M1-M10 are proposals:
+none is created before the review and the owner's decision on Q1-Q6.
