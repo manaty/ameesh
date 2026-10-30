@@ -23,7 +23,7 @@ import os
 import unittest
 from unittest import mock
 
-from ameesh import adapters, context_metrics, cost, mechanics
+from ameesh import adapters, context_metrics, cost, events, mechanics
 from ameesh.runner import AgentWorker
 
 from .support import PgTestCase
@@ -262,9 +262,15 @@ class ContextSessionStateTest(unittest.TestCase):
     def setUp(self):
         self.worker = _context_worker()
         patcher = mock.patch("ameesh.runner.cost_mod.session_reread",
-                             return_value=100)
+                             return_value={"tokens": 100, "turns": 1,
+                                           "last_ts": 1.0})
         self.addCleanup(patcher.stop)
         self.session_reread = patcher.start()
+        proof = mock.patch.object(
+            AgentWorker, "_context_resume_state",
+            return_value=(100, context_metrics.MEASURED, ()))
+        self.addCleanup(proof.stop)
+        proof.start()
 
     def test_partiel_puis_complet_reste_partiel(self):
         self.assertEqual(self.worker._context_session_baseline("s"), 100)
@@ -347,6 +353,86 @@ class ContextSessionStateTest(unittest.TestCase):
         self.assertEqual(self.worker._context_session_baseline(None), 0)
         self.assertEqual(self.worker._context_baseline_quality,
                          context_metrics.MEASURED)
+
+
+class ContextResumeProofTest(PgTestCase):
+    """Worker neuf sur la même session : la qualité ne remonte jamais à
+    ``measured`` sans preuve publiée (#4870, B cx3)."""
+
+    def setUp(self):
+        self.worker = _context_worker()
+        self.worker.db = self.db
+        # Le schéma PgTestCase est partagé par la classe : un agent par test
+        # évite qu'un tour d'un autre test entre dans la base relue.
+        self.agent = "ctx-resume-" + self._testMethodName
+        self.worker._name = self.agent
+
+    def _insert_turn(self, session, input_tokens=100, cached=0):
+        cost.storage.of(self.db).turn_costs.insert(
+            agent=self.agent, harness="deepseek", turn=None, model=None,
+            session=session, usd=0.0, input_tokens=input_tokens,
+            cached_input_tokens=cached, output_tokens=0,
+            cum_usd=None, cum_input_tokens=None,
+            cum_cached_input_tokens=None, cum_output_tokens=None)
+
+    def _publish(self, session, value, quality, reasons=()):
+        events.record(
+            self.db, cost.CONTEXT_EVENT, "agent:" + self.agent,
+            project="ameesh", session=session,
+            legacy={"session_turns": 1},
+            context={"session": session,
+                     "measures": {"R_session": {
+                         "value": value, "quality": quality,
+                         "reasons": list(reasons)}}})
+
+    def test_reprise_partielle_reste_partielle(self):
+        self._insert_turn("s")
+        self._publish("s", 100, context_metrics.PARTIAL,
+                      ("cache_read_unknown",))
+        self.assertEqual(self.worker._context_session_baseline("s"), 100)
+        self.assertEqual(self.worker._context_baseline_quality,
+                         context_metrics.PARTIAL)
+        self.assertIn("cache_read_unknown",
+                      self.worker._context_baseline_reasons)
+        # Un tour complet suivant ne promeut pas la base.
+        self.worker._remember_context_session(
+            _turn_document("s", 20, context_metrics.MEASURED), "s")
+        self.assertEqual(self.worker._context_session_reread, 120)
+        self.assertEqual(self.worker._context_session_quality,
+                         context_metrics.PARTIAL)
+        self.assertIn("cache_read_unknown",
+                      self.worker._context_session_reasons)
+
+    def test_reprise_complete_reste_mesuree(self):
+        self._insert_turn("s")
+        self._publish("s", 100, context_metrics.MEASURED)
+        self.assertEqual(self.worker._context_session_baseline("s"), 100)
+        self.assertEqual(self.worker._context_baseline_quality,
+                         context_metrics.MEASURED)
+
+    def test_sans_evenement_reste_inconnue(self):
+        self._insert_turn("s")
+        self.assertIsNone(self.worker._context_session_baseline("s"))
+        self.assertEqual(self.worker._context_baseline_quality,
+                         context_metrics.UNKNOWN)
+        self.assertIn(context_metrics.REASON_SESSION_BASELINE_UNKNOWN,
+                      self.worker._context_baseline_reasons)
+
+    def test_tour_inscrit_depuis_la_publication_reste_inconnue(self):
+        self._insert_turn("s")
+        self._publish("s", 100, context_metrics.MEASURED)
+        self._insert_turn("s", input_tokens=50)
+        self.assertIsNone(self.worker._context_session_baseline("s"))
+        self.assertEqual(self.worker._context_baseline_quality,
+                         context_metrics.UNKNOWN)
+
+    def test_evenement_sans_r_session_reste_inconnu(self):
+        self._insert_turn("s")
+        self._publish("s", None, context_metrics.UNKNOWN,
+                      (context_metrics.REASON_TURN_NOT_MEASURED,))
+        self.assertIsNone(self.worker._context_session_baseline("s"))
+        self.assertEqual(self.worker._context_baseline_quality,
+                         context_metrics.UNKNOWN)
 
 
 class SessionRereadTest(PgTestCase):

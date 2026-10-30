@@ -287,6 +287,11 @@ LIVE_REVIEW_START_SLACK_S = 300.0
 MEASURE_CANONS_TTL_S = 300.0
 #: L85 : rétention du journal d'événements, au plus une fois par heure
 EVENTS_PRUNE_EVERY_S = 3600.0
+#: CTX-02b (#4870) : la qualité d'une session reprise par un worker neuf se
+#: recharge du dernier `turn.context` publié. La fenêtre borne la lecture au
+#: journal récent ; au-delà, ou sans preuve, la base reste inconnue.
+CONTEXT_RESUME_DAYS = 30
+CONTEXT_RESUME_EVENTS = 200
 #: #3070 : levée des portes d'appareil indisponible, au plus toutes les 5 min
 DEVICE_GATES_EVERY_S = 300.0
 #: #2096 : bornes de l'affichage gardé pour un tour de résumé (repli d'un flux
@@ -2297,12 +2302,15 @@ class AgentWorker(threading.Thread):
     def _context_session_baseline(self, session: str | None) -> int | None:
         """CTX-02b : ``R_session`` des tours précédents, pour le normalisateur.
 
-        Une session neuve part de zéro ; une session reprise est relue du
-        grand livre **une fois** (puis tenue à jour par l'observation), et reste
-        inconnue si la lecture échoue — jamais un zéro supposé. Une base
-        partielle garde sa qualité et ses raisons ; une collecte perdue la rend
-        inconnue jusqu'à une session neuve explicite (#4870, B cx1). Observation
-        seule : aucune décision ne lit cette valeur.
+        Une session neuve part de zéro ; une session reprise relit le grand
+        livre **une fois** (puis la base est tenue à jour par l'observation).
+        La somme legacy ne prouve pas la complétude : elle n'est ``measured``
+        que si le dernier ``turn.context`` publié porte la même valeur et
+        qu'aucun tour n'a été inscrit depuis ; sinon la base reste inconnue,
+        avec sa raison (#4870, B cx3). Une base partielle garde sa qualité et
+        ses raisons ; une collecte perdue la rend inconnue jusqu'à une session
+        neuve explicite (B cx1). Observation seule : aucune décision ne lit
+        cette valeur.
         """
         if not session:
             if self._context_session_lost is not None:
@@ -2333,17 +2341,64 @@ class AgentWorker(threading.Thread):
             self._context_baseline_quality = self._context_session_quality
             self._context_baseline_reasons = self._context_session_reasons
             return self._context_session_reread
-        value = cost_mod.session_reread(self.db, self.name, session)
+        info = cost_mod.session_reread(self.db, self.name, session)
+        if info is None:
+            value, quality, reasons = (
+                None, context_metrics.UNKNOWN,
+                (context_metrics.REASON_SESSION_BASELINE_UNKNOWN,))
+        else:
+            value, quality, reasons = self._context_resume_state(session, info)
         self._context_session_id = session
         self._context_session_reread = value
-        self._context_session_quality = (context_metrics.MEASURED
-                                         if value is not None
-                                         else context_metrics.UNKNOWN)
-        self._context_session_reasons = ()
+        self._context_session_quality = quality
+        self._context_session_reasons = reasons
         self._context_baseline = value
-        self._context_baseline_quality = self._context_session_quality
-        self._context_baseline_reasons = self._context_session_reasons
+        self._context_baseline_quality = quality
+        self._context_baseline_reasons = reasons
         return value
+
+    def _context_resume_state(
+            self, session: str, info: dict) -> tuple[int | None, str, tuple[str, ...]]:
+        """CTX-02b : qualité durable d'une base ``R_session`` reprise.
+
+        Le grand livre ne dit pas si les tours précédents étaient complets :
+        un tour partiel, un ``R_turn`` absent ou une publication perdue y
+        laissent les mêmes compteurs legacy. La preuve est le dernier
+        ``turn.context`` publié pour cette session : il porte la valeur, la
+        qualité et les raisons de la base, et son instant dit si un tour a été
+        inscrit depuis. Sans événement, valeur divergente ou tour inscrit
+        depuis, la base reste inconnue (#4870, B cx3) — jamais un total
+        supposé.
+        """
+        try:
+            rows = storage.of(self.db).events.recent_type(
+                cost_mod.CONTEXT_EVENT, CONTEXT_RESUME_DAYS,
+                CONTEXT_RESUME_EVENTS, object="agent:" + self.name)
+        except Exception as exc:  # noqa: BLE001 — mesure seulement
+            log_async("[%s] context resume proof not read (%s)"
+                      % (self.name, " ".join(str(exc).split())[:160]))
+            rows = ()
+        for row in rows or ():
+            data = row.get("data") or {}
+            if data.get("session") != session:
+                continue
+            # Un tour inscrit depuis la publication est un trou : sa mesure
+            # n'est pas dans l'événement, la somme legacy ne la remplace pas.
+            if float(row.get("ts") or 0.0) < float(info.get("last_ts") or 0.0):
+                break
+            measure = (((data.get("context") or {}).get("measures") or {})
+                       .get("R_session") or {})
+            value = measure.get("value")
+            if value is None or int(value) != int(info.get("tokens") or 0):
+                break
+            quality = measure.get("quality")
+            if quality not in (context_metrics.MEASURED,
+                               context_metrics.DERIVED,
+                               context_metrics.PARTIAL):
+                break
+            return int(value), quality, tuple(measure.get("reasons") or ())
+        return (None, context_metrics.UNKNOWN,
+                (context_metrics.REASON_SESSION_BASELINE_UNKNOWN,))
 
     def _context_session_forget(self) -> None:
         """Oublie la base ``R_session`` : session neuve explicite (rotation,

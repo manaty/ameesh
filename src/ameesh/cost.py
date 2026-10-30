@@ -639,15 +639,22 @@ def context_publication(document: dict, *, legacy: dict, decision: dict,
     }
 
 
-def session_reread(db, agent: str, session: str) -> int | None:
+def session_reread(db, agent: str, session: str) -> dict | None:
     """Le cumul ``R_session`` des tours **précédents** d'une session, ou None.
 
     Lecture seule du grand livre, pour la base ``session_reread`` du
     normalisateur de contexte (CTX-02b) : entrée + cache **lu**, cache écrit
-    exclu ; Codex compte déjà le cache dans son entrée. Aucun tour inscrit
-    (session neuve, base neuve) ou lecture impossible : None — le normalisateur
-    publie alors ``R_session`` inconnu avec sa raison, jamais un zéro supposé.
-    Une erreur de base ne retient jamais un tour : la mesure est d'observation.
+    exclu ; Codex compte déjà le cache dans son entrée. Rend ``tokens``,
+    ``turns`` et ``last_ts`` (instant du dernier tour inscrit). Aucun tour
+    inscrit (session neuve, base neuve) ou lecture impossible : None — le
+    normalisateur publie alors ``R_session`` inconnu avec sa raison, jamais un
+    zéro supposé.
+
+    La somme legacy ne prouve pas la complétude des tours précédents : c'est
+    à l'appelant de vérifier la qualité durable de la base (un tour partiel,
+    un ``R_turn`` absent ou une publication perdue laissent les mêmes
+    compteurs). Une erreur de base ne retient jamais un tour : la mesure est
+    d'observation.
     """
     if not session:
         return None
@@ -657,7 +664,7 @@ def session_reread(db, agent: str, session: str) -> int | None:
         return None
     if not row or not int(row.get("turns") or 0):
         return None
-    return int(row.get("tokens") or 0)
+    return row
 
 
 def load_prices(path: str | None = None) -> dict:
