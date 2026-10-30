@@ -13,6 +13,7 @@ Témoins :
 """
 from __future__ import annotations
 
+import contextlib
 import time
 import unittest
 from types import SimpleNamespace
@@ -57,6 +58,9 @@ class SlowSweepTest(unittest.TestCase):
 
         with mock.patch.object(plan_git, "latest_freeze",
                                return_value={"sha": HEAD}), \
+                mock.patch.object(review_authors, "_local_object_repo",
+                                  side_effect=lambda _repo: contextlib.nullcontext(
+                                      ("/local-reader", {}))), \
                 mock.patch.object(lot_class, "repo_for_freeze",
                                   return_value=("/repo", HEAD)), \
                 mock.patch.object(lot_class, "default_base",
@@ -118,6 +122,8 @@ class SlowSweepTest(unittest.TestCase):
             gate = self._gate({"id": 4469, "app": "ameesh"}, cache)
         self.assertEqual(gate, {"ok": True})
         self.assertIn("4469", cache)
+        self.assertEqual(fast.call_args.args[0], "/local-reader")
+        self.assertEqual(fast.call_args.args[1], "grep")
 
 
 if __name__ == "__main__":

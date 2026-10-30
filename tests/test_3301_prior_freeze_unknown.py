@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """An obsolete unreceived freeze must not poison every later freeze (#3301)."""
+import subprocess
 from unittest import mock
 
 from ameesh import merge_queue, review_authors, review_provenance, work
@@ -101,9 +102,26 @@ class PriorUnknownTest(_RewriteFixture):
 
     def test_an_unreadable_patch_does_not_excuse_the_unknown(self):
         self.replace()
-        with mock.patch.object(review_authors.plan_git, "_diff_patch_id",
+        with mock.patch.object(review_authors, "_read_diff_patch_id",
                                return_value=None):
             self.assertIn(self.unreceived[:12], self.read(strict=True)[1])
+
+    def test_failed_local_diff_does_not_excuse_the_unknown(self):
+        self.replace()
+        original = review_authors._read_git
+        failed_reads = []
+
+        def unreadable(repo, *args, **kwargs):
+            if (args[0] == "diff" and
+                    self.unreceived.startswith(args[-1]) and
+                    args[-2] == args[-1] + "^"):
+                failed_reads.append(args)
+                return subprocess.CompletedProcess(args, 1, b"", b"unreadable object")
+            return original(repo, *args, **kwargs)
+
+        with mock.patch.object(review_authors, "_read_git", side_effect=unreadable):
+            self.assertIn(self.unreceived[:12], self.read(strict=True)[1])
+        self.assertTrue(failed_reads, "the unreadable diff must actually be attempted")
 
     def test_current_unknown_is_never_excused_by_a_historical_receipt(self):
         self.head_b = self.unreceived
