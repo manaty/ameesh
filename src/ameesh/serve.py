@@ -71,7 +71,7 @@ import time
 import urllib.parse
 from typing import Callable
 
-from . import events, httpkit, serve_actions, server_faults, storage, version
+from . import events, httpkit, serve_actions, server_faults, storage, turn_observation, version
 from . import db as db_mod
 
 BIND = "127.0.0.1"
@@ -94,6 +94,9 @@ LANGUAGES = ("fr", "en")
 #: an agent, host or project name; a lot id; a thread entry id; a duration
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@:+-]{0,127}$")
 _LOT_RE = re.compile(r"^[0-9]{1,9}$")
+#: a turn id (#2167: `uuid.uuid4().hex`) and a mailbox id (`bigserial`)
+_TURN_RE = re.compile(r"^[0-9a-f]{32}$")
+_MAIL_RE = re.compile(r"^[0-9]{1,19}$")
 #: a conversation cursor or page size (`?after=`, `?limit=`)
 _SEQ_RE = re.compile(r"^(0|[1-9][0-9]{0,15})$")
 _ENTRY_RE = re.compile(r"^[A-Za-z0-9._/#:-]{1,256}$")
@@ -380,6 +383,28 @@ def _thread(ctx: Context, db, params, query) -> dict:
                          "text": e.text, "ts": e.ts, "meta": e.meta} for e in entries]}
 
 
+def _turn(ctx: Context, db, params, query) -> dict:
+    """#2167 B1: the observation of one turn (metadata only).
+
+    Local mode: the token is the machine owner's, so it sees every agent's
+    turn, like `/api/v1/agents`. Team mode's relation filters (L86) apply to
+    events (`Context.sees`); a turn carries no project of its own, and the
+    document holds no message body or payload, so this read adds no content
+    exposure when the OIDC tokens arrive."""
+    try:
+        return turn_observation.observe(db, turn=params["turn"])
+    except turn_observation.Unknown as exc:
+        raise ApiError(404, "not_found", str(exc)) from exc
+
+
+def _request(ctx: Context, db, params, query) -> dict:
+    """#2167 B1: the observation of one mailbox request (metadata only)."""
+    try:
+        return turn_observation.observe(db, request=int(params["request"]))
+    except turn_observation.Unknown as exc:
+        raise ApiError(404, "not_found", str(exc)) from exc
+
+
 def _openapi(ctx: Context, db, params, query) -> dict:
     return openapi()
 
@@ -431,6 +456,10 @@ ROUTES = (
           query=(("state", {"type": "string"}, "state of the lots"),
                  ("assignee", {"type": "string"}, "assignee of the lots"), _LIMIT)),
     Route(API + "/lots/{id}", "ameesh-lot/1", "One lot (`ameesh work show --json`)", _lot),
+    Route(API + "/turns/{turn}", "ameesh-turn-observation/1",
+          "One turn's observation: state, agent, lease and accounting (#2167)", _turn),
+    Route(API + "/requests/{request}", "ameesh-turn-observation/1",
+          "One mailbox request's observation: delivery state and turn (#2167)", _request),
     Route(API + "/decisions", "ameesh-decisions/1",
           "Decisions waiting for the human (`ameesh decisions --for --json`)", _decisions,
           query=(("all", {"type": "string", "enum": ["0", "1"]},
@@ -452,7 +481,20 @@ ROUTES = (
           None, stream=True),
     Route(OPENAPI_PATH, "openapi", "This document", _openapi, db=False, auth=False),
 )
-_PARAM_RE = {"id": _LOT_RE}
+_PARAM_RE = {"id": _LOT_RE, "turn": _TURN_RE, "request": _MAIL_RE}
+
+
+def _path_schema(name: str) -> dict:
+    """The OpenAPI schema of a path parameter (the route's own matcher)."""
+    if name == "id":
+        return {"type": "integer"}
+    if name == "request":
+        return {"type": "integer", "minimum": 1}
+    if name == "turn":
+        return {"type": "string", "pattern": _TURN_RE.pattern}
+    return {"type": "string"}
+
+
 #: the human actions (L87), under the API prefix
 ACTIONS = tuple(dataclasses.replace(action, path=API + action.path)
                 for action in serve_actions.ACTIONS)
@@ -565,13 +607,70 @@ def _obj(schema_id: str | None, required=(), /, **props) -> dict:
             "properties": properties}
 
 
+def _nullable_obj(required=(), /, **props) -> dict:
+    """A block of the turn observation that is null when the fact is not
+    recorded (#2167): never an empty object that a consumer could read as a
+    state."""
+    return {"type": ["object", "null"], "required": list(required),
+            "properties": props}
+
+
 _STR = {"type": "string"}
 _STR_NULL = {"type": ["string", "null"]}
 _LIST = {"type": "array", "items": {"type": "object"}}
 _OBJ = {"type": "object"}
 _NUM = {"type": "number"}
+_NUM_NULL = {"type": ["number", "null"]}
+_INT_NULL = {"type": ["integer", "null"]}
 _HOST = _obj("ameesh-host/1", ["host", "limits", "pressure", "history"],
              host=_STR, limits=_OBJ, history=_LIST)
+#: #2167 B1: the observation of one turn or one request (study l2894, §3).
+#: The enums are the domain constants, so a new state cannot be documented
+#: without the builder and the tests seeing it.
+_OBSERVATION = _obj(
+    "ameesh-turn-observation/1",
+    ["observed_ts", "by", "request", "turn", "agent", "lease", "accounting",
+     "quiescent"],
+    observed_ts=_NUM,
+    by=_obj(None, [], turn=_STR_NULL, request={"type": ["integer", "null"]}),
+    request=_nullable_obj(
+        ["id", "agent", "state", "created_ts", "delivered_ts", "delivered_turn_id"],
+        id={"type": "integer"}, agent=_STR,
+        state={"enum": list(turn_observation.REQUEST_STATES)},
+        created_ts=_NUM, delivered_ts=_NUM_NULL, delivered_turn_id=_STR_NULL),
+    turn=_nullable_obj(
+        ["id", "state", "started_ts", "ended_ts", "work_item_id"],
+        id=_STR, state={"enum": list(turn_observation.TURN_STATES)},
+        started_ts=_NUM_NULL, ended_ts=_NUM_NULL, work_item_id=_STR_NULL),
+    agent=_obj(
+        None,
+        ["name", "status", "status_since_ts", "status_text", "harness", "model",
+         "session_id", "turns", "budget_usd", "spent_usd", "turn_in_progress",
+         "last_turn_ts"],
+        name=_STR, status=_STR, status_since_ts=_NUM_NULL, status_text=_STR_NULL,
+        harness=_STR_NULL, model=_STR_NULL, session_id=_STR_NULL,
+        turns={"type": "integer"}, budget_usd=_NUM_NULL, spent_usd=_NUM_NULL,
+        turn_in_progress={"type": "boolean"}, last_turn_ts=_NUM_NULL),
+    lease=_obj(None, ["owner", "epoch", "live", "expires_ts"],
+               owner=_STR_NULL, epoch=_INT_NULL, live={"type": "boolean"},
+               expires_ts=_NUM_NULL),
+    accounting=_obj(
+        None, ["state", "spend_key", "marker", "reservation", "ledger"],
+        state={"enum": list(turn_observation.ACCOUNTING_STATES)},
+        spend_key=_STR_NULL,
+        marker=_nullable_obj(["created_ts", "model", "turn_id"],
+                             created_ts=_NUM, model=_STR_NULL, turn_id=_STR_NULL),
+        reservation=_nullable_obj(
+            ["billing_account", "usd", "period", "state"],
+            billing_account=_STR, usd=_NUM, period=_STR, state=_STR),
+        ledger=_nullable_obj(
+            ["turn_id", "spend_key", "billing_account", "usd", "model",
+             "recorded_ts", "source"],
+            turn_id=_STR_NULL, spend_key=_STR_NULL, billing_account=_STR_NULL,
+            usd=_NUM, model=_STR_NULL, recorded_ts=_NUM, source=_STR_NULL)),
+    quiescent={"type": "boolean"},
+)
+
 #: the response schemas: the keys every response carries (the objects they
 #: hold are the CLI's, documented in docs/EXPLOITATION.md and docs/PROGRESS.md)
 SCHEMAS = {
@@ -613,6 +712,7 @@ SCHEMAS = {
         None, ["id", "title", "state", "events", "milestones", "planned", "estimate"],
         id={"type": "integer"}, title=_STR, state=_STR, events=_LIST, milestones=_LIST,
         planned=_OBJ)),
+    "ameesh-turn-observation/1": _OBSERVATION,
     "ameesh-decisions/1": _obj("ameesh-decisions/1", ["requests", "prose", "approvals"],
                                requests=_LIST, prose=_LIST, approvals=_LIST),
     "ameesh-alerts/1": _obj("ameesh-alerts/1", ["alerts"], alerts={
@@ -674,7 +774,7 @@ def openapi() -> dict:
                                           "schema": {"type": "object"}}}}}}}
             continue
         params = [{"name": name, "in": "path", "required": True,
-                   "schema": {"type": "integer"} if name == "id" else {"type": "string"}}
+                   "schema": _path_schema(name)}
                   for name in re.findall(r"\{(\w+)\}", route.path)]
         params += [{"name": name, "in": "query", "required": False, "schema": schema,
                     "description": query_description(route, name, text)}

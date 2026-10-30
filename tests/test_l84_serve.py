@@ -18,11 +18,13 @@ import stat
 import tempfile
 import threading
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
 from ameesh import db as db_mod
-from ameesh import fil, httpkit, mesh_cli, registry, serve, server_faults, storage, work
+from ameesh import fil, httpkit, mail, mesh_cli, registry, serve, server_faults, storage
+from ameesh import turn_observation, work
 from ameesh import resources as res
 from ameesh import version as package_version
 
@@ -294,6 +296,18 @@ class ServePgTest(ServerMixin, PgTestCase):
                                                         text="fil du projet"))
         transport.post(fil.ThreadRef("demo", str(cls.lot["id"])),
                        fil.Entry(author="agent:a1", recipient="tous", text="fil du lot"))
+        # #2167 B1: one turn with its resource row, and one request delivered
+        # in it (the turn recorded in `meta.consigne.turn` at reservation).
+        cls.turn = uuid.uuid4().hex
+        storage.of(cls.db).turn_resources.open_turn(
+            cls.turn, "a1", "h1", pgid=None, label="tour observé")
+        cls.request = mail.send(cls.db, "human:owner", "a1",
+                                "corps secret jamais observé", kind="request",
+                                payload={"secret": "charge utile jamais observée"})
+        token = mail.new_token()
+        mail.reserve(cls.db, "a1", None, None, token, ids=[cls.request],
+                     porteur="test", turn_id=cls.turn)
+        mail.deliver(cls.db, "a1", None, None, token, [cls.request])
 
     def setUp(self):
         ctx = serve.Context(cfg=dataclasses.replace(self.cfg, read_only=True),
@@ -313,6 +327,8 @@ class ServePgTest(ServerMixin, PgTestCase):
             "/api/v1/agents/{agent}/chat": "/api/v1/agents/a1/chat?limit=5",
             "/api/v1/lots": "/api/v1/lots?state=build&limit=10",
             "/api/v1/lots/{id}": "/api/v1/lots/" + lot,
+            "/api/v1/turns/{turn}": "/api/v1/turns/" + self.turn,
+            "/api/v1/requests/{request}": "/api/v1/requests/%d" % self.request,
             "/api/v1/decisions": "/api/v1/decisions?all=1",
             "/api/v1/alerts": "/api/v1/alerts",
             "/api/v1/hosts": "/api/v1/hosts",
@@ -338,6 +354,39 @@ class ServePgTest(ServerMixin, PgTestCase):
             schema = components["schemas"][route.schema.replace("/", "-")]
             self.assertEqual(schema_errors(schema, data), [], route.path)
             self.assertEqual(data["schema"], route.schema)
+
+    def test_turn_and_request_observation(self):
+        # #2167 B1: both routes answer the same `ameesh-turn-observation/1`
+        # document; the request names its delivery turn, the turn names no
+        # request. Local mode's token is the owner's, like `/api/v1/agents`.
+        status, turn = self.get_json("/api/v1/turns/" + self.turn)
+        self.assertEqual(status, 200, turn)
+        self.assertEqual(turn["by"], {"turn": self.turn})
+        self.assertIsNone(turn["request"])
+        self.assertEqual(turn["turn"]["id"], self.turn)
+        self.assertEqual(turn["turn"]["state"], "running")
+        self.assertEqual(turn["agent"]["name"], "a1")
+        self.assertFalse(turn["agent"]["turn_in_progress"])
+        self.assertFalse(turn["lease"]["live"])
+        self.assertEqual(turn["accounting"]["state"], "none")
+        self.assertTrue(turn["quiescent"])
+        status, request = self.get_json("/api/v1/requests/%d" % self.request)
+        self.assertEqual(status, 200, request)
+        self.assertEqual(request["by"], {"request": self.request})
+        self.assertEqual(request["request"]["state"], "delivered")
+        self.assertEqual(request["request"]["delivered_turn_id"], self.turn)
+        self.assertEqual(request["turn"]["id"], self.turn)
+        # metadata only: neither the body nor the payload crosses the route
+        raw = json.dumps(request) + json.dumps(turn)
+        for secret in ("corps secret", "charge utile"):
+            self.assertNotIn(secret, raw)
+        self.assertNotIn("payload", raw)
+
+    def test_turn_and_request_bad_ids(self):
+        for path in ("/api/v1/turns/not-a-turn", "/api/v1/requests/abcd",
+                     "/api/v1/requests/" + "9" * 20):
+            status, data = self.get_json(path)
+            self.assertEqual((status, data["error"]), (400, "bad_path"), path)
 
     def test_timeline_is_the_light_progress_view(self):
         # #3395: the Chronologie endpoint says the same lots as the progress
@@ -416,7 +465,8 @@ class ServePgTest(ServerMixin, PgTestCase):
 
     def test_unknown_objects_are_404(self):
         for path in ("/api/v1/agents/nobody", "/api/v1/lots/999999", "/api/v1/hosts/nowhere",
-                     "/api/v1/threads/nothing"):
+                     "/api/v1/threads/nothing", "/api/v1/turns/" + "0" * 32,
+                     "/api/v1/requests/999999"):
             status, data = self.get_json(path)
             self.assertEqual((status, data["error"]), (404, "not_found"), path)
 
@@ -433,6 +483,184 @@ class ServePgTest(ServerMixin, PgTestCase):
             serve.owner(self.cfg, "alice smith")
         cfg = dataclasses.replace(self.cfg, notify={"default_human": "human:bob"})
         self.assertEqual(serve.owner(cfg), "human:bob")
+
+
+class TurnObservationTest(PgTestCase):
+    """#2167 B1: the `ameesh-turn-observation/1` contract, from the facts.
+
+    The routes are covered by `ServePgTest` (schema and serialisation); here
+    the states are exercised at the builder both routes share, including the
+    accounting precedence that made #2166 silent.
+    """
+
+    def setUp(self):
+        super().setUp()
+        for table in ("turn_resources", "turn_costs", "spend_pending",
+                      "account_reservations"):
+            self.db.execute("DELETE FROM " + table)
+
+    def agent(self, name="a1", status="idle"):
+        registry.upsert(self.db, name, chantier="demo", harness="deepseek", host="h1")
+        if status != "idle":
+            self.db.execute("UPDATE agent_registry SET status=%s, status_text=%s"
+                            " WHERE name=%s", (status, status, name))
+        return name
+
+    def turn(self, state="running", agent="a1"):
+        turn_id = uuid.uuid4().hex
+        resources = storage.of(self.db).turn_resources
+        resources.open_turn(turn_id, agent, "h1", pgid=None, label="tour")
+        if state == "done":
+            resources.close_turn(turn_id, orphan=False)
+        elif state == "orphan":
+            resources.mark_orphan(turn_id)
+        return turn_id
+
+    def marker(self, agent="a1", turn_id=None):
+        return registry.pending_spend_begin(
+            self.db, agent, 1, "tour", "deepseek-flash",
+            turn_id=turn_id or uuid.uuid4().hex)
+
+    def ledger(self, agent, marker):
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, turn, model, usd, turn_id,"
+            " spend_key, started_at, recorded_at, source)"
+            " VALUES (%s, 'deepseek', 'tour', %s, 0.5, %s, %s,"
+            " now() - interval '1 hour', now(), 'harness')",
+            (agent, marker.get("model") or "deepseek-flash", marker["turn_id"],
+             marker["spend_key"]))
+
+    def request(self, *, agent="a1", turn_id=None, delivered=False,
+                body="corps secret jamais observé",
+                payload=None):
+        message = mail.send(self.db, "human:owner", agent, body, kind="request",
+                            payload=payload or {"secret": "charge jamais observée"})
+        if delivered:
+            token = mail.new_token()
+            mail.reserve(self.db, agent, None, None, token, ids=[message],
+                         porteur="test", turn_id=turn_id)
+            mail.deliver(self.db, agent, None, None, token, [message])
+        return message
+
+    def test_request_states(self):
+        agent = self.agent()
+        pending = self.request(agent=agent)
+        document = turn_observation.observe(self.db, request=pending)
+        self.assertEqual(document["by"], {"request": pending})
+        self.assertEqual(document["request"]["state"], "pending")
+        self.assertIsNone(document["request"]["delivered_ts"])
+        self.assertIsNone(document["turn"])
+        self.assertEqual(document["accounting"]["state"], "none")
+        self.assertTrue(document["quiescent"])
+
+        turn_id = self.turn("done", agent)
+        delivered = self.request(agent=agent, delivered=True, turn_id=turn_id)
+        document = turn_observation.observe(self.db, request=delivered)
+        self.assertEqual(document["request"]["state"], "delivered")
+        self.assertEqual(document["request"]["delivered_turn_id"], turn_id)
+        self.assertEqual(document["turn"]["state"], "ended")
+        self.assertIsNotNone(document["turn"]["ended_ts"])
+
+        withdrawn = self.request(agent=agent)
+        self.db.execute(
+            "UPDATE agent_mailbox SET delivered_at = now(), status = 'delivered',"
+            " meta = meta || '{\"retire\": {}}'::jsonb WHERE id = %s", (withdrawn,))
+        document = turn_observation.observe(self.db, request=withdrawn)
+        self.assertEqual(document["request"]["state"], "withdrawn")
+        self.assertIsNone(document["request"]["delivered_ts"])
+        self.assertIsNone(document["request"]["delivered_turn_id"])
+
+    def test_turn_states(self):
+        agent = self.agent()
+        running = self.turn("running", agent)
+        self.assertEqual(turn_observation.observe(
+            self.db, turn=running)["turn"]["state"], "running")
+        done = self.turn("done", agent)
+        self.assertEqual(turn_observation.observe(
+            self.db, turn=done)["turn"]["state"], "ended")
+        orphan = self.turn("orphan", agent)
+        self.assertEqual(turn_observation.observe(
+            self.db, turn=orphan)["turn"]["state"], "orphan")
+
+        # `starting`: the accounting marker exists before the resource row.
+        starting = self.marker(agent)
+        document = turn_observation.observe(self.db, turn=starting["turn_id"])
+        self.assertEqual(document["turn"]["state"], "starting")
+        self.assertEqual(document["turn"]["started_ts"], starting["created_ts"])
+        self.assertIsNone(document["turn"]["ended_ts"])
+
+        # `unknown`: the request names a delivery turn whose facts are gone.
+        unknown = uuid.uuid4().hex
+        message = self.request(agent=agent, delivered=True, turn_id=unknown)
+        document = turn_observation.observe(self.db, request=message)
+        self.assertEqual(document["turn"]["id"], unknown)
+        self.assertEqual(document["turn"]["state"], "unknown")
+        self.assertEqual(document["accounting"]["state"], "none")
+
+    def test_accounting_precedence(self):
+        # A ledger row settles the turn even when the marker is still there
+        # (the #2166 symptom): the stale marker is shown, but the state is
+        # `settled`, and the turn stays quiescent.
+        settled = self.agent("settled")
+        marker = self.marker(settled)
+        self.ledger(settled, marker)
+        document = turn_observation.observe(self.db, turn=marker["turn_id"])
+        self.assertEqual(document["accounting"]["state"], "settled")
+        self.assertEqual(document["accounting"]["ledger"]["spend_key"],
+                         marker["spend_key"])
+        self.assertIsNotNone(document["accounting"]["marker"])
+        self.assertTrue(document["quiescent"])
+
+        # A kept (or released) reservation is a terminal outcome and wins
+        # over the ledger's `settled`.
+        kept = self.agent("kept")
+        marker = self.marker(kept)
+        self.ledger(kept, marker)
+        self.db.execute(
+            "INSERT INTO account_reservations (billing_account, agent, usd,"
+            " period, state, spend_key) VALUES ('acct', %s, 2.0, current_date,"
+            " 'kept', %s)", (kept, marker["spend_key"]))
+        document = turn_observation.observe(self.db, turn=marker["turn_id"])
+        self.assertEqual(document["accounting"]["state"], "kept")
+        self.assertEqual(document["accounting"]["reservation"]["state"], "kept")
+
+        # A marker without a ledger is `pending`: the accounting is not done,
+        # so the agent is never quiescent, even when it looks idle.
+        pending = self.agent("pending")
+        marker = self.marker(pending)
+        document = turn_observation.observe(self.db, turn=marker["turn_id"])
+        self.assertEqual(document["accounting"]["state"], "pending")
+        self.assertIsNone(document["accounting"]["ledger"])
+        self.assertFalse(document["quiescent"])
+
+    def test_turn_in_progress_requires_a_live_lease_on_a_running_agent(self):
+        agent = self.agent("busy", status="running")
+        self.assertIsNotNone(registry.claim(self.db, agent, "runner-test", 3600))
+        document = turn_observation.observe(self.db, turn=self.turn("running", agent))
+        self.assertTrue(document["agent"]["turn_in_progress"])
+        self.assertTrue(document["lease"]["live"])
+        self.assertFalse(document["quiescent"])
+
+    def test_document_carries_no_message_content(self):
+        agent = self.agent()
+        turn_id = self.turn("done", agent)
+        message = self.request(agent=agent, delivered=True, turn_id=turn_id,
+                               body="corps-interdit", payload={"secret": "charge-interdite"})
+        for document in (turn_observation.observe(self.db, request=message),
+                         turn_observation.observe(self.db, turn=turn_id)):
+            text = json.dumps(document)
+            self.assertNotIn("corps-interdit", text)
+            self.assertNotIn("charge-interdite", text)
+            self.assertNotIn("payload", text)
+
+    def test_unknown_targets(self):
+        self.agent()
+        with self.assertRaises(turn_observation.Unknown):
+            turn_observation.observe(self.db, turn=uuid.uuid4().hex)
+        with self.assertRaises(turn_observation.Unknown):
+            turn_observation.observe(self.db, request=999999)
+        with self.assertRaises(ValueError):
+            turn_observation.observe(self.db)
 
 
 class BuildersTest(unittest.TestCase):
