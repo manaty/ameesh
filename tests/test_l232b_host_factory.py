@@ -104,7 +104,7 @@ class HostFactoryTest(unittest.TestCase):
         base=fixture.BootstrapFilesTest(); base.setUp(); self.addCleanup(base.doCleanups)
         self.base=base; self.temp=Path(base.temp.name); self.host='fixture-host'
         self.policy=dict(host=self.host,units=['ameesh-runner@one.service'],
-                         controller_unit='ameesh-release-controller.service',restart_seconds=30)
+                         controller_unit='ameesh-release-controller.service',manager={'kind':'system'},restart_seconds=30)
         self.enrollment_root=self.temp/'enrolled'; self.enrollment_root.mkdir(mode=0o700)
         self.store=self.temp/'store'; self.store.mkdir(mode=0o700); self.store.chmod(0o711)
         self.journal=self.temp/'configuration'; self.journal.mkdir(mode=0o700)
