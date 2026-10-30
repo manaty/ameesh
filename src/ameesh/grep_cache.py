@@ -33,6 +33,14 @@ grosse entrée l'applique aussitôt, les petites l'amortissent sur
 borne peut être dépassée de moins de `PRUNE_PENDING_BYTES` par processus
 entre deux élagages ; le compte exact est refait à chaque élagage.
 
+#4913 : une entrée au-delà de `MAX_ENTRY_BYTES` (16 Mio) n'est pas publiée ;
+sa valeur est quand même rendue à l'appelant. À 22 Mio, l'entrée d'arbre de
+`release/11ag` ne tenait que ~11 fois dans le budget et était réécrite en
+boucle dès qu'une autre lecture l'évincait. `review_authors._tree_lines` ne
+demande plus l'arbre entier pour un petit jeu de lignes : le balayage ciblé
+(`git grep -F -f -`) ne cache que les lignes trouvées, donc une entrée bornée
+par la demande.
+
 Attributs (B/P2 cx2 sur b4e42699) : `-I` dépend de l'attribut `binary`, que git
 lit dans les `.gitattributes` du dépôt de travail, `info/attributes`,
 `core.attributesFile` et le fichier système. Le balayage lit donc les
@@ -72,6 +80,12 @@ CACHE_DIR = "git-grep"
 MAX_ENTRIES = 20000
 #: octets persistés au plus ; les arbres complets peuvent faire plusieurs Mo
 MAX_BYTES = 256 * 1024 * 1024
+#: #4913 : une entrée plus grosse n'est pas publiée (sa valeur reste rendue à
+#: l'appelant). Elle évincerait à elle seule des dizaines de lectures utiles et
+#: ne tiendrait que quelques fois dans MAX_BYTES : sur release/11ag, l'entrée
+#: d'arbre de 22 Mio était réécrite en boucle. Les arbres de `main` (~10 Mio)
+#: restent gardés.
+MAX_ENTRY_BYTES = 16 * 1024 * 1024
 #: magasins entre deux élagages des petites entrées
 PRUNE_EVERY = 256
 #: au-delà, une écriture paie un élagage immédiat : c'est la taille des
@@ -110,7 +124,7 @@ _STORES = 0
 _MEMO: "OrderedDict[str, tuple[tuple[int, int], list, int]]" = OrderedDict()
 _MEMO_BYTES = 0
 _COUNTERS = {"reads": 0, "hits": 0, "memo_hits": 0, "misses": 0,
-             "stores": 0, "prunes": 0, "pruned": 0,
+             "stores": 0, "prunes": 0, "pruned": 0, "oversized": 0,
              "lookups": 0, "served": 0, "deduped": 0, "computed": 0}
 
 
@@ -408,6 +422,10 @@ def _write(name: str, value: list) -> None:
         try:
             with os.fdopen(fd, "wb") as handle:
                 _write_entry(handle, value)
+            if os.path.getsize(tmp) > MAX_ENTRY_BYTES:
+                os.unlink(tmp)
+                _count("oversized")
+                return
             os.replace(tmp, path)
         except BaseException:
             try:
