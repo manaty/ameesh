@@ -1,0 +1,4 @@
+{"type": "session", "sessionId": "ctx-dsh-1", "model": "deepseek-flash"}
+{"type": "status", "phase": "step_end", "usage": {"inputTokens": 1000, "cacheReadTokens": 20000, "outputTokens": 100}}
+{"type": "status", "phase": "step_end", "usage": {"inputTokens": 500, "cacheReadTokens": 22000, "outputTokens": 200}}
+{"type": "final", "text": "fini", "cost_usd": 0.001}

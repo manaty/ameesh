@@ -1,0 +1,1 @@
+{"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 600000, "cached_input_tokens": 100000, "output_tokens": 3000}, "last_token_usage": {"input_tokens": 60000, "cached_input_tokens": 10000, "output_tokens": 500}}}}
