@@ -116,18 +116,21 @@ class SignedBootstrapTest(support.PgTestCase):
         authority.register_key(self.db,'fixture-owner',signing.public_from_seed(self.seed),role='owner')
         registry.upsert(self.db,'fixture-controller',harness='other',host=self.cfg.host)
         lot=work.add(self.db,title='Synthetic bootstrap signature',assignee='fixture-controller')
+        self.lot=lot
         self.view=decisions.ask(self.cfg,self.db,requester='fixture-controller',lot=str(lot['id']),
             question=bootstrap.question(self.operation,self.bundle,expires_at=int(self.now)+600),
             options=['%s=%s'%(item['key'],item['label']) for item in bootstrap.OPTIONS],needs_signature=True)
         self.adapter=bootstrap.SignedBootstrapAuthority(self.db,self.view['id'],self.operation,self.bundle,clock=lambda:self.now)
-    def sign(self,text='install',ttl=900):
-        digest=decisions.answer_digest(self.view,text,text,'human:fixture-owner')
+    def sign(self,text='install',ttl=900,view=None):
+        view=view or self.view
+        option=decisions.match_option(view,text)
+        digest=decisions.answer_digest(view,text,option,'human:fixture-owner')
         # The validator runs on the test clock: the approval must expire a fixed
         # `ttl` after it, never relative to a wall-clock instant the test clock
         # does not share (a slow setUp otherwise leaves the expiry ahead).
         authority.create_approval(self.db,self.seed,approver='fixture-owner',action=decisions.APPROVAL_ACTION,
             artifact_kind=decisions.APPROVAL_KIND,artifact_hash=digest,ttl=(self.now+ttl)-time.time())
-        decisions.answer(self.cfg,self.db,self.view['id'],text,human='human:fixture-owner',channel='cli',signed=True)
+        decisions.answer(self.cfg,self.db,view['id'],text,human='human:fixture-owner',channel='cli',signed=True)
     def valid(self,step='account',digest=None):
         return self.adapter.validate(self.operation,digest or self.adapter.scopes[step],step)
 
@@ -194,3 +197,22 @@ class SignedBootstrapTest(support.PgTestCase):
         receipt=bootstrap.account.ensure(Path(self.tmp)/'account',request,authority=self.adapter,system=system)
         self.assertTrue(receipt['ok'])
         self.assertEqual(system.calls,['group','user'])
+
+    def test_bureau_mention_authorizes_install_and_revoke(self):
+        # #4788: signer-owner.sh keeps its fixed mention; both bootstrap kinds
+        # (install and the separate revoke) consume decisions.match_option,
+        # never the full text as if it were the option.
+        mention='install — saisi par le bureau, délégation §10'
+        self.sign(mention)
+        answer=decisions.get(self.db,self.view['id'])['answer']
+        self.assertEqual((answer['text'],answer['option']),(mention,'install'))
+        for step in bootstrap.STEPS: self.assertTrue(self.valid(step),step)
+        view=decisions.ask(self.cfg,self.db,requester='fixture-controller',lot=str(self.lot['id']),
+            question=bootstrap.revoke_question(self.operation,self.bundle,expires_at=int(self.now)+600),
+            options=['%s=%s'%(item['key'],item['label']) for item in bootstrap.REVOKE_OPTIONS],
+            needs_signature=True)
+        revoke='revoke — saisi par le bureau, délégation §10'
+        self.sign(revoke,view=view)
+        authority_obj=bootstrap.SignedBootstrapRevokeAuthority(self.db,view['id'],self.operation,
+                                                               self.bundle,clock=lambda:self.now)
+        self.assertTrue(authority_obj.validate(self.operation,authority_obj.scopes['revoke'],'revoke'))

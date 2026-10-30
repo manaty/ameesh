@@ -38,16 +38,29 @@ class ReleaseAuthorityTest(PgTestCase):
         self.adapter = release.SignedDecisionAuthority(
             self.db, self.view['id'], 'test-release', self.manifest, clock=lambda: self.now)
 
-    def signed_answer(self, text='apply', ttl=900):
-        digest = decisions.answer_digest(self.view, text, text, 'human:fixture-owner')
+    def sign_view(self, view, text, ttl=900):
+        # Same option `decisions.answer` records and signs: bounded native form
+        # only (raw key or the two signer-owner.sh mentions of #3443/#3454).
+        option = decisions.match_option(view, text)
+        digest = decisions.answer_digest(view, text, option, 'human:fixture-owner')
         # The validator runs on the test clock: the approval must expire a fixed
         # `ttl` after it, never relative to a wall-clock instant the test clock
         # does not share (a slow setUp otherwise leaves the expiry ahead).
         authority.create_approval(self.db, self.seed, approver='fixture-owner',
                                   action=decisions.APPROVAL_ACTION, artifact_kind=decisions.APPROVAL_KIND,
                                   artifact_hash=digest, ttl=(self.now + ttl) - time.time())
-        return decisions.answer(self.cfg, self.db, self.view['id'], text,
+        return decisions.answer(self.cfg, self.db, view['id'], text,
                                 human='human:fixture-owner', channel='cli', signed=True)['decision']
+
+    def signed_answer(self, text='apply', ttl=900):
+        return self.sign_view(self.view, text, ttl)
+
+    def another_view(self):
+        return decisions.ask(
+            self.cfg, self.db, requester='fixture-controller', lot=str(self.lot['id']),
+            question=release.question('test-release', self.manifest, expires_at=int(self.now) + 600),
+            options=['%s=%s' % (item['key'], item['label']) for item in release.OPTIONS],
+            needs_signature=True)
 
     def validate(self, step='activate', operation='test-release', digest=None):
         return self.adapter.validate(operation, digest or release.digest(self.manifest), step)
@@ -65,6 +78,78 @@ class ReleaseAuthorityTest(PgTestCase):
         self.assertFalse(self.validate(operation='another-release'))
         self.assertFalse(self.validate(digest='c' * 64))
         self.assertFalse(self.validate(step='arbitrary-shell'))
+
+    def test_bureau_mention_authorizes_the_real_controller_run(self):
+        # #4788: signer-owner.sh signs the option plus its fixed mention; the
+        # whole text stays recorded and digested, the bounded mention only
+        # names the option. Every step (fence and recovery included) must work.
+        mention = 'apply — saisi par le bureau, délégation §10'
+        signed = self.signed_answer(mention)
+        self.assertEqual(signed['answer']['text'], mention)
+        self.assertEqual((signed['answer']['option'], signed['answer']['option_label']),
+                         ('apply', release.OPTIONS[0]['label']))
+        for step in release.STEPS:
+            self.assertTrue(self.validate(step), step)
+        from tests.test_l232b_release_controller import controller, Host
+        host = Host()
+        self.assertEqual(controller.run(Path(self.tmp) / 'controller-mention', 'test-release',
+                                        self.manifest, authority=self.adapter, adapter=host),
+                         'accepted')
+        self.assertEqual(host.current, self.manifest['release'])
+
+    def test_relayed_owner_mention_is_the_same_bounded_authority(self):
+        mention = ('apply — réponse de l\'owner relayée par le bureau, source '
+                   '526a0a74-f00e-4639-b4d1-d11066d51f99')
+        self.signed_answer(mention)
+        self.assertEqual(decisions.get(self.db, self.view['id'])['answer']['text'], mention)
+        self.assertTrue(self.validate('prepare'))
+        self.assertTrue(self.validate('recovery_unfence'))
+
+    def test_foreign_or_free_text_never_becomes_the_signed_option(self):
+        # Only the two exact signer-owner.sh forms denote the option: no loose
+        # prefix, no extra explanation, no foreign/case-altered mention.
+        cases = ('apply — saisi par le bureau',
+                 'apply, mais seulement après la revue',
+                 'apply — Réponse de l\'owner relayée par le bureau, source x',
+                 'apply — réponse de l\'owner relayée par le bureau, source ' + 'x' * 201)
+        for text in cases:
+            with self.subTest(text=text):
+                view = self.another_view()
+                signed = self.sign_view(view, text)
+                self.assertIsNone(signed['answer']['option'])
+                adapter = release.SignedDecisionAuthority(
+                    self.db, view['id'], 'test-release', self.manifest, clock=lambda: self.now)
+                self.assertFalse(adapter.validate('test-release', release.digest(self.manifest),
+                                                  'prepare'))
+
+    def test_mentioned_answer_text_and_recorded_option_must_agree(self):
+        mention = 'apply — saisi par le bureau, délégation §10'
+        self.signed_answer(mention)
+        original = decisions.get(self.db, self.view['id'])
+        divergent = (
+            dict(original['answer'], option='leave'),
+            dict(original['answer'], text='leave — saisi par le bureau, délégation §10'),
+        )
+        for answer in divergent:
+            with self.subTest(answer=answer), mock.patch.object(
+                    decisions, 'get', return_value=dict(original, answer=answer)):
+                self.assertFalse(self.validate())
+
+    def test_mentioned_authority_expiry_and_revocation_are_live(self):
+        self.signed_answer('apply — saisi par le bureau, délégation §10')
+        self.assertTrue(self.validate())
+        self.now += 601
+        self.assertFalse(self.validate('recovery_unfence'))
+        self.now -= 601
+        authority.revoke_key(self.db, 'fixture-owner')
+        self.assertFalse(self.validate('prepare'))
+
+    def test_mentioned_authority_with_altered_approval_is_refused(self):
+        signed = self.signed_answer('apply — saisi par le bureau, délégation §10')
+        approval_id = signed['answer']['proof']['approval_id']
+        self.db.execute('UPDATE mesh_approvals SET signature = %s WHERE id = %s',
+                        (authority.b64(b'\x00' * 64), approval_id))
+        self.assertFalse(self.validate())
 
     def test_signed_decline_is_not_approval(self):
         self.signed_answer('leave')
