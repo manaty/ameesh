@@ -172,6 +172,73 @@ class ManualSeatReseatTest(_ActivationFixture, PgTestCase):
         self.assertEqual(again["manual_kept"], 0, again)
         self.assertEqual(len(self._alerts()), 1)
 
+    def _redesignate(self, name="r1"):
+        """r1, automatique au gel, est redésigné à la main par le pilote (#3602)."""
+        storage.of(self.db).work.designate_reviewer(
+            self.lot, name, actor="human:smichea", remove=True,
+            event="reviewer %s removed" % name)
+        storage.of(self.db).work.designate_reviewer(
+            self.lot, name, actor="human:smichea",
+            event="reviewer %s designated" % name)
+
+    def _frozen_qa(self):
+        self.freeze()
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (self.lot,))
+
+    def test_redesigne_a_la_main_avant_l_echeance_aucun_chemin_ne_le_prend(self):
+        # Le gel est vieux, le geste du pilote récent : le délai manuel court
+        # depuis le geste, y compris pour la passe et pour le rejeu --apply.
+        self._agent("r3", "claude")
+        self._frozen_qa()
+        self._age()
+        self._redesignate()
+        self._pause("r1")
+        self.assertIn("r1", act._manual(self.db, work.get(self.db, self.lot)))
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["manual_reseated"], 0, report)
+        self.assertEqual(report["reassigned"], 0, report)
+        self.assertEqual(self._column(), ["r1", "r2"])
+        act.reviewers(self.cfg, self.db, self.lot, apply=True)
+        self.assertEqual(self._column(), ["r1", "r2"])
+
+    def test_redesigne_a_la_main_apres_l_echeance_suit_le_chemin_manuel(self):
+        self._agent("r3", "claude")
+        self._agent("r4", "codex")
+        self._frozen_qa()
+        self._redesignate()
+        self._pause("r1")
+        self._age()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["manual_reseated"], 1, report)
+        self.assertEqual(report["reassigned"], 0, report)
+        self.assertEqual(self._column(), ["r2", "r3"])
+        self.assertEqual(len(self._alerts()), 1)
+
+    def test_redesigne_sans_remplacant_le_chemin_automatique_ne_le_prend_pas(self):
+        # Un codex libre (r4) n'est pas un remplaçant de r1 (claude).
+        self._agent("r4", "codex")
+        self._frozen_qa()
+        self.db.execute("UPDATE agent_registry SET operator_paused = true"
+                        " WHERE name = 'pilot'")
+        self._redesignate()
+        self._pause("r1")
+        self._age()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["manual_kept"], 1, report)
+        self.assertEqual(report["reassigned"], 0, report)
+        self.assertEqual(self._column(), ["r1", "r2"])
+
+    def test_siege_automatique_mort_a_cote_d_un_manuel_le_manuel_reste_manuel(self):
+        self._agent("r4", "codex")
+        self._frozen_qa()
+        self._age()
+        self._redesignate()
+        self._pause("r2")
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["reassigned"], 1, report)
+        self.assertEqual(self._column(), ["r1", "r4"])
+        self.assertIn("r1", act._manual(self.db, work.get(self.db, self.lot)))
+
 
 if __name__ == "__main__":
     import unittest

@@ -3785,7 +3785,7 @@ def _replay_designation(cfg, db, lot: int, freeze: Mapping, item: Mapping,
                 closed = alert_briefs.claims_closed_hosts(db)
                 dead, kept = _dead_seats(cfg, db, int(lot), freeze,
                                          effective[2], sorted(live), by_name,
-                                         closed)
+                                         closed, manual=_manual(db, item))
             except Exception as exc:  # noqa: BLE001 - unreadable evidence
                 # #3685 (B2) : on ne peut pas dire quels sièges sont morts.
                 # Poursuivre `designate` afficherait la marque enregistrée
@@ -4218,22 +4218,27 @@ def _acquired(name: str, voters: set, by_name: Mapping) -> bool:
 
 def _dead_seats(cfg, db, lot: int, freeze: Mapping, payload: Mapping,
                 column: Sequence[str], by_name: Mapping,
-                closed: set) -> tuple[list, list]:
+                closed: set, *, manual: Sequence[str] = ()) -> tuple[list, list]:
     """The dead seats of a designation mark, and the ones kept (#3685).
 
     Only a seat still present in the reviewer column is examined: one the
     pilot removed is history, not a live designation to move. A seat whose
     reviewer is unreachable but has already voted on the exact frozen head is
-    kept (#3367). Returns `(dead, kept)`, `dead` being `[(name, why)]` and
-    `kept` `[{"name", "family"}]`."""
+    kept (#3367). #4757: a seat the pilot re-designated after the mark
+    (`manual`, #3602) is no longer the mark's: it is neither moved here, where
+    its deadline and same-family guarantees would be lost (`_dead_manual_seats`
+    owns it), nor rewritten as kept, which would make it automatic again; the
+    reviewer sync preserves it. Returns `(dead, kept)`, `dead` being
+    `[(name, why)]` and `kept` `[{"name", "family"}]`."""
     live = {str(name or "").strip() for name in column or ()
             if str(name or "").strip()}
+    by_hand = set(manual or ())
     dead: list = []
     kept: list = []
     voters = None
     for reviewer in (payload or {}).get("reviewers") or ():
         name = str((reviewer or {}).get("name") or "").strip()
-        if not name or name not in live:
+        if not name or name not in live or name in by_hand:
             continue
         why = _unreachable_reviewer(by_name.get(name), closed)
         if why:
@@ -4637,7 +4642,7 @@ def _manual_designator(db, lot: int, name: str) -> str:
     return best[1]
 
 
-def _dead_manual_seats(cfg, db, item: Mapping, freeze: Mapping, mark: Optional[tuple],
+def _dead_manual_seats(cfg, db, item: Mapping, freeze: Mapping,
                        by_name: Mapping, closed: set, *,
                        now: Optional[float] = None) -> list:
     """The manual seats the pass may hand over (#4757), `[(name, why)]`.
@@ -4647,15 +4652,14 @@ def _dead_manual_seats(cfg, db, item: Mapping, freeze: Mapping, mark: Optional[t
     included, its « until » hour never read), the §9 `green_verdict` deadline
     has passed since the designation on this head (the latest of the freeze
     and the manual line, the start `_owed_read` gives the §9 clock), and the
-    reviewer has no verdict on the frozen head. A name the effective
-    automatic mark carries is the automatic seat's business (`reseat`).
+    reviewer has no verdict on the frozen head. `_manual` decides what is
+    manual: a name a mark carries, re-designated by hand after it (#3602), is
+    a manual seat here and is left alone by `_dead_seats`.
     """
     lot = int((item or {}).get("id") or 0)
     names = _manual(db, item)
     if not names:
         return []
-    automatic = {str((row or {}).get("name") or "").strip()
-                 for row in ((mark[2] if mark else None) or {}).get("reviewers") or ()}
     lines = _manual_designations(db, lot)
     if lines is None:
         return []
@@ -4670,7 +4674,7 @@ def _dead_manual_seats(cfg, db, item: Mapping, freeze: Mapping, mark: Optional[t
     dead: list = []
     voters = None
     for name in names:
-        if name in automatic or name not in lines:
+        if name not in lines:
             continue
         why = _unreachable_reviewer(by_name.get(name), closed)
         if not why:
@@ -5005,7 +5009,7 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
                     float(freeze.get("at_ts") or 0.0), ids=[lot]):
                 item = work.get(db, lot) or {}
                 manual_dead = _dead_manual_seats(
-                    cfg, db, item, freeze, mark, by_name, closed)
+                    cfg, db, item, freeze, by_name, closed)
                 if manual_dead:
                     attempted += 1
                     moved = reseat_manual(
@@ -5027,16 +5031,20 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
                 out["skipped"] += 1
                 continue
             # #3367 : a live seat, or a verdict acquired on the frozen head,
-            # is kept as it is; the pilot's removals are history.
-            dead, kept = _dead_seats(cfg, db, lot, freeze, mark[2],
-                                     row.get("reviewers") or (), by_name, closed)
+            # is kept as it is; the pilot's removals are history. #4757 : the
+            # column is read again, the manual branch above may have moved it,
+            # and a seat re-designated by hand stays out of this path.
+            item = work.get(db, lot) or {}
+            column = item.get("reviewers") or ()
+            dead, kept = _dead_seats(cfg, db, lot, freeze, mark[2], column,
+                                     by_name, closed, manual=_manual(db, item))
             if not dead:
                 out["skipped"] += 1
                 continue
             # #3685 (B1) : a seat the mark records but the column no longer
             # names was removed by the pilot. It stays out of the replacement
             # selection even when another seat of the same mark is dead.
-            removed = _removed_seats_from_mark(mark[2], row.get("reviewers") or ())
+            removed = _removed_seats_from_mark(mark[2], column)
             prefix = _reassign_prefix(lot, freeze_id, dead)
             since = float(freeze.get("at_ts") or 0.0)
             if storage.of(db).work.events_noted(prefix, since, ids=[lot]):
