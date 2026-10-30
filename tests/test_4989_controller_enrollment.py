@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import tempfile
 import time
 from types import SimpleNamespace
 import unittest
@@ -18,6 +19,24 @@ SPEC = importlib.util.spec_from_file_location('controller_enrollment',
     Path(__file__).resolve().parents[1] / 'deploy/mise-a-jour/enroler-controleur.py')
 enroll = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(enroll)
+
+
+class RealTransportKeyTest(unittest.TestCase):
+    def test_real_generated_key_roundtrips_without_root_or_comment(self):
+        # Only the trust of this disposable test directory is substituted.
+        # Both production methods execute the real fixed ssh-keygen binary;
+        # read() still checks ownership, mode, file type and link count.
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'identity'
+            system=enroll.System()
+            with mock.patch.object(enroll.runtime,'trusted'):
+                system.generate_key(path)
+                public=system.public_key(path)
+            self.assertEqual(len(public.split()),2)
+            self.assertTrue(public.startswith('ssh-ed25519 '))
+            self.assertEqual(path.with_name('identity.pub').read_text().strip(),public)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode),0o600)
+            self.assertEqual(stat.S_IMODE(path.with_name('identity.pub').stat().st_mode),0o600)
 
 
 class System:

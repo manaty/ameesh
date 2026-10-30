@@ -151,7 +151,7 @@ class System:
     def generate_key(self, path):
         runtime.trusted('/usr/bin/ssh-keygen')
         admin.installer.account.LinuxAccounts.command([
-            '/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(path)])
+            '/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', '', '-f', str(path)])
         path.chmod(0o600)
         path.with_name(path.name + '.pub').chmod(0o600)
 
