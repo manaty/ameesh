@@ -86,7 +86,7 @@ def _systemctl(*args: str) -> str | None:
 
 
 def served_agents(cfg, db) -> list[dict]:
-    """Les agents que l'hôte doit mener : cet hôte, mode `execute`, non arrêtés.
+    """Les agents que l'hôte doit mener : cet hôte, mode `execute`, ni arrêtés ni retirés.
 
     `veille` (`watch.SENDER`) est l'identité d'ENVOI de la consigne de veille,
     pas un agent mené par un exécuteur : une ligne de registre à ce nom — mode
@@ -98,6 +98,7 @@ def served_agents(cfg, db) -> list[dict]:
             if (row.get("host") or "") == (cfg.host or "")
             and (row.get("mode") or "execute") == "execute"
             and row.get("status") != "stopped"
+            and not row.get("retired_ts")
             and row.get("name") != watch.SENDER]
 
 
