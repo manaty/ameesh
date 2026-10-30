@@ -8,11 +8,17 @@ migration 0515; ``decide validation-history`` requires the owner's key.
   ameesh decide ask (--lot <id|ref> | --new-lot "title") --question "…"
                     --option a="…" [--option b="…" …] [--recommend a [--why "…"]]
                     [--urgent] [--by 2h|18:00|"2026-10-12 09:00"] [--needs-signature] [--json]
+                    [--supersedes <answered decision id> --supersedes-option KEY]
         an agent files a request: attached to the project and the work item, the
         work item moves to `waiting_human` (it returns to its previous state on
         the answer), the target owner is notified;
         `--from-mail <id>` (L233): the mail in which the agent wrote this
         decision in prose (the lot of the mail by default);
+        `--supersedes <id>` (#4991): replaces an answered decision only upon
+        a valid signed answer selecting `--supersedes-option`; pending
+        decisions use `withdraw`. The exact replaced id and approval option
+        are signed, both links are shown, and an additive event
+        in `decision_supersessions` preserves both decisions' original answers;
   ameesh decide <id> <option | "free text"> [--key FILE [--as NAME] | --signed] [--json]
         the owner answers (a HUMAN identity only); the answer goes to the
         requester by mail (it wakes them up), to the thread and to the work item;
@@ -295,6 +301,9 @@ def view_of(row: dict, now: float | None = None) -> dict:
         "why": d.get("why"),
         "urgent": bool(d.get("urgent")),
         "needs_signature": bool(d.get("needs_signature")),
+        "supersedes": d.get("supersedes"),
+        "supersedes_option": d.get("supersedes_option"),
+        "superseded_by": d.get("superseded_by"),
         "due_ts": due,
         "overdue": state == "pending" and due is not None and now >= due,
         "created_ts": round(created, 3),
@@ -311,6 +320,24 @@ def view_of(row: dict, now: float | None = None) -> dict:
 def get(db, decision_id: int, now: float | None = None) -> dict | None:
     row = storage.of(db).decisions.get(int(decision_id))
     return view_of(row, now) if row else None
+
+
+def require_current(view: dict) -> None:
+    """Reject authority permanently replaced by a signed decision (#4991)."""
+    if view.get("superseded_by") is not None:
+        raise DecisionError("decision #%d superseded by decision #%d"
+                            % (view["id"], view["superseded_by"]))
+
+
+def supersession_approved(view: dict) -> bool:
+    """Only the designated, signed approval option replaces authority."""
+    option = view.get("supersedes_option")
+    answer = view.get("answer") or {}
+    return bool(view.get("supersedes") is not None and option
+                and any(o["key"] == option for o in view.get("options") or [])
+                and view.get("state") == "answered" and answer.get("channel") == "signed"
+                and answer.get("option") == option
+                and match_option(view, answer.get("text") or "") == option)
 
 
 def pending(db, now: float | None = None, *, human: str | None = None) -> list[dict]:
@@ -491,6 +518,9 @@ def request_text(decision: dict, *, requester: str, owner: str | None,
         tail.append("URGENT.")
     if decision.get("needs_signature"):
         tail.append("SIGNED answer required (production or irreversible action).")
+    if decision.get("supersedes") is not None:
+        tail.append("Replaces decision #%d only upon signed option %s."
+                    % (decision["supersedes"], decision.get("supersedes_option")))
     if tail:
         lines.append(" ".join(tail))
     lines.append("Answer: ameesh decide %s <option | \"text\"> (or in ameesh chat)"
@@ -514,7 +544,8 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         new_lot: str | None = None, recommend: str | None = None, why: str | None = None,
         urgent: bool = False, due_ts: float | None = None, needs_signature: bool = False,
         source_mail: int | None = None, parent_lot: str | None = None,
-        now: float | None = None, domain: str = "decision", issue_links=()) -> dict:
+        now: float | None = None, domain: str = "decision", issue_links=(),
+        supersedes: int | None = None, supersedes_option: str | None = None) -> dict:
     """Dépose une demande de décision de `requester` (un agent) ; rend la
     demande (`ameesh-decision/1`) avec `lot_state`. DecisionError si refusée
     (rien n'est déposé).
@@ -523,6 +554,14 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
     prose; it must be theirs. Its lot is the default `lot`, and once the
     request names it, the mail is no longer shown as a prose decision."""
     now = time.time() if now is None else float(now)
+    if supersedes is not None:
+        if type(supersedes) is not int or supersedes <= 0:
+            raise DecisionError("supersedes: positive decision id required")
+        old = get(db, supersedes, now)
+        if not old or old["state"] != "answered":
+            raise DecisionError("supersedes requires an answered decision; pending uses withdraw")
+        require_current(old)
+        needs_signature = True
     mail_lot = None
     if source_mail is not None:
         mail_row = storage.of(db).decisions.source_mail(int(source_mail))
@@ -545,6 +584,11 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
     if reason:
         raise DecisionError("unreadable question — %s" % reason)
     opts = parse_options(options)
+    if supersedes is not None:
+        if not supersedes_option or not any(o["key"] == supersedes_option for o in opts):
+            raise DecisionError("--supersedes requires --supersedes-option naming an exact option key")
+    elif supersedes_option is not None:
+        raise DecisionError("--supersedes-option requires --supersedes")
     recommend = (recommend or "").strip() or None
     why = " ".join(str(why or "").split()) or None
     if recommend is not None:
@@ -642,6 +686,9 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         }
         if source_mail is not None:
             decision["source_mail"] = int(source_mail)
+        if supersedes is not None:
+            decision["supersedes"] = supersedes
+            decision["supersedes_option"] = supersedes_option
 
         def write(tx):
             row = storage.of(tx).decisions.create(
@@ -810,6 +857,11 @@ def answer_digest(view: dict, text: str, option: str | None, human: str) -> str:
                     "created": int(float(view.get("created_ts") or 0))},
         "answer": text, "option": option, "by": human,
     }
+    # Preserve every pre-existing signature; only new replacement requests
+    # extend the signed document with the exact authority they replace.
+    if view.get("supersedes") is not None:
+        document["request"]["supersedes"] = view["supersedes"]
+        document["request"]["supersedes_option"] = view.get("supersedes_option")
     return authority.hash_artifact(json.dumps(document, sort_keys=True, separators=(",", ":"),
                                               ensure_ascii=False))
 
@@ -861,7 +913,7 @@ def _sign(db, view: dict, text: str, option: str | None, human: str, *,
             "signature_key": row.get("signature_key"), "digest": digest}
 
 
-def verify_proof(db, view: dict) -> tuple[bool, str]:
+def verify_proof(db, view: dict, *, live: bool = False) -> tuple[bool, str]:
     """Revérifie la preuve d'une réponse signée : approbation consommée par
     CETTE décision, empreinte recalculée, clé `owner` toujours valide,
     signature Ed25519."""
@@ -899,6 +951,27 @@ def verify_proof(db, view: dict) -> tuple[bool, str]:
         ok = False
     if not ok:
         return False, "invalid Ed25519 signature"
+    if live:
+        # A replacement takes effect now, so a historical valid signature is
+        # insufficient: require its exact, still-live approval and nonce.
+        try:
+            nonce = storage.of(db).nonces.state(row["approver"], row["nonce"])
+            fields = ("approver", "action", "artifact_kind", "artifact_hash", "decision", "nonce")
+            ok = (parts[:2] == [authority.DOMAIN, "approval"]
+                  and all(signed.get(k) == row.get(k) for k in fields)
+                  and signed.get("decision") == "approved"
+                  and signed.get("artifact_kind") == APPROVAL_KIND
+                  and type(signed.get("expires")) is int and type(signed.get("ts")) is int
+                  and signed["expires"] > time.time() * 1_000_000
+                  and signed["ts"] <= (time.time() + 120) * 1_000_000
+                  and signed["expires"] > signed["ts"]
+                  and int(round(float(row["expires_ts"]) * 1_000_000)) == signed["expires"]
+                  and int(round(float(row["created_ts"]) * 1_000_000)) == signed["ts"]
+                  and nonce and nonce.get("consumed_by") == "decision:%d" % view["id"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            ok = False
+        if not ok:
+            return False, "supersession requires a live approved signature and consumed nonce"
     return True, "signed with the owner key %s (%s…), approval #%s" % (
         row.get("approver"), str(row.get("signature_key") or "")[:12], row["id"])
 
@@ -973,6 +1046,12 @@ def answer_text(view: dict) -> str:
                      "verified and consumed: `ameesh decide show %d`."
                      % (proof.get("approval_id"), str(proof.get("signature_key") or "")[:12],
                         view["id"]))
+    if supersession_approved(view):
+        lines.append("Decision #%d supersedes decision #%d; the former authority is refused."
+                     % (view["id"], view["supersedes"]))
+    elif view.get("supersedes") is not None:
+        lines.append("Decision #%d was not replaced: approval option %s was not selected."
+                     % (view["supersedes"], view.get("supersedes_option")))
     lines.append("This answer, recorded in the decision queue, is the owner's "
                  "decision: resume the work item accordingly (verifiable: ameesh decide "
                  "show %d)." % view["id"])
@@ -1341,6 +1420,13 @@ def format_view(view: dict, now: float | None = None) -> list[str]:
         view.get("lot"), fil.excerpt(view.get("lot_title") or "", 60), view.get("requester"),
         _owner_label(view.get("owner")), "  [%s]" % "] [".join(flags) if flags else "")
     lines = [head]
+    if view.get("supersedes") is not None:
+        lines.append("      supersedes decision #%d%s" % (
+            view["supersedes"], "" if supersession_approved(view) else
+            " upon signed option %s" % view.get("supersedes_option")
+            if view["state"] == "pending" else " (not effective)"))
+    if view.get("superseded_by") is not None:
+        lines.append("      superseded by decision #%d; authority refused" % view["superseded_by"])
     for line in (view.get("question") or "").splitlines() or [""]:
         lines.append("      %s" % line)
     for option in view.get("options") or ():
@@ -1440,6 +1526,10 @@ def cmd_ask(cfg: Config, argv: list[str]) -> int:
     parser.add_argument("--issue", action="append", default=[], help="related issue URL (repeatable)")
     parser.add_argument("--needs-signature", action="store_true",
                         help="production or irreversible action: signed answer required")
+    parser.add_argument("--supersedes", type=int, metavar="ID",
+                        help="replace an answered decision upon this signed answer")
+    parser.add_argument("--supersedes-option", metavar="KEY",
+                        help="exact approval option that effects the signed replacement")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     if os.environ.get(CHAT_ENV):
@@ -1458,7 +1548,8 @@ def cmd_ask(cfg: Config, argv: list[str]) -> int:
                    options=args.option, lot=args.lot, new_lot=args.new_lot,
                    recommend=args.recommend, why=args.why, urgent=args.urgent, due_ts=due,
                    needs_signature=args.needs_signature, source_mail=args.from_mail,
-                   parent_lot=args.parent_lot, domain=args.domain, issue_links=args.issue)
+                   parent_lot=args.parent_lot, domain=args.domain, issue_links=args.issue,
+                   supersedes=args.supersedes, supersedes_option=args.supersedes_option)
     finally:
         db.close()
     if args.json:

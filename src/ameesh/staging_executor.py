@@ -137,6 +137,11 @@ def tick(db, cfg, options) -> dict:
         env = dict(os.environ, BASCULE_ENV=options["bascule_env"],
                    STAGING_TIMEOUT_S=str(options.get("timeout_s", 7200)))
         env.pop("AMEESH_TURN_ID", None)
+        # Only this attempt names its run and a proved-stopped predecessor;
+        # never a value inherited from the unit's environment (review qa-01).
+        env.pop("STAGING_RUN_ID", None)
+        env.pop("STAGING_PREVIOUS_RUN", None)
+        env.pop("STAGING_PREVIOUS_HOST", None)
         if request["state"] == "running" or request.get("previous_run"):
             probe = options.get("quiescence_probe")
             if not probe:
@@ -150,6 +155,23 @@ def tick(db, cfg, options) -> dict:
                 return blocked("old execution not proved stopped")
         if not Path(options["bascule_env"]).is_file():
             return blocked("candidate deployment access missing")
+        # #4885: a sequence launched by another path (by hand, synchronous
+        # release, another host) holds no execution lease. Its shared
+        # progress does: wait for it, without host operation. staging.sh
+        # repeats the check atomically when it starts (exit BUSY).
+        # A late run still blocks: its deadline proves no stop.
+        previous = request.get("previous_run") or request.get("run")
+        rows = storage.of(db).events.latest_type(
+            staging_watch.EVENT, 60, staging_watch.LIMIT)
+        others = staging_watch.in_flight(rows, exempt={previous} if previous else ())
+        reason = ("staging history truncated; exclusivity unobservable"
+                  if len(rows) >= staging_watch.LIMIT else
+                  "another staging sequence running: " + ", ".join(others)
+                  if others else None)
+        if reason:
+            if request.get("blocked_reason") == reason:
+                return {"state": "blocked", "reason": reason}
+            return blocked(reason)
         repo = str(Path(options["repo"]).resolve())
         sha = request["sha"]
         subprocess.run(["git", "-C", repo, "fetch", "--no-tags", "origin"],
@@ -163,6 +185,7 @@ def tick(db, cfg, options) -> dict:
         project = release_cutoff.ProjectRelease(name=options["project"], repo=repo)
         if staging_pending.regressions(project, sha, db=db):
             return blocked("candidate would roll back active content")
+        queued = request
         attempt = dict(request, state="running", host=host, run=uuid.uuid4().hex,
                        started=time.time(), notify=options["role"],
                        deadline=time.time() + options.get("timeout_s", 7200))
@@ -193,6 +216,11 @@ def tick(db, cfg, options) -> dict:
             proofs = storage.of(db).events.recent_type(
                 staging_watch.EVENT, 60, 1, object="staging-run:" + attempt["run"])
             terminal = proofs[0]["data"]["state"] if proofs else None
+            if code == staging_watch.BUSY and terminal is None:
+                # Refused before any host operation (shared start or local
+                # flock): the request is queued again, not failed.
+                request = queued
+                return blocked("another staging sequence running")
             result = dict(attempt, state=terminal if code == 0 and terminal in ("completed", "partial") else "failed",
                           exit=code)
             _record(db, options["key"], result, lease=lease)

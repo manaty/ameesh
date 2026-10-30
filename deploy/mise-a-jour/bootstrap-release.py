@@ -102,9 +102,12 @@ class SignedBootstrapAuthority(signed.SignedDecisionAuthority):
         return question(operation,self.bundle,expires_at=expires_at)
 
     def validate(self,operation,digest,step):
+        self.denial_reason=None
         if operation!=self.operation or step not in self.steps or self.scopes[step]!=digest:
             return False
         view=signed.decisions.get(self.db,self.decision_id)
+        if view and not self._current(view):
+            return False
         if not view or view.get('state')!='answered' or view.get('needs_signature') is not True:
             return False
         answer=view.get('answer') or {}
@@ -156,7 +159,7 @@ def _run(journal,operation,bundle, *, authority,adapter,steps=STEPS,scopes_of=No
         except Exception:
             valid=False
         if not valid:
-            raise BootstrapError('bootstrap authority unavailable')
+            raise BootstrapError(getattr(authority,'denial_reason',None) or 'bootstrap authority unavailable')
     approved('preflight')
     with protocol.locked(journal,bundle['host']) as root:
         approved('preflight')
