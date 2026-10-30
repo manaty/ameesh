@@ -591,15 +591,22 @@ def known_writer_migrations(directory: str = MIGRATIONS_DIR) -> dict[int, str]:
 _ACTIVE_WRITER_TICKS = contextvars.ContextVar('ameesh_writer_ticks', default=())
 
 
-def writer_tick(method):
+def writer_tick(method=None, *, on_admission_error=None):
     """One fresh check at a process tick; nested passes share that admission."""
+    if method is None:
+        return lambda fn: writer_tick(fn, on_admission_error=on_admission_error)
     @functools.wraps(method)
     def checked(self, *args, **kwargs):
         active = _ACTIVE_WRITER_TICKS.get()
         key = id(self.db)
         if key in active:
             return method(self, *args, **kwargs)
-        require_compatible_writer(self.db)
+        try:
+            require_compatible_writer(self.db)
+        except DbError as exc:
+            if on_admission_error is None:
+                raise
+            return on_admission_error(method.__name__, exc)
         token = _ACTIVE_WRITER_TICKS.set(active + (key,))
         try:
             return method(self, *args, **kwargs)

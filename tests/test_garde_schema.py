@@ -50,6 +50,29 @@ class SchemaGuardTest(unittest.TestCase):
             self.admin.execute('INSERT INTO schema_non_additive_migrations VALUES (9999, %s, %s)',
                                ('future', 'f' * 64))
 
+    def test_rollback_removes_the_non_additive_marker(self):
+        self.admin.execute("INSERT INTO schema_migrations VALUES (518, 'generic_delivery_state', 'old')")
+        self.admin.execute("INSERT INTO schema_non_additive_migrations VALUES (518, 'generic_delivery_state', 'old')")
+        with self.admin.transaction() as tx:
+            tx.execute('DELETE FROM schema_migrations WHERE version = 518')
+        self.assertEqual(self.admin.query('SELECT version FROM schema_non_additive_migrations'), [])
+
+    def test_relay_checks_every_request_on_a_reused_connection(self):
+        from ameesh import relay
+        service = object.__new__(relay.Relay)
+        service.db = db_mod.connect(self.cfg)
+        self.addCleanup(service.db.close)
+        service._db_lock = threading.Lock()
+        service._route = mock.Mock(side_effect=relay.Refused(404, 'not_found_error', 'test'))
+        service._error = mock.Mock()
+        service.handle(mock.Mock())
+        service._route.assert_called_once()
+        self.mark_unknown()
+        service._route.reset_mock()
+        service.handle(mock.Mock())
+        service._route.assert_not_called()
+        self.assertEqual(service._error.call_args.args[1].status, 503)
+
     def test_unknown_non_additive_refuses_process_start_on_both_drivers(self):
         self.mark_unknown()
         for driver in DRIVERS:
@@ -320,3 +343,85 @@ class SchemaGuardTest(unittest.TestCase):
             with mock.patch.object(migrations, '_exclude_live_executors', side_effect=check):
                 migrations.migrate(self.admin, directory)
         observer.execute("INSERT INTO agent_registry VALUES ('new', 'new-executor', clock_timestamp() + interval '1 hour')")
+        with self.assertRaises(migrations.IncompatibleSchema):
+            migrations.require_compatible_writer(observer, directory=migrations.MIGRATIONS_DIR)
+
+    @unittest.skipUnless(HAVE_PSYCOPG, 'concurrent admission after migration commit')
+    def test_waiting_claim_is_admitted_after_commit_but_refuses_its_next_tick(self):
+        observer = db_mod.connect(self.cfg, driver='psycopg', writer=False)
+        self.addCleanup(observer.close)
+        entered, claimed = threading.Event(), threading.Event()
+        errors = []
+        original = migrations._exclude_live_executors
+        thread = None
+        def claim():
+            try:
+                entered.set()
+                observer.execute("INSERT INTO agent_registry VALUES ('waiting', 'executor', clock_timestamp() + interval '1 hour')")
+                claimed.set()
+                migrations.require_compatible_writer(observer)
+            except Exception as exc:
+                errors.append(exc)
+        def check(tx, todo, reason):
+            nonlocal thread
+            original(tx, todo, reason)
+            thread = threading.Thread(target=claim)
+            thread.start()
+            self.assertTrue(entered.wait(3))
+            self.assertFalse(claimed.wait(0.1))
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, '9999_break.sql').write_text('-- ameesh: non-additive\nUPDATE guard_writes SET n = 7;')
+            with mock.patch.object(migrations, '_exclude_live_executors', side_effect=check):
+                migrations.migrate(self.admin, directory)
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(claimed.is_set())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], migrations.IncompatibleSchema)
+
+
+
+class BackgroundAdmissionTest(unittest.TestCase):
+    def test_auxiliary_threads_survive_database_and_compatibility_failures(self):
+        names = ('resource_once', 'balance_once', 'harness_versions_once',
+                 'housekeeping_once', 'notify_health_once', 'branch_sweep_once',
+                 'account_claims_once', 'canon_sync_once', 'host_release_once')
+        process = object.__new__(runner.Runner)
+        process.db = object()
+        for name in names:
+            results, errors = [], []
+            def run():
+                try:
+                    for _ in range(2):
+                        results.append(getattr(process, name)())
+                except Exception as exc:
+                    errors.append(exc)
+            with self.subTest(name=name), mock.patch.object(
+                    migrations, 'require_compatible_writer', side_effect=[
+                        db_mod.Unavailable('offline'),
+                        migrations.IncompatibleSchema('unknown migration')]) as guard, \
+                    mock.patch.object(runner, 'log_async') as journal:
+                thread = threading.Thread(target=run)
+                thread.start()
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(results), 2)
+                self.assertEqual(guard.call_count, 2)
+                self.assertEqual(journal.call_count, 2)
+
+    def test_background_admission_recovers_on_the_next_pass(self):
+        writes = []
+        class Process:
+            db = object()
+            @migrations.writer_tick(on_admission_error=runner._background_admission_error)
+            def pass_once(self):
+                writes.append('passed')
+        with mock.patch.object(migrations, 'require_compatible_writer',
+                               side_effect=[db_mod.Unavailable('offline'), None]), \
+                mock.patch.object(runner, 'log_async'):
+            process = Process()
+            process.pass_once()
+            self.assertEqual(writes, [])
+            process.pass_once()
+            self.assertEqual(writes, ['passed'])

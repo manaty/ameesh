@@ -221,6 +221,13 @@ def _reasons_uniques(*groups) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _background_admission_error(name, exc):
+    """Skip this pass without killing its thread; the main loop stays strict."""
+    log_async("%s: writer admission refused (%s): %s" %
+              (name, type(exc).__name__, " ".join(str(exc).split())[:240]))
+    return False if name == 'canon_sync_once' else 0 if name == 'balance_once' else None
+
+
 #: délai borné accordé au fil `journal` pour vider sa file à l'arrêt
 JOURNAL_CLOSE_TIMEOUT = 2.0
 EXIT_REVOKED = 6
@@ -11901,7 +11908,7 @@ class Runner:
         log_async("shutdown: %d lease(s) returned, %d turn(s)" % (len(workers), self.turns))
 
     # -- canon sync (spec §4.4) --------------------------------------------
-    @migrations.writer_tick
+    @migrations.writer_tick(on_admission_error=_background_admission_error)
     def canon_sync_once(self) -> bool:
         """Un `canon sync` de l'hôte ; ne lève jamais, ne tue jamais un tour.
 
@@ -12174,7 +12181,7 @@ class Runner:
         self.canon_thread.start()
 
     # -- solde des fournisseurs payés au token (L26) ------------------------
-    @migrations.writer_tick
+    @migrations.writer_tick(on_admission_error=_background_admission_error)
     def balance_once(self, sources=None, min_interval_s: float = 0.0) -> int:
         """Relève le solde de chaque source configurée ; ne lève jamais.
 
@@ -12237,7 +12244,7 @@ class Runner:
         threading.Thread(target=boucle, daemon=True, name="solde").start()
 
     # -- ressources de l'hôte (L31, 0028) -----------------------------------
-    @migrations.writer_tick
+    @migrations.writer_tick(on_admission_error=_background_admission_error)
     def resource_once(self) -> dict | None:
         """Relève et publie les ressources de l'hôte ; ne lève jamais.
 
@@ -12315,7 +12322,7 @@ class Runner:
         except (db_mod.DbError, handoffs.HandoffError, ValueError):
             log_async("host lifecycle: request remains pending; helper or prerequisites unavailable")
 
-    @migrations.writer_tick
+    @migrations.writer_tick(on_admission_error=_background_admission_error)
     def host_release_once(self, *, scan_local=True, complete=False) -> None:
         """#4148: one release-scanner pass (adapter transitions, auto drain).
 
@@ -12424,7 +12431,7 @@ class Runner:
                        if worker.is_alive() and getattr(worker, "proc", None) is not None}
         return en_tour | self.background.agents()
 
-    @migrations.writer_tick
+    @migrations.writer_tick(on_admission_error=_background_admission_error)
     def housekeeping_once(self, *, min_interval_s: float = 0.0) -> dict | None:
         """Un passage de ménage (L73) ; ne lève jamais.
 
@@ -12623,7 +12630,7 @@ class Runner:
                       % (action["old"], action["new"], action["reason"].splitlines()[0]))
         return report
 
-    @migrations.writer_tick
+    @migrations.writer_tick(on_admission_error=_background_admission_error)
     def notify_health_once(self, db=None, now: float | None = None) -> dict | None:
         """#3007 : dit, depuis cet hôte, si un notificateur vivant couvre les
         humains qui ont des décisions en attente, et briefe les agents.
@@ -12667,7 +12674,7 @@ class Runner:
                       % (entry.get("recipient") or "?", entry.get("error")))
         return report
 
-    @migrations.writer_tick
+    @migrations.writer_tick(on_admission_error=_background_admission_error)
     def branch_sweep_once(self) -> dict | None:
         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
         cet hôte (et, avec `--agents`, parmi eux) : une branche fusionnée dans
@@ -12716,7 +12723,7 @@ class Runner:
                 except Exception:
                     pass
 
-    @migrations.writer_tick
+    @migrations.writer_tick(on_admission_error=_background_admission_error)
     def footprint_once(self, db) -> None:
         """#4818 : l'empreinte suit le travail réel — le diff d'une branche
         poussée par un agent de cet hôte remplace l'estimation dès le premier
@@ -13566,7 +13573,7 @@ class Runner:
                 and r.get("status") != "stopped"
                 and (self.agents_filter is None or r["name"] in self.agents_filter)]
 
-    @migrations.writer_tick
+    @migrations.writer_tick(on_admission_error=_background_admission_error)
     def harness_versions_once(self, now: float | None = None) -> list[dict] | None:
         """L120: read and record the version of the harnesses this runner
         serves, at most every `PROBE_INTERVAL_S`; never raises. Read only:
@@ -13594,7 +13601,7 @@ class Runner:
                 except Exception:
                     pass
 
-    @migrations.writer_tick
+    @migrations.writer_tick(on_admission_error=_background_admission_error)
     def account_claims_once(self) -> None:
         """#313/#2580 (décision 0033) : revendique, dans le registre de
         l'hôte, les identifiants des comptes de cette configuration, puis

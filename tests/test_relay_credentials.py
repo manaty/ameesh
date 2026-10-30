@@ -23,7 +23,7 @@ class RelayCredentialsTest(unittest.TestCase):
         self.cfg = types.SimpleNamespace(host="server-host")
         self.relay = relay.Relay(
             verifier=relay.StaticTokens({TOKEN: identity()}),
-            policy=relay.StaticPolicy({"a1": ["deepseek-flash"]}), db=object(), cfg=self.cfg,
+            policy=relay.StaticPolicy({"a1": ["deepseek-flash"]}), db=types.SimpleNamespace(query=lambda *_a, **_k: []), cfg=self.cfg,
             secrets=relay.ServerSecrets({"DEEPSEEK_API_KEY": SERVER_KEY}),
             config=relay.RelayConfig(upstreams={"deepseek": self.provider.url}),
             prices={"deepseek-flash": [0.27, 0.07, 1.10]})
