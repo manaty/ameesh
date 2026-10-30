@@ -827,6 +827,12 @@ class MenageDbTest(PgTestCase):
         super().setUp()
         for table in ("housekeeping_log", "managed_worktrees", "host_resources"):
             self.db.execute("DELETE FROM %s" % table)
+        # #4754 : le passage de la CLI re-épingle les unités de veille de
+        # l'hôte ; un test n'en lit ni n'en réécrit aucune réelle.
+        units = tempfile.mkdtemp(prefix="units-", dir=self.tmp)
+        patcher = mock.patch.dict(os.environ, {"AMEESH_SYSTEMD_USER_DIR": units})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.cfgl = _Cfg(self.state)
         self.cfgl.host = self.cfg.host
 

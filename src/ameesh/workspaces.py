@@ -367,7 +367,8 @@ def after_turn(turn, *, lot: str | None, turn_id: str, db, host: str,
 def periodic_pass(cfg, db, policy: Policy, *, host: str, actor: str,
                   busy: bool = False, agents_in_turn: set | None = None,
                   runtime=None, min_interval_s: float = 0.0,
-                  free_target: int = 0, artifact_scan: bool = True) -> dict:
+                  free_target: int = 0, artifact_scan: bool = True,
+                  units_dir: str | None = None) -> dict:
     """Un passage d'hôte (L73), partagé par les exécuteurs et la CLI.
 
     Mêmes verrous (`host-pass`, intervalle du passage) et mêmes seuils que
@@ -375,11 +376,19 @@ def periodic_pass(cfg, db, policy: Policy, *, host: str, actor: str,
     nu (pas de module `dev`), le passage est un no-op : aucune entrée."""
     if dev_module() is None:
         return {"status": "no-dev-module", "entries": []}
+    # #4754 : le dossier des unités n'est passé que s'il est nommé
+    extra = {"units_dir": units_dir} if units_dir else {}
     return housekeeping.run_pass(
         cfg, db, policy, host=host, actor=actor, busy=busy,
         agents_in_turn=agents_in_turn, runtime=runtime,
         min_interval_s=min_interval_s, free_target=free_target,
-        artifact_scan=artifact_scan)
+        artifact_scan=artifact_scan, **extra)
+
+
+def host_units_dir() -> str | None:
+    """#4754 : le dossier des unités de veille de l'hôte, que le passage
+    périodique re-épingle (None hors systemd)."""
+    return housekeeping.host_units_dir()
 
 
 def tmpfs_pressure(top, policy: Policy) -> str:

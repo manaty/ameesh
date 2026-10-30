@@ -308,11 +308,86 @@ def parse_wake_deadline(text: str | None, at: str | None, *,
     return reference + delay
 
 
+#: #4754 : un venv versionné de la bascule (`venv-<sha7>`, #1969), que son
+#: ménage (#3792) retire une fois quitté : une unité ne doit jamais le nommer.
+VERSIONED_VENV_RE = re.compile(r"^venv-[0-9a-f]{7,40}$")
+#: le lien de la version vivante, voisin de tout venv versionné (bascule.py)
+CURRENT_VENV = "venv-courant"
+#: un chemin absolu vers un binaire d'un venv versionné, dans une ligne d'unité
+VERSIONED_BINARY_RE = re.compile(r"/[^\s\"']*/venv-[0-9a-f]{7,40}/bin/[A-Za-z0-9_.+-]+")
+
+
+def stable_binary(binary: str, home: str | None = None) -> str:
+    """#4754 : le chemin à écrire dans une unité pour `binary`. Un binaire d'un
+    venv versionné (`…/venv-<sha7>/bin/<nom>`) devient celui du lien vivant
+    voisin (`…/venv-courant/bin/<nom>`), sinon `~/.local/bin/<nom>` ; le
+    ménage des venv retirerait sinon le chemin figé (203/EXEC). Un autre
+    chemin, ou faute de chemin stable exécutable, est rendu tel quel."""
+    bin_dir = os.path.dirname(binary)
+    venv = os.path.dirname(bin_dir)
+    if os.path.basename(bin_dir) != "bin" or not VERSIONED_VENV_RE.match(os.path.basename(venv)):
+        return binary
+    name = os.path.basename(binary)
+    home = home or os.path.expanduser("~")
+    for candidate in (os.path.join(os.path.dirname(venv), CURRENT_VENV, "bin", name),
+                      os.path.join(home, ".local", "bin", name)):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return binary
+
+
 def _ameesh_binary() -> str:
     found = shutil.which("ameesh")
     if found:
-        return os.path.abspath(found)
+        return stable_binary(os.path.abspath(found))
     return os.path.join(os.path.expanduser("~"), ".local", "bin", "ameesh")
+
+
+def repin_units(directory: str, *, run: Callable = subprocess.run, dry_run: bool = False,
+                home: str | None = None) -> list[dict]:
+    """#4754 : réécrit l'`ExecStart` des unités de veille et de réveil
+    d'ameesh (`ameesh-watch-*`, `ameesh-wake-*`) qui nomment encore un binaire
+    de venv versionné, écrites avant `stable_binary` : une veille dont le venv
+    a été retiré échoue en 203/EXEC à chaque tir sans que rien ne le dise.
+    Rend une entrée par unité (`path`, `before`, `after`) ; à blanc, n'écrit
+    rien. Un seul `daemon-reload` après les réécritures."""
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    fixed = []
+    for name in names:
+        if not name.endswith(".service") or not name.startswith((UNIT_PREFIX, WAKE_PREFIX)):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        lines, before, after = [], [], []
+        for line in text.splitlines(keepends=True):
+            if line.startswith("ExecStart="):
+                for old in VERSIONED_BINARY_RE.findall(line):
+                    new = stable_binary(old, home=home)
+                    if new != old:
+                        line = line.replace(old, new)
+                        before.append(old)
+                        after.append(new)
+            lines.append(line)
+        if not before:
+            continue
+        fixed.append({"path": path, "before": before, "after": after})
+        if dry_run:
+            continue
+        tmp = os.path.join(directory, "." + name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("".join(lines))
+        os.replace(tmp, path)
+    if fixed and not dry_run:
+        _systemctl_quiet(run, "daemon-reload")
+    return fixed
 
 
 def _env_binary() -> str:

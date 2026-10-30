@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#4609 : la signature d'un `pg_dump` dans les statistiques de la base du mesh.
 
-PostgreSQL 17 tient `pg_stat_user_tables.last_seq_scan`, l'instant du dernier
+PostgreSQL 16 tient `pg_stat_user_tables.last_seq_scan`, l'instant du dernier
 parcours séquentiel de chaque table. Un `pg_dump` lit toutes les tables dans
 une seule transaction (`REPEATABLE READ`) : les tables qu'il a lues portent le
 même instant, à la microseconde près. C'est la preuve, en lecture seule, que
@@ -11,10 +11,10 @@ ni de la copie hors de la VM (#4300).
 Lecture seule : aucune écriture, aucune inspection de fichier ni de S3.
 """
 
-#: `last_seq_scan` est apparu avec PostgreSQL 17. Un serveur plus ancien ne
+#: `last_seq_scan` est apparu avec PostgreSQL 16. Un serveur plus ancien ne
 #: peut pas fournir la preuve : l'appelant se tait plutôt que de lever une
 #: fausse alerte de sauvegarde manquante.
-FIRST_VERSION = 170000
+FIRST_VERSION = 160000
 
 
 def read(db):
