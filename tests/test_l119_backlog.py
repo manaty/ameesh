@@ -25,14 +25,6 @@ class _Base(PgTestCase):
     def setUp(self):
         super().setUp()
         self.now = time.time()
-        # #5005 : ces bancs L119/L165 utilisent le document de canon explicite,
-        # sans lire les paramètres de la machine qui exécute les tests.
-        from ameesh import mechanics
-        from .test_l1616_mechanics import MECHANICS
-        policy = patch.object(mechanics, "configured",
-                              return_value=mechanics.compile_document(MECHANICS))
-        policy.start()
-        self.addCleanup(policy.stop)
 
     def agent(self, name, harness="claude", *, status="idle", since_s=2 * HEURE, team=None,
               capabilities=None, roles=None, host=None, responsible="human:proprio"):

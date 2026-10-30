@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from ameesh import backlog, mechanics, work
+from ameesh import backlog, mechanics, notify, work
 from . import test_l165_prise_lots as lots
 from .test_l1616_mechanics import MECHANICS
 
@@ -102,6 +102,25 @@ class AutoTakeTest(lots._Lots):
                 return [{"agent": "excluded", "kind": kind}]
             with self.subTest(kind=kind), patch.object(backlog, "_propose_reviews", side_effect=propose):
                 self.assertEqual([r["kind"] for r in self.take()], [kind])
+
+    def test_notify_records_take_without_swallowing_a_canon_error(self):
+        self.policy()
+        self.agent("excluded", harness="deepseek", team="nexlink")
+        self.agent("eligible", harness="codex", team="nexlink")
+        lot = self.lot("travail neuf")
+        records, logs = [], []
+        notifier = notify.Notifier(
+            self.cfg, notify.parse_config({}), log=logs.append,
+            emit=records.append, clock=lambda: self.now,
+            take={"idle_s": 0, "max_per_hour": 0,
+                  "lot_idle_s": 900, "lot_max_per_hour": 6,
+                  "review_max_per_hour": 0, "orchestras": []})
+        notifier.run_pass(self.db, thresholds=lots._seuils())
+        self.assertFalse(any("auto-take failed" in entry for entry in logs), logs)
+        taken = [r for r in records if r["event"] == "auto_take"]
+        self.assertEqual([(r["agent"], r["lot"]) for r in taken],
+                         [("eligible", lot["id"])])
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "eligible")
 
     def test_local_orchestrator_fallback_cannot_bypass_exclusion(self):
         self.policy()
