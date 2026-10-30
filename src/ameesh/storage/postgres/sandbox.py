@@ -204,11 +204,12 @@ def _finish(tx, row, *, settle, outcome, cost_usd=None, close_registry=True):
     if settled is not None:
         cost_usd = settled.get('usd')
     if close_registry:
-        paused = tx.query('select operator_paused from agent_registry where name = %s',
-                          (row['agent'],))[0]['operator_paused']
+        agent = tx.query('select operator_paused, pending_prompt from agent_registry'
+                         ' where name = %s', (row['agent'],))[0]
+        queued = agent['operator_paused'] or bool(agent['pending_prompt'])
         if not ameesh_turn_close(
                 tx, row['agent'], row['owner'], row['lease_epoch'],
-                status='queued' if paused else 'idle', status_text=None, error=None,
+                status='queued' if queued else 'idle', status_text=None, error=None,
                 cost_usd=cost_usd, sandbox_turn_id=row['turn_id']):
             _refuse('stale')
     tx.execute('delete from spend_pending where agent = %s and turn_id = %s',

@@ -63,10 +63,18 @@ create unique index sandbox_turns_live_agent on sandbox_turns (agent)
 create function ameesh_sandbox_snapshot_guard() returns trigger
 language plpgsql as $$
 begin
-    if (to_jsonb(new) - array['sandbox_session','job_uid','job_phase','state',
+    -- A registered rename changes the spelling, never the admitted identity.
+    -- agent_rename first updates the primary and retains OLD as its alias.
+    if new.agent is distinct from old.agent and not exists (
+        select 1 from agent_registry where name = new.agent
+          and old.agent = any(aliases)
+    ) then
+        raise exception 'immutable sandbox identity';
+    end if;
+    if (to_jsonb(new) - array['agent','sandbox_session','job_uid','job_phase','state',
             'result_id','result_sha256','refusal','cancel_requested_at',
             'cancel_observed_at','completed_at']) is distinct from
-       (to_jsonb(old) - array['sandbox_session','job_uid','job_phase','state',
+       (to_jsonb(old) - array['agent','sandbox_session','job_uid','job_phase','state',
             'result_id','result_sha256','refusal','cancel_requested_at',
             'cancel_observed_at','completed_at']) then
         raise exception 'immutable sandbox admission';
@@ -82,3 +90,8 @@ begin
 end $$;
 create trigger sandbox_turns_snapshot_guard before update on sandbox_turns
     for each row execute function ameesh_sandbox_snapshot_guard();
+
+-- Same spelling contract as agent_rename.REWRITTEN: resolve aliases on new
+-- writes, under the registry lock used by the rename transaction (0516).
+create trigger ameesh_agent_spelling before insert or update of agent on sandbox_turns
+    for each row execute function ameesh_agent_spelling('agent');

@@ -5,8 +5,9 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from unittest import mock
 
-from ameesh import jcs, registry
+from ameesh import agent_rename, jcs, registry, work
 from ameesh.storage.postgres import sandbox
 from .support import PgTestCase
 
@@ -259,3 +260,39 @@ class SandboxTest(PgTestCase):
         self.db.execute("update agent_registry set operator_paused = true where name = 'sand'")
         self.complete()
         self.assertEqual(self.db.query("select status from agent_registry where name = 'sand'")[0]['status'],'queued')
+
+    def test_pending_prompt_closes_queued_without_losing_prompt(self):
+        self.bind()
+        registry.set_pending_prompt(self.db, 'sand', 'next request')
+        self.complete()
+        self.assertEqual(self.db.query(
+            "select status,pending_prompt from agent_registry where name = 'sand'")[0],
+            dict(status='queued',pending_prompt='next request'))
+
+    def test_rename_preserves_identity_and_normalizes_later_alias_writes(self):
+        with mock.patch.object(work, 'corrector', return_value='human:owner'):
+            self.db.execute("update agent_registry set status = 'idle',"
+                            " lease_expires_at = now() - interval '1 second' where name = 'sand'")
+            agent_rename.rename(self.cfg,self.db,'sand','sand-renamed',reason='sandbox test')
+            try:
+                row = self.db.query('select * from sandbox_turns')[0]
+                self.assertEqual(row['agent'],'sand-renamed')
+                self.assertEqual(row['owner'],'runner')
+                self.db.execute("update agent_registry set status = 'running',"
+                                " lease_expires_at = now() + interval '1 hour' where name = 'sand-renamed'")
+                self.bind()  # _live follows the same identity after the rename.
+                with self.assertRaises(Exception):
+                    self.db.execute("update sandbox_turns set agent = 'unrelated' where turn_id = 'turn-1'")
+                self.db.execute("update sandbox_turns set state = 'cancelled' where turn_id = 'turn-1'")
+                row.update(turn_id='alias-turn',spend_key='alias-spend',job_name='alias-job',
+                           attempt=2,agent='sand')
+                self.db.execute('insert into sandbox_turns select * from'
+                                ' jsonb_populate_record(null::sandbox_turns,%s::jsonb)',
+                                (json.dumps(row),))
+                self.assertEqual(self.db.query(
+                    "select agent from sandbox_turns where turn_id = 'alias-turn'")[0]['agent'],
+                    'sand-renamed')
+            finally:
+                self.db.execute("update agent_registry set status = 'idle',"
+                                " lease_expires_at = now() - interval '1 second' where name = 'sand-renamed'")
+                agent_rename.rename(self.cfg,self.db,'sand-renamed','sand',reason='restore fixture')
