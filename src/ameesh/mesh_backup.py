@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#4609 : `mesh_backup_unseen`, la lecture complète quotidienne de la base du mesh.
 
-Sous PostgreSQL 17, `pg_stat_user_tables.last_seq_scan` donne l'instant du
+Sous PostgreSQL 16, `pg_stat_user_tables.last_seq_scan` donne l'instant du
 dernier parcours séquentiel de chaque table. Le `pg_dump` quotidien de la base
 du mesh (minuterie `ameesh-sauvegarde`, 03:30 + jusqu'à 15 min d'aléa) lit
 toutes les tables dans une seule transaction : les tables qu'il a lues portent

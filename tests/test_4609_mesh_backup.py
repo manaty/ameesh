@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#4609 : `mesh_backup_unseen`, la lecture complète quotidienne de la base.
 
-Le constat du 29/10 (#4300) : sous PostgreSQL 17, les 150 tables encore lues
-par le `pg_dump` de 03:37Z portaient le même `last_seq_scan` à la microseconde ;
-121 autres, relues depuis par l'activité normale, avaient avancé cet instant.
+Le constat du 29/10 (#4300), sur le mesh alors en PostgreSQL 17 : les 150
+tables encore lues par le `pg_dump` de 03:37Z portaient le même
+`last_seq_scan` à la microseconde ; 121 autres, relues depuis par l'activité
+normale, avaient avancé cet instant.
 Le critère (B de relecture du 29/10) : un groupe d'au moins 5 % des tables
 lisibles partage un instant T dans la fenêtre, et au moins 90 % des tables
 lisibles ont un `last_seq_scan >= T` — une table relue après le dump a pu être
@@ -270,9 +271,21 @@ class ReadTest(unittest.TestCase):
         self.assertIn("pg_stat_user_tables", db.query.call_args_list[-1].args[0])
         self.assertIn("last_seq_scan", db.query.call_args_list[-1].args[0])
 
-    def test_pg16_ne_peut_pas_prouver_et_se_tait(self):
+    def test_pg16_lit_les_statistiques(self):
+        # #4617 (N cx2) : `last_seq_scan` existe dès PostgreSQL 16 ; la garde
+        # ne doit plus exclure une base PG16 de la vérification.
         db = mock.Mock(cfg=mock.Mock(backend="pg"))
-        db.query.return_value = [{"version": 160000}]
+        db.query.side_effect = [[{"version": 160000}], [{"relname": "t",
+                                                         "last_seq_scan_us": 1}]]
+        self.assertEqual(mesh_backup.read(db), [{"relname": "t",
+                                                 "last_seq_scan_us": 1}])
+        self.assertEqual(db.query.call_count, 2)
+
+    def test_pg15_ne_peut_pas_prouver_et_se_tait(self):
+        # La colonne est apparue en PostgreSQL 16 : un serveur plus ancien ne
+        # peut pas fournir la preuve, l'alerte se tait au lieu de mentir.
+        db = mock.Mock(cfg=mock.Mock(backend="pg"))
+        db.query.return_value = [{"version": 150000}]
         self.assertIsNone(mesh_backup.read(db))
         self.assertEqual(db.query.call_count, 1)
 
@@ -293,12 +306,12 @@ class ReadTest(unittest.TestCase):
 
 
 class ReadOnPostgresTest(PgTestCase):
-    """La requête réelle, sur la base du banc (PostgreSQL 17)."""
+    """La requête réelle, sur la base du banc (PostgreSQL 16 ou plus récent)."""
 
     def test_la_requete_lit_les_statistiques_reelles(self):
         stats = mesh_backup.read(self.db)
         if stats is None:
-            self.skipTest("PostgreSQL 17 required for last_seq_scan")
+            self.skipTest("PostgreSQL 16 required for last_seq_scan")
         self.assertTrue(stats)
         for row in stats:
             self.assertEqual(set(row), {"relname", "last_seq_scan_us"})
