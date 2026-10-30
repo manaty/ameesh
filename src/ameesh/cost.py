@@ -54,6 +54,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Sequence
 
 from . import config as config_mod
+from . import context_metrics
 from . import harnesses
 from . import storage
 from .gauge_cache import CLAUDE_GAUGES
@@ -544,6 +545,126 @@ class TurnUsage:
         if self.harness == "codex":
             return max(int(self.input_tokens), int(self.cached_input_tokens))
         return int(self.input_tokens) + int(self.cached_input_tokens)
+
+
+#: CTX-02b : type de l'événement qui publie, par tour, les mesures de contexte
+#: étiquetées ``ameesh-context/1`` à côté des compteurs legacy.
+CONTEXT_EVENT = "turn.context"
+
+#: Les compteurs legacy publiés **à côté** des mesures normalisées. Tous les
+#: champs sont présents, ``None`` quand la mesure manque : le lecteur n'a pas à
+#: distinguer une clé absente d'une absence mesurée.
+CONTEXT_LEGACY_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_tokens",
+    "output_tokens",
+    "reread_tokens",
+    "context_tokens",
+    "subagent_reread_tokens",
+    "session_tokens",
+    "session_turns",
+    "context_max_tokens",
+    "session_max_tokens",
+)
+
+
+def context_publication(document: dict, *, legacy: dict, decision: dict,
+                        agent: str, host: str, label: str | None = None,
+                        kind: str | None = None,
+                        work_item_id: str | None = None,
+                        started_ts: float | None = None,
+                        ended_ts: float | None = None) -> dict:
+    """La charge d'un événement ``turn.context`` (CTX-02b, observation seule).
+
+    Le document ``ameesh-context/1`` de :class:`context_metrics.TurnNormalizer`
+    (mesures étiquetées : qualité, raisons, granularité, source, cache,
+    sous-agents) est publié **à côté** des compteurs legacy du tour, sans
+    changer ni la ligne ``turn_costs`` ni une décision de rotation. ``legacy``
+    porte les valeurs que l'exécuteur et le grand livre utilisent déjà ;
+    ``decision`` porte la politique en vigueur et les motifs de clôture /
+    rotation observés, pour que l'écart legacy/cible soit lisible.
+
+    Lève :class:`CostError` si le document n'est pas un ``ameesh-context/1``
+    clos ou s'il manque un champ legacy : un appelant fautif doit le voir,
+    l'exécuteur attrape l'erreur pour ne jamais retenir un tour.
+    """
+    if not isinstance(document, dict) \
+            or document.get("schema") != context_metrics.SCHEMA:
+        raise CostError("context publication: an %s document is required"
+                        % context_metrics.SCHEMA)
+    if document.get("finished") is not True:
+        raise CostError("context publication: the turn document is not finished")
+    measures = document.get("measures")
+    if not isinstance(measures, dict) or "C_last" not in measures \
+            or "R_turn" not in measures:
+        raise CostError("context publication: normalized measures are missing")
+    if not isinstance(legacy, dict):
+        raise CostError("context publication: legacy counters must be a mapping")
+    missing = [name for name in CONTEXT_LEGACY_FIELDS if name not in legacy]
+    if missing:
+        raise CostError("context publication: legacy counters missing: %s"
+                        % ", ".join(missing))
+    if not isinstance(decision, dict):
+        raise CostError("context publication: decision must be a mapping")
+    policy = decision.get("policy")
+    if not isinstance(policy, dict):
+        raise CostError("context publication: decision.policy must be a mapping")
+    for name, value in (("started_ts", started_ts), ("ended_ts", ended_ts)):
+        if value is not None and (isinstance(value, bool)
+                                  or not isinstance(value, (int, float))):
+            raise CostError("context publication: %s must be a number" % name)
+    turn_id = document.get("turn")
+    return {
+        "schema": context_metrics.SCHEMA,
+        "observation_id": "turn:" + str(turn_id) if turn_id else None,
+        "agent": str(agent),
+        "host": str(host),
+        "turn_id": turn_id or None,
+        "turn": label or None,
+        "kind": kind or None,
+        "started_ts": float(started_ts) if started_ts is not None else None,
+        "ended_ts": float(ended_ts) if ended_ts is not None else None,
+        "work_item_id": str(work_item_id) if work_item_id else None,
+        "session": document.get("session"),
+        "harness": document.get("harness"),
+        "model": document.get("model"),
+        "mode": document.get("mode"),
+        "role": document.get("role"),
+        "policy": dict(policy),
+        "decision": {key: value for key, value in decision.items()
+                     if key != "policy"},
+        "legacy": {name: legacy.get(name) for name in CONTEXT_LEGACY_FIELDS},
+        "context": document,
+    }
+
+
+def session_reread(db, agent: str, session: str) -> dict | None:
+    """Le cumul ``R_session`` des tours **précédents** d'une session, ou None.
+
+    Lecture seule du grand livre, pour la base ``session_reread`` du
+    normalisateur de contexte (CTX-02b) : entrée + cache **lu**, cache écrit
+    exclu ; Codex compte déjà le cache dans son entrée. Rend ``tokens``,
+    ``turns`` et ``last_ts`` (instant du dernier tour inscrit). Aucun tour
+    inscrit (session neuve, base neuve) ou lecture impossible : None — le
+    normalisateur publie alors ``R_session`` inconnu avec sa raison, jamais un
+    zéro supposé.
+
+    La somme legacy ne prouve pas la complétude des tours précédents : c'est
+    à l'appelant de vérifier la qualité durable de la base (un tour partiel,
+    un ``R_turn`` absent ou une publication perdue laissent les mêmes
+    compteurs). Une erreur de base ne retient jamais un tour : la mesure est
+    d'observation.
+    """
+    if not session:
+        return None
+    try:
+        row = storage.of(db).turn_costs.session_reread(agent, session)
+    except Exception:  # noqa: BLE001 — mesure d'observation, jamais fatale
+        return None
+    if not row or not int(row.get("turns") or 0):
+        return None
+    return row
 
 
 def load_prices(path: str | None = None) -> dict:

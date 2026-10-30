@@ -108,6 +108,31 @@ class TurnCosts(interface.TurnCosts):
             return None
         return rows[0]
 
+    def session_reread(self, agent, session) -> dict | None:
+        """CTX-02b : le cumul des entrées relues d'une session, relu du livre.
+
+        Entrée + cache **lu** ; le cache écrit n'est jamais une relecture et
+        reste exclu (`cache_write_tokens` n'entre pas dans la somme). Codex
+        compte déjà le cache lu dans `input_tokens` : l'additionner serait un
+        double comptage. `turns` compte tous les tours inscrits, y compris
+        écartés du coût (`void_reason`) : leur usage a eu lieu. `last_ts` est
+        l'instant du dernier tour inscrit (epoch) : un appelant qui recharge
+        une qualité publiée s'en sert pour vérifier qu'aucun tour n'a été
+        écrit depuis. Aucun tour : None (jamais un zéro supposé). Cette
+        lecture ne change aucune décision ni aucune ligne.
+        """
+        rows = self.db.query(
+            "select coalesce(sum(case when harness = 'codex' then input_tokens"
+            "                          else input_tokens + cached_input_tokens end),"
+            "                0)::bigint as tokens,"
+            " count(*)::bigint as turns,"
+            " extract(epoch from max(recorded_at))::float8 as last_ts"
+            " from turn_costs where agent = %s and session = %s",
+            (agent, session))
+        if not rows or int(rows[0].get("turns") or 0) == 0:
+            return None
+        return rows[0]
+
     def insert(self, *, agent, harness, turn, model, session, usd, input_tokens,
                cached_input_tokens, output_tokens, cum_usd, cum_input_tokens,
                cum_cached_input_tokens, cum_output_tokens, account=None,
