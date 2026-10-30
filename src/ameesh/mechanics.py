@@ -11,7 +11,8 @@ mécanique, ce que l'outillage exécute sans agent :
   explicite et `last_packet`/`next_packet` refusés, jamais un repli sur
   `cutoffs` ni sur une durée locale (#1757) ;
 - `auto_take.excluded_families`, `expire` (#5005, bloc optionnel) : familles
-  exclues des prises lot/backlog jusqu’à la date ISO incluse (fuseau du canon),
+  exclues des prises lot/backlog et transferts build de pause budget jusqu’à
+  la date ISO incluse (fuseau du canon),
   sans fermer les propositions de relecture/correction ; absent ou expiré :
   aucune exclusion ; canon illisible : passage arrêté comme le plafond §4.
 - `build.max_in_build` : le plafond de lots en développement par agent ;

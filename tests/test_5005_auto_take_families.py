@@ -5,8 +5,9 @@ import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from ameesh import backlog, mechanics, notify, work
+from ameesh import backlog, handoff, mechanics, notify, work
 from . import test_l165_prise_lots as lots
+from .test_l233b_budget_handoff import _Handoff, GIT_OK
 from .test_l1616_mechanics import MECHANICS
 
 
@@ -48,6 +49,49 @@ class CompilationTest(unittest.TestCase):
             # Paris UTC+1 : 23:00 UTC est déjà le jour suivant.
             now = datetime(2026, 10, 30, hour, 59, tzinfo=ZoneInfo("UTC")).timestamp()
             self.assertEqual(policy.auto_take_excluded_families(now), expected)
+
+
+class BudgetHandoffTest(_Handoff):
+    def hand_with_policy(self, policy, **kwargs):
+        with patch.object(mechanics, "configured", return_value=policy), patch.object(
+                handoff, "lot_git", return_value=GIT_OK):
+            return self.hand(**kwargs)
+
+    def test_excluded_family_build_goes_to_other_family(self):
+        self.team()
+        self.agent("codex1", "codex", team="nexlink")
+        lot = self.lot("build", state="build", branch="lot/build")
+        out = self.hand_with_policy(document())
+        self.assertEqual([row["agent"] for row in out], ["codex1"])
+        self.assertEqual(self.assignee(lot), "codex1")
+
+    def test_without_eligible_target_build_stays_but_intake_returns(self):
+        self.team()
+        build = self.lot("build", state="build", branch="lot/build")
+        intake = self.lot("intake")
+        out = self.hand_with_policy(document())
+        self.assertEqual([(row["item"]["id"], row["agent"]) for row in out],
+                         [(intake["id"], None)])
+        self.assertEqual(self.assignee(build), "claude1")
+        self.assertIsNone(self.assignee(intake))
+
+    def test_absent_or_expired_exclusion_preserves_handoff(self):
+        self.team()
+        lot = self.lot("build", state="build", branch="lot/build")
+        for policy in (mechanics.compile_document(MECHANICS), document(expire="2000-01-01")):
+            with self.subTest(policy=policy.auto_take):
+                self.assertEqual([row["agent"] for row in self.hand_with_policy(policy, dry_run=True)],
+                                 ["deepseek1"])
+                self.assertEqual(self.assignee(lot), "claude1")
+
+    def test_unreadable_canon_prevents_handoff(self):
+        self.team()
+        lot = self.lot("build", state="build", branch="lot/build")
+        with patch.object(mechanics, "configured", side_effect=mechanics.MechanicsError("unreadable")):
+            with self.assertRaises(mechanics.MechanicsError):
+                self.hand()
+        self.assertEqual(self.assignee(lot), "claude1")
+        self.assertEqual(self.mails(), [])
 
 
 class AutoTakeTest(lots._Lots):

@@ -376,8 +376,13 @@ def budget_handoff(cfg, db, *, now: float | None = None,
     # un lot `intake` se rend à la file sans preneur ; un `build` exige un
     # preneur libre (DeepSeek ou Codex), le plus long repos d'abord : aucun
     # preneur n'a de lot (`idle_agents`)
+    from . import mechanics
+    from .review_lot import family_of
+    document = mechanics.configured(cfg)
+    excluded_families = document.auto_take_excluded_families(now)
     targets = sorted((row for row in sous_utilisation.idle_agents(listing, now, idle_s)
                       if row.get("harness") in TARGET_HARNESSES
+                      and family_of(row.get("harness"), document.families) not in excluded_families
                       and row["name"] not in orchestras),
                      key=lambda r: (sous_utilisation.idle_since(r), r["name"]))
     if budget_check is None:
