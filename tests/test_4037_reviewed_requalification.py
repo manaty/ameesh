@@ -489,6 +489,51 @@ class ReviewedMoveTest(unittest.TestCase):
                            ['processus/mecanique.yaml'], self.pr_refs)
         self.assert_unchanged()
 
+    def test_per_pr_guard_rename_and_edit_require_independent_reviews(self):
+        self.pr_range()
+        base = self.gate
+        for index, source in enumerate(('processus/mecanique.yaml', 'federation.yaml')):
+            with self.subTest(source=source):
+                self.repo.git('checkout', '-q', '--detach', base)
+                destination = 'moved/rules\n%s.yaml' % index
+                with open(os.path.join(self.repo.root, source)) as stream:
+                    content = stream.read()
+                self.repo.write(destination, content + '# moved\n')
+                self.repo.git('rm', source)
+                self.set_gate(self.repo.commit('rename and edit guarded rules'))
+                self.proofs[self.gate] = 'deepseek'
+                self.pr_marks[self.gate] = self.marks
+                # Witness the original bypass: Git's default name-only diff
+                # lists only the destination for this detected rename.
+                names = self.repo.git('diff', '--name-only', base, self.gate)
+                self.assertNotIn(source, names)
+                # Restore the guarded path in a separately reviewed commit,
+                # so the final canon is valid. Its reviews must not cover the
+                # preceding unreviewed rename merely because the net diff
+                # no longer contains the guarded path.
+                self.repo.write(source, content)
+                self.set_gate(self.repo.commit('restore guarded path'))
+                self.proofs[self.gate] = 'deepseek'
+                self.pr_marks[self.gate] = self.marks
+                with self.assertRaisesRegex(TrainError, 'requires --review'):
+                    self.execute(reviews=[*self.pr_refs, 'milestone:2'])
+                self.assert_unchanged()
+
+    def test_per_pr_branch_opposition_is_checked_with_merge_reviews(self):
+        heads = self.pr_range()
+        head = heads[1]
+        merge = self.repo.git('rev-parse', self.gate + '^1')
+        marks = self.pr_marks.pop(head)
+        self.pr_marks[merge] = marks
+        for mark in marks:
+            mark['sha'] = merge
+            self.receipts[mark['id']]['commit'] = merge
+        self.pr_marks[head] = [dict(id=999, kind='verdict', actor='human:smichea',
+                                    sha=head, verdict='blocked', at_ts=999)]
+        with self.assertRaisesRegex(TrainError, 'blocking opinion'):
+            self.execute(reviews=self.pr_refs)
+        self.assert_unchanged()
+
 
 class ReviewedActorTest(unittest.TestCase):
     def test_unreadable_role_is_a_named_refusal(self):

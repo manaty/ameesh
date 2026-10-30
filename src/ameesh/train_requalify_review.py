@@ -60,7 +60,8 @@ def _clean_merge_tree(repo, first, second):
 
 
 def _qualify_range(cfg, db, spec, pin, gate, changed, references, *,
-                   opinion_commit=None, require_pilot=True, policy_floor=()):
+                   opinion_commit=None, require_pilot=True, policy_floor=(),
+                   opposition_commits=()):
     """Read exact provenance and current verdicts before any configuration write."""
     if not references:
         raise TrainError("reviewed requalification requires --review milestone:<id>")
@@ -90,7 +91,7 @@ def _qualify_range(cfg, db, spec, pin, gate, changed, references, *,
     # Ask the common gate for opposition on the complete history. Its result
     # is not an authorization here: pilot assent and diff qualification are
     # checked below. This avoids maintaining a second definition of a block.
-    for commit in dict.fromkeys((gate, opinion_commit)):
+    for commit in dict.fromkeys((gate, opinion_commit, *opposition_commits)):
         opposition = merge_queue.review_gate(
             db, storage.of(db).work.verdicts_for_commit(commit), commit,
             repo=spec.canon, klass={"class": "sensitive"},
@@ -225,10 +226,7 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
     used = {gate}
     previous = pin
     for commit, *parents in steps:
-        delta = resolutions._run(spec.canon, "diff", "--name-only", previous, commit)
-        if delta.returncode:
-            raise TrainError("cannot read canon PR diff for %s" % commit)
-        paths = resolutions._text(delta).splitlines()
+        paths = train_assembly.canon_diff(spec.canon, previous, commit)
         if set(paths).intersection(train_assembly.REQUALIFY_GUARD):
             opinion = commit
             if len(parents) == 2 and parents[1] in by_commit:
@@ -241,7 +239,8 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
                     opinion = parents[1]
             records.extend(_qualify_range(
                 cfg, db, spec, previous, commit, paths, by_commit.get(opinion, []),
-                opinion_commit=opinion, require_pilot=False, policy_floor=floor))
+                opinion_commit=opinion, require_pilot=False, policy_floor=floor,
+                opposition_commits=parents[1:]))
             used.add(opinion)
         previous = commit
     if set(by_commit) - used:
