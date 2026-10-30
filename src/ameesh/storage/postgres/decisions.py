@@ -194,17 +194,19 @@ class Decisions(interface.Decisions):
             if (current["payload"]["decision"].get("supersedes") != target
                     or record.get("state") != "answered"):
                 raise decisions.DecisionError("supersession request changed")
-            old = repository.get(target)
-            old_view = decisions.view_of(old) if old else None
-            if not old_view or old_view["state"] != "answered":
-                raise decisions.DecisionError("supersedes requires an answered decision; pending uses withdraw")
-            decisions.require_current(old_view)
             closed = repository._close(decision_id, status=status, record=record)
             view = decisions.view_of(closed)
             if ((view.get("answer") or {}).get("channel") != "signed"
                     or view.get("needs_signature") is not True
                     or not decisions.verify_proof(tx, view, live=True)[0]):
                 raise decisions.DecisionError("supersession requires a valid signed answer")
+            if not decisions.supersession_approved(view):
+                return closed
+            old = repository.get(target)
+            old_view = decisions.view_of(old) if old else None
+            if not old_view or old_view["state"] != "answered":
+                raise decisions.DecisionError("supersedes requires an answered decision; pending uses withdraw")
+            decisions.require_current(old_view)
             tx.execute("UPDATE agent_mailbox SET payload = jsonb_set(payload,"
                        " '{decision,superseded_by}', to_jsonb(%s::bigint)) WHERE id = %s",
                        (int(decision_id), target))

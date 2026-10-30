@@ -4,8 +4,9 @@ from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 import time
+import unittest
 
-from ameesh import decisions, storage
+from ameesh import decisions, storage, harness_adoption
 from ameesh import db as db_mod
 from . import test_l124_decisions as fixtures
 
@@ -24,7 +25,7 @@ class SupersessionTest(fixtures._Base):
         return self.answer(old['id'], 'a', key_path=self.key)['decision']
 
     def replacement(self, old):
-        return self.ask(supersedes=old['id'], question='Replace the exact former authority?')
+        return self.ask(supersedes=old['id'], supersedes_option='a', question='Replace the exact former authority?')
 
     def test_only_signed_answer_replaces_exact_decision_and_keeps_history(self):
         old = self.old_answer()
@@ -73,9 +74,40 @@ class SupersessionTest(fixtures._Base):
         new = self.replacement(old)
         digest = decisions.answer_digest(new, 'a', 'a', ALICE)
         self.assertNotEqual(digest, decisions.answer_digest(dict(new, supersedes=old['id'] + 1), 'a', 'a', ALICE))
+        self.assertNotEqual(digest, decisions.answer_digest(dict(new, supersedes_option='b'), 'a', 'a', ALICE))
         legacy = dict(old)
         legacy.pop('supersedes')
         self.assertEqual(decisions.answer_digest(old, 'a', 'a', ALICE), decisions.answer_digest(legacy, 'a', 'a', ALICE))
+
+    def test_replacement_requires_a_designated_existing_option(self):
+        old = self.old_answer()
+        for option in (None, '', 'absent'):
+            with self.subTest(option=option), self.assertRaisesRegex(decisions.DecisionError, 'exact option key'):
+                self.ask(supersedes=old['id'], supersedes_option=option)
+        with self.assertRaisesRegex(decisions.DecisionError, 'requires --supersedes'):
+            self.ask(supersedes_option='a')
+
+    def assert_refusal_preserves_authority(self, text):
+        old = self.old_answer()
+        new = self.replacement(old)
+        answered = self.answer(new['id'], text, key_path=self.key)['decision']
+        self.assertEqual(answered['state'], 'answered')
+        self.assertFalse(decisions.supersession_approved(answered))
+        self.assertTrue(decisions.verify_proof(self.db, answered)[0])
+        self.assertIsNone(decisions.get(self.db, old['id'])['superseded_by'])
+        decisions.require_current(decisions.get(self.db, old['id']))
+        self.assertEqual(self.db.query('SELECT * FROM decision_supersessions'), [])
+        self.assertIn('not replaced', decisions.answer_text(answered))
+        self.assertIn('(not effective)', '\n'.join(decisions.format_view(answered)))
+        followup = self.replacement(old)
+        self.answer(followup['id'], 'a', key_path=self.key)
+        self.assertEqual(decisions.get(self.db, old['id'])['superseded_by'], followup['id'])
+
+    def test_signed_refusal_option_keeps_old_authority_and_allows_later_replacement(self):
+        self.assert_refusal_preserves_authority('b')
+
+    def test_signed_free_text_keeps_old_authority_and_allows_later_replacement(self):
+        self.assert_refusal_preserves_authority('non, ne remplace pas')
 
     def test_forged_proof_rolls_back_both_decisions(self):
         old = self.old_answer()
@@ -142,3 +174,13 @@ class SupersessionTest(fixtures._Base):
         events = self.db.query('SELECT * FROM decision_supersessions')
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['superseded_by'], decisions.get(self.db, old['id'])['superseded_by'])
+
+
+class AdoptionSupersessionTest(unittest.TestCase):
+    def test_superseded_adoption_is_refused_before_proof_and_host_actions(self):
+        view = dict(id=11, state='answered', answer={'option': 'adopt'}, superseded_by=12)
+        with mock.patch.object(decisions, 'get', return_value=view), mock.patch.object(decisions, 'verify_proof') as verify:
+            allowed, why = harness_adoption._owner_proof_still_valid(object(), {'decision_id': 11})
+        self.assertFalse(allowed)
+        self.assertIn('decision #11 superseded by decision #12', why)
+        verify.assert_not_called()

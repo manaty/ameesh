@@ -21,7 +21,7 @@ class ReleaseAuthorityTest(PgTestCase):
         self.signed_answer()
         new=decisions.ask(self.cfg,self.db,requester='fixture-controller',lot=str(self.lot['id']),
             question=self.view['question'],options=['%s=%s'%(item['key'],item['label']) for item in release.OPTIONS],
-            supersedes=self.view['id'])
+            supersedes=self.view['id'],supersedes_option='apply')
         self.assertTrue(self.validate())
         self.sign_view(new,'apply')
         for step in release.STEPS:

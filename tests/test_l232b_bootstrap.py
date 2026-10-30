@@ -114,12 +114,23 @@ class BootstrapTest(unittest.TestCase):
 
 
 class SignedBootstrapTest(support.PgTestCase):
+    def test_signed_leave_and_free_text_keep_old_enable_authorized(self):
+        self.sign()
+        for text in ('leave','non, ne remplace pas'):
+            with self.subTest(text=text):
+                new=decisions.ask(self.cfg,self.db,requester='fixture-controller',lot=str(self.lot['id']),
+                    question=self.view['question'],options=['%s=%s'%(item['key'],item['label']) for item in bootstrap.OPTIONS],
+                    supersedes=self.view['id'],supersedes_option='install')
+                self.sign(text,view=new)
+                self.assertTrue(self.valid('enable'))
+                self.assertIsNone(decisions.get(self.db,self.view['id'])['superseded_by'])
+
     def test_signed_supersession_refuses_every_old_step_including_enable(self):
         self.sign()
         old=decisions.get(self.db,self.view['id'])
         new=decisions.ask(self.cfg,self.db,requester='fixture-controller',lot=str(self.lot['id']),
             question=old['question'],options=['%s=%s'%(item['key'],item['label']) for item in bootstrap.OPTIONS],
-            supersedes=old['id'])
+            supersedes=old['id'],supersedes_option='install')
         self.assertTrue(self.valid('enable'))
         self.sign(view=new)
         for step in bootstrap.STEPS:

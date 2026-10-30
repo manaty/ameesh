@@ -125,6 +125,8 @@ FERMEES = {
     "sandbox_results": {"turn_id", "epoch", "result_id", "result_sha256", "payload",
                         "receipt", "accepted_at"},
 
+    # #4991: signed replacement audit, not part of supervisor visibility.
+    "decision_supersessions": {"supersedes", "superseded_by", "person", "occurred_at", "proof"},
     # #4256: private validation authority and per-person audit; owner CLI only.
     "decision_validations": {"decision_id", "routing", "escalated_at"},
     "validation_events": {"id", "decision_id", "person", "kind", "occurred_at", "facts", "event_key"},
