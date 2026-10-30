@@ -403,6 +403,116 @@ class EntrelacementTest(_Empreintes):
         work.assign(self.db, item["id"], "human:autre", actor="test")
 
 
+class RelectureTroisTest(_Empreintes):
+    """Troisième tour : lots non-code exemptés (qa-01), `--set` pendant le
+    calcul (B4 de cx1), diff prioritaire et file d'amélioration (B1, B2 de
+    dev3), véhicule hors du refresh (observation de dev3)."""
+
+    def policy(self, **kw):
+        return storage.of(self.db).work_footprints.set_policy(
+            "nexlink", actor="human:proprio", **kw)
+
+    def test_lots_de_decision_et_de_decoupage_exemptes(self):
+        self.occupant()
+        libre = self.lot("libre")
+        self.footprint(libre, "docs/x.md")
+        decision = work._decision_lot(self.db, title="question ?", requester="human:proprio",
+                                      app="nexlink", cfg=self.cfg)
+        decoupage = self.lot("découper", source="file-decoupage:nexlink")
+        self.assertEqual(self.policy(unknown_policy="repository")["lots"], [])
+        for item in (decision, decoupage):
+            self.assertEqual(fp.paths_of(self.db, item["id"]), [])
+        self.assertEqual(storage.of(self.db).work_footprints.overlapping(libre["id"]), [])
+        self.assertIn(libre["id"],
+                      {i["id"] for i in storage.of(self.db).work.unassigned_lots(10)})
+        # au plafond, une question au pilote se pose encore, et un lot de
+        # découpage se confie encore au pilote
+        self.policy(max_in_flight=1)
+        work._decision_lot(self.db, title="autre question ?", requester="human:proprio",
+                           app="nexlink", cfg=self.cfg)
+        work.assign(self.db, decoupage["id"], "human:pilote", actor="test")
+        # et ils ne comptent pas : un seul occupant de code
+        self.assertEqual(storage.of(self.db).work_footprints.cap_reached(libre["id"]),
+                         {"cap": 1, "in_flight": 1})
+        self.assertEqual([b["id"] for b in slo.footprint_blockers(
+            work.get(self.db, libre["id"]),
+            storage.of(self.db).operations.open_lots_activity(None),
+            {libre["id"]: ["docs/x.md"]},
+            fp.policies_of(self.db, ["nexlink"]))], [self.occupant_id])
+
+    def occupant(self):
+        item = self.lot("occupant")
+        self.footprint(item, "src/a.py")
+        self.give(item)
+        self.occupant_id = item["id"]
+        return item
+
+    def set_during_analysis(self, paths):
+        real = fp.analyze_lot
+
+        def analyze_then_set(cfg, db, item, *args, **kw):
+            analysis = real(cfg, db, item, *args, **kw)
+            other = db_mod.connect(self.cfg)
+            try:
+                fp.set_paths(other, int(item["id"]), paths, actor="human:proprio")
+            finally:
+                other.close()
+            return analysis
+        return mock.patch.object(fp, "analyze_lot", side_effect=analyze_then_set)
+
+    def test_set_pendant_le_calcul_prime(self):
+        self.policy(unknown_policy="repository")
+        for title in ("vague", "corriger src/b.py"):
+            item = self.lot(title, cfg=self.cfg)
+            before = storage.of(self.db).work_footprints.analyses([item["id"]])[item["id"]]
+            with self.set_during_analysis(["src/a.py"]):
+                self.assertIsNone(fp.record_estimate(
+                    self.db, self.cfg, work.get(self.db, item["id"]), actor="test"))
+            self.assertEqual(fp.paths_of(self.db, item["id"]), ["src/a.py"], title)
+            after = storage.of(self.db).work_footprints.analyses([item["id"]])[item["id"]]
+            self.assertEqual(after["attempts"], before["attempts"], title)
+
+    def test_le_diff_prime_sur_une_reanalyse_inconnue(self):
+        self.policy(unknown_policy="repository")
+        item = self.lot("vague", cfg=self.cfg)
+        self.assertEqual(fp.paths_of(self.db, item["id"]), ["."])
+        storage.of(self.db).work_footprints.replace(
+            item["id"], "diff", ["src/feature.py"], actor="runner", head="a" * 40)
+        self.assertEqual(fp.paths_of(self.db, item["id"]), ["src/feature.py"])
+        store = storage.of(self.db).work_footprints
+        self.assertEqual(store.analyses([item["id"]])[item["id"]]["status"], "known")
+        # même vieillie, l'analyse n'est plus reprise ; --estimate ne repose rien
+        self.db.execute("UPDATE work_item_impact_analyses SET status = 'unknown',"
+                        " analyzed_at = analyzed_at - interval '1 hour'"
+                        " WHERE work_item_id = %s", (item["id"],))
+        self.assertEqual(store.claim_unknown(retry_after_s=60, limit=5), [])
+        analysis = fp.record_estimate(self.db, self.cfg, work.get(self.db, item["id"]),
+                                      actor="test")
+        self.assertEqual(analysis["policy"], "open")
+        self.assertEqual(fp.paths_of(self.db, item["id"]), ["src/feature.py"])
+
+    def test_la_file_d_amelioration_ne_prend_pas_de_marqueur(self):
+        self.policy(unknown_policy="repository")
+        item = self.lot("amélioration vague", cfg=self.cfg)
+        self.db.execute("UPDATE work_items SET type = 'improvement', expected_value = 'gain',"
+                        " value_score = 40 WHERE id = %s", (item["id"],))
+        storage.of(self.db).work_footprints.replace(item["id"], "intake", [], actor="t")
+        self.db.execute("UPDATE work_item_impact_analyses SET analyzed_at = analyzed_at"
+                        " - interval '1 hour' WHERE work_item_id = %s", (item["id"],))
+        store = storage.of(self.db).work_footprints
+        self.assertEqual(store.claim_unknown(retry_after_s=60, limit=5), [])
+        fp.record_estimate(self.db, self.cfg, work.get(self.db, item["id"]), actor="test")
+        self.assertEqual(fp.paths_of(self.db, item["id"]), [])
+
+    def test_un_vehicule_n_est_pas_un_candidat_au_refresh(self):
+        vehicule = self.lot("paquet", branch="integration/paquet-h-3")
+        lot = self.lot("lot", branch="lot/9-x")
+        for item in (vehicule, lot):
+            self.give(item)
+        ids = [r["id"] for r in storage.of(self.db).work_footprints.refresh_candidates(limit=10)]
+        self.assertEqual(ids, [lot["id"]])
+
+
 class CreationTest(_Empreintes):
     def test_inconnue_prudente_ou_ouverte_selon_la_politique(self):
         ouvert = work.add(self.db, title="sans chemin", app="nexlink", cfg=self.cfg)

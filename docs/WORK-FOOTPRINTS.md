@@ -101,7 +101,16 @@ The analysis (git) runs outside any lock; the marker is decided where the
 analysis is written — the creation, `--estimate`, the runner's retry — on
 the policy read under the guard's lock, the lock of a policy change: a
 switch between the computation and the write is never lost, in either
-direction. A lot of the improvement backlog (not dispatched) gets no marker.
+direction. A `--set` that lands while an estimate is being computed wins: the
+stale estimate writes nothing. A lot whose branch diff is known never gets
+the marker back: the diff wins over any estimate, and its unknown analysis is
+closed (not retried).
+
+**Lots that are not code** — a packet vehicle (`integration/**`), a question
+to the pilot (`source = decision`), a roadmap-cutting lot
+(`file-decoupage:…`), the improvement backlog — never get the marker, are
+neither counted nor held by the in-flight cap, and are not refreshed at
+push.
 
 A change of the unknown footprint policy applies at once, in the same
 transaction and under the guard's lock, to the open lots of the repository:
@@ -142,8 +151,8 @@ under its lock:
 
 - `--unknown open|repository`: the unknown footprint policy (above);
 - `--max-in-flight N`: at most N lots of the repository occupy their
-  footprint at once. Packet vehicles (`integration/**`) are neither counted
-  nor held. A free lot of a repository at its cap is held like an overlap:
+  footprint at once. Lots that are not code (below) are neither counted nor
+  held. A free lot of a repository at its cap is held like an overlap:
   it is not offered to idle agents, `work assign` refuses it (`in-flight cap
   (N/N)`), and an assigned creation is created unassigned with a warning;
 - `--shared PATH…`: the files or directories whose merges are trivial

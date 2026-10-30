@@ -66,6 +66,21 @@ _VEHICLE = ("(coalesce(btrim({o}.branch), '')"
             " ~ '^(refs/heads/|refs/remotes/origin/|origin/)?integration/')")
 
 
+#: #4818 (relectures qa-01, dev3) : les lots qui ne sont pas du code — un
+#: véhicule de paquet, une question au pilote (`decision`), un lot de
+#: découpage (`file-decoupage:`), la file d'amélioration (non dispatchée) —
+#: n'entrent ni dans le plafond (comptés ou retenus), ni dans le marqueur
+#: d'empreinte inconnue, ni dans le refresh au push. Même règle que
+#: `ameesh.work_footprints.is_exempt`.
+_EXEMPT = ("(" + _VEHICLE + " OR coalesce({o}.source, '') = 'decision'"
+           " OR starts_with(coalesce({o}.source, ''), 'file-decoupage:')"
+           " OR {o}.type = 'improvement')")
+
+
+def exempt_sql(alias: str) -> str:
+    return _EXEMPT.format(o=alias)
+
+
 def in_flight_sql(alias: str) -> str:
     """Le nombre de lots qui OCCUPENT leur empreinte dans le dépôt du lot
     `alias`, lui et les véhicules de paquet exceptés (#4818, plafond de lots
@@ -74,7 +89,7 @@ def in_flight_sql(alias: str) -> str:
             "  WHERE coalesce(btrim(" + alias + ".app), '') <> ''"
             "    AND btrim(o.app) = btrim(" + alias + ".app)"
             "    AND o.id <> " + alias + ".id AND " + occupying_sql("o") +
-            "    AND NOT " + _VEHICLE.format(o="o") + ")")
+            "    AND NOT " + exempt_sql("o") + ")")
 
 
 def cap_rows_sql(alias: str) -> str:
@@ -85,7 +100,7 @@ def cap_rows_sql(alias: str) -> str:
             "  FROM repository_footprint_policies cp"
             " WHERE cp.app = btrim(" + alias + ".app)"
             "   AND cp.max_in_flight IS NOT NULL"
-            "   AND NOT " + _VEHICLE.format(o=alias) +
+            "   AND NOT " + exempt_sql(alias) +
             "   AND " + in_flight_sql(alias) + " >= cp.max_in_flight")
 
 
@@ -102,11 +117,17 @@ def held_sql(alias: str) -> str:
 
 
 def unknown_policy_sql(tx, item_id) -> str:
-    """La politique d'empreinte inconnue du dépôt du lot (`open` sans ligne),
-    lue dans la transaction de l'appelant, qui tient le verrou de la garde."""
+    """La politique d'empreinte inconnue APPLICABLE au lot, lue dans la
+    transaction de l'appelant, qui tient le verrou de la garde : celle de son
+    dépôt (`open` sans ligne), mais `open` pour un lot exempté (`_EXEMPT`) et
+    pour un lot dont le diff réel est connu — le diff prime sur toute
+    estimation (B1 de dev3)."""
     rows = tx.query("SELECT p.unknown_policy FROM work_items w"
                     " JOIN repository_footprint_policies p ON p.app = btrim(w.app)"
-                    " WHERE w.id = %s", (int(item_id),))
+                    " WHERE w.id = %s AND NOT " + exempt_sql("w") +
+                    "   AND NOT EXISTS (SELECT 1 FROM work_item_footprints d"
+                    "                    WHERE d.work_item_id = w.id AND d.source = 'diff')",
+                    (int(item_id),))
     return str(rows[0]["unknown_policy"]) if rows else "open"
 
 
@@ -115,7 +136,7 @@ class WorkFootprints(Contract):
         self.db = db
 
     def replace(self, item_id, source, paths, *, actor, head=None, replaces=(),
-                unknown=False):
+                unknown=False, unless_manual=False):
         sources = sorted({str(source)} | {str(s) for s in replaces})
         wanted = sorted({str(p) for p in paths})
         with self.db.transaction() as tx:
@@ -127,6 +148,13 @@ class WorkFootprints(Contract):
                             " FOR NO KEY UPDATE", (int(item_id),))
             if not rows:
                 return None
+            if unless_manual and tx.query(
+                    "SELECT 1 FROM work_item_footprints WHERE work_item_id = %s"
+                    " AND source = 'manual' LIMIT 1", (int(item_id),)):
+                # B4 de cx1 : un `--set` posé pendant le calcul prime ; la
+                # réestimation devenue caduque n'écrit rien
+                return {"paths": self._paths(tx, item_id), "changed": False,
+                        "policy": None, "skipped": "manual"}
             policy = None
             if unknown:
                 # B3 de cx1 : la politique du dépôt est relue SOUS le verrou de
@@ -145,6 +173,11 @@ class WorkFootprints(Contract):
                 # tombe. Un `.` posé à la main (`--set .`) reste.
                 tx.execute("DELETE FROM work_item_footprints WHERE work_item_id = %s"
                            " AND source = 'intake' AND path = '.'", (int(item_id),))
+                # l'analyse inconnue est résolue par le diff : plus de reprise
+                tx.execute("UPDATE work_item_impact_analyses SET status = 'known',"
+                           " reason = 'superseded by the branch diff'"
+                           " WHERE work_item_id = %s AND status = 'unknown'",
+                           (int(item_id),))
             for path in wanted:
                 tx.execute("INSERT INTO work_item_footprints"
                            "(work_item_id, source, path, head, created_by)"
@@ -257,7 +290,7 @@ class WorkFootprints(Contract):
             rows = tx.query(
                 "SELECT w.id, w.state FROM work_items w"
                 " WHERE btrim(w.app) = %s AND w.state NOT IN " + _DONE_SQL +
-                "   AND w.type <> 'improvement' AND NOT " + _VEHICLE.format(o="w") +
+                "   AND NOT " + exempt_sql("w") +
                 "   AND NOT EXISTS (SELECT 1 FROM work_item_footprints f"
                 "                    WHERE f.work_item_id = w.id)"
                 " ORDER BY w.id FOR NO KEY UPDATE OF w", (app,))
@@ -348,9 +381,12 @@ class WorkFootprints(Contract):
             "          JOIN work_items w ON w.id = a2.work_item_id"
             f"        WHERE a2.status = 'unknown' AND w.state = '{lifecycle.REQUESTED}'"
             "           AND a2.analyzed_at < clock_timestamp() - make_interval(secs => %s)"
-            # une empreinte manuelle remplace l'estimation : rien à retenter
+            # une empreinte manuelle remplace l'estimation, un diff la prime,
+            # un lot exempté n'en porte pas : rien à retenter
             "           AND NOT EXISTS (SELECT 1 FROM work_item_footprints m"
-            "                            WHERE m.work_item_id = w.id AND m.source = 'manual')"
+            "                            WHERE m.work_item_id = w.id"
+            "                              AND m.source IN ('manual', 'diff'))"
+            "           AND NOT " + exempt_sql("w")
             + app_filter +
             "         ORDER BY a2.analyzed_at LIMIT %s"
             "           FOR UPDATE OF a2 SKIP LOCKED) pick"
@@ -383,5 +419,6 @@ class WorkFootprints(Contract):
             "  FROM work_items w"
             " WHERE coalesce(btrim(w.branch), '') <> ''"
             "   AND coalesce(btrim(w.app), '') <> ''"
+            "   AND NOT " + exempt_sql("w") +
             "   AND " + occupying_sql("w") + app_filter +
             " ORDER BY w.id LIMIT %s", params + (int(limit),))

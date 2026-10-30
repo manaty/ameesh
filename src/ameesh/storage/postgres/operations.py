@@ -461,6 +461,9 @@ class Operations(interface.Operations):
     _LOTS_ACTIVITY = """
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
+                   -- #4818 : un lot de décision ou de découpage n'entre pas
+                   -- dans le plafond de lots en vol (`work_footprints.is_exempt`)
+                   w.source,
                    to_jsonb(w)->>'external_executor' AS external_executor,
                    -- #2335 : l'appartenance à un paquet se lit sur le porteur
                    -- (`integration/**`), son manifeste (corps) et la tête gelée

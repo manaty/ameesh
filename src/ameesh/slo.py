@@ -610,7 +610,7 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
     #4818 : `policies` (`{app: politique}`) porte les chemins partagés du
     dépôt (ignorés) et son plafond de lots en vol : sans chevauchement, un
     dépôt au plafond retient le lot par tous ses occupants (`reason: cap`,
-    véhicules de paquet exceptés). Le marqueur `.` chevauche tout."""
+    lots exemptés exceptés : `work_footprints.is_exempt`). Le marqueur `.` chevauche tout."""
     if str(item.get("state") or "") != lifecycle.REQUESTED:
         return []
     if str(item.get("assignee") or "").strip():
@@ -619,7 +619,7 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
     app = str(item.get("app") or "").strip()
     if not app:
         return []
-    from . import packet_guard, work_footprints
+    from . import work_footprints
 
     policy = (policies or {}).get(app) or {}
     shared = policy.get("shared_paths") or ()
@@ -641,7 +641,7 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
                "assignee": other.get("assignee") or None,
                "updated_ts": other.get("updated_ts"),
                "last_activity_ts": other.get("last_activity_ts")}
-        if not packet_guard.is_packet_branch(other.get("branch") or ""):
+        if not work_footprints.is_exempt(other):
             occupants.append(row)
         theirs = paths_by_lot.get(other_id) or ()
         if not mine or not theirs:
@@ -650,7 +650,7 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
             out.append(row)
     cap = policy.get("max_in_flight")
     if (not out and cap and len(occupants) >= int(cap)
-            and not packet_guard.is_packet_branch(item.get("branch") or "")):
+            and not work_footprints.is_exempt(item)):
         out = [dict(row, reason="cap") for row in occupants]
     return sorted(out, key=lambda blocker: blocker["id"])
 

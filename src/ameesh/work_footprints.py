@@ -80,6 +80,19 @@ def overlaps(left: str, right: str) -> bool:
             or WHOLE_REPOSITORY in (left, right))
 
 
+def is_exempt(row: dict) -> bool:
+    """#4818 : un lot qui n'est pas du code — véhicule de paquet
+    (`integration/**`), question au pilote (`decision`), lot de découpage
+    (`file-decoupage:`), file d'amélioration — n'entre ni dans le plafond de
+    lots en vol ni dans le marqueur d'empreinte inconnue. Même règle que le
+    SQL de la garde (`_EXEMPT`)."""
+    from . import packet_guard
+    source = str(row.get("source") or "")
+    return (packet_guard.is_packet_branch(row.get("branch") or "")
+            or source == "decision" or source.startswith("file-decoupage:")
+            or str(row.get("type") or "") == "improvement")
+
+
 def is_shared(path: str, shared: Iterable[str]) -> bool:
     """#4818 : `path` est un chemin partagé du dépôt (fusion triviale) ou sous
     un dossier partagé — ignoré pour le chevauchement. Le marqueur `.` ne
@@ -362,7 +375,11 @@ def record_estimate(db, cfg, item: dict, *, actor: str, repo: Optional[str] = No
     # le calcul (git) se fait hors verrou ; la politique se relit à l'écriture
     written = storage.of(db).work_footprints.replace(
         int(item["id"]), "intake", analysis["footprint"], actor=actor,
-        unknown=bool(analysis.get("unknown")))
+        unknown=bool(analysis.get("unknown")), unless_manual=True)
+    if (written or {}).get("skipped"):
+        # B4 de cx1 : un `--set` est arrivé pendant le calcul ; il prime, la
+        # réestimation caduque n'est ni écrite ni journalisée
+        return None
     settle(analysis, (written or {}).get("policy"))
     record_analysis(db, int(item["id"]), analysis, actor=actor)
     return analysis

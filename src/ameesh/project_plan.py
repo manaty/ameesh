@@ -47,7 +47,7 @@ def _disjoint_selection(ordered, policies):
     the repository's in-flight cap counts the selected lots on top of those
     already in flight. Same overlap rule as the guard (`held_pairs`, `.`
     overlaps everything, shared paths ignored)."""
-    from . import packet_guard, work_footprints
+    from . import work_footprints
     selected: dict = {}
     for row in ordered:
         if not row["ready"] or row.get("state") != "intake" or row.get("assignee"):
@@ -67,10 +67,9 @@ def _disjoint_selection(ordered, policies):
             row["waiting"].append("footprint overlaps %s, dispatched first"
                                   % ", ".join("#%s" % o["id"] for o in clash))
             continue
-        vehicle = packet_guard.is_packet_branch(row.get("branch") or "")
         cap = policy.get("max_in_flight")
-        counted = [o for o in others if not packet_guard.is_packet_branch(o.get("branch") or "")]
-        if cap and not vehicle and \
+        counted = [o for o in others if not work_footprints.is_exempt(o)]
+        if cap and not work_footprints.is_exempt(row) and \
                 int(row.get("repository_in_flight") or 0) + len(counted) >= int(cap):
             row["ready"] = False
             row["waiting"].append("repository in-flight cap %s reached with %s"
