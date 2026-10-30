@@ -95,13 +95,16 @@ host operation is fully prepared. This development checkpoint sends no request.
 The expiry must cover the rollback window. A prepared question is not authority.
 
 `SignedDecisionAuthority(db, decision_id, operation, manifest)` implements the
-controller's validation interface. Only an exact signed `apply` answer counts;
-a free-text answer, decline, pending decision, different operation, changed
-manifest or unknown action does not. It re-reads the decision and runs existing
-Ed25519 proof verification against the currently enrolled owner key. Revocation,
-key replacement, a changed signed question and corrupted signatures invalidate
-all subsequent release and recovery steps. The approval nonce must have been
-consumed by this exact decision; this is not a new unconsumed approval.
+controller's validation interface. Only the signed `apply` option counts, as
+`decisions.match_option` recognizes it: the raw key or the two fixed
+`signer-owner.sh` mentions, the whole signed text staying recorded and digested.
+Any other free-text answer, decline, pending decision, different operation,
+changed manifest or unknown action does not. It re-reads the decision and runs
+existing Ed25519 proof verification against the currently enrolled owner key.
+Revocation, key replacement, a changed signed question and corrupted signatures
+invalidate all subsequent release and recovery steps. The approval nonce must
+have been consumed by this exact decision; this is not a new unconsumed
+approval.
 
 Both the deadline embedded in the signed question and the original signed
 approval expiry must still be valid. The expiry row captured after the generic
@@ -515,7 +518,9 @@ The administrator stages `runtime/`, `sources/` and `plan.json` (exactly
 `plan`, `account_ids`, `expires_at`, optional `probe_turn`, `runtime_seal`,
 root 0600) under `/var/lib/ameesh-release-bootstrap/OPERATION/`. The question
 is then asked with `ameesh decide ask --needs-signature`; the owner signs
-`install`. Private state lives under `/var/lib/ameesh-release-bootstrap/.admin`
+`install`, raw or with the fixed `signer-owner.sh` mention, and the backend
+recognizes the option through `decisions.match_option`, never a free prefix.
+Private state lives under `/var/lib/ameesh-release-bootstrap/.admin`
 (no operation name starts with a dot): the controller and effect journals and
 `gestes.jsonl`, an append-only journal hash-chained line by line (`seq`,
 `prev`, `sha`) carrying the backend code digest, bundle digest, step, intent,

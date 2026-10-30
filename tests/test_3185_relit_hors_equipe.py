@@ -22,6 +22,19 @@ from .test_canon import _CanonDbCase, _TmpMixin, codes, write
 
 FAMILIES = ("claude", "codex", "deepseek")
 
+#: #4803 : la déclaration de projet du canon, hors fiches et paquets.
+FEDERATION = """\
+id: acme
+root: acme
+members: []
+review_policies:
+  risk_classes:
+    default: normal
+    projects:
+      acme-data:
+        default: light
+"""
+
 
 def row(name, *, team="nexlink", harness="deepseek", session="", relit=None):
     return {"name": name, "team": team, "harness": harness, "session_harness": session,
@@ -120,6 +133,32 @@ class RelitCardTest(_TmpMixin, unittest.TestCase):
         self.assertEqual((found[0].severity, found[0].agent), (canon.ERROR, "orchestre"))
         self.assertIn("zorg", found[0].message)
         self.assertNotIn("acme-web", found[0].message)
+
+    def test_project_declared_by_federation_risk_classes_is_accepted(self):
+        """#4803 : `risk_classes.projects` déclare le projet au canon, sans
+        donner ce projet à un agent. `canon sync` le lit sans base."""
+        root = self.example_copy()
+        write(root, "federation.yaml", FEDERATION)
+        write(root, "agents/orchestre.md",
+              orchestre(projects=["acme-api"], relit=["acme-data"]))
+        loaded, findings = self.check(root)
+        self.assertFalse({"agent-relit-unknown", "agent-relit-invalid"} & codes(findings))
+        # même verdict avec les projets connus de la base (`canon check`) :
+        # le projet du canon est accepté, un projet inconnu du canon ne l'est pas
+        found = [f for f in canon.validate(loaded, known_projects={"acme-data"})
+                 if f.code == "agent-relit-unknown"]
+        self.assertEqual(found, [])
+
+    def test_a_database_known_project_does_not_declare_relit(self):
+        """#4803 : un projet connu de la seule base (lot) ne suffit pas — le
+        `canon sync` sans base le refuserait. `canon check` doit refuser aussi."""
+        root = self.example_copy()
+        write(root, "agents/orchestre.md", orchestre(relit=["acme-db"]))
+        loaded = canon.load(root, untrusted=True)
+        found = [f for f in canon.validate(loaded, known_projects={"acme-db"})
+                 if f.code == "agent-relit-unknown"]
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("acme-db", found[0].message)
 
     def test_a_string_is_not_a_list(self):
         root = self.example_copy()
