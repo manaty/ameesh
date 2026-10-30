@@ -186,8 +186,8 @@ class LinuxChannelsTest(unittest.TestCase):
         with mock.patch.object(adapter_mod.Path,'is_file',return_value=True), \
                 mock.patch.object(adapter_mod.runtime,'trusted',side_effect=lambda path:path):
             self.assertTrue(host.validate_channels(bundle))
-        self.assertIn(['/usr/bin/visudo','-c','-f','/etc/sudoers.d/ameesh-handoff'],calls)
-        self.assertIn(['/usr/bin/visudo','-c','-f','/etc/sudoers.d/ameesh-secrets'],calls)
+        self.assertIn(['/usr/sbin/visudo','-c','-f','/etc/sudoers.d/ameesh-handoff'],calls)
+        self.assertIn(['/usr/sbin/visudo','-c','-f','/etc/sudoers.d/ameesh-secrets'],calls)
         self.assertTrue(any(args[-1]=='user=ameesh-handoff,host=fixture-host,addr=192.0.2.17' for args in calls))
         self.assertTrue(any(args[-1]=='user=ameesh-secrets,host=fixture-host,addr=192.0.2.18' for args in calls))
         def swapped(args):
