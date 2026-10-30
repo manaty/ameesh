@@ -12,16 +12,49 @@ import argparse
 import json
 import math
 import re
+import sys
+import time
 
 from ameesh import storage
 
 EVENT = "staging.sequence"
 LIMIT = 1000
 TERMINAL = frozenset(("completed", "partial", "failed", "unattested"))
+#: exit code of a refused exclusive start, as the local flock of staging.sh
+BUSY = 75
 
 
-def record(db, snapshot: dict) -> int:
-    """Write only the public, bounded progress fields, using the shared log."""
+class Busy(RuntimeError):
+    """#4885: another staging sequence is in flight in the shared log."""
+
+
+def in_flight(rows: list[dict], *, now: float, exempt=()) -> list[str]:
+    """Runs whose latest snapshot is `running` before its fixed deadline.
+
+    `exempt` names the caller's own run and a previous run whose stop was
+    proved (quiescence probe or operator): neither blocks a new start. A run
+    past its deadline no longer blocks either; the alerts pass reports it.
+    """
+    latest = {}
+    for row in sorted(rows, key=lambda row: int(row["id"]), reverse=True):
+        data = row.get("data") or {}
+        if isinstance(data, dict) and data.get("run"):
+            latest.setdefault(data["run"], data)
+    return sorted(run for run, data in latest.items()
+                  if run not in exempt and data.get("state") == "running"
+                  and now < float(data.get("deadline") or 0))
+
+
+def record(db, snapshot: dict, *, exclusive: bool = False,
+           supersede=()) -> int:
+    """Write only the public, bounded progress fields, using the shared log.
+
+    #4885: with `exclusive`, the start of a sequence is refused (`Busy`) while
+    another run is in flight, whatever path launched it: the elected executor
+    (#4880), a manual `staging.sh`, or the synchronous release. Check and
+    write share one transaction under an advisory lock, so two starts never
+    both pass.
+    """
     run = str(snapshot["run"])
     sha = str(snapshot["sha"])
     if not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,128}", run):
@@ -43,7 +76,18 @@ def record(db, snapshot: dict) -> int:
                 for key in ("stage", "verdict")}
                 for host, step in snapshot.get("hosts", {}).items()},
             "notify": str(snapshot.get("notify") or "")[:128]}
-    return storage.of(db).events.record(EVENT, "staging-run:" + run, None, data)
+    if not exclusive:
+        return storage.of(db).events.record(EVENT, "staging-run:" + run, None, data)
+    with db.transaction() as tx:
+        tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (EVENT,))
+        st = storage.of(tx)
+        rows = st.events.latest_type(EVENT, 60, LIMIT)
+        if len(rows) >= LIMIT:
+            raise RuntimeError("staging history truncated; exclusivity unobservable")
+        others = in_flight(rows, now=time.time(), exempt={run, *supersede})
+        if others:
+            raise Busy("staging sequence already running: " + ", ".join(others))
+        return st.events.record(EVENT, "staging-run:" + run, None, data)
 
 
 def findings(rows: list[dict], *, now: float) -> list[dict]:
@@ -123,11 +167,19 @@ def alerts(db, *, now: float) -> list[dict]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", help="public staging snapshot, JSON")
+    parser.add_argument("--exclusive", action="store_true",
+                        help="refuse (exit 75) while another run is in flight")
+    parser.add_argument("--supersede", action="append", default=[],
+                        help="previous run whose stop was proved")
     args = parser.parse_args(argv)
     from ameesh import config, db as db_mod
     conn = db_mod.connect(config.load())
     try:
-        record(conn, json.loads(args.snapshot))
+        record(conn, json.loads(args.snapshot), exclusive=args.exclusive,
+               supersede=[run for run in args.supersede if run])
+    except Busy as exc:
+        print(exc, file=sys.stderr)
+        return BUSY
     finally:
         conn.close()
     return 0

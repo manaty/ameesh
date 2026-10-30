@@ -131,7 +131,11 @@
 # n'est repris apres un echec ; relancer la commande est sur : un hote deja au
 # commit vise ne le reinstallle pas (le previous-sha reste le bon).
 # Un seul operateur a la fois : un second passage sort en 75 (verrou
-# ~/.local/state/ameesh/mise-a-jour/staging.lock) sans rien modifier.
+# ~/.local/state/ameesh/mise-a-jour/staging.lock) sans rien modifier. Entre
+# hotes et voies (executant elu, main, release), le debut exclusif dans le
+# journal partage `staging.sequence` sort aussi en 75 (#4885) ;
+# STAGING_PREVIOUS_RUN=<run> leve ce refus pour une sequence dont l'arret
+# est prouve.
 #
 # Traces : une ligne JSON par evenement (date, hote, etape, verdict, sha,
 # precedent, detail) dans ~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl ;
@@ -933,8 +937,9 @@ SUIVI_RUN=${STAGING_RUN_ID:-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
 SUIVI_DEBUT=$(date +%s)
 SUIVI_DELAI=${STAGING_TIMEOUT_S:-7200}
 SUIVI_DEMARRE=0
-publier_suivi() {
+publier_suivi() {  # etat [options de staging_watch…]
   local etat=$1 instantane
+  shift
   instantane=$(python3 - "$JOURNAL" "$SUIVI_RUN" "$SHA" "$SUIVI_DEBUT" \
     "$SUIVI_DELAI" "$NOTIF_STAGING" "$etat" "$DEPUIS" <<'PY'
 import json, sys
@@ -953,7 +958,7 @@ print(json.dumps(dict(run=run, sha=sha, started=float(start),
                      hosts=hosts, notify=notify)))
 PY
   ) || return
-  py_sequence "$SUIVI_PY" "$instantane"
+  py_sequence "$SUIVI_PY" "$instantane" "$@"
 }
 if [ "$POSTE_ABSENT" = 1 ]; then
   printf '  %-16s %-8s %s\n' pc-smichea absent "reporte — $POSTE_RAISON"
@@ -981,7 +986,21 @@ fi
 # La preuve d'absence du poste precede toute mutation : actif.py exige cet
 # evenement pour attester les quatre VM sans lui. Il porte le commit vise,
 # comme tous les autres, et n'est jamais un `retour`.
-publier_suivi running
+# #4885 : le verrou flock ne vaut que pour cet hote. Le debut est exclusif
+# dans le journal partage : refuse (75, rien n'est modifie) tant qu'une autre
+# sequence est en cours avant son echeance, quelle que soit sa voie
+# (executant elu #4880, lancement a la main, release synchrone).
+# STAGING_PREVIOUS_RUN nomme une sequence dont l'arret est prouve (sonde de
+# quiescence de l'executant, ou l'operateur qui l'a verifie) : elle ne
+# bloque pas sa reprise.
+rc_suivi=0
+publier_suivi running --exclusive \
+  ${STAGING_PREVIOUS_RUN:+--supersede "$STAGING_PREVIOUS_RUN"} || rc_suivi=$?
+if [ "$rc_suivi" -eq 75 ]; then
+  echo "staging deja en cours (journal partage staging.sequence) : rien n'est modifie" >&2
+  exit 75
+fi
+[ "$rc_suivi" -eq 0 ] || exit "$rc_suivi"
 SUIVI_DEMARRE=1
 if [ "$POSTE_ABSENT" = 1 ]; then
   trace pc-smichea absent reporte "$POSTE_RAISON"

@@ -2653,8 +2653,9 @@ def _staging_step(project: ProjectRelease, release_sha: str, included: list[int]
         return {"exit": None, "duration_s": 0.0, "log": "", "summary": [],
                 "attestation": None, "error": str(exc)}
     if result.get("exit") == 75:
-        # staging.sh's single-operator lock: another sequence is running. Not
-        # a release failure; the next tick reconciles the tag and retries.
+        # staging.sh's single-operator lock, or its exclusive shared start
+        # (#4885): another sequence is running, on any path or host. Not a
+        # release failure; the next tick reconciles the tag and retries.
         raise ReleaseBusy("staging is running (code 75, single-operator lock)")
     return result
 

@@ -744,6 +744,20 @@ coupure soumet la même demande et attend l'attestation partagée au prochain
 passage. Sans cette option, le chemin historique reste synchrone dans
 `ameesh-release.service` et bénéficie du suivi indépendant de `staging.sh`.
 
+Les deux voies ne se chevauchent pas (#4885). Le verrou `flock` de
+`staging.sh` ne vaut que pour un hôte, et le bail d'exécution ne couvre que
+l'exécutant élu ; le début de **chaque** séquence (exécutant élu, lancement à
+la main depuis n'importe quel hôte, release synchrone) passe donc par une
+écriture exclusive du premier événement `staging.sequence`, sous verrou
+consultatif de la base : tant qu'une autre séquence est `running` avant son
+échéance, `staging.sh` sort en 75 sans rien modifier, et l'exécutant élu
+publie l'attente (`another staging sequence running`, alerte au pilote) sans
+geste d'hôte, puis reprend la demande au passage suivant. Une séquence
+interrompue cesse de bloquer à son échéance ; avant, seule
+`STAGING_PREVIOUS_RUN=<run>` lève le refus, pour une séquence dont l'arrêt
+est prouvé (l'exécutant la pose après sa sonde de quiescence ; l'opérateur
+qui relance à la main ne la pose qu'après la même vérification).
+
 Le retour du premier hôte puis la reprise par un second candidat sont
 testés avec des hôtes simulés. La qualification physique et la mise en place
 des accès sur plusieurs hôtes restent des opérations distinctes : ne pas
