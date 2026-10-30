@@ -104,7 +104,7 @@ LOCK_WAIT_S = canon.GIT_TIMEOUT
 #: pas de l'attente du verrou (s)
 LOCK_STEP_S = 0.1
 #: version du format : un changement de format change toutes les clés
-FORMAT = 3
+FORMAT = 4  # #4791: discard results from potentially incomplete blob reads
 #: première version de git qui lit `GIT_ATTR_SOURCE` (absent de l'attr.c de
 #: v2.40.0, présent en v2.41.0 : relevé cx2)
 ATTR_SOURCE_GIT = (2, 41)
