@@ -2,12 +2,19 @@
 """Simulated candidate takeover; no SSH, service or real deployment."""
 from contextlib import nullcontext
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from ameesh import release_cutoff, staging_executor as executor
+from ameesh import release_cutoff, staging_executor as executor, staging_watch
+
+
+def running(run, deadline=600):
+    """#4885: a sequence of another path, in flight (deadline relative)."""
+    return dict(id=1, data=dict(run=run, sha="a" * 40, state="running",
+                                started=1, deadline=time.time() + deadline))
 
 
 class ExecutorTest(unittest.TestCase):
@@ -25,10 +32,13 @@ class ExecutorTest(unittest.TestCase):
         self.proofs = []
         self.calls = []
         self.held = False
+        #: #4885: sequences of other paths in the shared progress log
+        self.foreign = []
         self.db = types.SimpleNamespace()
         self.db.transaction = lambda: nullcontext(self.db)
         store = types.SimpleNamespace(events=types.SimpleNamespace(
-            record=self.record, recent_type=self.recent),
+            record=self.record, recent_type=self.recent,
+            latest_type=lambda *a: self.foreign),
             work=types.SimpleNamespace(land_lock=lambda *a, **kw: 1))
         patches = [
             mock.patch.object(executor.storage, "of", return_value=store),
@@ -174,6 +184,61 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(result["exit"], 75)
         self.assertEqual(result["request"], "request-1")
         self.assertEqual(self.calls, [])
+
+    def test_manual_sequence_blocks_elected_attempt_without_host_operation(self):
+        self.foreign = [running("manual")]
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("manual", self.request["blocked_reason"])
+        self.assertEqual(self.request["state"], "pending")
+        release_cutoff._worktree.assert_not_called()
+        # The same wait is not journaled again on every timer pass.
+        with mock.patch.object(executor, "_record") as record:
+            executor.tick(self.db, self.cfg, self.options)
+        record.assert_not_called()
+        self.foreign = []
+        self.assertEqual(executor.tick(
+            self.db, self.cfg, self.options)["state"], "completed")
+
+    def test_recovered_run_does_not_block_its_own_takeover(self):
+        self.foreign = [running("attempt-a")]
+        self.request.update(state="running", host="host-a", run="attempt-a")
+        self.cfg.host = "host-b"
+        self.assertEqual(executor.tick(
+            self.db, self.cfg, self.options)["state"], "completed")
+
+    def test_child_refused_at_start_requeues_request(self):
+        def busy(argv, env, *_):
+            self.calls.append((argv, env))
+            return staging_watch.BUSY, False
+        executor.role_run._run_under_lease.side_effect = busy
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(self.request["state"], "pending")
+        self.assertNotIn("run", self.request)
+
+    def test_late_sequence_of_another_path_still_blocks(self):
+        self.foreign = [running("manual", deadline=-60)]
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"], "blocked")
+        release_cutoff._worktree.assert_not_called()
+
+    def test_truncated_history_waits_instead_of_failing(self):
+        self.foreign = [running("x-%d" % i, deadline=-1) for i in range(staging_watch.LIMIT)]
+        for i, r in enumerate(self.foreign):
+            r["data"]["state"] = "completed"
+        result = executor.tick(self.db, self.cfg, self.options)
+        self.assertEqual(result["state"], "blocked")
+        self.assertIn("truncated", self.request["blocked_reason"])
+        self.assertEqual(self.request["state"], "pending")
+
+    def test_unit_environment_cannot_supersede_without_proof(self):
+        with mock.patch.dict("os.environ", STAGING_RUN_ID="fixed",
+                             STAGING_PREVIOUS_RUN="other", STAGING_PREVIOUS_HOST="h"):
+            result = executor.tick(self.db, self.cfg, self.options)
+        env = self.calls[-1][1]
+        self.assertEqual(env["STAGING_RUN_ID"], result["run"])
+        self.assertNotIn("STAGING_PREVIOUS_RUN", env)
+        self.assertNotIn("STAGING_PREVIOUS_HOST", env)
 
 
 if __name__ == '__main__':
