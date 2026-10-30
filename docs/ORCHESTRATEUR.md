@@ -1109,7 +1109,9 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
 8. **Publier chaque version** (L138). Une fois la PR de version fusionnée,
    `deploy/mise-a-jour/poste.sh publier <sha>` pose l'étiquette annotée
    `v<version>` sur ce commit de `main` (le numéro est celui de son
-   `pyproject.toml`), la pousse et crée la release GitHub. Les notes viennent
+   `pyproject.toml`), la pousse et crée la release GitHub, avec en actifs la
+   roue ameesh du commit, `runtime-pins.txt`, `runtime-build-pins.txt` et
+   `SHA256SUMS`, construits avant l'étiquette (#4786). Les notes viennent
    de `docs/versions/<version>.md` tel qu'il est dans `main` (une note se
    relit et se fusionne avant de publier), sinon de la description de la PR
    qui a fusionné ce commit (vérifié auprès de GitHub) ; une description

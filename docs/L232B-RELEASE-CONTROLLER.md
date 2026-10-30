@@ -420,6 +420,13 @@ anything. The administrator still reviews the closure and stages the measured
 tree root-owned (`runtime-release.py` requires the staged tree to belong to the
 installing root), not with the builder's ownership.
 
+`construction-runtime.py --assets` (#4786) writes, from the same commit, the
+release assets that publish this provenance: the same wheel, both pin files
+byte for byte and `SHA256SUMS` over the three. `poste.sh publier` builds them
+before the tag and attaches them to the GitHub release (none for versions
+older than `runtime-pins.txt`); a runtime root is admitted for real production
+only against the assets of its release.
+
 `compte-release.py` creates the dedicated group/account with exact numeric ids,
 no home creation or supplementary groups, a fixed forced-command shell and an
 impossible password sentinel. Shadow values are not persisted. Group/user intents

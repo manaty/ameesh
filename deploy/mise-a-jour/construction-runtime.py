@@ -3,6 +3,7 @@
 """Build the release bootstrap runtime from one exact Git SHA (#4778).
 
     construction-runtime.py --clone REPOSITORY --sha SHA --output DIRECTORY
+    construction-runtime.py --assets --clone REPOSITORY --sha SHA --output DIRECTORY
 
 The released bootstrap expects a supplied `runtime` tree next to the `sources`
 tree of `entree-operateur.py` (#4767). This command builds that runtime outside
@@ -24,6 +25,12 @@ that commit, not from the working tree. There is no pip, download or
 installation outside the new output directory, no root gesture and no
 publication. The administrator stages the measured `runtime` tree; this
 command does not choose a host, a destination or an authority.
+
+With `--assets` (#4786), the command writes the release assets instead:
+the same wheel, both pin files byte for byte and SHA256SUMS over the three.
+`poste.sh publier` attaches them to the GitHub release of the commit, so the
+handoff's runtime root has a published provenance; the clone only has to
+contain the commit (its checkout is not read).
 
 The final runtime is read-only and measured with `runtime-release.py`'s
 inventory (same 128 MiB / 20000-entry limits and refusals). Entry-point
@@ -67,6 +74,7 @@ SCRIPT_PREAMBLE = (
 PINS_NAME = 'deploy/mise-a-jour/runtime-pins.txt'
 BUILD_PINS_NAME = 'deploy/mise-a-jour/runtime-build-pins.txt'
 RECEIPT = 'receipt.json'
+SUMS = 'SHA256SUMS'
 MAX_PIN_BYTES = 1024 * 1024
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 200000
@@ -656,8 +664,8 @@ def _remove(path):
     shutil.rmtree(path, onerror=make_writable)
 
 
-def build(repo, sha, output, *, python=PYTHON):
-    """Build and measure one runtime; return its provenance receipt."""
+def _preflight(repo, sha, output):
+    """Refusals shared by every build, before any effect."""
     if os.geteuid() == 0:
         raise BuildError('build must run outside root')
     if SHA.fullmatch(sha) is None:
@@ -674,6 +682,12 @@ def build(repo, sha, output, *, python=PYTHON):
         raise BuildError('output parent must not be group/world writable') from None
     if output == repo or repo in output.parents or output in repo.parents:
         raise BuildError('output must be separate from the clone')
+    return repo, output
+
+
+def build(repo, sha, output, *, python=PYTHON):
+    """Build and measure one runtime; return its provenance receipt."""
+    repo, output = _preflight(repo, sha, output)
     epoch = verify_clone(repo, sha)
     output.mkdir(mode=0o700)
     build_dir = output / '.build'
@@ -708,6 +722,83 @@ def build(repo, sha, output, *, python=PYTHON):
     return document
 
 
+def commit_epoch(repo, sha):
+    """Timestamp of commit `sha` in `repo`, read from the object store only.
+
+    Release assets come from `git archive` of the commit: the checkout, its
+    HEAD and its cleanliness are not read (`poste.sh publier` runs from the
+    operator's clone, on another commit of main).
+    """
+    if SHA.fullmatch(sha) is None:
+        raise BuildError('full lowercase 40-hex SHA required')
+    if not GIT.is_file():
+        raise BuildError('git unavailable')
+    env = _git_env(Path(repo))
+    found = _git(repo, 'rev-parse', '--verify', '--end-of-options', sha + '^{commit}',
+                 env=env).decode().strip()
+    if found != sha:
+        raise BuildError('commit not found in the clone')
+    stamp = _git(repo, 'show', '-s', '--format=%ct', sha, env=env).decode().strip()
+    try:
+        epoch = int(stamp)
+    except ValueError:
+        raise BuildError('commit timestamp unavailable') from None
+    if epoch <= 0:
+        raise BuildError('commit timestamp unavailable')
+    return epoch
+
+
+def _write_asset(output, name, data):
+    fd = os.open(output / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return hashlib.sha256(data).hexdigest()
+
+
+def release_assets(repo, sha, output, *, python=PYTHON):
+    """Write the release assets of commit `sha` (#4786); return {name: sha256}.
+
+    The `ameesh` wheel built from the commit (same pinned backend and
+    SOURCE_DATE_EPOCH as the runtime build), both pin files byte for byte, and
+    SHA256SUMS over the three, in `sha256sum -c` format. These are the
+    published provenance of a runtime built by `build` from the same SHA.
+    """
+    repo, output = _preflight(repo, sha, output)
+    epoch = commit_epoch(repo, sha)
+    output.mkdir(mode=0o700)
+    build_dir = output / '.build'
+    build_dir.mkdir(mode=0o700)
+    home = build_dir / 'home'
+    home.mkdir(mode=0o700)
+    (home / 'tmp').mkdir(mode=0o700)
+    pip_env = _pip_env(home, epoch)
+    source = build_dir / 'source'
+    extract_source(repo, sha, source, env=_git_env(home))
+    read_pins(source / PINS_NAME, kind='runtime')
+    read_pins(source / BUILD_PINS_NAME, kind='build')
+    tools = build_dir / 'tools'
+    create_venv(tools, python=python, with_pip=True, env=pip_env)
+    install_build_pins(tools, source / BUILD_PINS_NAME, env=pip_env)
+    wheels = build_dir / 'wheels'
+    wheels.mkdir(mode=0o700)
+    wheel = build_wheel(tools, source, wheels, env=pip_env)
+    digests = {}
+    for name, path, limit in ((wheel['name'], wheel['path'], MAX_ARCHIVE_BYTES),
+                              (Path(PINS_NAME).name, source / PINS_NAME, MAX_PIN_BYTES),
+                              (Path(BUILD_PINS_NAME).name, source / BUILD_PINS_NAME,
+                               MAX_PIN_BYTES)):
+        digests[name] = _write_asset(output, name, _regular_bytes(path, limit))
+    if digests[wheel['name']] != wheel['sha256']:
+        raise BuildError('wheel changed while copied')
+    _write_asset(output, SUMS, ''.join(
+        '%s  %s\n' % (digests[name], name) for name in sorted(digests)).encode('ascii'))
+    _remove(build_dir)
+    output.chmod(0o755)
+    return digests
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description='Build the measured release runtime from one exact SHA.')
@@ -715,15 +806,25 @@ def main(argv=None):
     parser.add_argument('--sha', required=True, help='full lowercase commit SHA')
     parser.add_argument('--output', required=True,
                         help='new directory, outside root and group-writable parents')
+    parser.add_argument('--assets', action='store_true',
+                        help='write the release assets (wheel, pin files, SHA256SUMS) '
+                             'instead of the runtime; --clone only has to contain --sha')
     arguments = parser.parse_args(argv)
     try:
-        document = build(arguments.clone, arguments.sha, arguments.output)
+        if arguments.assets:
+            digests = release_assets(arguments.clone, arguments.sha, arguments.output)
+        else:
+            document = build(arguments.clone, arguments.sha, arguments.output)
     except (BuildError, OSError) as error:
         print('construction-runtime: %s' % error, file=sys.stderr)
         if (Path(arguments.output) / '.build').is_dir():
             print('construction-runtime: partial output is retained for inspection',
                   file=sys.stderr)
         return 2
+    if arguments.assets:
+        for name in sorted(digests):
+            print('asset: %s %s' % (digests[name], name))
+        return 0
     print('runtime: %s' % (Path(arguments.output) / 'runtime'))
     print('receipt: %s' % (Path(arguments.output) / RECEIPT))
     print('tree: %s' % document['tree_sha256'])
