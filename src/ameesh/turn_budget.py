@@ -37,9 +37,9 @@ def local_tranche(cfg, db, agent, *, canon_id=None, memory=None):
         if key in memory:
             if memory[key] is None:
                 return None
-        elif not db.query("select id from tranche_limits where state = 'open' limit 1"):
+        elif not db.query("select id from tranche_limits limit 1"):
             logging.getLogger(__name__).warning(
-                'tranche selector fallback: canon unavailable, no memory and no open tranche '
+                'tranche selector fallback: canon unavailable, no memory and empty tranche_limits '
                 '(canon=%r agent=%s); using account admission', canon_id, agent)
             return None
         raise Refusal('profile-refused') from None

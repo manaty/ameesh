@@ -389,6 +389,10 @@ class TurnAdmissionTest(PgTestCase):
             self.db.execute("update tranche_limits set state = 'closed'")
             # A remembered participant stays closed even with no open rows.
             self.refusal('profile-refused', select, 'ordinary')
+            # Closed rows still prove historical activation: no cold fallback.
+            self.refusal('profile-refused', select, 'unknown')
+            self.db.execute('delete from tranche_events')
+            self.db.execute('delete from tranche_limits')
             with self.assertLogs('ameesh.turn_budget', level='WARNING') as logs:
                 self.assertIsNone(select('unknown'))
             self.assertIn('using account admission', logs.output[0])

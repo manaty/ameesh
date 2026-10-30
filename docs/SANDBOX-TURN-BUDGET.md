@@ -68,7 +68,9 @@ The runner remembers the last trusted selector, including “no tranche”, per
 untrusted canon revision, a remembered ordinary agent keeps account admission;
 a remembered tranche participant refuses with `profile-refused`. Freshness is
 required only for participants. A recovered trusted profile replaces the memory.
-On restart without memory, an unavailable canon refuses if any tranche is open.
-If none is open, it logs the fallback and uses account admission. This accepted
-fallback can let an unknown participant use its account envelope during both
-failures; no new tranche selector is inferred. Memory is lost on runner restart.
+On restart without memory, an unavailable canon refuses if any tranche row
+exists, including a closed row. Only an entirely empty `tranche_limits` table
+allows a logged fallback to account admission. The accepted risk is limited to
+no tranche ever having been created. Once a tranche exists, restarting during a
+canon incident refuses agents without memory until the canon recovers. Remembered
+selectors take precedence over this fallback. Memory is lost on runner restart.
