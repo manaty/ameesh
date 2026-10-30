@@ -463,6 +463,8 @@ class VmAgentsHarness(unittest.TestCase):
         # l'installe dans son dépôt d'origine comme les autres pièces.
         shutil.copy2(ROOT / 'deploy/mise-a-jour/bascule.py',
                      self.origin / 'deploy/mise-a-jour/bascule.py')
+        shutil.copy2(ROOT / 'deploy/mise-a-jour/guest-runtime.py',
+                     self.origin / 'deploy/mise-a-jour/guest-runtime.py')
         # #3311 : vm.sh lit ce helper sur stdin pour prouver le venv du MainPID.
         shutil.copy2(ROOT / 'deploy/mise-a-jour/venv-processus.py',
                      self.origin / 'deploy/mise-a-jour/venv-processus.py')
@@ -934,6 +936,24 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
 
     # -- journal de récupération : relance d'installer (B1) ------------------
+    def test_guest_refresh_failure_keeps_recovery_target_until_successful_retour(self):
+        helper = self.origin / 'deploy/mise-a-jour/guest-runtime.py'
+        original = helper.read_text()
+        helper.write_text('raise SystemExit("guest refresh failed")\n')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('runtime invité non mis à jour', p.stderr)
+        self.assertIn('sha=' + self.old,
+                      (self.parts / 'installation-en-cours').read_text())
+        # The Python install succeeded; recovery must still choose the code
+        # left before the guest failure, and retry the guest before restart.
+        self.assertEqual(self.head(self.src), self.target)
+        helper.write_text(original)
+        r = self.run_vm('retour')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertFalse((self.parts / 'installation-en-cours').exists())
+
     def test_install_refuses_while_a_recovery_journal_exists(self):
         (self.parts / 'installation-en-cours').write_text(
             'sha=%s\ninstantane=src-%s\ncible=%s\n'

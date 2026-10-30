@@ -28,14 +28,16 @@ from ameesh import registry
 from ameesh import review_designation as rd
 
 from .support import PgTestCase
-from .test_2447_review_designation_activation import _ActivationFixture
+from .test_2447_review_designation_activation import _ActivationFixture, register_agent
 
 #: une ligne du registre telle que `registry.overview` la rend (#3415)
 def row(name, *, harness="claude", team="ameesh", status="idle", mode="execute",
-        text="", operator_paused=False):
+        text="", operator_paused=False,
+        capabilities=("read", "report-drift", "propose"), roles=("implementation",)):
     return {"name": name, "team": team, "harness": harness,
             "session_harness": "", "status": status, "mode": mode,
-            "status_text": text, "operator_paused": operator_paused}
+            "status_text": text, "operator_paused": operator_paused,
+            "capabilities": list(capabilities), "roles": list(roles)}
 
 
 class SelectionTest(unittest.TestCase):
@@ -73,8 +75,9 @@ class FreezeDeadPauseTest(_ActivationFixture, PgTestCase):
     """Au gel, le siège d'un mort ou d'un pausé n'est pas déposé."""
 
     def _agent(self, name, harness):
-        registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
-                        cwd=self.repo.root, status="idle")
+        # #4779 : profil de relecteur prouvé (propose + un rôle).
+        register_agent(self.db, name, harness=harness, host=self.cfg.host,
+                       cwd=self.repo.root, status="idle")
         self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
                         (name,))
 

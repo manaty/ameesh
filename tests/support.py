@@ -909,4 +909,15 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
                 args.append(flag)
             elif value is not None:
                 args += [flag, str(value)]
-        return self.runner(*args)
+        proc = self.runner(*args)
+        if proc.returncode == 0:
+            # #4779 : `agent-runner register` n'écrit pas le profil de fiche
+            # (`capabilities`, `roles`), que `canon sync` pose en production.
+            # Les agents de test sont des relecteurs ; les témoins qui veulent
+            # une fiche read-only ou sans rôle écrasent la ligne ensuite.
+            self.db.execute(
+                "UPDATE agent_registry SET capabilities ="
+                " ARRAY['read','report-drift','propose'], roles = ARRAY['implementation']"
+                " WHERE name = (SELECT ameesh_resolve_agent_name(%s, %s))",
+                (name, "tests.support.register"))
+        return proc

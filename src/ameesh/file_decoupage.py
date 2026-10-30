@@ -513,6 +513,12 @@ def _reviewer_spares(db, project: str, lots: list, listing: list, *,
         closed = alert_briefs.claims_closed_hosts(db)
     except Exception:  # noqa: BLE001 - hôte inconnu : ne ferme rien
         closed = set()
+    # #4779 : un profil de relecture illisible (capacités ou rôles absents du
+    # registre) n'est pas une preuve de capacité : l'agent n'entre pas dans le
+    # vivier des relecteurs, exactement comme la désignation le refuse. Le
+    # doute est borné à cet agent : un seul profil illisible ne rend pas toute
+    # l'exemption illisible et ne bloque pas le sommeil des autres (régression
+    # test_4610) ; la trace du refus est celle du gel (`prepare`).
     try:
         candidates = [c for c in rd.candidates_from_registry(
             listing or (), project=project, families=families, closed_hosts=closed)

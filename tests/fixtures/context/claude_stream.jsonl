@@ -1,0 +1,6 @@
+{"type": "system", "subtype": "init", "session_id": "ctx-claude-1", "model": "claude-opus-5-5"}
+{"type": "assistant", "message": {"id": "msg-1", "content": [{"type": "text", "text": "un"}], "usage": {"input_tokens": 1000, "cache_read_input_tokens": 20000, "cache_creation_input_tokens": 3000, "output_tokens": 200}}}
+{"type": "assistant", "message": {"id": "msg-1", "content": [{"type": "tool_use", "id": "toolu-1", "name": "x"}], "usage": {"input_tokens": 1000, "cache_read_input_tokens": 20000, "cache_creation_input_tokens": 3000, "output_tokens": 200}}}
+{"type": "assistant", "message": {"id": "msg-2", "content": [{"type": "text", "text": "deux"}], "usage": {"input_tokens": 500, "cache_read_input_tokens": 23000, "cache_creation_input_tokens": 0, "output_tokens": 300}}}
+{"type": "assistant", "parent_tool_use_id": "toolu-sub", "message": {"id": "sub-1", "content": [{"type": "text", "text": "sub"}], "usage": {"input_tokens": 4000, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 1000, "output_tokens": 50}}}
+{"type": "result", "result": "fini", "session_id": "ctx-claude-1", "usage": {"input_tokens": 1500, "cache_read_input_tokens": 43000, "cache_creation_input_tokens": 3000, "output_tokens": 500}, "total_cost_usd": 0.01}
