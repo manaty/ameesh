@@ -110,7 +110,7 @@
   ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
   ameesh migrate              apply schema migrations;
   ameesh models list|show|discover      model catalog and discovery;
-  ameesh module <name> …              installed project module commands, --list
+  ameesh module <name> …              project module commands (Pipeline: adopt/advance/hold/release), --list
                                       for installation evidence;
   ameesh module dev sync-merges | sync-github | project-github | merge-pr
         | review-class    development tooling (L100 T5); `work sync-merges…`

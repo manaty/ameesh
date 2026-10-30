@@ -2334,6 +2334,15 @@ class WorkItems(Domain):
         la fermeture."""
 
     @abc.abstractmethod
+    def lock_workflow_activation(self, project: str) -> None:
+        """Share the project policy lock through the adoption transaction."""
+
+    @abc.abstractmethod
+    def adopt_workflow(self, item_id: int, *, ref: str, version: int,
+                       stage: str, state: str, actor: str) -> None:
+        """Set the first workflow pin and journal it under the caller's lot lock."""
+
+    @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
         """Un lot, ou None. #1922/B5 : le lot porte `workflow_ref` (la
         révision Process pinnée, '' quand il n'y en a pas — y compris sur une
