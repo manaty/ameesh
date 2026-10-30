@@ -292,6 +292,9 @@ EVENTS_PRUNE_EVERY_S = 3600.0
 #: journal récent ; au-delà, ou sans preuve, la base reste inconnue.
 CONTEXT_RESUME_DAYS = 30
 CONTEXT_RESUME_EVENTS = 200
+#: CTX-04a (#4970) : motif d'une clôture sur budget de relecture opt-in, publié
+#: dans `turn.context` ; ni rotation ni compactage pour ce seul motif.
+REREAD_BUDGET_CLOSE = "reread_budget"
 #: #3070 : levée des portes d'appareil indisponible, au plus toutes les 5 min
 DEVICE_GATES_EVERY_S = 300.0
 #: #2096 : bornes de l'affichage gardé pour un tour de résumé (repli d'un flux
@@ -2291,6 +2294,34 @@ class AgentWorker(threading.Thread):
         ecoule = now - started - self.runner.gate_frozen_between(started, now)
         if duree_max > 0 and ecoule >= duree_max:
             return "maximum turn duration: %ds (cap %ds)" % (int(ecoule), duree_max)
+        return None
+
+    def reread_budget_due(self, live: dict) -> dict | None:
+        """CTX-04a : un budget de relecture opt-in est-il dépassé ? (§5.1, 4)
+
+        Rend l'observation de la clôture (raison, mesure, budget), ou None :
+        budget éteint, ou mesure ``None`` — aucune décision sans mesure. Après
+        la clôture, le tour suivant repart à ``R_turn`` nul ; ``R_session``,
+        lui, reste acquis dans la même session : son budget se lit par tranche
+        franchie pendant ce tour, sinon chaque tour suivant se clorait dès son
+        premier point sûr. Jamais lu comme une taille de fenêtre ni comparé à
+        ``context_max_tokens``.
+        """
+        budget_tour = int(self.cfg.turn_reread_budget)
+        relu_tour = live.get("R_turn")
+        if budget_tour > 0 and relu_tour is not None and relu_tour >= budget_tour:
+            return {"kind": REREAD_BUDGET_CLOSE, "measure": "R_turn",
+                    "value": relu_tour, "budget": budget_tour,
+                    "reason": "reread budget: R_turn %d tokens (budget %d)"
+                              % (relu_tour, budget_tour)}
+        budget_session = int(self.cfg.session_reread_budget)
+        relu_session, base = live.get("R_session"), live.get("base")
+        if budget_session > 0 and relu_session is not None and base is not None \
+                and relu_session // budget_session > int(base) // budget_session:
+            return {"kind": REREAD_BUDGET_CLOSE, "measure": "R_session",
+                    "value": relu_session, "budget": budget_session,
+                    "reason": "reread budget: R_session %d tokens (budget %d)"
+                              % (relu_session, budget_session)}
         return None
 
     def last_turn_context_reread(self) -> tuple[int, str | None]:
@@ -4847,6 +4878,11 @@ class AgentWorker(threading.Thread):
                     "session": self.session_policy(),
                     "context_max_tokens": self.context_max_tokens(),
                     "session_max_tokens": self.session_max_tokens(),
+                    # CTX-04a : présents seulement en opt-in.
+                    **({"turn_reread_budget": int(self.cfg.turn_reread_budget)}
+                       if self.cfg.turn_reread_budget > 0 else {}),
+                    **({"session_reread_budget": int(self.cfg.session_reread_budget)}
+                       if self.cfg.session_reread_budget > 0 else {}),
                 },
                 # Le journal partagé porte des états, pas du texte libre : le
                 # motif est normalisé (`kind`), les valeurs qui l'ont déclenché
@@ -8148,6 +8184,9 @@ class AgentWorker(threading.Thread):
         relus_mesures = False  # L217b : le flux a relevé au moins un appel
         appels_vus: set = set()
         cloture: str | None = None
+        cloture_budget = False
+        budget_relecture_actif = (self.cfg.turn_reread_budget > 0
+                                  or self.cfg.session_reread_budget > 0)
         clos = False
         self.last_turn_closed = None
 
@@ -8549,9 +8588,13 @@ class AgentWorker(threading.Thread):
                                 if ident:
                                     appels_vus.add(ident)
                                 relus_sous_agents += adapters.reread_tokens(harness, appel)
-                        if cloture is None and not clos:
-                            cloture = self.turn_close_due(started, contexte_appel)
-                            if cloture:
+                        # CTX-04a : les plafonds passent avant le budget, même
+                        # s'il a déjà demandé la clôture de ce tour : un plafond
+                        # de contexte atteint avant le point sûr garde sa rotation.
+                        if (cloture is None or cloture_budget) and not clos:
+                            plafond_atteint = self.turn_close_due(started, contexte_appel)
+                            if plafond_atteint:
+                                cloture, cloture_budget = plafond_atteint, False
                                 # CTX-02b : le motif et les valeurs qui ont
                                 # fermé le tour, publiés avec l'observation ;
                                 # aucune décision ne les relit.
@@ -8565,6 +8608,14 @@ class AgentWorker(threading.Thread):
                                     "elapsed_s": round(time.time() - started, 3),
                                     "turn_max_seconds": self.turn_max_seconds(),
                                 }
+                                log_async("[%s] %s: turn closed at the next safe point"
+                                          % (self.name, cloture))
+                        if cloture is None and not clos and budget_relecture_actif and any(
+                                cle in parsed for cle in ("call_usage", "usage_total", "usage")):
+                            budget_du = self.reread_budget_due(normalizer.live_reread())
+                            if budget_du:
+                                cloture, cloture_budget = budget_du["reason"], True
+                                self._turn_close_observation = budget_du
                                 log_async("[%s] %s: turn closed at the next safe point"
                                           % (self.name, cloture))
                         if cloture and not clos and parsed.get("safe_point") \
