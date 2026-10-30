@@ -3,6 +3,7 @@
 """Prepare host-bound bootstrap inputs outside root; never execute them (#4767).
 
 assemble REQUEST REPOSITORY RUNTIME OUTPUT
+fabrique REQUEST OUTPUT
 
 REQUEST is closed JSON: version, host, agent, sha, operation, expires_at,
 observation, choices. observation contains host, machine_id, host_key_sha256,
@@ -22,6 +23,12 @@ store contents. The generated manifest is preparatory evidence, not factory
 enrollment or a signed install mandate. Administrative commands are emitted
 as argv arrays with host/account; they are never run. Installation of the
 administrator backend itself remains a separately reviewed administrator step.
+
+fabrique accepts exactly {version, documents}, where documents contains the
+five existing factory documents (enrollment, hosts, repositories, secrets,
+transports), each in its existing closed shape. It validates their cross
+references and writes them in a new private directory, without reading any
+referenced credential or initiating a transport (#4770).
 """
 import argparse
 import base64
@@ -450,14 +457,75 @@ def assemble(request, repository, runtime_source, output, *, db, now=None):
         raise
 
 
+def assemble_factory(request, output):
+    """Render the factory's actual documents, with no alternate schema."""
+    if os.geteuid() == 0:
+        raise PreparationError('preparation must run outside root')
+    factory = module('fabrique-handoff')
+    exact(request, {'version', 'documents'})
+    if type(request['version']) is not int or request['version'] != 1:
+        raise PreparationError('version required')
+    documents = exact(request['documents'], factory.DOCUMENTS)
+    for name, fields in factory.DOCUMENTS.items():
+        exact(documents[name], fields)
+        if len(canonical(documents[name]).encode()) > 65536:
+            raise PreparationError('factory document exceeds consumer limit')
+    enrollment = documents['enrollment']
+    if (type(enrollment['version']) is not int or enrollment['version'] != 1
+            or not factory._name(enrollment['host'])):
+        raise PreparationError('factory host identity required')
+    hosts = factory._hosts(documents['hosts']['hosts'])
+    if enrollment['host'] not in hosts:
+        raise PreparationError('local factory host is not admitted')
+    factory._repositories(documents['repositories']['repositories'])
+    references = factory._references(documents['secrets']['references'])
+    for harnesses in hosts.values():
+        for admitted in harnesses.values():
+            if not set(admitted['secrets']) <= set(references):
+                raise PreparationError('factory secret alias has no reference')
+    # Paths are validated against the final enrolled root, never the temporary
+    # preparation directory. No identity file or secret store is opened.
+    factory._transports(documents['transports']['transports'], hosts, enrollment['host'], factory.ENROLLMENT_ROOT)
+    output = Path(output).absolute()
+    runtime.trusted(output.parent)
+    output.mkdir(mode=0o700)
+    output.chmod(0o700)
+    try:
+        for name, document in documents.items():
+            write(output / (name + '.json'), document)
+        reader = factory.Documents(output)
+        for name, fields in factory.DOCUMENTS.items():
+            if reader.json(name, exact=fields) != documents[name]:
+                raise PreparationError('factory document changed during preparation')
+        manifest = dict(version=1, host=enrollment['host'], files={
+            str(factory.ENROLLMENT_ROOT / (name + '.json')): dict(
+                source=str(output / (name + '.json')), mode=0o600,
+                sha256=backend.hashlib.sha256((output / (name + '.json')).read_bytes()).hexdigest())
+            for name in factory.DOCUMENTS})
+        manifest['digest'] = seal.identity(manifest)
+        write(output / 'manifest-fabrique.json', manifest)
+        return manifest
+    except BaseException:
+        shutil.rmtree(output)
+        raise
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['assemble'])
+    commands = parser.add_subparsers(dest='command', required=True)
+    assembly = commands.add_parser('assemble')
     for name in ('request', 'repository', 'runtime', 'output'):
-        parser.add_argument(name)
+        assembly.add_argument(name)
+    factory = commands.add_parser('fabrique')
+    factory.add_argument('request')
+    factory.add_argument('output')
     args = parser.parse_args(argv)
     try:
         request = json.loads(read_private(args.request), object_pairs_hook=unique)
+        if args.command == 'fabrique':
+            manifest = assemble_factory(request, args.output)
+            print(canonical(dict(host=manifest['host'], digest=manifest['digest'])))
+            return 0
         from ameesh.config import load
         from ameesh.db import connect
         manifest = assemble(request, args.repository, args.runtime, args.output, db=connect(load()))
