@@ -7849,7 +7849,8 @@ class AgentWorker(threading.Thread):
             self.cfg, self.db, self.name, compte,
             self._spend_key(events_start, marqueur), turn_id,
             canon_id=self._canon_id(),
-            retry=spec.get("prompt") == adapters.RETRY_PROMPT)
+            retry=spec.get("prompt") == adapters.RETRY_PROMPT,
+            memory=self.runner._tranche_selectors)
         if refus:
             registry.pending_spend_clear(self.db, self.name,
                                          marqueur)  # rien n'est parti
@@ -9331,6 +9332,7 @@ class Runner:
         except ValueError as exc:
             raise SystemExit("agent-runner: %s" % exc) from exc
         self.cfg = cfg
+        self._tranche_selectors = {}  # (canon_id, agent): last trusted tranche selector
         #: #1466 : options de ligne de commande (hôte, bail, sondage, réveil),
         #: décidées au démarrage. Elles ne se relisent pas — comme tous les
         #: champs hors `RELOADABLE_FIELDS` — et sont gardées ici pour la trace

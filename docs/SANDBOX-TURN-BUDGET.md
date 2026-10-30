@@ -62,3 +62,13 @@ part. A higher actual cost is counted in full and marks the tranche overdrawn,
 blocking further admissions until human reconciliation. The original bound is
 retained separately for admission replay. Existing account settlement/release
 entry points also settle/release both halves of a tranche admission.
+
+The runner remembers the last trusted selector, including “no tranche”, per
+(canon id, agent) in process memory. During an unreadable, missing, ambiguous or
+untrusted canon revision, a remembered ordinary agent keeps account admission;
+a remembered tranche participant refuses with `profile-refused`. Freshness is
+required only for participants. A recovered trusted profile replaces the memory.
+On restart without memory, an unavailable canon refuses if any tranche is open.
+If none is open, it logs the fallback and uses account admission. This accepted
+fallback can let an unknown participant use its account envelope during both
+failures; no new tranche selector is inferred. Memory is lost on runner restart.

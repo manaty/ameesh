@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 import json
 import threading
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
@@ -323,6 +324,74 @@ class TurnAdmissionTest(PgTestCase):
                 old.assert_called_once_with(self.db,'ordinary',profile,'key');admit.assert_not_called()
         finally:
             worker.watchdog_stop.set()
+
+    def test_no_tranches_preserves_account_path_during_canon_failures(self):
+        from ameesh import canon, turn_budget
+        self.db.execute('delete from tranche_events')
+        self.db.execute('delete from tranche_limits')
+        cfg = dataclasses.replace(self.cfg, canon='/unavailable-canon')
+        state = dict(status='ok', last_good_commit='', checked_ts=time.time())
+        for failure in ('empty', 'unreadable', 'untrusted', 'missing-pinned-commit'):
+            with self.subTest(failure=failure):
+                loaded = SimpleNamespace(owns=lambda _: True, readable=True, untrusted=False,
+                                         sources=[], root=cfg.canon, is_default=True)
+                loaded.readable = failure != 'unreadable'
+                loaded.untrusted = failure == 'untrusted'
+                current_state = dict(state, last_good_commit=(
+                    'f' * 40 if failure == 'missing-pinned-commit' else ''))
+                with mock.patch('ameesh.canon.load_configured', return_value=(
+                        [] if failure == 'empty' else [loaded])), \
+                     mock.patch('ameesh.canon_sync.state', return_value=current_state), \
+                     mock.patch('ameesh.canon.load', side_effect=canon.CanonError('missing commit')), \
+                     mock.patch('ameesh.account_budget.reserve', return_value='old result') as old, \
+                     mock.patch('ameesh.turn_budget.ameesh_admit_turn') as admit:
+                    profile = object()
+                    self.assertEqual(turn_budget.reserve_local(
+                        cfg, self.db, 'ordinary', profile, 'key', 'turn'), 'old result')
+                    old.assert_called_once_with(self.db, 'ordinary', profile, 'key')
+                    admit.assert_not_called()
+
+    def test_selector_memory_incident_and_recovery(self):
+        from ameesh import turn_budget
+        cfg = dataclasses.replace(self.cfg, canon='/canon')
+        memory = {}
+        profile = SimpleNamespace(tranche='migration', status='admitted')
+        loaded = SimpleNamespace(owns=lambda _: True, readable=True, untrusted=False,
+                                 sources=[SimpleNamespace(commit='a' * 40)], agent=lambda _: SimpleNamespace(sandbox=profile))
+        state = dict(status='ok', last_good_commit='a' * 40, checked_ts=time.time())
+        with mock.patch('ameesh.canon.load_configured', return_value=[loaded]) as read, \
+             mock.patch('ameesh.canon_sync.state', return_value=state), \
+             mock.patch('ameesh.canon.sandbox_profile_problems', return_value=[]):
+            select = lambda agent='participant', **kw: turn_budget.local_tranche(
+                cfg, self.db, agent, memory=memory, **kw)
+            self.assertEqual(select(), 'migration')
+            profile.tranche = None
+            self.assertIsNone(select('ordinary'))
+            # An open tranche exists throughout: ordinary agents keep their
+            # trusted selector, while known participants remain closed.
+            for failure in ([], [loaded, loaded], RuntimeError('canon read failed')):
+                read.return_value = failure if isinstance(failure, list) else []
+                read.side_effect = failure if isinstance(failure, Exception) else None
+                self.assertIsNone(select('ordinary'))
+                self.refusal('profile-refused', select)
+                self.refusal('profile-refused', select, 'unknown')
+                self.refusal('profile-refused', select, 'ordinary', canon_id='other')
+            read.side_effect = None
+            read.return_value = [loaded]
+            # Recovery replaces the remembered decision with the trusted profile.
+            self.assertIsNone(select())
+            profile.tranche = 'migration'
+            self.assertEqual(select('ordinary'), 'migration')
+            state['checked_ts'] = 1
+            self.refusal('profile-refused', select, 'ordinary')
+            read.return_value = []
+            self.refusal('profile-refused', select, 'ordinary')
+            self.db.execute("update tranche_limits set state = 'closed'")
+            # A remembered participant stays closed even with no open rows.
+            self.refusal('profile-refused', select, 'ordinary')
+            with self.assertLogs('ameesh.turn_budget', level='WARNING') as logs:
+                self.assertIsNone(select('unknown'))
+            self.assertIn('using account admission', logs.output[0])
 
     def test_retry_family_is_atomic_across_agents_and_accounts_share_tranche(self):
         storage.of(self.db).budgets.account_put('second',100,actor='human:t')
