@@ -362,14 +362,16 @@ test (three messages → three notifications) caught the bug.
   written cache is excluded, so the same token count does not mean the same
   thing across harnesses — hence the per-harness thresholds compiled from the
   canon. **Context
-  ceiling (L60)**: if the context of the last model call (the session size:
-  input + cache read + cache written) exceeds `AMEESH_CONTEXT_MAX_TOKENS`
+  ceiling (L60)**: if the context of the last model call (fresh input + cache
+  read + cache written) reaches `AMEESH_CONTEXT_MAX_TOKENS`
   tokens (default 15 M, adjustable per agent with `ameesh set <agent>
   context_max_tokens=…`), the same rotation takes place before the next turn,
   with no minimum number of turns. The sum of a turn's re-reads is not the
   measure (#2336): it grows with the number of steps of the turn, not with the
-  session (see
-  [EXPLOITATION.md](EXPLOITATION.md#plafond-de-contexte-l60)).
+  session. Without a per-call reading (a turn closed before its result, a
+  restarted worker), a non-Codex session falls back to the last recorded
+  turn's re-read, while Codex does not (#2932); see
+  [EXPLOITATION.md](EXPLOITATION.md#plafond-de-contexte-l60).
 * **Moved working directory (0018)**: at registration, the git identity of the
   directory (common repository + branch) is written to
   `<état>/<agent>/worktree.json`. If the cwd has disappeared, a **unique** candidate

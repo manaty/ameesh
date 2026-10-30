@@ -28,9 +28,8 @@ Long sessions degrade. The project's rule (design decision 0025) is:
 3. **Orchestrators** keep a long session, rotated with a resume summary when it
    grows, plus written state (memory, log) that survives the loss of the
    session.
-4. The size of the **session** is watched — the sum of its turns' input and
-   output tokens, not the context re-read per turn (#4448) — so a session that
-   misses instructions is rotated without waiting.
+4. The size of the context re-read per turn is watched; a session that misses
+   instructions is rotated without waiting.
 
 ## How ameesh applies it
 
@@ -42,6 +41,14 @@ session_policy=…` (default `AMEESH_SESSION_POLICY`, `par-lot`):
 | `par-lot` | a fresh session when the lot of the turn differs from the session's lot, opened on a resume summary; rotation on size and turn duration stays as a safeguard |
 | `taille` | rotation on size and turn duration only: for orchestrators, which receive messages from every lot |
 | `jamais` | no rotation |
+
+The **size rotation** (L11) compares `S_hist` — the sum of the session's
+`input_tokens + output_tokens` over its turns, with the per-harness cache
+convention (#4448) — to the threshold. The **context ceiling** (L60) watches
+`C_last`, the context of the last main-thread model call (falling back to the
+last recorded turn's re-read only when no per-call reading exists, and never
+for Codex); the resident maintenance (L81) keeps its own cumulative re-read
+measure.
 
 The `session_too_big` alert (`ameesh alerts`) watches the session's cumulative
 tokens (`input_tokens + output_tokens` over its turns, with the per-harness
