@@ -3404,6 +3404,10 @@ def _freeze_content_preserved(repo: str, freeze_sha: str, head_sha: str,
         return True
     if base:
         try:
+            # #4804: fire may pass origin/main. The isolated object reader
+            # has no refs; resolve source metadata before merge-tree there.
+            if not plan_git.full_commit_id(base):
+                base = _read_local_commit(repo, base) or base
             merged = _merged_tree(repo, freeze_sha, base)
         except (canon.GitError, canon.GitDeadline, plan_git.MergeProbeError):
             return True

@@ -76,3 +76,16 @@ class FireAuthorsBudgetTest(unittest.TestCase):
             ok, why, _ = self.ready()
         self.assertFalse(ok)
         self.assertIn("lecture d'auteurs non concluante", why)
+
+
+class FireSymbolicBaseTest(unittest.TestCase):
+    def test_freeze_preservation_resolves_origin_main_before_isolated_merge(self):
+        from .test_2442_verdict_carry import Repo
+        repo = Repo()
+        self.addCleanup(repo.cleanup)
+        head = repo.merge_target()
+        import subprocess
+        subprocess.run(['git', 'update-ref', 'refs/remotes/origin/main', repo.t1],
+                       cwd=repo.root, check=True)
+        self.assertTrue(authors._freeze_content_preserved(
+            repo.root, repo.reviewed, head, base='origin/main'))
