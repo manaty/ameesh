@@ -207,14 +207,16 @@ no role or migration is applied to a live mesh by this development work.
 
 ## Narrow restart host helper
 
-`helper-redemarrage.py.RestartHelper` supplies system-mode restart and recovery
-restart, restricted to exact enrolled `ameesh-runner@…` or
-`ameesh-runner-agent@…` instances. Its policy identifies the host, allowlist,
-independent controller service and 5–300 second restart budget. The signed
-manifest's policy reference must be `policy-` plus the canonical policy digest,
-so changing that allowlist or budget invalidates operation authority. The
-controller service itself is outside the allowlist and `system.slice` holds
-the action workers independently of runner slices.
+`helper-redemarrage.py.RestartHelper` supplies restart and recovery restart
+through one explicitly enrolled manager: the system manager or the user manager
+of a named account, never inferred from a unit name. It is restricted to exact
+enrolled `ameesh-runner@…` or `ameesh-runner-agent@…` instances. Its policy
+identifies the host, allowlist, manager, independent controller service and
+5–300 second restart budget. The signed manifest's policy reference must be
+`policy-` plus the canonical policy digest, so changing that allowlist, manager
+or budget invalidates operation authority. The controller service itself is
+outside the allowlist and `system.slice` holds the action workers independently
+of runner slices.
 
 Before launch, the helper verifies current signed authority, the live drained
 database fence, and cgroup process inventories. A runner's MainPID can remain;
@@ -263,8 +265,9 @@ snapshots and the controller's own installer wiring are prepared but not
 installed; a real-host pilot, including the enrollment of the probe turn
 (`turn.json`, assembled by `entree-operateur.py` below and installed by the
 signed bootstrap inventory), is still required. This
-checkpoint implements neither user-mode systemd nor other root operations and
-grants no root authority to an agent.
+checkpoint implements no user-mode systemd beyond the fixed helper path
+described below and no other root operation; it grants no root authority to an
+agent.
 
 ## Pinned SSH restart transport
 
@@ -327,10 +330,14 @@ match `[a-z_][a-z0-9_-]{0,31}`. Missing or unknown fields are refused; existing
 inventories must be regenerated and approved with the new policy digest.
 One manager applies to every runner in that policy, independently of unit names.
 For a user manager the root helper uses fixed `systemctl --machine=<account>@.host
---user show|restart` arguments. It inspects the returned cgroup under `user.slice`
-with the same subtree/orphan checks as system runners. The transient action job,
-its state observation and durable receipt remain in the system manager. Neither
-manager nor account can be supplied by the SSH request.
+--user show|restart` arguments. It walks the cgroup subtree reported for the
+enrolled unit with the same process-inventory checks as for system runners; it
+does not verify that the path lies under `user.slice` or any other slice. The
+unit's cgroup is delegated to that account, which can move processes out of the
+subtree, so the check bounds only the processes still visible in the reported
+cgroup. The transient action job, its state observation and durable receipt
+remain in the system manager. Neither manager nor account can be supplied by the
+SSH request.
 
 The public-key file is root-owned 0644 so the dedicated SSH account can read it;
 the enclosing root-owned directory must be searchable. Enrollment, database,
