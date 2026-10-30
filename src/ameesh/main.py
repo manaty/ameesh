@@ -36,8 +36,6 @@
   ameesh ci status <lot> [--limit N] [--json]
         latest CI runs and failing tests of a {work};
   ameesh conflicts [--all] [--json]     conflict radar between {works} (L160b);
-  ameesh turn current [--local] [--expect-turn ID] [--json]
-        read the calling turn; reuse requires its captured turn id;
   ameesh cost …               turn cost, per-turn usage, gauges and their
         history, pay-per-token provider balance (`cost turns|gauges|balance`);
   ameesh debit [--json] [--check] [--hours N] [--threshold 2h]
@@ -200,6 +198,8 @@
         turn_grace_seconds=20m|0
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
+  ameesh turn current [--local] [--expect-turn ID] [--json]
+        read the calling turn; reuse requires its captured turn id;
   ameesh turn observe (--turn ID | --request ID) [--json]
         #2167: a supervisor's read of one turn or request: states, accounting,
         `quiescent` (schema ameesh-turn-observation/1); never writes, exit 3 if unknown;
