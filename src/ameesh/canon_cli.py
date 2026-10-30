@@ -47,6 +47,10 @@
                                          tient un bail, un lot non clos ou une veille
   ameesh agent restore NOM [--actor A] [--json]
                                          l'inverse : l'agent redevient actif (#3460)
+  ameesh agent rename ANCIEN NOUVEAU --reason R [--actor A] [--dry-run] [--local-state] [--json]
+                                         renommage en place (#4299, L243b étape 3) :
+                                         l'ancien nom reste alias ; refusé sous bail
+                                         vivant ; l'inverse est le même geste
   ameesh canon agent spawn|name …        mêmes commandes sous `canon` (L243, #468) ;
                                          la place canonique du nommage
 
@@ -993,6 +997,39 @@ def cmd_restore(cfg: Config, args: argparse.Namespace) -> int:
         cfg, db, args.name, actor=args.actor))
 
 
+def cmd_rename(cfg: Config, args: argparse.Namespace) -> int:
+    """#4299 : `ameesh agent rename ANCIEN NOUVEAU`, une transaction."""
+    from . import agent_rename
+
+    db = db_mod.connect(cfg)
+    try:
+        db_mod.require_schema(db)
+        result = agent_rename.rename(cfg, db, args.old, args.new, reason=args.reason,
+                                     actor=args.actor, dry_run=bool(args.dry_run))
+        if args.local_state and not args.dry_run:
+            result["local_state"] = agent_rename.move_local_state(cfg, args.old, args.new)
+    except agent_rename.RenameError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    print("%s %s -> %s by %s, aliases %s" % (
+        "dry run (rolled back):" if result["dry_run"]
+        else "already renamed:" if result["already"] else "renamed", result["old"],
+        result["new"], result["actor"], _join(result["aliases"])))
+    for kind in ("rewritten", "cascaded", "swept"):
+        for column, count in sorted(result[kind].items()):
+            print("  %s %s: %d" % (kind, column, count))
+    if result.get("event"):
+        print("journal #%d" % result["event"])
+    if result.get("local_state"):
+        print("local state: %s" % result["local_state"])
+    return 0
+
+
 def cmd_move(cfg: Config, args: argparse.Namespace) -> int:
     """#3299 : `ameesh agent move NOM --to HÔTE`, déplacement manuel fencé."""
     from . import relocation
@@ -1133,6 +1170,24 @@ def _add_agent_parsers(parent, *, move: bool = False) -> None:
                                help="who restores it; otherwise this session's identity")
         p_restore.add_argument("--json", action="store_true")
         p_restore.set_defaults(func=cmd_restore)
+
+        p_rename = agent_sub.add_parser(
+            "rename", help="rename an identity in place between two turns; the old name "
+                           "stays an alias; reverse with the same command (#4299)")
+        p_rename.add_argument("old", help="current primary name")
+        p_rename.add_argument("new", help="new primary name")
+        p_rename.add_argument("--reason", required=True,
+                              help="why (the decision or the lot)")
+        p_rename.add_argument("--actor", default=None,
+                              help="who renames it (human:<id>, orchestrator or design "
+                                   "agent); otherwise this session's identity")
+        p_rename.add_argument("--dry-run", action="store_true",
+                              help="run the whole transaction, then roll it back")
+        p_rename.add_argument("--local-state", action="store_true",
+                              help="also move this host's state directory, the old "
+                                   "name left as a symlink")
+        p_rename.add_argument("--json", action="store_true")
+        p_rename.set_defaults(func=cmd_rename)
 
 
 def add_parsers(sub) -> None:

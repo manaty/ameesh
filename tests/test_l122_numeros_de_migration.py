@@ -250,6 +250,27 @@ class NumerosDuDepotTest(unittest.TestCase):
         self.assertEqual(AMEESH.file(378), "src/ameesh/migrations/0378_<name>.sql")
         self.assertIsNone(migrations.layout_for("manaty/inconnu"))
 
+    def test_largeur_declaree(self):
+        """#4750 : un dépôt déclaré à la configuration (pas en dur) porte sa
+        largeur ; `014_x.sql` se lit sur 3 chiffres, défaut 4, valeur vérifiée."""
+        from ameesh import radar, train_migrations
+
+        def cfg(**extra):
+            return types.SimpleNamespace(github=None, radar={"projects": {"liquichain": dict(
+                {"repo": "/x", "github": "manaty/liquichain",
+                 "migrations": "supabase/migrations"}, **extra)}})
+
+        layout = migrations.layout_for("manaty/liquichain", cfg(migrations_width=3))
+        self.assertEqual(layout.file(16), "supabase/migrations/016_<name>.sql")
+        self.assertEqual(migrations.layout_for("manaty/liquichain", cfg()).width, 4)
+        project = radar.settings_of(cfg(migrations_width=3)).projects["liquichain"]
+        self.assertEqual(train_migrations.layout(project).label(16), "016")
+        self.assertEqual(radar.settings_of(cfg(migrations_width=0))
+                         .projects["liquichain"].migrations_width, 0)
+        for bad in ("3", 10, -1, True, False, "", [], {}):
+            with self.subTest(bad=bad), self.assertRaises(radar.SettingsError):
+                radar.settings_of(cfg(migrations_width=bad))
+
 
 class ReservationTest(PgTestCase):
     def setUp(self):

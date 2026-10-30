@@ -187,6 +187,41 @@ class OperatorEntryTest(unittest.TestCase):
             with self.assertRaises(entry.OperatorError,msg=broken):
                 self.probe(**broken)
 
+    def test_probe_takes_the_unit_enrolled_for_this_agent_in_either_template(self):
+        # The unit comes from the enrolled policy, not from a hard-coded name:
+        # the deployed user template and the system template both qualify.
+        for unit in ('ameesh-runner@fixture.service', 'ameesh-runner-agent@fixture.service'):
+            with self.subTest(unit=unit):
+                policy=dict(self.plan['policy'],units=[unit])
+                document=self.probe(policy=policy)
+                self.assertEqual(document['unit'],unit)
+                self.assertEqual(document['agent'],'fixture')
+        # Other enrolled runners do not make this agent's unit ambiguous.
+        policy=dict(self.plan['policy'],
+                    units=['ameesh-runner@other.service','ameesh-runner-agent@fixture.service'])
+        self.assertEqual(self.probe(policy=policy)['unit'],
+                         'ameesh-runner-agent@fixture.service')
+        # No unit for this agent, or both templates at once: explicit refusal,
+        # never a choice or an alias.
+        for units in (['ameesh-runner@other.service'],
+                      ['ameesh-runner-agent@other.service'],
+                      ['ameesh-runner@fixture.service','ameesh-runner-agent@fixture.service']):
+            with self.subTest(units=units):
+                with self.assertRaises(entry.OperatorError):
+                    self.probe(policy=dict(self.plan['policy'],units=units))
+
+    def test_prepare_accepts_the_enrolled_user_template_unit(self):
+        self.plan=dict(self.plan,policy=dict(self.plan['policy'],
+                     units=['ameesh-runner-agent@fixture.service']))
+        self.turn=self.probe()
+        self.assertEqual(self.turn['unit'],'ameesh-runner-agent@fixture.service')
+        self.observed={path:None for path in entry.destinations(
+            plan=self.plan,account_ids=self.accounts,probe_turn=self.turn)}
+        prepared=self.prepare()
+        self.assertEqual(prepared.turn,self.turn)
+        self.assertEqual(json.loads(prepared.bundle['files'][entry.TURN]['content']),
+                         self.turn)
+
     def test_prepare_measures_the_staged_trees_and_refuses_a_repin_or_a_partial_inventory(self):
         prepared=self.prepare()
         for name,field in entry.TREES.items():

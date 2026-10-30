@@ -22,15 +22,26 @@ old commands (``ameesh work sync-merges | sync-github | project-github |
 merge-pr``, ``ameesh review-class``) stay aliases without a removal date
 (L104 removes them): both names run the same parser and handler, so outputs
 and exit codes are the same.
+
+L102 T1 (#4391): it declares the vocabulary of the work items it carries,
+``DEV`` ("lot"), read by :func:`ameesh.vocab.active` at discovery. The core
+does not import this module; the declaration is a read-only attribute.
 """
 from __future__ import annotations
 
+from ... import vocab
 from .git_merge import GitMergeConnector
 
 NAME = "dev"
 
 #: Capabilities this module provides (see ``registry.CAPABILITIES``).
 CAPABILITIES = ("cli", "workspaces", "audit")
+
+#: L102 T1 (#4391): a work item is a "lot" (masculine) in this module.
+DEV = vocab.Vocabulary("lot", "lots", "m")
+
+#: The declaration read by ``ameesh.vocab.active()`` through the registry.
+VOCABULARY = DEV
 
 #: Active on every host without a project selection (L101 T4): the canon may
 #: only select modules that declare a work item type, so ``dev`` never gets a
@@ -54,14 +65,15 @@ OWNS_CONNECTION = True
 
 USAGE = """usage: ameesh module dev {%s} …
 
-  sync-merges     close the work items whose frozen content is merged (git, L29)
-  sync-github     close the work items whose PR is merged (GitHub read-only)
-  project-github  one GitHub issue per work item of a project (L126)
-  merge-pr        merge a lot's PR without the gh API (REL-11)
+  sync-merges     close the %s whose frozen content is merged (git, L29)
+  sync-github     close the %s whose PR is merged (GitHub read-only)
+  project-github  one GitHub issue per %s of a project (L126)
+  merge-pr        merge a %s's PR without the gh API (REL-11)
   review-class    review class of a change (0018)
 
 Aliases without a removal date (L104): ameesh work sync-merges | sync-github |
-project-github | merge-pr, ameesh review-class.""" % ",".join(COMMANDS)
+project-github | merge-pr, ameesh review-class.""" % (
+    ",".join(COMMANDS), DEV.plural, DEV.plural, DEV.noun, DEV.noun)
 
 
 def main(db, argv, *, actor):

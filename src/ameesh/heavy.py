@@ -19,7 +19,8 @@ slot lives as long as the command, even if the wrapper is killed. The command
 runs in its own process group (codex review r2, P2): SIGTERM, SIGINT and
 SIGHUP sent to the wrapper are relayed to the whole group — a suite's workers
 too, which do not inherit the descriptor (Python closes it) — and the
-wrapper keeps the slot until no process of the group is left. What the
+wrapper keeps the slot until no process of the group is left; a group
+that ignores the relayed signal gets SIGKILL after `GROUP_GRACE_S` (#4463). What the
 command started and left running when it ended is part of the suite: it gets
 SIGTERM, then SIGKILL after `GROUP_GRACE_S`, before the slot is released.
 The command is reaped only after that (codex review r3): its zombie keeps
@@ -401,7 +402,7 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE, max_s: float | None = None
     """Runs `argv` holding a heavy slot; its exit code (127 if not found,
     128 + n if killed by signal n, `CAPPED_EXIT` if stopped by the duration
     cap `max_s`, #453: SIGTERM to its group with a message, SIGKILL after
-    `GROUP_GRACE_S`)."""
+    `GROUP_GRACE_S`). A relayed stop signal is escalated the same way."""
     import threading
 
     command = shlex.join(argv)
@@ -413,12 +414,24 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE, max_s: float | None = None
     slot, fh = held
     child = None
     pending: list = []
+    stopping: list = []
 
     def relay(signum, frame):
         if child is None:
             pending.append(signum)
-        else:
-            _killpg(child.pid, signum)  # the group, even once the command is gone
+            return
+        _killpg(child.pid, signum)  # the group, even once the command is gone
+        if not stopping:
+            # #4463: a group that ignores the relayed stop would keep the
+            # wrapper, and the slot, for ever: SIGKILL after the same grace
+            # as the duration cap
+            stopping.append(signum)
+            leader = child.pid
+            later = threading.Timer(GROUP_GRACE_S,
+                                    lambda: _killpg(leader, signal.SIGKILL))
+            later.daemon = True
+            timers.append(later)
+            later.start()
 
     previous = {sig: signal.signal(sig, relay) for sig in RELAYED}
     # L131c: what the command leaves, even through a fork chain or setsid,

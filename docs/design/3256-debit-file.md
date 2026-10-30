@@ -99,7 +99,26 @@ Quand le pilote note la feuille de route épuisée :
 
 Les relecteurs et les agents critiques ne sont jamais mis en sommeil par ce
 geste. Le premier lot démarrable qui arrive réveille les agents en sommeil,
-dans l'ordre normal de prise.
+dans l'ordre normal de prise. #4610 : un agent à qui un lot actionnable est
+attribué, ou qui reçoit un courrier non lu de son pilote ou d'un
+orchestrateur, n'est pas endormi ; s'il l'était déjà, la pause est levée à
+l'arrivée du lot ou du courrier, avec l'acteur et la raison au journal de la
+pause. La fenêtre du courrier récent est `file.wake_mail_s` (secondes), à
+défaut `file.repos_s` ; la même fenêtre s'applique au sommeil et à la levée
+(#4619). `file.wake_mail_s` reste **facultative** : elle n'entre au canon
+qu'une fois que tous les hôtes lisent ce code — un hôte d'une version
+antérieure ignorerait la clé et garderait `file.repos_s`, changeant son
+sommeil sans le savoir (#4619).
+
+**La dernière note du pilote fait foi (#4623)** : une note
+`roadmap: rouverte <projet>` postérieure à la dernière `roadmap: épuisée
+<projet>` désarme le sommeil et lève les dormeurs du projet dans la même
+passe ; le geste est journalisé sur le lot de découpage (auteur de la note,
+note, agents levés). Une réouverture antérieure à la dernière note
+d'épuisement ne change rien : `épuisée` → `rouverte` → `épuisée` endort de
+nouveau. L'alerte `roadmap_exhausted` suit la même règle et disparaît dès la
+réouverture. Le sommeil s'arrête aussi au classement du lot de découpage,
+comme avant.
 
 ### 2.4 Acceptation de A
 
@@ -112,7 +131,13 @@ dans l'ordre normal de prise.
 - Témoins :
   - aucun déclenchement sous 20 % ou sous 30 min ;
   - aucun déclenchement quand un lot démarrable existe ;
-  - un seul lot de découpage par projet ouvert.
+  - un seul lot de découpage par projet ouvert ;
+  - #4610 : un lot actionnable attribué ou un courrier récent du pilote ou
+    d'un orchestrateur retient l'agent, et la pause est levée à l'arrivée de
+    l'un ou de l'autre (acteur et cause au journal des pauses) ;
+  - `épuisée` → sommeil ; `épuisée` puis `rouverte` → aucun sommeil et levée
+    des dormeurs dans la même passe ; `rouverte` puis `épuisée` → sommeil
+    (#4623) ; l'alerte suit la dernière note.
 
 ## 3. Lot B : mesure de débit de l'auditeur **[owner]**
 

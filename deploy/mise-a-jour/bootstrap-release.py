@@ -108,8 +108,13 @@ class SignedBootstrapAuthority(signed.SignedDecisionAuthority):
         if not view or view.get('state')!='answered' or view.get('needs_signature') is not True:
             return False
         answer=view.get('answer') or {}
-        if (answer.get('option')!=self.option or answer.get('text')!=self.option
-                or answer.get('channel')!='signed' or view.get('options')!=self.options):
+        # #4788: install/revoke (release and channel bundles share this check)
+        # name the option through the bounded native forms of
+        # decisions.match_option, never the full signed text as the option.
+        # The text stays whole in answer_digest/proof.
+        if (view.get('options')!=self.options or answer.get('option')!=self.option
+                or answer.get('channel')!='signed'
+                or signed.decisions.match_option(view,answer.get('text') or '')!=self.option):
             return False
         text=view.get('question') or ''
         if not text.startswith(self.prefix):

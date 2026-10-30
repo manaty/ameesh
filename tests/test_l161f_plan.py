@@ -960,6 +960,8 @@ class MapTest(unittest.TestCase):
                                   "test_339_orphan_settle",
                                   "test_3752_gabarit",
                                   "test_4256_validation_deadlines",
+                                  "test_4259_client_literals",
+                                  "test_4299_agent_rename",
                                   "test_cluster", "test_events_attach", "test_l31_orphans",
                                   "test_l50_group_orphan_work_items",
                                   "test_l72_panne_de_base", "test_migrations"])

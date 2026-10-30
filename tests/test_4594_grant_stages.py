@@ -11,8 +11,8 @@ consommateur, après `first_output_ts`. Les témoins de ce module couvrent :
 * le réveil du worker **avant toute lecture en base** dans `dispatch` : un
   `mail.get` ou un `registry.get` qui attend la connexion partagée ne retarde
   plus le signal ;
-* le banc local qui reproduit la file derrière `_tx_lock` (plusieurs fils
-  dans une section critique courte) et mesure le réveil devant elle.
+* le banc local qui reproduit la file derrière `_tx_lock` (un détenteur
+  tient le verrou pendant la mesure) et mesure le réveil devant elle.
 """
 from __future__ import annotations
 
@@ -100,9 +100,11 @@ class ReveilAvantLectureTest(PgTestCase):
 class BancFileTxLockTest(PgTestCase):
     """Le banc local de la file derrière la connexion partagée.
 
-    Vingt fils tiennent `_tx_lock` 2 ms toutes les 10 ms (une passe de
-    sondage) ; une lecture en base attend derrière eux. Le réveil du worker
-    doit partir avant cette file, pas après."""
+    Un détenteur tient `_tx_lock` jusqu'à l'Event de relâchement : la file
+    existe par construction (une acquisition ordinaire attend plus de 2 ms),
+    `threading.Lock` n'étant pas FIFO, aucune mesure ne dépend plus de
+    l'ordonnancement. Une lecture en base attend derrière ce verrou ; le
+    réveil du worker doit partir avant cette file, pas après."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -114,23 +116,13 @@ class BancFileTxLockTest(PgTestCase):
 
     def test_le_reveil_devance_la_file(self):
         lock = threading.RLock()
-        stop = threading.Event()
+        held = threading.Event()
+        release = threading.Event()
 
-        def poller():
-            while not stop.is_set():
-                with lock:
-                    time.sleep(0.002)
-                time.sleep(0.008)
-
-        pollers = [threading.Thread(target=poller, daemon=True) for _ in range(20)]
-        for thread in pollers:
-            thread.start()
-        time.sleep(0.05)
-        # mesure de la file : une acquisition ordinaire attend les sondeurs
-        started = time.monotonic()
-        with lock:
-            pass
-        queue_s = time.monotonic() - started
+        def holder():
+            with lock:
+                held.set()
+                release.wait(5)
 
         original = mail.get
 
@@ -139,22 +131,49 @@ class BancFileTxLockTest(PgTestCase):
                 time.sleep(0.05)
             return original(db, message_id)
 
-        item = {"channel": "agent_mail",
-                "payload": json.dumps({"to": "lat-file", "id": self.mid})}
+        # 1. précondition : un détenteur tient le verrou, une acquisition
+        # ordinaire attend derrière lui. Non tenue = banc non concluant.
+        holder_thread = threading.Thread(target=holder, daemon=True)
+        holder_thread.start()
         try:
+            if not held.wait(5):
+                self.skipTest("le détenteur n'a pas pris le verrou")
+            started = time.monotonic()
+            acquired = lock.acquire(timeout=0.02)
+            queue_s = time.monotonic() - started
+            if acquired:
+                lock.release()
+            if acquired or queue_s <= 0.002:
+                self.skipTest("le banc ne reproduit pas la file derrière le verrou")
+        finally:
+            release.set()
+            holder_thread.join(timeout=5)
+
+        # 2. la lecture en base est derrière ce verrou quand `dispatch` part :
+        # le réveil doit devancer la file, pas l'attendre.
+        held.clear()
+        release.clear()
+        holder_thread = threading.Thread(target=holder, daemon=True)
+        holder_thread.start()
+        thread = None
+        try:
+            if not held.wait(5):
+                self.skipTest("le détenteur n'a pas repris le verrou")
+            item = {"channel": "agent_mail",
+                    "payload": json.dumps({"to": "lat-file", "id": self.mid})}
             with mock.patch.object(mail, "get", side_effect=queued_get):
                 started = time.monotonic()
                 thread = threading.Thread(target=self.runner_obj.dispatch, args=(item,))
                 thread.start()
                 woke = self.worker.wake.wait(0.2)
                 wake_s = time.monotonic() - started
+                release.set()
                 thread.join(timeout=5)
         finally:
-            stop.set()
-            for poller_thread in pollers:
-                poller_thread.join(timeout=2)
-        self.assertGreater(queue_s, 0.002,
-                           "le banc ne reproduit pas la file derrière le verrou")
+            release.set()
+            holder_thread.join(timeout=5)
+            if thread is not None:
+                thread.join(timeout=5)
         self.assertTrue(woke, "le réveil est resté derrière la file")
         self.assertLess(wake_s, 0.05,
                         "le réveil a attendu la lecture en base (file de %.3fs)"

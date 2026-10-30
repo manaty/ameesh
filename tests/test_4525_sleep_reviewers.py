@@ -34,7 +34,10 @@ def agent(name, *, idle=True, project="ameesh", harness="deepseek", **extra):
            "lease_owner": "runner:h1", "unread": 0, "assigned_lot_id": None,
            "active_lots": 0, "actionable_lots": 0 if idle else 1,
            "projects": [project], "team": project, "harness": harness,
-           "responsible": "human:alice"}
+           "responsible": "human:alice",
+           # #4779 : un relecteur prouve la capacité `propose` et un rôle.
+           "capabilities": ["read", "report-drift", "propose"],
+           "roles": ["implementation"]}
     row.update(extra)
     return row
 
@@ -329,6 +332,7 @@ class PauseActorTest(PgTestCase):
         text = alert_briefs._operator_pause(alert)
         self.assertIn("Automatic sleep still in place", text)
         self.assertIn("lifted by the first startable lot", text)
+        self.assertIn("pilot/orchestrator mail", text)
         self.assertNotIn("check with whoever set it", text)
 
     def test_the_normal_operator_pause_alert_keeps_its_maintenance_action(self):

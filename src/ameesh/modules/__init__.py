@@ -20,6 +20,15 @@ L98 T2a (#4407): a project's modules resolve from three scopes, widest first:
 module wins its options; a project always wins. The compiled rows remain per
 project, so ``project_modules`` and its SQL guard need no migration.
 
+L98 T2b (#4408): ``AMEESH_MODULES=bare`` is the bare profile at run time: no
+built-in module, the core alone (entry points are still read). It is a CI and
+test profile, never a host option (decision 2, #4405): ``doctor`` refuses it.
+
+L103 T2 (#4396): a valid ``Pipeline`` card of the canon is a declarative module
+(source ``canon``, ``registry.PipelineModule``): the canon may select it by name
+like an installed module. It stores no work item type, is never imported code,
+and may not take the name of an installed module.
+
 The core reads modules through ``registry`` (L98), never by importing a module
 implementation.
 """
@@ -27,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -40,8 +50,22 @@ ENTRY_POINT_GROUP = "ameesh.modules"
 #: Keys a descriptor must supply; the SQL policy stores all three.
 DESCRIPTOR_KEYS = ("types", "schemas", "rules")
 
+#: L98 T2b (#4408): run-time switch of the module profile (``bare`` or unset).
+PROFILE_ENV = "AMEESH_MODULES"
+PROFILES = ("default", "bare")
+
+
+def profile():
+    """The module profile in force: ``default``, ``bare``, or the unknown value.
+
+    An unknown value keeps the default profile (a typo never strips a host of
+    its modules); ``doctor`` reports it."""
+    return os.environ.get(PROFILE_ENV, "").strip() or "default"
+
 
 def _builtin():
+    if profile() == "bare":
+        return {}
     from . import dev, it
     return {dev.NAME: dev, it.NAME: it}
 
@@ -150,8 +174,13 @@ def _external(entry):
     return module, compiled
 
 
-def installed():
-    """Built-in plus externally installed descriptors, by name (fail closed)."""
+def installed(canon=None):
+    """Built-in plus externally installed descriptors, by name (fail closed).
+
+    L103 T2 (#4396): with a ``canon``, its valid Pipeline cards are added as
+    `registry.PipelineModule` adapters; a card taking an installed name (or
+    another card's) is refused, and an invalid card is left out (its
+    `pipeline-*` finding already fails `canon check`)."""
     registry = _builtin()
     for entry in sorted(_entry_points(), key=lambda point: getattr(point, "name", "")):
         name = getattr(entry, "name", None)
@@ -159,6 +188,13 @@ def installed():
             raise ValueError("duplicate installed module: %r" % (name,))
         module, _ = _external(entry)
         registry[name] = module
+    if canon is not None:
+        from .registry import _with_canon
+        implementations, _modules, refused = _with_canon((registry, (), ()), canon)
+        for row in refused:
+            if row.get("reason") == "duplicate":
+                raise ValueError(row["error"])
+        registry = implementations
     return registry
 
 
@@ -313,11 +349,16 @@ def resolve(federation, canon=None, *, discovery=None):
     if teams and canon is None:
         raise ValueError("extensions.ameesh.teams needs the canon (its packages and "
                          "agents carry the teams)")
-    from .registry import _discover
-    implementations, modules, refused = discovery or _discover()
+    from .registry import PipelineModule, _discover
+    implementations, modules, refused = discovery or _discover(canon=canon)
     by_name = {module.name: module for module in modules}
-    refused_by_name = {}
+    refused_by_name, shadowing = {}, []
     for row in refused:
+        if row.get("reason") == "duplicate":
+            # L103 T2: a card taking a discovered name never refuses that
+            # module; it is reported whether or not a scope selects the name.
+            shadowing.append(row)
+            continue
         refused_by_name.setdefault(row["name"], row)
     requested = set(federation_modules)
     for selection in teams.values():
@@ -331,16 +372,25 @@ def resolve(federation, canon=None, *, discovery=None):
             raise ValueError("installed module %r is activated but refused: %s"
                              % (name, refused_by_name[name]["error"]))
         if name not in by_name:
-            raise ValueError("unknown installed module: %s" % name)
+            raise ValueError("unknown installed module: %s (neither installed nor a "
+                             "valid Pipeline card)" % name)
     warnings = []
     for name, row in sorted(refused_by_name.items()):
-        if name not in requested:
+        # L103 T2: an invalid Pipeline card is already a `pipeline-*` finding.
+        if name not in requested and row.get("reason") != "invalid":
             warnings.append({
                 "code": "module-refused", "name": name,
                 "distribution": row.get("distribution"), "version": row.get("version"),
                 "error": row["error"],
                 "message": "installed module %r is refused and not activated: %s"
                            % (name, row["error"])})
+    for row in shadowing:
+        warnings.append({
+            "code": "pipeline-module-duplicate", "name": row["name"],
+            "source": "canon", "card_ref": row.get("card_ref"),
+            "distribution": None, "version": None, "error": row["error"],
+            "message": "Pipeline card %s takes the name of a discovered module %r: "
+                       "the card is not a module" % (row.get("card_ref"), row["name"])})
     team_projects = _team_projects(canon) if canon is not None else {}
     universe = _project_universe(canon, projects, teams, team_projects)
     result = []
@@ -364,7 +414,10 @@ def resolve(federation, canon=None, *, discovery=None):
         for name, (scope, team, options) in selected.items():
             module = implementations[name]
             descriptor = module.descriptor(options)
-            _validate_descriptor(name, descriptor)
+            # L103 T2: a declarative module stores no type (rule of #4357),
+            # yet the canon selects it; an installed one must declare types.
+            _validate_descriptor(name, descriptor,
+                                 allow_empty=isinstance(module, PipelineModule))
             _check_types(name, module, descriptor)
             if seen_types.intersection(descriptor["types"]):
                 raise ValueError("conflicting module types for project %s" % project)
@@ -394,16 +447,20 @@ def active(db=None, canons=()):
     supplies each row's scope and the current descriptor. Without a database
     the same rows are compiled from the local canon. Returns
     ``{"active": [...], "refused": [...], "warnings": [...]}``."""
-    from .registry import _discover
-    implementations, modules, refused = _discover()
-    by_name = {module.name: module for module in modules}
+    from .registry import _discover, _with_canon
+    base = _discover()
+    refused = base[2]
+    by_name = {module.name: module for module in base[1]}
     resolved = {}
     labels = {}
     warnings = []
-    discovery = (implementations, modules, refused)
     for canon in canons:
         label = canon.id or "default"
         labels[canon.state_key] = label
+        # L103 T2: each canon adds its own Pipeline cards to the discovery.
+        discovery = _with_canon(base, canon)
+        for module in discovery[1]:
+            by_name.setdefault(module.name, module)
         try:
             resolution = resolve(canon.federation, canon, discovery=discovery)
         except ValueError as exc:
@@ -453,16 +510,31 @@ def doctor_lines(db, canons=()):
     error; a stored row that no longer matches the readable canon, and a
     refused entry point that no scope activates, are warnings. The check is
     read-only and never blocks a canon sync."""
-    from .registry import _discover
-    implementations, modules, refused = _discover()
-    by_name = {module.name: module for module in modules}
+    from .registry import _discover, _with_canon
+    base = _discover()
+    refused = base[2]
+    by_name = {module.name: module for module in base[1]}
     refused_by_name = {row["name"]: row for row in refused}
     lines, ok, warnings = [], True, 0
+    # L98 T2b decision 2: the bare profile is for CI and tests; a host running
+    # it has neither housekeeping nor worktrees.
+    current = profile()
+    if current == "bare":
+        ok = False
+        lines.append("modules    : KO — bare profile (%s=bare): CI and test profile "
+                     "only, never a host" % PROFILE_ENV)
+    elif current not in PROFILES:
+        warnings += 1
+        lines.append("warning    : unknown %s=%r, default profile kept"
+                     % (PROFILE_ENV, current))
     resolved = {}
     seen_refused = set()
-    discovery = (implementations, modules, refused)
     for canon in canons:
         label = canon.id or "default"
+        # L103 T2: a stored Pipeline module is known through its canon's card.
+        discovery = _with_canon(base, canon)
+        for module in discovery[1]:
+            by_name.setdefault(module.name, module)
         try:
             resolution = resolve(canon.federation, canon, discovery=discovery)
         except ValueError as exc:
@@ -472,6 +544,10 @@ def doctor_lines(db, canons=()):
         for row in resolution.rows:
             resolved[(canon.state_key, row["project"], row["module"])] = (canon, row)
         for warning in resolution.warnings:
+            if warning["code"] == "pipeline-module-duplicate":
+                warnings += 1
+                lines.append("warning    : canon %s: %s" % (label, warning["message"]))
+                continue
             if warning["name"] in seen_refused:
                 continue
             seen_refused.add(warning["name"])

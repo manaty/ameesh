@@ -6,17 +6,17 @@
                  [--estimate 2h] [--app PROJECT]] [--force REASON] [--queue]
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
-                                                 project or work item (ameesh fil show <project> [<lot>]);
+                                                 project or {work} (ameesh fil show <project> [<lot>]);
                                                  from a declared orchestrator, --lot hands an
-                                                 unassigned work item (or one held by a human)
-                                                 to the recipient — an item already held by an
+                                                 unassigned {work} (or one held by a human)
+                                                 to the recipient — a {work} already held by an
                                                  agent is never reassigned by mail, whoever
                                                  holds it (#1066); --assign is the explicit
                                                  gesture that lets any sender hand over an
-                                                 unassigned item (#964) — and --new-lot creates it (L118),
+                                                 unassigned {work} (#964) — and --new-lot creates it (L118),
                                                  with its estimated duration --estimate (L157:
-                                                 required when an agent creates the work item);
-                                                 #540: a recipient who already has a work item
+                                                 required when an agent creates the {work});
+                                                 #540: a recipient who already has a {work}
                                                  not started does not get it (team queue, the
                                                  message is not dropped) unless --force "reason";
                                                  refused to a name not in the registry (close
@@ -106,9 +106,26 @@ from . import backend as backend_mod
 from . import config as config_mod
 from . import db as db_mod
 from . import fastmail
-from . import fil, identity, mail, migrations, platform, registry, signing, storage
+from . import fil, identity, mail, migrations, platform, registry, signing, storage, vocab
 from . import session_bindings as sb
 from .config import NAME_RE, Config
+
+
+def _vocabulary(vocabulary=None):
+    """The work-item vocabulary of the active module (L102 T2, #4392)."""
+    return vocab.active() if vocabulary is None else vocabulary
+
+
+def _words(vocabulary=None) -> dict:
+    """The words the help texts substitute into their ``{…}`` placeholders."""
+    v = _vocabulary(vocabulary)
+    return {"work": v.noun, "works": v.plural}
+
+
+def _doc(vocabulary=None) -> str:
+    """``agent-mail --help``: the description in the active vocabulary."""
+    return __doc__.format(**_words(vocabulary))
+
 
 MAX_STOP_BLOCKS = 3
 #: L61 : un hook ne réinscrit pas l'agent (aller-retour vers la base) plus
@@ -281,10 +298,10 @@ def set_title(cfg: Config, bk, name: str) -> None:
 _COMMAND_OUTPUT_RE = re.compile(
     r"(?m)^(?:"
     r"delivered to \S"
-    r"|milestone \w+ added to lot #\d+"
+    r"|milestone \w+ added to (?:lot|tâche) #\d+"
     r"|decision #\d+(?::| withdrawn)"
     r"|work item #\d+ closed:"
-    r"|lot #\d+ → merged \(commit"
+    r"|(?:lot|tâche) #\d+ → merged \(commit"
     r")")
 
 
@@ -329,6 +346,7 @@ def _command_output_in(text: str) -> str:
 
 
 def cmd_send(bk, cfg: Config, args: list[str]) -> int:
+    v = _vocabulary()
     sender = None
     key_path = None
     expires = None
@@ -466,25 +484,26 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
               file=sys.stderr)
         return 2
     if lot is not None and not NAME_RE.match(lot):
-        print("invalid lot: %r (letters, digits, . _ -)" % lot, file=sys.stderr)
+        print("invalid %s: %r (letters, digits, . _ -)" % (v.noun, lot), file=sys.stderr)
         return 2
     if new_lot is not None and lot is not None:
         print("--lot OR --new-lot, not both", file=sys.stderr)
         return 2
     if assign and lot is None:
-        print("--assign requires --lot <id|ref>: say which lot to assign to the recipient",
+        print("--assign requires --lot <id|ref>: say which %s to assign to the recipient"
+              % v.noun,
               file=sys.stderr)
         return 2
     if assign and new_lot is not None:
-        print("--assign goes with --lot (--new-lot already assigns the created lot to the "
-              "recipient)", file=sys.stderr)
+        print("--assign goes with --lot (--new-lot already assigns the created %s to the "
+              "recipient)" % v.noun, file=sys.stderr)
         return 2
     if new_lot is not None and not new_lot.strip():
         print("--new-lot: empty title", file=sys.stderr)
         return 2
     if app is not None and new_lot is None:
-        print("--app goes with --new-lot (to correct an existing lot: "
-              "ameesh work set-app <id> <project>)", file=sys.stderr)
+        print("--app goes with --new-lot (to correct an existing %s: "
+              "ameesh work set-app <id> <project>)" % v.noun, file=sys.stderr)
         return 2
     if app is not None and not app.strip():
         print("--app: empty project", file=sys.stderr)
@@ -493,17 +512,19 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--new-project goes with --new-lot \"title\" --app <project>", file=sys.stderr)
         return 2
     if estimate is not None and new_lot is None:
-        print("--estimate goes with --new-lot (the estimated duration of the created work item; for an "
-              "existing one: ameesh work plan <id> --estimate 2h)", file=sys.stderr)
+        print("--estimate goes with --new-lot (the estimated duration of the created %s; "
+              "for an existing one: ameesh work plan <id> --estimate 2h)" % v.noun,
+              file=sys.stderr)
         return 2
     if parent_lot is not None and new_lot is None:
         print("--parent-lot goes with --new-lot (the parent of the created suite; for an "
-              "existing lot: ameesh work dependencies <id> --add <parent>)", file=sys.stderr)
+              "existing %s: ameesh work dependencies <id> --add <parent>)" % v.noun,
+              file=sys.stderr)
         return 2
     if parent_lot is not None:
         number = str(parent_lot).strip().lstrip("#")
         if not number.isdigit() or int(number) <= 0:
-            print("--parent-lot: a lot number (e.g. 1070 or #1070)", file=sys.stderr)
+            print("--parent-lot: a %s number (e.g. 1070 or #1070)" % v.noun, file=sys.stderr)
             return 2
         parent_lot = int(number)
     dest = args[0]
@@ -699,14 +720,14 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     thread_meta = None
     if new_lot is not None and getattr(bk, "mediated", False):
         print("--new-lot is unavailable in mediated contract 1.1; create and assign "
-              "the work item on the server before sending mail", file=sys.stderr)
+              "the %s on the server before sending mail" % v.noun, file=sys.stderr)
         return 2
     if new_lot is not None and (bk.kind != "pg" or dest == "all"):
         print("--new-lot requires the database and a single recipient", file=sys.stderr)
         return 2
     if assign and getattr(bk, "mediated", False):
-        print("--assign is unavailable in mediated contract 1.1; assign the work item "
-              "on the server before sending mail", file=sys.stderr)
+        print("--assign is unavailable in mediated contract 1.1; assign the %s "
+              "on the server before sending mail" % v.noun, file=sys.stderr)
         return 2
     if assign and (bk.kind != "pg" or dest == "all"):
         print("--assign requires the database and a single recipient", file=sys.stderr)
@@ -742,8 +763,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                         else "created for %s without assignee" % dest)
             else:
                 quoi = "assigned to %s" % dest if linked["assigned"] else "linked"
-            print("lot #%d %s%s%s" % (
-                int(item["id"]), quoi,
+            print("%s #%d %s%s%s" % (
+                v.noun, int(item["id"]), quoi,
                 ": %s" % item.get("title") if linked["created"] else "",
                 " (branch %s)" % linked["branch"] if linked["branch"] else ""))
         passif = [key for key in ("ack", "info") if payload.get(key)]
@@ -752,8 +773,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             # #3451 : ni une simple information
             for key in passif:
                 del payload[key]
-            print("warning: this message hands a work item to %s: it wakes it "
-                  "(not %s)" % (dest, "an acknowledgement" if "ack" in passif
+            print("warning: this message hands a %s to %s: it wakes it "
+                  "(not %s)" % (v.noun, dest,
+                                "an acknowledgement" if "ack" in passif
                                 else "an information"), file=sys.stderr)
 
     skipped: list[str] = []
@@ -893,7 +915,7 @@ def cmd_status(bk, cfg: Config, rest: list[str]) -> int:
 
 def cmd_alias(cfg: Config, rest: list[str]) -> int:
     if len(rest) not in (2, 3) or not NAME_RE.match(rest[0]):
-        print(__doc__)
+        print(_doc())
         return 2
     chantier = rest[2] if len(rest) == 3 else ""
     path = identity.write_alias(cfg, rest[0], rest[1], chantier)
@@ -2458,7 +2480,7 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] in ("-h", "--help"):
-        print(__doc__)
+        print(_doc())
         return 0
     command, rest = argv[0], argv[1:]
     # `--help` n'exécute JAMAIS une sous-commande (une relecture a appliqué des
@@ -2466,7 +2488,7 @@ def main(argv: list[str] | None = None) -> int:
     # texte peut contenir « --help » : seule la première position compte.
     if (rest[:1] in (["-h"], ["--help"]) if command == "send"
             else any(arg in ("-h", "--help") for arg in rest)):
-        print(__doc__)
+        print(_doc())
         return 0
     cfg = config_mod.load()
     try:
@@ -2520,7 +2542,7 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_bindings(bk, rest)
         if command == "status":
             return cmd_status(bk, cfg, rest)
-        print(__doc__)
+        print(_doc())
         return 2
     except db_mod.SchemaMissing as exc:
         print("error: %s" % exc, file=sys.stderr)

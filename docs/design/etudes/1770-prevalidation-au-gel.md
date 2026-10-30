@@ -248,7 +248,10 @@ Le bloc global vaut pour tous les projets, mais `scripts/test-plan.py` et le
 lanceur de part sont des outils du dépôt ameesh (#2794) : avant tout arbre,
 carte ou hôte, leur présence est vérifiée au SHA candidat ; un dépôt qui ne
 les porte pas (nexlink) est indisponible, cause `tooling-missing`, au lieu
-d'un `can't open file` journalisé en `selection-unsafe`.
+d'un `can't open file` journalisé en `selection-unsafe`. Le journal du gel
+n'écrit qu'une note par lot et par cause (#4758) : la clé stable ne cite ni la
+tête ni le chemin du dépôt, sans quoi le SHA ferait revenir la note à chaque
+gel, `once=True` ne dédupliquant que le texte exact.
 
 ## Raccords
 

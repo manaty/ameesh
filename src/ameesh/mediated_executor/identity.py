@@ -379,9 +379,14 @@ class DbIdentityProvider(IdentityProvider):
             raise AuthError("token_invalid", "un jeton d'accès d'exécuteur est requis")
         if not fence.owner.startswith("exec:%s:" % principal.executor_id):
             raise ScopeError("forbidden_scope", "owner d'un autre exécuteur")
-        if principal.agents_allowlist is not None \
-                and fence.agent not in principal.agents_allowlist:
-            raise ScopeError("forbidden_scope", "agent hors de la liste de l'invitation")
+        if principal.agents_allowlist is not None:
+            # La liste garde l'orthographe de l'invitation : un renommage
+            # (#4299) la laisse en alias, lue par identité comme dans scope.py.
+            from ..agent_names import resolve
+            allowed = {resolve(n, db=self.db, operation="mediated.allowlist")
+                       for n in principal.agents_allowlist}
+            if fence.agent not in allowed:
+                raise ScopeError("forbidden_scope", "agent hors de la liste de l'invitation")
         token = new_token(SESSION_TOKEN_PREFIX)
         with self.db.transaction() as tx:
             state = tx.query("SELECT (revoked_at IS NOT NULL) AS revoked FROM executors "

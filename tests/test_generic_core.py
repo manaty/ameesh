@@ -132,11 +132,11 @@ def report() -> None:
 class GenericCoreTest(unittest.TestCase):
     def test_core_does_not_import_module_implementations(self):
         # L98 T3 (#4406): the legacy adapters read through the registry.
-        # L100 T1/T2 (#4382, #4383): the old paths are declared aliases of
-        # modules/dev; L104 removes them and empties these exceptions.
-        exceptions = Counter({("plan_git.py", "module-import"): 1,
-                              ("merge_pr.py", "module-import"): 1,
-                              ("connectors/git_merge.py", "module-import"): 1})
+        # L100 T1/T2/T4: temporary identity aliases, removed by L104.
+        exceptions = Counter({(name + ".py", "module-import"): 1
+                              for name in ("plan_github", "plan_git", "merge_pr",
+                                           "connectors/git_merge", "review",
+                                           "lot_class", "review_target")})
         actual = Counter({key: count for key, count in scan_core().items()
                           if key[1] == "module-import"})
         self.assertFalse(actual - exceptions,
@@ -180,7 +180,7 @@ class GenericCoreTest(unittest.TestCase):
         self.assertIn('registry.get("dev")', source)
         self.assertEqual(scan_python(source, "workspaces.py")["module-import"], 0)
 
-    def test_delivery_core_preserves_development_stage_transitions(self):
+    def test_delivery_core_keeps_generic_state_groups(self):
         self.assertEqual(work.STATES, ("intake", "build", "qa", "validated", "delivered",
                                        "blocked", "waiting_human", "closed"))
         self.assertEqual(work_lifecycle.canonical("merged"), "delivered")
@@ -189,6 +189,9 @@ class GenericCoreTest(unittest.TestCase):
         self.assertEqual(work.ACTIVE, ("intake", "build"))
         self.assertEqual(work.WAITING, {"blocked", "waiting_human"})
         self.assertEqual(work.TO_VALIDATE, ("qa", "validated"))
+
+    @support.needs_builtin_modules
+    def test_delivery_core_preserves_development_stage_transitions(self):
         self.assertEqual(registry.merge_connector(), "git-merge")
         self.assertFalse(work.TRANSITIONS["promoted"])
         self.assertIn("promoted", work.TRANSITIONS["merged"])

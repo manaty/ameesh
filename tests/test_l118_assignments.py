@@ -499,6 +499,129 @@ class BranchMergeTest(_Base):
         self.assertEqual(report["results"][0]["how"], "ancestor")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
+    def test_branche_associee_sur_sa_base_avant_son_premier_commit_ne_ferme_pas(self):
+        """#4508 (#4482) : une branche associée au lot avant son premier
+        commit, sur la base d'un AUTRE lot encore hors de la cible, n'a aucun
+        commit propre. Le relevé l'a vue en avance (c'était la base) ; quand
+        cette base entre ensuite dans la cible par un autre chemin, elle ne
+        doit pas fermer le lot. Le premier commit de l'auteur, puis sa fusion,
+        ferment normalement."""
+        # un commit d'un autre lot, pas encore dans develop
+        _git(self.repo, "checkout", "-q", "-b", "autre/lot", "develop")
+        base = self.commit("base-autre-lot")
+        _git(self.repo, "checkout", "-q", "develop")
+        # la branche du lot naît sur cette base, sans commit propre, et le lot
+        # l'associe avant le premier commit (comme #4482 à 08:24).
+        _git(self.repo, "branch", "agent/dev1-base", base)
+        lot = self.lot("agent/dev1-base")
+        first = self.sync()["results"][0]
+        self.assertEqual(first["result"], "open", first)
+        self.assertIn("no work of its own", first["detail"], first)
+        self.assertIsNone(work.get(self.db, lot["id"])["branch_head"])
+        # la base entre dans develop par un commit de fusion qui ne cite pas
+        # la branche du lot : c'est le paquet d'un autre lot, pas une preuve.
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge autre/lot", "autre/lot")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertIn("no work of its own", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+        # le premier commit de l'auteur, vu en avance, puis sa fusion : livré
+        _git(self.repo, "checkout", "-q", "agent/dev1-base")
+        propre = self.commit("propre")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.assertEqual(self.sync()["results"][0]["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["branch_head"], propre)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge agent/dev1-base",
+             "agent/dev1-base")
+        report = self.sync()
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(report["results"][0]["how"], "ancestor")
+        delivered = work.get(self.db, lot["id"])
+        self.assertEqual((delivered["state"], delivered["legacy_state"]),
+                         ("delivered", "merged"))
+
+    def test_gel_sur_le_commit_propre_ne_prouve_pas_la_base_vue(self):
+        """#4508 (B dev1) : le gel du lot sur son commit propre F ne prouve
+        pas la BASE B de la branche, qui en est un ancêtre. Le clone du
+        balayage voit encore B (F pas poussé ou pas récupéré) : B n'est pas
+        enregistrée comme tête vue, et quand elle entre par le paquet d'un
+        autre lot, le lot reste ouvert."""
+        # la base B : la pointe d'un autre lot, hors de develop
+        _git(self.repo, "checkout", "-q", "-b", "autre/lot", "develop")
+        base = self.commit("base-autre-lot")
+        _git(self.repo, "checkout", "-q", "develop")
+        # la branche du lot naît sur B, sans commit propre
+        _git(self.repo, "branch", "agent/dev1-base-gel", base)
+        lot = self.lot("agent/dev1-base-gel")
+        first = self.sync()["results"][0]
+        self.assertEqual(first["result"], "open", first)
+        self.assertIn("no work of its own", first["detail"], first)
+        self.assertIsNone(work.get(self.db, lot["id"])["branch_head"])
+        # l'auteur a un commit propre F et gèle dessus ; le clone du balayage
+        # voit encore la pointe de la branche à B
+        _git(self.repo, "checkout", "-q", "agent/dev1-base-gel")
+        propre = self.commit("propre")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "branch", "-f", "agent/dev1-base-gel", base)
+        storage.of(self.db).work.add_milestone(
+            lot["id"], "frozen", sha=propre, actor="dev1", verdict=None, note="")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertIsNone(work.get(self.db, lot["id"])["branch_head"])
+        self.assertIn("no work of its own", entry["detail"], entry)
+        # B entre dans develop par le paquet d'un autre lot : rien ne ferme
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge autre/lot", "autre/lot")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertIn("no work of its own", entry["detail"], entry)
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_tete_sans_commit_propre_enregistree_avant_le_correctif_est_refusee(self):
+        """#4508 : une tête déjà enregistrée (base d'un autre lot, avant le
+        correctif) est refusée par la même lecture : le reflog de la branche
+        locale dit qu'elle n'a pas bougé depuis sa création. Le lot reste
+        ouvert même quand la base entre dans la cible par une fusion."""
+        self.branch("autre/lot", "base-autre-lot")
+        base = _git(self.repo, "rev-parse", "autre/lot")
+        _git(self.repo, "branch", "agent/dev1-base-vue", base)
+        lot = self.lot("agent/dev1-base-vue")
+        # ce que l'ancien relevé avait enregistré : la base, vue en avance
+        storage.of(self.db).work.set_branch_head(
+            lot["id"], "agent/dev1-base-vue", base)
+        # la base entre dans develop par une fusion, puis la branche de
+        # l'autre lot est supprimée : seul le reflog reste
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge autre/lot", "autre/lot")
+        _git(self.repo, "branch", "-q", "-D", "autre/lot")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertIn("no work of its own", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+    def test_reflog_expire_ne_fait_pas_d_un_vrai_commit_une_base(self):
+        """#4508 (B1 cx2) : quand l'entrée de création a expiré, la plus
+        ancienne du reflog est un commit ordinaire ; prendre ce SHA pour la
+        création refuserait à tort un vrai commit. La preuve par la tête vue
+        reste acquise."""
+        t0 = int(time.time())
+        _git(self.repo, "checkout", "-q", "-b", "agent/dev1-expire", "develop")
+        time.sleep(2.1)                    # l'entrée de création date d'avant
+        vrai = self.commit("vrai")
+        _git(self.repo, "checkout", "-q", "develop")
+        lot = self.lot("agent/dev1-expire")
+        cutoff = datetime.datetime.fromtimestamp(
+            t0 + 1, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _git(self.repo, "reflog", "expire", "--expire=" + cutoff,
+             "refs/heads/agent/dev1-expire")
+        # le relevé enregistre le vrai commit (pas de faux « no work »)
+        self.assertEqual(self.sync()["results"][0]["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["branch_head"], vrai)
+        # sa fusion --no-ff, sans citation de la branche, le ferme
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Deliver reviewed packet", "agent/dev1-expire")
+        report = self.sync()
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(report["results"][0]["how"], "ancestor")
+
     def test_tete_hors_premiere_parente_vue_contre_une_cible_perimee_n_est_pas_livree(self):
         """#3326 avec #2543 : une pointe entrée par une fusion (hors première
         parente) ne prouve rien non plus si elle était déjà dans la cible

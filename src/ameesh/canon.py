@@ -4589,8 +4589,16 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
     known_harnesses = set(harnesses.known_ids())
     known = None if known_projects is None else (
         set(known_projects) | {p.team for p in canon.packages if p.team})
+    # #4803 : les projets que le canon déclare lui-même. `relit` ne peut nommer
+    # que ceux-là : `canon sync` valide sans base, et un projet connu de la
+    # seule base (lots, `github.projects`) y serait `agent-relit-unknown` —
+    # `canon check` doit rendre le même verdict. `risk_classes.projects` est la
+    # déclaration de projet de `federation.yaml` (cf.
+    # `mechanics.declared_projects` et `review.scoped_from_federation`), sans
+    # donner ce projet à un agent.
     declared_projects = {p.team for p in canon.packages if p.team} | {
-        project for agent in canon.agents for project in agent.effective_projects}
+        project for agent in canon.agents for project in agent.effective_projects} | set(
+            review_mod.scoped_from_federation(canon.federation).projects)
     for agent in canon.agents:
         f = agent.fiche
         if not NAME_RE.match(agent.title):
@@ -4666,12 +4674,12 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                         "unknown projects for %s: %s (neither a work package's team, "
                         "`github.projects` nor a lot's project)"
                         % (agent.title, ", ".join(unknown)), f, agent=agent.title)
-        # #3185 : `relit` ne nomme que des projets déclarés — ceux du canon
-        # (équipes des paquets, projets des fiches) et, avec une base, les
-        # projets connus ; une faute de frappe désignerait un relecteur nulle part
+        # #3185/#4803 : `relit` ne nomme que les projets déclarés par le canon
+        # (équipes des paquets, projets des fiches, `risk_classes.projects`) ;
+        # les projets connus de la seule base ne comptent pas, sinon
+        # `canon check` accepte ce que `canon sync` refuse sans base
         if agent.relit:
-            declared = (known or set()) | declared_projects
-            stray = [p for p in agent.relit if p not in declared]
+            stray = [p for p in agent.relit if p not in declared_projects]
             if stray:
                 add("agent-relit-unknown", ERROR,
                     "`relit` of %s names undeclared projects: %s"
@@ -4874,6 +4882,15 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
         # L98 T2a decision 3: a refused entry point no scope activates is a
         # warning; the same entry activated above is `project-modules-invalid`.
         for warning in resolution.warnings:
+            if warning["code"] == "pipeline-module-duplicate":
+                # L103 T2 (#4396): a Pipeline card taking the name of an
+                # installed module (or of another card) is refused even when
+                # no project selects it; it fails `canon check` without
+                # blocking any agent (`pipeline` subject).
+                card = canon.pipeline(warning["name"])
+                add("pipeline-module-duplicate", ERROR, warning["message"],
+                    card.fiche if card is not None else None, pipeline=warning["name"])
+                continue
             add("module-refused", WARNING, warning["message"],
                 **({"member": root_member, "path": "federation.yaml"} if root_member else {}))
     _scoped = review_mod.scoped_from_federation(canon.federation)

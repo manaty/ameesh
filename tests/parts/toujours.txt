@@ -27,6 +27,7 @@ test_2449_garde_mecanique  # #2449: canon mechanics (no hardcoded parameter, nam
 test_2457_garde_non_python  # #2457: shell/systemd/workflow mechanics guard and tracked-file scope
 test_339_orphan_settle  # #749: orphan turn groups settled without a reboot, outside the measured blocks
 test_4256_validation_deadlines  # #4256: validation authority, private audit and single-winner escalation (SQL contract)
+test_4259_client_literals  # #4574: client literals guard, reads src/ameesh as text (no map link)
 test_cluster  # roles created on the cluster (supervisor, approve), grants checked against every column
 test_events_attach  # LISTEN/NOTIFY channels, global to the cluster
 test_l31_orphans  # #749: orphan resources of a turn, lease and alert contract (the release red module)
@@ -34,3 +35,4 @@ test_l50_group_orphan_work_items  # #749: orphan work items of a group reattache
 test_l72_panne_de_base  # database outage and reconnection
 test_migrations  # migrations: application, idempotence, immuabilité (contrat, L1211)
 test_3752_gabarit  # #3752: a migration changes the template every class clones (clone ≡ migrate)
+test_4299_agent_rename  # #4299: every agent-name column of the schema is classified for the rename

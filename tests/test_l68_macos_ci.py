@@ -169,10 +169,11 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
         # #4557 : huit parts longues en file affamaient platform-macos.
         # Lire la stratégie YAML effective : un commentaire ou un plafond
         # posé sur un autre job ne protège pas le paquet.
-        import yaml
-
+        # #4567 (N1 de #4557) : PyYAML n'est pas une dépendance ; le lecteur
+        # du canon donne les mêmes valeurs et le témoin ne dépend plus d'un
+        # paquet installé.
         with open(MACOS, encoding="utf-8") as fh:
-            workflow = yaml.safe_load(fh)
+            workflow = canon.load_yaml(fh.read())
         strategy = workflow["jobs"]["suite"]["strategy"]
         ceiling = strategy.get("max-parallel")
         self.assertIs(type(ceiling), int, "plafond constant requis")
@@ -264,6 +265,7 @@ class CiMacosCoexistenceTest(unittest.TestCase):
             "github": {
                 "event_name": event,
                 "repository": REPO,
+                "run_id": 12345,
                 "ref": "refs/heads/main",
                 "ref_name": "main",
                 "base_ref": "",
@@ -331,10 +333,31 @@ class CiMacosCoexistenceTest(unittest.TestCase):
         self.assertTrue(bool(self._eval(condition, ci)))
         self.assertFalse(bool(self._eval(condition, gel)))
 
+    def test_crossing_long_suites_share_one_macos_suite_slot(self):
+        # #4567 (N2 de #4557) : `max-parallel` ne borne qu'un run ; le
+        # nocturne, un dispatch sur un autre réf et une étiquette ci-macos
+        # pouvaient faire tourner trois suites à la fois (six parts) et
+        # dépasser les cinq jobs macOS hébergés. Les suites longues partagent
+        # le groupe `macos-suite` : une seule tient les runners à la fois.
+        concurrence = self.macos_doc["concurrency"]
+        contextes = {
+            "nocturne": self._context("schedule", None, plan_result="success",
+                                      outputs={}),
+            "dispatch": self._context("workflow_dispatch", None,
+                                      plan_result="success", outputs={}),
+            "ci-macos": self._context("pull_request_target", "ci-macos",
+                                      plan_result="success", outputs={}),
+        }
+        groupes = {nom: self._template(concurrence["group"], ctx)
+                   for nom, ctx in contextes.items()}
+        self.assertEqual(set(groupes.values()), {"macos-suite"}, groupes)
+        self.assertIs(concurrence["cancel-in-progress"], False)
+
     def test_a_freeze_label_cannot_cancel_a_running_macos_suite(self):
         # Une étiquette ci-lot/ci-full arrive souvent pendant que la suite
         # ci-macos tourne : son groupe de concurrence doit être distinct et
-        # elle ne doit rien annuler.
+        # elle ne doit rien annuler. #4567 : la suite longue n'annule plus
+        # non plus un run précédent, elle attend le créneau unique.
         ci = self._context("pull_request_target", "ci-macos",
                            plan_result="skipped", outputs={})
         gel = self._context("pull_request_target", "ci-lot-" + "a" * 40,
@@ -342,8 +365,7 @@ class CiMacosCoexistenceTest(unittest.TestCase):
         concurrence = self.macos_doc["concurrency"]
         self.assertNotEqual(self._template(concurrence["group"], ci),
                             self._template(concurrence["group"], gel))
-        self.assertTrue(bool(self._eval(concurrence["cancel-in-progress"], ci)))
-        self.assertFalse(bool(self._eval(concurrence["cancel-in-progress"], gel)))
+        self.assertIs(concurrence["cancel-in-progress"], False)
 
 
 class BenchTmpdirTest(unittest.TestCase):

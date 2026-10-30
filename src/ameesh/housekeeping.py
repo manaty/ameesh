@@ -5065,12 +5065,21 @@ def _timed_out_report(host: str, dry_run: bool, budget: PassBudget,
             "orphans": orphans, "unowned": unowned, "measure": None}
 
 
+def host_units_dir() -> str | None:
+    """#4754 : le dossier des unités utilisateur de l'hôte (veilles, réveils),
+    ou None hors systemd."""
+    if not platform.is_linux():
+        return None
+    from . import watch
+    return watch.unit_dir()
+
+
 def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
              busy: bool = False, agents_in_turn: set | None = None,
              now: float | None = None,
              runtime=None, artifact_scan: bool = True, min_interval_s: float = 0.0,
              free_target: int = 0, budget_s: float | None = None,
-             progress=None) -> dict:
+             progress=None, units_dir: str | None = None) -> dict:
     """One host pass across all runners and the CLI, without waiting.
 
     Periodic callers share the last completed pass's timestamp, under the
@@ -5198,7 +5207,8 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                busy=busy, agents_in_turn=agents_in_turn, now=now,
                                runtime=runtime, artifact_scan=artifact_scan,
                                free_target=free_target, budget=budget,
-                               cursor=cursors.get(key), on_cursor=on_cursor)
+                               cursor=cursors.get(key), on_cursor=on_cursor,
+                               units_dir=units_dir)
         except _PassExpired as expired:
             notify("timed_out:%s" % expired.phase)
             report = _timed_out_report(host, dry_run, budget, expired.phase)
@@ -5233,7 +5243,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
               now: float | None = None,
               runtime=None, artifact_scan: bool = True,
               free_target: int = 0, budget: PassBudget | None = None,
-              cursor=None, on_cursor=None) -> dict:
+              cursor=None, on_cursor=None, units_dir: str | None = None) -> dict:
     """Un passage de ménage sur CET hôte ; rend le rapport.
 
     * dossiers temporaires : quota par agent (sauf agent en tour) ; dossier
@@ -5803,6 +5813,24 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     plan += orphan_plan
     skipped += declared_root_refused(cfg, policy)
     budget.context["orphans"] = orphans
+    # 6. #4754 : unités de veille et de réveil qui nomment un venv versionné
+    #    (retiré par le ménage des venv : 203/EXEC à chaque tir). Seulement
+    #    quand l'appelant nomme le dossier des unités (exécuteur, CLI).
+    if units_dir:
+        budget.check("units")
+        from . import watch
+        try:
+            repinned = watch.repin_units(units_dir, dry_run=dry_run)
+        except Exception as exc:  # jamais fatal pour le passage
+            repinned = []
+            skipped.append("watch units: pass failed (%s)" % type(exc).__name__)
+        for fix in repinned:
+            entries.append({
+                "kind": "unit", "action": "planned" if dry_run else "repinned",
+                "path": fix["path"], "bytes": 0,
+                "detail": "ExecStart %s -> %s" % (", ".join(fix["before"]),
+                                                  ", ".join(fix["after"])),
+                "data": {"before": fix["before"], "after": fix["after"]}})
     budget.check("measure")
     report_measure = measure(cfg, policy, budget=budget)
     # #3802 : la trace des phases reste au journal (relevé `mesure`), pas
@@ -6164,7 +6192,9 @@ def cmd_housekeeping(cfg, args) -> int:
                           # déclenche l'éviction des caches sous pression.
                           free_target=int(limits.get("min_disk_free") or 0),
                           runtime=containers_mod.Runtime.from_config(cfg),
-                          progress=progress)
+                          progress=progress,
+                          # #4754 : les unités de veille de CET hôte
+                          units_dir=host_units_dir())
         if report.get("dry_run") and not report.get("status") == "skipped":
             # #4234 : le volume des arbres gardés est enfin visible, les plus
             # gros en tête ; le relevé ne supprime rien et reste borné.

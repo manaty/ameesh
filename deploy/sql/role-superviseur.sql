@@ -146,6 +146,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('agent_name_resolutions', ARRAY[
         'id', 'at', 'supplied_name', 'primary_name', 'operation', 'db_user'
     ]),
+    -- L243b step 3 (0516, #4299): rename journal, without the free-text reason.
+    ('agent_renames', ARRAY[
+        'id', 'at', 'old_name', 'new_name', 'actor', 'lease_epoch', 'rewritten',
+        'db_user'
+    ]),
     ('agent_mesh_overview', ARRAY[
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
         'status', 'status_text', 'model', 'budget_usd', 'spent_usd',

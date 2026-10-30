@@ -59,6 +59,17 @@ CHECKS = (
     # L161a : un module qui lit docs/ ou site/ est déclaré lecteur de la doc
     ("doc readers L161a", ["-m", "unittest", "-q",
                            "tests.test_l161a_ci_sans_code.ReadersTest"]),
+    # #4521 : un alias `sys.modules` vers une implémentation de module ne peut
+    # pas tomber dans une classe de relecture plus faible que son ancien chemin
+    # (les `modules/dev/**` déplacés par L100 tombent au défaut léger).
+    ("alias de module #4521", ["scripts/garde-alias-classe.py", "--root", "."]),
+    # #4521 B/P1 auditeur : la politique épinglée lue en CI (canon privé
+    # illisible sur un runner) ne doit pas être plus faible que le canon de
+    # l'hôte ; une classe épinglée plus faible refuse le gel. Les règles
+    # peuvent bouger sans changer la classe (B/P2 auditeur).
+    ("alias de module #4521 (politique épinglée)",
+     ["scripts/garde-alias-classe.py", "--root", ".",
+      "--check-policy", "scripts/alias-review-classes.json"]),
 )
 #: #3687 : les modules de contrat de la porte de fusion (avis, auteurs, feu,
 #: désignation, report des verdicts) ; seules leurs classes sans base tournent

@@ -213,6 +213,48 @@ class AlerteTest(_Base):
         self.age(4 * HEURE)
         self.assertEqual(self.slo(), [])
 
+    def test_build_immobile_sous_hold_de_pilote_ne_signale_pas(self):
+        # #4704 (à vérifier) : une garde volontairement immobile (#4696) suit
+        # le hold « fenêtre » (#4235) ; sans cela, `build_quiet` alerterait
+        # toutes les heures sur un lot que son pilote a parqué exprès.
+        self.start(since_s=8 * HEURE)
+        work.note(self.db, self.lot["id"], "hold: fenêtre 0518 du 30/10 10:30Z",
+                  actor="human:pilote")
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
+            " WHERE work_item_id = %s AND note LIKE 'hold:%%'",
+            (8 * HEURE, self.lot["id"]))
+        self.now = time.time()
+        self.assertEqual([a for a in self.slo() if a["step"] == "build_quiet"], [])
+
+    def test_lot_reserve_a_un_executant_externe_ne_signale_pas_assigned(self):
+        # #4704, témoin de bout en bout : un lot né réservé au bureau n'a
+        # jamais d'`assignee` ; en build, « signalé → assigné » est conclue à
+        # la réservation (création), aucune alerte SLO ne part.
+        registry.upsert(self.db, "bureau_ext", harness="codex",
+                        host=self.cfg.host)
+        self.db.execute(
+            "UPDATE agent_registry SET mode = 'externe', responsible ="
+            " 'human:proprio', lease_owner = NULL WHERE name = 'bureau_ext'")
+        lot = work.add(self.db, title="fenêtre 0518", external_executor="bureau_ext",
+                       actor="human:proprio", cfg=self.cfg, priority=1)
+        # signalé et né réservé il y a 2 h ; en build depuis 30 min.
+        self.db.execute(
+            "UPDATE work_items SET created_at = now() - make_interval(secs => %s)"
+            " WHERE id = %s", (2 * HEURE, lot["id"]))
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
+            " WHERE work_item_id = %s AND state = 'intake'",
+            (2 * HEURE, lot["id"]))
+        work.move(self.db, lot["id"], "build")
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
+            " WHERE work_item_id = %s AND state = 'build'",
+            (1800.0, lot["id"]))
+        self.now = time.time()
+        alerts = [a for a in self.slo() if a["lot"] == lot["id"]]
+        self.assertEqual([(a["step"], a["level"]) for a in alerts], [])
+
     def test_bloquant_fusionne_le_delai_part_de_la_levee(self):
         # #2551 : #2198/#2498 — un lot assigné depuis 13 h mais retenu par
         # #2184 ne doit pas escalader au niveau 3 à la seconde où le bloqueur

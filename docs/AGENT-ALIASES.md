@@ -79,3 +79,45 @@ identity's references atomically between turns, keep the former primary as an
 alias, and preserve the session, worktree, mail and key signing bytes. Reverting
 the declaration uses that same migration in the opposite direction. Step 1 does
 not supply or run this migration.
+
+## Step 3: the identity migrator (#4299)
+
+```
+ameesh agent rename OLD NEW --reason R [--actor A] [--dry-run] [--local-state] [--json]
+```
+
+One transaction renames the registry row itself: primary `OLD` → `NEW`, with
+`OLD` appended to its aliases (other aliases kept, `NEW` removed from them).
+Key, fingerprint, lease epoch, session and worktree stay on that row; no
+second row is created and nothing is copied. Columns that designate the
+identity (`agent_rename.REWRITTEN`: lots, reviewers, delegations, mail
+sender/recipient, sessions, worktrees, costs, quotas, journals of lots and
+housekeeping) are rewritten where equal to `OLD`. The children of
+`agent_registry(name)` and `conversation_heads(agent)` follow by
+`ON UPDATE CASCADE` (migration 0516). Evidence is never rewritten
+(`agent_rename.KEPT`): approvals and nonces, keys and key events, receipts,
+executor audit and tokens, alias resolutions and the rename journal. Signed
+bytes are untouched; stored identities resolve through the alias. A test
+requires every agent-valued column in the schema to be classified.
+
+The gesture is refused, with nothing written, if the agent holds a live lease
+or is running (stop its runner between two turns first), if `NEW` designates
+another identity or a human key holder, if `NEW` already appears in a
+rewritten column (that would graft a foreign history), if the agent holds an
+owner key, or if a receipt under any of its spellings belongs to a lot not yet
+merged or closed: the review gate and the train pair kept receipts with
+rewritten names, so a lot under review keeps the spelling it was proven under
+(rename once it lands). The verdict-family and review-floor readers compare
+identities, not spellings, for lots already past that point. `--dry-run` runs the whole transaction and rolls it back. Each
+committed rename appends a row to `agent_renames` (append-only) and an
+`agent.renamed` event. After the commit, a sweep rewrites the rows a
+concurrent writer may still have spelled `OLD`. Running the same command again
+only sweeps. `--local-state` moves this host's state directory to `NEW` and
+leaves `OLD` as a symlink.
+
+Reverse is the same command in the other direction, `rename NEW OLD`: `NEW`
+then stays as an alias. Runner units addressed by the old name keep working
+through `--agents` resolution. Canon cards (`title`, `aliases`), placements
+and units are aligned by a separate application PR, as in the N1 table. Until
+that PR lands, `canon sync` reports `agent-alias-conflict` for the card and
+closes admission (fail-closed).

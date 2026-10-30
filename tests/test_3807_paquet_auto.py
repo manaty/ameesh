@@ -535,14 +535,18 @@ class PaquetAutoBanc(unittest.TestCase):
 
 
     def test_keep_composition_ecarte_une_resolution(self) -> None:
-        # Une unité à plusieurs lots ne se reprend pas sans la relire.
+        # Une unité à plusieurs lots ne se reprend pas sans la relire ; chaque
+        # lot est nommé aux écartés, sinon les suivants ne seraient ni composés
+        # ni expliqués au contrôle d'inclusion (#4593).
         candidates = [paquet_auto.Candidate(1, "a" * 40),
                       paquet_auto.Candidate(2, "b" * 40)]
         members, discarded = paquet_auto.keep_composition(
             candidates, [([1, 2], "a" * 40)], worktree=self.repo, already_discarded=set())
         self.assertEqual(members, [])
-        self.assertEqual([item.lot for item in discarded], [1])
-        self.assertIn("résolution", discarded[0].detail)
+        self.assertEqual([item.lot for item in discarded], [1, 2])
+        self.assertTrue(all("résolution" in item.detail for item in discarded))
+        self.assertEqual({item.reason for item in discarded},
+                         {paquet_auto.KEEP_NOT_READY_REASON})
 
     def test_keep_composition_lit_le_manifeste_gele(self) -> None:
         manifest = ("# Paquet\n\n## Composition (2 unités, 2 lots)\n\n"

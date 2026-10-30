@@ -336,6 +336,26 @@ def default_target(repo: Optional[str]) -> str:
         return ""
 
 
+def project_target(cfg, app: str, slug: str = "") -> str:
+    """La cible d'intégration déclarée du projet (`radar.projects.<p>.target`),
+    ou "" (#4733).
+
+    Un lot sans `branch_target` se lit sur la cible que le projet déclare
+    (`develop` pour Nexlink), jamais sur la branche par défaut de la forge
+    (`origin/HEAD`, souvent `main`/prod) : le diff `main...branche` porterait
+    tout l'écart d'intégration, pas les fichiers du lot.
+
+    Le projet se reconnaît à son nom, puis au dépôt déclaré pour ce nom
+    (`github.projects`) : un projet radar peut porter un autre nom que l'app.
+    """
+    if not slug and app:
+        slug = _project_slug(cfg, app)
+    project = _radar_project(cfg, app or "", slug)
+    if project is None:
+        return ""
+    return str(getattr(project, "target", "") or "").strip()
+
+
 # --------------------------------------------------------------------------
 # motifs
 # --------------------------------------------------------------------------

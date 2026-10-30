@@ -112,6 +112,8 @@ NON_CONCLUANT = "non-concluant"
 VERDICTS_NON_CONCLUANTS = ("sans-sonde", NON_CONCLUANT)
 #: report d'une sonde non concluante, dans l'attestation et le courrier
 REPORT_NON_CONCLUANT = "staging suivant"
+#: #4616 : mention de l'attestation d'une sequence lancee avec --sans-retour
+RETOUR_DESACTIVE = "desactive"
 #: etat par defaut des attestations (meme arbre que le journal de staging)
 ETAT_DEFAUT = Path.home() / ".local/state/ameesh/mise-a-jour"
 #: code de sortie d'une emission ambigue : rien n'a ete renvoye, le relais
@@ -537,7 +539,7 @@ def attestation_partagee(attestation: dict) -> dict:
         if preuve.get("non_concluant"):
             compacte["non_concluant"] = preuve["non_concluant"]
         hotes[hote] = compacte
-    return {
+    partage = {
         "schema": attestation.get("schema"),
         "cle": attestation.get("cle"),
         "date": attestation.get("date"),
@@ -549,6 +551,9 @@ def attestation_partagee(attestation: dict) -> dict:
         "lots": attestation.get("lots") or [],
         "rapporteurs": attestation.get("rapporteurs") or [],
     }
+    if attestation.get("retour_automatique"):
+        partage["retour_automatique"] = attestation["retour_automatique"]
+    return partage
 
 
 def enregistrer_attestation(attestation: dict) -> int:
@@ -589,6 +594,9 @@ def corps_courrier(attestation: dict, chemin: Path) -> str:
         entete = "Staging actif : commit %s, installe ET actif sur %d hotes ; %d reporte(s)." % (
             attestation["sha"][:9], len(attestation["hotes"]), len(reportes))
     lignes = [entete, ""]
+    if attestation.get("retour_automatique"):
+        lignes[1:1] = ["Retour automatique %s (--sans-retour, #4616)."
+                       % attestation["retour_automatique"]]
     for hote, preuve in sorted(attestation["hotes"].items()):
         sonde = preuve.get("sonde") or {}
         detail = ""
@@ -640,6 +648,8 @@ def analyseur() -> argparse.ArgumentParser:
                         help="agent a reveiller (repete)")
     parser.add_argument("--sans-sonde", action="store_true",
                         help="sequence sans sonde de remise reelle : activation non prouvee")
+    parser.add_argument("--sans-retour", action="store_true",
+                        help="sequence sans retour automatique (#4616) : mention dans l'attestation")
     parser.add_argument("--etat-dir", default=str(ETAT_DEFAUT))
     parser.add_argument("--json", action="store_true")
     return parser
@@ -724,6 +734,9 @@ def main(argv: list[str] | None = None) -> int:
         "emissions": emissions,
         "cloture": "aucune : verification apres deploiement par le rapporteur",
     }
+    if args.sans_retour:
+        #: #4616 : sequence menee avec --sans-retour (migration non additive)
+        attestation["retour_automatique"] = RETOUR_DESACTIVE
 
     echecs = []
     ambigus = []

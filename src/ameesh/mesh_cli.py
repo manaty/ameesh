@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""agent-mesh — the mesh CLI: observability, keys, approvals, work items.
+"""agent-mesh — the mesh CLI: observability, keys, approvals, {works}.
 
   agent-mesh list [--json]                     mesh list: agents, project, host, lease, unread,
                                                 budget, grouped by project (L62); status
@@ -20,12 +20,12 @@
   agent-mesh work list [--state S] | work show <id> | work move <id> <state> | work note <id> "…"
   agent-mesh work wake <id> --at ISO | --in DURATION | --cancel   scheduled wake, even under hold (#2466)
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
-  agent-mesh work external-executor <id> <agent> | --clear   reserve a lot to an external executor (#3447)
+  agent-mesh work external-executor <id> <agent> | --clear   reserve a {work} to an external executor (#3447)
   agent-mesh work merged <id> --sha S | --pr owner/repo#N [--note …]   merge done outside a PR: any open state → merged
-  agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the work item's migration numbers (L122, #2481)
+  agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the {work}'s migration numbers (L122, #2481)
   agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
-  agent-mesh work set-type <id> bug|evolution   retype a lot, journaled (#2954)
-  agent-mesh work set-priority <id> 1|2|3 --reason "…"   change an open lot's priority, journaled (#3370)
+  agent-mesh work set-type <id> bug|evolution   retype a {work}, journaled (#2954)
+  agent-mesh work set-priority <id> 1|2|3 --reason "…"   change an open {work}'s priority, journaled (#3370)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
   agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
   agent-mesh work land <id> [--project P]   land the queue head now (L160e2)
@@ -40,11 +40,11 @@
   agent-mesh placement check [--agent A] [--json]        admissions and admissible hosts (C4)
   agent-mesh hosts [--json] [HOST] [--history N]         host resources (L31)
   agent-mesh housekeeping [--dry-run | --apply] [--json] agent cleanup (L73)
-  agent-mesh conflicts [--project P] [--all] [--json]   conflict radar between work items (L160b)
+  agent-mesh conflicts [--project P] [--all] [--json]   conflict radar between {works} (L160b)
   agent-mesh ci status <item> [--limit N] [--json]      live CI, failures (L161c)
-  agent-mesh ci run <item> [--avis N] [--exception …]   the CI of a frozen lot, once,
+  agent-mesh ci run <item> [--avis N] [--exception …]   the CI of a frozen {work}, once,
         [--full] [--sha S] [--force] [--dry-run]        on the frozen commit (#1343)
-  agent-mesh ci cancel <item> [--all] [--dry-run]       cancel the stale runs of a lot
+  agent-mesh ci cancel <item> [--all] [--dry-run]       cancel the stale runs of a {work}
   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
   agent-mesh agent move NOM --to HOST [--keep-session]   manual move of a `releve: hote`
                                                           agent, fenced (#3299)
@@ -75,12 +75,32 @@ from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, progress, registry
 from . import rebalance as rebalance_mod
-from . import fil, release, signing, storage, work, work_lifecycle
+from . import fil, release, signing, storage, vocab, work, work_lifecycle
 from .config import Config
 from .db import Db
 from .deprecated import HiddenAliasParser
 
 USAGE_HINT = "agent-mesh: %s"
+
+
+def _vocabulary(vocabulary=None):
+    """The work-item vocabulary of the active module (L102 T2, #4392).
+
+    ``vocabulary`` is the test seam; without it the dev module's DEV ("lot")
+    is read through :func:`ameesh.vocab.active`, CORE ("tâche") when no active
+    module declares one."""
+    return vocab.active() if vocabulary is None else vocabulary
+
+
+def _words(vocabulary=None) -> dict:
+    """The words the help texts substitute into their ``{…}`` placeholders."""
+    v = _vocabulary(vocabulary)
+    return {"work": v.noun, "works": v.plural}
+
+
+def _doc(vocabulary=None) -> str:
+    """``agent-mesh --help``: the module description in the active vocabulary."""
+    return __doc__.format(**_words(vocabulary))
 
 
 def _open(cfg: Config) -> Db:
@@ -314,6 +334,7 @@ def cmd_handoff(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
+    v = _vocabulary()
     db = _open(cfg)
     # L61 : agents et lots préchargés en un seul aller-retour (db.prefetch) ;
     # le code ci-dessous lit ensuite ces réponses sans retourner à la base
@@ -431,9 +452,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         over = sorted(name for name, count in build_by_agent.items()
                       if cap is not None and count > cap)
         if over:
-            print("wip      : %d agent(s) above the §4 cap (%d lots in build): %s — "
-                  "ameesh work wip [--apply] returns the surplus to the team queue"
-                  % (len(over), cap, ", ".join(over)))
+            print(('wip      : %d agent(s) above the §4 cap (%d %s in build): %s — ameesh work wip [--apply] returns the surplus to the team queue') % (len(over), cap, v.plural, ", ".join(over)))
         elif cap is None:
             print("wip      : §4 cap unknown (build.max_in_build absent from the "
                   "compiled canon): no overrun judged")
@@ -1096,6 +1115,7 @@ def _host_menage(hk, host: str, policy, measure_row: dict | None,
 
 
 def _print_host_menage(menage: dict) -> None:
+    v = _vocabulary()
     tmp = menage.get("system_tmp")
     policy = menage["policy"]
     blocked = menage.get("host_pass")
@@ -1155,9 +1175,7 @@ def _print_host_menage(menage: dict) -> None:
             for r in faits))
     wt = menage.get("worktrees") or {}
     if wt.get("active") or wt.get("kept"):
-        print("  worktrees  %d tracked, waiting for their work item to end; %d kept%s" % (
-            wt.get("active", 0), len(wt.get("kept") or []),
-            ": " + "; ".join("%s (%s)" % (k["path"], k["detail"]) for k in wt["kept"][:5])
+        print(('  worktrees  %d tracked, waiting for their %s to end; %d kept%s') % (wt.get("active", 0), v.noun, len(wt.get("kept") or []), ": " + "; ".join("%s (%s)" % (k["path"], k["detail"]) for k in wt["kept"][:5])
             if wt.get("kept") else ""))
 
 
@@ -1611,6 +1629,7 @@ def _print_delays(row: dict) -> None:
 
 def _print_deep_analysis(result: dict | None) -> None:
     """L317c : ce que `work add` a déclenché chez l'auditeur."""
+    v = _vocabulary()
     from . import deep_analysis
     if not result:
         return
@@ -1622,8 +1641,7 @@ def _print_deep_analysis(result: dict | None) -> None:
         print("analysis : deep analysis requested from %s, first report due within %d min"
               % (", ".join(result["auditors"]), int(deep_analysis.DEADLINE_S // 60)))
     else:
-        print("warning: deep analysis requested on the lot, but no auditor is registered "
-              "to receive it", file=sys.stderr)
+        print(('warning: deep analysis requested on the %s, but no auditor is registered to receive it') % v.noun, file=sys.stderr)
 
 
 def _deep_analysis_line(found: dict) -> str:
@@ -1724,11 +1742,11 @@ def cmd_review_class(cfg: Config, args: argparse.Namespace) -> int:
 def _print_assignment(check: dict | None) -> None:
     """Ce que l'attribution gardée (L37) a à dire : session externe forcée,
     agent arrêté."""
+    v = _vocabulary()
     if not check:
         return
     if check.get("externe"):
-        print("external session: %s will not be woken by ameesh; the work item waits for %s "
-              "(responsible)" % (check["assignee"], check["responsible"]))
+        print(('external session: %s will not be woken by ameesh; the %s waits for %s (responsible)') % (check["assignee"], v.noun, check["responsible"]))
     if check.get("warning"):
         print("warning: %s" % check["warning"], file=sys.stderr)
 
@@ -1744,6 +1762,7 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
     sinon l'identité liée de la session, jamais vide (« inconnu », averti).
     Une correction d'état (`move --correct`) vérifie en plus qui corrige, un
     forçage (`add`/`assign --force`, #540) qui force."""
+    v = _vocabulary()
     if args.work_command == "move" and getattr(args, "correct", None) is not None:
         args.actor = work.corrector(cfg, db, args.actor)
         return
@@ -1767,9 +1786,7 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
         explicit = (args.actor or "").strip()
         args.actor = work.milestone_actor(cfg, db, args.actor, kind=args.kind)
         if not explicit and args.actor == work.UNKNOWN_ACTOR:
-            print("warning: unknown actor: no identity bound to this session "
-                  "(AGENT_MAIL_NAME, ameesh mail bind); the lot journal will say "
-                  "\"%s\"; pass --actor human:<id>" % work.UNKNOWN_ACTOR,
+            print(('warning: unknown actor: no identity bound to this session (AGENT_MAIL_NAME, ameesh mail bind); the %s journal will say "%s"; pass --actor human:<id>') % (v.noun, work.UNKNOWN_ACTOR),
                   file=sys.stderr)
         return
     if args.work_command in (*_OWN_ACTOR, "set-app", "set-type", "set-priority",
@@ -1950,6 +1967,7 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
 
 
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
+    v = _vocabulary()
     from . import plan, plan_cli, prevalidation, stagnation  # plan de travail (L29)
     db = _open(cfg)
     try:
@@ -2005,7 +2023,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                  indent=2, default=str))
                 return 0
             if not reports:
-                print("no open lot")
+                print(('no open %s') % v.noun)
                 return 0
             for report in reports:
                 print(backlog_coherence.format_report(report))
@@ -2113,12 +2131,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 check = None
                 print("warning: created unassigned: %s"
                       % work_footprints.refusal(item["id"], exc.overlaps), file=sys.stderr)
-            print("lot #%d created in %s: %s%s%s%s" % (
-                item["id"], item["state"], item["title"],
-                " (plan: %s)" % item["package_id"] if item.get("package_id") else "",
-                " (priority %s)" % work.PRIORITY_LABELS.get(item.get("priority"))
-                if item.get("priority") else "",
-                " — estimated %s" % estimates.label(minutes) if minutes else ""))
+            print(('%s #%d created in %s: %s%s%s%s') % (v.noun, item["id"], item["state"], item["title"], " (plan: %s)" % item["package_id"] if item.get("package_id") else "", " (priority %s)" % work.PRIORITY_LABELS.get(item.get("priority"))
+                if item.get("priority") else "", " — estimated %s" % estimates.label(minutes) if minutes else ""))
             if item.get("external_executor"):
                 print("executor : %s (external, reserved; not assigned — L165 does not "
                       "take it)" % item["external_executor"])
@@ -2179,14 +2193,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 return 0
             if result["created"]:
-                print("lot #%d opened for %s (priority %s%s)"
-                      % (result["lot"], result["source"], result["priority"],
-                         ", récidive de #%d" % result["recurrence_of"]
+                print(('%s #%d opened for %s (priority %s%s)') % (v.noun, result["lot"], result["source"], result["priority"], ", récidive de #%d" % result["recurrence_of"]
                          if result.get("recurrence_of") else ""))
             else:
-                print("lot #%d already open for %s: occurrence noted%s"
-                      % (result["lot"], result["source"],
-                         " (P1: a user is touched)" if result.get("escalated")
+                print(('%s #%d already open for %s: occurrence noted%s') % (v.noun, result["lot"], result["source"], " (P1: a user is touched)" if result.get("escalated")
                          else ""))
             return 0
         if args.work_command == "assign":
@@ -2196,8 +2206,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                               claim=args.claim, if_holder=args.if_holder,
                               wip_exception=args.wip_exception)
             if out.get("queue_warning"):
-                print("lot #%d not assigned to %s (before: %s)" % (
-                    out["item"]["id"], args.agent, out["previous"] or "nobody"))
+                print(('%s #%d not assigned to %s (before: %s)') % (v.noun, out["item"]["id"], args.agent, out["previous"] or "nobody"))
                 if args.claim:
                     # #1787 N2 : un claim qui retombe dans la file d'équipe
                     # (#540) n'a pas pris : refus lisible, code 1.
@@ -2206,22 +2215,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("warning: %s" % out["queue_warning"], file=sys.stderr)
             elif out.get("noop"):
                 # #1787 N3 : le porteur qui re-claim son propre lot : no-op.
-                print("lot #%d already assigned to %s: claim is a no-op, nothing changed"
-                      % (out["item"]["id"], out["item"]["assignee"]))
+                print(('%s #%d already assigned to %s: claim is a no-op, nothing changed') % (v.noun, out["item"]["id"], out["item"]["assignee"]))
             elif out["previous"] == out["item"]["assignee"]:
                 if args.wip_exception:
-                    print("lot #%d: WIP exception recorded for %s%s" % (
-                        out["item"]["id"], out["item"]["assignee"],
-                        "; branch %s" % out["item"]["branch"] if args.branch else ""))
+                    print(('%s #%d: WIP exception recorded for %s%s') % (v.noun, out["item"]["id"], out["item"]["assignee"], "; branch %s" % out["item"]["branch"] if args.branch else ""))
                 else:
-                    print("lot #%d: branch %s (assigned to %s)" % (
-                        out["item"]["id"], out["item"].get("branch"),
-                        out["item"]["assignee"]))
+                    print(('%s #%d: branch %s (assigned to %s)') % (v.noun, out["item"]["id"], out["item"].get("branch"), out["item"]["assignee"]))
             else:
-                print("lot #%d assigned to %s (before: %s)%s%s" % (
-                    out["item"]["id"], out["item"]["assignee"], out["previous"] or "nobody",
-                    "; branch %s" % out["item"]["branch"] if args.branch else "",
-                    "; WIP exception (§4)" if args.wip_exception else ""))
+                print(('%s #%d assigned to %s (before: %s)%s%s') % (v.noun, out["item"]["id"], out["item"]["assignee"], out["previous"] or "nobody", "; branch %s" % out["item"]["branch"] if args.branch else "", "; WIP exception (§4)" if args.wip_exception else ""))
             _print_assignment(out["check"])
             return 0
         if args.work_command == "external-executor":
@@ -2238,12 +2239,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
                 return 0
             if args.clear:
-                print("lot #%d: external executor cleared (was %s); the lot is back in "
-                      "the ordinary queue" % (out["item"]["id"],
-                                              out["previous"] or "nobody"))
+                print(('%s #%d: external executor cleared (was %s); the %s is back in the ordinary queue') % (v.noun, out["item"]["id"], out["previous"] or "nobody", v.noun))
             else:
-                print("lot #%d: reserved to %s (external executor; not assigned — L165 "
-                      "does not take it)" % (out["item"]["id"], out["executor"]))
+                print(('%s #%d: reserved to %s (external executor; not assigned — L165 does not take it)') % (v.noun, out["item"]["id"], out["executor"]))
             return 0
         if args.work_command == "branch":
             # #2102 : détachement explicite, ou (ré)association explicite
@@ -2254,9 +2252,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item = work.detach_branch(db, args.id, args.branch, reason=args.reason,
                                           actor=args.actor)
                 name = args.branch or before.get("branch")
-                print("lot #%d: branch %s detached (state %s, assignee %s kept); the "
-                      "merge sweep no longer associates it" % (
-                          item["id"], name, item["state"], item.get("assignee") or "nobody"))
+                print(('%s #%d: branch %s detached (state %s, assignee %s kept); the merge sweep no longer associates it') % (v.noun, item["id"], name, item["state"], item.get("assignee") or "nobody"))
                 return 0
             if not args.branch:
                 raise work.WorkError("name the branch to set, or pass --detach")
@@ -2266,20 +2262,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                    source="explicit association%s" % (
                                        " after its detachment" if again else ""),
                                    clear_target=cleared)
-            print("lot #%d: branch %s%s%s" % (
-                item["id"], item.get("branch"), " to %s" % (
-                    item["branch_target"]) if item.get("branch_target") else "",
-                " (target cleared)" if cleared else ""))
+            print(('%s #%d: branch %s%s%s') % (v.noun, item["id"], item.get("branch"), " to %s" % (
+                    item["branch_target"]) if item.get("branch_target") else "", " (target cleared)" if cleared else ""))
             return 0
         if args.work_command == "delegate":
             # L40 (0030, point 5) : délégation à échéance, gardée comme `assign`
             out = work.delegate(db, args.id, args.agent, within=args.within,
                                 actor=args.actor, cfg=cfg)
             item = out["item"]
-            print("lot #%d delegated to %s by %s, due in %s (%s)" % (
-                item["id"], item["assignee"], item["delegated_by"],
-                work.span(float(item["due_ts"]) - float(item["delegated_ts"])),
-                _fmt_moment(item.get("due_ts"))))
+            print(('%s #%d delegated to %s by %s, due in %s (%s)') % (v.noun, item["id"], item["assignee"], item["delegated_by"], work.span(float(item["due_ts"]) - float(item["delegated_ts"])), _fmt_moment(item.get("due_ts"))))
             if out.get("replaced"):
                 print("previous delegation replaced (%s, delegated by %s)" % (
                     out["replaced"]["delegate"], out["replaced"]["delegated_by"]))
@@ -2301,15 +2292,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
                 return 0
             if not rows:
-                print("no lot lifted" if args.apply
-                      else "no blocked lot declares a device session")
+                print(("no %s lifted" % v.noun) if args.apply
+                      else ("no blocked %s declares a device session" % v.noun))
                 return 0
             for row in rows:
                 if args.apply:
-                    print("lot #%d → %s (%s, verification lot #%d)" % (
-                        row["lot"], row["state"], device_gates.TRACE, row["verify"]))
+                    print(('%s #%d → %s (%s, verification %s #%d)') % (v.noun, row["lot"], row["state"], device_gates.TRACE, v.noun, row["verify"]))
                 else:
-                    print("lot #%d: %s" % (row["lot"], device_gates.label(row)))
+                    print(('%s #%d: %s') % (v.noun, row["lot"], device_gates.label(row)))
             return 0
         if args.work_command == "expire-delegations":
             rows = work.expire_delegations(db, actor=args.actor or work.SYSTEM_SENDER,
@@ -2325,10 +2315,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     "rendue": "returned to %s (no turn by %s)" % (row["delegated_by"],
                                                                 row["delegate"]),
                     "soldee": "delegation settled (work by %s)" % row["delegate"],
-                    "annulee": "delegation cancelled (work item closed or reassigned)",
+                    "annulee": "delegation cancelled (%s closed or reassigned)" % v.noun,
                 }.get(row["outcome"], row["outcome"])
-                print("%slot #%s: %s" % ("[dry-run] " if row.get("dry_run") else "",
-                                          row["work_item_id"], issue))
+                print("%s%s #%s: %s" % ("[dry-run] " if row.get("dry_run") else "",
+                                         v.noun, row["work_item_id"], issue))
             return 0
         if args.work_command == "list":
             rows = work_rows(db, state=args.state, assignee=args.assignee, limit=args.limit,
@@ -2340,7 +2330,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print(json.dumps(rows, ensure_ascii=False, indent=2))
                 return 0
             if not rows:
-                print("no work items")
+                print(('no %s') % v.plural)
                 return 0
             now = time.time()
             print("%-5s %-10s %-14s %-12s %-10s %-12s %-12s %s" % (
@@ -2373,12 +2363,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                repo=getattr(args, "git_dir", None),
                                target=getattr(args, "freeze_target", None))
             if item is None:
-                print(USAGE_HINT % ("lot %s not found" % args.id), file=sys.stderr)
+                print(USAGE_HINT % ("%s %s not found" % (v.noun, args.id)),
+                      file=sys.stderr)
                 return 1
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
-            print("lot      : #%d %s" % (item["id"], item["title"]))
+            print(('%-9s: #%d %s') % (v.noun, item["id"], item["title"]))
             print("type     : %-10s state: %-14s lifecycle: %-14s assignee: %s" % (
                 item["type"], item["state"], item["lifecycle"],
                 item.get("assignee") or "—"))
@@ -2553,17 +2544,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
             elif not item.get("migration"):
-                print("lot #%d: no migration reserved" % item["id"])
+                print(('%s #%d: no migration reserved') % (v.noun, item["id"]))
             elif len(item.get("migrations") or ()) <= 1:
-                print("lot #%d: migration %s reserved in %s — file %s" % (
-                    item["id"], item["migration_label"], item["migration_repo"],
-                    item.get("migration_file") or "<migrations>/%s_<name>.sql"
+                print(('%s #%d: migration %s reserved in %s — file %s') % (v.noun, item["id"], item["migration_label"], item["migration_repo"], item.get("migration_file") or "<migrations>/%s_<name>.sql"
                     % item["migration_label"]))
             else:
                 rows = item["migrations"]
-                print("lot #%d: migrations %s reserved in %s" % (
-                    item["id"], ", ".join(row["label"] for row in rows),
-                    ", ".join(sorted({row["repo"] for row in rows}))))
+                print(('%s #%d: migrations %s reserved in %s') % (v.noun, item["id"], ", ".join(row["label"] for row in rows), ", ".join(sorted({row["repo"] for row in rows}))))
                 for row in rows:
                     print("  %s — file %s" % (
                         row["label"], row.get("file")
@@ -2580,18 +2567,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # #3070 : la séance attendue sur un appareil, déclarée en note
                 from . import device_gates
                 if args.state != "blocked":
-                    print("ameesh work move: --device declares the device session a "
-                          "blocked lot waits for: ameesh work move %s blocked --device "
-                          "<device>" % args.id, file=sys.stderr)
+                    print(('ameesh work move: --device declares the device session a blocked %s waits for: ameesh work move %s blocked --device <device>') % (v.noun, args.id), file=sys.stderr)
                     return 2
                 note = device_gates.session_note(args.device, note)
             item = work.move(db, args.id, args.state, note=note, actor=args.actor,
                              correct=args.correct, reviewer=args.reviewer,
                              package_exclusion=args.package_exclusion)
-            print("lot #%d → %s (loops %s)%s%s" % (
-                item["id"], item["state"], item["loops"],
-                " — reviewer %s" % item["reviewer"] if item.get("reviewer") else "",
-                " — correction recorded in the log, by %s" % args.actor
+            print(('%s #%d → %s (loops %s)%s%s') % (v.noun, item["id"], item["state"], item["loops"], " — reviewer %s" % item["reviewer"] if item.get("reviewer") else "", " — correction recorded in the log, by %s" % args.actor
                 if args.correct is not None else ""))
             # #800 : la désignation est conservée ; l'avertissement de famille
             # est indicatif (canon §2).
@@ -2627,11 +2609,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     cfg, db, args.id, args.floor, reason=args.reason,
                     actor=args.actor, complete=not bool(args.agent))
                 if floor["changed"]:
-                    print("lot #%d: review floor %d (was %d, by %s)" % (
-                        floor["lot"], floor["floor"], floor["previous"], floor["actor"]))
+                    print(('%s #%d: review floor %d (was %d, by %s)') % (v.noun, floor["lot"], floor["floor"], floor["previous"], floor["actor"]))
                 else:
-                    print("lot #%d: review floor already %d: nothing written" % (
-                        floor["lot"], floor["floor"]))
+                    print(('%s #%d: review floor already %d: nothing written') % (v.noun, floor["lot"], floor["floor"]))
                 completion = floor.get("designation")
                 if completion:
                     state = completion.get("state")
@@ -2660,32 +2640,30 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 if item.get("reviewer_changed") is False:
                     # #2084/N2 : dire le non-effet, sans écrire un faux
                     # « removed » au journal.
-                    print("lot #%d: reviewer %s was not designated: nothing removed "
-                          "(state %s, by %s)" % (
-                              item["id"], args.agent, item["state"],
-                              args.actor or "the bound identity"))
+                    print(('%s #%d: reviewer %s was not designated: nothing removed (state %s, by %s)') % (v.noun, item["id"], args.agent, item["state"], args.actor or "the bound identity"))
                 else:
-                    print("lot #%d: reviewer %s removed (state %s, by %s)" % (
-                        item["id"], args.agent, item["state"],
-                        args.actor or "the bound identity"))
+                    print(('%s #%d: reviewer %s removed (state %s, by %s)') % (v.noun, item["id"], args.agent, item["state"], args.actor or "the bound identity"))
+                # #4779 : les demandes encore non remises du siège sont soldées
+                # sans tour ; le dire, même quand le siège n'était déjà plus là.
+                _settled = item.get("reviewer_settled") or []
+                if _settled:
+                    print(('%s #%d: %d pending review request(s) settled without a turn: %s') % (v.noun, item["id"], len(_settled), ", ".join("#%d" % int(i) for i in _settled)))
             elif args.remove:
                 item = work.clear_reviewer(cfg, db, args.id, actor=args.actor)
                 if item.get("reviewer_changed") is False:
-                    print("lot #%d: no reviewer designation to remove (state %s, by %s)" % (
-                        item["id"], item["state"], args.actor or "the bound identity"))
+                    print(('%s #%d: no reviewer designation to remove (state %s, by %s)') % (v.noun, item["id"], item["state"], args.actor or "the bound identity"))
                 else:
-                    print("lot #%d: reviewer designation removed (state %s, by %s)" % (
-                        item["id"], item["state"], args.actor or "the bound identity"))
+                    print(('%s #%d: reviewer designation removed (state %s, by %s)') % (v.noun, item["id"], item["state"], args.actor or "the bound identity"))
+                _settled = item.get("reviewer_settled") or []
+                if _settled:
+                    print(('%s #%d: %d pending review request(s) settled without a turn: %s') % (v.noun, item["id"], len(_settled), ", ".join("#%d" % int(i) for i in _settled)))
             elif args.no_verdict:
                 item = work.waive_review(cfg, db, args.id, actor=args.actor)
-                print("lot #%d: verdict not required (state %s, by %s)" % (
-                    item["id"], item["state"], args.actor or "the bound identity"))
+                print(('%s #%d: verdict not required (state %s, by %s)') % (v.noun, item["id"], item["state"], args.actor or "the bound identity"))
             else:
                 item = work.designate_reviewer(cfg, db, args.id, args.agent,
                                                actor=args.actor)
-                print("lot #%d: reviewer %s (state %s, designated by %s)" % (
-                    item["id"], item["reviewer"], item["state"],
-                    args.actor or "the bound identity"))
+                print(('%s #%d: reviewer %s (state %s, designated by %s)') % (v.noun, item["id"], item["reviewer"], item["state"], args.actor or "the bound identity"))
                 # #800 : la désignation est conservée ; l'avertissement de
                 # famille est indicatif (canon §2).
                 if item.get("reviewer_warning"):
@@ -2703,8 +2681,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # #1400 : le constat (lot/app/titre + sujet du commit, et la
                 # forme de la preuve) est montré AVANT l'écriture ; l'état du
                 # lot ne change qu'après.
-                print("declaring merge: lot #%d (%s: %s)"
-                      % (constat["id"], constat["app"] or "?", constat["title"]))
+                v = _vocabulary()
+                print(('declaring merge: %s #%d (%s: %s)') % (v.noun, constat["id"], constat["app"] or "?", constat["title"]))
                 print("commit %s (%s): %s"
                       % (constat["sha"][:12], constat["how"], constat["subject"]))
 
@@ -2719,15 +2697,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 prefix = "already %s" % done["item"]["state"]
                 if detail.startswith(prefix):
                     detail = detail[len(prefix):].lstrip(" —-")
-                print("lot #%d already %s%s" % (
-                    args.id, done["item"]["state"],
-                    ": %s" % detail if detail else ""))
+                print(('%s #%d already %s%s') % (v.noun, args.id, done["item"]["state"], ": %s" % detail if detail else ""))
             elif done["result"] == "landed":
-                print("lot #%d already %s: %s" % (
-                    args.id, done["item"]["state"], done["detail"]))
+                print(('%s #%d already %s: %s') % (v.noun, args.id, done["item"]["state"], done["detail"]))
             else:
-                print("lot #%d → merged (commit %s, declared by %s)" % (
-                    args.id, (done.get("sha") or args.sha or "?")[:12], args.actor))
+                print(('%s #%d → merged (commit %s, declared by %s)') % (v.noun, args.id, (done.get("sha") or args.sha or "?")[:12], args.actor))
                 print("%s: %s" % (done["item"].get("app") or "?", done["item"]["title"]))
             return 0
         if args.work_command == "note":
@@ -2741,7 +2715,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     raise work.WorkError(error)
             work.note(db, args.id, text, actor=args.actor,
                       wake_ts=_wake_deadline(args))
-            print("note added to lot #%d" % args.id)
+            print(('note added to %s #%d') % (v.noun, args.id))
             return 0
         if args.work_command == "wake":
             if args.cancel:
@@ -2749,7 +2723,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     raise work.WorkError("work wake: --cancel goes alone")
                 item = work.schedule_wake(db, args.id, None, text=args.why,
                                           actor=args.actor)
-                print("lot #%d: wake cancelled" % item["id"])
+                print(('%s #%d: wake cancelled') % (v.noun, item["id"]))
                 return 0
             deadline = _wake_deadline(args)
             if deadline is None:
@@ -2758,21 +2732,20 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     "or --cancel")
             item = work.schedule_wake(db, args.id, deadline, text=args.why,
                                       actor=args.actor)
-            print("lot #%d: wake scheduled for %s"
-                  % (item["id"], time.strftime("%Y-%m-%d %H:%M %Z",
+            print(('%s #%d: wake scheduled for %s') % (v.noun, item["id"], time.strftime("%Y-%m-%d %H:%M %Z",
                                                time.localtime(deadline))))
             return 0
         if args.work_command == "set-app":
             from . import work_projects
             item = work_projects.set_app(cfg, db, args.id, args.project, actor=args.actor)
-            print("lot #%d: project %s" % (item["id"], item["app"]))
+            print(('%s #%d: project %s') % (v.noun, item["id"], item["app"]))
             return 0
         if args.work_command == "set-type":
             item = work.set_type(db, args.id, args.lot_type, actor=args.actor, cfg=cfg)
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
             else:
-                print("lot #%d: type %s" % (item["id"], item["type"]))
+                print(('%s #%d: type %s') % (v.noun, item["id"], item["type"]))
             return 0
         if args.work_command == "set-priority":
             item = work.set_priority(db, args.id, args.priority, reason=args.reason,
@@ -2780,9 +2753,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
             else:
-                print("lot #%d: priority %s (%s)" % (
-                    item["id"], item.get("priority"),
-                    work.PRIORITY_LABELS.get(item.get("priority"), "?")))
+                print(('%s #%d: priority %s (%s)') % (v.noun, item["id"], item.get("priority"), work.PRIORITY_LABELS.get(item.get("priority"), "?")))
             return 0
         if args.work_command == "issue-ref":
             if bool(args.ref) == bool(args.none):
@@ -2792,14 +2763,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
             else:
-                print("lot #%d: issue_ref %s" % (item["id"], item.get("issue_ref") or "—"))
+                print(('%s #%d: issue_ref %s') % (v.noun, item["id"], item.get("issue_ref") or "—"))
             return 0
         if args.work_command == "backfill-app":
             from . import work_projects
             rows = work_projects.backfill_app(cfg, db, actor=args.actor, dry_run=args.dry_run)
             for row in rows:
-                print("lot #%d: %s — %s" % (row["id"], row["status"],
-                                           row.get("project") or row.get("reason", "changed concurrently")))
+                print(('%s #%d: %s — %s') % (v.noun, row["id"], row["status"], row.get("project") or row.get("reason", "changed concurrently")))
             return 0
         if args.work_command == "pending-reviews":
             # #3033 : les avis qu'un agent doit encore rendre (le calcul de la
@@ -2887,10 +2857,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             else:
                 freeze = out.get("freeze")
                 if not freeze:
-                    print("lot #%d is not frozen: no automatic designation" % args.id)
+                    print(('%s #%d is not frozen: no automatic designation') % (v.noun, args.id))
                 else:
-                    print("lot #%d: freeze #%s %s" % (
-                        args.id, freeze["id"], str(freeze.get("sha") or "")[:12]))
+                    print(('%s #%d: freeze #%s %s') % (v.noun, args.id, freeze["id"], str(freeze.get("sha") or "")[:12]))
                     designation = out.get("designation")
                     if not designation:
                         print("designation: none recorded")
@@ -2966,7 +2935,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # symbolique (HEAD, branche) est refusée ici.
                 item = work.get(db, args.id)
                 if item is None:
-                    raise work.WorkError("lot %s not found" % args.id)
+                    raise work.WorkError("%s %s not found" % (v.noun, args.id))
                 sha = work.freeze_head(db, item, sha, repo=args.repo)
                 # #2542 : un contrôle statique rouge refuse le gel, avant le paquet
                 from . import freeze_checks
@@ -2985,9 +2954,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 db, args.id, args.kind, sha=sha, actor=args.actor or "",
                 verdict=args.verdict, note=note, outcome=outcome, repo=args.repo,
                 supersedes=args.supersedes or None)
-            print("milestone %s added to lot #%d%s" % (
-                row["kind"], args.id,
-                " (%s)" % row["verdict"] if row.get("verdict") else ""))
+            print(('milestone %s added to %s #%d%s') % (row["kind"], v.noun, args.id, " (%s)" % row["verdict"] if row.get("verdict") else ""))
             if row.get("verdict") == "blocked":
                 # #3416 : le relecteur désigné qui bloque corrige souvent
                 # lui-même ; prévenu ici, il sait que sa famille deviendrait
@@ -3317,6 +3284,7 @@ def cmd_set(cfg: Config, args) -> int:
     du courrier, écrite dans l'état LOCAL — à poser sur l'hôte de l'agent,
     que son exécuteur lit à chaque sondage (sans migration de la base).
     """
+    v = _vocabulary()
     from . import adapters, harnesses, runner
     from .config import SESSION_POLICIES
 
@@ -3516,8 +3484,7 @@ def cmd_set(cfg: Config, args) -> int:
                   % valeurs["permission_mode"])
         if agent.get("mode") == "externe" and not agent.get("responsible"):
             # 0030 : un agent externe a obligatoirement un responsable humain
-            print("warning: external agent without a human responsible: its work items and its "
-                  "alerts have nobody to go to (designate one in the canon)",
+            print(('warning: external agent without a human responsible: its %s and its alerts have nobody to go to (designate one in the canon)') % v.plural,
                   file=sys.stderr)
         if valeurs.get("tier") and not adapters.supports_tier(agent.get("harness") or ""):
             print("warning: harness %s declares no tier: setting has no effect"
@@ -3633,9 +3600,10 @@ def cmd_models_discover(cfg, args) -> int:
 HIDDEN_COMMANDS = frozenset({"menage"})
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(vocabulary=None) -> argparse.ArgumentParser:
+    v = _vocabulary(vocabulary)
     parser = argparse.ArgumentParser(
-        prog="agent-mesh", description=__doc__,
+        prog="agent-mesh", description=_doc(v),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     # L148 : les sous-parseurs héritent de `HiddenAliasParser`, pour que les
     # alias cachés (ancienne graphie d'une option) ne captent jamais une
@@ -3708,7 +3676,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_menage.set_defaults(func=cmd_menage)
 
     p_conflicts = sub.add_parser(
-        "conflicts", help="conflict radar between work items, last pass on this host (L160b)")
+        "conflicts", help=("conflict radar between %s, last pass on this host (L160b)") % v.plural)
     p_conflicts.add_argument("--project", default="", help="a single project")
     p_conflicts.add_argument("--all", action="store_true",
                              help="also pairs that overlap without conflict")
@@ -3718,8 +3686,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ci = sub.add_parser("ci", help="CI read live by ameesh notify (L161c)")
     ci_sub = p_ci.add_subparsers(dest="ci_command", required=True)
     p_ci_status = ci_sub.add_parser(
-        "status", help="latest CI runs of a work item and their failing tests")
-    p_ci_status.add_argument("id", type=int, help="work item number")
+        "status", help=("latest CI runs of a %s and their failing tests") % v.noun)
+    p_ci_status.add_argument("id", type=int, help=("%s number") % v.noun)
     p_ci_status.add_argument("--limit", type=int, default=5,
                              help="maximum runs shown (default 5)")
     p_ci_status.add_argument("--json", action="store_true", help="`ameesh-ci-status/1` report")
@@ -3727,27 +3695,26 @@ def build_parser() -> argparse.ArgumentParser:
     # #1343 (canon §3) : la CI d'un lot part au gel, après les verdicts requis,
     # par une étiquette `ci-lot-<sha>`/`ci-full-<sha>` posée sur la PR.
     p_ci_run = ci_sub.add_parser(
-        "run", help="request the CI of a frozen lot, once, on the frozen head, "
-                    "by the ci-lot/ci-full label (#1343)")
-    p_ci_run.add_argument("id", type=int, help="work item number")
+        "run", help=("request the CI of a frozen %s, once, on the frozen head, "
+                    "by the ci-lot/ci-full label (#1343)") % v.noun)
+    p_ci_run.add_argument("id", type=int, help=("%s number") % v.noun)
     p_ci_run.add_argument("--sha", default="", help="the frozen commit (default: the "
                           "last `frozen` milestone)")
     p_ci_run.add_argument("--avis", type=int, default=1,
-                          help="required independent verdicts on the frozen commit: "
-                               "0 (lot léger), 1 (sensible), 2 (SQL/sécurité/prod)")
+                          help=("required independent verdicts on the frozen commit: 0 (%s), 1 (sensible), 2 (SQL/sécurité/prod)") % (v.noun + " " + v.agree("léger", "légère")))
     p_ci_run.add_argument("--exception", choices=("incident", "unblock"), default="",
                           help="incident|unblock: CI in parallel of the review, marked "
                                "(canon §3); requires --reason")
     p_ci_run.add_argument("--reason", default="",
-                          help="why (the exception, the full suite): written to the lot")
+                          help=("why (the exception, the full suite): written to the %s") % v.noun)
     p_ci_run.add_argument("--full", action="store_true",
-                          help="whole suite (release, package, explicit request), not the "
-                               "lot selection; requires --reason")
+                          help=("whole suite (release, package, explicit request), not the "
+                               "%s selection; requires --reason") % v.noun)
     p_ci_run.add_argument("--force", action="store_true",
                           help="request the CI again although this composition already "
                                "ran, none green (red or cancelled): explicit resumption")
-    p_ci_run.add_argument("--repo", default="", help="owner/name (default: the lot's "
-                          "issue_ref or github.projects)")
+    p_ci_run.add_argument("--repo", default="", help=("owner/name (default: the %s's "
+                          "issue_ref or github.projects)") % v.noun)
     p_ci_run.add_argument("--prevalidation-repo", default="",
                           help="#2644: the tree carrying the packet head (default: cwd, "
                                "then the assignee's worktree, then the project repository)")
@@ -3766,12 +3733,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_ci_run.add_argument("--json", action="store_true", help="`ameesh-ci-gel/1` report")
     p_ci_run.set_defaults(func=cmd_ci)
     p_ci_cancel = ci_sub.add_parser(
-        "cancel", help="cancel the open runs of a lot that do not carry its frozen commit")
-    p_ci_cancel.add_argument("id", type=int, help="work item number")
+        "cancel", help=("cancel the open runs of a %s that do not carry its frozen commit") % v.noun)
+    p_ci_cancel.add_argument("id", type=int, help=("%s number") % v.noun)
     p_ci_cancel.add_argument("--all", action="store_true",
                              help="also cancel the run of the frozen commit")
-    p_ci_cancel.add_argument("--repo", default="", help="owner/name (default: the lot's "
-                             "issue_ref or github.projects)")
+    p_ci_cancel.add_argument("--repo", default="", help=("owner/name (default: the %s's "
+                             "issue_ref or github.projects)") % v.noun)
     p_ci_cancel.add_argument("--dry-run", action="store_true",
                              help="list the runs, cancel nothing")
     p_ci_cancel.add_argument("--json", action="store_true", help="`ameesh-ci-cancel/1` report")
@@ -3800,7 +3767,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_models_discover.add_argument("--sender", default=os.environ.get("AMEESH_AGENT") or "catalogue")
     p_models_discover.set_defaults(func=cmd_models_discover)
 
-    p_handoff = sub.add_parser("handoff", help="plan a reserved lot-boundary host move or inspect its journal")
+    p_handoff = sub.add_parser("handoff", help=("plan a reserved host move at a %s boundary or inspect its journal") % v.noun)
     handoff_sub = p_handoff.add_subparsers(dest="handoff_command")
     p_handoff_plan = handoff_sub.add_parser("plan")
     p_handoff_plan.add_argument("agent")
@@ -3884,15 +3851,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_ver.add_argument("--json", action="store_true")
     p_ver.set_defaults(func=cmd_verify)
 
-    p_work = sub.add_parser("work", help="work items (work_items)")
+    p_work = sub.add_parser("work", help=("%s (work_items)") % v.plural)
     work_sub = p_work.add_subparsers(dest="work_command")
     pw_coherence = work_sub.add_parser(
-        "coherence", help="#4172: backlog coherence pass over the open lots of a "
+        "coherence", help=("#4172: backlog coherence pass over the open %s of a "
                           "project (already done, obsolete, duplicates, "
                           "contradictions); deterministic closures and one digest "
-                          "per project with --apply")
+                          "per project with --apply") % v.plural)
     pw_coherence.add_argument("--project", "--app", dest="project", default=None,
-                              help="one project (default: every project with open lots)")
+                              help=("one project (default: every project with open %s)") % v.plural)
     pw_coherence.add_argument("--repo", default=None, metavar="DIR",
                               help="local clone of the project's repository (default: the "
                                    "one declared for the project, else the current one)")
@@ -3904,10 +3871,10 @@ def build_parser() -> argparse.ArgumentParser:
     pw_coherence.add_argument("--json", action="store_true")
     pw_coherence.set_defaults(func=cmd_work)
     pw_neighbors = work_sub.add_parser(
-        "neighbors", help="#2988: read-only preview of the lots already touching this "
+        "neighbors", help=("#2988: read-only preview of the %s already touching this "
                           "constat (same file, close title, line changed since the "
-                          "reviewed head)")
-    pw_neighbors.add_argument("--app", default="", help="the lot's project")
+                          "reviewed head)") % v.plural)
+    pw_neighbors.add_argument("--app", default="", help=("the %s's project") % v.noun)
     pw_neighbors.add_argument("--title", required=True)
     pw_neighbors.add_argument("--body", default="")
     pw_neighbors.add_argument("--reviewed-head", default=None, metavar="SHA",
@@ -3920,8 +3887,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add = work_sub.add_parser("add")
     pw_add.add_argument("--title", required=True)
     pw_add.add_argument("--force", metavar="REASON",
-                        help="#540: give the lot to an assignee who already has a lot not "
-                             "started (the reason goes to the lot's journal)")
+                        help=("#540: give the %s to an assignee who already has a %s not "
+                             "started (the reason goes to the %s's journal)") % (v.noun, v.noun, v.noun))
     pw_add.add_argument("--type", default="evolution",
                         help="an improvement backlog item goes through "
                              "`ameesh work backlog add` (L119)")
@@ -3929,61 +3896,61 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--app", default=None,
                         help="project; default: the creating agent's registry or own canon")
     pw_add.add_argument("--new-project", action="store_true",
-                        help="#506: accept an --app project nobody declares yet "
-                             "(journaled on the lot); refused otherwise")
+                        help=("#506: accept an --app project nobody declares yet "
+                             "(journaled on the %s); refused otherwise") % v.noun)
     pw_add.add_argument("--body", default=None,
-                        help="the lot's statement; `-` reads it on standard input "
-                             "(heredoc <<'EOF', #3744)")
+                        help=("the %s's statement; `-` reads it on standard input "
+                             "(heredoc <<'EOF', #3744)") % v.noun)
     pw_add.add_argument("--issue-ref", default=None)
     pw_add.add_argument("--workstream", default=None)
     pw_add.add_argument("--assignee", default=None)
     pw_add.add_argument("--budget", type=float, default=None)
     pw_add.add_argument("--actor", default="")
-    pw_add.add_argument("--package", default=None, help="WorkPackage card of the work item (L29)")
+    pw_add.add_argument("--package", default=None, help=("WorkPackage card of the %s (L29)") % v.noun)
     pw_add.add_argument("--parent-lot", type=int, default=None, metavar="LOT",
-                        help="#1193: parent of a suite lot: its blocking prerequisite, linked "
-                             "with the creation (unknown parent refused)")
+                        help=("#1193: parent of a suite %s: its blocking prerequisite, linked "
+                             "with the creation (unknown parent refused)") % v.noun)
     pw_add.add_argument("--externe", action="store_true",
                         help="force assignment to an external agent that has a human "
                              "responsible (L37, 0030)")
     pw_add.add_argument("--external-executor", default=None, metavar="AGENT",
-                        help="#3447: declare the lot reserved to an external executor "
+                        help=("#3447: declare the %s reserved to an external executor "
                              "(an `externe` agent with a human owner, or human:<id>) "
-                             "without assigning it; L165 does not take it")
+                             "without assigning it; L165 does not take it") % v.noun)
     pw_add.add_argument("--branch", default=None,
-                        help="work item branch: its merge into the target closes the work item (L118)")
+                        help=("%s branch: its merge into the target closes the %s (L118)") % (v.noun, v.noun))
     pw_add.add_argument("--target", default=None,
                         help="target branch (default: the repository's git config ameesh.target, "
                              "otherwise origin/HEAD)")
     pw_add.add_argument("--priority", type=int, choices=list(work.PRIORITIES), default=None,
-                        help="1 high, 2 normal, 3 low (L130: every request from a "
-                             "human becomes a work item, with its priority)")
+                        help=("1 high, 2 normal, 3 low (L130: every request from a "
+                             "human becomes a %s, with its priority)") % v.noun)
     pw_add.add_argument("--estimate", default=None, metavar="DURATION",
-                        help="estimated duration of the work item: 90m, 2h, 1h30, 1,5h, 2d (or "
-                             "minutes) — mandatory for an agent (L157)")
+                        help=("estimated duration of the %s: 90m, 2h, 1h30, 1,5h, 2d (or "
+                             "minutes) — mandatory for an agent (L157)") % v.noun)
     pw_add.add_argument("--estimate-source", default=None, metavar="SOURCE",
                         help="where the estimate comes from (design, bug history ×1.3…)")
     pw_add.add_argument("--size", default=None, choices=list(work.SIZES),
                         help="size of the change: s small, m medium, l large — a key of "
                              "the reference estimate (L157b)")
     pw_add.add_argument("--reviewed-head", default=None, metavar="SHA",
-                        help="#2988: the head the review (ultrareview, verdict, "
+                        help=("#2988: the head the review (ultrareview, verdict, "
                              "re-reading) actually read; written as `reviewed head: "
-                             "<sha>` in the creation note. A review-born lot without it "
-                             "is still created, marked `absent` and warned")
+                             "<sha>` in the creation note. A review-born %s without it "
+                             "is still created, marked `absent` and warned") % v.noun)
     pw_add.set_defaults(func=cmd_work)
     pw_fp = work_sub.add_parser(
-        "fingerprint", help="#3885: one lot per server-failure fingerprint (canon §16), "
-                            "idempotent: an open lot is noted, a closed one opens a "
-                            "recurrence lot")
+        "fingerprint", help=("#3885: one %s per server-failure fingerprint (canon §16), "
+                            "idempotent: an open %s is noted, a closed one opens a "
+                            "recurrence %s") % (v.noun, v.noun, v.noun))
     fp_sub = pw_fp.add_subparsers(dest="fingerprint_command")
     pw_fp_open = fp_sub.add_parser(
-        "open", help="open a lot for empreinte:<app>:<key>, or note the open one; "
-                     "P1 as soon as one user is touched")
+        "open", help=("open a %s for empreinte:<app>:<key>, or note the open one; "
+                     "P1 as soon as one user is touched") % v.noun)
     pw_fp_open.add_argument("--app", required=True, help="the project of the failure")
     pw_fp_open.add_argument("--key", required=True,
                             help="the stable fingerprint key (route+code+revision, a hash, …)")
-    pw_fp_open.add_argument("--title", required=True, help="the lot title")
+    pw_fp_open.add_argument("--title", required=True, help=("the %s title") % v.noun)
     pw_fp_open.add_argument("--users", type=int, default=0,
                             help="number of users touched (P1 when > 0)")
     pw_fp_open.add_argument("--count", type=int, default=0,
@@ -4009,13 +3976,13 @@ def build_parser() -> argparse.ArgumentParser:
                               "freeze, or the last favourable verdict's commit when it "
                               "covers the head (origin, provenance, explicit causes)")
     pw_list.add_argument("--stale-after", default=None,
-                         help="work item is stale with no activity for (default 6h, L29)")
+                         help=("%s is stale with no activity for (default 6h, L29)") % v.noun)
     pw_list.add_argument("--git-dir", default=None, metavar="D",
                          help="#1905: local repository used to carry a verdict across a "
                               "mechanically constant rebase (with --freeze)")
     pw_list.add_argument("--freeze-target", default=None, metavar="REF",
-                         help="#1905: shared target of the rebase (default: the lot's "
-                              "target, else origin/main)")
+                         help=("#1905: shared target of the rebase (default: the %s's "
+                              "target, else origin/main)") % v.noun)
     pw_list.set_defaults(func=cmd_work)
     pw_show = work_sub.add_parser("show")
     pw_show.add_argument("id", type=int)
@@ -4024,8 +3991,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="#1905: local repository used to carry a verdict across a "
                               "mechanically constant rebase")
     pw_show.add_argument("--freeze-target", default=None, metavar="REF",
-                         help="#1905: shared target of the rebase (default: the lot's "
-                              "target, else origin/main)")
+                         help=("#1905: shared target of the rebase (default: the %s's "
+                              "target, else origin/main)") % v.noun)
     pw_show.set_defaults(func=cmd_work)
     from . import work_dependencies
     work_dependencies.add_parser(work_sub, cmd_work)
@@ -4034,34 +4001,34 @@ def build_parser() -> argparse.ArgumentParser:
     from . import work_footprints
     work_footprints.add_parser(work_sub, cmd_work)
     pw_mig = work_sub.add_parser(
-        "migration", help="reserve the next free migration number for the work item (L122), "
-                          "before writing the file; idempotent, visible in work show")
+        "migration", help=("reserve the next free migration number for the %s (L122), "
+                          "before writing the file; idempotent, visible in work show") % v.noun)
     pw_mig.add_argument("id", type=int)
     pw_mig.add_argument("--number", type=int, default=None,
-                        help="reserve this exact number (refused if it already exists on the "
-                             "lot's target branch or is reserved by another work item; branches "
+                        help=("reserve this exact number (refused if it already exists on the "
+                             "%s's target branch or is reserved by another %s; branches "
                              "not merged into the target do not count, #2620; the target is the "
-                             "lot's, else its project's, else `ameesh.target` — never the clone's "
+                             "%s's, else its project's, else `ameesh.target` — never the clone's "
                              "`origin/HEAD`, and none declared is a refusal, #2660); added to the "
-                             "lot's other reservations (#2481)")
+                             "%s's other reservations (#2481)") % (v.noun, v.noun, v.noun, v.noun))
     pw_mig.add_argument("--release", action="store_true",
-                        help="release all the lot's reservations, or only --number when given "
-                             "(the work item no longer adds those migrations)")
+                        help=("release all the %s's reservations, or only --number when given "
+                             "(the %s no longer adds those migrations)") % (v.noun, v.noun))
     pw_mig.add_argument("--repo", default=None,
-                        help="local clone of the lot's repository (that of its issue), whose "
+                        help=("local clone of the %s's repository (that of its issue), whose "
                              "worktree and branches count (default: the clone declared in "
                              "radar.projects, else the current git repository; its origin "
-                             "must be the lot's repository)")
+                             "must be the %s's repository)") % (v.noun, v.noun))
     pw_mig.add_argument("--skip-branch", action="append", default=None, metavar="BRANCH",
-                        help="also ignore this branch in the next-free scan, in addition to the "
-                             "lot's own branch (repeatable): the integration branch of a package "
+                        help=("also ignore this branch in the next-free scan, in addition to the "
+                             "%s's own branch (repeatable): the integration branch of a package "
                              "being composed, whose renumbered files must not count against the "
-                             "reservation (#1603); an exact number reads the target only (#2620)")
+                             "reservation (#1603); an exact number reads the target only (#2620)") % v.noun)
     pw_mig.add_argument("--repository", default=None, metavar="OWNER/REPO",
-                        help="#3885: reserve in this repository when the code lives in another "
-                             "repository than the lot's issue (a mirror ticket); the local clone "
+                        help=("#3885: reserve in this repository when the code lives in another "
+                             "repository than the %s's issue (a mirror ticket); the local clone "
                              "given by --repo must be a clone of it (default: the issue's "
-                             "repository)")
+                             "repository)") % v.noun)
     pw_mig.add_argument("--json", action="store_true")
     pw_mig.add_argument("--actor", default="",
                         help="default: the session's bound identity (AGENT_MAIL_NAME)")
@@ -4090,30 +4057,30 @@ def build_parser() -> argparse.ArgumentParser:
                               "alert name them before any verdict; a reviewer of the author's "
                               "declared harness warns (indicative, #800)")
     pw_move.add_argument("--package-exclusion", action="store_true",
-                         help="#4043: qa → build of a lot excluded from a package for a "
+                         help=("#4043: qa → build of a %s excluded from a package for a "
                               "negative test (paquet-horaire): no author loop is consumed "
                               "(loops unchanged, never refused at the limit); reserved for "
-                              "humans and for orchestrators or design agents")
+                              "humans and for orchestrators or design agents") % v.noun)
     pw_move.add_argument("--device", action="append", default=None, metavar="DEVICE",
-                         help="#3070: with blocked, the device (canon Host fiche) whose "
-                              "session the lot waits for (repeatable); --note then names the "
+                         help=("#3070: with blocked, the device (canon Host fiche) whose "
+                              "session the %s waits for (repeatable); --note then names the "
                               "cases not played. Declared unavailable (canon §12), the gate "
-                              "lifts by itself: see ameesh work device-gates")
+                              "lifts by itself: see ameesh work device-gates") % v.noun)
     pw_move.set_defaults(func=cmd_work)
     pw_reviewer = work_sub.add_parser(
         "reviewer",
-        help="#2076: add a designated reviewer of a lot already in qa, "
-             "without a build/qa round trip")
+        help=("#2076: add a designated reviewer of a %s already in qa, "
+             "without a build/qa round trip") % v.noun)
     pw_reviewer.add_argument("id", type=int)
     pw_reviewer.add_argument("agent", nargs="?", metavar="AGENT",
-                             help="a registry agent, or human:<id>; never the lot's assignee")
+                             help=("a registry agent, or human:<id>; never the %s's assignee") % v.noun)
     pw_reviewer.add_argument("--remove", action="store_true",
                              help="#2076: remove AGENT's designation; without AGENT, "
                                   "remove all designations (#1979)")
     pw_reviewer.add_argument("--no-verdict", dest="no_verdict", action="store_true",
-                             help="#1979: mark « verdict not required » (mechanical composition "
-                                  "resolution, canon §11 bis/#87): the lot waits for its merge "
-                                  "and no reminder goes to a reviewer")
+                             help=("#1979: mark « verdict not required » (mechanical composition "
+                                  "resolution, canon §11 bis/#87): the %s waits for its merge "
+                                  "and no reminder goes to a reviewer") % v.noun)
     pw_reviewer.add_argument("--actor", default="",
                              help="who designates: the session's bound identity by default; "
                                   "a human or an orchestrator (same authority as --correct)")
@@ -4131,8 +4098,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_reviewer.set_defaults(func=cmd_work)
     pw_pending = work_sub.add_parser(
         "pending-reviews",
-        help="#3033: the reviews an agent still owes — open lots whose latest freeze "
-             "designates them without a verdict of theirs on that head")
+        help=("#3033: the reviews an agent still owes — open %s whose latest freeze "
+             "designates them without a verdict of theirs on that head") % v.plural)
     pw_pending.add_argument("agent", nargs="?", metavar="AGENT",
                             help="default: the session's bound identity")
     pw_pending.add_argument("--all", action="store_true",
@@ -4141,8 +4108,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_pending.set_defaults(func=cmd_work)
     pw_fixes = work_sub.add_parser(
         "fixes-owed",
-        help="#3288: the fixes still owed after a blocking verdict — open lots whose "
-             "latest freeze carries a blocked verdict no later freeze replaced")
+        help=("#3288: the fixes still owed after a blocking verdict — open %s whose "
+             "latest freeze carries a blocked verdict no later freeze replaced") % v.plural)
     pw_fixes.add_argument("agent", nargs="?", metavar="AGENT",
                           help="default: the session's bound identity")
     pw_fixes.add_argument("--all", action="store_true",
@@ -4166,95 +4133,95 @@ def build_parser() -> argparse.ArgumentParser:
     pw_reviewers.add_argument("--json", action="store_true")
     pw_reviewers.set_defaults(func=cmd_work)
     pw_merged = work_sub.add_parser(
-        "merged", help="declare a work item merged outside a PR and without freeze (local merge "
+        "merged", help=("declare a %s merged outside a PR and without freeze (local merge "
                        "on the target), or by a merged PR of another repository: any open state "
-                       "→ merged, merged milestone with the commit")
+                       "→ merged, merged milestone with the commit") % v.noun)
     pw_merged.add_argument("id", type=int)
     pw_merged.add_argument("--sha", default="",
                            help="the merge commit (required without --pr; with --pr, an equality "
                                 "check on the reported merge commit)")
     pw_merged.add_argument("--pr", default=None, metavar="OWNER/REPO#N",
-                           help="#2603: a merged PR outside the lot's repository (canon, home); "
-                                "its head must be the lot's freeze, and its merge commit must be "
-                                "in the repository's default branch")
+                           help=("#2603: a merged PR outside the %s's repository (canon, home); "
+                                "its head must be the %s's freeze, and its merge commit must be "
+                                "in the repository's default branch") % (v.noun, v.noun))
     pw_merged.add_argument("--migration-landed", type=int, default=None, metavar="N",
-                           help="the migration number that actually landed (L122/#1567), when "
+                           help=("the migration number that actually landed (L122/#1567), when "
                                 "the landing renumbered the reservation; recorded with the "
-                                "merge, or corrected on an already merged lot")
+                                "merge, or corrected on an already merged %s") % v.noun)
     pw_merged.add_argument("--repo", default=None,
-                           help="local clone of the lot's repository (origin verified); no fetch")
+                           help=("local clone of the %s's repository (origin verified); no fetch") % v.noun)
     pw_merged.add_argument("--note", default="")
     pw_merged.add_argument("--actor", default="",
                            help="default: the session's bound identity (AGENT_MAIL_NAME)")
     pw_merged.set_defaults(func=cmd_work)
     pw_assign = work_sub.add_parser(
-        "assign", help="reassign a work item to a wakeable agent (L37, 0030)")
+        "assign", help=("reassign a %s to a wakeable agent (L37, 0030)") % v.noun)
     pw_assign.add_argument("id", type=int)
     pw_assign.add_argument("--force", metavar="REASON",
-                           help="#540: assign even though the agent already has a lot not "
-                                "started (the reason goes to the lot's journal)")
+                           help=("#540: assign even though the agent already has a %s not "
+                                "started (the reason goes to the %s's journal)") % (v.noun, v.noun))
     pw_assign.add_argument("agent")
     pw_assign.add_argument("--externe", action="store_true",
                            help="force assignment to an external agent that has a "
                                 "human responsible")
     pw_assign.add_argument("--claim", action="store_true",
-                           help="assign only if the work item has no assignee (atomic "
-                                "claim); refused, naming its holder, if it is already taken")
+                           help=("assign only if the %s has no assignee (atomic "
+                                "claim); refused, naming its holder, if it is already taken") % v.noun)
     pw_assign.add_argument("--if-holder", default=None, metavar="AGENT",
                            help="#2016: refuse unless the current assignee is still AGENT "
                                 "(the holder read when the alert was written)")
     pw_assign.add_argument("--branch", default=None,
-                           help="work item branch (L118); allowed on a work item already assigned "
-                                "to this agent")
+                           help=("%s branch (L118); allowed on a %s already assigned "
+                                "to this agent") % (v.noun, v.noun))
     pw_assign.add_argument("--target", default=None, help="target branch (see work add)")
     pw_assign.add_argument("--wip-exception", default=None, metavar="REASON",
-                           help="explicit pilot exception to the §4 WIP limit (lots in build "
-                                "per agent, capped by the compiled canon): this lot may stay "
+                           help=("explicit pilot exception to the §4 WIP limit (%s in build "
+                                "per agent, capped by the compiled canon): this %s may stay "
                                 "beyond the cap; reserved to humans and orchestrator/design "
-                                "agents")
+                                "agents") % (v.plural, v.noun))
     pw_assign.add_argument("--actor", default="")
     pw_assign.set_defaults(func=cmd_work)
     pw_executor = work_sub.add_parser(
         "external-executor",
-        help="#3447: declare the external executor a lot is reserved to (an `externe` "
-             "agent with a human owner, or a human), or clear the reservation")
+        help=("#3447: declare the external executor a %s is reserved to (an `externe` "
+             "agent with a human owner, or a human), or clear the reservation") % v.noun)
     pw_executor.add_argument("id", type=int)
     pw_executor.add_argument("agent", nargs="?", default=None,
                              help="the external executor (registered `externe` agent, or "
                                   "human:<id>); omitted with --clear")
     pw_executor.add_argument("--clear", action="store_true",
-                             help="clear the reservation (the lot returns to the ordinary queue)")
+                             help=("clear the reservation (the %s returns to the ordinary queue)") % v.noun)
     pw_executor.add_argument("--json", action="store_true")
     pw_executor.add_argument("--actor", default="")
     pw_executor.set_defaults(func=cmd_work)
     pw_branch = work_sub.add_parser(
-        "branch", help="set a work item's branch explicitly (L118), or detach an obsolete one "
-                       "(#2102: closed or superseded PR); journaled, state and assignee kept")
+        "branch", help=("set a %s's branch explicitly (L118), or detach an obsolete one "
+                       "(#2102: closed or superseded PR); journaled, state and assignee kept") % v.noun)
     pw_branch.add_argument("id", type=int)
     pw_branch.add_argument("branch", nargs="?", default=None,
-                           help="the branch to set; with --detach, the branch to detach "
-                                "(default: the work item's)")
+                           help=("the branch to set; with --detach, the branch to detach "
+                                "(default: the %s's)") % v.noun)
     pw_branch.add_argument("--target", default=None,
-                           help="target branch (see work add); an empty value clears "
-                                "the explicit target and the lot falls back to its "
-                                "project's or the repository's default")
+                           help=("target branch (see work add); an empty value clears "
+                                "the explicit target and the %s falls back to its "
+                                "project's or the repository's default") % v.noun)
     pw_branch.add_argument("--detach", action="store_true",
-                           help="remove the branch from the work item; the merge sweep no longer "
-                                "associates it implicitly (lot/<id>-…); Git is not touched")
+                           help=("remove the branch from the %s; the merge sweep no longer "
+                                "associates it implicitly (lot/<id>-…); Git is not touched") % v.noun)
     pw_branch.add_argument("--reason", default="", help="why the branch is detached (required "
                                                          "with --detach, goes to the journal)")
     pw_branch.add_argument("--actor", default="")
     pw_branch.set_defaults(func=cmd_work)
     pw_delegate = work_sub.add_parser(
-        "delegate", help="delegate a work item to a wakeable agent, with a deadline (L40, 0030): "
-                         "without a turn by the delegate by the deadline, it returns to the delegator")
+        "delegate", help=("delegate a %s to a wakeable agent, with a deadline (L40, 0030): "
+                         "without a turn by the delegate by the deadline, it returns to the delegator") % v.noun)
     pw_delegate.add_argument("id", type=int)
     pw_delegate.add_argument("agent")
     pw_delegate.add_argument("--within", required=True,
                              help="deadline: 30m, 2h, 1d (or seconds)")
     pw_delegate.add_argument("--actor", default="",
-                             help="the delegator, to whom the work item will return (default: "
-                                  "the current assignee; human:… allowed)")
+                             help=("the delegator, to whom the %s will return (default: "
+                                  "the current assignee; human:… allowed)") % v.noun)
     pw_delegate.set_defaults(func=cmd_work)
     pw_expire = work_sub.add_parser(
         "expire-delegations",
@@ -4266,11 +4233,11 @@ def build_parser() -> argparse.ArgumentParser:
     pw_expire.set_defaults(func=cmd_work)
     pw_gates = work_sub.add_parser(
         "device-gates",
-        help="#3070 (canon §12): blocked lots waiting for a session on a device; a device "
-             "declared unavailable lifts the gate (also done by the runner)")
+        help=("#3070 (canon §12): blocked %s waiting for a session on a device; a device "
+             "declared unavailable lifts the gate (also done by the runner)") % v.plural)
     pw_gates.add_argument("--apply", action="store_true",
-                          help="lift the gates: trace, verification lot, back to the state "
-                               "before blocked")
+                          help=("lift the gates: trace, verification %s, back to the state "
+                               "before blocked") % v.noun)
     pw_gates.add_argument("--json", action="store_true")
     pw_gates.add_argument("--actor", default="")
     pw_gates.set_defaults(func=cmd_work)
@@ -4298,9 +4265,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_note.add_argument("--actor", default="")
     pw_note.set_defaults(func=cmd_work)
     pw_wake = work_sub.add_parser(
-        "wake", help="#2466: arm, replace or cancel a lot's scheduled wake (the runner "
+        "wake", help=("#2466: arm, replace or cancel a %s's scheduled wake (the runner "
                      "wakes its assignee at the deadline, even under a hold or in "
-                     "waiting_human/blocked)")
+                     "waiting_human/blocked)") % v.noun)
     pw_wake.add_argument("id", type=int)
     pw_wake.add_argument("--at", dest="wake_at", default=None, metavar="TIME",
                          help="absolute deadline, ISO 8601 with timezone "
@@ -4310,27 +4277,27 @@ def build_parser() -> argparse.ArgumentParser:
     pw_wake.add_argument("--cancel", action="store_true",
                          help="remove the armed wake, journaled")
     pw_wake.add_argument("--why", default="", metavar="TEXT",
-                         help="why this wake (kept in the lot's journal)")
+                         help=("why this wake (kept in the %s's journal)") % v.noun)
     pw_wake.add_argument("--actor", default="")
     pw_wake.set_defaults(func=cmd_work)
 
-    pw_app = work_sub.add_parser("set-app", help="correct a lot's project, with a journal entry")
+    pw_app = work_sub.add_parser("set-app", help=("correct a %s's project, with a journal entry") % v.noun)
     pw_app.add_argument("id", type=int)
     pw_app.add_argument("project")
     pw_app.add_argument("--actor", default="",
                         help="human, orchestrator or design agent; default: bound session")
     pw_app.set_defaults(func=cmd_work)
     pw_type = work_sub.add_parser(
-        "set-type", help="retype a lot (bug/evolution), with a journal entry")
+        "set-type", help=("retype a %s (bug/evolution), with a journal entry") % v.noun)
     pw_type.add_argument("id", type=int)
     pw_type.add_argument("lot_type", choices=work.RETYPE_TARGETS,
-                         help="the new lot type; a basket `improvement` can only be left")
+                         help=("the new %s type; a basket `improvement` can only be left") % v.noun)
     pw_type.add_argument("--json", action="store_true")
     pw_type.add_argument("--actor", default="",
                          help="human, orchestrator or design agent; default: bound session")
     pw_type.set_defaults(func=cmd_work)
     pw_priority = work_sub.add_parser(
-        "set-priority", help="change an open lot's priority (1/2/3), with a journal entry")
+        "set-priority", help=("change an open %s's priority (1/2/3), with a journal entry") % v.noun)
     pw_priority.add_argument("id", type=int)
     pw_priority.add_argument("priority", type=int, choices=list(work.PRIORITIES),
                              help="1 high, 2 normal, 3 low")
@@ -4341,17 +4308,17 @@ def build_parser() -> argparse.ArgumentParser:
                              help="human, orchestrator or design agent; default: bound session")
     pw_priority.set_defaults(func=cmd_work)
     pw_iref = work_sub.add_parser(
-        "issue-ref", help="correct a lot's issue reference (owner/repo#N), with a journal entry")
+        "issue-ref", help=("correct a %s's issue reference (owner/repo#N), with a journal entry") % v.noun)
     pw_iref.add_argument("id", type=int)
     pw_iref.add_argument("ref", nargs="?", default=None,
                          help="the new reference, owner/repo#N (default: keep, use --none to clear)")
     pw_iref.add_argument("--none", action="store_true",
-                         help="clear the issue reference (the lot stays where it is)")
+                         help=("clear the issue reference (the %s stays where it is)") % v.noun)
     pw_iref.add_argument("--json", action="store_true")
     pw_iref.add_argument("--actor", default="",
                          help="human, orchestrator or design agent; default: bound session")
     pw_iref.set_defaults(func=cmd_work)
-    pw_backfill = work_sub.add_parser("backfill-app", help="fill uniquely inferred projects of open lots")
+    pw_backfill = work_sub.add_parser("backfill-app", help=("fill uniquely inferred projects of open %s") % v.plural)
     pw_backfill.add_argument("--dry-run", action="store_true")
     pw_backfill.add_argument("--actor", default="")
     pw_backfill.set_defaults(func=cmd_work)
@@ -4381,9 +4348,9 @@ def build_parser() -> argparse.ArgumentParser:
     # #2542 : les contrôles statiques du projet passent avant le gel ;
     # #2674 : pour un verdict, le dépôt où résoudre l'abréviation du SHA relu
     pw_ms.add_argument("--repo", default=None,
-                       help="frozen|verdict: the repository holding --sha (freeze default: "
-                            "the current directory, then the lot's project repository; "
-                            "verdict: the abbreviation must resolve there)")
+                       help=("frozen|verdict: the repository holding --sha (freeze default: "
+                            "the current directory, then the %s's project repository; "
+                            "verdict: the abbreviation must resolve there)") % v.noun)
     pw_ms.add_argument("--prevalidation-map", default="",
                        help="#2644: measured map (carte.json.gz) for the freeze "
                             "prevalidation; default: the last carte artifact")
@@ -4399,12 +4366,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "(scripts/freeze-checks.py); the reason goes in the note")
     pw_ms.add_argument("--supersedes", type=int, action="append", default=[],
                        metavar="FROZEN_ID",
-                       help="#2989/#3399: frozen only: a prior freeze of the same "
-                            "lot this freeze replaces (repeatable); only a freeze "
+                       help=("#2989/#3399: frozen only: a prior freeze of the same "
+                            "%s this freeze replaces (repeatable); only a freeze "
                             "absent from every known repository or left out of every "
                             "ref by a force-push (a proven ghost, dangling in the "
                             "object database) can be replaced, and the note keeps "
-                            "the machine trace")
+                            "the machine trace") % v.noun)
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)

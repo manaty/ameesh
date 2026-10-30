@@ -2239,24 +2239,16 @@ def read_capacity(db, *, cfg=None, now: float, hours: int, turns: list,
     # appelants). Ici, les lecteurs sont appelés en direct : un échec ferme
     # l'alerte au lieu de rendre « tout démarrable » ou « personne tenu ».
     def startable_lots():
-        from . import planned_waits, slo
+        from . import planned_waits
         waiting = sous_utilisation.waiting_project_lots(lots)
         waits = planned_waits.read(db, waiting, now=now) if waiting else {}
-        startable = sous_utilisation.split_startable(waiting, waits)[0]
-        # #4561 : la garde d'empreinte (#3185) retient un lot d'intake sans
-        # porteur ; il n'est pas démarrable (`work assign` le refuse) et se
-        # lit à part, avec ses bloqueurs et leur état.
-        footprint: dict = {}
-        if waiting:
-            paths: dict = {}
-            for row in store.work_footprints.for_items([int(lot["id"]) for lot in lots]):
-                paths.setdefault(int(row["work_item_id"]), []).append(str(row["path"]))
-            for lot in waiting:
-                blockers = slo.footprint_blockers(lot, lots, paths)
-                if blockers:
-                    footprint[int(lot["id"])] = blockers
-            startable = [lot for lot in startable
-                         if int(lot["id"]) not in footprint]
+        # #4699 : une seule lecture d'empreinte, partagée avec `idle_capacity`
+        # (#3185) ; un lot retenu n'est pas démarrable (`work assign` le
+        # refuse) et se lit à part, avec ses bloqueurs et leur état (#4561).
+        footprint = sous_utilisation.footprint_blockers(db, waiting, lots,
+                                                        store=store)
+        startable, _blocked = sous_utilisation.split_startable(waiting, waits,
+                                                               footprint)
         return startable, footprint
 
     def budget_holds(rows):

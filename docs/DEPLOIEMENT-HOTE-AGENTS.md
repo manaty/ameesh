@@ -412,6 +412,26 @@ Cette enveloppe dans `staging.sh` couvre aussi le retour depuis le tick
 `ameesh-release.service`, sans modifier la garde #2950 de `poste.sh` qui
 refuse les appels directs depuis une unité `ameesh-*`.
 
+**Sans retour automatique (`--sans-retour[=ROLLBACK]`, #4616).** Après une
+migration non additive (fenêtre de migration, go owner), réinstaller le
+`previous-sha` sur la base déjà migrée serait dangereux : l’ancien code lit mal
+le nouvel état. Avec `--sans-retour`, un échec d’hôte n’appelle jamais
+`retour` : il est tracé (`retour`, verdict `desactive`), la séquence s’arrête
+sur cet hôte et le courrier urgent au pilote donne la marche manuelle. L’hôte
+en échec n’est pas ramené : son commit actif est à vérifier (le commit visé si
+la bascule a eu lieu, l’ancien si `installer` a échoué avant). Marche
+manuelle, dans cet ordre : arrêter les exécuteurs des hôtes déjà passés ;
+**rollback SQL d’abord**, en une transaction (`ROLLBACK` nommé en argument, par
+exemple
+`--sans-retour=src/ameesh/migrations/rollback/0518_generic_delivery_state.sql` ;
+sans argument, le courrier renvoie au rollback de la migration posée dans
+`src/ameesh/migrations/rollback/`) ; **puis** retour de code de chaque hôte déjà
+passé (`vm.sh agents retour`, `vm.sh retour` ou `poste.sh retour`, avec le
+`BASCULE_ENV` de l’hôte) et `controler` ; enfin relancer les exécuteurs et
+vérifier (doctor, courrier). Une séquence saine menée ainsi passe
+`--sans-retour` à `actif.py` : l’attestation, sa copie partagée et le courrier
+portent « retour automatique désactivé ». Sans l’option, rien ne change.
+
 Le courrier nomme les hôtes prouvés, le commit **relu actif** sur chacun après
 la séquence, les preuves `installer`/`redemarrer`/`controler`/`sante`, les lots
 concernés et, s’il y a lieu, le poste reporté avec sa raison. Un échec, un

@@ -324,6 +324,22 @@ class ActifTest(unittest.TestCase):
         self.assertNotIn('notifies', evenement)
         self.assertNotIn('emissions', evenement)
 
+    def test_sans_retour_porte_la_mention_retour_automatique_desactive(self):
+        """#4616 : attestation, preuve partagee et courrier le disent ; sans
+        l'option, aucun champ nouveau."""
+        self.ecrire(journal_complet())
+        self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertNotIn('retour_automatique',
+                         json.loads(self.attestations()[0].read_text()))
+        self.assertNotIn('retour_automatique', self.enregistre.call_args.args[0])
+        self.assertNotIn('Retour automatique', self.envois[0]['corps'])
+        self.lancer(*self.hotes(), '--rapporteur', 'docs02', '--sans-retour')
+        attestation = json.loads(self.attestations()[0].read_text())
+        self.assertEqual(attestation['retour_automatique'], 'desactive')
+        self.assertEqual(self.enregistre.call_args.args[0]['retour_automatique'],
+                         'desactive')
+        self.assertIn('Retour automatique desactive', self.envois[-1]['corps'])
+
     def test_echec_du_partage_rend_le_code_echec_sans_perdre_la_preuve(self):
         """#3981 : un journal du mesh injoignable ne fait pas perdre le
         deploiement ; l'attestation locale reste et le code 4 le dit."""

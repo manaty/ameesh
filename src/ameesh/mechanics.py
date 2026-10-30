@@ -39,6 +39,10 @@ mécanique, ce que l'outillage exécute sans agent :
   horaire (au-delà, non concluant, canon §3) et le nombre de séries jouées en
   même temps dans les créneaux de l'hôte ; bloc absent : `None`, et
   paquet-horaire le dit sans supposer de valeur.
+  `packet_tests.total_timeout_seconds` (#4463, clé optionnelle du bloc) : la
+  borne totale des tests par unité d'une composition, au-delà de laquelle les
+  séries non parties sont non concluantes et le tic suivant peut partir ;
+  absente : `None`, aucune borne totale.
 - `projects.<projet>.production.branch` (#3022, canon §5, décision owner
   #122895) : la branche de prod d'un projet, où un lot de porte de production
   (`prod_gate`) doit être présent pour se fermer. Absente : un tel lot n'est
@@ -129,9 +133,11 @@ _ACCOUNTS_KEYS = ("pace_multipliers", "underused_loss")
 #: #3256 C : clés du bloc optionnel `paquet` (paquets en parallèle, §11 bis)
 _PAQUET_KEYS = ("attente_mediane_s", "max_paquets")
 #: #4271 : clés du bloc optionnel `packet_tests` (tests ciblés du paquet)
-_PACKET_TESTS_KEYS = ("unit_timeout_seconds", "parallel")
+_PACKET_TESTS_KEYS = ("unit_timeout_seconds", "parallel", "total_timeout_seconds")
+#: #4463 : clés du bloc `packet_tests` qui peuvent manquer
+_PACKET_TESTS_OPTIONAL = ("total_timeout_seconds",)
 #: #3256 A : clés du bloc optionnel `file` (déclencheur du lot de découpage)
-_FILE_KEYS = ("repos_part", "repos_s")
+_FILE_KEYS = ("repos_part", "repos_s", "wake_mail_s")
 #: #4448 : clés du bloc optionnel `session` (rotation par harnais)
 _SESSION_KEYS = ("max_tokens", "max_tokens_by_harness")
 #: bornes du score de valeur d'un élément de backlog (`backlog.add`)
@@ -230,10 +236,15 @@ class PacketTests:
 
     unit_timeout_seconds: int
     parallel: int
+    #: #4463 : borne totale des tests par unité ; None = clé absente
+    total_timeout_seconds: int | None = None
 
     def to_dict(self) -> dict:
-        return {"unit_timeout_seconds": self.unit_timeout_seconds,
-                "parallel": self.parallel}
+        payload = {"unit_timeout_seconds": self.unit_timeout_seconds,
+                   "parallel": self.parallel}
+        if self.total_timeout_seconds is not None:
+            payload["total_timeout_seconds"] = self.total_timeout_seconds
+        return payload
 
 
 @dataclass(frozen=True)
@@ -296,13 +307,32 @@ class QueueFill:
 
     `repos_part` : part des agents réveillables d'un projet au repos, dans
     ]0, 1] ; `repos_s` : durée (secondes) pendant laquelle cette part et
-    l'absence de lot démarrable doivent tenir."""
+    l'absence de lot démarrable doivent tenir.
+
+    #4610 : `wake_mail_s` est la fenêtre (secondes) du courrier récent d'un
+    orchestrateur ou du pilote qui retient un agent au moment du sommeil.
+    `None` (clé absente du canon) : la même durée que `repos_s`, pour que le
+    bloc `file` existant garde son sens sans nouvelle clé obligatoire.
+
+    #4619 : facultative ne veut pas dire déployable tout de suite — la clé
+    n'entre au canon qu'une fois que tous les hôtes lisent ce code. Un hôte
+    d'une version antérieure l'ignorerait et garderait `repos_s` : son
+    sommeil changerait sans le savoir. Le déploiement de la clé suit donc la
+    généralisation du lecteur, pas l'inverse."""
 
     repos_part: float
     repos_s: int
+    wake_mail_s: int | None = None
+
+    def mail_window(self) -> float:
+        """La fenêtre du courrier récent (#4610), en secondes."""
+        return float(self.wake_mail_s if self.wake_mail_s is not None else self.repos_s)
 
     def to_dict(self) -> dict:
-        return {"repos_part": self.repos_part, "repos_s": self.repos_s}
+        out = {"repos_part": self.repos_part, "repos_s": self.repos_s}
+        if self.wake_mail_s is not None:
+            out["wake_mail_s"] = self.wake_mail_s
+        return out
 
 
 @dataclass(frozen=True)
@@ -930,7 +960,8 @@ def _paquet(value, where: str) -> PaquetParallel:
 def _packet_tests(value, where: str) -> PacketTests:
     data = _mapping(value, where, _PACKET_TESTS_KEYS)
     return PacketTests(*(_positive_int(data.get(key), where + "." + key)
-                         for key in _PACKET_TESTS_KEYS))
+                         for key in _PACKET_TESTS_KEYS
+                         if key in data or key not in _PACKET_TESTS_OPTIONAL))
 
 
 def _session(value, where: str, families: tuple[str, ...]) -> Session:
@@ -1002,13 +1033,17 @@ def _accounts(value, where: str) -> AccountsPace:
 
 def _queue_fill(value, where: str) -> QueueFill:
     """Le bloc `file` (#3256 A, canon §4) : `repos_part` dans ]0, 1],
-    `repos_s` entier > 0 ; les deux sont requis."""
+    `repos_s` entier > 0 ; les deux sont requis. #4610 : `wake_mail_s`,
+    facultatif, entier > 0 (défaut : `repos_s`)."""
     data = _mapping(value, where, _FILE_KEYS)
     part = _number(data.get("repos_part"), where + ".repos_part")
     if not 0 < part <= 1:
         raise MechanicsError("%s.repos_part: a share in ]0, 1] is required" % where)
+    wake = data.get("wake_mail_s")
     return QueueFill(repos_part=part,
-                     repos_s=_positive_int(data.get("repos_s"), where + ".repos_s"))
+                     repos_s=_positive_int(data.get("repos_s"), where + ".repos_s"),
+                     wake_mail_s=(_positive_int(wake, where + ".wake_mail_s")
+                                  if wake is not None else None))
 
 
 def compile_document(text: str, *, source: str = PATH) -> Document:

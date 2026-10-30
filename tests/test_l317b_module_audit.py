@@ -93,6 +93,23 @@ class AuditReportingTest(unittest.TestCase):
         self.assertEqual(notify.key_of(project),
                          notify.key_of(dict(project, agent="reassigned")))
 
+    def test_host_scoped_findings_get_no_project_orchestrator(self):
+        """A host setting belongs to no project: never scope it by
+        `chantier == None`, which would attach a project-less orchestrator to
+        every host finding; a project finding keeps its project route."""
+        host = {"type": "module_deviation", "module": "dev",
+                "rule": "host-work-dir-missing", "project": None, "lot": None,
+                "host": "h1", "agent": "a1", "since": None,
+                "detail": "x", "action": "x"}
+        project = dict(self.finding(), orchestrators=[])
+        listing = [{"name": "global-orch"}, {"name": "orch-acme", "chantier": "acme"}]
+        with mock.patch.object(modules, "audit", return_value=[host, project]), \
+                mock.patch("ameesh.sous_utilisation.orchestrators",
+                           return_value=["global-orch", "orch-acme"]):
+            alerts = exploitation._module_deviations(None, mock.Mock(), listing)
+        self.assertEqual(alerts[0]["orchestrators"], [])
+        self.assertEqual(alerts[1]["orchestrators"], ["orch-acme"])
+
     def test_old_schema_is_supported_but_unavailability_propagates(self):
         db = mock.Mock()
         db.query.return_value = [{"relation": None}]
@@ -335,6 +352,37 @@ class AuditEvidenceTest(PgTestCase):
         self.assertEqual(router.resolve(dict(alert, agent="dev-b")), ("human:owner-a", "lot"))
         self.db.execute("UPDATE work_packages SET responsible = NULL WHERE id = 'owner-a'")
         self.assertEqual(router.resolve(dict(alert, agent="dev-b")), ("human:default", "defaut"))
+
+    def test_two_host_scoped_findings_reach_their_own_responsible_human(self):
+        """L101 T4 / #4552: a host-scoped module finding has no lot; it must
+        reach the responsible human of its host or agent, not fall back to the
+        default human. Two hosts with the same rule stay two routes."""
+        root = Path(self.tmp) / "canon-two-hosts"
+        hosts = root / "hotes"
+        hosts.mkdir(parents=True, exist_ok=True)
+        for host in ("h1", "h2"):
+            (hosts / ("%s.md" % host)).write_text(
+                "---\ntype: Host\ntitle: %s\nresponsible: human:resp-%s\n"
+                "policy:\n  harnesses: [claude]\n  max_agents: 2\n---\n\n# %s\n"
+                % (host, host, host), encoding="utf-8")
+        for agent, host in (("a1", "h1"), ("a2", "h2")):
+            registry.upsert(self.db, agent, harness="claude", host=host)
+        cfg = dataclasses.replace(self.cfg, canon=str(root), canon_untrusted=True)
+        ncfg = notify.parse_config({"default_human": "human:default"})
+
+        def finding(host, agent):
+            return {"type": "module_deviation", "module": "dev",
+                    "rule": "host-work-dir-missing", "project": None, "lot": None,
+                    "host": host, "agent": agent, "since": None,
+                    "detail": "workspace finding", "action": "fix the host"}
+
+        router = notify.Router(cfg, self.db, ncfg)
+        self.assertEqual(router.resolve(finding("h1", "a1")), ("human:resp-h1", "hote"))
+        self.assertEqual(router.resolve(finding("h2", "a2")), ("human:resp-h2", "hote"))
+        # The agent's responsible human is consulted before its host's.
+        self.db.execute("UPDATE agent_registry SET responsible = 'human:resp-a2' WHERE name = 'a2'")
+        self.assertEqual(notify.Router(cfg, self.db, ncfg).resolve(finding("h2", "a2")),
+                         ("human:resp-a2", "agent"))
 
     def test_persisted_foreign_human_delivery_is_reconciled_before_retry_or_resolution(self):
         storage.of(self.db).packages.upsert({"id": "owner-a", "kind": "lot", "title": "A",

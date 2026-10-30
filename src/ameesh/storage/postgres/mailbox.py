@@ -109,7 +109,8 @@ class Mailbox(interface.Mailbox):
         rows = self.db.query(
             """
             WITH registered AS (
-                SELECT retired_at FROM agent_registry WHERE name = %s FOR SHARE)
+                SELECT retired_at FROM agent_registry
+                 WHERE name = %s OR %s = ANY(aliases) FOR SHARE)
             INSERT INTO agent_mailbox
                 (sender, recipient, body, host, kind, payload, work_item_id,
                  signature, signature_key, signed_payload, nonce,
@@ -119,13 +120,15 @@ class Mailbox(interface.Mailbox):
                    to_timestamp(%s::bigint / 1000000.0)
              WHERE NOT EXISTS (SELECT 1 FROM registered WHERE retired_at IS NOT NULL)
             RETURNING id, extract(epoch from created_at)::float8 AS created_ts,
-                      (__PROJECT__) AS sender_project,
-                      (__PROJECT__) AS recipient_project
-            """.replace("__PROJECT__", PROJECT_SQL),
-            (recipient, sender, recipient, body, host, kind,
+                      (__SENDER_PROJECT__) AS sender_project,
+                      (__RECIPIENT_PROJECT__) AS recipient_project
+            """.replace("__SENDER_PROJECT__", PROJECT_SQL % "agent_mailbox.sender")
+               .replace("__RECIPIENT_PROJECT__", PROJECT_SQL % "agent_mailbox.recipient"),
+            # #4299: the stored names, which 0516 maps from an alias.
+            (recipient, recipient, sender, recipient, body, host, kind,
              json.dumps(payload or {}, ensure_ascii=False), work_item_id,
              signature, signature_key, signed_payload, nonce,
-             created_us, expires_us, sender, recipient),
+             created_us, expires_us),
         )
         if not rows:
             raise interface.RecipientRetired(

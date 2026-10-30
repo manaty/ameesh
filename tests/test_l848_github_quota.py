@@ -34,6 +34,7 @@ from unittest import mock
 from ameesh import ci, plan_github, versions
 
 from .fake_github import FakeGh
+from .support import ThreadLeakMixin
 
 BASE = "https://api.test"
 
@@ -875,8 +876,13 @@ class DataclassCompatTest(unittest.TestCase):
             config.ci_ttl = 1
 
 
-class JsonReportTest(unittest.TestCase):
-    """N2 #848 : la vue JSON de `ameesh ci status` dit les lectures partagées."""
+class JsonReportTest(ThreadLeakMixin, unittest.TestCase):
+    """N2 #848 : la vue JSON de `ameesh ci status` dit les lectures partagées.
+
+    #4740 : le témoin d'écriture concurrente lance un fil ; la classe vérifie
+    qu'aucun fil ne survit à son test (sinon son « {} » tombe dans la capture
+    d'un test voisin).
+    """
 
     def _run(self, cfg):
         args = SimpleNamespace(json=True, id=7, limit=5)
@@ -884,9 +890,10 @@ class JsonReportTest(unittest.TestCase):
         with mock.patch.object(
                 ci, "status_of",
                 lambda db, item_id, limit=5: {"id": item_id, "runs": []}), \
-                mock.patch("ameesh.db.open_db", lambda cfg: None), \
-                contextlib.redirect_stdout(out):
-            code = ci.cmd_ci(cfg, args)
+                mock.patch("ameesh.db.open_db", lambda cfg: None):
+            # #4736 : la vue va sur ce flux, jamais sur le `sys.stdout` global
+            # qu'un fil d'un autre test du même processus peut écrire.
+            code = ci.cmd_ci(cfg, args, out=out)
         return code, json.loads(out.getvalue())
 
     def test_json_porte_les_lectures_partagees(self):
@@ -905,6 +912,52 @@ class JsonReportTest(unittest.TestCase):
         code, report = self._run(SimpleNamespace(state_dir=None))
         self.assertEqual(code, 0)
         self.assertEqual(report["github_reads"], {"quota": {}, "counters": {}})
+
+    def test_un_fil_ecrivant_sur_le_flux_capture_ne_pollue_pas_la_vue(self):
+        """#4736 : témoin du « Extra data: line 1 column 3 » de la CI.
+
+        `redirect_stdout` est global au processus : un fil d'un autre test du
+        même processus qui écrit un JSON vide pendant que la commande rend sa
+        vue salit la capture. Ici l'écrivain écrit sur `bruit`, le flux capturé
+        du test, et la vue, passée par `out`, reste un JSON lisible.
+
+        #4740 : le fil est joint dans tous les cas — même si `status_of` n'est
+        pas appelé (échec avant) — et n'écrit jamais sur le `sys.stdout`
+        global : sinon il survit à son test et son « {} » atterrit plus tard
+        dans la capture d'un test voisin."""
+        args = SimpleNamespace(json=True, id=7, limit=5)
+        out, bruit = io.StringIO(), io.StringIO()
+        ecrit, fini = threading.Event(), threading.Event()
+
+        def ecrivain():
+            try:
+                if ecrit.wait(10):
+                    print("{}", file=bruit)
+            finally:
+                fini.set()
+
+        def status_of(db, item_id, limit=5):
+            ecrit.set()
+            self.assertTrue(fini.wait(10), "l'écrivain concurrent n'a pas écrit")
+            return {"id": item_id, "runs": []}
+
+        fil = threading.Thread(target=ecrivain, name="ecrivain-4736", daemon=True)
+        fil.start()
+        try:
+            with mock.patch.object(ci, "status_of", status_of), \
+                    mock.patch("ameesh.db.open_db", lambda cfg: None), \
+                    contextlib.redirect_stdout(bruit):
+                code = ci.cmd_ci(SimpleNamespace(state_dir=None), args, out=out)
+        finally:
+            # #4740 : libère l'écrivain même si le corps a échoué avant
+            # `status_of` ; il rend la main et ne parle qu'à `bruit`.
+            ecrit.set()
+            fil.join(10)
+        self.assertFalse(fil.is_alive(), "l'écrivain a survécu à son test")
+        self.assertEqual(code, 0)
+        self.assertEqual(bruit.getvalue(), "{}\n")       # le bruit est bien passé
+        self.assertEqual(json.loads(out.getvalue())["github_reads"],
+                         {"quota": {}, "counters": {}})
 
 
 class RateLimitedPropagationTest(unittest.TestCase):

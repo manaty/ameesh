@@ -24,6 +24,12 @@ class JournalDesignationsTest(PgTestCase):
                               ("tiers", "claude")):
             registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
                             cwd=self.tmp, status="idle")
+        # #4779 : désigner à la main exige une fiche qui prouve `propose` et un
+        # rôle ; le refus d'une fiche absente/illisible est couvert par
+        # test_4779, ici la fiche de test porte la capacité.
+        self.db.execute(
+            "UPDATE agent_registry SET capabilities = ARRAY['read', 'propose'],"
+            " roles = ARRAY['implementation'] WHERE name = 'relecteur'")
 
     def _lot(self, assignee="auteur"):
         item = work.add(self.db, title="journal", app="ameesh", assignee=assignee)
