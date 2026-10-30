@@ -16,6 +16,9 @@ et le désignateur est prévenu.
 """
 from __future__ import annotations
 
+import dataclasses
+from unittest import mock
+
 from ameesh import registry, storage, work
 from ameesh import review_designation as rd
 from ameesh import review_designation_activation as act
@@ -238,6 +241,98 @@ class ManualSeatReseatTest(_ActivationFixture, PgTestCase):
         self.assertEqual(report["reassigned"], 1, report)
         self.assertEqual(self._column(), ["r1", "r4"])
         self.assertIn("r1", act._manual(self.db, work.get(self.db, self.lot)))
+
+    def test_famille_de_l_auteur_le_siege_reste(self):
+        # Auteur claude : r3 (claude) ne prouve aucune indépendance.
+        self._agent("r3", "claude")
+        self._manual()
+        self.db.execute("UPDATE agent_registry SET harness = 'claude'"
+                        " WHERE name = 'author'")
+        self.db.execute("UPDATE provenance_receipts SET harness = 'claude'"
+                        " WHERE work_item_id = %s", (self.lot,))
+        self.db.execute("UPDATE turn_costs SET harness = 'claude' WHERE agent = 'author'")
+        self._pause()
+        self._age()
+        inputs = act.prepare(self.cfg, self.db, self.lot,
+                             freeze=act._latest_freeze(self.db, self.lot))
+        self.assertIn("claude", act._head_families(inputs))
+        self.assertIsNone(act._same_family_replacement(inputs, "claude", set()))
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["manual_reseated"], 0, report)
+        self.assertEqual(report["manual_kept"], 1, report)
+        self.assertEqual(self._column(), ["m1", "r1", "r2"])
+        self.assertIn("kept: family claude wrote this head",
+                      self.notes(act.MANUAL_RESEAT_PREFIX)[0])
+        self.assertEqual(len(self._alerts()), 1)
+
+    def test_provenance_inconnue_le_siege_reste(self):
+        self._agent("r3", "claude")
+        self._manual()
+        self._pause()
+        self._age()
+        prepare = act.prepare
+
+        def unproven(*args, **kwargs):
+            return dataclasses.replace(prepare(*args, **kwargs),
+                                       unknown_authors=["abc123"])
+
+        with mock.patch.object(act, "prepare", unproven):
+            report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["manual_reseated"], 0, report)
+        self.assertEqual(report["manual_kept"], 1, report)
+        self.assertEqual(self._column(), ["m1", "r1", "r2"])
+        self.assertIn("kept: author provenance unknown",
+                      self.notes(act.MANUAL_RESEAT_PREFIX)[0])
+        self.assertEqual(len(self._alerts()), 1)
+
+    def _during_prepare(self, gesture):
+        """`gesture` s'intercale entre la lecture de la passe et le verrou."""
+        prepare = act.prepare
+
+        def racing(*args, **kwargs):
+            gesture()
+            return prepare(*args, **kwargs)
+
+        return mock.patch.object(act, "prepare", racing)
+
+    def _assert_race_lost(self, report):
+        self.assertEqual(report["manual_reseated"], 0, report)
+        self.assertEqual(report["manual_kept"], 0, report)
+        self.assertFalse(self.notes(act.MANUAL_RESEAT_PREFIX))
+        self.assertFalse(self._alerts())
+
+    def test_redesigne_pendant_prepare_le_nouveau_delai_vaut(self):
+        self._agent("r3", "claude")
+        self._manual()
+        self._pause()
+        self._age()
+        with self._during_prepare(lambda: self._redesignate("m1")):
+            report = act.reassign_unreachable(self.cfg, self.db)
+        self._assert_race_lost(report)
+        self.assertEqual(self._column(), ["m1", "r1", "r2"])
+
+    def test_retour_du_relecteur_pendant_prepare_le_siege_reste(self):
+        self._agent("r3", "claude")
+        self._manual()
+        self._pause()
+        self._age()
+        back = lambda: self.db.execute(  # noqa: E731
+            "UPDATE agent_registry SET status = 'idle', status_text = ''"
+            " WHERE name = 'm1'")
+        with self._during_prepare(back):
+            report = act.reassign_unreachable(self.cfg, self.db)
+        self._assert_race_lost(report)
+        self.assertEqual(self._column(), ["m1", "r1", "r2"])
+
+    def test_retrait_ecrit_dans_une_note_libre_n_exclut_personne(self):
+        self._agent("r3", "claude")
+        self._manual()
+        storage.of(self.db).work.note(self.lot, "qa", "reviewer r3 removed", "r2")
+        self._pause()
+        self._age()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["manual_reseated"], 1, report)
+        self.assertEqual(self._column(), ["r1", "r2", "r3"])
 
 
 if __name__ == "__main__":

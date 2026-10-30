@@ -4691,20 +4691,37 @@ def _dead_manual_seats(cfg, db, item: Mapping, freeze: Mapping,
     return dead
 
 
+def _head_families(inputs: "Inputs") -> set:
+    """The families of the authors and correctors of the frozen head (#4757)."""
+    return rd.families_of(inputs.authors)[1] | rd.families_of(inputs.correctors)[1]
+
+
+def _no_provable_replacement(inputs: "Inputs") -> str:
+    """Why no replacement can prove its independence on this head, or "" (#4757).
+
+    The guard of the automatic path (`rd.apply`, `_manual_covers`): an unknown
+    commit provenance or an author of unknown family makes every family doubtful."""
+    if inputs.unknown_authors or rd.unknown_families(inputs.authors) \
+            or rd.unknown_families(inputs.correctors):
+        return "author provenance unknown"
+    return ""
+
+
 def _same_family_replacement(inputs: "Inputs", family: str,
                              taken: set) -> Optional[str]:
     """An available candidate of `family` for a manual seat (#4757), or None.
 
     Condition 4 of the decision: the manual choice serves the family coverage
     first, so the replacement is of the **same** family, never another one.
-    The authors and correctors of the head, the seats already in the column
-    and the pilot's removals are excluded; the least loaded then the name
-    decide, like the selection inside a family."""
+    The authors and correctors of the head, their families (a replacement of
+    those proves no independence, like `_manual_seats`), the seats already in
+    the column and the pilot's removals are excluded; the least loaded then
+    the name decide, like the selection inside a family."""
     forbidden = set(taken) | rd.names_of(inputs.authors) | rd.names_of(inputs.correctors)
     family = str(family or "").strip().lower()
     eligible = [candidate for candidate in inputs.candidates or ()
                 if candidate.eligible(forbidden_names=forbidden,
-                                      forbidden_families=set(),
+                                      forbidden_families=_head_families(inputs),
                                       families={family})]
     if not family or not eligible:
         return None
@@ -4721,13 +4738,13 @@ def _manual_reseat_alert(db, item: Mapping, freeze: Mapping, recipient: str,
 
     lot = int((item or {}).get("id") or 0)
     lines = []
-    for name, why, family, replacement in moves:
+    for name, why, family, replacement, kept in moves:
         if replacement:
             lines.append("- %s (%s, family %s) → %s, same family."
                          % (name, why, family or "?", replacement))
         else:
-            lines.append("- %s (%s, family %s): no available reviewer of that"
-                         " family, the seat is kept." % (name, why, family or "?"))
+            lines.append("- %s (%s, family %s): %s, the seat is kept."
+                         % (name, why, family or "?", kept))
     body = "\n".join([
         "Unreachable manual reviewer seat past its review deadline (canon §2, §9;"
         " #4757, decision mesh-design 30/10).",
@@ -4744,26 +4761,28 @@ def _manual_reseat_alert(db, item: Mapping, freeze: Mapping, recipient: str,
                   "lot": lot, "freeze": int((freeze or {}).get("id") or 0),
                   "sha": str((freeze or {}).get("sha") or ""),
                   "manual_reseat": [{"name": name, "replacement": replacement}
-                                    for name, _why, _family, replacement in moves]}},
+                                    for name, _why, _family, replacement, _kept in moves]}},
               after_commit=threads)
 
 
-def reseat_manual(cfg, db, lot: int, *, freeze: Mapping, dead: Sequence[tuple],
-                  listing: Sequence[Mapping] = (),
+def reseat_manual(cfg, db, lot: int, *, freeze: Mapping,
                   excluded: Sequence[str] = ()) -> dict:
     """Hands the dead manual seats of a freeze to their family (#4757).
 
     Decision mesh-design of 30/10 14:4xZ, amending #3328 (which left every
-    manual seat to the pilot): `dead` comes from `_dead_manual_seats`
-    (conditions 1 to 3). Each seat goes to an available reviewer of the
-    **same** family (4), written like the pilot's gesture (`reviewer X
-    designated` by the system, then `reviewer X removed`) so the replacement
-    stays a manual seat across freezes; the replacement gets the usual
-    request and the removed seat's undelivered request is settled. Without a
-    same-family reviewer the seat stays. Either way the attempt is journaled
-    once per freeze under the lot lock, and the designator (else the pilot)
-    gets one mail (5). A lot that left `qa`, a newer freeze, a seat the pilot
-    already moved, or an attempt already noted writes nothing (`stale`).
+    manual seat to the pilot): the seats are those of `_dead_manual_seats`
+    (conditions 1 to 3), read **under the lot lock** with the registry of that
+    instant: a pilot's gesture, a verdict or a return made while `prepare` ran
+    is not overridden by what the pass saw before it. Each seat goes to an
+    available reviewer of the **same** family (4), written like the pilot's
+    gesture (`reviewer X designated` by the system, then `reviewer X removed`)
+    so the replacement stays a manual seat across freezes; the replacement
+    gets the usual request and the removed seat's undelivered request is
+    settled. Without a same-family reviewer whose independence is proven, the
+    seat stays. Either way the attempt is journaled once per freeze under the
+    lot lock, and the designator (else the pilot) gets one mail (5). A lot
+    that left `qa`, a newer freeze, a seat no longer dead, or an attempt
+    already noted writes nothing (`stale`).
     """
     freeze = dict(freeze or {})
     lot = int(lot)
@@ -4779,8 +4798,8 @@ def reseat_manual(cfg, db, lot: int, *, freeze: Mapping, dead: Sequence[tuple],
         if isinstance(inputs, Unavailable):
             return outcome("unavailable", inputs.why)
         families = inputs.policy.families
-        rows = {str((row or {}).get("name") or "").strip(): row
-                for row in listing or ()}
+        unprovable = _no_provable_replacement(inputs)
+        forbidden_families = _head_families(inputs)
         with db.transaction() as tx:
             locked = tx.query(
                 "SELECT state, reviewers FROM work_items WHERE id = %s"
@@ -4801,17 +4820,24 @@ def reseat_manual(cfg, db, lot: int, *, freeze: Mapping, dead: Sequence[tuple],
             for event in storage.of(tx).work.events_noted(
                     "reviewer ", float(freeze.get("at_ts") or 0.0), ids=[lot]) or ():
                 note = str((event or {}).get("note") or "").strip()
-                if note.endswith(" removed"):
+                if note.endswith(" removed") \
+                        and _designation_authority(tx, (event or {}).get("actor")):
                     taken.add(note[len("reviewer "):-len(" removed")].strip())
             item = work.get(tx, lot) or {"id": lot, "title": "", "state": lifecycle.QA}
-            for name, why in dead or ():
-                if name not in column:
-                    continue
+            listing = storage.of(tx).agents.reachability()
+            if not listing:
+                return outcome("unavailable", "registry unreadable or empty")
+            for name, why in _dead_manual_seats(
+                    cfg, tx, item, latest, _reviewer_rows(listing),
+                    alert_briefs.claims_closed_hosts(tx)):
                 # The reachability rows carry no harness (#3631): the family
                 # is read on the full registry row, like the selection's.
-                family = rd.live_family(registry.get(tx, name) or rows.get(name) or {},
-                                        families=families)
-                replacement = _same_family_replacement(inputs, family, taken)
+                family = rd.live_family(registry.get(tx, name) or {}, families=families)
+                replacement = None if unprovable \
+                    else _same_family_replacement(inputs, family, taken)
+                kept = unprovable or (
+                    "family %s wrote this head" % family if family in forbidden_families
+                    else "no %s reviewer available" % (family or "known-family"))
                 designator = _manual_designator(tx, lot, name)
                 if replacement:
                     taken.add(replacement)
@@ -4827,43 +4853,42 @@ def reseat_manual(cfg, db, lot: int, *, freeze: Mapping, dead: Sequence[tuple],
                     storage.of(tx).work.designate_reviewer(
                         lot, name, actor=SENDER, remove=True,
                         event="reviewer %s removed" % name)
-                moves.append((name, why, family, replacement, designator))
+                moves.append((name, why, family, replacement, kept, designator))
             if not moves:
-                return outcome("stale", "the manual seats moved during the pass")
+                return outcome("stale", "no manual seat is dead under the lock")
             storage.of(tx).work.note(
                 lot, lifecycle.QA,
                 "%s manual seat(s) unreachable past the review deadline: %s"
                 % (prefix, "; ".join(
                     "%s (%s) %s" % (name, why,
                                     "→ %s" % replacement if replacement
-                                    else "kept: no %s reviewer available"
-                                    % (family or "known-family"))
-                    for name, why, family, replacement, _who in moves)),
+                                    else "kept: %s" % kept)
+                    for name, why, _family, replacement, kept, _who in moves)),
                 SENDER)
             by_recipient: dict = {}
-            for name, why, family, replacement, designator in moves:
+            for name, why, family, replacement, kept, designator in moves:
                 recipient = designator if registry.get(tx, designator or "") \
                     else inputs.notify
                 by_recipient.setdefault(recipient, []).append(
-                    (name, why, family, replacement))
+                    (name, why, family, replacement, kept))
             for recipient, told in by_recipient.items():
                 _manual_reseat_alert(tx, item, freeze, recipient, told, threads)
         _drain(db, threads)
     except (rd.DesignationError, work.WorkError) as exc:
         return outcome("unavailable", str(exc))
     item = work.get(db, lot) or {"id": lot}
-    for name, _why, _family, replacement, _who in moves:
+    for name, _why, _family, replacement, _kept, _who in moves:
         if not replacement:
             continue
         work._reviewer_request(db, item, replacement, SENDER, cfg=cfg)
         work._settle_reviewer_requests(cfg, db, item, name, SENDER)
-    replaced = [(name, replacement) for name, _w, _f, replacement, _d in moves
+    replaced = [(name, replacement) for name, _w, _f, replacement, _k, _d in moves
                 if replacement]
     return outcome(rd.DESIGNATED if replaced else rd.WAITING,
                    "manual seat(s) reseated" if replaced
                    else "no same-family replacement",
                    replaced=replaced,
-                   kept=[name for name, _w, _f, replacement, _d in moves
+                   kept=[name for name, _w, _f, replacement, _k, _d in moves
                          if not replacement])
 
 
@@ -5013,8 +5038,7 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
                 if manual_dead:
                     attempted += 1
                     moved = reseat_manual(
-                        cfg, db, lot, freeze=freeze, dead=manual_dead,
-                        listing=listing,
+                        cfg, db, lot, freeze=freeze,
                         excluded=_removed_seats_from_mark(
                             (mark[2] if mark else None) or {},
                             row.get("reviewers") or ()))
