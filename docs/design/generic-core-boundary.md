@@ -58,15 +58,21 @@ module; a declarative module is the one module without types a project may
 select (an installed one, and the always-active `dev`, still may not). A card
 never shadows an installed name.
 
-L99 tranche 1 adds the generic lifecycle names as accepted aliases:
-`requested` (intake), `in_progress` (build), `to_validate` (qa), `validated`
-(merged) and `delivered` (promoted); `blocked`, `waiting_human` and `closed`
-keep the same spelling. `work_lifecycle.ALIASES` names every accepted spelling,
-`canonical()` returns the persisted v1 one and `lifecycle_name()` the generic
-one. `work move`, `work list --state` and the lots API filter accept either
-spelling, and `work show` and `--json` carry a derived `lifecycle` field
-beside `state`. Storage does not change: the v1 spellings stay persisted
-until the storage switch.
+The generic lifecycle is requested → in_progress → to_validate → validated →
+delivered. The first three names accept the stored spellings `intake`, `build`
+and `qa`; `validated` remains distinct from delivery. `blocked`, `waiting_human`
+and `closed` retain their spelling. `work_lifecycle.ALIASES` lists accepted
+names, `canonical()` returns the stored core and `lifecycle_name()` the generic
+name. State arguments accept both vocabularies; work output adds `lifecycle`.
+Development stages `merged` and `promoted` share the stored core `delivered`,
+with `workflow_stage` and `legacy_state` preserving their meaning (details below).
+
+The core vocabulary (`vocab.CORE`) names a work item “tâche”; the development
+module declares “lot”. `vocab.active()` reads the discovered, always-active
+module implementations and falls back to CORE. Display vocabulary leaves
+commands, option names, JSON keys and identifiers unchanged. The English site
+uses “work item” for the core and “lot” for development; see
+[Work lifecycle](../../site/docs/concepts/work-lifecycle.md).
 
 L99 tranche 2 (#4350) makes `work.deliver(db, id, connector=…, evidence=…,
 actor=…)` the single delivery verb. The core owns two connectors: `document`
@@ -94,7 +100,7 @@ the same rule stay two alerts. The bare profile has no
 entry points cannot declare connectors, and a name declared twice or taken by
 the core is refused. `registry.merge_connector()` replaces
 `work_lifecycle.delivery_connector()`. The lot journal names the connector
-(`[via <connector>]`); storage is unchanged. Tranche 2b (#4366)
+(`[via <connector>]`). Tranche 2b (#4366)
 routes the merges observed by the sweeps and the packet and merge-queue paths
 (`plan_git`, `plan_github`, `packet_close`, `merge_pr`, `fire`) through the
 same verb, with a third `git-merge` evidence `{seen: <source>, sha, pr}`; a

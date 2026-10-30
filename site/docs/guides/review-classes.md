@@ -84,8 +84,11 @@ canonical branch (`--canon`, `--ref`, `--fetch` work as for `ameesh canon`).
 
 ## Delay metrics per lot
 
-The same lot lifecycle records milestones (requested → frozen → verdict →
+The development workflow records milestones (requested → frozen → verdict →
 merged), declared with `ameesh work milestone`, so that the time spent in each
 phase and the number of blocked verdicts can be read in `ameesh work list`
 (column DÉLAI), `ameesh work show` and `ameesh progress`. See
 [Progress view](progress-view.md#lot-milestones).
+
+See [Work lifecycle](../concepts/work-lifecycle.md) for the distinction between
+core states and development milestones.

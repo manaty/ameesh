@@ -247,6 +247,11 @@ class FakeProviderTest(unittest.TestCase):
     def test_delete_is_idempotent_and_returns_whether_a_job_existed(self):
         job = self.provider.create(self.spec)
         self.assertTrue(self.provider.delete("reviewers", job.name))
+        self.assertIsNotNone(self.provider.get("reviewers", job.name).deletion_timestamp)
+        self.assertTrue(self.provider.delete("reviewers", job.name))
+        with self.assertRaises(provider.JobAlreadyExists):
+            self.provider.create(self.spec)
+        self.provider.finish_delete("reviewers", job.name)
         self.assertIsNone(self.provider.get("reviewers", job.name))
         self.assertFalse(self.provider.delete("reviewers", job.name))
         with self.assertRaises(provider.JobNotFound):
@@ -255,6 +260,7 @@ class FakeProviderTest(unittest.TestCase):
     def test_recreated_job_gets_a_new_uid(self):
         first = self.provider.create(self.spec)
         self.provider.delete("reviewers", first.name)
+        self.provider.finish_delete("reviewers", first.name)
         second = self.provider.create(self.spec)
         self.assertEqual(first.name, second.name)
         self.assertNotEqual(first.uid, second.uid)

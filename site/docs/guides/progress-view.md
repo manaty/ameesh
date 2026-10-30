@@ -1,9 +1,9 @@
 # Progress view
 
-`ameesh progress` shows the real-time state of a project: **lots** on a
-timeline (requested → frozen → verdict → merged), **agents** (harness, model,
+`ameesh progress` shows the real-time state of a project: **work items** on a
+timeline with development milestones (requested → frozen → verdict → merged), **agents** (harness, model,
 effort, state, current task), **milestones** and **budget**. It is fed by what
-ameesh records itself (lot transitions, gated actions, turns and leases,
+ameesh records itself (work item transitions, gated actions, turns and leases,
 the cost ledger); neither git nor any issue tracker is read.
 
 ```bash
@@ -16,7 +16,7 @@ ameesh progress --serve [--port 8765] [--project P] [--since 24h]
 - `--since`: start of the window, a duration (`90m`, `16h`, `2d`) or an ISO
   8601 date (`2026-10-05`, `2026-10-05T08:00Z`; without a time zone = local
   time). Default `24h`.
-- `--project P`: lots whose app or workstream is `P`, the project's actions,
+- `--project P`: work items whose app or workstream is `P`, the project's actions,
   agents whose project or team is `P`, and their costs.
 - `--html FILE`: a **standalone** static page (inline CSS and script, embedded
   data, `default-src 'none'` policy: no network request, no font, no CDN),
@@ -55,6 +55,12 @@ GitHub is read **read-only** with the host's token (`GH_TOKEN`/`GITHUB_TOKEN`;
 `--serve`. Every datum says its source and read time; what cannot be read is
 listed in `versions.missing`, **never guessed**. `--no-versions` skips the
 GitHub reads altogether.
+
+The timeline milestones below belong to the development workflow. Core states
+follow requested → in_progress → to_validate → validated → delivered;
+integration (`merged`) and deployment (`promoted`) are separate development
+stages within the delivered core. See [Work lifecycle](../concepts/work-lifecycle.md).
+The compatibility JSON key `lots[]` is retained.
 
 ## Lot milestones
 

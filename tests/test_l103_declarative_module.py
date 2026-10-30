@@ -3,7 +3,7 @@
 
 A valid `Pipeline` card of the canon is a module of source ``canon``: no code
 is imported, the descriptor stores no type (``{types: [], schemas: {}, rules:
-[]}``) and the module only declares ``lifecycle``. The canon selects it by name
+[]}``); L103 T3 also exposes the core CLI. The canon selects it by name
 (`extensions.ameesh.projects`) like an installed module; `canon check` refuses
 an unknown name, a card taking an installed module's name, an invalid card
 that a project selects, and two modules claiming one type. `ameesh modules`
@@ -87,7 +87,7 @@ class DiscoveryTest(unittest.TestCase):
             module = found.get(name)
             self.assertEqual((module.source, module.storage, module.capabilities,
                               module.cli, module.version),
-                             ("canon", (), ("lifecycle",), None, None))
+                             ("canon", (), ("lifecycle", "cli"), "ameesh module %s" % name, None))
             self.assertEqual(module.card_ref,
                              "acme:pipelines/%s.md@%s" % (name, "a" * 40))
             self.assertEqual(module.descriptor_sha256, modules._digest(

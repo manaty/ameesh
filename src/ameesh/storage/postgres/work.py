@@ -792,6 +792,19 @@ class WorkItems(interface.WorkItems):
             (int(item_id),))
         return rows[0] if rows else None
 
+    def lock_workflow_activation(self, project):
+        self.db.execute(
+            "SELECT pg_advisory_xact_lock_shared(hashtext('ameesh-module-project'),"
+            " hashtext(%s))", (project,))
+
+    def adopt_workflow(self, item_id, *, ref, version, stage, state, actor):
+        self.db.execute(
+            "UPDATE work_items SET workflow_ref = %s, workflow_version = %s,"
+            " workflow_stage = %s, updated_at = now() WHERE id = %s",
+            (ref, int(version), stage, int(item_id)))
+        self._event(int(item_id), state,
+                    "pipeline adopted: %s version %s stage %s" % (ref, version, stage), actor)
+
     def get(self, item_id) -> dict | None:
         # #1922/B5 : `workflow_ref` (0452) est porté par la lecture, comme
         # `reviewer` (#705) l'est par `item_columns` — `to_jsonb` rend '' sur

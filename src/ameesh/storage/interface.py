@@ -1042,6 +1042,14 @@ class Events(Domain):
         retention index; `days` is the durability the caller needs, never a
         substitute for an absent event."""
 
+    def latest_type(self, type: str, days: int, limit: int) -> list[dict]:
+        """Newest snapshot per object, newest first, bounded by objects.
+
+        Unlike recent_type, a chatty object cannot hide an interrupted one.
+        A driver without this capability must refuse instead of truncating.
+        """
+        raise NotImplementedError("latest event per object is unavailable")
+
     @abc.abstractmethod
     def readable(self, position: tuple, limit: int) -> tuple[list[dict], str | None, tuple]:
         """The reader's order: (the events after `position` = (tx, id) whose
@@ -2332,6 +2340,15 @@ class WorkItems(Domain):
         `note`, les transitions par leur UPDATE) et de la fermeture par
         contenu — une retenue ne se glisse pas entre la lecture du journal et
         la fermeture."""
+
+    @abc.abstractmethod
+    def lock_workflow_activation(self, project: str) -> None:
+        """Share the project policy lock through the adoption transaction."""
+
+    @abc.abstractmethod
+    def adopt_workflow(self, item_id: int, *, ref: str, version: int,
+                       stage: str, state: str, actor: str) -> None:
+        """Set the first workflow pin and journal it under the caller's lot lock."""
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:

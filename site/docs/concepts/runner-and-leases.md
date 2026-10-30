@@ -57,7 +57,7 @@ the canon and GitHub — no session crosses hosts. The claim persists that
 briefing and resets the session in the same statement; a cross-host claim
 without the briefing is refused (the line is not moved), and the briefing is
 dropped with the session, so it never resurfaces later. When the first turn
-opens a lot session, the lot's minimal brief completes the election briefing
+opens a work item session, the work item's minimal brief completes the election briefing
 instead of replacing it. A same-host re-claim (runner restart) keeps the local
 session and is not an election.
 
@@ -219,7 +219,7 @@ still held (#379).
 claims, turns and prompt consumption close while the current turn finishes,
 **critical agents first**. The lifecycle state survives a restart (migration
 0380), and an unplanned loss is recovered only after a proof scoped to the
-source, agent and lease epoch. A **handoff** (L232a) reserves the move at a lot
+source, agent and lease epoch. A **handoff** (L232a) reserves the move at a work item
 boundary, with a durable journal: `ameesh handoff plan AGENT --repository R`
 then `ameesh handoff show OPERATION` (see
 [Operate agents](../guides/operate-agents.md#host-lifecycle-drain-return-and-handoff)).
@@ -302,18 +302,18 @@ ameesh run stop <name>        # no new lease; the current turn finishes
 ## Working on several projects
 
 An agent with several declared `projects` keeps its registry `cwd` for the
-primary project. A lot of another project uses that project's Host
+primary project. A work item of another project uses that project's Host
 `workspaces.roots` or `workspaces.root`, expanding `{agent}`; the agent's
 `workspaces.dirs` override applies to the primary project. Prepare that directory before
 automatic pick-up: the runner does not clone a repository or create an empty
-directory. A missing or ambiguous secondary directory leaves the lot
-unassigned; an explicitly assigned lot waits until its directory is ready —
+directory. A missing or ambiguous secondary directory leaves the work item
+unassigned; an explicitly assigned work item waits until its directory is ready —
 the agent is not blocked: its primary turns and mail keep flowing, and only
-that lot is retried later. A lot whose project the agent has **not** declared
-(or an unknown lot) keeps the primary `cwd`, as before per-project
-directories. Each lot's parked session keeps its opening directory, so
+that work item is retried later. A work item whose project the agent has **not** declared
+(or an unknown work item) keeps the primary `cwd`, as before per-project
+directories. Each work item's parked session keeps its opening directory, so
 returning to it resumes there. Changing the directory starts a new session.
-Multi-project agents keep separate lot sessions even with
+Multi-project agents keep separate work item sessions even with
 `session_policy=jamais`. The mediated executor's single agent depot cannot
 run a secondary project.
 

@@ -1250,7 +1250,15 @@ class StagingSignalTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         appels = self.actifs()
         self.assertEqual(len(appels), 1, self.calls())
-        self.assertEqual(self.calls()[-1], appels[0])  # rien apres le signal
+        # #4880 : seule la publication de fin de suivi suit l'attestation ;
+        # aucune nouvelle operation sur un hote ne doit suivre le signal.
+        calls = self.calls()
+        apres = calls[calls.index(appels[0]) + 1:]
+        self.assertEqual(len(apres), 1, apres)
+        self.assertIn(' -m ameesh.staging_watch ', apres[0])
+        suivi = json.loads(apres[0].split(' -m ameesh.staging_watch ', 1)[1])
+        self.assertEqual(suivi['state'], 'completed')
+        self.assertEqual(suivi['sha'], self.sha)
         ligne = appels[0]
         self.assertIn('actif.py', ligne)
         self.assertIn('--sha %s' % self.sha, ligne)

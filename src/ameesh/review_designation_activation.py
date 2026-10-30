@@ -2500,13 +2500,26 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     keep_marks = {effective[0]} if effective else set()
     manual = _manual_designations(db, lot)
     retired = set()
+    retired_freezes = set()
+    current_sha = str((freeze or {}).get("sha") or "").strip()
+    retired_same_head = False
+    # #4963: an unavailable selection is not a replacement of this freeze's
+    # seats, including an earlier freeze of the same content. Only a proven
+    # effective mark can supersede them.
+    protected = {str((reviewer or {}).get("name") or "").strip()
+                 for _id, _kind, noted, _ts in marks
+                 if (int((noted.get("freeze") or {}).get("id") or 0) == freeze_id
+                     or (current_sha and
+                         str((noted.get("freeze") or {}).get("sha") or "").strip()
+                         == current_sha))
+                 for reviewer in noted.get("reviewers") or ()} if not effective else set()
     if manual is not None:
         for row_id, _kind, noted, _ts in marks:
             if row_id in keep_marks:
                 continue
             for reviewer in noted.get("reviewers") or ():
                 name = str((reviewer or {}).get("name") or "").strip()
-                if not name:
+                if not name or name in protected:
                     continue
                 gesture = manual.get(name)
                 if gesture is not None and gesture[0] > row_id:
@@ -2515,6 +2528,10 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
                     # automatic past.
                     continue
                 retired.add(name)
+                if name in current:
+                    retired_freezes.add(int((noted.get("freeze") or {}).get("id") or 0))
+                    if current_sha and (noted.get("freeze") or {}).get("sha") == current_sha:
+                        retired_same_head = True
     keep = [name for name in current if name not in retired]
     wanted = [str((reviewer or {}).get("name") or "").strip()
               for reviewer in (effective[2].get("reviewers") or () if effective else ())]
@@ -2540,8 +2557,15 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     elif text:
         pass
     elif retired:
-        text = ("automatic reviewer designation of freeze #%d cleared"
-                " (previous head): %s" % (freeze_id, ", ".join(sorted(retired))))
+        previous = sorted(value for value in retired_freezes if value != freeze_id)
+        if freeze_id in retired_freezes or retired_same_head:
+            text = ("automatic reviewer seats superseded at freeze #%d: %s"
+                    % (freeze_id, ", ".join(sorted(retired))))
+        else:
+            text = ("automatic reviewer designation of freeze %s cleared"
+                    " (previous head): %s" % (
+                        ", ".join("#%d" % value for value in previous),
+                        ", ".join(sorted(retired))))
     else:
         return
     storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)

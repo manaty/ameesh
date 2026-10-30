@@ -101,6 +101,7 @@ nav:
   - Concepts:
       - concepts/index.md
       - Core and modules: concepts/core-and-modules.md
+      - Work lifecycle: concepts/work-lifecycle.md
       - The canon: concepts/canon.md
       - Members, agents, hosts, placements: concepts/members-agents-hosts.md
       - Runner and leases: concepts/runner-and-leases.md

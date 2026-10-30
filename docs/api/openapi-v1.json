@@ -498,6 +498,8 @@
               "alert.resolved",
               "pilot.gesture",
               "staging.attested",
+              "staging.sequence",
+              "staging.request",
               "packet.pause"
             ]
           }

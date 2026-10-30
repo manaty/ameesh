@@ -4551,3 +4551,39 @@ def promote(db: Db, item_id: int, *, note: str = "", actor: str = "") -> dict:
     """Promote a development delivery using its module's workflow."""
     return _module_registry.development_workflow().promote(
         db, item_id, note=note, actor=actor)
+
+
+def adopt_workflow(db, item_id: int, *, module: str, spec, actor: str) -> dict:
+    """First pin only: lock, authority, activation and initial core, then journal.
+
+    No receipt or revision transfer: subsequent revisions use #4007.
+    """
+    from . import process_registry as registry
+    registry._validate_spec(spec)
+    with db.transaction() as tx:
+        store = storage.of(tx).work
+        row = store.lock(item_id)
+        if row is None:
+            raise WorkError('pipeline-lot-unknown: %s' % item_id)
+        row = store.get(item_id)  # the locked row plus the workflow pin columns
+        registry._validate_authority(registry.Authority(actor, source='explicit'))
+        registry._check_authority(tx, registry.Authority(actor, source='explicit'))
+        if actor != row.get('assignee') and not claims_pilot(db.cfg, tx, actor):
+            raise WorkError('pipeline-authority: only the assignee or pilot can adopt')
+        if row.get('workflow_ref'):
+            raise WorkError('pipeline-already-pinned: use revision transfer')
+        phase = lifecycle.phase(row)
+        if row['state'] in lifecycle.COMPLETED:
+            raise WorkError('pipeline-terminal: completed work item')
+        store.lock_workflow_activation(row.get('app') or row.get('workstream') or '')
+        if not _module_registry.enabled(tx, row.get('app') or row.get('workstream') or '', module):
+            raise WorkError('pipeline-module-inactive: %s' % module)
+        if row.get('type') not in spec.types:
+            raise WorkError('pipeline-type: work item type is not covered by the card')
+        if spec.core_of(spec.initial) != phase:
+            raise WorkError('pipeline-stage-mismatch: initial stage must match current core')
+        store.adopt_workflow(item_id, ref=spec.workflow_ref,
+                             version=spec.workflow_version, stage=spec.initial,
+                             state=row['state'], actor=actor)
+        return {'work_item_id': int(item_id), 'workflow_ref': spec.workflow_ref,
+                'workflow_version': spec.workflow_version, 'workflow_stage': spec.initial}

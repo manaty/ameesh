@@ -10,8 +10,8 @@ never 0; durations are whole seconds.
 
 | Policy | Effect |
 |---|---|
-| `par-lot` (default) | a **fresh session when the lot of the turn differs** from the lot of the current session; rotation on size and turn duration stays as a safeguard |
-| `taille` | rotation on size and turn duration only (no rotation on a change of lot): for **orchestrators** |
+| `par-lot` (default) | a **fresh session when the work item of the turn differs** from the work item of the current session; rotation on size and turn duration stays as a safeguard |
+| `taille` | rotation on size and turn duration only (no rotation on a change of work item): for **orchestrators** |
 | `jamais` | no rotation |
 
 ```bash
@@ -21,15 +21,15 @@ ameesh set <agent> session_policy=par-lot|taille|jamais   # empty value = defaul
 The runner's default is `AMEESH_SESSION_POLICY` (`par-lot`). The canon profile
 has no key for it: the setting goes through `ameesh set` only.
 
-- **Lot of the turn**: the lot (`--lot`) of the turn's messages if there is a
-  single one; else the only open lot assigned to the agent; else unknown, and an
-  unknown lot never triggers a rotation.
+- **Work item of the turn**: the work item (`--lot`) of the turn's messages if there is a
+  single one; else the only open work item assigned to the agent; else unknown, and an
+  unknown work item never triggers a rotation.
 - **Rotation**: a summary is produced in the old session, the old id is kept in
   the session history, the thread keeps a trace, and the first turn of the new
-  lot opens on the summary. If the summary fails, the turn runs in the old
+  work item opens on the summary. If the summary fails, the turn runs in the old
   session (no retry at every turn; the `session_too_big` alert keeps watch).
-- An **orchestrator** receives messages from every lot: set it to `taille`,
-  otherwise every change of lot would open a session.
+- An **orchestrator** receives messages from every work item: set it to `taille`,
+  otherwise every change of work item would open a session.
 
 ## `ameesh set`
 
@@ -53,14 +53,14 @@ ameesh set <agent> model=… effort=… tier=… session_policy=… mode=execute
   `0` closes the turn's leftover background work at once, and wakes an idle
   agent at once without a batching window; see
   [Configuration](../reference/configuration.md#runner).
-- `lot_wake=off` stops the runner from waking this agent when an open lot of
+- `lot_wake=off` stops the runner from waking this agent when an open work item of
   its own becomes actionable (L165b).
 - Every setting takes effect at the **next turn**.
 
 ## Agent mode and stop reason
 
 The rule of design decision 0030 is **no work without a way to wake the
-agent**: a lot, a delegation or an orchestrator role goes only to an agent
+agent**: a work item, a delegation or an orchestrator role goes only to an agent
 ameesh knows how to wake. Each agent therefore has an explicit mode:
 
 | Mode | Meaning |
@@ -90,8 +90,8 @@ Each agent row keeps the historical keys and adds:
 | `state` | `working`, `idle`, `paused` or `stopped` (same rules as `ameesh progress`) |
 | `paused_on_budget` | `true` when the agent's turn is held by the budget/pace guard (status `blocked`, text `budget : …`, L242b); a `blocked` for another cause (host not ready, authentication) stays `false` (#1070) |
 | `state_since_ts`, `state_for_s` | since when |
-| `lot` | `{id, title, state, source}`: the session's lot (`"session"`) unless it is merged or closed, else the most recent open lot assigned (`"assigned"`), or `null` |
-| `title` | title of the current lot, else the status text |
+| `lot` | `{id, title, state, source}`: the session's work item (`"session"`) unless it is merged or closed, else the most recent open work item assigned (`"assigned"`), or `null` |
+| `title` | title of the current work item, else the status text |
 | `unread`, `oldest_unread_ts` | mail not delivered yet |
 | `turn_started_ts` | start of the running turn, or `null` |
 | `last_turn_reread_tokens` | tokens re-read at the last turn (input + cached input) |
@@ -99,8 +99,8 @@ Each agent row keeps the historical keys and adds:
 | `mode` | `execute` or `externe` (v1.4.0) |
 | `stop_reason` | `manuel`, `bail_expire`, `retire_du_canon` (`externe`, `erreur` reserved), or `null` while the agent runs (v1.4.0) |
 
-The text view of `ameesh list` counts the lots once at the bottom and shows,
-for each agent, a **LOTS** column with its open assigned lots. A budget-paused
+The text view of `ameesh list` counts the work items once at the bottom and shows,
+for each agent, a **LOTS** column with its open assigned work items. A budget-paused
 agent reads `paused/…` in the STATUS column (never the truncated
 `blocked/bud`); a `blocked` for another cause stays `blocked/…` (#1070).
 
@@ -144,14 +144,14 @@ One JSON object per line (`ameesh-alert/1`):
 | `idle_with_mail` | an idle agent with unread mail older than the threshold |
 | `dead_runner` | a lease expired without renewal, beyond the grace period |
 | `session_too_big` | cumulative tokens of the current session (`input_tokens + output_tokens` over its turns; per-harness cache convention, #4448) at or above the threshold of the last turn's harness, compiled from the canon (`session.max_tokens*`; the executor's common 150 000 is the fallback), with at least `AMEESH_SESSION_MIN_TURNS` turns (default 3) and no turn in progress; silent once the session has rotated |
-| `stale_lot` | an unmerged lot without activity for the threshold (default 6 h), with what it waits for: verdict, correction, merge or a human decision |
+| `stale_lot` | an unmerged work item without activity for the threshold (default 6 h), with what it waits for: verdict, correction, merge or a human decision |
 | `host_pressure` | a reading of the host crosses a limit of its `policy.resources` (v1.3.0); fields `host`, `critical`, `breaches` |
 | `orphan_resource` | a resource of a turn (process group, labelled container) that outlives its turn, or that a dead runner left behind (v1.3.0); it is reported, never removed |
 | `stopped_with_mail` | a stopped or dead agent with unread mail older than `--idle-mail`, **except** a manual stop (v1.4.0); fields `stop_reason`, `mode`, `responsible` |
-| `orphan_lot` | an open lot that nobody will move forward (v1.4.0); `reason`: `inconnu` (assignee unknown to the registry), `arrete` (assignee in `execute` mode stopped or dead), `externe_sans_responsable`, or `sans_tour` (an `intake`/`build` lot whose last activity **and** the assignee's last turn are older than `--orphan-lot`, default 30 min) |
-| `delegation_expired` | a delegation past its deadline and not yet processed by a runner (`reason: en_retard`, after `--delegation-grace`), or a lot handed back to the delegator in the last hour (`reason: rendu`) (v1.4.0) |
+| `orphan_lot` | an open work item that nobody will move forward (v1.4.0); `reason`: `inconnu` (assignee unknown to the registry), `arrete` (assignee in `execute` mode stopped or dead), `externe_sans_responsable`, or `sans_tour` (an `intake`/`build` work item whose last activity **and** the assignee's last turn are older than `--orphan-lot`, default 30 min) |
+| `delegation_expired` | a delegation past its deadline and not yet processed by a runner (`reason: en_retard`, after `--delegation-grace`), or a work item handed back to the delegator in the last hour (`reason: rendu`) (v1.4.0) |
 
-A lot without assignee, or assigned to a human, is never orphan; an external
+A work item without assignee, or assigned to a human, is never orphan; an external
 agent is never counted as `sans_tour` (it does not run ameesh turns). The
 `responsible` field of `stopped_with_mail`, `orphan_lot` and
 `delegation_expired` names the human who should act: the recipient of
@@ -171,10 +171,10 @@ pushes them by default:
 | Type | Raised when |
 |---|---|
 | `plan_underused` | a subscription account will lose unused capacity at its next reset: less than `--plan-used` % (50) projected at the reset with less than `--plan-tail` (24 h, at most a quarter of the window) left, or a projected loss above `--plan-pace-gap` points (25) at the recent rate on a window of a day or more; reports the estimated loss |
-| `idle_capacity` | wakeable agents idle without a lot for more than `--idle-capacity` (30 min) while lots wait unassigned, mail waits at a busy agent, or pay-per-token agents work while subscription agents sleep; suggests dispatching or waking the orchestrator |
-| `orchestrator_held` | an orchestrator (`--orchestrators`, `roles: [orchestrateur]` in its canon card, or an agent that handed out lots) is held by `ameesh attach` for more than `--orchestrator-held` (30 min) with unread mail |
+| `idle_capacity` | wakeable agents idle without a work item for more than `--idle-capacity` (30 min) while work items wait unassigned, mail waits at a busy agent, or pay-per-token agents work while subscription agents sleep; suggests dispatching or waking the orchestrator |
+| `orchestrator_held` | an orchestrator (`--orchestrators`, `roles: [orchestrateur]` in its canon card, or an agent that handed out work items) is held by `ameesh attach` for more than `--orchestrator-held` (30 min) with unread mail |
 | `host_underused` | a host stays almost idle for `--host-underused` (1 h: load per CPU below 0.25, under one turn on average) while another host is under pressure or agents wait elsewhere; a suggestion only, nothing is moved |
-| `backlog_empty` | wakeable agents idle without a lot for more than `--backlog-empty` (30 min), the improvement backlog has nothing left to take and no project lot waits; asks to fill it (`ameesh work backlog add`, L119) |
+| `backlog_empty` | wakeable agents idle without a work item for more than `--backlog-empty` (30 min), the improvement backlog has nothing left to take and no project work item waits; asks to fill it (`ameesh work backlog add`, L119) |
 | `balance_low` | a pay-per-token provider's runway at the real spend rate (balance readings over 6 h, top-ups ignored) falls under `--balance-hours` (48 h), or its balance under `--balance-min` USD (20); urgent under 12 h or 5 USD |
 
 A threshold of 0 disables the matching alert.
@@ -193,7 +193,7 @@ ameesh notify --test human:<id> [--json]
 - Types pushed by default: `stopped_with_mail`, `orphan_lot`, `dead_runner`,
   `idle_with_mail`, `delegation_expired` (setting `notify.types`).
 - **Recipient**, first found: the alert's `responsible`; the agent's
-  responsible human; the responsible of the lot's work package; the
+  responsible human; the responsible of the work item's work package; the
   responsible of the host's `Host` card; `notify.default_human`. An alert
   without a recipient or channel is logged once and kept: if a route appears
   while it lasts, it is sent.
@@ -236,7 +236,7 @@ ameesh work delegate <id> <agent> --within 30m [--actor A]
 ameesh work expire-delegations [--dry-run] [--json]
 ```
 
-**Guarded assignment** (v1.4.0). A lot goes only to a **wakeable** agent:
+**Guarded assignment** (v1.4.0). A work item goes only to a **wakeable** agent:
 known to the registry, in `execute` mode, ephemeral and not expired, admitted
 on its host for its current profile, and with a responsible human when a canon
 is configured. Otherwise the command refuses with the reason (exit 1),
@@ -247,29 +247,29 @@ human. Details:
 - an unknown name is refused; a bare name that designates a known human
   (a `Member` of a configured canon, `AMEESH_HUMANS`) is normalised to
   `human:<id>` with a warning;
-- a stopped agent is accepted with a warning (the lot waits for it, and the
+- a stopped agent is accepted with a warning (the work item waits for it, and the
   `orphan_lot` alert follows it);
 - a canon that is momentarily invalid does not block an assignment (warning);
   claiming stays closed until the next valid sync;
-- `work assign` reassigns an open lot, logs "assigned to X (before: Y)" in the
-  lot's events, and clears any delegation in progress;
-- `--claim` (#1026) assigns only a lot that has no assignee: an already taken
-  lot is refused (exit 1) naming its holder, and the write is conditional on
-  the assignee still being empty, so two concurrent claims on the same lot
+- `work assign` reassigns an open work item, logs "assigned to X (before: Y)" in the
+  work item's events, and clears any delegation in progress;
+- `--claim` (#1026) assigns only a work item that has no assignee: an already taken
+  work item is refused (exit 1) naming its holder, and the write is conditional on
+  the assignee still being empty, so two concurrent claims on the same work item
   produce one assignment and one readable refusal, never a silent hand
   change. The `stale_lot` and `idle_capacity` briefs carry that command.
 
-**Delegation with a deadline**. `work delegate` hands a lot to a wakeable
+**Delegation with a deadline**. `work delegate` hands a work item to a wakeable
 agent (same guard; a human is refused, use `work assign`) and drops an event
 in its mailbox, which wakes it. The delegator is `--actor`, else the current
-assignee; the lot comes back to them. At the deadline (`--within`: `30m`, `2h`,
+assignee; the work item comes back to them. At the deadline (`--within`: `30m`, `2h`,
 `1d` or seconds), processed by the runner at **every pass**:
 
-- if the delegate has done nothing on the lot since the delegation (no turn on
-  that lot, no transition, note, milestone, action or linked message), the lot
+- if the delegate has done nothing on the work item since the delegation (no turn on
+  that work item, no transition, note, milestone, action or linked message), the work item
   **goes back to the delegator**, with an event in their mailbox if it is an
   agent (a human is told by the `delegation_expired` alert);
-- otherwise the delegation is **settled**: the deadline is cleared and the lot
+- otherwise the delegation is **settled**: the deadline is cleared and the work item
   stays with the delegate.
 
 A new delegation replaces the previous one. `work list`, `work show` and
@@ -347,7 +347,7 @@ consumption close while the current turn finishes, **critical agents first**.
 durable (migration 0380): an unplanned loss is recovered only after a proof
 scoped to the source, agent and lease epoch, and a host that stays `active` but
 never retakes its runner lease is not reported as a healthy restart (#477). A
-**handoff** (L232a) reserves a host move at a lot boundary and keeps a durable
+**handoff** (L232a) reserves a host move at a work item boundary and keeps a durable
 journal; `plan` reserves it (the repository is the enrolled Git remote
 identity, never inferred from a directory name), `show` reads an operation.
 
@@ -478,7 +478,7 @@ another reason, or a running turn.
   fresh session under the new one).
 - Otherwise, or with `--fresh`, or without a session, the session is
   forgotten and the fresh one opens on a **deterministic resume brief** built
-  by ameesh without calling a model: identity and role, open assigned lots with
+  by ameesh without calling a model: identity and role, open assigned work items with
   what they wait for, the last exchanges of the project's thread, the unread
   count, the path of the old transcript, then the instruction (`--brief`).
   The brief is capped at 16 KB.
