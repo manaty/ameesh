@@ -74,7 +74,7 @@ import time
 
 from . import config as config_mod
 from . import db as db_mod
-from . import fil, identity, platform, registry, storage, work
+from . import fil, identity, platform, registry, storage, work, work_lifecycle
 from . import validation_deadlines as validations
 from .config import NAME_RE, Config
 
@@ -480,6 +480,10 @@ def request_text(decision: dict, *, requester: str, owner: str | None,
     validation = decision.get("validation") or {}
     due_label = validation.get("due_local") or (_local(decision["due_ts"]) if decision.get("due_ts") else None)
     tail = ["Deadline: %s (%s)." % (due_label, validation.get("timezone", "local"))] if due_label else []
+    if validation.get("status") == "escalated":
+        # #4542 : le remplaçant doit savoir pourquoi la demande lui arrive échue.
+        tail.insert(0, "ESCALATED: no answer from the first validator by the deadline; "
+                       "you are the substitute.")
     if validation.get("defaulted"):
         tail.append("Default: one business day.")
     lines.extend(validation.get("links") or [])
@@ -496,7 +500,7 @@ def request_text(decision: dict, *, requester: str, owner: str | None,
 
 def _hold_lot(db, item: dict, *, note: str, actor: str) -> str:
     """Le lot passe en `waiting_human` (journal) ; rend son état."""
-    state = item["state"]
+    state = work_lifecycle.phase(item)
     if state != "waiting_human" and "waiting_human" in work.TRANSITIONS.get(state, ()):
         try:
             return work.move(db, int(item["id"]), "waiting_human", note=note, actor=actor)["state"]
@@ -622,7 +626,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
                 links.append("https://github.com/%s/issues/%s" % (repo, number))
         validation = validations.metadata(route, due=due, defaulted=due_ts is None, links=links)
         lot_id = int(item["id"])
-        previous = item["state"]
+        previous = work_lifecycle.phase(item)
         if previous == "waiting_human":
             # une autre demande tient déjà le lot : son état d'avant est le bon
             inherited = [view_of(r, now).get("previous_state")
@@ -1226,6 +1230,7 @@ def withdraw(cfg: Config, db, decision_id: int, *, requester: str, why: str | No
         try:
             with db.transaction() as tx:
                 view, lot, closed = close_and_release(tx)
+                validations.withdrawn(tx, view, by=requester, now=now)
         except _DecisionRace:
             latest = get(db, decision_id, now)
             raise DecisionError(_closed_reason(latest) if latest else
@@ -1243,13 +1248,19 @@ def withdraw(cfg: Config, db, decision_id: int, *, requester: str, why: str | No
 # vues : alertes, en-tête de `ameesh projects`, file de `ameesh decisions`
 # --------------------------------------------------------------------------
 
+def escalated(view: dict) -> bool:
+    """#4542 : la demande a été escaladée au remplaçant après son échéance."""
+    return (view.get("validation") or {}).get("status") == "escalated"
+
+
 def describe(view: dict, limit: int = 220) -> str:
     """Une ligne : numéro, demandeur, question, options, recommandation."""
     options = " ; ".join("%s) %s" % (o["key"], fil.excerpt(o["label"], 40))
                          for o in view.get("options") or ())
-    return "decision #%d from %s for %s: \"%s\"%s%s — answer: ameesh decide %d <option> " \
+    return "decision #%d from %s for %s%s: \"%s\"%s%s — answer: ameesh decide %d <option> " \
            "(or ameesh chat)" % (
                view["id"], view.get("requester"), _owner_label(view.get("owner")),
+               " (escalated)" if escalated(view) else "",
                fil.excerpt(view.get("question") or "", limit),
                " — %s" % options if options else "",
                "; recommended: %s" % view["recommend"] if view.get("recommend") else "",
@@ -1320,6 +1331,8 @@ def format_view(view: dict, now: float | None = None) -> list[str]:
         flags.append("URGENT")
     if view.get("overdue"):
         flags.append("OVERDUE")
+    if escalated(view):
+        flags.append("ESCALATED")
     if view.get("needs_signature"):
         flags.append("signature required")
     head = "#%d  %s ago · %s · work item #%s \"%s\" · from %s → %s%s" % (

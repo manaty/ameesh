@@ -151,7 +151,8 @@ class ModuleStore:
             "ORDER BY id DESC LIMIT 1) e ON true "
             "WHERE p.project = %s AND p.module = %s "
             "AND w.type IN (SELECT jsonb_array_elements_text(%s::jsonb)) "
-            "AND w.state IN (SELECT jsonb_array_elements_text(%s::jsonb)) "
+            "AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(%s::jsonb) s(value) "
+            "WHERE s.value IN (w.state, to_jsonb(w)->>'legacy_state')) "
             "ORDER BY w.id",
             (subject_kind, evidence_kind, project, module,
              json.dumps(list(types)), json.dumps(list(states))))

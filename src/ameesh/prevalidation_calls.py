@@ -51,6 +51,7 @@ un run réel.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1148,7 +1149,22 @@ def gate_packet(cfg, db, item, decision: dict, *, repo: str = "",
 # (b) le gel : résultat attaché, jamais bloquant
 # --------------------------------------------------------------------------
 
-def _journal(db, lot: int, text: str, *, key: str = "") -> None:
+def _modules_fingerprint(missing) -> str:
+    """Jeton stable de la liste des modules non exécutés (#4769).
+
+    Le journal déduplique une indisponibilité par (lot, cause). Pour
+    ``run-incomplete``, cette clé masquait aussi la liste des modules d'une
+    tête ultérieure. Le jeton, ajouté à la note, permet de comparer la liste
+    au dernier constat de la cause sans citer la tête : une nouvelle liste
+    écrit sa ligne, la même liste (même ordre ou non) n'ajoute rien.
+    """
+    modules = sorted({str(m) for m in (missing or ())})
+    digest = hashlib.sha256("\n".join(modules).encode("utf-8")).hexdigest()[:12]
+    return "[modules %d:%s]" % (len(modules), digest)
+
+
+def _journal(db, lot: int, text: str, *, key: str = "",
+             fingerprint: str = "") -> None:
     """Une note de journal, au mieux : le gel ne dépend jamais d'elle.
 
     #4758 : ``once=True`` ne déduplique que le texte exact. Une note
@@ -1156,16 +1172,28 @@ def _journal(db, lot: int, text: str, *, key: str = "") -> None:
     gel et revient donc à chaque fois. ``key`` est la clé stable du couple
     (lot, cause), sans SHA ni chemin : quand une note du lot commence déjà par
     elle, rien n'est réécrit. Une lecture impossible n'empêche jamais la note.
+
+    #4769 : ``fingerprint`` (la liste des modules non exécutés) rend la cause
+    ``run-incomplete`` de nouveau visible quand cette liste change. La
+    déduplication reste celle de la cause tant que le dernier constat porte le
+    même jeton ; une liste différente écrit une ligne à sa tête.
     """
     if db is None:
         return
     try:
         if key:
             try:
-                if work.events_noted(db, int(lot), key):
-                    return
+                noted = work.events_noted(db, int(lot), key)
             except Exception:  # noqa: BLE001 - clé illisible : la note passe
-                pass
+                noted = []
+            if noted:
+                if not fingerprint:
+                    return
+                last = noted[-1]
+                last = (str(last.get("note") or "")
+                        if isinstance(last, dict) else "")
+                if fingerprint in last:
+                    return
         work.note(db, int(lot), text, actor="ameesh", once=True)
     except Exception:  # noqa: BLE001 - une note ne bloque pas un gel
         pass
@@ -1244,9 +1272,16 @@ def _after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
     why = describe(report)
     if state == "unavailable":
         why = _timed_out(deadline, why)
-        key = "%s unavailable: %s" % (
-            JOURNAL_PREFIX, (report.get("causes") or ("run-incomplete",))[0])
-        _journal(db, lot, "%s — tête %s: %s" % (key, head[:12], why), key=key)
+        cause = (report.get("causes") or ("run-incomplete",))[0]
+        key = "%s unavailable: %s" % (JOURNAL_PREFIX, cause)
+        fingerprint = ""
+        if cause == "run-incomplete" and report.get("missing"):
+            fingerprint = _modules_fingerprint(report.get("missing"))
+            _journal(db, lot, "%s %s — tête %s: %s"
+                     % (key, fingerprint, head[:12], why),
+                     key=key, fingerprint=fingerprint)
+        else:
+            _journal(db, lot, "%s — tête %s: %s" % (key, head[:12], why), key=key)
     else:
         _journal(db, lot, "%s %s %s: %s" % (JOURNAL_PREFIX, state, head[:12], why))
     return {"state": state, "report": report}

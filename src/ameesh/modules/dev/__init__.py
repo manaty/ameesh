@@ -225,3 +225,9 @@ ACTION_CONNECTORS = {MERGE_CONNECTOR: GitMergeConnector}
 
 #: delivery connectors this provider declares, by name (`work.deliver`)
 DELIVERY_CONNECTORS = {MERGE_CONNECTOR: deliver_git_merge}
+
+
+def workflow():
+    """Development stages and transitions (L99 T5)."""
+    from . import lifecycle
+    return lifecycle

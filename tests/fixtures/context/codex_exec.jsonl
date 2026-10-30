@@ -1,0 +1,3 @@
+{"type": "thread.started", "thread_id": "ctx-codex-1", "model": "gpt-6.1-sol"}
+{"type": "item.completed", "item": {"type": "agent_message", "text": "fini"}}
+{"type": "turn.completed", "usage": {"input_tokens": 600000, "cached_input_tokens": 100000, "output_tokens": 3000}}

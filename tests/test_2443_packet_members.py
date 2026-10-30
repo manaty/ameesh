@@ -563,7 +563,7 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
             self.assertEqual(result["result"], "merged", result)
             self.assertEqual(result["how"], "composition", result)
             self.assertEqual(result["composition"]["package"], porteur["id"])
-            self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+            self.assertEqual(work.get(self.db, item["id"])["state"], "delivered")
 
     def test_sync_merges_accepts_a_source_containing_the_freeze(self):
         frozen = self.unit_branch("lot/frozen", "code.py", "code\n", "code")

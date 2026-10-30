@@ -249,7 +249,8 @@ class SignedRefusalTest(Fixture,support.PgTestCase):
     def sign(self,view=None,text='install',signed=True):
         view=view or self.view
         if signed:
-            digest=decisions.answer_digest(view,text,text,'human:fixture-owner')
+            option=decisions.match_option(view,text)
+            digest=decisions.answer_digest(view,text,option,'human:fixture-owner')
             authority.create_approval(self.db,self.seed,approver='fixture-owner',action=decisions.APPROVAL_ACTION,
                 artifact_kind=decisions.APPROVAL_KIND,artifact_hash=digest,ttl=(self.now+900)-time.time())
         decisions.answer(self.cfg,self.db,view['id'],text,human='human:fixture-owner',channel='cli',signed=signed)
@@ -292,6 +293,40 @@ class SignedRefusalTest(Fixture,support.PgTestCase):
         self.assertTrue(self.backend.plan(self.operation,self.view['id'],authority=self.signed())['authorized'])
         self.assertEqual(self.backend.install(self.operation,self.view['id'],authority=self.signed())['outcome'],
                          'installed')
+
+    def test_bureau_mention_installs_then_revokes_through_the_backend(self):
+        # #4788: the canonical signer keeps its fixed mention; the backend must
+        # consume the same bounded native form as decisions.match_option, with
+        # the full signed text kept in the recorded answer/proof.
+        install='install — saisi par le bureau, délégation §10'
+        self.sign(self.view,install)
+        answer=decisions.get(self.db,self.view['id'])['answer']
+        self.assertEqual((answer['text'],answer['option']),(install,'install'))
+        self.assertTrue(self.backend.plan(self.operation,self.view['id'],authority=self.signed())['authorized'])
+        self.assertEqual(self.backend.install(self.operation,self.view['id'],authority=self.signed())['outcome'],
+                         'installed')
+        self.assertTrue((self.root/KEY.lstrip('/')).exists())
+        view=self.revoke_view()
+        revoke='revoke — saisi par le bureau, délégation §10'
+        self.sign(view,revoke)
+        self.assertEqual((decisions.get(self.db,view['id'])['answer']['text'],
+                          decisions.get(self.db,view['id'])['answer']['option']),(revoke,'revoke'))
+        self.assertEqual(self.backend.revoke(self.operation,view['id'],
+                                             authority=self.signed(view=view,revoke=True))['outcome'],
+                         'revoked')
+        self.assertFalse((self.root/KEY.lstrip('/')).exists())
+        self.assertTrue((self.root/'opt/ameesh-release/runtime/bin/python').exists())
+
+    def test_foreign_or_free_mention_never_authorizes_an_effect(self):
+        cases=('install — saisi par le bureau',
+               'install, mais seulement après la revue',
+               'install — Réponse de l\'owner relayée par le bureau, source x',
+               'install — réponse de l\'owner relayée par le bureau, source -x')
+        for text in cases:
+            with self.subTest(text=text):
+                view=self.ask(self.question,bootstrap.OPTIONS)
+                self.sign(view,text)
+                self.assert_refused(view['id'],self.signed(view=view))
 
     def test_install_decision_never_authorizes_revoke_and_conversely(self):
         self.sign()

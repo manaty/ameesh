@@ -273,7 +273,7 @@ class MailLinksLotsTest(_Base):
                          "--lot", str(lot["id"]))
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("message not delivered", proc.stderr)
-        self.assertIn("already merged", proc.stderr)
+        self.assertIn("already delivered", proc.stderr)
         self.assertEqual(self.unread("dev1"), [])
 
     def test_garde_d_attribution_rien_n_est_depose(self):
@@ -445,7 +445,7 @@ class BranchMergeTest(_Base):
         report = self.sync()
         self.assertEqual((report["merged"], report["results"][0]["how"]), (1, "ancestor"))
         item = work.get(self.db, lot["id"])
-        self.assertEqual(item["state"], "merged")
+        self.assertEqual(item["state"], "delivered")
         notes = [e["note"] for e in work.events(self.db, lot["id"])]
         self.assertTrue(any("branch agent/dev1-a" in n for n in notes), notes)
         self.assertEqual(self.sync()["results"], [])          # lot livré : plus examiné
@@ -497,7 +497,7 @@ class BranchMergeTest(_Base):
         report = self.sync()
         self.assertEqual(report["merged"], 1)
         self.assertEqual(report["results"][0]["how"], "ancestor")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def test_branche_associee_sur_sa_base_avant_son_premier_commit_ne_ferme_pas(self):
         """#4508 (#4482) : une branche associée au lot avant son premier
@@ -536,7 +536,9 @@ class BranchMergeTest(_Base):
         report = self.sync()
         self.assertEqual(report["merged"], 1)
         self.assertEqual(report["results"][0]["how"], "ancestor")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        delivered = work.get(self.db, lot["id"])
+        self.assertEqual((delivered["state"], delivered["legacy_state"]),
+                         ("delivered", "merged"))
 
     def test_gel_sur_le_commit_propre_ne_prouve_pas_la_base_vue(self):
         """#4508 (B dev1) : le gel du lot sur son commit propre F ne prouve
@@ -753,7 +755,7 @@ class BranchMergeTest(_Base):
         _git(self.repo, "merge", "-q", "--ff-only", "agent/dev1-ff")
         report = self.sync()
         self.assertEqual(report["results"][0]["how"], "vu-ancestor")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def origin(self):
         """#2654 : une forge (dépôt nu `origin`) et un second clone qui y pousse."""
@@ -829,7 +831,7 @@ class BranchMergeTest(_Base):
         _git(self.repo, "branch", "-q", "-D", "agent/dev1-fin")
         report = self.sync()
         self.assertEqual(report["results"][0]["how"], "vu-ancestor")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def test_forge_illisible_ne_conclut_pas(self):
         """#2654 : sans lecture de la forge, la tête vue ne ferme pas le lot."""
@@ -866,7 +868,7 @@ class BranchMergeTest(_Base):
         _git(self.repo, "branch", "-q", "-D", "agent/dev1-sq")
         report = self.sync()
         self.assertEqual(report["results"][0]["how"], "vu-squash")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def test_squash_branche_restee_sur_la_forge_ferme(self):
         """#2654 : la forge garde la branche après un squash ; sa tête, au
@@ -884,7 +886,7 @@ class BranchMergeTest(_Base):
         with mock.patch.object(plan_git, "git_fetch", return_value="fetch refused"):
             report = self.sync()
         self.assertEqual(report["results"][0]["how"], "vu-squash")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def test_commit_de_fusion_qui_cite_la_branche(self):
         self.branch("agent/dev1-m", "m1")
@@ -928,7 +930,7 @@ class BranchMergeTest(_Base):
         proc = self.mesh("work", "sync-branches")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("CLOSED", proc.stdout)
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def test_noms_refuses(self):
         for bad in ("a..b", "-x", "a b", "x.lock"):
@@ -1020,7 +1022,7 @@ class CloneRefreshTest(_Base):
         self.assertEqual(entry["result"], "merged", entry)
         self.assertEqual(entry["target"], "origin/main")     # ref publiée lue
         self.assertEqual(entry["how"], "ancestor")
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def test_the_project_repo_wins_over_the_assignee_wrong_repo(self):
         wrong_origin = os.path.join(self.tmp, "manaty", "nexlink.git")
@@ -1047,7 +1049,7 @@ class CloneRefreshTest(_Base):
         self.assertEqual(entry["result"], "merged", entry)
         self.assertEqual(entry["repo"], self.repo)
         self.assertIn("working directory", entry["repo_note"])
-        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "delivered")
 
     def test_a_wrong_repo_without_a_local_clone_is_reported(self):
         wrong_origin = os.path.join(self.tmp, "manaty", "nexlink.git")

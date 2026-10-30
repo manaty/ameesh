@@ -14,8 +14,9 @@ Readers should use these groups rather than repeat storage spellings:
 - `TO_VALIDATE`: work awaiting validation.
 - `DELIVERED`: delivery recorded or promoted.
 - `COMPLETED`: delivered work and explicitly closed work.
-- `TERMINAL`: states without further normal transitions. A recorded delivery
-  can still be promoted, so it is completed without being terminal.
+- `TERMINAL`: completed core outcomes (`delivered`, `closed`), including the
+  historical promotion spelling for compatibility. Development transitions
+  inside a delivered core are governed by its module stage.
 
 The legacy `closed` state also covers delivery outside the target and completed
 review missions. Its close reason must be checked before treating it as an
@@ -128,5 +129,46 @@ retained. The bare profile has neither built-ins nor external entry points,
 and workspace operations without `dev` are no-ops.
 
 The site's [Core and modules](../../site/docs/concepts/core-and-modules.md)
-page describes this installed-module architecture. Changes to persisted state
-spellings and removal of compatibility adapters remain separate work.
+page describes this installed-module architecture. Removal of compatibility
+adapters remains separate work.
+
+L99 tranche 5 (#4353, owner decision #164165, signed approval #167) stores
+both development delivery phases under `state = delivered`. Unpinned dev
+lots use the existing `workflow_stage` for `merged` or `promoted`;
+`legacy_state` carries the compatibility spelling. Pinned Process lots keep
+their admitted revision and arbitrary stage names: signed artifacts and
+receipts are not rewritten. Old Process cores remain interpreted under
+their original terminal and projection rules.
+
+The dev module declares these two stages and their compatibility transition
+maps through `registry.development_workflow()`. A core alone does not tell
+whether a development lot can still be promoted: use `work_lifecycle.phase`
+for that distinction. New core filters select both stages; the old `merged`
+and `promoted` filters continue selecting their individual stages. Public
+GitHub labels and closure text retain their phase-specific wording.
+
+Migration 0518 is explicitly non-additive. Stop executors before applying it
+and restart them after commit, as required by the signed decision. Do not
+roll back the code against the switched database alone: the old executor
+cannot read the new core. The disposable Postgres witness reconstructs the
+pre-switch constraints/functions, applies the migration in a transaction,
+rolls it back and verifies the original rows and milestones, then applies it
+again. Historical events stay intact; the migration adds no synthetic
+milestone or process receipt.
+
+The explicit operator rollback is
+`src/ameesh/migrations/rollback/0518_generic_delivery_state.sql`; it is outside
+automatic migration discovery. With executors stopped, execute its SQL in one
+transaction before restoring the previous code. It restores stage spellings,
+constraints, policy and milestone triggers, and the fingerprint index. Tests
+exercise this script and the forward migration on both delivery stages.
+`work promote <id>` delegates to the dev module; the old
+`work move <id> promoted` command remains accepted.
+
+Schedule the dedicated delivery package and schema application in the same
+staging window: a pending non-additive migration stops automatic packet
+composition. Stop all executors before applying 0518, then start only the
+new code. During that window, disable automatic code fallback or couple it
+to the SQL rollback above; reverting code alone is unsafe. An offline host
+must receive the new code before any of its executors starts against the
+switched database.

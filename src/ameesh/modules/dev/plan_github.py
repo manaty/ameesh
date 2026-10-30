@@ -102,10 +102,10 @@ _MARKER_RE = re.compile(r"<!-- ameesh:package=([A-Za-z0-9][A-Za-z0-9._-]*)(?: d=
 
 #: labels d'état d'une issue de lot
 STATE_LABELS = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, *lifecycle.TO_VALIDATE,
-                lifecycle.DELIVERY_RECORDED, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN)
+                "merged", "promoted", "delivered", lifecycle.BLOCKED, lifecycle.WAITING_HUMAN)
 BASE_LABEL = "ameesh"
 EPIC_LABEL = "ameesh:epic"
-LABEL_COLORS = {lifecycle.REQUESTED: "c5def5", lifecycle.IN_PROGRESS: "1d76db",
+LABEL_COLORS = {"merged": "0e8a16", "promoted": "0e8a16", lifecycle.REQUESTED: "c5def5", lifecycle.IN_PROGRESS: "1d76db",
                 lifecycle.QA: "fbca04", lifecycle.VALIDATED: "0e8a16", lifecycle.DELIVERY_RECORDED: "0e8a16",
                 lifecycle.BLOCKED: "b60205", lifecycle.WAITING_HUMAN: "d93f0b",
                 "epic": "5319e7", "": "ededed",
@@ -1379,7 +1379,7 @@ def lot_state(items: list[dict]) -> tuple[str | None, str]:
     if status == "pending":
         return lifecycle.REQUESTED, "open"
     if status == "merged":
-        return lifecycle.DELIVERY_RECORDED, "closed"
+        return "merged", "closed"
     if status == "abandoned":
         return None, "closed"
     states = {(lifecycle.DELIVERY_RECORDED if i["state"] in lifecycle.DELIVERED else i["state"])
@@ -1755,7 +1755,7 @@ _TYPE_FR = {"bug": "bug", "evolution": "evolution", "improvement": "improvement"
 _PRIORITY_FR = {1: "high priority", 2: "normal priority", 3: "low priority"}
 _STATE_FR = {lifecycle.REQUESTED: "to do", lifecycle.IN_PROGRESS: "in progress",
              lifecycle.QA: "in review", lifecycle.VALIDATED: "approved",
-             lifecycle.DELIVERY_RECORDED: "merged", lifecycle.PROMOTED: "delivered", lifecycle.BLOCKED: "blocked",
+             "merged": "merged", "promoted": "delivered", "delivered": "delivered", lifecycle.BLOCKED: "blocked",
              lifecycle.WAITING_HUMAN: "waiting for a human", lifecycle.CLOSED: "closed"}
 _LOT_FIELD_FR = {"title": "title", "body": "body", "labels": "ameesh labels",
                  "state": "state"}
@@ -2189,7 +2189,7 @@ def lot_labels(item: dict, *, stage_label: str | None = None) -> list[str]:
     if stage_label:
         labels.add(stage_label)
     elif item.get("state"):
-        labels.add("%s:%s" % (BASE_LABEL, item["state"]))
+        labels.add("%s:%s" % (BASE_LABEL, lifecycle.phase(item)))
     if item.get("type") in LOT_TYPES:
         labels.add("%s:%s" % (BASE_LABEL, item["type"]))
     priority = _priority(item)
@@ -2382,8 +2382,8 @@ def _closing(item: dict, *, repo: str, public: bool, issue_of,
     `core` (#2130/D) : le cœur décidé par la projection d'un lot pinné, quand
     il diffère de l'état de la ligne (retenue, ou cœur projeté)."""
     n = int(item["id"])
-    state = core or item.get("state")
-    if state == lifecycle.DELIVERY_RECORDED:
+    state = core or lifecycle.phase(item)
+    if state == "merged":
         pr = _ref_parts(item.get("pr_ref"))
         where = ""
         if pr and pr[0].casefold() == repo.casefold():
@@ -2391,7 +2391,7 @@ def _closing(item: dict, *, repo: str, public: bool, issue_of,
         elif pr and not public:
             where = " by PR %s#%d" % pr
         return "Work item %d merged%s: issue closed by ameesh." % (n, where)
-    if state == lifecycle.PROMOTED:
+    if state == "promoted":
         return "Work item %d delivered: issue closed by ameesh." % n
     if state == lifecycle.CLOSED:
         if item.get("close_reason") == "delivered":

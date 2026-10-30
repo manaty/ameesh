@@ -95,13 +95,16 @@ host operation is fully prepared. This development checkpoint sends no request.
 The expiry must cover the rollback window. A prepared question is not authority.
 
 `SignedDecisionAuthority(db, decision_id, operation, manifest)` implements the
-controller's validation interface. Only an exact signed `apply` answer counts;
-a free-text answer, decline, pending decision, different operation, changed
-manifest or unknown action does not. It re-reads the decision and runs existing
-Ed25519 proof verification against the currently enrolled owner key. Revocation,
-key replacement, a changed signed question and corrupted signatures invalidate
-all subsequent release and recovery steps. The approval nonce must have been
-consumed by this exact decision; this is not a new unconsumed approval.
+controller's validation interface. Only the signed `apply` option counts, as
+`decisions.match_option` recognizes it: the raw key or the two fixed
+`signer-owner.sh` mentions, the whole signed text staying recorded and digested.
+Any other free-text answer, decline, pending decision, different operation,
+changed manifest or unknown action does not. It re-reads the decision and runs
+existing Ed25519 proof verification against the currently enrolled owner key.
+Revocation, key replacement, a changed signed question and corrupted signatures
+invalidate all subsequent release and recovery steps. The approval nonce must
+have been consumed by this exact decision; this is not a new unconsumed
+approval.
 
 Both the deadline embedded in the signed question and the original signed
 approval expiry must still be valid. The expiry row captured after the generic
@@ -207,14 +210,16 @@ no role or migration is applied to a live mesh by this development work.
 
 ## Narrow restart host helper
 
-`helper-redemarrage.py.RestartHelper` supplies system-mode restart and recovery
-restart, restricted to exact enrolled `ameesh-runner@…` or
-`ameesh-runner-agent@…` instances. Its policy identifies the host, allowlist,
-independent controller service and 5–300 second restart budget. The signed
-manifest's policy reference must be `policy-` plus the canonical policy digest,
-so changing that allowlist or budget invalidates operation authority. The
-controller service itself is outside the allowlist and `system.slice` holds
-the action workers independently of runner slices.
+`helper-redemarrage.py.RestartHelper` supplies restart and recovery restart
+through one explicitly enrolled manager: the system manager or the user manager
+of a named account, never inferred from a unit name. It is restricted to exact
+enrolled `ameesh-runner@…` or `ameesh-runner-agent@…` instances. Its policy
+identifies the host, allowlist, manager, independent controller service and
+5–300 second restart budget. The signed manifest's policy reference must be
+`policy-` plus the canonical policy digest, so changing that allowlist, manager
+or budget invalidates operation authority. The controller service itself is
+outside the allowlist and `system.slice` holds the action workers independently
+of runner slices.
 
 Before launch, the helper verifies current signed authority, the live drained
 database fence, and cgroup process inventories. A runner's MainPID can remain;
@@ -263,8 +268,9 @@ snapshots and the controller's own installer wiring are prepared but not
 installed; a real-host pilot, including the enrollment of the probe turn
 (`turn.json`, assembled by `entree-operateur.py` below and installed by the
 signed bootstrap inventory), is still required. This
-checkpoint implements neither user-mode systemd nor other root operations and
-grants no root authority to an agent.
+checkpoint implements no user-mode systemd beyond the fixed helper path
+described below and no other root operation; it grants no root authority to an
+agent.
 
 ## Pinned SSH restart transport
 
@@ -327,10 +333,14 @@ match `[a-z_][a-z0-9_-]{0,31}`. Missing or unknown fields are refused; existing
 inventories must be regenerated and approved with the new policy digest.
 One manager applies to every runner in that policy, independently of unit names.
 For a user manager the root helper uses fixed `systemctl --machine=<account>@.host
---user show|restart` arguments. It inspects the returned cgroup under `user.slice`
-with the same subtree/orphan checks as system runners. The transient action job,
-its state observation and durable receipt remain in the system manager. Neither
-manager nor account can be supplied by the SSH request.
+--user show|restart` arguments. It walks the cgroup subtree reported for the
+enrolled unit with the same process-inventory checks as for system runners; it
+does not verify that the path lies under `user.slice` or any other slice. The
+unit's cgroup is delegated to that account, which can move processes out of the
+subtree, so the check bounds only the processes still visible in the reported
+cgroup. The transient action job, its state observation and durable receipt
+remain in the system manager. Neither manager nor account can be supplied by the
+SSH request.
 
 The public-key file is root-owned 0644 so the dedicated SSH account can read it;
 the enclosing root-owned directory must be searchable. Enrollment, database,
@@ -399,6 +409,31 @@ Authority is checked after slow reads/copy and before publication/replay.
 This pins supplied trees, **not completeness of external Python/ELF dependencies**;
 independently pinned immutable toolchain closure remains an administrator admission
 prerequisite. Tests use synthetic executable bytes, not a production interpreter.
+
+`construction-runtime.py` builds the supplied `runtime` tree, outside root and
+in a new directory, from one exact SHA: a fresh `/usr/bin/python3` venv, the
+ameesh wheel built from a `git archive` of that commit, and its dependency
+closure (`psycopg[binary]`, `psutil`) installed with
+`--require-hashes --only-binary=:all:` from `runtime-pins.txt`; the build
+backend is pinned separately in `runtime-build-pins.txt`. The clone must be
+clean and at exactly that SHA. The command writes a provenance receipt (SHA,
+both pin digests, Python version, wheel digest and measured tree digest) beside
+the read-only runtime, and never installs a root artifact or publishes
+anything. The administrator still reviews the closure and stages the measured
+tree root-owned (`runtime-release.py` requires the staged tree to belong to the
+installing root), not with the builder's ownership.
+
+`construction-runtime.py --assets` (#4786) writes, from the same commit, the
+release assets that publish this provenance: the same wheel, both pin files
+byte for byte and `SHA256SUMS` over the three. The 11:00/23:00 cutoff
+(`release_cutoff.ensure_github_release`) runs the release commit's own
+`construction-runtime.py --assets`, checks `SHA256SUMS` and attaches the assets
+to the GitHub release it creates; a manual `poste.sh publier` builds them
+before the tag. Versions older than `runtime-pins.txt` have none. A failed
+asset build at the cutoff is a report deviation: the release is created without
+assets (staging is not held), and a release created before its assets is not
+completed afterwards. A runtime root is admitted for real production only
+against the assets of its release, so such a release is never admitted.
 
 `compte-release.py` creates the dedicated group/account with exact numeric ids,
 no home creation or supplementary groups, a fixed forced-command shell and an
@@ -495,7 +530,9 @@ The administrator stages `runtime/`, `sources/` and `plan.json` (exactly
 `plan`, `account_ids`, `expires_at`, optional `probe_turn`, `runtime_seal`,
 root 0600) under `/var/lib/ameesh-release-bootstrap/OPERATION/`. The question
 is then asked with `ameesh decide ask --needs-signature`; the owner signs
-`install`. Private state lives under `/var/lib/ameesh-release-bootstrap/.admin`
+`install`, raw or with the fixed `signer-owner.sh` mention, and the backend
+recognizes the option through `decisions.match_option`, never a free prefix.
+Private state lives under `/var/lib/ameesh-release-bootstrap/.admin`
 (no operation name starts with a dot): the controller and effect journals and
 `gestes.jsonl`, an append-only journal hash-chained line by line (`seq`,
 `prev`, `sha`) carrying the backend code digest, bundle digest, step, intent,

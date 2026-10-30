@@ -116,6 +116,32 @@ class ValidationTest(PgTestCase):
         self.assertEqual(rows[0]["facts"]["requested_ts"], self.now + 61)
         self.assertEqual(rows[0]["facts"]["escalated_from"], "human:tpm")
 
+    def test_escalated_request_says_so_to_the_substitute(self):
+        """#4542 N1: the substitute sees why an overdue request reaches them."""
+        view = self.ask(due_ts=self.now + 60)
+        self.assertNotIn("ESCALATED", decisions.format_view(view, self.now)[0])
+        vd.sweep(self.cfg, self.db, now=self.now + 61)
+        current = decisions.get(self.db, view["id"], self.now + 62)
+        self.assertIn("ESCALATED", storage.of(self.db).decisions.get(view["id"])["body"])
+        self.assertIn("[ESCALATED]", decisions.format_view(current, self.now + 62)[0])
+        self.assertIn("(escalated)", decisions.describe(current))
+
+    def test_withdrawal_closes_each_journalled_request(self):
+        """#4542 N2: a withdrawal is the outcome of the initial and the
+        substitute's requests, once even on a replay."""
+        view = self.ask(due_ts=self.now + 60)
+        vd.sweep(self.cfg, self.db, now=self.now + 61)
+        decisions.withdraw(self.cfg, self.db, view["id"], requester="requester",
+                           why="obsolete", now=self.now + 70)
+        for person in ("human:tpm", "human:po"):
+            kinds = [r["kind"] for r in
+                     storage.of(self.db).decisions.validation_history(person=person)]
+            self.assertEqual(kinds.count("withdrawn"), 1, (person, kinds))
+            row = [r for r in storage.of(self.db).decisions.validation_history(person=person)
+                   if r["kind"] == "withdrawn"][0]
+            self.assertEqual(row["facts"]["withdrawn_by"], "requester")
+            self.assertNotIn("obsolete", json.dumps(row["facts"]))
+
     def test_early_response_cancels_escalation(self):
         view = self.ask(due_ts=self.now + 60)
         self.answer(view)

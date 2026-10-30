@@ -48,6 +48,14 @@ class NeighborTest(PgTestCase):
         self.assertIn("mobile-build.yml:121", row["motifs"][0])
         self.assertEqual(row["state_label"], "merged → develop")
 
+    def test_promoted_neighbor_is_labelled_delivered(self):
+        old = self.lot("correctif livré", body="x.txt:1")
+        self.db.execute("UPDATE work_items SET state = 'promoted' WHERE id = %s",
+                        (old["id"],))
+        found = intake_neighbors.neighbors(self.db, "p", title="x.txt:1")
+        self.assertEqual([row["id"] for row in found["neighbors"]], [old["id"]])
+        self.assertEqual(found["neighbors"][0]["state_label"], "livré")
+
     def test_t5_neighbor_closed_eight_days_ago_is_excluded(self):
         old = self.lot("ancien constat", body="x.txt:1")
         recent = self.lot("constat récent", body="x.txt:1")

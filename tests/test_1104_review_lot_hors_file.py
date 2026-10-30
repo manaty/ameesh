@@ -206,7 +206,11 @@ class _Witness(PgTestCase):
         _git(self.repo, "checkout", "-q", "-b", branch, "develop")
         self.commit(name)
         sha = _git(self.repo, "rev-parse", "HEAD")
-        work.milestone(self.db, lot, "frozen", sha=sha, actor="claude1")
+        # Repository discovery is not this witness: unassigned imported lots
+        # otherwise search the real host's neighbouring worktrees for the SHA.
+        from ameesh import review_designation_activation
+        with mock.patch.object(review_designation_activation, "_repository", return_value=self.repo):
+            work.milestone(self.db, lot, "frozen", sha=sha, actor="claude1", repo=self.repo)
         return sha
 
     def review_lots(self, lot):
@@ -476,7 +480,7 @@ class CatchUpWitnessTest(_Witness):
                          first)
         rows = self.review_lots(old)
         self.assertEqual(len(rows), 1, rows)
-        self.assertEqual(work.get(self.db, old)["state"], "merged", "la fusion reste acquise")
+        self.assertEqual(work.get(self.db, old)["state"], "delivered", "la fusion reste acquise")
         with mock.patch.object(review_lot, "class_at_merge",
                                return_value={"class": "light", "why": "témoin"}):
             second = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
@@ -497,7 +501,7 @@ class CatchUpWitnessTest(_Witness):
         self.assertEqual((first["examined"], first["missing"], first["opened"]), (1, 1, 1),
                          first)
         self.assertEqual(len(self.review_lots(promoted)), 1)
-        self.assertEqual(work.get(self.db, promoted)["state"], "promoted")
+        self.assertEqual(work.get(self.db, promoted)["state"], "delivered")
         with mock.patch.object(review_lot, "class_at_merge",
                                return_value={"class": "light", "why": "témoin"}):
             second = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
@@ -1028,7 +1032,7 @@ class DeclaredMergeWitnessTest(_Witness):
         proc = self.mesh("work", "merged", str(lot), "--sha", "abcdef1234",
                          "--repo", self.repo)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("lot #%d already merged:" % lot, proc.stdout)
+        self.assertIn("lot #%d already delivered:" % lot, proc.stdout)
         self.assertIn("relecture non ouverte", proc.stdout)
         self.assertNotIn("nothing to do", proc.stdout)
 
