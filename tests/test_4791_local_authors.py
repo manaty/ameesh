@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import canon, merge_queue, review_authors as authors
+from ameesh import canon, merge_queue, grep_cache, review_authors as authors
 
 
 class LocalAuthorsTest(unittest.TestCase):
@@ -225,3 +225,45 @@ class LocalAuthorsTest(unittest.TestCase):
         self.assertEqual(set(observed.splitlines()), set(expected.splitlines()))
         self.assertIn(detached, observed)
         self.assertIn(self.head, observed)
+
+    def test_missing_blob_does_not_poison_shared_cache(self):
+        # Both rc=1 (no readable match) and rc=0 (partial matches) occur with
+        # missing blobs. A complete clone sharing the cache must read afresh.
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                with open(os.path.join(self.repo, "moved"), "w") as stream:
+                    stream.write("original content\n")
+                if not partial:
+                    self.git("rm", "--quiet", "content")
+                else:
+                    with open(os.path.join(self.repo, "readable"), "w") as stream:
+                        stream.write("original content\nother line\n")
+                self.git("add", ".")
+                self.git("commit", "--quiet", "-m", "move")
+                head = self.git("rev-parse", "HEAD")
+                complete = os.path.join(self.repo, "complete")
+                subprocess.check_call(["git", "clone", "--quiet", "--no-hardlinks",
+                                       self.repo, complete])
+                blob = self.git("rev-parse", head + ":moved")
+                os.unlink(os.path.join(self.repo, ".git", "objects", blob[:2], blob[2:]))
+                self.git("config", "remote.origin.promisor", "true")
+                self.git("config", "remote.origin.url", "https://invalid.example/repo")
+                with mock.patch.dict(os.environ, {
+                        "AMEESH_GREP_CACHE": "on",
+                        "AMEESH_GREP_CACHE_DIR": os.path.join(self.repo, ".git", "grep-cache")}), \
+                        mock.patch.object(grep_cache, "ENABLED", True):
+                    grep_cache._reset_process_state()
+                    self.assertIsNone(authors._tree_lines(
+                        self.repo, head, ["original content"]))
+                    with mock.patch.object(authors, "TREE_LINES_WHOLE_MAX", 0):
+                        self.assertIsNone(authors._tree_lines(
+                            self.repo, head, ["original content"]))
+                    self.assertIsNone(authors._source_paths(
+                        self.repo, head, ["original content"], {}))
+                    self.assertEqual(authors._tree_lines(
+                        complete, head, ["original content"]), {"original content"})
+                # Restore the missing object for the next fixture revision.
+                import shutil
+                shutil.copyfile(os.path.join(complete, ".git", "objects", blob[:2], blob[2:]),
+                                os.path.join(self.repo, ".git", "objects", blob[:2], blob[2:]))
+                shutil.rmtree(complete)

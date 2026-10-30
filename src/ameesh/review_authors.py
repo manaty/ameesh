@@ -181,11 +181,16 @@ def _sweep_grep(repo: str, rev: str, args: Sequence[str], patterns: Sequence[str
         sweep.check(step)
     try:
         with _local_object_repo(repo) as (reader, local_env):
-            return plan_git._git(
+            proc = plan_git._git(
                 reader, "grep", *args, "-f", "-", str(rev), stdin=stdin,
                 timeout=sweep.deadline.remaining() if sweep is not None else canon.GIT_TIMEOUT,
                 deadline=sweep.deadline if sweep is not None else None,
                 env_extra={**env, **local_env})
+            # Missing blobs can yield rc=1 (no matches) or rc=0 (partial
+            # matches). Neither proves absence and neither may be shared.
+            if proc.stderr:
+                raise canon.GitError(proc.stderr.decode("utf-8", "replace"))
+            return proc
     except canon.GitDeadline:
         if sweep is not None:
             sweep.trip(step)
