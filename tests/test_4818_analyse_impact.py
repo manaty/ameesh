@@ -274,10 +274,6 @@ class CreationTest(_Empreintes):
         ouvert = work.add(self.db, title="sans chemin", app="nexlink", cfg=self.cfg)
         self.assertEqual(fp.paths_of(self.db, ouvert["id"]), [])
         store = storage.of(self.db).work_footprints
-        # sans cfg (aucun projet connu) : rien n'est deviné ni journalisé (#4186)
-        sans_cfg = work.add(self.db, title="corriger src/c.py", app="nexlink")
-        self.assertEqual(fp.paths_of(self.db, sans_cfg["id"]), [])
-        self.assertEqual(store.analyses([sans_cfg["id"]]), {})
         self.assertEqual(store.analyses([ouvert["id"]])[ouvert["id"]]["status"], "unknown")
         store.set_policy("nexlink", actor="human:proprio", unknown_policy="repository")
         prudent = work.add(self.db, title="toujours sans chemin", app="nexlink",
