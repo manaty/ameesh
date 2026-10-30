@@ -1411,6 +1411,14 @@ cannot be told apart from an old one: the cleanup may remove it, and
 `preparer` rebuilds it. `retour` does not clean up: the version it switches
 away from stays on disk for inspection and a retry.
 
+A systemd unit must therefore never name a versioned venv (#4754): a watch or
+wake unit armed from a process whose `PATH` held `venv-<sha7>/bin` failed with
+203/EXEC once that venv was removed. `ameesh watch` writes the stable path
+(`venv-courant/bin/ameesh` next to the versioned venv, else
+`~/.local/bin/ameesh`), and the periodic host pass (runner and
+`ameesh menage`) rewrites the `ExecStart` of the `ameesh-watch-*` and
+`ameesh-wake-*` units written before, journaled as `unit` / `repinned`.
+
 When writing a launcher fails, its temporary file is removed on a best effort
 basis and the previous destination stays intact; a cleanup error preserves the
 original write error.
