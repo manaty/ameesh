@@ -25,6 +25,7 @@ class GuestRuntimeTest(unittest.TestCase):
 
     def populate(self, *, legacy=False):
         self.lib.mkdir()
+        self.lib.chmod(0o755)
         self.config.write_text('{"slots": 3}')
         for relative, name, mode in runtime.FILES:
             origin = self.source / relative
