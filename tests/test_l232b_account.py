@@ -135,10 +135,20 @@ class AccountTest(unittest.TestCase):
         with mock.patch.object(account.os,'geteuid',return_value=0):
             system=account.LinuxAccounts()
         result=mock.Mock(stdout='')
+        # Ubuntu/Debian install groupadd and useradd in /usr/sbin; Arch exposes
+        # /usr/sbin as a system symlink. Both are called by absolute path and
+        # never resolved through the inherited PATH (fixed env below).
+        with mock.patch.object(account.subprocess,'run',return_value=result) as run:
+            system.create_group(987)
+            args=run.call_args.args[0]
+            self.assertEqual(args[0],'/usr/sbin/groupadd')
+            self.assertEqual(args[1:4],['--system','--gid','987'])
+            self.assertEqual(args[-1],'ameesh-release')
+            self.assertEqual(run.call_args.kwargs['env'],{'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C'})
         with mock.patch.object(account.subprocess,'run',return_value=result) as run:
             system.create_account(987,987)
             args=run.call_args.args[0]
-            self.assertEqual(args[0],'/usr/bin/useradd')
+            self.assertEqual(args[0],'/usr/sbin/useradd')
             self.assertEqual(args[-1],'ameesh-release')
             self.assertIn('--no-log-init',args)
             self.assertIn('--no-create-home',args)

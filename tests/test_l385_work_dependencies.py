@@ -197,10 +197,10 @@ class ReleasedWakeTest(PgTestCase):
         self.assertEqual(done["result"], "merged")
         [row] = self.inbox()
         self.assertEqual((row["kind"], self.mail_lot(row)), ("event", str(self.a)))
-        self.assertIn("lot #%d is merged" % self.b, row["body"])
+        self.assertIn("lot #%d is delivered" % self.b, row["body"])
         self.assertIn("lot #%d" % self.a, row["body"])
         self.assertEqual(mail.message_payload(row)["dependency"],
-                         {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})
+                         {"dependent": self.a, "blocker": self.b, "blocker_state": "delivered"})
         # Rejouer la déclaration de fusion ne réveille pas une seconde fois.
         self.assertEqual(work.close_merged(self.db, self.b, sha="a" * 40, actor="git:main")["result"],
                          "already")
@@ -349,7 +349,7 @@ class ReleasedWakeTest(PgTestCase):
 
         with mock.patch("ameesh.mail.send", side_effect=spy):
             work.close_merged(self.db, self.b, sha="b" * 40, actor="git:main")
-        self.assertEqual(seen, [("merged", "dev-a", "event", True)])
+        self.assertEqual(seen, [("delivered", "dev-a", "event", True)])
 
     def test_a_failed_wake_rolls_back_the_closure_and_a_retry_wakes_once(self):
         """Adversaire : le courrier échoue après l'écriture de la fermeture.
@@ -367,10 +367,10 @@ class ReleasedWakeTest(PgTestCase):
         self.assertEqual(self.inbox(), [])
         done = work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")
         self.assertEqual(done["result"], "merged")
-        self.assertEqual(work.get(self.db, self.b)["state"], "merged")
+        self.assertEqual(work.get(self.db, self.b)["state"], "delivered")
         [row] = self.inbox()
         self.assertEqual(mail.message_payload(row)["dependency"],
-                         {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})
+                         {"dependent": self.a, "blocker": self.b, "blocker_state": "delivered"})
         # Rejouer la déclaration, une fois la fusion commise, ne double pas.
         self.assertEqual(work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")["result"],
                          "already")

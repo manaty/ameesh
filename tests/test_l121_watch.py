@@ -634,6 +634,60 @@ class WakeTest(PgTestCase):
             self.arm()
         self.assertEqual(os.listdir(self.units), [])
 
+    def write_legacy_wake(self, agent: str, slug: str) -> list[str]:
+        """#4755: the four files of a wake armed before #1039, as they were
+        written (`ameesh-watch-<agent>-<slug>.*`)."""
+        names = {}
+        for suffix, text in watch.wake_units(agent, slug, 1800, "/home/u/.local/bin/ameesh",
+                                             "/usr/bin:/bin", self.units).items():
+            names[suffix.rsplit(".", 1)[1]] = text
+        names["env"] = 'AMEESH_HOST="laptop"\n'
+        names["wake.json"] = json.dumps({"agent": agent, "slug": slug,
+                                         "message": "REVEIL ancien"}) + "\n"
+        for suffix, text in names.items():
+            with open(os.path.join(self.units, "ameesh-watch-%s-%s.%s" % (agent, slug, suffix)),
+                      "w", encoding="utf-8") as fh:
+                fh.write(text)
+        return sorted("ameesh-watch-%s-%s.%s" % (agent, slug, s) for s in names)
+
+    def test_a_wake_armed_before_1039_disarms_itself_on_its_firing(self):
+        # #4755: `watch fire` looked for the state under the new prefix only,
+        # failed, and `Restart=on-failure` restarted the unit every 2 min
+        # (8622 restarts of ameesh-watch-deepseek1-1369-m24h since 18/10).
+        self.register_more("x")
+        self.assertEqual(len(self.write_legacy_wake("x", "1369-m24h")), 4)
+        with mock.patch.object(watch.fil, "record") as thread:
+            text = watch.fire(self.here, self.db, "x", "1369-m24h", run=self.run_for("x"),
+                              env={"AGENT_MAIL_NAME": "x", watch.UNIT_DIR_ENV: self.units})
+        self.assertIn("armed before #1039", text)
+        self.assertEqual(os.listdir(self.units), [])            # one firing, no restart
+        self.assertFalse(thread.called)                          # the stale message is not sent
+        self.assertIn(["stop", "ameesh-watch-x-1369-m24h.timer"], self.calls)
+        # a state already gone (fired, cancelled): the firing succeeds too
+        text = watch.fire(self.here, self.db, "x", "1369-m24h", run=self.run_for("x"),
+                          env={"AGENT_MAIL_NAME": "x", watch.UNIT_DIR_ENV: self.units})
+        self.assertIn("already fired or cancelled", text)
+
+    def test_the_sweep_takes_legacy_wakes_never_a_watch(self):
+        # the old name of the wake (x, deadline) is the periodic watch of
+        # `x-deadline` (#1039): only a service that runs `watch fire` goes
+        self.register_more("x")
+        self.register_more("x-deadline")
+        for name, text in watch.units("x-deadline", 1800, "/home/u/.local/bin/ameesh",
+                                      "/usr/bin:/bin", self.units).items():
+            with open(os.path.join(self.units, name), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        watch_files = sorted(os.listdir(self.units))
+        self.write_legacy_wake("x", "m6h")
+        self.assertFalse(watch._disarm_legacy(self.units, "x", "deadline", self.run_for("x")))
+        with mock.patch.object(watch.fil, "record"):
+            watch.arm(self.here, self.db, "x", "next", 1800, "REVEIL x",
+                      run=self.run_for("x"), env=self.env, actor="human:owner")
+        left = sorted(os.listdir(self.units))
+        self.assertEqual([n for n in left if n.startswith(watch.UNIT_PREFIX)], watch_files)
+        self.assertNotIn("ameesh-watch-x-m6h.service", left)
+        self.assertIn("ameesh-wake-1-x-next.wake.json", left)
+
     def test_cancel(self):
         self.arm()
         self.calls.clear()

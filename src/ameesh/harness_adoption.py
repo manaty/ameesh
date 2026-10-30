@@ -1280,7 +1280,7 @@ def _adopt_locked(cfg, db, lot: int, report: Report, *, bins: dict | None = None
     if report.evaluation_lot != int(lot):
         raise VeilleError("report.evaluation_lot is #%s, not #%s"
                           % (report.evaluation_lot, lot))
-    if item.get("state") in ("merged", "promoted", "closed"):
+    if item.get("state") in ("merged", "promoted", "delivered", "closed"):
         raise VeilleError("work item #%s is %s: nothing to adopt"
                           % (lot, item.get("state")))
     existing = load(db, int(lot))
@@ -1751,7 +1751,7 @@ def discover(cfg, db, *, now: float, project: str | None = None,
     rows = db.query(
         """
         SELECT w.id FROM work_items w
-         WHERE w.state NOT IN ('merged', 'promoted', 'closed')
+         WHERE w.state NOT IN ('merged', 'promoted', 'delivered', 'closed')
            AND w.title ILIKE %s
            AND (%s::text IS NULL OR w.app = %s)
            AND NOT EXISTS (SELECT 1 FROM harness_adoptions a

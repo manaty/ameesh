@@ -353,7 +353,9 @@ def parse_settings(raw) -> Settings:
             if not isinstance(text, str):
                 raise SettingsError("%s.%s: text expected" % (where, key))
             texts[key] = text.strip().strip("/")
-        width = value.get("migrations_width") or 0
+        width = value.get("migrations_width")
+        if width is None:
+            width = 0
         if isinstance(width, bool) or not isinstance(width, int) or not 0 <= width <= 9:
             raise SettingsError("%s.migrations_width: digits of a migration number (1-9) "
                                 "expected" % where)
@@ -1942,6 +1944,37 @@ def packet_suite_covered(entry, entries) -> bool:
                and (suite is None or other.get("checkSuiteId") is None
                     or other.get("checkSuiteId") == suite)
                for other in entries)
+
+
+def packet_portier_replaced(entry, entries, rollup) -> bool:
+    """#4812 : `entry` est un job du portier `paquet` qu'ameesh a annulé
+    **par construction** — `ameesh ci run --full` remplace le portier de la
+    tête par le run `pull_request` étiqueté de la PR (#2876) : `couverture`
+    finit CANCELLED, `suite complète du paquet` SKIPPED.
+
+    La preuve est double : le job `couverture` annulé du même run (même
+    `checkSuiteId` quand les deux le portent), et l'agrégat `tests` du
+    workflow `tests` vert dans le rollup de la même tête — la suite complète
+    a bien tourné, ailleurs. Sans elle, ou pour une suite annulée, expirée ou
+    rouge, rien ne change : le non concluant se consigne (#3085)."""
+    name = str(entry.get("name") or "")
+    state = str(entry.get("conclusion") or "").upper()
+    if not ((name == PACKET_COVERAGE and state == "CANCELLED")
+            or ((name == PACKET_SUITE or name.startswith(PACKET_SUITE + " / "))
+                and state == "SKIPPED")):
+        return False
+    suite = entry.get("checkSuiteId")
+    cancelled = any(str(other.get("name") or "") == PACKET_COVERAGE
+                    and str(other.get("workflowName") or "") == "paquet"
+                    and str(other.get("conclusion") or "").upper() == "CANCELLED"
+                    and (suite is None or other.get("checkSuiteId") is None
+                         or other.get("checkSuiteId") == suite)
+                    for other in entries)
+    return cancelled and any(
+        str(other.get("name") or "") == "tests"
+        and str(other.get("workflowName") or "") == "tests"
+        and check_result(other) == CI_GREEN_RESULT
+        for other in latest_rollup(rollup) or ())
 
 
 def ci_state(rollup) -> str:

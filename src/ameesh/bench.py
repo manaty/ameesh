@@ -27,6 +27,9 @@ depuis le 17/10). Cette maintenance :
   échanges aucun backend ne reste, la suite se reconnecte ensuite). Seul un
   opérateur, après avoir arrêté tout processus de suite, les admet
   explicitement (``python -m ameesh.bench purge --admit-unmarked``) ;
+* purge les bases jetables laissées **invalides** (`datconnlimit = -2`) par un
+  DROP DATABASE annulé pendant son checkpoint (#4822) : sans cela elles ne
+  peuvent plus être ouvertes et l'autovacuum du banc s'arrête (#4680) ;
 * signale le gonflement et un dernier autovacuum trop ancien (`doctor`) ;
 * refuse de conclure quand l'activité n'est pas lisible (pas superutilisateur,
   `pg_stat_file` refusé) : le doute ne supprime rien.
@@ -61,6 +64,24 @@ from . import platform as platform_mod
 SCHEMA_PREFIX = "t_"
 #: motif strict d'un nom de schéma purgé : jamais d'identifiant arbitraire
 SCHEMA_RE = re.compile(r"^t_[a-z0-9_]{1,58}$")
+
+#: #4822 : bases jetables créées par la suite et ses scripts (`scripts/test.sh`,
+#: `tests/test_l56_role_executor.py`, la restauration de sauvegarde). Seuls ces
+#: noms sont purgés quand un DROP DATABASE annulé les a laissés invalides.
+TEST_DATABASE_PREFIXES = (
+    "agent_mesh_test_",
+    "t_executor_db_",
+    "ameesh_backup_test_",
+    "ameesh_verify_",
+)
+TEST_DATABASE_RE = re.compile(
+    r"^(?:%s)[a-z0-9_]*$" % "|".join(re.escape(prefix)
+                                     for prefix in TEST_DATABASE_PREFIXES))
+
+#: PostgreSQL marque une base dont le DROP DATABASE a été interrompu par un
+#: `datconnlimit = -2` (DATCONNLIMIT_INVALID_DB) : plus aucune connexion n'y
+#: est possible, seul un nouveau DROP DATABASE la retire.
+INVALID_CONNLIMIT = -2
 
 #: catalogues suivis par le signal et le diagnostic
 CATALOGS = ("pg_attribute", "pg_class", "pg_depend", "pg_constraint",
@@ -651,6 +672,90 @@ def _database_size(db) -> int | None:
 def _short_reason(exc: Exception) -> str:
     text = " ".join(str(exc).split())
     return text[:80] if text else exc.__class__.__name__
+
+
+@dataclass(frozen=True)
+class InvalidPurge:
+    """Bases invalides vues, supprimées et gardées par la passe (#4822)."""
+
+    scanned: int
+    dropped: tuple[str, ...]
+    kept: tuple[tuple[str, str], ...]
+    unreadable: str = ""
+
+
+def invalid_databases(db) -> list[str]:
+    """Bases invalides visibles par `db`, hors base courante (#4822).
+
+    `datconnlimit = -2` est l'état que PostgreSQL laisse après un DROP
+    DATABASE annulé pendant son checkpoint : la base n'accepte plus de
+    connexion et seul un nouveau DROP DATABASE la retire.
+    """
+    rows = db.query(
+        "SELECT datname FROM pg_database WHERE datconnlimit = %s "
+        "AND datname <> current_database() ORDER BY datname",
+        (INVALID_CONNLIMIT,))
+    return [str(row["datname"]) for row in rows]
+
+
+def purge_invalid_databases(db, *,
+                            only: frozenset[str] | set[str] | None = None,
+                            budget_s: float = PURGE_BUDGET_S) -> InvalidPurge:
+    """Purge les bases de test invalides laissées par un DROP annulé (#4822).
+
+    Le DROP qui a produit l'état invalide a été coupé par son
+    `statement_timeout` pendant le checkpoint. La passe retire chaque base par
+    ``DROP DATABASE IF EXISTS … WITH (FORCE)``, comme la purge du banc de
+    #1992, sur une connexion dont le délai est explicitement mis à zéro
+    (`db.execute_without_statement_timeout`) : le délai de la suite — ou un
+    délai hérité du rôle, de la base, de `PGOPTIONS` ou du DSN — ne doit pas
+    reproduire l'état qu'il répare.
+
+    Seuls les noms des bases jetables de la suite et de ses scripts sont
+    visés (`TEST_DATABASE_RE`) ; une base invalide étrangère est gardée.
+    ``only`` borne la passe à ces noms (témoins).
+    """
+    cfg = getattr(db, "cfg", None)
+    if cfg is None or getattr(cfg, "backend", "pg") == "mediated":
+        return InvalidPurge(scanned=0, dropped=(), kept=(),
+                            unreadable="no PostgreSQL bench connection")
+    try:
+        names = invalid_databases(db)
+    except db_mod.DbError as exc:
+        return InvalidPurge(scanned=0, dropped=(), kept=(),
+                            unreadable=_short_reason(exc))
+    kept = [(name, "not a test database") for name in names
+            if not TEST_DATABASE_RE.match(name)]
+    targets = [name for name in names if TEST_DATABASE_RE.match(name)]
+    if only is not None:
+        kept.extend((name, "outside only") for name in targets if name not in only)
+        targets = [name for name in targets if name in only]
+    if not targets:
+        return InvalidPurge(scanned=len(names), dropped=(), kept=tuple(kept))
+    try:
+        admin = db_mod.connect(dataclasses.replace(cfg, statement_timeout_ms=0))
+    except (db_mod.Unavailable, db_mod.DbError, OSError) as exc:
+        return InvalidPurge(scanned=len(names), dropped=(), kept=tuple(kept),
+                            unreadable=_short_reason(exc))
+    dropped: list[str] = []
+    started = time.monotonic()
+    try:
+        for name in targets:
+            if time.monotonic() - started > budget_s:
+                kept.append((name, "purge budget exceeded"))
+                continue
+            try:
+                db_mod.execute_without_statement_timeout(
+                    admin, "DROP DATABASE IF EXISTS %s WITH (FORCE)"
+                    % db_mod.quote_ident(name))
+            except db_mod.DbError as exc:
+                kept.append((name, _short_reason(exc)))
+                continue
+            dropped.append(name)
+    finally:
+        admin.close()
+    return InvalidPurge(scanned=len(names), dropped=tuple(dropped),
+                        kept=tuple(kept))
 
 
 def doctor_lines(cfg=None, *, now: float | None = None) -> list[str]:

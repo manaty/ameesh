@@ -924,6 +924,15 @@ def _unreceived_authors(db, item: Mapping, repo: str, sha: str, *,
 
 #: longueur minimale d'une ligne « significative » pour la preuve de contenu
 MIN_CONTENT_LINE = 8
+#: #4913 : au-delà de ce nombre de lignes demandées, `git grep -F -f -` coûte
+#: plus cher que la lecture complète de l'arbre et de son cache (#4475) ;
+#: en dessous, le balayage ciblé ne garde que les lignes demandées, donc une
+#: entrée de cache bornée par la demande et jamais par la taille de l'arbre.
+#: Mesure release/11ag (arbre de 105 Mio, 22 Mio compressés) : 275 motifs
+#: 3,5 s, 409 motifs 16,6 s, 1 115 motifs 40,3 s, arbre complet ~0,8 s plus
+#: traitement de la sortie. 384 garde le ciblé sous le point où il devient
+#: plus cher que la lecture complète.
+TREE_LINES_WHOLE_MAX = 384
 #: lignes de code génériques : leur présence ne prouve aucun contenu propre
 _TRIVIAL_LINES = frozenset((
     "pass", "return", "return true", "return false", "break", "continue",
@@ -2862,10 +2871,13 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
     """Les lignes (dépouillées) de `lines` égales à une ligne de l'arbre de
     `rev` (à l'indentation près), ou None si la lecture est impossible.
 
-    L'arbre est lu en entier avec un seul motif universel, puis mis en cache
-    indépendamment des lignes demandées (#4475). L'intersection en Python
-    évite le coût motifs × arbre de `git grep -F`. Le format de sortie est
-    fixé : ni couleur, ni numéro, ni colonne (#2994 B1 cx1).
+    Jusqu'à `TREE_LINES_WHOLE_MAX` lignes demandées, le balayage est ciblé
+    (`git grep -F -f -`) : le cache ne garde que les lignes trouvées, donc une
+    entrée bornée par la demande, jamais par la taille de l'arbre (#4913).
+    Au-delà, l'arbre est lu en entier avec un seul motif universel, puis mis
+    en cache indépendamment des lignes demandées (#4475). L'intersection en
+    Python évite le coût motifs × arbre de `git grep -F`. Le format de sortie
+    est fixé : ni couleur, ni numéro, ni colonne (#2994 B1 cx1).
     `binary=True` lit aussi les fichiers binaires comme du texte (`-a`) ;
     sinon ils sont ignorés (`-I`)."""
     wanted = {str(line).strip() for line in lines or () if str(line).strip()}
@@ -2874,9 +2886,35 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
     if not repo or not rev:
         return None
     flag = "-a" if binary else "-I"
+    targeted = (len(wanted) <= TREE_LINES_WHOLE_MAX
+                and all("\n" not in line and "\x00" not in line
+                        for line in wanted))
     sweep = active_sweep()
     if sweep is not None:
-        sweep.check("git grep -h %s -G -f - %s" % (flag, rev))
+        sweep.check("git grep -h %s %s -f - %s" %
+                    (flag, "-F" if targeted else "-G", rev))
+    patterns = sorted(wanted)
+
+    def matches():
+        try:
+            proc = _sweep_grep(repo, rev, ("--no-color", "--no-line-number",
+                                           "--no-column", "-h", flag, "-F"),
+                               patterns,
+                               "git grep -h %s -F -f - %s" % (flag, rev))
+        except SweepDeadline:
+            raise
+        except Exception:  # noqa: BLE001 - lecture impossible : doute
+            return None
+        if proc.returncode == 1:
+            return []
+        if proc.returncode != 0:
+            return None
+        # Ne garder que les lignes demandées : un motif court peut correspondre
+        # à des milliers de lignes, et l'entrée doit rester bornée par la
+        # demande (#4913).
+        return sorted({line.strip() for line in
+                       proc.stdout.decode("utf-8", "replace").splitlines()
+                       if line.strip()} & wanted)
 
     def scan():
         try:
@@ -2895,8 +2933,18 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
                        proc.stdout.decode("utf-8", "replace").splitlines()
                        if line.strip()})
 
-    # Le mode distingue ce résultat des anciennes entrées limitées aux motifs.
-    # grep_cache lie aussi la clé à l'arbre immuable et à ses attributs (#3974).
+    # Un motif multiligne ou à NUL ne peut pas passer par `-f -` : la lecture
+    # complète reste alors la seule forme exacte.
+    if targeted:
+        # Le mode et les motifs entrent dans la clé : deux demandes
+        # différentes ne se remplacent plus l'une l'autre (#4913).
+        found = grep_cache.cached(repo, str(rev), "tree-match" + flag,
+                                  patterns, matches, wait=_cache_wait())
+        return None if found is None else wanted.intersection(found)
+
+    # Le mode distingue ce résultat des entrées ciblées et des anciennes
+    # entrées limitées aux motifs. grep_cache lie aussi la clé à l'arbre
+    # immuable et à ses attributs (#3974).
     found = grep_cache.cached(repo, str(rev), "tree-lines" + flag, [], scan,
                               wait=_cache_wait())
     return None if found is None else wanted.intersection(found)
