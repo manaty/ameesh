@@ -601,11 +601,25 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
         return None
     from . import review_authors, review_designation_activation as act
     milestone = _freeze_milestone(marks, frozen, repo)
-    authors, unknown, correctors = act.attribution_of_head(
-        db, item, milestone, repo, base, frozen, families=families or (),
-        commits=commits, strict=strict, families_out=families_out,
-        target=target or base, admitted_heads=tuple(admitted_heads),
-        exclusions_out=exclusions_out)
+    # #4791: queue and fire share this bounded, fail-closed attribution.
+    # Reuse an outer sweep rather than restarting its budget.
+    import contextlib
+    outer = review_authors.active_sweep()
+    scope = (contextlib.nullcontext(outer) if outer is not None else
+             review_authors.sweep_deadline(AUTHORS_SWEEP_BUDGET_S,
+                                          "lot #%s" % item.get("id")))
+    with scope as sweep:
+        try:
+            authors, unknown, correctors = act.attribution_of_head(
+                db, item, milestone, repo, base, frozen, families=families or (),
+                commits=commits, strict=strict, families_out=families_out,
+                target=target or base, admitted_heads=tuple(admitted_heads),
+                exclusions_out=exclusions_out)
+        except review_authors.SweepDeadline as exc:
+            raise ValueError("lecture d'auteurs non concluante: %s" % exc) from exc
+        if sweep.tripped or sweep.deadline.expired():
+            raise ValueError("lecture d'auteurs non concluante: budget exhausted "
+                             "at %s" % (sweep.tripped or "attribution"))
     if unknown:
         # #3835 : nommer le gel antérieur et le lot qui portent l'inconnu, et
         # ne proposer `--supersedes` que pour un gel prouvé hors de toute ref.
