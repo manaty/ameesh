@@ -36,6 +36,8 @@
   ameesh ci status <lot> [--limit N] [--json]
         latest CI runs and failing tests of a {work};
   ameesh conflicts [--all] [--json]     conflict radar between {works} (L160b);
+  ameesh turn current [--local] [--expect-turn ID] [--json]
+        read the calling turn; reuse requires its captured turn id;
   ameesh cost …               turn cost, per-turn usage, gauges and their
         history, pay-per-token provider balance (`cost turns|gauges|balance`);
   ameesh debit [--json] [--check] [--hours N] [--threshold 2h]
@@ -356,6 +358,9 @@ def _dispatch(argv: list[str] | None) -> int:
         from . import version
         print("ameesh %s" % version())
         return 0
+    if command == "turn" and rest[:1] == ["current"]:
+        from . import cli
+        return cli.cmd_turn_current(rest[1:])
     if command == "mail":
         from . import cli
         return cli.main(rest)

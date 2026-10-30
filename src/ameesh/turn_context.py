@@ -361,3 +361,57 @@ def remove(state_dir: str) -> None:
         os.unlink(path(state_dir))
     except FileNotFoundError:
         return
+
+
+def current(*, expect_turn: str | None = None, environ=None) -> dict:
+    """Read the calling turn, before any database access.
+
+    A resident turn pointer never falls back to the process's lifetime id.
+    Callers reusing an authorization must supply its captured turn id.
+    """
+    env = os.environ if environ is None else environ
+    try:
+        filename = env.get(ENV)
+        if not filename or not os.path.isabs(filename):
+            raise ContextError("not-in-turn")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        with os.fdopen(os.open(filename, flags), encoding="utf-8") as handle:
+            document = json.load(handle)
+        validate(document)
+        turn_id = document["turn"]["id"]
+        if expect_turn is not None and turn_id != expect_turn:
+            raise ContextError("turn-mismatch")
+        pointer = env.get("AMEESH_TURN_ID_FILE")
+        if pointer:
+            with open(pointer, encoding="utf-8") as handle:
+                active = handle.read().strip()
+        else:
+            active = env.get("AMEESH_TURN_ID", "")
+        if not active or active != turn_id:
+            raise ContextError("stale-turn")
+        owner = env.get("AMEESH_RUNNER_ID") or env.get("AGENT_MESH_RUNNER_ID")
+        epoch = env.get("AMEESH_LEASE_EPOCH") or env.get("AGENT_MESH_LEASE_EPOCH")
+        lease = document["lease"]
+        if (env.get("AGENT_MAIL_NAME") != document["turn"]["agent"]
+                or owner != lease["owner"] or epoch is None
+                or int(epoch) != lease["epoch"]):
+            raise ContextError("lease-mismatch")
+        return document
+    except ContextError:
+        raise
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        # Never echo file contents, paths, credentials or parser diagnostics.
+        raise ContextError("unreadable-context") from None
+
+
+def verify(document: dict, db) -> None:
+    """Recheck the live lease and pending turn using the mailbox fence."""
+    from . import registry
+    name = document["turn"]["agent"]
+    lease = document["lease"]
+    ok, _ = registry.lease_matches(db, name, lease["owner"], lease["epoch"])
+    if not ok:
+        raise ContextError("lease-mismatch")
+    marker = registry.pending_spend_get(db, name)
+    if not marker or marker.get("turn_id") != document["turn"]["id"]:
+        raise ContextError("stale-turn")
