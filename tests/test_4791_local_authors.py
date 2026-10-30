@@ -210,3 +210,18 @@ class LocalAuthorsTest(unittest.TestCase):
         call = next(call for call in calls.call_args_list if "merge-tree" in call.args)
         self.assertNotEqual(call.args[0], self.repo)
         self.assertIn("GIT_OBJECT_DIRECTORY", call.kwargs["env_extra"])
+
+    def test_all_refs_are_visible_in_remote_free_history_reader(self):
+        self.git('branch', 'retained-original', self.head)
+        self.git('checkout', '--quiet', '--detach', self.head)
+        with open(os.path.join(self.repo, 'content'), 'a') as stream:
+            stream.write('detached content\n')
+        self.git('commit', '--quiet', '-am', 'detached')
+        detached = self.git('rev-parse', 'HEAD')
+        expected = self.git('log', '--all', '--format=%H')
+        self.git('config', 'remote.origin.url', 'https://invalid.example/repo')
+        self.git('config', 'remote.origin.promisor', 'true')
+        observed = authors._read_out(self.repo, 'log', '--all', '--format=%H')
+        self.assertEqual(set(observed.splitlines()), set(expected.splitlines()))
+        self.assertIn(detached, observed)
+        self.assertIn(self.head, observed)

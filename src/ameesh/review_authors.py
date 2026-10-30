@@ -971,6 +971,17 @@ def _local_object_repo(repo):
 
 def _read_git(repo, *args, **kwargs):
     """Content reads use the remaining sweep budget, without lazy fetches."""
+    if args[0] == "log" and "--all" in args:
+        # The isolated object reader has no refs or HEAD. Resolve --all in
+        # the source clone (metadata only), then walk those exact object ids
+        # in the remote-free reader. Include detached HEAD, as git --all does.
+        refs = _read_out(repo, "for-each-ref", "--format=%(objectname)")
+        if refs is None:
+            raise plan_git.MergeProbeError("local reference list unreadable")
+        head = _read_out(repo, "rev-parse", "--verify", "HEAD")
+        revisions = list(dict.fromkeys([*refs.splitlines(), *([head] if head else [])]))
+        if revisions:
+            args = tuple(arg for arg in args if arg != "--all") + tuple(revisions)
     heavy = args[0] in {"log", "diff", "show", "patch-id"}
     limit = canon.GIT_TIMEOUT if heavy else plan_git.PROBE_TIMEOUT_S
     sweep = active_sweep()
