@@ -246,7 +246,7 @@ class PreparationTest(unittest.TestCase):
         try:
             decoded = base64.b64decode(alternate.split()[1], validate=True)
         except binascii.Error:
-            expected = ''
+            expected = 'invalid delegation enrollment'
         else:
             self.assertEqual(base64.b64decode(key.split()[1], validate=True), decoded)
             expected = 'distinct controller'
