@@ -94,7 +94,7 @@ def submit(db, cfg, options, sha, *, included=()):
         data = dict(request=uuid.uuid4().hex, sha=sha, state="pending",
                     included=[int(lot) for lot in included], notify=options["role"],
                     deadline=time.time() + options.get("start_timeout_s", 300))
-        if previous and previous.get("run") and previous["state"] != "completed":
+        if previous and previous.get("run") and previous["state"] not in ("completed", "partial"):
             data.update(previous_host=previous["host"], previous_run=previous["run"])
         _record(db, options["key"], data, lease=lease)
         return data
@@ -147,6 +147,8 @@ def tick(db, cfg, options) -> dict:
             return blocked("candidate deployment access missing")
         repo = str(Path(options["repo"]).resolve())
         sha = request["sha"]
+        subprocess.run(["git", "-C", repo, "fetch", "--no-tags", "origin"],
+                       check=True, timeout=60, stdout=subprocess.DEVNULL)
         # Resolve the requested commit in the candidate's dedicated clone.
         # A missing commit or one outside the declared target is a refusal.
         subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", sha,
@@ -185,8 +187,8 @@ def tick(db, cfg, options) -> dict:
                 return blocked("execution lease lost")
             proofs = storage.of(db).events.recent_type(
                 staging_watch.EVENT, 60, 1, object="staging-run:" + attempt["run"])
-            complete = bool(proofs and proofs[0]["data"]["state"] == "completed")
-            result = dict(attempt, state="completed" if code == 0 and complete else "failed",
+            terminal = proofs[0]["data"]["state"] if proofs else None
+            result = dict(attempt, state=terminal if code == 0 and terminal in ("completed", "partial") else "failed",
                           exit=code)
             _record(db, options["key"], result, lease=lease)
             return result

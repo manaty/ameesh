@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#4880: independent detection of an interrupted staging sequence."""
+import tempfile
 import unittest
 from unittest import mock
 
@@ -36,7 +37,7 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(len(staging_watch.findings([failed], now=150)), 1)
         old_success = row(1, run="old", state="completed")
         self.assertEqual(len(staging_watch.findings([old_success, failed], now=150)), 1)
-        new_success = row(3, run="new", state="completed")
+        new_success = row(3, run="new", state="completed", sha="b" * 40)
         self.assertEqual(staging_watch.findings([failed, new_success], now=250), [])
 
     def test_unattested_success_is_not_a_completed_run(self):
@@ -44,6 +45,25 @@ class WatchTest(unittest.TestCase):
             [row(state="unattested")], now=150)), 1)
         for state in ("completed", "partial"):
             self.assertEqual(staging_watch.findings([row(state=state)], now=250), [])
+
+    def test_local_writer_imports_without_platform_shadowing(self):
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+        source = (Path(__file__).resolve().parents[1] / 'deploy/mise-a-jour/staging.sh').read_text()
+        function = source.split('py_sequence() {', 1)[1].split('\n# #3981', 1)[0]
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as folder:
+            venv = Path(folder)
+            (venv / 'bin').mkdir()
+            (venv / 'bin/python').symlink_to(sys.executable)
+            command = 'py_sequence() {' + function + '\npy_sequence "$SUIVI_PY" --help'
+            proc = subprocess.run(['bash', '-c', command], capture_output=True, text=True,
+                                  env=dict(os.environ, OUTILS_DISTANTS='0', VENV=str(venv),
+                                           DEPOT=str(root), SUIVI_PY=str(root / 'src/ameesh/staging_watch.py')))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('public staging snapshot', proc.stdout)
 
     def test_record_drops_private_fields_and_validates_deadline(self):
         with mock.patch.object(staging_watch.storage, "of") as factory:
@@ -64,6 +84,15 @@ class WatchTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "truncated"):
                 staging_watch.alerts(None, now=250)
 
+    def test_later_successful_request_on_new_commit_settles_old_failure(self):
+        failed = dict(id=1, object="staging-request:mesh", data=dict(
+            request="old", sha="a" * 40, state="failed", notify="pilot"))
+        completed = dict(id=2, object="staging-request:mesh", data=dict(
+            request="new", sha="b" * 40, state="completed", notify="pilot"))
+        with mock.patch.object(staging_watch.storage, "of") as factory:
+            factory.return_value.events.latest_type.side_effect = [[], [failed, completed]]
+            self.assertEqual(staging_watch.alerts(None, now=250), [])
+
     def test_request_is_observable_even_if_launcher_dies_before_first_step(self):
         with mock.patch.object(staging_watch.storage, "of") as factory:
             request = dict(object="staging-request:mesh", data=dict(
@@ -80,6 +109,14 @@ class KilledSequenceTest(unittest.TestCase):
         self.fixture = fixture.StagingTest()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
+    def test_progress_outage_after_start_does_not_interrupt_hosts(self):
+        (self.fixture.state / 'scenario').write_text('suivi-off-after-start\n')
+        proc = self.fixture.run_staging()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('suivi staging indisponible', proc.stderr)
+        calls = (self.fixture.state / 'calls.log').read_text()
+        self.assertIn('host=ameesh-agents-3 action=redemarrer', calls)
+
     def test_kill_after_first_host_is_seen_without_launcher(self):
         (self.fixture.state / 'scenario').write_text('kill=ameesh-agents-2:installer\n')
         proc = self.fixture.run_staging()

@@ -106,6 +106,22 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"], "blocked")
         self.assertEqual(self.calls, [])
 
+    def test_partial_success_does_not_require_quiescence_on_next_request(self):
+        def partial(*args):
+            self.proofs = [dict(data=dict(state="partial"))]
+            return 0, False
+        executor.role_run._run_under_lease.side_effect = partial
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"], "partial")
+        queued = executor.submit(self.db, self.cfg, self.options, "b" * 40)
+        self.assertNotIn("previous_run", queued)
+
+    def test_candidate_fetches_before_resolving_new_commit(self):
+        executor.tick(self.db, self.cfg, self.options)
+        calls = executor.subprocess.run.call_args_list
+        self.assertEqual(calls[0].args[0][3:], ["fetch", "--no-tags", "origin"])
+        self.assertEqual(calls[0].kwargs["timeout"], 60)
+        self.assertEqual(calls[1].args[0][3], "merge-base")
+
     def test_zero_exit_without_attestation_is_failed(self):
         executor.role_run._run_under_lease.side_effect = lambda *a: (0, False)
         self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"], "failed")

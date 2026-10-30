@@ -596,7 +596,7 @@ with open(path, "a", encoding="utf-8") as fh:
     fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 PY
   if [ "${SUIVI_DEMARRE:-0}" = 1 ]; then
-    publier_suivi running
+    publier_suivi running || echo "suivi staging indisponible" >&2
   fi
 }
 
@@ -736,7 +736,11 @@ py_sequence() {  # script|- [args…]
   local script=$1 a commande
   shift
   if [ "$OUTILS_DISTANTS" != 1 ]; then
-    "$VENV/bin/python" "$script" "$@"
+    if [ "$script" = "$SUIVI_PY" ]; then
+      PYTHONPATH="$DEPOT/src${PYTHONPATH:+:$PYTHONPATH}" "$VENV/bin/python" -m ameesh.staging_watch "$@"
+    else
+      "$VENV/bin/python" "$script" "$@"
+    fi
     return
   fi
   commande="runuser -u ameesh -- env HOME=/home/ameesh"
@@ -1173,7 +1177,7 @@ else
     "$VENV/bin/python" "$ACTIF_PY" --journal "$JOURNAL_ACTIF" "${ARGS_ACTIF[@]}" || rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
-    publier_suivi unattested
+    publier_suivi unattested || echo "suivi staging indisponible" >&2
     SUIVI_DEMARRE=0
     if [ "$rc" -eq 5 ]; then
       echo "signal actif ambigu (emission anterieure non prouvee, aucun renvoi automatique) : attestation $ATTESTATION_ACTIF a verifier, journal $JOURNAL_ACTIF a relayer a la main" >&2
@@ -1187,9 +1191,9 @@ fi
 
 if [ "$SUIVI_DEMARRE" = 1 ]; then
   if [ "$SEQUENCE_COMPLETE" = 1 ]; then
-    publier_suivi completed
+    publier_suivi completed || echo "suivi staging indisponible" >&2
   else
-    publier_suivi partial
+    publier_suivi partial || echo "suivi staging indisponible" >&2
   fi
   SUIVI_DEMARRE=0
 fi

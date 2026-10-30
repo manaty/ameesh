@@ -56,14 +56,16 @@ def findings(rows: list[dict], *, now: float) -> list[dict]:
             latest.setdefault(data["run"], data)
             ids.setdefault(data["run"], int(row["id"]))
     out = []
-    # A later completed retry of the same commit settles an earlier failure.
+    # A later successful deployment by the same staging authority settles
+    # an earlier failure, including when it deploys a corrective commit.
     completed = {}
     for run, data in latest.items():
         if data.get("state") == "completed":
-            completed[data["sha"]] = max(completed.get(data["sha"], 0), ids[run])
+            scope = data.get("notify", "")
+            completed[scope] = max(completed.get(scope, 0), ids[run])
     for run, data in latest.items():
         state = data.get("state")
-        if state in ("completed", "partial") or completed.get(data.get("sha"), 0) > ids[run]:
+        if state in ("completed", "partial") or completed.get(data.get("notify", ""), 0) > ids[run]:
             continue
         if state == "running" and now < float(data["deadline"]):
             continue
@@ -97,7 +99,7 @@ def alerts(db, *, now: float) -> list[dict]:
     if len(requests) >= LIMIT:
         raise RuntimeError("staging requests truncated; resolution unobservable")
     seen = set()
-    for row in requests:
+    for row in sorted(requests, key=lambda row: int(row.get("id", 0)), reverse=True):
         key = row["object"]
         if key in seen:
             continue
@@ -105,7 +107,7 @@ def alerts(db, *, now: float) -> list[dict]:
         data = row["data"]
         state = data.get("state")
         late = state in ("pending", "running") and now >= data.get("deadline", float("inf"))
-        if state == "completed" or not (late or data.get("blocked_reason") or state == "failed"):
+        if state in ("completed", "partial") or not (late or data.get("blocked_reason") or state == "failed"):
             continue
         out.append(dict(schema="ameesh-alert/1", type="staging_interrupted", agent=None, since=None,
                         value=None, threshold=None, reason=key,

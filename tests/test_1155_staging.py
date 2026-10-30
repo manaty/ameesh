@@ -96,7 +96,9 @@ state=${FAKE_STATE:?}
 printf 'stub %s %s\n' "$0" "$*" >> "$state/calls.log"
 printf 'venv-python %s\n' "$*" >> "$state/calls.log"
 if [ "${1:-}" = "-" ]; then exit 0; fi   # notification
-if [[ "${1:-}" = */staging_watch.py ]]; then
+if [ "${1:-}" = -m ] && [ "${2:-}" = ameesh.staging_watch ]; then shift; fi
+if [[ "${1:-}" = */staging_watch.py || "${1:-}" = ameesh.staging_watch ]]; then
+  if grep -qx suivi-off-after-start "$state/scenario" && test -s "$state/staging-snapshots.jsonl"; then exit 1; fi
   printf '%s\n' "$2" >> "$state/staging-snapshots.jsonl"
   exit 0
 fi
@@ -684,7 +686,7 @@ class StagingTest(unittest.TestCase):
         ])
         self.assertFalse([line for line in self.calls()
                           if line.startswith('venv-python ')
-                          and 'staging_watch.py' not in line])
+                          and 'staging_watch' not in line])
 
     def test_migrations_failure_installs_nothing(self):
         (self.state / 'scenario').write_text('ko=pc-smichea:migrer\n')
