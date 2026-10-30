@@ -21,6 +21,7 @@ without a queue.
         "github": "acme/product",
         "target": "develop",
         "migrations": "supabase/migrations",
+        "migrations_width": 3,
         "land": "local",
         "lease_ref": "ameesh-land/",
         "ci_required": true,
@@ -45,6 +46,11 @@ without a queue.
   }
 }
 ```
+
+`migrations_width` (optional, integer 1-9) is the number of digits of a
+migration number (`014_x.sql`: 3). Absent or `0`, ameesh uses the width of a
+known repository, otherwise 4; any other value (`false`, `""`, `"3"`, `10`…)
+is rejected.
 
 Use the repository's actual commands and branch prefixes. Commands run in
 the radar's private clone and need their dependencies installed there.

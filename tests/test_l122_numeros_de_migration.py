@@ -265,7 +265,9 @@ class NumerosDuDepotTest(unittest.TestCase):
         self.assertEqual(migrations.layout_for("manaty/liquichain", cfg()).width, 4)
         project = radar.settings_of(cfg(migrations_width=3)).projects["liquichain"]
         self.assertEqual(train_migrations.layout(project).label(16), "016")
-        for bad in ("3", 10, -1, True):
+        self.assertEqual(radar.settings_of(cfg(migrations_width=0))
+                         .projects["liquichain"].migrations_width, 0)
+        for bad in ("3", 10, -1, True, False, "", [], {}):
             with self.subTest(bad=bad), self.assertRaises(radar.SettingsError):
                 radar.settings_of(cfg(migrations_width=bad))
 
