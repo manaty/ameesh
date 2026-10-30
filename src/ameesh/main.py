@@ -198,6 +198,8 @@
         turn_grace_seconds=20m|0
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
+  ameesh turn current [--local] [--expect-turn ID] [--json]
+        read the calling turn; reuse requires its captured turn id;
   ameesh turn observe (--turn ID | --request ID) [--json]
         #2167: a supervisor's read of one turn or request: states, accounting,
         `quiescent` (schema ameesh-turn-observation/1); never writes, exit 3 if unknown;
@@ -356,6 +358,9 @@ def _dispatch(argv: list[str] | None) -> int:
         from . import version
         print("ameesh %s" % version())
         return 0
+    if command == "turn" and rest[:1] == ["current"]:
+        from . import turn_context
+        return turn_context.cmd_current(rest[1:])
     if command == "mail":
         from . import cli
         return cli.main(rest)
