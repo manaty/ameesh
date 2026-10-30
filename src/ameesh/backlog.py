@@ -1384,6 +1384,16 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
                         continue
                     family = mine_family
             kind = "correction" if correction else "review"
+            # #4779 (B1 dev4) : une relecture proposée désigne son relecteur
+            # (#705) ; sa fiche doit donc prouver la capacité `propose` et un
+            # rôle, comme une désignation manuelle (`check_reviewer`) et la
+            # sélection au gel. Sans ce garde, un canari `[read]` / `roles: []`
+            # recevait la proposition et occupait le siège sans pouvoir rendre
+            # d'avis (test_1677).
+            if kind == "review":
+                eligible, _reason = rd.reviewer_eligibility(reg)
+                if not eligible:
+                    continue
             payload = {"review_proposal": {"lot": lot, "agent": name, "kind": kind}}
             message_id = None
             if not dry_run:
@@ -1517,6 +1527,15 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     if idle_s > 0 and max_per_hour > 0:
         room = int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S, AUTO_TAKE_NOTE)
     queue = st.work.backlog(open_only=True, limit=200, ready_only=True) if room > 0 else []
+    # #4741 : la file d'amélioration suit la même garde de hold pilote que les
+    # lots d'équipe — un élément tenu (ou dont le hold attend encore son
+    # réveil) n'est pas pris. `backlog(ready_only=True)` ne lit que
+    # `planned_start` et les dépendances, jamais le hold ni son réveil.
+    if queue:
+        queue_holds = _take_holds(db, queue, cfg=cfg)
+        if queue_holds:
+            queue = [item for item in queue
+                     if not _hold_blocks(item, queue_holds.get(int(item["id"])), now)]
     if not lots and not queue:
         # #1677 (c) : même sans lot prenable, un lot en qa sans verdict (ou à
         # correction due) peut occuper un agent au repos — la sonde est bon
@@ -1796,7 +1815,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 item.get("expected_value") or "")
             try:
                 done = _assign_ready(db, item, check["assignee"], note,
-                                     work.takes_rule(check), cap())
+                                     work.takes_rule(check), cap(),
+                                     cfg=cfg, hold_guard=True, now=now)
             except storage.PendingLot:
                 break                       # #540 : l'élément reste au suivant
             if done is None:

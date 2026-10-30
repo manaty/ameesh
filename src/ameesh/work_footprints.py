@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import posixpath
+import sys
 from typing import Iterable, Optional
 
 from . import storage, work
@@ -121,12 +122,37 @@ def diff_paths(repo: str, target: str, head: str) -> Optional[list[str]]:
     return _clean(proc.stdout.decode("utf-8", "replace").splitlines())
 
 
+def _fresh_base(repo: str, target: str) -> tuple[str, bool]:
+    """La base du diff et la preuve de sa fraîcheur (#4733).
+
+    La ref `origin/<cible>` d'un clone partagé n'est fraîche que de son
+    dernier fetch. La pointe **publiée** de la cible est donc lue à la forge
+    par SHA exact (`review_authors.refreshed_target`, lecture seule, aucun ref
+    déplacé — la lecture de #4673), puis l'objet exact est rapatrié. Une forge
+    muette rend la ref locale, qui n'est alors **pas** prouvée fraîche :
+    l'appelant le dit au lieu de la faire passer pour la cible du jour."""
+    if not target:
+        return "", False
+    from . import plan_git
+    if plan_git.full_commit_id(target):
+        return target, True
+    try:
+        from . import review_authors
+        fresh = review_authors.refreshed_target(repo, target)
+    except Exception:  # noqa: BLE001 - fraîcheur au mieux, le doute se dit
+        fresh = ""
+    if fresh:
+        return fresh, True
+    return _ref(repo, target), False
+
+
 def _clone_and_target(cfg, item: dict, repo: Optional[str] = None) -> tuple:
     from . import intake_neighbors
     clone = intake_neighbors.resolve_clone(cfg, item.get("app") or "", repo)
     if not clone:
         return None, ""
     target = (item.get("branch_target") or "").strip() \
+        or intake_neighbors.project_target(cfg, item.get("app") or "") \
         or intake_neighbors.default_target(clone)
     if target.startswith("origin/"):
         target = target[len("origin/"):]
@@ -207,7 +233,12 @@ def record_estimate(db, cfg, item: dict, *, actor: str, repo: Optional[str] = No
 def refresh(db, cfg, item_id: int, *, actor: str, head: str = "",
             repo: Optional[str] = None) -> dict:
     """Le diff réel de la branche du lot (ou de `head`, la tête gelée)
-    remplace les lignes `diff` de l'empreinte."""
+    remplace les lignes `diff` de l'empreinte.
+
+    La base est la cible du lot (`branch_target`), sinon celle que le projet
+    déclare (`develop` pour Nexlink), sinon le défaut du dépôt (#4733) ; sa
+    pointe publiée est relue à la forge quand elle répond, et `fresh` dit si
+    la base est prouvée fraîche ou seulement la ref du dernier fetch."""
     item = work.get(db, item_id)
     if item is None:
         raise work.WorkError("lot %s not found" % item_id)
@@ -218,12 +249,15 @@ def refresh(db, cfg, item_id: int, *, actor: str, head: str = "",
     if not clone or not target:
         raise work.WorkError("lot %s: no local clone of %s with a known target"
                              % (item_id, item.get("app") or "its repository"))
-    paths = diff_paths(clone, target, tip)
+    base, fresh = _fresh_base(clone, target)
+    paths = diff_paths(clone, base, tip)
     if paths is None:
         raise work.WorkError("lot %s: %s...%s unreadable in %s (fetch first)"
                              % (item_id, target, tip, clone))
-    return storage.of(db).work_footprints.replace(
+    result = storage.of(db).work_footprints.replace(
         item_id, "diff", paths, actor=actor, head=tip if head else None)
+    result.update({"target": target, "base": base, "fresh": fresh})
+    return result
 
 
 def refusal(item_id: int, rows: list) -> str:
@@ -266,10 +300,15 @@ def add_parser(sub, func):
                            "relative to the repository root)")
     mode.add_argument("--clear", action="store_true",
                       help="remove the estimated footprint (the diff rows stay)")
+    mode.add_argument("--clear-diff", action="store_true", dest="clear_diff",
+                      help="remove the diff rows (e.g. computed on a wrong base); "
+                           "pilot gesture, --refresh recomputes them")
     mode.add_argument("--estimate", action="store_true",
                       help="re-estimate from the paths cited by the title and body")
     mode.add_argument("--refresh", action="store_true",
-                      help="refine from the branch's actual diff against its target")
+                      help="replace the diff rows from the branch's actual diff against "
+                           "its target (branch target, else the project's declared "
+                           "target, else the repository default)")
     p.add_argument("--repo", help="local clone of the lot's repository")
     p.add_argument("--json", action="store_true")
     p.add_argument("--actor", default="")
@@ -281,18 +320,21 @@ def run(cfg, db, args) -> int:
     actor = args.actor or "ameesh"
     if work.get(db, args.id) is None:
         raise work.WorkError("lot %s not found" % args.id)
-    if (args.paths or args.clear) and not work.is_pilot(cfg, db, actor):
+    if (args.paths or args.clear or args.clear_diff) and not work.is_pilot(cfg, db, actor):
         # une empreinte posée à la main peut lever une attente : geste de
         # pilote, comme l'exception §4 (`--estimate`/`--refresh` sont
         # déterministes et restent ouverts)
-        raise work.WorkError("footprint --set/--clear refused: %s is neither a human nor "
-                             "an orchestrator/design agent (pilot gesture)"
+        raise work.WorkError("footprint --set/--clear/--clear-diff refused: %s is neither "
+                             "a human nor an orchestrator/design agent (pilot gesture)"
                              % (actor or "nobody"))
+    refreshed = None
     if args.paths:
         set_paths(db, args.id, args.paths, actor=actor)
     elif args.clear:
         storage.of(db).work_footprints.replace(args.id, "manual", [], actor=actor,
                                                replaces=ESTIMATE_SOURCES)
+    elif args.clear_diff:
+        storage.of(db).work_footprints.replace(args.id, "diff", [], actor=actor)
     elif args.estimate:
         item = work.get(db, args.id)
         manual = any(row["source"] == "manual"
@@ -305,8 +347,18 @@ def run(cfg, db, args) -> int:
         elif record_estimate(db, cfg, item, actor=actor, repo=args.repo) is None:
             print("lot #%d: no path cited by its title or body" % args.id)
     elif args.refresh:
-        refresh(db, cfg, args.id, actor=actor, repo=args.repo)
+        refreshed = refresh(db, cfg, args.id, actor=actor, repo=args.repo)
     found = describe(db, args.id)
+    if refreshed is not None:
+        found["refresh"] = {key: refreshed.get(key) for key in ("target", "base", "fresh")}
+        if not refreshed.get("fresh"):
+            print("warning: lot #%d: base %s of %s was not proven fresh (the clone's "
+                  "last fetch only): fetch it, or rerun when the forge answers"
+                  % (args.id, refreshed.get("base") or "?",
+                     refreshed.get("target") or "?"), file=sys.stderr)
+        elif not args.json:
+            print("lot #%d: diff base %s @%s (fresh)" % (
+                args.id, refreshed["target"], refreshed["base"][:12]))
     if args.json:
         print(json.dumps(found, ensure_ascii=False, indent=2, default=str))
         return 0

@@ -1128,14 +1128,51 @@ def _budget_held(cfg, db, rows: list) -> dict:
     return held
 
 
-def split_startable(waiting_lots: list, waits: dict) -> tuple:
+def footprint_blockers(db, waiting_lots: list, lots: list, *,
+                       store=None) -> dict:
+    """#4699 : `{lot: [bloqueurs]}` des lots d'intake sans porteur que la garde
+    d'empreinte (#3185) retient — la lecture partagée par le débit (#4561) et
+    `idle_capacity`, jamais une copie.
+
+    Les empreintes de tous les lots ouverts sont lues une fois (le lot retenu
+    comme ses occupants) ; `slo.footprint_blockers` applique la règle de la
+    garde. Un lot retenu n'est pas démarrable : `work assign` le refuse, et
+    `split_startable` le range avec son bloqueur."""
+    from . import slo
+    if not waiting_lots:
+        return {}
+    store = store or storage.of(db)
+    paths: dict = {}
+    for row in store.work_footprints.for_items(
+            [int(lot["id"]) for lot in lots]):
+        paths.setdefault(int(row["work_item_id"]), []).append(str(row["path"]))
+    out: dict = {}
+    for lot in waiting_lots:
+        blockers = slo.footprint_blockers(lot, lots, paths)
+        if blockers:
+            out[int(lot["id"])] = blockers
+    return out
+
+
+def split_startable(waiting_lots: list, waits: dict,
+                    footprint: dict | None = None) -> tuple:
     """#1608 : sépare les lots confiables (`startable`) de ceux qu'une attente
-    planifiée retient (`{id: attente}` de L368). Un orchestrateur à qui l'on
-    propose un lot bloqué l'assigne pour rien : le brief ne propose que les
-    premiers et nomme le bloqueur des seconds."""
-    startable = [lot for lot in waiting_lots if int(lot["id"]) not in waits]
-    blocked = {int(lot["id"]): waits[int(lot["id"])]
-               for lot in waiting_lots if int(lot["id"]) in waits}
+    planifiée retient (`{id: attente}` de L368) ou que la garde d'empreinte
+    occupe (`{id: [bloqueurs]}` de #3185, lue par `footprint_blockers`). Un
+    orchestrateur à qui l'on propose un lot bloqué l'assigne pour rien : le
+    brief ne propose que les premiers et nomme le bloqueur des seconds."""
+    footprint = footprint or {}
+    startable = []
+    blocked: dict = {}
+    for lot in waiting_lots:
+        ident = int(lot["id"])
+        if ident in waits:
+            blocked[ident] = waits[ident]
+        elif ident in footprint:
+            blocked[ident] = {"what": "footprint",
+                              "lots": [int(b["id"]) for b in footprint[ident]]}
+        else:
+            startable.append(lot)
     return startable, blocked
 
 
@@ -1157,11 +1194,15 @@ def lots_for_idle(lots: list, idle: list) -> list:
 
 
 def waiting_text(blocked: dict, limit: int = 6) -> str:
-    """« #12 waits on #3, #4; #15 is scheduled for 2026-10-16 » (L368)."""
+    """« #12 waits on #3, #4; #15 is scheduled for 2026-10-16 » (L368),
+    « #12 waits on the footprint of #7 » (#3185, #4699)."""
     parts = []
     for ident, wait in sorted(blocked.items())[:limit]:
         if wait.get("what") == "dependency":
             parts.append("#%d waits on %s" % (
+                ident, ", ".join("#%d" % int(i) for i in wait.get("lots") or ())))
+        elif wait.get("what") == "footprint":
+            parts.append("#%d waits on the footprint of %s" % (
                 ident, ", ".join("#%d" % int(i) for i in wait.get("lots") or ())))
         elif wait.get("what") == "scheduled":
             parts.append("#%d is scheduled for %s" % (ident, wait.get("start")))
@@ -1205,7 +1246,11 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     if not idle:
         return []
     if lots is None:
-        lots = storage.of(db).operations.open_lots_activity(500)
+        # #4717 : le débit lit tous les lots ouverts (`debit.startable_lots`,
+        # `open_lots_activity(None)`) ; le plafond à 500 laissait un occupant
+        # au-delà invisible et l'alerte proposait un lot que `work assign`
+        # refuse ensuite (#3185/#4699).
+        lots = storage.of(db).operations.open_lots_activity(None)
     # #1608 : la liste garde les lots retenus par une attente et les classe
     # (démarrables / en attente d'un prérequis) ; le filtrage `db=db` de
     # #1021 reste dans `waiting_project_lots` pour la prise automatique (0037).
@@ -1219,7 +1264,11 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     waiting_lots = lots_for_idle(waiting_lots, idle)
     reserved_lots = lots_for_idle(reserved_lots, idle)
     waits = planned_waits.read(db, waiting_lots, now=now) if waiting_lots else {}
-    startable_lots, blocked_lots = split_startable(waiting_lots, waits)
+    # #4699 : la garde d'empreinte (#3185) retient un lot d'intake sans porteur
+    # que `work assign` refuse ; le même filtre que le débit (#4561), rangé
+    # dans `blocked_lots` avec ses bloqueurs.
+    footprint = footprint_blockers(db, waiting_lots, lots) if waiting_lots else {}
+    startable_lots, blocked_lots = split_startable(waiting_lots, waits, footprint)
     backlog = [row for row in listing
                if _state(row) in ("working", "paused") and int(row.get("unread") or 0)
                and row.get("oldest_unread_ts") is not None

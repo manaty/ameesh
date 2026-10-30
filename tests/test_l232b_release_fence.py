@@ -304,7 +304,7 @@ class ReleaseFenceTest(PgTestCase):
     def test_restart_helper_uses_real_signed_authority_and_database_guard(self):
         from tests.test_l232b_restart_helper import helper, System
         policy = dict(host=self.manifest['host'],units=['ameesh-runner@test.service'],
-                      controller_unit='ameesh-release-controller.service',restart_seconds=5)
+                      controller_unit='ameesh-release-controller.service',manager={'kind':'system'},restart_seconds=5)
         self.manifest = dict(self.manifest,units=policy['units'],policy=helper.policy_id(policy))
         self.operation = 'guarded-release'
         lot = work.add(self.db,title='Synthetic guarded restart',assignee='fixture-controller')

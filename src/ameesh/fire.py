@@ -783,6 +783,18 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     if class_sha and repo:
         class_sha = merge_queue.pinned(repo, class_sha) or class_sha
     resolved = class_sha or (merge_queue.pinned(repo, base) if (repo and base) else None)
+    # #4673 : la ref `origin/<cible>` du checkout n'est fraîche que de son
+    # dernier fetch ; la branche **locale** peut même avoir divergé. La porte
+    # (et `packet_reviews.need`, qui reçoit cette cible comme base) ne doit
+    # jamais recevoir le nom nu : la pointe publiée est lue une fois ici et
+    # passée en commit exact. Une forge muette retombe sur la ref locale.
+    fresh_target = None
+    if repo and target:
+        try:
+            from . import review_authors
+            fresh_target = review_authors.refreshed_target(repo, target) or None
+        except Exception:  # noqa: BLE001 - rafraîchissement au mieux
+            fresh_target = None
     klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo or None,
                              base=target, base_sha=resolved or base, head=head)
     if str(klass.get("class") or "") == lot_class.RELEASE:
@@ -807,8 +819,8 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
             # sur le seul assigné.
             try:
                 authors, families = merge_queue._complete_authors(
-                    db, row, frozen, repo, target, klass=klass, marks=marks,
-                    cfg=cfg)
+                    db, row, frozen, repo, fresh_target or target, klass=klass,
+                    marks=marks, cfg=cfg)
             except merge_queue._ProvenanceError as exc:
                 return False, (
                     "no review verdict ok on the freeze %s (class: %s): the complete "
@@ -818,9 +830,14 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
             gate_authors = {"authors": authors, "families": families,
                             "authors_complete": True}
     # #3091 : la base de composition du véhicule est prouvée sur cette cible
-    # résolue, jamais sur la ref du checkout.
+    # résolue, jamais sur la ref du checkout. #4673 : sans base déjà résolue
+    # par l'appelant, la porte reçoit la **pointe publiée** en commit exact
+    # (pas le nom de branche, que `packet_reviews.need` résoudrait sur la
+    # branche locale) ; un clone partagé non rafraîchi ne fait alors plus
+    # passer des commits déjà dans la cible pour des tiers.
+    gate_target = resolved if class_sha else (fresh_target or resolved or base)
     gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass,
-                                   item=row, cfg=cfg, target=resolved or base,
+                                   item=row, cfg=cfg, target=gate_target,
                                    **gate_authors)
     if not gate["ok"]:
         return False, gate["why"], klass
@@ -1335,6 +1352,9 @@ def _packet_proof_gate(rollup) -> tuple:
     prouvé : il se consigne au lieu de bloquer, comme tout autre check.
     #3209 : la suite sautée parce qu'une PR porte la tête
     (`radar.packet_suite_covered`) n'a rien à consigner.
+    #4812 : le portier annulé par `ci run --full` au profit du run de la PR
+    (#2876), dont l'agrégat `tests` est vert, non plus
+    (`radar.packet_portier_replaced`).
     Rend `(gaps, consigned)`."""
     from . import radar
     gaps, consigned = [], []
@@ -1344,7 +1364,8 @@ def _packet_proof_gate(rollup) -> tuple:
         state = _rollup_state(entry) or "?"
         result = radar.check_result(entry)
         if result == radar.CI_INCONCLUSIVE_RESULT:
-            if radar.packet_suite_covered(entry, entries):
+            if radar.packet_suite_covered(entry, entries) \
+                    or radar.packet_portier_replaced(entry, entries, rollup):
                 continue
             consigned.append("%s (%s)" % (name, state))
         elif result != radar.CI_GREEN_RESULT:

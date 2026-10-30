@@ -279,6 +279,9 @@ class RewrittenCorrectorTest(_ActivationFixture, PgTestCase):
     def test_only_a_clean_refusal_is_cached(self):
         # B/P2 auditeur : un fetch non lancé ou coupé (None) ne doit pas être
         # mémorisé « refusé » pour 6 h ; un code non nul (False) l'est.
+        # #4679 : un reçu introuvable sans rattachement de lot ne prouve rien
+        # sur cette tête : il ne fait pas de son acteur un correcteur (le gel
+        # le dit à part, `unattached`). Le cache garde son sens.
         head_b = self._only_absent_receipt()
         dummy = "%040x" % 0x44570000
         with mock.patch.object(review_authors, "_forge_fetch", return_value=None):

@@ -59,11 +59,15 @@ def _clean_merge_tree(repo, first, second):
     return trial["tree"]
 
 
-def qualify(cfg, db, spec, pin, gate, changed, references):
+def _qualify_range(cfg, db, spec, pin, gate, changed, references, *,
+                   opinion_commit=None, require_pilot=True, policy_floor=(),
+                   opposition_commits=()):
     """Read exact provenance and current verdicts before any configuration write."""
     if not references:
         raise TrainError("reviewed requalification requires --review milestone:<id>")
-    rules = [mechanics.load(spec.canon, commit, spec.name) for commit in (pin, gate)]
+    opinion_commit = opinion_commit or gate
+    rules = [*policy_floor,
+             *(mechanics.load(spec.canon, commit, spec.name) for commit in (pin, gate))]
     families = tuple(dict.fromkeys(family for rule in rules for family in rule.families))
     selected, lots = {}, set()
     for reference in dict.fromkeys(references):
@@ -77,30 +81,35 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
         if not receipt or not origin or not origin.get("work_item_id"):
             raise TrainError("%s: exact review provenance missing" % reference)
         mark = receipt.get("milestone") or {}
-        if receipt["commit"] != gate or mark.get("verdict") != "ok":
+        if receipt["commit"] != opinion_commit or mark.get("verdict") != "ok":
             raise TrainError("%s: an ok opinion on the exact gate commit is required"
                              % reference)
         selected[number] = receipt
         lots.add(int(origin["work_item_id"]))
     # Opposition belongs to the canon commit, even on an uncited source lot.
-    marks = storage.of(db).work.verdicts_for_commit(gate)
+    marks = storage.of(db).work.verdicts_for_commit(opinion_commit)
     # Ask the common gate for opposition on the complete history. Its result
     # is not an authorization here: pilot assent and diff qualification are
     # checked below. This avoids maintaining a second definition of a block.
-    opposition = merge_queue.review_gate(
-        db, marks, gate, repo=spec.canon, klass={"class": "sensitive"},
-        families=families, authors=[], authors_complete=True)
-    if opposition["blocked"]:
-        raise TrainError("reviewed requalification has a current blocking opinion")
+    for commit in dict.fromkeys((gate, opinion_commit, *opposition_commits)):
+        opposition = merge_queue.review_gate(
+            db, storage.of(db).work.verdicts_for_commit(commit), commit,
+            repo=spec.canon, klass={"class": "sensitive"},
+            families=families, authors=[], authors_complete=True)
+        if opposition["blocked"]:
+            raise TrainError("reviewed requalification has a current blocking opinion")
     latest = {}
     for mark in sorted(marks, key=lambda m: (m["at_ts"], m["id"])):
         receipt = selected.get(mark["id"]) or _milestone_receipt(
             db, mark["id"])
-        if (receipt and receipt["commit"] == gate and receipt["actor"] == mark["actor"]
+        # #4299: a rename rewrites the milestone actor, never the receipt.
+        if (receipt and receipt["commit"] == opinion_commit
+                and (receipt["actor"] == mark["actor"]
+                     or storage.of(db).agents.same_identity(receipt["actor"], mark["actor"]))
                 and (receipt.get("milestone") or {}).get("verdict") == mark["verdict"]):
             latest[mark["actor"]] = mark
     current = [mark for mark in latest.values() if mark["id"] in selected]
-    if not any(_role(cfg, db, mark["actor"]) for mark in current):
+    if require_pilot and not any(_role(cfg, db, mark["actor"]) for mark in current):
         raise TrainError("reviewed requalification requires a current pilot opinion")
     guard = set(changed).intersection(train_assembly.REQUALIFY_GUARD)
     if guard:
@@ -170,12 +179,70 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
             raise TrainError("canon author provenance missing")
         need = max(rule.reviews_for(changed).reviews for rule in rules)
         verdict = merge_queue.review_gate(
-            db, current, gate, repo=spec.canon, klass={"class": "sensitive"},
+            db, current, opinion_commit, repo=spec.canon, klass={"class": "sensitive"},
             families=families, required=need, authors=authors, authors_complete=True,
             exclude_author_family=any(rule.exclude_author_family for rule in rules),
             distinct_families=any(rule.distinct_families for rule in rules))
         if not verdict["ok"]:
             raise TrainError("canon diff reviews refused: %s" % verdict["why"])
     return [{"reference": "milestone:%s" % mark["id"], "actor": mark["actor"],
-             "commit": gate, "record": selected[mark["id"]]["record"]}
+             "commit": opinion_commit, "record": selected[mark["id"]]["record"]}
             for mark in current]
+
+
+def qualify(cfg, db, spec, pin, gate, changed, references):
+    """Accept a whole-range review or exact reviews for every guarded PR.
+
+    Intermediate references opt into first-parent qualification. Each PR has
+    its own author set; an opinion on another PR can never cover it. The final
+    gate still needs the pilot's current assent. All evidence is read before
+    the caller changes a pin, and the original policy remains a floor.
+    """
+    by_commit = {}
+    for reference in dict.fromkeys(references):
+        match = re.fullmatch(r"milestone:([1-9][0-9]*)", reference)
+        if not match:
+            raise TrainError("unsupported review reference %r: milestone:<id> required"
+                             % reference)
+        receipt = _milestone_receipt(db, int(match[1]))
+        if not receipt:
+            raise TrainError("%s: exact review provenance missing" % reference)
+        by_commit.setdefault(receipt["commit"], []).append(reference)
+    if not by_commit or set(by_commit) == {gate}:
+        return _qualify_range(cfg, db, spec, pin, gate, changed, references)
+
+    records = _qualify_range(cfg, db, spec, pin, gate, [], by_commit.get(gate, []))
+    history = resolutions._run(spec.canon, "rev-list", "--first-parent",
+                               "--reverse", "--parents", pin + ".." + gate)
+    if history.returncode:
+        raise TrainError("cannot read canon first-parent history")
+    steps = [line.split() for line in resolutions._text(history).splitlines()]
+    if not steps or len(steps[0]) < 2 or steps[0][1] != pin:
+        raise TrainError("per-PR requalification requires the pin on the first-parent chain")
+    # Include intermediate policies: a temporary relaxation cannot qualify
+    # either itself or another PR under a weaker rule.
+    floor = [mechanics.load(spec.canon, commit, spec.name)
+             for commit in (pin, *(step[0] for step in steps))]
+    used = {gate}
+    previous = pin
+    for commit, *parents in steps:
+        paths = train_assembly.canon_diff(spec.canon, previous, commit)
+        if set(paths).intersection(train_assembly.REQUALIFY_GUARD):
+            opinion = commit
+            if len(parents) == 2 and parents[1] in by_commit:
+                tree = resolutions._run(spec.canon, "rev-parse", commit + "^{tree}")
+                if tree.returncode:
+                    raise TrainError("cannot read canon merge tree")
+                # Reviews of the PR head cover a clean hosting merge only.
+                # A resolution or edited merge must be reviewed at the merge.
+                if _clean_merge_tree(spec.canon, *parents) == resolutions._text(tree).strip():
+                    opinion = parents[1]
+            records.extend(_qualify_range(
+                cfg, db, spec, previous, commit, paths, by_commit.get(opinion, []),
+                opinion_commit=opinion, require_pilot=False, policy_floor=floor,
+                opposition_commits=parents[1:]))
+            used.add(opinion)
+        previous = commit
+    if set(by_commit) - used:
+        raise TrainError("review references outside the qualified canon PRs")
+    return list({record["reference"]: record for record in records}.values())

@@ -22,7 +22,7 @@ Postgres n'est jamais exposé sur Internet.
 | `cloud-init.yaml` | premier démarrage : paquets, clone d'ameesh, lance l'installation |
 | `installer-serveur.sh` | installation idempotente : WireGuard, Postgres TLS, utilisateur `ameesh`, ameesh, gabarits systemd, sauvegardes |
 | `ameesh-runner@.service` | un exécuteur par persona, service système sous `ameesh` |
-| `ameesh-sauvegarde.{service,timer}`, `sauvegarder-base.sh` | `pg_dump` quotidien (répertoire 0700, dumps 0600), rétention locale par catalogue privé et protection rollback, copie hors de la VM si configurée ; les sauvegardes non inscrites sont conservées |
+| `ameesh-sauvegarde.{service,timer}`, `sauvegarder-base.sh` | `pg_dump` quotidien (répertoire 0700, dumps 0600), rétention locale par catalogue privé et protection rollback, copie hors de la VM si configurée ; les sauvegardes non inscrites sont conservées. `ameesh alerts` vérifie que la base a bien été lue dans la fenêtre (`mesh_backup_unseen`, PostgreSQL 16 et suivants) : accorder `mesh_backup_window` à `OnCalendar` si le minuteur change |
 | `ajouter-appareil.sh` | déclare un appareil dans WireGuard et affiche sa configuration |
 
 ## Mise en place (actes de l'opérateur)
@@ -99,3 +99,9 @@ Une fois installé, le serveur se met à jour depuis le poste avec
 paquet : le gabarit `ameesh-runner@.service` et le script de sauvegarde
 installés ne changent que si l'on rejoue `installer-serveur.sh`, sans risque
 (idempotent) : `ORGANISATION=<id> /opt/ameesh/src/deploy/serveur/installer-serveur.sh`.
+Le rejeu réinstalle aussi `sauvegarder-prive.py` et `retention-scaleway.py` en
+0755 root:root ; le passage suivant du service resserre le répertoire en 0700
+et normalise les dumps existants en 0600 sans les réécrire (#1305/#1309).
+Après le rejeu, `systemctl start ameesh-sauvegarde.service` doit rendre
+`Result=success` et un nouveau dump 0600 ; l'objet distant se vérifie ensuite
+avec l'identité de récupération.

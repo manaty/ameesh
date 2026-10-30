@@ -1143,7 +1143,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         scopes = (tuple(admitted_heads) + inherited + stacked
                   + ((production,) if production else ()))
         if scopes and repo:
-            boundary = (review_authors.target_commit(repo, target or (klass or {}).get("target") or "")
+            boundary = (review_authors.target_commit(
+                            repo, target or (klass or {}).get("target") or "",
+                            fetch=True)
                         or (klass or {}).get("base_sha"))
             if boundary:
                 listing = plan_git._out(repo, "rev-list", "%s..%s" % (boundary, frozen))
@@ -1493,6 +1495,7 @@ _GATE_CODE_FILES = (
     "merge_queue.py", "review_authors.py", "review_designation_activation.py",
     "lot_class.py", "plan_git.py", "modules/dev/plan_git.py", "canon.py",
     "review_lot.py", "review.py", "provenance_scope.py", "packet_reviews.py",
+    "modules/dev/lot_class.py", "modules/dev/review.py", "modules/dev/review_target.py",
 )
 _GATE_CODE_FINGERPRINT: str | None = None
 
@@ -1741,6 +1744,19 @@ def _delta_base(repo: str, row, target: str | None = None, *,
                                "project target and repository default are all empty)")
     short = _remote_branch(target)
     places = [repo] + ([other] if other and other != repo else [])
+    # #4673 : la ref distante du checkout n'est fraîche que de son dernier
+    # fetch. Le delta de la porte se lit sur la **pointe publiée** de la
+    # cible : sans cela, les commits que la cible a gagnés depuis comptent
+    # comme des tiers de la plage et refusent la provenance. La lecture est
+    # best-effort : une forge muette laisse la ref locale (doute fermé).
+    if not queue:
+        try:
+            from . import review_authors
+            fresh = review_authors.refreshed_target(repo, target)
+        except Exception:  # noqa: BLE001 - rafraîchissement au mieux
+            fresh = ""
+        if fresh:
+            return fresh, target, repo
     private = QUEUE_REF + short
     if queue:
         for place in places:
@@ -2719,7 +2735,7 @@ def _readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
             # le seul assigné (#1515).
             try:
                 authors, families = _complete_authors(
-                    db, row, tip, where, target, target_repo=repo,
+                    db, row, tip, where, fresh_target or target, target_repo=repo,
                     queue=(where != repo), klass=klass, marks=marks, cfg=cfg)
             except _ProvenanceError as exc:
                 raise QueueError(

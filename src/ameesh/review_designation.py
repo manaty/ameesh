@@ -57,6 +57,29 @@ NONE = "none"
 REQUEST_KIND = "request"
 #: a harness that is not a model family (registry without a session)
 PLACEHOLDER_FAMILIES = frozenset(("", "none", "other", "unknown", "inconnu"))
+#: #4779: what a card must prove before its agent can be a reviewer. The
+#: `propose` capacity is the ability to produce a change and a verdict; an
+#: empty `roles` list means the card gives the agent no mandate at all. A
+#: canary (`capabilities: [read]`, `roles: []`) was designated at a freeze and
+#: held the merge gate of #4770 without any possible opinion. The registry
+#: copies both fields from the card (`canon_sync`); a row without them is not
+#: a proof — the candidacy is refused and the doubt is journaled.
+REVIEWER_CAPABILITY = "propose"
+#: why a row cannot be an automatic or manual reviewer (#4779)
+CAPABILITIES_UNREADABLE = "capabilities-unreadable"
+NO_PROPOSE = "no-propose"
+ROLES_UNREADABLE = "roles-unreadable"
+NO_ROLES = "no-roles"
+#: the reasons that are a **read failure**, not a clean refusal: they are
+#: journaled (an absent/unreadable field is not evidence of anything)
+UNREADABLE_PROFILE_REASONS = frozenset((CAPABILITIES_UNREADABLE, ROLES_UNREADABLE))
+#: the human-readable explanation of each refusal reason
+PROFILE_REASONS = {
+    CAPABILITIES_UNREADABLE: "its `capabilities` are absent or unreadable in the registry",
+    NO_PROPOSE: "it does not carry the `propose` capacity",
+    ROLES_UNREADABLE: "its `roles` are unreadable in the registry",
+    NO_ROLES: "it declares no role",
+}
 #: the registry states of an agent that no longer lives: the lease reaper
 #: writes `dead`, and a `stopped` agent waits for a human. Read by the
 #: automatic designation (#3415) and by the reassignment scan of
@@ -408,9 +431,61 @@ def is_retired(row: Optional[Mapping]) -> bool:
     return bool((row or {}).get("retired_ts"))
 
 
+def _array_values(value) -> Optional[list[str]]:
+    """The values of a registry text array, or None when it cannot be read.
+
+    psycopg returns a list; a stored dump may carry the `{a,b}` text form.
+    A scalar is a one-value array, as canon `_list` accepts a string too.
+    Any other type is unreadable: the caller must not guess from it.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{") and text.endswith("}"):
+            text = text[1:-1]
+        return [part.strip().strip('"') for part in text.split(",") if part.strip()]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        # un élément NULL d'un tableau Postgres n'est pas un rôle
+        return [str(part).strip() for part in value if part is not None]
+    return None
+
+
+def reviewer_eligibility(row: Mapping) -> tuple[bool, str]:
+    """#4779: does this registry row's card allow the agent to review?
+
+    `(True, "")` when the card proves both the `propose` capacity and at least
+    one role, otherwise `(False, reason)` with a reason from `PROFILE_REASONS`.
+
+    A missing/unreadable `capabilities` field is a **read failure**, not a
+    refusal: the caller journals it (`UNREADABLE_PROFILE_REASONS`). A readable
+    list without `propose` is a clean refusal. `roles` NULL means the card
+    declares none (canon `_roles` returns None when the key is absent) and is
+    a clean refusal too; only a non-array value is a read failure.
+    """
+    caps = (row or {}).get("capabilities")
+    if caps is None:
+        return False, CAPABILITIES_UNREADABLE
+    values = _array_values(caps)
+    if values is None:
+        return False, CAPABILITIES_UNREADABLE
+    if REVIEWER_CAPABILITY not in {value.strip().lower() for value in values}:
+        return False, NO_PROPOSE
+    roles = (row or {}).get("roles")
+    if roles is None:
+        return False, NO_ROLES
+    values = _array_values(roles)
+    if values is None:
+        return False, ROLES_UNREADABLE
+    if not [value for value in values if value]:
+        return False, NO_ROLES
+    return True, ""
+
+
 def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping] = None,
                              project: str = "", families,
-                             closed_hosts: Iterable[str] = ()) -> list[Candidate]:
+                             closed_hosts: Iterable[str] = (),
+                             unreadable_profiles: Optional[list] = None) -> list[Candidate]:
     """The candidates of a project: real family, availability, caller's charge.
 
     `loads` maps a name to the agent's charge (`review_designation_activation.
@@ -429,6 +504,10 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
     exclusions (authors, correctors, the project's pilot) stay the caller's.
     #3411: an ephemeral agent is never a candidate (`is_ephemeral`).
     #3460: nor is a retired agent (`is_retired`).
+    #4779: nor is an agent whose card does not prove the `propose` capacity
+    and a role (`reviewer_eligibility`). An unreadable capability/roles field
+    is not a proof: the candidacy is refused and the caller can journal it
+    through `unreadable_profiles` (a list of `(name, reason)`).
     """
     loads = loads or {}
     wanted = (project or "").strip()
@@ -442,6 +521,11 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
             continue
         name = str((row or {}).get("name") or "").strip()
         if not name:
+            continue
+        eligible, reason = reviewer_eligibility(row)
+        if not eligible:
+            if reason in UNREADABLE_PROFILE_REASONS and unreadable_profiles is not None:
+                unreadable_profiles.append((name, reason))
             continue
         try:
             load = int(loads.get(name, 0))
@@ -755,6 +839,25 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
     names, forbidden = families_of(authors)
     fixer_names = names_of(fixers)
+    #: #4679 : un correcteur dont le commit local (avant rebase/amend) est
+    #: introuvable reste exclu par son nom ; le gel dit le doute et le SHA,
+    #: au lieu de le redésigner en silence.
+    fixer_doubts: dict[str, str] = {}
+    for row in fixers or ():
+        if isinstance(row, Mapping) and row.get("unresolved"):
+            name = str(row.get("name") or "").strip()
+            if name:
+                fixer_doubts[name] = str(row.get("unresolved") or "").strip()
+
+    def excluded_fixers_text() -> str:
+        text = ", ".join(sorted(fixer_names))
+        if fixer_doubts:
+            text += (" (unresolved correction: %s — commit not recoverable,"
+                     " excluded by doubt)" % ", ".join(
+                         "%s %s" % (name, sha[:12])
+                         for name, sha in sorted(fixer_doubts.items())))
+        return text
+
     forbidden = forbidden | families_of(fixers)[1]
     seats = manual_seats(already, authors=authors, fixers=fixers, families=families)
     kept = automatic_seats(automatic, authors=authors, fixers=fixers,
@@ -856,7 +959,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
             missing_why += (" (already designated: %s)"
                             % ", ".join(row["name"] for row in kept))
         if fixer_names:
-            missing_why += " (corrector(s) excluded: %s)" % ", ".join(sorted(fixer_names))
+            missing_why += " (corrector(s) excluded: %s)" % excluded_fixers_text()
         out.update({
             "state": WAITING,
             "missing": remaining - len(chosen),
@@ -868,7 +971,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     if kept:
         why += " (kept %d already designated for this freeze)" % len(kept)
     if fixer_names:
-        why += " (corrector(s) excluded: %s)" % ", ".join(sorted(fixer_names))
+        why += " (corrector(s) excluded: %s)" % excluded_fixers_text()
     if pace:
         reading = ["%s %+.0f pt" % (c.family.strip().lower(), _advance_of(c, pace) * 100)
                    for c in chosen if c.family.strip().lower() in pace]
@@ -1237,7 +1340,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           base: str = "", policy_ref: str = "", notify: str = "",
           unknown_authors: Iterable = (), families,
           already: Iterable = (), fixers: Iterable = (), required: Optional[int] = None,
-          advances: Optional[Mapping] = None, held: Iterable = ()) -> dict:
+          advances: Optional[Mapping] = None, held: Iterable = (),
+          doubts: Iterable = ()) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
     `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
@@ -1270,6 +1374,10 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     A fixer row with an empty family is a **personal** exclusion only
     (`test_only`, #3518, or a rewritten correction, #4457): its family remains
     eligible and another agent of it may be designated.
+    `doubts` (#4679 B/P2) names unresolved correction receipts **without any
+    lot attachment**: they prove nothing about this head, so they exclude
+    nobody; the designation's `why` says them, so the freeze still reports
+    what could not be resolved.
 
     `advances` maps a family to its advance over the plan pace, in points
     (`review_pace`, #2668), or to a `{scope: advance}` mapping whose scoped
@@ -1370,6 +1478,30 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         selection = select(required=required, authors=authors, candidates=candidates,
                            families=families, already=already, fixers=fixers,
                            advances=advances, automatic=previous)
+    # #4679 B/P2 : un reçu de correctif introuvable **sans rattachement de lot**
+    # ne prouve rien sur cette tête. Il n'entre ni dans `fixers` ni dans la
+    # porte ; le gel le dit, pour que l'objet absent ne disparaisse pas en
+    # silence. Un acteur déjà correcteur de la tête n'est pas répété.
+    excluded = {str((row or {}).get("name") or "").strip().casefold()
+                for row in fixers or () if isinstance(row, Mapping)}
+    reported = []
+    for row in doubts or ():
+        if not isinstance(row, Mapping):
+            continue
+        name = str(row.get("name") or "").strip()
+        sha = str(row.get("sha") or "").strip()
+        if name and sha and name.casefold() not in excluded:
+            reported.append((name, sha))
+    if reported:
+        unique = sorted(set(reported))
+        selection = dict(selection)
+        note = ("%d unresolved correction receipt(s) without a lot attachment"
+                " ignored, no exclusion: %s%s"
+                % (len(unique),
+                   ", ".join("%s %s" % (name, sha[:12]) for name, sha in unique[:4]),
+                   ", …" if len(unique) > 4 else ""))
+        selection["why"] = ("%s; %s" % (selection["why"], note)
+                            if selection.get("why") else note)
     if (existing is not None and existing.get("state") == WAITING
             and selection["state"] == WAITING
             and {str(row.get("name") or "") for row in selection["reviewers"]}

@@ -9,7 +9,8 @@
 #   deploy/mise-a-jour/staging.sh [--a-blanc] [--hotes "nom …"]
 #                                [--lots "n …"] [--rapporteurs "agent …"]
 #                                [--sans-sauvegarde] [--sans-sonde]
-#                                [--sans-poste] [--absent nom=raison] [REF]
+#                                [--sans-poste] [--absent nom=raison]
+#                                [--sans-retour[=ROLLBACK]] [REF]
 #
 # REF : commit, branche ou etiquette du depot (defaut : HEAD). Il doit etre un
 # ancetre de origin/main, sauf HORS_MAIN=1 (BRANCHE_MAIN pour viser une autre
@@ -84,6 +85,17 @@
 # --absent nom=raison (repete) declare un hote sans acces reportable :
 # manaty-mesh-1 ou pc-smichea. Les trois VM d'agents ne le sont jamais ; chaque
 # absence est tracee au commit vise et reprise dans l'attestation.
+#
+# --sans-retour[=ROLLBACK] (#4616) desactive le retour automatique : apres une
+# migration non additive (fenetre de migration, go owner), reinstaller le
+# previous-sha sur la base deja migree serait dangereux (l'ancien code lit mal
+# le nouvel etat). Un echec d'hote est alors trace (`retour` desactive), la
+# sequence s'arrete sur cet hote sans `exec_hote retour`, et le courrier urgent
+# au pilote donne la marche manuelle : executeurs arretes, rollback SQL
+# d'abord (ROLLBACK, par exemple
+# src/ameesh/migrations/rollback/0518_generic_delivery_state.sql), puis retour
+# de code de l'hote. L'attestation d'une sequence saine porte la mention
+# « retour automatique desactive ». Sans l'option, rien ne change.
 #
 # --lots / --rapporteurs (ou LOTS_VERIF / RAPPORTEURS_VERIF) : les lots livres
 # par ce deploiement et les agents a reveiller quand il est reellement actif.
@@ -225,8 +237,11 @@ SONDE=1
 HOTES_FILTRE=""
 REF=HEAD
 POSITIONNELS=0
+#: #4616 : 1 = aucun retour automatique (migration non additive posee)
+SANS_RETOUR=0
+ROLLBACK_SQL=""
 
-usage() { sed -n '9,12p' "$0"; }
+usage() { sed -n '9,13p' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -234,6 +249,12 @@ while [ $# -gt 0 ]; do
     --sans-sauvegarde) SAUVER=0 ;;
     --sans-sonde) SONDE=0 ;;
     --sans-poste) SANS_POSTE=1 ;;
+    --sans-retour) SANS_RETOUR=1 ;;
+    --sans-retour=*)
+      SANS_RETOUR=1
+      ROLLBACK_SQL=${1#--sans-retour=}
+      [ -n "$ROLLBACK_SQL" ] || { echo "--sans-retour= : rollback vide" >&2; exit 2; }
+      ;;
     --absent)
       _absent=${2:?--absent attend NOM=RAISON}
       shift
@@ -813,6 +834,9 @@ echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
   if [ -n "$rapport" ]; then
     printf '   rapport de sonde : %s\n' "$rapport" >&2
   fi
+  if [ "$SANS_RETOUR" = 1 ]; then
+    retour_desactive "$nom" "$ou" "$detail" "$complement"
+  fi
   etape "$nom : retour automatique (previous-sha)"
   if ! exec_hote "$nom" retour; then
     trace "$nom" retour ko "le retour lui-meme a echoue"
@@ -832,6 +856,38 @@ echec_hote() {  # nom etape detail : retour de l'hote, controle, arret, courrier
   notifier "staging #1155 : $nom en echec, retour effectue" \
     "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail). Retour automatique effectue et controle (unites, baux, doctor). Sequence arretee avant les hotes suivants : rien d'autre n'a ete modifie.$complement Trace : $JOURNAL"
   echo "sequence arretee sur $nom (retour effectue et controle)" >&2
+  exit 1
+}
+
+# #4616 : --sans-retour. Apres une migration non additive, l'ancien code sur
+# la base migree est dangereux : aucun `exec_hote retour`. L'echec est trace,
+# la sequence s'arrete sur cet hote et le pilote recoit la marche manuelle,
+# rollback SQL d'abord, retour de code ensuite.
+retour_desactive() {  # nom etape detail complement
+  local nom=$1 ou=$2 detail=$3 complement=$4 precedent rollback marche outil
+  precedent=$(precedent_retour "$nom" || true)
+  case "$(mode_de "$nom")" in
+    poste) outil="poste.sh retour" ;;
+    agents) outil="vm.sh agents retour" ;;
+    serveur) outil="vm.sh retour" ;;
+  esac
+  rollback=${ROLLBACK_SQL:-le rollback SQL de la migration non additive posee (src/ameesh/migrations/rollback/)}
+  marche=$(printf '%s\n' \
+    "Marche manuelle (dans cet ordre) :" \
+    "1. arreter les executeurs des hotes deja passes a $SHA_TRAVE ;" \
+    "2. rollback SQL d'abord, en une transaction sur la base du mesh : $rollback ;" \
+    "3. seulement ensuite, retour de code de $nom vers ${precedent:-previous-sha (illisible)} : $outil (BASCULE_ENV de l'hote), puis controler ; de meme pour chaque hote deja a $SHA_TRAVE ;" \
+    "4. relancer les executeurs et verifier (doctor, courrier).")
+  trace "$nom" retour desactive "retour automatique desactive (--sans-retour) : rollback SQL d'abord ($rollback), puis retour de code"
+  printf '   retour automatique desactive (--sans-retour) : %s reste sur %s\n%s\n' \
+    "$nom" "$SHA_TRAVE" "$marche" >&2
+  notifier "staging #4616 : $nom en echec, retour automatique desactive" \
+    "Le staging $SHA_TRAVE a echoue sur $nom ($ou : $detail). Retour automatique desactive (--sans-retour) : aucun retour n'a ete lance, $nom reste sur $SHA_TRAVE. Sequence arretee avant les hotes suivants ; intervention requise.
+
+$marche$complement
+
+Trace : $JOURNAL"
+  echo "sequence arretee sur $nom (retour automatique desactive)" >&2
   exit 1
 }
 
@@ -867,6 +923,9 @@ if [ "$A_BLANC" = 1 ]; then
     echo "  etapes : verifier les VM de la sequence ; sauvegarde du serveur sur manaty-mesh-1 (poste absent ; sautee si le serveur est reporte) ; migrations appliquees depuis une VM d'agents (additif, dry-run d'abord) ; puis par hote installer, redemarrer, timers (agents et poste), controler, sante"
   else
     echo "  etapes : verifier partout, sauvegarder+migrer ${SHA_TRAVE} (additif), puis par hote installer, redemarrer, timers (agents et poste), controler, sante"
+  fi
+  if [ "$SANS_RETOUR" = 1 ]; then
+    echo "  retour automatique desactive (--sans-retour) : un echec arrete la sequence sans retour ; marche manuelle au pilote, rollback SQL ${ROLLBACK_SQL:-de la migration posee} d'abord"
   fi
   if [ "$SEQUENCE_COMPLETE" = 1 ]; then
     echo "  sequence complete et saine : attestation « staging actif » et courrier aux rapporteurs"
@@ -1037,6 +1096,7 @@ else
   etape "signal actif staging ($SHA_TRAVE)"
   ARGS_ACTIF=(--sha "$SHA" --depuis "$DEPUIS")
   [ "$SONDE" = 1 ] || ARGS_ACTIF+=(--sans-sonde)
+  [ "$SANS_RETOUR" = 0 ] || ARGS_ACTIF+=(--sans-retour)
   for nom in "${HOTES[@]}"; do
     actif_sha=$(sha_installe "$nom" || true)
     ARGS_ACTIF+=(--hote "$nom=${actif_sha,,}" --mode "$nom=$(mode_de "$nom")")

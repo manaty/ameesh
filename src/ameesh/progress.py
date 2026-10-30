@@ -76,6 +76,7 @@ from . import estimates as estimates_mod
 from . import plan as plan_mod
 from . import stagnation
 from . import storage
+from . import vocab
 from . import versions as versions_mod
 from . import work as work_mod
 
@@ -106,8 +107,28 @@ BUDGET_PAUSE_PREFIX = "budget : "
 
 _FR_LOT = {"active": "active", "review": "in review", "blocked": "blocked",
            "approved": "approved", "merged": "merged", "closed": "closed"}
+
 _FR_AGENT = {"working": "working", "idle": "idle", "paused": "paused",
              "stopped": "stopped"}
+
+
+def vocabulary_view(vocabulary=None) -> dict:
+    """L102 T3 (#4393) : le nom d'une tâche dans le vocabulaire du module
+    actif (`vocab.active()`), porté par l'instantané pour la page ; les
+    clés JSON (`lots`, `lots_merged`…) et les états ne changent pas."""
+    v = vocab.active() if vocabulary is None else vocabulary
+    return {"singular": v.singular, "plural": v.plural, "gender": v.gender,
+            "title": v.title, "title_plural": v.title_plural,
+            "abbreviation": v.abbreviation}
+
+
+def _vocabulary(snap: dict) -> vocab.Vocabulary:
+    """Le vocabulaire d'un instantané ; sans le champ, celui du module actif."""
+    v = snap.get("vocabulary")
+    if not v:
+        return vocab.active()
+    return vocab.Vocabulary(v["singular"], v["plural"], v.get("gender") or "f")
+
 
 #: connecteur de fusion (L5) : son approbation vaut verdict, sa confirmation fusion
 MERGE_CONNECTOR = registry.merge_connector()
@@ -1202,6 +1223,9 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
                        limits=limits),
         "truncated": truncated,
         "missing": list(MISSING),
+        # L102 T3 (#4393, champ ajouté) : le nom d'une tâche dans le vocabulaire
+        # du module actif, pour les titres et libellés de la page
+        "vocabulary": vocabulary_view(),
     }
 
 
@@ -1244,11 +1268,12 @@ def _build_cap(cfg) -> int | None:
         return None
 
 
-def _wip_label(builds: int, cap: int | None) -> str:
+def _wip_label(builds: int, cap: int | None, vocabulary=None) -> str:
     """§4 : l'en-cours d'un agent, et le dépassement du plafond s'il y en a un."""
+    v = vocab.active() if vocabulary is None else vocabulary
     if cap is not None and builds > cap:
-        return "%d lots in build (above the §4 cap of %d)" % (builds, cap)
-    return "%d lot(s) in build" % builds
+        return "%d %s in build (above the §4 cap of %d)" % (builds, v.plural, cap)
+    return "%d %s in build" % (builds, v.abbreviation)
 
 
 def _ci_suite_lines(ci: dict, width: int) -> list[str]:
@@ -1286,6 +1311,7 @@ def format_text(snap: dict, width: int | None = None) -> str:
         width = shutil.get_terminal_size((80, 24)).columns
     width = max(36, min(int(width), 100))
     now = snap["generated_ts"]
+    words = _vocabulary(snap)
     out: list[str] = []
 
     def line(text: str, indent: str = "") -> None:
@@ -1323,14 +1349,14 @@ def format_text(snap: dict, width: int | None = None) -> str:
         out.extend(roadmap_mod.format_gantt(snap["roadmap"], width).splitlines())
 
     out.append("")
-    line("LOTS (%d)" % len(snap["lots"]))
-    for key, label in (("lots", "lots"), ("actions", "actions")):
+    line("%s (%d)" % (words.plural.upper(), len(snap["lots"])))
+    for key, label in (("lots", words.plural), ("actions", "actions")):
         cut = (snap.get("truncated") or {}).get(key)
         if cut:
             line("TRUNCATED: %d of %d %s shown (limit %d)" % (
                 cut["shown"], cut["total"], label, cut["limit"]), "  ")
     if not snap["lots"]:
-        line("no lot in the window", "  ")
+        line("no %s in the window" % words.singular, "  ")
     for lot in snap["lots"]:
         m = lot["milestones"]
         state = _FR_LOT.get(lot["state"], lot["state"])
@@ -1361,7 +1387,7 @@ def format_text(snap: dict, width: int | None = None) -> str:
             line(" · ".join(extra), "    ")
         if lot.get("planned_wait"):
             from .work_dependencies import wait_label
-            line(wait_label(lot["planned_wait"]), "    ")
+            line(wait_label(lot["planned_wait"], words.plural), "    ")
         if lot.get("waiting_for"):
             line("waiting for: %s" % lot["waiting_for"]["label"], "    ")
         if lot.get("delegation"):
@@ -1376,8 +1402,8 @@ def format_text(snap: dict, width: int | None = None) -> str:
         line("EPICS (%d)" % len(epics))
         for epic in epics:
             counted = epic["lots_total"] - epic["lots_abandoned"]
-            line("%s — %s: %d/%d lots merged%s" % (
-                epic["id"], epic["title"], epic["lots_merged"], counted,
+            line("%s — %s: %d/%d %s merged%s" % (
+                epic["id"], epic["title"], epic["lots_merged"], counted, words.plural,
                 " (%d abandoned)" % epic["lots_abandoned"] if epic["lots_abandoned"] else ""),
                 "  ")
 
@@ -1392,7 +1418,7 @@ def format_text(snap: dict, width: int | None = None) -> str:
         line("%s · %s · effort %s · %s" % (
             agent["harness"] or "?", agent["model"] or "default",
             agent["effort"] or "default", _wip_label(agent.get("builds") or 0,
-                                                 snap.get("build_cap"))), "    ")
+                                                 snap.get("build_cap"), words)), "    ")
         turn = agent.get("turn")
         if turn:
             line("turn: %s" % (turn["task"] or turn["label"] or "running"), "    ")
@@ -1411,8 +1437,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
     if snap["milestones"]:
         line("MILESTONES (%d)" % len(snap["milestones"]))
         for ms in snap["milestones"]:
-            progress = ("%d/%d lots merged" % (
-                ms["lots_merged"], ms["lots_total"] - ms.get("lots_abandoned", 0))
+            progress = ("%d/%d %s merged" % (
+                ms["lots_merged"], ms["lots_total"] - ms.get("lots_abandoned", 0),
+                words.plural)
                 if "lots_total" in ms else "")
             line("%s %s%s" % (ms["date"] if ms.get("date") else "no date",
                               ms.get("title", ""), " — %s" % progress if progress else ""), "  ")

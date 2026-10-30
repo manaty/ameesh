@@ -113,6 +113,7 @@ class ModuleConfigurationTest(unittest.TestCase):
                                         identity={"agent": "tester", "runner_id": "r1",
                                                   "lease_epoch": 2})
 
+    @support.needs_builtin_modules
     def test_only_named_project_is_enabled(self):
         entries = modules.declarations(federation())
         self.assertEqual([(e["project"], e["module"]) for e in entries], [("acme", "it")])
@@ -120,6 +121,7 @@ class ModuleConfigurationTest(unittest.TestCase):
         self.assertEqual(modules.declarations({}), [])
         self.assertEqual(modules.declarations(federation(names=[])), [])
 
+    @support.needs_builtin_modules
     def test_dev_descriptor_without_a_type_leaves_project_policies_unchanged(self):
         """L101 T4: `dev` is built in, always active and stores no work type.
 
@@ -157,6 +159,7 @@ class ModuleConfigurationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown sample module option"):
             fake.descriptor({"require_qa": ["promoted"]})
 
+    @support.needs_builtin_modules
     def test_external_descriptor_and_it_coexist_with_disjoint_types(self):
         fake = external_sample()
         with external_points(FakeEntryPoint(fake)):
@@ -167,6 +170,7 @@ class ModuleConfigurationTest(unittest.TestCase):
         self.assertEqual(set(fake.TYPES), set(FIVE_DOCUMENTARY))
         self.assertFalse(it_types & set(fake.TYPES))
 
+    @support.needs_builtin_modules
     def test_external_module_refusals(self):
         mismatch = external_sample(name="other")
         no_descriptor = types_mod.ModuleType("broken_module")
@@ -214,6 +218,7 @@ class ModuleConfigurationTest(unittest.TestCase):
         self.assertFalse(row["ok"])
         self.assertIn("declares NAME", row["error"])
 
+    @support.needs_builtin_modules
     def test_external_evidence_reports_duplicates_as_unusable(self):
         points = (FakeEntryPoint(external_sample()),
                   FakeEntryPoint(external_sample()))
@@ -282,6 +287,7 @@ class ModuleConfigurationTest(unittest.TestCase):
         self.assertEqual(result.status, canon_sync.AUTH_REFUSED)
         apply.assert_not_called()
 
+    @support.needs_builtin_modules
     def test_partial_canon_preserves_policies_and_trusted_complete_canon_applies(self):
         c = canon.Canon(root=".", readable=True, federation=federation())
         lock = mock.Mock()
@@ -461,6 +467,7 @@ class ExecutionTest(unittest.TestCase):
         run.assert_not_called()
 
 
+@support.needs_builtin_modules
 class LifecycleGateTest(PgTestCase):
     def setUp(self):
         super().setUp()

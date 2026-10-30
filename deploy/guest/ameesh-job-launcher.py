@@ -511,7 +511,15 @@ def prune_job_volumes() -> None:
             # Never force: Podman checks references at deletion, including a
             # container created since inspect. Even stopped containers retain
             # their volumes; a concurrent live job cannot lose its data.
-            podman_cleanup("volume", "rm", *stale)
+            removed = podman_cleanup("volume", "rm", *stale)
+            if removed:
+                # The inventory proves anonymity/age, Podman proves absence
+                # of references at deletion. Log only names actually removed,
+                # never container environment or the volume's private data.
+                names = [name for name in removed.splitlines() if name in stale]
+                if names:
+                    sys.stderr.write("ameesh-job-launcher: removed %d stale anonymous "
+                                     "volume(s): %s\n" % (len(names), ", ".join(names)))
     except (ValueError, TypeError) as exc:
         die("podman volume inventory unreadable: %s" % exc)
 

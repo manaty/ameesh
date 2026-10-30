@@ -184,9 +184,12 @@ class _Base(PgTestCase):
                         " lease_expires_at = now() + interval '1 hour'")
         self.now = time.time()
 
-    def slo(self, **kw):
+    def slo(self, record_footprint=True, **kw):
+        # #4579 : par défaut, la passe de livraison du notificateur (qui date
+        # les épisodes) ; `record_footprint=False` est une simple lecture.
         kw.setdefault("orchestrators_declared", ["orch"])
         return [a for a in exploitation.alerts(self.cfg, self.db, now=self.now,
+                                               record_footprint=record_footprint,
                                                **_seuils(**kw))
                 if a["type"] == "slo_breach"]
 
@@ -234,6 +237,38 @@ class TemoinAqaBintakeTest(_Base):
             self.assertAlmostEqual(alert["since"], merged, delta=5)
             # 1 h 30 depuis la fusion : 30 min au-delà de la cible d'une heure
             self.assertAlmostEqual(alert["value"], 0.5 * H, delta=5)
+
+    def test_une_lecture_n_ecrit_aucune_note_d_episode(self):
+        # #4579 : `ameesh alerts` (lecture, tout agent) n'écrit pas au journal
+        # du lot ; la passe de livraison seule date l'ouverture et la levée.
+        a = work.add(self.db, title="A occupe f.py", app="ameesh", assignee="dev1")
+        b = work.add(self.db, title="B attend f.py", app="ameesh")
+        self.footprint(a, "f.py")
+        self.footprint(b, "f.py")
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s",
+                        (a["id"],))
+        self.db.execute("UPDATE work_items SET created_at = now() - interval '13 hours'"
+                        " WHERE id = %s", (b["id"],))
+        before = self.journal(b)
+
+        self.assertEqual(self.slo(record_footprint=False), [])
+        self.assertEqual(self.journal(b), before)
+
+        self.assertEqual(self.slo(), [])
+        opened = self.journal(b)
+        self.assertTrue(any(("en attente d'empreinte : #%d" % a["id"]) in note
+                            for note in opened))
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (a["id"],))
+        merged = time.time()
+        self.now = merged + 2 * H
+        # levée non encore notée : la lecture la date de la fusion du
+        # bloqueur, sans rien écrire
+        alerts = self.slo(record_footprint=False)
+        self.assertTrue(alerts)
+        for alert in alerts:
+            self.assertAlmostEqual(alert["since"], merged, delta=5)
+        self.assertEqual(self.journal(b), opened)
 
     def test_le_lot_retenu_n_entre_pas_dans_les_demarrables(self):
         from types import SimpleNamespace

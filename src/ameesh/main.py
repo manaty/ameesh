@@ -34,12 +34,12 @@
         requests forwarded to orchestrators; never takes another agent's
         session (L123);
   ameesh ci status <lot> [--limit N] [--json]
-        latest CI runs and failing tests of a work item;
-  ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
+        latest CI runs and failing tests of a {work};
+  ameesh conflicts [--all] [--json]     conflict radar between {works} (L160b);
   ameesh cost …               turn cost, per-turn usage, gauges and their
         history, pay-per-token provider balance (`cost turns|gauges|balance`);
   ameesh debit [--json] [--check] [--hours N] [--threshold 2h]
-        débit mesuré sur les jalons (canon 24/10/2026) : lots en qa/blocked par
+        débit mesuré sur les jalons (canon 24/10/2026) : les {works} en qa/blocked par
         âge, avis dus par relecteur, avis bloquants non traités, holds et
         réveils, agents au repos avec du travail dû, tours et fusions par
         heure, durée de CI par job ; `--check` sort 2 sur une attente > seuil ;
@@ -50,17 +50,17 @@
   ameesh decide ask (--lot <id|ref> | --new-lot "title") --question "…"
         --option a="…" [--option b="…"] [--recommend a --why "…"] [--urgent]
         [--by 2h] [--needs-signature] [--from-mail <id>]
-        an agent asks the owner for a decision (work item in waiting_human,
+        an agent asks the owner for a decision ({work} in waiting_human,
         the only way in — L233);
   ameesh decisions [--all] [--for human:ID] [--json]
         decisions waiting for a human, across all projects: agent requests
         (L124, oldest first), gated actions; apart, decisions written in prose
-        in mail and work items waiting with no question (L233, not requests);
+        in mail and {works} waiting with no question (L233, not requests);
   ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh device enroll|challenge|show   device-side enrollment, in the VM (L110);
   ameesh doctor               schema and diagnostics;
   ameesh events [--after ID] [--limit N] [--json] | prune [--days N] [--dry-run]
-        the event log (lot transitions, turns, costs, threads, decisions, alerts) and
+        the event log ({work} transitions, turns, costs, threads, decisions, alerts) and
         its retention (365 days by default, L85);
   ameesh export-v0            export to the v0 file mailbox;
   ameesh fil list | show <project> [<lot>] [--last N] | tail <project> [<lot>]
@@ -75,7 +75,7 @@
         and exit code 3 says the quota is exhausted with nothing cached.
   ameesh guard check|run|drain          capacity guard of a lending VM (L159e);
   ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
-        reserved host move at a lot boundary, durable journal (L232a);
+        reserved host move at a {work} boundary, durable journal (L232a);
   ameesh harness adopt|tick|show-adoption|rollback-adoption   adoption of a harness or model version
         (#3264 C): auto at equal price after a canary, owner decision otherwise;
   ameesh harness list|show|check|versions  harnesses (L16, L120);
@@ -93,8 +93,8 @@
   ameesh identity verify [JETON|-] [--issuer U --client-id C] [--domain D]
                          [--binding subject|email]
         vérifie un jeton d'identité OIDC et le rattache au canon (le couple
-        `{issuer, subject}` d'une fiche Member par défaut, `emails` sur choix
-        explicite) : L86, lot #377 ; sortie 3 si aucun membre ne correspond ;
+        `{{issuer, subject}}` d'une fiche Member par défaut, `emails` sur choix
+        explicite) : L86, {work} #377 ; sortie 3 si aucun membre ne correspond ;
   ameesh import-v0            import from the v0 file mailbox;
   ameesh interrupt <agent> <message…>   direct interruption (authorized senders);
   ameesh key …                public keys (owner / agent);
@@ -142,11 +142,11 @@
         attestations and approvals, the hosts read a fresh fail-closed
         projection; deployed never expires by age, QA observations do;
   ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since 24h]
-        progress: work items, agents, milestones, budget (schema ameesh-progress/1);
+        progress: {works}, agents, milestones, budget (schema ameesh-progress/1);
         --serve: the page served locally, read-only, with a Refresh button (L304);
   ameesh projects [--json] [--project P] [--all]
-        active projects: agents, state, current work item, unread, 24 h spend,
-        plan or token, work items without an agent (schema ameesh-projects/1, L62);
+        active projects: agents, state, current {work}, unread, 24 h spend,
+        plan or token, {works} without an agent (schema ameesh-projects/1, L62);
   ameesh provenance record --commit SHA | statement | intent | created | install | show
         #1465 : preuve exacte d'origine (acteur, session, tour, harnais) d'un
         commit ou d'un jalon — le hook `pre-commit` atteste le commit qui vient,
@@ -156,7 +156,7 @@
   ameesh receipt verify       approval receipts (spec §8);
   ameesh release open|check|reason <lot>   release perimeter and validation;
   ameesh replay bench|run|report   banc de rejeu comparatif (#3264 B, L15) :
-        trois lots livrés sur leur base gelée, version installée et version
+        trois {works} {delivered} sur leur base gelée, version installée et version
         évaluée, relecture croisée à l'aveugle ;
   ameesh restart <agent> --brief FILE|-   fresh session on a brief;
   ameesh resume <agent> [--brief FILE|-] [--fresh]
@@ -199,7 +199,7 @@
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
   ameesh veille scan [--dry-run] [--json] [--no-probe] [--harness ID]
-        #3264 A: daily watch of harness/model versions; one evaluation lot per
+        #3264 A: daily watch of harness/model versions; one evaluation {work} per
         harness, priority 1 on a vendor recommendation (config `veille.sources`);
   ameesh verify               verify a signed approval;
   ameesh version | --version  version of the installed package;
@@ -207,13 +207,13 @@
         L121: the watch of an agent, a timer on this host that sends it the
         versioned instruction (consignes/veille.md), shown in `ameesh projects`;
   ameesh work estimates [--app P] [--json]
-        L157: actual/estimated gaps of delivered work items (median, p80) by
-        type and by estimate author; every work item carries an estimated
+        L157: actual/estimated gaps of delivered {works} (median, p80) by
+        type and by estimate author; every {work} carries an estimated
         duration from creation (`work add --estimate 2h`, `work plan <id> --estimate 90m`);
-  ameesh work …               work items; `work backlog add|list`: continuous
+  ameesh work …               {works}; `work backlog add|list`: continuous
         improvement queue, picked up by idle agents (L119, 0037);
         `work unrecorded [--since 24h] [--json]`: human requests (mail,
-        decision answers, chat) not attached to any work item (L130);
+        decision answers, chat) not attached to any {work} (L130);
 
 The human approval service (spec §9) is a separate command,
 `ameesh-approve` (python -m ameesh.approve), run under its own
@@ -226,6 +226,20 @@ from __future__ import annotations
 
 import os
 import sys
+
+
+def _doc(vocabulary=None) -> str:
+    """``ameesh --help``: the description in the active module's vocabulary.
+
+    L102 T2 (#4392): the core's neutral word is CORE ("tâche"); the dev tooling
+    module declares DEV ("lot"), read through :func:`ameesh.vocab.active`. The
+    text is a template (``{work}``/``{works}``/``{delivered}``) so the verbs
+    and the agreement follow the vocabulary."""
+    from . import vocab
+    v = vocab.active() if vocabulary is None else vocabulary
+    return __doc__.format(work=v.noun, works=v.plural,
+                          delivered=v.agree("livré", "livrée", plural=True))
+
 
 #: sous-commandes servies par mesh_cli (parseur déjà en place)
 MESH_COMMANDS = (
@@ -314,7 +328,7 @@ def _stdout_closed() -> bool:
 def _dispatch(argv: list[str] | None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] in ("-h", "--help", "help"):
-        print(__doc__)
+        print(_doc())
         return 0
     command, rest = argv[0], argv[1:]
     if command == "role" and rest[:1] == ["run"]:
@@ -492,7 +506,7 @@ def _dispatch(argv: list[str] | None) -> int:
         from . import process_observations_cli
         return process_observations_cli.main(rest)
     print("ameesh: unknown subcommand %r" % command, file=sys.stderr)
-    print(__doc__)
+    print(_doc())
     return 2
 
 

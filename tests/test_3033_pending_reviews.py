@@ -97,6 +97,36 @@ class PendingReviewsTest(t2447._ActivationFixture, PgTestCase):
         self.assertNotIn("r1", loads)
         self.assertEqual(loads.get("r2"), 1)
 
+    def test_a_validated_quorum_discharges_the_surplus_seat(self):
+        # #4851 / #4825: three seats remain recorded after two sufficient
+        # opinions. The third reviewer owes nothing once the lot is validated.
+        lot, sha = self.pending_lot("r1")
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY['r1', 'r2', 'r3'] WHERE id = %s",
+            (lot,))
+        for reviewer in ("r1", "r2"):
+            self.db.execute(
+                "INSERT INTO work_item_milestones"
+                " (work_item_id, kind, sha, actor, verdict)"
+                " VALUES (%s, 'verdict', %s, %s, 'ok')", (lot, sha, reviewer))
+        # The same snapshot in qa still owes the remaining designated review.
+        self.assertEqual([r["name"] for r in act.pending_reviews(self.db)], ["r3"])
+        self.assertEqual(act._loads(self.db).get("r3"), 1)
+        author_load = act._loads(self.db).get("author")
+        self.db.execute("UPDATE work_items SET state = 'validated' WHERE id = %s", (lot,))
+        self.assertEqual(act.pending_reviews(self.db), [])
+        self.assertNotIn("r3", act._loads(self.db))
+        self.assertEqual(act._loads(self.db).get("author"), author_load)
+        reviews, _fixes = act.owed_work(self.db)
+        alerts = slo.lot_steps(
+            {"id": lot, "state": "validated", "priority": 2, "created_ts": 0.0,
+             "assignee": "author"}, {}, [], now=100000.0, reviews=reviews)
+        self.assertEqual([r for r in alerts if r["step"] == "green_verdict"], [])
+        self.assertIn(reprise.NO_PENDING_REVIEW, _reviews_section(_brief(self, "r3")))
+        # Returning to qa restores the due review without rewriting the seats.
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (lot,))
+        self.assertEqual([r["name"] for r in act.pending_reviews(self.db)], ["r3"])
+
     def test_an_old_automatic_name_is_not_owed_on_the_new_head(self):
         # During the selection of a new freeze, the column still carries the
         # previous head's automatic names: they owe nothing on the new head.

@@ -27,6 +27,10 @@ from dataclasses import dataclass
 
 DEFAULT_MIN_INTERVAL_S = 300.0
 _SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+# SigV4 signs the request body under x-amz-content-sha256. curl 7.88 (Debian 12)
+# signs that header when supplied but never adds it itself; Scaleway refuses
+# the request without it. A GET/list has no body and names the empty hash.
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 class BackupError(RuntimeError):
@@ -197,7 +201,9 @@ def _curl(args: list[str], data: bytes | None = None, timeout: float = 600,
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write('user = "' + quoted + '"\n')
         try:
-            proc = subprocess.run(["curl", "-q", "--config", path, "-fsS", "--retry", "3", *args],
+            proc = subprocess.run(["curl", "-q", "--config", path, "-fsS", "--retry", "3",
+                                   "-H", "x-amz-content-sha256: "
+                                   + hashlib.sha256(data or b"").hexdigest(), *args],
                                   input=data, capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             raise BackupError("S3 storage timed out") from None

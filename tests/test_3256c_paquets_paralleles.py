@@ -347,7 +347,8 @@ class ComposerParallelTest(unittest.TestCase):
                               parallel=SimpleNamespace(attente_mediane_s=3600.0,
                                                        max_paquets=2))
         self._saved = (ph.ready_lots, ph.candidates, ph.manifest_at,
-                       ph.replay_locally, ph.next_name)
+                       ph.replay_locally, ph.next_name,
+                       ph.auto.composition_holder)
         self.ready = [101, 102]
         self.payload = {"base": HEAD,
                         "candidates": [candidate(101, ["a.py"]),
@@ -359,10 +360,15 @@ class ComposerParallelTest(unittest.TestCase):
         ph.manifest_at = lambda ctx, item, sha: MANIFEST
         ph.replay_locally = lambda ctx, sha, tests: ""
         ph.next_name = lambda ctx: next(self.names)
+        # #4567 : le verrou de composition se lit dans le `.git` du checkout ;
+        # le guest de prévalidation rejoue un snapshot sans dépôt. Comme le
+        # Base de test_3845, les témoins remplacent cette lecture ; ceux du
+        # verrou la patchent explicitement dans leur `with`.
+        ph.auto.composition_holder = lambda repo, name: None
 
     def tearDown(self):
         (ph.ready_lots, ph.candidates, ph.manifest_at, ph.replay_locally,
-         ph.next_name) = self._saved
+         ph.next_name, ph.auto.composition_holder) = self._saved
 
     def autos(self):
         return [call for call in self.shell.calls

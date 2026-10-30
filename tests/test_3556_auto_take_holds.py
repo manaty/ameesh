@@ -74,3 +74,40 @@ class PilotHoldTest(_Lots):
             with self.assertRaisesRegex(RuntimeError, "canon unreadable"):
                 self.take()
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+
+
+class ImprovementQueueHoldTest(_Lots):
+    """#4741 : la file d'amélioration suit la garde des lots d'équipe."""
+
+    def held_element(self, title="amelioration tenue", *, score=15, wake=True):
+        item = self.element(title, score)
+        st = storage.of(self.db)
+        st.work.note(item["id"], "intake", "hold: fenêtre jusqu'au 04/11",
+                     "human:proprio")
+        if wake:
+            st.work.schedule_wake(item["id"], self.now + 3600,
+                                  text="réveil", actor="test")
+        return item
+
+    def test_held_improvement_with_future_wake_is_not_taken(self):
+        self.agent("claude1", team="nexlink")
+        item = self.held_element()
+        self.assertEqual(self.take(dry_run=True), [])
+        self.assertEqual(self.take(), [])
+        self.assertIsNone(work.get(self.db, item["id"])["assignee"])
+
+    def test_lift_releases_held_improvement(self):
+        self.agent("claude1", team="nexlink")
+        item = self.held_element()
+        self.assertEqual(self.take(), [])
+        storage.of(self.db).work.note(
+            item["id"], "intake", "unhold: fenêtre ouverte", "human:proprio")
+        self.assertEqual([t["item"]["id"] for t in self.take()], [item["id"]])
+
+    def test_wake_deadline_releases_held_improvement(self):
+        self.agent("claude1", team="nexlink")
+        item = self.held_element()
+        self.assertEqual(self.take(), [])
+        self.assertEqual([t["item"]["id"] for t in self.take(now=self.now + 7200)],
+                         [item["id"]])
+

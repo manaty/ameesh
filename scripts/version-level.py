@@ -41,7 +41,9 @@ migration, comments, strings and function bodies are not statements; the
 body of a `DO` block is (in dollars or in a plain string), with the strings,
 plain or in dollars, it hands to `EXECUTE` or `format(…)`. A package module
 is reached by alias, by its full name (`ameesh.plan_cli.add_parsers`) or
-through a module that imports a helper and hands it on; an import inside a
+through a module that imports a helper and hands it on; an old path that only
+aliases the module a command moved to (`sys.modules[__name__] = moved`,
+#4382) is read at the module it hands back; an import inside a
 function or a class body binds only there (not in the functions or methods
 it nests, nor around it), and hides a module function of the same name.
 
@@ -235,6 +237,27 @@ def _scope(nodes):
             todo.extend(ast.iter_child_nodes(node))
 
 
+def _alias(tree: ast.Module, modules: dict[str, str]) -> str | None:
+    """The module this file hands back for its own name, when the old import
+    path only aliases a moved one (`sys.modules[__name__] = _moved`, #4382):
+    a caller's `from . import moved` then gets the real module, parser
+    included."""
+    for node in _scope(tree.body):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target, value = node.targets[0], node.value
+        if not (isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Attribute)
+                and target.value.attr == "modules"
+                and isinstance(target.value.value, ast.Name)
+                and target.value.value.id == "sys"
+                and isinstance(target.slice, ast.Name) and target.slice.id == "__name__"):
+            continue
+        if isinstance(value, ast.Name) and value.id in modules:
+            return modules[value.id]
+    return None
+
+
 def _imports(nodes, module: str, init: bool = False,
              ) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
     """The package modules imported in `nodes` (one scope: a module without
@@ -283,6 +306,14 @@ class _Package:
         self.options: set[str] = set()
         self.files = {module: _Parsers(tree, module, self, init)
                       for module, (tree, init) in trees.items()}
+        #: a deprecated import path aliasing the module it moved to
+        #: (`sys.modules[__name__]`, #4382): the parser it registers is the
+        #: real module's
+        self.redirects = {}
+        for module, parsers in self.files.items():
+            target = _alias(parsers.tree, parsers.top[0])
+            if target is not None and target != module:
+                self.redirects[module] = target
         #: (module, function) running, against recursion across modules
         self.stack: list[tuple[str, str]] = []
         #: functions called somewhere in the package: their callers say
@@ -291,12 +322,22 @@ class _Package:
         self.called = {self.resolve(callee) for parsers in self.files.values()
                        for callee in parsers.calls()} - {None}
 
+    def redirect(self, module: str) -> str:
+        """The module an alias path hands back, following the chain."""
+        seen = set()
+        while module in self.redirects and module not in seen:
+            seen.add(module)
+            module = self.redirects[module]
+        return module
+
     def resolve(self, callee: tuple[str, str]) -> tuple[str, str] | None:
         """Where a function is defined: a module may import it from another
-        and hand it on (`bridge.fill`, imported in `bridge` from `plan_cli`)."""
+        and hand it on (`bridge.fill`, imported in `bridge` from `plan_cli`),
+        or alias the module it moved to (`sys.modules[__name__]`, #4382)."""
         seen = set()
         while callee is not None and callee not in seen:
             seen.add(callee)
+            callee = (self.redirect(callee[0]), callee[1])
             parsers = self.files.get(callee[0])
             if parsers is None:
                 return None

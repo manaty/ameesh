@@ -376,6 +376,53 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "vocabulary": {
+            "properties": {
+              "definite": {
+                "type": "string"
+              },
+              "definite_plural": {
+                "type": "string"
+              },
+              "elides": {
+                "type": "boolean"
+              },
+              "gender": {
+                "type": "string"
+              },
+              "indefinite": {
+                "type": "string"
+              },
+              "indefinite_plural": {
+                "type": "string"
+              },
+              "of": {
+                "type": "string"
+              },
+              "of_plural": {
+                "type": "string"
+              },
+              "plural": {
+                "type": "string"
+              },
+              "singular": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "title_plural": {
+                "type": "string"
+              },
+              "to": {
+                "type": "string"
+              },
+              "to_plural": {
+                "type": "string"
+              }
+            },
+            "type": "object"
           }
         },
         "required": [
@@ -800,6 +847,385 @@
           "generated_ts",
           "window",
           "lots"
+        ],
+        "type": "object"
+      },
+      "ameesh-turn-observation-1": {
+        "properties": {
+          "accounting": {
+            "properties": {
+              "ledger": {
+                "properties": {
+                  "billing_account": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "recorded_ts": {
+                    "type": "number"
+                  },
+                  "source": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "spend_key": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "turn_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "usd": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "turn_id",
+                  "spend_key",
+                  "billing_account",
+                  "usd",
+                  "model",
+                  "recorded_ts",
+                  "source"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "marker": {
+                "properties": {
+                  "created_ts": {
+                    "type": "number"
+                  },
+                  "model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "turn_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "created_ts",
+                  "model",
+                  "turn_id"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "reservation": {
+                "properties": {
+                  "billing_account": {
+                    "type": "string"
+                  },
+                  "period": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "type": "string"
+                  },
+                  "usd": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "billing_account",
+                  "usd",
+                  "period",
+                  "state"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "spend_key": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "state": {
+                "enum": [
+                  "settled",
+                  "pending",
+                  "none",
+                  "unknown",
+                  "kept",
+                  "released"
+                ]
+              }
+            },
+            "required": [
+              "state",
+              "spend_key",
+              "marker",
+              "reservation",
+              "ledger"
+            ],
+            "type": "object"
+          },
+          "agent": {
+            "properties": {
+              "budget_usd": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "harness": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "last_turn_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "model": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "type": "string"
+              },
+              "session_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "spent_usd": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "status": {
+                "type": "string"
+              },
+              "status_since_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "status_text": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "turn_in_progress": {
+                "type": "boolean"
+              },
+              "turns": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "name",
+              "status",
+              "status_since_ts",
+              "status_text",
+              "harness",
+              "model",
+              "session_id",
+              "turns",
+              "budget_usd",
+              "spent_usd",
+              "turn_in_progress",
+              "last_turn_ts"
+            ],
+            "type": "object"
+          },
+          "by": {
+            "properties": {
+              "request": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "turn": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "lease": {
+            "properties": {
+              "epoch": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "expires_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "live": {
+                "type": "boolean"
+              },
+              "owner": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "owner",
+              "epoch",
+              "live",
+              "expires_ts"
+            ],
+            "type": "object"
+          },
+          "observed_ts": {
+            "type": "number"
+          },
+          "quiescent": {
+            "type": "boolean"
+          },
+          "request": {
+            "properties": {
+              "agent": {
+                "type": "string"
+              },
+              "created_ts": {
+                "type": "number"
+              },
+              "delivered_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "delivered_turn_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "integer"
+              },
+              "state": {
+                "enum": [
+                  "pending",
+                  "delivered",
+                  "withdrawn"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "agent",
+              "state",
+              "created_ts",
+              "delivered_ts",
+              "delivered_turn_id"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "schema": {
+            "const": "ameesh-turn-observation/1",
+            "type": "string"
+          },
+          "turn": {
+            "properties": {
+              "ended_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "started_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "state": {
+                "enum": [
+                  "starting",
+                  "running",
+                  "ended",
+                  "orphan",
+                  "unknown"
+                ]
+              },
+              "work_item_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "state",
+              "started_ts",
+              "ended_ts",
+              "work_item_id"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "schema",
+          "observed_ts",
+          "by",
+          "request",
+          "turn",
+          "agent",
+          "lease",
+          "accounting",
+          "quiescent"
         ],
         "type": "object"
       }
@@ -2979,7 +3405,7 @@
         "operationId": "lots",
         "parameters": [
           {
-            "description": "state of the lots",
+            "description": "État des lots",
             "in": "query",
             "name": "state",
             "required": false,
@@ -2988,7 +3414,7 @@
             }
           },
           {
-            "description": "assignee of the lots",
+            "description": "Responsable des lots",
             "in": "query",
             "name": "assignee",
             "required": false,
@@ -2997,7 +3423,7 @@
             }
           },
           {
-            "description": "lots listed at most (default 100)",
+            "description": "Nombre maximal de lots (défaut 100)",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -3075,7 +3501,7 @@
                 }
               }
             },
-            "description": "One lot (`ameesh work show --json`)"
+            "description": "Détail du lot (`ameesh work show --json`)"
           },
           "400": {
             "content": {
@@ -3118,7 +3544,7 @@
             "description": "database unavailable"
           }
         },
-        "summary": "One lot (`ameesh work show --json`)"
+        "summary": "Détail du lot (`ameesh work show --json`)"
       }
     },
     "/api/v1/lots/{id}/assign": {
@@ -3172,7 +3598,7 @@
                 }
               }
             },
-            "description": "Reassign a lot (`ameesh work assign`, 0030 §2; never to an external agent)"
+            "description": "Réaffecter le lot (`ameesh work assign`, 0030 §2 ; jamais à un agent externe)"
           },
           "400": {
             "content": {
@@ -3265,7 +3691,7 @@
             "description": "database unavailable"
           }
         },
-        "summary": "Reassign a lot (`ameesh work assign`, 0030 §2; never to an external agent)"
+        "summary": "Réaffecter le lot (`ameesh work assign`, 0030 §2 ; jamais à un agent externe)"
       }
     },
     "/api/v1/me": {
@@ -3502,7 +3928,7 @@
                 }
               }
             },
-            "description": "Timeline of a project: its lots, window and rendering cut (#3395, #3401)"
+            "description": "Chronologie du projet : lots, fenêtre et rendu (#3395, #3401)"
           },
           "400": {
             "content": {
@@ -3545,7 +3971,76 @@
             "description": "database unavailable"
           }
         },
-        "summary": "Timeline of a project: its lots, window and rendering cut (#3395, #3401)"
+        "summary": "Chronologie du projet : lots, fenêtre et rendu (#3395, #3401)"
+      }
+    },
+    "/api/v1/requests/{request}": {
+      "get": {
+        "operationId": "requests_request",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request",
+            "required": true,
+            "schema": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-turn-observation-1"
+                }
+              }
+            },
+            "description": "One mailbox request's observation: delivery state and turn (#2167)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "One mailbox request's observation: delivery state and turn (#2167)"
       }
     },
     "/api/v1/threads/{project}": {
@@ -3811,7 +4306,7 @@
                 }
               }
             },
-            "description": "Lot thread (`ameesh fil show PROJECT LOT`)"
+            "description": "Fil du lot (`ameesh fil show PROJECT LOT`)"
           },
           "400": {
             "content": {
@@ -3854,7 +4349,7 @@
             "description": "database unavailable"
           }
         },
-        "summary": "Lot thread (`ameesh fil show PROJECT LOT`)"
+        "summary": "Fil du lot (`ameesh fil show PROJECT LOT`)"
       },
       "post": {
         "operationId": "post_threads_project_lot",
@@ -3916,7 +4411,7 @@
                 }
               }
             },
-            "description": "Publish in a lot's thread"
+            "description": "Publier dans le fil du lot"
           },
           "400": {
             "content": {
@@ -4009,7 +4504,76 @@
             "description": "database unavailable"
           }
         },
-        "summary": "Publish in a lot's thread"
+        "summary": "Publier dans le fil du lot"
+      }
+    },
+    "/api/v1/turns/{turn}": {
+      "get": {
+        "operationId": "turns_turn",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "turn",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-turn-observation-1"
+                }
+              }
+            },
+            "description": "One turn's observation: state, agent, lease and accounting (#2167)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "One turn's observation: state, agent, lease and accounting (#2167)"
       }
     }
   },
@@ -4022,5 +4586,21 @@
     {
       "url": "http://127.0.0.1:8780"
     }
-  ]
+  ],
+  "x-ameesh-vocabulary": {
+    "definite": "le lot",
+    "definite_plural": "les lots",
+    "elides": false,
+    "gender": "m",
+    "indefinite": "un lot",
+    "indefinite_plural": "des lots",
+    "of": "du lot",
+    "of_plural": "des lots",
+    "plural": "lots",
+    "singular": "lot",
+    "title": "Lot",
+    "title_plural": "Lots",
+    "to": "au lot",
+    "to_plural": "aux lots"
+  }
 }

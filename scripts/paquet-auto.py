@@ -95,6 +95,16 @@ carte sont pesés par `tests/parts/durees.json` pour le pilote des tests
 (`test_driver`), que le manifeste nomme : sous psql, la suite est ~6 fois plus
 lente que la mesure psycopg de la carte.
 
+#4463 : une fois la tête poussée, la garde relue avant chaque série relit
+aussi l'état de la PR : fusionnée (ou close) pendant les tests par unité, leurs
+résultats ne peuvent plus retirer une unité ; les séries non parties sont
+abandonnées et le porteur reçoit « tests par unité interrompus : porteur
+fusionné à <sha> ». `--tests-budget S` (paquet-horaire :
+`packet_tests.total_timeout_seconds` du canon compilé) borne la durée totale
+des tests : chaque série est bornée au temps restant, celles qui ne partent
+plus avant l'échéance sont non concluantes (canon §3) et le tic suivant peut
+partir.
+
 #4237 : un refus de geste (bail relevé, `GestureRefused`) **après des tests
 verts** ne perd plus le paquet : depuis #4304, la tête est déjà poussée,
 enregistrée et gelée avant ses tests ; sa fin (corps de PR, note, ci-full,
@@ -140,11 +150,13 @@ une tête testée n'est pas publiable (`--publish`, #4237).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -179,6 +191,10 @@ DEFAULT_TIMEOUT = 1800
 DEFAULT_PARALLEL = 1
 #: #4271 : code de sortie d'`ameesh heavy` arrêté par sa borne (`heavy.CAPPED_EXIT`)
 HEAVY_CAPPED_EXIT = 124
+#: #4463 : après SIGTERM au temps mural échu, le délai laissé à `ameesh heavy`
+#: pour arrêter sa série : SIGKILL au groupe après `heavy.GROUP_GRACE_S`
+#: (10 s), puis arrêt de ses autres descendants (SIGTERM, SIGKILL 10 s après)
+WALL_GRACE_S = 30
 FREEZE_TIMEOUT = 600
 GIT_TIMEOUT = 300
 #: #4245 : `RESTART_RESERVE_S` (90 s) de l'élection, plus la lecture
@@ -307,9 +323,9 @@ BLOCK_END_RE = re.compile(r"^=+$", re.MULTILINE)
 STRONG_EVIDENCE = 4
 #: l'outil qui rend l'attribution `packet_red` d'un rouge de composition
 ATTRIBUTION_SCRIPT = "scripts/paquet-attribution.py"
-#: #4025 : budget, en secondes (durées psycopg de la carte), des modules que
-#: la carte d'impact ajoute à une unité ; les modules `support`, déterministes,
-#: ne sont pas plafonnés
+#: #4025 : budget, en secondes (durées du pilote, `tests/parts/durees.json`),
+#: des modules voisins ajoutés à une unité ; #4814 : les modules `support`
+#: y entrent aussi, avant ceux de la carte
 IMPACT_BUDGET_S = 180
 #: un en-tête d'échec unittest (`FAIL: test (tests.test_x.T.t)`) ; une ligne
 #: `FAIL:` produite par le test lui-même n'a pas ce nom pointé et est ignorée
@@ -333,6 +349,19 @@ class GitError(PaquetAutoError):
 
 class EpochLost(PaquetAutoError):
     """#4237 : un geste refusé par la garde d'époque (bail relevé)."""
+
+
+class CarrierSettled(PaquetAutoError):
+    """#4463 : la PR du paquet a fusionné (ou a été close) pendant ses tests."""
+
+    def __init__(self, state: str) -> None:
+        self.state = state
+        super().__init__("PR %s pendant les tests par unité" % state.lower())
+
+
+class BudgetSpent(PaquetAutoError):
+    """#4463 : l'échéance totale des tests par unité passée en plein rejeu des
+    préfixes : non concluant, aucune unité retirée (§3)."""
 
 
 class ChainRefused(PaquetAutoError):
@@ -1156,10 +1185,10 @@ def keep_composition(candidates: list[Candidate],
     `specs` vient du manifeste gelé de la composition à conserver ;
     `already_discarded` porte les lots déjà écartés (erreurs de la liste
     calculée, `--exclude`, groupe parallèle). Un membre n'est repris que sur sa
-    source composée : une nouvelle tête, un lot sorti de la liste prête ou une
-    unité de résolution est écrit aux écartés pour la coupure suivante, jamais
-    composé ici. Tout lot prêt qui n'était pas dans la composition précédente
-    est nommé de même.
+    source composée : une nouvelle tête, un lot sorti de la liste prête ou les
+    lots d'une unité de résolution sont écrits aux écartés pour la coupure
+    suivante, jamais composés ici. Tout lot prêt qui n'était pas dans la
+    composition précédente est nommé de même.
     """
     by_lot = {candidate.lot: candidate for candidate in candidates}
     members: list[Candidate] = []
@@ -1172,11 +1201,13 @@ def keep_composition(candidates: list[Candidate],
         seen.update(lots)
         if len(lots) != 1:
             # paquet-auto ne compose pas de résolution (jugement humain) ; une
-            # telle unité ne se reprend pas sans la relire.
-            discarded.append(Discarded(
-                lots[0], KEEP_NOT_READY_REASON,
-                "unité de résolution (%s), non reprise par une recomposition"
-                % ", ".join("#%d" % lot for lot in lots)))
+            # telle unité ne se reprend pas sans la relire. Chaque lot de
+            # l'unité est nommé aux écartés : sinon les suivants ne seraient
+            # ni composés ni expliqués au contrôle d'inclusion (#4593).
+            detail = ("unité de résolution (%s), non reprise par une recomposition"
+                      % ", ".join("#%d" % lot for lot in lots))
+            discarded.extend(Discarded(lot, KEEP_NOT_READY_REASON, detail)
+                             for lot in lots)
             continue
         lot = lots[0]
         candidate = by_lot.get(lot)
@@ -1595,12 +1626,13 @@ def neighbor_modules(worktree: Path, composition: Composition, base_sha: str,
 
 
 def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
-                  timeout: int) -> set[str] | None:
+                  timeout: int, wall: int | None = None) -> set[str] | None:
     """#4025 : les tests de `modules` rouges sur la base, ou None (non concluant).
 
     Un module voisin rouge ne désigne l'unité que s'il est vert sur la base :
     un rouge aussi présent sur la base vient de l'environnement de l'hôte ou
     lui préexiste. Les modules sont rejoués dans un worktree détaché de la base.
+    #4463 : `wall` borne le rejeu en temps mural (`run_tests(wall=…)`).
     """
     if not base_sha or not modules:
         return None
@@ -1617,7 +1649,8 @@ def base_failures(worktree: Path, base_sha: str, modules: list[str], *,
                    if (path / (module.replace(".", "/") + ".py")).is_file()]
         if not present:
             return set()
-        run = run_tests(path, "base", present, timeout=timeout)
+        walled = {"wall": wall} if wall is not None else {}
+        run = run_tests(path, "base", present, timeout=timeout, **walled)
         if run.inconclusive:
             return None
         return {failure["test"] for failure in unittest_failures(run.output)}
@@ -1701,14 +1734,69 @@ def test_driver(worktree: Path) -> str:
 _SERIES = iter(range(1, 1 << 30))
 
 
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def run_walled(cmd: list[str], *, cwd: Path, env: dict,
+               wall: int) -> subprocess.CompletedProcess | None:
+    """#4463 : `cmd` borné en temps mural (attente d'un créneau comprise).
+
+    La commande a sa propre session, dont elle mène le groupe. À l'échéance,
+    SIGTERM à ce groupe : une série directe et ce qu'elle a lancé le
+    reçoivent ; `ameesh heavy` le relaie au groupe de sa série, l'escalade en
+    SIGKILL et arrête ses autres descendants avant de rendre le créneau. Ce
+    qui reste du groupe reçoit SIGKILL au plus `WALL_GRACE_S` après, même si
+    le meneur est déjà sorti ; None si la borne a été atteinte. La lecture des
+    sorties reste bornée."""
+    proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=wall)
+        return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        pass
+    stop_by = time.monotonic() + WALL_GRACE_S      # une seule grâce en tout
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.communicate(timeout=WALL_GRACE_S)
+        # meneur sorti : le reste de son groupe a le reste de la grâce
+        while time.monotonic() < stop_by and _group_alive(proc.pid):
+            time.sleep(0.1)
+    except subprocess.TimeoutExpired:
+        pass
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    # un descendant hors de la session peut tenir les tubes : on les lâche
+    for pipe in (proc.stdout, proc.stderr):
+        with contextlib.suppress(OSError):
+            pipe.close()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=max(1.0, stop_by - time.monotonic()))
+    return None
+
+
 def run_tests(worktree: Path, label: str, modules: list[str], *,
-              timeout: int, heavy: bool = False) -> TestRun:
+              timeout: int, heavy: bool = False,
+              wall: int | None = None) -> TestRun:
     """Une série unittest bornée par `timeout` (au-delà : non concluant).
 
     #4271 : avec `heavy`, la série prend un créneau de l'hôte
     (`ameesh heavy --max-duration`) et son propre schéma par défaut : la borne
     est tenue par `heavy`, qui arrête tout le groupe de la série ; l'attente
-    d'un créneau a la même borne en plus."""
+    d'un créneau a la même borne en plus.
+
+    #4463 : avec `wall` (le temps restant de l'échéance totale), attente du
+    créneau et exécution tiennent ensemble dans `wall` secondes (`run_walled`) ;
+    au-delà, la série est non concluante."""
     if not modules:
         return TestRun(label=label, modules=[], returncode=0, output="",
                        seconds=0.0)
@@ -1721,6 +1809,18 @@ def run_tests(worktree: Path, label: str, modules: list[str], *,
         cmd = [wrapper, "heavy", "--max-duration", "%ds" % timeout, "--", *cmd]
         env["AMEESH_SCHEMA"] = "t_paq_%d_%d" % (os.getpid(), next(_SERIES))
         wait = timeout + 60
+    if wall is not None:
+        proc = run_walled(cmd, cwd=worktree, env=env, wall=wall)
+        if proc is None:
+            return save_test_log(TestRun(
+                label=label, modules=list(modules), returncode=None,
+                output="borne totale des tests par unité atteinte après %d s "
+                       "(attente du créneau comprise) : série arrêtée (#4463)" % wall,
+                seconds=time.monotonic() - start, timed_out=True))
+        return save_test_log(TestRun(
+            label=label, modules=list(modules), returncode=proc.returncode,
+            output=_output(proc), seconds=time.monotonic() - start,
+            timed_out=bool(wrapper) and proc.returncode == HEAVY_CAPPED_EXIT))
     try:
         proc = run_command(cmd, cwd=worktree, timeout=timeout + wait, env=env)
         result = TestRun(label=label, modules=list(modules),
@@ -1834,8 +1934,9 @@ def _failure_matches(observed: str, failed: set[str]) -> bool:
 
 def prefix_failures(worktree: Path, composition: Composition,
                     failures: list[dict], *, timeout: int,
-                    replay=None,
-                    log=print) -> tuple[dict[int, list[dict]], str, list[dict]]:
+                    replay=None, log=print, guard=None,
+                    deadline: float | None = None,
+                    ) -> tuple[dict[int, list[dict]], str, list[dict]]:
     """#4217 : la première unité où chaque test rouge apparaît.
 
     Rejoue les tests rouges des modules **voisins** sur les préfixes de
@@ -1851,6 +1952,11 @@ def prefix_failures(worktree: Path, composition: Composition,
     `({}, pourquoi, [])` quand le rejeu ne conclut pas (worktree impossible,
     run non concluant, rouge sans nom de test) : l'appelant ne retire alors
     aucune unité. Aucune décision de retrait ici.
+
+    #4463 : `guard` est relu avant chaque préfixe après le premier (fusion du
+    porteur comprise) ; sous `deadline`, chaque rejeu est borné au temps
+    restant, en temps mural, et `BudgetSpent` est levée quand il n'en reste
+    plus, avant un préfixe ou pendant (rejeu coupé par l'échéance).
     """
     tests: list[dict] = []
     seen: set[str] = set()
@@ -1878,6 +1984,12 @@ def prefix_failures(worktree: Path, composition: Composition,
         unresolved = tests
         found: dict[int, list[dict]] = {}
         for index, unit in enumerate(composition.units, start=1):
+            if index > 1 and guard is not None:
+                guard()
+            limit = series_timeout(timeout, deadline)
+            if limit is None:
+                raise BudgetSpent("borne totale atteinte avant le préfixe %d "
+                                  "(#%d)" % (index, unit.lot))
             if index > 1:
                 moved = git(path, "reset", "--hard", unit.commit, check=False)
                 if moved.returncode != 0:
@@ -1887,8 +1999,14 @@ def prefix_failures(worktree: Path, composition: Composition,
                 git(path, "clean", "-fdq", check=False)
             run = replay(path, "préfixe %d (#%d)" % (index, unit.lot),
                          [_failure_name(failure) for failure in unresolved],
-                         timeout=timeout)
+                         timeout=limit,
+                         **({"wall": limit} if deadline is not None else {}))
             if run.inconclusive:
+                if deadline is not None and series_timeout(timeout, deadline) is None:
+                    # #4463 : coupé par l'échéance totale, pas par le préfixe
+                    raise BudgetSpent("borne totale atteinte pendant le préfixe "
+                                      "%d (#%d) : %s" % (index, unit.lot,
+                                                         run.motive()))
                 return {}, ("préfixe %d (#%d) non concluant : %s"
                             % (index, unit.lot, run.motive())), []
             failed = {entry["test"]
@@ -2043,14 +2161,30 @@ def _merge_removals(*groups: list[Removal]) -> list[Removal]:
     return [by_lot[lot] for lot in order]
 
 
+def series_timeout(timeout: int, deadline: float | None) -> int | None:
+    """#4463 : la borne d'une série sous l'échéance totale ; None si échue."""
+    if deadline is None:
+        return timeout
+    left = int(deadline - time.monotonic())
+    return min(timeout, left) if left > 0 else None
+
+
+def budget_spent(label: str, modules: list[str]) -> TestRun:
+    """#4463 : une série qui ne part plus, l'échéance totale passée (§3)."""
+    return TestRun(label=label, modules=list(modules), returncode=None,
+                   output="borne totale des tests par unité atteinte : série "
+                          "non jouée (#4463)", seconds=0.0, timed_out=True)
+
+
+
 def check_local_tests(worktree: Path, composition: Composition, *,
                       timeout: int, log=print,
                       attribute=None, base_sha: str = "",
                       select=None, on_base=None, guard=None,
                       prefix=None,
-                      parallel: int = DEFAULT_PARALLEL) -> tuple[list[TestRun],
-                                                          list[int],
-                                                          list[Removal]]:
+                      parallel: int = DEFAULT_PARALLEL,
+                      deadline: float | None = None) -> tuple[list[TestRun], list[int],
+                                                              list[Removal]]:
     """Exécute les modules des unités puis les contrats.
 
     Rend `(exécutions, unités fautives, retraits)`. Une unité est fautive
@@ -2085,6 +2219,12 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     sont indépendantes et jouées en même temps (au plus `parallel`), chacune
     dans un créneau `ameesh heavy` de l'hôte ; leurs résultats sont lus dans
     l'ordre des unités, comme en série. `guard` est relu avant chaque série.
+
+    #4463 : `deadline` (horloge monotone) borne la durée totale : chaque série
+    est bornée au temps restant ; une série qui n'est pas partie à l'échéance
+    est non concluante sans être jouée. L'attente d'un créneau `ameesh heavy`
+    compte dans ce temps (`run_tests(wall=…)`) : à l'échéance la série est
+    arrêtée, au plus `WALL_GRACE_S` après.
     """
     runs: list[TestRun] = []
     red: list[tuple[TestRun, list[dict]]] = []
@@ -2126,13 +2266,21 @@ def check_local_tests(worktree: Path, composition: Composition, *,
                              for row in added)))
         planned.append((unit, proper, added, modules))
 
+    def bounded(label: str, modules: list[str]) -> TestRun:
+        limit = series_timeout(timeout, deadline)
+        if limit is None:
+            log("tests %s : borne totale atteinte, série non jouée (non "
+                "concluant)" % label)
+            return budget_spent(label, modules)
+        # sous l'échéance, attente du créneau comprise (relecture cx3)
+        walled = {"wall": limit} if deadline is not None else {}
+        return run_tests(worktree, label, modules, timeout=limit, **slots, **walled)
+
     def unit_job(label: str, modules: list[str]):
-        return lambda: run_tests(worktree, label, modules, timeout=timeout,
-                                 **slots)
+        return lambda: bounded(label, modules)
 
     def contract_job():
-        modules = contract_modules(worktree)
-        return run_tests(worktree, "contrats", modules, timeout=timeout, **slots)
+        return bounded("contrats", contract_modules(worktree))
 
     jobs = [unit_job("unité #%d" % unit.lot, modules)
             for unit, _proper, _added, modules in planned] + [contract_job]
@@ -2172,8 +2320,11 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     if neighbor_red:
         if guard is not None:
             guard()
-        at_base = (on_base or base_failures)(worktree, base_sha, neighbor_red,
-                                             timeout=timeout)
+        limit = series_timeout(timeout, deadline)
+        walled = {"wall": limit} if deadline is not None and limit else {}
+        at_base = (None if limit is None else
+                   (on_base or base_failures)(worktree, base_sha, neighbor_red,
+                                              timeout=limit, **walled))
         log("tests voisins rouges rejoués sur la base %s : %s"
             % (base_sha[:12] or "?", "non concluant" if at_base is None
                else "%d rouge(s) aussi sur la base" % len(at_base)))
@@ -2252,10 +2403,20 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         log("tests voisins : rejeu du rouge sur les préfixes de l'empilement "
             "(%d test(s), %d unité(s))"
             % (len(prefix_red), len(composition.units)))
+        bounds = ({"guard": guard} if guard is not None else {}) | (
+            {"deadline": deadline} if deadline is not None else {})
         try:
             found_by_lot, prefix_why, flaky = (prefix or prefix_failures)(
-                worktree, composition, prefix_red, timeout=timeout, log=log)
-        except AttributionUnreadable:
+                worktree, composition, prefix_red, timeout=timeout, log=log,
+                **bounds)
+        except BudgetSpent as spent:
+            # #4463 : non concluant (§3) ; la ci-full tranche, rien n'est retiré
+            log("tests voisins : préfixes NON CONCLUANTS (%s) — consigné, le "
+                "paquet continue" % spent)
+            runs.append(budget_spent("préfixes", [_failure_name(failure)
+                                                  for failure in prefix_red]))
+            found_by_lot, prefix_why, flaky = {}, "", []
+        except (AttributionUnreadable, CarrierSettled, EpochLost):
             raise
         except PaquetAutoError as exc:
             raise AttributionUnreadable(
@@ -2490,9 +2651,15 @@ def _tests_summary(tests: list[TestRun]) -> str:
               and not run.ignored_red)
     ignored = sum(1 for run in tests if run.ignored_red)
     inconclusive = sum(1 for run in tests if run.inconclusive)
-    return ("%d séries, %d modules, %d tests exécutés, %d échec(s), "
-            "%d run(s) rouge(s) sans effet, %d non concluant(s), %d sauté(s) : %s"
-            % (len(tests), len(modules), total, red, ignored, inconclusive, skipped,
+    # #4814 : une série arrêtée par sa borne n'a joué aucun de ses modules
+    # jusqu'au bout ; le rapport ne les compte plus comme joués
+    finished = {module for run in tests if not run.timed_out
+                and run.returncode in (0, 1) for module in run.modules}
+    return ("%d séries, %d modules dont %d joués jusqu'au bout, %d tests "
+            "exécutés, %d échec(s), %d run(s) rouge(s) sans effet, "
+            "%d non concluant(s), %d sauté(s) : %s"
+            % (len(tests), len(modules), len(finished), total, red, ignored,
+               inconclusive, skipped,
                ", ".join("`%s`" % module for module in modules) or "aucun"))
 
 
@@ -2748,6 +2915,53 @@ def withdraw_packet(worktree: Path, carrier: int, pr_number: int | None,
         if proc.returncode != 0:
             failed.append("gh pr close #%d : %s" % (pr_number, _tail(_output(proc))))
     return failed
+
+
+def pull_request_merge_sha(worktree: Path, branch: str) -> str:
+    """Le commit de fusion de la PR de la branche, "" si illisible."""
+    view = _gh(worktree, "pr", "view", branch, "--json", "mergeCommit")
+    if view.returncode != 0:
+        return ""
+    try:
+        commit = json.loads(_decode(view.stdout)).get("mergeCommit") or {}
+        return str(commit.get("oid") or "")
+    except (ValueError, AttributeError):
+        return ""
+
+
+def watch_carrier(worktree: Path, branch: str) -> None:
+    """#4463 : la PR poussée a-t-elle fusionné (ou été close) ? Lu avant chaque
+    série ; un état illisible laisse les tests continuer."""
+    state = pull_request_state(worktree, branch)
+    if state and state != "OPEN":
+        raise CarrierSettled(state)
+
+
+def interrupted_by_carrier(args: argparse.Namespace, worktree: Path,
+                           branch: str, head: str, state: str) -> int:
+    """#4463 : la PR a fusionné (ou été close) pendant les tests par unité.
+
+    Leurs résultats ne peuvent plus retirer une unité : les séries non parties
+    sont abandonnées, le porteur le dit en une ligne. Fusionnée, la sortie finit
+    sur `MERGED_LINE` (paquet-horaire ne publie pas) ; close, un agent lit.
+    """
+    if state == "MERGED":
+        sha = pull_request_merge_sha(worktree, branch) or "?"
+        print(note_carrier(
+            worktree, args.carrier,
+            "paquet %s : tests par unité interrompus : porteur fusionné à %s "
+            "(tête %s) ; les résultats ne pouvaient plus retirer d'unité (#4463)"
+            % (args.name, sha[:12], head[:12])), flush=True)
+        print("%s : %s, tête %s, tests par unité interrompus (fusionné à %s)"
+              % (MERGED_LINE, branch, head[:12], sha[:12]), flush=True)
+        return 0
+    print(note_carrier(
+        worktree, args.carrier,
+        "paquet %s : tests par unité interrompus : PR %s (tête %s) (#4463)"
+        % (args.name, state.lower(), head[:12])), flush=True)
+    raise PaquetAutoError(
+        "PR de %s %s pendant les tests par unité : tests interrompus, rien "
+        "n'est recomposé, un agent lit" % (branch, state.lower()))
 
 
 def merged_during_tests(args: argparse.Namespace, worktree: Path, head: str,
@@ -3532,6 +3746,15 @@ def compose_packet(args: argparse.Namespace) -> int:
         ready_count = len([lot for lot in (payload.get("ready") or [])
                            if int(lot) not in error_lots])
         expected_file = Path(tmp.name) / "attendus.txt"
+        # #4463 : l'échéance totale des tests par unité, recompositions comprises
+        budget = int(getattr(args, "tests_budget", 0) or 0)
+        deadline = time.monotonic() + budget if budget > 0 else None
+
+        def tests_guard() -> None:
+            if guard is not None:
+                guard()
+            if pushed:
+                watch_carrier(worktree, branch)
 
         def title() -> str:
             return "Paquet %s — %d unités sur %s %s" % (
@@ -3606,8 +3829,14 @@ def compose_packet(args: argparse.Namespace) -> int:
             try:
                 runs, faulty, removals = check_local_tests(
                     worktree, composition, timeout=args.tests_timeout,
-                    base_sha=base_sha, guard=guard,
-                    parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL))
+                    base_sha=base_sha, guard=tests_guard,
+                    parallel=getattr(args, "tests_parallel", DEFAULT_PARALLEL),
+                    deadline=deadline)
+            except CarrierSettled as settled:
+                rc = interrupted_by_carrier(args, worktree, branch, head,
+                                            settled.state)
+                success = True
+                return rc
             except AttributionUnreadable as error:
                 # #4217 : aucun retrait automatique ; le pilote reçoit le
                 # rouge que les préfixes n'ont pas permis de situer.
@@ -3834,6 +4063,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="#4271 : séries d'unités jouées en même temps, "
                              "dans les créneaux `ameesh heavy` (défaut : %d, "
                              "en série)" % DEFAULT_PARALLEL)
+    parser.add_argument("--tests-budget", type=int, default=0, metavar="S",
+                        help="#4463 : borne totale des tests par unité, en "
+                             "secondes (paquet-horaire : packet_tests."
+                             "total_timeout_seconds ; défaut : 0, sans borne totale)")
     parser.add_argument("--keep-worktree", action="store_true",
                         help="conserver le worktree jetable (diagnostic)")
     parser.add_argument("--keep-failed-hours", type=float, default=24.0,

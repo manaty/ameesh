@@ -97,6 +97,36 @@ class HealthTurnTest(unittest.TestCase):
         return self.turn.one_turn(operation='release-fixture', step='health',
                                   release='a' * 40, root=self.root)
 
+    def test_both_runner_unit_templates_of_the_same_agent_are_accepted(self):
+        # The deployed user template is `ameesh-runner-agent@`; the system
+        # template `ameesh-runner@` remains valid on an L55 server. Both name
+        # this agent's own unit; neither is an alias for another agent.
+        for unit in ('ameesh-runner@one.service', 'ameesh-runner-agent@one.service'):
+            with self.subTest(unit=unit):
+                database = Database()
+                backend = Backend(database)
+                turn = pilot.HealthTurn(database, enrollment=dict(self.enrollment, unit=unit),
+                                        host='fixture-host', system=backend)
+                self.assertEqual(turn.unit, unit)
+                self.assertTrue(turn.one_turn(operation='release-fixture', step='health',
+                                              release='a' * 40, root=self.root))
+                self.assertEqual(backend.calls[0]['unit'], unit)
+                self.assertEqual(backend.calls[0]['agent'], 'one')
+
+    def test_a_runner_unit_of_another_agent_or_another_name_is_refused(self):
+        for unit in ('ameesh-runner@other.service',
+                     'ameesh-runner-agent@other.service',
+                     'ameesh-runner@one.service.extra',
+                     'ameesh-runner-agent@one',
+                     'ameesh-runner@One.service',
+                     'ameesh-runner-agent@one.service ',
+                     'runner-agent@one.service',
+                     None):
+            with self.subTest(unit=unit):
+                with self.assertRaises(pilot.TurnError):
+                    pilot.HealthTurn(self.db, enrollment=dict(self.enrollment, unit=unit),
+                                     host='fixture-host', system=self.backend)
+
     def test_one_completed_turn_is_accepted_with_the_enrolled_identity(self):
         self.assertTrue(self.call())
         self.assertEqual(len(self.backend.calls), 1)

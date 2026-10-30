@@ -366,8 +366,10 @@ class AcknowledgementTest(PostMixin, PgTestCase):
         self.assertEqual(len(observed), 1)
         # #3761 : `gate_cache` est un cache d'observation (verdicts de porte
         # déjà lus), pas un seuil ; le périmètre réconcilié ne le porte pas.
+        # #4579 : `record_footprint` non plus (écriture des notes d'épisode).
         thresholds = {k: v for k, v in observed[0].items()
-                  if k not in ("now", "local_pool", "unreadable", "gate_cache")}
+                  if k not in ("now", "local_pool", "unreadable", "gate_cache",
+                               "record_footprint")}
         # #2105 : the pass observes with the perimeter it declares to
         # reconcile — without thresholds, the parser's defaults, environment
         # included.

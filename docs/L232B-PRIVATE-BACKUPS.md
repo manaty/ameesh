@@ -70,6 +70,15 @@ a shared tmpfs. Upload success alone cannot prove remote recovery. The server sc
 runs catalog-based local expiry only after all required dump/upload steps
 succeed. Backups without a registered policy remain protected.
 
+Every signed request names `x-amz-content-sha256`: the file's SHA-256 for the
+upload PUT, and the empty-body digest for the retrieval GET (as well as the
+version-retention GET and DELETE). curl 7.88.1, shipped by Debian 12, signs
+that header when it is supplied but never adds it by itself; Scaleway then
+refuses the request (HTTP 400 `Required header missing`). The wire contract is
+witnessed against a local TLS fake S3 with the real curl 7.88.1: the request is
+refused without the header, and succeeds with it, the header appearing in
+`SignedHeaders`.
+
 `retrieve --credentials RECOVERY_CONFIG --host HOST --name OBJECT
 --sha256 SHA256 --output ARCHIVE` downloads an exact object using the
 separate recovery identity. The owned regular configuration file must be

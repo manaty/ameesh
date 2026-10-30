@@ -95,6 +95,8 @@ class PrivateBackupTest(unittest.TestCase):
         def child(args, *, env=None):
             self.assertEqual(args[:2], ["curl", "--disable"])
             self.assertNotIn("CANARY-SECRET", str(args))
+            header = args[args.index("-H") + 1]
+            self.assertEqual(header, "x-amz-content-sha256: " + backup.digest(self.output))
             self.assertNotIn("SCW_SECRET_KEY", env)
             self.assertNotIn("SCW_ACCESS_KEY", env)
             config = Path(args[3])
@@ -237,6 +239,8 @@ class PrivateBackupTest(unittest.TestCase):
             if args[0] == "curl":
                 self.assertEqual(args[:2], ["curl", "--disable"])
                 self.assertNotIn("--location", args)
+                self.assertEqual(args[args.index("-H") + 1],
+                                 "x-amz-content-sha256: " + backup.EMPTY_SHA256)
                 self.assertEqual(args[-1], "https://acme.s3.fr-par.scw.cloud/host-1/remote.dump")
                 config = Path(args[3])
                 self.assertIn("RECOVERY-SECRET", config.read_text())

@@ -34,13 +34,15 @@ que paquet-auto joue en plus des modules propres de l'unité :
 
 * `support` : les `tests/test_*.py` qui importent un module `tests/*.py`
   modifié par l'unité (un niveau, même lecture que `imported_test_files`) ;
-  déterministe, sans plafond ;
+  #4814 : le moins cher d'abord, dans `budget` secondes par unité, avant la
+  carte — un support partagé (`tests/support.py`, ~545 modules) faisait de
+  la série la suite entière, jamais finie dans sa borne ;
 * `carte` : les modules que la carte d'impact locale relie aux **blocs**
   `src/` que l'unité change (empreintes de `scripts/map.py`, un bloc nouveau
   lu à son bloc englobant) ; ceux qui couvrent une fonction ou une classe
   passent avant ceux qui ne couvrent que `<module>`, puis le moins cher
-  d'abord, jusqu'à `budget` secondes par unité ; le reste est compté
-  (`dropped`).
+  d'abord, dans ce qui reste du `budget` ; le reste, support compris, est
+  compté (`dropped`).
 
 Une carte absente ou antérieure à `base` est dite dans `card`, sans bloquer.
 
@@ -351,14 +353,26 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
                          if path.startswith("tests/") and path.endswith(".py")}
         added: list[dict] = []
         taken = set(own)
+        supports = []
         for module in sorted(imports):
             if module in taken:
                 continue
             hit = sorted(imports[module] & touched_tests)
             if hit:
-                added.append({"module": "tests." + module, "reason": "support",
-                              "files": hit})
+                supports.append((_module_seconds(card, module, durations,
+                                                 card_durations), module, hit))
                 taken.add(module)
+        # #4814 : un support partagé (`tests/support.py`, importé par ~545
+        # modules) ne fait plus de la série de l'unité la suite entière
+        supports.sort()
+        spent, dropped = 0.0, 0
+        for seconds, module, hit in supports:
+            if spent + seconds > budget:
+                dropped += 1
+                continue
+            spent += seconds
+            added.append({"module": "tests." + module, "reason": "support",
+                          "files": hit, "seconds": round(seconds, 1)})
         ranked = []
         found = card_candidates(repo, card, _text(unit.get("unit_sha")), files) \
             if card is not None else {}
@@ -369,7 +383,6 @@ def select(repo: Path, unit_rows: list[dict], budget: float, base: str,
             seconds = _module_seconds(card, module, durations, card_durations)
             ranked.append((not specific, seconds, module, hit))
         ranked.sort()
-        spent, dropped = 0.0, 0
         for _broad, seconds, module, hit in ranked:
             if spent + seconds > budget:
                 dropped += 1

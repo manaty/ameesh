@@ -170,6 +170,19 @@ def response(db, view, *, human, text, now):
             facts={"answered_by": human}, event_key="resolved")
 
 
+def withdrawn(db, view, *, by, now):
+    """#4542: a withdrawal is the outcome of every journalled request."""
+    route = storage.of(db).decisions.validation_route(view["id"])
+    if not route:
+        return
+    people = [route["nodes"][0]["human"], route.get("escalated_to")]
+    for person in dict.fromkeys(p for p in people if p):
+        storage.of(db).decisions.validation_event(
+            view["id"], person=person, kind="withdrawn", now=now,
+            facts={"requested_ts": view["created_ts"], "due_ts": view["due_ts"],
+                   "withdrawn_by": by}, event_key="withdrawn:" + person)
+
+
 def history(cfg, db, *, person, key_path, signer):
     """Owner key possession and a non-agent session are both required."""
     from . import authority, decisions, signing
