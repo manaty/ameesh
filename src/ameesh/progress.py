@@ -249,16 +249,16 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         if state == lifecycle.QA:
             ev_freezes.append(at)
         if prev in lifecycle.TO_VALIDATE and state in (
-                lifecycle.IN_PROGRESS, lifecycle.VALIDATED, lifecycle.DELIVERY_RECORDED):
-            ev_verdicts.append((at, "ok" if state in (lifecycle.VALIDATED, lifecycle.DELIVERY_RECORDED) else "blocked",
+                lifecycle.IN_PROGRESS, lifecycle.VALIDATED, "merged"):
+            ev_verdicts.append((at, "ok" if state in (lifecycle.VALIDATED, "merged") else "blocked",
                                 ev.get("actor") or None))
-        if state == lifecycle.DELIVERY_RECORDED and merged is None:
+        if state == "merged" and merged is None:
             # #1693 (N4) : la première entrée en merged APRÈS la dernière
             # correction `merged → build` (qui remet `merged` à None) date la
             # livraison. Un retour depuis promoted, blocked ou waiting_human
             # conserve la fusion réelle.
             merged = at
-        elif prev == lifecycle.DELIVERY_RECORDED and state == lifecycle.IN_PROGRESS:
+        elif prev == "merged" and state == lifecycle.IN_PROGRESS:
             # La correction annule aussi les replis depuis le journal et
             # l'action de fusion confirmée, pas seulement le jalon SQL.
             merge_corrected, merged = at, None

@@ -3180,8 +3180,7 @@ class Notifier:
                             and item.get("assignee") == entry.get("agent") \
                             and item.get("state") not in (
                                 lifecycle.CLOSED,
-                                lifecycle.DELIVERY_RECORDED,
-                                lifecycle.PROMOTED,
+                                *lifecycle.DELIVERED,
                             ):
                         continue
                 del sent[key]

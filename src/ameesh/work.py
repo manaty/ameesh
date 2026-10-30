@@ -75,62 +75,17 @@ SYSTEM_SENDER = "ameesh"
 MANUAL_REVIEW_START_RE = re.compile(r"^\s*R[12]\b", re.IGNORECASE)
 MANUAL_REVIEW_TITLE_RE = re.compile(r"^\s*R[12]\b[^:—–#]*#\s*(\d+)\b", re.IGNORECASE)
 MAX_QA_LOOPS = 2
-FORWARD = {
-    lifecycle.REQUESTED: (lifecycle.IN_PROGRESS,),
-    lifecycle.IN_PROGRESS: (lifecycle.QA,),
-    lifecycle.QA: (lifecycle.VALIDATED, lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
-    lifecycle.VALIDATED: (lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
-    lifecycle.DELIVERY_RECORDED: (lifecycle.PROMOTED,),
-    lifecycle.PROMOTED: (),
-    lifecycle.CLOSED: (),
-}
+# The development module owns its stages and compatibility transitions.
+from .modules import registry as _module_registry
 
-#: transitions autorisées, attentes comprises
-TRANSITIONS = {
-    lifecycle.REQUESTED: {lifecycle.IN_PROGRESS, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
-    lifecycle.IN_PROGRESS: {lifecycle.QA, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
-    lifecycle.QA: {
-        lifecycle.VALIDATED,
-        lifecycle.DELIVERY_RECORDED,
-        lifecycle.IN_PROGRESS,
-        lifecycle.BLOCKED,
-        lifecycle.WAITING_HUMAN,
-    },
-    lifecycle.VALIDATED: {
-        lifecycle.QA,
-        lifecycle.DELIVERY_RECORDED,
-        lifecycle.IN_PROGRESS,
-        lifecycle.BLOCKED,
-        lifecycle.WAITING_HUMAN,
-    },
-    lifecycle.DELIVERY_RECORDED: {lifecycle.PROMOTED, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN},
-    lifecycle.PROMOTED: set(),
-    lifecycle.CLOSED: set(),
-    lifecycle.BLOCKED: {
-        lifecycle.VALIDATED,
-        lifecycle.REQUESTED,
-        lifecycle.IN_PROGRESS,
-        lifecycle.QA,
-        lifecycle.DELIVERY_RECORDED,
-        lifecycle.WAITING_HUMAN,
-    },
-    lifecycle.WAITING_HUMAN: {
-        lifecycle.VALIDATED,
-        lifecycle.REQUESTED,
-        lifecycle.IN_PROGRESS,
-        lifecycle.QA,
-        lifecycle.DELIVERY_RECORDED,
-        lifecycle.BLOCKED,
-    },
-}
-#: corrections d'un état posé par erreur (`move(..., correct=…)`) : (depuis,
-#: vers). Un `promoted` à tort revient en `merged` ; un `merged` à tort (une
-#: PR d'étape fermée trop tôt, #759) revient en `build` ; ensuite, les
-#: transitions habituelles (merged → blocked → …) s'appliquent.
-CORRECTIONS = {
-    (lifecycle.PROMOTED, lifecycle.DELIVERY_RECORDED),
-    (lifecycle.DELIVERY_RECORDED, lifecycle.IN_PROGRESS),
-}
+
+def __getattr__(name):
+    # Compatibility exports are resolved only when development tooling uses
+    # them. Importing the generic core must also work in the bare profile.
+    if name in {"FORWARD", "TRANSITIONS", "CORRECTIONS"}:
+        return getattr(_module_registry.development_workflow(), name)
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
+
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
@@ -4136,7 +4091,7 @@ def get(db: Db, item_id: int) -> dict | None:
 
 
 def _canonical_state(state: str) -> str:
-    """#4349 : l'orthographe persistée v1 d'un état (v1 ou alias générique),
+    """#4353 : l'orthographe persistée d'un état (v1 ou alias générique),
     sinon `WorkError` nommant les orthographes acceptées."""
     from .work_lifecycle import ACCEPTED_STATES, canonical
     try:
@@ -4150,7 +4105,7 @@ def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
                limit: int = 50) -> list[dict]:
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.list_items")
-    if state:
+    if state and state not in ("merged", "promoted"):
         state = _canonical_state(state)
     return storage.of(db).work.items(state=state, assignee=assignee, limit=limit)
 
@@ -4223,7 +4178,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
 
     `state` accepte l'orthographe v1 et le nom générique du cycle de vie
     (#4349 : `in_progress` pour `build`, `to_validate` pour `qa`…)."""
-    state = _canonical_state(state)
+    try:
+        state = lifecycle.phase_name(state)
+    except ValueError as exc:
+        raise WorkError(str(exc)) from None
     if package_exclusion and correct is not None:
         raise WorkError("--package-exclusion and --correct are distinct gestures")
     if package_exclusion and state != lifecycle.IN_PROGRESS:
@@ -4261,7 +4219,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         # registre (process_registry), qui vérifie la garde côté serveur et
         # écrit le reçu dans la même transaction.
         raise _pinned_transition_error(item_id, pinned)
-    current = item["state"]
+    workflow = _module_registry.development_workflow()
+    transitions = workflow.TRANSITIONS
+    corrections = workflow.CORRECTIONS
+    current = lifecycle.phase(item)
     if current == state:
         raise WorkError("lot %s already in %s" % (item_id, state))
     if reviewer is not None:
@@ -4275,12 +4236,12 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         reason = (correct or "").strip()
         if not reason:
             raise WorkError("--correct: the reason for the correction is required")
-        if (current, state) not in CORRECTIONS:
+        if (current, state) not in corrections:
             raise WorkError(
                 "correction refused: %s → %s (possible corrections: %s; otherwise the "
                 "transitions allowed from %s: %s)"
-                % (current, state, ", ".join("%s → %s" % c for c in sorted(CORRECTIONS)),
-                   current, ", ".join(sorted(TRANSITIONS[current])) or "none"))
+                % (current, state, ", ".join("%s → %s" % c for c in sorted(corrections)),
+                   current, ", ".join(sorted(transitions[current])) or "none"))
         text = "correction: %s → %s — %s%s" % (
             current, state, reason, " (%s)" % note.strip() if note and note.strip() else "")
         row = storage.of(db).work.move(item_id, state, current=current, loops=0, note=text,
@@ -4292,12 +4253,12 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
                 raise _pinned_transition_error(item_id, pinned)
             raise WorkError("lot %s moved in the meantime: retry" % item_id)
         return row
-    if state not in TRANSITIONS[current]:
+    if state not in transitions[current]:
         raise WorkError(
             "transition refused: %s → %s (allowed from %s: %s)%s"
-            % (current, state, current, ", ".join(sorted(TRANSITIONS[current])) or "none",
+            % (current, state, current, ", ".join(sorted(transitions[current])) or "none",
                " — state set by mistake: ameesh work move %s %s --correct \"reason\""
-               % (item_id, state) if (current, state) in CORRECTIONS else ""))
+               % (item_id, state) if (current, state) in corrections else ""))
     if state == "validated":
         from . import merge_queue
         gate = merge_queue.review_gate_for_item(
@@ -4582,3 +4543,9 @@ def durations(row: dict) -> list[tuple[str, float | None]]:
     ne sont pas des durées, et les confondre afficherait « 1s » pour un verdict.
     """
     return [(label, row.get(key)) for label, key in MILESTONE_DURATIONS]
+
+
+def promote(db: Db, item_id: int, *, note: str = "", actor: str = "") -> dict:
+    """Promote a development delivery using its module's workflow."""
+    return _module_registry.development_workflow().promote(
+        db, item_id, note=note, actor=actor)

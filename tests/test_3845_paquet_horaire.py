@@ -215,11 +215,11 @@ class ComposeTest(Base):
     def test_porteur_fusionne_dans_l_heure_libere_le_creneau(self):
         # #4171 (décision #154026 a) : fusion vue → le suivant se compose
         # sans attendre l'heure suivante.
-        for state, reason in (("merged", ""), ("promoted", ""), ("closed", "delivered")):
+        for state, reason in (("merged", ""), ("promoted", ""), ("delivered", ""), ("closed", "delivered")):
             row = dict(carrier(lot=3990), state=state, close_reason=reason,
                        created_ts=NOW - 60)
             self.assertFalse(ph.slot_served([row], NOW, ZONE, "ameesh", "main"), state)
-        self.shell.lists[""] = [dict(carrier(lot=3990), state="merged", created_ts=NOW - 60)]
+        self.shell.lists[""] = [dict(carrier(lot=3990), state="delivered", created_ts=NOW - 60)]
         self.shell.items[4000] = carrier()
         self.assertIn("ci-full demandée", ph.tick(self.ctx))
         self.assertEqual(len(self.shell.ran("work", "add")), 1)
@@ -243,7 +243,7 @@ class ComposeTest(Base):
         # #4171 (a) : le créneau libéré par une fusion vue ne lève pas la
         # garde d'époque de #4113 (paquet-auto.check_epoch) : bail périmé →
         # rien de poussé, ni gel ni ci-full, échec signalé au pilote.
-        self.shell.lists[""] = [dict(carrier(lot=3990), state="merged", created_ts=NOW - 60)]
+        self.shell.lists[""] = [dict(carrier(lot=3990), state="delivered", created_ts=NOW - 60)]
         self.ctx.epoch = 279
         self.shell.auto_rc = 1
         self.shell.auto_out = ("paquet-auto : composition interrompue avant la prochaine "

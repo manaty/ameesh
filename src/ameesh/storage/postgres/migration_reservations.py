@@ -40,7 +40,7 @@ class MigrationReservations(Contract):
             row['slot'], action, row['number'], row['target_repo'],
             row['target_branch'] or 'unknown legacy target', row['target_sha'] or 'legacy')
         tx.execute('INSERT INTO work_item_events(work_item_id, state, note, actor)'
-                   ' SELECT id, state, %s, %s FROM work_items WHERE id = %s',
+                   " SELECT id, CASE WHEN state = 'delivered' THEN coalesce(to_jsonb(work_items)->>'legacy_state', state) ELSE state END, %s, %s FROM work_items WHERE id = %s",
                    (note, actor, row['work_item_id']))
         tx.execute('UPDATE work_items SET updated_at = now() WHERE id = %s',
                    (row['work_item_id'],))

@@ -22,7 +22,7 @@ GENERIC = {
     "build": "in_progress",
     "qa": "to_validate",
     "validated": "validated",
-    "merged": "merged",
+    "merged": "delivered",
     "promoted": "delivered",
     "blocked": "blocked",
     "waiting_human": "waiting_human",
@@ -34,8 +34,10 @@ class AliasVocabularyTest(unittest.TestCase):
     def test_aller_retour_des_alias(self):
         for v1, generic in GENERIC.items():
             with self.subTest(state=v1):
-                self.assertEqual(work_lifecycle.canonical(generic), v1)
-                self.assertEqual(work_lifecycle.canonical(v1), v1)
+                self.assertEqual(work_lifecycle.canonical(generic),
+                                 "delivered" if v1 in ("merged", "promoted") else v1)
+                self.assertEqual(work_lifecycle.canonical(v1),
+                                 "delivered" if v1 in ("merged", "promoted") else v1)
                 self.assertEqual(work_lifecycle.lifecycle_name(v1), generic)
                 self.assertEqual(work_lifecycle.lifecycle_name(generic), generic)
 
@@ -43,7 +45,8 @@ class AliasVocabularyTest(unittest.TestCase):
         self.assertEqual(set(work_lifecycle.ACCEPTED_STATES),
                          set(GENERIC) | set(GENERIC.values()))
         # les groupes existants gardent l'orthographe persistée
-        self.assertEqual(work_lifecycle.STATES, tuple(GENERIC))
+        self.assertEqual(work_lifecycle.STATES, ("intake", "build", "qa", "validated",
+                                                "delivered", "blocked", "waiting_human", "closed"))
 
     def test_un_nom_inconnu_est_refuse(self):
         for name in ("unknown", "inprogress", "", "Build"):

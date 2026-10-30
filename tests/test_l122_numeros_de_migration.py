@@ -1690,7 +1690,7 @@ class NumeroAtterriTest(PgTestCase):
         proc = self.mesh("work", "merged", str(lot["id"]), "--sha", sha,
                          "--migration-landed", "454")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("lot #%d already merged:" % lot["id"], proc.stdout)
+        self.assertIn("lot #%d already delivered:" % lot["id"], proc.stdout)
         self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 454)
 
     def test_le_sweep_concurrent_ne_perd_pas_le_numero_declare(self):
@@ -1708,7 +1708,7 @@ class NumeroAtterriTest(PgTestCase):
         item = work.get(self.db, lot["id"])
         self.assertEqual((item["state"], item["migration_landed"],
                           item["migration_landed_repo"]),
-                         ("merged", 452, "manaty/nexlink"))
+                         ("delivered", 452, "manaty/nexlink"))
         self.assertTrue(any("landed migration 452 recorded" in e["note"]
                             for e in work.events(self.db, lot["id"])))
 
@@ -1735,7 +1735,7 @@ class NumeroAtterriTest(PgTestCase):
         item = work.get(self.db, lot["id"])
         self.assertEqual((item["state"], item["migration_landed"],
                           item["migration_landed_repo"]),
-                         ("merged", 453, "manaty/nexlink"))
+                         ("delivered", 453, "manaty/nexlink"))
         registry = storage.of(self.db).work
         self.assertIsNone(registry.migration_landed_holder(452, "manaty/nexlink"))
 

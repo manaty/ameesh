@@ -64,13 +64,13 @@ CORE_STATES = (
     lifecycle.REQUESTED,
     lifecycle.IN_PROGRESS,
     lifecycle.QA,
-    lifecycle.DELIVERY_RECORDED,
-    lifecycle.PROMOTED,
+    "merged",
+    "promoted",
     lifecycle.CLOSED,
 )
 
 #: Cœurs terminaux et leur issue : un cœur terminal ne se rouvre jamais.
-TERMINAL_CORES = {lifecycle.PROMOTED: "completed", lifecycle.CLOSED: "not_planned"}
+TERMINAL_CORES = {"promoted": "completed", lifecycle.CLOSED: "not_planned"}
 
 #: Registre fini des vérificateurs du contrat consommateur (#1379). Le
 #: compilateur ne les exécute pas : il refuse une garde hors de ce registre.
