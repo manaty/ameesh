@@ -648,12 +648,15 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
     # #4186 : la file d'amélioration est un chemin de création comme un autre ;
     # le panier unionne les chemins de ses lignes, le lot direct les porte.
     footprint: list = []
+    impact = None
     if project:
+        # #4818 : la même analyse d'impact que `work.add`, journalisée
         from . import work_footprints
-        footprint = work_footprints.estimate_for_creation(
-            cfg, app=project, title=title, body=body or "")
+        impact = work_footprints.analyze_for_creation(
+            cfg, db, app=project, title=title, body=body or "")
+        footprint = list(impact["footprint"]) if impact else []
     if not basket_route:
-        return storage.of(db).work.backlog_add(
+        item = storage.of(db).work.backlog_add(
             title=title, body=body or "", source=source, expected_value=expected_value,
             value_score=value_score, priority=int(priority), team=team,
             required_capabilities=capabilities,
@@ -666,6 +669,10 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
             actor=actor, app=project, estimate_minutes=minutes,
             estimate_source=estimate_source, estimate_by=estimate_by,
             change_size=size or None, footprint=footprint)
+        if impact and item and item.get("id"):
+            work_footprints.record_analysis(db, int(item["id"]), impact,
+                                            actor=actor or "ameesh")
+        return item
     label, fiche = _chantier(chantier, fiche, reviewed, project)
     day = _basket_day(rule, now)
     line = "- [value %d, P%d] %s — %s (source: %s; by %s)" % (

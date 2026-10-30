@@ -601,6 +601,7 @@ def add(
     unique_ref: bool = False,
     external_executor: str | None = None,
     footprint=None,
+    impact: dict | None = None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -667,10 +668,13 @@ def add(
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.add")
     if footprint is None and not _is_vehicle_branch(branch):
+        # #4818 : l'analyse d'impact (lecture seule, bornée) remplace la
+        # seule lecture des chemins cités ; elle est journalisée à la création
         from . import work_footprints
-        footprint = work_footprints.estimate_for_creation(
-            cfg if cfg is not None else getattr(db, "cfg", None),
+        impact = work_footprints.analyze_for_creation(
+            cfg if cfg is not None else getattr(db, "cfg", None), db,
             app=app, title=title, body=body, branch_target=branch_target or "")
+        footprint = list(impact["footprint"]) if impact else []
     return _create(db, title=title, type=type, source=source, app=app, body=body,
                    issue_ref=issue_ref, workstream=workstream, assignee=assignee,
                    budget_usd=budget_usd, actor=actor, package=package, externe=externe,
@@ -679,7 +683,8 @@ def add(
                    note=note, force=force, parent_lot=parent_lot,
                    mark_item_id=mark_item_id, mark_note=mark_note,
                    unique_ref=unique_ref, team_queue=True,
-                   external_executor=external_executor, footprint=footprint)
+                   external_executor=external_executor, footprint=footprint,
+                   impact=impact)
 
 
 #: #3209 : les états d'un lot encore ouvert, lus par `open_with_source`
@@ -767,7 +772,7 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             branch_target=None, priority=None, estimate=None, estimate_source=None,
             size=None, note="", force=None, parent_lot=None, mark_item_id=None,
             mark_note="", unique_ref: bool = False, team_queue: bool,
-            external_executor=None, footprint=None) -> dict:
+            external_executor=None, footprint=None, impact=None) -> dict:
     """`add`, et `_decision_lot` (`team_queue=False`)."""
     minutes = None
     if estimate not in (None, ""):
@@ -831,6 +836,7 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         # une empreinte d'intake inférée de ce texte est fausse (le véhicule
         # n'a pas de delta propre) et refusait son attribution (#3185).
         footprint = []
+        impact = None
     created = ("created" + (" (plan: %s)" % package if package else "")
                + ("; estimate: %s" % span(minutes * 60) if minutes else "")
                + ("; reserved to external executor %s" % external_executor
@@ -864,6 +870,10 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         with db.transaction() as tx:
             fence.hold(tx)
             item = create(tx)
+    if impact:
+        # #4818 : une ligne de journal par estimation, et la dernière analyse
+        from . import work_footprints
+        work_footprints.record_analysis(db, int(item["id"]), impact, actor=actor)
 
     if item.get("queued_behind") is not None:
         item["queue_warning"] = queue_warning(db, item, assignee)
@@ -2294,7 +2304,9 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         # #4173 : l'empreinte du lot chevauche celle d'un lot en cours du
         # même dépôt — rien n'est écrit, le lot attend sa fusion.
         from . import work_footprints
-        raise WorkError(work_footprints.refusal(item_id, exc.overlaps)) from None
+        raise WorkError(work_footprints.refusal(item_id, exc.overlaps,
+                                                cap=getattr(exc, "cap", None),
+                                                in_flight=getattr(exc, "in_flight", None))) from None
     if row is None:
         if claim:
             holder = (get(db, item_id) or {}).get("assignee")

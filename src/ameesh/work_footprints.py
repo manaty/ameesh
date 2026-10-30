@@ -35,6 +35,18 @@ from . import storage, work
 SOURCES = ("intake", "manual", "diff")
 ESTIMATE_SOURCES = ("intake", "manual")
 
+#: #4818 : le marqueur d'empreinte inconnue — le dépôt entier, qui chevauche
+#: tout chemin du même dépôt (`overlaps`, et le SQL de la garde).
+WHOLE_REPOSITORY = "."
+UNKNOWN_POLICIES = ("repository", "open")
+#: sans politique posée, une empreinte inconnue n'occupe rien (règle d'avant
+#: #4818) : la politique prudente se pose par dépôt (`footprint-policy`)
+DEFAULT_UNKNOWN_POLICY = "open"
+#: une analyse inconnue est retentée par l'exécuteur après ce délai
+RETRY_AFTER_S = 1800
+#: au plus tant de lots par passe de l'exécuteur, par geste (analyse, diff)
+PASS_LIMIT = 5
+
 
 def normalize(path: str) -> Optional[str]:
     """Le chemin relatif à la racine, sans `./`, ni `/` en tête ou en queue ;
@@ -62,7 +74,24 @@ def overlaps(left: str, right: str) -> bool:
     parent de l'autre (`src/a` et `src/a/b.py`, pas `src/a` et `src/ab.py`).
     Même règle que le SQL de la garde (`storage.postgres.work_footprints`)."""
     return (left == right or right.startswith(left + "/")
-            or left.startswith(right + "/"))
+            or left.startswith(right + "/")
+            or WHOLE_REPOSITORY in (left, right))
+
+
+def is_shared(path: str, shared: Iterable[str]) -> bool:
+    """#4818 : `path` est un chemin partagé du dépôt (fusion triviale) ou sous
+    un dossier partagé — ignoré pour le chevauchement. Le marqueur `.` ne
+    l'est jamais. Même règle que le SQL de la garde (`_SHARED`)."""
+    return any(path == item or path.startswith(item + "/") for item in shared or ())
+
+
+def held_pairs(mine: Iterable[str], theirs: Iterable[str],
+               shared: Iterable[str] = ()) -> list[tuple[str, str]]:
+    """Les paires qui retiennent un lot : chevauchantes, aucun des deux
+    chemins partagé."""
+    shared = list(shared or ())
+    return [(a, b) for a, b in overlapping_pairs(mine, theirs)
+            if not is_shared(a, shared) and not is_shared(b, shared)]
 
 
 def overlapping_pairs(mine: Iterable[str], theirs: Iterable[str]) -> list[tuple[str, str]]:
@@ -73,6 +102,37 @@ def overlapping_pairs(mine: Iterable[str], theirs: Iterable[str]) -> list[tuple[
 
 def _clean(paths: Iterable[str]) -> list[str]:
     return sorted({p for p in (normalize(path) for path in paths) if p})
+
+
+# --------------------------------------------------------------------------
+# politique du dépôt (#4818)
+# --------------------------------------------------------------------------
+
+def default_policy(app: str) -> dict:
+    return {"app": app, "unknown_policy": DEFAULT_UNKNOWN_POLICY,
+            "max_in_flight": None, "shared_paths": [], "updated_by": None,
+            "default": True}
+
+
+def policy_of(db, app: str) -> dict:
+    """La politique d'empreinte du dépôt `app`, ou le défaut sans ligne :
+    empreinte inconnue ouverte (`open`), aucun plafond, aucun chemin partagé. Une base sans la table (avant 0519) rend le défaut."""
+    app = str(app or "").strip()
+    try:
+        found = storage.of(db).work_footprints.policies([app]).get(app)
+    except Exception:  # noqa: BLE001 - la politique se lit au mieux
+        found = None
+    return dict(found, default=False) if found else default_policy(app)
+
+
+def policies_of(db, apps: Iterable[str]) -> dict:
+    apps = sorted({str(a or "").strip() for a in apps if str(a or "").strip()})
+    try:
+        found = storage.of(db).work_footprints.policies(apps)
+    except Exception:  # noqa: BLE001
+        found = {}
+    return {app: (dict(found[app], default=False) if app in found else default_policy(app))
+            for app in apps}
 
 
 # --------------------------------------------------------------------------
@@ -172,14 +232,19 @@ def set_paths(db, item_id: int, paths: Iterable[str], *, actor: str) -> dict:
     remplace l'estimation d'intake) ; les lignes du diff restent. Un chemin
     absolu (ou vide) est refusé nommément, jamais rabattu en relatif."""
     raw = [str(path) for path in paths]
+    # #4818 : `.` (le dépôt entier) est un geste de pilote explicite
+    whole = any(path.strip() in (WHOLE_REPOSITORY, "./") for path in raw)
+    raw = [path for path in raw if path.strip() not in (WHOLE_REPOSITORY, "./")]
     invalid = [path for path in raw if path.strip() and normalize(path) is None]
     if invalid:
         raise work.WorkError(
             "invalid path(s), relative to the repository root: %s"
             % ", ".join(invalid))
     clean = _clean(raw)
-    if not clean and raw:
+    if not clean and raw and not whole:
         raise work.WorkError("no usable path: paths are relative to the repository root")
+    if whole:
+        clean = [WHOLE_REPOSITORY]
     result = storage.of(db).work_footprints.replace(
         item_id, "manual", clean, actor=actor, replaces=ESTIMATE_SOURCES)
     if result is None:
@@ -195,50 +260,110 @@ def estimate_lot(cfg, item: dict, repo: Optional[str] = None) -> list[str]:
                     clone, _ref(clone, target) if clone and target else "")
 
 
-def estimate_for_creation(cfg, *, app: str = "", title: str = "", body: str = "",
-                          branch_target: str = "", repo: Optional[str] = None) -> list[str]:
-    """L'estimation d'intake d'un lot à créer — le geste commun de tous les
-    chemins de création (`work.add`, file d'amélioration). Un texte qui ne cite
-    aucun chemin ne paie pas la résolution du clone ; un échec de la recherche
-    git laisse l'empreinte inconnue et ne défait jamais la création."""
+def _clone_ref(cfg, item: dict, repo: Optional[str] = None) -> tuple:
+    """Le clone du dépôt du lot et la ref de sa cible, ou `(None, "")`."""
     if cfg is None:
-        return []
-    from . import intake_neighbors
-    text = "%s\n%s" % (title or "", body or "")
-    if not intake_neighbors.cited_paths(text):
-        return []
+        return None, ""
+    clone, target = _clone_and_target(cfg, item, repo)
+    return clone, (_ref(clone, target) if clone and target else "")
+
+
+def analyze_lot(cfg, db, item: dict, repo: Optional[str] = None, **budget) -> dict:
+    """#4818 : l'analyse d'impact d'un lot (créé ou à créer : `app`, `title`,
+    `body`, `branch_target`), en lecture seule et bornée
+    (`impact_analysis.analyze`). Rend l'analyse avec `footprint` — les chemins
+    à écrire en `intake` : sa surface connue, sinon le marqueur `.` si la
+    politique du dépôt est prudente, sinon rien — `policy` et `note`, la
+    ligne de journal. Ne lève jamais : un échec est une analyse inconnue."""
+    from . import impact_analysis
+    text = "%s\n%s" % (item.get("title") or "", item.get("body") or "")
     try:
-        return estimate_lot(cfg, {"app": app or "", "title": title or "",
-                                  "body": body or "",
-                                  "branch_target": branch_target or ""}, repo)
-    except Exception:  # noqa: BLE001 - la création n'attend pas l'estimation
-        return []
+        clone, ref = _clone_ref(cfg, item, repo)
+    except Exception:  # noqa: BLE001 - sans clone, l'analyse reste textuelle
+        clone, ref = None, ""
+    try:
+        analysis = impact_analysis.analyze(text, repo=clone, ref=ref,
+                                           title=item.get("title") or "", **budget)
+    except Exception as exc:  # noqa: BLE001 - jamais d'échec de l'appelant
+        analysis = {"status": "unknown", "reason": "analysis failed: %s" % exc,
+                    "paths": [], "weak": [], "elapsed_ms": 0, "git_calls": 0}
+    policy = (policy_of(db, item.get("app") or "")["unknown_policy"]
+              if db is not None else DEFAULT_UNKNOWN_POLICY)
+    analysis["policy"] = policy
+    if analysis["status"] == "known":
+        analysis["footprint"] = sorted({p["path"] for p in analysis["paths"]})
+    elif policy == "repository":
+        analysis["footprint"] = [WHOLE_REPOSITORY]
+    else:
+        analysis["footprint"] = []
+    analysis["note"] = impact_analysis.note(analysis)
+    return analysis
+
+
+def analyze_for_creation(cfg, db, *, app: str = "", title: str = "", body: str = "",
+                         branch_target: str = "", repo: Optional[str] = None) -> dict | None:
+    """L'analyse d'impact d'un lot à créer — le geste commun de tous les
+    chemins de création (`work.add`, file d'amélioration, CLI). None sans
+    projet (`app`) — un lot hors dépôt n'a pas d'empreinte — ou sans `cfg`
+    (#4186 : aucun projet connu, rien n'est deviné ni journalisé)."""
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    if not str(app or "").strip() or cfg is None:
+        return None
+    return analyze_lot(cfg, db,
+                       {"app": app or "", "title": title or "", "body": body or "",
+                        "branch_target": branch_target or ""}, repo)
+
+
+def estimate_for_creation(cfg, *, app: str = "", title: str = "", body: str = "",
+                          branch_target: str = "", repo: Optional[str] = None,
+                          db=None) -> list[str]:
+    """L'empreinte d'intake d'un lot à créer (`analyze_for_creation`), sans
+    l'analyse ; vide sans projet. Ne défait jamais la création."""
+    analysis = analyze_for_creation(cfg, db, app=app, title=title, body=body,
+                                    branch_target=branch_target, repo=repo)
+    return list(analysis["footprint"]) if analysis else []
+
+
+def record_analysis(db, item_id: int, analysis: dict | None, *, actor: str) -> None:
+    """La dernière analyse du lot et sa ligne de journal ; jamais d'échec de
+    l'appelant (une base sans 0519 n'enregistre rien)."""
+    if not analysis:
+        return
+    try:
+        storage.of(db).work_footprints.record_analysis(int(item_id), analysis,
+                                                       actor=actor or "ameesh")
+    except Exception as exc:  # noqa: BLE001
+        print("warning: impact analysis of lot #%s not recorded: %s" % (item_id, exc),
+              file=sys.stderr)
 
 
 def record_estimate(db, cfg, item: dict, *, actor: str, repo: Optional[str] = None) -> dict | None:
-    """`--estimate` : l'estimation d'intake du lot, réécrite si elle trouve un
-    chemin. Le manuel remplace l'estimation : s'il existe, `--estimate` ne
-    ré-ajoute pas de lignes `intake` (l'union serait plus large que les deux) ;
-    `--clear` puis `--estimate` réestime."""
+    """`--estimate` : l'analyse d'impact du lot, réécrite (lignes `intake`)
+    et journalisée. Le manuel remplace l'estimation : s'il existe, rien n'est
+    écrit (l'union serait plus large que les deux) ; `--clear` puis
+    `--estimate` réestime. Rend l'analyse, ou None sous un manuel."""
     rows = storage.of(db).work_footprints.for_items([int(item["id"])])
     if any(str(row.get("source")) == "manual" for row in rows):
         return None
-    paths = estimate_lot(cfg, item, repo)
-    if not paths:
-        return None
-    return storage.of(db).work_footprints.replace(
-        int(item["id"]), "intake", paths, actor=actor)
+    analysis = analyze_lot(cfg, db, item, repo)
+    storage.of(db).work_footprints.replace(
+        int(item["id"]), "intake", analysis["footprint"], actor=actor)
+    record_analysis(db, int(item["id"]), analysis, actor=actor)
+    return analysis
 
 
 def refresh(db, cfg, item_id: int, *, actor: str, head: str = "",
-            repo: Optional[str] = None) -> dict:
+            repo: Optional[str] = None, published: bool = True) -> dict:
     """Le diff réel de la branche du lot (ou de `head`, la tête gelée)
     remplace les lignes `diff` de l'empreinte.
 
     La base est la cible du lot (`branch_target`), sinon celle que le projet
     déclare (`develop` pour Nexlink), sinon le défaut du dépôt (#4733) ; sa
     pointe publiée est relue à la forge quand elle répond, et `fresh` dit si
-    la base est prouvée fraîche ou seulement la ref du dernier fetch."""
+    la base est prouvée fraîche ou seulement la ref du dernier fetch.
+    `published=False` (passe de l'exécuteur, #4818) lit la ref locale sans
+    appel à la forge ; un diff qui trouve des fichiers fait tomber le
+    marqueur d'empreinte inconnue (`.`) de l'analyse."""
     item = work.get(db, item_id)
     if item is None:
         raise work.WorkError("lot %s not found" % item_id)
@@ -249,7 +374,8 @@ def refresh(db, cfg, item_id: int, *, actor: str, head: str = "",
     if not clone or not target:
         raise work.WorkError("lot %s: no local clone of %s with a known target"
                              % (item_id, item.get("app") or "its repository"))
-    base, fresh = _fresh_base(clone, target)
+    base, fresh = (_fresh_base(clone, target) if published
+                   else (_ref(clone, target), False))
     paths = diff_paths(clone, base, tip)
     if paths is None:
         raise work.WorkError("lot %s: %s...%s unreadable in %s (fetch first)"
@@ -260,27 +386,149 @@ def refresh(db, cfg, item_id: int, *, actor: str, head: str = "",
     return result
 
 
-def refusal(item_id: int, rows: list) -> str:
-    """Le message du refus d'attribution (`FootprintOverlap`)."""
+def _path_label(path: str) -> str:
+    return ("(unknown footprint: whole repository)" if path == WHOLE_REPOSITORY
+            else str(path))
+
+
+def refusal(item_id: int, rows: list, *, cap: int | None = None,
+            in_flight: int | None = None) -> str:
+    """Le message du refus d'attribution (`FootprintOverlap`), ou du plafond
+    de lots en vol du dépôt (`RepositoryCapReached`, #4818)."""
+    if cap is not None:
+        return ("lot #%s not assigned: its repository reached its in-flight cap (%s/%s "
+                "lots in progress, #4818). It waits for a merge; the cap is the "
+                "repository's policy (`ameesh work footprint-policy`)"
+                % (item_id, in_flight if in_flight is not None else "?", cap))
     by_lot: dict = {}
     for row in rows:
         by_lot.setdefault(int(row["id"]), row)
     parts = ["#%d (%s%s: %s ~ %s)" % (
         lot, row.get("state") or "?",
         ", %s" % row["assignee"] if row.get("assignee") else "",
-        row.get("path"), row.get("other_path")) for lot, row in sorted(by_lot.items())]
+        _path_label(row.get("path")), _path_label(row.get("other_path")))
+        for lot, row in sorted(by_lot.items())]
     return ("lot #%s not assigned: its footprint overlaps lot(s) in progress in the same "
             "repository: %s. It waits for their merge and starts on the updated base "
             "(#3185); a wrong footprint is corrected with `ameesh work footprint %s "
             "--set PATH…`" % (item_id, "; ".join(parts), item_id))
 
 
+# --------------------------------------------------------------------------
+# passe de l'exécuteur (#4818) : analyses inconnues retentées, diff au push
+# --------------------------------------------------------------------------
+
+def _published_tip(clone: str, branch: str) -> str:
+    """Le SHA de `origin/<branche>` dans le clone, ou "" si la branche n'a
+    jamais été poussée. Un `git push` met cette ref à jour localement : la
+    passe voit le premier push sans appel à la forge."""
+    from . import plan_git
+    name = plan_git.short_branch(branch) or branch
+    proc = _git(clone, "rev-parse", "--verify", "--quiet",
+                "refs/remotes/origin/%s^{commit}" % name)
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.decode("utf-8", "replace").strip()
+
+
+def run_pass(cfg, db, *, actor: str, agents=None, limit: int = PASS_LIMIT,
+             retry_after_s: float = RETRY_AFTER_S) -> dict:
+    """Une passe bornée, jamais fatale :
+
+    * **refresh au premier push** : un lot occupant dont la branche est
+      publiée (`origin/<branche>` dans le clone de l'hôte) et dont le diff
+      n'a jamais été lu, ou l'a été sur une autre tête, voit ses lignes
+      `diff` réécrites (base : ref locale de la cible, aucun appel à la
+      forge). Avec `agents`, seuls les lots de ces assignés (ceux de l'hôte,
+      dont le clone porte la branche) ;
+    * **analyse inconnue retentée** : au plus `limit` lots `intake` dont la
+      dernière analyse est inconnue depuis `retry_after_s` sont réanalysés
+      (prise exclusive : deux exécuteurs ne le font pas ensemble) ; une
+      empreinte manuelle n'est jamais réécrite.
+
+    Rend `{refreshed: [...], analyzed: [...], errors: [...]}`."""
+    out: dict = {"refreshed": [], "analyzed": [], "errors": []}
+    store = storage.of(db).work_footprints
+    try:
+        candidates = store.refresh_candidates(
+            limit=max(limit * 20, 50),
+            assignees=sorted(agents) if agents is not None else None)
+    except Exception as exc:  # noqa: BLE001 - base sans 0519 : rien à faire
+        out["errors"].append("refresh candidates: %s" % exc)
+        candidates = []
+    done = 0
+    for row in candidates:
+        if done >= limit:
+            break
+        try:
+            clone, _target = _clone_and_target(cfg, row)
+            if not clone:
+                continue
+            tip = _published_tip(clone, row["branch"])
+            if not tip or (row.get("has_diff") and (row.get("diff_head") or "") == tip):
+                continue
+            done += 1
+            result = refresh(db, cfg, int(row["id"]), actor=actor, head=tip,
+                             published=False)
+            out["refreshed"].append({"lot": int(row["id"]), "head": tip,
+                                     "paths": result.get("paths"),
+                                     "changed": result.get("changed")})
+        except Exception as exc:  # noqa: BLE001 - un lot illisible n'arrête pas la passe
+            out["errors"].append("lot #%s: refresh: %s" % (row.get("id"), exc))
+    try:
+        # seuls les dépôts dont cet hôte a un clone : un hôte sans clone
+        # repousserait l'essai d'un autre de `retry_after_s` sans rien savoir
+        from . import intake_neighbors
+        apps = [app for app in store.unknown_apps()
+                if intake_neighbors.resolve_clone(cfg, app)]
+        claimed = (store.claim_unknown(retry_after_s=retry_after_s, limit=limit, apps=apps)
+                   if apps else [])
+    except Exception as exc:  # noqa: BLE001
+        out["errors"].append("unknown analyses: %s" % exc)
+        claimed = []
+    for row in claimed:
+        lot = int(row["work_item_id"])
+        try:
+            item = work.get(db, lot)
+            if item is None:
+                continue
+            analysis = record_estimate(db, cfg, item, actor=actor)
+            if analysis is not None:
+                out["analyzed"].append({"lot": lot, "status": analysis["status"],
+                                        "footprint": analysis["footprint"]})
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append("lot #%s: analysis: %s" % (lot, exc))
+    return out
+
+
 def describe(db, item_id: int) -> dict:
-    rows = storage.of(db).work_footprints.for_items([item_id])
+    store = storage.of(db).work_footprints
+    rows = store.for_items([item_id])
+    try:
+        analysis = store.analyses([item_id]).get(int(item_id))
+    except Exception:  # noqa: BLE001 - base sans 0519
+        analysis = None
+    try:
+        cap = store.cap_reached(item_id)
+    except Exception:  # noqa: BLE001
+        cap = None
+    item = work.get(db, item_id) or {}
     return {"id": int(item_id),
             "paths": sorted({r["path"] for r in rows}),
             "rows": rows,
-            "overlapping": storage.of(db).work_footprints.overlapping(item_id)}
+            "analysis": analysis,
+            "policy": policy_of(db, item.get("app") or ""),
+            "cap": cap,
+            "overlapping": store.overlapping(item_id)}
+
+
+def policy_line(policy: dict) -> str:
+    return ("unknown footprint: %s; in-flight cap: %s; shared paths: %s%s" % (
+        policy.get("unknown_policy"),
+        policy.get("max_in_flight") or "none",
+        ", ".join(policy.get("shared_paths") or ()) or "none",
+        " (default)" if policy.get("default") else
+        " (set by %s)" % policy.get("updated_by") if policy.get("updated_by") else ""))
 
 
 # --------------------------------------------------------------------------
@@ -297,14 +545,16 @@ def add_parser(sub, func):
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--set", nargs="+", metavar="PATH", dest="paths",
                       help="replace the estimated footprint (files or directories, "
-                           "relative to the repository root)")
+                           "relative to the repository root; `.` is the whole "
+                           "repository)")
     mode.add_argument("--clear", action="store_true",
                       help="remove the estimated footprint (the diff rows stay)")
     mode.add_argument("--clear-diff", action="store_true", dest="clear_diff",
                       help="remove the diff rows (e.g. computed on a wrong base); "
                            "pilot gesture, --refresh recomputes them")
     mode.add_argument("--estimate", action="store_true",
-                      help="re-estimate from the paths cited by the title and body")
+                      help="rerun the impact analysis (cited paths, identifiers found "
+                           "in the repository; read-only, bounded budget, #4818)")
     mode.add_argument("--refresh", action="store_true",
                       help="replace the diff rows from the branch's actual diff against "
                            "its target (branch target, else the project's declared "
@@ -344,8 +594,10 @@ def run(cfg, db, args) -> int:
             # des lignes `intake` sous une correction de pilote.
             print("lot #%d: manual footprint set (--set), estimate not written — "
                   "change it with --set PATH…, or --clear then --estimate" % args.id)
-        elif record_estimate(db, cfg, item, actor=actor, repo=args.repo) is None:
-            print("lot #%d: no path cited by its title or body" % args.id)
+        else:
+            analysis = record_estimate(db, cfg, item, actor=actor, repo=args.repo)
+            if analysis is not None and not args.json:
+                print("lot #%d: %s" % (args.id, analysis["note"]))
     elif args.refresh:
         refreshed = refresh(db, cfg, args.id, actor=actor, repo=args.repo)
     found = describe(db, args.id)
@@ -364,13 +616,18 @@ def run(cfg, db, args) -> int:
         return 0
     if not found["paths"]:
         print("lot #%d: no known footprint" % args.id)
+        _print_analysis(found)
         return 0
     sources: dict = {}
     for row in found["rows"]:
         sources.setdefault(row["path"], []).append(row["source"])
+    confidence = {p["path"]: p.get("confidence")
+                  for p in ((found.get("analysis") or {}).get("paths") or ())}
     print("lot #%d footprint:" % args.id)
     for path in found["paths"]:
-        print("  %s  (%s)" % (path, ", ".join(sources.get(path, []))))
+        print("  %s  (%s%s)" % (_path_label(path), ", ".join(sources.get(path, [])),
+                                ", %s" % confidence[path] if path in confidence else ""))
+    _print_analysis(found)
     seen = set()
     for row in found["overlapping"]:
         if int(row["id"]) in seen:
@@ -379,5 +636,100 @@ def run(cfg, db, args) -> int:
         print("overlaps #%d (%s%s): %s ~ %s" % (
             int(row["id"]), row["state"],
             ", %s" % row["assignee"] if row.get("assignee") else "",
-            row["path"], row["other_path"]))
+            _path_label(row["path"]), _path_label(row["other_path"])))
+    if found.get("cap"):
+        print("repository in-flight cap reached: %s/%s" % (
+            found["cap"]["in_flight"], found["cap"]["cap"]))
+    return 0
+
+
+def _print_analysis(found: dict) -> None:
+    analysis = found.get("analysis")
+    if analysis:
+        print("impact analysis: %s%s, %s ms, %s git call(s), attempt %s, by %s" % (
+            analysis.get("status"),
+            " (%s)" % analysis["reason"] if analysis.get("reason") else "",
+            analysis.get("elapsed_ms"), analysis.get("git_calls"),
+            analysis.get("attempts"), analysis.get("analyzed_by")))
+        weak = analysis.get("weak") or ()
+        if weak:
+            print("  weak (not held): %s" % ", ".join(w["path"] for w in weak))
+    print("repository policy: %s" % policy_line(found.get("policy") or {}))
+
+
+# --------------------------------------------------------------------------
+# politique du dépôt : CLI (#4818)
+# --------------------------------------------------------------------------
+
+def add_policy_parser(sub, func):
+    p = sub.add_parser(
+        "footprint-policy",
+        help="#4818: show or set a repository's footprint policy — unknown footprint "
+             "(open, or repository: held as the whole repository), in-flight cap, "
+             "shared paths ignored for overlap (pilot gesture)")
+    p.add_argument("app", nargs="?", help="the repository (lot `app`); all policies without")
+    p.add_argument("--unknown", choices=UNKNOWN_POLICIES, dest="unknown_policy")
+    cap = p.add_mutually_exclusive_group()
+    cap.add_argument("--max-in-flight", type=int, dest="max_in_flight", metavar="N",
+                     help="at most N lots in progress in the repository (packet "
+                          "vehicles not counted)")
+    cap.add_argument("--no-cap", action="store_true", dest="no_cap")
+    shared = p.add_mutually_exclusive_group()
+    shared.add_argument("--shared", nargs="+", metavar="PATH", dest="shared_paths",
+                        help="replace the shared paths (trivial merge: changelog, "
+                             "locale index…), ignored for overlap")
+    shared.add_argument("--no-shared", action="store_true", dest="no_shared")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--actor", default="")
+    p.set_defaults(func=func)
+    return p
+
+
+def run_policy(cfg, db, args) -> int:
+    actor = args.actor or "ameesh"
+    changing = (args.unknown_policy or args.max_in_flight is not None or args.no_cap
+                or args.shared_paths or args.no_shared)
+    if changing:
+        if not args.app:
+            raise work.WorkError("footprint-policy: name the repository (app) to change")
+        if not work.is_pilot(cfg, db, actor):
+            raise work.WorkError("footprint-policy refused: %s is neither a human nor an "
+                                 "orchestrator/design agent (pilot gesture)"
+                                 % (actor or "nobody"))
+        if args.max_in_flight is not None and args.max_in_flight < 1:
+            raise work.WorkError("--max-in-flight: at least 1 (or --no-cap)")
+        shared = None
+        if args.no_shared:
+            shared = []
+        elif args.shared_paths:
+            bad = [p for p in args.shared_paths if normalize(p) is None]
+            if bad:
+                raise work.WorkError("invalid shared path(s), relative to the repository "
+                                     "root: %s" % ", ".join(bad))
+            shared = _clean(args.shared_paths)
+        result = storage.of(db).work_footprints.set_policy(
+            args.app.strip(), actor=actor, unknown_policy=args.unknown_policy,
+            max_in_flight=args.max_in_flight, clear_cap=args.no_cap, shared_paths=shared)
+        if result["changed"]:
+            from . import events
+            try:
+                events.record(db, "footprint.policy", args.app.strip()[:300],
+                              project=args.app.strip(), actor=actor,
+                              before=result["before"], after=result["after"])
+            except Exception as exc:  # noqa: BLE001 - la politique est posée
+                print("warning: policy change not journaled in events: %s" % exc,
+                      file=sys.stderr)
+    if args.app:
+        found = {args.app.strip(): policy_of(db, args.app)}
+    else:
+        found = {app: dict(row, default=False) for app, row in
+                 storage.of(db).work_footprints.policies().items()}
+    if args.json:
+        print(json.dumps(found, ensure_ascii=False, indent=2, default=str))
+        return 0
+    if not found:
+        print("no repository footprint policy set (default: %s)"
+              % policy_line(default_policy("")))
+    for app, policy in sorted(found.items()):
+        print("%s: %s" % (app, policy_line(policy)))
     return 0

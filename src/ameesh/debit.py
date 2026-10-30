@@ -1654,9 +1654,13 @@ def capacity(*, agents: Iterable[Mapping[str, Any]],
                 "assignee": other.get("assignee") or blocker.get("assignee") or None,
                 "stalled_s": (int(max(0.0, now - float(last)))
                               if last is not None else None)})
+        # #4818 : la raison de l'attente — chevauchement, ou plafond de lots
+        # en vol du dépôt (tous ses occupants le retiennent alors)
+        reason = ("cap" if blockers and all(b.get("reason") == "cap" for b in blockers)
+                  else "overlap")
         footprint_by.setdefault(project, []).append({
             "lot": ident, "state": lot.get("state") or "",
-            "blockers": delayed})
+            "reason": reason, "blockers": delayed})
     startable = [dict(lot) for lot in startable or ()
                  if int(lot["id"]) not in footprint]
     startable_by: dict[str, list[int]] = {}
@@ -1790,6 +1794,10 @@ def _footprint_gesture(rows: Iterable[Mapping[str, Any]]) -> str:
             tail = " ; sans mouvement depuis %s : %s" % (
                 _duration(stalled[0].get("stalled_s")),
                 ", ".join("#%d" % int(blocker["id"]) for blocker in stalled))
+        if row.get("reason") == "cap":
+            parts.append("#%d (%s) attend le plafond de lots en vol du dépôt (%s)%s"
+                         % (int(row["lot"]), row.get("state") or "intake", names, tail))
+            continue
         parts.append("#%d (%s) attend %s%s"
                      % (int(row["lot"]), row.get("state") or "intake", names, tail))
     return ("lots en attente d'empreinte : %s — le geste dû porte sur le lot "

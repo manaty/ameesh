@@ -9,9 +9,10 @@ is too narrow (or unknown) does not hold anything back, so the diff refresh
 matters.
 
 ```sh
-ameesh work footprint 212                      # show it, and the lots in progress it overlaps
+ameesh work footprint 212                      # show it, its impact analysis, the overlaps
 ameesh work footprint 212 --set src/ameesh/backlog.py docs
-ameesh work footprint 212 --estimate           # re-estimate from the title and body
+ameesh work footprint 212 --set .              # the whole repository (pilot gesture)
+ameesh work footprint 212 --estimate           # rerun the impact analysis
 ameesh work footprint 212 --refresh            # refine from the branch's actual diff
 ameesh work footprint 212 --clear              # drop the estimate (diff rows stay)
 ameesh work footprint 212 --clear-diff         # drop wrong diff rows (pilot gesture)
@@ -21,8 +22,8 @@ ameesh work footprint 212 --clear-diff         # drop wrong diff rows (pilot ges
 
 The footprint is the union of three sources (`work_item_footprints`, 0502):
 
-- `intake`: estimated at creation from the paths cited by the title and body
-  (the same detection as the intake neighbors), for **every** creation path:
+- `intake`: estimated at creation by the **impact analysis** (#4818, below),
+  for **every** creation path:
   `ameesh work add`, `agent-mail --new-lot`, incident, fingerprint, review-lot,
   packet carrier, improvement backlog and basket lines. With a local clone of
   the repository, a bare file name becomes its path when it is unique. A cited
@@ -60,12 +61,88 @@ estimate stays, the overlap disappears with the false files. `--set` and
 
 Every change writes one line in the lot's journal (`Footprint (source): …`).
 
+## Impact analysis (#4818)
+
+Before dispatch, every lot gets a fast, **read-only** and deterministic (no
+model) analysis of the files it will probably touch, with a confidence per
+path (`impact_analysis.py`):
+
+- `high`: a path cited by the title or body (the intake neighbors detection).
+  With a local clone of the repository, a bare file name becomes its path when
+  it is unique. A cited path absent from the repository is kept: it is often
+  the file to create.
+- `medium`: a cited identifier (`snake_case`, `CamelCase`, `module.function`,
+  a command such as `sync-branches`) that `git grep` finds in at most 3 files
+  outside the tests. Otherwise only its definitions count (`def`, `class`,
+  `function`…).
+- `weak`: a title word that names a file (`footprint` →
+  `work_footprints.py`). It is journaled only and never written to the
+  footprint: a guess holds no lot back.
+
+The budget is bounded twice: 3 s shared by every git call, and 16 git calls.
+Every estimate writes **one line** in the lot's journal (`Impact analysis: …`,
+known or not, with its time and git calls). The latest analysis is kept in
+`work_item_impact_analyses` (0519), and `ameesh work footprint <lot>` shows it.
+A manual footprint (`--set`) always wins: neither `--estimate` nor the retries
+rewrite it.
+
+**Unknown footprint.** When the analysis finds no `high` or `medium` path (no
+cited path or identifier, no clone, budget exhausted), the repository's
+policy decides:
+
+- `open` (the default when no policy is set): the lot holds nothing, the rule
+  before #4818;
+- `repository`: the lot carries the marker `.` (the whole repository), which
+  overlaps every path of the repository. While it is in progress it holds
+  every other lot of the repository, and while it is waiting every lot in
+  progress holds it.
+
+The runner retries an unknown analysis every 30 min (up to 5 lots per pass),
+on a host that has a clone of the repository. The first diff refresh
+replaces the marker: a branch's real diff is the known footprint.
+
+## Refresh at the first push (#4818)
+
+Each runner, in its branch sweep, refreshes the `diff` rows of the lots in
+progress assigned to its host's agents as soon as the branch is **pushed**:
+when `origin/<branch>` exists in the host's clone (a `git push` updates it
+locally, with no call to the forge) and no diff was read, or it was read on
+another head. The base is the clone's ref of the target. At most 5 lots are
+refreshed per pass. The diff refresh on freeze and on `--refresh` is
+unchanged.
+
+## Repository policy (#4818)
+
+```sh
+ameesh work footprint-policy                         # every policy set
+ameesh work footprint-policy tpk --unknown repository
+ameesh work footprint-policy tpk --max-in-flight 4   # or --no-cap
+ameesh work footprint-policy tpk --shared CHANGELOG.md src/locales/index.ts  # or --no-shared
+```
+
+A pilot gesture (human, orchestrator or design agent), journaled in the
+events (`footprint.policy`, before and after), and stored in
+`repository_footprint_policies` (0519) so that the SQL of the guard reads it
+under its lock:
+
+- `--unknown open|repository`: the unknown footprint policy (above);
+- `--max-in-flight N`: at most N lots of the repository occupy their
+  footprint at once. Packet vehicles (`integration/**`) are neither counted
+  nor held. A free lot of a repository at its cap is held like an overlap:
+  it is not offered to idle agents, `work assign` refuses it (`in-flight cap
+  (N/N)`), and an assigned creation is created unassigned with a warning;
+- `--shared PATH…`: the files or directories whose merges are trivial
+  (changelog, locale index…). They are ignored for overlap on both sides, and
+  a path under a shared directory is ignored too. The marker `.` is never
+  shared.
+
 ## Overlap
 
 Two paths overlap when they are equal or one is a parent directory of the
-other: `src/a` overlaps `src/a/b.py`, not `src/ab.py`. Paths of two different
-repositories never overlap. A lot without any footprint row has no known
-footprint and is not held.
+other: `src/a` overlaps `src/a/b.py`, not `src/ab.py`. The marker `.`
+overlaps everything. A shared path of the repository's policy overlaps
+nothing. Paths of two different repositories never overlap. A lot without
+any footprint row has no known footprint and is not held.
 
 ## Scheduling rule
 
@@ -75,7 +152,7 @@ until it is merged, promoted or closed: `build`, `qa`, `waiting_human` and
 (its branch exists).
 
 An `intake` lot whose footprint overlaps an occupying lot of the same
-repository:
+repository, or whose repository has reached its in-flight cap:
 
 - is not offered to idle agents (`unassigned_lots`, L165), and the take
   re-checks the rule under the dependency-graph lock after locking the lot;
@@ -98,6 +175,14 @@ Footprint writes take the same lock, so a footprint never changes between
 a check and the attribution it guards. Footprints set or refreshed on lots
 that are *already* in progress are not retroactive: `ameesh work footprint` shows the overlap, and the pilot decides.
 
+**A pairwise disjoint selection.** Two *free* lots that overlap each other
+are both startable for the guard. The project dispatch plan (`ameesh work
+plan --project`, and the dispatcher that reads it) walks the lots in dispatch
+order and keeps a set of ready lots whose footprints are pairwise disjoint. A
+later lot that overlaps one already selected waits, with `footprint overlaps
+#N, dispatched first`. The in-flight cap counts the selected lots on top of
+those already in progress (`repository in-flight cap N reached with #…`).
+
 ## SLO and dispatch (#4561)
 
 A held `intake` lot is not late: while an occupying lot overlaps its
@@ -111,3 +196,15 @@ from the lot's creation.
 `footprint_lots`, with the blocking lot and its state. When the blocker has
 not moved for 2 h, the due gesture is on it — its verdict or its package —
 not on an assignment.
+
+The wait for the in-flight cap is a footprint wait: every occupying lot of
+the repository holds the waiting lot (`reason: cap`). `ameesh debit` says so
+(`attend le plafond de lots en vol du dépôt`).
+
+## A lot that occupies without moving (#4818)
+
+The guard never releases a footprint by itself. When a lot that holds other
+lots (by its footprint or by the cap) is stale (`stale_lot` alert, to the
+pilots), the alert names the lots it holds and the due gesture: move it
+forward, narrow a wrong footprint (`--set`, or push the branch so that the
+diff replaces the estimate), or return it to the queue (`ameesh work return`).

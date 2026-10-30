@@ -1825,6 +1825,19 @@ class FootprintOverlap(RuntimeError):
             "#%d" % int(i) for i in sorted({int(r["id"]) for r in self.overlaps})))
 
 
+class RepositoryCapReached(FootprintOverlap):
+    """#4818 : l'attribution d'un lot libre est refusée — son dépôt a atteint
+    son plafond de lots en vol (`max_in_flight` de sa politique) ; rien n'est
+    écrit. Sous-classe de `FootprintOverlap` : les chemins qui la rattrapent
+    rendent le lot à la file au lieu d'échouer, sans liste de chemins."""
+
+    def __init__(self, cap: int, in_flight: int):
+        self.cap, self.in_flight = int(cap), int(in_flight)
+        self.overlaps = []
+        RuntimeError.__init__(self, "repository in-flight cap reached (%d/%d)"
+                              % (self.in_flight, self.cap))
+
+
 class BasketEstimateRequired(RuntimeError):
     """#4117 : `backlog_basket_add` allait OUVRIR un panier pour un agent sans
     estimation ni référence publiée ; `backlog.add` le traduit en

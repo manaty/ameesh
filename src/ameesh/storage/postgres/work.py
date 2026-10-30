@@ -24,7 +24,11 @@ from ...db import DbError, in_transaction, is_unique_violation
 from ...slo import VEHICLE_EXIT_MARK
 from .. import interface
 from . import catalog as _catalog
-from .work_footprints import (occupying_sql as footprint_occupying_sql,
+from .work_footprints import (cap_reached_sql as footprint_cap_sql,
+                              cap_rows_sql as footprint_cap_rows_sql,
+                              held_sql as footprint_held_sql,
+                              in_flight_sql as footprint_in_flight_sql,
+                              occupying_sql as footprint_occupying_sql,
                               overlap_exists_sql as footprint_overlap_sql,
                               overlap_rows_sql as footprint_overlap_rows_sql)
 from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK,
@@ -670,7 +674,9 @@ class WorkItems(interface.WorkItems):
                 # commit du premier, voit sa ligne.
                 tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
                          "lower(%s), 0))", (issue_ref,))
-            if footprint and assignee:
+            if assignee and (footprint or str(app or "").strip()):
+                # #4818 : le plafond de lots en vol garde aussi une création
+                # attribuée sans empreinte
                 tx.execute(_DEPENDENCIES_LOCK)
             # #540 : lignes de lots d'abord, par identifiant croissant, puis
             # le verrou d'agent de `_pending` — même ordre que `assign`.
@@ -745,9 +751,11 @@ class WorkItems(interface.WorkItems):
             if footprint:
                 WorkItems(tx)._intake_footprint(item["id"], footprint, actor)
                 if assignee:
-                    overlaps = WorkItems(tx)._footprint_overlaps(item["id"])
-                    if overlaps:
-                        raise interface.FootprintOverlap(overlaps)
+                    WorkItems(tx)._footprint_guard(item["id"])
+            elif assignee:
+                # #4818 : sans empreinte, le plafond de lots en vol du dépôt
+                # garde encore la création attribuée
+                WorkItems(tx)._footprint_guard(item["id"])
             if behind is not None:
                 item["forced_behind" if forced_note else "queued_behind"] = behind
             if parent_lot is not None:
@@ -1168,7 +1176,8 @@ class WorkItems(interface.WorkItems):
                              " LIMIT 1", (int(item_id),)):
                 return None
             ready_state = item["state"]
-            if ready_state == lifecycle.REQUESTED and self._footprint_overlaps(item_id):
+            if ready_state == lifecycle.REQUESTED and (
+                    self._footprint_overlaps(item_id) or self._footprint_cap(item_id)):
                 return None
         else:
             ready_state = None
@@ -1178,9 +1187,7 @@ class WorkItems(interface.WorkItems):
                 # attributions concurrentes de lots chevauchants décident
                 # l'une après l'autre.
                 self.db.execute(_DEPENDENCIES_LOCK)
-                overlaps = self._footprint_overlaps(item_id, free_only=True)
-                if overlaps:
-                    raise interface.FootprintOverlap(overlaps)
+                self._footprint_guard(item_id, free_only=True)
         behind = None
         if (queued_note is not None or take) and assignee:
             lot = self.db.query("SELECT started_at IS NULL AS fresh FROM work_items"
@@ -1207,6 +1214,27 @@ class WorkItems(interface.WorkItems):
             "SELECT DISTINCT x.* FROM work_items c, LATERAL ("
             + footprint_overlap_rows_sql("c") + ") x WHERE c.id = %s" + guard +
             " ORDER BY x.id, x.path", (int(item_id),))
+
+    def _footprint_cap(self, item_id, *, free_only=False) -> dict | None:
+        """#4818, sous le verrou du graphe : `{cap, in_flight}` si le dépôt du
+        lot a atteint son plafond de lots en vol, sinon None ; `free_only` :
+        None si le lot occupe déjà son empreinte (il est déjà compté)."""
+        guard = (" AND NOT " + footprint_occupying_sql("c")) if free_only else ""
+        rows = self.db.query(
+            "SELECT x.* FROM work_items c, LATERAL (" + footprint_cap_rows_sql("c")
+            + ") x WHERE c.id = %s" + guard, (int(item_id),))
+        return dict(rows[0]) if rows else None
+
+    def _footprint_guard(self, item_id, *, free_only=False) -> None:
+        """La garde d'attribution d'un lot libre : `FootprintOverlap` s'il
+        chevauche un lot occupant, `RepositoryCapReached` si son dépôt est au
+        plafond (#4818). Rien n'est écrit ; l'appelant tient le verrou."""
+        overlaps = self._footprint_overlaps(item_id, free_only=free_only)
+        if overlaps:
+            raise interface.FootprintOverlap(overlaps)
+        cap = self._footprint_cap(item_id, free_only=free_only)
+        if cap:
+            raise interface.RepositoryCapReached(cap["cap"], cap["in_flight"])
 
     def _pending(self, assignee, item_id) -> int | None:
         """#540, dans la transaction ouverte et sous le verrou de l'agent : son
@@ -3791,6 +3819,14 @@ class WorkItems(interface.WorkItems):
             # Match the intake footprint guard used by dispatch (#4173).
             "       (w.state = 'intake' AND " + footprint_overlap_sql("w") + ")"
             "         AS footprint_overlap,"
+            # #4818 : plafond de lots en vol du dépôt, et ce qu'il faut au plan
+            # pour choisir un ensemble aux empreintes disjointes deux à deux
+            "       (w.state = 'intake' AND w.assignee IS NULL AND "
+            + footprint_cap_sql("w") + ") AS repository_cap,"
+            "       ARRAY(SELECT DISTINCT f.path FROM work_item_footprints f"
+            "             WHERE f.work_item_id = w.id ORDER BY f.path) AS footprint_paths,"
+            "       CASE WHEN w.state = 'intake' THEN " + footprint_in_flight_sql("w") +
+            " END AS repository_in_flight,"
             "       EXISTS (SELECT 1 FROM commitments c WHERE c.work_item_id = w.id"
             "               AND c.kind = 'decision' AND c.status IN ('proposed', 'open'))"
             "         AS decision_milestone"
@@ -3841,8 +3877,9 @@ class WorkItems(interface.WorkItems):
                # lot occupant du même dépôt attend sa fusion (un lot `build`
                # rendu à la file occupe déjà la sienne) ; même prédicat que la
                # garde de `_assign_locked`, avant le LIMIT.
+               # #4818 : et le plafond de lots en vol de son dépôt (`held_sql`).
                f"           AND (state <> '{lifecycle.REQUESTED}' OR NOT "
-               + footprint_overlap_sql("work_items") + ")) w"
+               + footprint_held_sql("work_items") + ")) w"
                "  LEFT JOIN work_packages k ON k.id = w.package_id"
                "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
                f" ORDER BY coalesce(w.priority, 2), (w.state = '{lifecycle.IN_PROGRESS}') DESC,"

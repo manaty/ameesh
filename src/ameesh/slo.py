@@ -598,25 +598,33 @@ def _footprint_exact_release(named: Iterable[int],
 
 
 def footprint_blockers(item: dict, lots: Iterable[dict],
-                       paths_by_lot: dict) -> list[dict]:
+                       paths_by_lot: dict, policies: dict | None = None) -> list[dict]:
     """Les lots qui retiennent `item` par la garde d'empreinte (#3185, #4561).
 
     Même règle que la garde d'attribution : un lot du même dépôt (`app`), qui
     OCCUPE son empreinte (confié ou démarré, non fusionné) et dont un chemin
     chevauche celui du lot retenu. Seul un lot `intake` SANS porteur est
     retenu : la garde ne refuse pas la réassignation d'un lot en cours. Rend
-    `[{id, state, assignee, updated_ts, last_activity_ts}]`, triés par id."""
+    `[{id, state, assignee, updated_ts, last_activity_ts}]`, triés par id.
+
+    #4818 : `policies` (`{app: politique}`) porte les chemins partagés du
+    dépôt (ignorés) et son plafond de lots en vol : sans chevauchement, un
+    dépôt au plafond retient le lot par tous ses occupants (`reason: cap`,
+    véhicules de paquet exceptés). Le marqueur `.` chevauche tout."""
     if str(item.get("state") or "") != lifecycle.REQUESTED:
         return []
     if str(item.get("assignee") or "").strip():
         return []
     mine = paths_by_lot.get(int(item["id"])) or ()
     app = str(item.get("app") or "").strip()
-    if not mine or not app:
+    if not app:
         return []
-    from . import work_footprints
+    from . import packet_guard, work_footprints
 
+    policy = (policies or {}).get(app) or {}
+    shared = policy.get("shared_paths") or ()
     out = []
+    occupants = []
     for other in lots or ():
         other_id = int(other["id"])
         if other_id == int(item["id"]):
@@ -629,15 +637,21 @@ def footprint_blockers(item: dict, lots: Iterable[dict],
         if not (str(other.get("assignee") or "").strip()
                 or state != lifecycle.REQUESTED):
             continue
+        row = {"id": other_id, "state": state,
+               "assignee": other.get("assignee") or None,
+               "updated_ts": other.get("updated_ts"),
+               "last_activity_ts": other.get("last_activity_ts")}
+        if not packet_guard.is_packet_branch(other.get("branch") or ""):
+            occupants.append(row)
         theirs = paths_by_lot.get(other_id) or ()
-        if not theirs:
+        if not mine or not theirs:
             continue
-        if any(work_footprints.overlaps(a, b)
-               for a in mine for b in theirs):
-            out.append({"id": other_id, "state": state,
-                        "assignee": other.get("assignee") or None,
-                        "updated_ts": other.get("updated_ts"),
-                        "last_activity_ts": other.get("last_activity_ts")})
+        if work_footprints.held_pairs(mine, theirs, shared):
+            out.append(row)
+    cap = policy.get("max_in_flight")
+    if (not out and cap and len(occupants) >= int(cap)
+            and not packet_guard.is_packet_branch(item.get("branch") or "")):
+        out = [dict(row, reason="cap") for row in occupants]
     return sorted(out, key=lambda blocker: blocker["id"])
 
 
