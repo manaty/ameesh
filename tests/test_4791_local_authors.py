@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -98,10 +99,54 @@ class LocalAuthorsTest(unittest.TestCase):
         proc = subprocess.CompletedProcess([], 0, b"", b"")
         with authors.sweep_deadline(0.5):
             with mock.patch.object(authors.plan_git, "_git", return_value=proc) as git:
-                authors._read_git(self.repo, "show", self.head)
+                authors._read_git(self.repo, "rev-parse", self.head)
                 self.assertLessEqual(git.call_args.kwargs["timeout"],
                                      authors.plan_git.PROBE_TIMEOUT_S)
                 self.assertLessEqual(git.call_args.kwargs["deadline"].remaining(), 0.5)
+
+    def test_heavy_patch_history_over_two_seconds_uses_sweep_budget(self):
+        with open(os.path.join(self.repo, "content"), "a") as stream:
+            stream.write("new distinctive line\n")
+        self.git("commit", "-am", "change", "--quiet")
+        changed = self.git("rev-parse", "HEAD")
+        tree = self.git("rev-parse", changed + "^{tree}")
+        target = self.git("commit-tree", tree, "-p", self.head, "-m", "copy")
+        original = authors.plan_git._git
+        def slow_log(repo, *args, **kwargs):
+            if args[0] == "log":
+                self.assertGreater(kwargs["timeout"], 2)
+                self.assertNotEqual(repo, self.repo)
+                self.assertIn("GIT_OBJECT_DIRECTORY", kwargs["env_extra"])
+                time.sleep(2.1)
+            return original(repo, *args, **kwargs)
+        with authors.sweep_deadline(15), mock.patch.object(
+                authors.plan_git, "_git", side_effect=slow_log):
+            self.assertTrue(authors._patch_in_target(
+                self.repo, target, changed, {}))
+
+    def test_missing_blob_fails_in_reader_without_promisor(self):
+        blob = self.git("rev-parse", self.head + ":content")
+        self.git("config", "remote.origin.url", "https://invalid.example/repo")
+        self.git("config", "remote.origin.promisor", "true")
+        os.unlink(os.path.join(self.repo, ".git", "objects", blob[:2], blob[2:]))
+        original = authors.plan_git._git
+        with authors.sweep_deadline(15), mock.patch.object(
+                authors.plan_git, "_git", wraps=original) as calls:
+            proc = authors._read_git(self.repo, "show", self.head + ":content")
+        self.assertNotEqual(proc.returncode, 0)
+        show = next(call for call in calls.call_args_list if "show" in call.args)
+        self.assertNotEqual(show.args[0], self.repo)
+        self.assertIn("GIT_OBJECT_DIRECTORY", show.kwargs["env_extra"])
+        self.assertNotIn(b"https://invalid.example", proc.stderr)
+
+    def test_unreadable_target_index_marks_sweep_nonconclusive(self):
+        calls = [{"patch": "commit"}, canon.GitError("missing blob")]
+        with authors.sweep_deadline(15) as sweep, mock.patch.object(
+                authors, "_read_patch_ids", side_effect=calls), mock.patch.object(
+                authors, "_local_reads", return_value=True):
+            self.assertFalse(authors._patch_in_target(
+                self.repo, self.head, self.head, {}))
+            self.assertIn("target patch index unreadable", sweep.tripped)
 
     def test_ancestor_timeout_is_doubt_and_cached(self):
         cache = {}

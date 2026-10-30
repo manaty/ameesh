@@ -177,15 +177,19 @@ def _sweep_grep(repo: str, rev: str, args: Sequence[str], patterns: Sequence[str
     # B/P2 cx2 : les attributs (`-I`) sont ceux de l'arbre balayé, jamais ceux
     # du dépôt de travail lecteur ; le résultat se partage entre clones.
     env = grep_cache.neutral_attributes(rev, repo)
-    if sweep is None:
-        return plan_git._git(repo, "grep", *args, "-f", "-", str(rev), stdin=stdin,
-                             env_extra=env)
-    sweep.check(step)
+    if sweep is not None:
+        sweep.check(step)
     try:
-        return plan_git._git(repo, "grep", *args, "-f", "-", str(rev),
-                             stdin=stdin, deadline=sweep.deadline, env_extra=env)
+        with _local_object_repo(repo) as (reader, local_env):
+            return plan_git._git(
+                reader, "grep", *args, "-f", "-", str(rev), stdin=stdin,
+                timeout=sweep.deadline.remaining() if sweep is not None else canon.GIT_TIMEOUT,
+                deadline=sweep.deadline if sweep is not None else None,
+                env_extra={**env, **local_env})
     except canon.GitDeadline:
-        sweep.trip(step)
+        if sweep is not None:
+            sweep.trip(step)
+        raise
 
 
 def _cache_wait() -> Optional[float]:
@@ -927,31 +931,69 @@ _TRIVIAL_LINES = frozenset((
 ))
 
 
-def _read_bound():
+def _read_bound(limit=None):
     sweep = active_sweep()
     if sweep is not None:
         sweep.check("git read")
-    remaining = (sweep.deadline.remaining() if sweep is not None
-                 else plan_git.PROBE_TIMEOUT_S)
-    return Deadline(min(plan_git.PROBE_TIMEOUT_S, remaining))
+        return sweep.deadline if limit is None else Deadline(min(limit, sweep.deadline.remaining()))
+    return Deadline(canon.GIT_TIMEOUT if limit is None else limit)
+
+
+@contextlib.contextmanager
+def _local_object_repo(repo):
+    """Read shared objects from a repository with no promisor or remote."""
+    objects = _read_out(repo, "rev-parse", "--git-path", "objects")
+    if not objects:
+        raise plan_git.MergeProbeError("local object directory unreadable")
+    objects = os.path.realpath(os.path.join(repo, objects))
+    with tempfile.TemporaryDirectory(prefix="ameesh-authors-",
+                                     dir=os.environ.get("TMPDIR")) as gitdir:
+        proc = plan_git._git(gitdir, "init", "--quiet", "--bare",
+                             timeout=plan_git.PROBE_TIMEOUT_S,
+                             deadline=_read_bound(plan_git.PROBE_TIMEOUT_S))
+        if proc.returncode:
+            raise plan_git.MergeProbeError("local reader initialization failed")
+        # Preserve the reader's info/attributes semantics (grep_cache keys
+        # include them), while leaving all remote/promisor configuration out.
+        attributes = _read_out(repo, "rev-parse", "--git-path", "info/attributes")
+        if attributes:
+            try:
+                with open(os.path.join(repo, attributes), "rb") as source:
+                    content = source.read()
+            except FileNotFoundError:
+                pass
+            else:
+                with open(os.path.join(gitdir, "info", "attributes"), "wb") as target:
+                    target.write(content)
+        yield gitdir, {**plan_git.NO_LAZY_FETCH, "GIT_DIR": gitdir,
+                       "GIT_OBJECT_DIRECTORY": objects}
 
 
 def _read_git(repo, *args, **kwargs):
-    """#4791: short reads also respect the caller's total budget."""
-    kwargs["timeout"] = min(kwargs.get("timeout", plan_git.PROBE_TIMEOUT_S),
-                            plan_git.PROBE_TIMEOUT_S)
-    kwargs["deadline"] = _read_bound()
+    """Content reads use the remaining sweep budget, without lazy fetches."""
+    heavy = args[0] in {"log", "diff", "show", "patch-id"}
+    limit = canon.GIT_TIMEOUT if heavy else plan_git.PROBE_TIMEOUT_S
+    sweep = active_sweep()
+    kwargs["timeout"] = kwargs.get("timeout", (
+        sweep.deadline.remaining() if heavy and sweep is not None else limit))
+    kwargs["deadline"] = _read_bound(None if heavy else limit)
     try:
+        if heavy:
+            with _local_object_repo(repo) as (reader, env):
+                kwargs["env_extra"] = {**kwargs.get("env_extra", {}), **env}
+                return plan_git._git(reader, *args, **kwargs)
         return plan_git._git(repo, *args, **kwargs)
     finally:
-        sweep = active_sweep()
         if sweep is not None:
             sweep.check("git " + str(args[0]))
 
 
 def _read_out(repo, *args):
     try:
-        return plan_git._out(repo, *args, deadline=_read_bound())
+        if args[0] in {"log", "show", "diff"}:
+            proc = _read_git(repo, *args)
+            return proc.stdout.decode("utf-8", "replace").strip() if not proc.returncode else None
+        return plan_git._out(repo, *args, deadline=_read_bound(plan_git.PROBE_TIMEOUT_S))
     except canon.GitError:
         return None
     finally:
@@ -961,7 +1003,7 @@ def _read_out(repo, *args):
 
 
 def _read_local_commit(repo, rev):
-    return plan_git.local_commit(repo, rev, deadline=_read_bound())
+    return plan_git.local_commit(repo, rev, deadline=_read_bound(plan_git.PROBE_TIMEOUT_S))
 
 
 def _read_patch_ids(repo, *args):
@@ -1050,23 +1092,12 @@ def _present_commits(repo: str, shas: Sequence[str], *,
     if timeout is not None and timeout <= 0:
         return None
     try:
-        objects = _read_out(repo, "rev-parse", "--git-path", "objects")
-        if not objects:
-            return None
-        objects = os.path.realpath(os.path.join(repo, objects))
-        # Git 2.43 ignores GIT_NO_LAZY_FETCH. A repository without remotes
-        # cannot fetch, even when its object store is a partial clone.
-        with tempfile.TemporaryDirectory(prefix="ameesh-authors-",
-                                         dir=os.environ.get("TMPDIR")) as gitdir:
-            if _read_git(gitdir, "init", "--quiet", "--bare").returncode:
-                return None
+        with _local_object_repo(repo) as (gitdir, env):
             proc = _read_git(
                 gitdir, "cat-file", "--batch-check=%(objectname) %(objecttype)",
                 stdin=("\n".join(wanted) + "\n").encode("utf-8"),
                 timeout=plan_git.PROBE_TIMEOUT_S if timeout is None else timeout,
-                env_extra={**plan_git.NO_LAZY_FETCH, "GIT_DIR": gitdir,
-                           "GIT_OBJECT_DIRECTORY": objects,
-                           "GIT_ALTERNATE_OBJECT_DIRECTORIES": objects})
+                env_extra=env)
     except Exception:
         return None
     if proc.returncode != 0:
@@ -1417,8 +1448,16 @@ def _patch_in_target(repo: str, target: str, sha: str, cache: dict) -> bool:
                         cache[index_key] = _read_patch_ids(
                             repo, "--max-count=%d" % plan_git.MAX_TARGET_COMMITS,
                             "%s..%s" % (base, str(target)))
-                    except Exception:  # noqa: BLE001 - pas de preuve
+                    except Exception as exc:  # unreadable is not "not delivered"
                         cache[index_key] = None
+                        sweep = active_sweep()
+                        step = "target patch index unreadable: %s" % exc
+                        if sweep is not None:
+                            sweep.tripped = sweep.tripped or step
+                            sweep.trips += 1
+                        else:
+                            import logging
+                            logging.getLogger(__name__).warning(step)
                 on_target = cache[index_key]
                 found = bool(on_target) and patches.keys() <= on_target.keys()
     except Exception:  # noqa: BLE001 - pas de preuve : garder le commit
@@ -2824,6 +2863,9 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
     if not repo or not rev:
         return None
     flag = "-a" if binary else "-I"
+    sweep = active_sweep()
+    if sweep is not None:
+        sweep.check("git grep -h %s -G -f - %s" % (flag, rev))
 
     def scan():
         try:
