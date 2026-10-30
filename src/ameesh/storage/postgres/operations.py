@@ -145,6 +145,9 @@ class Operations(interface.Operations):
         return self.db.query(
             """
             SELECT r.name, r.chantier, r.team, r.projects, r.harness, r.host, r.model,
+                   -- #4779 : le profil de relecture (capacité `propose`, rôles),
+                   -- lu par `file_decoupage._reviewer_spares`
+                   r.capabilities, r.roles,
                    r.ephemeral,  -- #3411 : la prise automatique ne sert pas un éphémère
                    r.effort, r.tier,
                    r.cwd,  -- L73b : dossiers de travail protégés par le ménage

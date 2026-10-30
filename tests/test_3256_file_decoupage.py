@@ -28,7 +28,10 @@ def agent(name, *, idle=True, project="ameesh", **extra):
     row = {"name": name, "mode": "execute", "status": "idle", "lease_live": True,
            "lease_owner": "runner:h1", "unread": 0, "assigned_lot_id": None,
            "active_lots": 0, "actionable_lots": 0 if idle else 1,
-           "projects": [project], "responsible": "human:alice"}
+           "projects": [project], "responsible": "human:alice",
+           # #4779 : profil de relecteur prouvé (capacité `propose`, un rôle).
+           "capabilities": ["read", "report-drift", "propose"],
+           "roles": ["implementation"]}
     row.update(extra)
     return row
 
