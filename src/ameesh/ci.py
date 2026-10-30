@@ -124,6 +124,7 @@ import contextlib
 import json
 import re
 import secrets
+import sys
 import time
 from datetime import datetime
 from urllib.parse import quote
@@ -4014,7 +4015,14 @@ def cmd_ci_cancel(cfg, args) -> int:
     return 1 if failed else 0
 
 
-def cmd_ci(cfg, args) -> int:
+def cmd_ci(cfg, args, out=None) -> int:
+    """`ameesh ci ...` ; `out` reçoit la vue de statut (défaut : stdout).
+
+    #4736 : la vue est écrite sur le flux qu'on lui donne, jamais sur le
+    `sys.stdout` global. `redirect_stdout` est global au processus : un fil
+    laissé vivant par un autre test du même processus peut y écrire pendant la
+    commande et polluer une capture JSON (« Extra data »). Les commandes
+    `run`/`cancel` gardent stdout (elles ne servent pas de vue capturable)."""
     from . import plan_github
     from .db import open_db
     command = getattr(args, "ci_command", "status")
@@ -4022,21 +4030,22 @@ def cmd_ci(cfg, args) -> int:
         return cmd_ci_run(cfg, args)
     if command == "cancel":
         return cmd_ci_cancel(cfg, args)
+    out = sys.stdout if out is None else out
     db = open_db(cfg)
     try:
         report = status_of(db, args.id, limit=args.limit)
     except CiError as exc:
-        print("ameesh ci: %s" % exc)
+        print("ameesh ci: %s" % exc, file=out)
         return 1
     # N2 #848 : la vue JSON dit les lectures GitHub partagées de l'hôte, comme
     # la vue texte (`quota_line`) ; sans état, la projection est vide.
     report["github_reads"] = plan_github.quota_stats(getattr(cfg, "state_dir", None))
     if args.json:
-        print(json.dumps(report, ensure_ascii=False, indent=1))
+        print(json.dumps(report, ensure_ascii=False, indent=1), file=out)
         return 0
     lines = render_status(report)
     line = quota_line(getattr(cfg, "state_dir", None))
     if line:
         lines.append(line)
-    print("\n".join(lines))
+    print("\n".join(lines), file=out)
     return 0
