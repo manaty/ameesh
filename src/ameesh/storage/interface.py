@@ -3947,7 +3947,12 @@ class Decisions(Domain):
         """Clôt la demande si elle est encore en attente : `status`
         (`answered` | `delivered`), `record` fusionné dans `payload.decision`
         (état, réponse ou retrait). Rend la ligne close, ou None (déjà close,
-        inconnue) — rien n'est écrit."""
+        inconnue) — rien n'est écrit. A request carrying `supersedes` closes
+        only with a valid signed answer. Selecting its signed
+        `supersedes_option` atomically marks the earlier answered authority
+        `superseded_by`, with append-only audit events on both decisions;
+        another option or free text leaves that authority unchanged.
+        Existing answers are never rewritten."""
 
     def validation_register(self, decision_id: int, *, routing: dict):
         """#4256: immutable authority snapshot, outside the mediated contract."""
