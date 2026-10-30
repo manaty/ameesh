@@ -352,6 +352,143 @@ class ReviewedMoveTest(unittest.TestCase):
         self.assert_unchanged()
         self.note.assert_not_called()
 
+    def pr_range(self):
+        """Three PRs, one author family each, two independent reviews each."""
+        heads = [self.gate]
+        for index in range(2):
+            main = self.repo.git('rev-parse', '--abbrev-ref', 'HEAD')
+            branch = 'canon-pr-%s' % index
+            self.repo.git('checkout', '-qb', branch)
+            self.repo.write('processus/mecanique.yaml', 'schema: %s\n' % index)
+            heads.append(self.repo.commit('canon PR %s' % index))
+            self.repo.git('checkout', '-q', main)
+            self.repo.git('merge', '--no-ff', '-qm', 'hosting merge', branch)
+        self.set_gate(self.repo.git('rev-parse', 'HEAD'))
+        self.proofs = dict(zip(heads, ('deepseek', 'claude', 'codex')))
+        self.commit_proof.side_effect = lambda db, sha: (
+            dict(actor='author-' + self.proofs[sha], harness=self.proofs[sha])
+            if sha in self.proofs else
+            dict(actor='author-deepseek', harness='deepseek')
+            if sha == self.fixture.gate else None)
+        self.pr_marks = {self.gate: self.marks}
+        self.pr_refs = ['milestone:1']  # pilot assent on the final merge
+        for head, author in self.proofs.items():
+            marks = []
+            for family in self.rules.families:
+                if family == author:
+                    continue
+                number = 10 + len(self.receipts)
+                mark = dict(id=number, kind='verdict', actor='review-' + family,
+                            sha=head, verdict='ok', at_ts=number)
+                self.receipts[number] = dict(
+                    commit=head, actor=mark['actor'], harness=family,
+                    record='proof:%s' % number, milestone=mark)
+                marks.append(mark)
+                self.pr_refs.append('milestone:%s' % number)
+            self.pr_marks[head] = marks
+        review.storage.of(self.db).work.verdicts_for_commit = (
+            lambda commit: self.pr_marks.get(commit, []))
+        return heads
+
+    def test_three_author_families_qualify_by_pr_and_trace_exact_heads(self):
+        heads = self.pr_range()
+        result = self.execute(reviews=self.pr_refs)
+        self.assertEqual(result['state'], 'requalified')
+        self.assertEqual({r['commit'] for r in result['reviews']}, {*heads, self.gate})
+        self.assertEqual({r['reference'] for r in result['reviews']}, set(self.pr_refs))
+
+    def test_three_families_still_refuse_an_independent_whole_range_review(self):
+        self.pr_range()
+        with self.assertRaisesRegex(TrainError, 'diff reviews refused'):
+            self.execute()
+        self.assert_unchanged()
+
+    def test_per_pr_dry_run_checks_all_proofs_without_writing(self):
+        self.pr_range()
+        result = self.execute(reviews=self.pr_refs, dry_run=True)
+        self.assertTrue(result['dry_run'])
+        self.assertEqual(len(result['reviews']), len(self.pr_refs))
+        self.assert_unchanged()
+        self.note.assert_not_called()
+
+    def test_per_pr_intermediate_policy_cannot_lower_original_floor(self):
+        self.pr_range()
+        lower = types.SimpleNamespace(**vars(self.rules))
+        lower.reviews_for = lambda paths: types.SimpleNamespace(reviews=1)
+        with mock.patch.object(review.mechanics, 'load', side_effect=lambda repo, sha, name:
+                               self.rules if sha == self.pin else lower):
+            with self.assertRaisesRegex(TrainError, 'diff reviews refused'):
+                self.execute(reviews=self.pr_refs[:1] + self.pr_refs[2:])
+        self.assert_unchanged()
+
+    def test_per_pr_missing_or_nonindependent_review_never_writes(self):
+        heads = self.pr_range()
+        for head in heads:
+            mark = self.pr_marks[head][0]
+            reference = 'milestone:%s' % mark['id']
+            with self.subTest(head=head, problem='missing'):
+                with self.assertRaisesRegex(TrainError, 'diff reviews refused'):
+                    self.execute(reviews=[r for r in self.pr_refs if r != reference])
+                self.assert_unchanged()
+            receipt = self.receipts[mark['id']]
+            saved = receipt['harness']
+            receipt['harness'] = self.proofs[head]
+            with self.subTest(head=head, problem='author family'):
+                with self.assertRaisesRegex(TrainError, 'diff reviews refused'):
+                    self.execute(reviews=self.pr_refs)
+                self.assert_unchanged()
+            receipt['harness'] = saved
+
+    def test_per_pr_opposition_on_head_or_merge_is_not_hidden(self):
+        heads = self.pr_range()
+        merge = self.repo.git('rev-parse', self.gate + '^1')
+        for commit in (heads[0], merge, self.gate):
+            with self.subTest(commit=commit):
+                marks = self.pr_marks.setdefault(commit, [])
+                marks.append(dict(id=999, kind='verdict', actor='human:smichea',
+                                  sha=commit, verdict='blocked', at_ts=999))
+                with self.assertRaisesRegex(TrainError, 'blocking opinion'):
+                    self.execute(reviews=self.pr_refs)
+                self.assert_unchanged()
+                marks.pop()
+
+    def test_per_pr_requires_pilot_assent_at_final_gate(self):
+        self.pr_range()
+        with self.assertRaisesRegex(TrainError, 'requires --review'):
+            self.execute(reviews=self.pr_refs[1:])
+        self.assert_unchanged()
+
+    def test_per_pr_edited_merge_cannot_use_branch_reviews(self):
+        self.pr_range()
+        self.repo.write('processus/mecanique.yaml', 'schema: unreviewed resolution\n')
+        self.repo.git('add', '.')
+        self.repo.git('commit', '--amend', '--no-edit', '-q')
+        old_gate = self.gate
+        self.set_gate(self.repo.git('rev-parse', 'HEAD'))
+        self.pr_marks[self.gate] = self.pr_marks.pop(old_gate)
+        with self.assertRaisesRegex(TrainError, 'author provenance missing'):
+            self.execute(reviews=self.pr_refs)
+        self.assert_unchanged()
+
+    def test_per_pr_unrelated_exact_reviews_are_rejected(self):
+        self.pr_range()
+        mark = dict(id=999, kind='verdict', actor='reader', sha=self.pin,
+                    verdict='ok', at_ts=999)
+        self.receipts[999] = dict(commit=self.pin, actor='reader', harness='codex',
+                                  record='proof:999', milestone=mark)
+        with self.assertRaisesRegex(TrainError, 'outside the qualified'):
+            self.execute(reviews=[*self.pr_refs, 'milestone:999'])
+        self.assert_unchanged()
+
+    def test_per_pr_pin_on_side_branch_cannot_omit_first_parent_content(self):
+        self.pr_range()
+        other_pin = self.repo.git('rev-parse', self.gate + '^2')
+        spec = types.SimpleNamespace(canon=self.repo.root, name='ameesh')
+        with self.assertRaisesRegex(TrainError, 'pin on the first-parent chain'):
+            review.qualify(self.cfg, self.db, spec, other_pin, self.gate,
+                           ['processus/mecanique.yaml'], self.pr_refs)
+        self.assert_unchanged()
+
 
 class ReviewedActorTest(unittest.TestCase):
     def test_unreadable_role_is_a_named_refusal(self):
