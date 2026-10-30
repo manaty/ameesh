@@ -51,7 +51,7 @@ def layout(project) -> Layout | None:
         return None
     known = migrations.LAYOUTS.get(migrations.repo_key(
         getattr(project, "github", "") or ""))
-    return Layout(directory, known.width if known is not None else 4)
+    return Layout(directory, migrations.width_of(project, known))
 
 
 def _run(path: str, *args: str):

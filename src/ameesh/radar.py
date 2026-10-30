@@ -56,6 +56,9 @@ Configuration de l'hôte (clé `radar`) :
                                       "migrations": "src/ameesh/migrations",
                                       "github": "manaty/ameesh"}}}
 
+`migrations_width` (facultatif) : chiffres des numéros de migration
+(`014_x.sql` : 3) ; sinon celui d'un dépôt connu, sinon 4.
+
 `github` (facultatif, sinon déduit de l'URL `origin`) : le dépôt où lire l'état
 de la CI des PR, pour savoir si un conflit bloque.
 """
@@ -76,7 +79,7 @@ from .canon import GIT_TIMEOUT, NO_LAZY_FETCH, GitError, _git, _git_env
 
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
-PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
+PROJECT_KEYS = ("repo", "migrations", "migrations_width", "target", "github", "land", "gates", "merge_method",
                 "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts",
                 "required_statuses", "required_checks", "production_branch")
 #: L1651 : clés de la déclaration `ci_parts` (les espaces réservés d'`argv`
@@ -159,6 +162,9 @@ class Project:
     name: str
     repo: str
     migrations: str = ""
+    #: #4750 : chiffres des numéros de migration (`014_x.sql` : 3) ; 0 : celui
+    #: d'un dépôt connu (`migrations.LAYOUTS`), sinon 4
+    migrations_width: int = 0
     target: str = ""
     github: str = ""
     #: L160e2: `off` (default), `local` or `pr`; the commands run on the merged
@@ -347,6 +353,10 @@ def parse_settings(raw) -> Settings:
             if not isinstance(text, str):
                 raise SettingsError("%s.%s: text expected" % (where, key))
             texts[key] = text.strip().strip("/")
+        width = value.get("migrations_width") or 0
+        if isinstance(width, bool) or not isinstance(width, int) or not 0 <= width <= 9:
+            raise SettingsError("%s.migrations_width: digits of a migration number (1-9) "
+                                "expected" % where)
         if texts["target"]:
             plan_git.check_ref(texts["target"], "cible")
         if texts["production_branch"]:
@@ -505,7 +515,8 @@ def parse_settings(raw) -> Settings:
         except ValueError as exc:
             raise SettingsError("%s.lease_ref: %s" % (where, exc)) from exc
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
-                                 migrations=texts["migrations"], target=texts["target"],
+                                 migrations=texts["migrations"], migrations_width=width,
+                                 target=texts["target"],
                                  github=texts["github"], land=land,
                                  production_branch=texts["production_branch"],
                                  gates=tuple(gates), merge_method=method,
