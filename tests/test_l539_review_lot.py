@@ -125,6 +125,16 @@ class RuleTest(unittest.TestCase):
         self.assertIn("clore cette mission", body)
         self.assertIn("--done", body)
 
+    def test_un_vehicule_de_paquet_n_ouvre_pas_de_relecture(self):
+        """#4747 : les avis d'un porteur `integration/**` portent sur ses membres
+        (§12) ; lui ouvrir une relecture après fusion dépensait un tour de
+        relecteur par paquet léger fusionné (#4742 sur #4739)."""
+        self.item["branch"] = "integration/paquet-h-20261030-01"
+        out = self.open(merged_sha="a" * 40, pr=476)
+        self.assertFalse(out["created"], out)
+        self.assertIn("véhicule de paquet", out["why"])
+        self.assertEqual(self.ops.added, [])
+
     def gate_klass(self):
         """La classe réelle de la porte de fusion avant le correctif : le canon
         ne nomme pas `merge_pr.py`, la politique le rend donc `light` (#2374)."""
