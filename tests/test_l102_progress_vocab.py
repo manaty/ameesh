@@ -82,6 +82,16 @@ class TextRenderingTest(_VocabularyCase):
             self.assertNotIn("LOTS", text)
             self.assertNotRegex(text, r"\blots?\b")
 
+    def test_a_dependency_wait_uses_the_vocabulary(self):
+        # #4729 : le texte CORE suit planned_wait.what=dependency, comme la page
+        lots = [dict(_snap()["lots"][0], title="Titre",
+                     planned_wait={"what": "dependency", "lots": [12, 34]})]
+        self.assertIn("waiting on lots #12, #34", _text(lots=lots))
+        with self.core():
+            text = _text(lots=lots)
+        self.assertIn("waiting on tâches #12, #34", text)
+        self.assertNotRegex(text, r"\blots?\b")
+
     def test_the_snapshot_vocabulary_wins(self):
         # a snapshot rendered elsewhere keeps the vocabulary it was built with
         text = _text(vocabulary=progress.vocabulary_view(vocab.CORE))
