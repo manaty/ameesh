@@ -97,7 +97,7 @@ NOT_CARRIED = "verdict not carried:"
 #: au gel s'abstient et laisse la colonne `reviewers` aux relecteurs reportés
 CARRIED_MARK_PREFIX = "review-designation-carried:"
 #: résultats qu'un passage de l'exécuteur dit dans son journal
-LOUD = ("carried", "not-carried", "error")
+LOUD = ("carried", "not-carried", "error", "validated")
 #: lots examinés par passage
 MAX_LOTS = 1000
 
@@ -871,15 +871,137 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
     if carried:
         from .freeze_gate import _in_transaction
         # Nested carries are reconciled by the outer freeze writer. Ordinary
-        # carries use the same guarded entry as a manual validation, after
-        # committing their copied verdicts and provenance.
-        if not _in_transaction(db) and (work.get(db, lot) or {}).get("state") == "qa":
-            try:
-                work.move(db, lot, "validated", actor=work.SYSTEM_SENDER,
-                          note="qa → validated — carried review quorum (#4423)")
-            except work.WorkError:
-                pass  # incomplete/stale quorum keeps legacy qa eligibility
+        # carries apply the same guarded quorum transition as a rendered
+        # verdict (#4423), after committing their copied verdicts and
+        # provenance; a failed read is journaled and retried by `run_pass`
+        # (#4834), never dropped.
+        if not _in_transaction(db):
+            out["validation"] = promote_carried(db, lot, freeze=freeze)
     return out
+
+
+#: la ligne de journal d'une transition de quorum reportée qui n'a pas abouti
+PENDING = "carried quorum pending:"
+#: une panne de lecture se retente ce nombre de fois, puis le lot reste qa
+#: (l'alerte de lot en qa et l'auditeur prennent le relais, #4834)
+PENDING_ATTEMPTS = 5
+
+
+def _carried_ok_on_freeze(marks, freeze) -> list[dict]:
+    """Les verdicts `ok` **reportés** sur la tête gelée, écrits après le gel.
+
+    Le report copie le verdict d'origine avec son horodatage et un identifiant
+    neuf : c'est ce `id > freeze` que `_sync_validation` (#4423) exige pour
+    qu'un écrivain puisse promouvoir le lot. Un verdict bloqué n'ouvre jamais
+    la porte ; la porte est de toute façon relue avant l'écriture."""
+    frozen = _norm((freeze or {}).get("sha"))
+    if not frozen:
+        return []
+    freeze_id = int((freeze or {}).get("id") or 0)
+    found = []
+    for mark in marks or ():
+        if mark.get("kind") != "verdict" or (mark.get("verdict") or "") != "ok":
+            continue
+        if int(mark.get("id") or 0) <= freeze_id:
+            continue
+        if not _same(mark.get("sha"), frozen):
+            continue
+        if str(mark.get("note") or "").startswith(CARRIED):
+            found.append(mark)
+    return found
+
+
+def _carried_blocked_on_freeze(marks, freeze) -> bool:
+    """Un verdict bloqué sur la tête gelée ferme la porte : rien à retenter."""
+    frozen = _norm((freeze or {}).get("sha"))
+    if not frozen:
+        return False
+    return bool(merge_queue.blocked_verdicts(marks or (), frozen))
+
+
+def promote_carried(db, lot: int, *, freeze=None) -> dict:
+    """La transition de quorum d'un verdict reporté, comme pour un avis rendu.
+
+    Après la copie des verdicts — un INSERT direct, qui ne passe donc pas par
+    `add_milestone` ni par `_sync_validation` (#4423) — le lot doit passer en
+    `validated` dès que la porte est ouverte. L'écriture reste celle d'une
+    validation ordinaire (`work.move`, garde de quorum relue et sérialisée).
+
+    Un échec n'est **pas** silencieux (#4715, #4834). Une porte **illisible**
+    (lecture en échec, provenance non concluante) est une panne passagère :
+    une ligne `carried quorum pending:` la dit à chaque essai (5 au plus), et
+    `run_pass` retente. Une porte **lisible et fermée** (avis manquant,
+    bloquant) est le cours normal du `qa` : aucun retry, aucun bruit — le
+    verdict suivant la rouvrira. Sans cette distinction, une lecture ratée
+    laissait le lot en `qa` pour toujours : le report avait déjà marqué ses
+    verdicts « décidés », aucun écrivain ne revenait. Rend
+    `{result: validated|pending|closed|exhausted|idle, detail}` ; ne lève
+    jamais."""
+    row = work.get(db, lot)
+    if not row or str(row.get("state") or "") != "qa":
+        return {"result": "idle", "detail": "lot not in qa"}
+    if str(row.get("workflow_ref") or "").strip():
+        return {"result": "idle", "detail": "pinned lot"}
+    marks = work.milestones(db, lot)
+    latest = plan_git.latest_freeze(marks)
+    freeze = freeze or latest
+    if not _carried_ok_on_freeze(marks, freeze):
+        return {"result": "idle", "detail": "no carried ok verdict on the frozen head"}
+
+    def _attempt():
+        work.move(db, lot, "validated", actor=work.SYSTEM_SENDER,
+                  note="qa → validated — carried review quorum (#4423)")
+
+    exc = None
+    try:
+        _attempt()
+        return {"result": "validated"}
+    except Exception as caught:  # noqa: BLE001 - classée ci-dessous
+        exc = caught
+    # La lecture qui a échoué est refaite une fois, hors du geste d'écriture :
+    # elle dit si la porte est fermée pour une raison durable, lisible et
+    # normale, ou si la lecture elle-même n'a pas conclu (panne passagère).
+    try:
+        gate = merge_queue.review_gate_for_item(
+            db, getattr(db, "cfg", None), row, marks)
+    except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
+        gate = None
+    if isinstance(gate, dict) and gate.get("ok") and not gate.get("error"):
+        # La porte est ouverte : la première tentative a échoué sur autre
+        # chose (course, transaction). Un second essai borné, puis la reprise.
+        try:
+            _attempt()
+            return {"result": "validated"}
+        except Exception as caught:  # noqa: BLE001 - reprise au passage suivant
+            exc = caught
+    elif isinstance(gate, dict) and not gate.get("error"):
+        # Porte lisible et fermée : avis manquant ou bloquant. Le lot reste en
+        # `qa` par la règle ordinaire ; le prochain verdict le promouvra.
+        return {"result": "closed", "detail": gate.get("why") or ""}
+    why = ("%s: %s" % (type(exc).__name__, exc) if not isinstance(exc, work.WorkError)
+           else str(exc))
+    freeze_id = int((freeze or {}).get("id") or 0)
+    try:
+        # Le compte est celui de **ce** gel : une panne réparée sur un gel
+        # suivant ne doit pas hériter des essais du précédent.
+        seen = storage.of(db).work.events_noted(
+            "%s freeze #%d " % (PENDING, freeze_id), 0.0, ids=[int(lot)])
+        attempts = len(seen)
+    except Exception:  # noqa: BLE001 - lecture impossible : on s'arrête
+        attempts = PENDING_ATTEMPTS
+    if attempts >= PENDING_ATTEMPTS:
+        return {"result": "exhausted", "detail": why}
+    try:
+        retry = ("retried by the executor pass" if attempts + 1 < PENDING_ATTEMPTS
+                 else "no further retry")
+        storage.of(db).work.note(
+            lot, "qa",
+            "%s freeze #%d — %s — attempt %d/%d, %s (#4834)"
+            % (PENDING, freeze_id, why[:200], attempts + 1, PENDING_ATTEMPTS, retry),
+            work.SYSTEM_SENDER)
+    except Exception:  # noqa: BLE001 - une note ne retient jamais la passe
+        pass
+    return {"result": "pending", "detail": why}
 
 
 def _keep_reviewers(tx, lot: int, row: dict, freeze: dict, plan: list, out: dict) -> None:
@@ -949,6 +1071,8 @@ def describe(result: dict) -> str:
     if kind == "not-carried":
         return "verdicts not carried: %s" % "; ".join(
             "%s: %s" % (e["reviewed"][:12], e["why"]) for e in result.get("refused") or ())
+    if kind in ("validated", "would-validate"):
+        return "carried review quorum validated on the frozen head (#4423)"
     return "verdicts not carried (%s): %s" % (kind, result.get("detail") or "")
 
 
@@ -989,6 +1113,13 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
     """Un passage sur les lots ouverts dont la tête gelée attend un verdict
     qu'une tête précédente porte (`pending`). Le tri sans git écarte tous les
     autres : seuls ces lots coûtent une récupération et deux fusions d'essai.
+
+    #4834 : le même passage **retente** la transition de quorum d'un report déjà
+    écrit mais non appliqué (porte illisible un instant, lot resté en `qa`).
+    Le report a marqué ses verdicts « décidés » ; sans cette reprise, plus aucun
+    écrivain ne revient et le lot ne passe jamais en `validated`. Le tri est
+    encore sans git (marques en base) : seuls les lots qui portent un `ok`
+    reporté sur leur dernière tête gelée coûtent une lecture de porte.
     Ne lève jamais pour un lot."""
     st = storage.of(db)
     rows = [r for r in st.work.open_for_sweep(limit)
@@ -998,34 +1129,76 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
     marks: dict = {}
     for mark in st.progress.lot_milestones([int(r["id"]) for r in rows]):
         marks.setdefault(int(mark["work_item_id"]), []).append(mark)
+    # #4834 : seuls les lots dont une transition de quorum reportée a déjà
+    # échoué faute de lecture sont retentés (marque `carried quorum pending:`),
+    # dans la limite d'essais de **leur** gel. Une porte lisiblement fermée
+    # n'est pas une panne : elle ne se retente pas, et une panne qui dure laisse
+    # le lot en `qa` (visible par l'état) plutôt que de relire la porte à
+    # chaque passage.
+    pending_notes: dict[int, list[str]] = {}
+    for entry in st.work.events_noted(PENDING, 0.0, ids=[int(r["id"]) for r in rows]):
+        pending_notes.setdefault(int(entry["work_item_id"]), []).append(
+            str(entry.get("note") or ""))
     wanted = []
+    pending_quorum = []
     for row in rows:
         lot = int(row["id"])
-        freeze = plan_git.latest_freeze(marks.get(lot, []))
-        if freeze and pending(marks.get(lot, []), freeze.get("sha")):
+        lot_marks = marks.get(lot, [])
+        freeze = plan_git.latest_freeze(lot_marks)
+        if not freeze:
+            continue
+        if pending(lot_marks, freeze.get("sha")):
             wanted.append(lot)
-    if not wanted:
+        label = "%s freeze #%d " % (PENDING, int(freeze.get("id") or 0))
+        attempts = sum(1 for note in pending_notes.get(lot, ())
+                       if note.startswith(label))
+        if (0 < attempts < PENDING_ATTEMPTS
+                and str(row.get("state") or "") == "qa"
+                and _carried_ok_on_freeze(lot_marks, freeze)
+                and not _carried_blocked_on_freeze(lot_marks, freeze)):
+            pending_quorum.append((lot, freeze))
+    if not wanted and not pending_quorum:
         return []
-    notes = _outcomes(db, wanted)
-    fetched: dict = {}
     out = []
-    for lot in wanted:
-        result = carry(cfg, db, lot, dry_run=dry_run, notes=notes.get(lot), fetched=fetched)
-        if result.get("result") != "idle":
-            out.append(result)
-        if dry_run or result.get("result") not in ("not-carried", "error",
-                                                   "no-repository", "idle"):
+    handled: set = set()
+    if wanted:
+        notes = _outcomes(db, wanted)
+        fetched: dict = {}
+        for lot in wanted:
+            result = carry(cfg, db, lot, dry_run=dry_run, notes=notes.get(lot), fetched=fetched)
+            if result.get("result") != "idle":
+                out.append(result)
+            if result.get("result") in ("carried", "busy", "moved"):
+                # `carried` : `_write` a déjà tenté la transition de quorum ;
+                # `busy`/`moved` : un autre hôte écrit ou le gel a bougé, la
+                # reprise attend le passage suivant au lieu de courir après.
+                handled.add(lot)
+            if dry_run or result.get("result") not in ("not-carried", "error",
+                                                       "no-repository", "idle"):
+                continue
+            # #2487 : le gel s'est abstenu sur un plan de report qui n'a pas abouti.
+            # Personne n'est désigné ; on rejoue la désignation réelle du gel, une
+            # fois, sans toucher au reste. Le gel n'est pas re-déclaré.
+            freeze = plan_git.latest_freeze(marks.get(lot, []))
+            if not freeze or not _carried_pending(db, lot, freeze):
+                continue
+            try:
+                from . import review_designation_activation as activation
+                fixed = activation.designate(cfg, db, lot, force=True)
+                result["designation"] = str((fixed or {}).get("state") or "")
+            except Exception as exc:  # noqa: BLE001 - la passe suivante retente
+                result["designation"] = "error: %s" % (type(exc).__name__,)
+    for lot, freeze in pending_quorum:
+        if lot in handled:
             continue
-        # #2487 : le gel s'est abstenu sur un plan de report qui n'a pas abouti.
-        # Personne n'est désigné ; on rejoue la désignation réelle du gel, une
-        # fois, sans toucher au reste. Le gel n'est pas re-déclaré.
-        freeze = plan_git.latest_freeze(marks.get(lot, []))
-        if not freeze or not _carried_pending(db, lot, freeze):
+        if dry_run:
+            out.append({"lot": lot, "result": "would-validate",
+                        "detail": "carried review quorum on the frozen head (#4423)"})
             continue
-        try:
-            from . import review_designation_activation as activation
-            fixed = activation.designate(cfg, db, lot, force=True)
-            result["designation"] = str((fixed or {}).get("state") or "")
-        except Exception as exc:  # noqa: BLE001 - la passe suivante retente
-            result["designation"] = "error: %s" % (type(exc).__name__,)
+        result = promote_carried(db, lot, freeze=freeze)
+        if result["result"] == "validated":
+            out.append({"lot": lot, "result": "validated",
+                        "detail": "carried review quorum on the frozen head (#4423)"})
+        # `pending` est déjà dit une fois au journal du lot par
+        # `promote_carried` ; le passage suivant le retente sans bruit.
     return out
