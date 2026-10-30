@@ -14,7 +14,7 @@ import os
 import re
 from dataclasses import dataclass
 
-from .db import DbError, PsqlDriver, PsycopgDriver, quote_ident
+from .db import DbError, PsqlDriver, PsycopgDriver, quote_ident, schema_guard_bypass
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
 _FILE_RE = re.compile(r"^(\d{4})_([A-Za-z0-9._-]+)\.sql$")
@@ -402,7 +402,7 @@ def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
     A separate lock connection could disappear while its writer continued;
     this transaction owns both the lock and every migration write instead.
     """
-    with db.transaction() as tx:
+    with schema_guard_bypass(db), db.transaction() as tx:
         # The configured statement timeout bounds election. Only the elected
         # worker lifts it for migration SQL, as the previous implementation did.
         tx.query("SELECT pg_advisory_xact_lock(hashtext(%s))", (_LOCK,))
@@ -422,6 +422,16 @@ def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
             tx.script(migration.sql)
             tx.execute("INSERT INTO schema_migrations (version, name, checksum) VALUES (%s,%s,%s)",
                        (migration.version, migration.name, migration.checksum))
+        # Backfill historical non-additive migrations as soon as the additive
+        # marker migration is present. Future non-additive markers commit in
+        # the SAME transaction as their SQL, under the exclusive worker lock.
+        if marker_available(tx):
+            for migration in discover(directory):
+                if non_additive(migration):
+                    tx.execute(
+                        "INSERT INTO schema_non_additive_migrations (version, name, checksum) "
+                        "VALUES (%s,%s,%s) ON CONFLICT (version) DO NOTHING",
+                        (migration.version, migration.name, migration.checksum))
     # Neither a failed SQL statement nor an uncertain COMMIT publishes success.
     if log:
         for migration in todo:
@@ -515,3 +525,32 @@ def status(db: PsqlDriver | PsycopgDriver) -> tuple[list[Migration], set[int]]:
     Lecture seule (L146) : `doctor` n'écrit rien, pas même la table du
     registre des migrations (`applied()` la crée au besoin)."""
     return discover(), set(_applied_readonly(db))
+
+
+class IncompatibleSchema(DbError):
+    """The database has a non-additive migration absent from this code."""
+
+
+def marker_available(db) -> bool:
+    return bool(db.query(
+        "SELECT to_regclass('schema_non_additive_migrations') IS NOT NULL AS ok"
+    )[0]["ok"])
+
+
+def incompatible_migrations(db, directory: str = MIGRATIONS_DIR) -> list[dict]:
+    """Read-only, uncached: long-lived timers must see a new incompatibility."""
+    if not marker_available(db):
+        return []  # deployment of the additive marker has not happened yet
+    known = {m.version: m.checksum for m in discover(directory)}
+    return [row for row in db.query(
+        "SELECT version, name, checksum FROM schema_non_additive_migrations ORDER BY version"
+    ) if known.get(int(row["version"])) != row["checksum"]]
+
+
+def require_compatible_writer(db, directory: str = MIGRATIONS_DIR) -> None:
+    incompatible = incompatible_migrations(db, directory)
+    if incompatible:
+        labels = ", ".join("%04d_%s" % (int(r["version"]), r["name"]) for r in incompatible)
+        raise IncompatibleSchema(
+            "writes refused: database has non-additive migration(s) unknown to this code: "
+            + labels + "; upgrade this executor/CLI before writing")

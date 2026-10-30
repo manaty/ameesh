@@ -360,7 +360,9 @@ class MigrationsTest(PgTestCase):
 
                 def tenir():
                     try:
-                        with holder.transaction() as tx:
+                        # Simulate an external SQL client: this witness must
+                        # reach the TABLE lock, outside the application guard.
+                        with db_mod.schema_guard_bypass(holder), holder.transaction() as tx:
                             tx.execute("LOCK TABLE verrou IN ACCESS EXCLUSIVE MODE")
                             pris.set()
                             libere.wait(30)
@@ -448,7 +450,9 @@ class MigrationsTest(PgTestCase):
 
                 def tenir():
                     try:
-                        with holder.transaction() as tx:
+                        # Simulate an external SQL client: this witness must
+                        # reach the TABLE lock, outside the application guard.
+                        with db_mod.schema_guard_bypass(holder), holder.transaction() as tx:
                             tx.execute("LOCK TABLE propre IN ACCESS EXCLUSIVE MODE")
                             pris.set()
                             libere.wait(30)

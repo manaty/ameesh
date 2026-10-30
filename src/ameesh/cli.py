@@ -2066,6 +2066,7 @@ def cmd_probe(cfg: Config) -> int:
     try:
         db_mod.require_schema(db)
         missing, modified, unknown = migrations.check(db)
+        migrations.require_compatible_writer(db)
     except db_mod.SchemaMissing:
         print("probe: KO — schema missing (%s, schema %s)"
               % (config_mod.mask_dsn(cfg.dsn), cfg.schema))
@@ -2324,6 +2325,13 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     except db_mod.SchemaMissing as exc:
         print("schema     : missing (%s)" % exc)
         print("verdict    : KO — run \"agent-mesh migrate\"")
+        return 1
+    try:
+        migrations.require_compatible_writer(db)
+    except migrations.IncompatibleSchema as exc:
+        print("schema     : %s" % exc)
+        print("verdict    : KO — upgrade this code before writing")
+        db.close()
         return 1
     known, done = migrations.status(db)
     print("migrations : %d/%d applied" % (len(done), len(known)))

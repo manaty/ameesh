@@ -194,6 +194,57 @@ class SchemaMissing(DbError):
     """La base répond mais les tables agent-mesh ne sont pas migrées."""
 
 
+# #4975: guard every driver mutation, including RETURNING and mutating CTEs.
+# State is per thread AND connection: an executor's other thread is never
+# exempted while the migration worker operates on its own connection.
+_SCHEMA_GUARD_STATE = threading.local()
+_TRANSACTION_CONTROL = re.compile(
+    r"^\s*(?:SAVEPOINT\b|RELEASE\s+(?:SAVEPOINT\s+)?|ROLLBACK\s+TO\b)", re.I)
+
+
+@contextlib.contextmanager
+def schema_guard_bypass(db):
+    """Internal migration-worker exemption; never used by application writers."""
+    owner = getattr(db, "driver", db)
+    active = getattr(_SCHEMA_GUARD_STATE, "active", None)
+    if active is None:
+        active = _SCHEMA_GUARD_STATE.active = set()
+    key = id(owner)
+    nested = key in active
+    active.add(key)
+    try:
+        yield
+    finally:
+        if not nested:
+            active.remove(key)
+
+
+def _guard_statement(method):
+    @functools.wraps(method)
+    def guarded(self, sql, *args, **kwargs):
+        owner = getattr(self, "driver", self)
+        active = getattr(_SCHEMA_GUARD_STATE, "active", ())
+        if (id(owner) in active
+                or (_TRANSACTION_CONTROL.match(sql) and single_statement(sql))
+                or (method.__name__ == "query" and pure_read(sql)
+                    and single_statement(sql))):
+            return method(self, sql, *args, **kwargs)
+        from . import migrations
+        with schema_guard_bypass(owner):
+            # Shared with other writers, exclusive against migrate(). Keep
+            # the lock from inventory check through the mutation's COMMIT.
+            context = (contextlib.nullcontext(self) if isinstance(self, _PsqlTransaction)
+                       else self.transaction())
+            with context as tx:
+                tx.query("SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
+                         (migrations._LOCK,))
+                migrations.require_compatible_writer(tx)
+                if tx is self:
+                    return method(self, sql, *args, **kwargs)
+                return getattr(tx, method.__name__)(sql, *args, **kwargs)
+    return guarded
+
+
 # --------------------------------------------------------------------------
 # compteur d'allers-retours (L61)
 # --------------------------------------------------------------------------
@@ -607,6 +658,7 @@ class PsqlDriver:
                        constraint=name, sql=sql, elapsed_ms=elapsed_ms)
 
     # -- interface ---------------------------------------------------------
+    @_guard_statement
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
         started = time.monotonic()
         proc = self._run(["-c", _json_query(bind(sql, params))])
@@ -646,6 +698,7 @@ class PsqlDriver:
             out += [[_normalize_row(row) for row in (rows or [])] for rows in results]
         return out
 
+    @_guard_statement
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         started = time.monotonic()
         proc = self._run(["-c", bind(sql, params)])
@@ -654,6 +707,7 @@ class PsqlDriver:
                              elapsed_ms=(time.monotonic() - started) * 1000.0)
         return 0
 
+    @_guard_statement
     def script(self, sql: str) -> None:
         proc = self._run(["-1", "-f", "-"], stdin=sql)
         if proc.returncode != 0:
@@ -820,6 +874,7 @@ class _PsqlTransaction:
             self._buf += chunk
 
     # -- interface ---------------------------------------------------------
+    @_guard_statement
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
         return _parse_json_rows(self._run(_json_query(bind(sql, params))).strip())
 
@@ -827,10 +882,12 @@ class _PsqlTransaction:
         """Dans une transaction ouverte : séquentiel, sur la même session."""
         return [self.query(sql, params) for sql, params in map(_batch_item, items)]
 
+    @_guard_statement
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         self._run(bind(sql, params))
         return 0
 
+    @_guard_statement
     def script(self, sql: str) -> None:
         """Run raw multi-statement SQL on this transaction's backend.
 
@@ -1181,6 +1238,7 @@ class PsycopgDriver:
         return True
 
     # -- interface ---------------------------------------------------------
+    @_guard_statement
     @_serial
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
         self._live()
@@ -1228,6 +1286,7 @@ class PsycopgDriver:
             return [self.query(sql, params) for sql, params in items]
         return self._run_batch(items, probe=probe, fetch=True)
 
+    @_guard_statement
     @_serial
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         self._live()
@@ -1246,6 +1305,7 @@ class PsycopgDriver:
             raise _map_error(exc, sql=sql,
                              elapsed_ms=(time.monotonic() - started) * 1000.0) from exc
 
+    @_guard_statement
     @_serial
     def script(self, sql: str) -> None:
         self._live()
