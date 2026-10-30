@@ -423,6 +423,18 @@ anything. The administrator still reviews the closure and stages the measured
 tree root-owned (`runtime-release.py` requires the staged tree to belong to the
 installing root), not with the builder's ownership.
 
+`construction-runtime.py --assets` (#4786) writes, from the same commit, the
+release assets that publish this provenance: the same wheel, both pin files
+byte for byte and `SHA256SUMS` over the three. The 11:00/23:00 cutoff
+(`release_cutoff.ensure_github_release`) runs the release commit's own
+`construction-runtime.py --assets`, checks `SHA256SUMS` and attaches the assets
+to the GitHub release it creates; a manual `poste.sh publier` builds them
+before the tag. Versions older than `runtime-pins.txt` have none. A failed
+asset build at the cutoff is a report deviation: the release is created without
+assets (staging is not held), and a release created before its assets is not
+completed afterwards. A runtime root is admitted for real production only
+against the assets of its release, so such a release is never admitted.
+
 `compte-release.py` creates the dedicated group/account with exact numeric ids,
 no home creation or supplementary groups, a fixed forced-command shell and an
 impossible password sentinel. Shadow values are not persisted. Group/user intents

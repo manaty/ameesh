@@ -82,6 +82,15 @@ VERSION_FILE = "pyproject.toml"
 NOTES_DIR = "docs/versions"
 #: staging attestation of the installed source
 ATTESTATION_DIR = "mise-a-jour"
+# #4786: the release commit builds its own assets (wheel, pin files,
+# SHA256SUMS), like it runs its own staging.sh; a commit without these files
+# (another project, a version before #4778) publishes no asset.
+ASSETS_SCRIPT = "deploy/mise-a-jour/construction-runtime.py"
+ASSETS_SOURCES = (ASSETS_SCRIPT, "deploy/mise-a-jour/runtime-release.py",
+                  "deploy/mise-a-jour/runtime-pins.txt",
+                  "deploy/mise-a-jour/runtime-build-pins.txt")
+ASSETS_SUMS = "SHA256SUMS"
+ASSETS_TIMEOUT_S = 1800.0
 #: #3981 : the shared form of the attestation, in the append-only event log.
 #: `actif.py` may run on HOTE_OUTILS (a VM) when the launcher has no venv/DB;
 #: the event is what the poste reads without ssh. The window is the durability
@@ -1857,9 +1866,89 @@ def land_release(project: ProjectRelease, plan: Plan, release_sha: str,
     return {"landing": landing, "tag": tag}
 
 
+def _remove_tree(path: str) -> None:
+    """Remove a build tree, read-only entries included (assets are 0444)."""
+    def writable(function, name, _info):
+        os.chmod(os.path.dirname(name) or ".", 0o700)
+        with contextlib.suppress(OSError):
+            os.chmod(name, 0o700)
+        function(name)
+    with contextlib.suppress(OSError):
+        shutil.rmtree(path, onerror=writable)
+
+
+def _verify_sums(folder: str) -> list[str]:
+    """The asset paths of `folder`, once SHA256SUMS names and matches each."""
+    import hashlib
+    listed = {}
+    with open(os.path.join(folder, ASSETS_SUMS), encoding="ascii") as stream:
+        for line in stream:
+            digest, sep, name = line.rstrip("\n").partition("  ")
+            if (not sep or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    or name in ("", ".", "..", ASSETS_SUMS) or "/" in name or name in listed):
+                raise ReleaseError("SHA256SUMS: unreadable line")
+            listed[name] = digest
+    present = sorted(name for name in os.listdir(folder) if name != ASSETS_SUMS)
+    if present != sorted(listed):
+        raise ReleaseError("SHA256SUMS does not name exactly the built assets")
+    for name in present:
+        with open(os.path.join(folder, name), "rb") as stream:
+            if hashlib.sha256(stream.read()).hexdigest() != listed[name]:
+                raise ReleaseError("SHA256SUMS does not match %s" % name)
+    return [os.path.join(folder, name) for name in present + [ASSETS_SUMS]]
+
+
+def build_release_assets(project: ProjectRelease, sha: str, folder: str) -> list[str]:
+    """Build and verify the release assets of `sha` in `folder` (#4786).
+
+    `[]` when the commit carries no asset build; ReleaseError on a failure.
+    `folder` is private and its ancestors must not be group/world writable
+    (construction-runtime.py refuses them).
+    """
+    if not sha or any(_git(project.repo, "cat-file", "-e", "%s:%s" % (sha, path)).returncode
+                      for path in ASSETS_SOURCES):
+        return []
+    # the whole directory of the commit: the script loads its siblings
+    tools = os.path.join(folder, "outils")
+    os.mkdir(tools, 0o700)
+    archive = os.path.join(folder, "outils.tar")
+    proc = _git(project.repo, "archive", "--format=tar", "-o", archive, sha,
+                os.path.dirname(ASSETS_SCRIPT))
+    if proc.returncode:
+        raise ReleaseError("%s unreadable in %s" % (os.path.dirname(ASSETS_SCRIPT), sha[:12]))
+    import tarfile
+    with tarfile.open(archive) as tar:
+        tar.extractall(tools, filter="data")
+    output = os.path.join(folder, "actifs")
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-I", os.path.join(tools, ASSETS_SCRIPT),
+             "--assets", "--clone", os.path.abspath(project.repo), "--sha", sha,
+             "--output", output],
+            capture_output=True, text=True, timeout=ASSETS_TIMEOUT_S, cwd=folder)
+    except subprocess.TimeoutExpired as exc:
+        raise ReleaseError("asset build timed out after %ss" % ASSETS_TIMEOUT_S) from exc
+    except OSError as exc:
+        raise ReleaseError("asset build could not start: %s" % exc) from exc
+    if proc.returncode:
+        detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
+        raise ReleaseError("asset build failed: %s" % (detail or proc.returncode))
+    try:
+        return _verify_sums(output)
+    except OSError as exc:
+        raise ReleaseError("assets unreadable: %s" % exc) from exc
+
+
 def ensure_github_release(project: ProjectRelease, tag: str, version: str,
-                          notes: str) -> bool:
-    """Create the GitHub release if absent; True when it exists afterwards."""
+                          notes: str, sha: str = "",
+                          deviations: list | None = None) -> bool:
+    """Create the GitHub release if absent; True when it exists afterwards.
+
+    The assets of `sha` (#4786) are built, verified and attached at creation.
+    An asset failure is a deviation, never a held release: the release is
+    created without them, and the handoff refuses a release without assets.
+    An existing release is left as it is.
+    """
     slug = github_slug(project)
     try:
         gh = plan_github.Gh()
@@ -1868,14 +1957,27 @@ def ensure_github_release(project: ProjectRelease, tag: str, version: str,
             return True
         folder = tempfile.mkdtemp(prefix="ameesh-release-notes-")
         path = os.path.join(folder, "notes.md")
+        work = None
         try:
             with open(path, "w", encoding="utf-8") as stream:
                 stream.write(notes)
+            assets = []
+            try:
+                # under HOME: /tmp or a 0775 ~/.cache fails the build's refusal
+                # of group/world-writable parents
+                work = tempfile.mkdtemp(prefix=".ameesh-actifs-",
+                                        dir=os.path.expanduser("~"))
+                assets = build_release_assets(project, sha, work)
+            except (ReleaseError, OSError) as exc:
+                if deviations is not None:
+                    deviations.append("release %s sans actifs : %s" % (tag, exc))
             code, out, err = gh.run(["release", "create", tag, "-R", slug, "--verify-tag",
                                      "--title", "ameesh %s" % version,
-                                     "--notes-file", path])
+                                     "--notes-file", path, *assets])
         finally:
             shutil.rmtree(folder, ignore_errors=True)
+            if work is not None:
+                _remove_tree(work)
     except plan_github.GithubError as exc:
         raise TransientReleaseError("GitHub release %s: %s" % (tag, exc)) from exc
     if code == 0:
@@ -2438,7 +2540,9 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                 previous=previous, floor="patch", floor_reason="reconciled release",
                 packets=packets, direct=direct, migrations=migrations,
                 version_bump=project.version_bump)
-        ensure_github_release(project, recent["tag"], version_out, notes)
+        reconciled = ["reconciled an existing tag created at/after the cutoff"]
+        ensure_github_release(project, recent["tag"], version_out, notes,
+                              release_sha, reconciled)
         staging = (None if no_staging else
                    _staging_step(project, release_sha, included, cfg.state_dir, db=db))
         report = {"schema": SCHEMA, "result": "reconciled", "project": project.name,
@@ -2447,7 +2551,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                   "cutoff_at": at, "label": label, "canon_commit": source.commit,
                   "previous": previous, "staging": staging,
                   "started_at": started,
-                  "deviations": ["reconciled an existing tag created at/after the cutoff"]}
+                  "deviations": reconciled}
         return finish(cfg, db, project, report, state, state_slot, at, label, rules,
                       previous, None, staging, no_staging)
 
@@ -2573,7 +2677,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
         return report
     tag = landed["tag"]
     fetch(project.repo, project.remote, project.target)
-    ensure_github_release(project, tag, plan.version, plan.notes)
+    ensure_github_release(project, tag, plan.version, plan.notes, version_sha, deviations)
     if plan.ci.get("inconclusive") and db is not None:
         # #3085 : la release est publiée ; le suivi du non concluant s'ouvre
         # après elle, il ne la retient ni ne la défait.
