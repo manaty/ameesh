@@ -512,13 +512,16 @@ to an agent. Read their queue with `ameesh decisions`.
 
 To repair a human decision accidentally forwarded by an older version, a bound
 agent runs `ameesh decide repair-forward <original-id>`. The command atomically
-restores the original to pending and withdraws its copy, retaining the original
-question, owner and signature requirements. It refuses answered or withdrawn
-requests, changed copies and forwarding chains; it never creates an answer or
-approval. The audit remains in the original message metadata.
+restores the original to pending, retaining its question, owner and signature
+requirements, and withdraws its copy. A copy the requester already withdrew is
+accepted and left untouched, so its withdrawal trace is kept (#4576). It refuses
+a request answered or withdrawn at its origin, an answered copy, changed copies
+and forwarding chains; it never creates an answer or approval. The audit remains
+in the original message metadata.
 
 Details:
-[EXPLOITATION.md](EXPLOITATION.md), "Courrier en souffrance" (undeliverable mail).
+[EXPLOITATION.md](EXPLOITATION.md), "Décisions du propriétaire" and "Courrier en
+souffrance" (undeliverable mail).
 
 **Hooks: write first, mark after.** The JSON is written to stdout and
 flushed (`flush`) *before* marking the messages delivered; if the harness has closed its
