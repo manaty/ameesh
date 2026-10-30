@@ -152,6 +152,10 @@ whether a development lot can still be promoted: use `work_lifecycle.phase`
 for that distinction. New core filters select both stages; the old `merged`
 and `promoted` filters continue selecting their individual stages. Public
 GitHub labels and closure text retain their phase-specific wording.
+`work move <id> delivered` keeps its pre-switch meaning: it requests
+**promotion** (`work_lifecycle.phase_name` names that stage), it is not a
+third stage; `--state delivered` (and the API filter) selects both `merged`
+and `promoted`.
 
 Migration 0518 is explicitly non-additive. Stop executors before applying it
 and restart them after commit, as required by the signed decision. Do not
