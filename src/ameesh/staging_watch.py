@@ -23,6 +23,15 @@ TERMINAL = frozenset(("completed", "partial", "failed", "unattested"))
 BUSY = 75
 
 
+#: latest snapshot of every run; same predicate as `latest_type`, so the
+#: partial staging-progress index applies
+_LATEST_SQL = ("select * from (select distinct on (object) id, object, data"
+               " from ameesh_events where type = %s"
+               " and type in ('staging.sequence', 'staging.request')"
+               " and created_at > now() - make_interval(days => 60)"
+               " order by object, id desc) latest order by id desc limit %s")
+
+
 class Busy(RuntimeError):
     """#4885: another staging sequence is in flight in the shared log."""
 
@@ -81,9 +90,13 @@ def record(db, snapshot: dict, *, exclusive: bool = False,
     with db.transaction() as tx:
         tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (EVENT,))
         st = storage.of(tx)
-        rows = st.events.latest_type(EVENT, 60, LIMIT)
+        # Plain SQL, not `events.latest_type`: from bureau-goal this module
+        # runs from stdin against the package installed on HOTE_OUTILS, which
+        # may predate it (review qa-01). Only `events.record` is assumed.
+        rows = tx.query(_LATEST_SQL, (EVENT, LIMIT))
         if len(rows) >= LIMIT:
-            raise RuntimeError("staging history truncated; exclusivity unobservable")
+            # Unobservable is refused like busy: no host is modified.
+            raise Busy("staging history truncated; exclusivity unobservable")
         others = in_flight(rows, exempt={run, *supersede})
         if others:
             raise Busy("staging sequence already running: " + ", ".join(others))

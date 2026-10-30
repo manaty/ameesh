@@ -2150,6 +2150,16 @@ def _settle_poste_units(pid: int, wait, grace_s: float | None = None) -> tuple[s
                "still running" if alive else "in an unreadable state", grace_s)), False
 
 
+def _staging_env(timeout_s: float) -> dict:
+    """#4885: every synchronous sequence gets a fresh run id; an inherited
+    STAGING_RUN_ID would exempt a concurrent run of the same id from the
+    shared exclusive start. STAGING_PREVIOUS_RUN stays the operator's lever
+    after a proved stop (docs/DEPLOIEMENT-HOTE-AGENTS.md)."""
+    env = dict(os.environ, STAGING_TIMEOUT_S=str(timeout_s))
+    env.pop("STAGING_RUN_ID", None)
+    return env
+
+
 def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 *, state_dir: str, timeout_s: float | None = None,
                 db=None) -> dict:
@@ -2191,8 +2201,7 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
             try:
                 proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT, text=True,
-                                        env=dict(os.environ, STAGING_TIMEOUT_S=str(
-                                            timeout_s or project.staging_timeout_s)),
+                                        env=_staging_env(timeout_s or project.staging_timeout_s),
                                         start_new_session=True)
             except OSError as exc:
                 raise ReleaseError("staging could not start: %s" % exc) from exc

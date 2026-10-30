@@ -137,6 +137,11 @@ def tick(db, cfg, options) -> dict:
         env = dict(os.environ, BASCULE_ENV=options["bascule_env"],
                    STAGING_TIMEOUT_S=str(options.get("timeout_s", 7200)))
         env.pop("AMEESH_TURN_ID", None)
+        # Only this attempt names its run and a proved-stopped predecessor;
+        # never a value inherited from the unit's environment (review qa-01).
+        env.pop("STAGING_RUN_ID", None)
+        env.pop("STAGING_PREVIOUS_RUN", None)
+        env.pop("STAGING_PREVIOUS_HOST", None)
         if request["state"] == "running" or request.get("previous_run"):
             probe = options.get("quiescence_probe")
             if not probe:

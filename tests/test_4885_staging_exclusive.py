@@ -12,7 +12,9 @@ from contextlib import nullcontext
 from unittest import mock
 
 from ameesh import staging_watch
+from ameesh import storage
 from tests import test_1155_staging as fixture
+from tests.support import PgTestCase
 
 
 def row(ident, run, state="running", deadline=None):
@@ -30,15 +32,30 @@ class InFlightTest(unittest.TestCase):
 
 
 class SharedLog:
-    """One shared `staging.sequence` log, seen by two launcher hosts."""
+    """One shared `staging.sequence` log, seen by two launcher hosts.
+
+    The exclusive start reads it with plain SQL in the transaction: the
+    storage of a package installed before #4880 has only `events.record`.
+    """
     def __init__(self):
         self.rows = []
-        self.tx = mock.Mock()
+        self.locks = []
 
     def transaction(self):
-        return nullcontext(self.tx)
+        return nullcontext(self)
 
-    def latest_type(self, *a):
+    def query(self, sql, params):
+        if "pg_advisory_xact_lock" in sql:
+            self.locks.append(params)
+            return [{}]
+        self.assertion(sql, params)
+        return self.latest_type()
+
+    @staticmethod
+    def assertion(sql, params):
+        assert "distinct on (object)" in sql and params[0] == staging_watch.EVENT
+
+    def latest_type(self):
         latest = {}
         for r in self.rows:
             latest[r["object"]] = r
@@ -52,7 +69,8 @@ class SharedLog:
 class ExclusiveRecordTest(unittest.TestCase):
     def setUp(self):
         self.log = SharedLog()
-        store = types.SimpleNamespace(events=self.log)
+        # pre-#4880 installed storage: no `latest_type` on events
+        store = types.SimpleNamespace(events=types.SimpleNamespace(record=self.log.record))
         patch = mock.patch.object(staging_watch.storage, "of", return_value=store)
         patch.start()
         self.addCleanup(patch.stop)
@@ -69,7 +87,7 @@ class ExclusiveRecordTest(unittest.TestCase):
         with self.assertRaises(staging_watch.Busy):
             self.start("host-b-run")
         self.assertEqual(len(self.log.rows), 1)
-        self.assertIn("pg_advisory_xact_lock", self.log.tx.query.call_args.args[0])
+        self.assertEqual(self.log.locks, [(staging_watch.EVENT,)] * 2)
         # The deadline still alerts the pilot.
         self.assertEqual(len(staging_watch.findings(self.log.rows, now=time.time())), 1)
 
@@ -83,6 +101,12 @@ class ExclusiveRecordTest(unittest.TestCase):
         self.start("host-c-run")
         self.assertEqual(staging_watch.findings(self.log.rows, now=time.time()), [])
 
+    def test_truncated_history_is_refused_as_busy(self):
+        self.log.rows = [dict(id=i, object="staging-run:%d" % i, data=row(0, str(i), state="completed")["data"])
+                         for i in range(staging_watch.LIMIT)]
+        with self.assertRaises(staging_watch.Busy):
+            self.start("mine")
+
     def test_cli_exits_busy_without_writing(self):
         self.start("manual")
         import json
@@ -92,6 +116,32 @@ class ExclusiveRecordTest(unittest.TestCase):
             code = staging_watch.main([json.dumps(row(0, "mine")["data"]), "--exclusive"])
         self.assertEqual(code, staging_watch.BUSY)
         self.assertEqual(len(self.log.rows), 1)
+
+
+class ExclusiveStartPgTest(PgTestCase):
+    """The plain-SQL exclusive start against a migrated schema."""
+    def test_late_run_blocks_then_proved_stop_supersedes(self):
+        def snap(run):
+            # deadline long past: a late run must still block
+            return dict(run=run, sha="a" * 40, state="running", started=1,
+                        deadline=2, notify="pilot", hosts={})
+        staging_watch.record(self.db, snap("host-a"), exclusive=True)
+        with self.assertRaises(staging_watch.Busy):
+            staging_watch.record(self.db, snap("host-b"), exclusive=True)
+        staging_watch.record(self.db, snap("host-b"), exclusive=True, supersede=["host-a"])
+        latest = {r["data"]["run"]: r["data"]["state"] for r in
+                  storage.of(self.db).events.latest_type(staging_watch.EVENT, 1, 10)}
+        self.assertEqual(latest, {"host-a": "failed", "host-b": "running"})
+
+
+class InheritedRunIdTest(unittest.TestCase):
+    def test_synchronous_release_never_reuses_an_inherited_run_id(self):
+        from ameesh import release_cutoff
+        with mock.patch.dict("os.environ", STAGING_RUN_ID="fixed", STAGING_PREVIOUS_RUN="old"):
+            env = release_cutoff._staging_env(60)
+        self.assertNotIn("STAGING_RUN_ID", env)
+        self.assertEqual(env["STAGING_PREVIOUS_RUN"], "old")
+        self.assertEqual(env["STAGING_TIMEOUT_S"], "60")
 
 
 class StagingScriptExclusiveTest(unittest.TestCase):

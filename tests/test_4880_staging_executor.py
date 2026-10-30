@@ -231,6 +231,15 @@ class ExecutorTest(unittest.TestCase):
         self.assertIn("truncated", self.request["blocked_reason"])
         self.assertEqual(self.request["state"], "pending")
 
+    def test_unit_environment_cannot_supersede_without_proof(self):
+        with mock.patch.dict("os.environ", STAGING_RUN_ID="fixed",
+                             STAGING_PREVIOUS_RUN="other", STAGING_PREVIOUS_HOST="h"):
+            result = executor.tick(self.db, self.cfg, self.options)
+        env = self.calls[-1][1]
+        self.assertEqual(env["STAGING_RUN_ID"], result["run"])
+        self.assertNotIn("STAGING_PREVIOUS_RUN", env)
+        self.assertNotIn("STAGING_PREVIOUS_HOST", env)
+
 
 if __name__ == '__main__':
     unittest.main()
