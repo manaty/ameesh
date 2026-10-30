@@ -168,6 +168,14 @@ etape() { printf '\n== %s\n' "$*"; }
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10
           -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
 ssh_vm() { ssh "${SSH_OPTS[@]}" "root@$VM" "$@"; }
+# #4793 : le venv ne contient pas les exécutables root de l'invité. Mettre
+# aussi à jour ceux-ci, sans rejouer le provisionnement (clés/configuration).
+# Le helper vient de l'opérateur, les octets de l'arbre visé, y compris lors
+# d'un retour vers un commit antérieur à l'introduction du helper.
+runtime_invite() {  # transport, arbre exact, [--check]
+  local transport=$1 source=$2 verification=${3:-}
+  ENTREE_STDIN=1 "$transport" "python3 - '$source' $verification" < "$ICI/guest-runtime.py"
+}
 # #1969 : le helper de bascule atomique est copié depuis le poste, pour que
 # l'installation et le retour emploient la même version quel que soit le
 # commit déployé (l'ancien code n'a pas forcément le fichier).
@@ -1818,6 +1826,14 @@ controler_agents() {
   local menes=()
   etape "code installé sur $HOTE_AGENTS"
   releve_agents || { echo "relevé du code impossible" >&2; echec=1; }
+  local runtime_sha
+  if runtime_sha=$(installe_agents) && [[ $runtime_sha =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+    runtime_invite ssh_agents "/home/ameesh/.local/share/ameesh/src-${runtime_sha:0:7}" --check \
+      || { echo "runtime invité différent du code installé" >&2; echec=1; }
+  else
+    echo "runtime invité non prouvé : commit du venv installé absent ou invalide" >&2
+    echec=1
+  fi
   noms=$(agents_du_registre avec-arretes) || return 1
   while IFS= read -r p; do
     etape "$p"
@@ -1994,6 +2010,10 @@ installer_agents() {
     echo "installation inachevée : « $0 agents retour » revient à ${complet:0:9} (journal conservé)" >&2
     exit 1
   fi
+  if ! runtime_invite ssh_agents "/home/ameesh/.local/share/ameesh/src-$court"; then
+    echo "runtime invité non mis à jour : installation inachevée, journal conservé ; lancer retour" >&2
+    exit 1
+  fi
   # 9. previous-sha seulement après une installation réussie, et seulement si
   # le code installé change : relancer « installer » sur le SHA déjà en place
   # ne doit pas écraser la cible de retour (sinon « retour » revient sur place,
@@ -2068,6 +2088,7 @@ retour_agents() {
   fi
   # succès : le code installé devient la cible idempotente du retour, et le
   # journal d'une installation inachevée a rempli son rôle.
+  runtime_invite ssh_agents "/home/ameesh/.local/share/ameesh/src-$court" || return 1
   utilisateur_agents bash -c "printf '%s\n' '$complet' > /home/ameesh/.local/share/ameesh/previous-sha"
   effacer_journal_agents
   echo "code ${complet:0:9} réinstallé depuis src-$court ; previous-sha = ${complet:0:9} (retour idempotent)."
@@ -2112,6 +2133,7 @@ installer() {
     python3 $BASCULE_VM activer --venv $VENV --version ${sha:0:7} --precedent \$(cut -c1-7 $PRECEDENT)
     rm -f $BASCULE_VM
     $VENV/bin/python -c 'import psycopg, cryptography, ameesh.budget, ameesh.projects; print(\"psycopg\", psycopg.__version__, \"crypto\", cryptography.__version__, \": modules L70 et L62 présents\")'"
+  runtime_invite ssh_vm "$SRC"
   echo "installé. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 
@@ -2269,6 +2291,7 @@ preuve_venv_vm() {  # persona → 0 si le MainPID vivant exécute le venv instal
 
 controler() {
   local echec=0
+  runtime_invite ssh_vm "$SRC" --check || echec=1
   for p in $PERSONAS_VM; do
     etape "$p"
     ssh_vm "systemctl is-active ameesh-runner@$p && journalctl -u ameesh-runner@$p -n 15 --no-pager" || echec=1
@@ -2292,6 +2315,7 @@ retour() {
     rm -f $BASCULE_VM
     git -C $SRC checkout -q --detach \"\$(cat $PRECEDENT)\"
     echo \"code : \$(git -C $SRC rev-parse --short HEAD)\""
+  runtime_invite ssh_vm "$SRC"
   echo "base inchangée : les migrations passées avant l'installation sont additives, l'ancien code les ignore"
   redemarrer
 }
