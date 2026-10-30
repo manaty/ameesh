@@ -24,7 +24,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from ameesh import (db as db_mod, debit, exploitation, impact_analysis as ia,
+from ameesh import (backlog, db as db_mod, debit, exploitation, impact_analysis as ia,
                     project_plan, slo, storage, work, work_footprints as fp)
 from ameesh.storage.postgres.work import WorkItems
 
@@ -491,18 +491,46 @@ class RelectureTroisTest(_Empreintes):
         self.assertEqual(analysis["policy"], "open")
         self.assertEqual(fp.paths_of(self.db, item["id"]), ["src/feature.py"])
 
-    def test_la_file_d_amelioration_ne_prend_pas_de_marqueur(self):
-        self.policy(unknown_policy="repository")
-        item = self.lot("amélioration vague", cfg=self.cfg)
+    def amelioration(self, title):
+        item = self.lot(title, cfg=self.cfg)
         self.db.execute("UPDATE work_items SET type = 'improvement', expected_value = 'gain',"
                         " value_score = 40 WHERE id = %s", (item["id"],))
-        storage.of(self.db).work_footprints.replace(item["id"], "intake", [], actor="t")
-        self.db.execute("UPDATE work_item_impact_analyses SET analyzed_at = analyzed_at"
-                        " - interval '1 hour' WHERE work_item_id = %s", (item["id"],))
+        return work.get(self.db, item["id"])
+
+    def test_la_file_d_amelioration_suit_la_regle_commune(self):
+        # B de cx1 sur 176dc95 : un lot `improvement` est du code, pris par
+        # `auto_take` ; il prend le marqueur, compte au plafond, est retenu
+        # par lui et son diff se relève au push
+        self.policy(unknown_policy="repository")
+        with mock.patch.object(backlog, "rules", return_value=backlog.Rules(
+                lot_min_value=30, timezone="Europe/Paris", commit="c" * 40)):
+            file = backlog.add(self.db, title="amélioration vague", expected_value="gain",
+                               value_score=40, app="nexlink", actor="test", cfg=self.cfg,
+                               new_project=True)
+        self.assertEqual(work.get(self.db, file["id"])["type"], "improvement")
+        self.assertEqual(fp.paths_of(self.db, file["id"]), ["."])
         store = storage.of(self.db).work_footprints
-        self.assertEqual(store.claim_unknown(retry_after_s=60, limit=5), [])
-        fp.record_estimate(self.db, self.cfg, work.get(self.db, item["id"]), actor="test")
-        self.assertEqual(fp.paths_of(self.db, item["id"]), [])
+        self.assertEqual(store.analyses([file["id"]])[file["id"]]["policy"], "repository")
+        self.db.execute("UPDATE work_item_impact_analyses SET analyzed_at = analyzed_at"
+                        " - interval '1 hour' WHERE work_item_id = %s", (file["id"],))
+        self.assertEqual([r["work_item_id"] for r in store.claim_unknown(
+            retry_after_s=60, limit=5)], [file["id"]])
+        self.assertFalse(fp.is_exempt(work.get(self.db, file["id"])))
+        # pris et en vol, il compte au plafond et il est candidat au refresh
+        prise = self.amelioration("autre amélioration")
+        self.footprint(prise, "src/b.py")
+        self.db.execute("UPDATE work_items SET branch = 'lot/1-b' WHERE id = %s",
+                        (prise["id"],))
+        self.give(prise)
+        libre = self.lot("libre")
+        self.footprint(libre, "docs/x.md")
+        self.policy(max_in_flight=1)
+        self.assertEqual(store.cap_reached(libre["id"]), {"cap": 1, "in_flight": 1})
+        self.assertIn(prise["id"], [r["id"] for r in store.refresh_candidates(limit=10)])
+        # et une amélioration à prendre est retenue par le plafond
+        attente = self.amelioration("encore une")
+        self.footprint(attente, "docs/y.md")
+        self.assertEqual(store.cap_reached(attente["id"]), {"cap": 1, "in_flight": 1})
 
     def test_un_vehicule_n_est_pas_un_candidat_au_refresh(self):
         vehicule = self.lot("paquet", branch="integration/paquet-h-3")

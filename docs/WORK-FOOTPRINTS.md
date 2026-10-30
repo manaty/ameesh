@@ -108,9 +108,9 @@ closed (not retried).
 
 **Lots that are not code** — a packet vehicle (`integration/**`), a question
 to the pilot (`source = decision`), a roadmap-cutting lot
-(`file-decoupage:…`), the improvement backlog — never get the marker, are
-neither counted nor held by the in-flight cap, and are not refreshed at
-push.
+(`file-decoupage:…`) — never get the marker, are neither counted nor held
+by the in-flight cap, and are not refreshed at push. An improvement backlog
+lot is code, taken like any other: it follows the common rule.
 
 A change of the unknown footprint policy applies at once, in the same
 transaction and under the guard's lock, to the open lots of the repository:

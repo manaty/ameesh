@@ -83,14 +83,14 @@ def overlaps(left: str, right: str) -> bool:
 def is_exempt(row: dict) -> bool:
     """#4818 : un lot qui n'est pas du code — véhicule de paquet
     (`integration/**`), question au pilote (`decision`), lot de découpage
-    (`file-decoupage:`), file d'amélioration — n'entre ni dans le plafond de
-    lots en vol ni dans le marqueur d'empreinte inconnue. Même règle que le
-    SQL de la garde (`_EXEMPT`)."""
+    (`file-decoupage:`) — n'entre ni dans le plafond de lots en vol ni dans
+    le marqueur d'empreinte inconnue. Un lot de la file d'amélioration est du
+    code : il suit la règle commune. Même règle que le SQL de la garde
+    (`_EXEMPT`)."""
     from . import packet_guard
     source = str(row.get("source") or "")
     return (packet_guard.is_packet_branch(row.get("branch") or "")
-            or source == "decision" or source.startswith("file-decoupage:")
-            or str(row.get("type") or "") == "improvement")
+            or source == "decision" or source.startswith("file-decoupage:"))
 
 
 def is_shared(path: str, shared: Iterable[str]) -> bool:

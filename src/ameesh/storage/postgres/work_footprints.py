@@ -68,13 +68,13 @@ _VEHICLE = ("(coalesce(btrim({o}.branch), '')"
 
 #: #4818 (relectures qa-01, dev3) : les lots qui ne sont pas du code — un
 #: véhicule de paquet, une question au pilote (`decision`), un lot de
-#: découpage (`file-decoupage:`), la file d'amélioration (non dispatchée) —
-#: n'entrent ni dans le plafond (comptés ou retenus), ni dans le marqueur
-#: d'empreinte inconnue, ni dans le refresh au push. Même règle que
-#: `ameesh.work_footprints.is_exempt`.
+#: découpage (`file-decoupage:`) — n'entrent ni dans le plafond (comptés ou
+#: retenus), ni dans le marqueur d'empreinte inconnue, ni dans le refresh au
+#: push. Un lot de la file d'amélioration (`improvement`) est du code, pris
+#: par `auto_take` comme un autre (B de cx1 sur 176dc95) : il suit la règle
+#: commune. Même règle que `ameesh.work_footprints.is_exempt`.
 _EXEMPT = ("(" + _VEHICLE + " OR coalesce({o}.source, '') = 'decision'"
-           " OR starts_with(coalesce({o}.source, ''), 'file-decoupage:')"
-           " OR {o}.type = 'improvement')")
+           " OR starts_with(coalesce({o}.source, ''), 'file-decoupage:'))")
 
 
 def exempt_sql(alias: str) -> str:
