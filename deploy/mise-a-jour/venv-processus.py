@@ -58,6 +58,12 @@ def main(argv: list[str]) -> int:
     pid, venv, libelle = argv
     try:
         verifier(pid, Path(venv))
+    except PermissionError:
+        # #5094 : demander une preuve privilégiée, sans accepter le processus
+        # sur sa seule cmdline et sans désactiver son durcissement #5029.
+        print("%s : accès /proc refusé ; preuve privilégiée requise" % libelle,
+              file=sys.stderr)
+        return 3
     except (OSError, ValueError, RuntimeError):
         # Aucun contenu de cmdline/environ ni secret n'est affiché.
         print("%s : venv courant non prouvé pour le MainPID vivant ; "
