@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import time
 import unittest
 from unittest import mock
 
@@ -188,7 +187,8 @@ class TurnContextCodexTest(PgTestCase):
         self.addCleanup(worker.watchdog_stop.set)
         return worker
 
-    def _tour(self, worker, prompt: str = "travail") -> bool:
+    def _tour(self, worker, prompt: str = "travail", *,
+              journal: bool = True) -> bool:
         env = {
             "AMEESH_BIN_DIR": FAKEBIN,
             "AMEESH_TEST_LOG": self.turns_log,
@@ -197,6 +197,12 @@ class TurnContextCodexTest(PgTestCase):
                 "input_tokens": 600_000, "cached_input_tokens": 590_000,
                 "output_tokens": 900}),
         }
+        if journal:
+            # Le faux harnais écrit le journal **pendant** le tour : son
+            # `task_started` tombe dans la fenêtre observée, sans dépendre du
+            # temps passé à créer le worker (CI lente).
+            env["AMEESH_TEST_CODEX_JOURNAL"] = self.sessions
+            env["AMEESH_TEST_CODEX_LAST_USAGE"] = json.dumps(CALL)
         with mock.patch.dict(os.environ, env, clear=False):
             return worker.run_turn({"kind": "prompt", "prompt": prompt,
                                     "ids": []})
@@ -210,9 +216,6 @@ class TurnContextCodexTest(PgTestCase):
         return rows[0]["data"]
 
     def test_c_last_du_journal_dans_turn_context(self):
-        _journal(self.sessions, [
-            _task(time.time() - 1.0), _token(CALL),
-        ])
         worker = self._worker("cx-journal")
         self.assertTrue(self._tour(worker))
         data = self._published("cx-journal")
@@ -228,9 +231,6 @@ class TurnContextCodexTest(PgTestCase):
     def test_tour_de_resume_publie_c_last_sans_context_legacy(self):
         # `plafonne=False` : le legacy n'appelle pas le journal, mais
         # l'observation le lit et publie C_last (les 84 tours du corpus).
-        _journal(self.sessions, [
-            _task(time.time() - 1.0), _token(CALL),
-        ])
         worker = self._worker("cx-resume")
         self.assertTrue(self._tour(worker, prompt=adapters.SUMMARY_PROMPT))
         data = self._published("cx-resume")
@@ -241,7 +241,7 @@ class TurnContextCodexTest(PgTestCase):
 
     def test_journal_absent_reste_inconnu_avec_sa_cause(self):
         worker = self._worker("cx-sans-journal")
-        self.assertTrue(self._tour(worker))
+        self.assertTrue(self._tour(worker, journal=False))
         data = self._published("cx-sans-journal")
         measures = data["context"]["measures"]
         self.assertIsNone(measures["C_last"]["value"])
