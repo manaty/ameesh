@@ -164,7 +164,7 @@ class SandboxSupervisor:
                 or row['job_name'] != identity.name
                 or row['profile_ref'] != identity.profile
                 or row['placement_ref'] != identity.placement
-                or row['image_digest'] != spec.image):
+                or row['image_digest'] not in (spec.image, spec.image.rsplit('@', 1)[-1])):
             raise Refusal('job-conflict')
         if row['state'] in TERMINAL:
             return self._event(row, 'terminal', row['state'])
