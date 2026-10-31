@@ -2764,6 +2764,144 @@ class _FloorPort(_ForcedPort):
         return out
 
 
+def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
+                             inputs: Inputs) -> Inputs:
+    """#5129 : réveille les relecteurs désignés que le sommeil roadmap retient.
+
+    Quand la sélection de ce gel manque une famille de la politique dont des
+    relecteurs éligibles dorment du sommeil « feuille de route épuisée », la
+    désignation voit la famille comme absente et le pilote doit la réveiller à
+    la main (constat #4971). La sélection est donc rejouée **à blanc** sur le
+    vivier tel qu'il serait si le sommeil n'était pas là ; les sièges qu'elle
+    retient et que seul le sommeil écarte sont levés par
+    `file_decoupage.wake_reviewer` (un par famille, la sélection choisit), et
+    la levée est journalisée sur le lot de découpage. Le vivier est ensuite
+    relu pour que la vraie sélection désigne le relecteur réveillé.
+
+    Rien n'est levé quand la famille manque pour une autre raison qu'une pause
+    du sommeil automatique : une pause humaine ou budgétaire reste, et la
+    désignation attend comme avant. Une lecture impossible rend les entrées
+    inchangées, jamais une levée au hasard.
+    """
+    from . import file_decoupage as fd
+
+    policy = inputs.policy
+    required = int(policy.required or 0)
+    if required <= 0 or inputs.unknown_authors:
+        return inputs
+    if rd.unknown_families(inputs.authors):
+        # L'indépendance ne peut pas être prouvée : réveiller une famille ne
+        # changerait pas l'attente (elle vient de la provenance, pas de la
+        # capacité).
+        return inputs
+    lot = int((item or {}).get("id") or 0)
+    project = str((item or {}).get("app") or "").strip()
+    families = {str(value or "").strip().lower()
+                for value in (policy.families or ()) if str(value or "").strip()}
+    if not lot or not project or not families:
+        return inputs
+    # Les sièges déjà acquis de CE gel (une attente partielle les garde).
+    previous: list = []
+    try:
+        existing = pg.PgPort(tx).recorded(lot, int(freeze.get("id") or 0))
+    except Exception:  # noqa: BLE001 - marque illisible : rien n'est repris
+        existing = None
+    if existing is not None and existing.get("state") == rd.WAITING:
+        previous = [dict(row) for row in existing.get("reviewers") or ()
+                    if isinstance(row, Mapping)]
+    try:
+        listing = registry.overview(tx)
+        loads = _loads(tx)
+        closed = alert_briefs.claims_closed_hosts(tx)
+    except Exception:  # noqa: BLE001 - lecture impossible : aucune levée
+        return inputs
+    # Le vivier du gel, avec les seuls dormeurs que ce chemin peut lever : la
+    # pause exacte du sommeil automatique de ce projet, dont la levée rendrait
+    # l'agent disponible. Une autre cause (budget, compte, hôte perdu…) garde
+    # le siège, même si le sommeil est aussi posé.
+    sleeping: set[str] = set()
+    awake_listing = []
+    for row in listing or ():
+        row = dict(row or {})
+        name = str(row.get("name") or "").strip()
+        clear = dict(row)
+        if (name and row.get("operator_paused")
+                and str(row.get("operator_pause_by") or "") == fd.SLEEP_ACTOR
+                and fd.project_of_sleep_reason(
+                    str(row.get("operator_pause_reason") or "")) == project):
+            clear["operator_paused"] = False
+            clear["operator_pause_reason"] = ""
+            clear["operator_pause_by"] = ""
+            clear["operator_pause_for"] = ""
+            clear["operator_pause_ts"] = None
+            clear["operator_pause_until"] = None
+            if rd.is_available(clear, closed_hosts=closed):
+                sleeping.add(name)
+        awake_listing.append(clear)
+    if not sleeping:
+        return inputs
+    pilot = str(inputs.notify or "").strip()
+    try:
+        # La sélection réelle : elle seule dit si le gel manque une famille.
+        # Sans attente, le sommeil ne retire rien à ce gel et rien n'est levé.
+        current = rd.select(
+            required=required, authors=inputs.authors,
+            candidates=inputs.candidates, families=families,
+            already=list(inputs.manual_seats), fixers=inputs.correctors,
+            advances=inputs.advances, automatic=previous)
+        # La même sélection sur le vivier réveillé : elle nomme les sièges que
+        # le sommeil retient, sans en réveiller plus que nécessaire.
+        shadow = _candidates(awake_listing, loads=loads, project=project,
+                             families=families, pilot=pilot,
+                             closed_hosts=closed)
+        preview = rd.select(
+            required=required, authors=inputs.authors, candidates=shadow,
+            families=families, already=list(inputs.manual_seats),
+            fixers=inputs.correctors, advances=inputs.advances,
+            automatic=previous)
+    except Exception:  # noqa: BLE001 - pas de prévision : comportement d'avant
+        return inputs
+    if current.get("state") != rd.WAITING:
+        return inputs
+    if preview.get("state") not in (rd.DESIGNATED, rd.WAITING):
+        return inputs
+    wanted = [str((row or {}).get("name") or "").strip()
+              for row in preview.get("reviewers") or ()
+              if str((row or {}).get("name") or "").strip() in sleeping]
+    lifted: set[str] = set()
+    for name in wanted:
+        if name in lifted:
+            continue
+        family = next((str((seat or {}).get("family") or "").strip()
+                       for seat in preview.get("reviewers") or ()
+                       if str((seat or {}).get("name") or "").strip() == name), "")
+        try:
+            done = fd.wake_reviewer(tx, name, project, family=family,
+                                    for_lot=lot, freeze=freeze)
+        except Exception:  # noqa: BLE001 - la pause reste, le gel attend
+            continue
+        if done.get("lifted"):
+            lifted.add(name)
+    if not lifted:
+        return inputs
+    # Le vivier relu depuis la même liste, la pause levée : la sélection verra
+    # le relecteur exactement comme la base le porte après le geste.
+    refreshed = []
+    for row in listing or ():
+        row = dict(row or {})
+        if str(row.get("name") or "") in lifted:
+            row["operator_paused"] = False
+            row["operator_pause_reason"] = ""
+            row["operator_pause_by"] = ""
+            row["operator_pause_for"] = ""
+            row["operator_pause_ts"] = None
+            row["operator_pause_until"] = None
+        refreshed.append(row)
+    fresh = _candidates(refreshed, loads=loads, project=project,
+                        families=families, pilot=pilot, closed_hosts=closed)
+    return dataclasses.replace(inputs, candidates=fresh)
+
+
 def _selection(inputs: Inputs, port, *, force: bool = False,
                kept: Sequence[Mapping] = (), reported: Sequence[str] = ()) -> dict:
     """The `apply` call, shared by the hook and the recovery path.
@@ -3193,6 +3331,10 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
             _sync_reviewers(tx, item, freeze, [])
             _waive_ownless_vehicle(tx, item, inputs)
         else:
+            # #5129 : un gel arrivé après la mise en sommeil d'une famille ne
+            # doit pas la déclarer manquante ; la désignation lève le mieux
+            # classé de la famille et le désigne dans la même transaction.
+            inputs = _wake_sleeping_reviewers(tx, item, freeze, inputs)
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads),
                              reported=reported)
             if _manual_covers(inputs) and out.get("state") == "manual":
@@ -3726,6 +3868,12 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             return {"state": rd.NONE, "required": 0, "reviewers": [],
                     "freeze": freeze, "why": why}
         with db.transaction() as tx:
+            if not _lock_current_freeze(tx, int(lot), freeze):
+                return _stale(freeze)
+            # #5129 : une reprise d'attente lève aussi le sommeil de la
+            # famille manquante, sinon le pilote doit encore la réveiller à
+            # la main.
+            inputs = _wake_sleeping_reviewers(tx, item, freeze, inputs)
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
                                                 at_freeze=False, retired=removed),
                              force=force, reported=reported)
