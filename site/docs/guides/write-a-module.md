@@ -107,8 +107,9 @@ ameesh module hello --help
 ```
 
 `ameesh modules` lists discovered built-ins, installed entry points and readable
-Pipeline cards, with capabilities, distribution version and descriptor
-fingerprint. `--no-canon` lists built-ins and installed entry points, excluding Pipeline
+Pipeline cards, with name, version, source and capabilities. `--json` adds the
+distribution, entry point and descriptor fingerprint of each module.
+`--no-canon` lists built-ins and installed entry points, excluding Pipeline
 cards from the canon. `module --list`
 reports installation evidence, including per-entry `ok` and errors; inspect
 these fields rather than treating its exit code as a validation result.
@@ -145,8 +146,8 @@ ameesh doctor
 
 Sync follows the [trusted canon procedure](../concepts/canon.md#only-the-approved-source).
 Discovery is not activation: only applied project policies admit their types.
-Two selected modules cannot own the same type in one project. `bug` and
-`evolution` remain core types; custom types need their active module.
+Two selected modules cannot own the same type in one project. `bug`, `evolution`
+and `improvement` remain core types; custom types need their active module.
 
 Discovery reports refused entries and `ameesh modules` exits 1 if any are
 refused. Invalid names, duplicate entries, mismatched `NAME`/`TYPES`, missing

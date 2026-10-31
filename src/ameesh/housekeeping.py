@@ -6117,8 +6117,8 @@ def print_report(report: dict) -> None:
             "dirty_archive_retention): these trees stay"))
 
 
-#: #4234 : temps maximal du relevé de volume des arbres gardés pour du travail
-#: non commité (81 arbres, 7,2 Gio mesurés en 3,4 s sur agents-1) ; le relevé
+#: #4234 : temps maximal du relevé de volume de tous les arbres gardés ou en
+#: attente (81 arbres, 7,2 Gio mesurés en 3,4 s sur agents-1) ; le relevé
 #: est un affichage borné, jamais une condition de suppression.
 WORKTREE_SIZE_BUDGET_S = 20.0
 WORKTREE_SIZE_TOP = 10
