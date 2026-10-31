@@ -207,15 +207,16 @@ class DispatchTest(fixtures.GelTestCase):
                   "argv": [{"argv": ["workflow", "run", w, "--ref", fixtures.BRANCHE,
                                       "-f", "expected_sha=" + fixtures.GEL]} for w in SUITES]}
         with mock.patch("ameesh.prevalidation_calls.repository", return_value="/clone"), \
-             mock.patch("ameesh.release_cutoff._worktree", return_value=("/folder", "/tree")), \
+             mock.patch("tempfile.mkdtemp", return_value="/folder"), \
+             mock.patch("ameesh.release_cutoff._git"), \
              mock.patch("ameesh.release_cutoff._drop_worktree") as drop, \
              mock.patch("subprocess.run", return_value=types.SimpleNamespace(
                  returncode=0, stdout=json.dumps(report), stderr="")) as run:
             self.assertEqual(set(self.plan(api)["dispatch"]), set(SUITES))
             self.assertEqual(run.call_args.args[0], ["node", "scripts/ci/dispatch-due-parts.mjs",
                              fixtures.BRANCHE, fixtures.GEL, "--dry-run"])
-            self.assertEqual(run.call_args.kwargs["cwd"], "/tree")
-            drop.assert_called_once_with("/clone", "/folder", "/tree")
+            self.assertEqual(run.call_args.kwargs["cwd"], "/folder/tree")
+            drop.assert_called_once_with("/clone", "/folder", "/folder/tree")
 
     def test_registered_workflow_missing_refuses_before_dispatch(self):
         api = Api(suites=SUITES[:-1])
