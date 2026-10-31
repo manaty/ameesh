@@ -4186,10 +4186,11 @@ class Operations(Domain):
         (`unread`, `oldest_unread_ts` ; L125 : hors courrier passif, compté à
         part dans `passive_unread`), lot de session (`session_work_item`,
         `session_lot_title`, `session_lot_state`, `session_lot_later` : son
-        début prévu est après aujourd'hui), lot assigné ouvert le plus
+        début prévu est après aujourd'hui ou son réveil est futur), lot assigné ouvert le plus
         récent (`assigned_lot_id`, `assigned_lot_title`, `assigned_lot_state`),
         lots qui l'occupent (`active_lots`, L165b : assignés, ouverts, ni en
-        `qa`/`waiting_human`/`blocked`, ni prévus après aujourd'hui ;
+        `qa`/`waiting_human`/`blocked`, ni prévus après aujourd'hui,
+        ni en attente d'un réveil futur ;
         « aujourd'hui » : `today`, jour ISO, par défaut le jour local de
         l'hôte, jamais celui du fuseau de la base),
         dernier tour du grand livre (`last_turn_reread_tokens` = entrée +

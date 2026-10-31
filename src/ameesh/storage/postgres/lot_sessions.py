@@ -139,6 +139,7 @@ class LotSessions(interface.LotSessions):
                AND (w.state IN ('{lifecycle.REQUESTED}', '{lifecycle.IN_PROGRESS}')
                     OR (w.state = '{lifecycle.QA}' AND """ + freeze_due("w") + """))
                AND (w.planned_start IS NULL OR w.planned_start <= %s::date)
+               AND (w.wake_at IS NULL OR w.wake_at <= clock_timestamp())
                AND NOT EXISTS (SELECT 1 FROM agent_mailbox b
                                 WHERE b.delivered_at IS NULL AND b.kind = 'request'
                                   AND (b.payload -> 'decision') IS NOT NULL

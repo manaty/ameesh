@@ -201,6 +201,15 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(self.resolve(rows=rows, decisions=[open_], holds=held)[1]["what"],
                          "hold")
 
+    def test_future_wake_without_hold_expires_at_deadline(self):
+        row = dict(id=1, state="build", wake_ts=self.now + 3600)
+        wait = self.resolve(rows=[row])[1]
+        self.assertEqual(wait["what"], "scheduled")
+        self.assertEqual(wait["wake_ts"], row["wake_ts"])
+        self.assertTrue(D.wait_label(wait).startswith("scheduled wake "))
+        for wake in (self.now, self.now - 1, None):
+            self.assertEqual(self.resolve(rows=[dict(row, wake_ts=wake)]), {})
+
     def test_future_start_ends_at_local_midnight_without_changing_activity(self):
         dates = {1: {"planned_start": "2026-10-13"}}
         self.assertEqual(self.resolve(dates=dates), {1: {"what": "scheduled", "start": "2026-10-13"}})

@@ -869,6 +869,13 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
             if start_package:
                 waits[ident]["package"] = start_package
             continue
+        # #5028 : un réveil futur est une attente même sans hold, en build aussi.
+        wake = row.get("wake_ts")
+        if wake is not None and float(wake) > now:
+            start = datetime.datetime.fromtimestamp(
+                float(wake), datetime.timezone.utc).isoformat()
+            waits[ident] = {"what": "scheduled", "start": start, "wake_ts": float(wake)}
+            continue
         if ident in pilot:
             waits[ident] = dict(pilot[ident])
             continue
