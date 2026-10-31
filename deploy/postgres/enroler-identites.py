@@ -213,7 +213,18 @@ def audit_data(conn, name, schema, parent=None):
         if parent:
             select = conn.execute('SELECT has_sequence_privilege(%s,%s,\'SELECT\')' if kind == 'S' else
                                   'SELECT has_table_privilege(%s,%s,\'SELECT\')', (oid, obj)).fetchone()[0]
-            require(select == (ns == schema and table in CONTROLLER_READS and kind != 'S'),
+            # Extension views may intentionally expose SELECT to PUBLIC. Only
+            # that ambient read is allowed; all write/ownership audits still run.
+            public_extension_read = kind != 'S' and conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_depend WHERE classid='pg_class'::regclass "
+                "AND objid=%s AND objsubid=0 AND refclassid='pg_extension'::regclass AND deptype='e') "
+                "AND EXISTS (SELECT 1 FROM pg_class c, LATERAL aclexplode(c.relacl) a "
+                "WHERE c.oid=%s AND a.grantee=0 AND a.privilege_type='SELECT') "
+                "AND NOT EXISTS (SELECT 1 FROM pg_class c, LATERAL aclexplode(c.relacl) a "
+                "WHERE c.oid=%s AND a.grantee=ANY(%s::oid[]) AND a.privilege_type='SELECT')",
+                (obj, obj, obj, principals[1:])).fetchone()[0]
+            require(select == (ns == schema and table in CONTROLLER_READS and kind != 'S'
+                               or public_extension_read),
                     'controller read privilege differs from contract')
         if parent is None:
             require(not rls, 'backup cannot bypass row security')
@@ -440,6 +451,11 @@ def main():
             result = audit(value, ROOT) if operation == 'audit' else leave(value, ROOT) if operation == 'leave' else enroll(value, ROOT)
             print(json.dumps(result, sort_keys=True))
         return 0
+    except IdentityError as exc:
+        # IdentityError reasons are fixed local strings, never server messages.
+        print(json.dumps({'error': 'identity_enrollment_refused; private source and intents retained',
+                          'reason': str(exc)}), file=sys.stderr)
+        return 2
     except Exception:
         # psycopg errors, DSNs, server details and passwords must not cross stdout/stderr.
         print('{"error":"identity_enrollment_refused; private source and intents retained"}', file=sys.stderr)

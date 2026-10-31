@@ -46,7 +46,8 @@ class PrivateInputTest(unittest.TestCase):
         self.assertTrue(secret not in result.stdout + result.stderr, 'ambient credential escaped')
         self.assertEqual(result.stdout, '')
         self.assertEqual(json.loads(result.stderr),
-                         {'error': 'identity_enrollment_refused; private source and intents retained'})
+                         {'error': 'identity_enrollment_refused; private source and intents retained',
+                          'reason': 'isolated root enroll|audit|leave required'})
 
     def test_fake_server_cannot_downgrade_or_collect_a_password(self):
         for method in (3, 5, 0):  # cleartext password, MD5, trust
@@ -239,6 +240,25 @@ class RealIdentityTest(unittest.TestCase):
             logs = result.stdout + result.stderr
             for password in source['passwords'].values():
                 self.assertTrue(password.encode() not in logs, 'plaintext credential in server output')
+
+    def test_public_extension_reads_only_do_not_relax_other_audits(self):
+        with psycopg.connect(self.source) as conn:
+            conn.execute('CREATE EXTENSION pg_stat_statements')
+        self.enroll()
+        self.assertEqual(tool.audit(self.value, self.directory)['outcome'], 'audit_ok')
+        with psycopg.connect(self.source) as conn:
+            role = sql.Identifier(self.value['controller_role'])
+            for statement in (
+                sql.SQL('GRANT SELECT ON public.pg_stat_statements TO {}').format(role),
+                sql.SQL('GRANT SELECT ON mesh.payload TO PUBLIC'),
+                sql.SQL('GRANT UPDATE ON public.pg_stat_statements TO PUBLIC'),
+            ):
+                conn.execute('SAVEPOINT extra_privilege')
+                conn.execute(statement)
+                with self.assertRaises(tool.IdentityError):
+                    tool.audit_data(conn, self.value['controller_role'], 'mesh',
+                                    parent=self.value['group_role'])
+                conn.execute('ROLLBACK TO SAVEPOINT extra_privilege')
 
     def test_real_dump_and_restore_only_with_restore_identity(self):
         self.enroll()

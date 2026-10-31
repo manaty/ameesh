@@ -334,7 +334,12 @@ schémas et SELECT des relations/séquences de la base source, aucune écriture.
 L'audit refuse les privilèges supplémentaires, colonnes comprises, les rôles
 parents imprévus, les propriétés administratives, la propriété d'objets,
 les fonctions SECURITY DEFINER accessibles et les tables sous RLS que l'identité
-ne peut sauvegarder complètement. Les droits PUBLIC comptent dans cet audit.
+ne peut sauvegarder complètement. Les droits PUBLIC comptent dans cet audit. Seul le SELECT public d'un objet
+membre d'une extension est admis en plus pour le contrôleur (par exemple les
+vues de `pg_stat_statements`), sans grant SELECT direct au login ou à son
+groupe. Cette exception ne dispense d'aucun contrôle d'écriture, de propriété
+ou de fonction SECURITY DEFINER. Un refus `IdentityError` expose sa raison
+locale fixe ; les erreurs du serveur et les DSN restent masqués.
 La commande ne répare pas les droits PUBLIC d'une base partagée : un refus
 exige une correction explicite sous son propre mandat. Réappliquer après toute
 migration qui ajoute des relations à sauvegarder.
