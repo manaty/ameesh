@@ -178,6 +178,12 @@ with (state / 'ssh.log').open('a') as f:
 if 'MainPID' in command:
     print((state / 'pid').read_text().strip())
     sys.exit(0)
+if command.startswith('python3 - ') and command.endswith(' --check'):
+    # Le runtime invité appartient à la VM simulée : ne pas exécuter son
+    # contrôle root sur l'hôte qui lance ce test de preuve du venv.
+    sys.stdin.read()
+    print('guest runtime verified')
+    sys.exit(0)
 if 'python3 -' in command:
     # #3311 : le helper arrive sur stdin ; le venv stable de la VM est simulé.
     command = command.replace('/opt/ameesh/venv', os.environ['TEST_VENV'])
@@ -254,6 +260,7 @@ class ControlerServeurTest(unittest.TestCase):
         self.assertEqual(fait.returncode, 0, fait.stdout + fait.stderr)
         self.assertIn("MainPID vivant sur le venv courant", fait.stdout)
         self.assertIn("contrôles verts", fait.stdout)
+        self.assertIn("guest runtime verified", fait.stdout)
 
     def test_controler_rouge_si_le_runner_serveur_reste_sur_l_ancien_venv(self):
         fait = self.controler(self.processus(self.old))
