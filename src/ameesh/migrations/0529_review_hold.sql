@@ -29,14 +29,24 @@ create function ameesh_review_seats_guard() returns trigger
 language plpgsql security invoker set search_path from current as $$
 declare spelling text;
 begin
-    for spelling in select coalesce(ameesh_agent_primary_locked(n), n) from unnest(coalesce(new.reviewers, '{}'::text[])) n
-                    except select coalesce(ameesh_agent_primary_locked(n), n) from unnest(coalesce(old.reviewers, '{}'::text[])) n loop
+    for spelling in
+        select coalesce(ameesh_agent_primary_locked(n), n)
+          from unnest(coalesce(new.reviewers, '{}'::text[])) n
+        except
+        select coalesce(ameesh_agent_primary_locked(n), n)
+          from unnest(coalesce(old.reviewers, '{}'::text[])) n
+    loop
         perform ameesh_review_hold_check(spelling);
         delete from work_review_withdrawals
          where work_item_id = new.id and reviewer = spelling;
     end loop;
-    for spelling in select coalesce(ameesh_agent_primary_locked(n), n) from unnest(coalesce(old.reviewers, '{}'::text[])) n
-                    except select coalesce(ameesh_agent_primary_locked(n), n) from unnest(coalesce(new.reviewers, '{}'::text[])) n loop
+    for spelling in
+        select coalesce(ameesh_agent_primary_locked(n), n)
+          from unnest(coalesce(old.reviewers, '{}'::text[])) n
+        except
+        select coalesce(ameesh_agent_primary_locked(n), n)
+          from unnest(coalesce(new.reviewers, '{}'::text[])) n
+    loop
         insert into work_review_withdrawals(work_item_id, reviewer)
         values (new.id, spelling) on conflict do nothing;
     end loop;
