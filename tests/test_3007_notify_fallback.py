@@ -428,11 +428,12 @@ class AlertesTest(PgTestCase):
         self.assertFalse(bodies[1].startswith("Reminder"))
         self.assertIn("no living notifier", bodies[1])
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_le_runner_porte_le_brief_sans_le_poste(self):
         from ameesh import runner as runner_mod
         self.ask()
         now = self.beat(age=3600)
-        fake = types.SimpleNamespace(cfg=self.cfg, dry_run=False, mediated=False)
+        fake = types.SimpleNamespace(cfg=self.cfg, dry_run=False, mediated=False, db=None)
         report = runner_mod.Runner.notify_health_once(fake, db=self.db, now=now)
         self.assertEqual([(e["recipient"], e["human"]) for e in report["sent"]],
                          [("auditeur", ALICE)])

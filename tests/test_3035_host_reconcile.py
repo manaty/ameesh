@@ -280,9 +280,11 @@ class HostReconcileTest(PgTestCase):
             "SELECT count(*) AS n FROM ameesh_events WHERE id > %s AND type='host.reconciled' "
             "AND object='host:source'", (self.event_base,))[0]["n"], 1)
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_runner_lifecycle_pass_reconciles_a_returning_host(self):
         self.returned()
         runner = object.__new__(Runner)
+        runner.db = self.db
         runner.runner_id = "runner-mty-x@peer"
         runner.cfg = self.cfg
         runner.handoff_limits_for = lambda host: None
@@ -291,6 +293,7 @@ class HostReconcileTest(PgTestCase):
         self.assertEqual((row["mode"], row["actor"]), ("available", "runner-mty-x@peer"))
         self.assertIsNotNone(registry.claim(self.db, "dev", "runner", ttl_seconds=300))
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_runner_lifecycle_pass_reopens_a_rebooting_host_that_holds_its_leases(self):
         # #3180 (pc-smichea, 23/10): the runners of the returning machine take
         # their leases back at boot, so the first lifecycle pass sees home
@@ -300,6 +303,7 @@ class HostReconcileTest(PgTestCase):
         self.db.execute("UPDATE agent_registry SET lease_owner='runner-returning@source', "
                         "lease_expires_at=clock_timestamp()+interval '5 minutes' WHERE name='dev'")
         runner = object.__new__(Runner)
+        runner.db = self.db
         runner.runner_id = "runner-returning@source"
         runner.cfg = self.cfg
         runner.handoff_limits_for = lambda host: None

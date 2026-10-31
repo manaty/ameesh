@@ -76,8 +76,9 @@ class ConnectionPool:
     cours, au plus `size`. Une connexion qui a levé `Unavailable` est
     fermée et remplacée au prochain emprunt."""
 
-    def __init__(self, connect: Callable[[], Any], size: int = 8):
+    def __init__(self, connect: Callable[[], Any], size: int = 8, *, before_use=None):
         self._connect = connect
+        self._before_use = before_use
         self._idle: queue.LifoQueue = queue.LifoQueue()
         self._slots = threading.BoundedSemaphore(max(1, size))
 
@@ -91,6 +92,8 @@ class ConnectionPool:
                 conn = self._idle.get_nowait()
             except queue.Empty:
                 conn = self._connect()
+            if self._before_use is not None:
+                self._before_use(conn)
             yield conn
         except Unavailable:
             if conn is not None:

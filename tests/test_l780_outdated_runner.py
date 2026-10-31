@@ -108,12 +108,13 @@ class OutdatedRunnerTest(_CanonDbCase):
         self.assertEqual(canon_sync.state(self.db, "atelier"), before_state)
         self.assertEqual(self.snapshot(), before_rows)
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_executeur_perime_saute_la_passe(self):
         self.sync()
         before_state = canon_sync.state(self.db, "atelier")
         before_rows = self.snapshot()
         fake = types.SimpleNamespace(
-            cfg=dataclasses.replace(self.cfg, canon=self.root), host="atelier")
+            cfg=dataclasses.replace(self.cfg, canon=self.root), host="atelier", db=None)
         with mock.patch.object(harnesses, "_BOOT_VERSION", "0.9.0-old"):
             self.assertFalse(runner_mod.Runner.canon_sync_once(fake))
         self.assertIs(fake._canon_complete, False)   # porte d'hôte fermée

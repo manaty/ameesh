@@ -10,6 +10,7 @@ refus d'une identité d'expéditeur arrêtée, alerte `mail_undeliverable` (et
 `ameesh projects`), renvoi `ameesh mail forward`.
 """
 from __future__ import annotations
+from unittest import mock
 
 import dataclasses
 import json
@@ -778,13 +779,14 @@ class SweepTest(_Base):
         self.assertEqual((refused["old"], refused["new"]), ("claude3", "mesh-design"))
         self.assertEqual(report["expired"][0]["count"], 1)         # pas d'attente infinie
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_le_menage_de_l_executeur_balaye_et_respecte_dry_run(self):
         import types
         from ameesh import runner as runner_mod
         self.lie()
         self.stop("claude3")
         mail.send(self.db, "claude1", "claude3", "Rapport.")
-        fake = types.SimpleNamespace(cfg=self.cfg, dry_run=True, mediated=False)
+        fake = types.SimpleNamespace(cfg=self.cfg, dry_run=True, mediated=False, db=None)
         first = runner_mod.Runner.sweep_dead_letters_once(fake, self.db, clock=1000.0)
         self.assertEqual(first["forwarded"][0]["count"], 1)
         self.assertEqual(len(self.pending("claude3")), 1)          # dry-run : rien bougé

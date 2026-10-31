@@ -911,6 +911,7 @@ class TestRaccordTrain(unittest.TestCase):
         paquet dès qu'un import réel a eu lieu dans le processus."""
         return mock.patch.object(ameesh, "train_incidents", fake, create=True)
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_les_passages_du_train_sont_remis_au_consommateur(self):
         db = object()
         fake = self._fake([{"repo": "manaty/nexlink", "branch": "develop", "run_id": 501,
@@ -920,12 +921,13 @@ class TestRaccordTrain(unittest.TestCase):
                 self._patch_train(fake), \
                 mock.patch.object(incident, "consume") as direct, \
                 mock.patch.object(runner, "log_async") as log:
-            runner.Runner.incident_once(types.SimpleNamespace(train_passages=("p",)), db)
+            runner.Runner.incident_once(types.SimpleNamespace(train_passages=("p",), db=None), db)
         fake.consume.assert_called_once_with(db, ("p",), consumer=incident)
         direct.assert_not_called()
         self.assertTrue(any("lot #9100 ouvert" in call.args[0]
                             for call in log.call_args_list))
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_sans_passage_remis_vides(self):
         db = object()
         fake = self._fake()
@@ -933,21 +935,23 @@ class TestRaccordTrain(unittest.TestCase):
                 self._patch_train(fake), \
                 mock.patch.object(incident, "consume") as direct, \
                 mock.patch.object(runner, "log_async"):
-            runner.Runner.incident_once(types.SimpleNamespace(), db)
+            runner.Runner.incident_once(types.SimpleNamespace(db=None), db)
         fake.consume.assert_called_once_with(db, (), consumer=incident)
         direct.assert_not_called()
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_sans_module_ni_passage_le_releve_direct_fait_foi(self):
         db = object()
         with mock.patch.object(incident, "consume", return_value=[]) as direct, \
                 mock.patch.object(runner, "log_async"):
-            runner.Runner.incident_once(types.SimpleNamespace(), db)
+            runner.Runner.incident_once(types.SimpleNamespace(db=None), db)
         direct.assert_called_once_with(db)
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_faits_du_train_illisibles_releve_direct_sans_perte(self):
         db = object()
         fake = self._fake(error=RuntimeError("manifeste absent"))
-        stub = types.SimpleNamespace(train_passages=("p",))
+        stub = types.SimpleNamespace(train_passages=("p",), db=None)
         opened = {"repo": "manaty/nexlink", "branch": "develop", "run_id": 501,
                   "created": True, "id": 9200, "assigned": True, "author": "deepseek4",
                   "status": "unique"}
@@ -963,6 +967,7 @@ class TestRaccordTrain(unittest.TestCase):
         self.assertEqual(sum("train facts unreadable" in m for m in messages), 1)
         self.assertTrue(any("lot #9200 ouvert" in m for m in messages))
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_un_passage_d_ombre_ne_rend_pas_les_faits_du_train_illisibles(self):
         """#2682 : l'ombre n'a aucun fait de train ; le relevé direct fait foi."""
         db = object()
@@ -975,7 +980,7 @@ class TestRaccordTrain(unittest.TestCase):
         with mock.patch.object(incident, "consume", return_value=[]) as direct, \
                 mock.patch.object(runner, "log_async") as log:
             runner.Runner.incident_once(
-                types.SimpleNamespace(train_passages=(shadow,)), db)
+                types.SimpleNamespace(train_passages=(shadow,), db=None), db)
         direct.assert_called_once()
         self.assertIs(direct.call_args.args[0], db)
         self.assertFalse(any("train facts unreadable" in call.args[0]

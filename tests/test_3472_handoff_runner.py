@@ -175,6 +175,7 @@ class RunnerLifecycleTest(PgTestCase):
 
     def runner(self):
         runner = object.__new__(Runner)
+        runner.db = self.db
         runner.runner_id = "runner-mty-h5@source"
         runner.cfg = self.cfg
         runner.handoff_limits_for = lambda host: self.limits
@@ -182,6 +183,7 @@ class RunnerLifecycleTest(PgTestCase):
         runner._lifecycle_requirements = self.requirements
         return runner
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_pass_drains_and_enables_with_the_bound_adapter(self):
         self.api.host_lifecycle.drain("source", actor="orch", critical=("dev",))
         for _ in range(9):
@@ -189,6 +191,7 @@ class RunnerLifecycleTest(PgTestCase):
         self.assertEqual(registry.get(self.db, "dev")["host"], "target")
         self.assertGreaterEqual(self.adapter.calls.count("enable"), 1)
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_pass_returns_the_agent(self):
         self.api.host_lifecycle.drain("source", actor="orch", critical=("dev",))
         for _ in range(9):
@@ -200,6 +203,7 @@ class RunnerLifecycleTest(PgTestCase):
             Runner.host_lifecycle_once(self.runner(), self.db)
         self.assertEqual(registry.get(self.db, "dev")["host"], "source")
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_pass_recovers_a_lost_prepared_drain(self):
         self.adapter = RecoveryAdapter()
         self.api.host_lifecycle.drain("source", actor="orch", critical=("dev",))
@@ -217,6 +221,7 @@ class RunnerLifecycleTest(PgTestCase):
         self.assertIn("recover_source", self.adapter.calls)
         self.assertEqual(registry.get(self.db, "dev")["host"], "target")
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_post_switch_readiness_uses_the_frozen_plan_account(self):
         # A live session carries both values; the switch clears them.
         self.db.execute(
@@ -236,6 +241,7 @@ class RunnerLifecycleTest(PgTestCase):
             Runner.host_lifecycle_once(self.runner(), self.db)
         self.assertEqual(registry.get(self.db, "dev")["host"], "target")
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_elected_roles_stay_with_their_election(self):
         registry.upsert(self.db, "gov", harness="codex", host="source", cwd="/work/gov")
         self.db.execute(
@@ -267,21 +273,27 @@ class BindingRecoveryTest(unittest.TestCase):
 
     def test_lifecycle_pass_retries_an_empty_binding(self):
         runner = object.__new__(Runner)
+        runner.db = object()
         runner._lifecycle_factory = None
         with mock.patch.object(runner, "_bind_lifecycle") as bind, \
+                mock.patch("ameesh.migrations.require_compatible_writer") as admission, \
                 mock.patch("ameesh.runner.storage.of", side_effect=ValueError), \
                 mock.patch("ameesh.runner.log_async"):
             runner.host_lifecycle_once(object())
         bind.assert_called_once_with()
+        admission.assert_called_once_with(runner.db)
 
     def test_lifecycle_pass_keeps_an_active_binding(self):
         runner = object.__new__(Runner)
+        runner.db = object()
         runner._lifecycle_factory = object()
         with mock.patch.object(runner, "_bind_lifecycle") as bind, \
+                mock.patch("ameesh.migrations.require_compatible_writer") as admission, \
                 mock.patch("ameesh.runner.storage.of", side_effect=ValueError), \
                 mock.patch("ameesh.runner.log_async"):
             runner.host_lifecycle_once(object())
         bind.assert_not_called()
+        admission.assert_called_once_with(runner.db)
 
     def test_relocation_readiness_value_error_keeps_source(self):
         worker = SimpleNamespace(

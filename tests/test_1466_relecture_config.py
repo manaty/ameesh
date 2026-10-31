@@ -239,7 +239,7 @@ class RelectureConfigTest(unittest.TestCase):
     def test_un_compte_corrige_debloque_la_selection_du_prochain_tour(self):
         ancien = Config(accounts={"deepseek": [{"name": "plafonne"}]})
         frais = replace(ancien, accounts={"deepseek": [{"name": "disponible"}]})
-        worker = SimpleNamespace(cfg=ancien, _cfg_pending=None,
+        worker = SimpleNamespace(db=object(), cfg=ancien, _cfg_pending=None,
                                  _cfg_lock=threading.Lock(), stopping=threading.Event())
         worker.ensure_watchdog = lambda: None
         worker.ensure_peek = lambda: None  # #1349
@@ -260,7 +260,9 @@ class RelectureConfigTest(unittest.TestCase):
         worker.run_turn = lambda spec: observations.append(worker.cfg.accounts)
         AgentWorker.apply_config(worker, frais)
         self.assertIs(worker.cfg, ancien)  # le tour actif garde sa configuration
-        self.assertTrue(AgentWorker.process_once(worker, 0))
+        with mock.patch("ameesh.migrations.require_compatible_writer") as admission:
+            self.assertTrue(AgentWorker.process_once(worker, 0))
+        admission.assert_called_once_with(worker.db)
         self.assertEqual(observations, [frais.accounts, frais.accounts])
 
 

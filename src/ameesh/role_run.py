@@ -77,6 +77,7 @@ import threading
 import time
 import uuid
 
+from . import migrations
 from . import alerts_delegation_pg
 from . import config as config_mod
 from . import db as db_mod
@@ -188,6 +189,7 @@ class _AlertsLease:
                              if self.epoch is not None else None)
         return self.epoch
 
+    @migrations.writer_tick
     def renew(self) -> bool:
         """Extend the lease we hold; False when it expired or was taken."""
         with self.lock:
@@ -409,7 +411,11 @@ def _watch_alerts_lease(lease: _AlertsLease, execution: _AlertsExecution,
     while not stop.wait(max(0.1, lease.ttl / 3.0)):
         if stop.is_set():
             return
-        if lease.renew():
+        try:
+            renewed = lease.renew()
+        except db_mod.DbError:
+            renewed = False
+        if renewed:
             continue
         execution.kill()
         return

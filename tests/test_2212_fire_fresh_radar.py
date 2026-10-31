@@ -84,8 +84,9 @@ class RunnerPassesTest(_ConfigFile):
     """Les passages de l'exécuteur reçoivent la configuration relue."""
 
     def runner(self, cfg):
-        return types.SimpleNamespace(cfg=cfg, dry_run=False, runner_id="r-2212")
+        return types.SimpleNamespace(cfg=cfg, dry_run=False, runner_id="r-2212", db=None)
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_fire_pass_reads_the_current_radar(self):
         fake = self.runner(self.load())
         self.write({"radar": NEXLINK})
@@ -94,6 +95,7 @@ class RunnerPassesTest(_ConfigFile):
         self.assertEqual(run_pass.call_args.args[0].radar, NEXLINK)
         self.assertEqual(fake.cfg.radar, {})
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_radar_pass_reads_the_current_radar(self):
         fake = self.runner(self.load())
         self.write({"radar": NEXLINK})
@@ -101,6 +103,7 @@ class RunnerPassesTest(_ConfigFile):
             runner.Runner.radar_once(fake, None)
         self.assertEqual(run_pass.call_args.args[0].radar, NEXLINK)
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_unreadable_config_skips_the_fire_pass(self):
         self.write({"radar": NEXLINK})
         fake = self.runner(self.load())

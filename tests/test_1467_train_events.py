@@ -104,8 +104,10 @@ class TrainEventRoutingTest(unittest.TestCase):
                 with self.subTest(fields=repr(fields)[:100]), self.assertRaises(ValueError):
                     train_events.emit(db, **args)
 
-    def test_runner_dispatch_only_schedules_train_without_waking_workers(self):
+    @mock.patch("ameesh.migrations.require_compatible_writer")
+    def test_runner_dispatch_only_schedules_train_without_waking_workers(self, admission):
         runner = Runner.__new__(Runner)
+        runner.db = object()
         runner.train_service = self.service()
         runner.wake_all = mock.Mock()
         with mock.patch.object(storage, "of", side_effect=AssertionError("SQL in dispatch")):
@@ -115,6 +117,7 @@ class TrainEventRoutingTest(unittest.TestCase):
         runner.train_service = None
         runner.dispatch(self.notification())
         runner.wake_all.set.assert_not_called()
+        self.assertEqual(admission.call_args_list, [mock.call(runner.db), mock.call(runner.db)])
 
     def test_listener_subscribes_before_recovery_and_timeouts_never_wake_train(self):
         runner = Runner.__new__(Runner)

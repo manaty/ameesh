@@ -325,6 +325,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('mesh_consumed_nonces', ARRAY[
         'approver', 'approval_id', 'consumed_by', 'consumed_at'
     ]),
+    -- #4975: public schema compatibility inventory, no agent content.
+    ('schema_non_additive_migrations', ARRAY['version', 'name', 'checksum']),
     ('schema_migrations', ARRAY[
         'version', 'name', 'checksum', 'applied_at'
     ]),

@@ -63,6 +63,7 @@ class _FakeWorker:
 
 def _fake_runner(**kwargs):
     base = dict(
+        db=object(),
         restart_for_stale=False,
         _stale_woken=False,
         lock=threading.Lock(),
@@ -75,6 +76,11 @@ def _fake_runner(**kwargs):
 
 class StaleReasonRequestsRestartTest(unittest.TestCase):
     """`canon_sync_once` demande le redémarrage et réveille la boucle."""
+
+    def setUp(self):
+        admission = mock.patch('ameesh.migrations.require_compatible_writer')
+        admission.start()
+        self.addCleanup(admission.stop)
 
     def test_passe_perimee_demande_le_redemarrage(self):
         fake = _fake_runner(cfg=types.SimpleNamespace(canon=object()), host="atelier")
@@ -141,6 +147,11 @@ class StaleRestartIdleTest(unittest.TestCase):
 class NoClaimAfterStaleTest(unittest.TestCase):
     """`sweep` ne réclame plus aucun lot dès que le redémarrage est demandé."""
 
+    def setUp(self):
+        admission = mock.patch('ameesh.migrations.require_compatible_writer')
+        admission.start()
+        self.addCleanup(admission.stop)
+
     def test_sweep_ne_reclame_pas(self):
         fake = _fake_runner(
             restart_for_stale=True,
@@ -184,6 +195,11 @@ class SelectedTurnRefusedTest(unittest.TestCase):
     La consigne déjà prise repart en attente (comme au drainage) et le refus
     n'est pas compté comme un échec de tour (la série d'échecs rapides, L48,
     n'est pas touchée)."""
+
+    def setUp(self):
+        admission = mock.patch('ameesh.migrations.require_compatible_writer')
+        admission.start()
+        self.addCleanup(admission.stop)
 
     def test_run_turn_remet_la_consigne_et_refuse(self):
         runner = types.SimpleNamespace(
