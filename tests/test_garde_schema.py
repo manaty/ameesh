@@ -107,6 +107,18 @@ class SchemaGuardTest(unittest.TestCase):
                     self.admin.execute('DELETE FROM schema_migrations')
         self.assertEqual(self.admin.query('SELECT n FROM guard_writes'), [{'n': 0}])
 
+    def test_footprint_pass_refuses_unknown_schema_before_refresh(self):
+        # #4818 adds a background writer: its pass must obey the same guard.
+        writer = db_mod.connect(self.cfg)
+        self.addCleanup(writer.close)
+        self.mark_unknown()
+        process = SimpleNamespace(db=writer)
+        with mock.patch('ameesh.work_footprints.run_pass') as refresh:
+            runner.Runner.footprint_once(process, writer)
+        refresh.assert_not_called()
+        self.assertIs(process._writer_admission_states['footprint_once'],
+                      migrations.IncompatibleSchema)
+
     def test_additive_ahead_remains_writable_at_start_and_tick(self):
         self.mark_unknown(additive=True)
         for driver in DRIVERS:
