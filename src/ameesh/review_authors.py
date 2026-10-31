@@ -4735,65 +4735,10 @@ REWRITTEN_WINDOW_S = 2 * 3600
 REWRITTEN_SCAN_BUDGET_S = 60.0
 
 
-def _signed_lines(adds, removes) -> set:
-    """Les lignes significatives d'un diff, normalisées et signées (#5066)."""
-    return ({("+", " ".join(line.split())) for line in adds
-             if _meaningful_line(line)}
-            | {("-", " ".join(line.split())) for line in removes
-               if _meaningful_line(line)})
-
-
-def _reissued_in_head(repo: str, commit: str, head: str, freeze: str,
-                      target: str) -> bool:
-    """Le contenu de `commit` a-t-il pu être réémis dans la tête (#5066) ?
-
-    Les commits propres à la tête (ni dans le gel, ni dans la cible), avec la
-    part propre de leurs résolutions de fusion, sont comparés au commit, ligne
-    significative par ligne significative, y compris les lignes retirées : une
-    réécriture qui remplace les mêmes lignes partage ses retraits. Une seule
-    ligne commune suffit, quel que soit le volume alentour (B cx3 : un seuil se
-    dilue). Sans cible, sur un diff illisible ou sans ligne significative, la
-    réponse est oui (canon §2 : en cas de doute, la porte reste fermée). Le prix
-    assumé : deux lots voisins qui partagent une ligne par hasard restent
-    fermés (#5029/#5038 : 5 lignes). Limite : une réécriture d'ajouts purs sans
-    aucune ligne commune ne se détecte pas par le contenu."""
-    if not target:
-        return True
-    try:
-        delta = _text_delta(repo, commit + "^", commit)
-        proc = _read_git(repo, "log", "-p", "--diff-merges=remerge", "--no-color",
-                         "--no-ext-diff", "--no-textconv", "--no-renames",
-                         "--unified=0", "--format=", head, "^" + freeze,
-                         "^" + target, "--")
-    except (UnicodeDecodeError, canon.GitError, canon.GitDeadline,
-            plan_git.MergeProbeError):
-        return True
-    if delta is None or proc.returncode:
-        return True
-    adds, removes, hunk = set(), set(), False
-    for line in proc.stdout.decode("utf-8", "replace").split("\n"):
-        if line.startswith("diff --git "):
-            hunk = False
-        elif line.startswith("@@"):
-            hunk = True
-        elif hunk and line.startswith("+"):
-            adds.add(line[1:])
-        elif hunk and line.startswith("-"):
-            removes.add(line[1:])
-    own = _signed_lines(adds, removes)
-    if not own:
-        return False
-    lines = _signed_lines(*delta)
-    if not lines:
-        return True
-    return bool(lines & own)
-
-
 def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                             repo: str, *, head: str = "", strict: bool = False,
                             fetch: bool = True, recover=None,
-                            unattached: Optional[list] = None,
-                            target: str = "") -> dict[str, dict]:
+                            unattached: Optional[list] = None) -> dict[str, dict]:
     """Les correctifs de relecteur **retirés** après leur gel (#4457).
 
     Un relecteur désigné corrige lui-même au premier tour (canon §2) : son
@@ -4811,9 +4756,10 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     rendu par un relecteur sur sa tête, on lit les commits que ce relecteur a
     créés après le gel. Un commit qui descend de la tête gelée et qui n'est
     plus ancêtre de la tête lue est le correctif réécrit : son acteur reste
-    exclu par son nom, sans famille. #5066 : sauf si le reçu est rattaché à
-    un autre lot dont une tête contient le commit (un lot empilé sur le gel) et
-    que son contenu n'est pas réémis dans la tête (`_reissued_in_head`).
+    exclu par son nom, sans famille. #5066 : un lot empilé sur le gel en descend
+    aussi, et aucune preuve ne sépare son commit d'un correctif repris (réécrit
+    sans ligne commune, B cx2/cx3) : l'exclusion demeure, `stacked_lot` nomme ce
+    lot pour que la porte dise un doute et non une correction prouvée.
 
     La fenêtre lue est bornée autour du verdict (6 h avant, 2 h après, sans
     dépasser le gel courant) et **exhaustive** : une troncature silencieuse
@@ -4888,17 +4834,14 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         except Exception:  # noqa: BLE001 - lecture impossible : pas de lot
             return None
 
-    def stacked_by_other_lot(receipt, full: str) -> bool:
-        """Le commit est-il le travail d'un autre lot empilé sur ce gel (#5066) ?
+    def stacked_lot(receipt, full: str) -> int:
+        """L'autre lot dont une tête contient le commit, ou 0 (#5066).
 
-        Il faut deux preuves : le reçu rattaché à un autre lot, et le commit
-        contenu dans une tête de cet autre lot (sa tête de branche
-        enregistrée ou l'un de ses gels). Un reçu sans lot, une tête
-        illisible ou un objet absent ne prouvent rien, et l'acteur reste
-        exclu (canon §2 : en cas de doute, la porte reste fermée)."""
+        Une simple trace : elle ne retire jamais l'exclusion. Un reçu sans lot,
+        une tête illisible ou absente ne nomment aucun lot."""
         related = receipt_lot(receipt)
         if related is None or related == lot:
-            return False
+            return 0
         try:
             other = storage.of(db).work.get(int(related)) or {}
             heads = [str(other.get("branch_head") or "").strip()]
@@ -4906,10 +4849,11 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                          for row in storage.of(db).work.milestones(
                              int(related), None) or ()
                          if row.get("kind") == "frozen")
-        except Exception:  # noqa: BLE001 - autre lot illisible : aucune preuve
-            return False
-        return any(value and _is_ancestor(repo, full, value) is True
-                   for value in heads)
+        except Exception:  # noqa: BLE001 - autre lot illisible : aucune trace
+            return 0
+        return int(related) if any(
+            value and _is_ancestor(repo, full, value) is True
+            for value in heads) else 0
 
     check()
     try:
@@ -4964,6 +4908,9 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     #: grand livre, ou plusieurs lots) : il ne prouve rien sur cette tête.
     #: On le dit au gel (`unattached`) sans exclure son acteur.
     ignored: dict[tuple[str, str], dict] = {}
+    #: #5066 : acteur -> commit contenu dans un lot empilé sur le gel. Il exclut
+    #: comme un correctif, mais un correctif de ce lot garde la trace la plus forte.
+    stacked: dict[str, dict] = {}
 
     def finish(result: dict) -> dict:
         """Ajoute la trace des reçus sans lot au retour (#4679 B/P2)."""
@@ -4989,7 +4936,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                         "the provenance of prior reviewer corrections cannot be read"
                         " (%s)" % exc) from exc
                 check()
-                for name, row in doubt.items():
+                for name, row in (*doubt.items(), *stacked.items()):
                     out.setdefault(name, row)
                 return finish(out)
             # #4457 (gel #25249) : une seule sonde `cat-file --batch-check`
@@ -5067,16 +5014,13 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     continue                # encore dans la tête : lu par la plage
                 if _is_ancestor(repo, freeze_sha, full) is not True:
                     continue
-                # #5066 : la descendance du gel ne prouve pas une correction
-                # de ce lot. Un lot empilé sur ce gel (#5038 sur le gel
-                # fe75128d3 de #5029) en descend aussi. Le reçu n'est écarté
-                # que sur trois preuves : il est rattaché à un autre lot, le
-                # commit est contenu dans une tête de cet autre lot, et son
-                # contenu n'est pas réémis ici (B cx2, contre-examen #173774).
                 check()
-                if (stacked_by_other_lot(receipt, full)
-                        and not _reissued_in_head(repo, full, head_sha,
-                                                  freeze_sha, target)):
+                other_lot = stacked_lot(receipt, full)
+                if other_lot:
+                    stacked.setdefault(key, {
+                        "name": actor, "family": "", "families": [],
+                        "rewritten": full, "freeze": freeze_id,
+                        "stacked_lot": other_lot})
                     continue
                 # Un seul nom par acteur ; la première tête gelée qui porte
                 # le correctif suffit à la trace.
@@ -5090,7 +5034,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     check()
     # Une preuve topologique, quand elle existe, garde la trace la plus forte ;
     # le doute ne complète que les acteurs sans preuve.
-    for name, row in doubt.items():
+    for name, row in (*doubt.items(), *stacked.items()):
         out.setdefault(name, row)
     return finish(out)
 
@@ -5511,8 +5455,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     for row in _rewritten_after_freeze(
             db, item, milestone, repo, head=head, strict=strict,
             fetch=fetch, recover=recover,
-            unattached=(unattached if doubts_out is not None else None),
-            target=target_sha).values():
+            unattached=(unattached if doubts_out is not None else None)).values():
         key = str(row.get("name") or "").strip().lower()
         if not key or key in corrector_rows:
             continue
@@ -5520,6 +5463,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                                "proven": set(), "test_only": False,
                                "rewritten": str(row.get("rewritten") or ""),
                                "unresolved": str(row.get("unresolved") or ""),
+                               "stacked_lot": int(row.get("stacked_lot") or 0),
                                "freeze": int(row.get("freeze") or 0)}
     if doubts_out is not None:
         # #4679 B/P2 : reçus introuvables sans lot, à dire au gel — jamais des
@@ -5532,6 +5476,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             entry["test_only"] = True
         if row.get("rewritten"):
             entry["rewritten"] = row["rewritten"]
+            if row.get("stacked_lot"):
+                entry["stacked_lot"] = int(row["stacked_lot"])
             if row.get("freeze"):
                 entry["freeze"] = int(row["freeze"])
         if row.get("unresolved"):
