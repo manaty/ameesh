@@ -2163,7 +2163,7 @@ def _profile_audit(cfg: Config):
 
 def _print_profile_audit(audit) -> bool:
     """Imprime les lignes `profiles` ; vrai si l'audit est en défaut."""
-    if audit.profiles or audit.errors or audit.divergences:
+    if audit.profiles or audit.errors or audit.divergences or audit.warnings:
         for line in audit.lines():
             print(line)
     if audit.ok:

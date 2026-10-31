@@ -886,6 +886,9 @@ class ProfileAudit:
     profiles: tuple[str, ...] = ()
     divergences: tuple[ProfileDivergence, ...] = ()
     errors: tuple[str, ...] = ()
+    # #5152: radar overrides are intentional, but lost host keys deserve a
+    # warning. They do not change the shared-key deployment gate.
+    warnings: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -893,6 +896,7 @@ class ProfileAudit:
 
     def lines(self) -> list[str]:
         out = ["profiles   : ERROR %s" % error for error in self.errors]
+        out.extend("profiles   : WARNING %s" % warning for warning in self.warnings)
         for divergence in self.divergences:
             out.append("profiles   : DIVERGENCE %s: %s (profile %s, config.json %s)"
                        % (os.path.basename(divergence.profile), divergence.path,
@@ -940,6 +944,7 @@ def audit_profiles(extra=(), directory: str | None = None,
     seen: set[str] = set()
     profiles: list[str] = []
     divergences: list[ProfileDivergence] = []
+    warnings: list[str] = []
     for path in candidates:
         ident = os.path.abspath(path)
         if ident in seen:
@@ -958,6 +963,16 @@ def audit_profiles(extra=(), directory: str | None = None,
             continue
         profiles.append(path)
         merged = _merge_config(base_raw, raw)
+        # #5152: radar replaces the host object as a whole (#1466/#3345).
+        # Report omissions without inheriting them or exposing their values:
+        # even an empty required_checks declaration differs from absence.
+        if "radar" in raw:
+            for key_path, value, _base_value in _config_diff(
+                    base_raw.get("radar", _MISSING),
+                    merged.get("radar", _MISSING), "radar"):
+                if value is _MISSING:
+                    warnings.append("%s: %s absent from radar override (declared in %s)"
+                                    % (os.path.basename(path), key_path, host))
         for key in SHARED_CONFIG_KEYS:
             if key not in base_raw and key not in merged:
                 continue
@@ -966,7 +981,8 @@ def audit_profiles(extra=(), directory: str | None = None,
                 divergences.append(ProfileDivergence(
                     profile=path, key=key, path=chemin, value=value, base=base_value))
     return ProfileAudit(directory=directory, host=host, profiles=tuple(profiles),
-                        divergences=tuple(divergences), errors=tuple(errors))
+                        divergences=tuple(divergences), errors=tuple(errors),
+                        warnings=tuple(warnings))
 
 
 def load(env: dict | None = None) -> Config:
