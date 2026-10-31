@@ -1194,6 +1194,9 @@ def cmd_ci(cfg: Config, args: argparse.Namespace) -> int:
 
 def cmd_release(cfg: Config, args: argparse.Namespace) -> int:
     """`ameesh release open|check|reason` (L750/L756) : voir `ameesh.release`."""
+    from .platform.child_environment import managed_entry
+    if not managed_entry():
+        return 1
     return release.run(cfg, args)
 
 

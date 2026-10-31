@@ -1167,6 +1167,14 @@ class ProjectRelease:
             suite_tolerated=tolerated, model=model)
 
 
+def child_credentials(project) -> frozenset[str]:
+    """Credentials needed by the selected release model's guarded child."""
+    if getattr(project, "model", "semver") == "nexlink":
+        from . import nexlink_release
+        return nexlink_release.CHILD_CREDENTIALS
+    return frozenset()
+
+
 def projects(cfg) -> dict[str, ProjectRelease]:
     block = getattr(cfg, "release", None) or {}
     if not isinstance(block, dict):
@@ -2276,7 +2284,8 @@ def _staging_env(timeout_s: float) -> dict:
     after a proved stop (docs/DEPLOIEMENT-HOTE-AGENTS.md)."""
     env = dict(os.environ, STAGING_TIMEOUT_S=str(timeout_s))
     env.pop("STAGING_RUN_ID", None)
-    return env
+    from .platform.child_environment import execution_transport
+    return execution_transport(env)
 
 
 def run_staging(project: ProjectRelease, release_sha: str, included: list[int],

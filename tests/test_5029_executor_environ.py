@@ -108,36 +108,23 @@ class UndumpableWitnessTest(unittest.TestCase):
             "time.sleep(30)\n")
         start = platform.start_time(proc.pid)
         self.assertIsNotNone(start)
-        # The interpreter's name is the host's: a venv runs `.../bin/python`
-        # (comm "python"), the system one `python3`. `allow` matches `comm` and
-        # one of the first argv entries, so take the real names from the live
-        # process instead of naming one host's binary (#5029, CI red on the
-        # head).
-        with open("/proc/%d/comm" % proc.pid, encoding="utf-8") as fh:
-            comm = fh.read().strip()
-        with open("/proc/%d/cmdline" % proc.pid, "rb") as fh:
-            argv0 = os.path.basename(
-                fh.read().split(b"\0", 1)[0].decode("utf-8", "replace"))
-        allow = tuple(dict.fromkeys(n for n in (comm, argv0) if n))
-        self.assertTrue(allow, "the helper has no readable process name")
         table = [{"pid": proc.pid, "start": start, "zombie": False}]
         with mock.patch.object(platform.process, "_psutil", return_value=None), \
                 mock.patch.object(platform.process, "process_table", return_value=table):
             without = platform.env_values("AMEESH_TEST_SECRET")
-            allowed = platform.env_values("AMEESH_TEST_SECRET", allow=allow)
+            # #5038: a manager-proven PID, not the interpreter's borrowed name.
+            group = platform.self_cgroup_paths()[0]
+            identity = platform.process._executor_identity(proc.pid, group)
+            self.assertIsNotNone(identity)
+            with mock.patch.object(platform.process, "executor_processes",
+                                   return_value={proc.pid: identity}):
+                allowed = platform.env_values("AMEESH_TEST_SECRET")
         self.assertIn(start, without["unread"])
         self.assertNotIn(start, allowed["unread"])
 
     @unittest.skipUnless(platform.is_linux(), "the /proc credential check is Linux-only")
-    def test_a_shebang_executor_is_excused_by_its_bare_name(self):
-        """The production executor is a script: comm=ameesh, argv[0]=python.
-
-        It is launched by the shebang of the venv console script, so `argv[0]`
-        is the interpreter and the script announces itself in `argv[1]`.
-        Naming only `EXECUTOR_NAMES` must excuse it (#5029, B/P1 ameesh-dev7):
-        otherwise `adopt`/`resume`, the orphan scan and every housekeeping
-        doubt keep failing on a live executor.
-        """
+    def test_a_shebang_name_is_not_automatically_excused(self):
+        """A borrowed console-script name grants no automatic exemption."""
         workdir = tempfile.mkdtemp(prefix="l5029-", dir=os.environ.get("TMPDIR"))
         self.addCleanup(shutil.rmtree, workdir, True)
         script = os.path.join(workdir, "ameesh")
@@ -162,14 +149,13 @@ class UndumpableWitnessTest(unittest.TestCase):
             if time.monotonic() > deadline:
                 self.fail("shebang helper did not become undumpable in time")
             time.sleep(0.02)
-        self.assertTrue(platform.process._allowed_proc(proc.pid, platform.EXECUTOR_NAMES))
+        self.assertTrue(platform.process._allowed_proc(proc.pid, ("ameesh",)))
         start = platform.start_time(proc.pid)
         table = [{"pid": proc.pid, "start": start, "zombie": False}]
         with mock.patch.object(platform.process, "_psutil", return_value=None), \
                 mock.patch.object(platform.process, "process_table", return_value=table):
-            scan = platform.env_values("AMEESH_TEST_SECRET",
-                                       allow=platform.EXECUTOR_NAMES)
-        self.assertNotIn(start, scan["unread"])
+            scan = platform.env_values("AMEESH_TEST_SECRET")
+        self.assertIn(start, scan["unread"])
         self.assertEqual(scan["values"], {})
 
 
@@ -193,6 +179,10 @@ class BecomeUndumpableTest(unittest.TestCase):
 
 class ExecutorStartupTest(unittest.TestCase):
     """`runner.main` hardens the executor before it can run a turn."""
+
+    def setUp(self):
+        original = subprocess.Popen.__init__
+        self.addCleanup(setattr, subprocess.Popen, "__init__", original)
 
     def test_main_calls_the_hardening_before_loading_anything(self):
         called = []
@@ -242,21 +232,16 @@ class HolderChecksTest(unittest.TestCase):
     def test_session_holder_check_allows_the_executor(self):
         with mock.patch.object(platform, "holders", return_value=[]) as holders:
             reprise.holders("/tmp/session", "id")
-        self.assertEqual(holders.call_args.kwargs.get("allow"), platform.EXECUTOR_NAMES)
+        self.assertFalse(holders.call_args.kwargs.get("allow"))
 
     def test_dependency_holder_check_carries_the_host_allow(self):
         # #5046 : `_holders` reçoit désormais l'allow explicite de l'hôte
         # (`housekeeping.unreadable_allow`, qui inclut l'exécuteur) ; il ne le
         # fixe plus lui-même.
         with mock.patch.object(platform, "holders", return_value=[]) as holders:
-            deps._holders("/tmp/cache-entry", allow=platform.EXECUTOR_NAMES)
-        self.assertEqual(holders.call_args.kwargs.get("allow"), platform.EXECUTOR_NAMES)
+            deps._holders("/tmp/cache-entry", allow=("gpg-agent",))
+        self.assertEqual(holders.call_args.kwargs.get("allow"), ("gpg-agent",))
 
-    def test_housekeeping_allow_list_includes_the_executor(self):
-        from ameesh import housekeeping
-        allowed = housekeeping.unreadable_allow(
-            housekeeping.Policy(unreadable_ok=("gpg-agent",)))
-        self.assertEqual(allowed, ("gpg-agent",) + platform.EXECUTOR_NAMES)
 
 
 if __name__ == "__main__":

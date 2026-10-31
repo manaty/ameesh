@@ -459,7 +459,7 @@ def _elected_tick(cfg, args):
     # Validate the independent staging route before acquiring an execution
     # lease: synchronous staging may restart the runner that owns this role.
     from . import release_cutoff
-    release_cutoff.projects(cfg)
+    projects = release_cutoff.projects(cfg)
     from . import role_run, pilot_gesture
     wrapped_role = (os.environ.get(role_run.ENV_ROLE) or "").strip()
     if wrapped_role and os.environ.get(role_run.ENV_PASS) == "release":
@@ -489,9 +489,13 @@ def _elected_tick(cfg, args):
     for name in ("force", "no_staging", "json", "dry_run", "apply"):
         if getattr(args, name, False):
             command.append("--" + name.replace("_", "-"))
+    selected = getattr(args, "project", None)
+    credentials = frozenset().union(*(
+        release_cutoff.child_credentials(project)
+        for name, project in projects.items() if selected is None or name == selected))
     return role_run.run(cfg, argparse.Namespace(
         role=role, pass_name="release", command=command,
-        min_left=0, dry_run=False, json=False))
+        min_left=0, dry_run=False, json=False), credentials=credentials)
 
 
 def run(cfg, args) -> int:
