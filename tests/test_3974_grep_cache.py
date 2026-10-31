@@ -10,6 +10,12 @@ l'étape, même quand une couche intermédiaire l'a lue comme un doute.
 #4482 : les entrées sont compressées et relues sans JSON, la seconde lecture
 d'un même processus ne décode plus rien (`stats`), l'élagage n'est plus payé
 par chaque petite écriture, et les bornes de nombre/octets restent tenues.
+
+#4964 : une entrée au-delà de `MAX_ENTRY_BYTES` n'est pas publiée mais reste
+mémoïsée dans le processus : une demande de plus de `TREE_LINES_WHOLE_MAX`
+lignes ne relit pas l'arbre à chaque appel, et l'appelant qui attendait le
+verrou la retrouve. Une ligne décodée avec U+FFFD repasse par la lecture
+complète et garde son auteur.
 """
 from __future__ import annotations
 
@@ -379,13 +385,16 @@ class GrepCacheTest(unittest.TestCase):
             self.assertLessEqual(sum(os.path.getsize(p) for p in paths
                                      if os.path.exists(p)), 1500)
 
-    def test_an_entry_over_max_entry_bytes_is_not_published(self):
-        # #4913 : une entrée trop grosse ne prend pas la place des lectures
-        # utiles ; la valeur reste rendue à l'appelant, qui recalculera.
+    def test_an_entry_over_max_entry_bytes_is_not_published_but_memoized(self):
+        # #4913/#4964 : une entrée trop grosse ne prend pas la place des
+        # lectures utiles ; la valeur reste rendue à l'appelant et le processus
+        # la garde en mémoire, sans la publier.
         name = grep_cache.key("cap", "m", [])
+        value = [os.urandom(600).hex()]
         with mock.patch.object(grep_cache, "MAX_ENTRY_BYTES", 128):
-            grep_cache._write(name, [os.urandom(600).hex()])
-        self.assertFalse(grep_cache._read(name)[0])
+            grep_cache._write(name, value)
+        self.assertFalse(os.path.exists(grep_cache._path(name)))
+        self.assertEqual(grep_cache._read(name), (True, value))
         self.assertEqual(grep_cache.stats()["oversized"], 1)
         calls = []
         big = [os.urandom(600).hex()]
@@ -395,7 +404,79 @@ class GrepCacheTest(unittest.TestCase):
             second = grep_cache.cached(self.repo, self.first, "cap-cached",
                                        ["x"], lambda: calls.append(1) or big)
         self.assertEqual((first, second), (big, big))
-        self.assertEqual(calls, [1, 1])    # non publiée : recalculée
+        self.assertEqual(calls, [1])       # mémoïsée : plus recalculée
+
+    def test_a_large_request_over_the_entry_cap_reads_the_tree_once(self):
+        # #4964 : au-delà de TREE_LINES_WHOLE_MAX, la lecture complète de
+        # l'arbre dépasse MAX_ENTRY_BYTES et n'est pas publiée ; mémoïsée, elle
+        # ne relit pas l'arbre à chaque demande de la même clé.
+        self.write("big.py", "\n".join("ligne %d" % index
+                                       for index in range(3000)) + "\n")
+        tree = self.commit()
+        wanted = ["ligne %d" % index for index in range(0, 3000, 3)]
+        self.assertGreater(len(wanted), review_authors.TREE_LINES_WHOLE_MAX)
+        with mock.patch.object(grep_cache, "MAX_ENTRY_BYTES", 256):
+            first, launched = self.counted(review_authors._tree_lines,
+                                           self.repo, tree, wanted)
+            self.assertEqual(launched, 1)
+            again, launched = self.counted(review_authors._tree_lines,
+                                           self.repo, tree, wanted)
+        self.assertEqual(first, set(wanted))
+        self.assertEqual((again, launched), (first, 0))
+        entries = [name for _root, _dirs, files in os.walk(
+            os.path.join(self.tmp, "cache")) for name in files
+            if name.endswith(".json")]
+        self.assertEqual(entries, [])      # rien de publié
+
+    def test_unpublished_entry_is_not_recomputed_after_the_key_lock(self):
+        # #4964 : deux appelants concurrents de la même clé se sérialisent
+        # derrière `_KeyLock` ; le second retrouve la valeur mémoïsée au lieu
+        # de relire l'arbre.
+        import threading
+        name = grep_cache.key(
+            grep_cache.tree_of(self.repo, self.first), "cap-concurrent", ["x"],
+            grep_cache.attributes_token(self.repo))
+        big = [os.urandom(600).hex()]
+        calls = []
+        started, release = threading.Event(), threading.Event()
+
+        def compute():
+            calls.append(1)
+            started.set()
+            release.wait(10)
+            return big
+
+        results = []
+
+        def caller():
+            results.append(grep_cache.cached(self.repo, self.first,
+                                             "cap-concurrent", ["x"], compute))
+
+        with mock.patch.object(grep_cache, "MAX_ENTRY_BYTES", 128), \
+                mock.patch.object(grep_cache, "LOCK_WAIT_S", 10):
+            first = threading.Thread(target=caller)
+            first.start()
+            self.assertTrue(started.wait(10))
+            second = threading.Thread(target=caller)
+            second.start()
+            import time
+            time.sleep(0.2)                # le second attend le verrou
+            release.set()
+            first.join(10)
+            second.join(10)
+        self.assertEqual(calls, [1])
+        self.assertEqual(results, [big, big])
+        self.assertFalse(os.path.exists(grep_cache._path(name)))
+
+    def test_a_replacement_character_line_keeps_the_author(self):
+        # #4964 : une ligne décodée avec U+FFFD (octets invalides) ne peut pas
+        # être envoyée en motif UTF-8 à `git grep -F` ; la lecture complète la
+        # retrouve, et `_any_line_in_head` ne fait plus tomber l'auteur.
+        with open(os.path.join(self.repo, "latin1.py"), "wb") as handle:
+            handle.write(b"caf\xe9 = 1\n")
+        head = self.commit()
+        self.assertTrue(review_authors._any_line_in_head(
+            self.repo, head, ["caf\ufffd = 1"]))
 
     def test_a_second_read_is_served_from_process_memory(self):
         name = grep_cache.key("memo", "m", [])
@@ -471,6 +552,24 @@ class GrepCacheTest(unittest.TestCase):
                 grep_cache._write(grep_cache.key("memo%d" % index, "m", []),
                                   ["x%d" % index])
         self.assertLessEqual(grep_cache.stats()["memo_entries"], 2)
+
+    def test_the_memo_keeps_two_unpublished_entries(self):
+        # #4964 : l'arbre de fusion (21 Mio) et l'arbre d'un parent (21 Mio)
+        # doivent tenir ensemble, sinon le second évince le premier et l'arbre
+        # de fusion est relu à chaque commit. Une troisième évince la plus
+        # ancienne, pas les deux.
+        grep_cache._reset_process_state()
+        names = [grep_cache.key("memo-big%d" % index, "m", [])
+                 for index in range(3)]
+        values = [[os.urandom(600).hex()] for _ in range(3)]
+        with mock.patch.object(grep_cache, "MAX_ENTRY_BYTES", 128), \
+                mock.patch.object(grep_cache, "MEMO_MAX_BYTES", 1600):
+            for name, value in zip(names, values):
+                grep_cache._write(name, value)
+            self.assertEqual(grep_cache._read(names[1]), (True, values[1]))
+            self.assertEqual(grep_cache._read(names[2]), (True, values[2]))
+        self.assertEqual(grep_cache.stats()["memo_entries"], 2)
+        self.assertEqual(grep_cache._read(names[0]), (False, None))
 
     def test_small_writes_do_not_prune_every_time(self):
         with mock.patch.object(grep_cache, "MAX_BYTES", 10 ** 9), \

@@ -2990,6 +2990,7 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
     flag = "-a" if binary else "-I"
     targeted = (len(wanted) <= TREE_LINES_WHOLE_MAX
                 and all("\n" not in line and "\x00" not in line
+                        and "\ufffd" not in line
                         for line in wanted))
     sweep = active_sweep()
     if sweep is not None:
@@ -3035,8 +3036,11 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
                        proc.stdout.decode("utf-8", "replace").splitlines()
                        if line.strip()})
 
-    # Un motif multiligne ou à NUL ne peut pas passer par `-f -` : la lecture
-    # complète reste alors la seule forme exacte.
+    # Un motif multiligne, à NUL ou portant U+FFFD (une ligne décodée depuis
+    # des octets invalides) ne peut pas passer par `-f -` : le motif part en
+    # UTF-8 sur stdin et ne correspondrait jamais aux octets bruts de l'arbre,
+    # alors que la lecture complète, décodée en `replace`, le retrouve
+    # (#4964 ; sans la garde, `_any_line_in_head` écartait l'auteur).
     if targeted:
         # Le mode et les motifs entrent dans la clé : deux demandes
         # différentes ne se remplacent plus l'une l'autre (#4913).
