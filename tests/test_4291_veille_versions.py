@@ -9,6 +9,8 @@ non-réouverture d'un objet déjà évalué.
 """
 from __future__ import annotations
 
+from .entrypoint import run as isolated_entrypoint
+
 import dataclasses
 import json
 import types
@@ -712,6 +714,9 @@ class VeilleDbTest(PgTestCase):
 
 
     def test_cli_returns_nonzero_on_a_persistent_error(self):
+        import subprocess
+        original_spawn = subprocess.Popen.__init__
+        self.addCleanup(setattr, subprocess.Popen, "__init__", original_spawn)
         cfg = self.cfg
         args = types.SimpleNamespace(veille_command="scan", json=True,
                                      dry_run=False, no_probe=True, harness=None)
@@ -724,7 +729,8 @@ class VeilleDbTest(PgTestCase):
                   "actions": [], "errors": ["boom"]}
         with mock.patch("ameesh.mesh_cli._open", return_value=FakeDb()), \
                 mock.patch("ameesh.veille.scan", return_value=report):
-            self.assertEqual(veille_cli.cmd_veille(cfg, args), 1)
+            self.assertEqual(isolated_entrypoint(veille_cli.cmd_veille, cfg, args), 1)
+        self.assertIs(subprocess.Popen.__init__, original_spawn)
 
 
 class HostcheckTest(unittest.TestCase):
