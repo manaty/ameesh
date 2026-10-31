@@ -58,6 +58,21 @@ module; a declarative module is the one module without types a project may
 select (an installed one, and the always-active `dev`, still may not). A card
 never shadows an installed name.
 
+L103 tranches 3 and 4 (#4397, #4398) make that module executable and document
+it. `ameesh module <name> adopt <lot>` writes the three pin columns under the
+lot lock and one journal line, with no receipt and no migration: the card is
+re-read from the exact pinned git object (`pipeline_at`, through the hardened
+`canon.git_read`), never from a working tree or a branch. `advance`, `hold` and
+`release` go through the native registry, so installed verifiers, optimistic
+versioning and receipts are the same as for a Process admission. A pinned lot
+is no longer movable by `work.move`; later revisions stay on the #4007 transfer
+path. The consumer projection is the pure `process_projection.project_issue`
+fed by the admitted artifact: no `plan_github` call is involved, and the core
+writes no issue. The two shipped examples (`examples/pipelines/acme-work-delivery.md`
+and `support-work-delivery.md`) are data, not code; their end-to-end proof is
+`tests/test_l103_pipeline_examples.py`. The author guide is
+[Write a Pipeline](../../site/docs/guides/write-a-pipeline.md).
+
 The generic lifecycle is requested → in_progress → to_validate → validated →
 delivered. The first three names accept the stored spellings `intake`, `build`
 and `qa`; `validated` remains distinct from delivery. `blocked`, `waiting_human`
@@ -152,6 +167,10 @@ whether a development lot can still be promoted: use `work_lifecycle.phase`
 for that distinction. New core filters select both stages; the old `merged`
 and `promoted` filters continue selecting their individual stages. Public
 GitHub labels and closure text retain their phase-specific wording.
+`work move <id> delivered` keeps its pre-switch meaning: it requests
+**promotion** (`work_lifecycle.phase_name` names that stage), it is not a
+third stage; `--state delivered` (and the API filter) selects both `merged`
+and `promoted`.
 
 Migration 0518 is explicitly non-additive. Stop executors before applying it
 and restart them after commit, as required by the signed decision. Do not

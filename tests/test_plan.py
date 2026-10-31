@@ -1630,14 +1630,22 @@ class ContentMergeTest(_PlanDb):
     def test_un_gel_attend_la_fermeture_en_cours(self):
         """Ordre inverse : tant qu'une transaction tient la ligne du lot (comme
         la fermeture), `work milestone frozen` attend le verrou, puis s'écrit
-        après elle — jamais entre la relecture du gel et la fermeture."""
+        après elle — jamais entre la relecture du gel et la fermeture.
+
+        #4957 : le gel nomme son dépôt, comme le témoin #1104. Sans `repo`, la
+        résolution lisait le cwd — un clone partiel blob:none en CI pouvait
+        lancer un fetch avant la prise du verrou et décaler le témoin."""
         item = self.frozen("ordre", "e" * 40)
+        git(self.repo, "checkout", "-q", "-b", "lot/ordre")
+        gel = self.commit("src/ordre.py", "ordre = 1\n", "commit du gel")
+        git(self.repo, "checkout", "-q", "main")
         writer = db_mod.connect(self.cfg)
         done, errors = [], []
 
         def freeze():
             try:
-                done.append(work.milestone(writer, item["id"], "frozen", sha="f" * 40))
+                done.append(work.milestone(writer, item["id"], "frozen", sha=gel,
+                                           repo=self.repo))
             except Exception as exc:  # noqa: BLE001
                 errors.append(repr(exc))
 
@@ -1653,7 +1661,7 @@ class ContentMergeTest(_PlanDb):
             thread.join(10)
             self.assertFalse(thread.is_alive())
             self.assertEqual(errors, [])
-            self.assertEqual(done[0]["sha"], "f" * 40)
+            self.assertEqual(done[0]["sha"], gel)
             kinds = [m["kind"] for m in reversed(work.milestones(self.db, item["id"]))]
             self.assertLess(kinds.index("merged"), len(kinds) - 1)
             self.assertEqual(kinds[-1], "frozen")

@@ -485,6 +485,7 @@
               "turn.started",
               "turn.ended",
               "turn.stages",
+              "turn.context",
               "agent.updated",
               "agent.moved",
               "cost.recorded",

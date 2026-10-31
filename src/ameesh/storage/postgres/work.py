@@ -69,6 +69,21 @@ _COLUMNS_TEMPLATE = """
 #: (`work.waive_review`) ; un nom d'agent ne commence jamais par `-`.
 REVIEWER_NONE = "-none"
 
+#: #5016 : les seuls champs de la ligne du lot dont la porte des avis dépend
+#: (dépôt, cible, auteurs, véhicule de paquet) et la dispense de re-verdict
+#: (`reviewer`/`reviewers`, lue par `_waiver`). Une note concurrente ne déplace
+#: que `updated_at` et le journal : comparer la ligne entière annulait un
+#: quorum déjà acquis, sans réessai, et laissait le lot en qa.
+_GATE_ITEM_FIELDS = ("id", "app", "type", "assignee", "package_id",
+                     "branch", "branch_target", "pr_ref", "reviewer",
+                     "reviewers")
+
+
+def _gate_item(item) -> dict:
+    """Projection stable de la ligne pour les gardes de validation (#5016)."""
+    item = item or {}
+    return {key: item.get(key) for key in _GATE_ITEM_FIELDS}
+
 
 def has_reviewer(db) -> bool:
     """#705 : `work_items.reviewer` existe-t-elle (migration 0421) ?
@@ -1049,8 +1064,11 @@ class WorkItems(interface.WorkItems):
                 tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                          (int(item_id),))
                 gate = validation_gate
+                # #5016 : les jalons (gel/verdict) et les champs lus par la
+                # porte se comparent ; une note concurrente ne change que
+                # `updated_at` et n'annule plus le quorum.
                 if (WorkItems(tx).milestones(item_id, None) != validation_marks
-                        or WorkItems(tx).get(item_id) != validation_item):
+                        or _gate_item(WorkItems(tx).get(item_id)) != _gate_item(validation_item)):
                     gate = None
                 if not gate or not gate.get("ok"):
                     from ...work import WorkError
@@ -2155,8 +2173,12 @@ class WorkItems(interface.WorkItems):
     def _sync_validation(self, item_id, actor):
         """Compute the gate outside locks, then compare the immutable ledger.
 
-        Any concurrent freeze/verdict invalidates this observation. The next
-        writer reconciles its own snapshot; no stale quorum can promote a lot.
+        Any concurrent freeze/verdict invalidates this observation. #5016: a
+        concurrent note only moves `updated_at`, so the guard compares the
+        milestones and the fields the gate actually reads, never the whole
+        row — a stale note no longer cancels an acquired quorum for good.
+        The next writer reconciles its own snapshot; no stale quorum can
+        promote a lot.
         """
         item = self.get(item_id)
         if item["state"] != "qa" or item.get("workflow_ref"):
@@ -2175,7 +2197,7 @@ class WorkItems(interface.WorkItems):
             tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                      (int(item_id),))
             if (WorkItems(tx).milestones(item_id, None) != marks
-                    or WorkItems(tx).get(item_id) != item):
+                    or _gate_item(WorkItems(tx).get(item_id)) != _gate_item(item)):
                 return
             rows = tx.query("UPDATE work_items SET state = 'validated', updated_at = now()"
                             " WHERE id = %s AND state = 'qa' AND " + _UNPINNED + " RETURNING id",

@@ -57,6 +57,8 @@ REWRITTEN = (
     "operator_pause_events.actor", "persona_sessions.persona", "provider_account_credits.agent",
     "provider_account_credits.prepaid_by", "repository_footprint_policies.updated_by",
     "review_catch_up.actor", "sandbox_turns.agent", "session_bindings.agent",
+    "tranche_reservations.agent", "tranche_reservations.closed_by", "tranche_events.actor",
+    "tranche_limits.admitted_by",
     "session_bindings.created_by", "spend_pending.agent", "standing_reservations.reserved_by",
     "turn_costs.agent", "turn_resources.agent", "visibility_checks.persona",
     "work_item_delegations.delegate", "work_item_delegations.delegated_by",

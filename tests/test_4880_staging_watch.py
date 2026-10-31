@@ -16,6 +16,12 @@ def row(ident=1, run="run-a", state="running", **extra):
     return dict(id=ident, data=data)
 
 
+def request_row(ident, request, *, sha="a" * 40, state="failed", **extra):
+    data = dict(request=request, sha=sha, state=state, notify="pilot")
+    data.update(extra)
+    return dict(id=ident, object="staging-request:mesh", data=data)
+
+
 class WatchTest(unittest.TestCase):
     def test_fixed_deadline_survives_launcher_loss_and_reports_each_host(self):
         rows = [row(), row(2, hosts={
@@ -95,24 +101,91 @@ class WatchTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "truncated"):
                 staging_watch.alerts(None, now=250)
 
-    def test_later_successful_request_on_new_commit_settles_old_failure(self):
-        failed = dict(id=1, object="staging-request:mesh", data=dict(
-            request="old", sha="a" * 40, state="failed", notify="pilot"))
-        completed = dict(id=2, object="staging-request:mesh", data=dict(
-            request="new", sha="b" * 40, state="completed", notify="pilot"))
+    def alerts(self, *, sequence=(), attested=(), requests=(), now=250):
+        newest = {}
+        for item in requests:
+            key = item["object"]
+            if key not in newest or item["id"] > newest[key]["id"]:
+                newest[key] = item
         with mock.patch.object(staging_watch.storage, "of") as factory:
-            factory.return_value.events.latest_type.side_effect = [[], [failed, completed]]
-            self.assertEqual(staging_watch.alerts(None, now=250), [])
+            factory.return_value.events.latest_type.side_effect = [
+                list(sequence), list(attested), list(newest.values())]
+            factory.return_value.events.recent_type.return_value = list(requests)
+            return staging_watch.alerts(None, now=now)
+
+    def test_later_successful_request_on_new_commit_settles_old_failure(self):
+        self.assertEqual(self.alerts(requests=[
+            request_row(2, "new", sha="b" * 40, state="completed"),
+            request_row(1, "old")]), [])
+
+    def test_later_partial_does_not_mask_an_earlier_failure(self):
+        alert, = self.alerts(requests=[
+            request_row(2, "subset", sha="b" * 40, state="partial"),
+            request_row(1, "old")])
+        self.assertTrue(alert["urgent"])
+        self.assertIn("request old", alert["detail"])
+        self.assertIn("ultérieure", alert["detail"])
+        self.assertEqual(alert["reason"], "staging-request:mesh")
+
+    def test_blocked_request_is_kept_behind_a_later_partial(self):
+        alert, = self.alerts(requests=[
+            request_row(2, "subset", sha="b" * 40, state="partial"),
+            request_row(1, "blocked", state="pending",
+                        blocked_reason="candidate deployment access missing")])
+        self.assertIn("candidate deployment access missing", alert["detail"])
+
+    def test_attestation_settles_a_request_whose_publication_failed(self):
+        self.assertEqual(self.alerts(
+            attested=[dict(id=2, data=dict(sha="a" * 40))],
+            requests=[request_row(1, "old")]), [])
+
+    def test_running_snapshot_is_not_interrupted_when_the_commit_is_attested(self):
+        running = row(2, run="run-a", state="running", sha="a" * 40)
+        attested = [dict(id=3, data=dict(sha="a" * 40))]
+        self.assertEqual(staging_watch.findings([running], now=201,
+                                                attested=attested), [])
+        # An attestation older than the snapshot proves nothing about this run.
+        self.assertEqual(len(staging_watch.findings(
+            [running], now=201, attested=[dict(id=1, data=dict(sha="a" * 40))])), 1)
 
     def test_request_is_observable_even_if_launcher_dies_before_first_step(self):
+        alert, = self.alerts(
+            requests=[request_row(1, "request-a", state="pending", deadline=200)],
+            now=201)
+        self.assertTrue(alert["urgent"])
+        self.assertIn("deadline exceeded", alert["detail"])
+
+    def test_a_request_line_is_judged_by_its_newest_snapshot(self):
+        pending = request_row(1, "same-request", state="pending", deadline=300)
+        running = request_row(2, "same-request", state="running", deadline=7200)
+        # The initial pending line expires at 300 s, the running one at the
+        # deployment timeout: the same request must not alert at 1000 s.
+        self.assertEqual(self.alerts(requests=[running, pending], now=1000), [])
+        late = request_row(2, "same-request", state="running", deadline=900)
+        alert, = self.alerts(requests=[late, pending], now=1000)
+        self.assertIn("deadline exceeded", alert["detail"])
+        # A partial terminal snapshot supersedes the late running one.
+        partial = request_row(3, "same-request", state="partial", deadline=900)
+        self.assertEqual(self.alerts(requests=[partial, late, pending], now=1000), [])
+
+    def test_busy_key_escalates_history_instead_of_blinding_alerts(self):
+        completed = request_row(204, "new", sha="b" * 40, state="completed")
+        old = [request_row(i, "old-%d" % i, sha="c" * 40, state="partial")
+               for i in range(1, 204)]
+        rows = [completed] + old
+        calls = []
+
+        def recent(kind, days, limit, object=None):
+            calls.append(limit)
+            return rows[:limit]
+
         with mock.patch.object(staging_watch.storage, "of") as factory:
-            request = dict(object="staging-request:mesh", data=dict(
-                request="request-a", sha="a" * 40, state="pending",
-                deadline=200, notify="pilot"))
-            factory.return_value.events.latest_type.side_effect = [[], [request]]
-            alert, = staging_watch.alerts(None, now=201)
-            self.assertTrue(alert["urgent"])
-            self.assertIn("deadline exceeded", alert["detail"])
+            factory.return_value.events.latest_type.side_effect = [
+                [], [], [completed]]
+            factory.return_value.events.recent_type.side_effect = recent
+            self.assertEqual(staging_watch.alerts(None, now=250), [])
+        self.assertEqual(calls, [staging_watch.HISTORY_LIMIT,
+                                 staging_watch.HISTORY_LIMIT * 2])
 
 
 class KilledSequenceTest(unittest.TestCase):

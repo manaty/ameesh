@@ -52,6 +52,17 @@ class ConfiguredTest(unittest.TestCase):
         self.assertEqual(mechanics.configured(object()).families,
                          ("claude", "codex", "deepseek"))
 
+    def test_repeated_policy_reads_never_request_a_fetch(self):
+        repo = _Repo(self.tmp)
+        applied = _canon(repo.root, repo.git("rev-parse", "HEAD"))
+        def load(cfg, *, fetch=False):
+            self.assertFalse(fetch)
+            return [applied]
+        with mock.patch.object(canon, "load_configured", side_effect=load) as read:
+            first = mechanics.configured(object())
+            self.assertIs(mechanics.configured(object()), first)
+            self.assertEqual(read.call_count, 2)
+
     def test_a_new_canon_commit_changes_the_cap(self):
         repo = _Repo(self.tmp)
         first = repo.git("rev-parse", "HEAD")

@@ -1147,7 +1147,8 @@ def _print_host_menage(menage: dict) -> None:
         arch = m.get("worktree_archives") or {}
         print("  cleanup    temporary directories %s (quota %s per agent); caches %s / %s"
               "%s%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
-                        _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
+                        ("at least " if m.get("cache_partial") else "")
+                        + _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
                         "; %d /tmp entries reported (%s)" % (
                             m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
                         if m.get("orphans") else "",
@@ -2342,11 +2343,17 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print(('no %s') % v.plural)
                 return 0
             now = time.time()
-            print("%-5s %-10s %-14s %-12s %-10s %-12s %-12s %s" % (
-                "ID", "TYPE", "STATE", "ASSIGNEE", "UPDATED", "DELAY", "EPIC", "TITLE"))
+            # #4621 : la phase de livraison (`legacy_state`) distingue un lot
+            # fusionné d'un lot promu, tous deux `state=delivered` depuis
+            # 0518. Colonne vide quand la phase est le core lui-même.
+            print("%-5s %-10s %-14s %-9s %-12s %-10s %-12s %-12s %s" % (
+                "ID", "TYPE", "STATE", "PHASE", "ASSIGNEE", "UPDATED", "DELAY", "EPIC", "TITLE"))
             for row in rows:
-                print("%-5d %-10s %-14s %-12s %-10s %-12s %-12s %s" % (
-                    row["id"], row["type"], row["state"], (row.get("assignee") or "—")[:12],
+                phase = work_lifecycle.phase(row)
+                print("%-5d %-10s %-14s %-9s %-12s %-10s %-12s %-12s %s" % (
+                    row["id"], row["type"], row["state"],
+                    phase if phase != row["state"] else "—",
+                    (row.get("assignee") or "—")[:12],
                     _fmt_age(now - float(row.get("updated_ts") or 0)),
                     _delays_cell(row.get("delays"), now), (row.get("epic") or "—")[:12],
                     row["title"][:60]))
@@ -2382,6 +2389,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             print("type     : %-10s state: %-14s lifecycle: %-14s assignee: %s" % (
                 item["type"], item["state"], item["lifecycle"],
                 item.get("assignee") or "—"))
+            # #4621 : `state` est le core `delivered` ; `phase` porte la
+            # compatibilité (`merged`/`promoted`) que `legacy_state` conserve.
+            phase = work_lifecycle.phase(item)
+            if phase != item["state"]:
+                print("phase    : %s (delivery stage)" % phase)
             if item.get("external_executor"):
                 print("executor : %s (external, reserved; not assignable)" % (
                     item["external_executor"]))
@@ -2591,6 +2603,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # #2478 : la désignation est écrite ; un courrier non remis est dit.
             if item.get("reviewer_request_warning"):
                 print("warning: %s" % item["reviewer_request_warning"], file=sys.stderr)
+            # #5006 : un move par un agent qui n'est plus l'assigné
+            if item.get("assignee_warning"):
+                print("warning: %s" % item["assignee_warning"], file=sys.stderr)
             return 0
         if args.work_command == "reviewer":
             # #2076 : ajouter ou retirer un relecteur d'un lot DÉJÀ en qa,
@@ -2980,7 +2995,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # sans en faire un refus.
                 for line in str(row.get("note") or "").splitlines():
                     if line.startswith((work.FREEZE_UNPUBLISHED_MARK,
-                                        work.FREEZE_UNVERIFIED_MARK)):
+                                        work.FREEZE_UNVERIFIED_MARK,
+                                        work.NON_ASSIGNEE_MARK)):
                         print("warning: %s" % line, file=sys.stderr)
                 # #2442 : un réalignement mécanique sur la cible garde les
                 # verdicts de la tête relue ; sinon l'exécuteur retente.
@@ -4668,7 +4684,7 @@ def cmd_cost(cfg: Config, args) -> int:
         else:
             print(cost_mod.format_report(rows))
             # L95 : dépense réelle (soldes) face à l'estimation, sur 24 h
-            for entry in _real_spend_24h(db):
+            for entry in _real_spend_24h(db, cfg=cfg):
                 print(balance_mod.describe(entry))
             print()
             print(budget_mod.summary_line(limites))
@@ -4684,7 +4700,7 @@ def cmd_cost(cfg: Config, args) -> int:
         db.close()
 
 
-def _real_spend_24h(db) -> list:
+def _real_spend_24h(db, *, cfg=None) -> list:
     """L95 : dépense réelle des fournisseurs payés au token sur 24 h, face à
     l'estimation du grand livre ; vide si rien n'est lisible."""
     try:
@@ -4693,7 +4709,7 @@ def _real_spend_24h(db) -> list:
         return []
     now = time.time()
     return [dict(entry, period="24h")
-            for entry in balance_mod.compare(db, paid, now - 86400.0, now)]
+            for entry in balance_mod.compare(db, paid, now - 86400.0, now, cfg=cfg)]
 
 
 def _cost_report_reads(cfg: Config, db) -> None:
@@ -4716,7 +4732,7 @@ def _cost_report_reads(cfg: Config, db) -> None:
                                    for g in ligne["gauges"] if g.get("cap") is not None}
                 for ligne in comptes if ligne["active"]}
     book.report(accounts=actifs, multipliers=rythmes, caps=plafonds)
-    _real_spend_24h(db)
+    _real_spend_24h(db, cfg=cfg)
 
 
 def _config_origin(cfg: Config) -> dict:
@@ -4987,7 +5003,7 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
             except balance_mod.BalanceError as exc:
                 errors.append("%s: %s" % (nom, exc))
     rows = ops.balances(provider=args.provider, since_s=_since_seconds(args.since))
-    report = dict(balance_mod.spend(rows), schema="ameesh-balance/1", errors=errors)
+    report = dict(balance_mod.spend(rows, cfg=cfg), schema="ameesh-balance/1", errors=errors)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:

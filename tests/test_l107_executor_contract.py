@@ -122,7 +122,7 @@ class TableTest(unittest.TestCase):
                          ["agents.resolve_name", "mailbox.deliver", "mailbox.release", "mailbox.reserve",
                           "mailbox.unread", "mailbox.unread_human",
                           "mailbox.unread_human_page", "threads.index", "threads.recount"])
-        self.assertEqual(self.c.version, "1.9.0")
+        self.assertEqual(self.c.version, "1.10.0")
         self.assertEqual([o.name for o in ops if o.transport == "events"], ["wakeups.subscribe"])
         self.assertEqual(self.c.prefix, C.PREFIX)
 

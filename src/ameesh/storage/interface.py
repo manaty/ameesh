@@ -582,8 +582,13 @@ class Leases(Domain):
     @abc.abstractmethod
     def end_turn(self, name: str, owner: str, epoch: int, *, status: str,
                  status_text: str | None, error: str | None,
-                 cost_usd: float | None) -> bool:
-        """Clôt un tour seulement si le bail est encore détenu."""
+                 cost_usd: float | None, turn_id: str | None = None) -> bool:
+        """Clôt un tour seulement si le bail est encore détenu.
+
+        ``turn_id`` est l'identité du tour local fermé : elle fend la clôture
+        générique d'un tour sandbox (#4881). Absente, seul un tour sandbox
+        vivant sur le même bail refuse.
+        """
 
 
 class Catalog(Domain):
@@ -768,6 +773,18 @@ class TurnCosts(Domain):
         définition du compteur vivant de l'exécuteur (#4448 B), et non les
         seuls succès. C'est la même mesure que ce compteur, relue pour
         l'alerte `session_too_big`."""
+
+    @abc.abstractmethod
+    def session_reread(self, agent: str, session: str) -> dict | None:
+        """CTX-02b : le cumul des entrées relues des tours d'une session —
+        `tokens` (entrée + cache **lu**, cache écrit exclu ; Codex compte déjà
+        le cache dans son entrée), `turns` (tous les tours inscrits),
+        `last_ts` (instant du dernier tour inscrit, epoch ; pour vérifier
+        qu'aucun tour n'a été écrit depuis une qualité publiée) ; ou None si
+        aucun tour. Lecture seule, base de `R_session` pour la publication
+        `ameesh-context/1` : elle ne change aucune décision ni la ligne du
+        grand livre. Plusieurs harnais dans une session (anomalie) : chaque
+        ligne suit sa propre convention de cache."""
 
     @abc.abstractmethod
     def first_after(self, agent: str, ts: float) -> dict | None:
@@ -3943,6 +3960,18 @@ class Decisions(Domain):
     def get(self, decision_id: int) -> dict | None:
         """La demande `decision_id` (en attente ou close), ou None."""
 
+    def supersession(self, decision_id: int) -> dict | None:
+        """#4995: l'événement de remplacement signé qui a remplacé
+        `decision_id` (`supersedes`, `superseded_by`, `person`,
+        `occurred_at`, `proof`), ou None.
+
+        Journal append-only : la lecture d'autorité (`decisions.require_current`)
+        revérifie la réponse signée de la remplaçante au lieu de croire le
+        marqueur `payload.decision.superseded_by`. Pas une opération du contrat
+        médié (les décisions sont réservées au serveur du mesh) : un pilote qui
+        ne l'implémente pas lève NotImplementedError."""
+        raise NotImplementedError
+
     def repair_forward(self, decision_id: int, *, actor: str) -> dict:
         """Restore a human decision accidentally forwarded by mail. Atomically
         lock the original and its copy and restore the unchanged original to
@@ -3970,7 +3999,12 @@ class Decisions(Domain):
         """Clôt la demande si elle est encore en attente : `status`
         (`answered` | `delivered`), `record` fusionné dans `payload.decision`
         (état, réponse ou retrait). Rend la ligne close, ou None (déjà close,
-        inconnue) — rien n'est écrit."""
+        inconnue) — rien n'est écrit. A request carrying `supersedes` closes
+        only with a valid signed answer. Selecting its signed
+        `supersedes_option` atomically marks the earlier answered authority
+        `superseded_by`, with append-only audit events on both decisions;
+        another option or free text leaves that authority unchanged.
+        Existing answers are never rewritten."""
 
     def validation_register(self, decision_id: int, *, routing: dict):
         """#4256: immutable authority snapshot, outside the mediated contract."""

@@ -140,25 +140,29 @@ class Budgets(interface.Budgets):
         the envelope before this reservation (None: reserved, no cap).
         """
         with self.db.transaction() as tx:
-            tx.query("select pg_advisory_xact_lock(hashtext(%s))",
-                     ("ameesh-account-budget:%s" % account,))
-            at = tx.query("select clock_timestamp()::text as at")[0]["at"]
-            tx.execute("update account_reservations set state = 'kept', closed_at = %s,"
-                       " closed_by = 'unsettled turn' where agent = %s and state = 'open'",
-                       (at, agent))
-            rows = tx.query(self._USAGE.format(where=" where billing_account = %s"),
-                            (at, account))
-            usage = rows[0] if rows else None
-            if usage is not None:
-                used = usage["settled"] + usage["reserved"] + usage["kept"]
-                if used + float(usd) > usage["usd"] + 1e-9:
-                    return {"ok": False, "id": None, "usage": usage}
-            got = tx.query(
-                "insert into account_reservations (billing_account, agent, usd, period,"
-                " spend_key, created_at) values (%s, %s, %s, (%s::timestamptz at time zone"
-                " coalesce((select tz from account_budgets where billing_account = %s),"
-                " 'Europe/Paris'))::date, %s, %s) returning id",
-                (account, agent, float(usd), at, account, spend_key, at))
+            return self.account_reserve_tx(tx, account, agent, usd, spend_key)
+
+    def account_reserve_tx(self, tx, account, agent, usd, spend_key) -> dict:
+        """Internal: caller owns transaction, after the tranche row lock."""
+        tx.query("select pg_advisory_xact_lock(hashtext(%s))",
+                 ("ameesh-account-budget:%s" % account,))
+        at = tx.query("select clock_timestamp()::text as at")[0]["at"]
+        tx.execute("update account_reservations set state = 'kept', closed_at = %s,"
+                   " closed_by = 'unsettled turn' where agent = %s and state = 'open'",
+                   (at, agent))
+        rows = tx.query(self._USAGE.format(where=" where billing_account = %s"),
+                        (at, account))
+        usage = rows[0] if rows else None
+        if usage is not None:
+            used = usage["settled"] + usage["reserved"] + usage["kept"]
+            if used + float(usd) > usage["usd"] + 1e-9:
+                return {"ok": False, "id": None, "usage": usage}
+        got = tx.query(
+            "insert into account_reservations (billing_account, agent, usd, period,"
+            " spend_key, created_at) values (%s, %s, %s, (%s::timestamptz at time zone"
+            " coalesce((select tz from account_budgets where billing_account = %s),"
+            " 'Europe/Paris'))::date, %s, %s) returning id",
+            (account, agent, float(usd), at, account, spend_key, at))
         return {"ok": True, "id": int(got[0]["id"]), "usage": usage}
 
     def account_get(self, spend_key) -> dict | None:
@@ -180,6 +184,9 @@ class Budgets(interface.Budgets):
         tagged with the reservation's account: the real cost takes the place
         of the reservation atomically. A reservation already `kept` (the agent
         reserved again meanwhile) keeps counting; its row is still tagged."""
+        if self.db.query('select id from tranche_reservations where spend_key = %s', (spend_key,)):
+            from .turn_admission import settle_local_reservation
+            return settle_local_reservation(self.db, spend_key, state=state, actor=actor)
         with self.db.transaction() as tx:
             rows = tx.query("select id, billing_account, agent, state,"
                             " usd::float8 as usd from account_reservations"
@@ -198,6 +205,16 @@ class Budgets(interface.Budgets):
 
     def account_release(self, reservation_id, *, actor) -> dict | None:
         """A human releases a kept (or stuck open) reservation."""
+        tranche = self.db.query(
+            'select r.id from tranche_reservations r join account_reservations a'
+            ' on a.spend_key = r.spend_key where a.id = %s', (int(reservation_id),))
+        if tranche:
+            from .turn_admission import tranche_release
+            row = self.db.query('select * from account_reservations where id = %s',
+                                (int(reservation_id),))[0]
+            tranche_release(self.db, tranche[0]['id'], actor=actor,
+                            why='human account reservation release')
+            return row
         rows = self.db.query(
             "update account_reservations set state = 'released', closed_at = now(),"
             " closed_by = %s where id = %s and state in ('kept', 'open')"

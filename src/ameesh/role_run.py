@@ -216,6 +216,24 @@ class _AlertsLease:
             # a lost lease lets the caller fail closed without waiting.
             return self.deadline > time.monotonic()
 
+    def note_renewed(self, epoch: int, started: float) -> bool:
+        """Extend the local deadline after a CAS renewal made by the caller.
+
+        `_record` renews the shared lease inside its own transaction, to check
+        and journal under the same lock. Without this, the database expiry
+        would move but the monotonic deadline would not, and a slow
+        preparation could be reported as a lost lease (#4898 N1). `started`
+        is the monotonic instant taken before the caller's renewal call, so
+        the local deadline never moves later than the server's.
+        """
+        with self.lock:
+            if self.epoch != epoch:
+                return False
+            proposed = started + self.ttl - self.guard
+            if self.deadline is None or proposed > self.deadline:
+                self.deadline = proposed
+            return self.deadline > time.monotonic()
+
     def remaining(self) -> float:
         """Seconds left on the local deadline; negative when it has passed."""
         with self.lock:
@@ -383,7 +401,7 @@ class _AlertsExecution:
 
 def _watch_alerts_lease(lease: _AlertsLease, execution: _AlertsExecution,
                         stop: threading.Event) -> None:
-    """Renew the shared lease for the child's whole life.
+    """Renew the shared lease for the guarded span (child, or a slower caller).
 
     A failed renewal stops the child at once; the deadline watchdog is the
     second, local line of defence when the renewal call itself is blocked.
@@ -398,22 +416,28 @@ def _watch_alerts_lease(lease: _AlertsLease, execution: _AlertsExecution,
 
 
 def _run_under_lease(argv: list[str], env: dict, lease: _AlertsLease,
-                     execution: _AlertsExecution) -> tuple[int, bool]:
+                     execution: _AlertsExecution, *, watch: bool = True) -> tuple[int, bool]:
     """Run the child while the shared lease is held and renewed.
 
     Returns ``(exit code, lost)``. The caller releases the lease after closing
     the execution guard, so no stop thread can use the connection while it is
     released. The local deadline is already armed by the caller: it covers the
     selection re-reads that happen before this function starts the child.
+
+    ``watch=False`` lets a caller that already renews the lease for a wider
+    span (a pre-launch phase of its own) keep ONE renewal thread, instead of
+    racing two renewals over the same epoch (#4898 N1).
     """
     proc = execution.start_child(argv, env)
     if proc is None:
         return 1, True
     stop = threading.Event()
-    watcher = threading.Thread(target=_watch_alerts_lease,
-                               args=(lease, execution, stop),
-                               name="alerts-lease", daemon=True)
-    watcher.start()
+    watcher = None
+    if watch:
+        watcher = threading.Thread(target=_watch_alerts_lease,
+                                   args=(lease, execution, stop),
+                                   name="alerts-lease", daemon=True)
+        watcher.start()
     try:
         code = int(proc.wait())
     finally:
@@ -422,7 +446,8 @@ def _run_under_lease(argv: list[str], env: dict, lease: _AlertsLease,
         # would race the driver. The child is already stopped by the local
         # deadline even if this renewal never returns; the TTL then frees the
         # pass for the other hosts.
-        watcher.join()
+        if watcher is not None:
+            watcher.join()
     return code, execution.lost.is_set()
 
 

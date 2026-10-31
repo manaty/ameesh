@@ -85,6 +85,7 @@
   "state.build": "In progress",
   "state.qa": "Review",
   "state.merged": "Merged",
+  "state.delivered": "Delivered",
   "state.closed": "Closed",
   "state.blocked": "Blocked",
   "state.working": "Working",

@@ -16,7 +16,7 @@ import unittest
 from unittest import mock
 
 from ameesh import auditor, backlog, canon as canon_mod, work
-from .support import FIXTURE_BUILD_CAP
+from .support import FIXTURE_BUILD_CAP, patch_mechanics
 from ameesh.runner import AgentWorker, Runner
 from ameesh.platform import audit_guard
 
@@ -34,6 +34,7 @@ def canon(agents, *, ident="default", default=True, readable=True):
 
 class AuditorTest(unittest.TestCase):
     def setUp(self):
+        patch_mechanics(self)
         self.runner = Runner.__new__(Runner)
         self.runner.db = object()
         self.rows = {name: {"name": name, "canon": None} for name in

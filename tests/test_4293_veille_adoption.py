@@ -480,7 +480,7 @@ class AdoptionTest(PgTestCase):
             veille.adopt(self.cfg, self.db, self.lot, higher, bins=self.bins,
                          now=1000.0, rules=self.rules)
         with mock.patch.object(veille.decisions, "get",
-                               return_value={"state": "answered",
+                               return_value={"id": 91, "state": "answered",
                                              "answer": {"option": "refuse"}}):
             out = veille.tick(self.cfg, self.db, now=1001.0, rules=Rules(1800))
         self.assertEqual(out["adoptions"][0]["result"], "refused")
@@ -491,7 +491,7 @@ class AdoptionTest(PgTestCase):
         pas un refus de l'owner ; le motif doit le dire, sans « free text »."""
         self._owner_adoption()
         with mock.patch.object(veille.decisions, "get",
-                               return_value={"state": "closed"}):
+                               return_value={"id": 91, "state": "closed"}):
             out = veille.tick(self.cfg, self.db, now=1001.0, rules=Rules(1800))
         self.assertEqual(out["adoptions"][0]["result"], "refused")
         self.assertIn("closed without an answer or withdrawal",
@@ -509,7 +509,7 @@ class AdoptionTest(PgTestCase):
             veille.adopt(self.cfg, self.db, self.lot, higher, bins=self.bins,
                          now=1000.0, rules=self.rules)
         with mock.patch.object(veille.decisions, "get",
-                               return_value={"state": "answered",
+                               return_value={"id": 91, "state": "answered",
                                              "answer": {"option": "adopt"}}), \
              mock.patch.object(veille.decisions, "verify_proof",
                                return_value=(True, "signed owner key")):
@@ -521,7 +521,7 @@ class AdoptionTest(PgTestCase):
         """Avis B cx1 17:05 : la preuve est revérifiée à chaque hôte. Révoquée
         après le canari, elle arrête la bascule sans toucher un autre agent."""
         self._owner_adoption()
-        answered = {"state": "answered", "answer": {"option": "adopt"}}
+        answered = {"id": 91, "state": "answered", "answer": {"option": "adopt"}}
         with mock.patch.object(veille.decisions, "get", return_value=answered), \
              mock.patch.object(veille.decisions, "verify_proof",
                                return_value=(True, "signed owner key")) as proof:
@@ -546,7 +546,7 @@ class AdoptionTest(PgTestCase):
         """Avis B cx1 17:05 : révoquée entre deux hôtes, la preuve arrête la
         suite et rend aux agents déjà basculés leur valeur d'avant."""
         self._owner_adoption()
-        answered = {"state": "answered", "answer": {"option": "adopt"}}
+        answered = {"id": 91, "state": "answered", "answer": {"option": "adopt"}}
         with mock.patch.object(veille.decisions, "get", return_value=answered), \
              mock.patch.object(veille.decisions, "verify_proof",
                                return_value=(True, "signed owner key")) as proof:
@@ -572,7 +572,7 @@ class AdoptionTest(PgTestCase):
         """Avis B cx1 17:05 : la reprise d'une bascule bloquée repasse par la
         preuve ; sans elle, elle refuse et restaure l'hôte déjà fait."""
         self._owner_adoption(bins={"h1": self.new_bin})
-        answered = {"state": "answered", "answer": {"option": "adopt"}}
+        answered = {"id": 91, "state": "answered", "answer": {"option": "adopt"}}
         with mock.patch.object(veille.decisions, "get", return_value=answered), \
              mock.patch.object(veille.decisions, "verify_proof",
                                return_value=(True, "signed owner key")) as proof:
@@ -671,7 +671,7 @@ class AdoptionTest(PgTestCase):
     def _blocked_owner_canary(self):
         """Adoption owner approuvée, canari bloqué faute de carte de binaires."""
         self._owner_adoption(bins={})
-        answered = {"state": "answered", "answer": {"option": "adopt"}}
+        answered = {"id": 91, "state": "answered", "answer": {"option": "adopt"}}
         with mock.patch.object(veille.decisions, "get", return_value=answered), \
              mock.patch.object(veille.decisions, "verify_proof",
                                return_value=(True, "signed owner key")):
@@ -686,7 +686,7 @@ class AdoptionTest(PgTestCase):
         bloqué après approbation ne contourne pas une décision retirée."""
         self._blocked_owner_canary()
         with mock.patch.object(veille.decisions, "get",
-                               return_value={"state": "withdrawn"}):
+                               return_value={"id": 91, "state": "withdrawn"}):
             out = veille.tick(self.cfg, self.db, now=1002.0, bins=self.bins,
                               rules=Rules(1800))
         self.assertEqual(out["adoptions"][0]["result"], "refused")
@@ -697,7 +697,7 @@ class AdoptionTest(PgTestCase):
     def test_blocked_canary_resume_with_an_invalid_proof_is_refused(self):
         """#4312 : même reprise avec une preuve invalide (clé révoquée)."""
         self._blocked_owner_canary()
-        answered = {"state": "answered", "answer": {"option": "adopt"}}
+        answered = {"id": 91, "state": "answered", "answer": {"option": "adopt"}}
         with mock.patch.object(veille.decisions, "get", return_value=answered), \
              mock.patch.object(veille.decisions, "verify_proof",
                                return_value=(False, "key revoked since")):
@@ -737,7 +737,7 @@ class AdoptionTest(PgTestCase):
             veille.adopt(self.cfg, self.db, self.lot, higher, bins=self.bins,
                          now=1000.0, rules=self.rules)
         with mock.patch.object(veille.decisions, "get",
-                               return_value={"state": "answered",
+                               return_value={"id": 91, "state": "answered",
                                              "answer": {"option": "adopt"}}), \
              mock.patch.object(veille.decisions, "verify_proof",
                                return_value=(False, "unsigned answer")):

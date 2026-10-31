@@ -1487,6 +1487,10 @@ def _owner_proof_still_valid(db, state: dict) -> tuple[bool, str]:
     if view is None or view.get("state") != "answered" \
             or (view.get("answer") or {}).get("option") != "adopt":
         return False, "owner decision is no longer an approval"
+    try:
+        decisions.require_current(db, view)
+    except decisions.DecisionError as error:
+        return False, str(error)
     ok, why = decisions.verify_proof(db, view)
     if not ok:
         return False, "owner approval without a valid proof: %s" % why

@@ -99,6 +99,9 @@ if [ "${1:-}" = "-" ]; then exit 0; fi   # notification
 if [ "${1:-}" = -m ] && [ "${2:-}" = ameesh.staging_watch ]; then shift; fi
 if [[ "${1:-}" = */staging_watch.py || "${1:-}" = ameesh.staging_watch ]]; then
   if grep -qx suivi-off-after-start "$state/scenario" && test -s "$state/staging-snapshots.jsonl"; then exit 1; fi
+  printf '%s\n' "${*:3}" >> "$state/suivi-args.log"
+  # #4885 : debut exclusif refuse, sauf reprise d'une sequence prouvee arretee
+  if grep -qx suivi-occupe "$state/scenario" && [[ " $* " = *" --exclusive "* && " $* " != *" --supersede "* ]]; then exit 75; fi
   printf '%s\n' "$2" >> "$state/staging-snapshots.jsonl"
   exit 0
 fi

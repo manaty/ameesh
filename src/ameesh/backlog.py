@@ -1623,6 +1623,19 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         # harnais inconnus (descripteurs illisibles) : traité comme payé
         return paid is None or row.get("harness") in paid
 
+    take_documents = []
+
+    def take_allowed(row) -> bool:
+        # #5005 : lecture au même point que cap(), à la première prise
+        # tentée ; aucun accès pour un passage vide ou un simple avis.
+        if not take_documents:
+            from . import mechanics
+            take_documents.append(mechanics.configured(cfg))
+        document = take_documents[0]
+        from .review_lot import family_of
+        return family_of(row.get("harness"), document.families) not in (
+            document.auto_take_excluded_families(now))
+
     def candidates(threshold: float, skip=(), waiting_free: bool = False) -> list:
         out = []
         for row in sous_utilisation.idle_agents(listing, now, threshold,
@@ -1683,6 +1696,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if not lots or len(taken) >= lot_room or lot_place() <= 0:
                 break
             if not within_budget(row):
+                continue
+            if not take_allowed(row):
                 continue
             # §4 canon : plafond de lots en build par agent — la prise
             # automatique refuse au-delà (le témoin concurrent est dans
@@ -1819,6 +1834,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         if not queue or len(taken) >= room or place() <= 0:
             break
         if not within_budget(row):
+            continue
+        if not take_allowed(row):
             continue
         # §4 : le plafond de lots en build vaut aussi pour la file
         if st.work.count_builds(row["name"]) >= cap():

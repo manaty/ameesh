@@ -234,7 +234,9 @@ class AuditEvidenceTest(PgTestCase):
                 tx.execute("ALTER TABLE work_items DISABLE TRIGGER ameesh_module_work_guard")
                 tx.execute("UPDATE work_items SET state = %s WHERE id = %s", (state, self.lot))
                 tx.execute("ALTER TABLE work_items ENABLE TRIGGER ameesh_module_work_guard")
-            self.assertEqual(self.findings()[0]["lot_state"], "delivered")
+            # #4621 : le constat nomme la phase de livraison (`merged`/
+            # `promoted`), comme les états de policy, pas le core `delivered`.
+            self.assertEqual(self.findings()[0]["lot_state"], state)
             self.assertEqual(work.get(self.db, self.lot)["legacy_state"], state)
 
     def test_notifier_delivers_human_channel_and_events_once_then_resolves(self):

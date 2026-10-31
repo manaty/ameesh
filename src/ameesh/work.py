@@ -86,6 +86,21 @@ def __getattr__(name):
         return getattr(_module_registry.development_workflow(), name)
     raise AttributeError("module %r has no attribute %r" % (__name__, name))
 
+
+def development_transitions() -> dict:
+    """The dev workflow's transitions, or {} without the dev module.
+
+    #4957 : le noyau générique (`decisions`) tient et rend un lot ; au profil
+    nu (L98 T2b, CI/tests) le module dev n'existe pas. Sans table, l'appelant
+    ne tente aucun déplacement et journalise la note seule, au lieu de lever
+    une ValueError qui masquait le fonctionnement normal du reste.
+    """
+    try:
+        return _module_registry.development_workflow().TRANSITIONS
+    except ValueError:
+        return {}
+
+
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
@@ -2210,6 +2225,68 @@ def is_pilot(cfg, db: Db, actor: str) -> bool:
         return False
 
 
+#: #5006 : marque machine d'un geste de statut (move, gel) posé par un agent
+#: qui n'est plus l'assigné du lot — dans la note du journal et sur stderr.
+NON_ASSIGNEE_MARK = "ameesh-non-assignee:"
+
+
+def non_assignee_warning(cfg, db: Db, item: dict, actor: str) -> str:
+    """#5006 : l'avertissement d'un geste de statut (`work move`, gel) posé
+    par un agent qui n'est pas l'assigné du lot, ou ''.
+
+    Signalé, jamais refusé : un humain, le système, un pilote (`is_pilot`) ou
+    un relecteur désigné du lot agissent légitimement sur le lot d'un autre.
+    Le cas visé est l'ancien assigné dont le tour a continué après une
+    réassignation (#4858 : intake → build et gel après `work assign`)."""
+    name = (actor or "").strip()
+    holder = (item.get("assignee") or "").strip()
+    if not name or not holder or name == holder:
+        return ""
+    if name.startswith(HUMAN_PREFIX) or name in (SYSTEM_SENDER, UNKNOWN_ACTOR):
+        return ""
+    from .work_reviewers import designated
+    if holder.startswith(HUMAN_PREFIX) or name in designated(item):
+        return ""
+    if is_pilot(cfg, db, name):
+        return ""
+    return ("%s %s is not the assignee of lot #%s (assignee: %s); if the lot was "
+            "reassigned away from you, stop: no push, freeze or move — leave a "
+            "note of your state for %s" % (NON_ASSIGNEE_MARK, name, item.get("id"),
+                                           holder, holder))
+
+
+def _notify_reassigned(db: Db, item: dict, previous: str | None, assignee: str,
+                       actor: str) -> int | None:
+    """#5006 : prévient l'ancien assigné d'une réassignation.
+
+    Le courrier est passif (`info` : il n'ouvre pas de tour à un agent au
+    repos, son prochain brief relit l'assigné courant) et `reassigned`, une
+    clé remise EN COURS de tour (`mail.MID_TURN_KEYS`, L514) : un tour déjà
+    lancé sur le lot l'apprend au prochain appel d'outil. Rien pour un
+    humain, un externe, ni quand l'ancien assigné réassigne lui-même. Un
+    échec d'envoi ne retient pas la réassignation déjà écrite."""
+    from . import fil, mail
+    old = (previous or "").strip()
+    if not old or old == assignee or old == (actor or "").strip() \
+            or old.startswith(HUMAN_PREFIX):
+        return None
+    lot = int(item["id"])
+    to = assignee or "the team queue (nobody)"
+    body = ("Lot #%d (%s) is reassigned to %s by %s: it is no longer yours. "
+            "If a turn of yours is working on it, stop now: no push, no freeze, "
+            "no move. Leave a note of your state (`ameesh work note %d …`: branch, "
+            "pushed head, what remains) so that %s can take it over."
+            % (lot, fil.excerpt(item.get("title") or "", 120), to,
+               actor or "nobody", lot, assignee or "the next assignee"))
+    try:
+        return mail.send(db, SYSTEM_SENDER, old, body, work_item_id=str(lot),
+                         payload={"info": True,
+                                  "reassigned": {"lot": lot, "to": assignee,
+                                                 "by": actor or ""}})
+    except Exception:  # noqa: BLE001 - l'attribution est écrite ; le journal la dit
+        return None
+
+
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
            cfg=None, branch: str | None = None, branch_target: str | None = None,
            force: str | None = None, claim: bool = False,
@@ -2369,6 +2446,12 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     if branch:
         row = set_branch(db, item_id, branch, branch_target, actor=actor)
     out = {"item": row, "check": check, "previous": previous}
+    if (row.get("assignee") or None) != (previous or None):
+        # #540 : un lot rendu à la file d'équipe quitte aussi l'ancien assigné
+        notified = _notify_reassigned(db, item, previous,
+                                      row.get("assignee") or "", actor)
+        if notified is not None:
+            out["previous_notified"] = notified
     if behind is not None:
         row["queued_behind"] = behind
         out["queue_warning"] = queue_warning(db, row, check["assignee"])
@@ -4309,6 +4392,11 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     text = note or ("%s → %s" % (current, state))
     if reviewer:
         text = "%s — reviewer %s" % (text, reviewer)
+    # #5006 : un move par un agent qui n'est plus l'assigné est signalé
+    # (journal et sortie), jamais refusé : pilote et relecteur en sont exclus.
+    stranger = non_assignee_warning(getattr(db, "cfg", None), db, item, actor)
+    if stranger:
+        text = "%s\n%s" % (text, stranger)
     from . import planned_waits
     guarded = (planned_waits.is_hold_note(note)
                or planned_waits.is_lift_note(note))
@@ -4355,6 +4443,8 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         if reviewer_warning:
             row["reviewer_warning"] = reviewer_warning
         row.update(_reviewer_request(db, item, reviewer, actor))
+    if stranger:
+        row["assignee_warning"] = stranger
     return row
 
 

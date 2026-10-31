@@ -869,7 +869,7 @@ def _account_view(row: dict) -> dict:
     }
 
 
-def _real_spend(db, paid: Iterable[str], since_ts: float, now: float) -> list[dict]:
+def _real_spend(db, paid: Iterable[str], since_ts: float, now: float, *, cfg=None) -> list[dict]:
     """Dépense réelle (soldes) face à l'estimation, sur la fenêtre et sur 24 h
     (L95). Un relevé illisible n'empêche jamais l'instantané."""
     from . import balance as balance_mod
@@ -883,7 +883,7 @@ def _real_spend(db, paid: Iterable[str], since_ts: float, now: float) -> list[di
         if abs(since_ts - (now - 86400.0)) > 60.0:
             periods.insert(0, ("window", since_ts))   # fenêtre autre que 24 h
         for key, begin in periods:
-            for entry in balance_mod.compare(db, paid, begin, now, rows=rows):
+            for entry in balance_mod.compare(db, paid, begin, now, rows=rows, cfg=cfg):
                 out.append(dict(entry, period=key))
         return out
     except db_mod.DbError:
@@ -1150,7 +1150,7 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         except accounts_mod.AccountError:
             accounts = []
     paid = cost_mod.paid_harnesses_of()
-    real = _real_spend(db, paid, since_ts, now)
+    real = _real_spend(db, paid, since_ts, now, cfg=cfg)
     # L70 : plafonds en vigueur (base > configuration de l'hôte > défaut)
     limits = None
     if cfg is not None:
