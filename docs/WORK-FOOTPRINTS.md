@@ -84,7 +84,7 @@ Every estimate writes **one line** in the lot's journal (`Impact analysis: …`,
 known or not, with its time and git calls). The latest analysis is kept in
 `work_item_impact_analyses` (0519), and `ameesh work footprint <lot>` shows it.
 A manual footprint (`--set`) always wins: neither `--estimate` nor the retries
-rewrite it.
+rewrite it, and an unknown basket line added after it does not add the marker.
 
 **Unknown footprint.** When the analysis finds no `high` or `medium` path (no
 cited path or identifier, no clone, budget exhausted), the repository's

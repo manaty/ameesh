@@ -599,6 +599,48 @@ class RelectureTroisTest(_Empreintes):
         self.assertNotIn(connu["id"], result["lots"])
         self.assertEqual(fp.paths_of(self.db, connu["id"]), ["src/b.py"])
 
+    def test_le_manuel_prime_sur_une_ligne_vague_du_panier(self):
+        # B de docs-01 sur f28b48e : sous `repository`, une ligne vague
+        # ajoutée à un panier qui porte un `--set` n'y remet pas le marqueur,
+        # que le `--set` vienne avant ou après la première ligne vague
+        self.policy(unknown_policy="repository")
+        self.occupant()
+        store = storage.of(self.db).work_footprints
+
+        def ligne(chantier, new_project=False):
+            with self.rules():
+                return backlog.add(self.db, title="ligne vague", expected_value="gain",
+                                   value_score=10, app="nexlink", actor="test",
+                                   cfg=self.cfg, new_project=new_project,
+                                   chantier=chantier, estimate="1h")
+
+        # le `--set` d'abord, sur un panier connu
+        with self.rules():
+            avant = backlog.add(self.db, title="ligne précise", expected_value="gain",
+                                body="corrige src/a.py", value_score=10, app="nexlink",
+                                actor="test", cfg=self.cfg, new_project=True,
+                                chantier="ch1", estimate="1h")
+        fp.set_paths(self.db, avant["id"], ["src/m.py"], actor="human:proprio")
+        item = ligne("ch1")
+        self.assertEqual(item["id"], avant["id"])
+        self.assertEqual(item.get("footprint_policy"), "open")
+        self.assertEqual(fp.paths_of(self.db, avant["id"]), ["src/m.py"])
+        # la ligne vague d'abord : le `--set` remplace le marqueur, la ligne
+        # vague suivante ne le remet pas
+        apres = ligne("ch2", new_project=True)
+        self.assertEqual(fp.paths_of(self.db, apres["id"]), ["."])
+        fp.set_paths(self.db, apres["id"], ["src/n.py"], actor="human:proprio")
+        self.assertEqual(fp.paths_of(self.db, apres["id"]), ["src/n.py"])
+        self.assertEqual(ligne("ch2")["id"], apres["id"])
+        self.assertEqual(fp.paths_of(self.db, apres["id"]), ["src/n.py"])
+        # ni la bascule ni la reprise ne le remettent
+        store.set_policy("nexlink", actor="human:proprio", unknown_policy="open")
+        result = store.set_policy("nexlink", actor="human:proprio",
+                                  unknown_policy="repository")
+        self.assertNotIn(avant["id"], result["lots"])
+        self.assertNotIn(apres["id"], result["lots"])
+        self.assertEqual(fp.paths_of(self.db, apres["id"]), ["src/n.py"])
+
     def test_une_prise_juste_apres_la_creation_voit_le_marqueur(self):
         # B2 de cx3 sur d68ca19 : une prise sur une AUTRE connexion, juste
         # après le commit de la création, voit déjà le marqueur

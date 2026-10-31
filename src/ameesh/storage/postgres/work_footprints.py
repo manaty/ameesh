@@ -124,12 +124,15 @@ def unknown_policy_sql(tx, item_id) -> str:
     transaction de l'appelant, qui tient le verrou de la garde : celle de son
     dépôt (`open` sans ligne), mais `open` pour un lot exempté (`_EXEMPT`) et
     pour un lot dont le diff réel est connu — le diff prime sur toute
-    estimation (B1 de dev3)."""
+    estimation (B1 de dev3) — ou qui porte une empreinte manuelle : le
+    `--set` prime aussi, une ligne vague de panier n'y ajoute pas le marqueur
+    (B de docs-01)."""
     rows = tx.query("SELECT p.unknown_policy FROM work_items w"
                     " JOIN repository_footprint_policies p ON p.app = btrim(w.app)"
                     " WHERE w.id = %s AND NOT " + exempt_sql("w") +
                     "   AND NOT EXISTS (SELECT 1 FROM work_item_footprints d"
-                    "                    WHERE d.work_item_id = w.id AND d.source = 'diff')",
+                    "                    WHERE d.work_item_id = w.id"
+                    "                      AND d.source IN ('manual', 'diff'))",
                     (int(item_id),))
     return str(rows[0]["unknown_policy"]) if rows else "open"
 
