@@ -129,10 +129,11 @@ un runtime qui possède `decisions.require_current`. Ces seules commandes
 s'exécutent donc depuis les arbres de stage de l'opération. `backend.json` ne
 fournit que l'hôte et la machine ; la question signée lie le digest du code qui
 s'exécute (`code_sha256`). Tout autre emplacement refuse. Chaque commande
-recalcule en root les digests du stage (`runtime` et `sources`) avant d'importer
-la pile de base de données : stage root 0700 sous un parent 0700, sans lien ni
-écriture de groupe, mesuré sur la copie root et comparé au bundle signé. Un écart
-refuse avant tout effet.
+recalcule en root les digests du stage (`runtime` et `sources`) avant d'ouvrir la
+connexion à la base : stage root 0700 sous un parent 0700, sans lien ni écriture
+de groupe, mesuré sur la copie root et comparé au bundle signé. Un écart refuse
+avant tout effet. Les modules ameesh sont déjà chargés à ce moment : c'est la
+protection root 0700 du stage qui couvre ce chargement, pas la mesure.
 
 Ordre sur l'hôte :
 
@@ -147,7 +148,9 @@ Ordre sur l'hôte :
    "$DIR/out/runtime/bin/python" -I -B -c \
      'import ameesh.decisions as d; assert hasattr(d, "require_current")'
    ```
-3. Root copie, avec `OP` nouveau, `DIR/out/runtime` vers
+3. Inventorier d'abord les stages NEW et tout `continuation.json` déjà figé : un
+   NEW préparé sur les anciens arbres ne resservira pas. Root copie, avec `OP`
+   nouveau, `DIR/out/runtime` vers
    `/var/lib/ameesh-release-bootstrap/OP/runtime` et
    `runtime/share/ameesh/mise-a-jour/` vers `.../OP/sources` (root, sans lien ni
    écriture de groupe ; stage 0700). Il y écrit `replacement.json`, root 0600 :
@@ -157,23 +160,29 @@ Ordre sur l'hôte :
 4. Préparer, avec `S=/var/lib/ameesh-release-bootstrap/OP` :
    `$S/runtime/bin/python -I -B $S/sources/backend-administrateur.py
    replacement-prepare OP`.
-   La sortie donne la question et les options, à passer sans retouche à
-   `ameesh decide ask --needs-signature`. La question affiche `next.sha`,
+   Le fichier `$S/replacement-question.txt` et les options de la sortie sont à
+   passer sans retouche :
+   `ameesh decide ask --lot L --needs-signature --question "$(cat "$S/replacement-question.txt")" --option replace="Replace this exact sealed runtime" --option leave="Leave this host unchanged"`.
+   La question affiche `next.sha`,
    `next.runtime`, `next.lib` et `code_sha256`.
    Avant de signer, recalculer ces valeurs sans passer par le stage, hors root,
    depuis un clone propre et avec le même Python système :
    ```sh
    umask 022
    /usr/bin/python3 -I -B CLONE/deploy/mise-a-jour/verifier-remplacement.py \
-     --clone CLONE --output "$DIR2/out" --question question.txt
+     --clone CLONE --output "$DIR2/out" --question replacement-question.txt
    ```
    L'outil reconstruit au SHA de la question, mesure avec l'inventaire de
    `runtime-release.py` et refuse tout écart (code 2). Signer sans ce résultat
    revient à signer ce qui a été construit, sans l'avoir vérifié.
 5. Après signature, `replacement-plan OP --decision N` : effet nul, tous les pas
    autorisés. Arrêter `ameesh-handoff-local.socket` et ses instances ; le
-   contrôleur doit être inactif. Puis `replace OP --decision N`, à reprendre avec
-   la même commande en cas d'interruption.
+   contrôleur doit être inactif. Puis `replace OP --decision N`. Une interruption
+   se reprend avec la même commande, sauf pendant une copie : `runtime.publish`
+   refuse alors un `.runtime-*.pending` ou `.lib-*.pending` restant sous
+   `/opt/ameesh-release`. Ce stage ne se devine pas : l'inspecter, le retirer sous
+   le verrou, socket arrêté, puis relancer. Le retour arrière refuse aussi tant
+   qu'il reste.
 6. Vérifier :
    `/opt/ameesh-release/runtime/bin/python -I -B -c 'import ameesh.decisions as d; print(hasattr(d, "require_current"))'`
    doit rendre `True` ; `sha` du sceau = SHA retenu ; sous `retained/OP/` :
@@ -182,7 +191,8 @@ Ordre sur l'hôte :
 7. Suite : A2 sur ce même SHA, puis `prepare` de NEW sur les arbres neufs avec le
    sceau neuf, `continuation-question`, clé et enrôlement. La continuation admet
    l'écart d'arbres et de sceau par rapport à OLD seulement si un remplacement
-   achevé, signé et non annulé nomme OLD ; la référence signée le cite.
+   achevé, signé et non annulé nomme OLD ; la référence signée le cite. Garder le
+   stage `OP` jusqu'à la fin de la continuation : elle y relit bundle et question.
 
 Retour arrière : `replacement-rollback-question OP --expires T`, décision signée
 propre, socket arrêté, puis `replacement-rollback OP --decision N` depuis le même

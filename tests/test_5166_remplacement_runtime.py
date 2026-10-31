@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import time
 from unittest import mock
@@ -298,6 +299,56 @@ class ReplacementTest(Harness):
         target.chmod(0o664)
         with self.assertRaises(ValueError):
             self.item.prepare()
+
+    def test_code_digest_loads_under_a_python_without_ameesh_and_matches_the_backend(self):
+        # Ancestor ownership is real in a child process, so this stops at the
+        # companions; the real build and comparison ran by hand (lot note).
+        directory = self.swap_stage/'sources'
+        code = Path(backend_mod.__file__).with_name('verifier-remplacement.py')
+        result = subprocess.run([sys.executable, '-I', '-S', '-B', '-c',
+            'import importlib.util as u, sys\n'
+            's = u.spec_from_file_location("v", sys.argv[1]); m = u.module_from_spec(s)\n'
+            's.loader.exec_module(m); print(m.module("runtime-release").code_digest(sys.argv[2]))\n'
+            'assert "ameesh" not in sys.modules',
+            str(code), str(directory)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), backend_mod.code_digest(directory))
+
+    def test_foreign_decision_leaves_no_trace_and_replay_reverifies(self):
+        view, _ = self.replace()
+        before = self.backend.gestes.entries()
+        other = self.ask('Approve something else', swap.OPTIONS)
+        self.sign(other, 'replace')
+        with self.assertRaises(ValueError):
+            self.item.run(other['id'])
+        self.assertEqual(self.backend.gestes.entries(), before)
+        extra = self.base/'runtime/bin'
+        extra.chmod(0o755)
+        with self.assertRaises(ValueError):
+            (extra/'planted').write_text('x')
+            self.item.run(view['id'])
+
+    def test_missing_host_key_and_unsafe_held_name_refuse(self):
+        with mock.patch.object(self.backend, 'host_key', return_value=None):
+            with self.assertRaisesRegex(ValueError, 'host key'):
+                self.item.prepare()
+        value = json.loads((self.swap_stage/'replacement.json').read_bytes())
+        value['held_operation'] = '../elsewhere'
+        (self.swap_stage/'replacement.json').write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'exact staged'):
+            self.item.prepare()
+
+    def test_handoff_stopped_reads_states_and_instances(self):
+        installer = backend_mod.installer
+        with mock.patch.object(installer.account.os, 'geteuid', return_value=0):
+            host = installer.LinuxHost()
+        for states, instances, expected in (
+                ('ActiveState=inactive\n\nActiveState=failed\n', '', True),
+                ('ActiveState=active\n\nActiveState=inactive\n', '', False),
+                ('ActiveState=inactive\n', '', False),
+                ('ActiveState=inactive\n\nActiveState=inactive\n', 'ameesh-handoff-local@1.service loaded\n', False)):
+            with mock.patch.object(host, 'command', side_effect=[states, instances]):
+                self.assertIs(host.handoff_stopped(), expected)
 
     def test_independent_check_compares_the_signed_values(self):
         check = backend_mod.module('verifier-remplacement')

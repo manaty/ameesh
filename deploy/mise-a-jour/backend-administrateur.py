@@ -143,12 +143,7 @@ def kind_of(bundle):
 
 def code_digest(directory=None):
     """Digest of the installed backend and companion bytes it can load."""
-    directory=Path(directory or Path(__file__).parent)
-    items={}
-    for path in sorted(directory.iterdir()):
-        if path.suffix=='.py' and path.is_file() and not path.is_symlink():
-            items[path.name]=hashlib.sha256(path.read_bytes()).hexdigest()
-    return protocol.identity(items)
+    return runtime.code_digest(directory or Path(__file__).parent)
 
 
 class Gestes:

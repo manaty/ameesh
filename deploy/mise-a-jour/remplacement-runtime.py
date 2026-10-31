@@ -186,9 +186,13 @@ class Replacement:
         if (not isinstance(value,dict) or set(value)!=INPUT_FIELDS or value['version']!=1
                 or not isinstance(value['sha'],str) or re.fullmatch('[0-9a-f]{40}',value['sha']) is None
                 or (value['held_operation'] is not None and (not isinstance(value['held_operation'],str)
+                    or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}',value['held_operation']) is None
                     or value['held_operation']==self.operation))):
             raise ReplacementError('exact staged replacement required')
         self.check_held(value['held_operation'])
+        host_key=backend.host_key()
+        if not isinstance(host_key,str) or re.fullmatch('[0-9a-f]{64}',host_key) is None:
+            raise ReplacementError('pinned host key required')
         old,old_sha=self.current_pin()
         machine=backend.machine()
         if old['machine_id']!=machine or old['sha']==value['sha']:
@@ -204,7 +208,7 @@ class Replacement:
             return dict(sha=item['sha'],seal_sha256=digest,
                         **{name:item['trees'][name]['digest'] for name in ('runtime','lib','store')})
         body=dict(version=1,kind='runtime-replacement',operation=self.operation,
-            host=backend.enrollment['host'],machine_id=machine,host_key_sha256=backend.host_key(),
+            host=backend.enrollment['host'],machine_id=machine,host_key_sha256=host_key,
             code_sha256=backend.gestes.code,held_operation=value['held_operation'],
             previous=summary(old,old_sha),next=summary(document,hashlib.sha256(text.encode()).hexdigest()),
             retained=RETAINED+'/'+self.operation,
@@ -308,9 +312,10 @@ class Replacement:
                 raise ReplacementError(getattr(authority,'denial_reason',None)
                                        or 'replacement authority or stopped H8 unavailable')
             return True
+        approved('preflight')
+        # Only a valid decision is recorded: the continuation reads this entry.
         self.backend.gestes.append(command='replace',operation=self.operation,phase='start',
                                    bundle_digest=bundle['digest'],decision=decision)
-        approved('preflight')
         if not self.interpreter_outside():
             raise ReplacementError('run replacement from the staged runtime')
         if self.load_record('rollback') is not None:
@@ -326,6 +331,7 @@ class Replacement:
                 if record['bundle_digest']!=bundle['digest'] or record['lock_inode']!=inode:
                     raise ReplacementError('replacement journal or permanent lock changed')
                 if record['complete']:
+                    self.do_verify(bundle,None)
                     return dict(operation=self.operation,bundle_digest=bundle['digest'],outcome='replaced')
                 self.check_held(bundle['held_operation'])
                 for step in STEPS:

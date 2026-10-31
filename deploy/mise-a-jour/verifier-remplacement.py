@@ -36,10 +36,11 @@ def signed(question):
 
 
 def measure(runtime_tree):
-    inventory = module('runtime-release').inventory
+    # System Python, without ameesh: only the stdlib-only companions load here.
+    tree = module('runtime-release')
     sources = Path(runtime_tree) / 'share/ameesh/mise-a-jour'
-    return dict(runtime=inventory(runtime_tree)['digest'], lib=inventory(sources)['digest'],
-                code_sha256=module('backend-administrateur').code_digest(sources))
+    return dict(runtime=tree.inventory(runtime_tree)['digest'], lib=tree.inventory(sources)['digest'],
+                code_sha256=tree.code_digest(sources))
 
 
 def differences(question, measured):
