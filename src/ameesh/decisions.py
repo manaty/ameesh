@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+from datetime import datetime
 import getpass
 import json
 import os
@@ -322,11 +323,87 @@ def get(db, decision_id: int, now: float | None = None) -> dict | None:
     return view_of(row, now) if row else None
 
 
-def require_current(view: dict) -> None:
-    """Reject authority permanently replaced by a signed decision (#4991)."""
-    if view.get("superseded_by") is not None:
-        raise DecisionError("decision #%d superseded by decision #%d"
-                            % (view["id"], view["superseded_by"]))
+def supersession_event(db, decision_id: int) -> dict | None:
+    """#4995: the append-only replacement event that superseded `decision_id`."""
+    return storage.of(db).decisions.supersession(int(decision_id))
+
+
+def _supersession_timestamp(value) -> float | None:
+    """The event time as a float, whether the driver returned a datetime or
+    the ISO text psql's JSON report carries."""
+    if value is None:
+        return None
+    if hasattr(value, "timestamp"):
+        try:
+            return float(value.timestamp())
+        except (OSError, OverflowError, ValueError):
+            return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def require_current(db, view: dict) -> None:
+    """Refuse authority replaced by a signed decision, proven from the log
+    (#4991, #4995).
+
+    `payload.decision.superseded_by` is only a marker: an executor SQL writer
+    could clear it. The append-only `decision_supersessions` event is the
+    evidence, and the replacement's signed answer is re-verified (digest,
+    approval consumed by that decision, Ed25519 signature) against the exact
+    replaced id. A marker without an event, an event without a proven signed
+    answer, or two records that disagree all refuse the old authority: the
+    gate fails closed. The table owner and a superuser can still repair the
+    database with DDL/DML; this guard does not pretend to stop them.
+    """
+    identifier = int(view["id"])
+    try:
+        marker = None if view.get("superseded_by") is None else int(view["superseded_by"])
+    except (TypeError, ValueError):
+        raise DecisionError(
+            "decision #%d has an unreadable supersession marker: authority refused"
+            % identifier) from None
+    event = supersession_event(db, identifier)
+    if event is None:
+        if marker is not None:
+            raise DecisionError(
+                "decision #%d has a supersession marker without a logged replacement: "
+                "authority refused" % identifier)
+        return
+    replacement_id = int(event["superseded_by"])
+    if marker is not None and marker != replacement_id:
+        raise DecisionError(
+            "decision #%d has contradictory supersession records (#%d logged, #%s marked): "
+            "authority refused" % (identifier, replacement_id, marker))
+    replacement = get(db, replacement_id)
+    if (replacement is None or replacement.get("state") != "answered"
+            or replacement.get("needs_signature") is not True
+            or replacement.get("supersedes") != identifier
+            or not supersession_approved(replacement)):
+        raise DecisionError(
+            "decision #%d: the logged replacement #%d is not a signed replacement: "
+            "authority refused" % (identifier, replacement_id))
+    ok, why = verify_proof(db, replacement)
+    if not ok:
+        raise DecisionError(
+            "decision #%d: the logged replacement #%d is not proven (%s): authority refused"
+            % (identifier, replacement_id, why))
+    answer = replacement.get("answer") or {}
+    occurred = _supersession_timestamp(event.get("occurred_at"))
+    try:
+        answered_at = float(answer.get("ts") or 0)
+    except (TypeError, ValueError):
+        answered_at = -1.0
+    if (str(event.get("person") or "") != str(answer.get("by") or "")
+            or event.get("proof") != answer.get("proof")
+            or occurred is None
+            or abs(occurred - answered_at) > 0.001):
+        raise DecisionError(
+            "decision #%d: the logged replacement #%d does not match its signed answer: "
+            "authority refused" % (identifier, replacement_id))
+    raise DecisionError("decision #%d superseded by decision #%d"
+                        % (identifier, replacement_id))
 
 
 def supersession_approved(view: dict) -> bool:
@@ -564,7 +641,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         old = get(db, supersedes, now)
         if not old or old["state"] != "answered":
             raise DecisionError("supersedes requires an answered decision; pending uses withdraw")
-        require_current(old)
+        require_current(db, old)
         needs_signature = True
     mail_lot = None
     if source_mail is not None:

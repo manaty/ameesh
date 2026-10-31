@@ -3937,6 +3937,18 @@ class Decisions(Domain):
     def get(self, decision_id: int) -> dict | None:
         """La demande `decision_id` (en attente ou close), ou None."""
 
+    def supersession(self, decision_id: int) -> dict | None:
+        """#4995: l'événement de remplacement signé qui a remplacé
+        `decision_id` (`supersedes`, `superseded_by`, `person`,
+        `occurred_at`, `proof`), ou None.
+
+        Journal append-only : la lecture d'autorité (`decisions.require_current`)
+        revérifie la réponse signée de la remplaçante au lieu de croire le
+        marqueur `payload.decision.superseded_by`. Pas une opération du contrat
+        médié (les décisions sont réservées au serveur du mesh) : un pilote qui
+        ne l'implémente pas lève NotImplementedError."""
+        raise NotImplementedError
+
     def repair_forward(self, decision_id: int, *, actor: str) -> dict:
         """Restore a human decision accidentally forwarded by mail. Atomically
         lock the original and its copy and restore the unchanged original to
