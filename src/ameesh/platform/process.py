@@ -449,8 +449,10 @@ def publish_venv_attestation() -> str | None:
     update's `controler` must compare it with the interpreter of the current
     venv. The process publishes what only it can still read: its pid, its start
     in clock ticks (a recycled pid has another one) and the device and inode of
-    its executable. No secret, mode 0600. It detects a process left on the
-    wrong executable, not a same-user process forging the file.
+    its executable. No secret, mode 0600.
+
+    Accepted limit: a process of the same user can forge this file. `controler`
+    proves the health of a host, this is not a security boundary.
 
     Called after `become_undumpable`, and again after an in-place `exec`, which
     runs the startup path anew. Returns the path; None on an OS without `/proc`;

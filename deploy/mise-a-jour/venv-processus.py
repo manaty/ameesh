@@ -21,6 +21,8 @@ utilisateur. Il a publié au démarrage l'identité de son exécutable
 (`ameesh.platform.publish_venv_attestation`) ; elle remplace la lecture refusée
 si elle vise bien ce processus (PID et heure de démarrage). Absente ou périmée :
 code 3, preuve privilégiée requise ; contredite : rouge.
+Limite acceptée : un processus du même utilisateur peut falsifier ce fichier ;
+controler prouve la santé d'un hôte, ce n'est pas une frontière de sécurité.
 """
 from __future__ import annotations
 
