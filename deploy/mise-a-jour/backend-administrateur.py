@@ -27,7 +27,17 @@ journal or credential:
                                    sign (option `revoke`); writes nothing;
   revoke OPERATION --decision N    signed rollback under its own decision:
                                    key first, approved snapshots restored,
-                                   exact new files removed.
+                                   exact new files removed;
+  replacement-prepare OPERATION    measures the staged trees and the installed
+                                   pin, writes the replacement bundle/question;
+  replacement-plan OPERATION --decision N
+                                   dry run of the replacement; no effect;
+  replace OPERATION --decision N   replaces a sealed runtime (#5166): former
+                                   trees and pin retained, permanent lock kept;
+  replacement-rollback-question OPERATION --expires T
+                                   prints the separate question to sign;
+  replacement-rollback OPERATION --decision N
+                                   restores the retained trees and pin.
 
 The staged `plan.json` may name `"delegation": "canaux"` (#4327): the same
 commands then prepare and execute the separately signed bundle of the
@@ -88,8 +98,9 @@ PLAN_FIELDS={'plan','account_ids','expires_at'}
 PLAN_OPTIONAL={'probe_turn','runtime_seal','delegation'}
 #: Signed bundle kinds a staged plan may name; release is the default.
 DELEGATIONS=('release','canaux')
-COMMANDS=('inventory','prepare','plan','install','revoke-question','revoke','continuation-question','continue-install')
-SIGNED=('plan','install','revoke','continue-install')
+REPLACEMENT=('replacement-prepare','replacement-plan','replace','replacement-rollback-question','replacement-rollback')
+COMMANDS=('inventory','prepare','plan','install','revoke-question','revoke','continuation-question','continue-install',*REPLACEMENT)
+SIGNED=('plan','install','revoke','continue-install','replacement-plan','replace','replacement-rollback')
 GENESIS='0'*64
 
 
@@ -660,6 +671,19 @@ class Backend:
         self.gestes.append(phase=outcome,**base)
         return dict(operation=operation,bundle_digest=prepared.bundle['digest'],outcome=outcome)
 
+    def replacement(self,operation):
+        return module('remplacement-runtime').Replacement(self,operation)
+
+    def replacement_authority(self,decision,operation,bundle):
+        if self.db is None:
+            raise BackendError('enrolled decision registry required')
+        return module('remplacement-runtime').SignedReplacementAuthority(self.db,decision,operation,bundle)
+
+    def rollback_authority(self,decision,operation,bundle):
+        if self.db is None:
+            raise BackendError('enrolled decision registry required')
+        return module('remplacement-runtime').SignedRollbackAuthority(self.db,decision,operation,bundle)
+
     def revoke(self,operation,decision,authority=None):
         """Signed rollback under the bootstrap's own host lock.
 
@@ -686,6 +710,19 @@ class Backend:
         return dict(operation=operation,bundle_digest=bundle['digest'],outcome='revoked')
 
 
+def replacement_enrollment(enrollment,operation,code):
+    """Host enrollment of a replacement, bound to its own staged code (#5166).
+
+    The enrolled backend predates this entry and its re-enrollment needs the
+    runtime being replaced: this one case runs from the staged trees of the
+    operation, and its signed question binds the digest of exactly that code.
+    """
+    stage=Path(STAGE)/operation
+    if (Path(__file__).resolve().parent!=stage/'sources' or Path(sys.prefix).resolve()!=stage/'runtime'):
+        raise BackendError('replacement runs from its staged runtime and sources')
+    return dict(enrollment,code_sha256=code)
+
+
 def connect(config=CONFIG):
     """The separately enrolled controller connection; never runner settings."""
     path=Path(config); runtime.trusted(path)
@@ -708,7 +745,7 @@ def parse(argv):
                 or not rest[3].isdigit() or int(rest[3])<=0):
             raise BackendError('continuation-question requires --previous OPERATION --decision N')
         decision=(rest[1],int(rest[3]))
-    elif command=='revoke-question':
+    elif command in ('revoke-question','replacement-rollback-question'):
         if len(rest)!=2 or rest[0]!='--expires' or not rest[1].isdigit() or int(rest[1])<=0:
             raise BackendError(command+' requires --expires EPOCH')
         decision=int(rest[1])
@@ -730,6 +767,11 @@ def dispatch(backend,command,operation,decision):
         return getattr(backend,command)(operation)
     if command=='revoke-question':
         return backend.revoke_question(operation,decision)
+    if command in REPLACEMENT:
+        item=backend.replacement(operation)
+        return {'replacement-prepare':item.prepare,'replacement-plan':item.plan,'replace':item.run,
+                'replacement-rollback-question':item.rollback_text,'replacement-rollback':item.rollback}[command](
+                    *(() if decision is None else (decision,)))
     return getattr(backend,command)(operation,decision)
 
 
@@ -746,11 +788,13 @@ def main(argv=None):
         except Exception:
             raise BackendError('backend code must be installed root-owned') from None
         enrollment=json.loads(Backend.private(runtime.trusted(ENROLLMENT),4096))
+        if command in REPLACEMENT:
+            enrollment=replacement_enrollment(enrollment,operation,code_digest())
         db=connect() if command!='inventory' else None
         # LinuxChannels extends LinuxHost: one fixed system for both kinds.
         backend=Backend(system=channel_installer.LinuxChannels(),enrollment=enrollment,db=db)
         result=dispatch(backend,command,operation,decision)
-    except (BackendError,*Release.errors,*Channels.errors) as error:
+    except (BackendError,module('remplacement-runtime').ReplacementError,*Release.errors,*Channels.errors) as error:
         print(json.dumps(dict(ok=False,error=str(error))),file=sys.stderr)
         return 2
     except Exception as error:
@@ -759,6 +803,8 @@ def main(argv=None):
         return 1
     print(json.dumps(result,sort_keys=True,indent=1))
     if command=='plan' and not result['authorized'] and not result['revoke']['authorized']:
+        return 3
+    if command=='replacement-plan' and not result['authorized']:
         return 3
     return 0
 

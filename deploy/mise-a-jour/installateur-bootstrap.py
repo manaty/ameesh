@@ -152,6 +152,17 @@ class LinuxHost(account.LinuxAccounts):
         self.command(['/usr/bin/systemctl','reload',bundle['services']['ssh_reload']])
         return True
 
+    def handoff_stopped(self):
+        # Socket, Accept=yes instances and controller stopped before a sealed
+        # tree moves (#5166); the exclusive permanent lock is the second guard.
+        states=self.command(['/usr/bin/systemctl','show','ameesh-handoff-local.socket',
+            'ameesh-release-controller.service','--property=ActiveState'])
+        instances=self.command(['/usr/bin/systemctl','list-units','--plain','--no-legend',
+            '--state=active,activating,deactivating,reloading','ameesh-handoff-local@*.service'])
+        values=[line.split('=',1)[1] for line in states.splitlines() if '=' in line]
+        return (len(values)==2 and all(value in ('inactive','failed') for value in values)
+                and not instances.strip())
+
     def validate_restored_configuration(self,bundle):
         runtime.trusted('/usr/sbin/visudo')
         self.command(['/usr/sbin/visudo','-c'])

@@ -112,6 +112,68 @@ mesure réussie, sans corps de requête ni secret. Mesurer le coût sur le runti
 réel de chaque enrôlement ; si le budget est dépassé, réduire le runtime ou
 faire relire un changement de borne, jamais mettre un cache ou sauter une part.
 
+## Remplacer un runtime déjà scellé (#5166)
+
+`runtime-release.publish` refuse une destination existante et la mesure H8
+n'admet que `runtime`, `lib` et `store` sous `/opt/ameesh-release`. Le
+remplacement est donc un mandat distinct, porté par `remplacement-runtime.py`.
+Il retire les arbres et le sceau anciens vers
+`/opt/ameesh-release-retained/OPERATION/` (même système de fichiers, root 0700),
+publie les arbres neufs, puis remplace le sceau en dernier. Il ne fait que
+prendre le verrou permanent : l'inode reste le même. Le store reste en place et
+sa mesure est reprise telle quelle. Une interruption laisse un état que H8
+refuse ; la reprise repart de ce qu'elle observe.
+
+Le backend enrôlé ne connaît pas ces commandes, et son réenrôlement (A2) exige
+un runtime qui possède `decisions.require_current`. Ces seules commandes
+s'exécutent donc depuis les arbres de stage de l'opération. `backend.json` ne
+fournit que l'hôte et la machine ; la question signée lie le digest du code qui
+s'exécute (`code_sha256`). Tout autre emplacement refuse.
+
+Ordre sur l'hôte :
+
+1. Retenir le SHA : le commit actif en staging qui contient #5166. `f449ef772`
+   ne convient pas : il possède `require_current`, mais pas ce code.
+2. Construire hors root. `DIR` est un répertoire privé sans écriture de groupe
+   sur ses parents, `CLONE` un clone propre de ce SHA :
+   ```sh
+   umask 022
+   /usr/bin/python3 -I -B CLONE/deploy/mise-a-jour/construction-runtime.py \
+     --clone CLONE --sha "$SHA" --output "$DIR/out"
+   "$DIR/out/runtime/bin/python" -I -B -c \
+     'import ameesh.decisions as d; assert hasattr(d, "require_current")'
+   ```
+3. Root copie, avec `OP` nouveau, `DIR/out/runtime` vers
+   `/var/lib/ameesh-release-bootstrap/OP/runtime` et
+   `runtime/share/ameesh/mise-a-jour/` vers `.../OP/sources` (root, sans lien ni
+   écriture de groupe ; stage 0700). Il y écrit `replacement.json`, root 0600 :
+   `{"version":1,"sha":"…","expires_at":EPOCH,"held_operation":"OLD"}`.
+   `held_operation` nomme le bootstrap retenu à `validate` (`null` s'il n'y en a
+   aucun) ; sa réservation et son journal ne sont pas modifiés.
+4. Préparer, avec `S=/var/lib/ameesh-release-bootstrap/OP` :
+   `$S/runtime/bin/python -I -B $S/sources/backend-administrateur.py
+   replacement-prepare OP`.
+   La sortie donne la question et les options, à passer sans retouche à
+   `ameesh decide ask --needs-signature`.
+5. Après signature, `replacement-plan OP --decision N` : effet nul, tous les pas
+   autorisés. Arrêter `ameesh-handoff-local.socket` et ses instances ; le
+   contrôleur doit être inactif. Puis `replace OP --decision N`, à reprendre avec
+   la même commande en cas d'interruption.
+6. Vérifier :
+   `/opt/ameesh-release/runtime/bin/python -I -B -c 'import ameesh.decisions as d; print(hasattr(d, "require_current"))'`
+   doit rendre `True` ; `sha` du sceau = SHA retenu ; sous `retained/OP/` :
+   `runtime-seal.json`, `runtime/`, `lib/` ; inode du verrou inchangé ; socket
+   relancé.
+7. Suite : A2 sur ce même SHA, puis `prepare` de NEW sur les arbres neufs avec le
+   sceau neuf, `continuation-question`, clé et enrôlement. La continuation admet
+   l'écart d'arbres et de sceau par rapport à OLD seulement si un remplacement
+   achevé, signé et non annulé nomme OLD ; la référence signée le cite.
+
+Retour arrière : `replacement-rollback-question OP --expires T`, décision signée
+propre, socket arrêté, puis `replacement-rollback OP --decision N` depuis le même
+stage. Les arbres neufs restent sous `replaced-runtime` et `replaced-lib` ; un
+remplacement annulé ne reprend pas : préparer une nouvelle opération.
+
 ## Retour arrière
 
 Arrêter socket et instances, réconcilier les intents H7 conservés. Sous le
