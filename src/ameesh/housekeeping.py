@@ -6092,13 +6092,15 @@ def print_report(report: dict) -> None:
             print("    %s  %s  (%s%s)  →  %s" % (
                 _fmt(e.get("bytes")), e["path"], e.get("owner") or "?", sort,
                 e.get("command") or ""))
-    # #4234 : le volume des arbres de lots livrés gardés pour des fichiers
-    # modifiés/non suivis, les plus gros en tête. Le relevé est borné ; il ne
-    # supprime rien et ne remplace pas la politique d'archivage du Host.
+    # #5052 : volume de tous les arbres gardés ou en attente, y compris
+    # les HEAD non intégrés. Relevé borné, sans suppression ; les gardes
+    # de fin, d'inactivité et de sécurité restent celles de la passe.
     sizes = report.get("worktree_sizes") or {}
-    if sizes.get("dirty"):
-        print("  kept dirty worktrees by volume (biggest first; %d of %d measured "
-              "in %ss):" % (sizes.get("measured") or 0, sizes["dirty"],
+    if sizes.get("kept", sizes.get("dirty")):
+        label = "kept worktrees" if "kept" in sizes else "kept dirty worktrees"
+        print("  %s by volume (biggest first; %d of %d measured "
+              "in %ss):" % (label, sizes.get("measured") or 0,
+                            sizes.get("kept", sizes.get("dirty")),
                             sizes.get("seconds") or 0))
         for row in sizes.get("top") or ():
             print("    %s%s  %s — %s" % (
@@ -6108,7 +6110,7 @@ def print_report(report: dict) -> None:
             print("    … %d not measured this pass" % sizes["unmeasured"])
         print("    total measured %s; %s" % (
             _fmt(sizes.get("total_bytes")),
-            "archive policy declared: kept until the archive grace"
+            "archive policy declared: end, inactivity and safety guards still apply"
             if sizes.get("archive_declared") else
             "archive policy NOT declared (Host card dirty_worktree_after / "
             "dirty_archive_retention): these trees stay"))
@@ -6122,20 +6124,27 @@ WORKTREE_SIZE_TOP = 10
 
 
 def kept_worktree_sizes(plan, *, seconds: float = WORKTREE_SIZE_BUDGET_S) -> dict:
-    """#4234 : tailles des worktrees gardés pour des fichiers modifiés, non
-    suivis ou ignorés, les plus grosses d'abord.
+    """#5052 : tailles de TOUS les worktrees gardés ou en attente.
+
+    `dirty` reste le sous-ensemble modifié/ignoré ; `kept` est le périmètre
+    mesuré, y compris HEAD non intégré, processus et lots encore actifs.
 
     `plan` est le plan d'une passe en essai (les lignes `garde`/`attend` du
     kind `worktree`) ; chaque parcours est borné par le temps restant du
     relevé (20 s au total) et par 5 s pour un seul arbre. Rien n'est supprimé
     ni écrit : un arbre non mesuré est dit, jamais compté à zéro."""
     wanted = []
+    dirty = 0
+    seen = set()
     for row in plan or ():
+        if (row.get("kind") != "worktree" or row.get("action") not in ("garde", "attend")
+                or not row.get("path") or row["path"] in seen):
+            continue
+        seen.add(row["path"])
+        wanted.append(row)
         detail = row.get("detail") or ""
-        if (row.get("kind") == "worktree" and row.get("action") in ("garde", "attend")
-                and ("modified or untracked" in detail
-                     or "ignored file(s) outside build artifacts" in detail)):
-            wanted.append(row)
+        dirty += int("modified or untracked" in detail
+                     or "ignored file(s) outside build artifacts" in detail)
     started = time.monotonic()
     deadline = started + max(0.0, float(seconds))
     measured = []
@@ -6149,7 +6158,7 @@ def kept_worktree_sizes(plan, *, seconds: float = WORKTREE_SIZE_BUDGET_S) -> dic
                          "complete": complete, "detail": row.get("detail") or "",
                          "lot": row.get("lot")})
     top = sorted(measured, key=lambda item: item["bytes"], reverse=True)[:WORKTREE_SIZE_TOP]
-    return {"dirty": len(wanted), "measured": len(measured),
+    return {"dirty": dirty, "kept": len(wanted), "measured": len(measured),
             "unmeasured": len(wanted) - len(measured),
             "total_bytes": sum(item["bytes"] for item in measured),
             "seconds": round(time.monotonic() - started, 1),
