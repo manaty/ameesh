@@ -21,10 +21,10 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from urllib import error, parse, request
 
-from .canon import load_yaml
+from .canon import HostPolicy, SandboxPlacement, load_yaml
 from .sandbox_provider import (
     InvalidJob, Job, JobAlreadyExists, JobIdentity, JobNotFound, JobProvider,
-    JobSpec, JobUIDConflict, ProviderForbidden, ProviderUnavailable,
+    JobSpec, JobUIDConflict, ProviderError, ProviderForbidden, ProviderUnavailable,
     phase_from_status,
 )
 
@@ -61,6 +61,10 @@ def _time(value):
 class KubernetesJobProvider(JobProvider):
     """HTTP implementation. ``secrets(identity)`` returns prompt/relay_token.
 
+    Requires Kubernetes >= 1.27 (batch.kubernetes.io/controller-uid labels).
+    Embedded TLS keys briefly use 0600 files in a private TMPDIR directory
+    for SSLContext.load_cert_chain; the directory is removed before return.
+
     The caller supplies the admitted turn duration separately because JobSpec
     deliberately contains no profile limits. A provider is scoped to one Host
     namespace/image/deadline/TTL; a mismatched spec is refused before any IO.
@@ -76,9 +80,10 @@ class KubernetesJobProvider(JobProvider):
 
     def __init__(self, host, *, turn_seconds: int,
                  secrets: Callable[[JobIdentity], Mapping[str, str]], timeout=15):
-        policy = host.policy if hasattr(host, 'policy') else host['policy']
-        sandbox = policy.sandbox if hasattr(policy, 'sandbox') else policy['sandbox']
-        self.policy = sandbox.to_dict() if hasattr(sandbox, 'to_dict') else dict(sandbox)
+        if (not isinstance(getattr(host, 'policy', None), HostPolicy)
+                or not isinstance(host.policy.sandbox, SandboxPlacement)):
+            raise InvalidJob('provider requires a typed Host sandbox placement')
+        self.policy = host.policy.sandbox.to_dict()
         self.turn_seconds = turn_seconds
         if (isinstance(turn_seconds, bool) or not isinstance(turn_seconds, (int, float))
                 or not math.isfinite(turn_seconds) or turn_seconds <= 0):
@@ -97,10 +102,12 @@ class KubernetesJobProvider(JobProvider):
                 config = json.loads(raw)
             except ValueError:
                 config = load_yaml(raw.decode())
-            context_name = self.policy.get('context') or config['current-context']
-            context = self._named(config['contexts'], context_name, 'context')
-            cluster = self._named(config['clusters'], context['cluster'], 'cluster')
-            user = self._named(config['users'], context['user'], 'user')
+            context_name = config.get('current-context')
+            if not isinstance(context_name, str) or not context_name.strip():
+                raise ProviderUnavailable('kubeconfig current-context is missing')
+            context = self._named(config.get('contexts', []), context_name, 'context')
+            cluster = self._named(config.get('clusters', []), context.get('cluster'), 'cluster')
+            user = self._named(config.get('users', []), context.get('user'), 'user')
             if any(key in user for key in ('exec', 'auth-provider', 'username', 'password')):
                 raise InvalidJob('unsupported kubeconfig credential mechanism')
             server = parse.urlsplit(cluster['server'])
@@ -136,7 +143,7 @@ class KubernetesJobProvider(JobProvider):
             self._token = token
             self._opener = request.build_opener(request.ProxyHandler({}),
                                                 request.HTTPSHandler(context=tls), _NoRedirect())
-        except InvalidJob:
+        except (InvalidJob, ProviderUnavailable):
             raise
         except Exception:
             raise InvalidJob('invalid or unreadable kubeconfig') from None
@@ -145,7 +152,7 @@ class KubernetesJobProvider(JobProvider):
     def _named(entries, name, key):
         found = [entry[key] for entry in entries if entry.get('name') == name]
         if len(found) != 1:
-            raise InvalidJob('kubeconfig reference must be unique')
+            raise ProviderUnavailable('kubeconfig current-context references do not resolve uniquely')
         return found[0]
 
     @staticmethod
@@ -169,11 +176,11 @@ class KubernetesJobProvider(JobProvider):
                               headers=headers, method=method)
         try:
             with self._opener.open(req, timeout=self.timeout) as response:
-                content = response.read(limit + 1)
-                if len(content) > limit:
+                content = response.read(limit if raw else limit + 1)
+                if not raw and len(content) > limit:
                     raise ProviderUnavailable('Kubernetes response exceeds limit')
                 if raw:
-                    return content.decode('utf-8')
+                    return content
                 value = json.loads(content)
                 if not isinstance(value, dict):
                     raise ProviderUnavailable('invalid Kubernetes response')
@@ -206,33 +213,35 @@ class KubernetesJobProvider(JobProvider):
             owner.get('uid') == meta['uid'] and owner.get('kind') == 'Job'
             for owner in pod['metadata'].get('ownerReferences', []))]
 
-    def _check_output(self, value, content):
+    def _safe_output(self, value, content):
+        """Bad workload output is terminal data, never a transport failure.
+
+        The prompt may legitimately be quoted in a result. Only the relay
+        credential is withheld. An unreadable/malformed Secret neutralizes
+        output too: it must not prevent observation or cancellation of a Job.
+        """
         if not content:
-            return
+            return ''
         meta = value['metadata']
-        secret = self._call('GET', self._path(meta['namespace'], 'secrets', meta['name']))
         try:
-            sensitive = [base64.b64decode(v, validate=True).decode()
-                         for v in secret['data'].values()]
-        except (ValueError, KeyError):
-            raise ProviderUnavailable('invalid turn Secret') from None
-        if any(text and text in content for text in sensitive):
-            raise ProviderUnavailable('turn output contains secret material')
+            secret = self._call('GET', self._path(meta['namespace'], 'secrets', meta['name']))
+            token = base64.b64decode(secret['data']['relay_token'], validate=True).decode()
+        except (ProviderError, ValueError, KeyError, TypeError):
+            return ''
+        return '' if not token or token in content else content
 
     def _observe(self, value):
         meta, status = value['metadata'], value.get('status', {})
         message = ''
         if phase_from_status(status) in ('Succeeded', 'Failed'):
             pods = self._pods(value)
-            if len(pods) > 1:
-                raise ProviderUnavailable('multiple Pods for single-use Job')
-            for pod in pods:
-                for container in pod.get('status', {}).get('containerStatuses', []):
+            if len(pods) == 1:
+                for container in pods[0].get('status', {}).get('containerStatuses', []):
                     if container.get('name') == 'turn':
                         message = container.get('state', {}).get('terminated', {}).get('message', '')
-            if len(message.encode()) > MAX_MESSAGE_BYTES:
-                raise ProviderUnavailable('termination message exceeds limit')
-        self._check_output(value, message)
+            if not isinstance(message, str) or len(message.encode()) > MAX_MESSAGE_BYTES:
+                message = ''
+        message = self._safe_output(value, message)
         return Job(namespace=meta['namespace'], name=meta['name'], uid=meta['uid'],
                    labels=meta.get('labels', {}), phase=phase_from_status(status),
                    image=value['spec']['template']['spec']['containers'][0]['image'],
@@ -356,12 +365,19 @@ class KubernetesJobProvider(JobProvider):
         if not pods:
             return ''
         if len(pods) != 1:
-            raise ProviderUnavailable('multiple Pods for single-use Job')
+            return ''
         path = self._path(namespace, 'pods', pods[0]['metadata']['name']) + '/log?'
         path += parse.urlencode({'container': 'turn', 'limitBytes': MAX_LOG_BYTES + 1})
-        content = self._call('GET', path, limit=MAX_LOG_BYTES, raw=True)
-        self._check_output(value, content)
-        return content
+        content = self._call('GET', path, limit=MAX_LOG_BYTES + 1, raw=True)
+        if len(content) > MAX_LOG_BYTES:
+            # A bounded nonsecret sentinel follows the fake-provider contract:
+            # S4b refuses it as 'missing' on this step, rather than retrying.
+            return ' ' * (MAX_LOG_BYTES + 1)
+        try:
+            text = content.decode('utf-8')
+        except UnicodeError:
+            return ''
+        return self._safe_output(value, text)
 
     def delete(self, namespace, name, *, uid=None):
         path = self._path(namespace, name=name)

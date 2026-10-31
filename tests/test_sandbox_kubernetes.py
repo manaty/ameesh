@@ -15,6 +15,8 @@ import threading
 import unittest
 from urllib.parse import parse_qs, urlsplit
 
+from ameesh.canon import HostPolicy, SandboxPlacement, SandboxJob
+from ameesh.sandbox_supervisor import SandboxSupervisor
 from ameesh.sandbox_kubernetes import KubernetesJobProvider, FINALIZER
 from ameesh.sandbox_provider import (
     InvalidJob, JobAlreadyExists, JobIdentity, JobNotFound, JobSpec,
@@ -139,10 +141,9 @@ class KubernetesTest(unittest.TestCase):
                            'cluster': 'cluster', 'user': 'user'}}]}
         self.path = self.root / 'kubeconfig'
         self.write_config()
-        self.host = {'policy': {'sandbox': {'provider': 'kubernetes',
-            'kubeconfig': str(self.path), 'namespace': 'reviewers', 'image': IMAGE,
-            'job': {'activeDeadlineSeconds': 1200, 'ttlSecondsAfterFinished': 3600,
-                    'backoffLimit': 0, 'automountServiceAccountToken': False}}}}
+        self.host = SimpleNamespace(policy=HostPolicy(sandbox=SandboxPlacement(
+            'kubernetes', str(self.path), 'reviewers', IMAGE, ['profile'], 1,
+            'example/home#1', SandboxJob(1200, 0, 3600, False))))
         self.identity = JobIdentity('turn-1', 'reviewer', 1, 'host', 'profile', 'reviewers')
         self.spec = JobSpec(self.identity, IMAGE, 1200, 3600, ('review',))
         self.provider = self.make_provider()
@@ -224,8 +225,7 @@ class KubernetesTest(unittest.TestCase):
         self.assertEqual(seen.message, 'digest')
         self.assertEqual(seen.completed_at - seen.created_at, 60)
         self.pod('é' * 2049)
-        with self.assertRaises(ProviderUnavailable):
-            self.provider.get(job.namespace, job.name)
+        self.assertEqual(self.provider.get(job.namespace, job.name).message, '')
 
     def test_bounded_logs(self):
         job = self.create()
@@ -233,9 +233,9 @@ class KubernetesTest(unittest.TestCase):
         self.server.state['log'] = 'x' * 65536
         self.assertEqual(len(self.provider.logs(job.namespace, job.name)), 65536)
         self.server.state['log'] += 'x'
-        with self.assertRaises(ProviderUnavailable):
-            self.provider.logs(job.namespace, job.name)
-        self.assertEqual(self.server.state['calls'][-1][2]['limitBytes'], ['65537'])
+        self.assertEqual(len(self.provider.logs(job.namespace, job.name)), 65537)
+        calls = [c for c in self.server.state['calls'] if c[1].endswith('/log')]
+        self.assertEqual(calls[-1][2]['limitBytes'], ['65537'])
 
     def test_http_errors_do_not_echo_server_body(self):
         for status, exception in ((401, ProviderForbidden), (403, ProviderForbidden),
@@ -348,27 +348,78 @@ class KubernetesTest(unittest.TestCase):
             self.make_provider()
         del self.config['clusters'][0]['cluster']['insecure-skip-tls-verify']
         self.config['current-context'] = 'missing'
-        self.host['policy']['sandbox']['context'] = 'chosen'
         self.write_config()
-        self.assertIsNone(self.make_provider().get('reviewers', self.identity.name))
+        with self.assertRaises(ProviderUnavailable):
+            self.make_provider()
+        del self.config['current-context']
+        self.write_config()
+        with self.assertRaises(ProviderUnavailable):
+            self.make_provider()
+        self.config['current-context'] = 'chosen'
+        self.config['contexts'][0]['context']['cluster'] = 'missing'
+        self.write_config()
+        with self.assertRaises(ProviderUnavailable):
+            self.make_provider()
 
-    def test_output_never_returns_prompt_or_relay_token(self):
+    def supervisor_row(self, job, *, cancelling=False):
+        return dict(turn_id=self.identity.turn_id, agent=self.identity.agent,
+            lease_epoch=self.identity.epoch, namespace=job.namespace, job_name=job.name,
+            job_uid=job.uid, profile_ref=self.identity.profile,
+            placement_ref=self.identity.placement, image_digest=IMAGE,
+            state='cancelling' if cancelling else 'bound', deadline_ts=200,
+            cancel_requested_at=100 if cancelling else None)
+
+    def test_terminal_secret_message_remains_observable_and_cancellable(self):
         job = self.create()
-        self.pod()
-        for content in (TOKEN, PROMPT):
-            self.server.state['log'] = content
-            with self.assertRaises(ProviderUnavailable) as raised:
-                self.provider.logs(job.namespace, job.name)
-            self.assertNotIn(content, str(raised.exception))
         self.server.state['jobs'][job.name]['status'] = {
             'conditions': [{'type': 'Failed', 'status': 'True'}]}
         self.pod(TOKEN)
-        with self.assertRaises(ProviderUnavailable) as raised:
-            self.provider.get(job.namespace, job.name)
-        self.assertNotIn(TOKEN, str(raised.exception))
+        observed = self.provider.get(job.namespace, job.name)
+        self.assertEqual(observed.message, '')
+        self.assertEqual(self.provider.list(job.namespace)[0].message, '')
+        supervisor = SandboxSupervisor(self.provider, lambda event: None,
+                                       orphan_after=10, clock=lambda: 100)
+        event = supervisor.step(self.supervisor_row(job, cancelling=True), self.spec)
+        self.assertEqual(event.kind, 'cancelled')
+        # S4b deliberately does not delete terminal Jobs during cancellation.
+        self.assertTrue(self.provider.delete(job.namespace, job.name, uid=job.uid))
+        self.assertEqual(self.server.state['secrets'], {})
+
+    def test_running_cancel_calls_delete_despite_malicious_message(self):
+        job = self.create()
+        self.pod(TOKEN)
+        self.server.state['jobs'][job.name]['status'] = {'active': 1}
+        supervisor = SandboxSupervisor(self.provider, lambda event: None,
+                                       orphan_after=10, clock=lambda: 100)
+        event = supervisor.step(self.supervisor_row(job, cancelling=True), self.spec)
+        self.assertEqual(event.kind, 'cancelled')
+        self.assertTrue(any(c[0] == 'DELETE' and '/jobs/' in c[1]
+                            for c in self.server.state['calls']))
+        self.assertEqual(self.server.state['secrets'], {})
+
+    def test_invalid_log_is_failed_on_first_supervisor_step(self):
+        job = self.create()
+        self.server.state['jobs'][job.name]['status'] = {
+            'conditions': [{'type': 'Complete', 'status': 'True'}]}
+        self.pod('digest')
+        supervisor = SandboxSupervisor(self.provider, lambda event: None,
+                                       orphan_after=10, clock=lambda: 100)
+        for content in ('x' * 65537, TOKEN):
+            self.server.state['log'] = content
+            event = supervisor.step(self.supervisor_row(job), self.spec)
+            self.assertEqual(event.kind, 'failed')
+            self.assertEqual(event.refusal, 'missing')
+            self.assertNotIn(TOKEN, json.dumps(event.as_dict()))
+
+    def test_prompt_is_valid_output_but_relay_token_is_neutralized(self):
+        job = self.create()
+        self.pod()
+        self.server.state['log'] = PROMPT
+        self.assertEqual(self.provider.logs(job.namespace, job.name), PROMPT)
+        self.server.state['log'] = TOKEN
+        self.assertEqual(self.provider.logs(job.namespace, job.name), '')
 
     def test_typed_host_policy(self):
-        from ameesh.canon import HostPolicy, SandboxPlacement, SandboxJob
         placement = SandboxPlacement('kubernetes', str(self.path), 'reviewers', IMAGE,
             ['profile'], 1, 'example/home#1', SandboxJob(1200, 0, 3600, False))
         typed = SimpleNamespace(policy=HostPolicy(sandbox=placement))
@@ -420,8 +471,7 @@ contexts:
                          'ownerReferences': [{'kind': 'Job', 'uid': 'foreign'}]}}
         self.assertEqual(self.provider.logs(job.namespace, job.name), self.server.state['log'])
         self.server.state['pods']['foreign']['metadata']['ownerReferences'][0]['uid'] = job.uid
-        with self.assertRaises(ProviderUnavailable):
-            self.provider.logs(job.namespace, job.name)
+        self.assertEqual(self.provider.logs(job.namespace, job.name), '')
 
     def test_unreachable_server(self):
         self.provider.server = 'https://127.0.0.1:1'
