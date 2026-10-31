@@ -4,6 +4,7 @@ import os
 import signal
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace as NS
 from unittest import mock
 
@@ -76,6 +77,25 @@ class SelectionTest(card_fixture.SandboxCase):
         with mock.patch.object(runtime, '_pinned_canon', return_value=(loaded, state, pinned)):
             self.assertFalse(runtime.grant_valid(worker, admitted))
 
+    def test_missing_or_unscoped_relay_credentials_are_refused(self):
+        worker = self.worker()
+        worker.runner.runner_id = 'owner'
+        worker.epoch = 7
+        row = dict(turn_id='turn', deadline_ts=time.time()+60)
+        with self.assertRaises(s1.Refusal):
+            runtime.credentials(worker, row)
+        valid = runtime.SandboxCredentials('https://relay.example.test', 'private-token',
+            runtime.relay.Identity('executor', worker.runner.host, worker.name, 'owner', 7,
+                                    turn='turn', expires_ts=time.time()+30))
+        worker.runner.sandbox_credentials_for = lambda *args: valid
+        self.assertIs(runtime.credentials(worker, row), valid)
+        for claims in (replace(valid.identity, turn=None), replace(valid.identity, turn='other'),
+                       replace(valid.identity, lease_epoch=8),
+                       replace(valid.identity, expires_ts=time.time()+120)):
+            worker.runner.sandbox_credentials_for = lambda *args: replace(valid, identity=claims)
+            with self.assertRaises(s1.Refusal):
+                runtime.credentials(worker, row)
+
 
 class RunnerSandboxTest(PgTestCase):
     def setUp(self):
@@ -140,12 +160,11 @@ class RunnerSandboxTest(PgTestCase):
                 self.db.execute("update agent_registry set lease_owner='replacement', lease_epoch=8 where name='agent'")
                 self.worker.lease_lost.set()
             return child
-        def token(env, *args, **kwargs):
-            env['DEEPSEEK_API_KEY'] = 'private-session-token'
-            return True
+        self.worker.runner.sandbox_credentials_for = lambda agent, owner, epoch, turn, deadline: runtime.SandboxCredentials(
+            'https://relay.example.test', 'private-session-token', runtime.relay.Identity(
+                'test', 'host', agent, owner, epoch, turn=turn, expires_ts=time.time()+30))
         with mock.patch.object(SandboxTurn, 'start', start), \
              mock.patch.object(runtime, 'grant_valid', return_value=grant_valid), \
-             mock.patch.object(runtime.relay, 'apply_turn_env', side_effect=token), \
              mock.patch.object(runtime, 'source', return_value=dict(
                  release='test', commit='a'*40, contract='ameesh-sandbox/1')):
             result = runtime.run(self.worker, self.spec, (self.admitted, self.host, self.account))
@@ -180,3 +199,12 @@ class RunnerSandboxTest(PgTestCase):
         self.assertEqual(self.db.query('select state from sandbox_turns')[0]['state'], 'cancelled')
         self.assertFalse(self.db.query('select * from sandbox_results'))
         self.assertFalse(self.db.query('select * from spend_pending'))
+
+    def test_missing_scoped_issuer_refuses_before_reserving_or_launching(self):
+        with mock.patch.object(runtime, 'source', return_value=dict(
+                release='test', commit='a'*40, contract='ameesh-sandbox/1')):
+            result = runtime.run(self.worker, self.spec, (self.admitted, self.host, self.account))
+        self.assertFalse(result)
+        self.worker.fail_turn.assert_called_once_with('sandbox refused: profile-refused', 'profile-refused')
+        self.assertFalse(self.db.query('select * from sandbox_turns'))
+        self.assertFalse(self.db.query('select * from account_reservations'))

@@ -8,21 +8,63 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 from . import account_budget, account_turn, account_window, canon, canon_sync
 from . import placement, registry, relay, turn_context, version
 from .sandbox_provider import JobIdentity, JobSpec
+from .sandbox_supervisor import _deadline
 from .sandbox_turn import SandboxTurn, authorize
 from .storage.postgres import sandbox as s1
 
 LOG = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SandboxCredentials:
+    """Trusted issuer's token and verified claims; never supplied by mail."""
+    base_url: str
+    token: str
+    identity: relay.Identity
+
+
+def credentials(worker, row):
+    """Require an installed turn-scoped issuer; legacy lease tokens cannot do this.
+
+    S6 must wire ``runner.sandbox_credentials_for(agent, owner, epoch, turn,
+    deadline_ts)`` to the actual issuer/verifier. Missing wiring is a named
+    refusal, never a fallback to the mediated executor's lease token.
+    """
+    issuer = getattr(worker.runner, 'sandbox_credentials_for', None)
+    if not callable(issuer):
+        raise s1.Refusal('profile-refused')
+    value = issuer(worker.name, worker.runner.runner_id, worker.epoch,
+                   row['turn_id'], row['deadline_ts'])
+    if not isinstance(value, SandboxCredentials) or not isinstance(value.identity, relay.Identity):
+        raise s1.Refusal('profile-refused')
+    identity = value.identity
+    expiry = identity.expires_ts
+    if (identity.agent != worker.name or identity.host != worker.runner.host
+            or identity.lease_owner != worker.runner.runner_id
+            or identity.lease_epoch != worker.epoch or identity.turn != row['turn_id']
+            or isinstance(expiry, bool) or not isinstance(expiry, (int, float))
+            or not math.isfinite(expiry) or not time.time() < expiry <= _deadline(row['deadline_ts'])
+            or not isinstance(value.token, str) or not value.token
+            or not isinstance(value.base_url, str)):
+        raise s1.Refusal('profile-refused')
+    url = urlsplit(value.base_url)
+    if (url.scheme not in ('http', 'https') or not url.hostname or url.username
+            or url.password or url.query or url.fragment):
+        raise s1.Refusal('profile-refused')
+    return value
 
 
 def _pinned_canon(worker):
@@ -124,6 +166,8 @@ def run(worker, spec, selected):
     cancelling = False
     try:
         executable_source = source()
+        if not callable(getattr(worker.runner, 'sandbox_credentials_for', None)):
+            raise s1.Refusal('profile-refused')
         worker.stop_requested.clear()
         boundary = spec.get('_preempt_gen', worker.preempt_gen)
         with worker._preempt_lock:
@@ -177,19 +221,17 @@ def run(worker, spec, selected):
         reservation = account_budget.reservation(worker.db, spend_key)
         document['accounting']['reservation'] = turn_context._reservation(reservation)
         turn_context.write(worker.state_dir, document, secrets=turn_context.environment_secrets())
-        env = {}
-        if not relay.apply_turn_env(env, worker.agent['harness'], agent=worker.name,
-                                    owner=worker.runner.runner_id, epoch=worker.epoch, turn_id=turn_id):
-            raise s1.Refusal('profile-refused')
-        token = env[relay.HARNESS_ENV[worker.agent['harness']]['key']]
+        material = credentials(worker, row)
         job_input = dict(schema='ameesh-sandbox-job/1', turn_id=turn_id, epoch=worker.epoch,
+                         owner=worker.runner.runner_id, deadline_ts=_deadline(row['deadline_ts']),
+                         image_digest=admitted.image_digest,
                          scope=row['scope'], scope_digest=row['scope_digest'], limits=admitted.limits,
-                         source=executable_source, prompt=spec['prompt'], relay_url=relay.relay_url())
+                         source=executable_source, prompt=spec['prompt'], relay_url=material.base_url)
         job = JobSpec(JobIdentity(turn_id, worker.name, worker.epoch, host.title,
                                   admitted.profile, admitted.namespace), admitted.image,
                       admitted.active_deadline_seconds, admitted.ttl_seconds_after_finished)
         options = dict(placement=asdict(host.policy.sandbox), turn_seconds=admitted.limits['turn_seconds'],
-                       secrets=dict(prompt=json.dumps(job_input), relay_token=token))
+                       secrets=dict(prompt=json.dumps(job_input), relay_token=material.token))
         child = adapter.start(job, provider_factory=__name__ + ':kubernetes_provider',
                               provider_options=options, new_session=True, state_dir=worker.state_dir,
                               orphan_after=admitted.limits['job_seconds'],
