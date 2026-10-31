@@ -156,7 +156,7 @@ class TurnCosts(interface.TurnCosts):
                spend_key=None, source=None, executor=None, lease_owner=None,
                lease_epoch=None, void_reason=None, price_fallback=None,
                cache_write_tokens=None, work_item_id=None, started_at=None,
-               turn_id=None, inputs=None) -> bool:
+               turn_id=None, inputs=None, relay_call_id=None) -> bool:
         cols = ["agent", "harness", "turn", "model", "session", "usd",
                 "input_tokens", "cached_input_tokens", "output_tokens",
                 "cum_usd", "cum_input_tokens", "cum_cached_input_tokens",
@@ -215,6 +215,12 @@ class TurnCosts(interface.TurnCosts):
                 cols.append("billing_account")
                 values.append(reservations[0]["billing_account"])
         suffix = ""
+        if relay_call_id is not None:
+            if source != 'relay' or not turn_id or spend_key is not None:
+                raise ValueError('relay call requires relay source, turn and no spend key')
+            cols.append('relay_call_id')
+            values.append(relay_call_id)
+            suffix = " on conflict (turn_id, relay_call_id) where source = 'relay' do nothing"
         if spend_key is not None:
             # L60 (migration 0041) : un marqueur comptable n'écrit qu'une ligne,
             # même rejoué après une écriture dont l'effacement n'a pas suivi.

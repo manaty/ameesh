@@ -417,8 +417,14 @@ def relay_begin(db, identity):
                         ' and s.owner = %s and s.lease_epoch = %s for update of s',
                         (identity.turn,identity.agent,identity.lease_owner,identity.lease_epoch))
         if not rows:
+            if identity.executor.startswith('sandbox:'):
+                raise Refusal('revoked')
             return None  # non-tranche relay use retains its existing behavior
         row=rows[0]
+        # Verification happened before this transaction. Fence a lease lost
+        # meanwhile before recording intent to contact the provider (#5140).
+        from .sandbox import _live
+        _live(tx, row, identity.lease_owner, identity.lease_epoch)
         if row['state'] in TERMINAL or row['cancel_requested_at'] or tx.query(
                 'select turn_id from sandbox_turns where turn_id = %s'
                 ' and deadline_ts <= clock_timestamp()', (identity.turn,)):
