@@ -299,12 +299,14 @@ root 0600, régulier, non lié, avec les champs exacts suivants :
 sont des identifiants minuscules distincts, sans préfixe `pg_`. Les deux DSN
 administrateurs sont des références privées explicites avec host, port, dbname,
 user ; aucun profil ambiant, service libpq ou `options` n'est admis.
-Aucun DSN ne se transmet sur la ligne de commande. Pour l'administration peer
-locale du cluster de restauration, `restore_login_host: "127.0.0.1"` est le seul
-champ facultatif : le DSN administrateur utilise le socket privé, et le DSN
-du login utilise loopback avec le même port et la même base. La commande vérifie
-que le cluster écoute uniquement 127.0.0.1 sur ce port ; aucun endpoint distant
-alternatif n'est admis.
+Aucun DSN ne se transmet sur la ligne de commande. Les DSN de logins produits exigent
+`require_auth=scram-sha-256` : aucune négociation password/MD5/trust n'est
+acceptée. Les connexions administratives munies d'un mot de passe ont la même
+exigence ; l'administration locale peer utilise le socket sans mot de passe.
+La restauration utilise **uniquement** `/run/ameesh-release-restore`, jamais
+le port TCP du banc des agents. La politique est conservée dans le DSN transmis
+à pg_restore. Voir le [contrat require_auth de libpq 16](https://www.postgresql.org/docs/16/libpq-connect.html#LIBPQ-CONNECT-REQUIRE-AUTH).
+
 
 Après livraison par paquet et staging, installer les fichiers wheel
 `share/ameesh/postgres/enroler-identites.py` et
@@ -345,11 +347,12 @@ son identité nécessite CREATEDB, droit de cluster ; elle reste NOSUPERUSER,
 NOCREATEROLE, NOREPLICATION, NOBYPASSRLS et sans rôle parent. Aucun login de
 restauration n'est créé sur la source. Le cluster de vérification ne doit
 héberger aucune autre charge. Topologie #5165 (source c628f4c501eb) : initdb/pg_ctl directs, version
-choisie au moins égale au serveur source, port 55432 sur 127.0.0.1, données sous
+choisie au moins égale au serveur source, données sous
 `/var/lib/ameesh-release-restore/<major>/data`, configuration root
 `/etc/ameesh-release-restore`, socket privé `/run/ameesh-release-restore`
 (0700), propriétaire OS `ameesh-restore` nologin ; unité
-`ameesh-release-restore.service`. Le producteur root tourne toutes les 60 s
+`ameesh-release-restore.service`. Le port numérique du socket est 55432 ;
+il n'implique aucun accès TCP du consommateur. Le producteur root tourne toutes les 60 s
 et écrit au chemin exact `backup.json.restore_capacity`. Pour cette commande
 d'identités root, l'administration peer doit autoriser explicitement root vers
 le rôle administrateur par le seul socket privé ; un accès réservé à l'OS

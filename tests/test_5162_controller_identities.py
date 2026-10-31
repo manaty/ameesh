@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import socket
 import time
+import struct
+import threading
 import shutil
 import stat
 import sys
@@ -46,6 +48,41 @@ class PrivateInputTest(unittest.TestCase):
         self.assertEqual(json.loads(result.stderr),
                          {'error': 'identity_enrollment_refused; private source and intents retained'})
 
+    def test_fake_server_cannot_downgrade_or_collect_a_password(self):
+        for method in (3, 5, 0):  # cleartext password, MD5, trust
+            captured = []
+            secret = uuid.uuid4().hex
+            with socket.socket() as listener:
+                listener.bind(('127.0.0.1', 0))
+                listener.listen(1)
+                listener.settimeout(3)
+                port = listener.getsockname()[1]
+                def fake():
+                    with listener.accept()[0] as client:
+                        client.settimeout(3)
+                        length = struct.unpack('!I', client.recv(4))[0]
+                        startup = b''
+                        while len(startup) < length - 4:
+                            startup += client.recv(length - 4 - len(startup))
+                        extra = b'abcd' if method == 5 else b''
+                        client.sendall(b'R' + struct.pack('!II', 8 + len(extra), method) + extra
+                                       + (b'Z' + struct.pack('!I', 5) + b'I' if method == 0 else b''))
+                        try:
+                            captured.append(client.recv(4096))
+                        except (TimeoutError, ConnectionResetError):
+                            captured.append(b'')
+                thread = threading.Thread(target=fake, daemon=True)
+                thread.start()
+                owner = make_conninfo(host='127.0.0.1', port=port, dbname='postgres', user='admin', sslmode='disable')
+                dsn = tool.login_dsn(owner, 'restore_login', secret)
+                with self.assertRaises(psycopg.OperationalError):
+                    psycopg.connect(dsn, connect_timeout=2)
+                thread.join(timeout=4)
+                self.assertFalse(thread.is_alive(), 'fake server did not finish')
+                self.assertEqual(len(captured), 1, 'fake server did not observe client closure')
+                self.assertTrue(all(not packet.startswith(b'p') and secret.encode() not in packet
+                                    for packet in captured), 'password material sent to a fake server')
+
 
 class RealIdentityTest(unittest.TestCase):
     @classmethod
@@ -68,7 +105,8 @@ class RealIdentityTest(unittest.TestCase):
             password.chmod(0o600)
             if not local:
                 envfile = root / 'container.env'
-                envfile.write_text('POSTGRES_USER=test_admin\nPOSTGRES_PASSWORD=' + password.read_text() + '\n')
+                envfile.write_text('POSTGRES_USER=test_admin\nPOSTGRES_PASSWORD=' + password.read_text()
+                                   + '\nPOSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256\n')
                 envfile.chmod(0o600)
                 sockets = root / 's'
                 sockets.mkdir(mode=0o700)
@@ -101,7 +139,7 @@ class RealIdentityTest(unittest.TestCase):
                 cls.socket_dsns.append(make_conninfo(dsn, host=str(sockets)))
                 continue
             subprocess.run([str(binaries / 'initdb'), '-D', str(root / 'data'), '-U', 'test_admin',
-                            '--auth-local=trust', '--auth-host=scram-sha-256', '--pwfile', str(password)],
+                            '--auth-local=scram-sha-256', '--auth-host=scram-sha-256', '--pwfile', str(password)],
                            check=True, capture_output=True)
             with socket.socket() as sock:
                 sock.bind(('127.0.0.1', 0))
@@ -154,8 +192,11 @@ class RealIdentityTest(unittest.TestCase):
             conn.execute("INSERT INTO mesh.schema_migrations VALUES ('1','synthetic')")
             conn.execute('CREATE TABLE mesh.payload (id serial, value text)')
             conn.execute("INSERT INTO mesh.payload(value) VALUES ('one'),('two')")
+        socket_patch = mock.patch.object(tool, 'RESTORE_SOCKET', tool.connection(self.socket_dsns[1])['host'])
+        socket_patch.start()
+        self.addCleanup(socket_patch.stop)
         self.value = dict(version=1, operation='op_' + self.suffix, schema='mesh',
-                          source_owner_dsn=self.source, restore_owner_dsn=self.dsns[1],
+                          source_owner_dsn=self.source, restore_owner_dsn=self.socket_dsns[1],
                           controller_role='ctl_' + self.suffix, backup_role='bak_' + self.suffix,
                           restore_role='rst_' + self.suffix, group_role='grp_' + self.suffix)
 
@@ -226,22 +267,22 @@ class RealIdentityTest(unittest.TestCase):
         with self.assertRaises(psycopg.OperationalError):
             psycopg.connect(**wrong)
 
-    def test_peer_administration_socket_generates_authenticated_loopback_login(self):
-        self.value['restore_owner_dsn'] = self.socket_dsns[1]
-        self.value['restore_login_host'] = '127.0.0.1'
+    def test_restore_login_uses_private_socket_and_requires_scram(self):
         self.enroll()
         source = self.source_doc()
         parameters = tool.connection(source['restore_dsn'])
-        self.assertEqual(parameters['host'], '127.0.0.1')
+        self.assertEqual(parameters['host'], tool.RESTORE_SOCKET)
+        self.assertEqual(parameters['require_auth'], 'scram-sha-256')
         self.assertEqual(parameters['port'], tool.connection(self.socket_dsns[1])['port'])
         with psycopg.connect(source['restore_dsn'], autocommit=True) as conn:
             self.assertEqual(conn.execute('SELECT current_user').fetchone()[0], self.value['restore_role'])
             conn.execute(sql.SQL('CREATE DATABASE {} TEMPLATE template0').format(sql.Identifier('probe_' + self.suffix)))
 
     def test_refuses_same_cluster_even_different_database(self):
-        self.value['restore_owner_dsn'] = self.dsns[0]
-        with self.assertRaisesRegex(tool.IdentityError, 'distinct PostgreSQL cluster'):
-            self.enroll()
+        self.value['restore_owner_dsn'] = self.socket_dsns[0]
+        with mock.patch.object(tool, 'RESTORE_SOCKET', tool.connection(self.socket_dsns[0])['host']):
+            with self.assertRaisesRegex(tool.IdentityError, 'distinct PostgreSQL cluster'):
+                self.enroll()
         self.assertFalse((self.directory / 'credentials.json').exists())
 
     def test_refuses_unowned_existing_login_without_modifying_it(self):
