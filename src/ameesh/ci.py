@@ -2919,20 +2919,17 @@ def _dispatch_plan(db, cfg, item, api, repo, branch, sha) -> dict:
     found = watcher.discovered_workflows(repo)
     if found is None:
         raise GelError("cannot discover registered CI workflows in %s" % repo)
-    workflows = declared if declared is not None else tuple(w for w in found if SUITE_RE.search(w))
-    if not workflows:
-        raise GelError("no suite workflow declared or discovered in %s" % repo)
-    missing = set(workflows) - set(found)
-    if missing:
-        raise GelError("CI workflow(s) not registered: " + ", ".join(sorted(missing)))
     selected = _repository_dispatch_plan(db, cfg, item, api, repo, branch, sha)
     if selected is None:
+        workflows = declared if declared is not None else tuple(w for w in found if SUITE_RE.search(w))
+        if not workflows:
+            raise GelError("no suite workflow declared or discovered in %s" % repo)
         selected = {workflow: {"expected_sha": sha} for workflow in workflows}
     if not selected:
         raise GelError("the repository CI planner selected no suite workflows")
-    if set(selected) - set(workflows):
-        raise GelError("repository CI planner selected workflows outside the declared/discovered suites: "
-                       + ", ".join(sorted(set(selected) - set(workflows))))
+    missing = set(selected) - set(found)
+    if missing:
+        raise GelError("CI workflow(s) not registered: " + ", ".join(sorted(missing)))
     for workflow, inputs in selected.items():
         data = api("repos/%s/contents/.github/workflows/%s?ref=%s"
                    % (repo, _q(workflow), sha)) or {}
@@ -2994,7 +2991,7 @@ def _repository_dispatch_plan(db, cfg, item, api, repo, branch, sha):
                 or report.get("dryRun") is not True or report.get("failures")):
             raise GelError("repository CI planner returned an invalid dispatch plan")
         selected = {}
-        for entry in report["argv"]:
+        for entry in report.get("argv") or []:
             argv = entry["argv"]
             if (len(argv) < 7 or argv[:2] != ["workflow", "run"]
                     or argv[3:5] != ["--ref", branch]

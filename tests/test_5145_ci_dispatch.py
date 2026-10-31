@@ -219,6 +219,39 @@ class DispatchTest(fixtures.GelTestCase):
             self.assertEqual(run.call_args.kwargs["cwd"], "/folder/tree")
             drop.assert_called_once_with("/clone", "/folder", "/folder/tree")
 
+    def test_native_planner_accepts_registered_non_suite_names_without_config(self):
+        self.cfg.github = {}
+        names = ("backend-suite.yml", "sync-checks.yml", "civil-crypto.yml",
+                 "rollback-checks.yml", "mobile-android-release.yml",
+                 "mobile-native-harness.yml", "nexlink-key.yml", "host-rust.yml")
+        api = Api(suites=names)
+        selected = {w: {"expected_sha": fixtures.GEL} for w in names}
+        with mock.patch.object(ci, "_repository_dispatch_plan", return_value=selected):
+            decision = self.plan(api)
+            self.assertEqual(decision["dispatch"], selected)
+            self.assertTrue(self.request(api, decision)["requested"])
+        self.assertEqual({w for w, _ in api.dispatches}, set(names))
+        api = Api(suites=names[:-1])
+        with mock.patch.object(ci, "_repository_dispatch_plan", return_value=selected):
+            with self.assertRaisesRegex(ci.GelError, "not registered"):
+                self.plan(api)
+        self.assertEqual(api.dispatches, [])
+
+    def test_empty_native_plan_without_argv_has_named_refusal(self):
+        api = Api()
+        api.planner = True
+        report = {"schema": "nexlink-dispatch-due-parts/1", "ref": fixtures.BRANCHE,
+                  "head": fixtures.GEL, "dryRun": True, "failures": [], "parts": []}
+        with mock.patch("tempfile.mkdtemp", return_value="/folder"), \
+             mock.patch("ameesh.prevalidation_calls.repository", return_value="/clone"), \
+             mock.patch("ameesh.release_cutoff._git"), \
+             mock.patch("ameesh.release_cutoff._drop_worktree"), \
+             mock.patch("subprocess.run", return_value=types.SimpleNamespace(
+                 returncode=0, stdout=json.dumps(report), stderr="")):
+            with self.assertRaisesRegex(ci.GelError, "selected no suite workflows"):
+                self.plan(api)
+        self.assertEqual(api.dispatches, [])
+
     def test_registered_workflow_missing_refuses_before_dispatch(self):
         api = Api(suites=SUITES[:-1])
         with self.assertRaisesRegex(ci.GelError, "not registered"):
