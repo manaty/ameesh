@@ -115,7 +115,7 @@ class CapacityTest(unittest.TestCase):
     def test_capacity_output_never_targets_enrollment_or_configuration(self):
         # #5170 N2: refused before any write, not a replaced protected document.
         conf = producer.layout('16')[1]
-        remote = dict(host='objects', upload_credentials='/srv/keys/upload.json',
+        remote = dict(host='objects', upload_credentials='/srv/keys/../keys/upload.json',
                       restore_credentials='/srv/keys/restore.json')
         for output in (str(producer.ENROLLMENT), str(producer.INTENT),
                        self.enrollment['backup'], '/srv/probe.json',
@@ -123,7 +123,9 @@ class CapacityTest(unittest.TestCase):
                        str(producer.layout('16')[0] / 'capacity.json'),
                        str(producer.INSTALL / 'capacity.json'),
                        str(producer.UNIT_ROOT / 'capacity.json'),
-                       remote['upload_credentials'], remote['restore_credentials']):
+                       '/srv/keys/upload.json', remote['restore_credentials'],
+                       '//etc/ameesh-release/restore-probe.json', '/etc//ameesh-release/x.json',
+                       '/srv/./probe.json', '/srv/keys/../keys/upload.json'):
             with self.subTest(output=output), \
                     mock.patch.object(producer, 'protected', side_effect=Path), \
                     mock.patch.object(producer, 'atomic') as write:

@@ -968,7 +968,8 @@ naming the probe enrollment, the install intent, `backup.json`, a remote
 credential file, or any path under `/etc/ameesh-release`, the cluster
 configuration and data directories, the install tree or the systemd unit
 directory: a misdirected reference fails, it never replaces a protected
-document (#5170). The consumer refuses, before any restore, when its own
+document (#5170). Only a canonical absolute path is accepted (no `//`, `.` or
+`..` alias), and removal applies the same refusal before unlinking. The consumer refuses, before any restore, when its own
 environment carries libpq routing defaults the attested DSN leaves open
 (`PGSERVICE`, `PGSERVICEFILE`, `PGSYSCONFDIR`, `PGHOSTADDR`, `PGPORT`,
 `PGOPTIONS`): the in-process connection and `pg_restore` inherit them.
