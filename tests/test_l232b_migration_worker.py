@@ -107,6 +107,17 @@ class MigrationWorkerTest(PgTestCase):
         finally:
             db.close()
 
+    def test_additive_only_refuses_a_guard_on_an_existing_table(self):
+        # #5142
+        self.migration(1, 'CREATE TABLE untouched (id integer);')
+        self.migration(600, 'CREATE RULE r AS ON INSERT TO untouched DO NOTHING;')
+        db = db_mod.connect(self.fresh())
+        try:
+            with self.assertRaises(migrations.NonAdditiveMigration):
+                migrations.migrate(db, self.directory.name, additive_only=True)
+        finally:
+            db.close()
+
     def test_additive_guard_runs_inside_elected_transaction_without_bootstrap(self):
         self.migration(1, 'CREATE TABLE untouched (id integer);')
         self.migration(2, 'DROP TABLE untouched;')

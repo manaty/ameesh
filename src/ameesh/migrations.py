@@ -510,12 +510,32 @@ _ADD_CONSTRAINT = re.compile(r"\badd\s+(?:constraint\s+([\w\"]+)"
 #: le texte ne dit pas si une contrainte élargit ou resserre : celle qui ne
 #: resserre pas (remplacée pour l'élargir, posée sur une colonne neuve) le déclare
 _CONSTRAINT_MARKER = re.compile(r"--\s*ameesh\s*:\s*constraint\s+not\s+tightened", re.IGNORECASE)
+#: #5142 : un trigger, une règle ou une politique sur une table existante change
+#: ce que fait l'écriture du code d'avant (0529, #5087). Les versions déjà livrées,
+#: 0529 comprise, gardent leur classement, comme pour _PRIVILEGES_CHECKED_AFTER.
+_GUARDS_CHECKED_AFTER = 529
+_CREATE_GUARD = re.compile(r"\bcreate\s+(?:or\s+replace\s+)?(?:constraint\s+)?"
+                           r"(trigger|rule|policy)\b([^;]*)")
+#: une règle se lit `as on insert to t` ; un trigger et une politique, `on t`
+_GUARD_TARGET = {"rule": re.compile(r"\bto\s+(?:only\s+)?([\w.\"]+)"),
+                 "trigger": re.compile(r"\bon\s+(?:only\s+)?([\w.\"]+)"),
+                 "policy": re.compile(r"\bon\s+(?:only\s+)?([\w.\"]+)")}
+_ENABLE_GUARD = re.compile(r"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)\s[^;]*?"
+                           r"\benable\s+(?:always\s+|replica\s+)?(trigger|rule)\b")
+_ROW_SECURITY = re.compile(r"\b(?:enable|force)\s+row\s+level\s+security\b")
+_GUARD_IN_STRING = re.compile(
+    r"\b(?:create\s+(?:or\s+replace\s+)?(?:constraint\s+)?|enable\s+(?:always\s+|replica\s+)?)"
+    r"(trigger|rule|policy)\b|\b(row\s+level\s+security)\b")
+#: seul l'auteur sait qu'un trigger reproduit le comportement d'avant tant que le
+#: nouveau code ne l'allume pas : il le déclare, la relecture le vérifie
+_TRIGGER_MARKER = re.compile(r"--\s*ameesh\s*:\s*trigger\s+compatible\s+with\s+previous\s+code",
+                             re.IGNORECASE)
 
 
 def non_additive(migration: Migration) -> list[str]:
     """Raisons pour lesquelles `migration` casserait le code d'avant ; vide si
     elle ne fait qu'ajouter (tables, colonnes nullables ou avec défaut, index,
-    contraintes déclarées sans resserrement)."""
+    contraintes déclarées sans resserrement, triggers déclarés compatibles)."""
     reasons = []
     if _MARKER.search(migration.sql):
         reasons.append("marked non-additive")
@@ -535,6 +555,8 @@ def non_additive(migration: Migration) -> list[str]:
             reasons.append("removal (drop %s %s)" % (kind, name))
     if migration.version > _PRIVILEGES_CHECKED_AFTER:
         reasons.extend(_privilege_reasons(migration.sql))
+    if migration.version > _GUARDS_CHECKED_AFTER:
+        reasons.extend(_guard_reasons(migration.sql))
     return reasons
 
 
@@ -653,6 +675,35 @@ def _privilege_reasons(sql: str) -> list[str]:
             reasons.extend("constraint possibly tightened (add %s)"
                            % (name and "constraint " + name or form)
                            for name, form in _ADD_CONSTRAINT.findall(statement.group(0)))
+    return reasons
+
+
+def _guard_reasons(sql: str) -> list[str]:
+    """Triggers, règles et politiques qui changent l'écriture du code d'avant (#5142).
+    Un CREATE nu hors chaîne prouve la table neuve, même à côté de la fonction `$$`
+    de son trigger : ce qu'une chaîne exécuterait y est classé à part, sans analyse."""
+    strings, code, sure = _lex(sql)
+    code = re.sub(r"\s+", " ", code.lower())
+    trigger_declared = bool(_TRIGGER_MARKER.search(sql))
+
+    def proven_new(table: str | None) -> bool:
+        return bool(sure and table and '"' not in table and _proven_new(code, "table", table))
+
+    reasons = []
+    for kind, rest in _CREATE_GUARD.findall(code):
+        target = _GUARD_TARGET[kind].search(rest)
+        table = target.group(1) if target else None
+        if not proven_new(table) and not (kind == "trigger" and trigger_declared):
+            reasons.append("%s on a table not proven new (%s)" % (kind, table or "?"))
+    for table, kind in _ENABLE_GUARD.findall(code):
+        if not proven_new(table) and not (kind == "trigger" and trigger_declared):
+            reasons.append("%s enabled on a table not proven new (%s)" % (kind, table))
+    if _ROW_SECURITY.search(code):
+        reasons.append("row level security enabled")
+    for value in strings:
+        for match in _GUARD_IN_STRING.finditer(re.sub(r"\s+", " ", value.lower())):
+            if not (match.group(1) == "trigger" and trigger_declared):
+                reasons.append("%s in a string (not analysed)" % (match.group(1) or match.group(2)))
     return reasons
 
 

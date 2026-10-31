@@ -164,6 +164,25 @@ class SupervisorTest(unittest.TestCase):
         self.provider.finish_delete('reviewers', self.spec.identity.name)
         self.assertEqual(self.step().state, 'cancelled')
 
+    def test_cancel_cleans_pre_post_secret_even_without_observed_job(self):
+        self.cancel()
+        secret = {'exists': True}
+        def delete(namespace, name, *, uid):
+            self.assertEqual((namespace, name, uid),
+                             (self.spec.identity.namespace, self.spec.identity.name, None))
+            secret['exists'] = False
+        with mock.patch.object(self.provider, 'delete', side_effect=delete) as cleanup:
+            self.assertEqual(self.step().kind, 'cancelled')
+        cleanup.assert_called_once()
+        self.assertFalse(secret['exists'])
+
+    def test_cancel_cleanup_failure_cannot_be_reported_as_cancelled(self):
+        self.cancel()
+        with mock.patch.object(self.provider, 'delete', side_effect=p.ProviderUnavailable()):
+            event = self.step()
+        self.assertEqual(event.kind, 'orphaned')
+        self.assertEqual(event.refusal, p.ProviderUnavailable.code)
+
     def test_cancel_waits_for_async_deletion_and_survives_restart(self):
         self.bind()
         self.cancel()

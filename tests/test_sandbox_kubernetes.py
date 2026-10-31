@@ -384,9 +384,21 @@ class KubernetesTest(unittest.TestCase):
                                        orphan_after=10, clock=lambda: 100)
         event = supervisor.step(self.supervisor_row(job, cancelling=True), self.spec)
         self.assertEqual(event.kind, 'cancelled')
-        # S4b deliberately does not delete terminal Jobs during cancellation.
-        self.assertTrue(self.provider.delete(job.namespace, job.name, uid=job.uid))
+        # Explicit cancellation cleans the Secret even for a terminal Job.
         self.assertEqual(self.server.state['secrets'], {})
+
+    def test_cancel_after_secret_creation_and_failed_job_post_cleans_secret(self):
+        self.server.state['failures'] = [('POST', '/jobs', 503)]
+        with self.assertRaises(ProviderUnavailable):
+            self.create()
+        self.assertTrue(self.server.state['secrets'])
+        self.assertFalse(self.server.state['jobs'])
+        missing = SimpleNamespace(namespace='reviewers', name=self.identity.name, uid=None)
+        row = self.supervisor_row(missing, cancelling=True)
+        supervisor = SandboxSupervisor(self.provider, lambda event: None, orphan_after=10, clock=lambda: 100)
+        event = supervisor.step(row, self.spec)
+        self.assertEqual(event.kind, 'cancelled')
+        self.assertFalse(self.server.state['secrets'])
 
     def test_running_cancel_calls_delete_despite_malicious_message(self):
         job = self.create()

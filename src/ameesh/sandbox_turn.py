@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import math
 import os
 import selectors
+import signal
 import subprocess
 import sys
 import tempfile
@@ -70,6 +72,11 @@ class SandboxTurn:
         obj.context, obj.child, obj.recovery = None, None, True
         row = obj.snapshot()
         obj.owner, obj.epoch = row['owner'], row['lease_epoch']
+        if db.query('select name from agent_registry where name = %s'
+                    ' and lease_owner = %s and lease_epoch = %s'
+                    ' and lease_expires_at > clock_timestamp()',
+                    (row['agent'], obj.owner, obj.epoch)):
+            raise s1.Refusal('stale')
         return obj
 
     def snapshot(self):
@@ -121,6 +128,21 @@ class SandboxTurn:
         kind = event.get('kind')
         if self.recovery and kind in ('bound', 'result'):
             raise s1.Refusal('stale')
+        # Validate the existing closed event vocabulary before diagnostics.
+        # Unknown kinds already refused below; metadata does not expand it.
+        if kind not in ('bound', 'result', 'cancel-requested', 'failed', 'cancelled',
+                        'lost', 'expired', 'orphaned', 'heartbeat', 'retry',
+                        'cancelling', 'terminal'):
+            raise s1.Refusal('contract-mismatch')
+        try:
+            s1.observe_metadata(self.db, self.turn_id, self.owner, self.epoch,
+                                job_phase=event.get('job_phase'), refusal=event.get('refusal'),
+                                job_uid=event.get('job_uid'), recovery=self.recovery)
+        except Exception as exc:
+            # Diagnostics use their own transaction; never suppress S1.
+            logging.getLogger(__name__).warning(
+                'sandbox metadata unavailable (turn=%s, error=%s)',
+                self.turn_id, type(exc).__name__)
         args = self.db, self.turn_id, self.owner, self.epoch
         if kind == 'bound':
             s1.ameesh_sandbox_bind(*args, event.get('job_uid'))
@@ -141,7 +163,8 @@ class SandboxTurn:
             raise s1.Refusal('contract-mismatch')
         return self.snapshot()
 
-    def start(self, spec, *, provider_factory, state_dir, orphan_after, timeout):
+    def start(self, spec, *, provider_factory, state_dir, orphan_after, timeout,
+              provider_options=None, new_session=False):
         """Start a supervisor in the caller's process group, after intent.
 
         The trusted factory is ``package.module:callable`` (no arguments).
@@ -158,7 +181,8 @@ class SandboxTurn:
             row = self.snapshot()
         self.child = SupervisorChild(spec, provider_factory=provider_factory,
                                      state_dir=state_dir, orphan_after=orphan_after,
-                                     timeout=timeout)
+                                     timeout=timeout, provider_options=provider_options,
+                                     new_session=new_session)
         return self.child
 
     def step(self):
@@ -182,10 +206,12 @@ class SandboxTurn:
 
 class SupervisorChild:
     """Private file handoff and bounded JSONL; no DB handle crosses exec."""
-    def __init__(self, spec, *, provider_factory, state_dir, orphan_after, timeout):
+    def __init__(self, spec, *, provider_factory, state_dir, orphan_after, timeout,
+                 provider_options=None, new_session=False):
         if not all(math.isfinite(v) and v > 0 for v in (timeout, orphan_after)):
             raise ValueError('positive timeouts required')
         self.timeout = timeout
+        self.new_session = new_session
         self.process = None
         self.directory = tempfile.TemporaryDirectory(prefix='sandbox-turn-', dir=state_dir)
         self.path = Path(self.directory.name) / 'turn.json'
@@ -193,15 +219,16 @@ class SupervisorChild:
             fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, 'w', encoding='utf-8') as stream:
                 json.dump(dict(spec=asdict(spec), provider_factory=provider_factory,
-                               orphan_after=orphan_after), stream)
+                               orphan_after=orphan_after, provider_options=provider_options), stream)
             # Do not start a new session/group: cancellation of the turn must
             # reach its supervisor too. Only non-secret interpreter settings.
-            env = {k: os.environ[k] for k in ('PATH', 'PYTHONPATH', 'LANG', 'LC_ALL')
+            env = {k: os.environ[k] for k in ('PATH', 'PYTHONPATH', 'LANG', 'LC_ALL', 'TMPDIR')
                    if k in os.environ}
             self.process = subprocess.Popen(
                 [sys.executable, '-m', 'ameesh.sandbox_turn', str(self.path)],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, env=env, close_fds=True)
+                stderr=subprocess.DEVNULL, env=env, close_fds=True,
+                start_new_session=new_session)
             self.pending = b''
         except BaseException:
             self.close()
@@ -248,15 +275,24 @@ class SupervisorChild:
     def close(self):
         if self.process is not None:
             if self.process.poll() is None:
-                self.process.terminate()
+                self._signal(signal.SIGTERM)
                 try:
                     self.process.wait(timeout=self.timeout)
                 except subprocess.TimeoutExpired:
-                    self.process.kill()
+                    self._signal(signal.SIGKILL)
                     self.process.wait()
             for stream in (self.process.stdin, self.process.stdout):
                 stream.close()
         self.directory.cleanup()
+
+    def _signal(self, sig):
+        try:
+            if self.new_session:
+                os.killpg(self.process.pid, sig)
+            else:
+                self.process.send_signal(sig)
+        except ProcessLookupError:
+            pass
 
 
 def _child(filename):
@@ -266,7 +302,9 @@ def _child(filename):
     spec_data = handoff['spec']
     spec = JobSpec(**dict(spec_data, identity=JobIdentity(**spec_data['identity'])))
     module, name = handoff['provider_factory'].split(':', 1)
-    provider = getattr(importlib.import_module(module), name)()
+    factory = getattr(importlib.import_module(module), name)
+    options = handoff.get('provider_options')
+    provider = factory(options) if options is not None else factory()
     def emit(event):
         print(json.dumps(event, ensure_ascii=False, separators=(',', ':')), flush=True)
     supervisor = SandboxSupervisor(provider, emit, orphan_after=handoff['orphan_after'])

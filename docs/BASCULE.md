@@ -1329,7 +1329,9 @@ function deleted without being recreated in the same migration, a rename,
 a type change, `set not null`, `add column … not null` without a default,
 `truncate`, `delete from`. What examining the text cannot see (a
 tightened constraint, a rewritten function that changes behavior), the
-migration declares with a `-- ameesh: non additive` comment. All
+migration declares with a `-- ameesh: non additive` comment. A trigger,
+rule, policy or row level security on an existing table is non-additive too
+since 0530 (`docs/EXPLOITATION.md`, #5142). All
 migrations delivered up to 0051 are additive (verified by
 `tests/test_migrations_additives.py`).
 
