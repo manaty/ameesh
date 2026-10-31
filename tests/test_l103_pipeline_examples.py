@@ -298,6 +298,42 @@ class PipelineExamplesEndToEndTest(PgTestCase):
         self.assertEqual(process_registry.registry_state(
             self.db, self.support_lot).receipts, 6)
 
+    def test_support_stop_closes_as_not_planned(self):
+        for reason in ("abandoned", "superseded"):
+            with self.subTest(reason=reason):
+                lot = self.lot("stopped request", "docs", "support")
+                self.run_cli(self.support, "adopt", lot)
+                args = ["advance", lot, "--to", "closed", "--guard", "stop_work",
+                        "--ref", "reason=" + reason,
+                        "--command-id", "a37d4f21-33ee-4c2d-a412-560b5eae1a84"]
+                if reason == "superseded":
+                    args += ["--ref", "superseded_by=" + str(self.support_lot)]
+                receipt = self.run_cli(self.support, *args)
+                replay = self.run_cli(self.support, *args)
+                self.assertTrue(replay.pop("replayed"))
+                self.assertFalse(receipt.pop("replayed"))
+                self.assertEqual(replay, receipt)
+                row = work.get(self.db, lot)
+                self.assertEqual(row["close_reason"], reason)
+                self.assertEqual(row["superseded_by"],
+                                 self.support_lot if reason == "superseded" else None)
+                projected = self.projection(self.support, lot)
+                self.assertEqual((projected.state, projected.state_reason, projected.core),
+                                 ("closed", "not_planned", "closed"))
+                self.assertEqual(process_registry.registry_state(self.db, lot).receipts, 1)
+
+    def test_support_stop_refuses_invalid_replacements_without_a_receipt(self):
+        self.run_cli(self.support, "adopt", self.support_lot)
+        for value in (str(self.support_lot), "999999999", "1.5", "true", "0", "-1"):
+            with self.subTest(replacement=value):
+                self.run_cli(self.support, "advance", self.support_lot,
+                             "--to", "closed", "--guard", "stop_work",
+                             "--ref", "reason=superseded",
+                             "--ref", "superseded_by=" + value, expected=1)
+                state = process_registry.registry_state(self.db, self.support_lot)
+                self.assertEqual((state.workflow_stage, state.receipts), ("new", 0))
+                self.assertIsNone(work.get(self.db, self.support_lot)["close_reason"])
+
     def test_the_canon_activates_work_types_for_support_only(self):
         stored = {(row["project"], row["module"]): row["types"]
                   for row in ModuleStore(self.db).stored()}
