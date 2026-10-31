@@ -295,6 +295,73 @@ class DispatchTest(fixtures.GelTestCase):
         self.assertEqual(len(api.dispatches), 12)
 
 
+class CancelApi(Api):
+    """`Api` plus l'écriture d'annulation, pour le témoin CLI de `ci cancel`."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cancels = []
+
+    def run(self, argv, stdin=None):
+        if (argv[:3] == ["api", "-X", "POST"] and argv[3].startswith("repos/" + REPO + "/")
+                and argv[3].endswith("/cancel")):
+            self.cancels.append(argv[3])
+            return 0, "", ""
+        return super().run(argv, stdin)
+
+
+class CancelCliTest(fixtures.GelTestCase):
+    """#5154 : `ci cancel` lit les workflows déclarés/découverts, jamais
+    `tests.yml` en dur — un dépôt qui ne le publie pas (nexlink) n'a plus de 404."""
+
+    def setUp(self):
+        super().setUp()
+        self.item["issue_ref"] = REPO + "#1"
+        self.cfg = types.SimpleNamespace(github={"projects": {"product": {
+            "repo": REPO, "workflows": list(SUITES)}}})
+        self.args = argparse.Namespace(id=1343, all=False, repo=REPO,
+                                       dry_run=False, json=True)
+
+    def cancel(self, api):
+        output = io.StringIO()
+        with mock.patch("ameesh.db.open_db", return_value=self.db), \
+             mock.patch.object(plan_github, "Gh", return_value=api), \
+             mock.patch.object(plan_github, "_json",
+                               side_effect=lambda gh, argv: api(argv[-1])), \
+             contextlib.redirect_stdout(output):
+            code = ci.cmd_ci_cancel(self.cfg, self.args)
+        # `--json` garde la vue, puis les lignes d'annulation s'ajoutent.
+        return code, json.JSONDecoder().raw_decode(output.getvalue())[0]
+
+    def _open_run(self, api, workflow, ident=7):
+        api.runs = [dict(id=ident, path=".github/workflows/" + workflow,
+                         head_sha=fixtures.TETE, head_branch=fixtures.BRANCHE,
+                         event="workflow_dispatch", status="queued", conclusion=None)]
+
+    def test_cli_cancel_reads_the_declared_workflows(self):
+        api = CancelApi()
+        self._open_run(api, SUITES[0])
+        code, report = self.cancel(api)
+        self.assertEqual(code, 0)
+        self.assertEqual([r["id"] for r in report["runs"]], [7])
+        runs = [p for p in api.paths if "/runs?" in p]
+        queried = {p.split("/workflows/")[1].split("/runs?")[0] for p in runs}
+        self.assertEqual(queried, set(SUITES))
+        self.assertFalse(any("tests.yml/runs" in p for p in api.paths))
+        self.assertEqual(api.cancels, ["repos/%s/actions/runs/7/cancel" % REPO])
+
+    def test_cli_cancel_discovers_the_suite_workflows_without_a_declared_list(self):
+        self.cfg.github = {}
+        api = CancelApi()
+        self._open_run(api, SUITES[0])
+        code, report = self.cancel(api)
+        self.assertEqual(code, 0)
+        self.assertEqual([r["id"] for r in report["runs"]], [7])
+        self.assertIn("repos/%s/actions/workflows?per_page=100" % REPO, api.paths)
+        self.assertFalse(any("tests.yml/runs" in p for p in api.paths))
+        self.assertEqual(api.cancels, ["repos/%s/actions/runs/7/cancel" % REPO])
+
+
 class RepoTest(unittest.TestCase):
     def test_dot_and_absent_repo_resolve_origin(self):
         for remote in ("git@github.com:example/product.git", "https://github.com/example/product.git"):

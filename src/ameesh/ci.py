@@ -4285,7 +4285,7 @@ def cmd_ci_run(cfg, args) -> int:
 
 def cmd_ci_cancel(cfg, args) -> int:
     """`ameesh ci cancel <lot>` : annule les runs périmés de la branche."""
-    from . import plan_github
+    from . import plan_github, work
     from .db import open_db
     db = open_db(cfg)
     gh = plan_github.Gh()
@@ -4294,8 +4294,18 @@ def cmd_ci_cancel(cfg, args) -> int:
         return plan_github._json(gh, ["api", path])
 
     try:
+        item = work.get(db, args.id)
+        if item is None:
+            raise GelError("lot #%s unknown" % args.id)
+        # #5154 : lire les workflows que le relevé suit pour ce dépôt
+        # (#1110 : liste déclarée ; #1483 : découverte des suites quand
+        # `tests.yml` n'est pas publié — nexlink). Sans elle, `_runs_of`
+        # interrogeait `tests.yml` et rendait un 404 sur un dépôt qui ne le
+        # publie pas.
+        repo = repo_of(cfg, item, repo=args.repo or "")
+        workflows = Watcher(cfg, api=api).followed_workflows(repo)
         report = cancel_plan(db, cfg, args.id, api=api, all_runs=args.all,
-                             repo=args.repo or "")
+                             repo=args.repo or "", workflows=workflows)
     except (GelError, plan_github.GithubError) as exc:
         print("ameesh ci cancel: %s" % exc)
         return 1

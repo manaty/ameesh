@@ -162,7 +162,12 @@ def sweep(cfg, db: Db, *, dry_run: bool = False, limit: int = DEFAULT_MAX_RETURN
                 work_item_id=str(done["id"]),
                 payload={"wip_return": {"lot": int(done["id"]), "agent": agent,
                                         "limit": cap,
-                                        "activity_ts": _activity(row)}})
+                                        "activity_ts": _activity(row)},
+                         # #5025 N3 : la restitution EST l'avis de
+                         # réassignation à la file ; la clé le fait remettre
+                         # en cours de tour, comme `_notify_reassigned`.
+                         "reassigned": {"lot": int(done["id"]), "to": "",
+                                        "by": actor}})
             out.append({"item": done, "agent": agent, "message_id": message_id,
                         "dry_run": False, "activity_ts": _activity(row)})
     return out
@@ -222,6 +227,9 @@ def run(db: Db, args, cfg=None) -> int:
             item["id"], item["state"], item.get("branch") or "—"))
         print("branch, head and reviews kept; a free agent of the team can take it "
               "(ameesh work list --state build)")
+        if item.get("reassignment_warning"):
+            # #5025 N7 : le retour est écrit, l'avis peut manquer ; le dire.
+            print("warning: %s" % item["reassignment_warning"], file=sys.stderr)
         return 0
     limit = int(getattr(args, "limit", DEFAULT_MAX_RETURNS) or 0)
     from . import mechanics

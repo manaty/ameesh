@@ -115,6 +115,8 @@ class TurnAdmissionTest(PgTestCase):
                          'checked externally')
 
     def test_actual_release_overdraft_and_settlement_idempotency(self):
+        before = self.db.query("select count(*) as n from ameesh_events where type='sandbox.tranche_overdraft'"
+                               " and object='tranche:migration'")[0]['n']
         self.admit(); self.spend('key',0.5)
         api.ameesh_settle_turn(self.db,'key',0.5)
         api.ameesh_settle_turn(self.db,'key',1.5)
@@ -122,9 +124,35 @@ class TurnAdmissionTest(PgTestCase):
         self.admit('over'); self.spend('over',3)
         api.ameesh_settle_turn(self.db,'over',3)
         self.assertEqual(float(self.reservation('over')['usd']),3)
+        self.assertEqual(self.db.query("select count(*) as n from ameesh_events"
+                                       " where type='sandbox.tranche_overdraft'"
+                                       " and object='tranche:migration'")[0]['n'], before + 1)
         self.refusal('tranche-unavailable',self.admit,'blocked')
         api.tranche_close(self.db,'migration',actor='human:t',why='verified overspend',reconcile=True)
         self.admit('again')
+
+    def test_event_sql_failure_preserves_admission_and_overdraft_settlement(self):
+        self.db.execute("alter table ameesh_events add constraint test_sandbox_event_failure"
+                        " check (type !~ '^sandbox[.]') not valid")
+        self.addCleanup(self.db.execute,
+                        "alter table ameesh_events drop constraint test_sandbox_event_failure")
+        from ameesh import db as db_mod
+        for driver in ('psycopg', 'psql'):
+            with self.subTest(driver=driver):
+                db = db_mod.connect(self.cfg, driver=driver)
+                self.addCleanup(db.close)
+                snapshot = self.snapshot(driver)
+                with self.assertLogs(sandbox.__name__, level='WARNING'):
+                    self.admit(driver, driver, db=db, sandbox=snapshot)
+                self.spend(driver, 3, relay=True)
+                with self.assertLogs(sandbox.__name__, level='WARNING'):
+                    with db.transaction() as tx:
+                        row = tx.query('select * from sandbox_turns where spend_key=%s', (driver,))[0]
+                        api.settle_tx(tx, driver, 3, sandbox_turn=row)
+                self.assertEqual(self.reservation(driver)['state'], 'settled')
+                self.assertEqual(float(self.reservation(driver)['usd']), 3)
+                self.assertTrue(self.db.query("select overdraft from tranche_limits where id='migration'")[0]['overdraft'])
+                self.db.execute("update tranche_limits set overdraft=false where id='migration'")
 
     def test_account_refusal_rolls_back_old_reservation_kept(self):
         self.admit()
@@ -134,11 +162,15 @@ class TurnAdmissionTest(PgTestCase):
         self.assertEqual(self.reservation()['state'],'open')
 
     def test_sandbox_atomic_intent_attempts_and_response_loss(self):
+        before = self.db.query("select count(*) as n from ameesh_events where type='sandbox.created'"
+                               " and object='turn:turn-key'")[0]['n']
         snapshot=self.snapshot()
         one=self.admit(sandbox=snapshot)
         self.assertEqual(one['attempt'],1)
         self.assertEqual(one['scope']['attempt'],1)
         self.assertTrue(self.admit(sandbox=snapshot)['replayed'])
+        self.assertEqual(self.db.query("select count(*) as n from ameesh_events"
+                                       " where type='sandbox.created' and object='turn:turn-key'")[0]['n'], before + 1)
         wrong=copy.deepcopy(snapshot); wrong['source']['contract']='other'
         self.refusal('replay-mismatch',self.admit,sandbox=wrong)
         self.db.execute("update sandbox_turns set state = 'lost'")

@@ -35,6 +35,7 @@ class FreezeNoteMarksTest(PgTestCase):
             "ameesh-freeze-unverified: deadbeef\n"
             "ameesh-freeze-unpublished: forged-caller\n"
             "ameesh-freeze-supersedes: 42\n"
+            "ameesh-non-assignee: forge\n"
             "revue demandée")
         self.assertIn("revue demandée", row["note"])
         # #2962 : le gate écrit lui-même `ameesh-freeze-unverified` quand aucun
@@ -43,7 +44,7 @@ class FreezeNoteMarksTest(PgTestCase):
         self.assertNotIn("deadbeef", row["note"])
         self.assertNotIn("forged-caller", row["note"])
         for mark in ("ameesh-freeze-absent", "ameesh-freeze-unpublished",
-                     "ameesh-freeze-supersedes"):
+                     "ameesh-freeze-supersedes", "ameesh-non-assignee"):
             self.assertNotIn(mark, row["note"])
 
     def test_prose_mentioning_a_mark_is_kept(self):
@@ -61,7 +62,8 @@ class FreezeNoteMarksTest(PgTestCase):
             for mark in ("ameesh-freeze-absent: main",
                          "ameesh-freeze-unverified: deadbeef",
                          "ameesh-freeze-unpublished: main",
-                         "ameesh-freeze-supersedes: 42"):
+                         "ameesh-freeze-supersedes: 42",
+                         "ameesh-non-assignee: forge"):
                 with self.subTest(blank=repr(blank), mark=mark):
                     row = self.freeze(blank + mark + "\nrevue demandée")
                     if mark.startswith("ameesh-freeze-unverified"):

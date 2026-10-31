@@ -4729,6 +4729,7 @@
    "events": [
     "after",
     "bounds",
+    "context_events",
     "count_before",
     "prune",
     "readable",
@@ -4892,6 +4893,7 @@
     "models_used",
     "paid_lines",
     "session_reread",
+    "session_rows",
     "session_total",
     "spent_between",
     "unpriced",

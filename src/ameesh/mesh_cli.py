@@ -175,8 +175,12 @@ def _lease(row: dict) -> str:
 # mesh list / show  (spec §5 point 5)
 # --------------------------------------------------------------------------
 
-def _annotate_agents(cfg: Config, db, rows: list) -> list:
+def _annotate_agents(cfg: Config, db, rows: list, *, sees=None) -> list:
     """The fields of `list --json` added to `registry.overview` rows."""
+    from . import sandbox_observation
+    sandboxes = sandbox_observation.current_agents(db, [row['name'] for row in rows], sees=sees)
+    for row in rows:
+        row['sandbox'] = sandboxes.get(row['name'])
     # C4 : verdict de placement de chaque agent (0022)
     placement.annotate(db, rows)
     # L26 : champs d'exploitation (schéma `ameesh-agent/1`,
@@ -204,16 +208,16 @@ def _queue_of(row) -> dict | None:
     return resources_mod.parse_queue_status((row or {}).get("status_text"))
 
 
-def agent_rows(cfg: Config, db) -> list:
+def agent_rows(cfg: Config, db, *, sees=None) -> list:
     """The rows of `ameesh list --json` (also `GET /api/v1/agents`, L84)."""
     from .projects import agent_project
     rows = registry.overview(db)
     for row in rows:
         row["project"] = agent_project(row)
-    return _annotate_agents(cfg, db, rows)
+    return _annotate_agents(cfg, db, rows, sees=sees)
 
 
-def agent_detail(db, name: str, *, cfg=None, footprint: bool = False) -> dict | None:
+def agent_detail(db, name: str, *, cfg=None, footprint: bool = False, sees=None) -> dict | None:
     """The object of `ameesh show --json` (also `GET /api/v1/agents/{a}`)."""
     # L61 : la ligne et la clé en un seul aller-retour (db.batched)
     row, info = db_mod.batched(db, lambda db: (
@@ -226,6 +230,8 @@ def agent_detail(db, name: str, *, cfg=None, footprint: bool = False) -> dict | 
     row["paused_on_budget"] = progress.paused_on_budget(row)
     # #2814 : même objet `queued` que `ameesh list --json`
     row["queue"] = _queue_of(row)
+    from . import sandbox_observation
+    row['sandbox'] = sandbox_observation.current_agents(db, [name], sees=sees).get(name)
     row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
     row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
     row["key_updated_ts"] = (info or {}).get("key_updated_ts")
@@ -1254,9 +1260,9 @@ def _agent_credits(db, row: dict) -> tuple[str, list]:
     return harness, own or [r for r in credits if r.get("state") != provider_credits.OK]
 
 
-def agent_detail_json(db, name: str, *, cfg=None) -> dict | None:
+def agent_detail_json(db, name: str, *, cfg=None, sees=None) -> dict | None:
     """`show --json` et `/api/v1/agents/<agent>` : un seul sérialiseur (#4164)."""
-    row = agent_detail(db, name, cfg=cfg)
+    row = agent_detail(db, name, cfg=cfg, sees=sees)
     if row is None:
         return None
     return dict(row, provider_credits=_agent_credits(db, row)[1])
@@ -1764,6 +1770,7 @@ _OWN_ACTOR = ("delegate", "expire-delegations", "sync-branches", "device-gates",
 def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
     """L'acteur des commandes `work` (correctif du 2026-10-11) : `--actor`,
     sinon l'identité liée de la session, jamais vide (« inconnu », averti).
+    Un déplacement ordinaire journalise l'identité liée avant `--actor`.
     Une correction d'état (`move --correct`) vérifie en plus qui corrige, un
     forçage (`add`/`assign --force`, #540) qui force."""
     v = _vocabulary()
@@ -1774,6 +1781,12 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
         # #4043 : le retrait d'un paquet est le geste du pilote (paquet-horaire)
         args.actor = work.corrector(cfg, db, args.actor, what="package exclusion")
         return
+    if args.work_command == "move":
+        # #5041 : journaliser l'identité qui exerce l'autorité du move.
+        from . import identity
+        binding = identity.resolve_binding(cfg, db)
+        if binding.name:
+            args.actor = binding.name
     if args.work_command in ("add", "assign") and (getattr(args, "force", None) or "").strip():
         # #540 : l'auteur d'un forçage est l'identité de la session
         args.actor = work.forcer(cfg, db, args.actor)
@@ -2236,6 +2249,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print(('%s #%d: branch %s (assigned to %s)') % (v.noun, out["item"]["id"], out["item"].get("branch"), out["item"]["assignee"]))
             else:
                 print(('%s #%d assigned to %s (before: %s)%s%s') % (v.noun, out["item"]["id"], out["item"]["assignee"], out["previous"] or "nobody", "; branch %s" % out["item"]["branch"] if args.branch else "", "; WIP exception (§4)" if args.wip_exception else ""))
+            if out.get("reassignment_warning"):
+                # #5025 N7 : l'attribution est écrite, mais l'avis à l'ancien
+                # assigné n'est pas parti ; le dire, ne pas le taire.
+                print("warning: %s" % out["reassignment_warning"], file=sys.stderr)
             _print_assignment(out["check"])
             return 0
         if args.work_command == "external-executor":
@@ -4585,6 +4602,8 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
 
     from . import turn_observe
     turn_observe.add_parsers(sub)
+    from . import sandbox_cli
+    sandbox_cli.add_parsers(sub)
 
     p_review = sub.add_parser(
         "review-class", help="review class of a change (0018): light, normal, sensitive")

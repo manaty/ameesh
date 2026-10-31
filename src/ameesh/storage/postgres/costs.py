@@ -133,6 +133,23 @@ class TurnCosts(interface.TurnCosts):
             return None
         return rows[0]
 
+    def session_rows(self, agent, session) -> list:
+        """#5134 (CTX-05a) : toutes les lignes d'une session, dans l'ordre du
+        grand livre. Lecture seule, pour reconstruire ``S_hist`` tour par tour
+        (somme ``input_tokens + output_tokens``) sans supposer une valeur.
+
+        Les tours écartés du coût (``void_reason``) restent comptés : leur
+        usage a eu lieu, comme dans :meth:`session_total`. Aucun tour : liste
+        vide, jamais une ligne à zéro.
+        """
+        return self.db.query(
+            "select id, turn_id, harness, input_tokens, cached_input_tokens,"
+            " output_tokens, cache_write_tokens, void_reason,"
+            " extract(epoch from recorded_at)::float8 as recorded_ts"
+            " from turn_costs where agent = %s and session = %s"
+            " order by recorded_at, id",
+            (agent, session))
+
     def insert(self, *, agent, harness, turn, model, session, usd, input_tokens,
                cached_input_tokens, output_tokens, cum_usd, cum_input_tokens,
                cum_cached_input_tokens, cum_output_tokens, account=None,

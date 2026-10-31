@@ -96,6 +96,19 @@ def _as_share(value, default: float) -> float:
     return part if 0.0 <= part <= 1.0 else default
 
 
+def _as_reread_budget(value, default: float) -> float:
+    """Budget de relecture en jetons (CTX-04a) ; non fini ou négatif : éteint.
+
+    Un budget se compte en jetons entiers : une fraction est arrondie au jeton
+    supérieur (0,5 devient 1, jamais 0 : le budget ne s'éteint plus en
+    silence), et une valeur non finie (inf, nan) ou négative éteint le budget
+    au lieu de lever `OverflowError` / `ValueError` au tour (#5051)."""
+    budget = _as_float(value, default)
+    if not math.isfinite(budget) or budget <= 0:
+        return 0.0
+    return float(math.ceil(budget))
+
+
 _TIME_OF_DAY_RE = re.compile(r"([01]?[0-9]|2[0-3]):([0-5][0-9])\Z")
 
 
@@ -1152,10 +1165,10 @@ def load(env: dict | None = None) -> Config:
             cfg.session_min_turns)),
         context_max_tokens=max(0.0, _as_float(pick("AMEESH_CONTEXT_MAX_TOKENS"),
                                               cfg.context_max_tokens)),
-        turn_reread_budget=max(0.0, _as_float(pick("AMEESH_TURN_REREAD_BUDGET"),
-                                              cfg.turn_reread_budget)),
-        session_reread_budget=max(0.0, _as_float(pick("AMEESH_SESSION_REREAD_BUDGET"),
-                                                 cfg.session_reread_budget)),
+        turn_reread_budget=_as_reread_budget(pick("AMEESH_TURN_REREAD_BUDGET"),
+                                             cfg.turn_reread_budget),
+        session_reread_budget=_as_reread_budget(pick("AMEESH_SESSION_REREAD_BUDGET"),
+                                                cfg.session_reread_budget),
         window_maintenance_share=min(1.0, max(0.0, _as_float(
             pick("AMEESH_WINDOW_MAINTENANCE_SHARE"), cfg.window_maintenance_share))),
         window_input_reserve=_as_reserve(pick("AMEESH_WINDOW_INPUT_RESERVE"),

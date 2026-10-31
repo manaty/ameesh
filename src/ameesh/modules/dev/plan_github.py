@@ -1160,6 +1160,33 @@ def _stage_reason(item: dict, pr: dict, open_refs: list[str] | None,
     return "stage merged: %s — lot non fermé" % " ; ".join(reasons)
 
 
+def _linked_reason(db, item: dict, pr: dict, ref: str) -> str | None:
+    """#5168 : pourquoi une PR désignée par sa SEULE branche `lot/<id>-…`
+    (L118b) n'est pas la livraison du lot (None : elle l'est).
+
+    Elle l'est si sa branche est la branche de livraison enregistrée du lot,
+    ou si la tête fusionnée porte la tête gelée du lot (jalon `frozen`). Sinon
+    c'est une fusion liée — une PR préalable d'un autre dépôt (cas #3392 :
+    manaty/home#223, `lot/3392-canon-canary`, lot sans branche ni gel) : elle
+    se trace, sans transition. Un lot sans gel ni branche n'est donc jamais
+    clos par cette voie, et une correction à la main n'est pas défaite au
+    relevé suivant."""
+    head = pr.get("headRefName") or ""
+    if item.get("branch") and short_branch(item["branch"]) == head:
+        return None
+    frozen = work_mod.frozen_head(db, int(item["id"]))
+    commit = pr.get("mergeCommit") or {}
+    tips = {str(pr.get("headRefOid") or "").strip().lower(),
+            str((commit.get("oid") if isinstance(commit, dict) else "") or "").strip().lower()}
+    if frozen and frozen in tips:
+        return None
+    return ("linked merge: PR %s (branch %s%s) merged without the lot's freeze %s nor its "
+            "delivery branch — trace only, not a delivery"
+            % (ref, head, (", head %s" % str(pr.get("headRefOid"))[:12])
+               if pr.get("headRefOid") else "",
+               frozen[:12] if frozen else "(none)"))
+
+
 def open_prs_of_repo(gh, repo: str) -> list[dict]:
     """#759 : TOUTES les PR ouvertes du dépôt (REST paginé, sans plafond).
 
@@ -1199,11 +1226,15 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
     # la fiche (`lot/<fiche>-…`, `ameesh-lot:`). Une ligne explicite ne fait
     # donc pas retenir le reste de la fiche : une PR de fiche oubliée ne
     # bloque plus les lots dont la propre PR est déjà fusionnée.
+
+    #5168 : une PR désignée par sa seule branche `lot/<id>-…` ne livre le lot
+    que si c'est sa branche enregistrée ou si sa tête porte le gel du lot ;
+    sinon elle est tracée comme fusion liée (`linked`), sans transition.
     """
     check_repo(repo)
     prs = _json(gh, ["pr", "list", "--repo", repo, "--state", "merged", "--limit", str(int(limit)),
-                     "--json", "number,headRefName,isCrossRepository,body,state,mergeCommit,mergedBy,"
-                     "mergedAt,url"])
+                     "--json", "number,headRefName,headRefOid,isCrossRepository,body,state,mergeCommit,"
+                     "mergedBy,mergedAt,url"])
     if not isinstance(prs, list):
         raise GithubError("gh pr list: list expected")
     open_prs = open_prs_of_repo(gh, repo)
@@ -1213,6 +1244,7 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
     # fusionnée peut fermer. Collecter ces lots d'abord évite un LIKE sur tout
     # `work_item_events` à chaque relevé (l'ancien `events_noted(…, 0.0)`).
     targets_by_pr: dict[int, list] = {}
+    by_branch: set[int] = set()
     candidates: set[int] = set()
     by_issue: dict | None = None
     for pr in prs:
@@ -1220,6 +1252,12 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
             continue
         targets, by_issue = _targets_of_pr(db, st, pr, repo, idents, by_issue)
         targets_by_pr[int(pr.get("number") or 0)] = targets
+        # #5168 : désignée par sa seule branche `lot/<id>-…` (L118b), la PR
+        # doit encore prouver qu'elle livre le lot (`_linked_reason`)
+        if targets and not work_items_of_pr(pr) and not packages_of_pr(pr, idents) \
+                and not any(lot for issue in issues_of_pr(pr, repo)
+                            for lot in (by_issue or {}).get(issue.casefold(), ())):
+            by_branch.add(int(pr.get("number") or 0))
         candidates.update(int(item_id) for item_id, _pid in targets)
     # #1693 (N1, cx2) : une PR fusionnée AVANT la dernière correction
     # `merged → build` d'un lot ne peut plus le fermer — sa fusion a été
@@ -1266,11 +1304,14 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                 # n'est pas fermé par cette PR ; un lot déjà fermé suit son sort.
                 # #1693 (N1) : pas non plus par une fusion antérieure à la
                 # dernière correction merged → build (voir `_stage_reason`).
-                text = (_stage_reason(item, pr, open_lots.get(item_id), ref,
-                                      annulled_ts=annulled.get(item_id),
-                                      merged_ts=merged_ts)
-                        if item["state"] not in work_mod.MERGED_STATES
-                        and item["state"] != lifecycle.CLOSED else None)
+                live = (item["state"] not in work_mod.MERGED_STATES
+                        and item["state"] != lifecycle.CLOSED)
+                linked = (_linked_reason(db, item, pr, ref)
+                          if live and int(pr.get("number") or 0) in by_branch else None)
+                text = linked or (_stage_reason(item, pr, open_lots.get(item_id), ref,
+                                                annulled_ts=annulled.get(item_id),
+                                                merged_ts=merged_ts)
+                                  if live else None)
                 if text:
                     if not dry_run:
                         # #1693 (N3) : un relevé répété ne répète pas le même
@@ -1280,7 +1321,7 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                         recent = work_mod.events(db, item_id, _STAGE_DEDUP_EVENTS)
                         if not any((e.get("note") or "") == text for e in recent):
                             work_mod.note(db, item_id, text, actor=actor)
-                    entry.update(result="stage-merged",
+                    entry.update(result="linked" if linked else "stage-merged",
                                  detail=text + (" (dry run)" if dry_run else ""))
                 elif dry_run:
                     state = item["state"]

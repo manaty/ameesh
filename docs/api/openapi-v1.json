@@ -38,6 +38,265 @@
               },
               "name": {
                 "type": "string"
+              },
+              "sandbox": {
+                "properties": {
+                  "agent": {
+                    "type": "string"
+                  },
+                  "canon_ref": {
+                    "type": "string"
+                  },
+                  "completed_ts": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "counters": {
+                    "properties": {
+                      "model_calls": {
+                        "type": "integer"
+                      },
+                      "seconds": {
+                        "type": "integer"
+                      },
+                      "tool_calls": {
+                        "type": "integer"
+                      },
+                      "turns": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "turns",
+                      "tool_calls",
+                      "seconds",
+                      "model_calls"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "deadline_ts": {
+                    "type": "number"
+                  },
+                  "epoch": {
+                    "type": "integer"
+                  },
+                  "job": {
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "namespace": {
+                        "type": "string"
+                      },
+                      "phase": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "uid": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "namespace",
+                      "name",
+                      "uid",
+                      "phase"
+                    ],
+                    "type": "object"
+                  },
+                  "owner": {
+                    "type": "string"
+                  },
+                  "placement_ref": {
+                    "type": "string"
+                  },
+                  "profile_ref": {
+                    "type": "string"
+                  },
+                  "receipt": {
+                    "properties": {
+                      "epoch": {
+                        "type": "integer"
+                      },
+                      "job": {
+                        "type": "object"
+                      },
+                      "replayed": {
+                        "type": "boolean"
+                      },
+                      "result_id": {
+                        "type": "string"
+                      },
+                      "result_sha256": {
+                        "type": "string"
+                      },
+                      "schema": {
+                        "const": "ameesh-sandbox-receipt/1",
+                        "type": "string"
+                      },
+                      "scope": {
+                        "type": "object"
+                      },
+                      "scope_digest": {
+                        "type": "string"
+                      },
+                      "source": {
+                        "type": "object"
+                      },
+                      "turn_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "schema",
+                      "turn_id",
+                      "epoch",
+                      "scope",
+                      "scope_digest",
+                      "result_id",
+                      "result_sha256",
+                      "job",
+                      "source",
+                      "replayed"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "refusal": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "result_sha256": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "schema": {
+                    "const": "ameesh-sandbox-turn/1",
+                    "type": "string"
+                  },
+                  "scope": {
+                    "type": "object"
+                  },
+                  "scope_digest": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "type": "object"
+                  },
+                  "started_ts": {
+                    "type": "number"
+                  },
+                  "state": {
+                    "enum": [
+                      "intent",
+                      "created",
+                      "bound",
+                      "running",
+                      "cancelling",
+                      "succeeded",
+                      "failed",
+                      "cancelled",
+                      "expired",
+                      "orphaned",
+                      "lost"
+                    ],
+                    "type": "string"
+                  },
+                  "tranche": {
+                    "properties": {
+                      "kept_usd": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      },
+                      "reserved_usd": {
+                        "type": "number"
+                      },
+                      "settled_usd": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      },
+                      "state": {
+                        "enum": [
+                          "open",
+                          "settled",
+                          "kept",
+                          "released"
+                        ]
+                      },
+                      "tranche_id": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "tranche_id",
+                      "state",
+                      "reserved_usd",
+                      "settled_usd",
+                      "kept_usd"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "turn_id": {
+                    "type": "string"
+                  },
+                  "verdict": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "schema",
+                  "turn_id",
+                  "agent",
+                  "owner",
+                  "epoch",
+                  "state",
+                  "scope",
+                  "scope_digest",
+                  "profile_ref",
+                  "placement_ref",
+                  "canon_ref",
+                  "source",
+                  "job",
+                  "deadline_ts",
+                  "started_ts",
+                  "completed_ts",
+                  "counters",
+                  "result_sha256",
+                  "verdict",
+                  "receipt",
+                  "refusal",
+                  "tranche"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -110,6 +369,265 @@
               "properties": {
                 "name": {
                   "type": "string"
+                },
+                "sandbox": {
+                  "properties": {
+                    "agent": {
+                      "type": "string"
+                    },
+                    "canon_ref": {
+                      "type": "string"
+                    },
+                    "completed_ts": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "counters": {
+                      "properties": {
+                        "model_calls": {
+                          "type": "integer"
+                        },
+                        "seconds": {
+                          "type": "integer"
+                        },
+                        "tool_calls": {
+                          "type": "integer"
+                        },
+                        "turns": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "turns",
+                        "tool_calls",
+                        "seconds",
+                        "model_calls"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "deadline_ts": {
+                      "type": "number"
+                    },
+                    "epoch": {
+                      "type": "integer"
+                    },
+                    "job": {
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "namespace": {
+                          "type": "string"
+                        },
+                        "phase": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "uid": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "namespace",
+                        "name",
+                        "uid",
+                        "phase"
+                      ],
+                      "type": "object"
+                    },
+                    "owner": {
+                      "type": "string"
+                    },
+                    "placement_ref": {
+                      "type": "string"
+                    },
+                    "profile_ref": {
+                      "type": "string"
+                    },
+                    "receipt": {
+                      "properties": {
+                        "epoch": {
+                          "type": "integer"
+                        },
+                        "job": {
+                          "type": "object"
+                        },
+                        "replayed": {
+                          "type": "boolean"
+                        },
+                        "result_id": {
+                          "type": "string"
+                        },
+                        "result_sha256": {
+                          "type": "string"
+                        },
+                        "schema": {
+                          "const": "ameesh-sandbox-receipt/1",
+                          "type": "string"
+                        },
+                        "scope": {
+                          "type": "object"
+                        },
+                        "scope_digest": {
+                          "type": "string"
+                        },
+                        "source": {
+                          "type": "object"
+                        },
+                        "turn_id": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "schema",
+                        "turn_id",
+                        "epoch",
+                        "scope",
+                        "scope_digest",
+                        "result_id",
+                        "result_sha256",
+                        "job",
+                        "source",
+                        "replayed"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "refusal": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "result_sha256": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "schema": {
+                      "const": "ameesh-sandbox-turn/1",
+                      "type": "string"
+                    },
+                    "scope": {
+                      "type": "object"
+                    },
+                    "scope_digest": {
+                      "type": "string"
+                    },
+                    "source": {
+                      "type": "object"
+                    },
+                    "started_ts": {
+                      "type": "number"
+                    },
+                    "state": {
+                      "enum": [
+                        "intent",
+                        "created",
+                        "bound",
+                        "running",
+                        "cancelling",
+                        "succeeded",
+                        "failed",
+                        "cancelled",
+                        "expired",
+                        "orphaned",
+                        "lost"
+                      ],
+                      "type": "string"
+                    },
+                    "tranche": {
+                      "properties": {
+                        "kept_usd": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "reserved_usd": {
+                          "type": "number"
+                        },
+                        "settled_usd": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "state": {
+                          "enum": [
+                            "open",
+                            "settled",
+                            "kept",
+                            "released"
+                          ]
+                        },
+                        "tranche_id": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "tranche_id",
+                        "state",
+                        "reserved_usd",
+                        "settled_usd",
+                        "kept_usd"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "turn_id": {
+                      "type": "string"
+                    },
+                    "verdict": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "schema",
+                    "turn_id",
+                    "agent",
+                    "owner",
+                    "epoch",
+                    "state",
+                    "scope",
+                    "scope_digest",
+                    "profile_ref",
+                    "placement_ref",
+                    "canon_ref",
+                    "source",
+                    "job",
+                    "deadline_ts",
+                    "started_ts",
+                    "completed_ts",
+                    "counters",
+                    "result_sha256",
+                    "verdict",
+                    "receipt",
+                    "refusal",
+                    "tranche"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
                 }
               },
               "required": [
@@ -763,6 +1281,534 @@
         ],
         "type": "object"
       },
+      "ameesh-sandbox-turn-1": {
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "canon_ref": {
+            "type": "string"
+          },
+          "completed_ts": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "counters": {
+            "properties": {
+              "model_calls": {
+                "type": "integer"
+              },
+              "seconds": {
+                "type": "integer"
+              },
+              "tool_calls": {
+                "type": "integer"
+              },
+              "turns": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "turns",
+              "tool_calls",
+              "seconds",
+              "model_calls"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "deadline_ts": {
+            "type": "number"
+          },
+          "epoch": {
+            "type": "integer"
+          },
+          "job": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "namespace": {
+                "type": "string"
+              },
+              "phase": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "uid": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "namespace",
+              "name",
+              "uid",
+              "phase"
+            ],
+            "type": "object"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "placement_ref": {
+            "type": "string"
+          },
+          "profile_ref": {
+            "type": "string"
+          },
+          "receipt": {
+            "properties": {
+              "epoch": {
+                "type": "integer"
+              },
+              "job": {
+                "type": "object"
+              },
+              "replayed": {
+                "type": "boolean"
+              },
+              "result_id": {
+                "type": "string"
+              },
+              "result_sha256": {
+                "type": "string"
+              },
+              "schema": {
+                "const": "ameesh-sandbox-receipt/1",
+                "type": "string"
+              },
+              "scope": {
+                "type": "object"
+              },
+              "scope_digest": {
+                "type": "string"
+              },
+              "source": {
+                "type": "object"
+              },
+              "turn_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "schema",
+              "turn_id",
+              "epoch",
+              "scope",
+              "scope_digest",
+              "result_id",
+              "result_sha256",
+              "job",
+              "source",
+              "replayed"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "refusal": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schema": {
+            "const": "ameesh-sandbox-turn/1",
+            "type": "string"
+          },
+          "scope": {
+            "type": "object"
+          },
+          "scope_digest": {
+            "type": "string"
+          },
+          "source": {
+            "type": "object"
+          },
+          "started_ts": {
+            "type": "number"
+          },
+          "state": {
+            "enum": [
+              "intent",
+              "created",
+              "bound",
+              "running",
+              "cancelling",
+              "succeeded",
+              "failed",
+              "cancelled",
+              "expired",
+              "orphaned",
+              "lost"
+            ],
+            "type": "string"
+          },
+          "tranche": {
+            "properties": {
+              "kept_usd": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "reserved_usd": {
+                "type": "number"
+              },
+              "settled_usd": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "state": {
+                "enum": [
+                  "open",
+                  "settled",
+                  "kept",
+                  "released"
+                ]
+              },
+              "tranche_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tranche_id",
+              "state",
+              "reserved_usd",
+              "settled_usd",
+              "kept_usd"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "turn_id": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "schema",
+          "turn_id",
+          "agent",
+          "owner",
+          "epoch",
+          "state",
+          "scope",
+          "scope_digest",
+          "profile_ref",
+          "placement_ref",
+          "canon_ref",
+          "source",
+          "job",
+          "deadline_ts",
+          "started_ts",
+          "completed_ts",
+          "counters",
+          "result_sha256",
+          "verdict",
+          "receipt",
+          "refusal",
+          "tranche"
+        ],
+        "type": "object"
+      },
+      "ameesh-sandbox-turns-1": {
+        "properties": {
+          "schema": {
+            "const": "ameesh-sandbox-turns/1",
+            "type": "string"
+          },
+          "turns": {
+            "items": {
+              "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "canon_ref": {
+                  "type": "string"
+                },
+                "completed_ts": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "counters": {
+                  "properties": {
+                    "model_calls": {
+                      "type": "integer"
+                    },
+                    "seconds": {
+                      "type": "integer"
+                    },
+                    "tool_calls": {
+                      "type": "integer"
+                    },
+                    "turns": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "turns",
+                    "tool_calls",
+                    "seconds",
+                    "model_calls"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "deadline_ts": {
+                  "type": "number"
+                },
+                "epoch": {
+                  "type": "integer"
+                },
+                "job": {
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "namespace": {
+                      "type": "string"
+                    },
+                    "phase": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "uid": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "namespace",
+                    "name",
+                    "uid",
+                    "phase"
+                  ],
+                  "type": "object"
+                },
+                "owner": {
+                  "type": "string"
+                },
+                "placement_ref": {
+                  "type": "string"
+                },
+                "profile_ref": {
+                  "type": "string"
+                },
+                "receipt": {
+                  "properties": {
+                    "epoch": {
+                      "type": "integer"
+                    },
+                    "job": {
+                      "type": "object"
+                    },
+                    "replayed": {
+                      "type": "boolean"
+                    },
+                    "result_id": {
+                      "type": "string"
+                    },
+                    "result_sha256": {
+                      "type": "string"
+                    },
+                    "schema": {
+                      "const": "ameesh-sandbox-receipt/1",
+                      "type": "string"
+                    },
+                    "scope": {
+                      "type": "object"
+                    },
+                    "scope_digest": {
+                      "type": "string"
+                    },
+                    "source": {
+                      "type": "object"
+                    },
+                    "turn_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "schema",
+                    "turn_id",
+                    "epoch",
+                    "scope",
+                    "scope_digest",
+                    "result_id",
+                    "result_sha256",
+                    "job",
+                    "source",
+                    "replayed"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "refusal": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "result_sha256": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "schema": {
+                  "const": "ameesh-sandbox-turn/1",
+                  "type": "string"
+                },
+                "scope": {
+                  "type": "object"
+                },
+                "scope_digest": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "object"
+                },
+                "started_ts": {
+                  "type": "number"
+                },
+                "state": {
+                  "enum": [
+                    "intent",
+                    "created",
+                    "bound",
+                    "running",
+                    "cancelling",
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                    "expired",
+                    "orphaned",
+                    "lost"
+                  ],
+                  "type": "string"
+                },
+                "tranche": {
+                  "properties": {
+                    "kept_usd": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "reserved_usd": {
+                      "type": "number"
+                    },
+                    "settled_usd": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "state": {
+                      "enum": [
+                        "open",
+                        "settled",
+                        "kept",
+                        "released"
+                      ]
+                    },
+                    "tranche_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "tranche_id",
+                    "state",
+                    "reserved_usd",
+                    "settled_usd",
+                    "kept_usd"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "turn_id": {
+                  "type": "string"
+                },
+                "verdict": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "schema",
+                "turn_id",
+                "agent",
+                "owner",
+                "epoch",
+                "state",
+                "scope",
+                "scope_digest",
+                "profile_ref",
+                "placement_ref",
+                "canon_ref",
+                "source",
+                "job",
+                "deadline_ts",
+                "started_ts",
+                "completed_ts",
+                "counters",
+                "result_sha256",
+                "verdict",
+                "receipt",
+                "refusal",
+                "tranche"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "schema",
+          "turns"
+        ],
+        "type": "object"
+      },
       "ameesh-thread-1": {
         "properties": {
           "entries": {
@@ -1168,6 +2214,262 @@
               "object",
               "null"
             ]
+          },
+          "sandbox": {
+            "properties": {
+              "agent": {
+                "type": "string"
+              },
+              "canon_ref": {
+                "type": "string"
+              },
+              "completed_ts": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "counters": {
+                "properties": {
+                  "model_calls": {
+                    "type": "integer"
+                  },
+                  "seconds": {
+                    "type": "integer"
+                  },
+                  "tool_calls": {
+                    "type": "integer"
+                  },
+                  "turns": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "turns",
+                  "tool_calls",
+                  "seconds",
+                  "model_calls"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "deadline_ts": {
+                "type": "number"
+              },
+              "epoch": {
+                "type": "integer"
+              },
+              "job": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "namespace": {
+                    "type": "string"
+                  },
+                  "phase": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "uid": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "namespace",
+                  "name",
+                  "uid",
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "owner": {
+                "type": "string"
+              },
+              "placement_ref": {
+                "type": "string"
+              },
+              "profile_ref": {
+                "type": "string"
+              },
+              "receipt": {
+                "properties": {
+                  "epoch": {
+                    "type": "integer"
+                  },
+                  "job": {
+                    "type": "object"
+                  },
+                  "replayed": {
+                    "type": "boolean"
+                  },
+                  "result_id": {
+                    "type": "string"
+                  },
+                  "result_sha256": {
+                    "type": "string"
+                  },
+                  "schema": {
+                    "const": "ameesh-sandbox-receipt/1",
+                    "type": "string"
+                  },
+                  "scope": {
+                    "type": "object"
+                  },
+                  "scope_digest": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "type": "object"
+                  },
+                  "turn_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "schema",
+                  "turn_id",
+                  "epoch",
+                  "scope",
+                  "scope_digest",
+                  "result_id",
+                  "result_sha256",
+                  "job",
+                  "source",
+                  "replayed"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "refusal": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "result_sha256": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "schema": {
+                "const": "ameesh-sandbox-turn/1",
+                "type": "string"
+              },
+              "scope": {
+                "type": "object"
+              },
+              "scope_digest": {
+                "type": "string"
+              },
+              "source": {
+                "type": "object"
+              },
+              "started_ts": {
+                "type": "number"
+              },
+              "state": {
+                "enum": [
+                  "intent",
+                  "created",
+                  "bound",
+                  "running",
+                  "cancelling",
+                  "succeeded",
+                  "failed",
+                  "cancelled",
+                  "expired",
+                  "orphaned",
+                  "lost"
+                ],
+                "type": "string"
+              },
+              "tranche": {
+                "properties": {
+                  "kept_usd": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "reserved_usd": {
+                    "type": "number"
+                  },
+                  "settled_usd": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "state": {
+                    "enum": [
+                      "open",
+                      "settled",
+                      "kept",
+                      "released"
+                    ]
+                  },
+                  "tranche_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "tranche_id",
+                  "state",
+                  "reserved_usd",
+                  "settled_usd",
+                  "kept_usd"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "turn_id": {
+                "type": "string"
+              },
+              "verdict": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "schema",
+              "turn_id",
+              "agent",
+              "owner",
+              "epoch",
+              "state",
+              "scope",
+              "scope_digest",
+              "profile_ref",
+              "placement_ref",
+              "canon_ref",
+              "source",
+              "job",
+              "deadline_ts",
+              "started_ts",
+              "completed_ts",
+              "counters",
+              "result_sha256",
+              "verdict",
+              "receipt",
+              "refusal",
+              "tranche"
+            ],
+            "type": "object"
           },
           "schema": {
             "const": "ameesh-turn-observation/1",
@@ -4044,6 +5346,176 @@
           }
         },
         "summary": "One mailbox request's observation: delivery state and turn (#2167)"
+      }
+    },
+    "/api/v1/sandbox/turns": {
+      "get": {
+        "operationId": "sandbox_turns",
+        "parameters": [
+          {
+            "description": "agent name",
+            "in": "query",
+            "name": "agent",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "sandbox state",
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "enum": [
+                "intent",
+                "created",
+                "bound",
+                "running",
+                "cancelling",
+                "succeeded",
+                "failed",
+                "cancelled",
+                "expired",
+                "orphaned",
+                "lost"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "exact scope digest",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "at most 100 by default",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-sandbox-turns-1"
+                }
+              }
+            },
+            "description": "Sandbox turns (read-only, bounded)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Sandbox turns (read-only, bounded)"
+      }
+    },
+    "/api/v1/sandbox/turns/{turn}": {
+      "get": {
+        "operationId": "sandbox_turns_turn",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "turn",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-sandbox-turn-1"
+                }
+              }
+            },
+            "description": "Sandbox turn metadata and receipt (read-only)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Sandbox turn metadata and receipt (read-only)"
       }
     },
     "/api/v1/threads/{project}": {

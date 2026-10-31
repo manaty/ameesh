@@ -71,7 +71,7 @@ import time
 import urllib.parse
 from typing import Callable
 
-from . import events, httpkit, serve_actions, server_faults, storage, turn_observation, version
+from . import events, httpkit, serve_actions, server_faults, storage, turn_observation, sandbox_observation, version
 from . import db as db_mod
 
 BIND = "127.0.0.1"
@@ -262,12 +262,12 @@ def _timeline(ctx: Context, db, params, query) -> dict:
 
 def _agents(ctx: Context, db, params, query) -> dict:
     from . import mesh_cli
-    return {"schema": "ameesh-agents/1", "agents": mesh_cli.agent_rows(ctx.cfg, db)}
+    return {"schema": "ameesh-agents/1", "agents": mesh_cli.agent_rows(ctx.cfg, db, sees=ctx.sees)}
 
 
 def _agent(ctx: Context, db, params, query) -> dict:
     from . import mesh_cli
-    row = mesh_cli.agent_detail_json(db, params["agent"], cfg=ctx.cfg)
+    row = mesh_cli.agent_detail_json(db, params["agent"], cfg=ctx.cfg, sees=ctx.sees)
     if row is None:
         raise ApiError(404, "not_found", "unknown agent")
     return {"schema": "ameesh-agent-detail/1", "agent": row}
@@ -392,7 +392,8 @@ def _turn(ctx: Context, db, params, query) -> dict:
     document holds no message body or payload, so this read adds no content
     exposure when the OIDC tokens arrive."""
     try:
-        return turn_observation.observe(db, turn=params["turn"])
+        return turn_observation.observe(db, turn=params['turn'],
+                                        sees=ctx.sees if ctx is not None else None)
     except turn_observation.Unknown as exc:
         raise ApiError(404, "not_found", str(exc)) from exc
 
@@ -400,9 +401,29 @@ def _turn(ctx: Context, db, params, query) -> dict:
 def _request(ctx: Context, db, params, query) -> dict:
     """#2167 B1: the observation of one mailbox request (metadata only)."""
     try:
-        return turn_observation.observe(db, request=int(params["request"]))
+        return turn_observation.observe(db, request=int(params['request']),
+                                        sees=ctx.sees if ctx is not None else None)
     except turn_observation.Unknown as exc:
         raise ApiError(404, "not_found", str(exc)) from exc
+
+
+def _sandbox_turn(ctx, db, params, query):
+    from . import sandbox_observation
+    try:
+        return sandbox_observation.show(db, params['turn'], sees=ctx.sees)
+    except sandbox_observation.Unknown as exc:
+        raise ApiError(404, 'unknown-turn', str(exc)) from exc
+
+
+def _sandbox_turns(ctx, db, params, query):
+    from . import sandbox_observation
+    try:
+        return sandbox_observation.listing(
+            db, agent=_one(query, 'agent'), state=_one(query, 'state'),
+            scope=_one(query, 'scope'), limit=int(_one(query, 'limit') or 100),
+            sees=ctx.sees)
+    except ValueError as exc:
+        raise ApiError(400, 'bad_query', str(exc)) from exc
 
 
 def _openapi(ctx: Context, db, params, query) -> dict:
@@ -456,6 +477,14 @@ ROUTES = (
           query=(("state", {"type": "string"}, "state of the lots"),
                  ("assignee", {"type": "string"}, "assignee of the lots"), _LIMIT)),
     Route(API + "/lots/{id}", "ameesh-lot/1", "One lot (`ameesh work show --json`)", _lot),
+    Route(API + '/sandbox/turns/{turn}', 'ameesh-sandbox-turn/1',
+          'Sandbox turn metadata and receipt (read-only)', _sandbox_turn),
+    Route(API + '/sandbox/turns', 'ameesh-sandbox-turns/1',
+          'Sandbox turns (read-only, bounded)', _sandbox_turns,
+          query=(('agent', {'type': 'string'}, 'agent name'),
+                 ('state', {'type': 'string', 'enum': list(sandbox_observation.STATES)}, 'sandbox state'),
+                 ('scope', {'type': 'string'}, 'exact scope digest'),
+                 ('limit', {'type': 'integer', 'minimum': 1, 'maximum': 1000}, 'at most 100 by default'))),
     Route(API + "/turns/{turn}", "ameesh-turn-observation/1",
           "One turn's observation: state, agent, lease and accounting (#2167)", _turn),
     Route(API + "/requests/{request}", "ameesh-turn-observation/1",
@@ -624,6 +653,33 @@ _NUM_NULL = {"type": ["number", "null"]}
 _INT_NULL = {"type": ["integer", "null"]}
 _HOST = _obj("ameesh-host/1", ["host", "limits", "pressure", "history"],
              host=_STR, limits=_OBJ, history=_LIST)
+_SANDBOX = _obj(
+    'ameesh-sandbox-turn/1',
+    ['turn_id', 'agent', 'owner', 'epoch', 'state', 'scope', 'scope_digest',
+     'profile_ref', 'placement_ref', 'canon_ref', 'source', 'job', 'deadline_ts',
+     'started_ts', 'completed_ts', 'counters', 'result_sha256', 'verdict',
+     'receipt', 'refusal', 'tranche'],
+    turn_id=_STR, agent=_STR, owner=_STR, epoch={'type': 'integer'},
+    state={'type': 'string', 'enum': list(sandbox_observation.STATES)},
+    scope=_OBJ, scope_digest=_STR, profile_ref=_STR, placement_ref=_STR,
+    canon_ref=_STR, source=_OBJ,
+    job=_obj(None, ['namespace', 'name', 'uid', 'phase'],
+             namespace=_STR, name=_STR, uid=_STR_NULL, phase=_STR_NULL),
+    deadline_ts=_NUM, started_ts=_NUM, completed_ts=_NUM_NULL,
+    counters=_nullable_obj(['turns', 'tool_calls', 'seconds', 'model_calls'],
+                           **{k: {'type': 'integer'} for k in
+                              ('turns', 'tool_calls', 'seconds', 'model_calls')}),
+    result_sha256=_STR_NULL, verdict=_STR_NULL,
+    receipt=_nullable_obj(['schema', 'turn_id', 'epoch', 'scope', 'scope_digest',
+                          'result_id', 'result_sha256', 'job', 'source', 'replayed'],
+        schema={'const': 'ameesh-sandbox-receipt/1', 'type': 'string'},
+        turn_id=_STR, epoch={'type': 'integer'}, scope=_OBJ, scope_digest=_STR,
+        result_id=_STR, result_sha256=_STR, job=_OBJ, source=_OBJ,
+        replayed={'type': 'boolean'}),
+    refusal=_STR_NULL,
+    tranche=_nullable_obj(['tranche_id', 'state', 'reserved_usd', 'settled_usd', 'kept_usd'],
+        tranche_id=_STR, state={'enum': ['open', 'settled', 'kept', 'released']},
+        reserved_usd=_NUM, settled_usd=_NUM_NULL, kept_usd=_NUM_NULL))
 #: #2167 B1: the observation of one turn or one request (study l2894, §3).
 #: The enums are the domain constants, so a new state cannot be documented
 #: without the builder and the tests seeing it.
@@ -668,12 +724,16 @@ _OBSERVATION = _obj(
              "recorded_ts", "source"],
             turn_id=_STR_NULL, spend_key=_STR_NULL, billing_account=_STR_NULL,
             usd=_NUM, model=_STR_NULL, recorded_ts=_NUM, source=_STR_NULL)),
+    sandbox=_SANDBOX,
     quiescent={"type": "boolean"},
 )
 
 #: the response schemas: the keys every response carries (the objects they
 #: hold are the CLI's, documented in docs/EXPLOITATION.md and docs/PROGRESS.md)
 SCHEMAS = {
+    'ameesh-sandbox-turn/1': _SANDBOX,
+    'ameesh-sandbox-turns/1': _obj('ameesh-sandbox-turns/1', ['turns'],
+                                 turns={'type': 'array', 'items': _SANDBOX}),
     "ameesh-agent-peek/1": _obj("ameesh-agent-peek/1",
         ["agent", "host", "lot", "captured_ts", "stale", "workspace", "events"],
         agent=_STR, host=_STR, lot=_OBJ, captured_ts={"type": ["number", "null"]},
@@ -690,10 +750,11 @@ SCHEMAS = {
                               generated_ts=_NUM, window=_OBJ, lots=_LIST,
                               truncated=_OBJ),
     "ameesh-agents/1": _obj("ameesh-agents/1", ["agents"], agents={
-        "type": "array", "items": _obj(None, ["name"], name=_STR)}),
+        "type": "array", "items": _obj(None, ["name"], name=_STR, sandbox=dict(_SANDBOX, type=["object", "null"]))}),
     "ameesh-agent-detail/1": _obj("ameesh-agent-detail/1", ["agent"],
                                   agent=_obj(None, ["name", "key_ready"], name=_STR,
-                                             key_ready={"type": "boolean"})),
+                                             key_ready={"type": "boolean"},
+                                             sandbox=dict(_SANDBOX, type=["object", "null"]))),
     "ameesh-conversation/1": _obj(
         "ameesh-conversation/1",
         ["agent", "entries", "last_seq", "oldest_seq", "next_seq", "more", "gap"],

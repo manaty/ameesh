@@ -741,8 +741,14 @@ def human_account(row: Any) -> str:
 
 #: L514: payload keys of a message the sender marked as a review verdict
 #: (`agent-mail send --verdict`) or an arbitration (`--arbitration`); #5006:
-#: the notice of a reassignment to the previous assignee (`work.assign`)
+#: the notice of a reassignment to the previous assignee (`work.assign`).
+#: #5025 : `reassigned` est une clé de charge utile, jamais une option du CLI
+#: (sinon un corps commençant par `--reassigned` serait avalé) : les options
+#: que `cmd_send` reconnaît sont `MID_TURN_OPTIONS`, ci-dessous.
 MID_TURN_KEYS = ("verdict", "arbitration", "reassigned")
+
+#: #5025 : les marques de la L514 que `agent-mail send` accepte en option.
+MID_TURN_OPTIONS = ("verdict", "arbitration")
 
 
 def mid_turn(row: Any) -> bool:
