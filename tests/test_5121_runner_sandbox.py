@@ -8,7 +8,7 @@ from dataclasses import replace
 from types import SimpleNamespace as NS
 from unittest import mock
 
-from ameesh import canon, registry, runner_sandbox as runtime
+from ameesh import canon, registry, runner, runner_sandbox as runtime
 from ameesh.sandbox_turn import SandboxTurn
 from ameesh.storage.postgres import sandbox as s1, turn_admission as s3
 from . import test_sandbox_canon as card_fixture
@@ -17,6 +17,29 @@ from .support import PgTestCase
 
 
 class SelectionTest(card_fixture.SandboxCase):
+    def test_no_card_and_unavailable_sync_keep_legacy(self):
+        self.commit()
+        loaded, _ = self.load(trusted=True)
+        worker = self.worker()
+        worker.name = 'ghost-ephemeral'
+        worker.fail_turn = mock.Mock()
+        with mock.patch.object(canon, 'load_configured', return_value=[loaded]), \
+                mock.patch.object(runtime, '_pinned_canon', side_effect=AssertionError('not opt-in')):
+            self.assertIsNone(runtime.dispatch(worker, {}))
+        worker.fail_turn.assert_not_called()
+
+    def test_no_block_needs_neither_sync_state_nor_pinned_commit(self):
+        self.write('agents/tpk-reviewer.md', card_fixture.agent_card().split('sandbox:')[0] + '---\n')
+        self.commit()
+        loaded, _ = self.load(trusted=True)
+        with mock.patch.object(canon, 'load_configured', return_value=[loaded]), \
+                mock.patch.object(runtime, '_pinned_canon', side_effect=AssertionError('not opt-in')):
+            self.assertIsNone(runtime.select(self.worker()))
+
+    def test_unloadable_canon_without_declaration_keeps_legacy(self):
+        with mock.patch.object(canon, 'load_configured', return_value=[]):
+            self.assertIsNone(runtime.select(self.worker()))
+
     def worker(self):
         return NS(cfg=NS(canon=True), name='tpk-reviewer', db=object(),
                   runner=NS(host='tpk-stg-reviewers'), _canon_id=lambda: None)
@@ -149,7 +172,7 @@ class RunnerSandboxTest(PgTestCase):
             id=21, sender='requester', created_ts=time.time(), payload=dict(
                 schema='ameesh-sandbox-request/1', scope=self.envelope['scope']))])
 
-    def run_sandbox(self, lose_lease=False, grant_valid=True):
+    def run_sandbox(self, lose_lease=False, grant_valid=True, credential_epoch=None):
         original = SandboxTurn.start
         children = []
         def start(adapter, spec, **kwargs):
@@ -162,13 +185,108 @@ class RunnerSandboxTest(PgTestCase):
             return child
         self.worker.runner.sandbox_credentials_for = lambda agent, owner, epoch, turn, deadline: runtime.SandboxCredentials(
             'https://relay.example.test', 'private-session-token', runtime.relay.Identity(
-                'test', 'host', agent, owner, epoch, turn=turn, expires_ts=time.time()+30))
+                'test', 'host', agent, owner, epoch if credential_epoch is None else credential_epoch,
+                turn=turn, expires_ts=time.time()+30))
         with mock.patch.object(SandboxTurn, 'start', start), \
              mock.patch.object(runtime, 'grant_valid', return_value=grant_valid), \
              mock.patch.object(runtime, 'source', return_value=dict(
                  release='test', commit='a'*40, contract='ameesh-sandbox/1')):
             result = runtime.run(self.worker, self.spec, (self.admitted, self.host, self.account))
         return result, children
+
+    def assert_cancelled_and_prompt_restored(self):
+        self.assertEqual(self.db.query('select state from sandbox_turns')[0]['state'], 'cancelled')
+        row = self.db.query("select status, pending_prompt, current_prompt from agent_registry where name='agent'")[0]
+        self.assertEqual((row['status'], row['pending_prompt'], row['current_prompt']),
+                         ('queued', 'retry this request', None))
+        self.assertFalse(self.db.query('select * from spend_pending'))
+        self.assertFalse(self.db.query('select * from sandbox_results'))
+
+    def pending_prompt(self):
+        self.db.execute("update agent_registry set pending_prompt='retry this request' where name='agent'")
+
+    def test_invalid_issued_claims_close_admitted_intent_without_a_job(self):
+        self.pending_prompt()
+        result, children = self.run_sandbox(credential_epoch=999)
+        self.assertFalse(result)
+        self.assertFalse(children)
+        self.assert_cancelled_and_prompt_restored()
+
+    def test_context_rewrite_failure_after_admission_closes_intent(self):
+        self.pending_prompt()
+        original = runtime.turn_context.write
+        count = 0
+        def write(*args, **kwargs):
+            nonlocal count
+            count += 1
+            if count == 2:
+                raise OSError('cannot rewrite')
+            return original(*args, **kwargs)
+        with mock.patch.object(runtime.turn_context, 'write', side_effect=write):
+            result, children = self.run_sandbox()
+        self.assertFalse(result)
+        self.assertFalse(children)
+        self.assert_cancelled_and_prompt_restored()
+
+    def test_start_failure_closes_intent(self):
+        self.pending_prompt()
+        with mock.patch.object(runtime, 'kubernetes_provider'), \
+                mock.patch('ameesh.sandbox_turn.SupervisorChild', side_effect=OSError('cannot spawn')):
+            result, children = self.run_sandbox()
+        self.assertFalse(result)
+        self.assertFalse(children)
+        self.assert_cancelled_and_prompt_restored()
+
+    def test_getpgid_failure_closes_intent_and_stops_child(self):
+        self.pending_prompt()
+        with mock.patch.object(runtime.os, 'getpgid', side_effect=OSError('no process group')):
+            result, children = self.run_sandbox()
+        self.assertFalse(result)
+        self.assertIsNotNone(children[0].returncode)
+        self.assert_cancelled_and_prompt_restored()
+
+    def test_preemption_restart_and_host_withdrawal_observe_remote_deletion(self):
+        # Exercise the real stop entry point after a real supervisor has bound
+        # its Job, before it can publish its success. Each fresh test fixture
+        # provides a new admitted turn.
+        self.pending_prompt()
+        original = SandboxTurn.step
+        events = []
+        def step(adapter):
+            event, outcome = original(adapter)
+            events.append(event['kind'])
+            if event['kind'] == 'bound':
+                for reason in ('preemption', 'restart requested', 'the host is withdrawing: drain'):
+                    self.worker.resident = None
+                    self.worker.terminate = mock.Mock(side_effect=AssertionError('killed before delete'))
+                    self.assertTrue(runner.AgentWorker.stop_group_now(self.worker, reason, grace=1))
+            return event, outcome
+        with mock.patch.object(SandboxTurn, 'step', step):
+            result, children = self.run_sandbox()
+        self.assertFalse(result)
+        self.assertIn('cancelled', events)
+        self.assertNotIn('result', events)
+        self.assertIsNotNone(children[0].returncode)
+        self.assert_cancelled_and_prompt_restored()
+
+    def test_broken_supervisor_transport_can_observe_cancel_under_the_same_lease(self):
+        self.pending_prompt()
+        original = SandboxTurn.step
+        broken = False
+        def step(adapter):
+            nonlocal broken
+            event, outcome = original(adapter)
+            if not broken and event['kind'] == 'bound':
+                broken = True
+                adapter.close()
+                raise RuntimeError('transport lost after bind')
+            return event, outcome
+        with mock.patch.object(SandboxTurn, 'step', step):
+            result, children = self.run_sandbox()
+        self.assertFalse(result)
+        self.assertEqual(len(children), 2)
+        self.assertTrue(all(child.returncode is not None for child in children))
+        self.assert_cancelled_and_prompt_restored()
 
     def test_one_end_to_end_turn_uses_s1_receipt_and_never_generic_end_turn(self):
         with mock.patch.object(registry, 'end_turn', side_effect=AssertionError('generic close forbidden')):

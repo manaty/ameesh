@@ -89,11 +89,18 @@ def select(worker):
     """
     if not getattr(worker.cfg, 'canon', None):
         return None
+    # Legacy agents (including spawned agents without a card) do not depend
+    # on sandbox admission or on a synchronized sandbox revision.
+    matches = [c for c in canon.load_configured(worker.cfg) if c.owns(worker._canon_id())]
+    declared = [c for c in matches if c.agent(worker.name) is not None
+                and 'sandbox' in c.agent(worker.name).fiche.data]
+    if not declared:
+        return None
     try:
         loaded, state, pinned = _pinned_canon(worker)
         card = loaded.agent(worker.name)
         if card is None:
-            raise s1.Refusal('profile-refused')
+            return None
         declared = 'sandbox' in card.fiche.data
         if not declared:
             return None
@@ -164,6 +171,43 @@ def run(worker, spec, selected):
     pgid = None
     completed = False
     cancelling = False
+    provider_io = False
+    start_options = None
+    job = None
+    cancel_requested = threading.Event()
+
+    def cancel_and_observe():
+        """Fence first; keep the supervisor alive until deletion is observed.
+
+        Before the first step no provider call can have occurred. Otherwise a
+        broken transport is replaced by an observer of the same fenced turn,
+        never by a recovery adapter borrowing another lease.
+        """
+        nonlocal completed, pgid
+        adapter.cancel()
+        registry.restore_prompt(worker.db, worker.name, worker.runner.runner_id, worker.epoch)
+        if not provider_io:
+            outcome = adapter.consume(dict(kind='cancelled', turn_id=turn_id))
+        else:
+            if adapter.child is None or adapter.child.process.poll() is not None:
+                adapter.close()
+                if pgid is not None:
+                    worker._close_turn_resource(turn_id, pgid)
+                child = adapter.start(job, **start_options)
+                with worker.lock:
+                    worker.proc = child.process
+                    # start_new_session makes the new child its group leader.
+                    pgid = worker.pgid = child.process.pid
+                worker._open_turn_resource(turn_id, pgid)
+            while True:
+                _, outcome = adapter.step()
+                if outcome.get('state') in s1.TERMINAL or outcome.get('state') == 'orphaned':
+                    break
+                time.sleep(0.05)
+        completed = outcome.get('state') in s1.TERMINAL
+        if completed:
+            worker._compta_travail = None
+
     try:
         executable_source = source()
         if not callable(getattr(worker.runner, 'sandbox_credentials_for', None)):
@@ -232,30 +276,41 @@ def run(worker, spec, selected):
                       admitted.active_deadline_seconds, admitted.ttl_seconds_after_finished)
         options = dict(placement=asdict(host.policy.sandbox), turn_seconds=admitted.limits['turn_seconds'],
                        secrets=dict(prompt=json.dumps(job_input), relay_token=material.token))
-        child = adapter.start(job, provider_factory=__name__ + ':kubernetes_provider',
-                              provider_options=options, new_session=True, state_dir=worker.state_dir,
-                              orphan_after=admitted.limits['job_seconds'],
-                              timeout=admitted.limits['turn_seconds'])
+        start_options = dict(provider_factory=__name__ + ':kubernetes_provider',
+                             provider_options=options, new_session=True, state_dir=worker.state_dir,
+                             orphan_after=admitted.limits['job_seconds'],
+                             timeout=admitted.limits['turn_seconds'])
+        with worker.lock:
+            worker._sandbox_cancel_requested = cancel_requested
+        child = adapter.start(job, **start_options)
         with worker.lock:
             worker.proc = child.process
             pgid = worker.pgid = os.getpgid(child.process.pid)
         worker._open_turn_resource(turn_id, pgid)
         threading.Thread(target=worker._preempt_monitor, args=(monitor_done,),
                          daemon=True, name='sandbox-preempt-monitor').start()
-        if worker.kill_if_stop_requested():
-            adapter.cancel()
+        if worker.lease_lost.is_set():
+            worker.kill_if_stop_requested()
+            return False
+        if (cancel_requested.is_set() or worker.stopping.is_set()
+                or worker.stop_requested.is_set() or worker.preempting.is_set()):
+            cancel_and_observe()
             return False
         worker._turn_launched = True
         worker._consume_scheduled_wake(spec)
         worker._livre_courrier(spec)
         while True:
-            if worker.lease_lost.is_set() or worker.stopping.is_set() or worker.stop_requested.is_set():
-                adapter.cancel()
+            if worker.lease_lost.is_set():
                 worker.kill_if_stop_requested()
+                return False
+            if (cancel_requested.is_set() or worker.stopping.is_set()
+                    or worker.stop_requested.is_set() or worker.preempting.is_set()):
+                cancel_and_observe()
                 return False
             if not cancelling and not grant_valid(worker, admitted):
                 adapter.cancel()
                 cancelling = True
+            provider_io = True
             event, outcome = adapter.step()
             if event['kind'] == 'result':
                 worker._compta_travail = None
@@ -273,7 +328,7 @@ def run(worker, spec, selected):
                     reason)
         if intent and adapter is not None:
             try:
-                adapter.cancel()
+                cancel_and_observe()
             except Exception as cancel_error:
                 LOG.warning('sandbox cancellation pending (error=%s)', type(cancel_error).__name__)
         elif marker:
@@ -286,6 +341,7 @@ def run(worker, spec, selected):
         if adapter is not None:
             adapter.close()
         with worker.lock:
+            worker._sandbox_cancel_requested = None
             worker.proc = None
             worker.pgid = None
         worker.last_activity = time.monotonic()
