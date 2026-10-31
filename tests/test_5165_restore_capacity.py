@@ -236,6 +236,7 @@ class InstallationTest(unittest.TestCase):
             with mock.patch.object(producer, 'layout', return_value=(data, conf)), \
                     mock.patch.object(producer, 'protected', side_effect=Path), \
                     mock.patch.object(producer, 'INTENT', root / 'intent'), \
+                    mock.patch.object(producer, 'ENROLLMENT', root / 'enrollment.json'), \
                     mock.patch.object(Path, 'is_file', return_value=True), \
                     mock.patch.object(producer, 'command') as command:
                 with self.assertRaisesRegex(producer.RestoreError, 'unowned'):
