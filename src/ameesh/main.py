@@ -181,6 +181,8 @@
         les passes CI et issues sont refusées explicitement (§9) ;
   ameesh run [options]        the machine's runner; `agent-runner` remains
         an alias;
+  ameesh sandbox list [--agent NAME] [--state STATE] [--scope DIGEST] [--limit N] [--json]
+  ameesh sandbox show TURN_ID [--json]
   ameesh serve --exec-only --auth-file FILE [--listen HOST:PORT] …
         mediated executor API (/api/exec/v1, L108): an executor on a
         device without database access (docs/EXECUTEUR-MEDIEE.md).
@@ -269,6 +271,7 @@ MESH_COMMANDS = (
     "veille",
     # #2167 B2 : observation d'un tour ou d'une requête (`ameesh turn observe`)
     "turn",
+    "sandbox",
     # L30 : comptes multiples par fournisseur (`ameesh accounts list|use|auto`)
     "accounts",
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)

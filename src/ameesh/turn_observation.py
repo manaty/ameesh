@@ -216,7 +216,7 @@ def _accounting(db, turn: dict | None, open_reservation: dict | None = None) -> 
 
 
 def observe(db, *, turn: str | None = None, request: int | None = None,
-            now: float | None = None) -> dict:
+            now: float | None = None, sees=None) -> dict:
     """The `ameesh-turn-observation/1` document of one turn or one request.
 
     Exactly one of `turn` (the turn id) or `request` (the mailbox id) is
@@ -236,7 +236,7 @@ def observe(db, *, turn: str | None = None, request: int | None = None,
     agent = facts["agent"]
     quiescent = is_quiescent(agent_block["status"], accounting["state"],
                              agent_block["turn_in_progress"])
-    return {
+    document = {
         "schema": SCHEMA,
         "observed_ts": observed_ts,
         "by": ({"request": int(request)} if request is not None
@@ -254,3 +254,10 @@ def observe(db, *, turn: str | None = None, request: int | None = None,
         "accounting": accounting,
         "quiescent": quiescent,
     }
+
+    if turn_block is not None:
+        from . import sandbox_observation
+        sandbox = sandbox_observation.get(db, turn_block['id'], sees=sees)
+        if sandbox is not None:
+            document['sandbox'] = sandbox
+    return document

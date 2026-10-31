@@ -439,10 +439,18 @@ def cmd_current(argv: list[str]) -> int:
             except (ValueError, OSError):
                 print("turn current: invalid-configuration", file=sys.stderr)
                 return 2
-            bk, _ = backend_mod.open_backend(cfg)
+            import dataclasses
+            bk, _ = backend_mod.open_backend(dataclasses.replace(cfg, read_only=True))
             if bk.kind != "pg":
                 raise turn_context.ContextError("database-unavailable")
-            turn_context.verify(document, bk.db)
+            from . import sandbox_observation
+            try:
+                turn_context.verify(document, bk.db)
+                sandbox = sandbox_observation.get(bk.db, document['turn']['id'])
+                if sandbox is not None:
+                    document['sandbox'] = sandbox
+            finally:
+                bk.db.close()
     except turn_context.ContextError as exc:
         print("turn current: %s" % exc, file=sys.stderr)
         return 3
