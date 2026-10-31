@@ -15,7 +15,8 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import config as config_mod, cost as cost_mod, resident_runner, storage
+from ameesh import config as config_mod, context_metrics, cost as cost_mod, resident_runner, storage
+from ameesh.runner import AgentWorker
 
 from . import test_l81_resident_rotation as l81
 from .support import EMPTY_CONFIG
@@ -104,6 +105,68 @@ class MesureDeProfilTest(unittest.TestCase):
         self.assertEqual((rp.context_window, rp.profile_window), (200_000, 1_000_000))
         rp.record_turn(types.SimpleNamespace(usage={}, profile={"window_tokens": None}))
         self.assertIsNone(rp.profile_window)
+
+
+class MesurePartielleTest(unittest.TestCase):
+    """B1 (ameesh-cx1, mty-amh-qa-01) : une mesure partielle n'entre jamais dans
+    la projection ; l'inconnue est nommée et rien n'est décidé."""
+
+    APPEL = {"input_tokens": 900, "cache_read_input_tokens": 0,
+             "cache_creation_input_tokens": 0, "output_tokens": 7}
+
+    def _garde(self, document):
+        worker = types.SimpleNamespace(_window_measure=None)
+        AgentWorker._window_measure_keep(worker, document, False)
+        return worker._window_measure
+
+    def _normalizer(self, harness="claude", **kwargs):
+        return context_metrics.TurnNormalizer(harness, session="s", session_reread=0, **kwargs)
+
+    def _inconnues(self, document, *noms, motif):
+        self.assertIn(motif, document["reasons"])
+        mesure = self._garde(document)
+        for nom in noms:
+            self.assertIsNone(mesure[nom], nom)
+        projection = _projection(c_last=mesure["C_last"], o_last=mesure["O_last"])
+        self.assertEqual(projection["decision"], "")
+        self.assertIsNone(projection["near"])
+        self.assertEqual(projection["unknowns"], list(noms))
+
+    def test_tour_complet_mesure(self):
+        normalizer = self._normalizer()
+        normalizer.observe({"session": "s", "call_usage": self.APPEL, "call_id": "a"})
+        mesure = self._garde(normalizer.finish())
+        self.assertEqual((mesure["C_last"], mesure["O_last"]), (900, 7))
+
+    def test_tour_interrompu(self):
+        normalizer = self._normalizer()
+        normalizer.observe({"session": "s", "call_usage": self.APPEL, "call_id": "a"})
+        self._inconnues(normalizer.finish(interrupted=True), "C_last", "O_last",
+                        motif=context_metrics.REASON_TURN_INTERRUPTED)
+
+    def test_borne_d_appels(self):
+        normalizer = self._normalizer(max_calls=1)
+        for ident in ("a", "b"):
+            normalizer.observe({"session": "s", "call_usage": self.APPEL, "call_id": ident})
+        self._inconnues(normalizer.finish(), "C_last", "O_last",
+                        motif=context_metrics.REASON_CALL_BOUND_REACHED)
+
+    def test_autre_session(self):
+        normalizer = self._normalizer()
+        normalizer.observe({"session": "s", "call_usage": self.APPEL, "call_id": "a"})
+        normalizer.observe({"session": "s2", "call_usage": self.APPEL, "call_id": "b"})
+        self._inconnues(normalizer.finish(), "C_last", "O_last",
+                        motif=context_metrics.REASON_SESSION_MISMATCH)
+
+    def test_cache_ecrit_non_qualifie(self):
+        normalizer = self._normalizer("codex")
+        normalizer.observe({"session": "s", "call_usage": {
+            "input_tokens": 900, "cached_input_tokens": 0, "output_tokens": 7,
+            "cache_creation_input_tokens": 50}, "call_id": "a"})
+        document = normalizer.finish()
+        self.assertEqual(document["measures"]["C_last"]["quality"], context_metrics.PARTIAL)
+        self._inconnues(document, "C_last",
+                        motif=context_metrics.REASON_UNQUALIFIED_CACHE_WRITE)
 
 
 ACTIF = {"window_maintenance_share": 0.8, "window_input_reserve": 0.0,

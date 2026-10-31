@@ -2814,13 +2814,14 @@ class AgentWorker(threading.Thread):
 
     def _window_measure_keep(self, document: dict, compacted: bool) -> None:
         """CTX-04b : garde les mesures du fil principal d'un tour pour la
-        projection. Une mesure absente ou de repli reste inconnue ; un tour qui
-        a compacté n'en donne aucune : son dernier appel précède la frontière."""
+        projection. Une mesure absente, de repli ou partielle (tour interrompu,
+        borne d'appels, autre session, cache non qualifié) reste inconnue : la
+        projection serait incomplète. Un tour qui a compacté n'en donne aucune :
+        son dernier appel précède la frontière."""
         if compacted:
             self._window_measure = None
             return
-        fiables = (context_metrics.MEASURED, context_metrics.DERIVED,
-                   context_metrics.PARTIAL)
+        fiables = (context_metrics.MEASURED, context_metrics.DERIVED)
 
         def valeur(nom: str) -> int | None:
             mesure = (document.get("measures") or {}).get(nom) or {}
