@@ -4733,12 +4733,70 @@ REWRITTEN_WINDOW_S = 2 * 3600
 #: budget local de la lecture quand l'appelant n'a pas posé de `sweep_deadline`
 #: (le gel et la désignation) : au-delà, la lecture est incomplète et lève.
 REWRITTEN_SCAN_BUDGET_S = 60.0
+#: #5066 : part de lignes significatives communes à partir de laquelle un
+#: commit d'un autre lot est tenu pour réémis dans la tête. Mesure sur le cas
+#: réel #5029/#5038 : les quelques lignes communes restent bien en dessous.
+REISSUED_SHARED_SHARE = 0.10
+
+
+def _signed_lines(adds, removes) -> set:
+    """Les lignes significatives d'un diff, normalisées et signées (#5066)."""
+    return ({("+", " ".join(line.split())) for line in adds
+             if _meaningful_line(line)}
+            | {("-", " ".join(line.split())) for line in removes
+               if _meaningful_line(line)})
+
+
+def _reissued_in_head(repo: str, commit: str, head: str, freeze: str,
+                      target: str) -> bool:
+    """Le contenu de `commit` a-t-il pu être réémis dans la tête (#5066) ?
+
+    Les commits propres à la tête (ni dans le gel, ni dans la cible) sont
+    comparés au commit, ligne significative par ligne significative, y compris
+    les lignes retirées : une réécriture qui remplace les mêmes lignes partage
+    ses retraits. La tête d'un lot voisin partage souvent quelques lignes
+    banales, d'où un seuil relatif au plus petit des deux côtés. Sans cible,
+    sur un diff illisible ou sans ligne significative, la réponse est oui (canon
+    §2 : en cas de doute, la porte reste fermée). Limite : une réécriture
+    d'ajouts purs sans aucune ligne commune ne se détecte pas par le contenu."""
+    if not target:
+        return True
+    try:
+        delta = _text_delta(repo, commit + "^", commit)
+        proc = _read_git(repo, "log", "-p", "--no-merges", "--no-color",
+                         "--no-ext-diff", "--no-textconv", "--no-renames",
+                         "--unified=0", "--format=", head, "^" + freeze,
+                         "^" + target, "--")
+    except (UnicodeDecodeError, canon.GitError, canon.GitDeadline,
+            plan_git.MergeProbeError):
+        return True
+    if delta is None or proc.returncode:
+        return True
+    adds, removes, hunk = set(), set(), False
+    for line in proc.stdout.decode("utf-8", "replace").split("\n"):
+        if line.startswith("diff --git "):
+            hunk = False
+        elif line.startswith("@@"):
+            hunk = True
+        elif hunk and line.startswith("+"):
+            adds.add(line[1:])
+        elif hunk and line.startswith("-"):
+            removes.add(line[1:])
+    own = _signed_lines(adds, removes)
+    if not own:
+        return False
+    lines = _signed_lines(*delta)
+    if not lines:
+        return True
+    return (len(lines & own) / min(len(lines), len(own))
+            >= REISSUED_SHARED_SHARE)
 
 
 def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                             repo: str, *, head: str = "", strict: bool = False,
                             fetch: bool = True, recover=None,
-                            unattached: Optional[list] = None) -> dict[str, dict]:
+                            unattached: Optional[list] = None,
+                            target: str = "") -> dict[str, dict]:
     """Les correctifs de relecteur **retirés** après leur gel (#4457).
 
     Un relecteur désigné corrige lui-même au premier tour (canon §2) : son
@@ -4757,7 +4815,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     créés après le gel. Un commit qui descend de la tête gelée et qui n'est
     plus ancêtre de la tête lue est le correctif réécrit : son acteur reste
     exclu par son nom, sans famille. #5066 : sauf si le reçu est rattaché à
-    un autre lot dont une tête contient le commit (un lot empilé sur le gel).
+    un autre lot dont une tête contient le commit (un lot empilé sur le gel) et
+    que son contenu n'est pas réémis dans la tête (`_reissued_in_head`).
 
     La fenêtre lue est bornée autour du verdict (6 h avant, 2 h après, sans
     dépasser le gel courant) et **exhaustive** : une troncature silencieuse
@@ -5014,10 +5073,13 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 # #5066 : la descendance du gel ne prouve pas une correction
                 # de ce lot. Un lot empilé sur ce gel (#5038 sur le gel
                 # fe75128d3 de #5029) en descend aussi. Le reçu n'est écarté
-                # que sur deux preuves : il est rattaché à un autre lot, et
-                # le commit est contenu dans une tête de cet autre lot.
+                # que sur trois preuves : il est rattaché à un autre lot, le
+                # commit est contenu dans une tête de cet autre lot, et son
+                # contenu n'est pas réémis ici (B cx2, contre-examen #173774).
                 check()
-                if stacked_by_other_lot(receipt, full):
+                if (stacked_by_other_lot(receipt, full)
+                        and not _reissued_in_head(repo, full, head_sha,
+                                                  freeze_sha, target)):
                     continue
                 # Un seul nom par acteur ; la première tête gelée qui porte
                 # le correctif suffit à la trace.
@@ -5452,7 +5514,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     for row in _rewritten_after_freeze(
             db, item, milestone, repo, head=head, strict=strict,
             fetch=fetch, recover=recover,
-            unattached=(unattached if doubts_out is not None else None)).values():
+            unattached=(unattached if doubts_out is not None else None),
+            target=target_sha).values():
         key = str(row.get("name") or "").strip().lower()
         if not key or key in corrector_rows:
             continue
