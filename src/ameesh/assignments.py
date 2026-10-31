@@ -168,10 +168,18 @@ def _assignment_deferred(item: dict, recipient: str, why: str) -> str:
                recipient, int(item["id"]), recipient))
 
 
-def _footprint_deferred(item: dict, recipient: str, overlaps: list) -> str:
+def _footprint_deferred(item: dict, recipient: str, exc) -> str:
     """#4186 : l'avertissement d'une attribution différée par un chevauchement
     d'empreinte — le message part quand même, le lot reste libre et attend la
-    fusion du lot en cours."""
+    fusion du lot en cours. #4818 : ou par le plafond de lots en vol du dépôt."""
+    if getattr(exc, "cap", None) is not None:
+        return ("lot #%d not assigned to %s: its repository reached its in-flight cap "
+                "(%d/%d lots in progress) — the message is dropped anyway and linked to "
+                "lot #%d, which stays unassigned and waits for a merge; to hand it over "
+                "then: ameesh work assign %d %s"
+                % (int(item["id"]), recipient, exc.in_flight, exc.cap, int(item["id"]),
+                   int(item["id"]), recipient))
+    overlaps = exc.overlaps
     parts = ", ".join(
         "#%d (%s%s: %s ~ %s)" % (
             int(row["id"]), row.get("state") or "?",
@@ -325,7 +333,7 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                 # #4186 : comme `ameesh work add --assignee`, un lot attribué
                 # qui chevauche un lot en cours naît libre et attend sa fusion ;
                 # le message part quand même, rattaché au lot (#858).
-                overlapped = exc.overlaps
+                overlapped = exc
                 creation["assignee"] = None
                 item = work_mod.add(db, **creation)
             if not refusal and overlapped is None and item.get("queue_warning"):

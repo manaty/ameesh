@@ -31,6 +31,16 @@ def _git(repo, *args):
     return proc.stdout.strip()
 
 
+def _analysis(paths):
+    """#4818 : une analyse d'impact connue (ou inconnue, sans chemin), le
+    point d'entrée des chemins de création (`analyze_for_creation`)."""
+    return {"status": "known" if paths else "unknown",
+            "reason": None if paths else "no cited path",
+            "paths": [{"path": p, "confidence": "high", "why": "cited"} for p in paths],
+            "weak": [], "footprint": list(paths), "policy": "open",
+            "note": "Impact analysis: test", "elapsed_ms": 0, "git_calls": 0}
+
+
 class EstimationTest(unittest.TestCase):
     def test_un_texte_sans_chemin_ne_resout_rien(self):
         self.assertEqual(fp.estimate_for_creation(types.SimpleNamespace(), app="p",
@@ -66,8 +76,8 @@ class CreationTest(_Lots):
             (int(item["id"]),))]
 
     def test_work_add_ecrit_l_empreinte_estimee(self):
-        with mock.patch.object(fp, "estimate_for_creation",
-                               return_value=["src/a.py"]) as estimate:
+        with mock.patch.object(fp, "analyze_for_creation",
+                               return_value=_analysis(["src/a.py"])) as estimate:
             item = work.add(self.db, title="corriger src/a.py", app="ameesh",
                             cfg=self.cfg)
         self.assertEqual(fp.paths_of(self.db, item["id"]), ["src/a.py"])
@@ -75,8 +85,8 @@ class CreationTest(_Lots):
         self.assertEqual(estimate.call_args.kwargs["app"], "ameesh")
 
     def test_une_empreinte_explicite_prime_sur_l_estimation(self):
-        with mock.patch.object(fp, "estimate_for_creation",
-                               return_value=["src/a.py"]) as estimate:
+        with mock.patch.object(fp, "analyze_for_creation",
+                               return_value=_analysis(["src/a.py"])) as estimate:
             item = work.add(self.db, title="corriger src/a.py", app="ameesh",
                             cfg=self.cfg, footprint=["docs/x.md"])
         self.assertEqual(fp.paths_of(self.db, item["id"]), ["docs/x.md"])
@@ -86,12 +96,12 @@ class CreationTest(_Lots):
         occupe = work.add(self.db, title="occupe", app="ameesh",
                           assignee="human:proprio", footprint=["src"])
         self.assertEqual(occupe["assignee"], "human:proprio")
-        with mock.patch.object(fp, "estimate_for_creation", return_value=["src/a.py"]):
+        with mock.patch.object(fp, "analyze_for_creation", return_value=_analysis(["src/a.py"])):
             with self.assertRaises(storage.FootprintOverlap):
                 work.add(self.db, title="cite src/a.py", app="ameesh",
                          assignee="human:autre", cfg=self.cfg)
         # la même création libre passe et porte l'empreinte estimée
-        with mock.patch.object(fp, "estimate_for_creation", return_value=["src/a.py"]):
+        with mock.patch.object(fp, "analyze_for_creation", return_value=_analysis(["src/a.py"])):
             libre = work.add(self.db, title="cite src/a.py", app="ameesh", cfg=self.cfg)
         self.assertIsNone(libre["assignee"])
         self.assertEqual(fp.paths_of(self.db, libre["id"]), ["src/a.py"])
@@ -130,21 +140,21 @@ class BacklogTest(_Lots):
                                value_score=score, app="ameesh", actor="test", **kw)
 
     def test_un_lot_direct_porte_l_empreinte(self):
-        with mock.patch.object(fp, "estimate_for_creation",
-                               return_value=["src/a.py"]):
+        with mock.patch.object(fp, "analyze_for_creation",
+                               return_value=_analysis(["src/a.py"])):
             lot = self.element("corriger src/a.py", 40)
         self.assertEqual(fp.paths_of(self.db, lot["id"]), ["src/a.py"])
 
     def test_le_panier_unionne_les_chemins_de_ses_lignes(self):
-        with mock.patch.object(fp, "estimate_for_creation", return_value=["src/a.py"]):
+        with mock.patch.object(fp, "analyze_for_creation", return_value=_analysis(["src/a.py"])):
             premier = self.element("ligne a — src/a.py", 10)
-        with mock.patch.object(fp, "estimate_for_creation", return_value=["docs/x.md"]):
+        with mock.patch.object(fp, "analyze_for_creation", return_value=_analysis(["docs/x.md"])):
             panier = self.element("ligne b — docs/x.md", 10)
         self.assertEqual(panier["id"], premier["id"])
         self.assertEqual(fp.paths_of(self.db, panier["id"]),
                          ["docs/x.md", "src/a.py"])
         # une ligne qui ne cite rien ne retire pas l'empreinte acquise
-        with mock.patch.object(fp, "estimate_for_creation", return_value=[]):
+        with mock.patch.object(fp, "analyze_for_creation", return_value=_analysis([])):
             encore = self.element("ligne c", 5)
         self.assertEqual(encore["id"], premier["id"])
         self.assertEqual(fp.paths_of(self.db, panier["id"]),
@@ -157,7 +167,7 @@ class MailTest(_Lots):
         self.agent("dev1")
         occupe = work.add(self.db, title="occupe", app="p",
                           assignee="human:proprio", footprint=["src"])
-        with mock.patch.object(fp, "estimate_for_creation", return_value=["src/a.py"]):
+        with mock.patch.object(fp, "analyze_for_creation", return_value=_analysis(["src/a.py"])):
             out = assignments.link_message(
                 self.cfg, self.db, sender="orch", recipient="dev1",
                 new_lot="corriger src/a.py", estimate="1h", app="p", new_project=True)
@@ -183,7 +193,7 @@ class EstimateManuelTest(_Lots):
     def test_estimate_apres_set_ne_rajoute_pas_d_intake(self):
         item = self.lot("empreinte corrigée")
         fp.set_paths(self.db, item["id"], ["src/a.py"], actor="pilote")
-        with mock.patch.object(fp, "estimate_lot", return_value=["docs/x.md"]):
+        with mock.patch.object(fp, "analyze_lot", return_value=_analysis(["docs/x.md"])):
             self.assertIsNone(fp.record_estimate(
                 self.db, self.cfg, work.get(self.db, item["id"]), actor="test"))
         self.assertEqual(fp.paths_of(self.db, item["id"]), ["src/a.py"])
@@ -193,7 +203,7 @@ class EstimateManuelTest(_Lots):
         fp.set_paths(self.db, item["id"], ["src/a.py"], actor="pilote")
         storage.of(self.db).work_footprints.replace(
             item["id"], "manual", [], actor="pilote", replaces=fp.ESTIMATE_SOURCES)
-        with mock.patch.object(fp, "estimate_lot", return_value=["docs/x.md"]):
+        with mock.patch.object(fp, "analyze_lot", return_value=_analysis(["docs/x.md"])):
             self.assertIsNotNone(fp.record_estimate(
                 self.db, self.cfg, work.get(self.db, item["id"]), actor="test"))
         self.assertEqual(fp.paths_of(self.db, item["id"]), ["docs/x.md"])

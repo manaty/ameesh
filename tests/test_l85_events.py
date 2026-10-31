@@ -244,7 +244,9 @@ class EventLogPgTest(PgTestCase):
 
     def test_lot_events_carry_the_project(self):
         start = self.last()
-        lot = work.add(self.db, title="lot", app="demo")
+        # footprint=[] : sans analyse d'impact, dont la ligne de journal (#4818)
+        # serait un événement de plus
+        lot = work.add(self.db, title="lot", app="demo", footprint=[])
         work.move(self.db, lot["id"], "build")
         rows = _rows(self.db, start)
         self.assertEqual(_types(rows), [("lot.updated", "lot:%d" % lot["id"])] * 2)
@@ -827,7 +829,9 @@ class StreamPgTest(ServerMixin, PgTestCase):
         self.assertEqual(resp.status, 200)
         self.assertEqual(resp.getheader("Content-Type"), "text/event-stream; charset=utf-8")
         self.assertEqual(resp.getheader("Cache-Control"), "no-store")
-        lot = work.add(self.db, title="lot", app="demo")
+        # footprint=[] : sans analyse d'impact, dont la ligne de journal (#4818)
+        # serait un événement de plus
+        lot = work.add(self.db, title="lot", app="demo", footprint=[])
         work.move(self.db, lot["id"], "build")
         got = self.read_messages(resp, 2, kind="lot.updated")
         data = [json.loads(m["data"]) for m in got]

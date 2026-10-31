@@ -12662,6 +12662,8 @@ class Runner:
                     log_async("work item #%s delivered: %s%s" % (
                         entry["work_item"], entry["detail"],
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
+            if not self.dry_run:
+                self.footprint_once(db)
             self.carry_once(db)
             self.packet_sweep_once(db)
             self.fire_once(db)
@@ -12683,6 +12685,38 @@ class Runner:
                     db.close()
                 except Exception:
                     pass
+
+    def footprint_once(self, db) -> None:
+        """#4818 : l'empreinte suit le travail réel — le diff d'une branche
+        poussée par un agent de cet hôte remplace l'estimation dès le premier
+        push (et à chaque nouvelle tête), et une analyse d'impact restée
+        inconnue est retentée (`work_footprints.run_pass`, borné). Ne lève
+        jamais ; une même erreur n'est dite qu'une fois."""
+        from . import registry, work_footprints
+        try:
+            names = {row["name"] for row in registry.overview(db)
+                     if (row.get("host") or "") == self.host}
+            if self.agents_filter is not None:
+                names &= set(self.agents_filter)
+            report = work_footprints.run_pass(
+                self.cfg, db, actor="runner %s" % self.runner_id, agents=names,
+                cursor=getattr(self, "_footprint_cursor", 0))
+            self._footprint_cursor = int(report.get("cursor") or 0)
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            report = {"refreshed": [], "analyzed": [],
+                      "errors": ["%s: %s" % (type(exc).__name__, exc)]}
+        for entry in report["refreshed"]:
+            if entry.get("changed"):
+                log_async("footprint of #%s refreshed from its pushed head %s"
+                          % (entry["lot"], entry["head"][:12]))
+        for entry in report["analyzed"]:
+            log_async("impact analysis of #%s retried: %s"
+                      % (entry["lot"], entry["status"]))
+        seen = getattr(self, "_footprint_errors", set())
+        errors = set("footprint pass: %s" % error for error in report["errors"])
+        for line in sorted(errors - seen):
+            log_async(line)
+        self._footprint_errors = errors
 
     def carry_once(self, db) -> None:
         """#2442 : reporte sur la tête gelée les verdicts d'une tête dont elle
