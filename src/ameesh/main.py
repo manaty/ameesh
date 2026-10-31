@@ -110,7 +110,7 @@
   ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
   ameesh migrate              apply schema migrations;
   ameesh models list|show|discover      model catalog and discovery;
-  ameesh module <name> …              installed project module commands, --list
+  ameesh module <name> …              project module commands (Pipeline: adopt/advance/hold/release), --list
                                       for installation evidence;
   ameesh module dev sync-merges | sync-github | project-github | merge-pr
         | review-class    development tooling (L100 T5); `work sync-merges…`
@@ -198,6 +198,11 @@
         turn_grace_seconds=20m|0
         run settings, effective from the next turn;
   ameesh show <agent>         detailed agent observability;
+  ameesh turn current [--local] [--expect-turn ID] [--json]
+        read the calling turn; reuse requires its captured turn id;
+  ameesh turn observe (--turn ID | --request ID) [--json]
+        #2167: a supervisor's read of one turn or request: states, accounting,
+        `quiescent` (schema ameesh-turn-observation/1); never writes, exit 3 if unknown;
   ameesh veille scan [--dry-run] [--json] [--no-probe] [--harness ID]
         #3264 A: daily watch of harness/model versions; one evaluation {work} per
         harness, priority 1 on a vendor recommendation (config `veille.sources`);
@@ -262,6 +267,8 @@ MESH_COMMANDS = (
     "harness",
     # #3264 A : veille quotidienne des versions (`ameesh veille scan`)
     "veille",
+    # #2167 B2 : observation d'un tour ou d'une requête (`ameesh turn observe`)
+    "turn",
     # L30 : comptes multiples par fournisseur (`ameesh accounts list|use|auto`)
     "accounts",
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
@@ -351,6 +358,9 @@ def _dispatch(argv: list[str] | None) -> int:
         from . import version
         print("ameesh %s" % version())
         return 0
+    if command == "turn" and rest[:1] == ["current"]:
+        from . import turn_context
+        return turn_context.cmd_current(rest[1:])
     if command == "mail":
         from . import cli
         return cli.main(rest)

@@ -5,6 +5,7 @@ import ast
 import importlib
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -58,6 +59,9 @@ class ArgparseHelpTests(unittest.TestCase):
                             kwargs[name] = ["backup", "--help"] if module_name == "ameesh.session_backup" else ["--help"]
                         elif name == "prog":
                             kwargs[name] = "ameesh"
+                        elif name == "module" and module_name == "ameesh.pipeline_cli":
+                            # Declarative CLI parsers need the discovered module's name.
+                            kwargs[name] = SimpleNamespace(NAME="example")
                         elif param.default is inspect.Parameter.empty:
                             kwargs[name] = None
                     with patch.object(argparse.ArgumentParser, "parse_args", stop), \

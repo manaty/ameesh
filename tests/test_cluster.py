@@ -111,6 +111,33 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #4872 / 0526: budget authority and relay accounting remain closed to
+    # supervisor roles; classification grants no additional access.
+    "tranche_limits": {"id", "project", "cap_usd", "currency", "tz", "starts_at",
+                       "ends_at", "state", "overdraft", "admitted_by", "admitted_ref",
+                       "created_at"},
+    "tranche_reservations": {"id", "tranche_id", "spend_key", "turn_id", "agent",
+                            "billing_account", "scope_digest", "path", "reserved_usd",
+                            "usd", "state", "created_at", "closed_at", "closed_by"},
+    "tranche_events": {"id", "tranche_id", "reservation_id", "action", "actor",
+                       "reason", "at", "data"},
+    "tranche_relay_requests": {"id", "turn_id", "state", "created_at", "recorded_at"},
+    # #4867 / 0520: dormant native sandbox authority, immutable admissions and
+    # application-bound receipts/results. Preserve the existing closed rights
+    # for BOTH supervisor roles; S5 owns any explicit read projection/grant.
+    "sandbox_turns": {
+        "turn_id", "spend_key", "agent", "owner", "lease_epoch", "sandbox_session",
+        "request_ids", "work_item_id", "scope", "scope_digest", "retry_family",
+        "scope_generation", "attempt", "max_attempts", "profile_ref", "profile_digest",
+        "placement_ref", "placement_digest", "canon_ref", "tranche_id", "limits",
+        "image_digest", "provider", "namespace", "job_name", "job_uid", "job_phase",
+        "state", "result_id", "result_sha256", "refusal", "cancel_requested_at",
+        "cancel_observed_at", "deadline_ts", "started_at", "completed_at", "source"},
+    "sandbox_results": {"turn_id", "epoch", "result_id", "result_sha256", "payload",
+                        "receipt", "accepted_at"},
+
+    # #4991: signed replacement audit, not part of supervisor visibility.
+    "decision_supersessions": {"supersedes", "superseded_by", "person", "occurred_at", "proof"},
     # #4256: private validation authority and per-person audit; owner CLI only.
     "decision_validations": {"decision_id", "routing", "escalated_at"},
     "validation_events": {"id", "decision_id", "person", "kind", "occurred_at", "facts", "event_key"},

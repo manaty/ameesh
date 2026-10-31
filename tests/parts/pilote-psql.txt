@@ -61,6 +61,7 @@ test_4256_validation_deadlines  # #4256: validation authority, private audit and
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_4989_controller_enrollment  # signed independent controller/key enrollment, exact payload and bounded stop authority
 test_4989_transport_delegation  # exact two-key release transport and effective SSH validation for both sources
+test_4867_sandbox  # storage: transactional sandbox lifecycle, immutable admission and concurrent result/cancel/bind (#4867)
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_705_reviewer_designated  # stockage : relecteur désigné (colonne 0421, lectures avant migration, alerte stale_lot) (#705)
@@ -123,6 +124,7 @@ test_l87c_alert_ack  # storage: alert acknowledgement, concurrent insert, expiry
 test_migrations  # couche base : migrations sur un schéma neuf
 test_process_registry  # stockage/driver : reçus transactionnels, verrous FOR UPDATE/FOR SHARE, concurrence et annulation (#1922)
 test_registry_lease  # verrous et baux : comportement différent entre psql et psycopg
+test_sandbox_supervisor_pg  # #4889: supervisor observations applied by runner through S1, exactly-once completion and fenced recovery
 test_undeliverable  # courrier en souffrance : renvoi en une transaction (psql persistant), lecture jointe à la vue par projet (une requête)
 test_3752_gabarit  # #3752 : le schéma cloné du gabarit vaut migrate(), rejoué par le pilote psql comme psycopg
 test_4147_host_footprint  # projection des relevés cgroup persistés, deux pilotes

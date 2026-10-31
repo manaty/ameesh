@@ -621,7 +621,19 @@ def main(argv):
         print(json.dumps(evidence(), ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     try:
-        registry = installed()
+        from .. import canon as canon_mod
+        from .registry import _discover, _with_canon
+        cfg = config.load()
+        discovery = _discover()
+        # Installed commands (including help) remain usable without a canon.
+        # Canon cards cannot shadow these names; canon check reports collisions.
+        if not argv or argv[0] not in discovery[0]:
+            for loaded in canon_mod.load_configured(cfg):
+                discovery = _with_canon(discovery, loaded)
+        for row in discovery[2]:
+            if row.get('source') != 'canon' or row.get('reason') == 'duplicate':
+                raise ValueError(row['error'])
+        registry = discovery[0]
     except ValueError as exc:
         print("ameesh module: %s" % exc, file=sys.stderr)
         return 1

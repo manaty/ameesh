@@ -100,7 +100,9 @@ import codecs
 import contextlib
 import contextvars
 import difflib
+import os
 import re
+import tempfile
 
 from typing import Mapping, Optional, Sequence
 
@@ -175,15 +177,24 @@ def _sweep_grep(repo: str, rev: str, args: Sequence[str], patterns: Sequence[str
     # B/P2 cx2 : les attributs (`-I`) sont ceux de l'arbre balayé, jamais ceux
     # du dépôt de travail lecteur ; le résultat se partage entre clones.
     env = grep_cache.neutral_attributes(rev, repo)
-    if sweep is None:
-        return plan_git._git(repo, "grep", *args, "-f", "-", str(rev), stdin=stdin,
-                             env_extra=env)
-    sweep.check(step)
+    if sweep is not None:
+        sweep.check(step)
     try:
-        return plan_git._git(repo, "grep", *args, "-f", "-", str(rev),
-                             stdin=stdin, deadline=sweep.deadline, env_extra=env)
+        with _local_object_repo(repo) as (reader, local_env):
+            proc = plan_git._git(
+                reader, "grep", *args, "-f", "-", str(rev), stdin=stdin,
+                timeout=sweep.deadline.remaining() if sweep is not None else canon.GIT_TIMEOUT,
+                deadline=sweep.deadline if sweep is not None else None,
+                env_extra={**env, **local_env})
+            # Missing blobs can yield rc=1 (no matches) or rc=0 (partial
+            # matches). Neither proves absence and neither may be shared.
+            if proc.stderr:
+                raise canon.GitError(proc.stderr.decode("utf-8", "replace"))
+            return proc
     except canon.GitDeadline:
-        sweep.trip(step)
+        if sweep is not None:
+            sweep.trip(step)
+        raise
 
 
 def _cache_wait() -> Optional[float]:
@@ -228,7 +239,7 @@ def _manifest_commit(repo: str, sha: str) -> bool:
     """
     if not repo:
         return False
-    text = plan_git._out(repo, "show", "--name-only", "--format=", sha)
+    text = _read_out(repo, "show", "--name-only", "--format=", sha)
     if text is None:
         return False
     paths = [line.strip() for line in str(text).splitlines() if line.strip()]
@@ -438,7 +449,7 @@ def change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
     l'auteur, #2638)."""
     if not repo:
         return None
-    text = plan_git._out(repo, "show", "--numstat", "-z", "--format=",
+    text = _read_out(repo, "show", "--numstat", "-z", "--format=",
                          "--no-renames", sha)
     if text is None:
         return None
@@ -476,8 +487,10 @@ def _test_only_correction(repo: str, entries, project: str) -> bool:
     if not repo or not entries:
         return False
     changed = set()
+    if not _local_reads(repo, [sha for sha, _family in entries], {}):
+        return False
     for sha, _family in entries:
-        text = plan_git._out(repo, "show", "--format=", "--name-only", "-z",
+        text = _read_out(repo, "show", "--format=", "--name-only", "-z",
                              "--no-renames", sha)
         if text is None:
             return False
@@ -531,7 +544,7 @@ def commit_actor(repo: str, sha: str, db=None) -> tuple[str, float]:
     runner. L'ancienne adresse `<nom>@ameesh.local` n'est lue qu'avec `db`,
     datée d'avant la convention et vers un agent du registre (#3111).
     L'instant sert au journal des tours, jamais à une proximité arbitraire."""
-    text = plan_git._out(repo, "show", "-s", "--format=%ce%x1f%ct", sha)
+    text = _read_out(repo, "show", "-s", "--format=%ce%x1f%ct", sha)
     if text is None:
         return "", 0.0
     fields = str(text).strip().split("\x1f")
@@ -563,7 +576,7 @@ def commit_author(repo: str, sha: str, db=None) -> tuple[str, float]:
     doute ne devine jamais une famille depuis un nom Git seul."""
     if not repo or not sha:
         return "", 0.0
-    text = plan_git._out(repo, "show", "-s", "--format=%ae%x1f%at", sha)
+    text = _read_out(repo, "show", "-s", "--format=%ae%x1f%at", sha)
     if text is None:
         return "", 0.0
     fields = str(text).strip().split("\x1f")
@@ -599,7 +612,7 @@ def commit_ids_written_by(repo: str, commits: Sequence[str], name: str,
     shas = [str(sha).strip() for sha in commits or () if str(sha).strip()]
     if not shas:
         return []
-    text = plan_git._out(repo, "log", "--no-walk", "--format=%H%x1f%ae%x1f%at", *shas)
+    text = _read_out(repo, "log", "--no-walk", "--format=%H%x1f%ae%x1f%at", *shas)
     if text is None or len(str(text).splitlines()) != len(set(shas)):
         return None                     # unreadable is not proof of absence
     wanted = str(name).strip().lower()
@@ -677,7 +690,7 @@ def _receipt_search_heads(db, item: Mapping, repo: str) -> list:
         if not sha or sha in heads:
             continue
         try:
-            if plan_git.local_commit(repo, sha):
+            if _read_local_commit(repo, sha):
                 heads.append(sha)
         except Exception:  # noqa: BLE001 - dépôt illisible : ce gel est ignoré
             continue
@@ -699,7 +712,7 @@ def _same_patch_candidates(db, item: Mapping, repo: str, email: str,
             "--format=%H%x1f%ae%x1f%at%x1f%P", "--author=" + email]
     args.extend(_receipt_search_heads(db, item, repo))
     try:
-        log = plan_git._out(repo, *args)
+        log = _read_out(repo, *args)
     except Exception:  # noqa: BLE001 - recherche impossible : pas de reçu
         log = None
     candidates = []
@@ -740,7 +753,7 @@ def _same_patch_receipts(db, item: Mapping, repo: str, sha: str, *,
     """
     if db is None or not repo or not sha:
         return []
-    text = plan_git._out(repo, "show", "-s", "--format=%ae%x1f%at%x1f%P", sha)
+    text = _read_out(repo, "show", "-s", "--format=%ae%x1f%at%x1f%P", sha)
     if text is None:
         return []
     fields = str(text).strip().split("\x1f")
@@ -762,7 +775,7 @@ def _same_patch_receipts(db, item: Mapping, repo: str, sha: str, *,
     if not candidates:
         return []
     try:
-        wanted = plan_git._diff_patch_id(repo, sha + "^", sha)
+        wanted = _read_diff_patch_id(repo, sha + "^", sha)
     except Exception:  # noqa: BLE001 - patch illisible : pas de preuve
         return []
     if not wanted:
@@ -779,7 +792,7 @@ def _same_patch_receipts(db, item: Mapping, repo: str, sha: str, *,
         if str(receipt.get("actor") or "").strip().casefold() != actor.casefold():
             continue
         try:
-            patch = plan_git._diff_patch_id(repo, candidate + "^", candidate)
+            patch = _read_diff_patch_id(repo, candidate + "^", candidate)
         except Exception:  # noqa: BLE001 - ce candidat reste sans preuve
             continue
         if not patch or patch != wanted:
@@ -932,16 +945,159 @@ _TRIVIAL_LINES = frozenset((
 ))
 
 
-def _is_ancestor(repo: str, before: str, after: str) -> Optional[bool]:
+def _read_bound(limit=None):
+    sweep = active_sweep()
+    if sweep is not None:
+        sweep.check("git read")
+        return sweep.deadline if limit is None else Deadline(min(limit, sweep.deadline.remaining()))
+    return Deadline(canon.GIT_TIMEOUT if limit is None else limit)
+
+
+@contextlib.contextmanager
+def _local_object_repo(repo):
+    """Read shared objects from a repository with no promisor or remote."""
+    objects = _read_out(repo, "rev-parse", "--git-path", "objects")
+    if not objects:
+        raise plan_git.MergeProbeError("local object directory unreadable")
+    objects = os.path.realpath(os.path.join(repo, objects))
+    with tempfile.TemporaryDirectory(prefix="ameesh-authors-",
+                                     dir=os.environ.get("TMPDIR")) as gitdir:
+        proc = plan_git._git(gitdir, "init", "--quiet", "--bare",
+                             timeout=plan_git.PROBE_TIMEOUT_S,
+                             deadline=_read_bound(plan_git.PROBE_TIMEOUT_S))
+        if proc.returncode:
+            raise plan_git.MergeProbeError("local reader initialization failed")
+        # Preserve the reader's info/attributes semantics (grep_cache keys
+        # include them), while leaving all remote/promisor configuration out.
+        attributes = _read_out(repo, "rev-parse", "--git-path", "info/attributes")
+        if attributes:
+            try:
+                with open(os.path.join(repo, attributes), "rb") as source:
+                    content = source.read()
+            except FileNotFoundError:
+                pass
+            else:
+                with open(os.path.join(gitdir, "info", "attributes"), "wb") as target:
+                    target.write(content)
+        yield gitdir, {**plan_git.NO_LAZY_FETCH, "GIT_DIR": gitdir,
+                       "GIT_OBJECT_DIRECTORY": objects}
+
+
+def _read_git(repo, *args, **kwargs):
+    """Content reads use the remaining sweep budget, without lazy fetches."""
+    if args[0] == "log" and "--all" in args:
+        # The isolated object reader has no refs or HEAD. Resolve --all in
+        # the source clone (metadata only), then walk those exact object ids
+        # in the remote-free reader. Include detached HEAD, as git --all does.
+        refs = _read_out(repo, "for-each-ref", "--format=%(objectname)")
+        if refs is None:
+            raise plan_git.MergeProbeError("local reference list unreadable")
+        head = _read_out(repo, "rev-parse", "--verify", "HEAD")
+        revisions = list(dict.fromkeys([*refs.splitlines(), *([head] if head else [])]))
+        if revisions:
+            args = tuple(arg for arg in args if arg != "--all") + tuple(revisions)
+    heavy = args[0] in {"log", "diff", "show", "patch-id"}
+    limit = canon.GIT_TIMEOUT if heavy else plan_git.PROBE_TIMEOUT_S
+    sweep = active_sweep()
+    kwargs["timeout"] = kwargs.get("timeout", (
+        sweep.deadline.remaining() if heavy and sweep is not None else limit))
+    kwargs["deadline"] = _read_bound(None if heavy else limit)
+    try:
+        if heavy or args[0] == "merge-tree":
+            with _local_object_repo(repo) as (reader, env):
+                kwargs["env_extra"] = {**kwargs.get("env_extra", {}), **env}
+                return plan_git._git(reader, *args, **kwargs)
+        return plan_git._git(repo, *args, **kwargs)
+    finally:
+        if sweep is not None:
+            sweep.check("git " + str(args[0]))
+
+
+def _read_out(repo, *args):
+    try:
+        if args[0] in {"log", "show", "diff"}:
+            proc = _read_git(repo, *args)
+            return proc.stdout.decode("utf-8", "replace").strip() if not proc.returncode else None
+        return plan_git._out(repo, *args, deadline=_read_bound(plan_git.PROBE_TIMEOUT_S))
+    except (canon.GitError, canon.GitDeadline, plan_git.MergeProbeError):
+        return None
+    finally:
+        sweep = active_sweep()
+        if sweep is not None:
+            sweep.check("git " + str(args[0]))
+
+
+def _read_local_commit(repo, rev):
+    return plan_git.local_commit(repo, rev, deadline=_read_bound(plan_git.PROBE_TIMEOUT_S))
+
+
+def _read_patch_ids(repo, *args):
+    log = _read_git(repo, "log", "-p", "--no-merges", "--no-color",
+                    "--format=commit %H", *args)
+    if log.returncode:
+        raise plan_git.MergeProbeError("patch history unreadable")
+    if not log.stdout.strip():
+        return {}
+    proc = _read_git(repo, *plan_git.PATCH_ID, stdin=log.stdout)
+    if proc.returncode:
+        raise plan_git.MergeProbeError("patch ids unreadable")
+    return plan_git._parse_patch_ids(proc)
+
+
+def _read_diff_patch_id(repo, before, after):
+    if not _local_reads(repo, [before, after], {}):
+        return None
+    diff = _read_git(repo, "diff", "--no-ext-diff", "--no-color", before, after)
+    if diff.returncode:
+        return None
+    proc = _read_git(repo, *plan_git.PATCH_ID,
+                     stdin=b"commit " + after.encode() + b"\n" + diff.stdout)
+    if proc.returncode:
+        return None
+    values = proc.stdout.decode("utf-8", "replace").split()
+    return values[0] if values else None
+
+
+def _local_reads(repo, revs, cache):
+    """Batch presence, including negative/uncertain results, per reading."""
+    cache = {} if cache is None else cache
+    wanted = list(dict.fromkeys(str(rev) for rev in revs if rev))
+    missing = [rev for rev in wanted if ("local-commit", repo, rev) not in cache]
+    if missing:
+        resolved = {}
+        for rev in missing:
+            if re.fullmatch(r"[0-9a-fA-F]{7,64}(?:\^[0-9]*)?", rev):
+                resolved[rev] = rev.lower()
+            else:
+                try:
+                    resolved[rev] = _read_out(repo, "rev-parse", "--verify", rev)
+                except Exception:
+                    resolved[rev] = None
+        present = _present_commits(repo, [r for r in resolved.values() if r],
+                                   timeout=plan_git.PROBE_TIMEOUT_S)
+        for rev in missing:
+            cache[("local-commit", repo, rev)] = bool(
+                present is not None and resolved[rev] in present)
+    return all(cache[("local-commit", repo, rev)] for rev in wanted)
+
+
+def _is_ancestor(repo: str, before: str, after: str, cache=None) -> Optional[bool]:
     """`before` est-il ancêtre de `after` ? None si Git ne peut pas le dire."""
     if not repo or not before or not after:
         return None
-    proc = plan_git._git(repo, "merge-base", "--is-ancestor", before, after)
-    if proc.returncode == 0:
-        return True
-    if proc.returncode == 1:
-        return False
-    return None
+    cache = {} if cache is None else cache
+    key = ("ancestor", repo, before, after)
+    if key not in cache:
+        value = None
+        if _local_reads(repo, [before, after], cache):
+            try:
+                proc = _read_git(repo, "merge-base", "--is-ancestor", before, after)
+                if proc.returncode in (0, 1):
+                    value = proc.returncode == 0
+            except Exception:
+                pass
+        cache[key] = value
+    return cache[key]
 
 
 def _present_commits(repo: str, shas: Sequence[str], *,
@@ -951,34 +1107,31 @@ def _present_commits(repo: str, shas: Sequence[str], *,
     #4457 (gel #25249) : `plan_git.local_commit` lançait un processus git par
     reçu ; 500 reçus prenaient ~40 s, au-delà du budget de 60 s du balayage en
     CI. `cat-file --batch-check` lit la présence des objets en un passage, sans
-    fetch paresseux (`GIT_NO_LAZY_FETCH`), et rend `{sha: sha complet}`.
-    `None` quand la lecture échoue : l'appelant retombe sur la sonde par SHA.
+    fetch paresseux (magasin sans remote), et rend `{sha: sha complet}`.
+    `None` quand la lecture échoue : la preuve locale reste non concluante.
     """
-    wanted = [value for value in
-              (plan_git.full_commit_id(sha) for sha in shas or ()) if value]
+    wanted = list(dict.fromkeys(str(sha).lower() for sha in shas or ()
+        if re.fullmatch(r"[0-9a-fA-F]{7,64}(?:\^[0-9]*)?", str(sha))))
     if not wanted:
         return {}
     if timeout is not None and timeout <= 0:
         return None
     try:
-        proc = plan_git._git(
-            repo, "cat-file", "--batch-check=%(objectname) %(objecttype)",
-            stdin=("\n".join(wanted) + "\n").encode("utf-8"),
-            timeout=(plan_git.GIT_TIMEOUT if timeout is None
-                     else min(float(timeout), plan_git.GIT_TIMEOUT)),
-            env_extra=dict(plan_git.NO_LAZY_FETCH))
-    except Exception:  # noqa: BLE001 - lecture impossible : repli par SHA
+        with _local_object_repo(repo) as (gitdir, env):
+            proc = _read_git(
+                gitdir, "cat-file", "--batch-check=%(objectname) %(objecttype)",
+                stdin=("\n".join(wanted) + "\n").encode("utf-8"),
+                timeout=plan_git.PROBE_TIMEOUT_S if timeout is None else timeout,
+                env_extra=env)
+    except Exception:
         return None
     if proc.returncode != 0:
         return None
     present = {}
-    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+    for rev, line in zip(wanted, proc.stdout.decode("utf-8", "replace").splitlines()):
         fields = line.split()
-        if len(fields) < 2 or fields[1] != "commit":
-            continue
-        sha = fields[0].strip().lower()
-        if sha:
-            present[sha] = sha
+        if len(fields) == 2 and fields[1] == "commit":
+            present[rev] = fields[0].lower()
     return present
 
 
@@ -1114,7 +1267,7 @@ def target_commit(repo: str, target: str, *, fetch: bool = False) -> str:
         refs = ([remote] if remote else []) + [text]
     for ref in refs:
         try:
-            found = plan_git._commit(repo, ref) or ""
+            found = _read_local_commit(repo, ref) or ""
         except Exception:  # noqa: BLE001 - cible illisible : pas d'écart
             found = ""
         if found:
@@ -1161,7 +1314,7 @@ def stacked_parents(db, item: Mapping, repo: str, head: str) -> list[dict]:
     # prouver de plus.
     if not candidates:
         return []
-    head_full = plan_git.local_commit(repo, str(head or ""))
+    head_full = _read_local_commit(repo, str(head or ""))
     if not head_full:
         return []
     parents: list[dict] = []
@@ -1179,7 +1332,7 @@ def stacked_parents(db, item: Mapping, repo: str, head: str) -> list[dict]:
         for freeze in rows:
             if str((freeze or {}).get("kind") or "") != "frozen":
                 continue
-            frozen = plan_git.local_commit(repo, str((freeze or {}).get("sha") or ""))
+            frozen = _read_local_commit(repo, str((freeze or {}).get("sha") or ""))
             if not frozen or frozen == head_full:
                 continue
             if canon.git_contains(repo, frozen, head_full):
@@ -1201,11 +1354,13 @@ def _applied_in(repo: str, target: str, sha: str) -> bool:
     Un patch-id historique seul ne suffit pas après un revert ou une
     réécriture. Toute fusion conflictuelle ou lecture impossible garde l'auteur.
     """
+    if not _local_reads(repo, [target, sha, sha + "^"], {}):
+        return False
     try:
         tree = _tree_of(repo, target)
         if not tree:
             return False
-        proc = plan_git._git(repo, "merge-tree", "--write-tree",
+        proc = _read_git(repo, "merge-tree", "--write-tree",
                              "--merge-base", sha + "^", target, sha)
         if proc.returncode != 0:
             return False
@@ -1222,7 +1377,7 @@ def _text_delta(repo: str, before: str, after: str, *, path: str = ""):
     repeated line can only retain an author. Modes, submodules and binaries
     have no line proof and never grant the exception (#3781).
     """
-    proc = plan_git._git(repo, "diff", "--no-color", "--no-ext-diff", "--no-textconv",
+    proc = _read_git(repo, "diff", "--no-color", "--no-ext-diff", "--no-textconv",
                          "--ignore-submodules=none",
                          "--no-renames", "--unified=0", before, after, "--",
                          *([path] if path else []))
@@ -1298,14 +1453,16 @@ def _patch_in_target(repo: str, target: str, sha: str, cache: dict) -> bool:
     de la cible. Une lecture impossible, un diff vide ou un patch absent
     rendent `False` : le doute garde le commit.
     """
+    if not _local_reads(repo, [target, sha, sha + "^"], cache):
+        return False
     key = ("patch-in-target", str(target), str(sha))
     if key in cache:
         return bool(cache[key])
     found = False
     try:
-        patches = plan_git._patch_ids(repo, "--no-walk", sha)
+        patches = _read_patch_ids(repo, "--no-walk", sha)
         if patches:
-            base = plan_git._out(repo, "merge-base", str(target), sha)
+            base = _read_out(repo, "merge-base", str(target), sha)
             if base:
                 # Une seule lecture de la cible par base : les copies d'un
                 # même gel partagent leur point de divergence, et le parcours
@@ -1313,11 +1470,19 @@ def _patch_in_target(repo: str, target: str, sha: str, cache: dict) -> bool:
                 index_key = ("target-patch-ids", str(target), str(base))
                 if index_key not in cache:
                     try:
-                        cache[index_key] = plan_git._patch_ids(
+                        cache[index_key] = _read_patch_ids(
                             repo, "--max-count=%d" % plan_git.MAX_TARGET_COMMITS,
                             "%s..%s" % (base, str(target)))
-                    except Exception:  # noqa: BLE001 - pas de preuve
+                    except Exception as exc:  # unreadable is not "not delivered"
                         cache[index_key] = None
+                        sweep = active_sweep()
+                        step = "target patch index unreadable: %s" % exc
+                        if sweep is not None:
+                            sweep.tripped = sweep.tripped or step
+                            sweep.trips += 1
+                        else:
+                            import logging
+                            logging.getLogger(__name__).warning(step)
                 on_target = cache[index_key]
                 found = bool(on_target) and patches.keys() <= on_target.keys()
     except Exception:  # noqa: BLE001 - pas de preuve : garder le commit
@@ -1328,7 +1493,7 @@ def _patch_in_target(repo: str, target: str, sha: str, cache: dict) -> bool:
 
 def _delivered_paths(repo: str, target: str, tree: str):
     """Exact landing lines by destination path; unreadable changes fail closed."""
-    proc = plan_git._git(repo, "diff", "--no-renames", "--name-only", "-z",
+    proc = _read_git(repo, "diff", "--no-renames", "--name-only", "-z",
                          target, tree, "--")
     if proc.returncode:
         return None
@@ -1368,6 +1533,76 @@ def _outside_delivered(repo: str, target: str, commit: str, landing,
         return False
 
 
+#: #4858 : une seule lecture `rev-list --ancestry-path` prouve quelles têtes
+#: de gel contiennent le commit inconnu (#4825 : 256 candidats, 2 841 appels
+#: git, 149 s). La preuve est locale et bornée ; au-delà (ou si elle échoue)
+#: l'inconnu reste inconnu, jamais deviné.
+CONTAINMENT_TIMEOUT = 30.0
+#: #4858 : au plus ce nombre de gels sources sont relus en profondeur pour un
+#: commit inconnu. La mesure de #4825 en lisait 12 pour une attribution et 11
+#: par inconnu, après 256 candidats ; le plafond empêche le coût de croître
+#: avec les gels de l'application. Au-delà, l'inconnu reste inconnu : une
+#: borne ne retire ni n'ajoute jamais un auteur sans preuve.
+MAX_ATTRIBUTION_SOURCES = 32
+
+
+def _containing_heads(repo: str, commit: str, heads: Sequence[str], *,
+                      cache: Optional[dict] = None) -> Optional[set]:
+    """Les têtes qui contiennent `commit`, en **une** lecture git (#4858).
+
+    `rev-list --ancestry-path ^commit <têtes>` ne rend que les commits sur un
+    chemin d'ascendance entre le commit et une tête : l'intersection avec les
+    têtes demandées est exactement l'ensemble des têtes dont l'historique
+    contient le commit. La forme par candidat lançait un processus git par
+    tête (256 par commit inconnu sur #4825) ; celle-ci en lance un seul. Les
+    objets absents sont filtrés localement (`_present_commits`, sans fetch
+    paresseux) : une tête absente n'est jamais tenue pour contenante. `None`
+    quand la preuve est illisible : l'appelant laisse l'inconnu inchangé.
+    """
+    full = plan_git.full_commit_id(commit)
+    if not full and repo and commit:
+        try:
+            full = _read_local_commit(repo, str(commit)) or ""
+        except Exception:  # noqa: BLE001 - forme illisible : pas de preuve
+            full = ""
+    if not repo or not full:
+        return None
+    wanted = list(dict.fromkeys(
+        value for value in (plan_git.full_commit_id(head) for head in heads or ())
+        if value))
+    if not wanted:
+        return set()
+    cache = {} if cache is None else cache
+    key = ("containing-heads", repo, full, tuple(wanted))
+    if key in cache:
+        return cache[key]
+    found = None
+    try:
+        present = _present_commits(repo, [full, *wanted],
+                                   timeout=CONTAINMENT_TIMEOUT)
+        if present and full in present:
+            heads_present = [head for head in wanted if head in present]
+            if heads_present:
+                proc = plan_git._git(
+                    repo, "rev-list", "--ancestry-path", "^" + full,
+                    *heads_present, timeout=CONTAINMENT_TIMEOUT,
+                    deadline=_read_bound(CONTAINMENT_TIMEOUT),
+                    env_extra=canon.NO_LAZY_FETCH)
+                if proc.returncode == 0:
+                    reached = set(proc.stdout.decode("utf-8", "replace").split())
+                    found = {head for head in heads_present if head in reached}
+                    # `git rev-list ^C C` élague la tête égale au commit : une
+                    # gelée sur ce commit même le contient évidemment.
+                    if full in wanted:
+                        found.add(full)
+            else:
+                found = set()
+    except Exception:  # noqa: BLE001 - preuve illisible : l'inconnu demeure
+        found = None
+    cache[key] = found
+    return found
+
+
 def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
                                   commit: str, repo: str, families, *,
                                   provider=None, cache: dict, target: str = ""):
@@ -1375,7 +1610,11 @@ def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
 
     Only exact membership and recorded provenance count. Re-read the exact
     commit using the other lot's historical reference; no recursive carry.
-    Bounded/missing/unreadable candidates leave the unknown unchanged.
+    The freeze heads that contain the commit are proved by one batched
+    `rev-list` (#4858), the source item and receipt are read once per source,
+    and at most `MAX_ATTRIBUTION_SOURCES` sources are deeply re-read. Missing,
+    unreadable or beyond-the-bound candidates leave the unknown unchanged:
+    the result never gains an author without recorded proof.
     """
     lot = int(item.get("id") or 0)
     app = str(item.get("app") or "")
@@ -1387,6 +1626,7 @@ def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
         key = ("other-freezes", app, lot, float(at_ts))
         if key not in cache:
             cache[key] = port.earlier_freezes(app, lot, float(at_ts))
+        sources = []
         for source in cache[key] or ():
             source_lot = int(source.get("work_item_id") or 0)
             source_sha = plan_git.full_commit_id(source.get("sha"))
@@ -1394,19 +1634,41 @@ def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
             if (not source_lot or source_lot == lot or not source_sha
                     or stamp is None or float(stamp) > float(at_ts)):
                 continue
-            if _is_ancestor(repo, commit, source_sha) is not True:
+            sources.append((source, source_lot, source_sha))
+        containing = _containing_heads(
+            repo, commit, [source_sha for _source, _lot, source_sha in sources],
+            cache=cache)
+        if containing is None:
+            return None
+        examined = 0
+        for source, source_lot, source_sha in sources:
+            if source_sha not in containing:
                 continue
-            source_item = port.get(source_lot)
+            if examined >= MAX_ATTRIBUTION_SOURCES:
+                break                     # borne : l'inconnu reste inconnu
+            examined += 1
+            item_key = ("source-item", source_lot)
+            if item_key not in cache:
+                cache[item_key] = port.get(source_lot)
+            source_item = cache[item_key]
             if (not source_item or source_item.get("app") != app
                     or packet_composer(source_item)):
                 continue
             # The source range is above its common baseline with the exact
             # target. A baseline ancestor is never attributed by this proof.
-            start = plan_git._out(repo, "merge-base", target, source_sha) if target else None
-            if not start or _is_ancestor(repo, commit, start) is not False:
+            start_key = ("source-start", str(target), source_sha)
+            if start_key not in cache:
+                cache[start_key] = (_read_out(repo, "merge-base", target,
+                                              source_sha) if target else None)
+            start = cache[start_key]
+            if not start or _is_ancestor(repo, commit, start, cache) is not False:
                 continue
             # Freeze receipt pins the source head.
-            receipt = _milestone_receipt(provider, db, int(source["id"]), strict=True)
+            receipt_key = ("source-receipt", int(source["id"]))
+            if receipt_key not in cache:
+                cache[receipt_key] = _milestone_receipt(
+                    provider, db, int(source["id"]), strict=True)
+            receipt = cache[receipt_key]
             if not receipt or receipt.get("commit") != source_sha:
                 continue
             known, written, corrections, unknown = _prior_reading(
@@ -1551,7 +1813,7 @@ def _path_mode(repo: str, rev: str, path: str, cache: dict):
     """Mode Git de `path` dans `rev` (`"100644"`, `"100755"`, ...), ou None."""
     key = ("path-mode", str(rev), str(path))
     if key not in cache:
-        text = plan_git._out(repo, "ls-tree", str(rev), "--", str(path))
+        text = _read_out(repo, "ls-tree", str(rev), "--", str(path))
         if text is None:
             cache[key] = None
         else:
@@ -1578,6 +1840,8 @@ def _mode_delivery(repo: str, target: str, sha: str, cache: dict) -> Optional[bo
     modes est impossible : les autres preuves gardent alors le doute), False
     dès qu'un mode annoncé n'y est pas. Un chemin à mode seul compte comme
     les autres (#3902 B/P2, témoin cx1)."""
+    if not _local_reads(repo, [target, sha, sha + "^"], cache):
+        return None
     parsed = _parsed_hunks(repo, sha, cache)
     if not parsed:
         return True
@@ -1689,6 +1953,8 @@ def _content_before_head(repo: str, before: str, sha: str,
     Le résultat est mis en cache par `(cible, sha)` : la désignation et la
     porte relisent le même commit, et l'alignement coûte cher sur un gros
     fichier (#3902 N de dev1)."""
+    if not _local_reads(repo, [before, sha, sha + "^"], cache):
+        return False
     cache = {} if cache is None else cache
     key = ("content-before", str(before), str(sha))
     if key not in cache:
@@ -1892,8 +2158,15 @@ def _not_in_target(repo: str, commits, target: str, *, head: str = "",
               if str(commit).strip()]
     if not wanted or not target:
         return wanted
+    _local_reads(repo, [*wanted, *(sha + "^" for sha in wanted), target, head], cache)
+    if not _local_reads(repo, [target], cache):
+        return wanted
+    absent = [sha for sha in wanted if not _local_reads(repo, [sha], cache)]
+    wanted = [sha for sha in wanted if sha not in absent]
+    if absent:
+        return absent + _not_in_target(repo, wanted, target, head=head, cache=cache)
     try:
-        text = plan_git._out(repo, "rev-list", *wanted, "--not", str(target))
+        text = _read_out(repo, "rev-list", *wanted, "--not", str(target))
     except Exception:  # noqa: BLE001 - lecture impossible : aucun écart
         return wanted
     if text is None:
@@ -1903,7 +2176,7 @@ def _not_in_target(repo: str, commits, target: str, *, head: str = "",
     for commit in wanted:
         canonical = plan_git.full_commit_id(commit)
         if not canonical:
-            canonical = plan_git.local_commit(repo, commit) or ""
+            canonical = _read_local_commit(repo, commit) or ""
         # `outside` est la sortie de rev-list : les commits NON atteignables
         # depuis la cible. Seule une entrée absente de cet ensemble est prouvée
         # dans la cible ; non résolue, elle reste (le doute ne retire jamais).
@@ -1915,11 +2188,11 @@ def _not_in_target(repo: str, commits, target: str, *, head: str = "",
     try:
         # Borne commune à TOUS les candidats : exclure l'union de leurs
         # ancêtres masquerait la cible dès qu'un candidat descend de celle-ci.
-        base = plan_git._out(repo, "merge-base", "--octopus", str(target), *kept)
+        base = _read_out(repo, "merge-base", "--octopus", str(target), *kept)
         if not base:
             return kept
         # Un seul parcours de la cible, puis lecture des seuls candidats.
-        on_target = plan_git._patch_ids(
+        on_target = _read_patch_ids(
             repo, "--max-count=%d" % plan_git.MAX_TARGET_COMMITS,
             "%s..%s" % (base, target))
         if not on_target:
@@ -1934,10 +2207,12 @@ def _not_in_target(repo: str, commits, target: str, *, head: str = "",
     # contenu absent) garde le commit.
     before = str(target) if head else ""
     for sha in set(kept):
+        if not _local_reads(repo, [sha + "^"], cache):
+            continue
         try:
             # Une entrée par commit : deux copies du même patch doivent être
             # écartées toutes les deux (le dictionnaire est indexé par patch).
-            patches = plan_git._patch_ids(repo, "--no-walk", sha)
+            patches = _read_patch_ids(repo, "--no-walk", sha)
         except Exception:  # noqa: BLE001 - ce candidat reste dans le doute
             continue
         # Un mode encore absent de la cible est un doute : aucune autre
@@ -1968,6 +2243,17 @@ def _not_in_target(repo: str, commits, target: str, *, head: str = "",
 
 def _survives_rewrite(repo: str, head: str, sha: str, cache: dict,
                       base: str = "", target: str = "") -> bool:
+    key = ("survives-rewrite", repo, head, sha, base, target)
+    if key not in cache:
+        try:
+            cache[key] = _survives_rewrite_value(repo, head, sha, cache, base, target)
+        except Exception:
+            cache[key] = True  # unreadable evidence never removes an author
+    return cache[key]
+
+
+def _survives_rewrite_value(repo: str, head: str, sha: str, cache: dict,
+                      base: str = "", target: str = "") -> bool:
     """Un commit d'un gel antérieur compte-t-il encore pour la tête lue ?
 
     #3116 : un commit déjà dans la cible ne compte ni comme auteur ni comme
@@ -1985,9 +2271,11 @@ def _survives_rewrite(repo: str, head: str, sha: str, cache: dict,
     # ne retient que sa contribution **propre**, car une ligne vide ou héritée
     # retenait indéfiniment les copies H7/H8. Sans preuve, le doute garde.
     """
+    if not _local_reads(repo, [head, sha, base, target], cache):
+        return True
     if not head:
         return True
-    if target and _is_ancestor(repo, sha, target) is True:
+    if target and _is_ancestor(repo, sha, target, cache) is True:
         return False
     if target and _mode_delivery(repo, str(target), sha, cache) is not False:
         if _content_before_head(repo, str(target), sha, cache):
@@ -1999,7 +2287,7 @@ def _survives_rewrite(repo: str, head: str, sha: str, cache: dict,
                     repo, sha,
                     _landing_delta(repo, str(target), head, cache)):
                 return False
-    if _is_ancestor(repo, sha, head) is True:
+    if _is_ancestor(repo, sha, head, cache) is True:
         return True
     # #3116 B1 : la preuve de réécriture cherche le contenu DÉPLACÉ (un
     # fichier renommé garde ses lignes) et garde le doute quand un chemin a
@@ -2012,14 +2300,14 @@ def _tree_of(repo: str, rev: str) -> Optional[str]:
     """L'arbre d'un commit, ou None s'il est illisible."""
     if not repo or not rev:
         return None
-    return plan_git._out(repo, "rev-parse", str(rev) + "^{tree}")
+    return _read_out(repo, "rev-parse", str(rev) + "^{tree}")
 
 
 def _merged_tree(repo: str, left: str, right: str) -> Optional[str]:
     """L'arbre de la fusion `left`+`right`, ou None (conflit ou illisible)."""
     if not repo or not left or not right:
         return None
-    proc = plan_git._git(repo, "merge-tree", "--write-tree", left, right)
+    proc = _read_git(repo, "merge-tree", "--write-tree", left, right)
     if proc.returncode != 0:
         return None
     lines = proc.stdout.decode("utf-8", "replace").splitlines()
@@ -2051,7 +2339,7 @@ def _commits_between(repo: str, start: str, head: str) -> Optional[list]:
     """Les commits de contenu de `start..head`, ou None si illisible."""
     if not repo or not start or not head:
         return None
-    text = plan_git._out(repo, "rev-list", "--no-merges", "%s..%s" % (start, head))
+    text = _read_out(repo, "rev-list", "--no-merges", "%s..%s" % (start, head))
     if text is None:
         return None
     return [line.strip() for line in str(text).splitlines() if line.strip()]
@@ -2064,7 +2352,7 @@ def _commit_lines(repo: str, sha: str):
     confondu avec une ligne de contenu qui commencerait par `++`/`--`. Un diff
     binaire ne se compare pas ligne à ligne : le lecteur conserve l'auteur
     (jamais l'inverse)."""
-    text = plan_git._out(repo, "show", "--format=", "--unified=0",
+    text = _read_out(repo, "show", "--format=", "--unified=0",
                          "--no-renames", sha)
     if text is None:
         return None
@@ -2113,7 +2401,7 @@ def _meaningful_line(text: str) -> bool:
 def _head_lines(repo: str, head: str, path: str, cache: dict):
     """Les lignes (dépouillées) de `path` dans la tête, ou None si absentes."""
     if path not in cache:
-        text = plan_git._out(repo, "show", "%s:%s" % (head, path))
+        text = _read_out(repo, "show", "%s:%s" % (head, path))
         cache[path] = None if text is None else {
             line.strip() for line in str(text).splitlines()}
     return cache[path]
@@ -2128,7 +2416,7 @@ def _path_absent(repo: str, head: str, path: str, cache: dict):
     ne retire l'auteur que sur une absence prouvée ; le doute garde."""
     key = ("absent", head, path)
     if key not in cache:
-        text = plan_git._out(repo, "ls-tree", "--name-only", head, "--", path)
+        text = _read_out(repo, "ls-tree", "--name-only", head, "--", path)
         cache[key] = None if text is None else not str(text).strip()
     return cache[key]
 
@@ -2142,7 +2430,7 @@ def _renamed_targets(repo: str, head: str, sha: str, cache: dict):
     exacte ; une lecture impossible est un doute (None), jamais une absence."""
     key = ("renames", sha, head)
     if key not in cache:
-        text = plan_git._out(repo, "diff", "--name-status", "-z", "-M",
+        text = _read_out(repo, "diff", "--name-status", "-z", "-M",
                              sha, head)
         if text is None:
             cache[key] = None
@@ -2186,7 +2474,7 @@ def _tree_blobs(repo: str, rev: str, cache: dict):
     key = ("tree-blobs", rev)
     if key not in cache:
         try:
-            proc = plan_git._git(repo, "ls-tree", "-r", "-z", rev)
+            proc = _read_git(repo, "ls-tree", "-r", "-z", rev)
         except Exception:  # noqa: BLE001 - lecture impossible : doute
             proc = None
         if proc is None or proc.returncode != 0:
@@ -2218,7 +2506,7 @@ def _content_carried(repo: str, head: str, sha: str, path: str,
     est impossible : le doute conserve l'auteur."""
     key = ("carried", sha, head, path)
     if key not in cache:
-        blob = plan_git._out(repo, "rev-parse", "%s:%s" % (sha, path))
+        blob = _read_out(repo, "rev-parse", "%s:%s" % (sha, path))
         if blob is None:
             cache[key] = None
         else:
@@ -2241,7 +2529,7 @@ def _post_blob_in_head(repo: str, head: str, sha: str, path: str,
     `sha:path` est identique à un blob de la tête. None si la lecture échoue."""
     key = ("post-blob", sha, head, path)
     if key not in cache:
-        blob = plan_git._out(repo, "rev-parse", "%s:%s" % (sha, path))
+        blob = _read_out(repo, "rev-parse", "%s:%s" % (sha, path))
         if blob is None:
             cache[key] = None
         else:
@@ -2256,7 +2544,7 @@ def _head_file_lines(repo: str, head: str, path: str, cache: dict):
     illisible. Un fichier vide rend une liste vide, pas None."""
     key = ("file-lines", head, path)
     if key not in cache:
-        text = plan_git._out(repo, "show", "%s:%s" % (head, path))
+        text = _read_out(repo, "show", "%s:%s" % (head, path))
         cache[key] = (None if text is None
                       else [line.strip() for line in str(text).splitlines()])
     return cache[key]
@@ -2269,7 +2557,7 @@ def _changed_paths(repo: str, head: str, sha: str, cache: dict):
     chemin d'origine). `D` est exclu : il ne porte plus de contenu."""
     key = ("changed-paths", sha, head)
     if key not in cache:
-        text = plan_git._out(repo, "diff", "--name-status", "-z", "-M",
+        text = _read_out(repo, "diff", "--name-status", "-z", "-M",
                              sha, head)
         if text is None:
             cache[key] = None
@@ -2309,12 +2597,12 @@ def _removal_hunks(repo: str, sha: str, path: str, cache: dict):
     distingue un retrait pur du côté retiré d'une modification (#2994)."""
     key = ("removal-hunks", sha, path)
     if key not in cache:
-        parent = plan_git._out(repo, "rev-parse", "--verify", "--quiet",
+        parent = _read_out(repo, "rev-parse", "--verify", "--quiet",
                                str(sha) + "^")
         if parent is None:
             cache[key] = None
         else:
-            text = plan_git._out(
+            text = _read_out(
                 repo, "diff", "--no-renames", "--no-color", "--unified=3",
                 str(sha) + "^", str(sha), "--", path)
             if text is None:
@@ -2496,7 +2784,7 @@ def _post_image_carried(repo: str, head: str, sha: str, path: str,
     if key not in cache:
         current = _head_file_lines(repo, sha, path, cache)
         blocks = _removal_hunks(repo, sha, path, cache)
-        parent = plan_git._out(repo, "rev-parse", "--verify", "--quiet",
+        parent = _read_out(repo, "rev-parse", "--verify", "--quiet",
                                str(sha) + "^")
         if current is None or blocks is None or parent is None:
             cache[key] = None
@@ -2536,7 +2824,7 @@ def _path_line_counts(repo: str, rev: str, path: str, cache: dict):
     `rev`, ou None si le chemin y est absent ou illisible (#2977 B2)."""
     key = ("counts", rev, path)
     if key not in cache:
-        text = plan_git._out(repo, "show", "%s:%s" % (rev, path))
+        text = _read_out(repo, "show", "%s:%s" % (rev, path))
         counts = None
         if text is not None:
             counts = {}
@@ -2552,7 +2840,7 @@ def _raw_out(repo: str, *args: str) -> Optional[str]:
     `plan_git._out` dépouille la sortie : le blanc initial de la première
     ligne d'un fichier disparaît, et un hunk indenté ne s'y retrouve plus
     (#2994 B1 cx2/impl-04 sur e127e8d4)."""
-    proc = plan_git._git(repo, *args)
+    proc = _read_git(repo, *args)
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace")
@@ -2565,7 +2853,7 @@ def _raw_out_strict(repo: str, *args: str) -> Optional[str]:
     `replace` y confondrait des octets distincts (`\x80` et `\x81` donnent
     le même U+FFFD) et pourrait écarter un auteur dont la contribution reste
     à livrer (#3902 B/P2, témoin cx2). Le doute conserve l'auteur."""
-    proc = plan_git._git(repo, *args)
+    proc = _read_git(repo, *args)
     if proc.returncode != 0:
         return None
     try:
@@ -2700,6 +2988,13 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
     if not repo or not rev:
         return None
     flag = "-a" if binary else "-I"
+    targeted = (len(wanted) <= TREE_LINES_WHOLE_MAX
+                and all("\n" not in line and "\x00" not in line
+                        for line in wanted))
+    sweep = active_sweep()
+    if sweep is not None:
+        sweep.check("git grep -h %s %s -f - %s" %
+                    (flag, "-F" if targeted else "-G", rev))
     patterns = sorted(wanted)
 
     def matches():
@@ -2742,9 +3037,7 @@ def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
 
     # Un motif multiligne ou à NUL ne peut pas passer par `-f -` : la lecture
     # complète reste alors la seule forme exacte.
-    if (len(wanted) <= TREE_LINES_WHOLE_MAX
-            and all("\n" not in line and "\x00" not in line
-                    for line in wanted)):
+    if targeted:
         # Le mode et les motifs entrent dans la clé : deux demandes
         # différentes ne se remplacent plus l'une l'autre (#4913).
         found = grep_cache.cached(repo, str(rev), "tree-match" + flag,
@@ -2783,7 +3076,7 @@ def _inherited_lines(repo: str, head: str, sha: str, base: str,
     if base:
         key = ("merge-base", head, base)
         if key not in cache:
-            cache[key] = plan_git._out(repo, "merge-base", head, base) or ""
+            cache[key] = _read_out(repo, "merge-base", head, base) or ""
         if cache[key]:
             inherited |= _lines_in_tree(repo, cache[key], lines)
     return inherited
@@ -2810,7 +3103,7 @@ def _removal_proves_survival(repo: str, head: str, sha: str, path: str,
         return True
     key = ("merge-base", head, base)
     if key not in cache:
-        cache[key] = plan_git._out(repo, "merge-base", head, base) or ""
+        cache[key] = _read_out(repo, "merge-base", head, base) or ""
     merge_base = cache[key]
     if not merge_base:
         return True                     # base illisible : doute
@@ -2912,6 +3205,8 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     reste un doute, sauf le cas #3220 B2 ci-dessus) : une copie retirée ne
     garde pas son correcteur (B1). Un diff sans ligne significative conserve
     l'auteur."""
+    if not _local_reads(repo, [head, sha, sha + "^", base], cache):
+        return True
     parsed = _commit_lines(repo, sha)
     if parsed is None:
         return True
@@ -3258,7 +3553,18 @@ def _freeze_content_preserved(repo: str, freeze_sha: str, head_sha: str,
     if head_tree == freeze_tree:
         return True
     if base:
-        merged = _merged_tree(repo, freeze_sha, base)
+        try:
+            # #4804: fire may pass origin/main. The isolated object reader
+            # has no refs; resolve source metadata before merge-tree there.
+            if not plan_git.full_commit_id(base):
+                base = _read_local_commit(repo, base) or base
+            merged = _merged_tree(repo, freeze_sha, base)
+        except (canon.GitError, canon.GitDeadline, plan_git.MergeProbeError):
+            return True
+        finally:
+            sweep = active_sweep()
+            if sweep is not None:
+                sweep.check("merge-tree preservation")
         if merged is not None and merged == head_tree:
             return True
     return False
@@ -3365,6 +3671,9 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
             record_unreadable(sha)
             continue
         if receipt is None:
+            if not _local_reads(repo, [sha], cache):
+                record_unknown(sha)
+                continue
             rows, missing = _unreceived_authors(
                 db, item, repo, sha, author_name=author_name,
                 author_family=author_family, reviewers=reviewers,
@@ -3423,15 +3732,17 @@ def _authored_patch(db, repo: str, sha: str, cache: dict):
     peut donc pas acheter cette équivalence."""
     if sha not in cache:
         cache[sha] = None
+        if not _local_reads(repo, [sha, sha + "^"], cache):
+            return None
         try:
-            text = plan_git._out(repo, "show", "-s", "--format=%ae%x1f%at", sha)
+            text = _read_out(repo, "show", "-s", "--format=%ae%x1f%at", sha)
             fields = str(text or "").split("\x1f")
             if len(fields) != 2:
                 return None
             author = _agent_of_email(db, fields[0], float(fields[1]))
             if not author:
                 return None
-            patch = plan_git._diff_patch_id(repo, sha + "^", sha)
+            patch = _read_diff_patch_id(repo, sha + "^", sha)
             if patch:
                 cache[sha] = (author.casefold(), patch)
         except Exception:  # noqa: BLE001 - comparaison impossible : inconnu
@@ -3699,6 +4010,10 @@ def _forge_fetch(repo: str, sha: str, *, timeout: Optional[float] = None):
         return None
     bound = plan_git.FETCH_TIMEOUT if timeout is None else min(
         float(timeout), plan_git.FETCH_TIMEOUT)
+    sweep = active_sweep()
+    if sweep is not None:
+        sweep.check("recover prior freeze")
+        bound = min(bound, sweep.deadline.remaining())
     if bound <= 0:
         return None
     try:
@@ -3943,6 +4258,8 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     processed: list[str] = []
     survival: dict[str, bool] = {}
     file_cache: dict = {}
+    _local_reads(repo, [head_sha, base, target_sha,
+                       *(str(row.get("sha") or "") for row in prior)], file_cache)
     patch_cache: dict = {}
     received_patches = None
     reference_patches = None
@@ -4047,7 +4364,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     def present(commit: str) -> bool:
         """Le commit est-il lisible **localement** (jamais un fetch paresseux) ?"""
         try:
-            return bool(plan_git.local_commit(repo, str(commit or "").strip()))
+            return _local_reads(repo, [str(commit or "").strip()], file_cache)
         except Exception:  # noqa: BLE001 - dépôt illisible : absence
             return False
 
@@ -4072,7 +4389,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             return access_cache[key]
         reasons: list[str] = []
         try:
-            full = plan_git.local_commit(repo, key)
+            full = key if present(key) else ""
             if not full:
                 access_cache[key] = False
                 return False
@@ -4107,12 +4424,17 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             return False
         if recover is not None:
             try:
-                if recover(commit) and present(commit):
-                    return True
+                if recover(commit):
+                    file_cache.pop(("local-commit", repo, commit), None)
+                    if present(commit):
+                        return True
             except Exception:  # noqa: BLE001 - source en échec : la forge reste
                 pass
         try:
-            return _forge_fetch(repo, commit) and present(commit)
+            if _forge_fetch(repo, commit):
+                file_cache.pop(("local-commit", repo, commit), None)
+                return present(commit)
+            return False
         except Exception:  # noqa: BLE001 - récupération en échec : absence
             return False
 
@@ -4184,14 +4506,14 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             recover_one(head_sha)
         # le contenu d'un gel déjà entré dans la cible n'est pas relu (#3116) :
         # ses commits ont été relus sous leur propre lot, jamais sous celui-ci.
-        if target_sha and _is_ancestor(repo, sha, target_sha) is True:
+        if target_sha and _is_ancestor(repo, sha, target_sha, file_cache) is True:
             continue
-        if base and _is_ancestor(repo, sha, base) is True:
+        if base and _is_ancestor(repo, sha, base, file_cache) is True:
             continue
         # un gel plus récent déjà traité couvre celui-ci (même histoire)
-        if any(_is_ancestor(repo, sha, kept) is True for kept in processed):
+        if any(_is_ancestor(repo, sha, kept, file_cache) is True for kept in processed):
             continue
-        start = plan_git._out(repo, "merge-base", sha, base or head_sha)
+        start = _read_out(repo, "merge-base", sha, base or head_sha)
         if not start:
             access = at_ref(sha)
             if strict:
@@ -4507,7 +4829,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
 
     check()
     try:
-        if not plan_git.local_commit(repo, head_sha):
+        if not _read_local_commit(repo, head_sha):
             return {}
     except Exception:  # noqa: BLE001 - tête illisible : comportement historique
         return {}
@@ -4602,7 +4924,7 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                     # Lecture groupée impossible : repli par SHA, jamais une
                     # absence supposée.
                     try:
-                        full = plan_git.local_commit(repo, sha)
+                        full = _read_local_commit(repo, sha)
                     except Exception:  # noqa: BLE001 - objet illisible : ignoré
                         full = None
                 else:

@@ -92,7 +92,8 @@ class LinuxHost(account.LinuxAccounts):
         return True
 
     def validate_configuration(self,bundle):
-        self.command(['/usr/bin/visudo','-c','-f','/etc/sudoers.d/ameesh-release'])
+        runtime.trusted('/usr/sbin/visudo')
+        self.command(['/usr/sbin/visudo','-c','-f','/etc/sudoers.d/ameesh-release'])
         sshd=next((path for path in ('/usr/bin/sshd','/usr/sbin/sshd') if Path(path).is_file()),None)
         if sshd is None:
             raise InstallError('enrolled SSH daemon unavailable')
@@ -152,7 +153,8 @@ class LinuxHost(account.LinuxAccounts):
         return True
 
     def validate_restored_configuration(self,bundle):
-        self.command(['/usr/bin/visudo','-c'])
+        runtime.trusted('/usr/sbin/visudo')
+        self.command(['/usr/sbin/visudo','-c'])
         sshd=next((path for path in ('/usr/bin/sshd','/usr/sbin/sshd') if Path(path).is_file()),None)
         if sshd is None:
             raise InstallError('enrolled SSH daemon unavailable')

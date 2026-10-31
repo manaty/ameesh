@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from unittest import mock
 
 from ameesh import db as db_mod
@@ -162,6 +163,9 @@ class _Fixture(PgTestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        # la mémoire des portes fermées est celle du processus (#4849)
+        verdict_carry._closed_gates.clear()
+        self.addCleanup(verdict_carry._closed_gates.clear)
         self.db.execute("DELETE FROM turn_costs")
         self.db.execute("DELETE FROM provenance_receipts")
         self.db.execute("DELETE FROM canon_state")
@@ -395,10 +399,11 @@ class CarriedFreezeTest(_Fixture):
         self.assertEqual([r for r in verdict_carry.run_pass(self.cfg, self.db)
                           if r["lot"] == self.lot], [])
 
-    def test_a_closed_gate_gets_no_pending_note_and_no_retry(self):
+    def test_a_closed_gate_is_read_once_until_the_lot_moves(self):
         # Une porte lisiblement fermée (un avis sur deux) est le cours normal
-        # du qa : aucune marque de panne, aucun retry à chaque passage. Le
-        # verdict qui manque la rouvrira par le chemin #4423.
+        # du qa : aucune marque de panne, aucun essai. #4849 : le passage la
+        # lit une fois, puis ne la relit que si le lot bouge (le verdict qui
+        # manque la rouvrira aussi par le chemin #4423).
         _, outcome = self.freeze(self.repo.reviewed)
         self.assertEqual(outcome["state"], "designated", outcome)
         self.verdict("rev1", self.repo.reviewed)
@@ -410,8 +415,29 @@ class CarriedFreezeTest(_Fixture):
         self.assertEqual(carried["result"], "carried", carried)
         self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
         self.assertEqual(self.notes(verdict_carry.PENDING), [])
-        self.assertEqual([r for r in verdict_carry.run_pass(self.cfg, self.db)
-                          if r["lot"] == self.lot], [])
+        real = merge_queue.review_gate_for_item
+        with mock.patch.object(merge_queue, "review_gate_for_item",
+                               side_effect=real) as gate_read:
+            self.assertEqual([r for r in verdict_carry.run_pass(self.cfg, self.db)
+                              if r["lot"] == self.lot], [])
+            once = gate_read.call_count  # la lecture du passage qui la ferme
+            self.assertGreater(once, 0)
+            for _ in range(3):
+                self.assertEqual([r for r in verdict_carry.run_pass(self.cfg, self.db)
+                                  if r["lot"] == self.lot], [])
+            self.assertEqual(gate_read.call_count, once)
+            # le délai passé, la porte est relue une fois
+            with mock.patch.object(verdict_carry.time, "time",
+                                   return_value=time.time()
+                                   + verdict_carry.CLOSED_RECHECK_S + 1):
+                verdict_carry.run_pass(self.cfg, self.db)
+            self.assertEqual(gate_read.call_count, 2 * once)
+        self.assertEqual(self.notes(verdict_carry.PENDING), [])
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
+        # le verdict qui manque rouvre la porte : le lot passe en validated
+        self.verdict("rev2", frozen)
+        verdict_carry.run_pass(self.cfg, self.db)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
 
     def test_the_retry_of_a_transient_gate_read_is_bounded(self):
         # Une panne qui ne se répare pas ne relit pas la porte indéfiniment :

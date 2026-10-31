@@ -13,7 +13,9 @@ voir « Contrat 1.5 »), puis par le franchissement d'un préfixe de 200 humains
 actifs retenus (#286/B14, version `1.6.0`, compatible : voir « Contrat 1.6 »),
 puis par l'élection d'un pilote entre hôtes candidats (L165/EP1, version
 `1.8.0`, compatible : voir « Contrat 1.8 »), puis par le brief de relève à
-l'élection (L165/EP3, version `1.9.0`, compatible : voir « Contrat 1.9 »).
+l'élection (L165/EP3, version `1.9.0`, compatible : voir « Contrat 1.9 »),
+puis par l'identité du tour fermé (version `1.10.0`, compatible : voir
+« Contrat 1.10 »).
 Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -497,6 +499,19 @@ appareil ne choisit jamais le texte du résumé. Une relève **croisée sans
 brief est refusée** (`leases.claim` ne déplace pas la ligne) : côté médié, le
 paramètre forcé à null interdit donc une relève croisée et l'appareil reste en
 attente ; EP3 est natif. Rien d'autre ne change dans la table.
+
+## Contrat 1.10 : identité du tour fermé (#4881)
+
+`leases.end_turn` gagne un mot-clé facultatif `turn_id` : le runner y nomme le
+tour local qu'il ferme, et la clôture refuse alors par identité le tour d'un
+sandbox (`wrong-completion`) au lieu de deviner d'après la dernière ligne
+`turn_resources`. Un tour local dont la ligne de ressources n'a pas pu être
+attachée se ferme donc normalement ; un tour sandbox terminal reste, lui,
+identifié par son propre `turn_id`.
+
+L'ajout est compatible : la version passe à `1.10.0` ; un client 1.9 omet
+`turn_id`, et une clôture sans identité ne refuse plus que sur un tour sandbox
+vivant du même bail. Rien d'autre ne change dans la table.
 
 ## Porte d'hôte
 

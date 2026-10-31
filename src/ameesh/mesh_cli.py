@@ -4550,6 +4550,9 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     from . import veille_cli
     veille_cli.add_parsers(sub)
 
+    from . import turn_observe
+    turn_observe.add_parsers(sub)
+
     p_review = sub.add_parser(
         "review-class", help="review class of a change (0018): light, normal, sensitive")
     p_review.add_argument("paths", nargs="*", metavar="FILE",

@@ -15,6 +15,9 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
   turn.stages          the stage receipt of a mail turn: per-stage timestamps
                        and durations from the message to the harness's first
                        output (#3218, written by the runner, `turn_stages`)
+  turn.context         the labelled context measures of a turn
+                       (`ameesh-context/1`) next to its legacy counters and
+                       the close/rotation values (#4870, observation only)
   agent.updated        another change of status, lease, mode or stop reason
   agent.moved          a manual move of a `releve: hote` agent to another
                        admitted host (#3299, written with the move)
@@ -34,6 +37,10 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
                        transaction of its lease check
   staging.attested     a complete staging sequence, its active hosts and its
                        commit (no table: written by `actif.py`, #3981)
+  staging.sequence     bounded progress snapshot and fixed deadline, written
+                       before staging mutations and at each step (#4880)
+  staging.request      queued commit and elected execution attempt; survives
+                       the launching turn, reused by candidate takeover (#4880)
   packet.pause         a bounded pause of the hourly packet tick, or its end
                        (no table: written by `paquet-horaire.py pause|resume`,
                        read by its tick and `role timers --check`, #4361)
@@ -84,11 +91,12 @@ import time
 from . import storage
 
 CHANNEL = "ameesh_events"
-TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages", "agent.updated",
+TYPES = ("lot.updated", "turn.started", "turn.ended", "turn.stages",
+         "turn.context", "agent.updated",
          "agent.moved",
          "cost.recorded", "thread.entry", "decision.created", "decision.closed",
          "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
-         "alert.resolved", "pilot.gesture", "staging.attested",
+         "alert.resolved", "pilot.gesture", "staging.attested", "staging.sequence", "staging.request",
          "packet.pause")
 RETENTION_ENV = "AMEESH_EVENTS_RETENTION_DAYS"
 RETENTION_DAYS = 365

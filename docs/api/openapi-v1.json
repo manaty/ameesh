@@ -485,6 +485,7 @@
               "turn.started",
               "turn.ended",
               "turn.stages",
+              "turn.context",
               "agent.updated",
               "agent.moved",
               "cost.recorded",
@@ -498,6 +499,8 @@
               "alert.resolved",
               "pilot.gesture",
               "staging.attested",
+              "staging.sequence",
+              "staging.request",
               "packet.pause"
             ]
           }

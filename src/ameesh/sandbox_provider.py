@@ -22,9 +22,9 @@ No S1 table, no database, no cluster credential and no secret is read or
 written here. The provider only models the Job facts the supervisor needs:
 namespace/name/UID, labels, phase, image, timestamps, message and logs.
 
-Phases use the Kubernetes Job vocabulary (``Pending``, ``Running``,
-``Succeeded``, ``Failed``). A Job is terminal exactly when it succeeded or
-failed; a Job with no reported phase yet is live.
+Phases are normalized observations, derived from Job conditions and counters,
+not a Kubernetes Job status.phase field. Only Complete/Failed conditions prove
+termination; a failed Pod counter alone does not.
 """
 from __future__ import annotations
 
@@ -111,6 +111,12 @@ class JobNotFound(ProviderError):
     code = "not-found"
 
 
+class JobUIDConflict(ProviderError):
+    """A UID precondition refused deletion of a replacement Job."""
+
+    code = "job-conflict"
+
+
 class ProviderForbidden(ProviderError):
     """The provider refused the call (bad or missing credential); retrying fails."""
 
@@ -181,6 +187,22 @@ def job_name(turn_id: str) -> str:
     _text("turn_id", turn_id)
     digest = hashlib.sha256(turn_id.encode("utf-8")).hexdigest()
     return JOB_NAME_PREFIX + digest[:JOB_NAME_HEX]
+
+
+def phase_from_status(status: Mapping) -> str:
+    """Normalize Kubernetes Job status; counters never prove termination."""
+    conditions = status.get("conditions") or ()
+    true = {condition.get("type") for condition in conditions
+            if condition.get("status") in (True, "True")}
+    if {"Complete", "Failed"} <= true:
+        raise InvalidJob("contradictory Job terminal conditions")
+    if "Complete" in true:
+        return PHASE_SUCCEEDED
+    if "Failed" in true:
+        return PHASE_FAILED
+    if status.get("active", 0) or status.get("startTime"):
+        return PHASE_RUNNING
+    return PHASE_PENDING
 
 
 def job_labels(turn_id: str, agent: str, epoch: int, placement: str,
@@ -299,6 +321,7 @@ class Job:
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     message: str = ""
+    deletion_timestamp: Optional[float] = None
 
     def __post_init__(self) -> None:
         _dns_label("namespace", self.namespace)
@@ -327,6 +350,8 @@ class Job:
                                              optional=True))
         if not isinstance(self.message, str):
             raise InvalidJob("message must be a string")
+        object.__setattr__(self, "deletion_timestamp", _timestamp(
+            "deletion_timestamp", self.deletion_timestamp, optional=True))
 
     @property
     def terminal(self) -> bool:
@@ -379,8 +404,11 @@ class JobProvider(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def delete(self, namespace: str, name: str) -> bool:
-        """Request deletion; return whether a Job existed. Do not wait."""
+    def delete(self, namespace: str, name: str, *, uid: Optional[str] = None) -> bool:
+        """Request deletion with an atomic UID precondition. Do not wait.
+
+        A different current UID raises JobUIDConflict; it is never deleted.
+        """
         raise NotImplementedError
 
 
@@ -465,9 +493,28 @@ class FakeJobProvider(JobProvider):
                     "job %s/%s does not exist" % (namespace, name), name=name)
             return "".join(entry.logs)
 
-    def delete(self, namespace: str, name: str) -> bool:
+    def delete(self, namespace: str, name: str, *, uid: Optional[str] = None) -> bool:
         with self._lock:
-            return self._jobs.pop((namespace, name), None) is not None
+            entry = self._jobs.get((namespace, name))
+            if entry is None:
+                return False
+            if uid is not None and uid != entry.job.uid:
+                raise JobUIDConflict(name=name)
+            if entry.job.deletion_timestamp is None:
+                entry.job = replace(entry.job, deletion_timestamp=self._now())
+            return True
+
+    def finish_delete(self, namespace: str, name: str) -> None:
+        """Observe asynchronous deletion finishing (test helper)."""
+        with self._lock:
+            entry = self._jobs.get((namespace, name))
+            if entry is not None and entry.job.deletion_timestamp is None:
+                raise InvalidJob("deletion has not been requested")
+            self._jobs.pop((namespace, name), None)
+
+    def set_status(self, namespace: str, name: str, status: Mapping, **kwargs) -> Job:
+        """Drive the fake with Kubernetes Job conditions/counters."""
+        return self.set_phase(namespace, name, phase_from_status(status), **kwargs)
 
     # -- test helpers (not part of the provider contract) -------------------
 

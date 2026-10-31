@@ -211,6 +211,21 @@ class TurnContextRunnerTest(PgTestCase):
         self.addCleanup(worker.watchdog_stop.set)
         return runner, worker
 
+    def test_current_verification_tracks_real_marker_and_lease(self):
+        name = "ctx-reader"
+        runner, worker = self._worker(name, prompt="read")
+        document = _document(agent=name, lease_owner=runner.runner_id,
+                             lease_epoch=worker.epoch)
+        registry.pending_spend_begin(self.db, name, 1, turn_id="turn-1")
+        turn_context.verify(document, self.db)
+        document["turn"]["id"] = "old-turn"
+        with self.assertRaisesRegex(turn_context.ContextError, "stale-turn"):
+            turn_context.verify(document, self.db)
+        document["turn"]["id"] = "turn-1"
+        document["lease"]["epoch"] += 1
+        with self.assertRaisesRegex(turn_context.ContextError, "lease-mismatch"):
+            turn_context.verify(document, self.db)
+
     def _capture_env(self, capture: str, **extra: str):
         env = {
             "AMEESH_BIN_DIR": FAKEBIN,
@@ -411,3 +426,98 @@ class ResidentTurnContextTest(PgTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TurnCurrentTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.document = _document()
+        filename = turn_context.write(self.tmp.name, self.document)
+        self.env = {"AMEESH_TURN_CONTEXT": filename, "AMEESH_TURN_ID": "turn-1",
+                    "AGENT_MAIL_NAME": "doc-agent", "AMEESH_RUNNER_ID": "runner-1",
+                    "AMEESH_LEASE_EPOCH": "7"}
+
+    def call(self, *args):
+        import contextlib
+        import io
+        from ameesh import main
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main._dispatch(["turn", "current", "--json", *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_local_never_opens_backend(self):
+        with mock.patch("ameesh.backend.open_backend", side_effect=AssertionError):
+            code, out, _ = self.call("--local")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), self.document)
+
+    def test_resident_boundary_fences_lingering_operation_before_database(self):
+        pointer = os.path.join(self.tmp.name, "turn-id")
+        self.env["AMEESH_TURN_ID_FILE"] = pointer
+        for turn in ("turn-1", "turn-2"):
+            with open(pointer, "w") as handle:
+                handle.write(turn)
+            self.document["turn"]["id"] = turn
+            self.document["accounting"]["marker"]["turn_id"] = turn
+            turn_context.write(self.tmp.name, self.document)
+            with mock.patch("ameesh.registry.lease_matches", return_value=(True, "")), \
+                    mock.patch("ameesh.registry.pending_spend_get", return_value={"turn_id": turn}):
+                turn_context.verify(self.document, object())
+            self.assertEqual(self.call("--local", "--expect-turn", turn)[0], 0)
+        for flags in ((), ("--local",)):
+            with mock.patch("ameesh.backend.open_backend", side_effect=AssertionError):
+                code, out, err = self.call(*flags, "--expect-turn", "turn-1")
+            self.assertEqual((code, out), (3, ""))
+            self.assertIn("turn-mismatch", err)
+        # Empty/missing resident pointer cannot fall back to the lifetime id.
+        for missing in (False, True):
+            with open(pointer, "w") as handle:
+                handle.write("")
+            if missing:
+                os.unlink(pointer)
+            self.assertEqual(self.call("--local")[0], 3)
+
+    def test_invalid_documents_and_identity_fail_closed(self):
+        for field, value in (("AMEESH_TURN_CONTEXT", "/absent/context"),
+                             ("AMEESH_TURN_ID", "old"),
+                             ("AMEESH_RUNNER_ID", "other"),
+                             ("AMEESH_LEASE_EPOCH", "bad"),
+                             ("AGENT_MAIL_NAME", "other")):
+            with self.subTest(field=field):
+                saved = self.env[field]
+                self.env[field] = value
+                code, out, _ = self.call("--local")
+                self.assertEqual((code, out), (3, ""))
+                self.env[field] = saved
+        self.document["schema"] = "unknown/2"
+        with open(self.env["AMEESH_TURN_CONTEXT"], "w") as handle:
+            json.dump(self.document, handle)
+        self.assertEqual(self.call("--local")[:2], (3, ""))
+
+    def test_verified_command_and_database_failures(self):
+        backend = mock.Mock(kind="pg")
+        with mock.patch("ameesh.backend.open_backend", return_value=(backend, "")), \
+                mock.patch("ameesh.registry.lease_matches", return_value=(True, "")), \
+                mock.patch("ameesh.registry.pending_spend_get", return_value={"turn_id": "turn-1"}):
+            self.assertEqual(self.call()[0], 0)
+        for live, marker in ((False, {"turn_id": "turn-1"}), (True, None),
+                             (True, {"turn_id": "old"})):
+            with mock.patch("ameesh.backend.open_backend", return_value=(backend, "")), \
+                    mock.patch("ameesh.registry.lease_matches", return_value=(live, "")), \
+                    mock.patch("ameesh.registry.pending_spend_get", return_value=marker):
+                self.assertEqual(self.call()[:2], (3, ""))
+        with mock.patch("ameesh.backend.open_backend", side_effect=RuntimeError("secret-dsn")):
+            code, out, err = self.call()
+        self.assertEqual((code, out), (3, ""))
+        self.assertNotIn("secret-dsn", err)
+
+    def test_usage_errors(self):
+        with mock.patch("ameesh.config.load", side_effect=ValueError("secret-path")):
+            code, out, err = self.call()
+        self.assertEqual((code, out), (2, ""))
+        self.assertNotIn("secret-path", err)
+        for args in (("--expect-turn",), ("--unknown",)):
+            self.assertEqual(self.call(*args)[0], 2)

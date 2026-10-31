@@ -10,7 +10,8 @@ declared capabilities, CLI entry point and storage entry point.
 L103 T2 (#4396): a valid `Pipeline` card of the canon (`pipelines/*.md`) is a
 declarative module of source ``canon``: data, never imported code. Its
 `PipelineModule` adapter stores no work item type (descriptor
-``{types: [], schemas: {}, rules: []}``) and only declares ``lifecycle``.
+``{types: [], schemas: {}, rules: []}``) and serves lifecycle commands through
+the core (L103 T3, #4397).
 
 Discovery is read-only and fails closed per entry: a refused entry point is
 reported with its error and never becomes a `Module`. The bare profile (no
@@ -56,17 +57,21 @@ class PipelineModule:
 
     Same surface as an installed descriptor (``NAME``, ``descriptor(options)``),
     built from canon data: the card's types are the ones its workflow covers,
-    not types stored by the module, so the descriptor declares none. No
-    ``main`` and no ``audit``: only ``lifecycle`` until the generic commands
-    (T3)."""
+    not types stored by the module, so the descriptor declares none. Its
+    ``main`` delegates to the generic core CLI; there is no card-provided code
+    or audit hook."""
 
-    CAPABILITIES = ("lifecycle",)
+    CAPABILITIES = ("lifecycle", "cli")
     TYPES = ()
 
     def __init__(self, pipeline):
         self.NAME = pipeline.name
         self.CARD_REF = pipeline.fiche.ref
         self.pipeline = pipeline
+
+    def main(self, db, argv, *, actor):
+        from .. import pipeline_cli
+        return pipeline_cli.main(db, argv, actor=actor, module=self)
 
     def descriptor(self, options=None):
         return {"types": [], "schemas": {}, "rules": []}
@@ -197,7 +202,8 @@ def _with_canon(discovery, canon):
                                         allow_empty=True)
         implementations[pipeline.name] = module
         modules.append(Module(name=pipeline.name, version=None, source="canon",
-                              capabilities=PipelineModule.CAPABILITIES, cli=None,
+                              capabilities=PipelineModule.CAPABILITIES,
+                              cli="ameesh module %s" % pipeline.name,
                               storage=(), descriptor_sha256=_digest(compiled),
                               card_ref=pipeline.fiche.ref))
     return implementations, tuple(modules), tuple(refused)
@@ -277,6 +283,12 @@ def merge_connector():
     """Name of the connector of a merge on the target (gate actions, `merged`)."""
     module = get("dev")
     return getattr(module, "MERGE_CONNECTOR", "git-merge")
+
+
+def enabled(db, project, name):
+    """Whether a module is active for this project (generic lifecycle admission)."""
+    from .storage import ModuleStore
+    return ModuleStore(db).enabled(project, name)
 
 
 def admits(db, project, kind):

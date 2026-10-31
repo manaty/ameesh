@@ -582,8 +582,13 @@ class Leases(Domain):
     @abc.abstractmethod
     def end_turn(self, name: str, owner: str, epoch: int, *, status: str,
                  status_text: str | None, error: str | None,
-                 cost_usd: float | None) -> bool:
-        """Clôt un tour seulement si le bail est encore détenu."""
+                 cost_usd: float | None, turn_id: str | None = None) -> bool:
+        """Clôt un tour seulement si le bail est encore détenu.
+
+        ``turn_id`` est l'identité du tour local fermé : elle fend la clôture
+        générique d'un tour sandbox (#4881). Absente, seul un tour sandbox
+        vivant sur le même bail refuse.
+        """
 
 
 class Catalog(Domain):
@@ -768,6 +773,18 @@ class TurnCosts(Domain):
         définition du compteur vivant de l'exécuteur (#4448 B), et non les
         seuls succès. C'est la même mesure que ce compteur, relue pour
         l'alerte `session_too_big`."""
+
+    @abc.abstractmethod
+    def session_reread(self, agent: str, session: str) -> dict | None:
+        """CTX-02b : le cumul des entrées relues des tours d'une session —
+        `tokens` (entrée + cache **lu**, cache écrit exclu ; Codex compte déjà
+        le cache dans son entrée), `turns` (tous les tours inscrits),
+        `last_ts` (instant du dernier tour inscrit, epoch ; pour vérifier
+        qu'aucun tour n'a été écrit depuis une qualité publiée) ; ou None si
+        aucun tour. Lecture seule, base de `R_session` pour la publication
+        `ameesh-context/1` : elle ne change aucune décision ni la ligne du
+        grand livre. Plusieurs harnais dans une session (anomalie) : chaque
+        ligne suit sa propre convention de cache."""
 
     @abc.abstractmethod
     def first_after(self, agent: str, ts: float) -> dict | None:
@@ -1041,6 +1058,14 @@ class Events(Domain):
         staging attestation). The `created_at` bound keeps the read on the
         retention index; `days` is the durability the caller needs, never a
         substitute for an absent event."""
+
+    def latest_type(self, type: str, days: int, limit: int) -> list[dict]:
+        """Newest snapshot per object, newest first, bounded by objects.
+
+        Unlike recent_type, a chatty object cannot hide an interrupted one.
+        A driver without this capability must refuse instead of truncating.
+        """
+        raise NotImplementedError("latest event per object is unavailable")
 
     @abc.abstractmethod
     def readable(self, position: tuple, limit: int) -> tuple[list[dict], str | None, tuple]:
@@ -2332,6 +2357,15 @@ class WorkItems(Domain):
         `note`, les transitions par leur UPDATE) et de la fermeture par
         contenu — une retenue ne se glisse pas entre la lecture du journal et
         la fermeture."""
+
+    @abc.abstractmethod
+    def lock_workflow_activation(self, project: str) -> None:
+        """Share the project policy lock through the adoption transaction."""
+
+    @abc.abstractmethod
+    def adopt_workflow(self, item_id: int, *, ref: str, version: int,
+                       stage: str, state: str, actor: str) -> None:
+        """Set the first workflow pin and journal it under the caller's lot lock."""
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
@@ -3930,7 +3964,12 @@ class Decisions(Domain):
         """Clôt la demande si elle est encore en attente : `status`
         (`answered` | `delivered`), `record` fusionné dans `payload.decision`
         (état, réponse ou retrait). Rend la ligne close, ou None (déjà close,
-        inconnue) — rien n'est écrit."""
+        inconnue) — rien n'est écrit. A request carrying `supersedes` closes
+        only with a valid signed answer. Selecting its signed
+        `supersedes_option` atomically marks the earlier answered authority
+        `superseded_by`, with append-only audit events on both decisions;
+        another option or free text leaves that authority unchanged.
+        Existing answers are never rewritten."""
 
     def validation_register(self, decision_id: int, *, routing: dict):
         """#4256: immutable authority snapshot, outside the mediated contract."""

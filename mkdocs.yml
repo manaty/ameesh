@@ -101,6 +101,7 @@ nav:
   - Concepts:
       - concepts/index.md
       - Core and modules: concepts/core-and-modules.md
+      - Work lifecycle: concepts/work-lifecycle.md
       - The canon: concepts/canon.md
       - Members, agents, hosts, placements: concepts/members-agents-hosts.md
       - Runner and leases: concepts/runner-and-leases.md
@@ -114,6 +115,7 @@ nav:
       - Install on a workstation: guides/install.md
       - Write a canon: guides/write-a-canon.md
       - Write a Process card: guides/write-a-process.md
+      - Write a Pipeline: guides/write-a-pipeline.md
       - Run the demo: guides/run-the-demo.md
       - Switch from a v0 setup: guides/switch-from-v0.md
       - Cluster profile: guides/cluster-profile.md
