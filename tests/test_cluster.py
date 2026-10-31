@@ -111,6 +111,10 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #5087 / 0529: review admission and withdrawals remain internal authority;
+    # neither supervisor role receives additional access.
+    "agent_registry": {"review_hold"},
+    "work_review_withdrawals": {"work_item_id", "reviewer", "withdrawn"},
     # #4872 / 0526: budget authority and relay accounting remain closed to
     # supervisor roles; classification grants no additional access.
     "tranche_limits": {"id", "project", "cap_usd", "currency", "tz", "starts_at",
