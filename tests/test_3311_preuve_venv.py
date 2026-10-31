@@ -146,7 +146,7 @@ class ControlerVenvTest(unittest.TestCase):
         sudo = self.bin / "sudo"
         sudo.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$TEST_STATE/sudo.log\"\nexit 1\n")
         sudo.chmod(0o755)
-        fait = self.lancer({"dev9": enfant.pid})
+        fait = self.seul_dev9(enfant.pid)
         self.assertNotEqual(fait.returncode, 0)
         self.assertIn("-n python3", (self.state / "sudo.log").read_text())
         self.assertNotIn("contrôles verts", fait.stdout)
@@ -186,9 +186,42 @@ class ControlerVenvTest(unittest.TestCase):
         sudo.chmod(0o755)
         return self.state / "sudo.log"
 
+    def seul_dev9(self, pid):
+        """Sans dev8 : le résultat ne dépend que de ce processus."""
+        (self.state / "units").write_text(
+            "ameesh-runner-agent@dev9.service loaded active running runner\n",
+            encoding="utf-8")
+        return self.lancer({"dev9": pid})
+
     def attestation(self, pid):
-        return (Path(self.env["XDG_STATE_HOME"]) / "ameesh-host/venv-vivant"
-                / ("%d.json" % pid))
+        base = (Path(self.env["XDG_STATE_HOME"]) if "XDG_STATE_HOME" in self.env
+                else self.home / ".local/state")
+        return base / "ameesh-host/venv-vivant" / ("%d.json" % pid)
+
+    def test_non_dumpable_vert_sous_le_dossier_d_etat_par_defaut(self):
+        # Le chemin réel d'un poste : la règle est écrite des deux côtés.
+        for valeur in (None, "relatif"):
+            with self.subTest(XDG_STATE_HOME=valeur):
+                self.env.pop("XDG_STATE_HOME", None)
+                if valeur:
+                    self.env["XDG_STATE_HOME"] = valeur
+                journal = self.sudo_refuse()
+                enfant = self.non_dumpable(self.live)
+                self.assertTrue((self.home / ".local/state/ameesh-host/venv-vivant"
+                                 / ("%d.json" % enfant.pid)).exists())
+                fait = self.seul_dev9(enfant.pid)
+                self.assertEqual(fait.returncode, 0, fait.stdout + fait.stderr)
+                self.assertFalse(journal.exists())
+
+    def test_non_dumpable_rouge_sans_blocage_si_l_attestation_est_un_fifo(self):
+        enfant = self.non_dumpable(self.live)
+        chemin = self.attestation(enfant.pid)
+        chemin.unlink()
+        os.mkfifo(chemin, 0o600)
+        self.sudo_refuse()
+        fait = self.seul_dev9(enfant.pid)  # délai de 60 s : un blocage échoue
+        self.assertNotEqual(fait.returncode, 0)
+        self.assertNotIn("contrôles verts", fait.stdout)
 
     def test_non_dumpable_vert_sans_privilege_sur_le_venv_courant(self):
         journal = self.sudo_refuse()
@@ -224,6 +257,9 @@ class ControlerVenvTest(unittest.TestCase):
         chemin = self.attestation(enfant.pid)
         vraie = json.loads(chemin.read_text())
         journal = self.sudo_refuse()
+        # Témoin : la même attestation intacte est verte, le rouge vient du cas.
+        fait = self.seul_dev9(enfant.pid)
+        self.assertEqual(fait.returncode, 0, fait.stdout + fait.stderr)
         cas = {
             "absente": None,
             "pid recyclé": dict(vraie, start_ticks="1"),
@@ -238,7 +274,7 @@ class ControlerVenvTest(unittest.TestCase):
                     chemin.touch(mode=0o600)
                     chemin.write_text(contenu if isinstance(contenu, str)
                                       else json.dumps(contenu))
-                fait = self.lancer({"dev9": enfant.pid})
+                fait = self.seul_dev9(enfant.pid)
                 self.assertNotEqual(fait.returncode, 0)
                 self.assertNotIn("contrôles verts", fait.stdout)
                 self.assertEqual(journal.exists(), nom != "autre exécutable", nom)
@@ -246,7 +282,7 @@ class ControlerVenvTest(unittest.TestCase):
         with self.subTest("lisible par d'autres"):
             chemin.write_text(json.dumps(vraie))
             chemin.chmod(0o644)
-            fait = self.lancer({"dev9": enfant.pid})
+            fait = self.seul_dev9(enfant.pid)
             self.assertNotEqual(fait.returncode, 0)
         with self.subTest("lien symbolique"):
             copie = self.root / "copie.json"
@@ -254,7 +290,7 @@ class ControlerVenvTest(unittest.TestCase):
             copie.chmod(0o600)
             chemin.unlink()
             chemin.symlink_to(copie)
-            fait = self.lancer({"dev9": enfant.pid})
+            fait = self.seul_dev9(enfant.pid)
             self.assertNotEqual(fait.returncode, 0)
 
     def test_controler_rouge_si_un_mainpid_est_absent(self):

@@ -48,7 +48,7 @@ def attestation(pid: str) -> dict | None:
         base = os.path.expanduser("~/.local/state")
     chemin = os.path.join(base, "ameesh-host", "venv-vivant", pid + ".json")
     try:
-        fd = os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(chemin, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     with os.fdopen(fd, encoding="utf-8") as flux:
