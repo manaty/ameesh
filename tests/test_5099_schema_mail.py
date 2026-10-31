@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from ameesh import cli, mail, registry, work
 from ameesh.backend import PgBackend
+from ameesh.storage.postgres.registry import GET_SQL
 from .support import PgTestCase
 
 
@@ -63,3 +64,34 @@ class SchemaMailTest(PgTestCase):
         finally:
             self.db.execute("ALTER TABLE agent_registry ADD COLUMN review_hold jsonb")
             self.db.execute("ALTER TABLE agent_registry ADD COLUMN operator_pause_until timestamptz")
+
+    def test_diffusion_avec_colonnes_de_la_tete_absentes(self):
+        # #5101 : la diffusion lit le registre par `overview()` ; elle ne doit
+        # pas nommer une colonne additive absente avant l'alignement du schéma.
+        registry.upsert(self.db, "sender", status="idle", harness="codex")
+        registry.upsert(self.db, "pilot", status="idle", harness="claude")
+        registry.upsert(self.db, "other", status="idle", harness="deepseek")
+        self.db.execute("ALTER TABLE agent_registry DROP COLUMN review_hold")
+        self.db.execute("ALTER TABLE agent_registry DROP COLUMN operator_pause_until")
+        try:
+            rows = {row["name"]: row for row in registry.overview(self.db)}
+            self.assertEqual(set(rows), {"sender", "pilot", "other"})
+            self.assertIsNone(rows["pilot"]["review_hold"])
+            self.assertIsNone(rows["pilot"]["operator_pause_until_ts"])
+            self.assertFalse(rows["pilot"]["operator_paused"])
+            body = "Diffusion avant migration : le courrier part quand même."
+            self.assertEqual(cli.cmd_send(PgBackend(self.cfg, self.db), self.cfg,
+                                         ["all", body, "--from", "sender"]), 0)
+            for name in ("pilot", "other"):
+                messages = mail.unread(self.db, name)
+                self.assertEqual([m["body"] for m in messages], [body], name)
+            self.assertEqual(mail.unread(self.db, "sender"), [])
+        finally:
+            self.db.execute("ALTER TABLE agent_registry ADD COLUMN review_hold jsonb")
+            self.db.execute("ALTER TABLE agent_registry ADD COLUMN operator_pause_until timestamptz")
+
+    def test_get_evalue_le_jsonb_une_fois(self):
+        # #5101 : `GET_COLUMNS` projetait `to_jsonb(agent_registry)` dans
+        # chaque date (17 évaluations par ligne) ; la latérale le fait une fois.
+        self.assertEqual(GET_SQL.count("to_jsonb(agent_registry)"), 1)
+        self.assertIn("CROSS JOIN LATERAL", GET_SQL)

@@ -84,9 +84,27 @@ _GET_FIELDS = [part.strip() for part in re.sub(r"--[^\n]*", "", AGENT_COLUMNS).s
 _GET_NAMES = [part.rsplit(" as ", 1)[-1].strip() for part in _GET_FIELDS]
 _GET_NAMES += ["last_mail_ts", "last_mail_host"]
 _GET_TIMESTAMPS = [re.sub(
-    r"from (\w+)", r"from (to_jsonb(agent_registry)->>'\1')::timestamptz", part)
+    r"from (\w+)", r"from (j.__row->>'\1')::timestamptz", part)
     for part in _GET_FIELDS if part.startswith("extract(")]
 GET_COLUMNS = "agent_registry.*, " + ", ".join(_GET_TIMESTAMPS)
+#: #5101 : `to_jsonb(agent_registry)` est évalué UNE fois par ligne (`__row`),
+#: puis chaque date est projetée depuis ce jsonb ; `OFFSET 0` empêche le
+#: planificateur de replier la latérale et de répéter l'appel. La lecture ne
+#: nomme aucune colonne de la table : une colonne additive absente (schéma en
+#: retard, #5099) laisse la clé à NULL au lieu de lever 42703.
+GET_SQL = """
+    SELECT %s, presence.last_mail_ts, presence.last_mail_host
+      FROM agent_registry
+      CROSS JOIN LATERAL (
+          SELECT to_jsonb(agent_registry) AS __row OFFSET 0) j
+      LEFT JOIN LATERAL (
+          SELECT extract(epoch from m.created_at)::float8 AS last_mail_ts,
+                 m.host AS last_mail_host
+            FROM agent_mailbox m
+           WHERE m.sender = agent_registry.name
+           ORDER BY m.id DESC LIMIT 1) presence ON true
+     WHERE name = (SELECT ameesh_resolve_agent_name(%%s, %%s))
+    """ % GET_COLUMNS
 
 
 def check_name(name: str) -> str:
@@ -543,19 +561,7 @@ class Agents(interface.Agents):
     def get(self, name) -> dict | None:
         # #3729 : le dernier message déposé et son hôte, comme `overview`
         # (#3337) — `ameesh show` lit la même preuve de vie que `list`.
-        rows = self.db.query(
-            """
-            SELECT %s, presence.last_mail_ts, presence.last_mail_host
-              FROM agent_registry
-              LEFT JOIN LATERAL (
-                  SELECT extract(epoch from m.created_at)::float8 AS last_mail_ts,
-                         m.host AS last_mail_host
-                    FROM agent_mailbox m
-                   WHERE m.sender = agent_registry.name
-                   ORDER BY m.id DESC LIMIT 1) presence ON true
-             WHERE name = (SELECT ameesh_resolve_agent_name(%%s, %%s))
-            """ % GET_COLUMNS,
-            (name, "agents.get"))
+        rows = self.db.query(GET_SQL, (name, "agents.get"))
         return {key: rows[0].get(key) for key in _GET_NAMES} if rows else None
 
     def resolve_name(self, name, *, operation="lookup") -> str:
@@ -582,17 +588,18 @@ class Agents(interface.Agents):
     def overview(self) -> list[dict]:
         return self.db.query(
             """
-            SELECT name, (SELECT r.review_hold FROM agent_registry r WHERE r.name=o.name) AS review_hold,
+            SELECT name, (SELECT (to_jsonb(r)->>'review_hold')::jsonb FROM agent_registry r
+                           WHERE r.name=o.name) AS review_hold,
                    (SELECT r.aliases FROM agent_registry r WHERE r.name=o.name) AS aliases,
                    -- #3185 : projets relus hors équipe (la vue ne porte pas la colonne)
                    (SELECT r.relit FROM agent_registry r WHERE r.name=o.name) AS relit,
                    -- #3460 : retrait (la vue ne porte pas la colonne)
-                   (SELECT extract(epoch from r.retired_at)::float8 FROM agent_registry r
-                     WHERE r.name=o.name) AS retired_ts,
+                   (SELECT extract(epoch from (to_jsonb(r)->>'retired_at')::timestamptz)::float8
+                      FROM agent_registry r WHERE r.name=o.name) AS retired_ts,
                    chantier, harness, host, cwd, session_id, status, status_text,
                    model,
                    -- #4293 : colonne absente de la vue figée ; lue sur la ligne
-                   (SELECT r.harness_bin FROM agent_registry r
+                   (SELECT to_jsonb(r)->>'harness_bin' FROM agent_registry r
                      WHERE r.name = o.name) AS harness_bin,
                    budget_usd, spent_usd, turns, pending_prompt, last_error,
                    -- #3337 : un message déposé est un signe de vie distinct de
@@ -646,11 +653,22 @@ class Agents(interface.Agents):
                      WHERE r.name = o.name) AS session_harness
             FROM agent_mesh_overview o
             LEFT JOIN LATERAL (
-                SELECT operator_paused, operator_pause_reason, operator_pause_by,
-                       operator_pause_for,
-                       extract(epoch from operator_pause_at)::float8 AS operator_pause_ts,
-                       extract(epoch from operator_pause_until)::float8
-                           AS operator_pause_until_ts
+                -- #5101 : ces colonnes ne sont pas dans la vue figée et
+                -- peuvent manquer sur un schéma en retard (42703 sinon).
+                SELECT (to_jsonb(agent_registry)->>'operator_paused')::boolean
+                           AS operator_paused,
+                       to_jsonb(agent_registry)->>'operator_pause_reason'
+                           AS operator_pause_reason,
+                       to_jsonb(agent_registry)->>'operator_pause_by'
+                           AS operator_pause_by,
+                       to_jsonb(agent_registry)->>'operator_pause_for'
+                           AS operator_pause_for,
+                       extract(epoch from
+                           (to_jsonb(agent_registry)->>'operator_pause_at')::timestamptz
+                       )::float8 AS operator_pause_ts,
+                       extract(epoch from
+                           (to_jsonb(agent_registry)->>'operator_pause_until')::timestamptz
+                       )::float8 AS operator_pause_until_ts
                   FROM agent_registry WHERE name = o.name
             ) p ON true
             ORDER BY last_seen_ts DESC NULLS LAST
