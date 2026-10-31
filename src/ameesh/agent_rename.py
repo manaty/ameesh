@@ -69,7 +69,7 @@ REWRITTEN = (
     "work_item_links.decided_by", "work_item_milestones.actor", "work_items.assignee",
     "work_items.delegated_by", "work_items.estimate_by",
     "work_items.external_executor", "work_items.planned_by", "work_items.reviewer",
-    "work_items.reviewers[]", "work_landings.created_by",
+    "work_review_withdrawals.reviewer", "work_items.reviewers[]", "work_landings.created_by",
     "work_packages.planned_by", "work_packet_members.recorded_by", "work_resolutions.created_by",
 )
 

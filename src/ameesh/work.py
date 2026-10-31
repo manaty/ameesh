@@ -1661,6 +1661,8 @@ def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
     row = registry.get(db, name)
     if row is not None:
         if isinstance(row, dict):
+            if row.get("review_hold"):
+                raise WorkError("reviewer refused: %s has a review hold" % (row.get("name") or name))
             if row.get("retired_ts"):
                 raise WorkError("reviewer refused: %s is retired (ameesh agent retire, "
                                 "#3460): name an active reviewer"

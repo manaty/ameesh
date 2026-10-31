@@ -1002,6 +1002,9 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
     out["frozen"] = declared
     marks = work.milestones(db, lot)
     candidates = pending(marks, declared)
+    from .agent_review_hold import carried_reviewers
+    eligible = set(carried_reviewers(db, lot, [m.get("actor") for m in candidates.values()]))
+    candidates = {key: mark for key, mark in candidates.items() if mark.get("actor") in eligible}
     if not candidates:
         out["detail"] = "no verdict to carry"
         return out, [], [], ""
@@ -1130,7 +1133,11 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
             return out
         row = rows[0]
         still = pending(marks, declared)
+        from .agent_review_hold import carried_reviewers
+        eligible = set(carried_reviewers(tx, lot, [m.get("actor") for m, _ in plan]))
         for mark, reviewed in plan:
+            if mark.get("actor") not in eligible:
+                continue
             now = still.get(_key(mark.get("actor")))
             if now is None or int(now.get("id") or 0) != int(mark.get("id") or 0):
                 continue              # verdict rendu ou reporté entre-temps : le sien vaut
