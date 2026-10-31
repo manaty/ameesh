@@ -4669,7 +4669,7 @@ def cmd_cost(cfg: Config, args) -> int:
         else:
             print(cost_mod.format_report(rows))
             # L95 : dépense réelle (soldes) face à l'estimation, sur 24 h
-            for entry in _real_spend_24h(db):
+            for entry in _real_spend_24h(db, cfg=cfg):
                 print(balance_mod.describe(entry))
             print()
             print(budget_mod.summary_line(limites))
@@ -4685,7 +4685,7 @@ def cmd_cost(cfg: Config, args) -> int:
         db.close()
 
 
-def _real_spend_24h(db) -> list:
+def _real_spend_24h(db, *, cfg=None) -> list:
     """L95 : dépense réelle des fournisseurs payés au token sur 24 h, face à
     l'estimation du grand livre ; vide si rien n'est lisible."""
     try:
@@ -4694,7 +4694,7 @@ def _real_spend_24h(db) -> list:
         return []
     now = time.time()
     return [dict(entry, period="24h")
-            for entry in balance_mod.compare(db, paid, now - 86400.0, now)]
+            for entry in balance_mod.compare(db, paid, now - 86400.0, now, cfg=cfg)]
 
 
 def _cost_report_reads(cfg: Config, db) -> None:
@@ -4717,7 +4717,7 @@ def _cost_report_reads(cfg: Config, db) -> None:
                                    for g in ligne["gauges"] if g.get("cap") is not None}
                 for ligne in comptes if ligne["active"]}
     book.report(accounts=actifs, multipliers=rythmes, caps=plafonds)
-    _real_spend_24h(db)
+    _real_spend_24h(db, cfg=cfg)
 
 
 def _config_origin(cfg: Config) -> dict:
@@ -4988,7 +4988,7 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
             except balance_mod.BalanceError as exc:
                 errors.append("%s: %s" % (nom, exc))
     rows = ops.balances(provider=args.provider, since_s=_since_seconds(args.since))
-    report = dict(balance_mod.spend(rows), schema="ameesh-balance/1", errors=errors)
+    report = dict(balance_mod.spend(rows, cfg=cfg), schema="ameesh-balance/1", errors=errors)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
