@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import time
@@ -281,6 +282,29 @@ class RealIdentityTest(unittest.TestCase):
             self.enroll()
 
     def test_real_dump_and_restore_only_with_restore_identity(self):
+        majors = []
+        for dsn in self.dsns:
+            with psycopg.connect(dsn) as conn:
+                majors.append(conn.info.server_version // 10000)
+        # Prefer the server's own toolchain over the system pg_wrapper default.
+        binaries = Path('/usr/lib/postgresql') / str(majors[0]) / 'bin'
+        clients = []
+        client_majors = []
+        for name in ('pg_dump', 'pg_restore'):
+            candidate = binaries / name
+            client = str(candidate) if candidate.is_file() else shutil.which(name)
+            if client is None:
+                self.skipTest(f'{name} unavailable for PostgreSQL servers {majors}')
+            result = subprocess.run([client, '--version'], capture_output=True, text=True, check=True)
+            match = re.search(r'\(PostgreSQL\) (\d+)\.', result.stdout)
+            if match is None:
+                self.skipTest(f'{name} version unreadable: {result.stdout.strip()}')
+            clients.append(client)
+            client_majors.append(int(match.group(1)))
+        dump_major, restore_major = client_majors
+        if not (majors[0] <= dump_major <= majors[1] and restore_major >= dump_major):
+            self.skipTest(f'incompatible PostgreSQL versions: source={majors[0]}, '
+                          f'target={majors[1]}, pg_dump={dump_major}, pg_restore={restore_major}')
         self.enroll()
         source = self.source_doc()
         # Feed connection parameters through protected pgpass, not argv passwords.
@@ -289,7 +313,7 @@ class RealIdentityTest(unittest.TestCase):
         helper_spec.loader.exec_module(backup)
         archive = self.directory / 'dump'
         with backup.private_connection(tool.connection(source['backup_dsn']), self.directory) as (dsn, env):
-            result = subprocess.run(['/usr/bin/pg_dump', '-Fc', '--no-password', '--dbname', dsn, '-f', str(archive)], env=env, capture_output=True)
+            result = subprocess.run([clients[0], '-Fc', '--no-password', '--dbname', dsn, '-f', str(archive)], env=env, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr.decode())
         database = 'probe_' + self.suffix
         with psycopg.connect(source['restore_dsn'], autocommit=True) as conn:
@@ -297,7 +321,7 @@ class RealIdentityTest(unittest.TestCase):
         params = tool.connection(source['restore_dsn'])
         params['dbname'] = database
         with backup.private_connection(params, self.directory) as (dsn, env):
-            result = subprocess.run(['/usr/bin/pg_restore', '--exit-on-error', '--no-owner', '--no-privileges',
+            result = subprocess.run([clients[1], '--exit-on-error', '--no-owner', '--no-privileges',
                                      '--no-password', '--dbname', dsn, str(archive)], env=env, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr.decode())
         with psycopg.connect(**params) as conn:
