@@ -461,11 +461,18 @@ def _elected_tick(cfg, args):
     from . import release_cutoff
     release_cutoff.projects(cfg)
     from . import role_run, pilot_gesture
-    if (os.environ.get(role_run.ENV_ROLE) == role
-            and os.environ.get(role_run.ENV_PASS) == "release"):
+    wrapped_role = (os.environ.get(role_run.ENV_ROLE) or "").strip()
+    if wrapped_role and os.environ.get(role_run.ENV_PASS) == "release":
         from .db import open_db
         db = open_db(cfg)
         try:
+            # The wrapper exports the canonical registry name, even when its
+            # configured role was an alias. Never acquire a second pass here.
+            if wrapped_role != role:
+                configured_role = role_run.live(db, role)["role"]
+                if configured_role != wrapped_role:
+                    raise pilot_gesture.GestureRefused(
+                        "release child does not match the configured role")
             fence = pilot_gesture.gate(cfg, db, "release", "release " + args.release_command)
             if fence is None:
                 raise pilot_gesture.GestureRefused("release tick requires an elected role")

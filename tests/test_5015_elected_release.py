@@ -67,6 +67,33 @@ class ElectionTest(unittest.TestCase):
         cut.assert_called_once()
         watch.assert_called_once()
 
+    def test_canonical_child_of_alias_never_acquires_another_pass(self):
+        cfg = self.cfg()
+        cfg.release['role'] = cfg.packet_watch['role'] = 'pilot-alias'
+        for child, accepted in (('pilot', True), ('foreign-pilot', False)):
+            with self.subTest(child=child), \
+                    mock.patch.object(release_cutoff, 'projects', return_value={'example': object()}), \
+                    mock.patch.dict(os.environ, {role_run.ENV_ROLE: child,
+                                                 role_run.ENV_PASS: 'release'}, clear=True), \
+                    mock.patch('ameesh.db.open_db') as opened, \
+                    mock.patch.object(role_run, 'live', return_value=report()) as live, \
+                    mock.patch.object(role_run, 'run') as wrapper, \
+                    mock.patch.object(pilot_gesture, 'gate') as gate, \
+                    mock.patch.object(release, '_release_tick', return_value=0) as cut, \
+                    mock.patch.object(release, '_packet_watch', return_value=0):
+                if accepted:
+                    self.assertEqual(release.run(cfg, self.args()), 0)
+                    gate.assert_called_once()
+                    cut.assert_called_once()
+                else:
+                    with self.assertRaises(pilot_gesture.GestureRefused):
+                        release.run(cfg, self.args())
+                    gate.assert_not_called()
+                    cut.assert_not_called()
+                live.assert_called_once_with(opened.return_value, 'pilot-alias')
+                wrapper.assert_not_called()
+                opened.return_value.close.assert_called_once()
+
     def test_manual_watch_dry_run_is_preserved_by_wrapper(self):
         args = self.args()
         args.release_command, args.dry_run = 'packet-watch', True
@@ -182,13 +209,14 @@ class ElectionTest(unittest.TestCase):
 
 
 class ExecutionLeaseTest(PgTestCase):
-    def test_real_release_gate_never_renews_the_runner_lease(self):
+    def test_real_aliased_release_gate_never_renews_the_runner_lease(self):
         name, owner = 'test-release-pilot', 'test-release-runner'
         registry.upsert(self.db, name, harness='other', host=self.cfg.host, status='idle')
-        self.db.execute("UPDATE agent_registry SET releve='election', candidats=ARRAY[%s]"
-                        " WHERE name=%s", (self.cfg.host, name))
+        self.db.execute("UPDATE agent_registry SET releve='election', candidats=ARRAY[%s],"
+                        " aliases=ARRAY['test-release-alias'] WHERE name=%s",
+                        (self.cfg.host, name))
         lease = registry.claim(self.db, name, owner, 60, host=self.cfg.host)
-        cfg = types.SimpleNamespace(host=self.cfg.host, release=dict(role=name),
+        cfg = types.SimpleNamespace(host=self.cfg.host, release=dict(role='test-release-alias'),
                                     packet_watch={}, canon=[])
         env = {role_run.ENV_ROLE:name, role_run.ENV_PASS:'release',
                role_run.ENV_EPOCH:str(lease['lease_epoch']), role_run.ENV_OWNER:owner}
