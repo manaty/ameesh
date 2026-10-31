@@ -2303,16 +2303,11 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
             texte = ("Règles de travail du canon : %s\n\n%s"
                      % (process.title, (process.body or "").strip())).strip()
             for name in sorted(set(agents)):
-                # #5055 : un agent retiré est sauté ; le refus annulerait sinon
-                # la poussée de tous les autres et le repère de ce commit.
-                try:
-                    mail_mod.send(tx, work_mod.SYSTEM_SENDER, name, texte, host=host,
-                                  kind="event",
-                                  payload={"event": "canon-process",
-                                           "path": process.fiche.path},
-                                  thread=False)
-                except storage.RecipientRetired:
-                    continue
+                mail_mod.send(tx, work_mod.SYSTEM_SENDER, name, texte, host=host,
+                              kind="event",
+                              payload={"event": "canon-process",
+                                       "path": process.fiche.path},
+                              thread=False)
                 done.sent += 1
             done.changed.append(process.title)
     return done
