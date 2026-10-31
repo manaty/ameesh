@@ -611,6 +611,62 @@ class MergeSweepTest(_Base):
         self.assertEqual(report[n]["result"], "open")
         self.assertFalse([m for m in work.milestones(self.db, n) if m["kind"] == "merged"])
 
+    def test_trailer_d_un_autre_lot_l_emporte_sur_le_titre(self):
+        # #5110, cas Nexlink 281c5be4c3d2 (paquet 278) : le titre
+        # « #4820 B8 (#659) » cite #659 en contexte, le trailer désigne 4820 ;
+        # seul 4820 est livré, #659 reste ouvert.
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        livre, cite = self.lot(), self.lot()
+        self.merge("feature/paquet-278",
+                   "Paquet 278 : #%d B8 (#%d) : useThread.ts sans garde "
+                   "contentHintsEnabled\n\nameesh-work: %d"
+                   % (livre["id"], cite["id"], livre["id"]))
+        self.sync()
+        self.assertEqual(work.get(self.db, livre["id"])["state"], "delivered")
+        self.assertEqual(work.get(self.db, cite["id"])["state"], "intake")
+        self.assertFalse([m for m in work.milestones(self.db, cite["id"])
+                          if m["kind"] == "merged"])
+
+    def test_cited_lots_designation_explicite_fait_foi(self):
+        # #5110 : tout trailer, ou la fusion d'une branche de lot, coupe les
+        # `#<id>` du titre ; sans désignation explicite, le titre cite encore.
+        cited = plan_git.cited_lots
+        self.assertEqual(cited("Paquet 278 : #4820 B8 (#659)\n\nameesh-work: 4820",
+                               hash_refs=True), {4820: "ameesh-work"})
+        self.assertEqual(cited("#12 et #13\n\nameesh-work-partial: 12",
+                               hash_refs=True), {})
+        self.assertEqual(cited("Merge pull request #8 from manaty/lot/7-x", hash_refs=True),
+                         {7: "lot-branch"})
+        self.assertEqual(cited("Paquet 278 : #4820 B8 (#659)", hash_refs=True),
+                         {4820: "#id", 659: "#id"})
+
+    def test_cible_du_projet_plutot_que_celle_du_clone(self):
+        # #5110 : sans `ameesh.target` dans le clone (cible par défaut main),
+        # la cible déclarée du projet du lot (`develop` pour Nexlink) fait foi :
+        # la fusion sur develop ferme sans « off the default target », une
+        # fusion sur main n'est qu'un résidu.
+        from ameesh import intake_neighbors
+        _git(self.repo, "config", "--unset", plan_git.TARGET_GIT_KEY)
+        lot = work.add(self.db, title="lot nexlink", app="nexlink", assignee="claude1",
+                       actor="orch", force="test: several lots for one agent (#540)")
+        ailleurs = work.add(self.db, title="lot nexlink sur main", app="nexlink",
+                            assignee="claude1", actor="orch",
+                            force="test: several lots for one agent (#540)")
+        self.merge("feature/n", "merge n\n\nameesh-work: %d" % lot["id"])
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "merge m\n\nameesh-work: %d" % ailleurs["id"], "feature/n")
+        _git(self.repo, "checkout", "-q", "develop")
+        targets = {"nexlink": "develop"}
+        with mock.patch.object(intake_neighbors, "project_target",
+                               side_effect=lambda cfg, app, slug="": targets.get(app, "")):
+            report = {r["work_item"]: r for r in self.sync()["results"]}
+        self.assertEqual(report[lot["id"]]["result"], "merged")
+        self.assertEqual(report[lot["id"]]["target"], "develop")
+        self.assertIsNone(report[lot["id"]].get("off_target"))
+        self.assertNotIn("off the default target", self.merged_milestone(lot["id"])["note"])
+        self.assertEqual(work.get(self.db, ailleurs["id"])["state"], "intake")
+
     def test_diese_parenthese_nie_ne_ferme_pas_le_lot(self):
         # R Codex #2259 : la parenthèse ne sépare pas « sans » du lot exclu.
         _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
