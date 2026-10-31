@@ -51,6 +51,7 @@ from ameesh.storage.postgres.authenticators import AUTH_COLUMNS
 
 from .support import REPO, TEST_DSN, PgTestCase, apply_authenticators, child_env
 from .webauthn_soft import SoftWebAuthn
+from .role_acl import serialize_role_acl
 
 H_A = "equipe-a.approve.example.test"
 H_B = "equipe-b.approve.example.test"
@@ -926,6 +927,7 @@ class RoleApproveTest(PgTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        serialize_role_acl(cls)
         suffix = uuid.uuid4().hex[:8]
         cls.role = "t_appr_%s" % suffix
         cls.login = "t_appr_login_%s" % suffix
