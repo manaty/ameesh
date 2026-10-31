@@ -6183,10 +6183,48 @@ class AgentWorker(threading.Thread):
                     self.name, lot, float(reveil["wake_ts"])):
                 log_async("[%s] scheduled wake for lot #%s consumed"
                           % (self.name, lot))
+            else:
+                # #5006 : réassigné pendant le lancement ; `consume_wake` laisse
+                # l'échéance au nouvel assigné, le courrier `reassigned` atteint
+                # ce tour à son prochain point sûr.
+                log_async("[%s] scheduled wake for lot #%s not consumed: no longer "
+                          "ours, the turn already started" % (self.name, lot))
         except db_mod.DbError as exc:
             log_async("[%s] scheduled wake for lot #%s not consumed (%s): it will "
                       "be redelivered when its claim expires"
                       % (self.name, lot, exc))
+
+    def _wake_outdated(self, spec: dict) -> bool:
+        """#5006 : le réveil porté par ce tour est-il devenu sans objet ?
+
+        Assigné, état et échéance sont lus au choix du tour ; la bascule de
+        session et la préparation peuvent durer, et une réassignation tombée
+        entre-temps enverrait le tour à l'ancien assigné. Réveil programmé : le
+        renouvellement du bail relit tout (assigné, état, échéance), par une
+        opération déjà au contrat de l'exécuteur médié. Relance d'inactivité :
+        le lot doit encore figurer dans les lots actionnables de l'agent. Une
+        base en panne ne dit rien : le tour continue, et `consume_wake` reste
+        filtré par l'assigné."""
+        lot = spec.get("lot")
+        reveil = spec.get("scheduled_wake")
+        if reveil:
+            perime = not self._renew_wake_claim(
+                {"lot": int(reveil["lot"]), "wake_ts": float(reveil["wake_ts"])})
+        elif spec.get("lot_wake"):
+            import datetime as _dt
+            try:
+                lots = storage.of(self.db).lot_sessions.actionable(
+                    self.name, today=_dt.date.today().isoformat())
+            except db_mod.DbError as exc:
+                log_async("[%s] actionable lots unreadable (%s)" % (self.name, exc))
+                return False
+            perime = str(lot) not in {str(row["id"]) for row in lots}
+        else:
+            return False
+        if perime:
+            log_async("[%s] wake for lot #%s outdated (reassigned, closed or moved): "
+                      "no turn" % (self.name, lot))
+        return perime
 
     def _lot_wake_spec(self) -> dict | None:
         """Règle 1 (#408) : l'agent au repos depuis plus de `mail_batch` +
@@ -6223,7 +6261,7 @@ class AgentWorker(threading.Thread):
                 note = st.note_wake(self.name, int(row["id"]), row.get("activity_ts"))
                 log_async("[%s] idle with actionable lot #%s (%s): woken (wake %s)"
                           % (self.name, row["id"], row["state"], note.get("wakes")))
-                return {"kind": "idle", "ids": [], "lot": str(row["id"]),
+                return {"kind": "idle", "ids": [], "lot": str(row["id"]), "lot_wake": True,
                         "prompt": adapters.LOT_WAKE_PROMPT % {
                             "id": int(row["id"]), "title": row.get("title") or "",
                             "state": row["state"]}}
@@ -8255,6 +8293,16 @@ class AgentWorker(threading.Thread):
             self._annule_tour_avant_lancement(marqueur, spend_key)
             self.fail_turn("turn context unavailable",
                            "turn context not written: %s" % exc)
+            return False
+
+        # #5006 (B1 cx2, dev3) : dernier contrôle avant le lancement, préparation
+        # faite. Un réveil devenu sans objet ne part pas ; rien de comptable ne
+        # reste ouvert, `begin_turn` est défait et l'échéance attend le nouvel
+        # assigné.
+        if self._wake_outdated(spec):
+            self._annule_tour_avant_lancement(marqueur, spend_key)
+            registry.set_status(self.db, self.name, "idle",
+                                status_text="wake outdated: no turn")
             return False
 
         preempt_done = threading.Event()

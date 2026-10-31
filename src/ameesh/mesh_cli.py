@@ -2593,6 +2593,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # #2478 : la désignation est écrite ; un courrier non remis est dit.
             if item.get("reviewer_request_warning"):
                 print("warning: %s" % item["reviewer_request_warning"], file=sys.stderr)
+            # #5006 : un move par un agent qui n'est plus l'assigné
+            if item.get("assignee_warning"):
+                print("warning: %s" % item["assignee_warning"], file=sys.stderr)
             return 0
         if args.work_command == "reviewer":
             # #2076 : ajouter ou retirer un relecteur d'un lot DÉJÀ en qa,
@@ -2982,7 +2985,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # sans en faire un refus.
                 for line in str(row.get("note") or "").splitlines():
                     if line.startswith((work.FREEZE_UNPUBLISHED_MARK,
-                                        work.FREEZE_UNVERIFIED_MARK)):
+                                        work.FREEZE_UNVERIFIED_MARK,
+                                        work.NON_ASSIGNEE_MARK)):
                         print("warning: %s" % line, file=sys.stderr)
                 # #2442 : un réalignement mécanique sur la cible garde les
                 # verdicts de la tête relue ; sinon l'exécuteur retente.
