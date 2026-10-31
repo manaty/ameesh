@@ -305,6 +305,12 @@ class ResidentProfileEventTest(ResidentBench):
             self.assertEqual(data["context"]["compaction"]["post"], 120)
             # La compaction est un fait du tour : le suivant ne la rejoue pas.
             self.assertTrue(self._turn(worker, "deux"))
+            # Témoin ResidentProcess : le second tour garde le contexte mesuré
+            # (600), jamais l'ancien post de compaction (120), et ne compte
+            # pas une seconde compaction.
+            rp = worker.resident
+            self.assertEqual(rp.compactions, 1)
+            self.assertEqual(rp.last_context, 600)
             data = self._latest()
             self.assertIs(data["decision"]["compacted"], False)
             self.assertIsNone(data["context"]["compaction"])
