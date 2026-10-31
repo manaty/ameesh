@@ -1415,7 +1415,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                              "families": raised_families, "reason": "author"})
             continue                      # on ne relit pas son propre travail
         if actor and actor.lower() in corrections:
-            rejected.append({"actor": actor, "family": "", "reason": "corrector"})
+            # #5197 : le refus dit la famille du relecteur (celle de son avis),
+            # pas « famille inconnue » ; l'exclusion, elle, est par le nom.
+            try:
+                shown = _verdict_family(mark) or ""
+            except RegistryReadError:
+                shown = ""
+            rejected.append({"actor": actor, "family": shown, "reason": "corrector"})
             doubt = stacked_doubts.get(actor.lower())
             if doubt:
                 rejected[-1].update(reason="stacked-corrector",
