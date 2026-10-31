@@ -44,6 +44,7 @@ from __future__ import annotations
 import os
 
 from . import storage
+from .db import DbError
 from . import work as work_mod
 
 #: variable qui déclare des orchestrateurs (comme `ameesh alerts --orchestrators`)
@@ -154,6 +155,12 @@ def _assignee_refusal(db, name: str, cfg) -> str | None:
         work_mod.check_assignee(db, name, cfg=cfg)
     except work_mod.WorkError as exc:
         return str(exc)
+    except DbError as exc:
+        # #5099 : schéma en retard pendant une alerte de migration. La
+        # garde reste fermée pour l’attribution, sans perdre le courrier.
+        if exc.sqlstate not in ("42703", "42P01"):
+            raise
+        return "assignment check unavailable (schema not aligned)"
     return None
 
 

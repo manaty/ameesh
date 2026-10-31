@@ -498,7 +498,15 @@ def wake_note(cfg, db, name: str, row: dict, *, sender: str | None = None) -> li
     lui-même d'un réveil qui n'aura pas lieu."""
     if "mode" not in row or (row.get("mode") or "execute") == "externe":
         return []
-    ok, why, _note = registry.wake_status(db, cfg, name)
+    try:
+        ok, why, _note = registry.wake_status(db, cfg, name)
+    except db_mod.DbError as exc:
+        # #5099 : ce diagnostic est consultatif ; le dépôt durable de
+        # l'alerte de migration ne doit pas attendre le schéma de la tête.
+        if exc.sqlstate not in ("42703", "42P01"):
+            raise
+        return ["%s: wake status unavailable (schema not aligned); message stored"
+                % name]
     if ok:
         # #4610 : seuls une attribution, un lot démarrable, un courrier du
         # pilote ou d'un orchestrateur, ou l'échéance lèvent ce sommeil ; un
