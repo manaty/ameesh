@@ -821,11 +821,40 @@ class SchemaTest(unittest.TestCase):
         self.assertIn("droit DDL", mails[0][2])
 
     def test_empreinte_deja_ouverte_aucun_courrier(self):
-        ctx, _, mails = self.ctx(read=(0, self.ADDITIVE), apply=(1, "permission denied"),
-                                 created=False)
+        ctx, calls, mails = self.ctx(read=(0, self.ADDITIVE), apply=(1, "permission denied"),
+                                     created=False)
         with self.assertRaises(ph.HoraireError):
             ph.align_schema(ctx)
         self.assertEqual(mails, [])
+        notes = [c for c in calls if c[:3] == ["ameesh", "work", "note"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("permission denied", notes[0][-1])
+
+    def test_verrou_reessaye_une_seule_fois_avant_alerte(self):
+        for second in (ph.Result(0, "applied"), ph.Result(1, "[SQLSTATE 55P03] lock")):
+            with self.subTest(second=second.returncode):
+                ctx, calls, mails = self.ctx(read=(0, self.ADDITIVE))
+                results = iter((ph.Result(0, self.ADDITIVE),
+                                ph.Result(1, "migration failed [SQLSTATE 55P03]: lock"), second))
+                with mock.patch.object(ph, "_migrate", side_effect=lambda *a: next(results)) as migrate:
+                    if second.returncode:
+                        with self.assertRaises(ph.HoraireError):
+                            ph.align_schema(ctx)
+                    else:
+                        ph.align_schema(ctx)
+                self.assertEqual(migrate.call_count, 3)
+                self.assertEqual(len(mails), 2 if second.returncode else 0)
+
+    def test_autre_erreur_aucun_reessai_et_detail_dans_lot(self):
+        ctx, calls, mails = self.ctx(read=(0, self.ADDITIVE),
+                                     apply=(1, "migration failed [SQLSTATE 42501]: permission denied"))
+        with self.assertRaises(ph.HoraireError):
+            ph.align_schema(ctx)
+        self.assertEqual(sum(c[-1] == "--additive-only" for c in calls), 1)
+        notes = [c for c in calls if c[:3] == ["ameesh", "work", "note"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("SQLSTATE 42501", notes[0][-1])
+        self.assertEqual(notes[0][-1], mails[0][2])
 
     def test_essai_lit_seulement(self):
         ctx, calls, mails = self.ctx(read=(0, self.ADDITIVE), dry_run=True)
