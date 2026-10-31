@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#5038: kernel witnesses and negative credential/process-identity cases."""
+import io
 import json
 import os
 from pathlib import Path
@@ -77,6 +78,16 @@ with tempfile.TemporaryDirectory() as root:
         with self.assertRaises(SystemExit):
             run(fails)
         self.assertIs(subprocess.Popen.__init__, original)
+
+    def test_runner_entrypoint_does_not_harden_the_shared_test_interpreter(self):
+        from ameesh import runner
+        from .entrypoint import run
+        with mock.patch.object(P, "become_undumpable") as kernel, \
+                mock.patch.object(runner, "load_config"), \
+                mock.patch("sys.stdout", new=io.StringIO()):
+            with self.assertRaises(SystemExit):
+                run(runner.main, ["--help"])
+            kernel.assert_not_called()
 
     def test_custom_account_source_and_selected_destination(self):
         with mock.patch.object(E, "DECLARED_CREDENTIALS", set()):
