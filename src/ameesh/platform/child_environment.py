@@ -149,3 +149,18 @@ def harden() -> bool:
         return False
     install()
     return True
+
+
+def managed_entry() -> bool:
+    """Filter every child; hide only a verified installed service MainPID.
+
+    INVOCATION_ID is only a cheap hint: children inherit it, so the manager
+    snapshot and kernel identity must still identify this exact process.
+    Manual CLI calls and service children stay readable to holder scans.
+    """
+    install()
+    if os.environ.get("INVOCATION_ID"):
+        from .process import _trusted_executor, executor_processes
+        if _trusted_executor(os.getpid(), executor_processes):
+            return harden()
+    return True

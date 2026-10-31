@@ -917,8 +917,9 @@ def _split(argv: list[str]) -> tuple[list[str], list[str]]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from .platform.child_environment import install
-    install()
+    from .platform.child_environment import managed_entry
+    if not managed_entry():
+        return 1
     argv = sys.argv[1:] if argv is None else argv
     head, command = _split(argv)
     args = build_parser().parse_args(head)

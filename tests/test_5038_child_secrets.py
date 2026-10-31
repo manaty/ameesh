@@ -118,6 +118,13 @@ with tempfile.TemporaryDirectory() as root:
 """
         subprocess.run([sys.executable, "-c", script], env=env, check=True)
 
+    def test_inherited_invocation_id_does_not_harden_an_ordinary_child(self):
+        with mock.patch.dict(os.environ, INVOCATION_ID="inherited"), \
+                mock.patch.object(E, "install"), mock.patch.object(E, "harden") as harden, \
+                mock.patch.object(P, "_trusted_executor", return_value=False):
+            self.assertTrue(E.managed_entry())
+            harden.assert_not_called()
+
     def test_mechanical_scripts_receive_transport_but_no_provider_credentials(self):
         env = E.execution_transport(dict(AMEESH_DSN="db", GH_TOKEN="github",
                                         DEEPSEEK_API_KEY="provider"))
@@ -148,7 +155,7 @@ class ExecutorIdentityTest(unittest.TestCase):
         (root / "cgroup").write_text("0::" + (group or self.group + "/runner") + "\n")
 
     def snapshot(self):
-        response = "Id=%s\nMainPID=91\nControlGroup=%s\n" % (self.unit, self.group)
+        response = "Id=%s\nMainPID=91\nControlGroup=%s\nTransient=no\nFragmentPath=/etc/systemd/system/ameesh-runner@.service\n" % (self.unit, self.group)
         with mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=response)):
             return P.executor_processes()
 
@@ -168,7 +175,7 @@ class ExecutorIdentityTest(unittest.TestCase):
         self.assertEqual(self.snapshot(), {})
 
     def test_system_services_are_found_when_the_user_manager_is_unavailable(self):
-        response = "Id=%s\nMainPID=91\nControlGroup=%s\n" % (self.unit, self.group)
+        response = "Id=%s\nMainPID=91\nControlGroup=%s\nTransient=no\nFragmentPath=/etc/systemd/system/ameesh-runner@.service\n" % (self.unit, self.group)
         def show(argv, **kwargs):
             if "--user" in argv:
                 raise OSError("no user manager")
@@ -176,6 +183,14 @@ class ExecutorIdentityTest(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout=response)
         with mock.patch("subprocess.run", side_effect=show):
             self.assertTrue(P._trusted_executor(91, P.executor_processes))
+
+    def test_transient_and_missing_fragment_services_are_not_exempt(self):
+        for properties in ("Transient=yes\nFragmentPath=/etc/systemd/system/a.service",
+                           "Transient=no\nFragmentPath=/run/user/1001/systemd/transient/a.service",
+                           "Transient=no\nFragmentPath=", ""):
+            response = "Id=%s\nMainPID=91\nControlGroup=%s\n%s\n" % (self.unit, self.group, properties)
+            with self.subTest(properties=properties), mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=response)):
+                self.assertEqual(P.executor_processes(), {})
 
     def test_missing_service_manager_grants_nothing(self):
         with mock.patch("subprocess.run", side_effect=OSError("unavailable")):
@@ -217,6 +232,46 @@ time.sleep(30)
                         self.assertIn(start, platform.env_values("AMEESH_TURN_ID")["unread"])
                     self.assertIsNotNone(P._doubt_proc(
                         child.pid, os.getuid(), lambda: set(), executors=lambda: {}))
+                finally:
+                    child.kill()
+                    child.wait()
+
+    def test_managed_cli_hides_parent_credentials_and_filters_its_child(self):
+        # The service-manager snapshot is injected, the identity and read
+        # refusal are checked against a real process by the kernel.
+        env = E.for_child([sys.executable], os.environ)
+        env.update(PYTHONPATH=SRC, INVOCATION_ID="synthetic-invocation",
+                   DEEPSEEK_API_KEY="provider", AMEESH_DSN="transport")
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root, "ready")
+            code = """
+import os,pathlib,subprocess,sys,time
+from ameesh import main,platform
+from ameesh.platform import child_environment as E
+P = platform.process
+identity = P._executor_identity(os.getpid(), platform.self_cgroup_paths()[0])
+assert identity is not None
+P.executor_processes = lambda: {os.getpid(): identity}
+def dispatch(*args):
+    subprocess.run([sys.executable, '-c', "import os; assert 'DEEPSEEK_API_KEY' not in os.environ; assert os.environ['AMEESH_DSN']=='transport'"], env=E.execution_transport(os.environ), check=True)
+    pathlib.Path(sys.argv[1]).touch()
+    return 0
+main._dispatch = dispatch
+assert main.main(['role','run']) == 0
+time.sleep(30)
+"""
+            with subprocess.Popen([sys.executable, "-c", code, str(marker)], env=env,
+                                  stderr=subprocess.PIPE, text=True) as child:
+                try:
+                    deadline = time.monotonic() + 10
+                    while not marker.exists():
+                        if child.poll() is not None:
+                            self.fail(child.stderr.read())
+                        if time.monotonic() > deadline:
+                            self.fail("managed CLI did not launch its filtered child")
+                        time.sleep(0.02)
+                    with self.assertRaises(PermissionError):
+                        Path("/proc/%d/environ" % child.pid).read_bytes()
                 finally:
                     child.kill()
                     child.wait()

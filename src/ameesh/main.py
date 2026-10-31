@@ -294,8 +294,9 @@ ACTION_COMMANDS = ("action", "decisions")
 
 
 def main(argv: list[str] | None = None) -> int:
-    from .platform.child_environment import install
-    install()
+    from .platform.child_environment import managed_entry
+    if not managed_entry():
+        return 1
     try:
         return _dispatch(argv)
     except BrokenPipeError:

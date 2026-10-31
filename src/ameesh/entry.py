@@ -76,8 +76,9 @@ def _rapide_hook(cfg, fastmail, rest: list) -> int | None:
 
 
 def main(argv: list | None = None) -> int:
-    from .platform.child_environment import install
-    install()
+    from .platform.child_environment import managed_entry
+    if not managed_entry():
+        return 1
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] in (["statusline"], ["hook"]) and not any(
             arg in ("-h", "--help") for arg in argv[1:]):

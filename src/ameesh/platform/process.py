@@ -847,7 +847,7 @@ def executor_processes() -> dict:
         try:
             done = subprocess.run(
                 [*manager, "show", "--no-pager",
-                 "--property=Id,MainPID,ControlGroup", "ameesh-*.service"],
+                 "--property=Id,MainPID,ControlGroup,Transient,FragmentPath", "ameesh-*.service"],
                 capture_output=True, text=True, timeout=5, check=False)
         except (OSError, subprocess.SubprocessError):
             continue
@@ -857,6 +857,10 @@ def executor_processes() -> dict:
     for block in blocks:
         fields = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
         unit, pid, group = (fields.get(k, "") for k in ("Id", "MainPID", "ControlGroup"))
+        fragment = fields.get("FragmentPath", "")
+        if (fields.get("Transient") != "no" or not os.path.isabs(fragment)
+                or "/transient/" in fragment):
+            continue
         if not (unit.startswith("ameesh-") and unit.endswith(".service")
                 and pid.isdecimal() and int(pid) > 1 and group.startswith("/")
                 and group.rstrip("/").split("/")[-1] == unit):
