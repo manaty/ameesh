@@ -292,6 +292,13 @@ class MultipleReviewersTest(PgTestCase):
         migration = Path(REPO, "src/ameesh/migrations/0456_work_item_reviewers.sql").read_text()
         audit = Path(REPO, "src/ameesh/migrations/0462_reviewer_audit.sql").read_text()
         spelling = Path(REPO, "src/ameesh/migrations/0516_agent_rename.sql").read_text()
+        # 0529 also depends on reviewers. Suspend only its seat trigger while
+        # simulating the pre-0456 schema, then restore it after the column.
+        self.addCleanup(
+            self.db.execute,
+            "CREATE TRIGGER ameesh_review_seats_guard AFTER INSERT OR UPDATE OF reviewers, reviewer "
+            "ON work_items FOR EACH ROW EXECUTE FUNCTION ameesh_review_seats_guard()")
+        self.db.execute("DROP TRIGGER ameesh_review_seats_guard ON work_items")
         self.db.execute("DROP TRIGGER work_item_reviewers_sync ON work_items")
         self.db.execute("DROP TRIGGER IF EXISTS work_item_reviewers_audit ON work_items")
         # 0516 : le trigger d'orthographe des noms d'agents dépend de la colonne.
