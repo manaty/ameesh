@@ -1505,3 +1505,32 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
             if path and path != "/":
                 out.paths.setdefault(os.path.realpath(path), who)
     return out
+
+
+def git_process_in(path: str, proc_root: str | None = None) -> bool | None:
+    """Un processus git travaille-t-il dans le clone `path` (son `cwd` y est, ou
+    sa ligne de commande le nomme) ? `None` : on ne peut pas l'exclure — `/proc`
+    illisible, ou un git dont le `cwd` n'est pas lisible. Un processus disparu
+    pendant la lecture ne compte pas."""
+    proc_root = PROC if proc_root is None else proc_root
+    real = os.path.realpath(path)
+    inside = real + os.sep
+    try:
+        pids = [name for name in os.listdir(proc_root) if name.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, pid, "cmdline"), "rb") as handle:
+                argv = os.fsdecode(handle.read()).split("\0")
+            name = os.path.basename(argv[0])
+            if name != "git" and not name.startswith("git-"):
+                continue
+            cwd = os.readlink(os.path.join(proc_root, pid, "cwd"))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            return None
+        if cwd == real or cwd.startswith(inside) or any(real in arg for arg in argv[1:]):
+            return True
+    return False

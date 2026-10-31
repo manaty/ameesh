@@ -72,6 +72,7 @@ import time
 from contextlib import contextmanager
 
 from . import migrations, plan_git, review_provenance, storage, work
+from .platform.process import git_process_in
 from .canon import (FETCH_TIMEOUT, GIT_TIMEOUT, NO_LAZY_FETCH, GitError, _git,
                     _git_env)
 
@@ -1277,34 +1278,6 @@ def git_locks(path: str) -> list[str]:
     return sorted(found)
 
 
-def git_process_in(path: str, proc_root: str = "/proc") -> bool | None:
-    """Un processus git travaille-t-il dans le clone `path` (son `cwd` y est, ou
-    sa ligne de commande le nomme) ? `None` : on ne peut pas l'exclure — `/proc`
-    illisible, ou un git dont le `cwd` n'est pas lisible. Un processus disparu
-    pendant la lecture ne compte pas."""
-    real = os.path.realpath(path)
-    inside = real + os.sep
-    try:
-        pids = [name for name in os.listdir(proc_root) if name.isdigit()]
-    except OSError:
-        return None
-    for pid in pids:
-        try:
-            with open(os.path.join(proc_root, pid, "cmdline"), "rb") as handle:
-                argv = os.fsdecode(handle.read()).split("\0")
-            name = os.path.basename(argv[0])
-            if name != "git" and not name.startswith("git-"):
-                continue
-            cwd = os.readlink(os.path.join(proc_root, pid, "cwd"))
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        except OSError:
-            return None
-        if cwd == real or cwd.startswith(inside) or any(real in arg for arg in argv[1:]):
-            return True
-    return False
-
-
 def _journal_removed(path: str, record: dict, db=None) -> None:
     """Un verrou retiré : stderr, `<clone>.git-locks.log` à côté du clone, et
     l'événement `git.lock_removed` quand l'appelant a une base. Le journal
@@ -1327,7 +1300,7 @@ def _journal_removed(path: str, record: dict, db=None) -> None:
 
 
 def sweep_orphan_locks(path: str, *, db=None, stale_s: float | None = None,
-                       now: float | None = None, proc_root: str = "/proc") -> list[dict]:
+                       now: float | None = None, proc_root: str | None = None) -> list[dict]:
     """#5179 : retire les verrous git orphelins du clone radar `path` ; rend ce
     qui a été retiré (chemin, âge, taille).
 
@@ -1359,7 +1332,7 @@ def sweep_orphan_locks(path: str, *, db=None, stale_s: float | None = None,
                 busy = git_process_in(path, proc_root)
                 if busy is not False:
                     print("ameesh: #5179 git locks of %s kept: %s" % (
-                        path, "git process at work" if busy else "/proc unreadable"),
+                        path, "git process at work" if busy else "processes unreadable"),
                         file=sys.stderr)
                     return removed
                 checked = True
