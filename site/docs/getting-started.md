@@ -75,6 +75,9 @@ export AMEESH_HUMANS=alice                   # names that are humans, not agents
 python3 -m ameesh migrate                    # versioned migrations, idempotent
 python3 -m ameesh doctor --notify-test       # driver, schema, migrations, LISTEN/NOTIFY
 
+# Discover installed implementations; this does not activate project policy.
+python3 -m ameesh modules --no-canon
+
 # register an agent pinned to this host, send it a message, run one pass of the runner
 python3 -m ameesh run register worker1 deepseek --cwd ~/src/acme
 python3 -m ameesh mail send worker1 "Please start on lot 7." --from alice
@@ -106,4 +109,5 @@ python3 -m ameesh progress
 - Install ameesh for real: [Install on a workstation](guides/install.md).
 - Understand the model: [Concepts](concepts/index.md).
 - Describe your own team: [Write a canon](guides/write-a-canon.md).
+- Add domain rules: [Core and modules](concepts/core-and-modules.md) and [Write a module](guides/write-a-module.md).
 - Every command: [CLI reference](reference/cli.md).
