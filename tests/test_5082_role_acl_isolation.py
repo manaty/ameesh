@@ -4,6 +4,15 @@ from .role_acl import serialize_role_acl
 from .support import PgTestCase
 
 
+def lock_holders(db) -> list[int]:
+    return [row["pid"] for row in db.query(
+        "SELECT pid FROM pg_locks l, pg_database d WHERE l.locktype = 'advisory' "
+        "AND l.granted AND l.objsubid = 1 AND l.database = d.oid "
+        "AND d.datname = current_database() "
+        "AND (l.classid::bigint << 32 | l.objid::bigint) = "
+        "hashtextextended('ameesh-test-role-public-acl', 0)")]
+
+
 class RoleAclIsolationTest(PgTestCase):
     def test_lock_survives_statements_and_setup_failure(self):
         class Fixture:
@@ -22,15 +31,12 @@ class RoleAclIsolationTest(PgTestCase):
                 # Les scripts sont lancés sur d'autres connexions ; une requête
                 # terminée sur la connexion de classe ne doit pas lever la garde.
                 self.db.query("SELECT 1")
-                with probe.transaction() as tx:
-                    self.assertFalse(tx.query(
-                        "SELECT pg_try_advisory_xact_lock(hashtextextended("
-                        "'ameesh-test-role-public-acl', 0)) AS acquired")[0]["acquired"])
+                holders = lock_holders(probe)
+                self.assertEqual(len(holders), 1)
                 raise RuntimeError("échec simulé de setUpClass")
         finally:
             for cleanup in reversed(Fixture.cleanups):
                 cleanup()
-        with probe.transaction() as tx:
-            self.assertTrue(tx.query(
-                "SELECT pg_try_advisory_xact_lock(hashtextextended("
-                "'ameesh-test-role-public-acl', 0)) AS acquired")[0]["acquired"])
+        # Pas de nouvel essai de verrou : une autre classe en file le prend
+        # dès la libération, seule compte la session de cette garde.
+        self.assertNotIn(holders[0], lock_holders(probe))
