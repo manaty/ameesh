@@ -6,12 +6,15 @@ Ce module publie les faits de profil que le contrat
 des décisions legacy :
 
 * ``model_effective`` : le modèle **annoncé par le harnais** pour le fil
-  principal ; le modèle demandé par le registre n'est jamais le modèle
-  effectif ;
+  principal, ou — à défaut d'annonce — le modèle demandé au lancement, publié
+  avec ``model_quality=requested`` et jamais ``measured`` ;
 * ``window_tokens`` : la fenêtre runtime de ce modèle, jamais celle d'un
   modèle auxiliaire, d'un modèle précédent ou du catalogue ;
 * l'état d'une compaction native : ``pre``/``post``, ``partial`` quand le
-  harnais ne publie pas l'après (le contrat interdit d'inventer cet après).
+  harnais ne publie pas l'après (le contrat interdit d'inventer cet après) ;
+* :func:`publish` : la section ``profile`` de ``turn.context`` (CTX-03b), qui
+  ajoute au profil du tour le harnais et sa version, le mode et la classe de
+  rôle du canon — pour un tour résident comme non résident.
 
 **Observation seule.** Rien ici ne décide d'une rotation ni d'un compactage,
 et aucune valeur legacy n'est requalifiée : ``resident`` garde son chemin de
@@ -32,7 +35,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 
-from .context_metrics import DERIVED, MEASURED, PARTIAL, UNKNOWN
+from .context_metrics import DERIVED, FALLBACK, MEASURED, PARTIAL, UNKNOWN
 
 SCHEMA = "ameesh-context/1"
 
@@ -48,8 +51,84 @@ REASON_MODEL_AMBIGUOUS = "model_ambiguous"
 REASON_ALIAS_UNKNOWN = "alias_unknown"
 REASON_ALIAS_AMBIGUOUS = "alias_ambiguous"
 REASON_WINDOW_UNKNOWN = "window_unknown"
+REASON_VERSION_UNKNOWN = "version_unknown"
+REASON_MODE_UNKNOWN = "mode_unknown"
 REASON_PRE_UNKNOWN = "pre_tokens_unknown"
 REASON_POST_UNKNOWN = "post_tokens_unknown"
+
+#: qualités admises pour le modèle effectif (contrat §3.1) : le modèle
+#: **demandé** n'est jamais ``measured`` s'il n'a pas été annoncé.
+MODEL_QUALITIES = (MEASURED, DERIVED, FALLBACK, PARTIAL, UNKNOWN, "requested")
+
+#: classes de rôle du contrat §3.1/§3.6. Le canon porte des noms plus fins
+#: (`implementation`, `relecture`, `orchestrateur`, `github-watch`…) : le
+#: profil publie la classe de politique, jamais l'identité de l'agent.
+ROLE_PILOT = "pilot"
+ROLE_REVIEW = "review"
+ROLE_AUDIT = "audit"
+ROLE_BUILD = "build"
+ROLE_DOCS = "docs"
+ROLE_WATCH = "watch"
+ROLE_OTHER = "other"
+ROLES = (ROLE_PILOT, ROLE_REVIEW, ROLE_AUDIT, ROLE_BUILD, ROLE_DOCS,
+         ROLE_WATCH, ROLE_OTHER)
+
+#: premier rôle déclaré au canon → classe de politique. Une valeur inconnue
+#: ne devient jamais une supposition : elle retombe sur ``other`` (§3.6).
+ROLE_BY_CANON = {
+    "orchestrateur": ROLE_PILOT,
+    "orchestrator": ROLE_PILOT,
+    "pilote": ROLE_PILOT,
+    "pilot": ROLE_PILOT,
+    "relecture": ROLE_REVIEW,
+    "review": ROLE_REVIEW,
+    "reviewer": ROLE_REVIEW,
+    "qa": ROLE_REVIEW,
+    "auditeur": ROLE_AUDIT,
+    "auditor": ROLE_AUDIT,
+    "audit": ROLE_AUDIT,
+    "implementation": ROLE_BUILD,
+    "implémentation": ROLE_BUILD,
+    "build": ROLE_BUILD,
+    "composition": ROLE_BUILD,
+    "composeur": ROLE_BUILD,
+    "documentation": ROLE_DOCS,
+    "docs": ROLE_DOCS,
+    "release-notes": ROLE_DOCS,
+    "github-watch": ROLE_WATCH,
+    "veille": ROLE_WATCH,
+    "watch": ROLE_WATCH,
+    "other": ROLE_OTHER,
+}
+
+
+def role_of(roles) -> str:
+    """La classe de politique du **premier** rôle déclaré au canon.
+
+    Le canon ordonne les rôles d'une fiche (``[implementation, relecture]``,
+    ``[orchestrateur, conception]``) : le premier est le rôle principal, et
+    c'est celui que le profil date. Une fiche sans rôle, ou dont aucun rôle
+    n'est reconnu, vaut ``other`` — le profil ne devine pas (§3.6). Un rôle
+    déjà nommé dans le vocabulaire du contrat est accepté tel quel.
+    """
+    if isinstance(roles, str):
+        roles = [roles]
+    if isinstance(roles, (set, frozenset)):
+        # un ensemble n'a pas d'ordre : le tri rend le profil reproductible
+        roles = sorted(roles, key=lambda item: str(item))
+    if not isinstance(roles, (list, tuple)):
+        return ROLE_OTHER
+    for role in roles:
+        name = str(role or "").strip().lower()
+        if not name:
+            continue
+        if name in ROLES:
+            return name
+        # Le premier rôle **déclaré** est le principal : s'il n'appartient
+        # pas au vocabulaire du contrat, le profil ne saute pas au suivant
+        # pour se fabriquer une politique.
+        return ROLE_BY_CANON.get(name, ROLE_OTHER)
+    return ROLE_OTHER
 
 
 def _name(value) -> str | None:
@@ -283,6 +362,111 @@ def advance(previous: Window | None, observed: Window) -> Window:
     if observed.window_tokens is not None or previous.window_tokens is None:
         return observed
     return replace(previous, model_quality=observed.model_quality)
+
+
+def _window_dict(observed) -> dict:
+    """La forme dict d'une fenêtre observée, quelle que soit son origine."""
+    if isinstance(observed, Window):
+        return observed.to_dict()
+    if isinstance(observed, Mapping):
+        return dict(observed)
+    return {}
+
+
+def _reason_list(value) -> list[str]:
+    """Les raisons non vides d'un profil, dans leur ordre."""
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    return [str(item).strip() for item in value if str(item or "").strip()]
+
+
+def publish(observed: Window | Mapping | None = None, *,
+            requested_model: str | None = None,
+            harness: str | None = None,
+            harness_version: str | None = None,
+            mode: str | None = None,
+            roles=None, role: str | None = None) -> dict:
+    """La section ``profile`` publiée dans ``turn.context`` (contrat §3.1).
+
+    ``observed`` est la fenêtre runtime du tour — :class:`Window` pour un tour
+    non résident, le dict déjà publié par un driver résident — ou ``None``.
+    ``requested_model`` est le modèle **demandé** au lancement : sans annonce
+    du harnais, il remplit ``model_effective`` avec la qualité ``requested``,
+    jamais ``measured`` (§3.1) ; il ne donne jamais de fenêtre. Une fenêtre
+    ``None`` reste ``None`` avec ``window_unknown`` : jamais la fenêtre d'un
+    modèle auxiliaire ou précédent (R1, §3.3).
+
+    ``harness_version`` vient de ``harness_versions.probe``, enregistrée par
+    hôte ; illisible elle reste ``None`` avec ``version_unknown`` dans
+    ``version_reasons``. ``role`` explicite prime, sinon le premier rôle de
+    ``roles`` est mappé par :func:`role_of`. Une valeur inconnue ne devient
+    jamais une supposition. ``reasons`` ne porte que les absences du modèle et
+    de la fenêtre : un consommateur les attache à ``W``.
+    """
+    raw = _window_dict(observed)
+    reasons = _reason_list(raw.get("reasons"))
+
+    model = _name(raw.get("model_effective"))
+    model_quality = raw.get("model_quality")
+    if model_quality not in MODEL_QUALITIES:
+        model_quality = MEASURED if model is not None else UNKNOWN
+    if model is None:
+        requested = _name(requested_model)
+        if requested is not None:
+            # Le registre/lancement est une entrée, pas une annonce runtime :
+            # la qualité le dit, et aucune fenêtre n'en est déduite.
+            model, model_quality = requested, "requested"
+        else:
+            model_quality = UNKNOWN
+            reasons.append(REASON_MODEL_UNKNOWN)
+
+    window = _positive(raw.get("window_tokens"))
+    if window is None:
+        window_quality = UNKNOWN
+        window_source = None
+        reasons.append(REASON_WINDOW_UNKNOWN)
+    else:
+        window_quality = raw.get("window_quality")
+        if window_quality not in (MEASURED, DERIVED, FALLBACK, PARTIAL, UNKNOWN):
+            window_quality = MEASURED
+        window_source = _name(raw.get("window_source"))
+
+    version = _name(harness_version)
+    # `reasons` reste réservé au modèle et à la fenêtre (le consommateur
+    # `ameesh-context-corpus/1` les attache à `W`) ; les absences du harnais
+    # ont leurs propres listes, pour ne pas salir la provenance de `W`.
+    version_reasons = [] if version is not None else [REASON_VERSION_UNKNOWN]
+    mode_value = _name(mode) or _name(raw.get("mode"))
+    mode_reasons = [] if mode_value is not None else [REASON_MODE_UNKNOWN]
+    explicit_role = _name(role)
+    if explicit_role is not None:
+        explicit_role = explicit_role.lower()
+        role_value = explicit_role if explicit_role in ROLES \
+            else ROLE_BY_CANON.get(explicit_role, ROLE_OTHER)
+    else:
+        role_value = role_of(roles)
+
+    auxiliary = raw.get("auxiliary_models")
+    auxiliary_models = [str(name) for name in auxiliary if _name(name)] \
+        if isinstance(auxiliary, (list, tuple, set, frozenset)) else []
+
+    return {
+        "schema": SCHEMA,
+        "model_effective": model,
+        "model_quality": model_quality,
+        "harness": _name(harness) or _name(raw.get("harness")),
+        "harness_version": version,
+        "harness_version_quality": MEASURED if version is not None else UNKNOWN,
+        "version_reasons": version_reasons,
+        "mode": mode_value,
+        "mode_reasons": mode_reasons,
+        "role": role_value,
+        "window_tokens": window,
+        "window_quality": window_quality,
+        "window_source": window_source,
+        "reasons": list(dict.fromkeys(reasons)),
+        "auxiliary_models": auxiliary_models,
+    }
 
 
 def compaction(event: Mapping | None) -> Compaction:

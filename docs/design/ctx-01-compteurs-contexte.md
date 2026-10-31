@@ -223,8 +223,9 @@ Un profil est la combinaison explicite :
 * `mode` ∈ {`non-résident`, `résident`}. Le champ `mode` du registre
   (`execute`/`externe`) est un autre concept : il ne remplace pas celui-ci.
 * `rôle` est une classe de politique, pas une identité d'agent : `pilot`,
-  `review`, `build`, `docs`, `watch`, `other`. Le rôle effectif vient du canon
-  et de la fiche de l'agent ; le profil ne le devine pas.
+  `review`, `audit`, `build`, `docs`, `watch`, `other` (la table §3.6 nomme
+  `audit`). Le rôle effectif vient du canon et de la fiche de l'agent ; le
+  profil ne le devine pas.
 * `compte` et `mode_de_compte` (`subscription`/`api-key`) font partie de
   l'identité pour le cache et le coût ; ils ne changent pas la fenêtre du
   modèle, mais leur changement invalide la lecture de `Cost` et des caches.
@@ -239,7 +240,10 @@ sans ambiguïté ; sinon `model_effectif=null`, `window=null`.
 **Version du harnais** : version du binaire lue par
 `harness_versions.probe` (`<binaire> --version`), enregistrée par hôte. La
 version du descripteur (`1.0.0`, schéma 1) n'est pas la version du binaire et
-ne doit pas la remplacer. Version illisible : `null` + `version_unknown`.
+ne doit pas la remplacer. Version illisible : `null` +
+`version_unknown` dans `version_reasons` ; les `reasons` du profil restent
+réservés au modèle et à `W`, pour que le corpus ne les attache pas à la
+fenêtre.
 
 ### 3.2 Priorité et traçabilité des overrides
 
@@ -355,6 +359,17 @@ réutiliser les valeurs d'un autre rôle.
 Le profil **complet** est le croisement d'une ligne 3.5 et d'un rôle 3.6. Une
 valeur observée pour `pilot` ne vaut pas pour `review` ; une valeur observée en
 non-résident ne vaut pas en résident.
+
+**Rôle publié.** `turn.context.profile.role` porte la classe de politique,
+jamais le nom de la fiche : le **premier** rôle déclaré dans `roles:` du canon
+est le rôle principal, et les synonymes sont ramenés à cette classe
+(`orchestrateur` → `pilot`, `relecture`/`qa` → `review`, `auditeur` → `audit`,
+`implementation`/`composition` → `build`, `documentation`/`release-notes` →
+`docs`, `github-watch`/`veille` → `watch`, le reste → `other`). Le mappage est
+déterministe et versionné avec le code (`context_profile.ROLE_BY_CANON`) ; un
+premier rôle hors vocabulaire, une fiche sans rôle ou un rôle illisible ne
+devient jamais une supposition : il vaut `other` (le profil ne saute pas au
+rôle suivant pour se fabriquer une politique).
 
 ---
 

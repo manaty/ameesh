@@ -896,6 +896,11 @@ class ClaudeStream(StreamReader):
                 out["cost"] = float(event["total_cost_usd"])
             if isinstance(event.get("usage"), dict):
                 out["usage"] = event["usage"]  # rotation de session (0018)
+            if principal and isinstance(event.get("modelUsage"), dict):
+                # CTX-03b : métadonnée runtime du modèle principal (fenêtre
+                # `contextWindow`, R1) ; un `result` de sous-agent n'annonce
+                # jamais la fenêtre du fil principal.
+                out["model_usage"] = event["modelUsage"]
             if event.get("session_id") and principal:
                 out["session"] = event["session_id"]
             if event.get("is_error"):

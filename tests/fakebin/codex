@@ -43,7 +43,12 @@ def main() -> int:
     thread = "codex-thread-1"
     if "resume" in args:
         thread = args[args.index("resume") + 1]
-    print(json.dumps({"type": "thread.started", "thread_id": thread}), flush=True)
+    demarrage = {"type": "thread.started", "thread_id": thread}
+    # CTX-03b : le vrai `codex exec --json` n'annonce pas son modèle ; ce
+    # réglage de banc permet de témoigner du cas où un harnais le fait.
+    if os.environ.get("AMEESH_TEST_CODEX_MODEL"):
+        demarrage["model"] = os.environ["AMEESH_TEST_CODEX_MODEL"]
+    print(json.dumps(demarrage), flush=True)
     # #3779 : un tour refusé par le fournisseur (429), comme le vrai CLI.
     failed = os.environ.get("AMEESH_TEST_TURN_FAILED")
     if failed:
