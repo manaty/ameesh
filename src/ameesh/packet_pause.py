@@ -16,11 +16,15 @@ newest event of that object is the state:
 * ``{"state": "resumed", "by": …}``
 
 A pause always has a deadline (at most `MAX_S` ahead): at `until`, the tick
-resumes by itself, with no gesture. The timer stays active, so
+resumes by itself, unless `await_announcement` is true (#5045): then the
+deadline alerts the pilot and only a sourced `resume` lifts the pause. The
+latest state (including a resume) is retained even beyond log retention.
+The timer stays active, so
 `role timers --check` stays green and names the pause as a warning.
 """
 from __future__ import annotations
 
+import math
 import time
 
 from . import storage
@@ -28,7 +32,7 @@ from . import storage
 EVENT = "packet.pause"
 #: a pause is a staging window, not a freeze: 12 h at most, renewable
 MAX_S = 12 * 3600
-#: the log reads recent events only (`recent_type`, retention index)
+#: history/SLO windows are bounded; the latest state has no age cutoff (#5045)
 LOOKBACK_DAYS = 2
 #: `data` stays short (events.py: identifiers and states)
 REASON_MAX = 200
@@ -47,8 +51,8 @@ def _events(db):
 
 
 def pause(db, *, project: str, target: str, until: float, reason: str, by: str,
-          now: float | None = None) -> dict:
-    """Records a pause until `until` (epoch); the recorded data."""
+          now: float | None = None, await_announcement: bool = False) -> dict:
+    """Records a pause with deadline `until` (epoch); optionally await announcement."""
     now = time.time() if now is None else float(now)
     reason = " ".join(str(reason or "").split())
     if not reason:
@@ -58,29 +62,44 @@ def pause(db, *, project: str, target: str, until: float, reason: str, by: str,
     if until is None:
         raise PauseError("a pause needs a deadline (--until)")
     until = float(until)
-    if until <= now:
+    if not math.isfinite(until) or until <= now:
         raise PauseError("deadline already past")
     if until - now > MAX_S:
         raise PauseError("deadline more than %d h ahead" % (MAX_S // 3600))
+    before = latest(db, project=project, target=target)
+    if (before and before.get("state") == "paused" and before.get("await_announcement")
+            and not await_announcement):
+        raise PauseError("announcement still required: resume --source before an ordinary pause")
     data = {"state": "paused", "until": int(until), "reason": reason, "by": by,
             "target": target}
+    if await_announcement:
+        data["await_announcement"] = True
     data["event"] = _events(db).record(EVENT, key(project, target), project, data)
     return data
 
 
-def resume(db, *, project: str, target: str, by: str) -> dict:
+def resume(db, *, project: str, target: str, by: str, source: str = "") -> dict:
     """Records the end of the pause (a no-op state if none was active)."""
+    before = latest(db, project=project, target=target)
+    source = " ".join(str(source or "").split())
+    if len(source) > REASON_MAX:
+        raise PauseError("announcement source longer than 200 characters")
+    if before and before.get("state") == "paused" and before.get("await_announcement"):
+        if not source:
+            raise PauseError("announcement source required (author, date, message; --source)")
     data = {"state": "resumed", "by": by, "target": target}
+    if source:
+        data["source"] = source
     data["event"] = _events(db).record(EVENT, key(project, target), project, data)
     return data
 
 
 def latest(db, *, project: str, target: str) -> dict | None:
-    rows = _events(db).recent_type(EVENT, LOOKBACK_DAYS, 1, object=key(project, target))
+    rows = _events(db).recent_type(EVENT, None, 1, object=key(project, target))
     for row in rows or ():
         data = row.get("data") if isinstance(row, dict) else None
         if isinstance(data, dict):
-            return data
+            return dict(data, event=row["id"])
     return None
 
 
@@ -93,17 +112,43 @@ def active_of(data: dict | None, now: float | None = None) -> dict | None:
         until = float(data.get("until"))
     except (TypeError, ValueError):
         return None
-    return data if until > now else None
+    return data if until > now or data.get("await_announcement") else None
 
 
 def active(db, *, project: str, target: str, now: float | None = None) -> dict | None:
     return active_of(latest(db, project=project, target=target), now)
 
 
+def alert_due(db, data: dict | None, *, project: str, target: str,
+              recipients, now: float | None = None) -> None:
+    """#5045: deadline of an announcement pause alerts, never resumes.
+
+    One mail per pause and recipient, including across a composer lease move.
+    A failed delivery is retried at the next tick with the same key.
+    """
+    from . import mail, work
+    now = time.time() if now is None else float(now)
+    if not active_of(data, now) or not data.get("await_announcement"):
+        return
+    if float(data["until"]) > now:
+        return
+    body = ("Paquet horaire %s/%s : échéance de pause atteinte. "
+            "Annonce explicite toujours attendue ; aucun geste de composition. "
+            "Motif : %s. Publier la fin de fenêtre puis lever avec "
+            "paquet-horaire.py resume --source (auteur, date, message)."
+            % (project, target, data.get("reason") or "?"))
+    for recipient in dict.fromkeys(recipients):
+        mail.send(db, work.SYSTEM_SENDER, recipient, body, kind="request",
+                  idempotency_key="packet-pause-%s-%s" % (data["event"], recipient))
+
+
 def describe(data: dict, zone=None) -> str:
     """« en pause jusqu'à HH:MM (raison) », in `zone` (canon) or UTC."""
     from datetime import datetime, timezone
     when = datetime.fromtimestamp(float(data["until"]), zone or timezone.utc)
+    if data.get("await_announcement"):
+        return "en pause jusqu’à annonce explicite (alerte à %s ; %s, par %s)" % (
+            when.strftime("%Y-%m-%d %H:%M %Z"), data.get("reason") or "?", data.get("by") or "?")
     return "en pause jusqu'à %s (%s, par %s)" % (
         when.strftime("%Y-%m-%d %H:%M %Z"), data.get("reason") or "?", data.get("by") or "?")
 

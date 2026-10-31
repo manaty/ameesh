@@ -9,6 +9,12 @@ from .. import interface
 _COLUMNS = ("id, type, object, project, data,"
             " extract(epoch from created_at)::float8 as ts")
 
+# #5045: retain the latest pause state, including a resume tombstone.
+_DISPOSABLE = ("not (e.type = 'packet.pause' and not exists ("
+               "select 1 from ameesh_events newer where newer.type = e.type"
+               " and newer.object = e.object and newer.id > e.id))")
+
+
 
 def _position(text) -> tuple:
     """A "<tx>:<id>" watermark as a position; (0, 0) when there is none."""
@@ -32,13 +38,16 @@ class Events(interface.Events):
 
     def recent_type(self, type, days, limit, object=None) -> list:
         # #3981 : la preuve de staging vit dans le journal partagé. La borne
-        # `created_at` garde la lecture sur l'index de rétention (l'index
-        # partiel type/objet demanderait une migration) : la preuve de staging
-        # n'a de sens que récente, et la bornure est dite à l'appelant.
-        sql = ("select " + _COLUMNS + " from ameesh_events"
-               " where type = %s"
-               "   and created_at > now() - make_interval(days => %s::int)")
-        params = [type, int(days)]
+        # `created_at` garde la lecture sur l'index de rétention ;
+        # la preuve de staging n'a de sens que récente. La lecture d'un état
+        # durable exact utilise l'index type/objet/id (#5045, migration 0528).
+        if days is None and object is None:
+            raise ValueError("an unbounded event read requires an exact object")
+        sql = "select " + _COLUMNS + " from ameesh_events where type = %s"
+        params = [type]
+        if days is not None:
+            sql += " and created_at > now() - make_interval(days => %s::int)"
+            params.append(int(days))
         if object is not None:
             sql += " and object = %s"
             params.append(object)
@@ -125,8 +134,8 @@ class Events(interface.Events):
         # `now()` (the database's clock) is the clock of the table's own
         # guard: a host ahead of the base cannot have its deletion refused
         return int(self.db.query(
-            "select count(*) as n from ameesh_events"
-            " where created_at < now() - make_interval(days => %s::int)",
+            "select count(*) as n from ameesh_events e"
+            " where created_at < now() - make_interval(days => %s::int) and " + _DISPOSABLE,
             (int(days),))[0]["n"])
 
     def prune(self, days, limit, timeout_s=None) -> int:
@@ -146,8 +155,9 @@ class Events(interface.Events):
                          " set_config('statement_timeout', %s, true)", (ms, ms))
             gone = tx.query(
                 "delete from ameesh_events where id in ("
-                " select id from ameesh_events"
+                " select id from ameesh_events e"
                 " where created_at < now() - make_interval(days => %s::int)"
+                " and " + _DISPOSABLE +
                 " order by created_at, id limit %s for update) returning tx::text as tx, id",
                 (int(days), int(limit)))
             if gone:
