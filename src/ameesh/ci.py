@@ -11,7 +11,9 @@
 verdicts requis et la composition de la PR, puis pose sur elle l'étiquette
 `ci-lot-<40hex>` / `ci-full-<40hex>` qui déclenche `tests.yml`
 (`pull_request` `types: [labeled]`) sur la tête gelée ; `ci cancel` annule les
-runs périmés d'un lot.
+runs périmés d'un lot. For repositories without the label trigger, `--full`
+uses the declared/discovered suites and the repository's own dispatch planner
+(#5145), with `expected_sha` pinned to the requested head.
 
 #2333 (canon §11 bis, décision owner 18/10/2026 « tout passe par paquet ») :
 `ci run` en mode lot (`ci-lot-<sha>`) est refusé entre deux paquets, sauf
@@ -2785,21 +2787,26 @@ def label_name(mode: str, sha: str) -> str:
 
 
 def repo_of(cfg, item: dict, *, repo: str = "") -> str:
-    """`owner/repo` du lot : `--repo`, son `issue_ref`, sinon `github.projects`."""
+    """Explicit owner/name, otherwise the calling clone's origin (#5145)."""
     from . import plan_github
-    if repo.strip():
-        return repo.strip()
-    parts = plan_github._ref_parts(item.get("issue_ref"))
-    if parts and parts[0]:
-        return parts[0]
+    value = repo.strip()
+    return _local_repo() if value in ("", ".") else plan_github.check_repo(value)
+
+
+def _local_repo() -> str:
+    """Resolve origin before constructing an API path; never send repos/./… ."""
+    import subprocess
+    from . import plan_github
     try:
-        found = plan_github.settings_of(cfg).repo_for(item.get("app"))
-    except plan_github.SettingsError as exc:
-        raise GelError(str(exc)) from exc
-    if found:
-        return found
-    raise GelError("lot #%s: no issue_ref and no github.projects entry for %r: "
-                   "pass --repo owner/name" % (item.get("id"), item.get("app")))
+        result = subprocess.run(["git", "remote", "get-url", "origin"],
+                                capture_output=True, text=True, timeout=10)
+        match = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$",
+                          result.stdout.strip()) if result.returncode == 0 else None
+        if match:
+            return plan_github.check_repo(match.group(1))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    raise GelError("cannot resolve origin to a GitHub owner/name; pass --repo owner/name")
 
 
 def frozen_of(db, item_id: int) -> dict | None:
@@ -2861,7 +2868,7 @@ def _head_of(api, repo: str, branch: str) -> str:
 
 
 def _runs_of(api, repo: str, *, sha: str = "", branch: str = "",
-             event: str = "") -> list[dict]:
+             event: str = "", workflows=WORKFLOWS) -> list[dict]:
     query = "per_page=50"
     if sha:
         query += "&head_sha=%s" % _q(sha)
@@ -2869,8 +2876,187 @@ def _runs_of(api, repo: str, *, sha: str = "", branch: str = "",
         query += "&branch=%s" % _q(branch)
     if event:
         query += "&event=%s" % _q(event)
-    data = api("repos/%s/actions/workflows/tests.yml/runs?%s" % (repo, query)) or {}
-    return list(data.get("workflow_runs") or ())
+    rows = []
+    for workflow in workflows:
+        data = api("repos/%s/actions/workflows/%s/runs?%s"
+                   % (repo, _q(workflow), query)) or {}
+        rows.extend(dict(row, path=row.get("path") or ".github/workflows/" + workflow)
+                    for row in data.get("workflow_runs") or ())
+    return rows
+
+
+def _dispatch_plan(db, cfg, item, api, repo, branch, sha) -> dict:
+    """Use declared/discovered suites and the repository's own due-parts plan.
+
+    No project-specific workflow list lives here. A repository that provides
+    dispatch-due-parts.mjs owns its selection and additional dispatch inputs;
+    otherwise every declared/discovered suite is due.
+    """
+    import base64
+    from . import canon, plan_github
+    declared = plan_github.settings_of(cfg).workflows_for(repo)
+    watcher = Watcher(cfg, api=api)
+    found = watcher.discovered_workflows(repo)
+    if found is None:
+        raise GelError("cannot discover registered CI workflows in %s" % repo)
+    workflows = declared if declared is not None else tuple(w for w in found if SUITE_RE.search(w))
+    if not workflows:
+        raise GelError("no suite workflow declared or discovered in %s" % repo)
+    missing = set(workflows) - set(found)
+    if missing:
+        raise GelError("CI workflow(s) not registered: " + ", ".join(sorted(missing)))
+    selected = _repository_dispatch_plan(db, cfg, item, api, repo, branch, sha)
+    if selected is None:
+        selected = {workflow: {"expected_sha": sha} for workflow in workflows}
+    if not selected:
+        raise GelError("the repository CI planner selected no suite workflows")
+    if set(selected) - set(workflows):
+        raise GelError("repository CI planner selected workflows outside the declared/discovered suites: "
+                       + ", ".join(sorted(set(selected) - set(workflows))))
+    for workflow, inputs in selected.items():
+        data = api("repos/%s/contents/.github/workflows/%s?ref=%s"
+                   % (repo, _q(workflow), sha)) or {}
+        try:
+            doc = canon.load_yaml(base64.b64decode(data.get("content") or "").decode())
+            triggers = doc.get("on", doc.get(True, {}))
+            dispatch = triggers["workflow_dispatch"] or {}
+            spec = dispatch.get("inputs") or {}
+            if "expected_sha" not in spec or inputs.get("expected_sha") != sha:
+                raise ValueError("expected_sha input missing or differs from frozen head")
+            for name, entry in spec.items():
+                if entry.get("required") and name not in inputs and "default" not in entry:
+                    raise ValueError("required input %s missing from repository plan" % name)
+            if set(inputs) - set(spec):
+                raise ValueError("repository planner supplied undeclared inputs")
+        except (ValueError, TypeError, KeyError, AttributeError, canon.YamlError) as exc:
+            raise GelError("workflow %s cannot dispatch the frozen head: %s" % (workflow, exc)) from exc
+    return selected
+
+
+def _repository_dispatch_plan(db, cfg, item, api, repo, branch, sha):
+    """Read the planner at the frozen tree, then run only its dry-run path.
+
+    Mirrors nexlink_release.ci_plan: a detached worktree prevents the caller's
+    checkout from substituting a planner. Absence permits generic suites;
+    presence with an unreadable/invalid plan fails before any dispatch.
+    """
+    import json
+    import subprocess
+    from . import plan_github, prevalidation_calls, release_cutoff as rc
+    script = "scripts/ci/dispatch-due-parts.mjs"
+    try:
+        data = api("repos/%s/contents/%s?ref=%s" % (repo, script, sha)) or {}
+    except plan_github.GithubError as exc:
+        if "404" not in str(exc):
+            raise
+        return None
+    if not data.get("content"):
+        return None
+    local = prevalidation_calls.repository(cfg, db, item, sha)
+    if not local:
+        raise GelError("repository CI planner needs a local clone containing %s" % sha)
+    folder = path = None
+    try:
+        folder, path = rc._worktree(local, sha)
+        # The script fetches origin/develop and verifies the integration tip;
+        # its JSON argv is generated by dispatchArgv, including SQL anchors.
+        proc = subprocess.run(["node", script, branch, sha, "--dry-run"], cwd=path,
+                              capture_output=True, text=True, timeout=60)
+        if proc.returncode:
+            raise GelError("repository CI planner refused: " + proc.stderr[-500:])
+        report = json.loads(proc.stdout)
+        if (report.get("schema") != "nexlink-dispatch-due-parts/1"
+                or report.get("ref") != branch or report.get("head") != sha
+                or report.get("dryRun") is not True or report.get("failures")):
+            raise GelError("repository CI planner returned an invalid dispatch plan")
+        selected = {}
+        for entry in report["argv"]:
+            argv = entry["argv"]
+            if (len(argv) < 7 or argv[:2] != ["workflow", "run"]
+                    or argv[3:5] != ["--ref", branch]
+                    or not re.fullmatch(r"[A-Za-z0-9_-]+\.ya?ml", argv[2])):
+                raise GelError("repository planner returned invalid workflow arguments")
+            inputs = {}
+            for index in range(5, len(argv), 2):
+                if argv[index] != "-f" or index + 1 >= len(argv):
+                    raise GelError("repository planner returned invalid dispatch inputs")
+                name, value = argv[index + 1].split("=", 1)
+                if name in inputs:
+                    raise GelError("repository planner repeated an input")
+                inputs[name] = value
+            if argv[2] in selected:
+                raise GelError("repository planner repeated a workflow")
+            selected[argv[2]] = inputs
+        if set(selected) != {part["workflow"] for part in report["parts"]}:
+            raise GelError("repository planner's parts and dispatch arguments differ")
+        return selected
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, rc.ReleaseError) as exc:
+        raise GelError("repository CI dispatch plan unavailable: %s" % exc) from exc
+    finally:
+        if folder is not None:
+            rc._drop_worktree(local, folder, path)
+
+
+def _dispatch_request_runs(db, item_id, api, decision):
+    """A full dispatch is green only when every selected workflow succeeded.
+
+    Dispatch titles don't encode the PR base. Only an applied request of this
+    composition correlates runs after its watermark; foreign completed runs
+    never prove this request green. Live foreign runs still prevent duplicates.
+    """
+    rows = _runs_of(api, decision["repo"], sha=decision["sha"],
+                    branch=decision["branch"], event="workflow_dispatch",
+                    workflows=tuple(decision["dispatch"]))
+    marks = [m for m in request_events(db, item_id)
+             if m["state"] == "applied" and m["sha"] == decision["sha"]
+             and m["base"] == decision["base"] and m["mode"] == "full"]
+    mark = marks[-1] if marks else None
+    correlated = [r for r in rows if mark and _run_id(r) > (mark.get("seen") or 0)]
+    latest = {}
+    for row in correlated:
+        workflow = workflow_of(row.get("path"))
+        if workflow not in latest or _run_id(row) > _run_id(latest[workflow]):
+            latest[workflow] = row
+    live = [r for r in rows if r.get("status") in OPEN_STATUSES]
+    if not latest:
+        carried = [{"row": row, "id": _run_id(row), "mode": "full",
+                    "status": row.get("status") or "", "conclusion": row.get("conclusion") or ""}
+                   for row in rows]
+        return [], carried
+    complete = set(latest) == set(decision["dispatch"])
+    green = complete and all(r.get("status") == "completed" and r.get("conclusion") == "success"
+                             for r in latest.values())
+    status = "in_progress" if live else "completed"
+    conclusion = "success" if green else ("" if live else "failure")
+    row = dict(max(rows, key=_run_id), status=status, conclusion=conclusion)
+    return [{"row": row, "id": _run_id(row), "number": decision["pr"],
+             "sha": decision["sha"], "base": decision["base"], "mode": "full",
+             "status": status, "conclusion": conclusion}], []
+
+
+def _pose_dispatch(gh, decision, *, api):
+    """Same client/token as labels; stop on ambiguous failure, keep the intent."""
+    from . import plan_github
+    accepted = []
+    for workflow, inputs in decision["dispatch"].items():
+        payload = {"ref": decision["branch"], "inputs": inputs}
+        try:
+            if _head_of(api, decision["repo"], decision["branch"]) != decision["sha"]:
+                return {"requested": False, "action": "refuse",
+                        "why": "branch moved before dispatch; accepted workflows: " + ", ".join(accepted)}
+            code, out, err = gh.run(["api", "-X", "POST",
+                                    "repos/%s/actions/workflows/%s/dispatches"
+                                    % (decision["repo"], _q(workflow)), "--input", "-"],
+                                   json.dumps(payload))
+        except (plan_github.GithubError, OSError) as exc:
+            code, out, err = 1, "", str(exc)
+        if code:
+            return {"requested": False, "action": "refuse",
+                    "why": "dispatch %s failed or is ambiguous (%s); accepted: %s; "
+                           "intent retained, inspect runs before --force"
+                           % (workflow, _gh_error(out, err), ", ".join(accepted) or "none")}
+        accepted.append(workflow)
+    return {"requested": True, "action": "request", "run": {}, "warnings": []}
 
 
 def _packet_runs(api, repo: str, branch: str, sha: str) -> list[dict]:
@@ -3027,8 +3213,14 @@ def _carries_freeze_request(api, repo: str, sha: str) -> bool:
     explicite : refusionner la branche sur main avant de demander la CI.
     """
     import base64
-    data = api("repos/%s/contents/.github/workflows/tests.yml?ref=%s"
-               % (repo, _q(sha))) or {}
+    from . import plan_github
+    try:
+        data = api("repos/%s/contents/.github/workflows/tests.yml?ref=%s"
+                   % (repo, _q(sha))) or {}
+    except plan_github.GithubError as exc:
+        if "404" not in str(exc):
+            raise
+        return False
     content = (data.get("content") or "").replace("\n", "")
     if not content:
         return False
@@ -3317,7 +3509,19 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                        % (pr["number"], pr["head_ref"] or "—", pr["base_ref"] or "—"))
     base = pr["base"]
     label = label_name(mode, frozen_sha)
-    runs, carried = _pr_request_runs(api, name, pr["number"], frozen_sha, branch)
+    dispatch = None
+    if full:
+        from . import plan_github
+        declared = plan_github.settings_of(cfg).workflows_for(name)
+        if (declared is not None and WORKFLOWS[0] not in declared
+                or not _carries_freeze_request(api, name, frozen_sha)):
+            dispatch = _dispatch_plan(db, cfg, item, api, name, branch, frozen_sha)
+    dispatch_decision = {"repo": name, "sha": frozen_sha, "base": base,
+                         "branch": branch, "pr": pr["number"], "mode": mode,
+                         "dispatch": dispatch}
+    runs, carried = (_dispatch_request_runs(db, item_id, api, dispatch_decision)
+                     if dispatch is not None else
+                     _pr_request_runs(api, name, pr["number"], frozen_sha, branch))
     #: P1 R1 : la composition compte — même tête mais autre base, ou mode
     #: insuffisant (`lot` ne prouve pas le `full`), ne verdit pas.
     applicable = [r for r in runs if r["base"] == base and _covers(r["mode"], mode)]
@@ -3327,7 +3531,10 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
     decision = {"schema": GEL_SCHEMA, "work_item": int(item_id), "repo": name,
                 "branch": branch, "target": target, "sha": frozen_sha, "base": base,
                 "head_ref": pr["head_ref"], "base_ref": pr["base_ref"],
-                "mode": mode, "label": label, "path": "pr-label", "pr": pr["number"],
+                "mode": mode, "label": label,
+                "path": "workflow-dispatch" if dispatch is not None else "pr-label",
+                **({"dispatch": dispatch} if dispatch is not None else {}),
+                "pr": pr["number"],
                 "exception": exception, "reason": reason.strip(), "avis": avis,
                 "verdicts": sorted((m.get("actor") or "") for m in reviews),
                 "frozen": bool(freeze), "runs": len(runs),
@@ -3348,7 +3555,7 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
         #: le vert applicable ne suffit pas si le dernier check requis de la
         #: tête est rouge (une étiquette étrangère a pu le laisser ainsi) : la
         #: reprise est alors explicite (`--force`), jamais automatique.
-        check = _latest_check(api, name, frozen_sha)
+        check = None if dispatch is not None else _latest_check(api, name, frozen_sha)
         if check is None or (check["status"] == "completed"
                              and check["conclusion"] in CHECK_GREEN):
             return {**decision, "action": "green",
@@ -3410,7 +3617,7 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                                "resumption)"
                                % (item_id, pr["number"], frozen_sha[:12],
                                   carried[0]["id"], carried[0]["mode"]))
-    if not _carries_freeze_request(api, name, frozen_sha):
+    if dispatch is None and not _carries_freeze_request(api, name, frozen_sha):
         raise GelError("the workflow at %s does not carry the freeze request trigger "
                        "with a pinned target base (#1343/#2328, ci-lot/ci-full label): "
                        "rebase the lot on main before "
@@ -3423,7 +3630,7 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
 
 
 def cancel_plan(db, cfg, item_id: int, *, api, all_runs: bool = False,
-                repo: str = "", number: int = 0, base: str = "") -> dict:
+                repo: str = "", number: int = 0, base: str = "", workflows=WORKFLOWS) -> dict:
     """Les runs d'un lot à annuler : non conclues, hors de la composition gardée.
 
     `all_runs` annule aussi le run du SHA gelé (geste explicite). Un lot non
@@ -3441,7 +3648,7 @@ def cancel_plan(db, cfg, item_id: int, *, api, all_runs: bool = False,
         raise GelError("lot #%s has no branch: nothing to cancel" % item_id)
     freeze = frozen_of(db, item_id)
     frozen = ((freeze or {}).get("sha") or "").strip().lower()
-    rows = [r for r in _runs_of(api, name, branch=branch)
+    rows = [r for r in _runs_of(api, name, branch=branch, workflows=workflows)
             if (r.get("status") or "").strip().lower() in OPEN_STATUSES]
     if frozen and not all_runs:
         rows = [r for r in rows if not _current_run(r, frozen, number, base)]
@@ -3652,8 +3859,10 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
                                     avis=int(decision.get("avis") or 0), seen=seen))
 
         note("reserve", "freeze CI requested")
-        known, carried = _pr_request_runs(api, decision["repo"], number, sha,
-                                          decision["branch"])
+        known, carried = (_dispatch_request_runs(tx, item_id, api, decision)
+                          if decision.get("dispatch") is not None else
+                          _pr_request_runs(api, decision["repo"], number, sha,
+                                           decision["branch"]))
         #: P2-3 : le plus grand identifiant d'exécution déjà connu avant la pose
         #: est la marque de l'instant ; le run de cette demande, créé après,
         #: portera un identifiant supérieur. La marque `applied` l'enregistre
@@ -3675,7 +3884,8 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
             #: avis delta R1 : la phase critique refait la même décision que `gel_plan`
             #: — un vert applicable ne suffit pas si le dernier check requis
             #: est rouge ; `--force` répare, sans lui rien ne part.
-            check = _latest_check(api, decision["repo"], sha)
+            check = (None if decision.get("dispatch") is not None else
+                     _latest_check(api, decision["repo"], sha))
             if check is None or (check["status"] == "completed"
                                  and check["conclusion"] in CHECK_GREEN):
                 return {"requested": False, "action": "green",
@@ -3756,7 +3966,8 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
         # #2876 : le push peut avoir lancé le portier avant la création de
         # la PR. Son workflow_call ne porte pas le check requis de cette PR.
         # Le remplacer avant labeled, après toutes les gardes et sous verrou.
-        if mode == "full" and pr["head_ref"].startswith("integration/"):
+        if (decision.get("dispatch") is None and mode == "full"
+                and pr["head_ref"].startswith("integration/")):
             for row in _packet_runs(api, decision["repo"], decision["branch"], sha):
                 messages = []
                 failed = _cancel_runs(gh, decision["repo"], [_short_run(row)],
@@ -3766,6 +3977,14 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
                 if failed:
                     note("released", text)
                     return {"requested": False, "action": "refuse", "why": text}
+        if decision.get("dispatch") is not None:
+            # Keep the request mark on an ambiguous API outcome; do not resend.
+            note("applied", "workflow dispatch intent: " +
+                 ", ".join(decision["dispatch"]), seen=watermark)
+            result = _pose_dispatch(gh, decision, api=api)
+            work.note(tx, int(item_id), "CI workflow dispatch outcome: " +
+                      (result.get("why") or "all selected workflows accepted"))
+            return result
         posed = _pose_request(gh, decision["repo"], pr, label, mode)
         if not posed["ok"]:
             note("released", posed["error"])
@@ -4001,7 +4220,9 @@ def cmd_ci_run(cfg, args) -> int:
         packet_guard.declare(db, args.id, decision["exception"], decision["reason"],
                              decision["sha"], actor=getattr(args, "actor", "") or "")
     stale = cancel_plan(db, cfg, args.id, api=api, repo=args.repo or "",
-                        number=decision["pr"], base=decision["base"])["runs"]
+                        number=decision["pr"], base=decision["base"],
+                        workflows=tuple(decision["dispatch"]) if decision.get("dispatch")
+                        is not None else WORKFLOWS)["runs"]
     if stale:
         _cancel_runs(gh, decision["repo"], stale,
                      say=lambda text: print("  %s" % text))
