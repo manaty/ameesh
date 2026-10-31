@@ -1,21 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
 # ameesh release — tag and staging at the compiled canon cutoffs (#2448).
-# Service UTILISATEUR, on the single operator host (pc-smichea): the release
-# command reads `release.projects` from ~/.config/ameesh/config.json, refuses
-# when it is not this host, and holds the target lease while it works.
-#
-# Install, on the operator host only:
-#   install -m 0644 deploy/systemd/ameesh-release.service \
-#                      deploy/systemd/ameesh-release.timer ~/.config/systemd/user/
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now ameesh-release.timer
-#   journalctl --user -u ameesh-release -f
-#
-# The timer ticks every five minutes; `ameesh release tick` decides from the
-# compiled `mechanics.cutoffs` and does nothing outside a cutoff window.
-# #2601: the same tick runs the "missed slot" packet alert when the host file
-# declares `packet_watch` (composer and pilot as `notify`).
+# User service on EVERY candidate of release.role (the elected pilot).
+# Configure release.role and packet_watch.role identically; remove legacy host
+# selectors. The CLI wraps the whole tick in a shared, watched execution lease,
+# including packet-watch; standby candidates exit 0 without host operations.
+# Use the installed versioned venv, never a command from an abandoned checkout.
+# Install service+timer on each candidate; the bureau migrates existing drop-ins.
+# The 60 s cadence plus a 180 s role lease permits takeover within five minutes.
 [Unit]
 Description=ameesh release at the compiled canon cutoffs (#2448)
 After=network-online.target

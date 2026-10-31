@@ -986,7 +986,8 @@ def migrations_between(repo: str, since: str, target: str) -> list[str]:
     names = _out(repo, "diff", "--name-only", "%s..%s" % (since, target),
                  "--", "src/ameesh/migrations")
     return sorted({os.path.basename(name) for name in names.splitlines()
-                   if name.endswith(".sql")})
+                   if name.endswith(".sql")
+                   and os.path.dirname(name) == "src/ameesh/migrations"})
 
 
 def generate_notes(*, project: "ProjectRelease", repo: str, since: str, target: str,
@@ -1163,11 +1164,14 @@ def projects(cfg) -> dict[str, ProjectRelease]:
     block = getattr(cfg, "release", None) or {}
     if not isinstance(block, dict):
         raise ReleaseError("release: an object is required")
-    unknown = set(block) - {"host", "projects"}
+    unknown = set(block) - {"host", "role", "projects"}
     if unknown:
         raise ReleaseError("release: unknown key(s) %s" % ", ".join(sorted(unknown)))
     host = block.get("host")
-    if host and str(host) != cfg.host:
+    role = block.get("role")
+    if role is not None and (not isinstance(role, str) or not role.strip()):
+        raise ReleaseError("release.role: a non-empty role name is required")
+    if not role and host and str(host) != cfg.host:
         return {}
     declared = block.get("projects") or {}
     if not isinstance(declared, dict):
