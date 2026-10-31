@@ -537,7 +537,7 @@ def non_additive(migration: Migration) -> list[str]:
 def _lex(sql: str) -> tuple[str, str]:
     """(texte sans commentaires, texte sans commentaires ni chaînes), en une
     seule passe : le délimiteur d'une chaîne ne se lit jamais dans un
-    commentaire, ni l'inverse. Une fin manquante garde le reste pour commentaire
+    commentaire, ni l'inverse. Le premier garde les chaînes, sans leurs `;`. Une fin manquante garde le reste pour commentaire
     ou chaîne : le CREATE qu'il contiendrait ne prouve rien."""
     kept, code, at, size = [], [], 0, len(sql)
     while at < size:
@@ -572,7 +572,14 @@ def _lex(sql: str) -> tuple[str, str]:
                     else:
                         end += 1
                 end = min(end + 1, size)
-            kept.append(sql[at:end])
+            if dollar:
+                # un corps $$ est du code : ses propres chaînes y sont neutralisées
+                tag = dollar.group(0)
+                body = sql[dollar.end():end - len(tag) if closing >= 0 else end]
+                kept.append(tag + _lex(body)[0] + (tag if closing >= 0 else ""))
+            else:
+                # un `;` dans une chaîne ne termine pas l'instruction (B docs-01)
+                kept.append(sql[at:end].replace(";", " "))
             # un identifiant entre guillemets reste du code, pas une chaîne
             code.append(sql[at:end] if sql[at] == '"' else " ")
             at = end

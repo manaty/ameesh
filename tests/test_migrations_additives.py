@@ -105,6 +105,17 @@ class NonAdditiveTest(unittest.TestCase):
              "add constraint k"),
             ("alter table only t add column d int, add constraint k unique (c);",
              "add constraint k"),
+            # B docs-01 : un `;` dans une chaîne ne termine pas l'instruction
+            ("alter table t add column d text default ';', add unique (c);", "add unique"),
+            ("alter table t add column d text default e';', add constraint k unique (c);",
+             "add constraint k"),
+            ("alter table t add column d text default ';', add primary key (c);",
+             "add primary key"),
+            ("alter table t add column d text default ';', add foreign key (c) references u;",
+             "add foreign key"),
+            ("do $$ begin alter table t add column d text default ';', add unique (c); end $$;",
+             "add unique"),
+            ("revoke all on \"a;b\" from r;", "privilege removed (revoke"),
         ):
             with self.subTest(sql=sql):
                 reasons = migrations.non_additive(_migration(sql))
