@@ -188,6 +188,30 @@ class ClaudeTest(unittest.TestCase):
         self.assertFalse(self.result["partial"])
 
 
+class ModelProvenanceTest(unittest.TestCase):
+    """Le nom demandé au lancement n'est jamais publié comme mesuré (#5147)."""
+
+    def test_annonce_du_flux_remplace_le_nom_demande_et_devient_mesuree(self):
+        normalizer = context_metrics.TurnNormalizer(
+            "claude", session="s", model="alias-demande")
+        normalizer.observe({"model": "claude-opus-5-5"})
+        normalizer.observe({})
+        document = normalizer.finish()
+        self.assertEqual(document["model"], "claude-opus-5-5")
+        self.assertEqual(document["model_quality"], context_metrics.MEASURED)
+
+    def test_nom_demande_sans_annonce_reste_requested(self):
+        document = context_metrics.TurnNormalizer(
+            "claude", session="s", model="alias-demande").finish()
+        self.assertEqual(document["model"], "alias-demande")
+        self.assertEqual(document["model_quality"], context_metrics.REQUESTED)
+
+    def test_sans_nom_la_qualite_reste_inconnue(self):
+        document = context_metrics.TurnNormalizer("claude", session="s").finish()
+        self.assertIsNone(document["model"])
+        self.assertEqual(document["model_quality"], context_metrics.UNKNOWN)
+
+
 class CodexTest(unittest.TestCase):
     def test_cumul_de_fil_ramene_au_delta_du_tour(self):
         result = observe_all(

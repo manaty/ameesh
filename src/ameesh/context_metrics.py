@@ -26,7 +26,9 @@ résultat d'un outil, ni un secret : seulement les dictionnaires d'usage.
 
 Absence et qualité (contrat §2.4) : une valeur absente vaut ``None`` avec une
 raison, jamais ``0``. Un ``0`` réel reste une mesure. Les qualités sont
-``measured``, ``derived``, ``fallback``, ``partial`` et ``unknown``.
+``measured``, ``derived``, ``fallback``, ``partial`` et ``unknown`` ; le nom du
+modèle peut en plus être ``requested`` quand seul le lancement le nomme, jamais
+une mesure runtime (§3.1).
 
 Conventions retenues (§2.2) :
 
@@ -58,6 +60,11 @@ FALLBACK = "fallback"
 PARTIAL = "partial"
 UNKNOWN = "unknown"
 QUALITIES = (MEASURED, DERIVED, FALLBACK, PARTIAL, UNKNOWN)
+#: le nom **demandé** au lancement n'est pas une mesure runtime (§3.1) ; cette
+#: qualité ne s'applique qu'au nom du modèle, jamais à un compteur.
+REQUESTED = "requested"
+#: qualités admises pour le modèle effectif : les mesures, plus ``requested``
+MODEL_QUALITIES = QUALITIES + (REQUESTED,)
 
 #: provenances d'une mesure
 SOURCE_STREAM = "stream"
@@ -465,6 +472,10 @@ class TurnNormalizer:
         self.session = str(session) if session else None
         self.turn = str(turn) if turn else None
         self.model = model
+        #: provenance du nom : ``requested`` tant que le flux n'a pas annoncé
+        #: le modèle effectif, ``measured`` après cette annonce (§3.1). Un nom
+        #: de lancement n'est jamais publié comme une mesure runtime.
+        self.model_quality = REQUESTED if model else UNKNOWN
         self.mode = mode
         self.role = role
         self.source = source
@@ -598,10 +609,18 @@ class TurnNormalizer:
         ``usage`` sans ``call_usage`` est le cumul de ``turn.completed`` ; pour
         les autres harnais, ``usage`` est un agrégat de tour et n'est pas un
         appel : il est ignoré (jamais compté comme un appel).
+
+        Le ``model`` annoncé par le flux est le modèle **effectif** : il
+        remplace le nom demandé au lancement et sa qualité devient
+        ``measured``. Sans annonce, le nom garde sa provenance ``requested``.
         """
         self._ensure_open()
         if not isinstance(parsed, Mapping):
             return self
+        announced_model = parsed.get("model")
+        if isinstance(announced_model, str) and announced_model.strip():
+            self.model = announced_model.strip()
+            self.model_quality = MEASURED
         session = parsed.get("session")
         if session:
             session = str(session)
@@ -699,6 +718,7 @@ class TurnNormalizer:
             "schema": SCHEMA,
             "harness": self.harness,
             "model": self.model,
+            "model_quality": self.model_quality,
             "mode": self.mode,
             "role": self.role,
             "session": self.session,
