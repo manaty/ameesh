@@ -775,6 +775,32 @@ class RegistryTest(PgTestCase):
         self.assertEqual(self.row(lot)["state"], "intake")
         self.assertEqual(self.closure_milestones(lot), [])
 
+    def test_advance_to_closed_bounds_and_normalizes_superseded_by(self):
+        """#5027: a huge or padded superseded_by is refused or normalized.
+
+        A reference beyond the CPython int/str limit (or the bigint range) is
+        the named `superseded-unknown` refusal, never an uncaught ValueError
+        or an out-of-range SQL parameter; the surrounding spaces accepted by
+        the verifier are normalized to the lot id."""
+        superseding = self.pinned()
+        lot = self.pinned()
+        with self.refusal("superseded-unknown"):
+            self.apply(self.command(lot, to="stopped", guard="stop_work",
+                                    facts={"close_reason": "superseded",
+                                           "superseded_by": "9" * 4301}))
+        with self.refusal("superseded-unknown"):
+            self.apply(self.command(lot, to="stopped", guard="stop_work",
+                                    facts={"close_reason": "superseded",
+                                           "superseded_by": str(2 ** 63)}))
+        self.assertEqual(self.events(lot), [])
+        self.assertEqual(self.row(lot)["state"], "intake")
+        self.apply(self.command(lot, to="stopped", guard="stop_work",
+                                facts={"close_reason": "superseded",
+                                       "superseded_by": " %d " % superseding}))
+        row = self.row(lot)
+        self.assertEqual(row["superseded_by"], superseding)
+        self.assertEqual(row["state"], "closed")
+
     def test_advance_to_closed_records_superseded_by_and_delivered(self):
         superseding = self.pinned()
         lot = self.pinned()
