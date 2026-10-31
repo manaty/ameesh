@@ -76,6 +76,39 @@ def freeze_due(alias: str) -> str:
             " AND coalesce(to_jsonb({a})->>'reviewer', '') <> '-none')").format(a=alias)
 
 
+def fix_owed(alias: str) -> str:
+    """#5151 (B1 de ameesh-cx3) : SQL « l'assigné doit une correction », la
+    règle de `review_designation_activation._owed_read` (#3288, #2231).
+
+    Avec des sièges désignés (`reviewers`), le DERNIER verdict de chaque
+    relecteur désigné sur le dernier gel tranche : un `blocked` de A n'est pas
+    levé par un `ok` de B rendu après. Sans siège, le dernier verdict du gel
+    décide (`current_verdict`). Un verdict s'applique au gel par son sha
+    (préfixe admis), à défaut par son instant, comme `current_verdict`."""
+    seats = ("(SELECT lower(btrim(s)) FROM jsonb_array_elements_text("
+             "CASE WHEN jsonb_typeof(to_jsonb({a})->'reviewers') = 'array'"
+             " THEN to_jsonb({a})->'reviewers' ELSE '[]'::jsonb END) s"
+             " WHERE btrim(s) NOT IN ('', '-none'))")
+    return ("(CASE WHEN EXISTS " + seats + " THEN EXISTS ("
+            "SELECT 1 FROM (SELECT DISTINCT ON (lower(btrim(m.actor))) m.verdict"
+            "   FROM work_item_milestones m"
+            "   LEFT JOIN LATERAL (SELECT fz.sha, fz.at FROM work_item_milestones fz"
+            "          WHERE fz.work_item_id = {a}.id AND fz.kind = 'frozen'"
+            "          ORDER BY fz.at DESC, fz.id DESC LIMIT 1) f ON true"
+            "  WHERE m.work_item_id = {a}.id AND m.kind = 'verdict'"
+            "    AND lower(btrim(m.actor)) IN " + seats +
+            "    AND (f.sha IS NULL"
+            "         OR (btrim(coalesce(m.sha, '')) <> '' AND btrim(f.sha) <> ''"
+            "             AND (lower(btrim(m.sha)) = lower(btrim(f.sha))"
+            "                  OR starts_with(lower(btrim(m.sha)), lower(btrim(f.sha)))"
+            "                  OR starts_with(lower(btrim(f.sha)), lower(btrim(m.sha)))))"
+            "         OR (btrim(coalesce(m.sha, '')) = '' AND m.at >= f.at))"
+            "  ORDER BY lower(btrim(m.actor)), m.at DESC, m.id DESC) last"
+            " WHERE last.verdict = 'blocked')"
+            " ELSE coalesce(" + current_verdict(alias) + " = 'blocked', false) END)"
+            ).format(a=alias)
+
+
 def wake_defers(alias: str) -> str:
     """#5037 : ce réveil programmé futur écarte-t-il encore ce lot ?
 
@@ -88,8 +121,8 @@ def wake_defers(alias: str) -> str:
     """
     return ("({a}.wake_at IS NOT NULL AND {a}.wake_at > clock_timestamp()"
             " AND NOT ({a}.state = '{qa}' AND (" + freeze_due(alias) + " OR "
-            + current_verdict(alias) + " = 'blocked')))").format(
-                a=alias, qa=lifecycle.QA)
+            + fix_owed(alias).replace("{", "{{").replace("}", "}}")
+            + ")))").format(a=alias, qa=lifecycle.QA)
 
 
 #: #5151 : `planned_source` des dates écrites par `work schedule`

@@ -200,6 +200,48 @@ class SleepTest(PgTestCase):
         self.assertIn("%s dev1: #%d (planned start %s)"
                       % (fd.SLEEP_SET_ASIDE_PREFIX, lot, tomorrow), self.notes(split))
 
+    # -- B1 de ameesh-cx3 : la correction due par relecteur désigné ------
+    def qa_lot(self, reviewers):
+        lot = int(work.add(self.db, title="qa à deux relecteurs", app="ameesh",
+                           actor="pilote")["id"])
+        work.assign(self.db, lot, "dev1", actor="pilote")
+        work.move(self.db, lot, "build")
+        work.move(self.db, lot, "qa")
+        work.milestone(self.db, lot, "frozen", sha="c" * 40, actor="dev1")
+        self.db.execute("UPDATE work_items SET reviewers ="
+                        " coalesce(string_to_array(nullif(%s, ''), ','), '{}')"
+                        " WHERE id = %s", (",".join(reviewers), lot))
+        return lot
+
+    def verdict(self, lot, actor, kind):
+        work.milestone(self.db, lot, "verdict", verdict=kind, sha="c" * 40, actor=actor)
+
+    def test_a_block_then_another_reviewer_ok_keeps_the_author_actionable(self):
+        from ameesh import review_designation_activation as rda
+        split = self.exhausted()
+        lot = self.qa_lot(["rev-a", "rev-b"])
+        self.verdict(lot, "rev-a", "blocked")
+        self.verdict(lot, "rev-b", "ok")
+        self.assertEqual([r["lot"] for r in rda.due_fixes(self.db, "dev1")], [lot])
+        row = self.listing_row("dev1")
+        self.assertEqual((row["actionable_lots"], row["actionable_lot_id"]), (1, lot))
+        out = self.run_pass(1900)
+        by_agent = {r["agent"]: r for g in out if g["kind"] == "sleep"
+                    for r in g["agents"]}
+        self.assertFalse(by_agent["dev1"]["slept"])
+        self.assertFalse(registry.get(self.db, "dev1")["operator_paused"])
+        # le même relecteur lève son blocage : plus rien n'est dû
+        self.verdict(lot, "rev-a", "ok")
+        self.assertEqual(self.listing_row("dev1")["actionable_lots"], 0)
+        self.assertIsNotNone(split)
+
+    def test_without_seats_the_last_verdict_decides(self):
+        lot = self.qa_lot([])
+        self.verdict(lot, "rev-a", "blocked")
+        self.assertEqual(self.listing_row("dev1")["actionable_lots"], 1)
+        self.verdict(lot, "rev-b", "ok")
+        self.assertEqual(self.listing_row("dev1")["actionable_lots"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,7 +24,7 @@ from .. import interface
 from .mailbox import PASSIVE_SQL
 from .work import REQUEUED_PARAMS, has_reviewer, requeued_sql
 from .work_dependencies import (current_verdict as _current_verdict, freeze_due,
-                                start_defers, wake_defers)
+                                fix_owed, start_defers, wake_defers)
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"   # closed : abandonné ou remplacé (L29)
@@ -260,7 +260,7 @@ class Operations(interface.Operations):
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                      AND (w.state NOT IN """ + _WAITING_ON_OTHERS + f"""
                           OR (w.state = '{lifecycle.QA}' AND (""" + freeze_due("w") + """
-                              OR """ + _current_verdict("w") + """ = 'blocked')))
+                              OR """ + fix_owed("w") + """)))
                      AND NOT """ + start_defers("w", "j.today") + """
                      AND NOT """ + wake_defers("w") + """) ac ON true
               LEFT JOIN LATERAL (
