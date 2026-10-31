@@ -842,8 +842,8 @@ def run(cfg, args, *, credentials=()) -> int:
                                else str(int(report["left_s"]))),
                     ENV_OWNER: str(report.get("owner") or ""),
                 })
-            from .platform.child_environment import execution_transport, grant
-            env = execution_transport(env)
+            from .platform.child_environment import role_transport, grant
+            env = role_transport(env, argv, getattr(cfg, "notify", {}))
             # Only trusted in-process callers can extend this one spawn; the
             # public role CLI exposes no credential-grant argument.
             env = grant(env, env.credentials | frozenset(credentials))
