@@ -41,7 +41,8 @@ class ExecutorTest(unittest.TestCase):
         self.db.transaction = lambda: nullcontext(self.db)
         store = types.SimpleNamespace(events=types.SimpleNamespace(
             record=self.record, recent_type=self.recent,
-            latest_type=lambda *a: self.foreign),
+            latest_type=lambda kind, *a: (self.attested if kind == release_cutoff.STAGING_EVENT
+                                         else self.foreign)),
             work=types.SimpleNamespace(land_lock=lambda *a, **kw: 1))
         def renewing(lease, execution, stop):
             self.renewals.append(stop)
@@ -85,6 +86,12 @@ class ExecutorTest(unittest.TestCase):
         if argv[0] == "bash":
             self.proofs = [dict(data=dict(state="completed"))]
         return 0, False
+
+    def test_attested_foreign_run_allows_next_attempt(self):
+        self.foreign = [running("previous")]
+        self.attested = [dict(id=2, data=dict(sha="a" * 40))]
+        self.assertEqual(executor.tick(self.db, self.cfg, self.options)["state"], "completed")
+        self.assertTrue(self.calls)
 
     def test_interrupted_a_is_taken_over_by_b_after_quiescence_proof(self):
         self.request.update(state="running", host="host-a", run="attempt-a")

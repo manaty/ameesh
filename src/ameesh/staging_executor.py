@@ -227,7 +227,11 @@ def tick(db, cfg, options) -> dict:
         previous = request.get("previous_run") or request.get("run")
         rows = storage.of(db).events.latest_type(
             staging_watch.EVENT, 60, staging_watch.LIMIT)
-        others = staging_watch.in_flight(rows, exempt={previous} if previous else ())
+        from ameesh import release_cutoff
+        attested = storage.of(db).events.latest_type(
+            release_cutoff.STAGING_EVENT, 60, staging_watch.LIMIT)
+        others = staging_watch.in_flight(
+            rows, exempt={previous} if previous else (), attested=attested)
         reason = ("staging history truncated; exclusivity unobservable"
                   if len(rows) >= staging_watch.LIMIT else
                   "another staging sequence running: " + ", ".join(others)

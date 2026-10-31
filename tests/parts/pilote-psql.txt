@@ -59,7 +59,11 @@ test_423_agent_aliases  # storage: alias namespace guards, audit, same fenced le
 test_1022_creneau_landed  # storage: une fusion lande le creneau de migration, une liberation sans atterrissage le libere (#1022)
 test_4256_validation_deadlines  # #4256: validation authority, private audit and single-winner escalation (SQL contract)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
+test_4989_bootstrap_continuation  # signed replacement, inherited effects and immutable previous receipts
+test_4989_controller_enrollment  # signed independent controller/key enrollment, exact payload and bounded stop authority
+test_4989_transport_delegation  # exact two-key release transport and effective SSH validation for both sources
 test_4867_sandbox  # storage: transactional sandbox lifecycle, immutable admission and concurrent result/cancel/bind (#4867)
+test_4885_staging_exclusive  # #5010: exclusive staging start reads shared terminal attestations
 test_4995_decision_supersession_journal  # #4995: journal append-only et lecture prouvée du remplacement, occurred_at lu en texte JSON par psql
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
@@ -132,3 +136,5 @@ test_4150_host_idle  # état inactif conservateur et empreinte des vues
 test_4151_host_capacity_alerts  # alertes agents de capacité inactive
 test_4299_agent_rename  # #4299: rename counts rows through SQL (psql execute has no row count)
 test_5022_cache_measure  # storage: retained shared-cache entries and partial measurements persist in housekeeping_log (#5022)
+
+test_5046_deps_policy  # #5046: nm host policy and actual deletion journal through both drivers
