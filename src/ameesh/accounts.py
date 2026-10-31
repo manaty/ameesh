@@ -344,6 +344,8 @@ class Profile:
     #: celui de l'environnement de l'exécuteur (L1078). Faux pour un profil
     #: synthétique (« (default) » : hôte sans comptes, session d'avant L30).
     declared: bool = False
+    #: #4944: explicitly assign historical unnamed balance readings to this profile.
+    adopts_unnamed: bool = False
     #: #313/#2580 : raison du refus du compte par CE mesh (`accounts_shared:
     #: refuse` ou `account_sharing: strict`, identifiant déclaré aussi par un
     #: autre mesh de l'hôte, posée par `account_claims.mark_refused`) ; vide =
@@ -597,12 +599,19 @@ def parse(raw) -> dict[str, list[Profile]]:
                     raise AccountError("account %s/%s: `env` variable expected" % (harness, name))
                 if key_file and not os.path.isabs(os.path.expanduser(key_file)):
                     raise AccountError("account %s/%s: absolute path expected" % (harness, name))
+            adopts = item.get("adopts_unnamed", False)
+            if not isinstance(adopts, bool) or (adopts and kind != "api_key_env"):
+                raise AccountError("account %s/%s: adopts_unnamed must be a boolean "
+                                   "on an api_key_env profile" % (harness, name))
+            if adopts and any(p.adopts_unnamed for p in profiles):
+                raise AccountError("accounts.%s: only one profile may adopt unnamed "
+                                   "balance readings" % harness)
             profiles.append(Profile(
                 harness=harness, name=name, kind=kind,
                 path=_expand(path) if path else "",
                 env=env or (default_key_env_of(harness) if kind == "api_key_env" else ""),
                 key_env=key_env, key_file=_expand(key_file) if key_file else "",
-                hourly_usd=hourly, min_balance=min_balance,
+                hourly_usd=hourly, min_balance=min_balance, adopts_unnamed=adopts,
                 check_credentials=bool(item.get("check_credentials", True)),
                 priority=priority, overage=overage, **caps,
                 pace_multiplier=pace_multiplier, pace_local=pace_local, declared=True,

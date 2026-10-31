@@ -16,12 +16,17 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
+import threading
 import time
 import uuid
 
 from ameesh import role_run, staging_watch, storage
 
 EVENT = "staging.request"
+#: One attempt's worktree is named after its run, so the tree kept after a
+#: lost lease can be found and removed once the stop is proved (#4898 N3).
+WORKTREE_PREFIX = "ameesh-release-staging-"
 
 
 class ExecutionLease(role_run._AlertsLease):
@@ -64,12 +69,51 @@ def _record(db, key, data, *, lease):
     # Recheck and journal in the SAME transaction under the execution lock.
     if lease.remaining() <= 0:
         raise RuntimeError("staging execution lease expired before journal write")
+    # The CAS below also renews the server expiry. Measure from before the
+    # call, and extend the local monotonic deadline from the same instant:
+    # otherwise a slow preparation renews in the database without surviving
+    # its own local deadline (#4898 N1).
+    started = time.monotonic()
     with db.transaction() as tx:
         st = storage.of(tx)
         epoch = st.work.land_lock(lease.key, lease.owner, lease.ttl, epoch=lease.epoch)
         if epoch != lease.epoch:
             raise RuntimeError("staging execution lease lost before journal write")
-        st.events.record(EVENT, "staging-request:" + key, None, data)
+        if not lease.note_renewed(epoch, started):
+            raise RuntimeError("staging execution lease expired before journal write")
+        return st.events.record(EVENT, "staging-request:" + key, None, data)
+
+
+def _worktree_prefix(run) -> str:
+    return WORKTREE_PREFIX + str(run) + "-"
+
+
+def _drop_retained(repo: str, run) -> None:
+    """Remove the worktrees an attempt kept when its execution lease was lost.
+
+    The caller has already proved the old execution stopped (the quiescence
+    probe), so no process can still be using them. An absent tree is not an
+    error: the attempt may have died before creating it.
+    """
+    if not run:
+        return
+    from ameesh import release_cutoff
+    prefix = _worktree_prefix(run)
+    base = os.path.dirname(os.path.abspath(repo)) or tempfile.gettempdir()
+    try:
+        entries = list(os.scandir(base))
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.startswith(prefix):
+            continue
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        release_cutoff._drop_worktree(repo, entry.path,
+                                      os.path.join(entry.path, "worktree"))
 
 
 def latest(db, key):
@@ -120,7 +164,20 @@ def tick(db, cfg, options) -> dict:
         return {"state": "standby", "reason": "execution still leased"}
     execution = role_run._AlertsExecution(lease)
     execution.start()
+    # ONE renewal loop covers the whole attempt: the pre-launch phase (probe,
+    # fetch, merge-base, regression read, worktree) as well as the child.
+    # Without it, a fetch or worktree slower than the 45 s local deadline was
+    # reported as a lost lease although the database lease stayed fresh
+    # (#4898 N1). The child runs with `watch=False`: a second loop renewing
+    # the same epoch would race this one for nothing.
+    renewal_stop = threading.Event()
+    renewal = None
+    attempt_id = 0
     try:
+        renewal = threading.Thread(target=role_run._watch_alerts_lease,
+                                   args=(lease, execution, renewal_stop),
+                                   name="staging-lease", daemon=True)
+        renewal.start()
         request = latest(db, options["key"])
         if not request or request["state"] not in ("pending", "running"):
             return {"state": "idle"}
@@ -142,6 +199,7 @@ def tick(db, cfg, options) -> dict:
         env.pop("STAGING_RUN_ID", None)
         env.pop("STAGING_PREVIOUS_RUN", None)
         env.pop("STAGING_PREVIOUS_HOST", None)
+        repo = str(Path(options["repo"]).resolve())
         if request["state"] == "running" or request.get("previous_run"):
             probe = options.get("quiescence_probe")
             if not probe:
@@ -150,9 +208,15 @@ def tick(db, cfg, options) -> dict:
                        STAGING_PREVIOUS_RUN=request.get("previous_run") or request["run"])
             # The probe itself is bounded by the same execution watchdog.
             # It must inspect remote operations too, never just a local PID.
-            code, lost = role_run._run_under_lease(probe, env, lease, execution)
+            code, lost = role_run._run_under_lease(probe, env, lease, execution,
+                                                   watch=False)
             if code or lost:
                 return blocked("old execution not proved stopped")
+            # The stop is proved: the trees kept by the interrupted attempt
+            # can be removed now (#4898 N3). Only after this proof, never
+            # before, since the old process may still be writing in them.
+            for run in (request.get("run"), request.get("previous_run")):
+                _drop_retained(repo, run)
         if not Path(options["bascule_env"]).is_file():
             return blocked("candidate deployment access missing")
         # #4885: a sequence launched by another path (by hand, synchronous
@@ -163,7 +227,11 @@ def tick(db, cfg, options) -> dict:
         previous = request.get("previous_run") or request.get("run")
         rows = storage.of(db).events.latest_type(
             staging_watch.EVENT, 60, staging_watch.LIMIT)
-        others = staging_watch.in_flight(rows, exempt={previous} if previous else ())
+        from ameesh import release_cutoff
+        attested = storage.of(db).events.latest_type(
+            release_cutoff.STAGING_EVENT, 60, staging_watch.LIMIT)
+        others = staging_watch.in_flight(
+            rows, exempt={previous} if previous else (), attested=attested)
         reason = ("staging history truncated; exclusivity unobservable"
                   if len(rows) >= staging_watch.LIMIT else
                   "another staging sequence running: " + ", ".join(others)
@@ -172,7 +240,6 @@ def tick(db, cfg, options) -> dict:
             if request.get("blocked_reason") == reason:
                 return {"state": "blocked", "reason": reason}
             return blocked(reason)
-        repo = str(Path(options["repo"]).resolve())
         sha = request["sha"]
         subprocess.run(["git", "-C", repo, "fetch", "--no-tags", "origin"],
                        check=True, timeout=60, stdout=subprocess.DEVNULL)
@@ -192,12 +259,15 @@ def tick(db, cfg, options) -> dict:
         attempt.pop("blocked_reason", None)
         attempt.pop("previous_host", None)
         attempt.pop("previous_run", None)
-        _record(db, options["key"], attempt, lease=lease)
+        attempt_id = _record(db, options["key"], attempt, lease=lease)
         request = attempt
         env["STAGING_RUN_ID"] = attempt["run"]
         # An immutable worktree of the requested commit is prepared by the
         # existing release primitive, and removed only after the child ends.
-        folder, tree = release_cutoff._worktree(repo, sha)
+        # Its name carries the run, so a tree kept after a lost lease is
+        # found by the recovery that proves the old stop.
+        folder, tree = release_cutoff._worktree(
+            repo, sha, prefix=_worktree_prefix(attempt["run"]))
         drop = True
         try:
             argv = ["bash", str(Path(tree) / options.get(
@@ -206,7 +276,8 @@ def tick(db, cfg, options) -> dict:
             if attempt.get("included"):
                 argv += ["--lots", " ".join(str(lot) for lot in attempt["included"])]
             argv.append(sha)
-            code, lost = role_run._run_under_lease(argv, env, lease, execution)
+            code, lost = role_run._run_under_lease(argv, env, lease, execution,
+                                                   watch=False)
             if lost:
                 # A workstation's transient unit may outlive the bash group.
                 # Keep its sources until quiescence is proved on recovery.
@@ -221,6 +292,18 @@ def tick(db, cfg, options) -> dict:
                 # flock): the request is queued again, not failed.
                 request = queued
                 return blocked("another staging sequence running")
+            if code == 0 and terminal not in ("completed", "partial"):
+                # The last snapshot publication can fail after a successful
+                # sequence. The shared attestation written by actif.py is
+                # then the terminal proof; without it the alerts pass would
+                # raise a false staging_interrupted (#4898 N2).
+                attested = storage.of(db).events.recent_type(
+                    release_cutoff.STAGING_EVENT, 60, 20,
+                    object="staging:" + sha)
+                if any(int(row.get("id") or 0) > int(attempt_id or 0)
+                       and (row.get("data") or {}).get("sha") == sha
+                       for row in attested):
+                    terminal = "completed"
             result = dict(attempt, state=terminal if code == 0 and terminal in ("completed", "partial") else "failed",
                           exit=code)
             _record(db, options["key"], result, lease=lease)
@@ -237,6 +320,9 @@ def tick(db, cfg, options) -> dict:
                     notify=options["role"]), lease=lease)
         raise
     finally:
+        renewal_stop.set()
+        if renewal is not None:
+            renewal.join()
         execution.close()
         lease.release()
 

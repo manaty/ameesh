@@ -199,9 +199,12 @@ class HolderChecksTest(unittest.TestCase):
             reprise.holders("/tmp/session", "id")
         self.assertEqual(holders.call_args.kwargs.get("allow"), platform.EXECUTOR_NAMES)
 
-    def test_dependency_holder_check_allows_the_executor(self):
+    def test_dependency_holder_check_carries_the_host_allow(self):
+        # #5046 : `_holders` reçoit désormais l'allow explicite de l'hôte
+        # (`housekeeping.unreadable_allow`, qui inclut l'exécuteur) ; il ne le
+        # fixe plus lui-même.
         with mock.patch.object(platform, "holders", return_value=[]) as holders:
-            deps._holders("/tmp/cache-entry")
+            deps._holders("/tmp/cache-entry", allow=platform.EXECUTOR_NAMES)
         self.assertEqual(holders.call_args.kwargs.get("allow"), platform.EXECUTOR_NAMES)
 
     def test_housekeeping_allow_list_includes_the_executor(self):

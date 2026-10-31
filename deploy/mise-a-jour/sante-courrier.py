@@ -50,6 +50,11 @@ Read-only checks, then one real delivery probe:
   (``last_turn_ts``) is required too — unless the target is working a lot in
   ``build``/``qa``: that long turn does real work, the report names it (``travail``)
   and the probe is conclusive (#4181);
+  A pause observed before delivery (operator or budget, including idle
+  budget waits) makes an undelivered probe non-conclusive. If it is still
+  queued halfway through the delivery budget, a fresh free target can take
+  one replacement probe within the remaining budget; the report retains the
+  first message and the replacement reason (#5034).
 * dead letters (recipient stopped or unknown) are reported, never blocking.
 
 The JSON report (`--json`) is the structured proof consumed by `actif.py`
@@ -135,14 +140,14 @@ def libre(row: dict) -> bool:
     turn. Probing either would measure a queue, not the host's chain (#2190).
     """
     return ((row.get("status") or "idle") == "idle"
-            and not row.get("operator_paused"))
+            and not row.get("operator_paused") and not attente_budget(row))
 
 
 def motif_non_libre(row: dict) -> str:
     """Why a persona cannot take the probe now (state named in the verdict)."""
     if row.get("operator_paused"):
         return "pause operateur"
-    return row.get("status") or "?"
+    return attente_budget(row) or row.get("status") or "?"
 
 
 def pourquoi_occupees(portee: str, menes: list[dict]) -> str:
@@ -171,7 +176,7 @@ def stuck(db, rows: list[dict], souffrance: float, now: float) -> list[dict]:
     """
     out = []
     for row in rows:
-        if (row.get("status") or "idle") != "idle" or row.get("operator_paused"):
+        if not libre(row):
             continue
         if not driven(row, now):
             continue
@@ -483,7 +488,7 @@ def attente_budget(row: dict) -> str:
     failed turn (as ``sans_executeur`` already reads it).
     """
     for texte in (row.get("last_error") or "",
-                  row.get("status_text") if row.get("status") == "blocked" else ""):
+                  row.get("status_text") or ""):
         if (texte or "").startswith(budget.PAUSE_PREFIX):
             return texte
     return ""
@@ -511,7 +516,7 @@ def travail_en_cours(db, name: str) -> dict | None:
 
 
 def probe(db, row: dict, sha: str, attente: float,
-          hote_mesure: str | None = None) -> dict:
+          hote_mesure: str | None = None, *, alternatives: list[dict] | None = None) -> dict:
     """Drop one system message and wait (bounded) for the answered, ended turn.
 
     An answered turn still running is conclusive when the target is working a
@@ -541,16 +546,20 @@ def probe(db, row: dict, sha: str, attente: float,
     fin = debut + attente
     repondu = False
     budget_vu = ""
+    pause_vue = False
     while time.monotonic() < fin:
         message = mail.get(db, message_id)
         livre = float((message or {}).get("delivered_ts") or 0)
+        # #5034: deliberate waits may precede delivery, even with idle status.
+        etat = registry.get(db, row["name"]) or {}
+        budget_vu = attente_budget(etat) or budget_vu
+        pause_vue = bool(etat.get("operator_paused")) or pause_vue
         if livre:
             if out["remise_s"] is None:
                 out["remise_s"] = round(time.monotonic() - debut, 1)
             repondu = repondu or answered(db, row["name"], jeton)
             # one registry read for both verdicts: a turn ending in error
             # between two reads must not be taken for a clean end
-            etat = registry.get(db, row["name"]) or {}
             echec = failed_turn(db, row["name"], livre, etat)
             if echec:
                 return dict(out, tour="tour en echec : %s" % echec[:200])
@@ -573,7 +582,26 @@ def probe(db, row: dict, sha: str, attente: float,
                                 travail={"lot": travail.get("id"),
                                          "state": travail.get("state")})
                 out["tour"] = "reponse vue, tour non termine"
-        time.sleep(2.0)
+        elif alternatives and time.monotonic() - debut >= attente / 2:
+            # Reserve the remaining half of the SAME time budget for one
+            # fresh, driven, free target. Never replace a delivered probe.
+            cible, _ = revalider(db, [r for r in alternatives if r["name"] != row["name"]])
+            reste = fin - time.monotonic()
+            if cible is not None and reste > 0:
+                motif = (budget_vu or ("pause operateur" if pause_vue else
+                         "sonde non remise, cible %s" % (etat.get("status") or "?")))
+                attendu = round(time.monotonic() - debut, 1)
+                resultat = probe(db, cible, sha, reste, hote_mesure)
+                resultat["remplacement"] = {
+                    "cible_nommee": row["name"], "remplacante": cible["name"],
+                    "raison": motif, "attente_s": attendu}
+                resultat["tentative_precedente"] = dict(out, attente=motif)
+                return resultat
+        time.sleep(min(2.0, max(0.0, fin - time.monotonic())))
+    # #5034: an observed pause remains evidence even if the target is free now.
+    if out["remise_s"] is None and (budget_vu or pause_vue):
+        out["concluant"] = False
+        out["tour"] += " (attente %s)" % (budget_vu or "pause operateur")
     # #4089 (canon §3) : seul un negatif est concluant. Remis sans tour
     # termine, ou retenu par une attente budget : non concluant, nomme.
     if out["remise_s"] is not None and (budget_vu or out["tour"] != (
@@ -637,6 +665,7 @@ def main(argv: list[str] | None = None) -> int:
         toutes = toutes_personas(conn, args.hote)
         mortes = dead_letters(conn, args.hote, toutes)
         canal = canal_humain(conn, args.hote, now, toutes)
+        pool = rows
         try:
             if args.serveur and not rows:
                 # le serveur sans executant n'a aucune persona locale : sa chaine
@@ -653,8 +682,11 @@ def main(argv: list[str] | None = None) -> int:
             # vide : le rapport KO la porte (#2190).
             raise RuntimeError("sonde invalide : %s" % exc) from None
         rapport["remplacement"] = remplacement
-        resultat = (probe(conn, cible, args.sha, args.attente, args.hote)
+        resultat = (probe(conn, cible, args.sha, args.attente, args.hote, alternatives=pool)
                     if cible is not None else None)
+        if resultat is not None and resultat.get("remplacement"):
+            remplacement = resultat["remplacement"]
+            pourquoi = "remplacante %s : %s" % (remplacement["remplacante"], remplacement["raison"])
         verdict = "ok"
         if souffrance or sans or (resultat is not None and resultat["delai_s"] is None
                                   and resultat.get("concluant", True)):

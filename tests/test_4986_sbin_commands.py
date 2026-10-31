@@ -36,7 +36,9 @@ class SbinCommandsTest(unittest.TestCase):
                                side_effect=lambda path: str(path).startswith('/usr/sbin/')), \
                 mock.patch.object(installer.runtime, 'trusted') as trusted:
             self.assertTrue(host.validate_configuration(dict(
-                host='fixture-host', plan=dict(controller_source='192.0.2.1/32'))))
+                host='fixture-host', plan=dict(
+                    controller_source='192.0.2.1/32',
+                    controller_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh'))))
             self.assertTrue(host.validate_restored_configuration({}))
         self.assertEqual(calls[0], ['/usr/sbin/visudo', '-c', '-f',
                                     '/etc/sudoers.d/ameesh-release'])

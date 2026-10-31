@@ -498,6 +498,25 @@ class CarriedFreezeTest(_Fixture):
                          ["validated"], report)
         self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
 
+    def test_an_open_gate_validates_even_with_an_empty_repo_probe(self):
+        # #4882 (N P3 de l'auditeur sur 30ebce999) : la porte est lue avant
+        # toute sonde de dépôt. Un hôte dont `repo_for_freeze` ne rend rien
+        # doit valider une porte ouverte ; l'ordre inverse rendait
+        # `no-repository` et laissait le lot en qa (régression h-10).
+        self._reviewed_freeze()
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+        with mock.patch.object(lot_class, "repo_for_freeze",
+                               return_value=("", "")):
+            carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                          repo=self.repo.root)
+        self.assertEqual(carried["result"], "carried", carried)
+        self.assertEqual((carried.get("validation") or {}).get("result"),
+                         "validated", carried)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "validated")
+        self.assertTrue(self.notes("qa → validated — carried review quorum"))
+        self.assertEqual(self.notes(verdict_carry.PENDING), [])
+
     def test_another_pending_verdict_does_not_starve_the_quorum_retry(self):
         # #4834 : un verdict encore reportable sur une autre tête ne doit pas
         # faire oublier la transition de quorum déjà en attente sur ce gel.

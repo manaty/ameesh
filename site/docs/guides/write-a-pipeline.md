@@ -115,8 +115,10 @@ types: [docs, investigation, governance-tracking, human_operation]
 
 A declarative module stores **no work item type** of its own: those types are
 the ones the workflow covers, and the project still admits them through its
-installed modules (section 5). A lot may only be adopted by a card whose
-`types` contains the lot's type.
+installed modules (section 5). `bug` and `evolution` are always admitted; the
+other five come with the built-in `work-types` module, which declares them
+without any behaviour and is active only in the projects that select it. A lot
+may only be adopted by a card whose `types` contains the lot's type.
 
 ### Transitions and guards
 
@@ -223,8 +225,15 @@ extensions:
   ameesh:
     projects:
       support:
-        modules: [support-work-delivery]
+        modules: [support-work-delivery, work-types]
 ```
+
+`work-types` admits the support card's non-code types (`docs`,
+`investigation`, `governance-tracking`, `human_operation`, plus `promotion`).
+Without it, creating a `docs` lot in `support` is refused (`unknown type 'docs'
+for project 'support'`, and below the API `AMEESH_MODULE_RULE: work item type
+docs has no active module in project support`). A project whose card covers
+only `bug` and `evolution` needs no type module.
 
 Apply the canon through the normal trusted procedure (`ameesh canon sync`), then
 check the applied rows:
@@ -239,8 +248,10 @@ ameesh modules --active
 two selected modules claiming one type (`project-modules-invalid`). The
 declarative module stores empty `types`, `schemas` and `rules`: the work item
 types covered by the card must still be admitted by the project's installed
-modules, as any project type is. Do not remove the card's module while lots
-pinned to it remain active.
+modules, as any project type is (here `work-types`). Two selected modules
+cannot declare the same type, so a project already admitting these types
+through another module does not add `work-types`. Do not remove the card's
+module while lots pinned to it remain active.
 
 ## 6. Drive a lot
 
@@ -262,6 +273,16 @@ Each successful command prints its receipt as JSON. `advance` accepts
 `--expected-version N` for optimistic concurrency and a `--command-id UUID` for
 an idempotent replay (the same command id and the same intent are replayed,
 never applied twice).
+
+A request can stop from `new`, `triage`, `draft` or `approval`:
+
+```bash
+ameesh module support-work-delivery advance 42 --to closed --guard stop_work --ref reason=abandoned
+# Or supersede it with an existing, distinct lot:
+ameesh module support-work-delivery advance 42 --to closed --guard stop_work --ref reason=superseded --ref superseded_by=43
+```
+
+Both commands produce a receipt and project the issue as `closed/not_planned`.
 
 `adopt` rules:
 
@@ -289,7 +310,10 @@ The shipped examples are exercised on PostgreSQL by
 1. the example canon is committed to a throw-away git repository and
    `canon check` compiles both cards (acme: 8 stages, 20 transitions, 7 types;
    support: 6 stages, 9 transitions, 4 types);
-2. the registry lists both cards as modules of source `canon`;
+2. the registry lists both cards as modules of source `canon`; the canon
+   selects each card for its project and `work-types` for support, and the
+   module rows are written by the normal canon sync, never by hand: a `docs`
+   lot is created in support, and refused in acme;
 3. a lot of type `evolution` is adopted on the acme card, advanced twice,
    held and released, producing receipts and pure projections
    (open/Backlog, open/Sprint);
@@ -319,6 +343,7 @@ a canon change, checked before merge; it never requires a Python change.
       evidence.
 * [ ] the projection classifies every stage exactly once, without overlap.
 * [ ] `ameesh canon check` is green, the card is selected by `name` in the
-      project's modules, and `canon sync` applied it.
+      project's modules (with `work-types` when it covers a non-code type),
+      and `canon sync` applied it.
 * [ ] a lot of a covered type can `adopt`, advance, hold and release, and the
       projection matches the stage.

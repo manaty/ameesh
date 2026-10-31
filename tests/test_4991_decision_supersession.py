@@ -2,6 +2,7 @@
 """#4991: signed replacement, atomic authority revocation, immutable history."""
 from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from threading import Barrier
 import time
 import unittest
@@ -32,7 +33,7 @@ class SupersessionTest(fixtures._Base):
         new = self.replacement(old)
         self.assertTrue(new['needs_signature'])
         self.assertEqual(new['supersedes'], old['id'])
-        decisions.require_current(decisions.get(self.db, old['id']))
+        decisions.require_current(self.db, decisions.get(self.db, old['id']))
         with self.assertRaisesRegex(decisions.DecisionError, 'SIGNED answer required'):
             self.answer(new['id'], 'a')
         self.assertIsNone(decisions.get(self.db, old['id'])['superseded_by'])
@@ -43,7 +44,7 @@ class SupersessionTest(fixtures._Base):
         self.assertTrue(decisions.verify_proof(self.db, previous)[0])
         self.assertEqual(previous['superseded_by'], new['id'])
         with self.assertRaisesRegex(decisions.DecisionError, 'superseded by decision #%d' % new['id']):
-            decisions.require_current(previous)
+            decisions.require_current(self.db, previous)
         events = self.db.query('SELECT * FROM decision_supersessions')
         self.assertEqual([(e['supersedes'], e['superseded_by']) for e in events], [(old['id'], new['id'])])
         self.assertEqual(events[0]['proof'], decisions.get(self.db, new['id'])['answer']['proof'])
@@ -64,7 +65,7 @@ class SupersessionTest(fixtures._Base):
         new = self.replacement(old)
         decisions.withdraw(self.cfg, self.db, new['id'], requester='orch')
         previous = decisions.get(self.db, old['id'])
-        decisions.require_current(previous)
+        decisions.require_current(self.db, previous)
         self.assertIsNone(previous['superseded_by'])
         self.assertEqual(self.db.query('SELECT * FROM decision_supersessions'), [])
         self.assertIn('(not effective)', '\n'.join(decisions.format_view(decisions.get(self.db, new['id']))))
@@ -95,7 +96,7 @@ class SupersessionTest(fixtures._Base):
         self.assertFalse(decisions.supersession_approved(answered))
         self.assertTrue(decisions.verify_proof(self.db, answered)[0])
         self.assertIsNone(decisions.get(self.db, old['id'])['superseded_by'])
-        decisions.require_current(decisions.get(self.db, old['id']))
+        decisions.require_current(self.db, decisions.get(self.db, old['id']))
         self.assertEqual(self.db.query('SELECT * FROM decision_supersessions'), [])
         self.assertIn('not replaced', decisions.answer_text(answered))
         self.assertIn('(not effective)', '\n'.join(decisions.format_view(answered)))
@@ -177,10 +178,27 @@ class SupersessionTest(fixtures._Base):
 
 
 class AdoptionSupersessionTest(unittest.TestCase):
-    def test_superseded_adoption_is_refused_before_proof_and_host_actions(self):
+    def test_superseded_adoption_is_refused_before_host_actions(self):
         view = dict(id=11, state='answered', answer={'option': 'adopt'}, superseded_by=12)
-        with mock.patch.object(decisions, 'get', return_value=view), mock.patch.object(decisions, 'verify_proof') as verify:
+        replacement = dict(
+            id=12, state='answered', needs_signature=True, supersedes=11,
+            supersedes_option='a', options=[{'key': 'a'}],
+            answer={'by': ALICE, 'channel': 'signed', 'option': 'a', 'text': 'a',
+                    'ts': 1000.0, 'proof': {'digest': 'proof'}},
+            created_ts=900.0, closed_ts=1000.0, question='Replace?')
+        event = dict(superseded_by=12, person=ALICE,
+                     occurred_at=datetime.fromtimestamp(1000.0, timezone.utc),
+                     proof={'digest': 'proof'})
+
+        def fake_get(db, identifier):
+            return view if identifier == 11 else replacement
+
+        with mock.patch.object(decisions, 'get', side_effect=fake_get), \
+                mock.patch.object(decisions, 'supersession_event', return_value=event), \
+                mock.patch.object(decisions, 'verify_proof', return_value=(True, '')) as verify:
             allowed, why = harness_adoption._owner_proof_still_valid(object(), {'decision_id': 11})
         self.assertFalse(allowed)
         self.assertIn('decision #11 superseded by decision #12', why)
-        verify.assert_not_called()
+        # The old decision's own proof is never consulted; only the
+        # replacement's signed answer is, by the authority gate.
+        verify.assert_called_once_with(mock.ANY, replacement)

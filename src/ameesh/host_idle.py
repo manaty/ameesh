@@ -44,6 +44,9 @@ def project(reading, history, agents, lots, *, now, idle_after_s=1800,
     from .backlog import _hold_blocks
     held_lots = {int(lot['id']) for lot in lots if lot.get('id') is not None
                  and _hold_blocks(lot, (holds or {}).get(int(lot['id'])), now)}
+    future_wakes = {str(lot['id']) for lot in lots
+                    if lot.get('id') is not None
+                    and (resources.finite_float(lot.get('wake_ts')) or 0) > now}
     today = datetime.date.fromtimestamp(now).isoformat()
     busy = bool(turns)
     since = 0.0
@@ -58,11 +61,14 @@ def project(reading, history, agents, lots, *, now, idle_after_s=1800,
                      and agent['session_lot_state'] not in DONE
                      and str(agent.get('session_work_item')) not in
                      {str(ident) for ident in held_lots})
+        lot_lease = lot_lease and str(agent.get('session_work_item')) not in future_wakes
         leases += bool(lot_lease)
         held_actions = sum(lot.get('assignee') == agent.get('name')
                            and lot.get('state') in lifecycle.ACTIVE
                            and str(lot.get('planned_start') or '')[:10] <= today
-                           and lot.get('id') in held_lots for lot in lots)
+                           and lot.get('id') in held_lots
+                           and (resources.finite_float(lot.get('wake_ts')) or 0) <= now
+                           for lot in lots)
         actionable = max(0, int(agent.get('actionable_lots') or 0) - held_actions)
         busy |= bool(lot_lease or agent.get('turn_started_ts')
                      or agent.get('status') in ('running', 'working')

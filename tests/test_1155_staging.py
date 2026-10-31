@@ -1746,6 +1746,68 @@ class SanteCourrierTest(unittest.TestCase):
              mock.patch.object(self.mod.time, 'sleep'):
             return self.mod.probe(object(), {'name': 'p', 'host': 'h'}, 'abc', attente)
 
+    def probe_5034(self, state, *, replacement=False, delivered=False):
+        clock = [0.0]
+        sent = []
+        tokens = {}
+        base = dict(host='h', status='idle', lease_owner='runner', lease_expires_ts=2000)
+        rows = [dict(base, name='a'), dict(base, name='b')]
+        def send(db, sender, name, body, **kwargs):
+            sent.append(name)
+            tokens[name] = body.split('--ack ')[1].split()[0]
+            return len(sent)
+        def get_registry(db, name):
+            return dict(base, name=name, last_turn_ts=1001,
+                        **(state(clock[0]) if name == 'a' else {}))
+        with mock.patch.object(self.mod.time, 'monotonic', side_effect=lambda: clock[0]), \
+             mock.patch.object(self.mod.time, 'time', return_value=1000), \
+             mock.patch.object(self.mod.time, 'sleep', side_effect=lambda d: clock.__setitem__(0, clock[0]+d)), \
+             mock.patch.object(self.mod.mail, 'send', side_effect=send), \
+             mock.patch.object(self.mod.mail, 'get', side_effect=lambda db, mid: {
+                 'delivered_ts': 1000 if mid == 2 or delivered else None}), \
+             mock.patch.object(self.mod.mail, 'history', side_effect=lambda db, name, **kw: [
+                 {'sender': name, 'body': tokens[name]}] if name == 'b' or delivered else []), \
+             mock.patch.object(self.mod.registry, 'get', side_effect=get_registry):
+            result = self.mod.probe(None, rows[0], 'abc', 8,
+                                    alternatives=rows if replacement else None)
+        return result, sent, clock[0]
+
+    def test_5034_operator_pause_after_send_is_inconclusive_even_if_resumed(self):
+        result, sent, elapsed = self.probe_5034(
+            lambda t: {'operator_paused': 2 <= t < 4})
+        self.assertFalse(result['concluant'])
+        self.assertIn('pause operateur', result['tour'])
+        self.assertEqual(sent, ['a'])
+        self.assertEqual(elapsed, 8)
+
+    def test_5034_budget_wait_before_delivery_with_idle_status_is_inconclusive(self):
+        result, _, _ = self.probe_5034(lambda t: {
+            'status_text': 'budget : concurrent turns 2/2' if 2 <= t < 4 else ''})
+        self.assertFalse(result['concluant'])
+        self.assertIn('budget : concurrent turns 2/2', result['tour'])
+
+    def test_5034_free_undelivered_target_stays_ko(self):
+        result, _, elapsed = self.probe_5034(lambda t: {})
+        self.assertTrue(result['concluant'])
+        self.assertIsNone(result['remise_s'])
+        self.assertEqual(elapsed, 8)
+
+    def test_5034_idle_queued_probe_replaced_within_same_time_budget(self):
+        for wait in ({}, {'status_text': 'budget : concurrent turns 2/2'},
+                     {'operator_paused': True}):
+            with self.subTest(wait=wait):
+                result, sent, elapsed = self.probe_5034(lambda t: wait, replacement=True)
+                self.assertEqual(sent, ['a', 'b'])
+                self.assertEqual(result['tour'], 'ok')
+                self.assertEqual(result['destinataire'], 'b')
+                self.assertEqual(result['remplacement']['cible_nommee'], 'a')
+                self.assertLessEqual(elapsed, 8)
+
+    def test_5034_delivered_normal_probe_is_not_replaced(self):
+        result, sent, _ = self.probe_5034(lambda t: {}, replacement=True, delivered=True)
+        self.assertEqual(sent, ['a'])
+        self.assertEqual(result['tour'], 'ok')
+
     def test_probe_ko_when_the_harness_exits_127_after_delivery(self):
         etat = {'last_turn_ts': 101.0, 'status': 'blocked', 'last_error':
                 'hote non pret : the harness could not run (code 127)'}
@@ -2237,6 +2299,26 @@ class SanteCourrierTest(unittest.TestCase):
              redirect_stdout(sortie):
             code = self.mod.main(argv)
         return code, json.loads(sortie.getvalue()), envois
+
+    def test_5034_main_idle_queue_replacement_report(self):
+        rows = {r['name']: dict(r, status='idle') for r in self.rangs_4126()}
+        replacement = [False]
+        def get_registry(db, name):
+            if name == 'ameesh-dev5':
+                replacement[0] = True
+            return dict(rows[name], last_turn_ts=1001.0)
+        code, report, sent = self.principal_4126(
+            get_registry,
+            lambda db, mid: {'delivered_ts': 1000.0} if replacement[0] else {},
+            lambda name, sent: [{'sender': name, 'body': sent['jeton']}],
+            ['--hote', 'ameesh-agents-1', '--sonde', 'ameesh-dev3',
+             '--attente', '8', '--json'])
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report['verdict'], 'ok')
+        self.assertEqual(report['sonde']['destinataire'], 'ameesh-dev5')
+        self.assertEqual(report['remplacement']['cible_nommee'], 'ameesh-dev3')
+        self.assertEqual(report['sonde']['tentative_precedente']['destinataire'], 'ameesh-dev3')
+        self.assertIn('sonde non remise', report['pourquoi'])
 
     def test_4126_main_remplacante_ok_et_nommee_dans_le_rapport(self):
         """Incident 28/10 02:29Z : SONDE_AMEESH_AGENTS_1=ameesh-dev3 en tour

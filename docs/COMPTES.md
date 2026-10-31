@@ -171,6 +171,28 @@ dans le canon :
   un compte au seuil bascule, un plafond du mesh atteint met en pause. `min_balance` : le compte est au seuil quand son dernier solde
   relevé est au plus ce montant (relevé par l'exécuteur, ou
   `ameesh cost balance --record`).
+* `adopts_unnamed: true` (facultatif, `api_key_env`, #4944) : déclare que
+  **tous les relevés de solde sans compte de ce fournisseur** appartiennent à
+  ce profil. Une seule adoption est permise par fournisseur ; sa valeur est
+  un booléen, faux par défaut. Vérifier d'abord l'identité du compte des
+  collecteurs concernés : des soldes semblables ne suffisent pas. Les vues
+  de dépenses, `budget_drift` et `balance_low` fusionnent alors les lectures
+  nommées et sans compte dans l'ordre chronologique, sans réécrire la base.
+  Les autres comptes nommés restent des séries indépendantes, additionnées.
+  Exemple de profil :
+
+  ```json
+  {"name": "compte-a", "type": "api_key_env", "key_env": "DEEPSEEK_API_KEY",
+   "adopts_unnamed": true}
+  ```
+
+  Déployer d'abord le lecteur qui connaît cet attribut, puis déclarer le
+  même profil sur chaque hôte collecteur et chaque hôte qui produit ces
+  vues. Les nouveaux relevés portent déjà le nom du profil déclaré ;
+  l'adoption rattache l'historique et les collecteurs encore sans profil.
+  Sans déclaration, chaque série reste distincte. Si les lectures sans
+  compte proviennent de plusieurs comptes réels, cette adoption globale
+  n'est pas applicable.
 * Isolement : sur un hôte à comptes, chaque harnais lancé (tour ou `ameesh
   attach`) part de l'environnement de l'exécuteur **sans** les variables
   d'identifiants — sources de clé de tous les comptes déclarés, et, quand un

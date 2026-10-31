@@ -30,6 +30,15 @@ class InFlightTest(unittest.TestCase):
         self.assertEqual(list(staging_watch.in_flight(rows)), ["a", "late"])
         self.assertEqual(list(staging_watch.in_flight(rows, exempt={"a", "late"})), [])
 
+    def test_only_later_same_commit_proof_releases_latest_snapshot(self):
+        rows = [row(2, "old"), row(4, "live")]
+        for proof in ([], [dict(id=1, data=dict(sha="a" * 40))],
+                      [dict(id=3, data=dict(sha="b" * 40))]):
+            self.assertEqual(list(staging_watch.in_flight(rows, attested=proof)),
+                             ["live", "old"])
+        proof = [dict(id=3, data=dict(sha="a" * 40))]
+        self.assertEqual(list(staging_watch.in_flight(rows, attested=proof)), ["live"])
+
 
 class SharedLog:
     """One shared `staging.sequence` log, seen by two launcher hosts.
@@ -40,6 +49,7 @@ class SharedLog:
     def __init__(self):
         self.rows = []
         self.locks = []
+        self.attested = []
 
     def transaction(self):
         return nullcontext(self)
@@ -48,6 +58,8 @@ class SharedLog:
         if "pg_advisory_xact_lock" in sql:
             self.locks.append(params)
             return [{}]
+        if params[0] == "staging.attested":
+            return self.attested
         self.assertion(sql, params)
         return self.latest_type()
 
@@ -78,6 +90,15 @@ class ExclusiveRecordTest(unittest.TestCase):
     def start(self, run, deadline=None, **kw):
         snapshot = row(0, run, deadline=deadline)["data"]
         return staging_watch.record(self.log, snapshot, exclusive=True, **kw)
+
+    def test_attested_run_without_terminal_snapshot_allows_new_start(self):
+        self.start("attested")
+        self.log.attested = [dict(id=2, data=dict(sha="a" * 40))]
+        self.start("next")
+        self.assertEqual([r["data"]["run"] for r in self.log.rows],
+                         ["attested", "next"])
+        with self.assertRaises(staging_watch.Busy):
+            self.start("third")
 
     def test_live_launcher_past_deadline_refuses_second_host(self):
         # Host A: a manual launcher still alive after its deadline.
@@ -142,6 +163,19 @@ class ExclusiveRecordTest(unittest.TestCase):
             code = staging_watch.main([json.dumps(row(0, "mine")["data"]), "--exclusive"])
         self.assertEqual(code, staging_watch.BUSY)
         self.assertEqual(len(self.log.rows), 1)
+
+
+class AttestedStartPgTest(PgTestCase):
+    """A terminal attestation releases the exclusive start in real SQL."""
+    def test_attestation_releases_only_the_prior_sequence(self):
+        def snap(run):
+            return dict(row(0, run)["data"])
+        staging_watch.record(self.db, snap("first"), exclusive=True)
+        storage.of(self.db).events.record(
+            "staging.attested", "staging:" + "a" * 40, None, dict(sha="a" * 40))
+        staging_watch.record(self.db, snap("second"), exclusive=True)
+        with self.assertRaises(staging_watch.Busy):
+            staging_watch.record(self.db, snap("third"), exclusive=True)
 
 
 class ExclusiveStartPgTest(PgTestCase):

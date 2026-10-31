@@ -626,6 +626,21 @@ class TurnNormalizer:
         return self
 
     # -- sortie ---------------------------------------------------------
+    def live_reread(self) -> dict:
+        """Les relectures à cet instant du tour, sans clore le normalisateur.
+
+        ``R_turn`` et ``R_session`` portent ``None`` si la mesure manque (jamais
+        ``0``), et tous deux si un relevé vient d'une autre session ;
+        ``base`` est le cumul des tours précédents. Le verdict reste à
+        l'appelant : le normalisateur ne lit aucun seuil.
+        """
+        if self._session_mismatch:
+            return {"R_turn": None, "R_session": None, "base": None}
+        principal = self._principal_measures()
+        return {"R_turn": principal["R_turn"].value,
+                "R_session": principal["R_session"].value,
+                "base": self.session_reread}
+
     def finish(self, *, interrupted: bool = False) -> dict:
         """Clôt le tour et rend l'observation ``ameesh-context/1``.
 

@@ -9,6 +9,17 @@ from __future__ import annotations
 import json
 
 
+def _phase_state(alias: str) -> str:
+    """#4621 : la phase de livraison, lue par les états de policy.
+
+    Depuis 0518 le core `delivered` porte `merged` et `promoted` ; un constat
+    doit nommer la phase (`merged`/`promoted`), comme les règles `require_qa`.
+    `to_jsonb` garde la lecture compatible avec une base d'avant 0518.
+    """
+    return "coalesce(to_jsonb(%s)->>'legacy_state', %s.state) AS state" % (
+        alias, alias)
+
+
 class ModuleStore:
     def __init__(self, db):
         self.db = db
@@ -104,7 +115,7 @@ class ModuleStore:
     def audit_evidence(self, project, module, types, subject_kind, evidence_kind):
         """Read current declarations and matching evidence in one snapshot."""
         return self.db.query(
-            "SELECT w.id, w.title, w.type, w.state, w.assignee, "
+            "SELECT w.id, w.title, w.type, " + _phase_state("w") + ", w.assignee, "
             "extract(epoch from w.created_at)::float8 AS created_ts, "
             "d.id AS declaration_id, d.subject, "
             "extract(epoch from d.at)::float8 AS declaration_ts, "
@@ -135,7 +146,7 @@ class ModuleStore:
         evidence, or whose evidence is bound to an earlier declaration, is a
         deviation the module decides how to report."""
         return self.db.query(
-            "SELECT w.id, w.title, w.type, w.state, w.assignee, "
+            "SELECT w.id, w.title, w.type, " + _phase_state("w") + ", w.assignee, "
             "extract(epoch from w.created_at)::float8 AS created_ts, "
             "d.id AS declaration_id, d.subject, "
             "extract(epoch from d.at)::float8 AS declaration_ts, "
