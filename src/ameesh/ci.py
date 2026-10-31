@@ -2787,10 +2787,30 @@ def label_name(mode: str, sha: str) -> str:
 
 
 def repo_of(cfg, item: dict, *, repo: str = "") -> str:
-    """Explicit owner/name, otherwise the calling clone's origin (#5145)."""
+    """Explicit repository, lot metadata, then origin as a last resort.
+
+    Only an explicit dot selects the caller's clone over the lot metadata;
+    it must still agree with the known project to avoid testing another repo.
+    """
     from . import plan_github
     value = repo.strip()
-    return _local_repo() if value in ("", ".") else plan_github.check_repo(value)
+    if value and value != ".":
+        return plan_github.check_repo(value)
+    parts = plan_github._ref_parts(item.get("issue_ref"))
+    expected = parts[0] if parts and parts[0] else None
+    if not expected:
+        try:
+            expected = plan_github.settings_of(cfg).repo_for(item.get("app"))
+        except plan_github.SettingsError as exc:
+            raise GelError(str(exc)) from exc
+    if not value and expected:
+        return expected
+    local = _local_repo()
+    if expected and local.casefold() != expected.casefold():
+        raise GelError("origin repository %s differs from lot #%s repository %s; "
+                       "use the project's clone or --repo %s"
+                       % (local, item.get("id"), expected, expected))
+    return local
 
 
 def _local_repo() -> str:

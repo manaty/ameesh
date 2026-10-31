@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import types
+import tempfile
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -268,6 +269,34 @@ class RepoTest(unittest.TestCase):
                     types.SimpleNamespace(returncode=0, stdout=remote)):
                 self.assertEqual(ci.repo_of(None, {}, repo="."), REPO)
                 self.assertEqual(ci.repo_of(None, {}), REPO)
+
+    def test_issue_ref_outside_git_does_not_read_origin(self):
+        with tempfile.TemporaryDirectory(prefix="ameesh-5145-") as directory, \
+             contextlib.chdir(directory), \
+             mock.patch.object(ci, "_local_repo", side_effect=AssertionError("origin not needed")):
+            self.assertEqual(ci.repo_of(None, {"issue_ref": "manaty/nexlink#12"}),
+                             "manaty/nexlink")
+
+    def test_nexlink_lot_from_ameesh_clone_uses_issue_ref(self):
+        with mock.patch.object(ci, "_local_repo", return_value="manaty/ameesh") as origin:
+            self.assertEqual(ci.repo_of(None, {"issue_ref": "manaty/nexlink#12"}),
+                             "manaty/nexlink")
+            origin.assert_not_called()
+
+    def test_configured_project_outside_git_and_issue_ref_precedence(self):
+        cfg = types.SimpleNamespace(github={"projects": {"nexlink": "manaty/nexlink"}})
+        with tempfile.TemporaryDirectory(prefix="ameesh-5145-") as directory, \
+             contextlib.chdir(directory), \
+             mock.patch.object(ci, "_local_repo", side_effect=AssertionError("origin not needed")):
+            self.assertEqual(ci.repo_of(cfg, {"app": "nexlink"}), "manaty/nexlink")
+            self.assertEqual(ci.repo_of(cfg, {"app": "nexlink", "issue_ref": REPO + "#12"}), REPO)
+
+    def test_dot_refuses_an_origin_diverging_from_lot(self):
+        with mock.patch.object(ci, "_local_repo", return_value="manaty/ameesh"):
+            with self.assertRaisesRegex(ci.GelError, "differs from lot"):
+                ci.repo_of(None, {"id": 5141, "issue_ref": "manaty/nexlink#12"}, repo=".")
+            self.assertEqual(ci.repo_of(None, {"issue_ref": "manaty/nexlink#12"},
+                                        repo="example/product"), REPO)
 
     def test_unreadable_or_invalid_origin_refuses(self):
         with mock.patch("subprocess.run", return_value=types.SimpleNamespace(returncode=1, stdout="")):
