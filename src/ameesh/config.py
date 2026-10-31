@@ -1324,6 +1324,7 @@ def load(env: dict | None = None) -> Config:
                   config_shadowed=shadowed)
     from .platform import child_environment
     child_environment.declare_accounts(cfg.accounts)
+    child_environment.notify_credentials(cfg.notify)
     return cfg
 
 
