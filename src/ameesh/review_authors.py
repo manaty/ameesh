@@ -4756,7 +4756,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
     rendu par un relecteur sur sa tête, on lit les commits que ce relecteur a
     créés après le gel. Un commit qui descend de la tête gelée et qui n'est
     plus ancêtre de la tête lue est le correctif réécrit : son acteur reste
-    exclu par son nom, sans famille.
+    exclu par son nom, sans famille. #5066 : sauf si le reçu est rattaché à
+    un autre lot dont une tête contient le commit (un lot empilé sur le gel).
 
     La fenêtre lue est bornée autour du verdict (6 h avant, 2 h après, sans
     dépasser le gel courant) et **exhaustive** : une troncature silencieuse
@@ -4830,6 +4831,29 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
             return storage.of(db).turn_costs.work_item_of_turn(turn)
         except Exception:  # noqa: BLE001 - lecture impossible : pas de lot
             return None
+
+    def stacked_by_other_lot(receipt, full: str) -> bool:
+        """Le commit est-il le travail d'un autre lot empilé sur ce gel (#5066) ?
+
+        Il faut deux preuves : le reçu rattaché à un autre lot, et le commit
+        contenu dans une tête de cet autre lot (sa tête de branche
+        enregistrée ou l'un de ses gels). Un reçu sans lot, une tête
+        illisible ou un objet absent ne prouvent rien, et l'acteur reste
+        exclu (canon §2 : en cas de doute, la porte reste fermée)."""
+        related = receipt_lot(receipt)
+        if related is None or related == lot:
+            return False
+        try:
+            other = storage.of(db).work.get(int(related)) or {}
+            heads = [str(other.get("branch_head") or "").strip()]
+            heads.extend(str(row.get("sha") or "").strip()
+                         for row in storage.of(db).work.milestones(
+                             int(related), None) or ()
+                         if row.get("kind") == "frozen")
+        except Exception:  # noqa: BLE001 - autre lot illisible : aucune preuve
+            return False
+        return any(value and _is_ancestor(repo, full, value) is True
+                   for value in heads)
 
     check()
     try:
@@ -4986,6 +5010,14 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 if _is_ancestor(repo, full, head_sha) is True:
                     continue                # encore dans la tête : lu par la plage
                 if _is_ancestor(repo, freeze_sha, full) is not True:
+                    continue
+                # #5066 : la descendance du gel ne prouve pas une correction
+                # de ce lot. Un lot empilé sur ce gel (#5038 sur le gel
+                # fe75128d3 de #5029) en descend aussi. Le reçu n'est écarté
+                # que sur deux preuves : il est rattaché à un autre lot, et
+                # le commit est contenu dans une tête de cet autre lot.
+                check()
+                if stacked_by_other_lot(receipt, full):
                     continue
                 # Un seul nom par acteur ; la première tête gelée qui porte
                 # le correctif suffit à la trace.
