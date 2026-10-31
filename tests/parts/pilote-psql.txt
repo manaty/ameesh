@@ -63,6 +63,7 @@ test_4989_bootstrap_continuation  # signed replacement, inherited effects and im
 test_4989_controller_enrollment  # signed independent controller/key enrollment, exact payload and bounded stop authority
 test_4989_transport_delegation  # exact two-key release transport and effective SSH validation for both sources
 test_4867_sandbox  # storage: transactional sandbox lifecycle, immutable admission and concurrent result/cancel/bind (#4867)
+test_4885_staging_exclusive  # #5010: exclusive staging start reads shared terminal attestations
 test_4995_decision_supersession_journal  # #4995: journal append-only et lecture prouvée du remplacement, occurred_at lu en texte JSON par psql
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
