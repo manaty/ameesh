@@ -83,6 +83,16 @@ class VersionLevelTest(unittest.TestCase):
         self._commit("1.3.0", "ameesh 1.3.0")
         self.assertEqual(self._pr(), 0)
 
+    def test_manual_rollback_does_not_raise_upgrade_floor(self):
+        path = "src/ameesh/migrations/rollback/0001_init.sql"
+        for text in ("DROP TABLE a;", "DELETE FROM schema_migrations;"):
+            self._write(path, text)
+            self._commit("1.2.3", "manual rollback")
+            self.assertEqual(vl.level("v1.2.3", "HEAD")[0], "patch")
+        (self.repo / path).unlink()
+        self._commit("1.2.3", "remove manual rollback")
+        self.assertEqual(vl.level("HEAD^1", "HEAD")[0], "patch")
+
     def test_new_command_option_or_setting_needs_a_minor(self):
         self._write("src/ameesh/cli.py", CLI + '''    p.add_argument("-a", "--all")
     q = sub.add_parser("land")
