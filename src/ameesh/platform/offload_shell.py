@@ -234,6 +234,13 @@ def _dir(cfg: dict, *parts: str, mode: int = 0o700) -> str:
 NONCE = ""
 NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 
+#: the process this shell was started under: the forced command's sshd
+#: session. Captured at the entry of `main`, before any admission work, so a
+#: session that dies during admission (the client's wait budget expires
+#: before `job` is announced) is never mistaken for a live one: recording
+#: `os.getppid()` later would record the reparenting target instead (#5184).
+SESSION_PARENT: int | None = None
+
 
 def _no_dump() -> None:
     """PR_SET_DUMPABLE 0: /proc/<pid>/{environ,cmdline,mem,fd} of this shell
@@ -1105,11 +1112,13 @@ class Job:
     session loss, host gate and one deadline for the whole job."""
 
     def __init__(self, cfg: dict, job_id: str, job_dir: str,
-                 executor: Executor | None = None):
+                 executor: Executor | None = None, ssh_parent: int | None = None):
         self.cfg = cfg
         self.job_id = job_id
         self.cancel_flag = os.path.join(job_dir, "cancel")
-        self.ssh_parent = os.getppid()
+        # `main` passes the parent observed before admission; direct callers
+        # (tests) and jobs created outside `main` keep the historical anchor.
+        self.ssh_parent = os.getppid() if ssh_parent is None else ssh_parent
         # set from the slot on (`set_limit`): waiting in the queue is no timeout
         self.deadline = float("inf")
         self.limit = int(cfg["max_job_seconds"])
@@ -1380,6 +1389,14 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
         result.update(outcome="refused", reason=str(exc))
         emit_result(result)
         return 2
+    if SESSION_PARENT is not None and os.getppid() != SESSION_PARENT:
+        # the session died while the request was on its way (idle client,
+        # slow startup): no client is left to receive a result or to cancel,
+        # and a job started now would never be seen. Create none (#5184).
+        result.update(outcome="cancelled",
+                      reason="SSH session closed before the job started")
+        emit_result(result)
+        return 130
     state, _, reason = gate_state(cfg)
     if state != "available":
         result.update(outcome="refused", reason="host %s%s" % (state, ": " + reason if reason else ""))
@@ -1415,7 +1432,7 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
             "shell_pid": os.getpid(), "shell_start": _proc_identity(os.getpid())}
     _write_meta(meta_path, meta)
     emit("job", job_id)
-    job = Job(cfg, job_id, job_dir, executor=executor)
+    job = Job(cfg, job_id, job_dir, executor=executor, ssh_parent=SESSION_PARENT)
 
     def on_signal(signum, _frame):
         # the SSH session went away (SIGHUP), or `cancel` (SIGTERM)
@@ -1472,6 +1489,12 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
                 if ENV_RE.match(line):
                     key, value = line.split("=", 1)
                     cmd_env[key] = value
+        # a session lost during admission, or a cancel that arrived before the
+        # command: stop here, before `running` and the launch. Starting the
+        # command would leave a job the client can neither see nor cancel
+        # (#5184: the client's budget expired before `job` was announced).
+        if job.check():
+            raise Stopped()
         meta.update(state="running", started_ts=int(time.time()), limit_s=job.limit)
         _write_meta(meta_path, meta)
         emit("start", {"job": job_id, "profile": req["profile"], "limit_s": job.limit})
@@ -1640,6 +1663,10 @@ VERBS = {"put": cmd_put, "run": cmd_run, "status": cmd_status, "cancel": cmd_can
 
 
 def main(argv: list[str] | None = None) -> int:
+    # the session parent, before anything slow: a later `os.getppid()` may be
+    # the reparenting target of a session that already died (see Job)
+    global SESSION_PARENT
+    SESSION_PARENT = os.getppid()
     argv = sys.argv[1:] if argv is None else argv
     config = DEFAULT_CONFIG
     if argv[:1] == ["--config"] and len(argv) >= 2:
