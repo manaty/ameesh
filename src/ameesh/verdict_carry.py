@@ -42,10 +42,10 @@ aucun avis ». Quand le critère ci-dessus refuse, `adapted` prouve une seconde
 forme : la fusion de la nouvelle tête et la fusion d'essai de la tête relue ne
 diffèrent que par des fichiers de test modifiés ou ajoutés (la reconnaissance du
 véhicule, `packet_reviews` : le plan de CI `tests/parts/` n'en est pas), et par
-des morceaux en conflit résolus en **gardant les changements des deux côtés** sur
-la base, sans aucune ligne nouvelle : deux ajouts juxtaposés, ou un ajout voisin
-d'une ligne modifiée par l'autre côté. Deux côtés qui changent la même ligne de
-la base restent un jugement. Chaque commit nouveau reste prouvé : fusion de même nature,
+des morceaux en conflit résolus en **appliquant chaque côté à sa place** sur la
+base, sans aucune ligne nouvelle et chaque bloc contigu : deux ajouts juxtaposés,
+ou un ajout voisin d'une ligne modifiée par l'autre côté. Deux côtés qui changent
+la même ligne de la base, ou deux blocs entrelacés, restent un jugement. Chaque commit nouveau reste prouvé : fusion de même nature,
 commit limité aux tests, ou reprise propre d'un commit relu. Un lot fait de
 tests seuls n'en profite pas : ses tests sont son contenu. **Seul un avis
 favorable se reporte ainsi** : une adaptation peut répondre au blocage, son
@@ -94,13 +94,13 @@ vrai gel ultérieur les remplace.
 """
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
 import shutil
 import tempfile
 import time
-from collections import Counter
 from typing import Mapping, Optional
 
 from . import merge_queue, plan_git, storage, work
@@ -292,6 +292,9 @@ def conflict_hunks(repo: str, target: str, head: str) -> int | None:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+#: morceau en conflit : ajouts des deux côtés au même endroit essayés au plus
+#: dans les deux ordres (borne de coût : 2 rendus par juxtaposition)
+MAX_JUXTAPOSITIONS = 6
 #: commits nouveaux examinés au plus pour une preuve d'historique (borne de coût)
 MAX_NEW_COMMITS = 200
 #: commits relus essayés au plus pour un commit rejoué dont le conflit a été
@@ -583,44 +586,59 @@ def _conflict_segments(blob: bytes) -> list | None:
     return None if side is not None else segments
 
 
-def _without(lines: list, removed: Counter) -> list:
-    """`lines` sans les occurrences de `removed`, les premières d'abord."""
-    left = Counter(removed)
-    kept = []
-    for line in lines:
-        if left[line] > 0:
-            left[line] -= 1
-        else:
-            kept.append(line)
-    return kept
+def _edits(origin: list, side: list) -> list:
+    """Les changements d'un côté sur la base : `(début, fin, lignes rendues)`, en
+    positions de la base (début = fin : un ajout devant cette ligne)."""
+    matcher = difflib.SequenceMatcher(None, origin, side, autojunk=False)
+    return [(start, end, side[first:last])
+            for tag, start, end, first, last in matcher.get_opcodes() if tag != "equal"]
 
 
-def _in_order(lines: list, within: list) -> bool:
-    """`lines` est-elle une sous-suite de `within` ?"""
-    rest = iter(within)
-    return all(line in rest for line in lines)
-
-
-def _hunk_lines(left: list, origin: list, right: list) -> Counter | None:
-    """Les lignes qu'un morceau en conflit rend quand ses deux côtés s'appliquent
-    sur la base : celles de la base qui restent et celles que chacun ajoute. None
-    si les deux retirent une même ligne de la base : un vrai désaccord, un
-    jugement."""
-    base = Counter(origin)
-    gone_left, gone_right = base - Counter(left), base - Counter(right)
-    if gone_left & gone_right:
+def _hunk_renderings(left: list, origin: list, right: list) -> list | None:
+    """Les rendus mécaniques d'un morceau en conflit : la base, les changements des
+    deux côtés appliqués chacun à sa place, chaque bloc contigu. Deux ajouts au même
+    endroit se juxtaposent dans un ordre ou dans l'autre ; un ajout voisin d'une
+    ligne modifiée par l'autre côté garde les deux (cas #4975). None si les côtés
+    touchent une même ligne de la base (un vrai désaccord, un jugement), ou si les
+    ordres à essayer dépassent `MAX_JUXTAPOSITIONS`."""
+    edits_left, edits_right = _edits(origin, left), _edits(origin, right)
+    for start, end, _lines in edits_left:
+        for other, stop, _rendered in edits_right:
+            if (max(start, other) < min(end, stop)
+                    or (start == end and other < start < stop)
+                    or (other == stop and start < other < end)):
+                return None
+    ties = {start for start, end, _lines in edits_left if start == end} & {
+        start for start, end, _lines in edits_right if start == end}
+    if len(ties) > MAX_JUXTAPOSITIONS:
         return None
-    return (base - gone_left - gone_right
-            + (Counter(left) - base) + (Counter(right) - base))
+    renderings: list = [[]]
+    cursor = 0
+    # Un ajout (fin = début) passe devant la modification qui commence au même
+    # endroit : il est écrit devant cette ligne de la base.
+    edits = sorted(edits_left + edits_right, key=lambda edit: edit[:2])
+    index = 0
+    while index < len(edits):
+        start, end, lines = edits[index]
+        kept = origin[cursor:start]
+        if start in ties and start == end:
+            again = edits[index + 1][2]
+            index += 1
+            renderings = [done + kept + order for done in renderings
+                          for order in (lines + again, again + lines)]
+        else:
+            renderings = [done + kept + lines for done in renderings]
+        cursor = max(cursor, end)
+        index += 1
+    return [done + origin[cursor:] for done in renderings]
 
 
 def composed_hunks(conflicted: bytes, resolved: bytes) -> int | None:
     """Le nombre de morceaux en conflit de `conflicted`, si `resolved` en est la
-    résolution mécanique : tout le reste à l'octet près, et chaque morceau rend
-    exactement `_hunk_lines`, l'ordre de chaque côté gardé. Deux ajouts se
-    juxtaposent ; un ajout voisin d'une ligne modifiée par l'autre côté garde les
-    deux (cas #4975). None sinon : une ligne ajoutée, retirée ou retouchée est un
-    jugement."""
+    résolution mécanique : tout le reste à l'octet près, et chaque morceau égal à
+    l'un de ses rendus (`_hunk_renderings`). None sinon : une ligne ajoutée, retirée,
+    retouchée, ou deux blocs entrelacés (cx2 #172928 : l'ordre peut changer le
+    comportement) sont un jugement."""
     segments = _conflict_segments(conflicted)
     if not segments:
         return None
@@ -632,17 +650,13 @@ def composed_hunks(conflicted: bytes, resolved: bytes) -> int | None:
                 return None
             position += 1
             continue
-        left, origin, right = segment
-        lines = _hunk_lines(left, origin, right)
-        if lines is None:
+        renderings = _hunk_renderings(*segment)
+        if not renderings:
             return None
-        rendered = expected[position:position + sum(lines.values())]
-        base = Counter(origin)
-        if (Counter(rendered) != lines
-                or not _in_order(_without(left, base - Counter(right)), rendered)
-                or not _in_order(_without(right, base - Counter(left)), rendered)):
+        size = len(renderings[0])
+        if expected[position:position + size] not in renderings:
             return None
-        position += len(rendered)
+        position += size
         hunks += 1
     return hunks if hunks and position == len(expected) else None
 

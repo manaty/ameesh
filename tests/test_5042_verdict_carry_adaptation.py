@@ -3,10 +3,11 @@
 
 Canon §2 : « conflit mécanique, adaptation de test : aucun avis ». Témoins du
 critère sur un vrai dépôt : adaptation de test seule ou après une fusion de la
-cible, conflit résolu en gardant les deux côtés (deux ajouts, ou ajout voisin
-d'une ligne modifiée : le cas #4975) ; et les refus : ligne de produit, plan de
-CI, test retiré, lot fait de tests, désaccord sur une même ligne, ligne ajoutée,
-côté perdu, marques restées, fusion « maligne », contenu ajouté puis retiré. Puis
+cible, conflit résolu en appliquant chaque côté à sa place (deux ajouts, ou ajout
+voisin d'une ligne modifiée : le cas #4975) ; et les refus : ligne de produit, plan
+de CI, test retiré, lot fait de tests, désaccord sur une même ligne, blocs
+entrelacés, ligne ajoutée, côté perdu, marques restées, fusion « maligne », contenu
+ajouté puis retiré. Puis
 sur Postgres : l'avis favorable se reporte et ouvre la porte, un blocage ne se
 reporte pas, et son auteur reste dû."""
 from __future__ import annotations
@@ -53,6 +54,7 @@ class ComposedHunksTest(unittest.TestCase):
         for name, resolved in (("new line", b"a\nl1\nb2\nnew\nz\n"),
                                ("side lost", b"a\nb2\nz\n"),
                                ("old line kept", b"a\nl1\nb\nb2\nz\n"),
+                               ("order of the sides", b"a\nb2\nl1\nz\n"),
                                ("outside", b"a!\nl1\nb2\nz\n"),
                                ("trailing", b"a\nl1\nb2\nz\nmore\n")):
             with self.subTest(name):
@@ -62,6 +64,36 @@ class ComposedHunksTest(unittest.TestCase):
         both = b"<<<<<<< L\nx\ny\n||||||| B\n=======\nw\n>>>>>>> R\n"
         self.assertEqual(verdict_carry.composed_hunks(both, b"x\ny\nw\n"), 1)
         self.assertIsNone(verdict_carry.composed_hunks(both, b"y\nx\nw\n"))
+
+    def test_interleaved_blocks_are_a_judgment(self):
+        # B1 cx2 #172928 : juxtaposés, les blocs affichent 1 puis 2 (ou l'inverse) ;
+        # entrelacés, ils affichent 2 deux fois. Aucune ligne nouvelle, mais un
+        # autre comportement.
+        both = (b"<<<<<<< L\nx = 1\nprint(x)\n||||||| B\n=======\nx = 2\nprint(x)\n"
+                b">>>>>>> R\n")
+        self.assertIsNone(verdict_carry.composed_hunks(
+            both, b"x = 1\nx = 2\nprint(x)\nprint(x)\n"))
+        self.assertEqual(verdict_carry.composed_hunks(
+            both, b"x = 1\nprint(x)\nx = 2\nprint(x)\n"), 1)
+        self.assertEqual(verdict_carry.composed_hunks(
+            both, b"x = 2\nprint(x)\nx = 1\nprint(x)\n"), 1)
+
+    def test_changes_at_separate_places_of_the_base_keep_their_place(self):
+        both = (b"<<<<<<< L\nnew a\nb\nc\n||||||| B\na\nb\nc\n=======\na\nb\nnew c\n"
+                b">>>>>>> R\n")
+        self.assertEqual(verdict_carry.composed_hunks(both, b"new a\nb\nnew c\n"), 1)
+        self.assertIsNone(verdict_carry.composed_hunks(both, b"new c\nb\nnew a\n"))
+
+    def test_an_addition_inside_a_change_of_the_other_side_is_a_judgment(self):
+        both = (b"<<<<<<< L\na\nmine\nb\n||||||| B\na\nb\n=======\nchanged\n"
+                b">>>>>>> R\n")
+        self.assertIsNone(verdict_carry.composed_hunks(both, b"mine\nchanged\n"))
+
+    def test_too_many_orders_prove_nothing(self):
+        lines = [b"k%d\n" % index for index in range(7)]
+        left = [line for key in lines for line in (b"l" + key, key)]
+        right = [line for key in lines for line in (b"r" + key, key)]
+        self.assertIsNone(verdict_carry._hunk_renderings(left, lines, right))
 
     def test_both_sides_changing_one_line_is_a_judgment(self):
         both = b"<<<<<<< L\nx = 1\n||||||| B\nx = 0\n=======\nx = 2\n>>>>>>> R\n"
