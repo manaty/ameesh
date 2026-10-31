@@ -886,6 +886,14 @@ def service_managers(uid: int | None = None) -> frozenset:
     return frozenset(out)
 
 
+class ExecutorSnapshot(dict):
+    """Per-scan identities and unavailable managers; never caches PID trust."""
+
+    def __init__(self):
+        super().__init__()
+        self.unavailable = []
+
+
 def executor_processes() -> dict:
     """#5038: service MainPIDs with their kernel start ticks and cgroup.
 
@@ -898,6 +906,7 @@ def executor_processes() -> dict:
         return {}
     import subprocess
     blocks = []
+    result = ExecutorSnapshot()
     for manager in (["systemctl", "--user"], ["systemctl", "--system"]):
         try:
             done = subprocess.run(
@@ -905,10 +914,12 @@ def executor_processes() -> dict:
                  "--property=Id,MainPID,ControlGroup,Transient,FragmentPath", "ameesh-*.service"],
                 capture_output=True, text=True, timeout=5, check=False)
         except (OSError, subprocess.SubprocessError):
+            result.unavailable.append(manager[-1])
             continue
         if done.returncode == 0:
             blocks.extend(done.stdout.strip().split("\n\n"))
-    result = {}
+        else:
+            result.unavailable.append(manager[-1])
     for block in blocks:
         fields = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
         unit, pid, group = (fields.get(k, "") for k in ("Id", "MainPID", "ControlGroup"))
@@ -996,7 +1007,11 @@ def _doubt_proc(pid, uid: int, managers, allow=(), executors=None) -> str | None
     if ((executors is not None and _trusted_executor(pid, executors))
             or _allowed_proc(pid, allow)):
         return None
-    return "%s %s" % (pid, " ".join(status.get("Name") or ["?"]))
+    detail = "%s %s" % (pid, " ".join(status.get("Name") or ["?"]))
+    if executors is not None and "--user" in getattr(executors(), "unavailable", ()):
+        detail += (" (systemctl --user unavailable; verify user session context: "
+                   "XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS)")
+    return detail
 
 
 def _doubt_psutil(ps, pid: int, user, allow=()) -> str | None:
