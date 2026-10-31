@@ -1068,10 +1068,13 @@ class Events(Domain):
 
     def context_type(self, type: str, days: int, limit: int, *,
                      object_prefix: str) -> list[dict]:
-        """Recent events plus the last pre-window state per matching object.
+        """Recent events plus the pre-window state per matching object.
 
         Each group is bounded by `limit`; the preceding state has no age
         cutoff, for durable states whose validity exceeds the history window.
+        #5057: it is the last state plus the renewed `paused` states chained
+        before it (back to a non-`paused` state, or to an ordinary pause whose
+        deadline passed before the next event).
         """
         raise NotImplementedError("event history with preceding state is unavailable")
 

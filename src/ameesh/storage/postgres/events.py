@@ -58,14 +58,25 @@ class Events(interface.Events):
     def context_type(self, type, days, limit, *, object_prefix) -> list:
         # One snapshot for the boundary, recent history and its preceding state.
         # Bound each set independently: recent chatter must not evict old states.
+        # #5057: the preceding state is the chain of renewed pauses before the
+        # boundary, back to the last break: a non-`paused` state, or an
+        # ordinary pause whose deadline passed before the next event.
         return self.db.query(
             "with boundary as (select now() - make_interval(days => %s::int) as at),"
             " recent as (select " + _COLUMNS + " from ameesh_events, boundary"
             " where type = %s and starts_with(object, %s) and created_at > boundary.at"
             " order by id desc limit %s),"
-            " preceding as (select * from (select distinct on (object) " + _COLUMNS
-            + " from ameesh_events, boundary where type = %s and starts_with(object, %s)"
-            " and created_at <= boundary.at order by object, id desc) states"
+            " marked as (select " + _COLUMNS + ", coalesce(data->>'state', '') <> 'paused'"
+            " or (data->'await_announcement' is distinct from 'true'::jsonb"
+            " and jsonb_typeof(data->'until') = 'number'"
+            " and (data->>'until')::float8"
+            " < extract(epoch from lead(created_at) over chain)) as breaks"
+            " from ameesh_events, boundary where type = %s and starts_with(object, %s)"
+            " and created_at <= boundary.at window chain as (partition by object order by id)),"
+            " preceding as (select id, type, object, project, data, ts from ("
+            "select *, max(case when breaks then id end) over (partition by object) as cut,"
+            " max(id) over (partition by object) as last from marked) states"
+            " where id > coalesce(cut, 0) or id = last"
             " order by id desc limit %s)"
             " select * from recent union all select * from preceding",
             (int(days), type, object_prefix, int(limit), type, object_prefix, int(limit)))

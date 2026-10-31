@@ -123,7 +123,8 @@ part.
 créneau) sans arrêter la minuterie : `role timers --check` reste vert et nomme
 la pause. L'échéance est obligatoire (au plus 12 h) ; la pause vit au journal
 partagé (`packet.pause`, `ameesh.packet_pause`), pas sur l'hôte : un bail qui
-change de main la garde. `--await-announcement` transforme l’échéance en alerte :
+change de main la garde. `--await-announcement` transforme l’échéance en alerte,
+relancée chaque heure tant que l’annonce manque (#5057) :
 la pause reste jusqu’à `resume --source "auteur, date, message"` (canon §7). Pendant la pause, le tic ne fait aucun geste (ni
 migration ni composition) et le dit ; sans attente d’annonce, à l'échéance il
 reprend seul ; `resume` lève avant. Pose et levée sont dites au pilote et au bureau.
