@@ -496,6 +496,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sandbox/turns": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Sandbox turns (read-only, bounded) */
+        get: operations["sandbox_turns"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sandbox/turns/{turn}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Sandbox turn metadata and receipt (read-only) */
+        get: operations["sandbox_turns_turn"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/threads/{project}": {
         parameters: {
             query?: never;
@@ -565,6 +599,61 @@ export interface components {
             agent: {
                 key_ready: boolean;
                 name: string;
+                sandbox?: {
+                    agent: string;
+                    canon_ref: string;
+                    completed_ts: number | null;
+                    counters: {
+                        model_calls: number;
+                        seconds: number;
+                        tool_calls: number;
+                        turns: number;
+                    } | null;
+                    deadline_ts: number;
+                    epoch: number;
+                    job: {
+                        name: string;
+                        namespace: string;
+                        phase: string | null;
+                        uid: string | null;
+                    };
+                    owner: string;
+                    placement_ref: string;
+                    profile_ref: string;
+                    receipt: {
+                        epoch: number;
+                        job: Record<string, never>;
+                        replayed: boolean;
+                        result_id: string;
+                        result_sha256: string;
+                        /** @constant */
+                        schema: "ameesh-sandbox-receipt/1";
+                        scope: Record<string, never>;
+                        scope_digest: string;
+                        source: Record<string, never>;
+                        turn_id: string;
+                    } | null;
+                    refusal: string | null;
+                    result_sha256: string | null;
+                    /** @constant */
+                    schema: "ameesh-sandbox-turn/1";
+                    scope: Record<string, never>;
+                    scope_digest: string;
+                    source: Record<string, never>;
+                    started_ts: number;
+                    /** @enum {string} */
+                    state: "intent" | "created" | "bound" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "expired" | "orphaned" | "lost";
+                    tranche: {
+                        kept_usd: number | null;
+                        reserved_usd: number;
+                        settled_usd: number | null;
+                        /** @enum {unknown} */
+                        state: "open" | "settled" | "kept" | "released";
+                        tranche_id: string;
+                    } | null;
+                    turn_id: string;
+                    verdict: string | null;
+                } | null;
             };
             /** @constant */
             schema: "ameesh-agent-detail/1";
@@ -583,6 +672,61 @@ export interface components {
         "ameesh-agents-1": {
             agents: {
                 name: string;
+                sandbox?: {
+                    agent: string;
+                    canon_ref: string;
+                    completed_ts: number | null;
+                    counters: {
+                        model_calls: number;
+                        seconds: number;
+                        tool_calls: number;
+                        turns: number;
+                    } | null;
+                    deadline_ts: number;
+                    epoch: number;
+                    job: {
+                        name: string;
+                        namespace: string;
+                        phase: string | null;
+                        uid: string | null;
+                    };
+                    owner: string;
+                    placement_ref: string;
+                    profile_ref: string;
+                    receipt: {
+                        epoch: number;
+                        job: Record<string, never>;
+                        replayed: boolean;
+                        result_id: string;
+                        result_sha256: string;
+                        /** @constant */
+                        schema: "ameesh-sandbox-receipt/1";
+                        scope: Record<string, never>;
+                        scope_digest: string;
+                        source: Record<string, never>;
+                        turn_id: string;
+                    } | null;
+                    refusal: string | null;
+                    result_sha256: string | null;
+                    /** @constant */
+                    schema: "ameesh-sandbox-turn/1";
+                    scope: Record<string, never>;
+                    scope_digest: string;
+                    source: Record<string, never>;
+                    started_ts: number;
+                    /** @enum {string} */
+                    state: "intent" | "created" | "bound" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "expired" | "orphaned" | "lost";
+                    tranche: {
+                        kept_usd: number | null;
+                        reserved_usd: number;
+                        settled_usd: number | null;
+                        /** @enum {unknown} */
+                        state: "open" | "settled" | "kept" | "released";
+                        tranche_id: string;
+                    } | null;
+                    turn_id: string;
+                    verdict: string | null;
+                } | null;
             }[];
             /** @constant */
             schema: "ameesh-agents/1";
@@ -740,6 +884,120 @@ export interface components {
             /** @constant */
             schema: "ameesh-projects/1";
         };
+        "ameesh-sandbox-turn-1": {
+            agent: string;
+            canon_ref: string;
+            completed_ts: number | null;
+            counters: {
+                model_calls: number;
+                seconds: number;
+                tool_calls: number;
+                turns: number;
+            } | null;
+            deadline_ts: number;
+            epoch: number;
+            job: {
+                name: string;
+                namespace: string;
+                phase: string | null;
+                uid: string | null;
+            };
+            owner: string;
+            placement_ref: string;
+            profile_ref: string;
+            receipt: {
+                epoch: number;
+                job: Record<string, never>;
+                replayed: boolean;
+                result_id: string;
+                result_sha256: string;
+                /** @constant */
+                schema: "ameesh-sandbox-receipt/1";
+                scope: Record<string, never>;
+                scope_digest: string;
+                source: Record<string, never>;
+                turn_id: string;
+            } | null;
+            refusal: string | null;
+            result_sha256: string | null;
+            /** @constant */
+            schema: "ameesh-sandbox-turn/1";
+            scope: Record<string, never>;
+            scope_digest: string;
+            source: Record<string, never>;
+            started_ts: number;
+            /** @enum {string} */
+            state: "intent" | "created" | "bound" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "expired" | "orphaned" | "lost";
+            tranche: {
+                kept_usd: number | null;
+                reserved_usd: number;
+                settled_usd: number | null;
+                /** @enum {unknown} */
+                state: "open" | "settled" | "kept" | "released";
+                tranche_id: string;
+            } | null;
+            turn_id: string;
+            verdict: string | null;
+        };
+        "ameesh-sandbox-turns-1": {
+            /** @constant */
+            schema: "ameesh-sandbox-turns/1";
+            turns: {
+                agent: string;
+                canon_ref: string;
+                completed_ts: number | null;
+                counters: {
+                    model_calls: number;
+                    seconds: number;
+                    tool_calls: number;
+                    turns: number;
+                } | null;
+                deadline_ts: number;
+                epoch: number;
+                job: {
+                    name: string;
+                    namespace: string;
+                    phase: string | null;
+                    uid: string | null;
+                };
+                owner: string;
+                placement_ref: string;
+                profile_ref: string;
+                receipt: {
+                    epoch: number;
+                    job: Record<string, never>;
+                    replayed: boolean;
+                    result_id: string;
+                    result_sha256: string;
+                    /** @constant */
+                    schema: "ameesh-sandbox-receipt/1";
+                    scope: Record<string, never>;
+                    scope_digest: string;
+                    source: Record<string, never>;
+                    turn_id: string;
+                } | null;
+                refusal: string | null;
+                result_sha256: string | null;
+                /** @constant */
+                schema: "ameesh-sandbox-turn/1";
+                scope: Record<string, never>;
+                scope_digest: string;
+                source: Record<string, never>;
+                started_ts: number;
+                /** @enum {string} */
+                state: "intent" | "created" | "bound" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "expired" | "orphaned" | "lost";
+                tranche: {
+                    kept_usd: number | null;
+                    reserved_usd: number;
+                    settled_usd: number | null;
+                    /** @enum {unknown} */
+                    state: "open" | "settled" | "kept" | "released";
+                    tranche_id: string;
+                } | null;
+                turn_id: string;
+                verdict: string | null;
+            }[];
+        };
         "ameesh-thread-1": {
             entries: {
                 author: string;
@@ -823,6 +1081,61 @@ export interface components {
                 /** @enum {unknown} */
                 state: "pending" | "delivered" | "withdrawn";
             } | null;
+            sandbox?: {
+                agent: string;
+                canon_ref: string;
+                completed_ts: number | null;
+                counters: {
+                    model_calls: number;
+                    seconds: number;
+                    tool_calls: number;
+                    turns: number;
+                } | null;
+                deadline_ts: number;
+                epoch: number;
+                job: {
+                    name: string;
+                    namespace: string;
+                    phase: string | null;
+                    uid: string | null;
+                };
+                owner: string;
+                placement_ref: string;
+                profile_ref: string;
+                receipt: {
+                    epoch: number;
+                    job: Record<string, never>;
+                    replayed: boolean;
+                    result_id: string;
+                    result_sha256: string;
+                    /** @constant */
+                    schema: "ameesh-sandbox-receipt/1";
+                    scope: Record<string, never>;
+                    scope_digest: string;
+                    source: Record<string, never>;
+                    turn_id: string;
+                } | null;
+                refusal: string | null;
+                result_sha256: string | null;
+                /** @constant */
+                schema: "ameesh-sandbox-turn/1";
+                scope: Record<string, never>;
+                scope_digest: string;
+                source: Record<string, never>;
+                started_ts: number;
+                /** @enum {string} */
+                state: "intent" | "created" | "bound" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "expired" | "orphaned" | "lost";
+                tranche: {
+                    kept_usd: number | null;
+                    reserved_usd: number;
+                    settled_usd: number | null;
+                    /** @enum {unknown} */
+                    state: "open" | "settled" | "kept" | "released";
+                    tranche_id: string;
+                } | null;
+                turn_id: string;
+                verdict: string | null;
+            };
             /** @constant */
             schema: "ameesh-turn-observation/1";
             turn: {
@@ -3003,6 +3316,120 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ameesh-turn-observation-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    sandbox_turns: {
+        parameters: {
+            query?: {
+                /** @description agent name */
+                agent?: string;
+                /** @description at most 100 by default */
+                limit?: number;
+                /** @description exact scope digest */
+                scope?: string;
+                /** @description sandbox state */
+                state?: "intent" | "created" | "bound" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled" | "expired" | "orphaned" | "lost";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sandbox turns (read-only, bounded) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-sandbox-turns-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    sandbox_turns_turn: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                turn: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sandbox turn metadata and receipt (read-only) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-sandbox-turn-1"];
                 };
             };
             /** @description bad request */

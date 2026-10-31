@@ -499,6 +499,7 @@ class TurnCurrentTest(unittest.TestCase):
 
     def test_verified_command_and_database_failures(self):
         backend = mock.Mock(kind="pg")
+        backend.db.query.return_value = []
         with mock.patch("ameesh.backend.open_backend", return_value=(backend, "")), \
                 mock.patch("ameesh.registry.lease_matches", return_value=(True, "")), \
                 mock.patch("ameesh.registry.pending_spend_get", return_value={"turn_id": "turn-1"}):
