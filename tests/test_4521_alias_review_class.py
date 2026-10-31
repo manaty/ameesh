@@ -55,6 +55,20 @@ def test_core_does_not_import_module_implementations(self):
                           for name in ("plan_github", "plan_git", "merge_pr")})
 """
 
+#: la liste nommée et datée de #4414
+NAMED_LIST = """\
+from collections import Counter
+
+COMPATIBILITY_ALIASES = {
+    "plan_git.py": ("#4383", "2026-10-29", "reason"),
+    "review.py": ("#4385", "2026-10-29", "reason"),
+}
+
+
+def test_core_does_not_import_module_implementations(self):
+    exceptions = Counter({(path, "module-import"): 1 for path in COMPATIBILITY_ALIASES})
+"""
+
 ALIAS = """\
 import sys
 
@@ -124,6 +138,18 @@ class DeclarationTest(Fixture):
         tree.declare()
         self.assertEqual(script.declared_paths(tree.root),
                          ["plan_git.py", "review.py"])
+
+    def test_liste_nommee_de_4414(self):
+        tree = self.tree()
+        tree.declare(NAMED_LIST)
+        self.assertEqual(script.declared_paths(tree.root),
+                         ["plan_git.py", "review.py"])
+
+    def test_nom_inconnu_refuse(self):
+        tree = self.tree()
+        tree.declare(NAMED_LIST.replace("in COMPATIBILITY_ALIASES", "in AILLEURS"))
+        with self.assertRaises(script.GuardError):
+            script.declared_paths(tree.root)
 
     def test_comprehension_de_4385(self):
         tree = self.tree()

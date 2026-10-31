@@ -144,7 +144,19 @@ def _counter_argument(node):
     return node
 
 
-def _declared_keys(node) -> list:
+def _constants(tree) -> dict:
+    """Les dicts littéraux de tête du module, réduits au tuple de leurs clés (#4414)."""
+    found = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
+                and all(isinstance(target, ast.Name) for target in node.targets)
+                and all(key is not None for key in node.value.keys)):
+            keys = tuple(_value(key) for key in node.value.keys)
+            found.update({target.id: keys for target in node.targets})
+    return found
+
+
+def _declared_keys(node, constants=None) -> list:
     """Les clés ``(chemin, motif)`` d'un dict littéral ou d'une compréhension."""
     if isinstance(node, ast.Dict):
         return [_value(key) for key in node.keys]
@@ -154,7 +166,7 @@ def _declared_keys(node) -> list:
         generator = node.generators[0]
         if not isinstance(generator.target, ast.Name):
             raise GuardError("exceptions : variable de compréhension attendue")
-        values = _value(generator.iter)
+        values = _value(generator.iter, constants or {})
         if not isinstance(values, tuple):
             raise GuardError("exceptions : itération non prise en charge")
         return [_value(node.key, {generator.target.id: value}) for value in values]
@@ -199,7 +211,7 @@ def declared_paths(root: str) -> list:
     if exceptions is None:
         raise GuardError("variable `exceptions` absente de %s" % DECLARING_TEST)
     paths = []
-    for key in _declared_keys(_counter_argument(exceptions)):
+    for key in _declared_keys(_counter_argument(exceptions), _constants(tree)):
         declared, motif = _tuple_key(key)
         if motif == MODULE_IMPORT and isinstance(declared, str):
             paths.append(declared)
