@@ -88,10 +88,10 @@ from dataclasses import dataclass, field
 
 from . import agent_names, identity, registry, storage
 
-#: the five gestures of the study, and the drill's no-op `canary` (EP7 P3,
+#: the pilot gestures, the elected release pass, and the no-op `canary` (EP7 P3,
 #: `ameesh role canary`, #3433); kept explicit so a typo can never create a
 #: new event namespace by accident
-GESTURES = ("merge", "queue", "assign", "packet", "decision", "canary")
+GESTURES = ("merge", "queue", "assign", "packet", "decision", "canary", "release")
 #: event type written in `ameesh_events` (append-only, one year by default)
 EVENT = "pilot.gesture"
 #: minimum lease duration used to hold the role while the gesture runs (the

@@ -462,19 +462,20 @@ def _elected_tick(cfg, args):
         from .db import open_db
         db = open_db(cfg)
         try:
-            fence = pilot_gesture.gate(cfg, db, "release", "release tick")
+            fence = pilot_gesture.gate(cfg, db, "release", "release " + args.release_command)
             if fence is None:
                 raise pilot_gesture.GestureRefused("release tick requires an elected role")
-            fence.hold(db)
+            # The runner alone renews the role; a timer must not keep a dead
+            # runner elected. The wrapper watches its live epoch throughout.
         finally:
             db.close()
         return None
     command = [sys.executable, "-m", "ameesh", "release", args.release_command]
-    for name in ("project", "now", "version"):
+    for name in ("project", "now", "version", "actor"):
         value = getattr(args, name, None)
         if value is not None:
             command += ["--" + name, str(value)]
-    for name in ("force", "no_staging", "json", "dry_run"):
+    for name in ("force", "no_staging", "json", "dry_run", "apply"):
         if getattr(args, name, False):
             command.append("--" + name.replace("_", "-"))
     return role_run.run(cfg, argparse.Namespace(
@@ -486,7 +487,8 @@ def run(cfg, args) -> int:
     """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch`."""
     from . import release_cutoff
     command = args.release_command
-    if command in ("tick", "packet-watch"):
+    if (command in ("tick", "packet-watch", "cutoff")
+            or command == "staging-needed" and getattr(args, "apply", False)):
         status = _elected_tick(cfg, args)
         if status is not None:
             return status

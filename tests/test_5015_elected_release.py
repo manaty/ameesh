@@ -6,7 +6,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import packet_watch, release, release_cutoff, role_run
+from ameesh import packet_watch, release, release_cutoff, role_run, pilot_gesture, registry
 from tests.support import PgTestCase
 
 
@@ -63,7 +63,7 @@ class ElectionTest(unittest.TestCase):
                 mock.patch.object(release, '_release_tick', return_value=0) as cut, \
                 mock.patch.object(release, '_packet_watch', return_value=0) as watch:
             self.assertEqual(release.run(self.cfg(), self.args()), 0)
-        gate.return_value.hold.assert_called_once()
+        gate.return_value.hold.assert_not_called()
         cut.assert_called_once()
         watch.assert_called_once()
 
@@ -74,6 +74,25 @@ class ElectionTest(unittest.TestCase):
                 mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(release.run(self.cfg(), args), 0)
         self.assertIn('--dry-run', wrapper.call_args.args[1].command)
+
+    def test_direct_cutoff_and_staging_apply_require_the_elected_wrapper(self):
+        for command in ('cutoff', 'staging-needed'):
+            with self.subTest(command=command):
+                args = self.args()
+                args.release_command = command
+                if command == 'staging-needed':
+                    args.apply, args.actor = True, 'pilot'
+                with mock.patch.dict(os.environ, {}, clear=True), \
+                        mock.patch.object(role_run, 'run', return_value=0) as wrapper, \
+                        mock.patch.object(release, '_release_tick') as cut, \
+                        mock.patch('ameesh.staging_pending.apply') as stage:
+                    self.assertEqual(release.run(self.cfg(), args), 0)
+                cut.assert_not_called()
+                stage.assert_not_called()
+                self.assertIn(command, wrapper.call_args.args[1].command)
+                if command == 'staging-needed':
+                    self.assertIn('--apply', wrapper.call_args.args[1].command)
+                    self.assertIn('--actor', wrapper.call_args.args[1].command)
 
     def test_role_projects_replace_legacy_host_selection(self):
         cfg = self.cfg()
@@ -120,6 +139,43 @@ class ElectionTest(unittest.TestCase):
 
 
 class ExecutionLeaseTest(PgTestCase):
+    def test_real_release_gate_never_renews_the_runner_lease(self):
+        name, owner = 'test-release-pilot', 'test-release-runner'
+        registry.upsert(self.db, name, harness='other', host=self.cfg.host, status='idle')
+        self.db.execute("UPDATE agent_registry SET releve='election', candidats=ARRAY[%s]"
+                        " WHERE name=%s", (self.cfg.host, name))
+        lease = registry.claim(self.db, name, owner, 60, host=self.cfg.host)
+        cfg = types.SimpleNamespace(host=self.cfg.host, release=dict(role=name),
+                                    packet_watch={}, canon=[])
+        env = {role_run.ENV_ROLE:name, role_run.ENV_PASS:'release',
+               role_run.ENV_EPOCH:str(lease['lease_epoch']), role_run.ENV_OWNER:owner}
+        def snapshot():
+            return self.db.query("SELECT last_seen, lease_expires_at FROM agent_registry"
+                                 " WHERE name=%s", (name,))[0]
+        before = snapshot()
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch('ameesh.db.open_db', return_value=self.db), \
+                mock.patch.object(self.db, 'close'), \
+                mock.patch.object(pilot_gesture, 'effective_ttl', return_value=(60, False)):
+            self.assertIsNone(release._elected_tick(cfg, ElectionTest().args()))
+            self.assertEqual(snapshot(), before)
+            self.db.execute("UPDATE agent_registry SET lease_expires_at=clock_timestamp()"
+                            " - interval '1 second' WHERE name=%s", (name,))
+            expired = snapshot()
+            for command in ('tick', 'packet-watch', 'cutoff', 'staging-needed'):
+                args = ElectionTest().args()
+                args.release_command, args.apply = command, True
+                with self.subTest(command=command), \
+                        mock.patch.object(release, '_release_tick') as cut, \
+                        mock.patch.object(release, '_packet_watch') as watch, \
+                        mock.patch('ameesh.staging_pending.apply') as stage:
+                    with self.assertRaises(pilot_gesture.GestureRefused):
+                        release.run(cfg, args)
+                    cut.assert_not_called()
+                    watch.assert_not_called()
+                    stage.assert_not_called()
+                    self.assertEqual(snapshot(), expired)
+
     def test_shared_lease_excludes_second_host_and_allows_successor(self):
         first = role_run._ReleaseLease(self.db, 'test-5015', 'a', 1)
         second = role_run._ReleaseLease(self.db, 'test-5015', 'b', 2)
