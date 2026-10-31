@@ -722,11 +722,20 @@ redemarrer() {
 
 # L'ExecStart peut pointer vers le lanceur stable alors que le processus
 # vivant garde l'ancien venv. Ni ExecStart ni /proc/PID/exe seuls ne le prouvent.
+# #5094 : conserver la preuve stricte pour les exécuteurs non dumpables.
+# Aucun prompt interactif : absence de privilèges = contrôle en échec.
+preuve_venv_poste() {
+  local rc=0
+  python3 "$ICI/venv-processus.py" "$@" || rc=$?
+  [ "$rc" = 3 ] || return "$rc"
+  sudo -n python3 "$ICI/venv-processus.py" "$@"
+}
+
 controler_notify() {
   local pid apres
   systemctl --user is-active --quiet ameesh-notify.service || return 1
   pid=$(systemctl --user show -p MainPID --value ameesh-notify.service) || return 1
-  python3 "$ICI/venv-processus.py" "$pid" "$VENV" ameesh-notify || return 1
+  preuve_venv_poste "$pid" "$VENV" ameesh-notify || return 1
   apres=$(systemctl --user show -p MainPID --value ameesh-notify.service) || return 1
   [ "$pid" = "$apres" ] \
     || { echo "ameesh-notify : MainPID changé pendant le contrôle, relancer controler" >&2; return 1; }
@@ -741,7 +750,7 @@ controler_executeurs() {
     [ -n "$u" ] || continue
     pid=$(systemctl --user show -p MainPID --value "$u") \
       || { echo "$u : MainPID illisible — venv non prouvé" >&2; echec=1; continue; }
-    python3 "$ICI/venv-processus.py" "$pid" "$VENV" "$u" \
+    preuve_venv_poste "$pid" "$VENV" "$u" \
       || { echec=1; continue; }
     apres=$(systemctl --user show -p MainPID --value "$u") \
       || { echo "$u : MainPID illisible après la preuve, relancer controler" >&2; echec=1; continue; }
