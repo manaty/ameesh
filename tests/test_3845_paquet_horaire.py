@@ -506,6 +506,23 @@ class ResumeTest(Base):
         self.assertFalse([n for n in notes if n.startswith(ph.MARK_FAILED)])
         self.assertEqual(self.shell.mails, [])
 
+    def test_pause_relue_avant_poussee_non_decomptee(self):
+        # #5084 : la pause posée pendant la tentative l'arrête avant la
+        # poussée ; ni échec décompté ni courrier, une marque non concluante
+        item = self.unfrozen()
+        self.shell.auto_rc = ph.auto.PAUSED_RC
+        self.shell.auto_out = "paquet-auto : pause posée pendant la tentative\n"
+        out = ph.tick(self.ctx)
+        self.assertIn("pause", out)
+        self.assertEqual(self.autos()[0][self.autos()[0].index("--pause-project") + 1],
+                         "ameesh")
+        notes = ph.marks(item)
+        self.assertFalse([n for n in notes if n.startswith(ph.MARK_FAILED)])
+        [fenced] = [n for n in notes if n.startswith(ph.MARK_FENCED)]
+        self.assertTrue(ph.FENCED_RE.match(fenced))
+        self.assertTrue(ph.attempts(item)[-1].fenced)
+        self.assertEqual(self.shell.mails, [])
+
     def test_tentative_vivante_sur_cet_hote_attend(self):
         self.ctx.alive = lambda pid: True
         self.unfrozen(ph.MARK_ATTEMPT + "composition n=1 base=- par=%s:99" % self.ctx.host)
