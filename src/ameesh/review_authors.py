@@ -4733,10 +4733,6 @@ REWRITTEN_WINDOW_S = 2 * 3600
 #: budget local de la lecture quand l'appelant n'a pas posé de `sweep_deadline`
 #: (le gel et la désignation) : au-delà, la lecture est incomplète et lève.
 REWRITTEN_SCAN_BUDGET_S = 60.0
-#: #5066 : part de lignes significatives communes à partir de laquelle un
-#: commit d'un autre lot est tenu pour réémis dans la tête. Mesure sur le cas
-#: réel #5029/#5038 : les quelques lignes communes restent bien en dessous.
-REISSUED_SHARED_SHARE = 0.10
 
 
 def _signed_lines(adds, removes) -> set:
@@ -4751,19 +4747,21 @@ def _reissued_in_head(repo: str, commit: str, head: str, freeze: str,
                       target: str) -> bool:
     """Le contenu de `commit` a-t-il pu être réémis dans la tête (#5066) ?
 
-    Les commits propres à la tête (ni dans le gel, ni dans la cible) sont
-    comparés au commit, ligne significative par ligne significative, y compris
-    les lignes retirées : une réécriture qui remplace les mêmes lignes partage
-    ses retraits. La tête d'un lot voisin partage souvent quelques lignes
-    banales, d'où un seuil relatif au plus petit des deux côtés. Sans cible,
-    sur un diff illisible ou sans ligne significative, la réponse est oui (canon
-    §2 : en cas de doute, la porte reste fermée). Limite : une réécriture
-    d'ajouts purs sans aucune ligne commune ne se détecte pas par le contenu."""
+    Les commits propres à la tête (ni dans le gel, ni dans la cible), avec la
+    part propre de leurs résolutions de fusion, sont comparés au commit, ligne
+    significative par ligne significative, y compris les lignes retirées : une
+    réécriture qui remplace les mêmes lignes partage ses retraits. Une seule
+    ligne commune suffit, quel que soit le volume alentour (B cx3 : un seuil se
+    dilue). Sans cible, sur un diff illisible ou sans ligne significative, la
+    réponse est oui (canon §2 : en cas de doute, la porte reste fermée). Le prix
+    assumé : deux lots voisins qui partagent une ligne par hasard restent
+    fermés (#5029/#5038 : 5 lignes). Limite : une réécriture d'ajouts purs sans
+    aucune ligne commune ne se détecte pas par le contenu."""
     if not target:
         return True
     try:
         delta = _text_delta(repo, commit + "^", commit)
-        proc = _read_git(repo, "log", "-p", "--no-merges", "--no-color",
+        proc = _read_git(repo, "log", "-p", "--diff-merges=remerge", "--no-color",
                          "--no-ext-diff", "--no-textconv", "--no-renames",
                          "--unified=0", "--format=", head, "^" + freeze,
                          "^" + target, "--")
@@ -4788,8 +4786,7 @@ def _reissued_in_head(repo: str, commit: str, head: str, freeze: str,
     lines = _signed_lines(*delta)
     if not lines:
         return True
-    return (len(lines & own) / min(len(lines), len(own))
-            >= REISSUED_SHARED_SHARE)
+    return bool(lines & own)
 
 
 def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],

@@ -165,6 +165,44 @@ class StackedLotNotCorrectorTest(_ActivationFixture, PgTestCase):
         self.assertIn("cx3", out["corrections"])
         self.assertFalse(out["ok"], out)
 
+    def test_one_line_diluted_in_other_lines_stays_closed(self):
+        # B cx3 : une ligne reprise parmi vingt ne se dilue pas sous un seuil.
+        lines = ["    valeur_du_relecteur_%d = 1\n" % n for n in range(20)]
+        others = ["    valeur_de_l_auteur_%d = 1\n" % n for n in range(19)]
+        out = self.gate(self._stack(receipt_lot="other",
+                                    stacked_text="".join(lines),
+                                    author_text=lines[7] + "".join(others),
+                                    author_path="src/ameesh/ailleurs.py"))
+        self.assertIn("cx3", out["corrections"])
+        self.assertFalse(out["ok"], out)
+
+    def _merge(self, head, *, resolved):
+        """Fusionne une branche voisine dans `head`, la résolution ajoutant `resolved`."""
+        self.repo.git("checkout", "-q", "-b", "voisine", head + "^")
+        self.repo.write("src/ameesh/voisine.py", "contenu de la branche voisine\n")
+        side = self.repo.commit("author: voisine", agent="author")
+        self.repo.git("checkout", "-q", "-B", "lot-fusion", head)
+        self.repo.git("merge", "-q", "--no-ff", "--no-commit", side)
+        if resolved:
+            self.repo.write(self.STACKED_PATH, resolved)
+        merged = self.repo.commit("author: fusion", agent="author")
+        self.receipts(commits=[side, merged])
+        self.frozen = merged
+        self.freeze()
+        return merged
+
+    def test_a_reissue_in_a_merge_resolution_stays_closed(self):
+        # B cx3 : le correctif n'est repris que dans la résolution d'une fusion.
+        head = self._stack(receipt_lot="other", stacked_text=self.FIX)
+        out = self.gate(self._merge(head, resolved=self.FIX))
+        self.assertIn("cx3", out["corrections"])
+        self.assertFalse(out["ok"], out)
+
+    def test_a_clean_merge_does_not_close_the_gate(self):
+        head = self._stack(receipt_lot="other", stacked_text=self.FIX)
+        out = self.gate(self._merge(head, resolved=None))
+        self.assertNotIn("cx3", out["corrections"])
+
     def test_a_rewrite_of_the_same_replaced_lines_stays_closed(self):
         # Les ajouts diffèrent, mais les deux commits retirent la même ligne
         # du fichier gelé : la réécriture se lit dans le retrait.
