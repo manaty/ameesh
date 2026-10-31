@@ -1019,6 +1019,7 @@
               "staging.attested",
               "staging.sequence",
               "staging.request",
+              "git.lock_removed",
               "packet.pause"
             ]
           }
