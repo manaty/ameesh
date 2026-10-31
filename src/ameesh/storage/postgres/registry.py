@@ -84,9 +84,27 @@ _GET_FIELDS = [part.strip() for part in re.sub(r"--[^\n]*", "", AGENT_COLUMNS).s
 _GET_NAMES = [part.rsplit(" as ", 1)[-1].strip() for part in _GET_FIELDS]
 _GET_NAMES += ["last_mail_ts", "last_mail_host"]
 _GET_TIMESTAMPS = [re.sub(
-    r"from (\w+)", r"from (to_jsonb(agent_registry)->>'\1')::timestamptz", part)
+    r"from (\w+)", r"from (j.__row->>'\1')::timestamptz", part)
     for part in _GET_FIELDS if part.startswith("extract(")]
 GET_COLUMNS = "agent_registry.*, " + ", ".join(_GET_TIMESTAMPS)
+#: #5101 : `to_jsonb(agent_registry)` est évalué UNE fois par ligne (`__row`),
+#: puis chaque date est projetée depuis ce jsonb ; `OFFSET 0` empêche le
+#: planificateur de replier la latérale et de répéter l'appel. La lecture ne
+#: nomme aucune colonne de la table : une colonne additive absente (schéma en
+#: retard, #5099) laisse la clé à NULL au lieu de lever 42703.
+GET_SQL = """
+    SELECT %s, presence.last_mail_ts, presence.last_mail_host
+      FROM agent_registry
+      CROSS JOIN LATERAL (
+          SELECT to_jsonb(agent_registry) AS __row OFFSET 0) j
+      LEFT JOIN LATERAL (
+          SELECT extract(epoch from m.created_at)::float8 AS last_mail_ts,
+                 m.host AS last_mail_host
+            FROM agent_mailbox m
+           WHERE m.sender = agent_registry.name
+           ORDER BY m.id DESC LIMIT 1) presence ON true
+     WHERE name = (SELECT ameesh_resolve_agent_name(%%s, %%s))
+    """ % GET_COLUMNS
 
 
 def check_name(name: str) -> str:
@@ -326,6 +344,95 @@ def name_lock_key(name: str) -> str:
 # lignes du registre
 # --------------------------------------------------------------------------
 
+#: #5101 : `overview()` lit les colonnes absentes de la vue figée
+#: (`review_hold`, `retired_at`, `harness_bin`, les six colonnes de pause) sur
+#: UNE latérale par ligne (`j.__row`), partagée par toutes les projections :
+#: `to_jsonb(agent_registry)` n'est évalué qu'une fois. `OFFSET 0` empêche le
+#: planificateur de replier la latérale et de répéter l'appel (mesure de
+#: l'auditeur : 9 évaluations par ligne faisaient passer overview() de
+#: ~0,2-0,8 s à ~1,8-2,0 s sur la base commune). Une colonne additive absente
+#: d'un schéma en retard laisse NULL au lieu de lever 42703 (#5099).
+OVERVIEW_SQL = ("""
+            SELECT name,
+                   (j.__row->>'review_hold')::jsonb AS review_hold,
+                   (SELECT r.aliases FROM agent_registry r WHERE r.name=o.name) AS aliases,
+                   -- #3185 : projets relus hors équipe (la vue ne porte pas la colonne)
+                   (SELECT r.relit FROM agent_registry r WHERE r.name=o.name) AS relit,
+                   -- #3460 : retrait (la vue ne porte pas la colonne)
+                   extract(epoch from (j.__row->>'retired_at')::timestamptz)::float8
+                       AS retired_ts,
+                   chantier, harness, host, cwd, session_id, status, status_text,
+                   model,
+                   -- #4293 : colonne absente de la vue figée ; lue sur la ligne
+                   j.__row->>'harness_bin' AS harness_bin,
+                   budget_usd, spent_usd, turns, pending_prompt, last_error,
+                   -- #3337 : un message déposé est un signe de vie distinct de
+                   -- `last_seen` (hook/exécuteur). L'index (sender, id desc)
+                   -- rend la lecture ponctuelle ; une identité `externe` écrit
+                   -- sans exécuteur, son `last_seen` ne bouge donc pas.
+                   (SELECT extract(epoch from m.created_at)::float8
+                      FROM agent_mailbox m WHERE m.sender = o.name
+                     ORDER BY m.id DESC LIMIT 1) AS last_mail_ts,
+                   -- #3729 : l'hôte du dernier dépôt, pour nommer un signe de
+                   -- vie venu d'ailleurs que l'hôte déclaré.
+                   (SELECT m.host FROM agent_mailbox m WHERE m.sender = o.name
+                     ORDER BY m.id DESC LIMIT 1) AS last_mail_host,
+                   lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
+                   public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
+                   passive_unread,
+                   responsible, team, projects, provider, credential_mode, capabilities,
+                   -- #4779 : les rôles déclarés, requis pour la désignation des
+                   -- relecteurs (la vue les porte depuis 0483)
+                   roles,
+                   canon_ref,
+                   ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
+                   mode, stop_reason, canon,
+                   (SELECT extract(epoch from r.runner_seen_at)::float8
+                      FROM agent_registry r WHERE r.name = o.name) AS runner_seen_ts,
+                   (SELECT r.runner_seen_host FROM agent_registry r
+                     WHERE r.name = o.name) AS runner_seen_host,
+                   (SELECT r.runner_seen_owner FROM agent_registry r
+                     WHERE r.name = o.name) AS runner_seen_owner,
+                   -- #5101 : ces colonnes ne sont pas dans la vue figée et
+                   -- peuvent manquer sur un schéma en retard (42703 sinon).
+                   (j.__row->>'operator_paused')::boolean AS operator_paused,
+                   j.__row->>'operator_pause_reason' AS operator_pause_reason,
+                   j.__row->>'operator_pause_by' AS operator_pause_by,
+                   j.__row->>'operator_pause_for' AS operator_pause_for,
+                   extract(epoch from (j.__row->>'operator_pause_at')::timestamptz)::float8
+                       AS operator_pause_ts,
+                   extract(epoch from (j.__row->>'operator_pause_until')::timestamptz)::float8
+                       AS operator_pause_until_ts,
+                   __GOVERNED__ AS canon_governed,
+                   (SELECT s.status FROM canon_state s WHERE s.host = o.host
+                       AND s.canon = coalesce(o.canon, '')) AS canon_status,
+                   (SELECT s.diagnostic FROM canon_state s
+                     WHERE s.host = o.host
+                       AND s.canon = coalesce(o.canon, '')) AS canon_diagnostic,
+                   (SELECT extract(epoch from s.checked_at)::float8 FROM canon_state s
+                     WHERE s.host = o.host
+                       AND s.canon = coalesce(o.canon, '')) AS canon_checked_ts,
+                   -- L165 (EP1) : la vue est figée à sa création et ne porte
+                   -- pas `releve`/`candidats` ; le prédicat les lit sur la
+                   -- ligne du registre, sous-requête plutôt qu'une jointure
+                   -- pour ne pas qualifier toutes les colonnes de la vue.
+                   (SELECT __CLAIM_OK__ FROM agent_registry r
+                     WHERE r.name = o.name) AS canon_claim_ok,
+                   -- #1250 : le harnais de la session VIVANTE (0384), absent de
+                   -- la vue dont les colonnes sont figées à sa création ;
+                   -- sous-requête pour ne pas qualifier toutes les colonnes.
+                   (SELECT r.session_harness FROM agent_registry r
+                     WHERE r.name = o.name) AS session_harness
+            FROM agent_mesh_overview o
+            LEFT JOIN LATERAL (
+                SELECT to_jsonb(agent_registry) AS __row
+                  FROM agent_registry WHERE name = o.name
+                 OFFSET 0) j ON true
+            ORDER BY last_seen_ts DESC NULLS LAST
+            """.replace("__GOVERNED__", canon_governed_sql("o"))
+               .replace("__CLAIM_OK__", canon_claim_predicate_sql("r")))
+
+
 class Agents(interface.Agents):
 
     def operator_pause(self, name, *, paused, reason, actor, principal,
@@ -543,19 +650,7 @@ class Agents(interface.Agents):
     def get(self, name) -> dict | None:
         # #3729 : le dernier message déposé et son hôte, comme `overview`
         # (#3337) — `ameesh show` lit la même preuve de vie que `list`.
-        rows = self.db.query(
-            """
-            SELECT %s, presence.last_mail_ts, presence.last_mail_host
-              FROM agent_registry
-              LEFT JOIN LATERAL (
-                  SELECT extract(epoch from m.created_at)::float8 AS last_mail_ts,
-                         m.host AS last_mail_host
-                    FROM agent_mailbox m
-                   WHERE m.sender = agent_registry.name
-                   ORDER BY m.id DESC LIMIT 1) presence ON true
-             WHERE name = (SELECT ameesh_resolve_agent_name(%%s, %%s))
-            """ % GET_COLUMNS,
-            (name, "agents.get"))
+        rows = self.db.query(GET_SQL, (name, "agents.get"))
         return {key: rows[0].get(key) for key in _GET_NAMES} if rows else None
 
     def resolve_name(self, name, *, operation="lookup") -> str:
@@ -580,83 +675,7 @@ class Agents(interface.Agents):
         return {row["name"]: row["harness"] or "" for row in rows}
 
     def overview(self) -> list[dict]:
-        return self.db.query(
-            """
-            SELECT name, (SELECT r.review_hold FROM agent_registry r WHERE r.name=o.name) AS review_hold,
-                   (SELECT r.aliases FROM agent_registry r WHERE r.name=o.name) AS aliases,
-                   -- #3185 : projets relus hors équipe (la vue ne porte pas la colonne)
-                   (SELECT r.relit FROM agent_registry r WHERE r.name=o.name) AS relit,
-                   -- #3460 : retrait (la vue ne porte pas la colonne)
-                   (SELECT extract(epoch from r.retired_at)::float8 FROM agent_registry r
-                     WHERE r.name=o.name) AS retired_ts,
-                   chantier, harness, host, cwd, session_id, status, status_text,
-                   model,
-                   -- #4293 : colonne absente de la vue figée ; lue sur la ligne
-                   (SELECT r.harness_bin FROM agent_registry r
-                     WHERE r.name = o.name) AS harness_bin,
-                   budget_usd, spent_usd, turns, pending_prompt, last_error,
-                   -- #3337 : un message déposé est un signe de vie distinct de
-                   -- `last_seen` (hook/exécuteur). L'index (sender, id desc)
-                   -- rend la lecture ponctuelle ; une identité `externe` écrit
-                   -- sans exécuteur, son `last_seen` ne bouge donc pas.
-                   (SELECT extract(epoch from m.created_at)::float8
-                      FROM agent_mailbox m WHERE m.sender = o.name
-                     ORDER BY m.id DESC LIMIT 1) AS last_mail_ts,
-                   -- #3729 : l'hôte du dernier dépôt, pour nommer un signe de
-                   -- vie venu d'ailleurs que l'hôte déclaré.
-                   (SELECT m.host FROM agent_mailbox m WHERE m.sender = o.name
-                     ORDER BY m.id DESC LIMIT 1) AS last_mail_host,
-                   lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
-                   public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
-                   passive_unread,
-                   responsible, team, projects, provider, credential_mode, capabilities,
-                   -- #4779 : les rôles déclarés, requis pour la désignation des
-                   -- relecteurs (la vue les porte depuis 0483)
-                   roles,
-                   canon_ref,
-                   ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
-                   mode, stop_reason, canon,
-                   (SELECT extract(epoch from r.runner_seen_at)::float8
-                      FROM agent_registry r WHERE r.name = o.name) AS runner_seen_ts,
-                   (SELECT r.runner_seen_host FROM agent_registry r
-                     WHERE r.name = o.name) AS runner_seen_host,
-                   (SELECT r.runner_seen_owner FROM agent_registry r
-                     WHERE r.name = o.name) AS runner_seen_owner,
-                   p.operator_paused, p.operator_pause_reason, p.operator_pause_by,
-                   p.operator_pause_for, p.operator_pause_ts, p.operator_pause_until_ts,
-                   __GOVERNED__ AS canon_governed,
-                   (SELECT s.status FROM canon_state s WHERE s.host = o.host
-                       AND s.canon = coalesce(o.canon, '')) AS canon_status,
-                   (SELECT s.diagnostic FROM canon_state s
-                     WHERE s.host = o.host
-                       AND s.canon = coalesce(o.canon, '')) AS canon_diagnostic,
-                   (SELECT extract(epoch from s.checked_at)::float8 FROM canon_state s
-                     WHERE s.host = o.host
-                       AND s.canon = coalesce(o.canon, '')) AS canon_checked_ts,
-                   -- L165 (EP1) : la vue est figée à sa création et ne porte
-                   -- pas `releve`/`candidats` ; le prédicat les lit sur la
-                   -- ligne du registre, sous-requête plutôt qu'une jointure
-                   -- pour ne pas qualifier toutes les colonnes de la vue.
-                   (SELECT __CLAIM_OK__ FROM agent_registry r
-                     WHERE r.name = o.name) AS canon_claim_ok,
-                   -- #1250 : le harnais de la session VIVANTE (0384), absent de
-                   -- la vue dont les colonnes sont figées à sa création ;
-                   -- sous-requête pour ne pas qualifier toutes les colonnes.
-                   (SELECT r.session_harness FROM agent_registry r
-                     WHERE r.name = o.name) AS session_harness
-            FROM agent_mesh_overview o
-            LEFT JOIN LATERAL (
-                SELECT operator_paused, operator_pause_reason, operator_pause_by,
-                       operator_pause_for,
-                       extract(epoch from operator_pause_at)::float8 AS operator_pause_ts,
-                       extract(epoch from operator_pause_until)::float8
-                           AS operator_pause_until_ts
-                  FROM agent_registry WHERE name = o.name
-            ) p ON true
-            ORDER BY last_seen_ts DESC NULLS LAST
-            """.replace("__GOVERNED__", canon_governed_sql("o"))
-               .replace("__CLAIM_OK__", canon_claim_predicate_sql("r"))
-        )
+        return self.db.query(OVERVIEW_SQL)
 
     def reachability(self) -> list[dict]:
         # #3631 : la passe de redésignation n'a besoin que de ces sept
@@ -666,11 +685,18 @@ class Agents(interface.Agents):
         # lit `review_designation.is_retired` ; `status_text` porte le préfixe
         # `auth_blocked` (#4491), court et nécessaire pour que le siège bloqué
         # ne soit pas laissé en place.
+        # #5101 (N1 auditeur) : `review_hold` et `retired_at` peuvent manquer
+        # sur un schéma en retard ; une seule latérale `to_jsonb` par ligne
+        # évite le 42703 sans répéter l'évaluation (même motif qu'overview).
         return self.db.query(
-            "SELECT name, aliases, review_hold,"
-            "       extract(epoch from retired_at)::float8 AS retired_ts,"
+            "SELECT name, aliases,"
+            "       (j.__row->>'review_hold')::jsonb AS review_hold,"
+            "       extract(epoch from (j.__row->>'retired_at')::timestamptz)::float8"
+            "           AS retired_ts,"
             "       mode, status, status_text, host"
             "  FROM agent_registry"
+            "  LEFT JOIN LATERAL ("
+            "      SELECT to_jsonb(agent_registry) AS __row OFFSET 0) j ON true"
             " ORDER BY name")
 
     def stopped_with(self, reasons) -> list[str]:
