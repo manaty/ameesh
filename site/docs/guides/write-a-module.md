@@ -108,7 +108,8 @@ ameesh module hello --help
 
 `ameesh modules` lists discovered built-ins, installed entry points and readable
 Pipeline cards, with capabilities, distribution version and descriptor
-fingerprint. `--no-canon` limits this to installed modules. `module --list`
+fingerprint. `--no-canon` lists built-ins and installed entry points, excluding Pipeline
+cards from the canon. `module --list`
 reports installation evidence, including per-entry `ok` and errors; inspect
 these fields rather than treating its exit code as a validation result.
 

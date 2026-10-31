@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ameesh-hello-module"
 version = "0.1.0"
 description = "Minimal installed ameesh module example"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 
 [project.entry-points."ameesh.modules"]
 hello = "hello_module"
