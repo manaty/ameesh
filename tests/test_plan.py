@@ -508,9 +508,10 @@ class GithubTest(_PlanDb):
         self.assertIsNone(rows[0]["assignee"])
 
     def test_sync_github_branche_lot_numero_et_pr_partielle(self):
-        # L118b : lot/<id>-… sans fiche de ce nom ferme le lot <id> ; une PR
-        # qui se déclare partielle ne le ferme pas
+        # L118b : lot/<id>-… sans fiche de ce nom ferme le lot <id> dont elle
+        # porte le gel (#5168) ; une PR qui se déclare partielle ne le ferme pas
         a = work.add(self.db, title="garde")
+        work.milestone(self.db, a["id"], "frozen", sha=SHA, actor="alice")
         b = work.add(self.db, title="parapluie")
         self.merged_pr(11, "lot/%d-garde" % a["id"], body="Lot.")
         self.merged_pr(12, "lot/%d-un" % b["id"],
@@ -538,6 +539,63 @@ class GithubTest(_PlanDb):
         del self.gh.state["prs"]["%s#21" % REPO]["isCrossRepository"]
         report = plan_github.sync_github(self.db, self.gh, REPO)
         self.assertEqual(work.get(self.db, a["id"])["state"], "intake")
+
+    # --- #5168 : la branche lot/<id>-… seule ne prouve pas la livraison ----
+
+    def test_5168_pr_prealable_sans_gel_trace_seule(self):
+        # cas #3392 : PR canon préalable (manaty/home#223, lot/3392-canon-canary)
+        # d'un lot opérationnel sans branche ni gel : fusion liée, tracée une fois
+        a = work.add(self.db, title="pilote opérationnel")
+        work.move(self.db, a["id"], "build")
+        self.merged_pr(41, "lot/%d-canon-canary" % a["id"], body="canon: admettre le canari")
+        dry = plan_github.sync_github(self.db, self.gh, REPO, dry_run=True)
+        self.assertEqual([r["result"] for r in dry["results"]], ["linked"])
+        for _ in range(2):
+            report = plan_github.sync_github(self.db, self.gh, REPO)
+            self.assertEqual(report["merged"], 0)
+            self.assertEqual([r["result"] for r in report["results"]], ["linked"])
+        self.assertEqual(work.get(self.db, a["id"])["state"], "build")
+        self.assertFalse([m for m in work.milestones(self.db, a["id"]) if m["kind"] == "merged"])
+        notes = [e["note"] for e in work.events(self.db, a["id"], 20)
+                 if (e.get("note") or "").startswith("linked merge: PR %s#41" % REPO)]
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("freeze (none)", notes[0])
+
+    def test_5168_gel_sur_une_autre_tete_trace_seule(self):
+        a = work.add(self.db, title="gelé ailleurs")
+        work.milestone(self.db, a["id"], "frozen", sha="e" * 40, actor="alice")
+        before = work.get(self.db, a["id"])["state"]
+        self.merged_pr(42, "lot/%d-prealable" % a["id"])
+        self.gh.state["prs"]["%s#42" % REPO]["headRefOid"] = "c" * 40
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual([r["result"] for r in report["results"]], ["linked"])
+        self.assertEqual(work.get(self.db, a["id"])["state"], before)
+        self.assertFalse([m for m in work.milestones(self.db, a["id"]) if m["kind"] == "merged"])
+
+    def test_5168_tete_fusionnee_porte_le_gel_livre(self):
+        a = work.add(self.db, title="gelé ici")
+        work.milestone(self.db, a["id"], "frozen", sha="d" * 40, actor="alice")
+        self.merged_pr(43, "lot/%d-livraison" % a["id"])
+        self.gh.state["prs"]["%s#43" % REPO]["headRefOid"] = "D" * 40
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(work.get(self.db, a["id"])["state"], "delivered")
+
+    def test_5168_lot_corrige_a_la_main_non_referme(self):
+        # #3392 corrigé à la main merged → blocked : la passe suivante le laisse
+        a = work.add(self.db, title="corrigé")
+        work.move(self.db, a["id"], "build")
+        work.move(self.db, a["id"], "blocked")
+        self.merged_pr(44, "lot/%d-canon-canary" % a["id"])
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(work.get(self.db, a["id"])["state"], "blocked")
+
+    def test_5168_ligne_explicite_inchangee(self):
+        # la désignation explicite (`ameesh-work:`) n'est pas concernée
+        a = work.add(self.db, title="explicite")
+        self.merged_pr(45, "lot/%d-x" % a["id"], body="ameesh-work: %d" % a["id"])
+        self.assertEqual(plan_github.sync_github(self.db, self.gh, REPO)["merged"], 1)
 
     # --- #759 : un lot multi-étapes ne se ferme pas à la première PR --------
 
