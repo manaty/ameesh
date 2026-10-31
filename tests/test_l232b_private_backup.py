@@ -36,6 +36,15 @@ class PrivateBackupTest(unittest.TestCase):
         self.config = self.root / "config.json"
         self.config.write_text(json.dumps({"dsn": "postgresql://acme:CANARY-PASSWORD@localhost/db"}))
         self.output = self.root / "backups/archive.dump"
+        # #5189 : the archives and servers here are fakes; one coherent chain
+        # of majors (17) keeps the version guard out of these contracts.
+        for name, value in (("client_major", lambda name, env=None: 17),
+                            ("server_major", lambda connection: 17),
+                            ("source_server_major", lambda parameters: 17),
+                            ("archive_majors", lambda path: (17, 17))):
+            patcher = mock.patch.object(backup, name, side_effect=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_password_channel_and_atomic_completed_archive(self):
         seen = []
@@ -488,8 +497,25 @@ class PrivateBackupTest(unittest.TestCase):
             "pathlib.Path(args[args.index('--file') + 1]).write_bytes(b'p' * 42)\n"
             "raise SystemExit(3)\n")
         fake_dump.chmod(0o755)
+        # #5189 : a child process escapes the patches of setUp; the launcher
+        # pins the unreachable source server, the clients answer for themselves.
+        (fakebin / "pg_restore").write_text("#!/bin/sh\necho 'pg_restore (PostgreSQL) 17.2'\n")
+        (fakebin / "pg_restore").chmod(0o755)
+        fake_dump.write_text(fake_dump.read_text().replace(
+            "args = sys.argv[1:]\n",
+            "args = sys.argv[1:]\n"
+            "if args == ['--version']:\n"
+            "    print('pg_dump (PostgreSQL) 17.2'); raise SystemExit(0)\n"))
+        launcher = self.root / "launcher.py"
+        launcher.write_text(
+            "import importlib.util\n"
+            "spec = importlib.util.spec_from_file_location('helper', %r)\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "module.source_server_major = lambda parameters: 17\n"
+            "raise SystemExit(module.main())\n" % str(PATH))
         with mock.patch.dict(os.environ, {"PATH": str(fakebin) + os.pathsep + os.environ["PATH"]}):
-            done = subprocess.run([sys.executable, str(PATH), "dump",
+            done = subprocess.run([sys.executable, str(launcher), "dump",
                                    "--config", str(self.config), "--output", str(self.output)],
                                   capture_output=True, text=True, timeout=30)
         self.assertEqual(done.returncode, 1, done.stderr)

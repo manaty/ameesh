@@ -101,6 +101,13 @@ class PayloadSha256ContractTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ameesh-4687-")
         self.addCleanup(self.temp.cleanup)
+        # #5189 : the retrieved archive is a fake; its majors and the client's
+        # are pinned, the version guard has its own contracts.
+        for name, value in (("client_major", lambda name, env=None: 17),
+                            ("archive_majors", lambda path: (17, 17))):
+            patcher = mock.patch.object(backup, name, side_effect=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.root = Path(self.temp.name)
         cert, key = _certificate(self.root)
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)

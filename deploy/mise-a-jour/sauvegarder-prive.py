@@ -51,6 +51,119 @@ def run(args, *, env=None, timeout=1800):
         raise BackupError("%s could not be started (%s)" % (name, exc.strerror or "OSError")) from None
 
 
+def client_major(name, env=None):
+    """#5189 : major of the PostgreSQL client the same PATH would execute.
+
+    The probe runs under the exact environment of the operation, so a
+    pg_wrapper or a PGDG directory first in PATH answers for the binary that
+    then runs; an unreadable answer refuses, it is never assumed compatible.
+    """
+    try:
+        result = subprocess.run([name, "--version"], env=env, check=True, capture_output=True,
+                                timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        raise BackupError("%s version unavailable" % name) from None
+    match = re.search(r"\(PostgreSQL\) (\d+)", result.stdout.decode("ascii", "replace"))
+    if match is None:
+        raise BackupError("%s version unreadable" % name)
+    return int(match.group(1))
+
+
+def server_major(connection):
+    """#5189 : major of the server behind a psycopg connection (170011 → 17)."""
+    version = connection.info.server_version
+    if isinstance(version, bool) or not isinstance(version, int) or version < 100000:
+        raise BackupError("server version unreadable")
+    return version // 10000
+
+
+def source_server_major(parameters):
+    """#5189 : major of the source server, read before pg_dump starts."""
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+    try:
+        with psycopg.connect(make_conninfo(**parameters)) as source:
+            return server_major(source)
+    except psycopg.Error:
+        # libpq diagnostics may repeat the DSN: name the step only.
+        raise BackupError("source server unreachable for the version check") from None
+
+
+def version_major(text):
+    match = re.match(r"(\d+)", text or "")
+    if match is None:
+        raise BackupError("archive version unreadable")
+    return int(match.group(1))
+
+
+def archive_majors(path):
+    """#5189 : (source server, pg_dump) majors written in a custom-format header.
+
+    Read from the bytes, not through a pg_restore that may be too old to open
+    the archive: the refusal must still name the versions. Layout of ReadHead
+    (pg_backup_archiver.c), archive formats 1.10 and later.
+    """
+    with Path(path).open("rb") as stream:
+        data = stream.read(65536)
+    if data[:5] != b"PGDMP" or len(data) < 11:
+        raise BackupError("archive header unreadable")
+    format_version = tuple(data[5:8])
+    int_size, position = data[8], 11
+    if format_version < (1, 10, 0) or not 1 <= int_size <= 8:
+        raise BackupError("archive header unreadable")
+
+    def read_int():
+        nonlocal position
+        chunk = data[position:position + 1 + int_size]
+        if len(chunk) != 1 + int_size:
+            raise BackupError("archive header unreadable")
+        position += 1 + int_size
+        value = int.from_bytes(chunk[1:], "little")
+        return -value if chunk[0] else value
+
+    def read_str():
+        nonlocal position
+        length = read_int()
+        if length < 0:
+            return None
+        chunk = data[position:position + length]
+        if len(chunk) != length:
+            raise BackupError("archive header unreadable")
+        position += length
+        return chunk.decode("utf-8", "replace")
+
+    if format_version >= (1, 15, 0):
+        position += 1  # compression algorithm, one byte since 1.15
+    else:
+        read_int()  # compression level
+    for _ in range(7):  # creation date
+        read_int()
+    read_str()  # database name, never reported
+    source, dumped = read_str(), read_str()
+    return version_major(source), version_major(dumped)
+
+
+def require_compatible(*, source=None, dump=None, restore=None, target=None):
+    """#5189 : refuse an incompatible PostgreSQL chain before it starts.
+
+    pg_dump reads servers up to its own major, an archive restores into a
+    server of at least its pg_dump major, pg_restore reads archives up to its
+    own major and must not be newer than the server it writes to. The message
+    names the majors only: never a DSN, a host or an intention.
+    """
+    known = [(label, value) for label, value in (("source server", source), ("pg_dump", dump),
+                                                 ("pg_restore", restore), ("target server", target))
+             if value is not None]
+    rules = ((source, dump, "pg_dump older than the source server"),
+             (dump, target, "archive newer than the target server"),
+             (dump, restore, "pg_restore older than the archive"),
+             (restore, target, "pg_restore newer than the target server"))
+    for low, high, reason in rules:
+        if low is not None and high is not None and low > high:
+            raise BackupError("incompatible PostgreSQL versions: %s (%s)"
+                              % (reason, ", ".join("%s %d" % item for item in known)))
+
+
 def private_parent(path, what):
     """Create or tighten a private directory, never narrow a shared one.
 
@@ -120,15 +233,20 @@ def dump(config, output):
     return dump_parameters(parameters_from(config), output)
 
 
-def dump_parameters(parameters, output, *, snapshot=None):
+def dump_parameters(parameters, output, *, snapshot=None, source_major=None):
     output = Path(output)
     private_parent(output.parent, "backup directory")
     if os.path.lexists(output):
         raise BackupError("backup destination already exists")
+    if source_major is None:
+        source_major = source_server_major(parameters)
     with tempfile.TemporaryDirectory(prefix=".backup-", dir=output.parent) as staging:
         private = Path(staging)
         archive = private / "archive.dump"
         with private_connection(parameters, private) as (public_dsn, env):
+            # #5189 : the dump is listed right after, by the same PATH.
+            require_compatible(source=source_major, dump=client_major("pg_dump", env),
+                               restore=client_major("pg_restore", env))
             args = ["pg_dump", "--no-password", "-Fc", "--dbname", public_dsn]
             if snapshot is not None:
                 args.extend(["--snapshot", snapshot])
@@ -185,6 +303,7 @@ def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_
         # avec le processus ; pg_dump fait de même pour sa propre session.
         # L'exemption vaut pour cette transaction seulement.
         source.execute("SET LOCAL idle_in_transaction_session_timeout = 0")
+        major = server_major(source)
         snapshot = source.execute("SELECT pg_export_snapshot()").fetchone()[0]
         if not isinstance(snapshot, str) or not re.fullmatch(r"[0-9A-Fa-f-]+", snapshot):
             raise BackupError("source did not export a valid snapshot")
@@ -203,7 +322,7 @@ def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_
             raise BackupError("source did not report a usable database size")
         # The exporting transaction stays open until pg_dump imports and
         # finishes the snapshot, including writes made concurrently afterwards.
-        dump_parameters(parameters, output, snapshot=snapshot)
+        dump_parameters(parameters, output, snapshot=snapshot, source_major=major)
         expected = {"schema": schema, "migrations": [list(row) for row in versions],
                     "row_counts": counts, "artifact_sha256": digest(output),
                     "source_bytes": size}
@@ -322,6 +441,10 @@ def verify_restore(config, archive, expected):
     marker = verify_marker(archive.parent, database)
     # In-process libpq receives credentials directly; they never become argv.
     with psycopg.connect(make_conninfo(**parameters), autocommit=True) as admin:
+        # #5189 : the whole chain is checked before any database is created.
+        source, dumped = archive_majors(archive)
+        require_compatible(source=source, dump=dumped, restore=client_major("pg_restore"),
+                           target=server_major(admin))
         # A verification killed between CREATE and DROP names its database in a
         # private marker; reaping it here is the cleanup that survives the kill,
         # and it runs before another cleartext copy is created.
@@ -537,6 +660,8 @@ def retrieve(credentials, host, name, sha256, output, *, version_id=None):
         if not archive.is_file() or archive.stat().st_size == 0 or digest(archive) != sha256:
             raise BackupError("retrieved recovery artifact digest mismatch")
         archive.chmod(0o600)
+        source, dumped = archive_majors(archive)
+        require_compatible(source=source, dump=dumped, restore=client_major("pg_restore", env))
         run(["pg_restore", "--list", str(archive)], env=env)
         with archive.open("rb") as stream:
             os.fsync(stream.fileno())
