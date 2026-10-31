@@ -36,6 +36,11 @@
   ameesh ci status <lot> [--limit N] [--json]
         latest CI runs and failing tests of a {work};
   ameesh conflicts [--all] [--json]     conflict radar between {works} (L160b);
+  ameesh context corpus export --out FILE [--days N | --since T] [--harness H]
+        | check FILE
+        read-only replay corpus (`ameesh-context-corpus/1`) rebuilt from the
+        turn ledger and `turn.context` events; written outside the repository,
+        mode 0600 (#5134);
   ameesh cost …               turn cost, per-turn usage, gauges and their
         history, pay-per-token provider balance (`cost turns|gauges|balance`);
   ameesh debit [--json] [--check] [--hours N] [--threshold 2h]
@@ -58,11 +63,6 @@
         in mail and {works} waiting with no question (L233, not requests);
   ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh device enroll|challenge|show   device-side enrollment, in the VM (L110);
-  ameesh context corpus export --out FILE [--days N | --since T] [--harness H]
-        | check FILE
-        read-only replay corpus (`ameesh-context-corpus/1`) rebuilt from the
-        turn ledger and `turn.context` events; written outside the repository,
-        mode 0600 (#5134);
   ameesh doctor               schema and diagnostics;
   ameesh events [--after ID] [--limit N] [--json] | prune [--days N] [--dry-run]
         the event log ({work} transitions, turns, costs, threads, decisions, alerts) and
