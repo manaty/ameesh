@@ -7962,6 +7962,10 @@ class AgentWorker(threading.Thread):
         if spec.get("lot_switch_failed"):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
+        from . import runner_sandbox
+        sandbox_result = runner_sandbox.dispatch(self, spec)
+        if sandbox_result is not None:
+            return sandbox_result
         self._workdir_lot = spec.get("lot") or self.agent.get("session_work_item")
         cwd = self._resolve_workdir()
         if not cwd:

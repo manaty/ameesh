@@ -226,6 +226,8 @@ class AdapterTest(PgTestCase):
         self.admit()
         self.adapter.consume(self.event())
         self.complete_job()
+        self.db.execute("update agent_registry set lease_expires_at = now() - interval '1 second' "
+                        "where name = 'agent'")
         recovery = SandboxTurn.recover(self.db, self.adapter.turn_id)
         recovery.cancel()
         recovery.consume(self.event(recovery=True))
@@ -255,6 +257,45 @@ class AdapterTest(PgTestCase):
         child.close.assert_called_once()
         self.assertIsNone(self.adapter.child)
         self.assertEqual(self.adapter.snapshot()['state'], 'intent')
+
+    def test_recovery_refuses_a_still_live_lease(self):
+        self.admit()
+        with self.assertRaises(s1.Refusal) as caught:
+            SandboxTurn.recover(self.db, self.adapter.turn_id)
+        self.assertEqual(caught.exception.code, 'stale')
+        self.assertEqual(self.adapter.snapshot()['state'], 'intent')
+
+    def test_metadata_is_fenced_and_does_not_advance_lifecycle(self):
+        self.admit()
+        self.adapter.consume(self.event())
+        uid = self.adapter.snapshot()['job_uid']
+        self.adapter.consume(dict(kind='heartbeat', turn_id='turn-key',
+                                  job_uid=uid, job_phase='Running'))
+        row = self.adapter.snapshot()
+        self.assertEqual((row['state'], row['job_phase']), ('bound', 'Running'))
+        with self.assertRaises(s1.Refusal):
+            s1.observe_metadata(self.db, 'turn-key', 'other', 7, job_phase='Failed')
+        with self.assertRaises(s1.Refusal):
+            s1.observe_metadata(self.db, 'turn-key', 'owner', 7, job_uid='other', job_phase='Failed')
+        self.assertEqual(self.adapter.snapshot()['job_phase'], 'Running')
+
+    def test_metadata_failure_does_not_prevent_result_or_its_receipt(self):
+        self.admit()
+        self.adapter.consume(self.event())
+        self.complete_job()
+        with mock.patch.object(s1, 'observe_metadata', side_effect=RuntimeError('diagnostic')):
+            with self.assertLogs('ameesh.sandbox_turn', level='WARNING'):
+                receipt = self.adapter.consume(self.event())
+        self.assertFalse(receipt['replayed'])
+        self.assertEqual(self.adapter.snapshot()['state'], 'succeeded')
+
+    def test_unknown_event_remains_a_contract_mismatch_without_observation(self):
+        self.admit()
+        with mock.patch.object(s1, 'observe_metadata') as observe:
+            with self.assertRaises(s1.Refusal) as caught:
+                self.adapter.consume(dict(kind='foreign', turn_id='turn-key', job_phase='Running'))
+        self.assertEqual(caught.exception.code, 'contract-mismatch')
+        observe.assert_not_called()
 
     def test_lost_lease_recovery_cannot_complete_or_close_replacement(self):
         self.admit()
