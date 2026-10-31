@@ -1145,6 +1145,12 @@ class VmAgentsInstallTest(VmAgentsHarness):
     def test_control_reports_the_installed_code_without_restarting(self):
         p = self.run_vm('controler')
         self.assertEqual(p.returncode, 0, p.stderr)
+        # #5094 : le helper arrive directement au transport administratif,
+        # sans runuser ameesh qui perdrait l'accès aux exécuteurs non dumpables.
+        preuves = [ligne for ligne in (self.state / 'ssh.log').read_text().splitlines()
+                   if 'python3 - ' in ligne]
+        self.assertTrue(preuves)
+        self.assertTrue(all('runuser' not in ligne for ligne in preuves), preuves)
         self.assertIn('code installé', p.stdout)
         self.assertIn(self.old[:7], p.stdout)
         self.assertNotIn('restart', (self.state / 'systemctl.log').read_text())
