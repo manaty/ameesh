@@ -1173,6 +1173,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         out["why"] = "provenance scope unreadable: %s" % exc
         return out
     corrections: set = set()
+    stacked_doubts: dict = {}
     proven_families: dict = {}
     try:
         attribution = _attribution_on_freeze(db, marks, frozen, repo=repo,
@@ -1205,6 +1206,11 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         corrections = {str((row or {}).get("name") or "").strip().lower()
                        for row in range_correctors or ()
                        if str((row or {}).get("name") or "").strip()}
+        # #5066 : l'exclusion par un commit d'un lot empilé est un doute, à
+        # dire comme tel.
+        stacked_doubts = {str(row["name"]).strip().lower(): row
+                          for row in range_correctors or ()
+                          if (row or {}).get("stacked_lot") and row.get("name")}
     out["corrections"] = sorted(corrections)
     # #2961 : la famille de la référence est celle de la **trace du gel**,
     # lue avec la plage gelée (`review_authors.reading` : reçu exact du commit,
@@ -1405,6 +1411,11 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             continue                      # on ne relit pas son propre travail
         if actor and actor.lower() in corrections:
             rejected.append({"actor": actor, "family": "", "reason": "corrector"})
+            doubt = stacked_doubts.get(actor.lower())
+            if doubt:
+                rejected[-1].update(reason="stacked-corrector",
+                                    stacked_lot=int(doubt["stacked_lot"]),
+                                    rewritten=str(doubt.get("rewritten") or ""))
             continue                      # l'auteur d'un correctif ne le relit pas (#2739)
         try:
             family = _verdict_family(mark)
@@ -1470,6 +1481,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     if rejected:
         causes = {"author": "author of the head",
                   "corrector": "reviewer who corrected the head",
+                  "stacked-corrector": "doubt: reviewer's commit on a lot stacked"
+                                       " on this freeze may have been carried here;"
+                                       " another reviewer of the family can review",
                   "unknown-family": "unknown model family (independence not proven)",
                   "author-family": "family of an author of the head"}
         out["why"] += "; not counted: %s" % ", ".join(
