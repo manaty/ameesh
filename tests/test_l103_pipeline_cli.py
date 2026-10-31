@@ -253,3 +253,100 @@ class PipelineCliTest(PgTestCase):
         self.db.execute("INSERT INTO agent_registry(name, status) VALUES ('reviewer', 'idle')")
         self.db.execute("UPDATE work_items SET reviewer='reviewer' WHERE id=%s", (self.lot,))
         self.assertEqual(self.run_cli(*args)['workflow_stage'], 'review')
+
+    # -- #4968: the non-blocking review points --------------------------------
+
+    def _lot(self):
+        return self.db.query(
+            "INSERT INTO work_items (title, type, app, state, assignee) "
+            "VALUES ('held pipeline test', 'evolution', 'acme', 'intake', 'author') "
+            "RETURNING id")[0]['id']
+
+    def _event(self, lot, state, note=''):
+        self.db.execute("INSERT INTO work_item_events (work_item_id, state, note, actor) "
+                        "VALUES (%s, %s, %s, 'author')", (lot, state, note))
+
+    def test_adoption_keeps_a_held_lot_when_the_journal_proves_the_core(self):
+        for hold in ('blocked', 'waiting_human'):
+            with self.subTest(hold=hold):
+                lot = self._lot()
+                self._event(lot, 'intake', 'created')
+                self.db.execute("UPDATE work_items SET state=%s WHERE id=%s", (hold, lot))
+                self.run_cli('adopt', lot)
+                state = process_registry.registry_state(self.db, lot)
+                self.assertEqual((state.workflow_stage, work.get(self.db, lot)['state']),
+                                 ('draft', hold))
+
+    def test_held_adoption_refuses_an_unproven_or_divergent_core(self):
+        lot = self._lot()
+        self.db.execute("UPDATE work_items SET state='blocked' WHERE id=%s", (lot,))
+        self.assertIn('pipeline-hold-core-unproven',
+                      self.run_cli('adopt', lot, expected=1))
+        self.assertFalse(work.get(self.db, lot)['workflow_ref'])
+        self._event(lot, 'build', 'worked before the hold')
+        self.assertIn('pipeline-stage-mismatch',
+                      self.run_cli('adopt', lot, expected=1))
+        self.assertFalse(work.get(self.db, lot)['workflow_ref'])
+
+    def test_stop_work_accepts_close_reason_and_types_superseded_by(self):
+        self.run_cli('adopt', self.lot)
+        target = self._lot()
+        key = str(uuid.uuid4())
+        self.run_cli('advance', self.lot, '--to', 'stopped', '--guard', 'stop_work',
+                     '--ref', 'close_reason=superseded',
+                     '--ref', 'superseded_by=%d' % target, '--command-id', key)
+        closed = work.get(self.db, self.lot)
+        self.assertEqual((closed['close_reason'], closed['superseded_by']),
+                         ('superseded', target))
+        facts = process_registry.receipt_of(self.db, self.lot, key)['evidence']['facts']
+        self.assertEqual(facts, {'reason': 'superseded', 'superseded_by': target})
+        self.assertIsInstance(facts['superseded_by'], int)
+        other = self._lot()
+        self.run_cli('adopt', other)
+        self.run_cli('advance', other, '--to', 'stopped', '--guard', 'stop_work',
+                     '--ref', 'close_reason=abandoned')
+        self.assertEqual(work.get(self.db, other)['close_reason'], 'abandoned')
+
+    def test_human_actor_is_refused_with_the_registered_agent_policy(self):
+        self.assertIn('pipeline-authority',
+                      self.run_cli('adopt', self.lot, actor='human:alice', expected=1))
+        self.assertFalse(work.get(self.db, self.lot)['workflow_ref'])
+
+    def test_help_is_served_without_opening_a_database(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch('ameesh.config.load', return_value=self.cfg), \
+             mock.patch('ameesh.db.connect', side_effect=AssertionError('database opened')), \
+             mock.patch.object(canon, 'load_configured', return_value=[self.loaded]), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            with self.assertRaises(SystemExit) as stopped:
+                modules.main(['delivery', '--help'])
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertIn('usage: ameesh module delivery', output.getvalue())
+        self.assertIn('stop_work', output.getvalue())
+        self.assertEqual(errors.getvalue(), '')
+
+    def test_pinned_card_in_a_sha256_repository(self):
+        root = Path(self.tmp) / 'sha256repo'
+        root.mkdir()
+        (root / 'pipelines').mkdir()
+        (root / 'pipelines' / 'delivery.md').write_text(carte(name='delivery'))
+
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(root), *args], text=True,
+                                           stderr=subprocess.DEVNULL)
+        try:
+            git('init', '-q', '--object-format=sha256')
+        except subprocess.CalledProcessError:
+            self.skipTest('git without the SHA-256 object format')
+        git('add', '.')
+        git('-c', 'user.name=test', '-c', 'user.email=test@example.org',
+            'commit', '-qm', 'card')
+        sha = git('rev-parse', 'HEAD').strip()
+        self.assertEqual(len(sha), 64)
+        loaded = canon.Canon(
+            root=str(root), readable=True, id='sha',
+            sources=[canon.Source('acme', str(root), repo=str(root), commit=sha)])
+        ref = 'acme:pipelines/delivery.md@' + sha
+        with mock.patch.object(canon, 'load_configured', return_value=[loaded]):
+            name, spec, _encoding = pipeline_cli.pipeline_at(ref, cfg=self.cfg)
+        self.assertEqual((name, spec.initial), ('delivery', 'draft'))

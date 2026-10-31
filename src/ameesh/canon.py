@@ -4681,6 +4681,14 @@ class _Loader:
                      "`.`, `_`, `-`; 64 characters at most)" % fiche.data.get("name", name),
                      **where, **subject)
             valid = False
+        if name in modules_mod.RESERVED_NAMES:
+            # `ameesh module list` prints the installation evidence before any
+            # dispatch: a card of that name would be unreachable.
+            self.add("pipeline-name-reserved", ERROR,
+                     "Pipeline card: name %r is reserved by the `ameesh module` "
+                     "wrapper (`ameesh module list` prints the installation evidence)"
+                     % name, **where, **subject)
+            valid = False
         responsible = _text(fiche.data.get("responsible"))
         if not responsible:
             self.add("pipeline-responsible-missing", ERROR,

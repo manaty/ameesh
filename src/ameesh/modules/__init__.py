@@ -44,6 +44,12 @@ from importlib import metadata
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+#: Names the `ameesh module` wrapper keeps for itself. `list` prints the
+#: installation evidence before any dispatch, so a module of that name would
+#: be unreachable; the name is reserved whatever the source (built-in, entry
+#: point, Pipeline card) and `canon check` reports it.
+RESERVED_NAMES = frozenset({"list"})
+
 #: Python entry-point group for externally installed module descriptors.
 ENTRY_POINT_GROUP = "ameesh.modules"
 
@@ -154,6 +160,9 @@ def _external(entry):
     name = getattr(entry, "name", None)
     if not isinstance(name, str) or not NAME.fullmatch(name):
         raise ValueError("invalid external module entry point: %r" % (name,))
+    if name in RESERVED_NAMES:
+        raise ValueError("external module %r: reserved module name (the `ameesh "
+                         "module` wrapper keeps `list`)" % name)
     try:
         module = entry.load()
     except Exception as exc:  # installed code: its failure is a closed refusal

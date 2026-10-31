@@ -136,6 +136,21 @@ class DiscoveryTest(unittest.TestCase):
                          "acme:pipelines/livraison.md@%s" % ("a" * 40))
         self.assertEqual(sorted(modules.installed()), ["dev", "it", "work-types"])
 
+    def test_the_reserved_list_name_never_becomes_a_module(self):
+        # #4968/N4: `ameesh module list` keeps that name for the installation
+        # evidence; a card (or an entry point) of that name is refused.
+        found = registry.discover(canon=canon_with(card("list")))
+        self.assertIsNone(found.get("list"))
+        [row] = found.refused
+        self.assertEqual((row["name"], row["source"], row["reason"]),
+                         ("list", "canon", "invalid"))
+        self.assertIn("reserved module name", row["error"])
+        with points(FakeEntryPoint(sample(), name="list")):
+            found = registry.discover()
+        self.assertIsNone(found.get("list"))
+        self.assertTrue(any(row["name"] == "list" and "reserved module name" in row["error"]
+                            for row in found.refused), found.refused)
+
 
 class ActivationTest(unittest.TestCase):
     def setUp(self):

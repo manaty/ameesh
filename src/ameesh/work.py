@@ -4706,7 +4706,10 @@ def promote(db: Db, item_id: int, *, note: str = "", actor: str = "") -> dict:
 def adopt_workflow(db, item_id: int, *, module: str, spec, actor: str) -> dict:
     """First pin only: lock, authority, activation and initial core, then journal.
 
-    No receipt or revision transfer: subsequent revisions use #4007.
+    A held lot (`blocked`/`waiting_human`) is adopted under the same rule as
+    the #4007 revision transfer: the hold is kept and the journal must prove
+    the core it will resume into (N10, `_pre_hold_core`). No receipt or
+    revision transfer: subsequent revisions use #4007.
     """
     from . import process_registry as registry
     registry._validate_spec(spec)
@@ -4722,7 +4725,6 @@ def adopt_workflow(db, item_id: int, *, module: str, spec, actor: str) -> dict:
             raise WorkError('pipeline-authority: only the assignee or pilot can adopt')
         if row.get('workflow_ref'):
             raise WorkError('pipeline-already-pinned: use revision transfer')
-        phase = lifecycle.phase(row)
         if row['state'] in lifecycle.COMPLETED:
             raise WorkError('pipeline-terminal: completed work item')
         store.lock_workflow_activation(row.get('app') or row.get('workstream') or '')
@@ -4730,7 +4732,19 @@ def adopt_workflow(db, item_id: int, *, module: str, spec, actor: str) -> dict:
             raise WorkError('pipeline-module-inactive: %s' % module)
         if row.get('type') not in spec.types:
             raise WorkError('pipeline-type: work item type is not covered by the card')
-        if spec.core_of(spec.initial) != phase:
+        core = spec.core_of(spec.initial)
+        if row['state'] in registry.HOLDS:
+            # N10: the row does not carry the pre-hold core; the journal is
+            # the only witness. Adopt the initial stage only if it projects
+            # the core the lot resumes into, and keep the hold state.
+            proof = registry._pre_hold_core(tx, item_id)
+            if proof is None:
+                raise WorkError('pipeline-hold-core-unproven: lot %s is held and its '
+                                'journal proves no core before the hold' % item_id)
+            if proof != core:
+                raise WorkError('pipeline-stage-mismatch: initial stage must match '
+                                'current core')
+        elif lifecycle.phase(row) != core:
             raise WorkError('pipeline-stage-mismatch: initial stage must match current core')
         store.adopt_workflow(item_id, ref=spec.workflow_ref,
                              version=spec.workflow_version, stage=spec.initial,

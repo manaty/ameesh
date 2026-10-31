@@ -22,8 +22,8 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 
-from . import (NAME, _builtin, _check_types, _digest, _distribution, _entry_points,
-               _external, _validate_descriptor)
+from . import (NAME, RESERVED_NAMES, _builtin, _check_types, _digest,
+               _distribution, _entry_points, _external, _validate_descriptor)
 
 #: Capabilities a module may declare in ``CAPABILITIES``.
 CAPABILITIES = ("lifecycle", "cli", "audit", "workspaces")
@@ -173,9 +173,10 @@ def _with_canon(discovery, canon):
 
     A valid card becomes a `PipelineModule` of source ``canon``; nothing is
     imported. A card is refused (third item, ``source: "canon"``) when it is
-    invalid or shares its name with another card (``reason: "invalid"``,
-    already a `pipeline-*` finding), or when its name is already a discovered
-    module (``reason: "duplicate"``). Installed names are never shadowed."""
+    invalid (including the reserved `list` name) or shares its name with
+    another card (``reason: "invalid"``, already a `pipeline-*` finding), or
+    when its name is already a discovered module (``reason: "duplicate"``).
+    Installed names are never shadowed."""
     implementations, modules, refused = discovery
     implementations, modules, refused = dict(implementations), list(modules), list(refused)
     taken = set(implementations) | {row["name"] for row in refused}
@@ -184,6 +185,12 @@ def _with_canon(discovery, canon):
     for pipeline in sorted(cards, key=lambda p: (p.name, p.fiche.path)):
         row = {"name": pipeline.name, "source": "canon", "distribution": None,
                "version": None, "entry_point": None, "card_ref": pipeline.fiche.ref}
+        if pipeline.name in RESERVED_NAMES:
+            refused.append(dict(row, reason="invalid",
+                                error="reserved module name: %r (Pipeline card %s); "
+                                      "`ameesh module list` keeps that name"
+                                      % (pipeline.name, pipeline.fiche.ref)))
+            continue
         if pipeline.name in taken or counts[pipeline.name] > 1:
             # two cards of one name are `pipeline-duplicate` already: invalid
             refused.append(dict(row, reason=("duplicate" if pipeline.name in taken

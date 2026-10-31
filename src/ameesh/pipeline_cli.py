@@ -13,6 +13,22 @@ import uuid
 from . import canon, process_card, process_registry as registry, work
 from .process_workflow import WorkflowRefusal
 
+#: Evidence keys the guards read as integers (the closure's replacement lot,
+#: `_close_facts`). Everything else stays the string the caller typed.
+EVIDENCE_INT_KEYS = frozenset({"superseded_by"})
+
+
+def _evidence_value(key, value):
+    """Type a known numeric fact; every other reference remains a string.
+
+    The CLI is an adapter over the guards' evidence contracts: a lot number is
+    an integer (``superseded_by``), and `_close_facts` also accepts its decimal
+    spelling for older callers. The receipt and the replay intent carry the
+    typed value."""
+    if key in EVIDENCE_INT_KEYS and re.fullmatch(r'[0-9]+', value):
+        return int(value)
+    return value
+
 
 @lru_cache(maxsize=128)
 def _compiled(repo, ref, path, commit, version):
@@ -40,7 +56,7 @@ def pipeline_at(ref, *, cfg, version=0):
     if not parsed:
         raise work.WorkError('pipeline-ref: expected a pinned card reference')
     prefix, member, path, commit = parsed
-    if (not re.fullmatch(r'[0-9a-f]{40}', commit)
+    if (not canon._SHA_RE.fullmatch(commit)
             or PurePosixPath(path).is_absolute() or '..' in PurePosixPath(path).parts):
         raise work.WorkError('pipeline-ref: immutable commit and relative path required')
     for loaded in canon.load_configured(cfg):
@@ -54,7 +70,13 @@ def pipeline_at(ref, *, cfg, version=0):
 
 def main(db, argv, *, actor, module, cfg=None):
     """Serve one canon module through the native registry and its verifiers."""
-    parser = argparse.ArgumentParser(prog='ameesh module %s' % module.NAME)
+    parser = argparse.ArgumentParser(
+        prog='ameesh module %s' % module.NAME,
+        description=("Pipeline commands are signed by a registered agent, the lot's "
+                     "assignee or a pilot; a human pilot acts through its agent."),
+        epilog=("Evidence: --ref KEY=VALUE, repeatable. The guard decides the keys; "
+                "stop_work takes reason=abandoned|superseded (close_reason is "
+                "accepted) and superseded_by=LOT for a supersession."))
     commands = parser.add_subparsers(dest='action', required=True)
     adopt = commands.add_parser('adopt', help='pin an unpinned work item')
     adopt.add_argument('lot', type=int)
@@ -63,7 +85,10 @@ def main(db, argv, *, actor, module, cfg=None):
         command.add_argument('lot', type=int)
         command.add_argument('--expected-version', type=int)
         command.add_argument('--command-id', default=None)
-        command.add_argument('--ref', action='append', default=[], metavar='KEY=VALUE')
+        command.add_argument('--ref', action='append', default=[],
+                             metavar='KEY=VALUE',
+                             help='guard evidence fact, repeatable (strings, except '
+                                  'superseded_by)')
         if action == 'advance':
             command.add_argument('--to', required=True)
             command.add_argument('--guard', required=True)
@@ -74,6 +99,13 @@ def main(db, argv, *, actor, module, cfg=None):
         return 0
     cfg = cfg or db.cfg
     try:
+        if str(actor or '').startswith(work.HUMAN_PREFIX):
+            # The Process registry signs commands of registered agents only:
+            # a human actor is refused before it reads as a dead authority.
+            raise work.WorkError(
+                'pipeline-authority: a Pipeline command is signed by a registered '
+                'agent (the lot assignee or a pilot); a human pilot acts through '
+                'its agent')
         if args.action == 'adopt':
             # The discovered card is a merged, trusted canon object. Resolve it
             # again from git rather than trusting its in-memory compilation.
@@ -99,7 +131,16 @@ def main(db, argv, *, actor, module, cfg=None):
                 key, sep, value = reference.partition('=')
                 if not sep or not key or key in evidence:
                     raise work.WorkError('pipeline-reference: unique KEY=VALUE required')
-                evidence[key] = value
+                evidence[key] = _evidence_value(key, value)
+            if getattr(args, 'guard', '') == 'stop_work' and 'close_reason' in evidence:
+                # The native closure key is `close_reason` (work.close); the
+                # stop_work verifier names the same fact `reason` (#5000).
+                # Accept both spellings, never two contradictory reasons.
+                reason = evidence.pop('close_reason')
+                if 'reason' in evidence and evidence['reason'] != reason:
+                    raise work.WorkError(
+                        'pipeline-reference: close_reason and reason disagree')
+                evidence['reason'] = reason
             from . import process_verifiers
             process_verifiers.install_verifiers()
             command = registry.Command(
