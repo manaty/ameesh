@@ -54,3 +54,5 @@ rounding up. It follows §11 of the specification.
 - Using **subscription** credentials for unattended agents on a server must be
   checked against each provider's terms; a host policy can refuse that
   credential mode.
+
+Installed Python modules execute trusted code inside the ameesh process without a sandbox; see [Write a module](guides/write-a-module.md) before installing an extension.
