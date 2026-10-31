@@ -61,6 +61,25 @@ class RoleNotifyCredentialsTest(unittest.TestCase):
                 self.assertEqual(set(E.for_child([sys.executable], granted)),
                                  {"AMEESH_SLACK_WEBHOOK", "GH_TOKEN"})
 
+    def test_invalid_variable_name_is_never_declared(self):
+        """#5083: `notify._channel` refuses the name; nothing is declared before."""
+        raw = {"channels": {"push": {"type": "ntfy", "token_env": "BAD NAME"},
+                            "slack": {"webhook_env": "1BAD"}}}
+        with mock.patch.object(E, "DECLARED_CREDENTIALS", set()):
+            self.assertEqual(E.notify_credentials(raw), frozenset())
+            self.assertEqual(E.DECLARED_CREDENTIALS, set())
+        self.assertIs(notify.DEFAULT_SLACK_ENV, E.DEFAULT_SLACK_ENV)
+
+    def test_once_hides_its_environment_or_refuses(self):
+        """#5083: the role's `notify --once` holds the granted secrets."""
+        from ameesh.platform import process
+        with mock.patch.object(process, "become_undumpable",
+                               side_effect=OSError(1, "refused")) as hide, \
+                mock.patch.object(notify.config_mod, "load") as load:
+            self.assertEqual(notify.main(["--once"]), 1)
+        hide.assert_called_once_with()
+        load.assert_not_called()
+
     def test_role_child_sends_signed_primary_request_with_filter_active(self):
         requests = []
 

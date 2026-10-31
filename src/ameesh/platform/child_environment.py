@@ -86,6 +86,11 @@ def for_child(argv, environment=None, *, executable=None, shell=False) -> dict:
             if not secret_name(name) or os.fsdecode(name) in allowed}
 
 
+#: Slack webhook variable when a `slack` channel names none (`notify` reads it).
+DEFAULT_SLACK_ENV = "AMEESH_SLACK_WEBHOOK"
+_VARIABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def _route_names(value) -> tuple:
     """Channel names of a route, as `notify._names` reads them (never raises)."""
     if isinstance(value, str):
@@ -125,8 +130,10 @@ def notify_credentials(raw) -> frozenset[str]:
             variable = channel.get(env_key)
             if (env_key == "webhook_env" and not variable
                     and (channel.get("type") or name) == "slack"):
-                variable = "AMEESH_SLACK_WEBHOOK"
-            if isinstance(variable, str) and variable:
+                variable = DEFAULT_SLACK_ENV
+            # Same name check as `notify._channel`: an invalid name is refused
+            # there, never declared here (#5083).
+            if isinstance(variable, str) and _VARIABLE_RE.match(variable):
                 DECLARED_CREDENTIALS.add(variable.upper())
                 if not channel.get(file_key):
                     names.add(variable)

@@ -130,6 +130,7 @@ from . import alert_briefs, exploitation, fil, nexlink_alerts, notify_gap, \
 from . import vocab
 from .config import Config
 from .platform import notify as platform_notify
+from .platform.child_environment import DEFAULT_SLACK_ENV
 
 NOTIFY_SCHEMA = "ameesh-notify/1"
 STATE_SCHEMA = "ameesh-notify-state/1"
@@ -259,7 +260,6 @@ RATE_WINDOW_S = 60.0
 #: l'état reste petit même sur une longue série d'alertes.
 NOTIFIED_RETENTION_S = 30 * 24 * 3600.0
 NOTIFIED_MAX = 5000
-DEFAULT_SLACK_ENV = "AMEESH_SLACK_WEBHOOK"
 
 #: clés qui porteraient un secret EN CLAIR dans la configuration : refusées
 SECRET_KEYS = ("token", "password", "secret", "webhook", "webhook_url", "authorization",
@@ -4644,6 +4644,16 @@ def main(argv: list | None = None) -> int:
     if not args.once and not args.test:
         from .platform.child_environment import harden
         if not harden():
+            return 1
+    elif args.once:
+        # #5083: a role's `--once` holds the channel secrets granted to it
+        # alone (#5077); its `/proc` environ stays closed to the other turns.
+        from .platform.process import become_undumpable
+        try:
+            become_undumpable()
+        except OSError as exc:
+            print("ameesh notify: refusing to run: process environment protection "
+                  "failed (%s)" % exc, file=sys.stderr)
             return 1
     cfg = config_mod.load()
     try:
