@@ -1211,6 +1211,11 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         stacked_doubts = {str(row["name"]).strip().lower(): row
                           for row in range_correctors or ()
                           if (row or {}).get("stacked_lot") and row.get("name")}
+        # #5055 : ascendance illisible dans ce clone : la porte reste fermée
+        # et dit quel lot empilé elle n'a pas pu vérifier.
+        unread_stacks = {str(row["name"]).strip().lower(): int(row["stacked_unread"])
+                         for row in range_correctors or ()
+                         if (row or {}).get("stacked_unread") and row.get("name")}
     out["corrections"] = sorted(corrections)
     # #2961 : la famille de la référence est celle de la **trace du gel**,
     # lue avec la plage gelée (`review_authors.reading` : reçu exact du commit,
@@ -1416,6 +1421,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 rejected[-1].update(reason="stacked-corrector",
                                     stacked_lot=int(doubt["stacked_lot"]),
                                     rewritten=str(doubt.get("rewritten") or ""))
+            elif unread_stacks.get(actor.lower()):
+                rejected[-1]["stacked_unread"] = unread_stacks[actor.lower()]
             continue                      # l'auteur d'un correctif ne le relit pas (#2739)
         try:
             family = _verdict_family(mark)

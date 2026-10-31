@@ -474,8 +474,7 @@ def check(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
 #: Gestes qui cassent le code d'avant sur une base migrée (L151) : il lit ou
 #: écrit encore ce qui disparaît, change de type ou devient obligatoire. Une
 #: migration qui n'en contient aucun est « additive » : on peut l'appliquer
-#: AVANT d'installer le code qui l'apporte. Remplacer une contrainte (drop puis
-#: add) reste additif : les migrations du dépôt ne le font que pour l'élargir.
+#: AVANT d'installer le code qui l'apporte.
 _NON_ADDITIVE = (
     (re.compile(r"\bdrop\s+(table|column|schema|type)\b"), "removal (drop %s)"),
     (re.compile(r"\brename\b"), "rename"),
@@ -492,14 +491,31 @@ _NON_ADDITIVE = (
 _DROP_RECREATED = re.compile(
     r"\bdrop\s+(view|materialized\s+view|function)\s+(?:if\s+exists\s+)?([\w.\"]+)")
 #: marqueur explicite, pour ce que l'examen du texte ne voit pas (une
-#: contrainte resserrée, une fonction réécrite) : `-- ameesh: non additive`
+#: fonction réécrite) : `-- ameesh: non additive`
 _MARKER = re.compile(r"--\s*ameesh\s*:\s*non[- ]additive", re.IGNORECASE)
+#: #5055 : retirer un droit ou resserrer une contrainte casse aussi le code
+#: d'avant. Les versions déjà livrées gardent leur classement : le rétablir
+#: ferait entrer leurs marqueurs dans `schema_non_additive_migrations`.
+_PRIVILEGES_CHECKED_AFTER = 528
+_REVOKE = re.compile(r"\brevoke\b[^;]*?\bon\s+(?:(table|function|sequence)\s+)?([\w.\"]+)"
+                     r"\s*(\([^)]*\))?\s*(from\b)?|\brevoke\b")
+_DOLLAR_TAG = re.compile(r"\$(?:[^\W\d]\w*)?\$")
+#: lu, comme _REVOKE, sur le texte sans chaînes : ses `;` et ses mots sont du code
+_ALTER_TABLE = re.compile(r"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)\s[^;]*")
+#: mots qui, dans une chaîne, peuvent être du code exécuté : la forme n'est plus simple
+_SENSITIVE = re.compile(r";|\b(?:revoke|grant|alter|add|create|drop|execute|constraint"
+                        r"|unique|primary|check|foreign|references)\b")
+_ADD_CONSTRAINT = re.compile(r"\badd\s+(?:constraint\s+([\w\"]+)"
+                             r"|(primary\s+key|unique|check|foreign\s+key)\b)")
+#: le texte ne dit pas si une contrainte élargit ou resserre : celle qui ne
+#: resserre pas (remplacée pour l'élargir, posée sur une colonne neuve) le déclare
+_CONSTRAINT_MARKER = re.compile(r"--\s*ameesh\s*:\s*constraint\s+not\s+tightened", re.IGNORECASE)
 
 
 def non_additive(migration: Migration) -> list[str]:
     """Raisons pour lesquelles `migration` casserait le code d'avant ; vide si
     elle ne fait qu'ajouter (tables, colonnes nullables ou avec défaut, index,
-    contraintes remplacées)."""
+    contraintes déclarées sans resserrement)."""
     reasons = []
     if _MARKER.search(migration.sql):
         reasons.append("marked non-additive")
@@ -517,7 +533,128 @@ def non_additive(migration: Migration) -> list[str]:
                                % (r"\s+".join(kind.split()), re.escape(name)))
         if not recreated.search(text, match.end()):
             reasons.append("removal (drop %s %s)" % (kind, name))
+    if migration.version > _PRIVILEGES_CHECKED_AFTER:
+        reasons.extend(_privilege_reasons(migration.sql))
     return reasons
+
+
+def _lex(sql: str) -> tuple[list[str], str, bool]:
+    """(chaînes, texte sans commentaires ni chaînes, lecture sûre), en une seule
+    passe : le délimiteur d'une chaîne ne se lit jamais dans un commentaire, ni
+    l'inverse. Un identifiant cité devient un jeton neutre : son contenu n'est
+    pas du code et sa casse ne survit pas aux minuscules. La lecture n'est pas
+    sûre si un commentaire coupe une instruction ou si une fin manque."""
+    strings, code, at, size, sure = [], [], 0, len(sql), True
+    while at < size:
+        two = sql[at:at + 2]
+        dollar = _DOLLAR_TAG.match(sql, at) if sql[at] == "$" else None
+        if two in ("--", "/*") and "".join(code).rsplit(";", 1)[-1].strip():
+            sure = False
+        if two == "--":
+            end = sql.find("\n", at)
+            at = size if end < 0 else end
+        elif two == "/*":
+            depth, at = 1, at + 2
+            while at < size and depth:
+                two = sql[at:at + 2]
+                depth += (two == "/*") - (two == "*/")
+                at += 2 if two in ("/*", "*/") else 1
+            sure = sure and not depth
+            code.append(" ")
+        elif dollar or sql[at] in "'\"":
+            if dollar:
+                closing = sql.find(dollar.group(0), dollar.end())
+                end = size if closing < 0 else closing + len(dollar.group(0))
+            else:
+                end = at + 1
+                # E'' seul connaît l'échappement par barre oblique
+                escaped = sql[at] == "'" and at and sql[at - 1] in "eE" and not (
+                    at > 1 and (sql[at - 2].isalnum() or sql[at - 2] == "_"))
+                while end < size:
+                    if escaped and sql[end] == "\\":
+                        end += 2
+                    elif sql[end] == sql[at]:
+                        if sql[end + 1:end + 2] != sql[at]:
+                            break
+                        end += 2
+                    else:
+                        end += 1
+                sure = sure and end < size
+                end = min(end + 1, size)
+            sure = sure and not (dollar and closing < 0)
+            if sql[at] == '"':
+                code.append('"_"')
+            else:
+                strings.append(sql[at:end]), code.append(" ")
+            at = end
+        else:
+            code.append(sql[at])
+            at += 1
+    return strings, "".join(code), sure
+
+
+def _param_types(params: str, *, named: bool) -> list[str]:
+    """Types d'une signature ; `named` : le premier mot d'un paramètre est son nom."""
+    types = []
+    for param in params.strip(" ()").split(","):
+        words = re.split(r"\s+(?:default\b|=)|=", param)[0].split()
+        types.append(" ".join(words[1:] if named and len(words) > 1 else words))
+    return types
+
+
+def _proven_new(code: str, kind: str, name: str, signature: str = "") -> bool:
+    """`name` (sans guillemets) est-il prouvé neuf ? Seul un CREATE nu, hors chaîne SQL,
+    échoue sur un objet existant : `or replace`, `if not exists`, un drop
+    préalable, une chaîne non exécutée et une autre surcharge laissent au code
+    d'avant son objet."""
+    quoted = re.escape(name) + r"(?![\w.\"])"
+    kinds = {"table": r"table|view|materialized\s+view|sequence", "function": "function",
+             "sequence": "sequence"}[kind]
+    if re.search(r"\bdrop\s+(?:%s)\s+(?:if\s+exists\s+)?%s" % (kinds, quoted), code):
+        return False
+    match = re.search(r"\bcreate\s+(?:%s)\s+%s\s*(\([^)]*\))?" % (kinds, quoted), code)
+    if not match:
+        return False
+    if signature:
+        return bool(match.group(1)) and (_param_types(match.group(1), named=True)
+                                         == _param_types(signature, named=False))
+    return True
+
+
+def _privilege_reasons(sql: str) -> list[str]:
+    """Droits retirés et contraintes posées sur ce qui n'est pas prouvé neuf (#5055).
+    Seule une migration de forme simple peut prouver un objet neuf (mesh-design,
+    #174729) : sans `$` ni DO, sans identifiant cité, sans commentaire dans une
+    instruction et sans mot sensible (EXECUTE compris) dans une chaîne. Ailleurs,
+    tout REVOKE et tout ADD de contrainte classent la migration, sans analyse."""
+    def normal(value: str) -> str:
+        return re.sub(r"\s+", " ", value.lower())
+
+    strings, code, sure = _lex(sql)
+    code, strings = normal(code), [normal(value) for value in strings]
+    simple = sure and not re.search(r"[$\"\\]", sql) \
+        and not re.search(r"\bdo\b", code) \
+        and not any(_SENSITIVE.search(value) for value in strings)
+    reasons = []
+    if not simple and any(re.search(r"\brevoke\b", value) or (
+            re.search(r"\badd\b", value)
+            and re.search(r"\b(?:constraint|unique|primary|check|foreign)\b", value))
+            for value in strings):
+        reasons.append("privilege removed or constraint added in a string (not analysed)")
+    for match in _REVOKE.finditer(code):
+        kind, name, signature, single = match.groups()
+        if not (simple and name and single
+                and _proven_new(code, kind or "table", name, signature or "")):
+            reasons.append("privilege removed (revoke%s)" % (" on " + name if name else ""))
+    if not _CONSTRAINT_MARKER.search(sql):
+        for statement in _ALTER_TABLE.finditer(code):
+            if simple and _proven_new(code, "table", statement.group(1)):
+                continue
+            reasons.extend("constraint possibly tightened (add %s)"
+                           % (name and "constraint " + name or form)
+                           for name, form in _ADD_CONSTRAINT.findall(statement.group(0)))
+    return reasons
+
 
 def _applied_readonly(db: PsqlDriver | PsycopgDriver) -> dict[int, str]:
     """Versions appliquées et leur empreinte, sans `create table` : vide si

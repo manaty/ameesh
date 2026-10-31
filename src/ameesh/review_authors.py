@@ -4834,11 +4834,14 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
         except Exception:  # noqa: BLE001 - lecture impossible : pas de lot
             return None
 
+    unread_stacks: dict[str, int] = {}
+
     def stacked_lot(receipt, full: str) -> int:
         """L'autre lot dont une tête contient le commit, ou 0 (#5066).
 
         Une simple trace : elle ne retire jamais l'exclusion. Un reçu sans lot,
-        une tête illisible ou absente ne nomment aucun lot."""
+        une tête illisible ou absente ne nomment aucun lot ; une ascendance que
+        ce clone ne sait pas lire est notée dans `unread_stacks` (#5055)."""
         related = receipt_lot(receipt)
         if related is None or related == lot:
             return 0
@@ -4851,9 +4854,12 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                          if row.get("kind") == "frozen")
         except Exception:  # noqa: BLE001 - autre lot illisible : aucune trace
             return 0
-        return int(related) if any(
-            value and _is_ancestor(repo, full, value) is True
-            for value in heads) else 0
+        readings = [_is_ancestor(repo, full, value) for value in heads if value]
+        if True in readings:
+            return int(related)
+        if None in readings:
+            unread_stacks[full] = int(related)
+        return 0
 
     check()
     try:
@@ -5027,7 +5033,8 @@ def _rewritten_after_freeze(db, item: Mapping, milestone: Optional[Mapping],
                 out.setdefault(key, {"name": actor, "family": "",
                                      "families": [],
                                      "rewritten": full,
-                                     "freeze": freeze_id})
+                                     "freeze": freeze_id,
+                                     "stacked_unread": unread_stacks.get(full, 0)})
                 break
             if key in out:
                 break
@@ -5464,6 +5471,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                                "rewritten": str(row.get("rewritten") or ""),
                                "unresolved": str(row.get("unresolved") or ""),
                                "stacked_lot": int(row.get("stacked_lot") or 0),
+                               "stacked_unread": int(row.get("stacked_unread") or 0),
                                "freeze": int(row.get("freeze") or 0)}
     if doubts_out is not None:
         # #4679 B/P2 : reçus introuvables sans lot, à dire au gel — jamais des
@@ -5478,6 +5486,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             entry["rewritten"] = row["rewritten"]
             if row.get("stacked_lot"):
                 entry["stacked_lot"] = int(row["stacked_lot"])
+            if row.get("stacked_unread"):
+                entry["stacked_unread"] = int(row["stacked_unread"])
             if row.get("freeze"):
                 entry["freeze"] = int(row["freeze"])
         if row.get("unresolved"):
