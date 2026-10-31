@@ -633,7 +633,7 @@ raison, jamais `0` (§2.4).
 |---|---|
 | `schema` | `ameesh-context-corpus/1` |
 | `turn_id`, `agent`, `started_ts`, `ended_ts`, `duration_s` | identité et fenêtre du tour ; `started_ts`/`ended_ts` viennent de la publication |
-| `harness`, `model`, `model_quality`, `mode`, `role` | profil effectif du tour |
+| `harness`, `model`, `model_quality`, `mode`, `role` | profil effectif du tour ; `model_quality` vaut `measured` quand le flux a annoncé le modèle, `requested` quand seul le nom demandé au lancement est connu, `unknown` sans nom |
 | `session` | identifiant **opaque** : `sha256:` + 32 hex, lié à l'agent ; jamais l'identifiant brut |
 | `session_seq` | rang du tour dans sa session (1..N), stable et suffisant au rejeu |
 | `W` | fenêtre du modèle effectif : `value`, `quality`, `reasons`, `granularity`, `source` (provenance runtime) |
@@ -645,7 +645,7 @@ raison, jamais `0` (§2.4).
 | `quality`, `reasons` | qualité d'ensemble (mesures principales) et raisons, triées |
 | `source` | `event_id`, `observation_id`, `ledger_id`, schéma source, hôte |
 
-La publication `turn.context` de CTX-02b ne porte pas encore le profil CTX-03 : sur le corpus réel, `W` reste donc `null` avec `window_unknown`, et `C_next_input`/`C_next` restent `null` hors opt-in CTX-04b. Les fixtures R1 et R4 portent, elles, une fenêtre observée. Aucune valeur n'est supposée pour combler ces absences.
+La publication `turn.context` de CTX-02b ne porte pas encore le profil CTX-03 complet : sur le corpus réel, `W` reste donc `null` avec `window_unknown`, et `C_next_input`/`C_next` restent `null` hors opt-in CTX-04b. Elle publie en revanche le nom du modèle **et sa provenance** (`model_quality`) : le nom annoncé par le flux est `measured`, le seul nom du lancement reste `requested`. Un événement antérieur, qui ne porte pas cette provenance, est traité comme `requested` : une configuration n'est jamais requalifiée en mesure runtime. Les fixtures R1 et R4 portent, elles, une fenêtre observée. Aucune valeur n'est supposée pour combler ces absences.
 
 `S_hist` est reconstruit du grand livre : somme des `input_tokens +
 output_tokens` des lignes `turn_costs` de la session jusqu'au tour inclus.
