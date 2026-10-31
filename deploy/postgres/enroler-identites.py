@@ -24,6 +24,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 ROOT = Path('/etc/ameesh-release-identities')
 RESTORE_SOCKET = '/run/ameesh-release-restore'
+PUBLIC_READ_EXTENSIONS = ('pg_stat_statements',)
 NAME = re.compile(r'[a-z][a-z0-9_]{0,62}\Z')
 CONTROLLER_READS = frozenset(('agent_registry', 'agent_mailbox', 'mesh_approvals',
     'mesh_consumed_nonces', 'turn_resources', 'spend_pending', 'host_release_operations',
@@ -219,13 +220,13 @@ def audit_data(conn, name, schema, parent=None):
             # Extension views may intentionally expose SELECT to PUBLIC. Only
             # that ambient read is allowed; all write/ownership audits still run.
             public_extension_read = kind != 'S' and conn.execute(
-                "SELECT EXISTS (SELECT 1 FROM pg_depend WHERE classid='pg_class'::regclass "
-                "AND objid=%s AND objsubid=0 AND refclassid='pg_extension'::regclass AND deptype='e') "
+                "SELECT EXISTS (SELECT 1 FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid WHERE classid='pg_class'::regclass "
+                "AND objid=%s AND objsubid=0 AND refclassid='pg_extension'::regclass AND deptype='e' AND e.extname=ANY(%s)) "
                 "AND EXISTS (SELECT 1 FROM pg_class c, LATERAL aclexplode(c.relacl) a "
                 "WHERE c.oid=%s AND a.grantee=0 AND a.privilege_type='SELECT') "
                 "AND NOT EXISTS (SELECT 1 FROM pg_class c, LATERAL aclexplode(c.relacl) a "
                 "WHERE c.oid=%s AND a.grantee=ANY(%s::oid[]) AND a.privilege_type='SELECT')",
-                (obj, obj, obj, principals[1:])).fetchone()[0]
+                (obj, list(PUBLIC_READ_EXTENSIONS), obj, obj, principals[1:])).fetchone()[0]
             require(select == (ns == schema and table in CONTROLLER_READS and kind != 'S'
                                or public_extension_read),
                     'controller read privilege differs from contract')

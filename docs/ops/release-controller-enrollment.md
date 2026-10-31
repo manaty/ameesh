@@ -336,8 +336,8 @@ L'audit refuse les privilèges supplémentaires, colonnes comprises, les rôles
 parents imprévus, les propriétés administratives, la propriété d'objets,
 les fonctions SECURITY DEFINER accessibles et les tables sous RLS que l'identité
 ne peut sauvegarder complètement. Les droits PUBLIC comptent dans cet audit. Seul le SELECT public d'un objet
-membre d'une extension est admis en plus pour le contrôleur (par exemple les
-vues de `pg_stat_statements`), sans grant SELECT direct au login ou à son
+membre d'une extension nommée dans la liste explicite du code est admis en plus
+pour le contrôleur (uniquement `pg_stat_statements` aujourd'hui), sans grant SELECT direct au login ou à son
 groupe. Cette exception ne dispense d'aucun contrôle d'écriture, de propriété
 ou de fonction SECURITY DEFINER. Un refus `IdentityError` expose sa raison
 locale fixe ; les erreurs du serveur et les DSN restent masqués.
@@ -364,13 +364,21 @@ d'identités root, l'administration peer doit autoriser explicitement root vers
 le rôle administrateur par le seul socket privé ; un accès réservé à l'OS
 `ameesh-restore` ne suffit pas et ne doit pas être promu implicitement.
 Le nom SQL administrateur est explicite dans `restore_owner_dsn` et doit être
-superutilisateur. S'il s'agit de `ameesh-restore`, le provisionneur peut écrire
-`local all ameesh-restore peer map=release_admin`, avec les deux correspondances
-pg_ident `release_admin root ameesh-restore` et
-`release_admin ameesh-restore ameesh-restore`, pour la commande root et la sonde.
-La ligne suivante est `local all <restore_role> scram-sha-256` : toutes les bases
-sont nécessaires aux restaurations dans des bases aléatoires. Aucun accès host
-ou hostssl n'est configuré. Le rôle de restauration vient de l'entrée privée.
+superutilisateur. Le provisionneur écrit exactement ces trois lignes pg_hba
+(décision mesh-design du 31/10, #176452) :
+
+```text
+local all ameesh-restore peer
+local all <rôle administrateur> peer map=<carte root>
+local all <rôle de restauration> scram-sha-256
+```
+
+pg_ident contient une seule correspondance explicite :
+`<carte root> root <rôle administrateur>`, sans regex ni autre entrée.
+Les noms du rôle administrateur et de la carte sont ceux du provisionnement.
+Toutes les bases sont nécessaires aux restaurations dans des bases aléatoires.
+Aucune ligne host, hostssl ou hostnossl, ni autre ligne local, n'est configurée.
+Le rôle de restauration vient de l'entrée privée.
 Son provisionnement et le producteur de
 `restore_capacity` relèvent du lot compagnon #5165 : la mesure doit être faite
 sur le volume PostgreSQL cible ; les octets libres d'agents-3 ne prouvent pas

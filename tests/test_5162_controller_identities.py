@@ -271,6 +271,15 @@ class RealIdentityTest(unittest.TestCase):
                                     parent=self.value['group_role'])
                 conn.execute('ROLLBACK TO SAVEPOINT extra_privilege')
 
+    def test_unlisted_extension_public_select_is_refused(self):
+        with psycopg.connect(self.source) as conn:
+            conn.execute('CREATE EXTENSION pg_stat_statements')
+            conn.execute('CREATE EXTENSION hstore')
+            conn.execute('ALTER EXTENSION hstore ADD TABLE mesh.payload')
+            conn.execute('GRANT SELECT ON mesh.payload TO PUBLIC')
+        with self.assertRaisesRegex(tool.IdentityError, 'controller read privilege'):
+            self.enroll()
+
     def test_real_dump_and_restore_only_with_restore_identity(self):
         self.enroll()
         source = self.source_doc()
