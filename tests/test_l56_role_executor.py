@@ -151,6 +151,39 @@ class RoleExecutorTest(PgTestCase):
                                "-v", "ON_ERROR_STOP=1", "-c", sql],
                               capture_output=True, text=True, timeout=30, env=env)
 
+    def assert_inventory_cannot_be_erased(self, role):
+        """Real SET ROLE attack on the cascading parent, then a fresh guard."""
+        q = db_mod.quote_ident
+        self.db.execute("INSERT INTO schema_migrations(version,name,checksum) VALUES (9999,'future',%s)", ('f' * 64,))
+        self.db.execute("INSERT INTO schema_non_additive_migrations VALUES (9999,'future',%s)", ('f' * 64,))
+        try:
+            for privilege in ('UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'):
+                self.assertFalse(self.db.query(
+                    "SELECT has_table_privilege(%s,'schema_migrations',%s) AS p",
+                    (role, privilege))[0]['p'], (role, privilege))
+            for sql in ("DELETE FROM schema_migrations WHERE version=9999",
+                        "UPDATE schema_migrations SET version=10000 WHERE version=9999",
+                        "TRUNCATE schema_migrations CASCADE"):
+                with self.assertRaisesRegex(db_mod.DbError, 'permission denied'):
+                    with self.db.transaction() as tx:
+                        tx.execute('SET LOCAL ROLE %s' % q(role))
+                        tx.execute(sql)
+            self.assertEqual(self.db.query(
+                'SELECT version FROM schema_non_additive_migrations WHERE version=9999'),
+                [{'version': 9999}])
+            with self.assertRaisesRegex(migrations.IncompatibleSchema, '9999_future'):
+                with self.db.transaction() as tx:
+                    tx.execute('SET LOCAL ROLE %s' % q(role))
+                    migrations.require_compatible_writer(tx)
+        finally:
+            self.db.execute('DELETE FROM schema_migrations WHERE version=9999')
+
+    def test_executor_cannot_erase_schema_guard_through_parent(self):
+        self.assert_inventory_cannot_be_erased(self.role)
+        self.assertTrue(self.db.query(
+            "SELECT has_table_privilege(%s,'schema_migrations','INSERT') AS p",
+            (self.role,))[0]['p'])
+
     def test_drop_database_does_not_inherit_the_statement_timeout(self):
         """#4822 : un DROP annulé par le délai de la suite laissait la base
         invalide (`datconnlimit = -2`). Avec 1 ms, le geste serait annulé ;
@@ -438,6 +471,8 @@ class RoleExecutorTest(PgTestCase):
                         self.assertFalse(row['writes'], writer_role)
                     proc = run_writers()
                     self.assertEqual(proc.returncode, 0, proc.stderr)
+                for writer_role in names:
+                    self.assert_inventory_cannot_be_erased(writer_role)
                 self.db.execute('GRANT UPDATE ON schema_non_additive_migrations TO PUBLIC')
                 try:
                     proc = run_writers()
@@ -702,6 +737,11 @@ class RoleExecutorTest(PgTestCase):
                         (self.role,schema+'.'+relation,privilege))[0]['allowed'])
                 self.assertTrue(db.query('SELECT has_table_privilege(%s,%s,%s) AS allowed',
                     (self.role,schema+'.'+relation,'SELECT'))[0]['allowed'])
+            for privilege in ('UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER'):
+                self.assertFalse(db.query('SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                    (self.role,schema+'.schema_migrations',privilege))[0]['allowed'])
+            self.assertTrue(db.query('SELECT has_table_privilege(%s,%s,%s) AS allowed',
+                (self.role,schema+'.schema_migrations','INSERT'))[0]['allowed'])
             result = self.run_script(self.role)
             self.assertEqual(result.returncode, 0, result.stderr)
             for privilege in ('SELECT', 'INSERT', 'UPDATE', 'DELETE'):

@@ -7,7 +7,8 @@ CREATE TABLE schema_non_additive_migrations (
     checksum text NOT NULL
 );
 
--- Revoke creation-time default writer grants.
+-- Revoke creation-time defaults and existing writers on the parent inventory.
+-- DELETE of a parent would erase the marker by cascade; keep migration INSERT.
 DO $marker_acl$
 DECLARE item record;
 BEGIN
@@ -15,9 +16,10 @@ BEGIN
                   FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
                   CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) acl
                  WHERE n.nspname=current_schema()
-                   AND c.relname = 'schema_non_additive_migrations'
+                   AND c.relname IN ('schema_non_additive_migrations', 'schema_migrations')
                    AND acl.grantee<>c.relowner
-                   AND acl.privilege_type<>'SELECT' LOOP
+                   AND acl.privilege_type<>'SELECT'
+                   AND NOT (c.relname='schema_migrations' AND acl.privilege_type='INSERT') LOOP
         EXECUTE format('REVOKE %s ON %I.%I FROM %s',
                        item.privilege_type,
                        current_schema(),item.relname,

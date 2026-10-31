@@ -19,6 +19,9 @@ SELECT 'CREATE ROLE ameesh_it_qa NOLOGIN'
 SELECT format('GRANT USAGE ON SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
 -- Canon sync executes the existing registry/authenticator/package transaction.
 SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I TO ameesh_canon_sync', :'schema') \gexec
+-- #4975: deleting the parent inventory would cascade into the marker.
+SELECT format('REVOKE UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON %I.schema_migrations FROM ameesh_canon_sync', :'schema')
+ WHERE to_regclass(format('%I.schema_migrations', :'schema')) IS NOT NULL \gexec
 -- #2274: the review catch-up activation bound is the owner's alone
 -- (migration 0438); canon sync must not move it.
 SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.%I FROM ameesh_canon_sync', :'schema', name)
@@ -102,6 +105,14 @@ BEGIN
            AND has_table_privilege(writer_group.oid, 'schema_non_additive_migrations', 'INSERT,UPDATE,DELETE')
     ) THEN
         RAISE EXCEPTION 'module writers must not change the schema compatibility inventory';
+    END IF;
+    IF to_regclass('schema_migrations') IS NOT NULL AND EXISTS (
+        SELECT 1 FROM pg_roles writer_group
+         WHERE writer_group.rolname IN ('ameesh_canon_sync', 'ameesh_it_proof', 'ameesh_it_qa')
+           AND (has_table_privilege(writer_group.oid, 'schema_migrations', 'UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+                OR has_any_column_privilege(writer_group.oid, 'schema_migrations', 'UPDATE'))
+    ) THEN
+        RAISE EXCEPTION 'module writers must not modify the schema migration inventory';
     END IF;
     -- #2274: the catch-up bound is owner-only; a write left to canon sync
     -- would let the sync service move the review horizon.
