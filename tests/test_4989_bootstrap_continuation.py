@@ -131,6 +131,26 @@ class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
             self.backend.continue_install(self.operation, self.view['id'])
         self.assertEqual(self.old_journal.read_bytes(), self.old_bytes)
 
+    def test_signed_reconciliation_removes_duplicate_authority(self):
+        duplicate = self.ask(self.backend.prepared(self.old_operation).question, bootstrap.OPTIONS)
+        self.sign(duplicate)
+        with self.assertRaisesRegex(ValueError, 'multiple previous'):
+            self.backend.continuation_question(self.operation, self.old_operation, self.old_decision)
+        reconciliation = self.ask('Reconcile duplicate bootstrap authority', bootstrap.OPTIONS,
+                                  supersedes=duplicate['id'], supersedes_option='install')
+        self.sign(reconciliation)
+        self.assertEqual(decisions.get(self.db, duplicate['id'])['superseded_by'],
+                         reconciliation['id'])
+        with self.assertRaisesRegex(ValueError, 'superseded'):
+            self.backend.install(self.old_operation, duplicate['id'])
+        self.backend.continuation_question(self.operation, self.old_operation, self.old_decision)
+        self.sign()
+        self.assertEqual(self.backend.continue_install(self.operation, self.view['id'])['outcome'],
+                         'installed')
+        self.assertEqual(self.old_journal.read_bytes(), self.old_bytes)
+        self.assertEqual(len(self.root.joinpath('etc/ameesh-release/authorized_keys')
+                             .read_text().splitlines()), 2)
+
     def test_revoked_signature_and_missing_old_reservation_refuse(self):
         self.sign()
         authority.revoke_key(self.db, 'fixture-owner')
