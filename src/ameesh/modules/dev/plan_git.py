@@ -1197,12 +1197,14 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
 
 
 def _content_refs(row: dict, target: str | None, *, declared_repo: str | None,
-                  default: str | None, candidates: list[str]) -> list[tuple[str, bool, bool]]:
+                  default: str | None, candidates: list[str],
+                  project: str = "") -> list[tuple[str, bool, bool]]:
     """#1005 : les refs où chercher le contenu gelé d'un lot, dans l'ordre, et
     `(ref, hors cible, ferme)`.
 
     Une cible explicite (`--target`) ou déclarée par le lot (`branch_target`)
-    est seule à foi : elle ferme, jamais une autre ref. Sinon la cible
+    est seule à foi : elle ferme, jamais une autre ref ; à défaut, celle du
+    projet du lot (`project`, #5110) de même. Sinon la cible
     déclarée du dépôt (`ameesh.target`) fait foi de même, et les refs
     d'intégration ne servent qu'à signaler le résidu. Sans aucune cible
     déclarée : la cible par défaut du clone (`origin/HEAD`, puis main/master),
@@ -1213,6 +1215,8 @@ def _content_refs(row: dict, target: str | None, *, declared_repo: str | None,
         return [(target, False, True)]
     if own:
         return [(own, False, True)]
+    if project:
+        return [(project, False, True)]
     if default is None:
         return [(ref, bool(index), True) for index, ref in enumerate(candidates)]
     to_try = [(default, False, True)]
@@ -1555,6 +1559,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         members, packet_error = [], str(exc)
     for member in members:
         packets.setdefault(int(member["work_item_id"]), []).append(member)
+    projects: dict = {}                      # #5110 : app → cible déclarée du projet
     results: list[dict] = []
     for row in sorted(rows, key=lambda r: int(r["id"])):
         lot = int(row["id"])
@@ -1564,6 +1569,13 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         frozen_id = int(freeze["id"]) if freeze else None
         freeze_origin = "frozen" if sha else None
         unchecked = None
+        app = (row.get("app") or "").strip()
+        if app not in projects:
+            # la ref publiée (`origin/develop`), comme le relevé des branches
+            declared_project = _project_target(db, app)
+            projects[app] = (published_target(repo_dir, declared_project)
+                             if declared_project else "")
+        project = projects[app]
         if not sha:
             # #2399 (cas #2366) : un avis `ok` sur la tête publiée vaut gel
             # effectif (`freeze.origin=verdict`, #1756) ; sans jalon `frozen`,
@@ -1571,7 +1583,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             # autre tête ne prouve rien : la branche a avancé depuis.
             from ... import merge_queue
             candidate = freeze_candidate(
-                marks, repo_dir, target or row.get("branch_target") or default,
+                marks, repo_dir, target or row.get("branch_target") or project or default,
                 waived=merge_queue.is_waived(row))
             # #2444 : la tête confrontée est la tête publiée (origin d'abord) ;
             # une branche disparue ne vaut pas un contrôle de la tête.
@@ -1604,7 +1616,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         # #2443 : ne pas sortir sur l'absence de gel déclaré avant d'avoir
         # examiné une composition de paquet — c'est la voie du cas #2366.
         refs = _content_refs(row, target, declared_repo=declared_repo, default=default,
-                             candidates=candidates)
+                             candidates=candidates, project=project)
         if not refs:
             entry.update(result="no-target",
                          detail="no target: `git config %s <branch>` in %s, or --target"
@@ -2439,7 +2451,13 @@ def cited_lots(message: str, *, hash_refs: bool = False) -> dict[int, str]:
     `hash_refs`, `#<id>` dans le titre (forme `#id`) — pas dans le corps, qui
     peut recopier les titres des commits fusionnés. Un `#<id>` nié par sa
     proposition ne désigne pas le lot (#2259). Un lot déclaré partiel
-    (`ameesh-work-partial: <id>`) n'est pas désigné."""
+    (`ameesh-work-partial: <id>`) n'est pas désigné.
+
+    #5110 : une désignation explicite (trailer `ameesh-work:` ou
+    `ameesh-work-partial:`, fusion d'une branche `lot/<id>-…`) fait foi : les
+    `#<id>` du titre ne sont alors que du contexte. « Paquet 278 : #4820 B8
+    (#659) » porte `ameesh-work: 4820` et ne livre pas #659 (Nexlink,
+    commit 281c5be4c3d2, deux fermetures à tort)."""
     found: dict[int, str] = {}
     lines = (message or "").strip().splitlines()
     title = lines[0].strip() if lines else ""
@@ -2448,7 +2466,8 @@ def cited_lots(message: str, *, hash_refs: bool = False) -> dict[int, str]:
     branch = LOT_BRANCH_MERGE_RE.match(title)
     if branch:
         found.setdefault(int(branch.group("lot")), "lot-branch")
-    if hash_refs:
+    explicit = bool(found) or PARTIAL_TRAILER_RE.search(message or "") is not None
+    if hash_refs and not explicit:
         negated = negated_hash_positions(title)
         for match in HASH_REF_RE.finditer(title):
             if match.start() not in negated:
@@ -3629,6 +3648,19 @@ def _lot_clone(db, host: str | None, row: dict, repo: str,
     return repo, ""
 
 
+def _project_target(db, app: str) -> str:
+    """#5110 : la cible déclarée du projet d'un lot (`radar.projects.<p>.target`,
+    `intake_neighbors.project_target`), ou "" ; une configuration illisible
+    laisse la résolution par le clone."""
+    if not app:
+        return ""
+    try:
+        from ... import intake_neighbors
+        return intake_neighbors.project_target(getattr(db, "cfg", None), app)
+    except Exception:  # noqa: BLE001 - configuration absente : repli sur le clone
+        return ""
+
+
 def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = False,
                   actor: str = "", limit: int = MAX_BRANCH_LOTS, pr_body=None) -> dict:
     """L118 : ferme les lots ouverts dont la fusion dans leur cible est constatée.
@@ -3651,8 +3683,9 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     lot, et un corps illisible le laisse ouvert (un lot fermé n'est jamais
     rouvert : on ne ferme pas sans savoir).
 
-    #746 : une cible déclarée — celle du lot (`branch_target`) ou
-    `ameesh.target` du dépôt — fait foi : une fusion constatée ailleurs
+    #746 : une cible déclarée — celle du lot (`branch_target`), celle de son
+    projet (`radar.projects.<p>.target`, #5110) ou `ameesh.target` du
+    dépôt — fait foi : une fusion constatée ailleurs
     n'est qu'un résidu signalé (note au lot, message à l'assigné), jamais
     une fermeture. Quand aucune des deux n'est déclarée et que la cible par
     défaut (`origin/HEAD`, figé à la création du clone) ne porte pas la
@@ -3710,6 +3743,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     candidates: dict = {}                    # #746 : (dépôt, cible) → refs d'intégration
     implicits: dict = {}                     # #746 : branche implicite, une fois par lot
     tips: dict = {}                          # #746 : (dépôt, branche) → pointe
+    projects: dict = {}                      # #5110 : app → cible déclarée du projet
     hashes: dict = {}
     merges: dict = {}
     regs: dict = {}                          # une lecture du registre par assigné
@@ -3785,8 +3819,16 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             # dépôt — fait foi ; sinon la cible par défaut du clone
             # (`origin/HEAD`, figé à sa création), puis les refs d'intégration
             # du remote, essayées seulement si elle ne porte pas la fusion.
+            # #5110 : à défaut, la cible déclarée du projet du lot
+            # (`radar.projects.<p>.target`, `develop` pour Nexlink) fait foi
+            # comme celle du lot, quel que soit le réglage du clone.
+            app = (row.get("app") or "").strip()
+            if app not in projects:
+                projects[app] = _project_target(db, app)
             if row.get("branch_target"):
                 primary, explicit = row["branch_target"], True
+            elif projects[app]:
+                primary, explicit = projects[app], True
             else:
                 if repo not in targets:
                     try:
