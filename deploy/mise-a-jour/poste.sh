@@ -723,7 +723,8 @@ redemarrer() {
 # L'ExecStart peut pointer vers le lanceur stable alors que le processus
 # vivant garde l'ancien venv. Ni ExecStart ni /proc/PID/exe seuls ne le prouvent.
 # #5094 : conserver la preuve stricte pour les exécuteurs non dumpables.
-# Aucun prompt interactif : absence de privilèges = contrôle en échec.
+# #5100 : leur attestation suffit, sans privilège ; `sudo -n` ne sert que si
+# elle manque. Aucun prompt interactif : absence de privilèges = contrôle en échec.
 preuve_venv_poste() {
   local rc=0
   python3 "$ICI/venv-processus.py" "$@" || rc=$?

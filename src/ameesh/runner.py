@@ -15170,6 +15170,8 @@ def _harden_executor_environment() -> bool:
         _ENV_HIDDEN = True
         log("executor environment hidden from other processes of the same user "
             "(PR_SET_DUMPABLE=0)")
+    if hidden:
+        child_environment.attest_venv()
     return True
 
 
