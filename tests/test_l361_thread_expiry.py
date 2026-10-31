@@ -411,10 +411,11 @@ class TransportTest(unittest.TestCase):
             self.assertIn("nothing expires", out.getvalue())
         self.assertEqual([e.text for e in self.transport.read(THREAD)], ["kept"])
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_runner_expires_at_most_once_a_day(self):
         cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
         self.post(entry("old", 500), entry("kept", 1))
-        fake = types.SimpleNamespace(cfg=cfg, dry_run=False)
+        fake = types.SimpleNamespace(cfg=cfg, dry_run=False, db=None)
         with mock.patch.object(runner, "log_async") as logged:
             reports = runner.Runner.expire_threads_once(fake, None, now=NOW, clock=0.0)
             self.assertEqual(reports[0]["dropped"], 1)
@@ -442,6 +443,7 @@ class MediatedHostTest(TransportTest):
     def remote_db(self):
         from ameesh.storage.remote.client import RemoteDb
         db = object.__new__(RemoteDb)
+        db.cfg = self.mediated_cfg()
         db.storage = mock.Mock()
         db.close = mock.Mock()
         return db
@@ -647,6 +649,7 @@ class MediatedHostTest(TransportTest):
         self.assertIsNone(runner.Runner.expire_threads_once(fake, None, now=NOW + 3600,
                                                             clock=3600.0))
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_runner_closes_the_connection_it_opened_itself(self):
         # #1482-N3 : la connexion ouverte pour l'expiration quotidienne est
         # fermée ; celle que l'exécuteur tient déjà ne l'est pas.
@@ -654,7 +657,7 @@ class MediatedHostTest(TransportTest):
         self.post(entry("old", 500), entry("kept", 1))
         db = self.remote_db()
         from ameesh import db as db_mod
-        fake = types.SimpleNamespace(cfg=cfg, dry_run=False)
+        fake = types.SimpleNamespace(cfg=cfg, dry_run=False, db=None)
         with mock.patch.object(db_mod, "connect", return_value=db) as connect, \
                 mock.patch.object(runner, "log_async"):
             reports = runner.Runner.expire_threads_once(fake, None, now=NOW)
@@ -662,13 +665,14 @@ class MediatedHostTest(TransportTest):
         db.close.assert_called_once()
         self.assertEqual([r["dropped"] for r in reports], [1])
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_runner_says_the_missing_index_once_per_pass(self):
         cfg = self.mediated_cfg()
         self.post(entry("old", 500), entry("kept", 1), thread=fil.ThreadRef("other"))
         self.post(entry("old", 500), entry("kept", 1))
         before = self.read_bytes()
         from ameesh import db as db_mod
-        fake = types.SimpleNamespace(cfg=cfg, dry_run=False)
+        fake = types.SimpleNamespace(cfg=cfg, dry_run=False, db=None)
         with mock.patch.object(db_mod, "connect",
                                side_effect=db_mod.DbError("no token")) as connect, \
                 mock.patch.object(runner, "log_async") as logged:
@@ -751,13 +755,14 @@ class MediatedHostTest(TransportTest):
         self.assertEqual(err.getvalue(), "")
         self.assertEqual(self.read_bytes(), before)
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_runner_says_it_without_housekeeping(self):
         # r7: a mediated runner has no housekeeping pass; the notice has its
         # own daily schedule, whatever the housekeeping interval
         for interval in (0, 600):
             cfg = dataclasses.replace(self.mediated_cfg(), housekeeping_interval=interval)
             fake = types.SimpleNamespace(cfg=cfg, dry_run=False, once=False, mediated=True,
-                                         stop=threading.Event())
+                                         stop=threading.Event(), db=None)
             fake.expire_threads_once = lambda db, now=None, f=fake: \
                 runner.Runner.expire_threads_once(f, db, now=now)
             fake._start_thread_expiry_notice = lambda f=fake: \
@@ -773,7 +778,7 @@ class MediatedHostTest(TransportTest):
             self.assertIn("index unavailable", logged.call_args.args[0])
         # in --once, nothing scheduled
         fake = types.SimpleNamespace(cfg=cfg, once=True, mediated=True,
-                                     _start_thread_expiry_notice=mock.Mock())
+                                     _start_thread_expiry_notice=mock.Mock(), db=None)
         runner.Runner.start_housekeeping_poll(fake)
         fake._start_thread_expiry_notice.assert_not_called()
 

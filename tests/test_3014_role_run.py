@@ -263,6 +263,7 @@ class NotifyOnlyTest(unittest.TestCase):
         args = notify.build_parser().parse_args(
             ["--skip", "issues,github-watch,ci", "--dry-run"])
         fake = mock.Mock()
+        fake.query.return_value = []  # compatible schema inventory (#4975)
         fake.run_pass = mock.Mock(return_value=[])
         fake.run_local_pass = mock.Mock()
         with mock.patch.object(notify, "Notifier", return_value=fake) as ctor, \
@@ -299,6 +300,7 @@ class NotifyOnlyTest(unittest.TestCase):
     def test_only_ci_takes_no_state_lock_and_runs_no_alert_pass(self):
         args = notify.build_parser().parse_args(["--once", "--only", "ci"])
         fake = mock.Mock()
+        fake.query.return_value = []  # compatible schema inventory (#4975)
         fake.run_pass = mock.Mock(return_value=[])
         fake.run_local_pass = mock.Mock()
         fake.state = {}

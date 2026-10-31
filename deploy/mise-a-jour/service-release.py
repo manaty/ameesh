@@ -217,7 +217,7 @@ def main():
         if (cfg_document.get('backend')!='postgres' or not isinstance(cfg_document.get('dsn'),str)
                 or not cfg_document['dsn']):
             raise ServiceError('independent database enrollment required')
-        from ameesh import config,db as db_mod
+        from ameesh import config,db as db_mod,migrations
         db=db_mod.connect(config.load(env={'AMEESH_CONFIG':str(database)}),driver='psycopg')
         factory=factory_module.HostFactory(db,enrollment)
         service=IndependentService(ROOT,OPERATIONS,enrollment,pins,documents=documents,system=System(),factory=factory,
@@ -226,6 +226,7 @@ def main():
         def stop(signum,frame): stopping[0]=True
         signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
         while not stopping[0]:
+            migrations.require_compatible_writer(db)
             for result in service.tick():
                 print(json.dumps(result,sort_keys=True),flush=True)
             for _ in range(20):

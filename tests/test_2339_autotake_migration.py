@@ -17,6 +17,7 @@ spec.loader.exec_module(probe)
 
 
 class LogTest(unittest.TestCase):
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_failed_take_keeps_bounded_sql_message_and_continues_sweep(self):
         state = mock.Mock()
         state.workers = {}

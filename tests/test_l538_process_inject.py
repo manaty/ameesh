@@ -86,9 +86,14 @@ def _canon_approuve(tmp: str, nom: str = "acme", contenu: str = "") -> str:
 
 
 class ProcessRunnerLogTest(unittest.TestCase):
+    def setUp(self):
+        admission = mock.patch('ameesh.migrations.require_compatible_writer')
+        admission.start()
+        self.addCleanup(admission.stop)
+
     def test_les_incidents_sont_memorises_par_canon(self):
         canons = [types.SimpleNamespace(id="a"), types.SimpleNamespace(id="b")]
-        fake = types.SimpleNamespace(cfg=object(), host="atelier")
+        fake = types.SimpleNamespace(db=object(), cfg=object(), host="atelier")
         errors = {"a": "repere absent", "b": ""}
 
         def sync(_db, one, _host):
@@ -746,7 +751,7 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         fake = types.SimpleNamespace(
             cfg=dataclasses.replace(self.cfg, canon=self.clone, canon_ref="",
                                     canon_untrusted=False),
-            host="atelier")
+            host="atelier", db=self.db)
         with mock.patch("ameesh.runner.log_async") as journal:
             self.assertTrue(Runner.canon_sync_once(fake))
             lignes = [appel.args[0] for appel in journal.call_args_list]

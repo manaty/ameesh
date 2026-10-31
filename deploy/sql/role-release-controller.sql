@@ -20,6 +20,7 @@ SELECT format('GRANT USAGE ON SCHEMA %I TO %I', :'schema', :'role') \gexec
 SELECT format('GRANT SELECT ON %I.agent_registry,%I.agent_mailbox,%I.mesh_approvals,%I.mesh_consumed_nonces,%I.turn_resources,%I.spend_pending,%I.host_release_operations,%I.host_release_fences,%I.host_release_fence_receipts,%I.decision_supersessions TO %I',
               :'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'role') \gexec
 SELECT format('GRANT SELECT ON %I.mesh_approvals_status TO %I', :'schema', :'role') \gexec
+SELECT format('GRANT SELECT ON %I.schema_non_additive_migrations TO %I', :'schema', :'role') \gexec
 -- SignedDecisionAuthority re-reads the owner key at every step (verify_proof,
 -- key_info); mesh_keys is a view, outside the table-write audit below.
 SELECT format('GRANT SELECT ON %I.mesh_keys TO %I', :'schema', :'role') \gexec

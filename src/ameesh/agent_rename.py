@@ -97,6 +97,7 @@ KEPT = (
     "key_events.holder", "key_events.name", "key_holders.name", "mesh_approvals.approver",
     "mesh_approvals.consumed_by", "mesh_consumed_nonces.approver",
     "mesh_consumed_nonces.consumed_by", "provenance_receipts.actor", "schema_migrations.name",
+    "schema_non_additive_migrations.name",
     "sandbox_turns.owner",  # Runner lease owner, never an agent identity.
     "standing_approvals.approver", "standing_approvals.registered_by",
     "standing_approvals.revoked_by", "turn_cost_corrections.actor",

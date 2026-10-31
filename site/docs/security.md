@@ -55,4 +55,15 @@ rounding up. It follows §11 of the specification.
   checked against each provider's terms; a host policy can refuse that
   credential mode.
 
-Installed Python modules execute trusted code inside the ameesh process without a sandbox; see [Write a module](guides/write-a-module.md) before installing an extension.
+## Module trust boundary
+
+Installed Python modules execute trusted code inside the ameesh process without
+a sandbox. Review the package and its revision before installation; descriptor
+validation does not isolate executable code. See [Write a module](guides/write-a-module.md).
+
+Discovery validates names, descriptors and capabilities and refuses malformed
+entries or collisions. An activated but refused entry point blocks canon sync;
+an unselected refused entry point produces a warning. Unknown selections fail
+closed. The canon selects registered names and options, never Python import
+paths. Pipeline cards are validated data, with pinned revisions and installed
+evidence verifiers; they cannot add executable guards or bypass the gate.

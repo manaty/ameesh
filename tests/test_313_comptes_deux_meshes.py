@@ -246,6 +246,7 @@ class AlerteTest(_Base):
 
 
 class ExecuteurTest(_Base):
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_demarrage_revendique_et_journalise_une_fois(self):
         self.refresh(self.cfg(AUTRE, self.secondaire(),
                               fichier="config-ancienne-base.json"), mesh=MESH_B)
@@ -264,6 +265,7 @@ class ExecuteurTest(_Base):
         self.assertTrue(account_claims.shared(
             self.cfg(AUTRE, self.secondaire()), mesh=MESH_B, now=time.time()))
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_registre_inutilisable_journalise(self):
         with open(self.registre, "w", encoding="utf-8"):
             pass   # un fichier là où le registre attend un dossier
@@ -275,6 +277,7 @@ class ExecuteurTest(_Base):
         self.assertEqual(len(lignes), 1)
         self.assertIn("account registry of this host unusable", lignes[0])
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_identite_illisible_journalise(self):
         class _Illisible:
             def query(self, sql, params=()):

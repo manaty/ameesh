@@ -1479,7 +1479,7 @@ def explain(exc: BaseException, limit: int = 160) -> str:
 # fabrique
 # --------------------------------------------------------------------------
 
-def connect(cfg: Config, driver: str | None = None) -> PsqlDriver | PsycopgDriver:
+def connect(cfg: Config, driver: str | None = None, *, writer: bool = True) -> PsqlDriver | PsycopgDriver:
     """Ouvre une connexion. Lève `Unavailable` si la base (ou le pilote) manque.
 
     L109 : `backend: mediated` (exécuteur médié, session du harnais dans la
@@ -1495,17 +1495,33 @@ def connect(cfg: Config, driver: str | None = None) -> PsqlDriver | PsycopgDrive
     errors: list[str] = []
     if wanted in ("auto", "psycopg"):
         try:
-            return PsycopgDriver(cfg)
+            return _writer_connection(PsycopgDriver(cfg), writer=writer)
         except Unavailable as exc:
             errors.append(str(exc))
             if wanted == "psycopg":
                 raise
     if wanted in ("auto", "psql"):
         try:
-            return PsqlDriver(cfg)
+            return _writer_connection(PsqlDriver(cfg), writer=writer)
         except Unavailable as exc:
             errors.append(str(exc))
     raise Unavailable("; ".join(errors) or "no Postgres driver available")
+
+
+def _writer_connection(db, *, writer: bool):
+    """Process admission; diagnostics/migration opt out explicitly.
+
+    No per-statement guard, SQL classification or transaction lock. Long-lived
+    processes must also call require_compatible_writer at their tick boundary.
+    """
+    if writer and not getattr(db.cfg, 'read_only', False):
+        from .migrations import require_compatible_writer
+        try:
+            require_compatible_writer(db)
+        except BaseException:
+            db.close()
+            raise
+    return db
 
 
 def _schema_message(db) -> str:

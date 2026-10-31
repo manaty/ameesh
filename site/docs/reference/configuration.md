@@ -17,6 +17,58 @@ the historical `~/.config/agent-mesh/config.json` is the fallback.
 No secret is stored in the repository. The database password comes from
 `PGPASSWORD` or `~/.pgpass` (mode `0600`), or from a full DSN.
 
+## Modules and workspace policy in the canon
+
+Module activation belongs in the trusted canon's `federation.yaml`, rather
+than the host JSON configuration:
+
+```yaml
+extensions:
+  ameesh:
+    modules: [it]
+    teams:
+      ops:
+        modules: {it: {require_qa: [promoted]}}
+    projects:
+      service:
+        modules: {it: {require_qa: [merged, promoted]}}
+      support:
+        modules: [support-work-delivery]
+```
+
+Lists select default options; mappings supply per-module options. For a
+module selected at several scopes, project options override team options,
+which override federation options. The Pipeline name in this example requires
+a valid matching card in `pipelines/`. Apply declarations with `ameesh canon
+check` and the [trusted canon sync procedure](../concepts/canon.md#only-the-approved-source).
+`ameesh modules --active --json` inspects the applied policies; `doctor`
+compares them with the canon and installed descriptors.
+
+Python extensions register the `ameesh.modules` package entry-point group.
+The canon selects a registered name and its options; it supplies no Python
+import path. Installation alone does not activate a project policy. See
+[Write a module](../guides/write-a-module.md) for the package contract.
+`dev` is always active in a standard installation and cannot be selected or
+disabled per project. A project without selected modules is distinct from a
+bare registry with no built-ins or entry points: without `dev`, workspace
+housekeeping and worktree operations are no-ops.
+
+Host working directories and housekeeping belong to `policy.workspaces` on
+the Host card. For example:
+
+```yaml
+policy:
+  workspaces:
+    root: /srv/work
+    roots: {ops: /srv/ops}
+    dirs: {worker1: /srv/ops/worker1}
+```
+
+The first match wins: `workspaces.dirs[<agent>]`, then
+`workspaces.roots[<team>]`, then `workspaces.root/<team>`. The older `work_dirs`, `work_roots` and `work_root` keys remain
+accepted aliases. The `dev` module supplies the `workspaces` capability and
+its host audit; see [Write a canon](../guides/write-a-canon.md#3-hosts-and-their-policies).
+
 ## Database and host
 
 | Variable | Config key | Default | Meaning |

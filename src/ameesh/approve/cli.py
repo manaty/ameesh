@@ -83,7 +83,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                           workdir=config_mod.ensure_private_dir(cfg.state_dir))
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s ameesh-approve %(levelname)s %(message)s")
-    db = db_mod.connect(ameesh_config.load())
+    db = db_mod.connect(ameesh_config.load(), writer=False)
     db_mod.require_schema(db)
     try:
         lock = threading.RLock()

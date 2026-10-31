@@ -2289,9 +2289,10 @@ class AuthenticatorRelayTest(_AuthenticatorCase):
         """Une passe de `Runner.canon_sync_once` (code de l'exécuteur, non
         modifié) avec une configuration d'hôte qui pose `changes`."""
         fake = types.SimpleNamespace(
-            cfg=dataclasses.replace(self.cfg, canon=self.clone, **changes), host="atelier")
+            cfg=dataclasses.replace(self.cfg, canon=self.clone, **changes), host="atelier", db=self.db)
         return runner_mod.Runner.canon_sync_once(fake)
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_sync_sans_trusted_ref_prend_la_configuration(self):
         first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
         # registre vierge, ni --bootstrap-ref ni trusted_ref : la configuration suffit
@@ -2321,6 +2322,7 @@ class AuthenticatorRelayTest(_AuthenticatorCase):
         self.assertEqual([j["trust"] for j in self.journal()], ["config"])
         self.assertEqual(len(self.live()), 2)
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_erreur_d_authentificateurs_dans_canon_state_et_le_fil(self):
         self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
         # premier amorçage sans branche de confiance : refusé — l'exécuteur ne le

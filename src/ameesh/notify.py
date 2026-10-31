@@ -122,6 +122,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field, replace
 
+from . import migrations
 from . import config as config_mod
 from . import db as db_mod
 from . import alert_briefs, exploitation, fil, nexlink_alerts, notify_gap, \
@@ -1847,6 +1848,7 @@ class _StateRenewal:
                 try:
                     if conn is None:
                         conn = db_mod.connect(self.cfg)
+                    migrations.require_compatible_writer(conn)
                     # L'échéance locale démarre AVANT l'appel : l'heure de la
                     # base est postérieure au départ, donc la marge est du bon
                     # côté (on ne dépasse jamais le bail du serveur).
@@ -4571,6 +4573,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
                 if db is None:
                     db = db_mod.connect(cfg)
                     db_mod.require_schema(db)
+                migrations.require_compatible_writer(db)
                 if alerts_pass:
                     # #3576 : l'état de livraison est partagé et un seul hôte
                     # livre. Sans le bail, ce passage se met en veille sans

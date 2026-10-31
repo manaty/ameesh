@@ -39,6 +39,13 @@ SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I T
               :'schema', :'role') \gexec
 SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA %I TO %I',
               :'schema', :'role') \gexec
+-- #4975: keep INSERT for migration recording, but protect the parent of
+-- the cascading compatibility marker against deletion and modification.
+SELECT format('REVOKE UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON %I.schema_migrations FROM %I', :'schema', :'role')
+ WHERE to_regclass(format('%I.schema_migrations', :'schema')) IS NOT NULL \gexec
+-- #4975: executors may read compatibility metadata, never change it.
+SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.schema_non_additive_migrations FROM %I', :'schema', :'role')
+ WHERE to_regclass(format('%I.schema_non_additive_migrations', :'schema')) IS NOT NULL \gexec
 -- #4806 : le GRANT global `ON ALL FUNCTIONS IN SCHEMA` échouait sur les
 -- fonctions d'extension qui ne nous appartiennent pas (`pg_stat_statements_reset`
 -- appartient à postgres, pas au migrationowner) : « permission denied for
@@ -167,16 +174,18 @@ BEGIN
                            AND c.relname IN ('project_modules', 'host_release_operations',
                                              'host_release_fences',
                                              'host_release_fence_receipts',
-                                             'review_catch_up') LOOP
+                                             'review_catch_up','schema_non_additive_migrations','schema_migrations') LOOP
                 FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE', 'DELETE'] LOOP
-                    IF has_table_privilege(parent.oid, item.oid, privilege) THEN
+                    IF NOT (item.relname='schema_migrations' AND privilege='INSERT')
+                       AND has_table_privilege(parent.oid, item.oid, privilege) THEN
                         violations := violations || format('forbidden %s on %s through %s',
                                                            privilege, item.relname,
                                                            parent.rolname);
                     END IF;
                 END LOOP;
                 FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE'] LOOP
-                    IF has_any_column_privilege(parent.oid, item.oid, privilege) THEN
+                    IF NOT (item.relname='schema_migrations' AND privilege='INSERT')
+                       AND has_any_column_privilege(parent.oid, item.oid, privilege) THEN
                         violations := violations || format(
                             'forbidden %s on a column of %s through %s',
                             privilege, item.relname, parent.rolname);
@@ -258,19 +267,21 @@ BEGIN
             IF has_any_column_privilege(r, item.oid, 'UPDATE') THEN
                 violations := violations || format('forbidden UPDATE on a column of %s', item.relname);
             END IF;
-        ELSIF item.relname IN ('project_modules','host_release_operations','host_release_fences','host_release_fence_receipts','review_catch_up') THEN
+        ELSIF item.relname IN ('project_modules','host_release_operations','host_release_fences','host_release_fence_receipts','review_catch_up','schema_non_additive_migrations','schema_migrations') THEN
             IF NOT has_table_privilege(r, item.oid, 'SELECT') THEN
                 violations := violations || format('missing SELECT on %s', item.relname);
             END IF;
             FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE', 'DELETE'] LOOP
-                IF has_table_privilege(r, item.oid, privilege) THEN
+                IF NOT (item.relname='schema_migrations' AND privilege='INSERT')
+                   AND has_table_privilege(r, item.oid, privilege) THEN
                     violations := violations || format('forbidden %s on %s', privilege, item.relname);
                 END IF;
             END LOOP;
             -- B1 : un droit de colonne laissé au rôle nommé (le REVOKE de
             -- table le nettoie normalement, mais l'audit reste fail-closed).
             FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE'] LOOP
-                IF has_any_column_privilege(r, item.oid, privilege) THEN
+                IF NOT (item.relname='schema_migrations' AND privilege='INSERT')
+                   AND has_any_column_privilege(r, item.oid, privilege) THEN
                     violations := violations || format('forbidden %s on a column of %s',
                                                        privilege, item.relname);
                 END IF;

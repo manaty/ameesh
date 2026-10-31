@@ -651,6 +651,15 @@ class Relay:
         slot = False
         try:
             provider, rest = self._route(handler)
+            from . import migrations, db as db_mod
+            try:
+                # GET /models only reads policy/credential health; POST writes costs.
+                if handler.command != "GET":
+                    with self._db_lock:
+                        migrations.require_compatible_writer(self.db)
+            except db_mod.DbError as exc:
+                log.error("relay writer admission refused (%s)", type(exc).__name__)
+                raise Refused(503, "api_error", "relay schema compatibility unavailable") from None
             identity = self._authenticate(handler)
             wait = self.limiter.take(identity.agent)
             if wait:

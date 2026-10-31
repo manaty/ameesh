@@ -219,9 +219,10 @@ class MainIntegrationTest(unittest.TestCase):
                          dict(item_id=1, state="waiting_human", note="note", actor="a"), None)
         self.assertNotIn("held", kw)
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_host_maintenance_stays_off_the_device(self):
         from ameesh.runner import Runner
-        runner = types.SimpleNamespace(mediated=True, once=False)
+        runner = types.SimpleNamespace(mediated=True, once=False, db=None)
         with mock.patch("ameesh.db.connect", side_effect=AssertionError("host maintenance")):
             self.assertIsNone(Runner.start_version_poll(runner))
             self.assertIsNone(Runner.harness_versions_once(runner))

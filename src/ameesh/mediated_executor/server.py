@@ -113,6 +113,8 @@ class LockedIdentity(IdentityProvider):
             if self._provider is None:
                 self._provider = DbIdentityProvider(self._connect(), mesh=self._mesh)
             try:
+                from ..migrations import require_compatible_writer
+                require_compatible_writer(self._provider.db)
                 return getattr(self._provider, name)(*args, **kwargs)
             except Unavailable:
                 try:
@@ -700,7 +702,9 @@ def build(cfg, auth: ExecutorAuth, *, mesh: str, pool_size: int = 8,
     écoute LISTEN). `listen=False` : flux sans écoute (essais)."""
     from .. import db as db_mod
     from .. import storage
-    pool = ConnectionPool(lambda: db_mod.connect(cfg), size=pool_size)
+    from ..migrations import require_compatible_writer
+    pool = ConnectionPool(lambda: db_mod.connect(cfg), size=pool_size,
+                          before_use=require_compatible_writer)
     policy = policy or HostPolicy()
     dispatcher = PgDispatcher(pool, credential_modes=credential_modes,
                               lease_ttl_s=policy.lease_ttl_s)

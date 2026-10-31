@@ -991,7 +991,7 @@ class RoleApproveTest(PgTestCase):
 
     def login_db(self):
         cfg = dataclasses.replace(self.cfg, dsn=_dsn_for(self.login, self.password))
-        db = db_mod.connect(cfg)
+        db = db_mod.connect(cfg, writer=False)
         self.addCleanup(db.close)
         return db
 

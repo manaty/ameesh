@@ -22,16 +22,19 @@ B = "b" * 40
 class FireNoLandJournalTest(unittest.TestCase):
     def setUp(self):
         self.runner = Runner.__new__(Runner)
+        self.runner.db = object()
         self.runner.cfg = mock.Mock()
         self.runner.dry_run = False
         self.runner._fire_no_land = {}
 
     def _pass(self, *entries):
         with mock.patch("ameesh.fire.run_pass", return_value=list(entries)) as run_pass, \
+                mock.patch("ameesh.migrations.require_compatible_writer") as admission, \
                 mock.patch("ameesh.runner.fresh_radar", side_effect=lambda cfg: cfg), \
                 mock.patch("ameesh.runner.log_async") as journal:
             self.runner.fire_once(mock.Mock())
         run_pass.assert_called_once()
+        admission.assert_called_once_with(self.runner.db)
         return [call.args[0] for call in journal.call_args_list]
 
     @staticmethod

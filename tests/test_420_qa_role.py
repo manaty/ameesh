@@ -231,7 +231,7 @@ class QaEvidenceTest(PgTestCase):
             tx.execute("GRANT USAGE ON SCHEMA %s TO %s" % (q(self.schema), q(role)))
             # #2481: the full work row projects its reserved migration slots.
             tx.execute("GRANT SELECT ON work_items, project_modules, work_module_milestones, "
-                       "work_migration_reservations TO %s" % q(role))
+                       "work_migration_reservations, schema_non_additive_migrations TO %s" % q(role))
             tx.execute("GRANT UPDATE (id) ON work_items TO %s" % q(role))
             tx.execute("GRANT INSERT ON work_module_milestones TO %s" % q(role))
             tx.execute("GRANT USAGE ON SEQUENCE work_module_milestones_id_seq TO %s" % q(role))

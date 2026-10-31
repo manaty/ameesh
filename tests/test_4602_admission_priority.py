@@ -23,6 +23,7 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 
 from ameesh import admission_lock
 from ameesh.runner import AgentWorker, Runner
@@ -248,21 +249,23 @@ class PrioriteWorkerTest(unittest.TestCase):
     def tearDown(self) -> None:
         admission_lock.reset()
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_dispatch_marque_la_passe(self):
         worker = _Worker()
         fake = types.SimpleNamespace(lock=threading.RLock(),
                                      workers={"x": worker},
-                                     wake_all=threading.Event())
+                                     wake_all=threading.Event(), db=None)
         Runner.dispatch(fake, {"channel": "agent_mail",
                                "payload": json.dumps({"to": "x"})})
         self.assertTrue(worker._priority_wake)
         self.assertTrue(worker.wake.is_set())
 
+    @mock.patch("ameesh.migrations.require_compatible_writer", new=lambda db: None)
     def test_sans_cible_ne_met_pas_tout_en_control(self):
         worker = _Worker()
         fake = types.SimpleNamespace(lock=threading.RLock(),
                                      workers={"x": worker},
-                                     wake_all=threading.Event())
+                                     wake_all=threading.Event(), db=None)
         Runner.dispatch(fake, {"channel": "agent_mail",
                                "payload": json.dumps({})})
         self.assertTrue(worker.wake.is_set())

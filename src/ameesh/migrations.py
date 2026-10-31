@@ -10,11 +10,14 @@ Le verrou et les écritures partagent la même transaction et connexion.
 from __future__ import annotations
 
 import hashlib
+import contextvars
+import functools
+import json
 import os
 import re
 from dataclasses import dataclass
 
-from .db import DbError, PsqlDriver, PsycopgDriver, quote_ident
+from .db import DbError, Unavailable, PsqlDriver, PsycopgDriver, quote_ident
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
 _FILE_RE = re.compile(r"^(\d{4})_([A-Za-z0-9._-]+)\.sql$")
@@ -392,7 +395,7 @@ class NonAdditiveMigration(DbError):
 
 
 def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
-            log=None, *, additive_only: bool = False) -> list[Migration]:
+            log=None, *, additive_only: bool = False, allow_live_executors: str | None = None) -> list[Migration]:
     """Elect one database worker, re-read inventory and commit the whole pass.
 
     PostgreSQL scopes the existing lock key to the actual database, regardless
@@ -402,7 +405,12 @@ def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
     A separate lock connection could disappear while its writer continued;
     this transaction owns both the lock and every migration write instead.
     """
+    if allow_live_executors is not None and not allow_live_executors.strip():
+        raise ValueError('--allow-live-executors requires a nonempty reason')
     with db.transaction() as tx:
+        # The lease snapshot must be taken after the relation lock, even if
+        # the operator's connection defaults to REPEATABLE READ.
+        tx.execute('SET TRANSACTION ISOLATION LEVEL READ COMMITTED')
         # The configured statement timeout bounds election. Only the elected
         # worker lifts it for migration SQL, as the previous implementation did.
         tx.query("SELECT pg_advisory_xact_lock(hashtext(%s))", (_LOCK,))
@@ -418,10 +426,22 @@ def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
         todo = pending(tx, directory)
         if additive_only and any(non_additive(migration) for migration in todo):
             raise NonAdditiveMigration("nothing applied (--additive-only)")
+        if any(non_additive(migration) for migration in todo):
+            _exclude_live_executors(tx, todo, allow_live_executors)
         for migration in todo:
             tx.script(migration.sql)
             tx.execute("INSERT INTO schema_migrations (version, name, checksum) VALUES (%s,%s,%s)",
                        (migration.version, migration.name, migration.checksum))
+        # Backfill historical non-additive migrations as soon as the additive
+        # marker migration is present. Future non-additive markers commit in
+        # the SAME transaction as their SQL, under the exclusive worker lock.
+        if marker_available(tx):
+            for migration in discover(directory):
+                if non_additive(migration):
+                    tx.execute(
+                        "INSERT INTO schema_non_additive_migrations (version, name, checksum) "
+                        "VALUES (%s,%s,%s) ON CONFLICT (version) DO NOTHING",
+                        (migration.version, migration.name, migration.checksum))
     # Neither a failed SQL statement nor an uncertain COMMIT publishes success.
     if log:
         for migration in todo:
@@ -515,3 +535,111 @@ def status(db: PsqlDriver | PsycopgDriver) -> tuple[list[Migration], set[int]]:
     Lecture seule (L146) : `doctor` n'écrit rien, pas même la table du
     registre des migrations (`applied()` la crée au besoin)."""
     return discover(), set(_applied_readonly(db))
+
+
+class IncompatibleSchema(DbError):
+    """The database has a non-additive migration absent from this code."""
+
+
+def marker_available(db) -> bool:
+    return bool(db.query(
+        "SELECT to_regclass('schema_non_additive_migrations') IS NOT NULL AS ok"
+    )[0]["ok"])
+
+
+def incompatible_migrations(db, directory: str = MIGRATIONS_DIR) -> list[dict]:
+    """Read-only, uncached: long-lived timers must see a new incompatibility."""
+    known = known_writer_migrations(directory)
+    try:
+        rows = db.query(
+            "SELECT version, name, checksum FROM schema_non_additive_migrations ORDER BY version")
+    except Unavailable:
+        raise  # connectivity failure keeps the existing reconnect semantics
+    except DbError as exc:
+        if exc.sqlstate == '42P01':
+            try:
+                installed = db.query("SELECT 1 FROM schema_migrations WHERE version = 524")
+            except DbError as bootstrap:
+                if bootstrap.sqlstate != '42P01':
+                    raise IncompatibleSchema('writes refused: schema compatibility inventory unreadable: '
+                                             + str(bootstrap)) from bootstrap
+                installed = []
+            if not installed:
+                return []  # bootstrap: additive marker not deployed yet
+        raise IncompatibleSchema("writes refused: schema compatibility marker unreadable: "
+                                 + str(exc)) from exc
+    return [row for row in rows if known.get(int(row['version'])) != row['checksum']]
+
+
+def require_compatible_writer(db, directory: str = MIGRATIONS_DIR) -> None:
+    if getattr(getattr(db, 'cfg', None), 'backend', '') == 'mediated':
+        return  # requests are admitted by the server running its own code
+    incompatible = incompatible_migrations(db, directory)
+    if incompatible:
+        labels = ", ".join("%04d_%s" % (int(r["version"]), r["name"]) for r in incompatible)
+        raise IncompatibleSchema(
+            "writes refused: database has non-additive migration(s) unknown to this code: "
+            + labels + "; upgrade this executor/CLI before writing")
+
+
+@functools.lru_cache(maxsize=16)
+def known_writer_migrations(directory: str = MIGRATIONS_DIR) -> dict[int, str]:
+    """Code inventory is immutable for a versioned process; DB inventory isn't."""
+    return {m.version: m.checksum for m in discover(directory)}
+
+
+_ACTIVE_WRITER_TICKS = contextvars.ContextVar('ameesh_writer_ticks', default=())
+
+
+def writer_tick(method=None, *, on_admission_error=None):
+    """One fresh check at a process tick; nested passes share that admission."""
+    if method is None:
+        return lambda fn: writer_tick(fn, on_admission_error=on_admission_error)
+    @functools.wraps(method)
+    def checked(self, *args, **kwargs):
+        active = _ACTIVE_WRITER_TICKS.get()
+        key = id(self.db)
+        if key in active:
+            return method(self, *args, **kwargs)
+        try:
+            require_compatible_writer(self.db)
+        except (Unavailable, IncompatibleSchema) as exc:
+            if on_admission_error is None:
+                raise
+            return on_admission_error(self, method.__name__, exc)
+        if on_admission_error is not None:
+            on_admission_error(self, method.__name__, None)
+        token = _ACTIVE_WRITER_TICKS.set(active + (key,))
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            _ACTIVE_WRITER_TICKS.reset(token)
+    return checked
+
+
+class LiveExecutors(DbError):
+    """Non-additive SQL requires stopped executors or an audited override."""
+
+
+def _exclude_live_executors(tx, todo, reason):
+    # Claims/attach/renew all take ROW EXCLUSIVE on this existing relation.
+    # SHARE excludes them, including INSERT of a new agent, until COMMIT.
+    # Take the relation lock BEFORE reading leases (a fresh RC snapshot).
+    exists = tx.query("SELECT to_regclass('agent_registry') IS NOT NULL AS ok")[0]['ok']
+    if not exists:
+        return  # initial schema creation has no executor admissions yet
+    tx.execute('LOCK TABLE agent_registry IN SHARE MODE')
+    live = tx.query("SELECT name, lease_owner FROM agent_registry "
+                    "WHERE lease_owner IS NOT NULL AND lease_expires_at > clock_timestamp() "
+                    "ORDER BY name")
+    if not live:
+        return
+    if not reason or not reason.strip():
+        raise LiveExecutors('non-additive migration refused: live executor lease(s): '
+                            + ', '.join(row['name'] for row in live)
+                            + '; stop executors or use --allow-live-executors REASON')
+    tx.execute("INSERT INTO ameesh_events(type, object, data) "
+               "VALUES ('schema.migration_override', 'schema:' || current_schema(), %s::jsonb || jsonb_build_object('database_user', current_user))",
+               (json.dumps({'reason': reason.strip(), 'live_leases': live,
+                            'migrations': [m.label for m in todo],
+                            'host': tx.cfg.host, 'runner': tx.cfg.runner}),))
