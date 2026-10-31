@@ -112,14 +112,17 @@ to the pilot (`source = decision`), a roadmap-cutting lot
 by the in-flight cap, and are not refreshed at push. An improvement backlog
 lot is code, taken like any other: it follows the common rule. A basket
 line takes the marker too, united with the earlier lines' paths, and a known
-line does not clear the unknown analysis of an earlier one. On every creation
+line does not clear the unknown analysis of an earlier one: such a basket is
+not retried, not even by `--estimate` (its body unites its lines, so a known
+line would hide the unknown one); the branch diff or `--set` settles it. On every creation
 path the policy is read and the marker written in the creation's own
 transaction, under the guard's lock: no take sees the lot without it.
 
 A change of the unknown footprint policy applies at once, in the same
 transaction and under the guard's lock, to the open lots of the repository:
 `repository` puts the marker on every open lot without any footprint row
-(unknown under `open`, or created before #4818; packet vehicles excepted) and
+(unknown under `open`, or created before #4818) or whose analysis is unknown
+with neither a manual footprint nor a diff (packet vehicles excepted) and
 opens an unknown analysis for the runner to retry; `open` removes the
 `intake` markers (a `.` set by `--set` stays). Each lot gets a journal line.
 
@@ -131,9 +134,11 @@ replaces the marker: a branch's real diff is the known footprint.
 
 Each runner, in its branch sweep, refreshes the `diff` rows of the lots in
 progress assigned to its host's agents as soon as the branch is **pushed**:
-when `origin/<branch>` exists in the host's clone (a `git push` updates it
-locally, with no call to the forge) and no diff was read, or it was read on
-another head. The base is the clone's ref of the target. At most 5 lots are
+the published heads are read at the forge (one bounded `ls-remote` per clone
+and per pass, the host's clone being rarely the one the agent pushed from; the
+clone's own refs when the forge does not answer), and a lot is refreshed when
+no diff was read, or it was read on another head. The head is fetched by SHA,
+no ref written; the base is the target's published tip, as for `--refresh`. At most 5 lots are
 refreshed per pass, among at most 100 candidates read through a cursor: the
 next pass resumes after the last lot inspected and wraps at the end, so a
 first push is never stuck behind lots already up to date. The diff refresh on freeze and on `--refresh` is

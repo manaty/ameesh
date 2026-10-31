@@ -562,8 +562,42 @@ class RelectureTroisTest(_Empreintes):
         self.assertEqual(store.analyses([panier["id"]])[panier["id"]]["status"], "unknown")
         self.db.execute("UPDATE work_item_impact_analyses SET analyzed_at = analyzed_at"
                         " - interval '1 hour' WHERE work_item_id = %s", (panier["id"],))
-        self.assertEqual([r["work_item_id"] for r in store.claim_unknown(
-            retry_after_s=60, limit=5)], [panier["id"]])
+        # B de dev3 sur 055b48b : un panier inconnu n'est pas repris
+        self.assertEqual(store.claim_unknown(retry_after_s=60, limit=5), [])
+
+    def test_la_reprise_ne_perd_pas_la_ligne_vague_du_panier(self):
+        # B de dev3 sur 055b48b : ligne connue puis ligne vague, sous `open`
+        store = storage.of(self.db).work_footprints
+        self.occupant()
+        with self.rules():
+            panier = backlog.add(self.db, title="ligne précise", expected_value="gain",
+                                 body="corrige src/a.py", value_score=10, app="nexlink",
+                                 actor="test", cfg=self.cfg, new_project=True, chantier="ch",
+                                 estimate="1h")
+            backlog.add(self.db, title="ligne vague", expected_value="gain", value_score=10,
+                        app="nexlink", actor="test", cfg=self.cfg, chantier="ch")
+        self.assertEqual(fp.paths_of(self.db, panier["id"]), ["src/a.py"])
+        self.db.execute("UPDATE work_item_impact_analyses SET analyzed_at = analyzed_at"
+                        " - interval '1 hour' WHERE work_item_id = %s", (panier["id"],))
+        self.assertEqual(store.claim_unknown(retry_after_s=60, limit=5), [])
+        self.assertIsNone(fp.record_estimate(self.db, self.cfg, work.get(self.db, panier["id"]),
+                                             actor="runner"))
+        self.assertEqual(store.analyses([panier["id"]])[panier["id"]]["status"], "unknown")
+        # la bascule retrouve l'inconnue malgré le chemin connu, et la rend
+        result = store.set_policy("nexlink", actor="human:proprio",
+                                  unknown_policy="repository")
+        self.assertEqual(result["lots"], [panier["id"]])
+        self.assertEqual(fp.paths_of(self.db, panier["id"]), [".", "src/a.py"])
+        with self.assertRaises(work.WorkError):
+            work.assign(self.db, panier["id"], "human:autre", actor="test")
+        store.set_policy("nexlink", actor="human:proprio", unknown_policy="open")
+        self.assertEqual(fp.paths_of(self.db, panier["id"]), ["src/a.py"])
+        # un lot connu avec des chemins n'est pas touché par la bascule
+        connu = work.add(self.db, title="corrige src/b.py", app="nexlink", cfg=self.cfg)
+        result = store.set_policy("nexlink", actor="human:proprio",
+                                  unknown_policy="repository")
+        self.assertNotIn(connu["id"], result["lots"])
+        self.assertEqual(fp.paths_of(self.db, connu["id"]), ["src/b.py"])
 
     def test_une_prise_juste_apres_la_creation_voit_le_marqueur(self):
         # B2 de cx3 sur d68ca19 : une prise sur une AUTRE connexion, juste
@@ -638,6 +672,7 @@ class PassePushTest(PgTestCase):
         self.repo.write("src/hot.py", "def hot_path():\n    pass\n")
         self.repo.commit("base")
         self.repo.git("branch", "-M", "main")
+        self.root = root
         origin = os.path.join(root, "origin.git")
         self.repo.git("init", "--bare", "-q", origin)
         self.repo.git("remote", "add", "origin", origin)
@@ -672,6 +707,51 @@ class PassePushTest(PgTestCase):
                                      agents={"autre"})["refreshed"], [])
         fp.run_pass(self.cfg, self.db, actor="runner", agents={"agent1"})
         self.assertEqual(fp.paths_of(self.db, item["id"]), ["src/feature.py", "src/more.py"])
+
+    def _lot_pousse_d_un_autre_clone(self, branch):
+        """Le lot poussé depuis le clone du porteur, inconnu de celui de l'hôte."""
+        item = work.add(self.db, title="quelque chose de vague", app="tpk", branch=branch,
+                        cfg=self.cfg)
+        self.db.execute("UPDATE work_items SET assignee = 'agent1', state = 'build'"
+                        " WHERE id = %s", (item["id"],))
+        origin = self.repo.git("remote", "get-url", "origin").strip()
+        author = os.path.join(self.root, "porteur-" + branch.replace("/", "-"))
+        self.repo.git("clone", "-q", "-b", "main", origin, author)
+        self.repo.git("-C", author, "checkout", "-qb", branch)
+        os.makedirs(os.path.join(author, "src"), exist_ok=True)
+        with open(os.path.join(author, "src", "ailleurs.py"), "w") as out:
+            out.write("x\n")
+        self.repo.git("-C", author, "add", ".")
+        self.repo.git("-C", author, "-c", "user.name=a", "-c", "user.email=a@b",
+                      "commit", "-qm", "lot")
+        self.repo.git("-C", author, "push", "-q", "origin", branch)
+        return item
+
+    def test_un_push_depuis_un_autre_clone_est_vu(self):
+        # B de cx2 sur 055b48b : l'hôte n'a ni la ref ni l'objet de la branche
+        item = self._lot_pousse_d_un_autre_clone("lot/2-ailleurs")
+        self.assertEqual(fp._published_tip(self.repo.root, "lot/2-ailleurs"), "")
+        report = fp.run_pass(self.cfg, self.db, actor="runner", agents={"agent1"})
+        self.assertEqual([r["lot"] for r in report["refreshed"]], [item["id"]], report)
+        self.assertEqual(fp.paths_of(self.db, item["id"]), ["src/ailleurs.py"])
+        self.assertEqual(fp._published_tip(self.repo.root, "lot/2-ailleurs"), "",
+                         "the shared clone gets no ref")
+        self.assertEqual(fp.run_pass(self.cfg, self.db, actor="runner",
+                                     agents={"agent1"})["refreshed"], [])
+
+    def test_forge_injoignable_les_refs_du_clone_et_la_passe_continue(self):
+        item = work.add(self.db, title="quelque chose de vague", app="tpk",
+                        branch="lot/3-local", cfg=self.cfg)
+        self.db.execute("UPDATE work_items SET assignee = 'agent1', state = 'build'"
+                        " WHERE id = %s", (item["id"],))
+        self.repo.git("checkout", "-qb", "lot/3-local")
+        self.repo.write("src/local.py", "x\n")
+        self.repo.commit("lot")
+        self.repo.git("push", "-q", "origin", "lot/3-local")
+        self.repo.git("remote", "set-url", "origin", os.path.join(self.root, "absent.git"))
+        report = fp.run_pass(self.cfg, self.db, actor="runner", agents={"agent1"})
+        self.assertEqual([r["lot"] for r in report["refreshed"]], [item["id"]], report)
+        self.assertEqual(fp.paths_of(self.db, item["id"]), ["src/local.py"])
 
     def test_le_curseur_atteint_les_lots_au_dela_de_la_page(self):
         """B2 de cx1 : des candidats déjà à jour en tête de liste ne cachent

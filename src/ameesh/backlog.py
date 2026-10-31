@@ -709,7 +709,8 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
             estimates.REQUIRED % (creator or actor, "add --estimate 2h")) from None
     if impact and not impact.get("unknown") and not item.get("basket_opened"):
         # une ligne connue n'efface pas l'inconnue d'une ligne précédente :
-        # le panier reste à reprendre (son corps entier est réanalysé)
+        # le panier reste inconnu jusqu'au diff ou à un `--set` (son corps
+        # unit les lignes : le réanalyser perdrait cette inconnue)
         from . import impact_analysis, work_footprints
         before = storage.of(db).work_footprints.analyses([int(item["id"])])
         if (before.get(int(item["id"])) or {}).get("status") == "unknown":

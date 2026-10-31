@@ -363,13 +363,27 @@ def record_analysis(db, item_id: int, analysis: dict | None, *, actor: str) -> N
               file=sys.stderr)
 
 
+def _basket_held_unknown(db, item: dict) -> bool:
+    """Le lot est un panier dont l'analyse est inconnue."""
+    from . import backlog
+    if not backlog.is_basket(item):
+        return False
+    known = storage.of(db).work_footprints.analyses([int(item["id"])])
+    return (known.get(int(item["id"])) or {}).get("status") == "unknown"
+
+
 def record_estimate(db, cfg, item: dict, *, actor: str, repo: Optional[str] = None) -> dict | None:
     """`--estimate` : l'analyse d'impact du lot, réécrite (lignes `intake`)
     et journalisée. Le manuel remplace l'estimation : s'il existe, rien n'est
     écrit (l'union serait plus large que les deux) ; `--clear` puis
-    `--estimate` réestime. Rend l'analyse, ou None sous un manuel."""
+    `--estimate` réestime. Un panier dont une ligne est inconnue ne se
+    réanalyse pas non plus : son corps unit ses lignes, une ligne connue y
+    masquerait l'inconnue d'une autre (B de dev3 sur 055b48b). Rend l'analyse,
+    ou None si rien n'est écrit."""
     rows = storage.of(db).work_footprints.for_items([int(item["id"])])
     if any(str(row.get("source")) == "manual" for row in rows):
+        return None
+    if _basket_held_unknown(db, item):
         return None
     analysis = analyze_lot(cfg, db, item, repo)
     # le calcul (git) se fait hors verrou ; la politique se relit à l'écriture
@@ -386,17 +400,16 @@ def record_estimate(db, cfg, item: dict, *, actor: str, repo: Optional[str] = No
 
 
 def refresh(db, cfg, item_id: int, *, actor: str, head: str = "",
-            repo: Optional[str] = None, published: bool = True) -> dict:
+            repo: Optional[str] = None) -> dict:
     """Le diff réel de la branche du lot (ou de `head`, la tête gelée)
     remplace les lignes `diff` de l'empreinte.
 
     La base est la cible du lot (`branch_target`), sinon celle que le projet
     déclare (`develop` pour Nexlink), sinon le défaut du dépôt (#4733) ; sa
     pointe publiée est relue à la forge quand elle répond, et `fresh` dit si
-    la base est prouvée fraîche ou seulement la ref du dernier fetch.
-    `published=False` (passe de l'exécuteur, #4818) lit la ref locale sans
-    appel à la forge ; un diff qui trouve des fichiers fait tomber le
-    marqueur d'empreinte inconnue (`.`) de l'analyse."""
+    la base est prouvée fraîche ou seulement la ref du dernier fetch. Un diff
+    qui trouve des fichiers fait tomber le marqueur d'empreinte inconnue (`.`)
+    de l'analyse (#4818)."""
     item = work.get(db, item_id)
     if item is None:
         raise work.WorkError("lot %s not found" % item_id)
@@ -407,8 +420,7 @@ def refresh(db, cfg, item_id: int, *, actor: str, head: str = "",
     if not clone or not target:
         raise work.WorkError("lot %s: no local clone of %s with a known target"
                              % (item_id, item.get("app") or "its repository"))
-    base, fresh = (_fresh_base(clone, target) if published
-                   else (_ref(clone, target), False))
+    base, fresh = _fresh_base(clone, target)
     paths = diff_paths(clone, base, tip)
     if paths is None:
         raise work.WorkError("lot %s: %s...%s unreadable in %s (fetch first)"
@@ -452,9 +464,8 @@ def refusal(item_id: int, rows: list, *, cap: int | None = None,
 # --------------------------------------------------------------------------
 
 def _published_tip(clone: str, branch: str) -> str:
-    """Le SHA de `origin/<branche>` dans le clone, ou "" si la branche n'a
-    jamais été poussée. Un `git push` met cette ref à jour localement : la
-    passe voit le premier push sans appel à la forge."""
+    """Le SHA de `origin/<branche>` dans le clone, ou "" si le clone ne la
+    connaît pas : le repli de `_published_tips` quand la forge ne répond pas."""
     from . import plan_git
     name = plan_git.short_branch(branch) or branch
     proc = _git(clone, "rev-parse", "--verify", "--quiet",
@@ -464,17 +475,57 @@ def _published_tip(clone: str, branch: str) -> str:
     return proc.stdout.decode("utf-8", "replace").strip()
 
 
+def _published_tips(clone: str, branches: Iterable[str]) -> dict:
+    """`{branche: SHA}` des têtes publiées, lues à la forge en UN `ls-remote`
+    borné : le clone de l'hôte n'est pas celui où l'agent a poussé, sa ref
+    `origin/<branche>` n'en sait rien (B de cx2 sur 055b48b). Une branche
+    absente de la réponse n'est pas publiée. Forge injoignable : les refs
+    locales du clone, au mieux."""
+    from . import plan_git, review_authors
+    names = {branch: plan_git.short_branch(branch) or branch for branch in branches}
+    try:
+        listing = plan_git._git(
+            clone, "ls-remote", "--refs", "origin",
+            *sorted("refs/heads/%s" % name for name in set(names.values())),
+            timeout=review_authors.TARGET_REFRESH_TIMEOUT)
+        failed = listing.returncode != 0
+    except Exception:  # noqa: BLE001 - forge coupée : lecture locale
+        failed = True
+    if failed:
+        return {branch: _published_tip(clone, branch) for branch in names}
+    heads = {}
+    for line in listing.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1].startswith("refs/heads/"):
+            heads[fields[1][len("refs/heads/"):]] = fields[0]
+    return {branch: heads.get(name, "") for branch, name in names.items()}
+
+
+def _ensure_commit(clone: str, sha: str) -> None:
+    """L'objet publié dans le clone, demandé par SHA et sans écrire de ref
+    (même geste que `review_authors._published_target`). Lève si la forge ne
+    le donne pas : la passe suivante réessaie."""
+    from . import plan_git, review_authors
+    if plan_git.local_commit(clone, sha):
+        return
+    proc = plan_git._git(clone, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+                         "--", "origin", sha,
+                         timeout=review_authors.TARGET_REFRESH_TIMEOUT)
+    if proc.returncode != 0 or not plan_git.local_commit(clone, sha):
+        raise work.WorkError("published head %s not fetched in %s" % (sha[:12], clone))
+
+
 def run_pass(cfg, db, *, actor: str, agents=None, limit: int = PASS_LIMIT,
              retry_after_s: float = RETRY_AFTER_S, cursor: int = 0,
              scan: int = PASS_SCAN) -> dict:
     """Une passe bornée, jamais fatale :
 
     * **refresh au premier push** : un lot occupant dont la branche est
-      publiée (`origin/<branche>` dans le clone de l'hôte) et dont le diff
-      n'a jamais été lu, ou l'a été sur une autre tête, voit ses lignes
-      `diff` réécrites (base : ref locale de la cible, aucun appel à la
-      forge). Avec `agents`, seuls les lots de ces assignés (ceux de l'hôte,
-      dont le clone porte la branche). La lecture avance par curseur
+      publiée (tête lue à la forge, un `ls-remote` par clone, `_published_tips`)
+      et dont le diff n'a jamais été lu, ou l'a été sur une autre tête, voit
+      ses lignes `diff` réécrites, l'objet étant d'abord demandé par SHA. Avec
+      `agents`, seuls les lots de ces assignés (ceux de l'hôte, pour qu'un
+      seul exécuteur s'en charge). La lecture avance par curseur
       (`cursor` → `out["cursor"]`) : au plus `scan` candidats par passe, le
       suivant reprend après le dernier inspecté et revient au début en fin de
       liste — un premier push n'attend jamais derrière des lots à jour (B2
@@ -498,6 +549,15 @@ def run_pass(cfg, db, *, actor: str, agents=None, limit: int = PASS_LIMIT,
     # au début ; sinon après le dernier candidat inspecté
     out["cursor"] = int(candidates[-1]["id"]) if len(candidates) >= scan else 0
     done = 0
+    clones: dict = {}
+    for row in candidates:
+        try:
+            clone = _clone_and_target(cfg, row)[0]
+            if clone:
+                clones.setdefault(clone, set()).add(row["branch"])
+        except Exception as exc:  # noqa: BLE001 - un lot illisible n'arrête pas la passe
+            out["errors"].append("lot #%s: refresh: %s" % (row.get("id"), exc))
+    tips = {clone: _published_tips(clone, branches) for clone, branches in clones.items()}
     for row in candidates:
         if done >= limit:
             out["cursor"] = int(row["id"]) - 1
@@ -506,12 +566,12 @@ def run_pass(cfg, db, *, actor: str, agents=None, limit: int = PASS_LIMIT,
             clone, _target = _clone_and_target(cfg, row)
             if not clone:
                 continue
-            tip = _published_tip(clone, row["branch"])
+            tip = tips.get(clone, {}).get(row["branch"]) or ""
             if not tip or (row.get("has_diff") and (row.get("diff_head") or "") == tip):
                 continue
             done += 1
-            result = refresh(db, cfg, int(row["id"]), actor=actor, head=tip,
-                             published=False)
+            _ensure_commit(clone, tip)
+            result = refresh(db, cfg, int(row["id"]), actor=actor, head=tip)
             out["refreshed"].append({"lot": int(row["id"]), "head": tip,
                                      "paths": result.get("paths"),
                                      "changed": result.get("changed")})
@@ -640,6 +700,9 @@ def run(cfg, db, args) -> int:
             analysis = record_estimate(db, cfg, item, actor=actor, repo=args.repo)
             if analysis is not None and not args.json:
                 print("lot #%d: %s" % (args.id, analysis["note"]))
+            elif analysis is None and not args.json:
+                print("lot #%d: estimate not written: a manual footprint or a basket with an "
+                      "unknown line — the branch diff or --set PATH… settles it" % args.id)
     elif args.refresh:
         refreshed = refresh(db, cfg, args.id, actor=actor, repo=args.repo)
     found = describe(db, args.id)

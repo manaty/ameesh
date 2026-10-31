@@ -8,6 +8,9 @@ from ..work_footprints import WorkFootprints as Contract
 from .catalog import _text_array
 from .work_dependencies import _DONE_SQL, _LOCK as _GRAPH_LOCK
 
+#: Le préfixe de `source` d'un panier (`backlog.BASKET_PREFIX`).
+BASKET_PREFIX = "backlog-basket:"
+
 #: Un lot OCCUPE son empreinte dès qu'il est confié ou démarré, jusqu'à sa
 #: fusion (ou sa fermeture) : sa branche peut encore entrer en conflit. Un lot
 #: `intake` sans assigné n'occupe rien.
@@ -283,16 +286,23 @@ class WorkFootprints(Contract):
         la transaction et sous le verrou de la garde. `repository` pose le
         marqueur `.` (source `intake`) sur chaque lot ouvert du dépôt sans
         aucune ligne d'empreinte (analyse inconnue sous `open`, ou lot d'avant
-        #4818), véhicules exceptés, et leur ouvre une analyse inconnue que
-        l'exécuteur retente ; `open` retire les marqueurs `intake` (un `.`
+        #4818) ou dont l'analyse est inconnue sans empreinte manuelle ni diff
+        (panier dont une ligne seule est inconnue, B de dev3), véhicules
+        exceptés, et leur ouvre une analyse inconnue que l'exécuteur retente ;
+        `open` retire les marqueurs `intake` (un `.`
         posé à la main reste). Une ligne de journal par lot. Rend les lots."""
         if policy == "repository":
             rows = tx.query(
                 "SELECT w.id, w.state FROM work_items w"
                 " WHERE btrim(w.app) = %s AND w.state NOT IN " + _DONE_SQL +
                 "   AND NOT " + exempt_sql("w") +
-                "   AND NOT EXISTS (SELECT 1 FROM work_item_footprints f"
-                "                    WHERE f.work_item_id = w.id)"
+                "   AND (NOT EXISTS (SELECT 1 FROM work_item_footprints f"
+                "                     WHERE f.work_item_id = w.id)"
+                "        OR (EXISTS (SELECT 1 FROM work_item_impact_analyses a"
+                "                     WHERE a.work_item_id = w.id AND a.status = 'unknown')"
+                "            AND NOT EXISTS (SELECT 1 FROM work_item_footprints f"
+                "                             WHERE f.work_item_id = w.id"
+                "                               AND f.source IN ('manual', 'diff'))))"
                 " ORDER BY w.id FOR NO KEY UPDATE OF w", (app,))
             note = ("Footprint (intake): . — unknown footprint held as the whole "
                     "repository (policy repository)")
@@ -366,7 +376,7 @@ class WorkFootprints(Contract):
 
     def claim_unknown(self, *, retry_after_s, limit, apps=None):
         app_filter = ""
-        params: tuple = (float(retry_after_s),)
+        params: tuple = (float(retry_after_s), BASKET_PREFIX)
         if apps is not None:
             wanted = sorted({str(a).strip() for a in apps if str(a or "").strip()})
             if not wanted:
@@ -386,7 +396,11 @@ class WorkFootprints(Contract):
             "           AND NOT EXISTS (SELECT 1 FROM work_item_footprints m"
             "                            WHERE m.work_item_id = w.id"
             "                              AND m.source IN ('manual', 'diff'))"
-            "           AND NOT " + exempt_sql("w")
+            "           AND NOT " + exempt_sql("w") +
+            # un panier inconnu : son corps unit ses lignes, le réanalyser
+            # perdrait l'inconnue d'une ligne (B de dev3 sur 055b48b)
+            "           AND NOT (w.type = 'improvement'"
+            "                    AND starts_with(coalesce(w.source, ''), %s))"
             + app_filter +
             "         ORDER BY a2.analyzed_at LIMIT %s"
             "           FOR UPDATE OF a2 SKIP LOCKED) pick"
