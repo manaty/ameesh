@@ -2,6 +2,8 @@
 """A one-shot wake keeps its deadline across installation and timer reloads."""
 from __future__ import annotations
 
+from .entrypoint import run as isolated_entrypoint
+
 import contextlib
 import datetime
 import io
@@ -59,7 +61,7 @@ class DeadlineTest(unittest.TestCase):
                 mock.patch.object(watch, "arm", side_effect=arm), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            return watch.main(["at", "--agent", "deadline-agent", "--message", "check",
+            return isolated_entrypoint(watch.main, ["at", "--agent", "deadline-agent", "--message", "check",
                                *args])
 
     def timer(self):

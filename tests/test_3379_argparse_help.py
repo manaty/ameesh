@@ -4,12 +4,14 @@ import argparse
 import ast
 import importlib
 import inspect
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from tests import support  # noqa: F401 — isolate the host configuration
+from .entrypoint import run as isolated_entrypoint
 
 
 class _Parsed(BaseException):
@@ -28,6 +30,8 @@ def _render(parser):
 
 class ArgparseHelpTests(unittest.TestCase):
     def test_all_parser_entry_points(self):
+        original_spawn = subprocess.Popen.__init__
+        self.addCleanup(setattr, subprocess.Popen, "__init__", original_spawn)
         root = Path(__file__).resolve().parents[1] / "src" / "ameesh"
         covered = set()
 
@@ -67,13 +71,15 @@ class ArgparseHelpTests(unittest.TestCase):
                     with patch.object(argparse.ArgumentParser, "parse_args", stop), \
                             patch.object(argparse.ArgumentParser, "parse_known_args", stop):
                         try:
-                            result = func(**kwargs)
+                            result = isolated_entrypoint(func, **kwargs)
                         except _Parsed:
                             pass
                         else:
                             self.assertIsInstance(result, argparse.ArgumentParser)
                             _render(result)
                     covered.add((module_name, node.name))
+                    self.assertIs(subprocess.Popen.__init__, original_spawn,
+                                  (module_name, node.name))
         self.assertIn(("ameesh.mesh_cli", "build_parser"), covered)
         self.assertIn(("ameesh.role_timers", "main"), covered)
         self.assertIn(("ameesh.roadmap", "build_parser"), covered)

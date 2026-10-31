@@ -18,6 +18,8 @@ le routage n'est PAS ce qui refuse.
 """
 from __future__ import annotations
 
+from .entrypoint import run as isolated_entrypoint
+
 import argparse
 import contextlib
 import io
@@ -52,7 +54,7 @@ def run_entrypoint(argv: list[str]) -> tuple[int, str]:
     with patch.object(db_mod, "connect", side_effect=db_mod.Unavailable("test")):
         try:
             with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-                code = main_mod.main(argv)
+                code = isolated_entrypoint(main_mod.main, argv)
         except SystemExit as exit_:  # argparse : `--help` sort ainsi, avec le code 0
             code = int(exit_.code or 0)
     return code, err.getvalue()

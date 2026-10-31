@@ -191,8 +191,9 @@ def tick(db, cfg, options) -> dict:
         elected = role_run.live(db, options["role"])
         if not elected["held"] or elected.get("holder") != host:
             return {"state": "standby", "reason": "role changed"}
-        env = dict(os.environ, BASCULE_ENV=options["bascule_env"],
-                   STAGING_TIMEOUT_S=str(options.get("timeout_s", 7200)))
+        from .platform.child_environment import execution_transport
+        env = execution_transport(dict(os.environ, BASCULE_ENV=options["bascule_env"],
+                   STAGING_TIMEOUT_S=str(options.get("timeout_s", 7200))))
         env.pop("AMEESH_TURN_ID", None)
         # Only this attempt names its run and a proved-stopped predecessor;
         # never a value inherited from the unit's environment (review qa-01).
@@ -328,6 +329,8 @@ def tick(db, cfg, options) -> dict:
 
 
 def main(argv=None):
+    from .platform.child_environment import install
+    install()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -335,6 +338,10 @@ def main(argv=None):
     submit_p = commands.add_parser("submit")
     submit_p.add_argument("sha")
     args = parser.parse_args(argv)
+    if args.command == "tick":
+        from .platform.child_environment import harden
+        if not harden():
+            return 1
     from ameesh import config, db as db_mod
     cfg = config.load()
     options = settings(args.config)

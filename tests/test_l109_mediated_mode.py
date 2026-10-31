@@ -14,6 +14,8 @@ les jeux dorés (`tests/exec_fake.py`) :
 """
 from __future__ import annotations
 
+from .entrypoint import run as isolated_entrypoint
+
 import contextlib
 import dataclasses
 import io
@@ -167,7 +169,7 @@ class GardesTest(MedieBase):
         env = {"AMEESH_BACKEND": "mediated", "AMEESH_EXEC_URL": "https://mesh.exemple",
                "AMEESH_CONFIG": self.config_vide}
         with mock.patch.dict(os.environ, env), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(runner_mod.main(["register", "x", "dsh"]), 2)
+            self.assertEqual(isolated_entrypoint(runner_mod.main, ["register", "x", "dsh"]), 2)
 
 
 class ReveilParLeFluxTest(MedieBase):
@@ -401,7 +403,7 @@ class SessionTest(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
                 mock.patch("sys.stdin", io.StringIO(stdin)):
-            code = main_mod.main(list(argv))
+            code = isolated_entrypoint(main_mod.main, list(argv))
         return code, out.getvalue(), err.getvalue()
 
     def session_requests(self) -> list:

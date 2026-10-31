@@ -8,6 +8,8 @@ compilation stricte. Aucune base, aucun état natif, aucune exécution.
 """
 from __future__ import annotations
 
+from .entrypoint import run as isolated_entrypoint
+
 import contextlib
 import io
 import json
@@ -281,7 +283,7 @@ class CliTest(PageCase):
 
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = ameesh_main(["process", "check", str(EXAMPLE)])
+            code = isolated_entrypoint(ameesh_main, ["process", "check", str(EXAMPLE)])
         self.assertEqual(0, code, err.getvalue())
         self.assertIn("OK — 8 stages", out.getvalue())
 
