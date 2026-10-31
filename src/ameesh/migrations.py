@@ -580,8 +580,9 @@ def _lex(sql: str) -> tuple[str, str]:
             else:
                 # un `;` dans une chaîne ne termine pas l'instruction (B docs-01)
                 kept.append(sql[at:end].replace(";", " "))
-            # un identifiant entre guillemets reste du code, pas une chaîne
-            code.append(sql[at:end] if sql[at] == '"' else " ")
+            # un identifiant entre guillemets n'est ni du code ni un nom
+            # comparable une fois les minuscules posées : jeton neutre (B cx1)
+            code.append('"_"' if sql[at] == '"' else " ")
             at = end
         else:
             kept.append(sql[at]), code.append(sql[at])
@@ -599,7 +600,7 @@ def _param_types(params: str, *, named: bool) -> list[str]:
 
 
 def _proven_new(code: str, kind: str, name: str, signature: str = "") -> bool:
-    """`name` est-il prouvé neuf ? Seul un CREATE nu, hors chaîne SQL,
+    """`name` (sans guillemets) est-il prouvé neuf ? Seul un CREATE nu, hors chaîne SQL,
     échoue sur un objet existant : `or replace`, `if not exists`, un drop
     préalable, une chaîne non exécutée et une autre surcharge laissent au code
     d'avant son objet."""
@@ -626,11 +627,12 @@ def _privilege_reasons(sql: str) -> list[str]:
     reasons = []
     for match in _REVOKE.finditer(kept):
         kind, name, signature, single = match.groups()
-        if not (name and single and _proven_new(code, kind or "table", name, signature or "")):
+        if not (name and single and '"' not in name
+                and _proven_new(code, kind or "table", name, signature or "")):
             reasons.append("privilege removed (revoke%s)" % (" on " + name if name else ""))
     if not _CONSTRAINT_MARKER.search(sql):
         for statement in _ALTER_TABLE.finditer(kept):
-            if _proven_new(code, "table", statement.group(1)):
+            if '"' not in statement.group(1) and _proven_new(code, "table", statement.group(1)):
                 continue
             reasons.extend("constraint possibly tightened (add %s)"
                            % (name and "constraint " + name or form)

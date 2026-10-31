@@ -116,6 +116,12 @@ class NonAdditiveTest(unittest.TestCase):
             ("do $$ begin alter table t add column d text default ';', add unique (c); end $$;",
              "add unique"),
             ("revoke all on \"a;b\" from r;", "privilege removed (revoke"),
+            # B cx1 : un nom cité garde sa casse, et son contenu n'est pas du code
+            ('create table "T" (id bigint); revoke insert on "t" from app;',
+             'revoke on "t"'),
+            ('select 1 as "create table t "; revoke insert on t from app;', "revoke on t"),
+            ('create table "T" (id bigint); alter table "t" add unique (id);', "add unique"),
+            ('select 1 as "create table t "; alter table t add unique (c);', "add unique"),
         ):
             with self.subTest(sql=sql):
                 reasons = migrations.non_additive(_migration(sql))
