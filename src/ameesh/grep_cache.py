@@ -41,6 +41,14 @@ demande plus l'arbre entier pour un petit jeu de lignes : le balayage ciblé
 (`git grep -F -f -`) ne cache que les lignes trouvées, donc une entrée bornée
 par la demande.
 
+#4964 : une entrée écartée par `MAX_ENTRY_BYTES` reste **mémoïsée dans le
+processus** (marqueur `None` dans `_MEMO`, budget `MEMO_MAX_BYTES` porté à
+48 Mio pour garder deux grosses entrées). Une demande de plus de
+`TREE_LINES_WHOLE_MAX` lignes lit l'arbre entier une fois par processus au
+lieu d'une fois par appel, et un appelant concurrent de la même clé retrouve
+cette valeur après le verrou au lieu de recalculer. Le plafond ne change pas :
+rien n'est publié, un autre processus repaie sa lecture.
+
 Attributs (B/P2 cx2 sur b4e42699) : `-I` dépend de l'attribut `binary`, que git
 lit dans les `.gitattributes` du dépôt de travail, `info/attributes`,
 `core.attributesFile` et le fichier système. Le balayage lit donc les
@@ -94,8 +102,12 @@ PRUNE_LARGE_BYTES = 1024 * 1024
 #: octets écrits par ce processus depuis le dernier élagage avant de le
 #: refaire (les petites entrées amortissent le coût du balayage)
 PRUNE_PENDING_BYTES = MAX_BYTES // 16
-#: valeurs décodées gardées dans le processus, en octets encodés
-MEMO_MAX_BYTES = 24 * 1024 * 1024
+#: valeurs décodées gardées dans le processus, en octets encodés. 48 Mio
+#: gardent deux entrées au-dessus de `MAX_ENTRY_BYTES` (21 Mio chacune sur
+#: release/11ag) : sans la seconde, la lecture de l'arbre de fusion, réutilisée
+#: par chaque commit, était évincée par celle, unique, de chaque parent et
+#: relue à chaque appel (#4964).
+MEMO_MAX_BYTES = 48 * 1024 * 1024
 MEMO_MAX_ENTRIES = 64
 #: niveau gzip : le niveau 4 tient 25 arbres de `main` dans 256 Mio
 GZIP_LEVEL = 4
@@ -117,11 +129,13 @@ ENABLED = True
 
 #: état du processus : racine courante, octets en attente d'élagage,
 #: magasins depuis le dernier élagage, valeurs décodées (LRU) et compteurs.
+#: La signature d'un mémo est `(inode, taille)` pour une entrée publiée et
+#: `None` pour une valeur calculée mais trop grosse pour être publiée (#4964).
 _STATE_LOCK = threading.RLock()
 _STATE_ROOT: Optional[str] = None
 _PENDING_BYTES = 0
 _STORES = 0
-_MEMO: "OrderedDict[str, tuple[tuple[int, int], list, int]]" = OrderedDict()
+_MEMO: "OrderedDict[str, tuple[Optional[tuple[int, int]], list, int]]" = OrderedDict()
 _MEMO_BYTES = 0
 _COUNTERS = {"reads": 0, "hits": 0, "memo_hits": 0, "misses": 0,
              "stores": 0, "prunes": 0, "pruned": 0, "oversized": 0,
@@ -358,7 +372,22 @@ def _memo_get(name: str, signature: tuple) -> Optional[list]:
         return list(entry[1])
 
 
-def _memo_put(name: str, value: list, signature: tuple, size: int) -> None:
+def _memo_get_unpublished(name: str) -> Optional[list]:
+    """La valeur calculée mais non publiée d'une entrée trop grosse (#4964).
+
+    Elle n'a pas de fichier à statuer : la clé est content-addressed, donc sa
+    valeur ne peut pas être périmée. `None` quand le mémo ne la garde pas."""
+    with _STATE_LOCK:
+        entry = _MEMO.get(name)
+        if entry is None or entry[0] is not None:
+            return None
+        _MEMO.move_to_end(name)
+        _COUNTERS["memo_hits"] += 1
+        return list(entry[1])
+
+
+def _memo_put(name: str, value: list, signature: Optional[tuple[int, int]],
+              size: int) -> None:
     global _MEMO_BYTES
     if size > MEMO_MAX_BYTES:
         return
@@ -383,13 +412,21 @@ def _memo_drop(name: str) -> None:
 
 
 def _read(name: str):
-    """(True, valeur) si l'entrée est lisible, sinon (False, None)."""
+    """(True, valeur) si l'entrée est lisible, sinon (False, None).
+
+    Une valeur non publiée (au-delà de `MAX_ENTRY_BYTES`) est servie depuis le
+    mémo du processus (#4964) : `_write` la garde là avant de renoncer au
+    fichier."""
     _state()
     _count("reads")
     path = _path(name)
     try:
         info = os.stat(path)
     except OSError:
+        value = _memo_get_unpublished(name)
+        if value is not None:
+            _count("hits")
+            return True, value
         _memo_drop(name)
         _count("misses")
         return False, None
@@ -422,9 +459,14 @@ def _write(name: str, value: list) -> None:
         try:
             with os.fdopen(fd, "wb") as handle:
                 _write_entry(handle, value)
-            if os.path.getsize(tmp) > MAX_ENTRY_BYTES:
+            size = os.path.getsize(tmp)
+            if size > MAX_ENTRY_BYTES:
                 os.unlink(tmp)
                 _count("oversized")
+                # #4964 : non publiée, mais mémoïsée dans le processus. Le
+                # prochain appel de la même clé (ou l'appelant qui attendait le
+                # verrou) la retrouve, au lieu de relire l'arbre entier.
+                _memo_put(name, list(value), None, size)
                 return
             os.replace(tmp, path)
         except BaseException:
