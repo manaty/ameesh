@@ -24,7 +24,7 @@ from urllib import error, parse, request
 from .canon import HostPolicy, SandboxPlacement, load_yaml
 from .sandbox_provider import (
     InvalidJob, Job, JobAlreadyExists, JobIdentity, JobNotFound, JobProvider,
-    JobSpec, JobUIDConflict, ProviderError, ProviderForbidden, ProviderUnavailable,
+    JobSpec, JobUIDConflict, ProviderForbidden, ProviderUnavailable,
     phase_from_status,
 )
 
@@ -217,8 +217,9 @@ class KubernetesJobProvider(JobProvider):
         """Bad workload output is terminal data, never a transport failure.
 
         The prompt may legitimately be quoted in a result. Only the relay
-        credential is withheld. An unreadable/malformed Secret neutralizes
-        output too: it must not prevent observation or cancellation of a Job.
+        credential is withheld. A missing or malformed Secret neutralizes
+        output. Transport and authorization failures propagate so the
+        supervisor can retry without discarding a successful result.
         """
         if not content:
             return ''
@@ -226,7 +227,7 @@ class KubernetesJobProvider(JobProvider):
         try:
             secret = self._call('GET', self._path(meta['namespace'], 'secrets', meta['name']))
             token = base64.b64decode(secret['data']['relay_token'], validate=True).decode()
-        except (ProviderError, ValueError, KeyError, TypeError):
+        except (JobNotFound, ValueError, KeyError, TypeError):
             return ''
         return '' if not token or token in content else content
 

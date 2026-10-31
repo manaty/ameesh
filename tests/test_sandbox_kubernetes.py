@@ -45,8 +45,11 @@ class API(http.server.BaseHTTPRequestHandler):
         if state['failures']:
             verb, suffix, code = state['failures'][0]
             if self.command == verb and url.path.endswith(suffix):
-                state['failures'].pop(0)
-                return self.reply(code, {'message': PROMPT + TOKEN})
+                if state.get('failure_skip', 0):
+                    state['failure_skip'] -= 1
+                else:
+                    state['failures'].pop(0)
+                    return self.reply(code, {'message': PROMPT + TOKEN})
         if self.headers.get('Authorization') != 'Bearer cluster-token':
             return self.reply(401, {})
         parts = url.path.split('/')
@@ -410,6 +413,39 @@ class KubernetesTest(unittest.TestCase):
             self.assertEqual(event.kind, 'failed')
             self.assertEqual(event.refusal, 'missing')
             self.assertNotIn(TOKEN, json.dumps(event.as_dict()))
+
+    def test_secret_transport_failure_retries_then_returns_result(self):
+        from ameesh.storage.postgres.sandbox import _canonical
+        job = self.create()
+        row = self.supervisor_row(job)
+        row.update(scope={'repository': 'example/repo', 'pr': 1, 'head': 'a' * 40},
+                   scope_digest='scope-digest', source={'contract': 'ameesh-sandbox/1'},
+                   limits=dict(turns=1, tool_calls=10, seconds=60, model_calls=10,
+                               session='none', tools=[], capabilities=[]))
+        result = dict(schema='ameesh-sandbox-result/1', turn_id=row['turn_id'],
+            epoch=row['lease_epoch'], scope=row['scope'], scope_digest=row['scope_digest'],
+            result_id='result-1', outcome='accepted', verdict='green', findings=[], evidence=[],
+            usage=dict(turns=1, tool_calls=1, seconds=2, model_calls=1),
+            cost={'usd': 0.01}, sandbox_session=None, source=row['source'],
+            finished_at='2026-10-31T12:00:00Z')
+        self.server.state['jobs'][job.name]['status'] = {
+            'conditions': [{'type': 'Complete', 'status': 'True'}]}
+        self.server.state['log'] = json.dumps(result)
+        self.pod(json.dumps({'result_sha256': _canonical(result)[1]}))
+        supervisor = SandboxSupervisor(self.provider, lambda event: None,
+                                       orphan_after=10, clock=lambda: 100)
+        for status, refusal, skip in ((503, 'unavailable', 0), (503, 'unavailable', 2),
+                                     (403, 'forbidden', 0), (403, 'forbidden', 2)):
+            with self.subTest(status=status, earlier_secret_reads=skip):
+                self.server.state['failure_skip'] = skip
+                self.server.state['failures'] = [('GET', '/secrets/' + job.name, status)]
+                event = supervisor.step(row, self.spec)
+                self.assertEqual(event.kind, 'retry')
+                self.assertEqual(event.refusal, refusal)
+                event = supervisor.step(row, self.spec)
+                self.assertEqual(event.kind, 'result')
+                self.assertEqual(event.result, result)
+                self.assertFalse(any(c[0] == 'DELETE' for c in self.server.state['calls']))
 
     def test_prompt_is_valid_output_but_relay_token_is_neutralized(self):
         job = self.create()
