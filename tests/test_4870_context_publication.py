@@ -544,6 +544,10 @@ class TurnContextEventTest(PgTestCase):
         self.assertEqual(data["model"], "deepseek-flash")
         self.assertEqual(data["mode"], "non-resident")
         self.assertEqual(data["role"], "build")
+        # L'absence de compaction est explicite : le rejeu peut juger la
+        # fenêtre au lieu de rester aveugle.
+        self.assertIs(data["decision"]["compacted"], False)
+        self.assertIsNone(data["context"]["compaction"])
 
     def test_profil_claude_porte_la_fenetre_annoncee(self):
         # Claude annonce son modèle (`system/init`) et sa fenêtre
@@ -592,6 +596,23 @@ class TurnContextEventTest(PgTestCase):
         self.assertEqual(profile["window_quality"], "unknown")
         self.assertIn("window_unknown", profile["reasons"])
         self.assertEqual(data["model"], "gpt-6.1-sol")
+        self.assertIs(data["decision"]["compacted"], False)
+
+    def test_profil_claude_publie_la_compaction_native(self):
+        # Une frontière `compact_boundary` du fil principal est publiée avec
+        # ses jetons avant/après, et `decision.compacted` vaut vrai.
+        data = self._run(
+            "ctx-compact-claude", harness="claude",
+            env={"AMEESH_TEST_CLAUDE_MODEL": "claude-opus-5-5",
+                 "AMEESH_TEST_CLAUDE_MODEL_USAGE": json.dumps(
+                     {"claude-opus-5-5": {"contextWindow": 1_000_000}}),
+                 "AMEESH_TEST_CLAUDE_COMPACT": json.dumps(
+                     {"pre_tokens": 150_000, "post_tokens": 30_000})})
+        self.assertIs(data["decision"]["compacted"], True)
+        compaction = data["context"]["compaction"]
+        self.assertEqual(compaction["pre"], 150_000)
+        self.assertEqual(compaction["post"], 30_000)
+        self.assertEqual(compaction["quality"], "measured")
 
     def test_deuxieme_tour_reprend_le_cumul_de_session(self):
         self._run("ctx-deux", "1000,20000,100;500,22000,200")

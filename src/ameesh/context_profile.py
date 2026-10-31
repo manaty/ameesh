@@ -11,7 +11,8 @@ des décisions legacy :
 * ``window_tokens`` : la fenêtre runtime de ce modèle, jamais celle d'un
   modèle auxiliaire, d'un modèle précédent ou du catalogue ;
 * l'état d'une compaction native : ``pre``/``post``, ``partial`` quand le
-  harnais ne publie pas l'après (le contrat interdit d'inventer cet après) ;
+  harnais ne publie pas l'après (le contrat interdit d'inventer cet après),
+  publié dans ``turn.context.compaction`` ;
 * :func:`publish` : la section ``profile`` de ``turn.context`` (CTX-03b), qui
   ajoute au profil du tour le harnais et sa version, le mode et la classe de
   rôle du canon — pour un tour résident comme non résident.

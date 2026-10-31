@@ -19,7 +19,7 @@ import json
 import unittest
 from unittest import mock
 
-from ameesh import adapters, context_profile
+from ameesh import adapters, context_profile, resident_runner
 from tests.test_l81_resident_rotation import ResidentBench
 
 MAIN = {"contextWindow": 1_000_000}
@@ -204,6 +204,20 @@ class ClaudeModelUsageTest(unittest.TestCase):
             {"claude-opus-5-5": MAIN}, announced=parsed["model"])
         self.assertEqual(observed.window_tokens, 1_000_000)
 
+    def test_main_thread_compact_boundary_is_exposed(self):
+        parsed = self.reader.parse_event({
+            "type": "system", "subtype": "compact_boundary", "session_id": "s",
+            "compact_metadata": {"pre_tokens": 150_000, "post_tokens": 30_000}})
+        self.assertEqual(parsed["compaction"]["compact_metadata"]["post_tokens"],
+                         30_000)
+
+    def test_subagent_compact_boundary_is_ignored(self):
+        parsed = self.reader.parse_event({
+            "type": "system", "subtype": "compact_boundary",
+            "parent_tool_use_id": "tool-1",
+            "compact_metadata": {"pre_tokens": 1, "post_tokens": 1}})
+        self.assertNotIn("compaction", parsed)
+
 
 class PublicationPayloadTest(unittest.TestCase):
     """Le profil reste dans le document `ameesh-context/1` publié."""
@@ -244,6 +258,13 @@ class PublicationPayloadTest(unittest.TestCase):
 class ResidentProfileEventTest(ResidentBench):
     """Un tour résident publie le profil du driver et les faits du tour."""
 
+    def _latest(self) -> dict:
+        rows = self.db.query(
+            "select data from ameesh_events where type = %s"
+            " order by id desc limit 1", ("turn.context",))
+        self.assertTrue(rows, "aucun événement turn.context publié")
+        return rows[0]["data"]
+
     def test_resident_turn_publishes_mode_role_and_window(self):
         self.db.execute(
             "insert into harness_versions (host, harness, path, version, raw)"
@@ -253,11 +274,7 @@ class ResidentProfileEventTest(ResidentBench):
         _runner, worker = self._worker(name="ctx-profil-resident")
         with mock.patch.dict("os.environ", {"FAKE_CLAUDE_WINDOW": "1000000"}):
             self.assertTrue(self._turn(worker, "profil resident"))
-        rows = self.db.query(
-            "select data from ameesh_events where type = %s"
-            " order by id desc limit 1", ("turn.context",))
-        self.assertTrue(rows, "aucun événement turn.context publié")
-        data = rows[0]["data"]
+        data = self._latest()
         profile = data["context"]["profile"]
         self.assertEqual(profile["model_effective"], "fake-model")
         self.assertEqual(profile["model_quality"], "measured")
@@ -270,6 +287,27 @@ class ResidentProfileEventTest(ResidentBench):
         self.assertEqual(profile["role"], "build")
         self.assertEqual(data["mode"], "resident")
         self.assertEqual(data["role"], "build")
+        self.assertIs(data["decision"]["compacted"], False)
+        self.assertIsNone(data["context"]["compaction"])
+
+    def test_resident_compaction_is_true_then_reset_next_turn(self):
+        with mock.patch.dict("os.environ", {"FAKE_CLAUDE_CONTEXT": "600",
+                                            "FAKE_CLAUDE_WINDOW": "1000"}):
+            _runner, worker = self._worker(name="ctx-compact-resident",
+                                           resident_reread_max="0")
+            self.assertTrue(self._turn(worker, "premier"))
+            self.assertEqual(worker._resident_maintenance(),
+                             resident_runner.COMPACT)
+            self.assertTrue(worker.maybe_rotate())
+            data = self._latest()
+            self.assertIs(data["decision"]["compacted"], True)
+            self.assertEqual(data["context"]["compaction"]["pre"], 600)
+            self.assertEqual(data["context"]["compaction"]["post"], 120)
+            # La compaction est un fait du tour : le suivant ne la rejoue pas.
+            self.assertTrue(self._turn(worker, "deux"))
+            data = self._latest()
+            self.assertIs(data["decision"]["compacted"], False)
+            self.assertIsNone(data["context"]["compaction"])
 
 
 if __name__ == "__main__":

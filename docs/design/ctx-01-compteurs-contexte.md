@@ -401,6 +401,14 @@ rôle suivant pour se fabriquer une politique).
 * **Pas de compaction en cours de tour non résident** : Claude/DeepSeek/ACP
   peuvent seulement clôturer au point sûr ; Codex non-résident n'a aucune
   mesure par appel, donc aucune décision de compaction en cours de tour.
+* **Publication** : `turn.context.compaction` porte la compaction native
+  observée du tour (`pre`, `post`, `quality`, `reasons`, `trigger`) ; le
+  runner la publie pour un tour résident (le driver) comme non résident
+  (`compact_boundary` du flux principal). `decision.compacted` vaut `true`
+  quand elle est observée, `false` quand le tour n'a pas compacté — une
+  compaction demandée par la politique n'est pas une réussite (§4.2). Le
+  `false` explicite est ce qui permet au rejeu de juger la fenêtre ; `null`
+  reste réservé au tour dont la mesure est perdue.
 
 ---
 

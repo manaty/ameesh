@@ -779,6 +779,9 @@ class ResidentDriver:
                 duration_s=round(time.monotonic() - current.started, 3),
                 compact=dict(self._compact) if self._compact else None,
                 profile=self._profile.to_dict() if self._profile is not None else {})
+            # CTX-03b : une compaction est un fait du tour ; la garder ferait
+            # publier `compacted=true` au tour suivant, qui n'a pas compacté.
+            self._compact = None
             self._turn = None
             self._followups.clear()
             self._unconfirmed.clear()

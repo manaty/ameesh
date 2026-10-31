@@ -5021,6 +5021,10 @@ class AgentWorker(threading.Thread):
                 # restent lisibles à côté.
                 "close": _sans_raison(self._turn_close_observation),
                 "rotation": _sans_raison(self._last_rotation_observation),
+                # CTX-03b : `false` explicite quand le tour n'a pas compacté
+                # (une demande n'est pas une réussite, contrat §4.2) ; le rejeu
+                # peut alors juger la fenêtre au lieu de rester aveugle.
+                "compacted": document.get("compaction") is not None,
             }
             if self.cfg.window_maintenance_share > 0:
                 decision["window"] = self._window_decision(self.resident)
@@ -8337,10 +8341,11 @@ class AgentWorker(threading.Thread):
             events_start = 0
         session_new: str | None = None
         modele_annonce = ""  # modèle annoncé par le flux du harnais (L13 B4)
-        #: CTX-03b : `modelUsage` runtime du fil principal (Claude), collecté
-        #: sur le même flux que les compteurs ; le profil résident, lui, vient
-        #: du driver.
+        #: CTX-03b : `modelUsage` et frontière de compaction du fil principal
+        #: (Claude), collectés sur le même flux que les compteurs ; le profil
+        #: résident, lui, vient du driver.
         model_usage = None
+        compaction_event = None
         cost: float | None = None
         error: str | None = None
         result_code = 0
@@ -8728,6 +8733,10 @@ class AgentWorker(threading.Thread):
                         # principal donne le profil du tour (R1 : jamais la
                         # première entrée d'un `modelUsage` auxiliaire).
                         model_usage = parsed["model_usage"]
+                    if isinstance(parsed.get("compaction"), dict):
+                        # CTX-03b : frontière de compaction native du fil
+                        # principal ; un sous-agent n'en publie pas.
+                        compaction_event = parsed["compaction"]
                     try:
                         normalizer.observe(parsed)
                     except Exception as exc:  # noqa: BLE001 — observation seule
@@ -9025,6 +9034,18 @@ class AgentWorker(threading.Thread):
                 self._context_profile_observed = observed
                 self._context_profile_mode = (
                     "resident" if rp is not None else "non-resident")
+                # CTX-03b : la compaction native du tour, résidente (driver)
+                # ou non résidente (`compact_boundary` du flux). Absente, le
+                # document la garde à None et la décision dit `compacted=false`
+                # explicitement, pour que le rejeu ne suppose rien.
+                resident_compact = getattr(fin_resident, "compact", None)
+                if isinstance(resident_compact, dict):
+                    compaction = dict(resident_compact)
+                elif compaction_event is not None:
+                    compaction = context_profile.compaction(compaction_event).to_dict()
+                else:
+                    compaction = None
+                document["compaction"] = compaction
                 self._context_observation = document
                 self._remember_context_session(document, session_new or session)
                 self._window_measure_keep(

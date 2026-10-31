@@ -12,9 +12,12 @@ Travail de fond : AMEESH_TEST_BACKGROUND (commande shell lancée en fond, dans
 le groupe du tour, que le harnais n'attend pas) et AMEESH_TEST_BACKGROUND_PID
 (fichier où écrire son pid). L217b : AMEESH_TEST_CLAUDE_ON_TERM (JSON : un
 appel du fil principal émis à la réception de SIGTERM, donc lu après la
-clôture du tour, comme un appel encore en tampon). #1270 :
-AMEESH_TEST_STDERR (texte écrit sur le stderr du harnais, canal fournisseur
-distinct du résultat libre).
+clôture du tour, comme un appel encore en tampon). CTX-03b :
+AMEESH_TEST_CLAUDE_MODEL (modèle annoncé par `system/init`),
+AMEESH_TEST_CLAUDE_MODEL_USAGE (JSON `modelUsage` du `result`) et
+AMEESH_TEST_CLAUDE_COMPACT (JSON `compact_metadata` d'une frontière de
+compaction). #1270 : AMEESH_TEST_STDERR (texte écrit sur le stderr du
+harnais, canal fournisseur distinct du résultat libre).
 """
 import json
 import os
@@ -117,6 +120,13 @@ def main() -> int:
     if os.environ.get("AMEESH_TEST_CLAUDE_MODEL"):
         initial["model"] = os.environ["AMEESH_TEST_CLAUDE_MODEL"]
     print(json.dumps(initial), flush=True)
+    # CTX-03b : une frontière de compaction native du fil (comme le vrai
+    # `system/compact_boundary`), quand le témoin la fournit.
+    compact = os.environ.get("AMEESH_TEST_CLAUDE_COMPACT")
+    if compact:
+        print(json.dumps({"type": "system", "subtype": "compact_boundary",
+                          "session_id": session,
+                          "compact_metadata": json.loads(compact)}), flush=True)
     if os.environ.get("AMEESH_TEST_CLAUDE_ON_TERM"):
         tampon = json.loads(os.environ["AMEESH_TEST_CLAUDE_ON_TERM"])
 
