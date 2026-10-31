@@ -499,7 +499,8 @@ _MARKER = re.compile(r"--\s*ameesh\s*:\s*non[- ]additive", re.IGNORECASE)
 _PRIVILEGES_CHECKED_AFTER = 528
 _REVOKE = re.compile(r"\brevoke\b[^;]*?\bon\s+(?:(table|function|sequence)\s+)?([\w.\"]+)"
                      r"\s*(\([^)]*\))?\s*(from\b)?|\brevoke\b")
-_DOLLAR_QUOTED = re.compile(r"\$(\w*)\$.*?\$\1\$")
+#: toute chaîne SQL : un CREATE qu'elle contient n'est pas forcément exécuté
+_SQL_STRING = re.compile(r"\$(\w*)\$.*?\$\1\$|\be'(?:[^'\\]|\\.|'')*'|'(?:[^']|'')*'")
 _ALTER_TABLE = re.compile(r"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)\s[^;]*")
 _ADD_CONSTRAINT = re.compile(r"\badd\s+constraint\s+([\w\"]+)")
 #: le texte ne dit pas si une contrainte élargit ou resserre : celle qui ne
@@ -543,11 +544,12 @@ def _param_types(params: str, *, named: bool) -> list[str]:
 
 
 def _proven_new(text: str, kind: str, name: str, signature: str = "") -> bool:
-    """`name` est-il prouvé neuf ? Seul un CREATE nu, hors corps conditionnel,
+    """`name` est-il prouvé neuf ? Seul un CREATE nu, hors chaîne SQL,
     échoue sur un objet existant : `or replace`, `if not exists`, un drop
-    préalable et une autre surcharge laissent au code d'avant son objet."""
+    préalable, une chaîne non exécutée et une autre surcharge laissent au code
+    d'avant son objet."""
     quoted = re.escape(name) + r"(?![\w.\"])"
-    outside = _DOLLAR_QUOTED.sub(" ", text)
+    outside = _SQL_STRING.sub(" ", text)
     kinds = {"table": r"table|view|materialized\s+view|sequence", "function": "function",
              "sequence": "sequence"}[kind]
     if re.search(r"\bdrop\s+(?:%s)\s+(?:if\s+exists\s+)?%s" % (kinds, quoted), outside):

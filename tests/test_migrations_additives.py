@@ -36,7 +36,8 @@ class NonAdditiveTest(unittest.TestCase):
             "create function f(a text, b timestamptz default now()) returns int language sql"
             " as $$select 1$$; revoke all on function f(text, timestamptz) from public;"
             " grant execute on function f(text, timestamptz) to r;",
-            "create table u (id bigint); revoke insert on table u from public;",
+            "create table u (id bigint, c text default 'x');"
+            " revoke insert on table u from public;",
             "alter table t add column revoked_at timestamptz;",
             "drop view if exists v; create view v as select * from t;",
             "drop trigger if exists g on t; create trigger g after insert on t "
@@ -79,6 +80,10 @@ class NonAdditiveTest(unittest.TestCase):
             ("create table f (id bigint); revoke all on function f() from r;", "revoke on f"),
             ("do $$ begin if false then create table t (id bigint); end if; end $$;"
              " revoke insert on t from app;", "revoke on t"),
+            ("do 'begin if false then create table t (id bigint); end if; end';"
+             " revoke insert on t from app;", "revoke on t"),
+            ("do e'it\\'s create table t (id bigint);'; revoke insert on t from app;",
+             "revoke on t"),
             ("alter table t add constraint k check (c > 0);", "add constraint k"),
             ("alter table t drop constraint k; alter table t add constraint k check (c > 0);",
              "add constraint k"),
