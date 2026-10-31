@@ -549,18 +549,21 @@ def footprint_release_note(blockers: Iterable[dict], *, at: float) -> str:
 def footprint_episode(events: Iterable[dict]) -> dict:
     """L'épisode d'attente d'empreinte porté par le journal du lot (#4561).
 
-    Rend `{open, ids, released_ts}` : `open` (le dernier fait est une ouverture
-    ou un changement, aucune clôture depuis), `ids` l'UNION des bloqueurs
-    nommés dans l'épisode et `released_ts` l'instant de clôture du dernier
-    épisode.
+    Rend `{open, ids, last_ids, released_ts}` : `open` (le dernier fait est une
+    ouverture ou un changement, aucune clôture depuis), `ids` l'UNION des
+    bloqueurs nommés dans l'épisode, `last_ids` ceux de sa dernière note et
+    `released_ts` l'instant de clôture du dernier épisode.
 
-    C'est l'union, jamais la seule dernière note : un ensemble qui revient
-    (`{A, B}`, puis `{B}`, puis `{A, B}`) ne réécrit pas la note `{A, B}` ;
-    garder la dernière note perdrait A, et la levée serait datée sur B, avant
-    la vraie libération (B1 de cx2 sur 1f182041f). La clôture, elle, est datée
-    une seule fois et ne bouge plus (P1 de cx1 sur b8d7a9901)."""
+    La levée se date sur l'union, jamais sur la seule dernière note : après
+    `{A, B}` puis `{B}`, garder la dernière note perdrait A, et la levée serait
+    datée sur B, avant la vraie libération (B1 de cx2 sur 1f182041f). Le
+    changement d'ensemble se compare à `last_ids`, jamais à l'union : dès qu'un
+    bloqueur sort, l'union ne redevient plus égale à l'ensemble courant et
+    chaque passe réécrirait la note (#5115). La clôture, elle, est datée une
+    seule fois et ne bouge plus (P1 de cx1 sur b8d7a9901)."""
     opened = False
     ids: set = set()
+    last_ids: set = set()
     released = None
     ordered = sorted(events or (),
                      key=lambda ev: (float(ev.get("created_ts") or 0.0),
@@ -578,10 +581,12 @@ def footprint_episode(events: Iterable[dict]) -> dict:
                 ids = set()
                 opened = True
             ids.update(found)
+            last_ids = found
         elif note.startswith(FOOTPRINT_RELEASE_NOTE) and opened:
             opened = False
             released = float(at)
-    return {"open": opened, "ids": sorted(ids), "released_ts": released}
+    return {"open": opened, "ids": sorted(ids), "last_ids": sorted(last_ids),
+            "released_ts": released}
 
 
 def _footprint_exact_release(named: Iterable[int],
