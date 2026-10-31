@@ -2588,19 +2588,46 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
 
 
 _SAVEPOINT = "ameesh_review_designation"
+#: #5136 : la levée du sommeil dans la reprise a son propre point de retour,
+#: pour ne pas se confondre avec celui du gel.
+_WAKE_SAVEPOINT = "ameesh_review_designation_wake"
+#: #5136 : point de retour d'un appel isolé de la levée (lecture ou levée).
+_GUARD_SAVEPOINT = "ameesh_review_designation_guard"
 
 
-def _savepoint(tx) -> None:
-    tx.execute("SAVEPOINT " + _SAVEPOINT)
+def _savepoint(tx, name: str = _SAVEPOINT) -> None:
+    tx.execute("SAVEPOINT " + name)
 
 
-def _release(tx) -> None:
-    tx.execute("RELEASE SAVEPOINT " + _SAVEPOINT)
+def _release(tx, name: str = _SAVEPOINT) -> None:
+    tx.execute("RELEASE SAVEPOINT " + name)
 
 
-def _rollback(tx) -> None:
-    tx.execute("ROLLBACK TO SAVEPOINT " + _SAVEPOINT)
-    tx.execute("RELEASE SAVEPOINT " + _SAVEPOINT)
+def _rollback(tx, name: str = _SAVEPOINT) -> None:
+    tx.execute("ROLLBACK TO SAVEPOINT " + name)
+    tx.execute("RELEASE SAVEPOINT " + name)
+
+
+def _guarded(tx, call, default):
+    """Run `call` in its own savepoint, returning `default` when it fails.
+
+    #5136 : les appels de `_wake_sleeping_reviewers` promettent qu'une lecture
+    ou une levée impossible laisse la désignation « comme avant ». Leurs
+    `except` avalent bien l'exception, mais sous PostgreSQL une instruction en
+    échec avorte la transaction : tout ce qui suit échoue. `RELEASE` est
+    refusé dans une transaction avortée, il sert donc de sonde ; un échec
+    revient au point de retour et rend la transaction utilisable. Sous psql la
+    première erreur ferme la session et rien ne peut être rattrapé : l'erreur
+    remonte alors, comme avant ce correctif.
+    """
+    _savepoint(tx, _GUARD_SAVEPOINT)
+    try:
+        out = call()
+        _release(tx, _GUARD_SAVEPOINT)
+    except Exception:
+        _rollback(tx, _GUARD_SAVEPOINT)
+        return default
+    return out
 
 
 def _internal_failure(cfg, tx, item: Mapping, freeze: Mapping, threads: list,
@@ -2790,6 +2817,13 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
     dormeurs y sont remplacées par leur version réveillée. Reconstruire tout le
     registre perdrait ce retrait et pourrait redésigner un siège retiré
     (B1 des avis cx3 et auditeur du 31/10 sur #5129).
+
+    #5136 : la prévision reprend les sièges que la sélection réelle couvre déjà
+    comme acquis (``automatic``) : elle ne classe donc que les sièges
+    manquants, et un second relecteur d'une famille déjà pourvue ne peut plus
+    passer devant celui de la famille absente. Chaque lecture et chaque levée
+    est isolée dans un point de retour (``_guarded``) : une erreur SQL avalée
+    par un ``except`` ne laisse pas la transaction avortée.
     """
     from . import file_decoupage as fd
 
@@ -2812,18 +2846,25 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
     # Les sièges déjà acquis de CE gel (une attente partielle les garde).
     previous: list = []
     try:
-        existing = pg.PgPort(tx).recorded(lot, int(freeze.get("id") or 0))
+        # #5136 : une marque illisible ne doit pas avorter la transaction de
+        # la reprise ; la lecture est isolée dans son point de retour.
+        existing = _guarded(
+            tx, lambda: pg.PgPort(tx).recorded(lot, int(freeze.get("id") or 0)),
+            None)
     except Exception:  # noqa: BLE001 - marque illisible : rien n'est repris
-        existing = None
+        return inputs
     if existing is not None and existing.get("state") == rd.WAITING:
         previous = [dict(row) for row in existing.get("reviewers") or ()
                     if isinstance(row, Mapping)
                     and str((row or {}).get("name") or "").strip() not in excluded]
     try:
-        listing = registry.overview(tx)
-        loads = _loads(tx)
-        closed = alert_briefs.claims_closed_hosts(tx)
+        listing, loads, closed = _guarded(
+            tx, lambda: (registry.overview(tx), _loads(tx),
+                         alert_briefs.claims_closed_hosts(tx)),
+            (None, None, None))
     except Exception:  # noqa: BLE001 - lecture impossible : aucune levée
+        return inputs
+    if listing is None:
         return inputs
     # Le vivier du gel, avec les seuls dormeurs que ce chemin peut lever : la
     # pause exacte du sommeil automatique de ce projet, dont la levée rendrait
@@ -2873,11 +2914,16 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
             if key in sleeping and key in shadow_by_name:
                 shadow_by_name[key] = candidate
         shadow = list(shadow_by_name.values())
+        # #5136 : la prévision reprend les sièges que la sélection réelle
+        # couvre déjà (`current`) comme sièges acquis. Elle ne classe donc que
+        # les sièges réellement manquants : un second relecteur d'une famille
+        # déjà pourvue ne peut plus passer devant celui de la famille absente
+        # et être levé pour rien.
         preview = rd.select(
             required=required, authors=inputs.authors, candidates=shadow,
             families=families, already=list(inputs.manual_seats),
             fixers=inputs.correctors, advances=inputs.advances,
-            automatic=previous)
+            automatic=list(current.get("reviewers") or ()))
     except Exception:  # noqa: BLE001 - pas de prévision : comportement d'avant
         return inputs
     if current.get("state") != rd.WAITING:
@@ -2895,8 +2941,12 @@ def _wake_sleeping_reviewers(tx, item: Mapping, freeze: Mapping,
                        for seat in preview.get("reviewers") or ()
                        if str((seat or {}).get("name") or "").strip() == name), "")
         try:
-            done = fd.wake_reviewer(tx, name, project, family=family,
-                                    for_lot=lot, freeze=freeze)
+            # #5136 : même point de retour que les lectures ; `RELEASE` sonde
+            # une transaction avortée par une erreur SQL avalée par la levée.
+            done = _guarded(
+                tx, lambda name=name, family=family: fd.wake_reviewer(
+                    tx, name, project, family=family, for_lot=lot, freeze=freeze),
+                {})
         except Exception:  # noqa: BLE001 - la pause reste, le gel attend
             continue
         if done.get("lifted"):
@@ -3887,8 +3937,17 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             # famille manquante, sinon le pilote doit encore la réveiller à
             # la main. Les sièges retirés de la colonne (#3617/#3661) restent
             # exclus de la prévision et du vivier final (B1 des avis du 31/10).
-            inputs = _wake_sleeping_reviewers(tx, item, freeze, inputs,
-                                              excluded=removed)
+            # #5136 : la levée a son point de retour dans la reprise, comme le
+            # gel ; une erreur qu'elle laisserait échapper revient en arrière
+            # au lieu d'avorter la désignation.
+            _savepoint(tx, _WAKE_SAVEPOINT)
+            try:
+                inputs = _wake_sleeping_reviewers(tx, item, freeze, inputs,
+                                                  excluded=removed)
+            except Exception:  # noqa: BLE001 - la désignation continue sans levée
+                _rollback(tx, _WAKE_SAVEPOINT)
+            else:
+                _release(tx, _WAKE_SAVEPOINT)
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
                                                 at_freeze=False, retired=removed),
                              force=force, reported=reported)
