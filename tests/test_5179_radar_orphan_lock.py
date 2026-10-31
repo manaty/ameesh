@@ -16,7 +16,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import exploitation, land, radar, resolutions
+from ameesh import exploitation, land, merge_queue, radar, resolutions
 
 from .test_l160b_radar import _git
 from .test_l160e2_land import _Land
@@ -163,6 +163,62 @@ class LandTest(_Clone):
         notes = [c.kwargs.get("note") for c in update.call_args_list]
         self.assertTrue([n for n in notes if n and n.startswith(land.FAILURE_NOTE + "lock ")
                          and n.endswith(":" + path)], notes)
+
+
+class FetchTest(_Clone):
+    """B1 de la relecture : `fetch_fresh` écrit `refs/ameesh/queue/**` hors du
+    verrou de clone."""
+
+    def queue_lock(self, clone: str, age: float) -> str:
+        return self.lock(clone, "refs/ameesh/queue/%s.lock" % self.fake.lots[4]["branch"], age=age)
+
+    def test_an_orphan_queue_ref_lock_no_longer_stops_the_fetch(self):
+        self.ready(4)
+        clone = self.clone()
+        path = self.queue_lock(clone, 3600.0)
+        replayer = resolutions.Replayer(self.repo, clone)
+        branch = self.fake.lots[4]["branch"]
+        tips, _where = merge_queue.fetch_fresh(self.repo, [branch], replayer)
+        self.assertEqual(tips[branch], self.tip(4))
+        self.assertFalse(os.path.exists(path))
+
+    def test_a_busy_clone_is_not_waited_for_and_keeps_the_lock(self):
+        self.ready(4)
+        clone = self.clone()
+        path = self.queue_lock(clone, 3600.0)
+        with open(clone + ".worktree.lock", "a+", encoding="utf-8") as other:
+            fcntl.flock(other.fileno(), fcntl.LOCK_EX)
+            resolutions.Replayer(self.repo, clone).sweep_locks()
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_kept_queue_ref_lock_is_noted_by_the_pass(self):
+        self.queued(4)
+        clone = radar.clone_dir(self.cfg, "p")
+        # une ref à déplacer : git ne prend pas le verrou d'une ref déjà à jour
+        _git(clone, "update-ref", "-d", "refs/ameesh/queue/" + self.fake.lots[4]["branch"])
+        path = self.queue_lock(clone, 30.0)
+        replayer = resolutions.Replayer(self.repo, clone)
+        with mock.patch.object(self.fake, "queue_update",
+                               wraps=self.fake.queue_update) as update:
+            merge_queue.run_pass(self.cfg, None, self.project, {"pairs": []},
+                                 replayer=replayer)
+        notes = [c.kwargs.get("note") for c in update.call_args_list]
+        self.assertTrue([n for n in notes if n and n.endswith(":" + path)], notes)
+        self.assertTrue(os.path.exists(path))
+
+
+class ParamTest(unittest.TestCase):
+    def test_a_malformed_value_keeps_the_default(self):
+        for raw in ("x", "0", "-5", "nan", "inf"):
+            with self.assertWarns(RuntimeWarning):
+                self.assertEqual(
+                    resolutions._git_lock_stale_s({"AMEESH_GIT_LOCK_STALE_S": raw}),
+                    resolutions.DEFAULT_GIT_LOCK_STALE_S)
+        with self.assertWarns(RuntimeWarning):
+            self.assertEqual(land._git_lock_alert_after({"AMEESH_GIT_LOCK_ALERT_AFTER": "x"}),
+                             land.DEFAULT_GIT_LOCK_ALERT_AFTER)
+        self.assertEqual(resolutions._git_lock_stale_s({"AMEESH_GIT_LOCK_STALE_S": "60"}), 60.0)
+        self.assertEqual(land._git_lock_alert_after({"AMEESH_GIT_LOCK_ALERT_AFTER": "5"}), 5)
 
 
 class AlertTest(unittest.TestCase):

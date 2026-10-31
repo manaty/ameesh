@@ -106,7 +106,26 @@ RETRY_NOTE = "land transient retry"
 #: `other` ; le journal, et non `reason`, que le radar réécrit (#2345)
 FAILURE_NOTE = "land failure: "
 #: #5179 : échecs consécutifs sur le même verrou git avant `merge_lock_stuck`
-GIT_LOCK_ALERT_AFTER = int(os.environ.get("AMEESH_GIT_LOCK_ALERT_AFTER", "3"))
+DEFAULT_GIT_LOCK_ALERT_AFTER = 3
+
+
+def _git_lock_alert_after(environ=None) -> int:
+    """La borne lue sans faire échouer l'import (#2371) ; mal formée ou inférieure
+    à 1 : le défaut, avec un avertissement."""
+    raw = (os.environ if environ is None else environ).get("AMEESH_GIT_LOCK_ALERT_AFTER", "")
+    if not raw.strip():
+        return DEFAULT_GIT_LOCK_ALERT_AFTER
+    try:
+        if int(raw) >= 1:
+            return int(raw)
+    except ValueError:
+        pass
+    warnings.warn("AMEESH_GIT_LOCK_ALERT_AFTER=%r is not a positive integer: using %d"
+                  % (raw, DEFAULT_GIT_LOCK_ALERT_AFTER), RuntimeWarning, stacklevel=2)
+    return DEFAULT_GIT_LOCK_ALERT_AFTER
+
+
+GIT_LOCK_ALERT_AFTER = _git_lock_alert_after()
 #: #5179 : au-delà sans nouvel échec, le blocage n'est plus tenu pour actuel
 GIT_LOCK_ALERT_FRESH_S = 3600.0
 _GIT_LOCK_ERROR = re.compile(r"'?(/[^'\n:]+\.lock)'?:? File exists")
@@ -1641,12 +1660,17 @@ def run_pass(cfg, db, project, report: dict, *, owner: str, locks=None, gh=_gh) 
 BLOCKED_AFTER_S = float(os.environ.get("AMEESH_MERGE_BLOCKED_MIN", "30")) * 60
 
 
-def _failure_note(error: str) -> str:
-    """#5179 : la cause d'un échec, comparable d'un passage à l'autre."""
+def lock_note(error: str) -> str | None:
+    """#5179 : la note d'un échec dû à un verrou git, sinon None."""
     found = _GIT_LOCK_ERROR.search(error)
     if found is None:
-        return FAILURE_NOTE + "other"
+        return None
     return "%slock %s:%s" % (FAILURE_NOTE, socket.gethostname(), found.group(1))
+
+
+def _failure_note(error: str) -> str:
+    """#5179 : la cause d'un échec, comparable d'un passage à l'autre."""
+    return lock_note(error) or FAILURE_NOTE + "other"
 
 
 def lock_stuck(db, now: float | None = None) -> list[dict]:
@@ -1658,7 +1682,7 @@ def lock_stuck(db, now: float | None = None) -> list[dict]:
     ops = storage.of(db).work
     out = []
     try:
-        rows = [r for r in ops.queue() if r["state"] == "queued"]
+        rows = [r for r in ops.queue() if r["state"] in ("queued", "landing")]
     except Exception:  # noqa: BLE001 - database without 0058
         return []
     for row in rows:

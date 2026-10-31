@@ -69,6 +69,7 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 from contextlib import contextmanager
 
 from . import migrations, plan_git, review_provenance, storage, work
@@ -1256,7 +1257,27 @@ def show_lines(rows: list[dict], lot: int) -> list[str]:
 #: #5179 : âge minimal (s) d'un verrou git du clone radar pour le dire orphelin.
 #: Bien au-delà de l'opération git la plus longue du clone (`FETCH_TIMEOUT`,
 #: 180 s), réglable par `AMEESH_GIT_LOCK_STALE_S`.
-GIT_LOCK_STALE_S = float(os.environ.get("AMEESH_GIT_LOCK_STALE_S", "900"))
+DEFAULT_GIT_LOCK_STALE_S = 900.0
+
+
+def _git_lock_stale_s(environ=None) -> float:
+    """L'âge lu sans faire échouer l'import (#2371) ; mal formé ou non positif :
+    le défaut, avec un avertissement."""
+    raw = (os.environ if environ is None else environ).get("AMEESH_GIT_LOCK_STALE_S", "")
+    if not raw.strip():
+        return DEFAULT_GIT_LOCK_STALE_S
+    try:
+        value = float(raw)
+        if 0 < value < float("inf"):
+            return value
+    except ValueError:
+        pass
+    warnings.warn("AMEESH_GIT_LOCK_STALE_S=%r is not a positive number: using %.0f"
+                  % (raw, DEFAULT_GIT_LOCK_STALE_S), RuntimeWarning, stacklevel=2)
+    return DEFAULT_GIT_LOCK_STALE_S
+
+
+GIT_LOCK_STALE_S = _git_lock_stale_s()
 #: suffixe de `radar.clone_dir` : seul un clone privé du radar est balayé, jamais
 #: un dépôt d'agent ni un clone jetable
 RADAR_CLONE_SUFFIX = ".clone"
@@ -1466,6 +1487,16 @@ class Replayer:
             yield
         finally:
             lock.release()
+
+    def sweep_locks(self) -> None:
+        """#5179 : le balayage de `locked`, pour une opération hors du verrou de
+        clone (`merge_queue.fetch_fresh`). Clone occupé : rien, sans attendre ; le
+        passage suivant balaie."""
+        try:
+            with self.locked(wait=0):
+                pass
+        except CloneBusy:
+            pass
 
     def ensure(self) -> None:
         with self.locked():
