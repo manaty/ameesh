@@ -108,11 +108,22 @@ class UndumpableWitnessTest(unittest.TestCase):
             "time.sleep(30)\n")
         start = platform.start_time(proc.pid)
         self.assertIsNotNone(start)
+        # The interpreter's name is the host's: a venv runs `.../bin/python`
+        # (comm "python"), the system one `python3`. `allow` matches both the
+        # `comm` and `argv[0]`, so take the real names from the live process
+        # instead of naming one host's binary (#5029, CI red on the head).
+        with open("/proc/%d/comm" % proc.pid, encoding="utf-8") as fh:
+            comm = fh.read().strip()
+        with open("/proc/%d/cmdline" % proc.pid, "rb") as fh:
+            argv0 = os.path.basename(
+                fh.read().split(b"\0", 1)[0].decode("utf-8", "replace"))
+        allow = tuple(dict.fromkeys(n for n in (comm, argv0) if n))
+        self.assertTrue(allow, "the helper has no readable process name")
         table = [{"pid": proc.pid, "start": start, "zombie": False}]
         with mock.patch.object(platform.process, "_psutil", return_value=None), \
                 mock.patch.object(platform.process, "process_table", return_value=table):
             without = platform.env_values("AMEESH_TEST_SECRET")
-            allowed = platform.env_values("AMEESH_TEST_SECRET", allow=("python3",))
+            allowed = platform.env_values("AMEESH_TEST_SECRET", allow=allow)
         self.assertIn(start, without["unread"])
         self.assertNotIn(start, allowed["unread"])
 
