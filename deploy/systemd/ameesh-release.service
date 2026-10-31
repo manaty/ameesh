@@ -20,6 +20,8 @@ Environment=PATH=%h/.local/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=%h/.config/ameesh/env
 # Optional: GH_TOKEN if `gh` has no session for this service.
 EnvironmentFile=-%h/.config/ameesh/release.env
+# Load the deployed package, never a stale release checkout from the environment.
+UnsetEnvironment=PYTHONPATH
 ExecStart=%h/.local/share/ameesh/venv/bin/ameesh release tick
 # A full staging sequence is bounded to two hours; the unit must not cut it.
 TimeoutStartSec=4h
