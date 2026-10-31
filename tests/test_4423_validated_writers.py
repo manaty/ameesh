@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Stored validation is derived from the exact-head review gate."""
+"""Stored validation is derived from the exact-head review gate (#4423, #5016)."""
 from unittest import mock
 
 from ameesh import progress, storage, work, work_lifecycle
@@ -112,4 +112,48 @@ class ValidatedWritersTest(PgTestCase):
         self.mark()
         self.assertEqual(self.current_state(), "validated")
         self.mark("frozen")
+        self.assertEqual(self.current_state(), "qa")
+
+    def test_concurrent_note_does_not_cancel_the_quorum(self):
+        # #5016 : une note concurrente ne change que `updated_at` ; la garde
+        # comparait la ligne entière et laissait le lot en qa à quorum acquis.
+        def note_during_gate(*args, **kwargs):
+            work.note(self.db, self.lot, "note concurrente", actor="writer")
+            return {"ok": True}
+        self.read.side_effect = note_during_gate
+        self.mark()
+        self.assertEqual(self.current_state(), "validated")
+
+    def test_manual_validation_survives_a_concurrent_note(self):
+        def note_during_gate(*args, **kwargs):
+            work.note(self.db, self.lot, "note concurrente", actor="writer")
+            return {"ok": True}
+        self.read.side_effect = note_during_gate
+        work.move(self.db, self.lot, "validated")
+        self.assertEqual(self.current_state(), "validated")
+
+    def test_concurrent_gate_input_still_invalidates_the_quorum(self):
+        # La garde ne doit pas s'affaiblir : un champ lu par la porte
+        # (l'assigné) change encore l'observation et annule la promotion.
+        def reassign_during_gate(*args, **kwargs):
+            self.db.execute(
+                "UPDATE work_items SET assignee = 'other', updated_at = now()"
+                " WHERE id = %s", (self.lot,))
+            return {"ok": True}
+        self.read.side_effect = reassign_during_gate
+        self.mark()
+        self.assertEqual(self.current_state(), "qa")
+
+    def test_concurrent_reviewer_designation_invalidates_the_quorum(self):
+        # #5016 (revue auditeur) : une désignation de relecteur retire la
+        # dispense `-none` en qa, sans jalon ; la porte calculée avec la
+        # dispense ne doit pas promouvoir le lot.
+        self.db.execute(
+            "UPDATE work_items SET reviewer = '-none' WHERE id = %s", (self.lot,))
+        def designate_during_gate(*args, **kwargs):
+            self.db.execute(
+                "UPDATE work_items SET reviewer = 'reader' WHERE id = %s", (self.lot,))
+            return {"ok": True}
+        self.read.side_effect = designate_during_gate
+        self.mark()
         self.assertEqual(self.current_state(), "qa")
