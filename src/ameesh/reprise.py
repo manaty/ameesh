@@ -244,13 +244,9 @@ def holders(path: str | None, session_id: str) -> list[dict]:
     Limite connue : Claude Code n'ouvre son journal que le temps d'une
     écriture ; une session interactive démarrée sans `--resume` n'est donc vue
     que si elle écrit au moment du contrôle.
-
-    #5029 : l'exécuteur est non-dumpable et ne tient jamais le journal d'une
-    session ; son refus de lire ses propres fichiers ne doit pas faire refuser
-    un `adopt`/`resume` (le bail vivant, lui, est contrôlé avant).
     """
     return platform.holders(path, session_id, exclude=platform.ancestry(),
-                            session=True, allow=platform.EXECUTOR_NAMES)
+                            session=True)
 
 
 def recently_modified(path: str | None) -> bool:

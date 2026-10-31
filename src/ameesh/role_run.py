@@ -842,6 +842,8 @@ def run(cfg, args) -> int:
                                else str(int(report["left_s"]))),
                     ENV_OWNER: str(report.get("owner") or ""),
                 })
+            from .platform.child_environment import execution_transport
+            env = execution_transport(env)
             if lease is not None:
                 code, lost = _run_under_lease(argv, env, lease, execution)
                 if lost:
@@ -921,6 +923,9 @@ def _split(argv: list[str]) -> tuple[list[str], list[str]]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .platform.child_environment import managed_entry
+    if not managed_entry():
+        return 1
     argv = sys.argv[1:] if argv is None else argv
     head, command = _split(argv)
     args = build_parser().parse_args(head)
