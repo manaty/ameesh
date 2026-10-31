@@ -24,7 +24,8 @@ queue:
    the cautious one. Days are LOCAL days, as everywhere in the roadmap
    (`roadmap.today`).
 5. **#5151**: a lot waiting on someone else (`qa`, `validated`,
-   `waiting_human`, `blocked`) gets its dates but does not move the queue;
+   `waiting_human`, `blocked`) gets its dates but does not move the queue
+   — except a `qa` lot whose assignee owes a fix (#5161);
    a priority 1 lot is placed before the lower priority ones, even in
    progress (whose remaining time moves after it).
 6. **A lot dated by a person** keeps its date and only takes its place in
@@ -80,9 +81,25 @@ def open_states() -> tuple:
 def waits_on_others(lot: dict) -> bool:
     """#5151: a lot waiting on someone else than its assignee (review,
     package or merge, decision, block — `WAITING_ON_OTHERS`, as the
-    `active_lots` of `operations.listing`, L165b) does not hold the queue."""
+    `active_lots` of `operations.listing`, L165b) does not hold the queue.
+    #5161: a `qa` lot whose assignee owes a fix (`fix_owed`, set by `build`
+    from `review_designation_activation.due_fixes`) waits on its assignee
+    and holds the queue."""
     from . import work_lifecycle
+    if lot.get("fix_owed"):
+        return False
     return lot.get("state") in work_lifecycle.WAITING_ON_OTHERS
+
+
+def _owed_fixes(db) -> set:
+    """#5161: the lots whose assignee owes a fix, from the one calculation
+    (`due_fixes`, #3288). Unreadable: none, the lots keep their state's
+    reading (waiting on others), as before #5161."""
+    from . import review_designation_activation as rda
+    try:
+        return {int(row["lot"]) for row in rda.due_fixes(db)}
+    except Exception:  # noqa: BLE001 - a dated queue is better than none
+        return set()
 
 
 def _p1(lot: dict) -> bool:
@@ -229,6 +246,8 @@ def build(db, *, assignee: str | None = None, now: float | None = None,
         lots += [l for l in st.work.items(state=state, assignee=assignee, limit=LOT_LIMIT)
                  if l.get("assignee")]
     plans = {int(p["id"]): p for p in st.roadmap.item_plans([int(l["id"]) for l in lots])}
+    owed = _owed_fixes(db) if any(waits_on_others(l) for l in lots) else set()
+    lots = [dict(l, fix_owed=True) if int(l["id"]) in owed else l for l in lots]
     queues: dict = {}
     for lot in lots:
         queues.setdefault(lot["assignee"], []).append(lot)
