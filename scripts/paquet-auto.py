@@ -192,6 +192,11 @@ INCLUSION_SCRIPT = "scripts/paquet-inclusion.py"
 LOCK_DIR = "ameesh-paquet-auto"
 #: #4329 : code de retour d'un refus « composition en cours »
 IN_PROGRESS_RC = 3
+#: #5084 : code de retour d'une tentative arrêtée par une pause posée après son
+#: départ (relue avant de pousser) : rien n'est poussé, tentative non décomptée
+PAUSED_RC = 4
+#: #5084 : sortie du lecteur de pause (Python du projet) quand la pause est active
+PAUSE_ACTIVE_EXIT = 10
 #: #3916 : les remises (`ameesh.resolutions.REF_PREFIX`) et leur copie locale
 REMISE_PREFIX = "refs/ameesh/resolutions/"
 REMISE_LOCAL = "refs/ameesh/paquet-auto/remise/"
@@ -222,6 +227,8 @@ TESTS_DONE_RE = re.compile(
 REFUSAL_RE = re.compile(r"\bgesture \w+ refused\b|GestureRefused")
 #: sortie de `--publish` sur une chaîne refusée : recomposer
 PUBLISH_REFUSED = 3
+#: #5084 : une source qui contient celle d'un lot écarté le porterait au paquet
+CONTAINS_DISCARDED_REASON = "contient un lot écarté, coupure suivante"
 #: un rouge local n'est retiré du paquet qu'une fois ; au-delà, un agent lit.
 MAX_RECOMPOSITIONS = 1
 #: #4304 : la ligne du manifeste poussé avant les tests par unité (relue par
@@ -363,6 +370,10 @@ class GitError(PaquetAutoError):
 
 class EpochLost(PaquetAutoError):
     """#4237 : un geste refusé par la garde d'époque (bail relevé)."""
+
+
+class PacketPaused(PaquetAutoError):
+    """#5084 : une pause de la cible posée pendant la tentative, relue avant de pousser."""
 
 
 class CarrierSettled(PaquetAutoError):
@@ -1454,13 +1465,91 @@ finally:
                     % _output(proc))
 
 
+def check_pause(worktree: Path, project: str, target: str) -> None:
+    """#5084 : relit la pause de la cible (`packet_pause`) avant de pousser.
+
+    Le tic lit la pause une fois, à son départ ; une tentative qui dure (tests
+    par unité) ignorait une pause posée ensuite. `project` vide (lancement à la
+    main, sans `--pause-project`) : aucune lecture. Une lecture illisible
+    arrête aussi la poussée : on ne pousse pas sur un état inconnu.
+    """
+    if not project:
+        return
+    code = """
+import sys
+from ameesh import config, db, packet_pause
+conn = None
+try:
+    conn = db.connect(config.load())
+    if conn is None:
+        raise RuntimeError("base absente pour relire la pause")
+    data = packet_pause.active(conn, project=sys.argv[1], target=sys.argv[2])
+    if data:
+        print(packet_pause.describe(data))
+        sys.exit(%d)
+finally:
+    if conn is not None:
+        conn.close()
+""" % PAUSE_ACTIVE_EXIT
+    proc = run_command([project_python(worktree), "-c", code, project, target],
+                       cwd=worktree, env=python_env(worktree), timeout=EPOCH_CHECK_TIMEOUT)
+    if proc.returncode == PAUSE_ACTIVE_EXIT:
+        raise PacketPaused("pause posée pendant la tentative, relue avant de "
+                           "pousser (%s %s) : rien n'est poussé"
+                           % (target, _decode(proc.stdout).strip()))
+    if proc.returncode:
+        raise PacketPaused("pause illisible avant de pousser : rien n'est poussé : %s"
+                           % _tail(_output(proc), 5))
+
+
+def discarded_sources(payload: dict, candidates: list[Candidate],
+                      lots) -> dict[int, str]:
+    """#5084 : la source de chaque lot écarté, quand la liste calculée la donne."""
+    by_lot = {candidate.lot: candidate.source for candidate in candidates}
+    for entry in payload.get("candidates") or []:
+        lot = int(entry.get("work_item") or 0)
+        source = str(entry.get("source") or entry.get("published_head") or "").strip()
+        if lot and source:
+            by_lot.setdefault(lot, source)
+    return {lot: by_lot[lot] for lot in lots if by_lot.get(lot)}
+
+
+def contained_discard(worktree: Path, source: str, head: str,
+                      removed: dict[int, str]) -> tuple[int, str] | None:
+    """#5084 : le lot écarté dont `source` contient la source, ou None.
+
+    Composer une telle source porterait au paquet les commits d'un lot que le
+    manifeste dit écarté (h-09 : #5038 écarté, #5077 gardé alors que sa tête
+    contient celle de #5038). Une source écartée déjà dans la tête composée
+    (cible ou unité précédente) n'ajoute rien ; une source absente du clone
+    n'est l'ancêtre d'aucune source présente.
+    """
+    for lot, gone in removed.items():
+        if rev(worktree, gone) is None:
+            continue
+        if git(worktree, "merge-base", "--is-ancestor", gone, head,
+               check=False).returncode == 0:
+            continue
+        if git(worktree, "merge-base", "--is-ancestor", gone, source,
+               check=False).returncode == 0:
+            return lot, gone
+    return None
+
+
 def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int,
                        *, compose_script: Path, record_package: bool,
                        expect_pushed: str = "",
+                       removed: dict[int, str] | None = None,
                        log=print, guard=None) -> Composition:
-    """Compose les candidats dans l'ordre ; un conflit est écarté, jamais résolu."""
+    """Compose les candidats dans l'ordre ; un conflit est écarté, jamais résolu.
+
+    `removed` (#5084) : lot → source des lots déjà écartés ; un candidat dont
+    la source en contient une est écarté à son tour, et un lot écarté ici
+    (conflit, contenance) s'y ajoute pour les candidats suivants.
+    """
     units: list[Unit] = []
     discarded: list[Discarded] = []
+    removed = dict(removed or {})
     for candidate in candidates:
         if guard is not None:
             guard()
@@ -1468,6 +1557,15 @@ def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int
         before = rev(worktree, "HEAD")
         if before is None:
             raise PaquetAutoError("worktree sans commit")
+        contained = contained_discard(worktree, candidate.source, before, removed)
+        if contained is not None:
+            lot, gone = contained
+            detail = ("sa source %s contient celle de #%d (%s), écarté"
+                      % (candidate.source[:12], lot, gone[:12]))
+            discarded.append(Discarded(candidate.lot, CONTAINS_DISCARDED_REASON, detail))
+            removed[candidate.lot] = candidate.source
+            log("écarté #%d : %s (%s)" % (candidate.lot, CONTAINS_DISCARDED_REASON, detail))
+            continue
         if git(worktree, "merge-base", "--is-ancestor", candidate.source, before,
                check=False).returncode == 0:
             discarded.append(Discarded(
@@ -1496,6 +1594,7 @@ def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int
             _abort_merge(worktree, before)
             detail = "fichiers : %s" % ", ".join(files) if files else ""
             discarded.append(Discarded(candidate.lot, "conflit, coupure suivante", detail))
+            removed[candidate.lot] = candidate.source
             log("écarté #%d : conflit, coupure suivante%s"
                 % (candidate.lot, (" (%s)" % detail) if detail else ""))
             continue
@@ -1520,6 +1619,7 @@ def compose_candidates(worktree: Path, candidates: list[Candidate], carrier: int
 def recompose(worktree: Path, base_sha: str, candidates: list[Candidate],
               carrier: int, *, compose_script: Path, record_package: bool,
               expect_pushed: str = "",
+              removed: dict[int, str] | None = None,
               log=print, guard=None) -> Composition:
     """Repart de la base exacte et recompose, sans les unités fautives."""
     if guard is not None:
@@ -1530,6 +1630,7 @@ def recompose(worktree: Path, base_sha: str, candidates: list[Candidate],
                               compose_script=compose_script,
                               record_package=record_package,
                               expect_pushed=expect_pushed,
+                              removed=removed,
                               log=log, guard=guard)
 
 
@@ -3853,6 +3954,7 @@ def publish_tested(args: argparse.Namespace) -> int:
             "paquet %s : fin publiée par scripts/paquet-auto.py --publish (#4237) "
             "sur la tête poussée %s, tests par unité d'origine verts (non rejoués) ; "
             "manifeste %s" % (args.name, head[:12], rel)), flush=True)
+        check_pause(worktree, getattr(args, "pause_project", "") or "", args.target)
         print(request_full_ci(worktree, args.carrier, head), flush=True)
         pr = ("PR #%d %s" % (pr_number, pr_url)) if pr_number else (pr_url or "PR non lue")
         mail = "\n".join([
@@ -3937,6 +4039,7 @@ def compose_packet(args: argparse.Namespace) -> int:
             guard()
         candidates, payload = compute_candidates(worktree, args.target,
                                                  base_sha, ready_out)
+        listed = list(candidates)
         errors = error_discards(payload)
         error_lots = {item.lot for item in errors}
         # #3845/#4201 : un lot retiré sur un rouge de ci-full (paquet-horaire.py,
@@ -4012,11 +4115,15 @@ def compose_packet(args: argparse.Namespace) -> int:
         if not compose_script.is_file():
             raise PaquetAutoError("%s absent de l'arbre %s"
                                   % (COMPOSE_SCRIPT, worktree))
+        # #5084 : une unité qui contient un lot écarté le porterait au paquet
+        removed_sources = discarded_sources(
+            payload, listed, [item.lot for item in errors])
         composition = compose_candidates(
             worktree, candidates, args.carrier,
             compose_script=compose_script,
             record_package=not args.no_packet_record,
-            expect_pushed=remote_sha or "", guard=guard)
+            expect_pushed=remote_sha or "", removed=removed_sources,
+            guard=guard)
         if not composition.units:
             print("aucune unité composée : %s"
                   % ", ".join("#%d (%s)" % (item.lot, item.reason)
@@ -4114,6 +4221,8 @@ def compose_packet(args: argparse.Namespace) -> int:
                             "PR de %s %s pendant les tests par unité : la "
                             "recomposition n'est pas poussée, un agent lit"
                             % (branch, state.lower()))
+                check_pause(worktree, getattr(args, "pause_project", "") or "",
+                            args.target)
                 push_branch(worktree, branch, force_lease=lease)
                 print("poussée : %s%s" % (branch, " (recomposition)"
                                           if lease else ""), flush=True)
@@ -4205,13 +4314,17 @@ def compose_packet(args: argparse.Namespace) -> int:
                 reasons.append(Discarded(removal.lot, reason, detail))
             print("recomposition : retrait de %s"
                   % ", ".join("#%d" % lot for lot in faulty), flush=True)
+            removed_sources.update(
+                (candidate.lot, candidate.source) for candidate in candidates
+                if candidate.lot in removed)
             candidates = [candidate for candidate in candidates
                           if candidate.lot not in removed]
             composition = recompose(
                 worktree, base_sha, candidates, args.carrier,
                 compose_script=compose_script,
                 record_package=not args.no_packet_record,
-                expect_pushed=lease or "", guard=guard)
+                expect_pushed=lease or "", removed=removed_sources,
+                guard=guard)
             composition.discarded = errors + composition.discarded + reasons
             # `--local` est une composition de contrôle : aucun courrier.
             failed: list[str] = []
@@ -4385,6 +4498,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="#4237 : avec --publish, le SHA complet de la tête "
                              "testée (marque `%s`) ; une réf qui en diffère est "
                              "refusée" % TESTED_MARK.strip())
+    parser.add_argument("--pause-project", default="", metavar="PROJET",
+                        help="#5084 : relire la pause de la cible de ce projet "
+                             "(`packet_pause`) avant de pousser ; une pause "
+                             "active arrête la tentative sans poussée (sortie %d)"
+                             % PAUSED_RC)
     parser.add_argument("--no-packet-record", action="store_true",
                         help="banc : ne pas lire/écrire la base (porteur, packet record)")
     args = parser.parse_args(argv)
@@ -4440,6 +4558,9 @@ def main(argv: list[str] | None = None) -> int:
     except CompositionBusy as error:
         print("paquet-auto : %s" % error, file=sys.stderr)
         return IN_PROGRESS_RC
+    except PacketPaused as error:
+        print("paquet-auto : %s" % error, file=sys.stderr)
+        return PAUSED_RC
     except PaquetAutoError as error:
         print("paquet-auto : %s" % error, file=sys.stderr)
         return 1

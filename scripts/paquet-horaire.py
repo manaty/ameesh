@@ -127,6 +127,9 @@ change de main la garde. `--await-announcement` transforme l’échéance en ale
 la pause reste jusqu’à `resume --source "auteur, date, message"` (canon §7). Pendant la pause, le tic ne fait aucun geste (ni
 migration ni composition) et le dit ; sans attente d’annonce, à l'échéance il
 reprend seul ; `resume` lève avant. Pose et levée sont dites au pilote et au bureau.
+Une tentative déjà partie relit la pause avant de pousser (#5084,
+`paquet-auto.py --pause-project`) : posée entre-temps, elle arrête la tentative
+sans poussée, notée « non concluant … pause », non décomptée.
 
 **Cohérence de version (#4473).** Le tic exécute le script de la cible exacte
 (`check_fresh`) ; `main()` met `src/` de ce même clone en tête de `sys.path`
@@ -681,7 +684,9 @@ def paquet_auto(ctx: Context, name: str, carrier: int, *,
     """
     cmd = [ctx.python, str(SCRIPT_DIR / "paquet-auto.py"), "--repo", str(ctx.repo),
            "--target", ctx.target, "--name", name, "--carrier", str(carrier),
-           "--pilot", ctx.pilot, "--from", ctx.actor]
+           "--pilot", ctx.pilot, "--from", ctx.actor,
+           # #5084 : la pause posée après le départ du tic est relue avant de pousser
+           "--pause-project", ctx.project]
     if publish:
         ref, _, sha = publish.rpartition("@")
         cmd += ["--publish", ref, "--publish-sha", sha]
@@ -1354,6 +1359,14 @@ def after_compose(ctx: Context, carrier: int, name: str, result: Result,
                                                        exclude=list(this.exclude),
                                                        only=only,
                                                        reasons=list(this.reasons)))
+    elif result.returncode == auto.PAUSED_RC:
+        # #5084 : pause posée pendant la tentative, relue avant de pousser ;
+        # rien n'est poussé, la tentative n'est pas décomptée (comme un refus
+        # de garde) et le tic qui suit la levée reprend.
+        ctx.note(carrier, "%s%s n=%d base=%s pause" % (
+            MARK_FENCED, step, this.n, this.base or "-"))
+        return "#%d : %s arrêtée par une pause posée pendant la tentative (%s)" % (
+            carrier, step, auto._tail(result.text, 1).strip())
     elif result.returncode == auto.IN_PROGRESS_RC:
         # #4329 : le verrou du paquet est vivant ; ce n'est pas un échec de
         # composition et le tic n'écrit ni marque d'échec ni courrier.
