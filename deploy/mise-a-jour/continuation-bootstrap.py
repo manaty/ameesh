@@ -23,7 +23,8 @@ def reference(backend, operation, previous, decision):
             or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}', previous) is None
             or type(decision) is not int or decision <= 0):
         raise b.BootstrapError('distinct previous operation and signed decision required')
-    old = backend.prepared(previous).bundle
+    previous_prepared = backend.prepared(previous)
+    old = previous_prepared.bundle
     new = backend.prepared(operation).bundle
     b.delegation.question(old); b.delegation.question(new)
     # This operation only adds the second transport. A runtime/account/policy
@@ -48,12 +49,34 @@ def reference(backend, operation, previous, decision):
                         scope_digest=scopes[step], bundle=old, ok=True)
         if receipt != expected:
             raise b.BootstrapError('previous bootstrap receipt mismatch')
+    # A start entry is written even for a refused mandate. It is provenance,
+    # not authority: authenticate the exact historical question and proof too.
+    decisions = b.signed.decisions
+    def signed_previous(identifier):
+        view = decisions.get(backend.db, identifier)
+        answer = (view or {}).get('answer') or {}
+        return (view is not None and view.get('state') == 'answered'
+                and view.get('needs_signature') is True and view.get('options') == b.OPTIONS
+                and view.get('question') == previous_prepared.question
+                and answer.get('channel') == 'signed' and answer.get('option') == 'install'
+                and decisions.match_option(view, answer.get('text') or '') == 'install'
+                and decisions.verify_proof(backend.db, view)[0])
+    if not signed_previous(decision):
+        raise b.BootstrapError('exact signed previous bootstrap decision required')
     # The append-only native journal connects these receipts to the old decision.
     entries = backend.gestes.entries()
     if not any(e.get('command') == 'install' and e.get('phase') == 'start'
                and e.get('operation') == previous and e.get('bundle_digest') == old['digest']
                and e.get('decision') == decision for e in entries):
         raise b.BootstrapError('previous signed install provenance unavailable')
+    # If this operation was also run with another genuine install mandate,
+    # replacing only one would leave an executable old enable. Refuse this
+    # ambiguous history; it needs an explicit multi-authority reconciliation.
+    others = {e.get('decision') for e in entries if e.get('command') == 'install'
+              and e.get('phase') == 'start' and e.get('operation') == previous
+              and e.get('bundle_digest') == old['digest'] and e.get('decision') != decision}
+    if any(type(identifier) is int and signed_previous(identifier) for identifier in others):
+        raise b.BootstrapError('multiple previous signed bootstrap decisions require reconciliation')
     return dict(version=1, operation=previous, decision=decision, digest=old['digest'],
                 journal_sha256=b.protocol.identity(record), code_sha256=backend.gestes.code)
 

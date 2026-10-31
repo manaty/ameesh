@@ -108,6 +108,25 @@ class SignedContinuationTest(fixture.Fixture, support.PgTestCase):
         self.assertFalse(self.root.joinpath('etc/ameesh-release/authorized_keys').exists())
         self.assertEqual(self.old_journal.read_bytes(), self.old_bytes)
 
+    def test_refused_start_cannot_bind_receipts_to_an_unrelated_signed_decision(self):
+        unrelated = self.ask('Approve an unrelated administrative scope', bootstrap.OPTIONS)
+        self.sign(unrelated)
+        with self.assertRaises(ValueError):
+            self.backend.install(self.old_operation, unrelated['id'])
+        with self.assertRaisesRegex(ValueError, 'signed previous'):
+            self.backend.continuation_question(self.operation, self.old_operation, unrelated['id'])
+        self.assertEqual(self.old_journal.read_bytes(), self.old_bytes)
+
+    def test_duplicate_genuine_old_authority_requires_explicit_reconciliation(self):
+        duplicate = self.ask(self.backend.prepared(self.old_operation).question, bootstrap.OPTIONS)
+        self.sign(duplicate)
+        self.system.is_ready = False
+        with self.assertRaises(ValueError):
+            self.backend.install(self.old_operation, duplicate['id'])
+        with self.assertRaisesRegex(ValueError, 'multiple previous'):
+            self.backend.continuation_question(self.operation, self.old_operation, self.old_decision)
+        self.assertFalse(self.root.joinpath('etc/ameesh-release/authorized_keys').exists())
+
     def test_revoked_signature_and_missing_old_reservation_refuse(self):
         self.sign()
         authority.revoke_key(self.db, 'fixture-owner')

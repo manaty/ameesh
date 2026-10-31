@@ -242,7 +242,12 @@ pas autorisation de continuation.
 L'ancien journal doit contenir les six premiers reçus natifs complets, avec
 éventuellement celui de validation ; il doit rester incomplet, sans intent
 d'activation. Un intent `validate` est permis. La chaîne append-only des gestes
-relie l'opération à la décision précédente. Avant chaque étape, la continuation
+relie l'opération à la décision précédente ; la question exacte et la preuve
+signée historique de celle-ci sont aussi vérifiées, sans exiger une fenêtre
+ancienne encore active. Une entrée de démarrage refusée ne vaut pas cette
+preuve. Plusieurs décisions signées pour la même ancienne opération demandent
+une réconciliation explicite : remplacer une seule laisserait une autre
+autorité d'activation possible. Avant chaque étape, la continuation
 vérifie que l'ancienne décision nomme la nouvelle comme remplaçante et que la
 nouvelle nomme l'ancienne, avec réponse `install` signée et preuve encore valide.
 Une demande en attente, une seule moitié du lien ou un ancien reçu modifié refuse.
