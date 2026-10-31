@@ -5,6 +5,7 @@ alter table agent_registry add column review_hold jsonb;
 create table work_review_withdrawals (
     work_item_id bigint not null references work_items(id) on delete cascade,
     reviewer text not null,
+    withdrawn boolean not null default true,
     primary key (work_item_id, reviewer)
 );
 
@@ -37,7 +38,7 @@ begin
           from unnest(coalesce(old.reviewers, '{}'::text[])) n
     loop
         perform ameesh_review_hold_check(spelling);
-        delete from work_review_withdrawals
+        update work_review_withdrawals set withdrawn = false
          where work_item_id = new.id and reviewer = spelling;
     end loop;
     for spelling in
@@ -48,7 +49,8 @@ begin
           from unnest(coalesce(new.reviewers, '{}'::text[])) n
     loop
         insert into work_review_withdrawals(work_item_id, reviewer)
-        values (new.id, spelling) on conflict do nothing;
+        values (new.id, spelling)
+        on conflict (work_item_id, reviewer) do update set withdrawn = true;
     end loop;
     return new;
 end $$;
@@ -64,7 +66,7 @@ begin
         perform id from work_items where id = new.work_item_id for no key update;
         perform ameesh_review_hold_check(new.actor);
         if exists (select 1 from work_review_withdrawals w
-                    where w.work_item_id = new.work_item_id
+                    where w.withdrawn and w.work_item_id = new.work_item_id
                       and w.reviewer = coalesce(ameesh_agent_primary_locked(new.actor), new.actor)) then
             raise exception 'verdict refused: % was withdrawn from lot %; designate again first',
                 new.actor, new.work_item_id;

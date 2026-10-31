@@ -4,6 +4,7 @@ from unittest import mock
 
 from ameesh import agent_review_hold, agent_rename, db as db_mod, registry, storage, work
 from ameesh import review_designation as rd, review_designation_activation as activation
+from ameesh import migrations
 from .support import PgTestCase
 
 HEAD = "a" * 40
@@ -78,6 +79,9 @@ class ReviewHoldTest(PgTestCase):
         self.assertEqual(kept["verdict"], "ok")
         self.seat()
         self.verdict()
+        self.seat(remove=True)
+        with self.assertRaisesRegex(db_mod.DbError, "withdrawn"):
+            self.verdict()
 
     def test_unsolicited_opinion_remains_possible(self):
         self.verdict()
@@ -157,3 +161,7 @@ class ReviewHoldTest(PgTestCase):
         with self.assertRaisesRegex(db_mod.DbError, "review hold"):
             storage.of(other).work.add_milestone(self.lot, "verdict", sha=HEAD,
                          actor="reader", verdict="ok", note="")
+
+    def test_migration_is_additive_for_the_staging_gate(self):
+        migration = next(m for m in migrations.discover() if m.name == "review_hold")
+        self.assertEqual(migrations.non_additive(migration), [])
