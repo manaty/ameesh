@@ -502,6 +502,9 @@ _REVOKE = re.compile(r"\brevoke\b[^;]*?\bon\s+(?:(table|function|sequence)\s+)?(
 _DOLLAR_TAG = re.compile(r"\$(?:[^\W\d]\w*)?\$")
 #: lu, comme _REVOKE, sur le texte sans chaînes : ses `;` et ses mots sont du code
 _ALTER_TABLE = re.compile(r"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)\s[^;]*")
+#: mots qui, dans une chaîne, peuvent être du code exécuté : la forme n'est plus simple
+_SENSITIVE = re.compile(r";|\b(?:revoke|grant|alter|add|create|drop|execute|constraint"
+                        r"|unique|primary|check|foreign|references)\b")
 _ADD_CONSTRAINT = re.compile(r"\badd\s+(?:constraint\s+([\w\"]+)"
                              r"|(primary\s+key|unique|check|foreign\s+key)\b)")
 #: le texte ne dit pas si une contrainte élargit ou resserre : celle qui ne
@@ -535,16 +538,18 @@ def non_additive(migration: Migration) -> list[str]:
     return reasons
 
 
-def _lex(sql: str) -> tuple[list[str], str]:
-    """(chaînes, texte sans commentaires ni chaînes), en une seule passe : le
-    délimiteur d'une chaîne ne se lit jamais dans un commentaire, ni l'inverse.
-    Un identifiant cité devient un jeton neutre : son contenu n'est pas du code
-    et sa casse ne survit pas aux minuscules. Une fin manquante garde le reste
-    pour commentaire ou chaîne : le CREATE qu'il contiendrait ne prouve rien."""
-    strings, code, at, size = [], [], 0, len(sql)
+def _lex(sql: str) -> tuple[list[str], str, bool]:
+    """(chaînes, texte sans commentaires ni chaînes, lecture sûre), en une seule
+    passe : le délimiteur d'une chaîne ne se lit jamais dans un commentaire, ni
+    l'inverse. Un identifiant cité devient un jeton neutre : son contenu n'est
+    pas du code et sa casse ne survit pas aux minuscules. La lecture n'est pas
+    sûre si un commentaire coupe une instruction ou si une fin manque."""
+    strings, code, at, size, sure = [], [], 0, len(sql), True
     while at < size:
         two = sql[at:at + 2]
         dollar = _DOLLAR_TAG.match(sql, at) if sql[at] == "$" else None
+        if two in ("--", "/*") and "".join(code).rsplit(";", 1)[-1].strip():
+            sure = False
         if two == "--":
             end = sql.find("\n", at)
             at = size if end < 0 else end
@@ -554,6 +559,7 @@ def _lex(sql: str) -> tuple[list[str], str]:
                 two = sql[at:at + 2]
                 depth += (two == "/*") - (two == "*/")
                 at += 2 if two in ("/*", "*/") else 1
+            sure = sure and not depth
             code.append(" ")
         elif dollar or sql[at] in "'\"":
             if dollar:
@@ -573,7 +579,9 @@ def _lex(sql: str) -> tuple[list[str], str]:
                         end += 2
                     else:
                         end += 1
+                sure = sure and end < size
                 end = min(end + 1, size)
+            sure = sure and not (dollar and closing < 0)
             if sql[at] == '"':
                 code.append('"_"')
             else:
@@ -582,7 +590,7 @@ def _lex(sql: str) -> tuple[list[str], str]:
         else:
             code.append(sql[at])
             at += 1
-    return strings, "".join(code)
+    return strings, "".join(code), sure
 
 
 def _param_types(params: str, *, named: bool) -> list[str]:
@@ -615,28 +623,32 @@ def _proven_new(code: str, kind: str, name: str, signature: str = "") -> bool:
 
 def _privilege_reasons(sql: str) -> list[str]:
     """Droits retirés et contraintes posées sur ce qui n'est pas prouvé neuf (#5055).
-    Une chaîne n'est pas analysée : un REVOKE ou un ADD de contrainte qu'elle
-    contient (DO, EXECUTE) suffit à classer la migration, sans chercher de preuve."""
+    Seule une migration de forme simple peut prouver un objet neuf (mesh-design,
+    #174729) : sans `$` ni DO, sans identifiant cité, sans commentaire dans une
+    instruction et sans mot sensible (EXECUTE compris) dans une chaîne. Ailleurs,
+    tout REVOKE et tout ADD de contrainte classent la migration, sans analyse."""
     def normal(value: str) -> str:
         return re.sub(r"\s+", " ", value.lower())
 
-    strings, code = _lex(sql)
+    strings, code, sure = _lex(sql)
     code, strings = normal(code), [normal(value) for value in strings]
+    simple = sure and not re.search(r"[$\"\\]", sql) \
+        and not re.search(r"\bdo\b", code) \
+        and not any(_SENSITIVE.search(value) for value in strings)
     reasons = []
-    if any(re.search(r"\brevoke\b", value) for value in strings):
-        reasons.append("privilege removed (revoke in a string, not analysed)")
+    if not simple and any(re.search(r"\brevoke\b", value) or (
+            re.search(r"\badd\b", value)
+            and re.search(r"\b(?:constraint|unique|primary|check|foreign)\b", value))
+            for value in strings):
+        reasons.append("privilege removed or constraint added in a string (not analysed)")
     for match in _REVOKE.finditer(code):
         kind, name, signature, single = match.groups()
-        if not (name and single and '"' not in name
+        if not (simple and name and single
                 and _proven_new(code, kind or "table", name, signature or "")):
             reasons.append("privilege removed (revoke%s)" % (" on " + name if name else ""))
     if not _CONSTRAINT_MARKER.search(sql):
-        for value in strings:
-            reasons.extend("constraint possibly tightened (add %s in a string, not analysed)"
-                           % (name and "constraint " + name or form)
-                           for name, form in _ADD_CONSTRAINT.findall(value))
         for statement in _ALTER_TABLE.finditer(code):
-            if '"' not in statement.group(1) and _proven_new(code, "table", statement.group(1)):
+            if simple and _proven_new(code, "table", statement.group(1)):
                 continue
             reasons.extend("constraint possibly tightened (add %s)"
                            % (name and "constraint " + name or form)

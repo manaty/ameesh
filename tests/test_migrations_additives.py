@@ -33,9 +33,13 @@ class NonAdditiveTest(unittest.TestCase):
             " alter table t add constraint t_c check (c > 0);",
             "alter table t drop constraint t_c;",
             "create table u (id bigint); alter table u add constraint k check (id > 0);",
+            # forme simple (#174729) : un objet neuf peut perdre un droit, recevoir une contrainte
             "create function f(a text, b timestamptz default now()) returns int language sql"
-            " as $$select 1$$; revoke all on function f(text, timestamptz) from public;"
+            " as 'select 1'; revoke all on function f(text, timestamptz) from public;"
             " grant execute on function f(text, timestamptz) to r;",
+            "create table n (id int); alter table n add unique (id);",
+            "-- en-tête\ncreate table n (id int);\n/* entre deux */ alter table n add unique (id);",
+            "alter table t add column c text default 'please add this';",
             "create table u (id bigint, c text default 'x');"
             " revoke insert on table u from public;",
             "alter table t add column revoked_at timestamptz;",
@@ -95,7 +99,7 @@ class NonAdditiveTest(unittest.TestCase):
             ("do $a$ create table t (id bigint); $b$ $a$; revoke insert on t from app;",
              "revoke on t"),
             ("do 'unterminated create table t (id bigint); revoke insert on t from app;",
-             "revoke in a string"),
+             "in a string (not analysed)"),
             ("alter table t add unique (c);", "add unique"),
             ("alter table t add primary key (c);", "add primary key"),
             ("alter table t add check (c > 0);", "add check"),
@@ -114,7 +118,7 @@ class NonAdditiveTest(unittest.TestCase):
             ("alter table t add column d text default ';', add foreign key (c) references u;",
              "add foreign key"),
             ("do $$ begin alter table t add column d text default ';', add unique (c); end $$;",
-             "add unique"),
+             "in a string (not analysed)"),
             ("revoke all on \"a;b\" from r;", "privilege removed (revoke"),
             # B cx1 : un nom cité garde sa casse, et son contenu n'est pas du code
             ('create table "T" (id bigint); revoke insert on "t" from app;',
@@ -127,7 +131,7 @@ class NonAdditiveTest(unittest.TestCase):
             ("alter table t add column d text default $s$;$s$, add constraint k unique (c);",
              "add constraint k"),
             ("create table n (id int); do $$ begin alter table n add column x int;"
-             " alter table t add unique (c); end $$;", "add unique"),
+             " alter table t add unique (c); end $$;", "in a string (not analysed)"),
             # B cx1 : les mots d'une chaîne ne coupent pas une instruction
             ("create table n (id int);"
              " alter table t add column d text default 'alter table n ', add unique (c);",
@@ -137,8 +141,19 @@ class NonAdditiveTest(unittest.TestCase):
              "add unique"),
             # mesh-design #174693 : une chaîne n'est pas analysée, même pour une table neuve
             ("create table n (id int); do $$ begin alter table n add unique (id); end $$;",
-             "add unique in a string"),
-            ("execute 'revoke insert on t from app';", "revoke in a string"),
+             "in a string (not analysed)"),
+            ("execute 'revoke insert on t from app';", "in a string (not analysed)"),
+            # B cx1 / #174729 : hors forme simple, plus de preuve d'objet neuf
+            ("do $$ begin alter table t add /* separation */ unique (c); end $$;",
+             "in a string (not analysed)"),
+            ("do $$ begin alter table t add -- separation\n unique (c); end $$;",
+             "in a string (not analysed)"),
+            ("create table n (id int); alter table n add /* x */ unique (id);", "add unique"),
+            ("create function f() returns int language sql as $$select 1$$;"
+             " revoke all on function f() from public;", "revoke on f"),
+            ('create table "n" (id int); revoke insert on n from app;', "revoke on n"),
+            ("create table n (id int, c text default 'drop'); revoke insert on n from app;",
+             "revoke on n"),
         ):
             with self.subTest(sql=sql):
                 reasons = migrations.non_additive(_migration(sql))
