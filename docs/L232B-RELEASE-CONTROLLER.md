@@ -882,3 +882,100 @@ See [the operator procedure](ops/release-controller-enrollment.md) for document
 schemas, secret provenance, durable resume, proof collection and the unresolved
 pilot transport/delegation prerequisites. The administrator must enroll the new
 backend code and supply the private inputs before this entry can run on a host.
+
+### Dedicated restore volume and capacity producer (#5165)
+
+`deploy/mise-a-jour/restauration-release.py` is an administrator-only installer,
+probe and remover for the disposable recovery cluster. It is independent of
+Debian's default cluster and of the live mesh database: it uses PostgreSQL's
+`initdb`/`pg_ctl` directly and never changes a `main` cluster or its service.
+The bureau runs it on the controller host after delivery through a package.
+The host and PostgreSQL major version are enrollment choices; no host name is
+compiled into the script. Install an already available PostgreSQL major that
+can restore the source dump (at least the source server's major), and an
+administrator-owned Python environment with `psycopg`. The installer does not
+install packages or fetch dependencies.
+
+For example, with PostgreSQL 16 and the controller's protected backup document:
+
+```sh
+sudo /opt/ameesh-release/runtime/bin/python3 -I \
+  deploy/mise-a-jour/restauration-release.py install \
+  --pg-version 16 --backup /etc/ameesh-release/backup.json \
+  --python /opt/ameesh-release/runtime/bin/python3
+```
+
+The installed script is `/opt/ameesh-release/restore/restauration-release.py`.
+Its cluster has these fixed boundaries:
+
+- OS account `ameesh-restore`, without a login shell, owns only the disposable
+  data at `/var/lib/ameesh-release-restore/<major>/data`;
+- configuration is root-owned under `/etc/ameesh-release-restore/`, outside
+  that account's writable tree;
+- TCP listens only at `127.0.0.1:55432`, with SCRAM password authentication;
+  the maintenance socket `/run/ameesh-release-restore` is mode 0700 and is
+  accessible only to the dedicated OS account and root. Runners receive
+  neither this socket nor the restore identity's credentials;
+- `ameesh-release-restore.service` runs PostgreSQL as that OS account, with a
+  read-only system view and write access to its private data and socket;
+- `ameesh-release-restore-capacity.service` runs as root and its timer refreshes
+  once per minute. Each invocation is bounded to 120 seconds. A failed probe
+  leaves the previous attestation unchanged; the consumer refuses it after
+  300 seconds, rather than treating a failed probe as fresh evidence.
+
+The identity lot #5162 enrolls a separate PostgreSQL role with `LOGIN CREATEDB`
+(and no superuser, replication or role-administration privilege) on this
+cluster. Local maintenance is available to the bureau through:
+
+```sh
+sudo runuser -u ameesh-restore -- \
+  /usr/lib/postgresql/16/bin/psql -X -w \
+  -h /run/ameesh-release-restore -p 55432 -d postgres
+```
+
+Its `backup.json.restore_dsn` must explicitly name `host=127.0.0.1`,
+`port=55432`, `dbname=postgres` and that separate role; credentials stay in
+protected enrollment, never command arguments. Service references, hostaddr,
+options, multiple hosts and environment routing overrides are refused. The
+live cluster's port or a remote host is therefore unusable for the probe.
+`backup.json.restore_capacity` names an absolute private root-owned output,
+for example `/var/lib/ameesh-release-restore/capacity.json`. This directory is
+root-owned, mode 0755; the attestation itself is root 0600. The recovery
+consumer must run as root to read it, as the independent controller does;
+copying it to a runner is not part of enrollment.
+
+The root-private `/etc/ameesh-release/restore-probe.json` pins the backup
+configuration path, PostgreSQL major and cluster `system_identifier` observed
+at provisioning. A separate root-private install intent allows reentry on the
+same installation without reinitializing data, and refuses to adopt a
+preexisting unenrolled data tree. The probe connects through the private peer
+socket, verifies that identifier, the actual `data_directory`, port and listen
+address, and refuses external tablespaces. It reads `statvfs` on that verified
+real data directory (`f_bavail * f_frsize`, excluding reserved blocks). It then
+atomically replaces the attestation with mode 0600, exact fields
+`target_sha256` (SHA-256 of the exact enrolled restore DSN), `free_bytes` and
+integer epoch `checked_at`. It includes no DSN, credential or database content.
+The existing consumer enforces the five-minute TTL, target hash, disk floor
+and twice the source size before any restore copy.
+
+After #5162 enrolls the restore identity and backup document, the bureau can
+run `systemctl start ameesh-release-restore-capacity.service` to obtain the
+first attestation immediately and check a real dump/restore through the
+controller. Qualification in a development checkout uses simulated host
+commands and real producer/consumer documents; it does not provision a host.
+
+Removal is explicit and deletes only the enrolled disposable cluster:
+
+```sh
+sudo /opt/ameesh-release/runtime/bin/python3 -I \
+  /opt/ameesh-release/restore/restauration-release.py remove
+```
+
+It checks the offline cluster identifier before deletion, stops the capacity
+producer before PostgreSQL, removes its attestation, data, configuration,
+installed script and units, and reloads systemd. A repeated removal is a no-op.
+The locked OS identity, empty parent directories and the separately managed
+backup enrollment remain; its uid is never recycled. A partially initialized
+or foreign cluster is refused for administrator reconciliation instead of
+being deleted speculatively. The live database, its roles, data and services
+are never removal targets.
