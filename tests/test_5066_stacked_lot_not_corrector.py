@@ -127,6 +127,28 @@ class StackedLotNotCorrectorTest(_ActivationFixture, PgTestCase):
         self.assertIn("cx3", out["corrections"])
         self.assertTrue(out["ok"], out)
 
+    def test_a_receipt_without_a_lot_reads_it_from_its_turn(self):
+        # #5055 : le chemin de production (#5029) : hook post-commit, lot NULL
+        # sur le reçu, lot lu dans la ligne `turn_costs` du tour.
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, turn_id, work_item_id)"
+            " VALUES ('cx3', 'codex', 't', %s)", (self.other,))
+        row = self.rejected_row(self.gate(self._stack(receipt_lot=None)))
+        self.assertEqual(row["reason"], "stacked-corrector")
+        self.assertEqual(row["stacked_lot"], self.other)
+
+    def test_an_unreadable_ancestry_keeps_the_gate_closed_and_says_so(self):
+        # #5055 : clone partiel, tête de l'autre lot absente : la trace n'est
+        # pas muette, et l'exclusion demeure.
+        head = self._stack(receipt_lot="other")
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        ("f" * 40, self.other))
+        out = self.gate(head)
+        self.assertFalse(out["ok"], out)
+        row = self.rejected_row(out)
+        self.assertEqual(row["reason"], "corrector")
+        self.assertEqual(row["stacked_unread"], self.other)
+
     def _assert_plain_corrector(self, out):
         self.assertIn("cx3", out["corrections"])
         self.assertFalse(out["ok"], out)

@@ -708,6 +708,22 @@ class PushProcessTest(_TmpMixin, PgTestCase):
         self.assertEqual(again.sent, 0)
         self.assertEqual(len(self._sujets("orchestre")), 2)
 
+    def test_un_agent_retire_n_arrete_pas_la_poussee(self):
+        # #5055 : RecipientRetired annulait la transaction de toute la poussée.
+        self.sync()
+        self._change("# Processus de lot\n\n- règle Y\n")
+        revision = canon.load(self.clone)
+        real = mail.send
+        def send(db, sender, name, *args, **kwargs):
+            if name == "retire":
+                raise storage.RecipientRetired("retire is retired")
+            return real(db, sender, name, *args, **kwargs)
+        with mock.patch.object(mail, "send", send):
+            done = canon_sync.sync_processes(self.db, revision, "atelier",
+                                             ["orchestre", "retire"])
+        self.assertEqual(done.sent, 1)
+        self.assertEqual(len(self._sujets("orchestre")), 1)
+
     def test_un_ancien_commit_ne_repousse_pas_des_regles_perimees(self):
         self.sync()
         self._change("# Processus de lot\n\n- règle Y\n")

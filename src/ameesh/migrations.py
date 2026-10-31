@@ -474,8 +474,7 @@ def check(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
 #: Gestes qui cassent le code d'avant sur une base migrée (L151) : il lit ou
 #: écrit encore ce qui disparaît, change de type ou devient obligatoire. Une
 #: migration qui n'en contient aucun est « additive » : on peut l'appliquer
-#: AVANT d'installer le code qui l'apporte. Remplacer une contrainte (drop puis
-#: add) reste additif : les migrations du dépôt ne le font que pour l'élargir.
+#: AVANT d'installer le code qui l'apporte.
 _NON_ADDITIVE = (
     (re.compile(r"\bdrop\s+(table|column|schema|type)\b"), "removal (drop %s)"),
     (re.compile(r"\brename\b"), "rename"),
@@ -492,14 +491,28 @@ _NON_ADDITIVE = (
 _DROP_RECREATED = re.compile(
     r"\bdrop\s+(view|materialized\s+view|function)\s+(?:if\s+exists\s+)?([\w.\"]+)")
 #: marqueur explicite, pour ce que l'examen du texte ne voit pas (une
-#: contrainte resserrée, une fonction réécrite) : `-- ameesh: non additive`
+#: fonction réécrite) : `-- ameesh: non additive`
 _MARKER = re.compile(r"--\s*ameesh\s*:\s*non[- ]additive", re.IGNORECASE)
+#: #5055 : retirer un droit ou resserrer une contrainte casse aussi le code
+#: d'avant. Les versions déjà livrées gardent leur classement : le rétablir
+#: ferait entrer leurs marqueurs dans `schema_non_additive_migrations`.
+_PRIVILEGES_CHECKED_AFTER = 528
+_REVOKE = re.compile(r"\brevoke\b[^;]*?\bon\s+(?:table\s+|function\s+|sequence\s+|view\s+)?"
+                     r"([\w.\"]+)|\brevoke\b")
+#: l'objet créé (ou remplacé) par la migration : le code d'avant ne s'en sert pas
+_CREATED = r"\bcreate\s+(?:or\s+replace\s+)?(?:table|function|sequence|view|materialized\s+view)" \
+           r"\s+(?:if\s+not\s+exists\s+)?%s(?![\w.\"])"
+_ALTER_TABLE = re.compile(r"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)\s[^;]*")
+_ADD_CONSTRAINT = re.compile(r"\badd\s+constraint\s+([\w\"]+)")
+#: le texte ne dit pas si une contrainte élargit ou resserre : celle qui ne
+#: resserre pas (remplacée pour l'élargir, posée sur une colonne neuve) le déclare
+_CONSTRAINT_MARKER = re.compile(r"--\s*ameesh\s*:\s*constraint\s+not\s+tightened", re.IGNORECASE)
 
 
 def non_additive(migration: Migration) -> list[str]:
     """Raisons pour lesquelles `migration` casserait le code d'avant ; vide si
     elle ne fait qu'ajouter (tables, colonnes nullables ou avec défaut, index,
-    contraintes remplacées)."""
+    contraintes déclarées sans resserrement)."""
     reasons = []
     if _MARKER.search(migration.sql):
         reasons.append("marked non-additive")
@@ -517,6 +530,27 @@ def non_additive(migration: Migration) -> list[str]:
                                % (r"\s+".join(kind.split()), re.escape(name)))
         if not recreated.search(text, match.end()):
             reasons.append("removal (drop %s %s)" % (kind, name))
+    if migration.version > _PRIVILEGES_CHECKED_AFTER:
+        reasons.extend(_privilege_reasons(text, migration.sql))
+    return reasons
+
+
+def _privilege_reasons(text: str, sql: str) -> list[str]:
+    """Droits retirés et contraintes posées sur ce qui existait déjà (#5055)."""
+    def created(name: str) -> bool:
+        return bool(re.search(_CREATED % re.escape(name), text))
+
+    reasons = []
+    for match in _REVOKE.finditer(text):
+        if not (match.group(1) and created(match.group(1))):
+            reasons.append("privilege removed (revoke%s)"
+                           % (" on " + match.group(1) if match.group(1) else ""))
+    if not _CONSTRAINT_MARKER.search(sql):
+        for statement in _ALTER_TABLE.finditer(text):
+            if created(statement.group(1)):
+                continue
+            reasons.extend("constraint possibly tightened (add constraint %s)" % name
+                           for name in _ADD_CONSTRAINT.findall(statement.group(0)))
     return reasons
 
 def _applied_readonly(db: PsqlDriver | PsycopgDriver) -> dict[int, str]:
