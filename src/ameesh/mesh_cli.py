@@ -1147,7 +1147,8 @@ def _print_host_menage(menage: dict) -> None:
         arch = m.get("worktree_archives") or {}
         print("  cleanup    temporary directories %s (quota %s per agent); caches %s / %s"
               "%s%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
-                        _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
+                        ("at least " if m.get("cache_partial") else "")
+                        + _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
                         "; %d /tmp entries reported (%s)" % (
                             m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
                         if m.get("orphans") else "",
