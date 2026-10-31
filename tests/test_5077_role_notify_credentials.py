@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import role_run
+from ameesh import nexlink_alerts, role_run
 from ameesh.platform import child_environment as E
 
 
@@ -100,6 +100,10 @@ notify.Sender()._nexlink_call(channel, 'POST', '/mesh/alerts', {'title': 'role a
             self.assertEqual(len(requests), 1)
             self.assertEqual(requests[0][0], '/mesh/alerts')
             self.assertEqual(json.loads(requests[0][2]), {'title': 'role alert'})
+            headers = {key.lower(): value for key, value in requests[0][1].items()}
+            self.assertEqual(headers['x-mesh-signature'], nexlink_alerts.mesh_signature(
+                'synthetic-secret', headers['x-mesh-key-id'],
+                headers['x-mesh-timestamp'], requests[0][2]))
         finally:
             server.shutdown()
             server.server_close()
