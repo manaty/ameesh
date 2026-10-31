@@ -276,10 +276,17 @@ def normalize_readings(rows: Iterable[dict], cfg=None) -> list[dict]:
 
     Configuration is validated without reading credentials. No balance matching,
     persisted rewrite, or inference from the number of configured accounts.
+
+    #5026 : une configuration illisible ne doit pas casser les lecteurs qui
+    dégradent déjà (alertes `balance_low`, rapport de coût) : les lignes
+    restent inchangées, aucune adoption n'est appliquée.
     """
     from . import accounts
 
-    declared = accounts.parse(getattr(cfg, "accounts", None) or {})
+    try:
+        declared = accounts.parse(getattr(cfg, "accounts", None) or {})
+    except accounts.AccountError:
+        return [dict(row) for row in rows]
     owners = {provider: profile.name for provider, profiles in declared.items()
               for profile in profiles if profile.adopts_unnamed}
     return [dict(row, account=owners[row["provider"]])
