@@ -9,6 +9,8 @@ the same output, in `--json` too, and the same exit code as its alias.
 """
 from __future__ import annotations
 
+from .entrypoint import run as isolated_entrypoint
+
 import contextlib
 import io
 import json
@@ -41,7 +43,7 @@ def _run(argv):
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         try:
-            code = main_mod.main(list(argv))
+            code = isolated_entrypoint(main_mod.main, list(argv))
         except SystemExit as exc:
             code = exc.code
     return code, out.getvalue(), err.getvalue()

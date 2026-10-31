@@ -29,7 +29,7 @@ class ChildCredentialsTest(unittest.TestCase):
                 self.assertEqual(child, dict(PATH="/bin", AMEESH_MAX_TOKENS="1000"))
         self.assertIn("OPENAI_API_KEY", env)  # never mutate the parent mapping
         for tool, wanted in (("psql", {"PGPASSWORD"}), ("gh", {"GH_TOKEN"}),
-                             ("git", {"GH_TOKEN"}), ("ameesh", {"AMEESH_DSN"})):
+                             ("git", {"GH_TOKEN"}), ("ameesh", {"AMEESH_DSN", "PGPASSWORD"})):
             self.assertEqual({key for key in E.for_child([tool], env)
                               if key not in ("PATH", "AMEESH_MAX_TOKENS")}, wanted)
         self.assertNotIn("GH_TOKEN", E.for_child("gh api", env, shell=True))
@@ -37,6 +37,46 @@ class ChildCredentialsTest(unittest.TestCase):
                      OPENAI_API_KEY="provider")
         self.assertEqual(E.for_child(["scw"], cloud), {"SCW_SECRET_KEY": "scw"})
         self.assertEqual(E.for_child(["gcloud"], cloud), {"GOOGLE_APPLICATION_CREDENTIALS": "file"})
+
+    def test_mesh_child_and_mechanical_wrapper_keep_separate_database_password(self):
+        env = E.for_child([sys.executable], os.environ)
+        env.update(PYTHONPATH=SRC, AMEESH_DSN="postgresql://mesh@localhost/mesh",
+                   PGPASSWORD="synthetic-password", OPENAI_API_KEY="provider")
+        script = r'''
+import os, pathlib, subprocess, sys, tempfile
+from ameesh.platform import child_environment as E
+E.install()
+with tempfile.TemporaryDirectory() as root:
+    tool = pathlib.Path(root, 'ameesh')
+    tool.write_text('#!' + sys.executable + '\n' +
+        "from ameesh.config import load\nimport os\n" +
+        "assert load().dsn == 'postgresql://mesh@localhost/mesh'\n" +
+        "assert os.environ['PGPASSWORD'] == 'synthetic-password'\n" +
+        "assert 'OPENAI_API_KEY' not in os.environ\n")
+    tool.chmod(0o700)
+    subprocess.run([str(tool)], check=True)
+    subprocess.run([sys.executable, str(tool)],
+                   env=E.execution_transport(os.environ), check=True)
+'''
+        subprocess.run([sys.executable, "-c", script],
+                       env=E.grant(env, env), check=True)
+
+    def test_in_process_entrypoint_restores_guard_after_return_and_exception(self):
+        from ameesh import main
+        from .entrypoint import run
+        original = subprocess.Popen.__init__
+        with mock.patch("builtins.print"):
+            self.assertEqual(run(main.main, ["version"]), 0)
+        self.assertIs(subprocess.Popen.__init__, original)
+
+        def fails():
+            E.install()
+            self.assertIsNot(subprocess.Popen.__init__, original)
+            raise SystemExit(7)
+
+        with self.assertRaises(SystemExit):
+            run(fails)
+        self.assertIs(subprocess.Popen.__init__, original)
 
     def test_custom_account_source_and_selected_destination(self):
         with mock.patch.object(E, "DECLARED_CREDENTIALS", set()):

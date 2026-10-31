@@ -19,7 +19,8 @@ from collections.abc import Mapping
 GITHUB_CREDENTIALS = frozenset({"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
                                 "GITHUB_ENTERPRISE_TOKEN"})
 MESH_CREDENTIALS = frozenset({"AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
-                              "AGENT_MESH_DATABASE_URL", "AMEESH_EXEC_TOKEN"})
+                              "AGENT_MESH_DATABASE_URL", "AMEESH_EXEC_TOKEN",
+                              "PGPASSWORD"})
 TOOL_CREDENTIALS = {
     "psql": frozenset({"PGPASSWORD"}),
     "pg_dump": frozenset({"PGPASSWORD"}),

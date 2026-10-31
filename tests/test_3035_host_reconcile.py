@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#3035: a lost host reopens only on a verified reconciliation proof."""
+
+from .entrypoint import run as isolated_entrypoint
 import contextlib
 import io
 import json
@@ -310,7 +312,7 @@ class HostReconcileTest(PgTestCase):
     def test_cli_dispatch_routes_host_reconcile(self):
         from ameesh import main as main_mod
         with mock.patch("ameesh.host_lifecycle.main", return_value=0) as impl:
-            self.assertEqual(main_mod.main(["host", "reconcile", "source"]), 0)
+            self.assertEqual(isolated_entrypoint(main_mod.main, ["host", "reconcile", "source"]), 0)
         impl.assert_called_once_with(["reconcile", "source"])
 
     def test_module_reconcile_uses_the_session_corrector(self):
