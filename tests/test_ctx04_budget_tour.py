@@ -90,6 +90,26 @@ class DecisionTest(unittest.TestCase):
                                    "AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual((cfg.turn_reread_budget, cfg.session_reread_budget), (400000.0, 0.0))
 
+    def test_budget_non_fini_eteint_et_fraction_arrondie(self):
+        """#5051 : inf/nan n'atteignent jamais `int()` au tour ; 0,5 n'est
+        plus silencieusement éteint, il vaut un jeton."""
+        for value in ("inf", "-inf", "nan"):
+            cfg = config_mod.load(env={"AMEESH_TURN_REREAD_BUDGET": value,
+                                       "AMEESH_SESSION_REREAD_BUDGET": value,
+                                       "AMEESH_CONFIG": EMPTY_CONFIG})
+            self.assertEqual((cfg.turn_reread_budget, cfg.session_reread_budget),
+                             (0.0, 0.0), value)
+            self.assertIsNone(_due({"R_turn": 10**9, "R_session": 10**9, "base": 0},
+                                   tour=int(cfg.turn_reread_budget),
+                                   session=int(cfg.session_reread_budget)))
+        cfg = config_mod.load(env={"AMEESH_TURN_REREAD_BUDGET": "0.5",
+                                   "AMEESH_SESSION_REREAD_BUDGET": "1.2",
+                                   "AMEESH_CONFIG": EMPTY_CONFIG})
+        self.assertEqual((cfg.turn_reread_budget, cfg.session_reread_budget), (1.0, 2.0))
+        self.assertEqual(
+            _due({"R_turn": 1, "R_session": None, "base": None},
+                 tour=int(cfg.turn_reread_budget))["budget"], 1)
+
 
 class ClotureTest(_Base):
     #: quatre appels de 50 k : la somme dépasse 120 k au troisième, le contexte
