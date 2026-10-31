@@ -20,7 +20,9 @@ import time
 
 NAME = 'ameesh-release-restore'
 ACCOUNT = 'ameesh-restore'
-PORT = 55432
+PORT = 5432
+ADMIN = 'release_restore_admin'
+ADMIN_MAP = 'release_admin'
 SOCKET = '/run/' + NAME
 INSTALL = Path('/opt/ameesh-release/restore')
 UNIT_ROOT = Path('/etc/systemd/system')
@@ -118,10 +120,11 @@ def target(dsn, parser):
     if any(os.environ.get(key) for key in ('PGSERVICE', 'PGSERVICEFILE', 'PGHOSTADDR', 'PGOPTIONS')):
         raise RestoreError('external libpq routing refused')
     allowed = {'host', 'port', 'dbname', 'user', 'password', 'passfile',
-               'sslmode', 'connect_timeout', 'application_name'}
-    if (set(fields) - allowed or fields.get('host') != '127.0.0.1'
-            or fields.get('port') != str(PORT) or fields.get('dbname') != 'postgres'
-            or not fields.get('user') or fields['user'] == ACCOUNT):
+               'sslmode', 'connect_timeout', 'application_name', 'require_auth'}
+    if (set(fields) - allowed or fields.get('host') != SOCKET
+            or 'port' in fields or fields.get('dbname') != 'postgres'
+            or fields.get('require_auth') != 'scram-sha-256'
+            or not fields.get('user') or fields['user'] in (ACCOUNT, ADMIN)):
         raise RestoreError('restore DSN must address the dedicated local cluster')
     return fields
 
@@ -144,7 +147,7 @@ def inspect_cluster(version):
         " 'external_tablespaces', (select count(*) from pg_tablespace"
         " where spcname not in ('pg_default','pg_global')))"))
     if (result.get('data_directory') != str(data) or result.get('port') != str(PORT)
-            or result.get('listen_addresses') != '127.0.0.1'
+            or result.get('listen_addresses') != ''
             or result.get('external_tablespaces') != 0):
         raise RestoreError('restore cluster layout mismatch')
     info = data.lstat()
@@ -165,7 +168,7 @@ def capacity(document, backup, observed, *, parser, free_bytes, now):
     if (observed.get('system_identifier') != config['system_identifier']
             or observed.get('data_directory') != str(data)
             or observed.get('port') != str(PORT)
-            or observed.get('listen_addresses') != '127.0.0.1'
+            or observed.get('listen_addresses') != ''
             or observed.get('external_tablespaces') != 0):
         raise RestoreError('dedicated cluster identity mismatch')
     if type(free_bytes) is not int or not 0 <= free_bytes <= 10**15:
@@ -263,15 +266,30 @@ def save_document(path, value):
     atomic(path, (json.dumps(value, sort_keys=True) + '\n').encode())
 
 
-def install(version, backup_path, python):
+def authentication(restore_role):
+    # Restrict identifiers before rendering HBA rules.
+    if (not isinstance(restore_role, str)
+            or not re.fullmatch(r'[a-z_][a-z0-9_]{0,62}', restore_role)
+            or restore_role in (ACCOUNT, ADMIN, 'all', 'replication')
+            or restore_role.startswith('pg_')):
+        raise RestoreError('explicit separate restore role required')
+    return (f'local all {ACCOUNT} peer\n'
+            f'local all {ADMIN} peer map={ADMIN_MAP}\n'
+            f'local all {restore_role} scram-sha-256\n',
+            f'{ADMIN_MAP} root {ADMIN}\n')
+
+
+def install(version, backup_path, python, restore_role):
     data, conf = layout(version)
     rendered = units(version, python)
+    hba, ident = authentication(restore_role)
     protected(backup_path)
     if not Path('/usr/lib/postgresql', version, 'bin/initdb').is_file():
         raise RestoreError('PostgreSQL binaries missing')
     ENROLLMENT.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     protected(INTENT)
-    request = dict(version=version, backup=str(backup_path), python=python)
+    request = dict(version=version, backup=str(backup_path), python=python,
+                   restore_role=restore_role)
     if INTENT.exists():
         intent = read_document(INTENT)
         if (not isinstance(intent, dict) or set(intent) != {'request', 'system_identifier'}
@@ -312,11 +330,10 @@ def install(version, backup_path, python):
     # restored database or a runner. The private socket has no runner access.
     conf.mkdir(mode=0o755, exist_ok=True)
     protected(conf / 'postgresql.conf')
-    atomic(conf / 'pg_hba.conf', (
-        'local all all peer\nhost all all 127.0.0.1/32 scram-sha-256\n').encode(), 0o644)
-    atomic(conf / 'pg_ident.conf', b'', 0o644)
+    atomic(conf / 'pg_hba.conf', hba.encode(), 0o644)
+    atomic(conf / 'pg_ident.conf', ident.encode(), 0o644)
     atomic(conf / 'postgresql.conf', (
-        "listen_addresses = '127.0.0.1'\n"
+        "listen_addresses = ''\n"
         f"data_directory = '{data}'\nhba_file = '{conf}/pg_hba.conf'\n"
         f"ident_file = '{conf}/pg_ident.conf'\nport = {PORT}\n"
         f"unix_socket_directories = '{SOCKET}'\n"
@@ -328,9 +345,14 @@ def install(version, backup_path, python):
         atomic(UNIT_ROOT / name, text.encode(), 0o644)
     command(['/usr/bin/systemctl', 'daemon-reload'])
     command(['/usr/bin/systemctl', 'enable', '--now', NAME + '.service'])
+    command(['/usr/bin/systemctl', 'restart', NAME + '.service'])
     observed = inspect_cluster(version)
     if observed['system_identifier'] != observed_id:
         raise RestoreError('restore cluster identity changed')
+    # Root assumes this identity through the sole explicit pg_ident entry.
+    local_sql(version, f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles "
+              f"WHERE rolname = '{ADMIN}') THEN CREATE ROLE {ADMIN} LOGIN SUPERUSER; "
+              "END IF; END $$;")
     current = dict(version=version, backup=str(backup_path), system_identifier=observed_id)
     if ENROLLMENT.exists() and read_document(ENROLLMENT) != current:
         raise RestoreError('restore enrollment changed')
@@ -389,6 +411,7 @@ def main():
     setup.add_argument('--pg-version', required=True)
     setup.add_argument('--backup', required=True, type=Path)
     setup.add_argument('--python', required=True)
+    setup.add_argument('--restore-role', required=True)
     sub.add_parser('probe')
     sub.add_parser('remove')
     args = parser.parse_args()
@@ -396,7 +419,7 @@ def main():
         parser.exit(1, 'administrator required\n')
     try:
         if args.action == 'install':
-            install(args.pg_version, args.backup, args.python)
+            install(args.pg_version, args.backup, args.python, args.restore_role)
         elif args.action == 'probe':
             probe()
         else:

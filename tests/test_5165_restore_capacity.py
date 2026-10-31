@@ -29,11 +29,11 @@ class CapacityTest(unittest.TestCase):
     def setUp(self):
         self.enrollment = dict(version='16', backup='/etc/ameesh-release/backup.json',
                                system_identifier='1234567890123456789')
-        self.dsn = 'host=127.0.0.1 port=55432 dbname=postgres user=restore password=CANARY'
+        self.dsn = 'host=/run/ameesh-release-restore dbname=postgres user=restore password=CANARY require_auth=scram-sha-256'
         self.backup = dict(restore_dsn=self.dsn, restore_capacity='/root/capacity.json')
         self.observed = dict(system_identifier=self.enrollment['system_identifier'],
-            data_directory=str(producer.layout('16')[0]), port='55432',
-            listen_addresses='127.0.0.1', external_tablespaces=0)
+            data_directory=str(producer.layout('16')[0]), port='5432',
+            listen_addresses='', external_tablespaces=0)
         self.parser = lambda dsn: dict(part.split('=', 1) for part in dsn.split())
         self.environment = mock.patch.dict(os.environ, {}, clear=True)
         self.environment.start()
@@ -77,10 +77,14 @@ class CapacityTest(unittest.TestCase):
         restore.assert_not_called()
 
     def test_live_cluster_or_redirected_target_refused(self):
-        for dsn in ('host=127.0.0.1 port=5432 dbname=postgres user=restore',
+        for dsn in (self.dsn.replace('/run/ameesh-release-restore', '127.0.0.1') + ' port=55432',
+                    self.dsn.replace('/run/ameesh-release-restore', '127.0.0.1'),
                     'host=live port=55432 dbname=postgres user=restore',
                     self.dsn + ' hostaddr=10.0.0.1', self.dsn + ' service=live',
-                    self.dsn + ' options=-cdata_directory=/live'):
+                    self.dsn + ' options=-cdata_directory=/live',
+                    self.dsn.replace(' require_auth=scram-sha-256', ''),
+                    self.dsn.replace('scram-sha-256', 'password'),
+                    self.dsn + ' port=55432', self.dsn + ' port=5432'):
             with self.subTest(dsn=dsn):
                 self.backup['restore_dsn'] = dsn
                 with self.assertRaises(producer.RestoreError):
@@ -95,7 +99,7 @@ class CapacityTest(unittest.TestCase):
     def test_foreign_cluster_volume_or_tablespace_refused(self):
         for key, invalid in (('system_identifier', '9876543210987654321'),
                              ('data_directory', '/var/lib/postgresql/live'),
-                             ('port', '5432'), ('listen_addresses', '*'),
+                             ('port', '55432'), ('listen_addresses', '*'),
                              ('external_tablespaces', 1)):
             with self.subTest(key=key), mock.patch.dict(self.observed, {key: invalid}):
                 with self.assertRaises(producer.RestoreError):
@@ -190,8 +194,15 @@ class InstallationTest(unittest.TestCase):
                     mock.patch.object(producer.pwd, 'getpwnam', return_value=account), \
                     mock.patch.object(producer.os, 'chown'), \
                     mock.patch.object(Path, 'is_file', available):
-                producer.install('16', backup, '/opt/release/bin/python3')
-                producer.install('16', backup, '/opt/release/bin/python3')
+                producer.install('16', backup, '/opt/release/bin/python3', 'restore')
+                producer.install('16', backup, '/opt/release/bin/python3', 'restore')
+                self.assertEqual((conf / 'pg_hba.conf').read_text(),
+                    'local all ameesh-restore peer\n'
+                    'local all release_restore_admin peer map=release_admin\n'
+                    'local all restore scram-sha-256\n')
+                self.assertEqual((conf / 'pg_ident.conf').read_text(),
+                    'release_admin root release_restore_admin\n')
+                self.assertIn("listen_addresses = ''\n", (conf / 'postgresql.conf').read_text())
                 initializations = [args for args in calls if any(
                     str(item).endswith('/bin/initdb') for item in args)]
                 self.assertEqual(len(initializations), 1)
@@ -211,6 +222,12 @@ class InstallationTest(unittest.TestCase):
                             if args[1:] == ['disable', '--now', producer.NAME + '.service'])
                 self.assertLess(stop, cluster_stop)
 
+    def test_hba_role_cannot_add_rules_or_assume_admin(self):
+        for role in ('all', 'replication', 'pg_monitor', producer.ADMIN,
+                     producer.ACCOUNT, 'restore\nlocal all all trust', '"restore"'):
+            with self.subTest(role=role), self.assertRaises(producer.RestoreError):
+                producer.authentication(role)
+
     def test_existing_unenrolled_tree_is_never_adopted(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -222,5 +239,5 @@ class InstallationTest(unittest.TestCase):
                     mock.patch.object(Path, 'is_file', return_value=True), \
                     mock.patch.object(producer, 'command') as command:
                 with self.assertRaisesRegex(producer.RestoreError, 'unowned'):
-                    producer.install('16', root / 'backup', '/bin/python3')
+                    producer.install('16', root / 'backup', '/bin/python3', 'restore')
             command.assert_not_called()

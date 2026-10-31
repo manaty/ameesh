@@ -902,8 +902,11 @@ For example, with PostgreSQL 16 and the controller's protected backup document:
 sudo /opt/ameesh-release/runtime/bin/python3 -I \
   deploy/mise-a-jour/restauration-release.py install \
   --pg-version 16 --backup /etc/ameesh-release/backup.json \
-  --python /opt/ameesh-release/runtime/bin/python3
+  --python /opt/ameesh-release/runtime/bin/python3 --restore-role release_restore
 ```
+
+The restore role must match the login chosen for #5162; it is an explicit
+installation parameter, restricted to a plain lowercase SQL identifier.
 
 The installed script is `/opt/ameesh-release/restore/restauration-release.py`.
 Its cluster has these fixed boundaries:
@@ -912,8 +915,8 @@ Its cluster has these fixed boundaries:
   data at `/var/lib/ameesh-release-restore/<major>/data`;
 - configuration is root-owned under `/etc/ameesh-release-restore/`, outside
   that account's writable tree;
-- TCP listens only at `127.0.0.1:55432`, with SCRAM password authentication;
-  the maintenance socket `/run/ameesh-release-restore` is mode 0700 and is
+- TCP is disabled (`listen_addresses = ''`); the only endpoint is
+  the private socket `/run/ameesh-release-restore` is mode 0700 and is
   accessible only to the dedicated OS account and root. Runners receive
   neither this socket nor the restore identity's credentials;
 - `ameesh-release-restore.service` runs PostgreSQL as that OS account, with a
@@ -930,14 +933,32 @@ cluster. Local maintenance is available to the bureau through:
 ```sh
 sudo runuser -u ameesh-restore -- \
   /usr/lib/postgresql/16/bin/psql -X -w \
-  -h /run/ameesh-release-restore -p 55432 -d postgres
+  -h /run/ameesh-release-restore -d postgres
 ```
 
-Its `backup.json.restore_dsn` must explicitly name `host=127.0.0.1`,
-`port=55432`, `dbname=postgres` and that separate role; credentials stay in
-protected enrollment, never command arguments. Service references, hostaddr,
-options, multiple hosts and environment routing overrides are refused. The
-live cluster's port or a remote host is therefore unusable for the probe.
+The installer creates `release_restore_admin` as a separate SQL superuser with
+LOGIN and no password. Root uses `restore_owner_dsn` with
+`host=/run/ameesh-release-restore dbname=postgres user=release_restore_admin`.
+The exact HBA rules (with the selected restore role) are:
+
+```text
+local all ameesh-restore peer
+local all release_restore_admin peer map=release_admin
+local all release_restore scram-sha-256
+```
+
+The only `pg_ident` entry is `release_admin root release_restore_admin`.
+There are no host rules. The first rule serves the maintenance probe; the
+second serves #5162 as root; SCRAM permits the restore login to connect to
+random databases created by verification. Port 5432 only names the socket
+file `.s.PGSQL.5432`; no TCP port is bound.
+
+Its `backup.json.restore_dsn` must explicitly name
+`host=/run/ameesh-release-restore`, `dbname=postgres`, the separate restore
+role and `require_auth=scram-sha-256`, with no port parameter. Credentials stay
+in protected enrollment, never command arguments. Service references,
+hostaddr, options, multiple hosts, TCP hosts and environment routing overrides
+are refused. The exact enrolled DSN bytes are hashed into the attestation.
 `backup.json.restore_capacity` names an absolute private root-owned output,
 for example `/var/lib/ameesh-release-restore/capacity.json`. This directory is
 root-owned, mode 0755; the attestation itself is root 0600. The recovery
