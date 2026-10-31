@@ -700,8 +700,17 @@ ISOLATION_ENV_VARS = frozenset((
     "CODEX_HOME", "XDG_STATE_HOME", "TMPDIR", "HOME", "PATH",
     *ACCOUNT_ENV_VARS, *HOST_CACHE_VARS,
 ))
-#: le module dont le prochain verdict de la garde vient, et sa photographie
+#: la photographie de l'état du banc, prise avant le premier module lancé
 _isolation_baseline: dict | None = None
+
+# #5180 : le greffon #1749 (`background._watch_own_children`) remplace
+# `Popen.__init__` une fois par processus, comme dans l'exécuteur, au premier
+# `BackgroundTracker`. Posé ici, avant la photographie, il fait partie de
+# l'état du banc : sinon le premier module de chaque série qui construit un
+# exécuteur serait nommé fautif, et sa remise laisserait le drapeau
+# `_own_hook` levé sans greffon (les `Popen` suivants non retenus).
+from ameesh import background as _background  # noqa: E402
+_background._watch_own_children()
 
 
 def _isolation_env_var(name: str) -> bool:
