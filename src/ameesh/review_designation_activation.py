@@ -4096,6 +4096,8 @@ def _unreachable_reviewer(row: Optional[Mapping], closed_hosts: set) -> str:
     # #3460 : un agent retiré ne reçoit plus de courrier, son siège est mort
     if rd.is_retired(row):
         return "retired"
+    if row.get("review_hold"):
+        return "review hold"
     if (row.get("mode") or "execute") != "execute":
         return "mode %s" % (row.get("mode"),)
     status = str(row.get("status") or "").strip().lower()

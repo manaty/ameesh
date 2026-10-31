@@ -121,3 +121,31 @@ through `--agents` resolution. Canon cards (`title`, `aliases`), placements
 and units are aligned by a separate application PR, as in the N1 table. Until
 that PR lands, `canon sync` reports `agent-alias-conflict` for the card and
 closes admission (fail-closed).
+
+### Retenir les nouvelles relectures avant un renommage (#5087)
+
+Depuis le correctif du 31/10/2026 (lot #5087, manaty/ameesh#3835), le pilote,
+un agent de conception, l'auditeur ou un humain peut poser une retenue durable :
+
+```sh
+ameesh agent review-hold NOM --reason 'N2 : préparer le renommage'
+ameesh agent review-hold NOM --clear --reason 'N2 terminé'
+```
+
+La retenue est visible dans le registre (`review_hold`, avec raison et acteur),
+journalisée et conservée par le renommage. Elle écarte les nouvelles désignations
+automatiques et manuelles et refuse tout nouveau verdict, même si une demande
+était déjà remise. Les gardes SQL relisent la retenue à l'écriture : une sélection
+faite avant la retenue ne permet pas de la contourner. La retenue ne révoque pas
+les preuves déjà acquises, ne retire pas l'agent du registre et ne change ni son
+bail, ni son statut, ni la réception de son courrier. Elle ne ferme pas les prises
+de lots ou les gels : arrêter le runner reste nécessaire avant le renommage.
+Elle n'expire pas automatiquement ; sa levée est un geste explicite et tracé.
+
+Le retrait d'un relecteur d'un lot interdit désormais ses **nouveaux** verdicts
+sur ce lot, jusqu'à une nouvelle désignation enregistrée. Un avis signé avant le retrait
+reste une preuve valable ; le retrait ne réécrit pas l'historique. Une relecture
+spontanée reste acceptée si le relecteur n'a jamais été retiré de ce lot. Le registre
+de retrait suit les alias et les renommages ; une nouvelle tête ne vaut pas
+redésignation. Les retraits antérieurs à cette migration ne sont pas reconstruits
+à partir des courriers ou du texte du journal.

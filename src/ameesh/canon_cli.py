@@ -1151,6 +1151,15 @@ def _add_agent_parsers(parent, *, move: bool = False) -> None:
         p_move.add_argument("--json", action="store_true")
         p_move.set_defaults(func=cmd_move)
 
+        from .agent_review_hold import cmd_cli as cmd_review_hold
+        p_hold = agent_sub.add_parser("review-hold", help="hold new review designations and verdicts (#5087)")
+        p_hold.add_argument("name")
+        p_hold.add_argument("--reason", required=True)
+        p_hold.add_argument("--clear", action="store_true")
+        p_hold.add_argument("--actor", default=None)
+        p_hold.add_argument("--json", action="store_true")
+        p_hold.set_defaults(func=cmd_review_hold)
+
         p_retire = agent_sub.add_parser(
             "retire", help="take an agent out of the active registry: never designated, "
                            "claimed nor mailed again; history kept (#3460)")

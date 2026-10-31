@@ -236,6 +236,11 @@ class Domain(abc.ABC):
 # --------------------------------------------------------------------------
 
 class Agents(Domain):
+    def review_hold(self, name: str, *, reason: str, actor: str,
+                    clear: bool = False) -> dict | None:
+        """#5087: native operator hold on new reviews, journaled atomically."""
+        raise NotImplementedError("native operator operation")
+
     """Lignes du registre hors bail : inscription, lecture, statut."""
 
     @abc.abstractmethod
