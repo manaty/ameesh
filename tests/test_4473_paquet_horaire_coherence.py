@@ -61,6 +61,10 @@ def active(db, **kwargs):
     return None
 
 
+def alert_due(db, data, **kwargs):
+    print("TREE_PACKET_PAUSE_ALERT", file=sys.stderr)
+
+
 def describe(data, zone=None):
     return "?"
 
@@ -172,6 +176,7 @@ class TreeLibraryTest(unittest.TestCase):
         """Le témoin de l'incident : sans l'arbre, « pause illisible »."""
         out = self._run(RUN_TICK)
         self.assertIn("TREE_PACKET_PAUSE", out)
+        self.assertIn("TREE_PACKET_PAUSE_ALERT", out)
         self.assertIn("PYTHONPATH_FIRST=%s" % (self.tree / "src"), out)
         self.assertIn("RC 1", out)  # le faux clone n'a pas d'origin : rien n'est fait
         self.assertIn("fetch main", out)

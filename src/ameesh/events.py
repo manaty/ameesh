@@ -41,13 +41,14 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
                        before staging mutations and at each step (#4880)
   staging.request      queued commit and elected execution attempt; survives
                        the launching turn, reused by candidate takeover (#4880)
-  packet.pause         a bounded pause of the hourly packet tick, or its end
+  packet.pause         a pause with a deadline (alert or automatic end) of the hourly packet tick, or its end
                        (no table: written by `paquet-horaire.py pause|resume`,
                        read by its tick and `role timers --check`, #4361)
 
 `data` holds identifiers and states, never free text: the client rereads the
 object through the API. One bounded exception: `packet.pause` carries the
-pause's `reason` (normalized, 200 characters at most, `packet_pause`), the
+pause's `reason` and announcement `source` (normalized, 200 characters at most,
+`packet_pause`), the
 only place the tick and `role timers --check` read it from (#4361).
 
 **Delivery order.** A `bigserial` is taken at insertion, not at commit: the

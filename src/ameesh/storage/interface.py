@@ -1051,13 +1051,24 @@ class Events(Domain):
         most `limit` (a listing for humans: ids are not in commit order)."""
 
     @abc.abstractmethod
-    def recent_type(self, type: str, days: int, limit: int,
+    def recent_type(self, type: str, days: int | None, limit: int,
                     object: str | None = None) -> list[dict]:
         """The most recent events of `type` (optionally about `object`) written
         in the last `days`, newest first, at most `limit` (#3981: the shared
-        staging attestation). The `created_at` bound keeps the read on the
+        staging attestation). `days=None` requires an exact object and reads
+        its latest durable state without an age cutoff (#5045).
+        The `created_at` bound keeps the read on the
         retention index; `days` is the durability the caller needs, never a
         substitute for an absent event."""
+
+    def context_type(self, type: str, days: int, limit: int, *,
+                     object_prefix: str) -> list[dict]:
+        """Recent events plus the last pre-window state per matching object.
+
+        Each group is bounded by `limit`; the preceding state has no age
+        cutoff, for durable states whose validity exceeds the history window.
+        """
+        raise NotImplementedError("event history with preceding state is unavailable")
 
     def latest_type(self, type: str, days: int, limit: int) -> list[dict]:
         """Newest snapshot per object, newest first, bounded by objects.
