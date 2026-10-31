@@ -9,9 +9,11 @@ rend visible (`ameesh alerts`), part en courrier aux orchestrateurs de son
 """
 from __future__ import annotations
 
+import time
+import types
 import unittest
 
-from ameesh import alert_briefs, exploitation, notify, registry
+from ameesh import accounts, alert_briefs, exploitation, notify, registry
 
 from .support import PgTestCase
 
@@ -78,6 +80,48 @@ class PauseLongueTest(PgTestCase):
         self.assertIn("auditeur", out)
         self.assertNotIn("ouvrier", out)      # en pause : il ne lirait pas
         self.assertIn("ameesh doctor", out["orch"])
+
+    def _dated(self, delta_s):
+        """#4781 : le texte réel de `pause_label`, échéance à `delta_s`."""
+        ev = types.SimpleNamespace(
+            until=time.time() + delta_s, held=("seven_day", 0.23),
+            profile=types.SimpleNamespace(name="primaire"))
+        return "budget : " + accounts.pause_label({"primaire": ev}) + "claude paused"
+
+    def test_regulation_a_echeance_proche_sans_alerte(self):
+        self._pause(self._dated(3600), 61)
+        self.assertEqual(self._alertes(), [])
+
+    def test_echeance_a_peine_depassee_sans_alerte(self):
+        # 30/10 : alerte à 02:40:47 pour « until 02:38 », agent repris
+        self._pause(self._dated(-170), 61)
+        self.assertEqual(self._alertes(), [])
+
+    def test_echeance_depassee_signalee(self):
+        self._pause(self._dated(-600), 61)
+        self.assertEqual(len(self._alertes()), 1)
+
+    def test_echeance_lointaine_signalee(self):
+        self._pause(self._dated(4 * 86400), 61)
+        self.assertEqual(len(self._alertes()), 1)
+
+    def test_echeance_qui_recule_signalee_a_24_h(self):
+        self._pause(self._dated(3600), 24 * 60 + 1)
+        self.assertEqual(len(self._alertes()), 1)
+
+    def test_pause_operateur_sans_alerte(self):
+        # 30/10, ameesh-cx1 : sommeil de feuille de route, motif de budget resté
+        self._pause("budget : account primaire: next turn in 24s (start gap 30s, #3779)", 61)
+        self.assertEqual(len(self._alertes()), 1)
+        self.db.execute("UPDATE agent_registry SET operator_paused = true"
+                        " WHERE name = 'ouvrier'")
+        self.assertEqual(self._alertes(), [])
+
+    def test_le_marqueur_ne_change_pas_la_nature_de_la_pause(self):
+        texte = self._dated(3600)[len("budget : "):]
+        self.assertNotIn("@", accounts.pause_nature(texte))
+        self.assertEqual(accounts.pause_nature(texte).split("|")[:3],
+                         ["pause", "primaire", "seven_day"])
 
     def test_type_non_pousse_aux_humains_par_defaut(self):
         self.assertIn("budget_pause_long", notify.TYPE_LABELS)

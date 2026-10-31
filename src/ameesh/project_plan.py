@@ -37,11 +37,55 @@ def order_key(item):
             float(item.get("created_ts") or 0), int(item["id"]))
 
 
-def evaluate(rows, *, project, rule=None, holds=None, now=None, can_take=None, phase=True):
+def _disjoint_selection(ordered, policies):
+    """#4818: keep a set of ready lots whose footprints are pairwise disjoint.
+
+    The SQL guard already holds an intake lot that overlaps an *occupying*
+    lot; two free lots that overlap each other are both ready, and the
+    dispatcher would start both in the same pass. Walking the dispatch order,
+    a free intake lot that overlaps one already selected waits for it, and
+    the repository's in-flight cap counts the selected lots on top of those
+    already in flight. Same overlap rule as the guard (`held_pairs`, `.`
+    overlaps everything, shared paths ignored)."""
+    from . import work_footprints
+    selected: dict = {}
+    for row in ordered:
+        if not row["ready"] or row.get("state") != "intake" or row.get("assignee"):
+            continue
+        app = str(row.get("app") or "").strip()
+        if not app:
+            continue
+        policy = (policies or {}).get(app) or {}
+        mine = list(row.get("footprint_paths") or ())
+        others = selected.setdefault(app, [])
+        clash = [other for other in others
+                 if mine and other.get("footprint_paths")
+                 and work_footprints.held_pairs(mine, other["footprint_paths"],
+                                                policy.get("shared_paths") or ())]
+        if clash:
+            row["ready"] = False
+            row["waiting"].append("footprint overlaps %s, dispatched first"
+                                  % ", ".join("#%s" % o["id"] for o in clash))
+            continue
+        cap = policy.get("max_in_flight")
+        counted = [o for o in others if not work_footprints.is_exempt(o)]
+        if cap and not work_footprints.is_exempt(row) and \
+                int(row.get("repository_in_flight") or 0) + len(counted) >= int(cap):
+            row["ready"] = False
+            row["waiting"].append("repository in-flight cap %s reached with %s"
+                                  % (cap, ", ".join("#%s" % o["id"] for o in counted)))
+            continue
+        others.append(row)
+
+
+def evaluate(rows, *, project, rule=None, holds=None, now=None, can_take=None, phase=True,
+             policies=None):
     """Readiness, optionally scoped to an agent before bug preemption.
 
     ``phase=False`` retains both kinds for the initial dispatcher candidate
     pool; each agent applies its own phase without deleting others' candidates.
+    #4818: ``policies`` (repository footprint policies, by app) let the plan
+    pick a set of ready lots with pairwise disjoint footprints.
     """
     from . import backlog
     stamp = time.time() if now is None else float(now)
@@ -68,7 +112,12 @@ def evaluate(rows, *, project, rule=None, holds=None, now=None, can_take=None, p
         if row.get("pending_decision") or row.get("decision_milestone"):
             reasons.append("decision pending")
         if row.get("footprint_overlap"):
-            reasons.append("footprint overlaps an occupying lot")
+            reasons.append("footprint overlaps an occupying lot"
+                           + (" (unknown footprint: whole repository)"
+                              if "." in (row.get("footprint_paths") or ()) else ""))
+        elif row.get("repository_cap"):
+            reasons.append("repository in-flight cap reached (%s lots in progress)"
+                           % (row.get("repository_in_flight") or "?"))
         if set(row.get("required_capabilities") or ()) & set(backlog.RESERVED_CAPABILITIES):
             reasons.append("human/production capability required")
         reason = spec_reason(row, rule)
@@ -96,6 +145,7 @@ def evaluate(rows, *, project, rule=None, holds=None, now=None, can_take=None, p
         row = min(roots or list(pending.values()), key=lambda r: (not r["ready"], order_key(r)))
         pending.pop(int(row["id"]))
         ordered.append(row)
+    _disjoint_selection(ordered, policies)
     return {"schema": SCHEMA, "project": project,
             "phase": "bugs" if bugs else "evolutions", "dispatchable_bugs": bugs,
             "ready": [int(r["id"]) for r in ordered if r["ready"]], "lots": ordered}
@@ -123,8 +173,10 @@ def report(db, project, *, cfg=None, now=None, can_take=None, phase=True, snapsh
         holds = backlog._take_holds(db, rows, cfg=cfg)
         if snapshots is not None:
             snapshots[project] = (rows, holds)
+    from . import work_footprints
+    policies = work_footprints.policies_of(db, {str(r.get("app") or "") for r in rows})
     return evaluate(rows, project=project, rule=rule, holds=holds, now=now,
-                    can_take=can_take, phase=phase)
+                    can_take=can_take, phase=phase, policies=policies)
 
 
 def eligible(db, items, *, cfg=None, now=None, can_take=None, phase=True, snapshots=None):

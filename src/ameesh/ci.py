@@ -85,10 +85,14 @@ L125 :
   exécution conclue de la base n'a été relevée, car l'échec est peut-être
   hérité ;
 * échecs suivants : un événement ordinaire par relevé (regroupé par la
-  fenêtre de 90 s du courrier) ;
+  fenêtre de 90 s du courrier), passif (`info`, #5044) une fois la première
+  alerte partie : le verdict les reprend tous ;
 * verdict (vert, ou rouge avec la liste) : un événement ordinaire (#514 : la
   fin de CI réveille l'agent, elle ne perce pas le tour en cours ; le rouge
-  perce déjà par la première alerte d'échec) ; le courrier et la référence qui
+  perce déjà par la première alerte d'échec) ; passif (#5044) tant qu'un autre
+  workflow de la même tête tourne, si c'est un vert ou un rouge déjà signalé :
+  seul le dernier réveille, et si ce dernier est annulé (donc sans verdict), un
+  avis réveille à sa place ; le courrier et la référence qui
   le rend vérifiable (`ci_runs.verdict_message_id`) sont publiés dans la même
   transaction (#795 N2) ; rien pour une exécution annulée ou remplacée ; le
   verdict nomme le workflow et, quand d'autres workflows de la même tête
@@ -821,6 +825,13 @@ def _send_posed(db, to: str, text: str, short: str, *, lot: int | None, payload:
     for record in threads:
         record(db.cfg, db)
     return message_id
+
+
+def _same_lot(row: dict, pending: list[dict] | None) -> list[dict]:
+    """Les exécutions encore en cours dont le verdict ira au même lot : seul
+    celui-là peut prendre le relais du réveil (#5044)."""
+    return [r for r in pending or ()
+            if r.get("work_item_id") == row.get("work_item_id")]
 
 
 def recipient_of(lot: dict | None) -> str | None:
@@ -2016,8 +2027,15 @@ class Watcher:
         view = dict(run, run_id=int(run["id"]), branch=run.get("head_branch") or "",
                     url=run.get("html_url") or run.get("url"),
                     workflow=workflow_of(run.get("path")))
+        # #5044 : l'attente n'appelle aucun geste (passif), et un redémarrage du
+        # service, qui oublie `_pending_alerted`, ne la redit pas.
+        once = "ci-pending:%s:%s:%s" % (repo.replace("/", "."), int(run["id"]),
+                                        int(run.get("run_attempt") or 1))
+        if storage.of(db).mailbox.by_idempotency_key(work.SYSTEM_SENDER, to, once):
+            return []
         text = pending_text(view, lot, waited, cancelled)
-        payload = {"ci": {"repo": repo, "run_id": int(run["id"]),
+        payload = {"info": True, "idempotency_key": once,
+                   "ci": {"repo": repo, "run_id": int(run["id"]),
                           "head_sha": run.get("head_sha"), "branch": run.get("head_branch"),
                           "kind": "pending", "workflow": workflow_of(run.get("path")),
                           "waited_s": int(waited), "cancelled": list(cancelled)}}
@@ -2177,6 +2195,9 @@ class Watcher:
                           "tests": [f["test"] for f in own]}}
         if unknown_base:
             payload["ci_passif"] = True
+        elif row.get("urgent_message_id"):
+            # #5044 : la première alerte a réveillé, le verdict reprendra la liste
+            payload["info"] = True
         def pose(st, message_id: int) -> None:
             if urgent:
                 st.ci.set_message(repo, int(row["run_id"]), "urgent", message_id)
@@ -2299,9 +2320,40 @@ class Watcher:
         if not st.ci.conclude(repo, int(row["run_id"]), status):
             return []
         if status == "cancelled":
-            return [{"action": "verdict", "repo": repo, "run_id": row["run_id"],
-                     "status": status, "to": None}]
+            return self._cancelled_last(db, repo, row, pending) or [
+                {"action": "verdict", "repo": repo, "run_id": row["run_id"],
+                 "status": status, "to": None}]
         return self._verdict(db, repo, row, run, status, pending=pending)
+
+    def _cancelled_last(self, db, repo: str, row: dict,
+                        pending: list[dict] | None) -> list[dict]:
+        """#5044 : le dernier workflow d'une tête est annulé, il ne rend aucun
+        verdict ; ceux des autres, passifs, attendaient ce dernier pour
+        réveiller. Un avis prend sa place, sinon l'agent au repos ne les lit
+        jamais. Une tête remplacée n'en a pas besoin : la nouvelle réveillera."""
+        from . import mail, work
+        if not row.get("work_item_id") or _same_lot(row, pending) \
+                or storage.of(db).ci.head_replaced(repo, row["branch"], row["head_sha"],
+                                                   int(row["run_id"])):
+            return []
+        st = storage.of(db)
+        held = [r for r in st.ci.for_lot(row["work_item_id"], 50)
+                if r.get("head_sha") == row.get("head_sha") and r.get("verdict_message_id")
+                and mail.passive_reason(st.mailbox.get(r["verdict_message_id"]) or {})]
+        lot = work.get(db, int(row["work_item_id"]))
+        to = recipient_of(lot)
+        if not held or not to:
+            return []
+        text = ("%s: cancelled, and it was the last workflow of this head. Verdicts of "
+                "the others, in your mail: %s."
+                % (_head(row, lot), ", ".join("%s %s" % (r.get("workflow") or r["run_id"],
+                                                         r.get("status")) for r in held)))
+        payload = {"ci": {"repo": repo, "run_id": row["run_id"], "head_sha": row["head_sha"],
+                          "branch": row["branch"], "kind": "cancelled_last",
+                          "workflow": row.get("workflow") or ""}}
+        message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=False)
+        return [{"action": "verdict", "repo": repo, "run_id": row["run_id"],
+                 "status": "cancelled", "to": to, "message_id": message_id}]
 
     def _verdict(self, db, repo: str, row: dict, run: dict, status: str, *,
                  pending: list[dict] | None = None) -> list[dict]:
@@ -2332,6 +2384,11 @@ class Watcher:
         # #514 : la fin de CI réveille l'agent (événement ordinaire), elle ne
         # perce pas le tour en cours ; le rouge perce déjà par la première
         # alerte d'échec, urgente et vérifiable en base (`interrupt_allowed`).
+        # #5044 : un autre workflow de la tête tourne encore, et ce verdict
+        # n'apporte aucun signal neuf (vert, ou rouge déjà annoncé par l'alerte
+        # urgente) : passif, le dernier verdict réveille.
+        if _same_lot(row, pending) and (status == "success" or row.get("urgent_message_id")):
+            payload["info"] = True
         # #795 N2 : le courrier du verdict et `verdict_message_id` restent
         # publiés dans la même transaction (un relevé intercalé ne voit jamais
         # l'un sans l'autre).

@@ -80,6 +80,7 @@ GATE_CONTRACTS = (
     "tests.test_2273_merge_pr_required",            # checks requis hors API
     "tests.test_2394_review_gate_verdicts",         # verdicts comptés à la porte
     "tests.test_2442_verdict_carry",                # report sur tête réalignée
+    "tests.test_5042_verdict_carry_adaptation",     # report sur tête adaptée
     # test_2447 (activation au gel) n'a que des classes Postgres : CI du paquet
 )
 #: #3687 : les chemins de la porte touchés, en JSON, posés par le garde du gel

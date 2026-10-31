@@ -836,7 +836,7 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
             "TRUNCATE agent_registry, key_holders, key_events, agent_mailbox, mesh_approvals, "
             "work_items, work_item_events, work_item_milestones, work_packages, "
             "thread_index, notify_liveness, notify_briefs, estimate_references, "
-            "harness_adoptions, harness_versions "
+            "harness_adoptions, harness_versions, repository_footprint_policies "
             "RESTART IDENTITY CASCADE")
         shutil.rmtree(self.tmp, ignore_errors=True)
         os.makedirs(self.tmp, exist_ok=True)

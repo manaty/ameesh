@@ -1998,6 +1998,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "footprint":   # #4173 : empreinte de lot (#3185)
             from . import work_footprints
             return work_footprints.run(cfg, db, args)
+        if args.work_command == "footprint-policy":   # #4818 : politique du dépôt
+            from . import work_footprints
+            return work_footprints.run_policy(cfg, db, args)
         if args.work_command == "landing":   # #1945 : atterrissage planifié sur un véhicule
             from . import work_dependencies
             return work_dependencies.run_landing(db, args)
@@ -2097,14 +2100,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             note = "; ".join(part for part in (segment, introduced) if part)
             # #4173 : l'empreinte d'intake (chemins cités), écrite par la
             # création même ; jamais d'échec de la création pour l'estimer.
+            # #4818 : l'analyse d'impact (lecture seule, bornée), une fois pour
+            # les deux tentatives de création
             from . import work_footprints
-            try:
-                footprint = work_footprints.estimate_lot(cfg, {
-                    "app": args.app or "", "title": args.title, "body": args.body or "",
-                    "branch_target": args.target or ""})
-            except Exception as exc:  # noqa: BLE001 - la création n'attend pas l'estimation
-                footprint = []
-                print("warning: footprint not estimated: %s" % exc, file=sys.stderr)
+            impact = None
+            if not work._is_vehicle_branch(args.branch):
+                impact = work_footprints.analyze_for_creation(
+                    cfg, db, app=args.app or "", title=args.title, body=args.body or "",
+                    branch_target=args.target or "")
+            footprint = list(impact["footprint"]) if impact else []
             add_kwargs = dict(
                 title=args.title, type=args.type, source=args.source, app=args.app,
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
@@ -2115,7 +2119,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 estimate=minutes, estimate_source=args.estimate_source, size=args.size,
                 note=note,
                 force=args.force,
-                parent_lot=args.parent_lot, footprint=footprint)
+                parent_lot=args.parent_lot, footprint=footprint, impact=impact)
             try:
                 item = work.add(db, assignee=args.assignee, **add_kwargs)
             except storage.FootprintOverlap as exc:
@@ -2131,7 +2135,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # doit plus s'afficher (`_print_assignment` plus bas).
                 check = None
                 print("warning: created unassigned: %s"
-                      % work_footprints.refusal(item["id"], exc.overlaps), file=sys.stderr)
+                      % work_footprints.refusal(item["id"], exc.overlaps,
+                                                cap=getattr(exc, "cap", None),
+                                                in_flight=getattr(exc, "in_flight", None)),
+                      file=sys.stderr)
             print(('%s #%d created in %s: %s%s%s%s') % (v.noun, item["id"], item["state"], item["title"], " (plan: %s)" % item["package_id"] if item.get("package_id") else "", " (priority %s)" % work.PRIORITY_LABELS.get(item.get("priority"))
                 if item.get("priority") else "", " — estimated %s" % estimates.label(minutes) if minutes else ""))
             if item.get("external_executor"):
@@ -2173,6 +2180,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                       file=sys.stderr)
             if footprint:
                 print("footprint: %s" % ", ".join(footprint))
+            if impact:
+                print(impact["note"])
             return 0
         if args.work_command == "fingerprint":
             # #3885 : primitive idempotente de la règle §16 — un lot par
@@ -4020,6 +4029,7 @@ def build_parser(vocabulary=None) -> argparse.ArgumentParser:
     work_dependencies.add_links_parser(work_sub, cmd_work)
     from . import work_footprints
     work_footprints.add_parser(work_sub, cmd_work)
+    work_footprints.add_policy_parser(work_sub, cmd_work)
     pw_mig = work_sub.add_parser(
         "migration", help=("reserve the next free migration number for the %s (L122), "
                           "before writing the file; idempotent, visible in work show") % v.noun)

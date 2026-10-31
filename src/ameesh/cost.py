@@ -1356,9 +1356,10 @@ class CostBook:
         if all(gauge.resets_at for gauge in held):
             free, gauge = max(((float(g.free_at(now, reserve)), g) for g in held),
                               key=lambda pair: pair[0])
-            head = "pause (account %s, %s %.0f %%) until %s; " % (
+            # #4781 : `@epoch`, voir `accounts.pause_label`
+            head = "pause (account %s, %s %.0f %%) until %s@%d; " % (
                 DEFAULT_ACCOUNT_LABEL, gauge.key, gauge.used * 100,
-                until_label(free, now))
+                until_label(free, now), int(free) // 60 * 60)
         else:
             gauge = held[0]
         return head + ("plan %s %s: %.0f%% used with %.0f%% of the window "

@@ -24,6 +24,11 @@ from .test_l30_accounts import _Base as _L30Base, _codex_rollout
 HEURE = 3600.0
 
 
+def _sans_epoch(raison):
+    """#4781 : le libellé lisible, sans le marqueur `@epoch` de l'échéance."""
+    return re.sub(r"@\d+;", ";", raison)
+
+
 class ReserveForfaitTest(_Comptes):
     def test_un_non_critique_s_arrete_dix_points_plus_tot(self):
         self.jauge("primaire", 96)       # au seuil pour tous
@@ -62,7 +67,7 @@ class ReserveForfaitTest(_Comptes):
         fin = time.localtime(self.now + 1800)
         meme_jour = fin[:3] == time.localtime(self.now)[:3]
         heure = time.strftime("%H:%M" if meme_jour else "%d/%m %H:%M", fin)
-        self.assertTrue(raison.startswith(
+        self.assertTrue(_sans_epoch(raison).startswith(
             "pause (account (default), five_hour 96 %%) until %s; plan codex five_hour" % heure),
             raison)
 
@@ -76,7 +81,7 @@ class ReserveForfaitTest(_Comptes):
                 mock.patch.object(book, "clock", return_value=self.now):
             raison = book.pace_exceeded("codex")
         fin = time.strftime("%d/%m %H:%M", time.localtime(self.now + 2 * 86400))
-        self.assertTrue(raison.startswith(
+        self.assertTrue(_sans_epoch(raison).startswith(
             "pause (account (default), seven_day 96 %%) until %s; plan codex seven_day" % fin),
             raison)
         # une fenêtre qui bloque sans date : aucune heure annoncée
@@ -147,7 +152,7 @@ class DebutDeFenetreTest(unittest.TestCase):
                 mock.patch.object(book, "clock", return_value=self.now):
             raison = book.pace_exceeded("codex", accounts.RESERVE)
         fin = avance.free_at(self.now, accounts.RESERVE)
-        self.assertTrue(raison.startswith(
+        self.assertTrue(_sans_epoch(raison).startswith(
             "pause (account (default), seven_day 15 %%) until %s; plan codex seven_day"
             % cost.until_label(fin, self.now)), raison)
         self.assertIn("pace cap 10%", raison)
@@ -219,7 +224,7 @@ class AffichageDeLaPauseTest(_Comptes):
         meme_jour = fin[:3] == time.localtime(self.now)[:3]
         heure = time.strftime("%H:%M" if meme_jour else "%d/%m %H:%M", fin)
         self.assertTrue(pause.reason.startswith("pause (account "), pause.reason)
-        self.assertIn(") until %s; all codex accounts at threshold" % heure, pause.reason)
+        self.assertIn(") until %s; all codex accounts at threshold" % heure, _sans_epoch(pause.reason))
         self.assertRegex(pause.reason, r"codex-300min (96|97) %")
 
     def test_la_pause_d_un_compte_dit_sa_fenetre_la_plus_longue(self):
@@ -241,7 +246,7 @@ class AffichageDeLaPauseTest(_Comptes):
         pause = self.choose()
         self.assertIsNone(pause.profile)
         fin = time.strftime("%d/%m %H:%M", time.localtime(self.now + 2 * 86400))
-        self.assertRegex(pause.reason, r"^pause \(account \w+, codex-10080min 96 %%\) "
+        self.assertRegex(_sans_epoch(pause.reason), r"^pause \(account \w+, codex-10080min 96 %%\) "
                                        r"until %s; " % re.escape(fin))
 
     def test_une_pause_budget_n_est_jamais_un_arret(self):

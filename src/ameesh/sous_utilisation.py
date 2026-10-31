@@ -1146,9 +1146,13 @@ def footprint_blockers(db, waiting_lots: list, lots: list, *,
     for row in store.work_footprints.for_items(
             [int(lot["id"]) for lot in lots]):
         paths.setdefault(int(row["work_item_id"]), []).append(str(row["path"]))
+    # #4818 : chemins partagés et plafond de lots en vol de chaque dépôt
+    from . import work_footprints
+    policies = work_footprints.policies_of(
+        db, {str(lot.get("app") or "") for lot in waiting_lots})
     out: dict = {}
     for lot in waiting_lots:
-        blockers = slo.footprint_blockers(lot, lots, paths)
+        blockers = slo.footprint_blockers(lot, lots, paths, policies)
         if blockers:
             out[int(lot["id"])] = blockers
     return out

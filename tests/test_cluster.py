@@ -191,6 +191,16 @@ FERMEES = {
     # modifié.
     "work_item_footprints": {"work_item_id", "source", "path", "head", "created_by",
                              "created_at"},
+    # #4818 (0519) : politique d'empreinte d'un dépôt (inconnue, plafond,
+    # chemins partagés) et dernière analyse d'impact d'un lot (chemins,
+    # confiance, budget). État interne lu par la garde d'attribution ; fermé
+    # aux deux rôles superviseur en attendant un classement, aucun GRANT
+    # modifié.
+    "repository_footprint_policies": {"app", "unknown_policy", "max_in_flight",
+                                      "shared_paths", "updated_by", "updated_at"},
+    "work_item_impact_analyses": {"work_item_id", "status", "reason", "paths", "weak",
+                                  "policy", "elapsed_ms", "git_calls", "attempts",
+                                  "analyzed_by", "analyzed_at"},
     # #1770 (0450) : le rapport de prévalidation au gel (sélection, tests, hôte,
     # chemin du plan) est une preuve interne lue par l'exécuteur, pas un état
     # de supervision ; table fermée aux deux rôles, aucun GRANT modifié.

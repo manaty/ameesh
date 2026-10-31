@@ -56,8 +56,8 @@ class CarrierAssigneeTest(_Lots):
         # Le corps du porteur cite le script du composeur : ce n'est pas un
         # delta du porteur. L'estimation d'intake n'est pas même demandée.
         with mock.patch.object(
-                fp, "estimate_for_creation",
-                return_value=["scripts/paquet-horaire.py"]) as estimate:
+                fp, "analyze_for_creation",
+                return_value={"footprint": ["scripts/paquet-horaire.py"]}) as estimate:
             carrier = self.carrier(
                 body="Paquet composé par scripts/paquet-horaire.py (#3845).")
         estimate.assert_not_called()
