@@ -16,6 +16,7 @@ class CanonGuardTest(unittest.TestCase):
     take = l234.AuditorTest.take
 
     def setUp(self):
+        support.patch_mechanics(self)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         # #2451 : le plafond §4 passe par le canon compilé ; ces témoins
