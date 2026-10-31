@@ -41,6 +41,11 @@ begin
         update work_review_withdrawals set withdrawn = false
          where work_item_id = new.id and reviewer = spelling;
     end loop;
+    -- Automatic seat rotation is not an explicit withdrawal. The caller
+    -- scopes this transaction setting to its single reviewers UPDATE.
+    if current_setting('ameesh.review_seat_rotation', true) = 'on' then
+        return new;
+    end if;
     for spelling in
         select coalesce(ameesh_agent_primary_locked(n), n)
           from unnest(coalesce(old.reviewers, '{}'::text[])) n

@@ -102,6 +102,47 @@ class ReviewHoldTest(PgTestCase):
             self.verdict()
         self.assertEqual(work.get(self.db, self.lot)["reviewers"], [])
 
+    def rotate(self, db=None):
+        db = db or self.db
+        registry.upsert(db, "next-reader", harness="claude", host=self.cfg.host)
+        old = {"freeze": {"id": 1}, "reviewers": [{"name": "reader"}]}
+        new = {"freeze": {"id": 2}, "reviewers": [{"name": "next-reader"}]}
+        with mock.patch.object(activation, "_lock_current_freeze", return_value=True), \
+                mock.patch.object(activation, "_marks", return_value=[(1, "selection", old, 0)]), \
+                mock.patch.object(activation, "_effective_mark", return_value=(2, "selection", new)), \
+                mock.patch.object(activation, "_manual_designations", return_value={}):
+            activation._sync_reviewers(db, {"id": self.lot, "state": "qa"},
+                                       {"id": 2, "sha": HEAD}, ["next-reader"])
+
+    def test_rotation_keeps_old_reviewers_right_to_unsolicited_verdict(self):
+        self.seat()
+        self.rotate()
+        self.assertEqual(work.get(self.db, self.lot)["reviewers"], ["next-reader"])
+        self.assertEqual(self.db.query("SELECT * FROM work_review_withdrawals"
+                                       " WHERE work_item_id = %s", (self.lot,)), [])
+        self.verdict()
+
+    def test_rotation_setting_does_not_leak_into_later_explicit_removal(self):
+        self.seat()
+        with self.db.transaction() as tx:
+            self.rotate(tx)
+            storage.of(tx).work.designate_reviewer(
+                self.lot, "next-reader", actor="human:alice", remove=True)
+        with self.assertRaisesRegex(db_mod.DbError, "withdrawn"):
+            self.verdict(actor="next-reader")
+        self.verdict()
+
+    def test_rotation_rollback_restores_seat_and_setting(self):
+        self.seat()
+        with self.assertRaisesRegex(RuntimeError, "rollback"):
+            with self.db.transaction() as tx:
+                self.rotate(tx)
+                raise RuntimeError("rollback")
+        self.assertEqual(work.get(self.db, self.lot)["reviewers"], ["reader"])
+        self.seat(remove=True)
+        with self.assertRaisesRegex(db_mod.DbError, "withdrawn"):
+            self.verdict()
+
     def test_direct_removal_and_alias_cannot_bypass_withdrawal(self):
         self.seat()
         self.db.execute("UPDATE agent_registry SET aliases = ARRAY['old-reader'] WHERE name = 'reader'")

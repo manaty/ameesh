@@ -142,7 +142,9 @@ bail, ni son statut, ni la réception de son courrier. Elle ne ferme pas les pri
 de lots ou les gels : arrêter le runner reste nécessaire avant le renommage.
 Elle n'expire pas automatiquement ; sa levée est un geste explicite et tracé.
 
-Le retrait d'un relecteur d'un lot interdit désormais ses **nouveaux** verdicts
+La rotation automatique des sièges au regel ne constitue pas un retrait : les
+anciens relecteurs peuvent toujours proposer un avis spontané. Le retrait
+explicite d'un relecteur d'un lot interdit désormais ses **nouveaux** verdicts
 sur ce lot, jusqu'à une nouvelle désignation enregistrée. Un avis signé avant le retrait
 reste une preuve valable ; le retrait ne réécrit pas l'historique. Une relecture
 spontanée reste acceptée si le relecteur n'a jamais été retiré de ce lot. Le registre
