@@ -50,6 +50,30 @@ class MoveLotOfAnotherTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.lot_state(), "build")
 
+    def test_le_move_journalise_l_identite_liee_malgre_actor(self):
+        for state, actor in (("build", "tiers"), ("qa", "human:owner")):
+            proc = self.move(state, "--actor", actor, session="porteur")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(work.events(self.db, self.lot)[0]["actor"], "porteur")
+
+    def test_le_delegant_avec_echeance_peut_deplacer_le_lot(self):
+        self.db.execute("UPDATE work_items SET delegated_by = 'tiers', "
+                        "due_at = now() + interval '1 hour' WHERE id = %s",
+                        (self.lot,))
+        proc = self.move("build", "--actor", "porteur", session="tiers")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = work.get(self.db, self.lot)
+        self.assertEqual(item["state"], "build")
+        self.assertEqual(work.events(self.db, self.lot)[0]["actor"], "tiers")
+
+    def test_le_delegant_sans_echeance_est_refuse(self):
+        self.db.execute("UPDATE work_items SET delegated_by = 'tiers' WHERE id = %s",
+                        (self.lot,))
+        proc = self.move("build", session="tiers")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("held by porteur", proc.stderr)
+        self.assertEqual(self.lot_state(), "intake")
+
     def test_humain_et_session_sans_identite_passent(self):
         proc = self.move("build", "--actor", "human:owner")
         self.assertEqual(proc.returncode, 0, proc.stderr)

@@ -301,6 +301,14 @@ class ServePgTest(ServerMixin, PgTestCase):
         cls.turn = uuid.uuid4().hex
         storage.of(cls.db).turn_resources.open_turn(
             cls.turn, "a1", "h1", pgid=None, label="tour observé")
+        cls.db.execute("insert into sandbox_turns (turn_id,spend_key,agent,owner,lease_epoch,"
+                       "scope,scope_digest,retry_family,scope_generation,attempt,max_attempts,"
+                       "profile_ref,profile_digest,placement_ref,placement_digest,canon_ref,limits,"
+                       "image_digest,provider,namespace,job_name,deadline_ts,source) values"
+                       " (%s,'sandbox-api-key','a1','runner',1,'{}','digest','family',1,1,2,"
+                       " 'profile','pd','place','pld','canon','{}','sha256:image',"
+                       " 'kubernetes','default','sandbox-api-job',now()+interval '1 hour','{}')",
+                       (cls.turn,))
         cls.request = mail.send(cls.db, "human:owner", "a1",
                                 "corps secret jamais observé", kind="request",
                                 payload={"secret": "charge utile jamais observée"})
@@ -327,6 +335,8 @@ class ServePgTest(ServerMixin, PgTestCase):
             "/api/v1/agents/{agent}/chat": "/api/v1/agents/a1/chat?limit=5",
             "/api/v1/lots": "/api/v1/lots?state=build&limit=10",
             "/api/v1/lots/{id}": "/api/v1/lots/" + lot,
+            '/api/v1/sandbox/turns': '/api/v1/sandbox/turns',
+            '/api/v1/sandbox/turns/{turn}': '/api/v1/sandbox/turns/' + self.turn,
             "/api/v1/turns/{turn}": "/api/v1/turns/" + self.turn,
             "/api/v1/requests/{request}": "/api/v1/requests/%d" % self.request,
             "/api/v1/decisions": "/api/v1/decisions?all=1",
@@ -387,6 +397,16 @@ class ServePgTest(ServerMixin, PgTestCase):
                      "/api/v1/requests/" + "9" * 20):
             status, data = self.get_json(path)
             self.assertEqual((status, data["error"]), (400, "bad_path"), path)
+
+    def test_sandbox_errors_and_read_filters(self):
+        status, body = self.get_json('/api/v1/sandbox/turns/' + '0' * 32)
+        self.assertEqual((status, body['error']), (404, 'unknown-turn'))
+        for query in ('limit=0', 'limit=1001', 'limit=bad', 'state=invalid'):
+            status, body = self.get_json('/api/v1/sandbox/turns?' + query)
+            self.assertEqual((status, body['error']), (400, 'bad_query'))
+        status, body = self.get_json('/api/v1/sandbox/turns?agent=nobody')
+        self.assertEqual(status, 200)
+        self.assertEqual(body['turns'], [])
 
     def test_timeline_is_the_light_progress_view(self):
         # #3395: the Chronologie endpoint says the same lots as the progress

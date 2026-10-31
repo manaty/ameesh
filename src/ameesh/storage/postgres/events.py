@@ -55,6 +55,29 @@ class Events(interface.Events):
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
 
+    def context_events(self, since_ts, until_ts, limit, *, after_id=0,
+                       harness=None) -> list:
+        # #5134 : la fenêtre porte sur `created_at`, l'instant d'insertion que
+        # le journal garantit ; `id` ordonne la lecture et sert de curseur.
+        # Aucun index dédié au JSON n'est supposé : le filtre de type et la
+        # borne de temps gardent la lecture sur les index existants, puis le
+        # harnais est filtré dans la même requête.
+        if int(limit) < 1:
+            raise ValueError("context_events: limit must be positive")
+        sql = ("select " + _COLUMNS + " from ameesh_events"
+               " where type = 'turn.context' and id > %s"
+               " and created_at >= to_timestamp(%s)")
+        params = [int(after_id), float(since_ts)]
+        if until_ts is not None:
+            sql += " and created_at < to_timestamp(%s)"
+            params.append(float(until_ts))
+        if harness is not None:
+            sql += " and data->>'harness' = %s"
+            params.append(str(harness))
+        sql += " order by id limit %s"
+        params.append(int(limit))
+        return self.db.query(sql, tuple(params))
+
     def context_type(self, type, days, limit, *, object_prefix) -> list:
         # One snapshot for the boundary, recent history and its preceding state.
         # Bound each set independently: recent chatter must not evict old states.

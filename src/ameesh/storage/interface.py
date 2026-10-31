@@ -792,6 +792,21 @@ class TurnCosts(Domain):
         ligne suit sa propre convention de cache."""
 
     @abc.abstractmethod
+    def session_rows(self, agent: str, session: str) -> list[dict]:
+        """#5134 (CTX-05a) : toutes les lignes du grand livre d'une session.
+
+        Lecture seule, pour reconstruire ``S_hist`` tour par tour : les lignes
+        ``turn_costs`` de ``(agent, session)`` dans l'ordre du grand livre
+        (``recorded_at``, ``id``), avec ``id``, ``turn_id``, ``harness``,
+        ``input_tokens``, ``cached_input_tokens``, ``output_tokens``,
+        ``cache_write_tokens``, ``void_reason`` et ``recorded_ts`` (epoch).
+        Aucun tour : liste vide. Les lignes sont comptées quels que soient
+        leur coût ou leur ``void_reason`` : leur usage a eu lieu. Plusieurs
+        harnais dans la session suivent chacun leur convention de cache, comme
+        :meth:`session_reread`."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def first_after(self, agent: str, ts: float) -> dict | None:
         """#1777 : la première ligne écrite de `agent` à `ts` (epoch) ou après :
         `harness`, `session`, `recorded_ts` (epoch) ; ou None. `cost.record`
@@ -1065,6 +1080,23 @@ class Events(Domain):
         The `created_at` bound keeps the read on the
         retention index; `days` is the durability the caller needs, never a
         substitute for an absent event."""
+
+    @abc.abstractmethod
+    def context_events(self, since_ts: float, until_ts: float | None, limit: int,
+                       *, after_id: int = 0,
+                       harness: str | None = None) -> list[dict]:
+        """#5134 (CTX-05a) : les événements ``turn.context`` d'une fenêtre.
+
+        Lecture seule, pour reconstruire le corpus de rejeu : les lignes dont
+        l'insertion est dans ``[since_ts, until_ts]`` (epoch ; ``until_ts``
+        exclusif), d'identifiant supérieur à ``after_id``, dans l'ordre
+        croissant de l'identifiant, au plus ``limit``. ``harness`` filtre sur
+        le harnais **publié** dans la charge (``data->>'harness'``), jamais sur
+        une valeur supposée. La fenêtre porte sur l'instant d'insertion de
+        l'événement, pas sur un horodatage de la charge : c'est la seule borne
+        que le journal garantit. Aucun texte libre n'est lu par cette
+        opération."""
+        raise NotImplementedError
 
     def context_type(self, type: str, days: int, limit: int, *,
                      object_prefix: str) -> list[dict]:

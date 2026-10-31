@@ -64,10 +64,14 @@ FREEZE_ABSENT_LINE = re.compile(r"(?m)^[ \t]*ameesh-freeze-absent:[^\n]*(?:\n|$)
 #: d'appelant. Le motif est générique pour couvrir aussi les marques des
 #: branches #2962/#2989 : une ligne fournie par `--note` est retirée avant
 #: l'écriture, comme `FREEZE_ABSENT_LINE` le fait pour `absent`.
+#: #5025 : `ameesh-non-assignee:` est aussi une preuve machine (posée par
+#: `work.non_assignee_warning`, imprimée par le CLI) : une ligne fournie par
+#: `--note` doit disparaître comme les marques de gel, sinon l'appelant
+#: fabrique un avertissement que le gate n'a pas produit.
 #: Le motif juge une ligne déjà strippée : `add_milestone` strippe la note
 #: finale, donc un blanc de tête (`\v`, `\f`, espace insécable) ne doit pas
 #: cacher la marque (#2971, revue impl-05 — même classe que #2989 B).
-FREEZE_MACHINE_LINE = re.compile(r"ameesh-freeze-[a-z0-9-]+:")
+FREEZE_MACHINE_LINE = re.compile(r"ameesh-(?:freeze-[a-z0-9-]+|non-assignee):")
 #: #2989 : la ligne machine d'un gel qui déclare un gel antérieur **remplacé**
 #: (un gel fantôme dont le SHA n'existe nulle part, ou un gel devenu objet
 #: pendant après un force-push, hors de toute ref — #3399). Elle n'est écrite

@@ -117,6 +117,10 @@ class TurnObservation(interface.TurnObservation):
             ledger = rows[0] if rows else None
             if agent_name is None:
                 agent_name = (resource or ledger or marker or {}).get("agent")
+        if agent_name is None and turn_id:
+            rows = self.db.query('select agent from sandbox_turns where turn_id = %s',
+                                 (turn_id,))
+            agent_name = rows[0]['agent'] if rows else None
         if agent_name is None:
             return None
         rows = self.db.query(AGENT_SQL, (agent_name,))

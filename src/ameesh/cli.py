@@ -393,9 +393,11 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     new_project = "--new-project" in args
     args = [arg for arg in args if arg != "--new-project"]
     # L514: a review verdict or an arbitration reaches a dsh or codex turn
-    # at its next safe point instead of waiting for the end of the turn
-    marks = [key for key in mail.MID_TURN_KEYS if "--" + key in args]
-    args = [arg for arg in args if arg not in ["--" + key for key in mail.MID_TURN_KEYS]]
+    # at its next safe point instead of waiting for the end of the turn.
+    # #5025 : seules les marques que le CLI documente sont des options ; une
+    # clé de charge utile interne (`reassigned`) ne doit pas avaler un corps.
+    marks = [key for key in mail.MID_TURN_OPTIONS if "--" + key in args]
+    args = [arg for arg in args if arg not in ["--" + key for key in mail.MID_TURN_OPTIONS]]
     explicit_sender = "--from" in args
     estimate = None
     force = None

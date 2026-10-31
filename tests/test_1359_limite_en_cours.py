@@ -16,7 +16,7 @@ import os
 import time
 from unittest import mock
 
-from ameesh import backlog, handoff, notify, progress, registry, storage, work, wip
+from ameesh import backlog, handoff, mail, notify, progress, registry, storage, work, wip
 from ameesh.db import DbError
 from ameesh.storage import interface
 
@@ -787,6 +787,13 @@ class BranchementNotifyTest(_Base):
         self.assertEqual(releves[0]["delivery"], "rendu")
         mails = self.courriers("dev1")
         self.assertEqual([m["work_item_id"] for m in mails], [str(lots[0]["id"])])
+        # #5025 N3 : ce courrier EST l'avis de réassignation à la file ; la
+        # clé `reassigned` le fait remettre au point sûr d'un tour en cours.
+        payload = self.db.query(
+            "SELECT payload FROM agent_mailbox WHERE recipient = 'dev1'"
+            " ORDER BY id DESC LIMIT 1")[0]["payload"] or {}
+        self.assertIn("reassigned", payload)
+        self.assertTrue(mail.mid_turn({"payload": payload}))
 
     def test_le_dry_run_global_force_le_dry_run(self):
         self._trois_lots()

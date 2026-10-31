@@ -563,10 +563,12 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("812", out)
         code, out, err = self.ameesh("work", "move", "812", "qa", "--note", "PR ouverte",
-                                     "--actor", "inge-front")
+                                     "--actor", "autre-agent")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.server.ops(), ["agents.resolve_name", "work.get", "work.note",
-                                             "agents.resolve_name", "work.get", "work.move"])
+                                             "leases.state", "agents.resolve_name", "work.get", "work.move"])
+        move = [r for r in self.session_requests() if r["body"]["op"] == "work.move"][0]
+        self.assertEqual(move["body"]["kwargs"]["actor"], "inge-front")
         self.assert_session_only()
 
     def test_work_move_lot_pinne_refuse_sans_sql(self):
@@ -581,7 +583,7 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("pinned to workflow canon/process/site@7", err)
         self.assertIn("process_registry", err)
-        self.assertEqual(self.server.ops(), ["agents.resolve_name", "work.get"])
+        self.assertEqual(self.server.ops(), ["leases.state", "agents.resolve_name", "work.get"])
         self.assert_session_only()
 
     def test_work_close_lot_pinne_refuse_sans_sql(self):
