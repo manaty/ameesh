@@ -13857,7 +13857,8 @@ class Runner:
             if not candidates:
                 return []
             try:
-                scan = os_layer.env_values("AMEESH_TURN_ID")
+                scan = os_layer.env_values("AMEESH_TURN_ID",
+                                           allow=_executor_process_names())
             except os_layer.NotAvailable as exc:
                 log("turn resources not settled: %s; next review in %ds"
                     % (exc, int(LIVE_REVIEW_EVERY_S)))
@@ -14791,6 +14792,8 @@ def attach_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max", type=attach_mod.duration, default=attach_mod.DEFAULT_MAX,
                         help="maximum interactive duration (default: 2h; e.g. 30m, 4h)")
     parsed = parser.parse_args(argv)
+    if not _harden_executor_environment():
+        return 1
     cfg = load_config()
     adapters.configure(cfg)  # L106 : `harness_bins` de l'hôte
     try:
@@ -15064,7 +15067,59 @@ def _take_balance(args) -> dict:
     return exploitation.balance_thresholds(args)
 
 
+#: #5029: vrai quand ce processus a déjà posé son drapeau non-dumpable.
+_ENV_HIDDEN = False
+
+
+def _executor_process_names() -> tuple:
+    """#5029 : noms sous lesquels un exécuteur se présente dans `/proc`.
+
+    `settle_dead_turns` cherche l'identifiant de tour dans l'environnement de
+    tous les processus de l'utilisateur. Depuis #5029, l'exécuteur est
+    non-dumpable et illisible ; il ne porte jamais d'identifiant de tour, mais
+    le doute d'un tour inachevé est sans borne haute : sans `allow`, le premier
+    exécuteur redémarré après un incident empêcherait de solder le tour pour
+    toujours. Les noms sont ceux des deux points d'entrée du paquet
+    (`ameesh`, `agent-runner`) et du script réellement invoqué."""
+    from . import platform as os_layer
+    names = set(os_layer.EXECUTOR_NAMES)
+    argv0 = os.path.basename(sys.argv[0] or "")
+    if argv0 and not argv0.startswith("python") and not argv0.endswith(".py"):
+        names.add(argv0)
+    return tuple(sorted(names))
+
+
+def _harden_executor_environment() -> bool:
+    """#5029: rendre l'environnement de l'exécuteur illisible à ses pairs.
+
+    Les clés de fournisseur (`DEEPSEEK_API_KEY`…) et le DSN vivent dans
+    l'environnement initial de l'exécuteur ; un tour du même utilisateur les
+    lisait dans `/proc/<pid>/environ` (incident cx2 #4944). `PR_SET_DUMPABLE`
+    à 0 fait refuser cette lecture par le noyau.
+
+    Appelé par l'exécuteur **lui-même**, jamais par un lanceur qui `exec` :
+    `execve` remet le drapeau à 1. Un refus du noyau arrête l'exécuteur plutôt
+    que de le laisser courir avec son environnement lisible.
+    """
+    global _ENV_HIDDEN
+    from .platform import process as process_mod
+    try:
+        hidden = process_mod.become_undumpable()
+    except OSError as exc:
+        print("agent-runner: refusing to run: %s (the executor's environment would "
+              "stay readable by other processes of the same user)" % exc,
+              file=sys.stderr)
+        return False
+    if hidden and not _ENV_HIDDEN:
+        _ENV_HIDDEN = True
+        log("executor environment hidden from other processes of the same user "
+            "(PR_SET_DUMPABLE=0)")
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
+    if not _harden_executor_environment():
+        return 1
     argv = sys.argv[1:] if argv is None else argv
     # `register --help` / `stop --help` affichent l'aide, jamais d'écriture en base
     if argv and argv[0] in ("register", "stop") and any(a in ("-h", "--help") for a in argv[1:]):

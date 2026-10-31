@@ -100,6 +100,8 @@ class MainSortieSansTourTest(unittest.TestCase):
     def test_stoprequested_rend_zero(self):
         with mock.patch.object(runner_mod, "load_config",
                                return_value=config_mod.Config()), \
+                mock.patch.object(runner_mod, "_harden_executor_environment",
+                                  return_value=True), \
                 mock.patch("ameesh.host_gate.gate_choice"), \
                 mock.patch.object(runner_mod, "_connect_at_start",
                                   side_effect=runner_mod.StopRequested(signal.SIGTERM)):

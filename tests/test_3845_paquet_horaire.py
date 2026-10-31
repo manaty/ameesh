@@ -742,7 +742,7 @@ class FreshTest(unittest.TestCase):
 
     def test_main_refuse_sans_aucun_geste(self):
         saved = (ph.check_fresh, ph.tick, ph.align_schema, ph.read_pause)
-        ph.read_pause = lambda project, target: None
+        ph.read_pause = lambda project, target, **kw: None
         ticked = []
         def stale(ctx):
             raise ph.HoraireError("code périmé")
@@ -848,7 +848,7 @@ class GitIdentityTest(unittest.TestCase):
 
     def test_main_pose_l_identite_du_pilote(self):
         saved = (ph.check_fresh, ph.tick, ph.align_schema, ph.read_pause)
-        ph.read_pause = lambda project, target: None
+        ph.read_pause = lambda project, target, **kw: None
         seen = []
         ph.check_fresh = ph.align_schema = lambda ctx: None
         ph.tick = lambda ctx: seen.append(

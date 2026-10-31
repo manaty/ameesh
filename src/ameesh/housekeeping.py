@@ -404,6 +404,18 @@ HOLDERS_UNREADABLE = "holders unreadable"
 #: #3396 : la clé du canon qui excuse un démon par son nom ; dite dans le plan
 #: pour que l'opérateur sache quoi déclarer quand gpg-agent retient tout
 UNREADABLE_OK_HINT = "policy.housekeeping.unreadable_ok if it is a daemon"
+
+
+def unreadable_allow(policy: "Policy") -> tuple:
+    """L230 + #5029 : démons de la carte d'hôte, plus l'exécuteur lui-même.
+
+    L'exécuteur est non-dumpable (#5029) et ne tient jamais un worktree, un
+    artefact ou une entrée de /tmp : le harnais et ses outils sont les
+    détenteurs, et ils restent dumpables. Sans cette liste, chaque hôte à
+    exécuteur garderait tous ses worktrees (doute fail-closed) tant que sa
+    carte ne nomme pas `ameesh`."""
+    return tuple(dict.fromkeys(tuple(policy.unreadable_ok) + platform.EXECUTOR_NAMES))
+
 #: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
 MEMORY_FS = ("tmpfs", "ramfs")
 #: L162 : l'action attendue quand le tmpfs se remplit (alertes, journal)
@@ -2558,11 +2570,12 @@ def _orphan_verdict(row: dict, policy: Policy, *, base: str, registered, protect
         return "attend", "modified %s ago (deleted after %s without change)" % (
             fmt_idle(max(0.0, idle)), fmt_idle(policy.orphan_idle))
     holder = tmp_holder(path)
-    if holder.startswith(HOLDERS_UNREADABLE) and policy.unreadable_ok:
+    allowed = unreadable_allow(policy)
+    if holder.startswith(HOLDERS_UNREADABLE) and allowed:
         # L230 : la première lecture est muette (processus non dumpable) ;
         # l'hôte qui a nommé ces processus repose la question avec son allow,
         # et un détenteur CONSTATÉ reste rapporté.
-        holder = tmp_holder(path, allow=policy.unreadable_ok)
+        holder = tmp_holder(path, allow=allowed)
     if holder:
         return "attend", holder
     # #2512 : an attributed entry (before #222) gets the same saved-work
@@ -4399,6 +4412,7 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
     if budget is not None:
         # #3802 (B1) : l'artefact ne mange pas la réserve des phases suivantes
         seconds = min(seconds, max(0.0, budget.remaining() - reserve_s))
+    allowed = unreadable_allow(policy)
     return build_artifacts.gently(
         lambda: build_artifacts.run(
             candidates(), rules,
@@ -4406,7 +4420,7 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
             ended_idle_s=policy.artifact_ended_idle, ended_of=ended_of,
             protected=list(cwd_of.values()), skip_roots=skip,
             owner_of=owner_of, keep=keep, dry_run=dry_run, now=now,
-            allow=policy.unreadable_ok, lock_path=lock_path, journal_path=journal_path,
+            allow=allowed, lock_path=lock_path, journal_path=journal_path,
             budget_s=seconds))
 
 
@@ -5684,7 +5698,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         for line in deps_mod.gc_node_modules(croot, now=now, idle=policy.deps_idle,
                                              dry_run=dry_run, worktrees=known_worktrees,
                                              budget=budget,
-                                             reserve=reserve, allow=policy.unreadable_ok):
+                                             reserve=reserve,
+                                             allow=unreadable_allow(policy)):
             if line["action"] == "would-delete":
                 plan.append({"kind": "deps", "path": line["path"], "action": "suppression",
                              "bytes": line["bytes"], "detail": line["detail"]})
@@ -5733,10 +5748,11 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             entries += found["entries"]
             plan += found["plan"]
             skipped += found["skipped"]
+        allowed = unreadable_allow(policy)
         wt_entries, wt_plan = _worktree_pass(db, host, dry_run=dry_run,
                                              protected=protected, now=now, running=running,
                                              artifacts=policy.artifacts,
-                                             allow=policy.unreadable_ok, lock_path=lock_path,
+                                             allow=allowed, lock_path=lock_path,
                                              journal_path=journal_path,
                                              skip_roots=(troot, croot, cfg.state_dir)
                                              + _shared_roots(),
@@ -5757,7 +5773,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                 cl_entries, cl_plan, cl_skipped = housekeeping_clones.reap(
                     db, host, cfg, roots=policy.worktree_roots, agents=cwd_of,
                     protected=protected, dry_run=dry_run, now=now,
-                    artifacts=policy.artifacts, allow=policy.unreadable_ok,
+                    artifacts=policy.artifacts, allow=allowed,
                     lock_path=lock_path, journal_path=journal_path,
                     skip_roots=(troot, croot, cfg.state_dir) + _shared_roots(),
                     budget_s=max(0.0, budget.remaining() - reserve))

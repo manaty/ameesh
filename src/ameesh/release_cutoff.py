@@ -986,7 +986,8 @@ def migrations_between(repo: str, since: str, target: str) -> list[str]:
     names = _out(repo, "diff", "--name-only", "%s..%s" % (since, target),
                  "--", "src/ameesh/migrations")
     return sorted({os.path.basename(name) for name in names.splitlines()
-                   if name.endswith(".sql")})
+                   if name.endswith(".sql")
+                   and os.path.dirname(name) == "src/ameesh/migrations"})
 
 
 def generate_notes(*, project: "ProjectRelease", repo: str, since: str, target: str,
@@ -1127,6 +1128,13 @@ class ProjectRelease:
                                     or "staging" in entry):
             raise ReleaseError("nexlink model requires project nexlink, target develop, "
                                "and its closed staging workflow list (no staging script)")
+        elected_role = ((getattr(cfg, "release", None) or {}).get("role")
+                        or (getattr(cfg, "packet_watch", None) or {}).get("role"))
+        executor = entry.get("staging_executor")
+        if (elected_role and model != "nexlink"
+                and (not isinstance(executor, str) or not executor.strip())):
+            raise ReleaseError("release.projects.%s.staging_executor is required under an "
+                               "elected role: synchronous staging can restart its pilot" % name)
         bump = entry.get("version_bump", "level")
         if bump not in ("level", "patch"):
             raise ReleaseError("release.projects.%s.version_bump: level | patch" % name)
@@ -1163,11 +1171,14 @@ def projects(cfg) -> dict[str, ProjectRelease]:
     block = getattr(cfg, "release", None) or {}
     if not isinstance(block, dict):
         raise ReleaseError("release: an object is required")
-    unknown = set(block) - {"host", "projects"}
+    unknown = set(block) - {"host", "role", "projects"}
     if unknown:
         raise ReleaseError("release: unknown key(s) %s" % ", ".join(sorted(unknown)))
     host = block.get("host")
-    if host and str(host) != cfg.host:
+    role = block.get("role")
+    if role is not None and (not isinstance(role, str) or not role.strip()):
+        raise ReleaseError("release.role: a non-empty role name is required")
+    if not role and host and str(host) != cfg.host:
         return {}
     declared = block.get("projects") or {}
     if not isinstance(declared, dict):

@@ -112,11 +112,14 @@ def projects(cfg) -> dict[str, ProjectWatch]:
     block = getattr(cfg, "packet_watch", None) or {}
     if not isinstance(block, dict):
         raise WatchError("packet_watch: an object is required")
-    unknown = set(block) - {"host", "projects"}
+    unknown = set(block) - {"host", "role", "projects"}
     if unknown:
         raise WatchError("packet_watch: unknown key(s) %s" % ", ".join(sorted(unknown)))
     host = block.get("host")
-    if host and str(host) != cfg.host:
+    role = block.get("role") or (getattr(cfg, "release", None) or {}).get("role")
+    if role is not None and (not isinstance(role, str) or not role.strip()):
+        raise WatchError("packet_watch.role: a non-empty role name is required")
+    if not role and host and str(host) != cfg.host:
         return {}
     declared = block.get("projects") or {}
     if not isinstance(declared, dict):
