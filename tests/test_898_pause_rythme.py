@@ -10,6 +10,7 @@ non-critiques) attend la fenêtre suivante.
 """
 from __future__ import annotations
 
+import re
 import time
 from unittest import mock
 
@@ -81,6 +82,9 @@ class PauseDeRythmeTest(_Comptes):
         with mock.patch.object(self.book, "gauges", return_value=[jauge]), \
                 mock.patch.object(self.book, "clock", return_value=self.now):
             raison = self.book.pace_exceeded("codex", accounts.RESERVE)
-        self.assertTrue(raison.startswith(
+        # #4781 : le libellé porte l'échéance absolue (`@epoch`), lue à part.
+        self.assertTrue(re.sub(r"@\d+;", ";", raison).startswith(
             "pause (account (default), codex-10080min 10 %%) until %s; plan codex"
             % self.heure(self.now + 0.05 * FENETRE)), raison)
+        self.assertAlmostEqual(accounts.pause_deadline(raison),
+                               self.now + 0.05 * FENETRE, delta=60.0)
