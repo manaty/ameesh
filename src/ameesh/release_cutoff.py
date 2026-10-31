@@ -1686,8 +1686,8 @@ def rerun_head(project: "ProjectRelease", plan: "Plan") -> list:
                 for row in rows]
 
 
-def _worktree(repo: str, sha: str) -> tuple[str, str]:
-    folder = tempfile.mkdtemp(prefix="ameesh-release-", dir=os.path.dirname(repo) or None)
+def _worktree(repo: str, sha: str, *, prefix: str = "ameesh-release-") -> tuple[str, str]:
+    folder = tempfile.mkdtemp(prefix=prefix, dir=os.path.dirname(repo) or None)
     path = os.path.join(folder, "worktree")
     proc = _git(repo, "worktree", "add", "--detach", path, sha)
     if proc.returncode:
