@@ -37,6 +37,20 @@ ratée ne prouvent rien : pas de report. Un **clone superficiel** ne prouve rien
 non plus (N2 #2486) : `mechanical_history` dépend de l'histoire complète, comme
 `train_history` (`rev-parse --is-shallow-repository`).
 
+**Adaptation (#5042)** — canon §2 : « conflit mécanique, adaptation de test :
+aucun avis ». Quand le critère ci-dessus refuse, `adapted` prouve une seconde
+forme : la fusion de la nouvelle tête et la fusion d'essai de la tête relue ne
+diffèrent que par des fichiers de test modifiés ou ajoutés (la reconnaissance du
+véhicule, `packet_reviews` : le plan de CI `tests/parts/` n'en est pas), et par
+des morceaux en conflit résolus en **appliquant chaque côté à sa place** sur la
+base, sans aucune ligne nouvelle et chaque bloc contigu : deux ajouts juxtaposés,
+ou un ajout voisin d'une ligne modifiée par l'autre côté. Deux côtés qui changent
+la même ligne de la base, ou deux blocs entrelacés, restent un jugement. Chaque commit nouveau reste prouvé : fusion de même nature,
+commit limité aux tests, ou reprise propre d'un commit relu. Un lot fait de
+tests seuls n'en profite pas : ses tests sont son contenu. **Seul un avis
+favorable se reporte ainsi** : une adaptation peut répondre au blocage, son
+auteur juge donc la nouvelle tête, redésigné normalement.
+
 **Report** — pour chaque relecteur, son **dernier** verdict, s'il porte sur une
 tête réalignée, est recopié en jalon `verdict` sur la tête gelée : au nom du
 relecteur (sa famille compte à la porte, #1374), sans preuve de tour (#1465 :
@@ -80,6 +94,7 @@ vrai gel ultérieur les remplace.
 """
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -97,6 +112,8 @@ NOT_CARRIED = "verdict not carried:"
 #: préfixe de la marque de désignation gardée par un report : la désignation
 #: au gel s'abstient et laisse la colonne `reviewers` aux relecteurs reportés
 CARRIED_MARK_PREFIX = "review-designation-carried:"
+#: #5042 : une adaptation peut répondre au blocage, son auteur juge la nouvelle tête
+NOT_OK_ADAPTATION = "a blocking verdict is not carried across an adaptation"
 #: résultats qu'un passage de l'exécuteur dit dans son journal
 LOUD = ("carried", "not-carried", "error", "validated")
 #: lots examinés par passage
@@ -275,6 +292,9 @@ def conflict_hunks(repo: str, target: str, head: str) -> int | None:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+#: morceau en conflit : ajouts des deux côtés au même endroit essayés au plus
+#: dans les deux ordres (borne de coût : 2 rendus par juxtaposition)
+MAX_JUXTAPOSITIONS = 6
 #: commits nouveaux examinés au plus pour une preuve d'historique (borne de coût)
 MAX_NEW_COMMITS = 200
 #: commits relus essayés au plus pour un commit rejoué dont le conflit a été
@@ -525,6 +545,290 @@ def realigned(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
     return True, reason
 
 
+def _adaptable_test(path: str) -> bool:
+    """Un fichier de test qu'on adapte sans avis : la reconnaissance du véhicule
+    (#3518), hors plan de CI, qui décide quels modules tournent (#2792)."""
+    from . import packet_reviews
+    return (bool(packet_reviews._TEST.search(path))
+            and not packet_reviews._CI_PLAN.search(path))
+
+
+def _conflict_segments(blob: bytes) -> list | None:
+    """Le fichier écrit par une fusion en conflit (style `diff3`), découpé : une
+    ligne (`bytes`) hors conflit, `(côté gauche, base, côté droit)` pour un morceau
+    en conflit. None si les marques ne se lisent pas exactement (marque d'une
+    autre taille, morceau non fermé, base elle-même en conflit) : rien n'est alors
+    prouvé."""
+    segments: list = []
+    left: list = []
+    origin: list = []
+    right: list = []
+    side = None
+    for line in blob.splitlines(keepends=True):
+        bare = line.rstrip(b"\r\n")
+        if side is None:
+            if line.startswith(b"<<<<<<< "):
+                left, origin, right = [], [], []
+                side = left
+            else:
+                segments.append(line)
+        elif line.startswith(b"<<<<<<< "):
+            return None
+        elif side is left and line.startswith(b"||||||| "):
+            side = origin
+        elif side is origin and bare == b"=======":
+            side = right
+        elif side is right and line.startswith(b">>>>>>> "):
+            segments.append((left, origin, right))
+            side = None
+        else:
+            side.append(line)
+    return None if side is not None else segments
+
+
+def _edits(origin: list, side: list) -> list:
+    """Les changements d'un côté sur la base : `(début, fin, lignes rendues)`, en
+    positions de la base (début = fin : un ajout devant cette ligne)."""
+    matcher = difflib.SequenceMatcher(None, origin, side, autojunk=False)
+    return [(start, end, side[first:last])
+            for tag, start, end, first, last in matcher.get_opcodes() if tag != "equal"]
+
+
+def _hunk_renderings(left: list, origin: list, right: list) -> list | None:
+    """Les rendus mécaniques d'un morceau en conflit : la base, les changements des
+    deux côtés appliqués chacun à sa place, chaque bloc contigu. Deux ajouts au même
+    endroit se juxtaposent dans un ordre ou dans l'autre ; un ajout voisin d'une
+    ligne modifiée par l'autre côté garde les deux (cas #4975). None si les côtés
+    touchent une même ligne de la base (un vrai désaccord, un jugement), ou si les
+    ordres à essayer dépassent `MAX_JUXTAPOSITIONS`."""
+    edits_left, edits_right = _edits(origin, left), _edits(origin, right)
+    for start, end, _lines in edits_left:
+        for other, stop, _rendered in edits_right:
+            if (max(start, other) < min(end, stop)
+                    or (start == end and other < start < stop)
+                    or (other == stop and start < other < end)):
+                return None
+    ties = {start for start, end, _lines in edits_left if start == end} & {
+        start for start, end, _lines in edits_right if start == end}
+    if len(ties) > MAX_JUXTAPOSITIONS:
+        return None
+    renderings: list = [[]]
+    cursor = 0
+    # Un ajout (fin = début) passe devant la modification qui commence au même
+    # endroit : il est écrit devant cette ligne de la base.
+    edits = sorted(edits_left + edits_right, key=lambda edit: edit[:2])
+    index = 0
+    while index < len(edits):
+        start, end, lines = edits[index]
+        kept = origin[cursor:start]
+        if start in ties and start == end:
+            again = edits[index + 1][2]
+            index += 1
+            renderings = [done + kept + order for done in renderings
+                          for order in (lines + again, again + lines)]
+        else:
+            renderings = [done + kept + lines for done in renderings]
+        cursor = max(cursor, end)
+        index += 1
+    return [done + origin[cursor:] for done in renderings]
+
+
+def composed_hunks(conflicted: bytes, resolved: bytes) -> int | None:
+    """Le nombre de morceaux en conflit de `conflicted`, si `resolved` en est la
+    résolution mécanique : tout le reste à l'octet près, et chaque morceau égal à
+    l'un de ses rendus (`_hunk_renderings`). None sinon : une ligne ajoutée, retirée,
+    retouchée, ou deux blocs entrelacés (cx2 #172928 : l'ordre peut changer le
+    comportement) sont un jugement."""
+    segments = _conflict_segments(conflicted)
+    if not segments:
+        return None
+    expected = resolved.splitlines(keepends=True)
+    position = hunks = 0
+    for segment in segments:
+        if not isinstance(segment, tuple):
+            if expected[position:position + 1] != [segment]:
+                return None
+            position += 1
+            continue
+        renderings = _hunk_renderings(*segment)
+        if not renderings:
+            return None
+        size = len(renderings[0])
+        if expected[position:position + size] not in renderings:
+            return None
+        position += size
+        hunks += 1
+    return hunks if hunks and position == len(expected) else None
+
+
+def _merge_adaptation(repo: str, left: str, right: str, *, head: str | None = None,
+                      tree: str | None = None) -> dict:
+    """La fusion `left` + `right` comparée à son résultat attendu : l'arbre `tree`
+    (une fusion de l'historique), ou la fusion propre de `head` dans `left`.
+    Rend `{ok, why, tests, hunks}` : seuls des fichiers de test modifiés ou
+    ajoutés et des conflits résolus mécaniquement peuvent différer."""
+    from . import radar
+    refused = {"ok": False, "tests": 0, "hunks": 0}
+    objects = plan_git._out(repo, "rev-parse", "--path-format=absolute",
+                            "--git-path", "objects")
+    if not objects:
+        return dict(refused, why="the object directory cannot be read")
+    scratch = tempfile.mkdtemp(prefix="ameesh-carry-")
+
+    def merge(one: str, other: str):
+        return radar._scratch_git(repo, objects, scratch,
+                                  "-c", "attr.tree=%s" % one,
+                                  "-c", "merge.conflictStyle=diff3",
+                                  "merge-tree", "--write-tree", "-z", "--name-only",
+                                  "--no-messages", one, other)
+
+    def blob(root: str, path: str) -> bytes | None:
+        proc = radar._scratch_git(repo, objects, scratch, "cat-file", "blob",
+                                  "%s:%s" % (root, path))
+        return proc.stdout if proc.returncode == 0 else None
+
+    try:
+        trial = merge(left, right)
+        lines = radar._lines(trial)
+        if trial.returncode not in (0, 1) or not lines:
+            return dict(refused, why="the trial merge cannot be computed")
+        base = lines[0].strip()
+        conflicts = set(lines[1:]) if trial.returncode == 1 else set()
+        if tree is None:
+            landed = merge(left, head)
+            lines = radar._lines(landed)
+            if landed.returncode != 0 or not lines:
+                return dict(refused, why="the frozen head does not merge cleanly")
+            tree = lines[0].strip()
+        diff = radar._scratch_git(repo, objects, scratch, "diff-tree", "-r", "--no-renames",
+                                  "--name-status", "-z", base, tree)
+        if diff.returncode != 0:
+            return dict(refused, why="the two merges cannot be compared")
+        fields = radar._lines(diff)
+        changes = dict(zip(fields[1::2], fields[0::2]))
+        unresolved = sorted(path for path in conflicts if path not in changes)
+        if unresolved:
+            return dict(refused, why="conflict left as is in %s" % unresolved[0])
+        tests = hunks = 0
+        for path, status in sorted(changes.items()):
+            if status in ("M", "A") and _adaptable_test(path):
+                tests += 1
+                continue
+            if status != "M" or path not in conflicts:
+                return dict(refused, why="%s differs outside a test or a conflict" % path)
+            before, after = blob(base, path), blob(tree, path)
+            found = (composed_hunks(before, after)
+                     if before is not None and after is not None else None)
+            if not found:
+                return dict(refused, why="conflict in %s is not resolved by keeping both "
+                            "sides' changes and nothing else" % path)
+            hunks += found
+        return {"ok": True, "why": "", "tests": tests, "hunks": hunks}
+    except radar.GitError as exc:
+        return dict(refused, why=str(exc)[:200])
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _adapted_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
+    """Chaque commit que `frozen` apporte, hors tête relue et cible, est une
+    adaptation : fusion dont l'arbre est celle de ses parents à une adaptation
+    près, commit limité à des fichiers de test modifiés ou ajoutés, ou reprise
+    propre d'un commit relu. Tout autre contenu est refusé, même retiré ensuite :
+    il resterait dans l'historique (R1 cx1). Rend `(oui, raison)`."""
+    new = _lines_of(repo, "rev-list", "--topo-order", "--reverse", frozen, "--not",
+                    reviewed, tip)
+    if new is None:
+        return False, "the new commits cannot be listed"
+    if len(new) > MAX_NEW_COMMITS:
+        return False, "too many new commits to prove (%d)" % len(new)
+    sources = None
+    for commit in new:
+        parents = _lines_of(repo, "rev-list", "--parents", "-n", "1", commit)
+        tree = plan_git._out(repo, "rev-parse", commit + "^{tree}")
+        if not parents or not tree:
+            return False, "commit %s cannot be read" % commit[:12]
+        parents = parents[1:]
+        if len(parents) == 2:
+            merge = _merge_adaptation(repo, parents[0], parents[1], tree=tree)
+            if not merge["ok"]:
+                return False, "merge %s: %s" % (commit[:12], merge["why"])
+            continue
+        if len(parents) != 1:
+            return False, "commit %s has %d parents" % (commit[:12], len(parents))
+        fields = _name_status(repo, parents[0], commit)
+        if fields is None:
+            return False, "commit %s cannot be read" % commit[:12]
+        if fields and all(status in ("M", "A") and _adaptable_test(path)
+                          for path, status in fields.items()):
+            continue
+        if sources is None:
+            try:
+                sources = plan_git._patch_ids(repo, reviewed, "--not", tip)
+            except Exception:  # noqa: BLE001 - patch-id illisible : rien de prouvé
+                return False, "the reviewed commits' patch-ids cannot be read"
+        try:
+            pid = plan_git._diff_patch_id(repo, parents[0], commit)
+        except Exception:  # noqa: BLE001 - idem
+            pid = None
+        source = sources.get(pid) if pid else None
+        if not source or not _replays(repo, parents[0], source, tree):
+            return False, ("commit %s is neither a test adaptation nor the clean replay of "
+                           "a reviewed commit" % commit[:12])
+    return True, "%d commit(s) proved" % len(new)
+
+
+def _name_status(repo: str, old: str, new: str) -> dict | None:
+    """{chemin: statut} entre deux commits, renommages dépliés ; None si illisible."""
+    proc = plan_git._git(repo, "diff-tree", "-r", "--no-renames", "--name-status", "-z",
+                         old, new)
+    if proc.returncode != 0:
+        return None
+    fields = [f for f in proc.stdout.decode("utf-8", "surrogateescape").split("\0") if f]
+    return dict(zip(fields[1::2], fields[0::2]))
+
+
+def adapted(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
+    """#5042 : `frozen` n'est-elle qu'une adaptation de `reviewed` au sens du
+    canon §2 (« conflit mécanique, adaptation de test : aucun avis ») ? Rend
+    `(oui, raison)` ; le critère est dans la doc du module. Un clone superficiel
+    ne prouve rien (N2 #2486)."""
+    if not _complete_history(repo):
+        return False, "complete Git history required; shallow clone refused"
+    if _same(reviewed, frozen):
+        return False, "same head"
+    merge = _merge_adaptation(repo, tip, reviewed, head=frozen)
+    if not merge["ok"]:
+        return False, merge["why"]
+    if not merge["tests"] and not merge["hunks"]:
+        return False, "no test adaptation and no mechanical conflict"
+    if merge["tests"]:
+        base = plan_git._out(repo, "merge-base", reviewed, tip)
+        own = _name_status(repo, base, reviewed) if base else None
+        if own is None:
+            return False, "the reviewed delta cannot be read"
+        if all(_adaptable_test(path) for path in own):
+            return False, "the lot is made of tests: they are its reviewed content"
+    history, why = _adapted_history(repo, reviewed, frozen, tip)
+    if not history:
+        return False, why
+    return True, ("test or mechanical adaptation (canon §2): %d test file(s) changed, "
+                  "%d conflict hunk(s) keeping both sides, no other line; %s"
+                  % (merge["tests"], merge["hunks"], why))
+
+
+def _carriable(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
+    """`(oui, raison, adaptation)` : réalignement (tout verdict se reporte) ou, à
+    défaut, adaptation (l'avis favorable seul se reporte, #5042)."""
+    ok, why = realigned(repo, reviewed, frozen, tip)
+    if ok:
+        return True, why, False
+    fits, how = adapted(repo, reviewed, frozen, tip)
+    if fits:
+        return True, how, True
+    return False, "%s; not an adaptation either: %s" % (why, how), False
+
+
 def _outcomes(db, lots) -> dict:
     """{lot: notes de journal des issues déjà rendues}, en une lecture."""
     out: dict = {int(lot): [] for lot in lots}
@@ -747,10 +1051,14 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
                 _norm(mark.get("sha"))[:12], where)
             continue                  # objet absent : rien de prouvé, retenté
         if reviewed not in verdicts:
-            verdicts[reviewed] = realigned(where, reviewed, frozen, tip)
-        ok, why = verdicts[reviewed]
+            verdicts[reviewed] = _carriable(where, reviewed, frozen, tip)
+        ok, why, adaptation = verdicts[reviewed]
+        if ok and adaptation and (mark.get("verdict") or "ok") != "ok":
+            ok, why = False, NOT_OK_ADAPTATION
         if ok:
             plan.append((mark, reviewed))
+            if adaptation:
+                out.setdefault("adaptations", {})[reviewed] = why
         elif (reviewed, why) not in refused:
             refused.append((reviewed, why))
     if not plan and not refused:
@@ -810,6 +1118,7 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
     désignation fermer la porte."""
     from . import train_events
     frozen, tip, target = out["frozen"], out["tip"], out["target"]
+    adaptations = out.get("adaptations") or {}
     carried = []
     with db.transaction() as tx:
         rows = tx.query("SELECT id, state, title, app, assignee, branch_target"
@@ -825,8 +1134,10 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
             now = still.get(_key(mark.get("actor")))
             if now is None or int(now.get("id") or 0) != int(mark.get("id") or 0):
                 continue              # verdict rendu ou reporté entre-temps : le sien vaut
-            note = ("%s %s on %s@%s, same merge result and same lot delta as the reviewed "
-                    "head (#2442)" % (CARRIED, _arrow(reviewed, frozen), target, tip[:12]))
+            note = ("%s %s on %s@%s, %s" % (
+                CARRIED, _arrow(reviewed, frozen), target, tip[:12],
+                adaptations.get(reviewed) or "same merge result and same lot delta as "
+                "the reviewed head (#2442)"))
             copied = tx.query(_COPY_SQL, (frozen, note, int(mark["id"]), int(lot)))
             if copied:
                 # #2928 : le reçu du verdict d'origine suit le jalon reporté
@@ -848,9 +1159,10 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
     for entry in carried:
         by_head.setdefault(entry["from"], []).append(entry)
     for reviewed, entries in by_head.items():
-        st.note(lot, state, "%s %s on %s@%s: %s — no re-review due (#2442)"
+        st.note(lot, state, "%s %s on %s@%s: %s — no re-review due (%s)"
                 % (CARRIED, _arrow(reviewed, frozen), target, tip[:12],
-                   ", ".join("%s %s" % (e["verdict"], e["actor"]) for e in entries)),
+                   ", ".join("%s %s" % (e["verdict"], e["actor"]) for e in entries),
+                   adaptations.get(reviewed) or "#2442"),
                 work.SYSTEM_SENDER, once=True)
     for reviewed, why in refused:
         st.note(lot, state, "%s %s on %s@%s: %s — verdicts are due on the frozen head (#2442)"
@@ -859,10 +1171,13 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
     out.update(carried=carried, refused=[{"reviewed": r, "why": w} for r, w in refused],
                result="carried" if carried else "not-carried" if refused else "idle")
     if carried:
-        text = ("Lot #%d « %s »: the new freeze %s is a mechanical realignment on %s "
-                "(same merge result and same lot delta as the reviewed head); verdicts "
+        how = ("a test or mechanical adaptation of the reviewed head (canon §2)"
+               if any(e["from"] in adaptations for e in carried) else
+               "a mechanical realignment (same merge result and same lot delta as the "
+               "reviewed head)")
+        text = ("Lot #%d « %s »: the new freeze %s on %s is %s; verdicts "
                 "carried: %s. No re-review is due (#2442)."
-                % (lot, row.get("title") or "", frozen[:12], target,
+                % (lot, row.get("title") or "", frozen[:12], target, how,
                    ", ".join("%s %s from %s" % (e["verdict"], e["actor"], e["from"][:12])
                              for e in carried)))
         data = {"project": row.get("app") or "", "target": target, "sha": frozen}
