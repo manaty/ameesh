@@ -2581,6 +2581,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print(('ameesh work move: --device declares the device session a blocked %s waits for: ameesh work move %s blocked --device <device>') % (v.noun, args.id), file=sys.stderr)
                     return 2
                 note = device_gates.session_note(args.device, note)
+            if args.correct is None and not args.package_exclusion:
+                # #5035 : `--correct` et `--package-exclusion` ont leur autorité
+                # (`_work_actor`) ; le reste n'avance pas le lot d'un autre.
+                work.check_mover(cfg, db, args.id, args.state, args.actor)
             item = work.move(db, args.id, args.state, note=note, actor=args.actor,
                              correct=args.correct, reviewer=args.reviewer,
                              package_exclusion=args.package_exclusion)

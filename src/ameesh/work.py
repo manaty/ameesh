@@ -4357,6 +4357,48 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     return row
 
 
+def check_mover(cfg, db: Db, item_id: int, state: str, actor: str) -> None:
+    """#5035 : qui fait avancer le lot d'un autre (`ameesh work move`).
+
+    Le 31/10, `mty-amh-impl-05` a fait passer #5029 d'intake à build : sa prise
+    (`assign --claim`) venait d'être refusée, le lot était à `ameesh-dev3`, et
+    la commande suivante de la chaîne n'a rien refusé. Un lot qui a un porteur
+    n'est déplacé que par lui ou celui qui lui a délégué le lot, un humain, un
+    pilote, le bureau ou l'auditeur (escalades du §9) ; un relecteur désigné
+    rend un lot en revue. L'entrée en `validated` reste ouverte : elle a sa
+    porte, le quorum d'avis (`move`). Un lot sans porteur se prend d'abord,
+    mais son déplacement n'est pas refusé ici. Une session liée agit en son nom :
+    `--actor` ne prête pas l'autorité d'un autre. Une session sans identité
+    n'a rien à prouver ici (l'avertissement « inconnu » la dit au journal). Le
+    chemin médié a déjà sa garde (`_require_assigned`) ; les moves internes
+    (décisions, report de verdict) n'appellent pas ce contrôle."""
+    from . import identity, slo
+    from .work_reviewers import designated
+
+    if storage.is_remote(db):
+        return
+    item = get(db, item_id)
+    holder = (item or {}).get("assignee")
+    if not holder or lifecycle.phase_name(state) == "validated":
+        return
+    binding = identity.resolve_binding(cfg, db)
+    who = binding.name or (actor or "").strip()
+    if not who or who == UNKNOWN_ACTOR or who == holder or who.startswith(HUMAN_PREFIX):
+        return
+    if who == item.get("delegated_by") and item.get("due_ts"):
+        return
+    if lifecycle.phase(item) in (*TO_VALIDATE, "validated") \
+            and who in designated(item):
+        return
+    if who in slo.CRITICAL_TARGETS or is_pilot(cfg, db, who) or is_auditor(cfg, db, who):
+        return
+    raise WorkError(
+        "move refused: lot %s is held by %s, not %s; nothing changed. Only its holder, "
+        "a designated reviewer, a human, a pilot, the bureau or the auditor moves it "
+        "(take it through the pilot, or say what you found: ameesh work note %s \"…\")"
+        % (item_id, holder, who, item_id))
+
+
 def _wake_moment(ts: float) -> str:
     """Un instant de réveil, fuseau du poste (lisible dans le journal)."""
     return time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(float(ts)))
