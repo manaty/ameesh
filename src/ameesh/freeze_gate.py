@@ -853,6 +853,13 @@ def milestone(
         raise WorkError("verdict refused (provenance-missing): %s" % exc) from exc
     if proof and not actor:
         actor = proof["actor"]
+    if kind == "frozen":
+        # #5006 : un gel par un agent qui n'est plus l'assigné est signalé
+        # dans la note du jalon (et la sortie), jamais refusé.
+        from .work import non_assignee_warning
+        stranger = non_assignee_warning(getattr(db, "cfg", None), db, item, actor)
+        if stranger:
+            note = (note + "\n" if note else "") + stranger
     drain: list | None = None
     prepared = None
     if kind == "frozen" and on_frozen is None:

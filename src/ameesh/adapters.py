@@ -863,8 +863,8 @@ class ClaudeStream(StreamReader):
         if kind == "system" and event.get("subtype") == "init":
             if principal:
                 out["session"] = event.get("session_id")
-            if event.get("model"):
-                out["model"] = event["model"]  # modèle effectif annoncé (L13 B4)
+                if event.get("model"):
+                    out["model"] = event["model"]  # modèle effectif annoncé (L13 B4)
         elif kind == "assistant":
             message = event.get("message") or {}
             texts = [

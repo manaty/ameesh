@@ -292,6 +292,9 @@ EVENTS_PRUNE_EVERY_S = 3600.0
 #: journal récent ; au-delà, ou sans preuve, la base reste inconnue.
 CONTEXT_RESUME_DAYS = 30
 CONTEXT_RESUME_EVENTS = 200
+#: CTX-04a (#4970) : motif d'une clôture sur budget de relecture opt-in, publié
+#: dans `turn.context` ; ni rotation ni compactage pour ce seul motif.
+REREAD_BUDGET_CLOSE = "reread_budget"
 #: #3070 : levée des portes d'appareil indisponible, au plus toutes les 5 min
 DEVICE_GATES_EVERY_S = 300.0
 #: #2096 : bornes de l'affichage gardé pour un tour de résumé (repli d'un flux
@@ -2291,6 +2294,34 @@ class AgentWorker(threading.Thread):
         ecoule = now - started - self.runner.gate_frozen_between(started, now)
         if duree_max > 0 and ecoule >= duree_max:
             return "maximum turn duration: %ds (cap %ds)" % (int(ecoule), duree_max)
+        return None
+
+    def reread_budget_due(self, live: dict) -> dict | None:
+        """CTX-04a : un budget de relecture opt-in est-il dépassé ? (§5.1, 4)
+
+        Rend l'observation de la clôture (raison, mesure, budget), ou None :
+        budget éteint, ou mesure ``None`` — aucune décision sans mesure. Après
+        la clôture, le tour suivant repart à ``R_turn`` nul ; ``R_session``,
+        lui, reste acquis dans la même session : son budget se lit par tranche
+        franchie pendant ce tour, sinon chaque tour suivant se clorait dès son
+        premier point sûr. Jamais lu comme une taille de fenêtre ni comparé à
+        ``context_max_tokens``.
+        """
+        budget_tour = int(self.cfg.turn_reread_budget)
+        relu_tour = live.get("R_turn")
+        if budget_tour > 0 and relu_tour is not None and relu_tour >= budget_tour:
+            return {"kind": REREAD_BUDGET_CLOSE, "measure": "R_turn",
+                    "value": relu_tour, "budget": budget_tour,
+                    "reason": "reread budget: R_turn %d tokens (budget %d)"
+                              % (relu_tour, budget_tour)}
+        budget_session = int(self.cfg.session_reread_budget)
+        relu_session, base = live.get("R_session"), live.get("base")
+        if budget_session > 0 and relu_session is not None and base is not None \
+                and relu_session // budget_session > int(base) // budget_session:
+            return {"kind": REREAD_BUDGET_CLOSE, "measure": "R_session",
+                    "value": relu_session, "budget": budget_session,
+                    "reason": "reread budget: R_session %d tokens (budget %d)"
+                              % (relu_session, budget_session)}
         return None
 
     def last_turn_context_reread(self) -> tuple[int, str | None]:
@@ -4847,6 +4878,11 @@ class AgentWorker(threading.Thread):
                     "session": self.session_policy(),
                     "context_max_tokens": self.context_max_tokens(),
                     "session_max_tokens": self.session_max_tokens(),
+                    # CTX-04a : présents seulement en opt-in.
+                    **({"turn_reread_budget": int(self.cfg.turn_reread_budget)}
+                       if self.cfg.turn_reread_budget > 0 else {}),
+                    **({"session_reread_budget": int(self.cfg.session_reread_budget)}
+                       if self.cfg.session_reread_budget > 0 else {}),
                 },
                 # Le journal partagé porte des états, pas du texte libre : le
                 # motif est normalisé (`kind`), les valeurs qui l'ont déclenché
@@ -6147,10 +6183,48 @@ class AgentWorker(threading.Thread):
                     self.name, lot, float(reveil["wake_ts"])):
                 log_async("[%s] scheduled wake for lot #%s consumed"
                           % (self.name, lot))
+            else:
+                # #5006 : réassigné pendant le lancement ; `consume_wake` laisse
+                # l'échéance au nouvel assigné, le courrier `reassigned` atteint
+                # ce tour à son prochain point sûr.
+                log_async("[%s] scheduled wake for lot #%s not consumed: no longer "
+                          "ours, the turn already started" % (self.name, lot))
         except db_mod.DbError as exc:
             log_async("[%s] scheduled wake for lot #%s not consumed (%s): it will "
                       "be redelivered when its claim expires"
                       % (self.name, lot, exc))
+
+    def _wake_outdated(self, spec: dict) -> bool:
+        """#5006 : le réveil porté par ce tour est-il devenu sans objet ?
+
+        Assigné, état et échéance sont lus au choix du tour ; la bascule de
+        session et la préparation peuvent durer, et une réassignation tombée
+        entre-temps enverrait le tour à l'ancien assigné. Réveil programmé : le
+        renouvellement du bail relit tout (assigné, état, échéance), par une
+        opération déjà au contrat de l'exécuteur médié. Relance d'inactivité :
+        le lot doit encore figurer dans les lots actionnables de l'agent. Une
+        base en panne ne dit rien : le tour continue, et `consume_wake` reste
+        filtré par l'assigné."""
+        lot = spec.get("lot")
+        reveil = spec.get("scheduled_wake")
+        if reveil:
+            perime = not self._renew_wake_claim(
+                {"lot": int(reveil["lot"]), "wake_ts": float(reveil["wake_ts"])})
+        elif spec.get("lot_wake"):
+            import datetime as _dt
+            try:
+                lots = storage.of(self.db).lot_sessions.actionable(
+                    self.name, today=_dt.date.today().isoformat())
+            except db_mod.DbError as exc:
+                log_async("[%s] actionable lots unreadable (%s)" % (self.name, exc))
+                return False
+            perime = str(lot) not in {str(row["id"]) for row in lots}
+        else:
+            return False
+        if perime:
+            log_async("[%s] wake for lot #%s outdated (reassigned, closed or moved): "
+                      "no turn" % (self.name, lot))
+        return perime
 
     def _lot_wake_spec(self) -> dict | None:
         """Règle 1 (#408) : l'agent au repos depuis plus de `mail_batch` +
@@ -6187,7 +6261,7 @@ class AgentWorker(threading.Thread):
                 note = st.note_wake(self.name, int(row["id"]), row.get("activity_ts"))
                 log_async("[%s] idle with actionable lot #%s (%s): woken (wake %s)"
                           % (self.name, row["id"], row["state"], note.get("wakes")))
-                return {"kind": "idle", "ids": [], "lot": str(row["id"]),
+                return {"kind": "idle", "ids": [], "lot": str(row["id"]), "lot_wake": True,
                         "prompt": adapters.LOT_WAKE_PROMPT % {
                             "id": int(row["id"]), "title": row.get("title") or "",
                             "state": row["state"]}}
@@ -8148,6 +8222,9 @@ class AgentWorker(threading.Thread):
         relus_mesures = False  # L217b : le flux a relevé au moins un appel
         appels_vus: set = set()
         cloture: str | None = None
+        cloture_budget = False
+        budget_relecture_actif = (self.cfg.turn_reread_budget > 0
+                                  or self.cfg.session_reread_budget > 0)
         clos = False
         self.last_turn_closed = None
 
@@ -8216,6 +8293,16 @@ class AgentWorker(threading.Thread):
             self._annule_tour_avant_lancement(marqueur, spend_key)
             self.fail_turn("turn context unavailable",
                            "turn context not written: %s" % exc)
+            return False
+
+        # #5006 (B1 cx2, dev3) : dernier contrôle avant le lancement, préparation
+        # faite. Un réveil devenu sans objet ne part pas ; rien de comptable ne
+        # reste ouvert, `begin_turn` est défait et l'échéance attend le nouvel
+        # assigné.
+        if self._wake_outdated(spec):
+            self._annule_tour_avant_lancement(marqueur, spend_key)
+            registry.set_status(self.db, self.name, "idle",
+                                status_text="wake outdated: no turn")
             return False
 
         preempt_done = threading.Event()
@@ -8549,9 +8636,13 @@ class AgentWorker(threading.Thread):
                                 if ident:
                                     appels_vus.add(ident)
                                 relus_sous_agents += adapters.reread_tokens(harness, appel)
-                        if cloture is None and not clos:
-                            cloture = self.turn_close_due(started, contexte_appel)
-                            if cloture:
+                        # CTX-04a : les plafonds passent avant le budget, même
+                        # s'il a déjà demandé la clôture de ce tour : un plafond
+                        # de contexte atteint avant le point sûr garde sa rotation.
+                        if (cloture is None or cloture_budget) and not clos:
+                            plafond_atteint = self.turn_close_due(started, contexte_appel)
+                            if plafond_atteint:
+                                cloture, cloture_budget = plafond_atteint, False
                                 # CTX-02b : le motif et les valeurs qui ont
                                 # fermé le tour, publiés avec l'observation ;
                                 # aucune décision ne les relit.
@@ -8565,6 +8656,14 @@ class AgentWorker(threading.Thread):
                                     "elapsed_s": round(time.time() - started, 3),
                                     "turn_max_seconds": self.turn_max_seconds(),
                                 }
+                                log_async("[%s] %s: turn closed at the next safe point"
+                                          % (self.name, cloture))
+                        if cloture is None and not clos and budget_relecture_actif and any(
+                                cle in parsed for cle in ("call_usage", "usage_total", "usage")):
+                            budget_du = self.reread_budget_due(normalizer.live_reread())
+                            if budget_du:
+                                cloture, cloture_budget = budget_du["reason"], True
+                                self._turn_close_observation = budget_du
                                 log_async("[%s] %s: turn closed at the next safe point"
                                           % (self.name, cloture))
                         if cloture and not clos and parsed.get("safe_point") \

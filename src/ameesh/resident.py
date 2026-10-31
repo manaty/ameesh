@@ -53,6 +53,7 @@ reader thread takes the same lock to record what it reads.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import select
@@ -267,7 +268,13 @@ def availability(descriptor, version: str | None) -> str:
 
 
 def _number(value: Any) -> int:
+    """Un entier non négatif, ou ``0``.
+
+    ``NaN``/``Infinity`` (acceptés par ``json.loads``) ne lèvent jamais : ils
+    valent ``0``, comme une valeur absente (#4892 N2)."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            return 0
         return max(int(value), 0)
     return 0
 

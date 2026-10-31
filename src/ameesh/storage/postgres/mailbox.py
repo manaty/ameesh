@@ -246,7 +246,8 @@ class Mailbox(interface.Mailbox):
               AND (payload @> '{"urgent": true}'::jsonb
                    OR payload @> '{"human": true}'::jsonb
                    OR payload @> '{"verdict": true}'::jsonb
-                   OR payload @> '{"arbitration": true}'::jsonb)%s
+                   OR payload @> '{"arbitration": true}'::jsonb
+                   OR payload ? 'reassigned')%s
               AND NOT EXISTS (
                   SELECT 1 FROM agent_registry v
                   WHERE v.name = m.recipient AND (%s)

@@ -326,8 +326,8 @@ lock, started, mode = sys.argv[1:4]
 if mode == "grandchild":
     handle = open(lock, "a")
     fcntl.flock(handle, fcntl.LOCK_EX)
-    pathlib.Path(started).write_text(str(os.getpid()))
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    pathlib.Path(started).write_text(str(os.getpid()))
     time.sleep(60)
     raise SystemExit(0)
 
@@ -393,6 +393,15 @@ class ChildGroupStopTest(unittest.TestCase):
             return False
         finally:
             handle.close()
+
+    def test_the_descendant_ignores_term_before_it_announces_itself(self):
+        # #5030: `spawn` returns on the announcement; a TERM sent in the gap
+        # killed the descendant at once, and the grace looked unhonoured.
+        grandchild = GROUP_CHILD.split('if mode == "grandchild":')[1]
+        self.assertLess(
+            grandchild.index("signal.SIG_IGN"),
+            grandchild.index("write_text"),
+            "the descendant announces itself before ignoring TERM")
 
     def test_a_descendant_that_ignores_term_is_killed_after_the_leader(self):
         proc = self.spawn("leader")
