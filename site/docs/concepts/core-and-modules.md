@@ -195,3 +195,5 @@ new direct imports of module implementations from the core are refused.
 Declared compatibility exceptions remain explicit; the registry is the
 supported interface. The [architecture document](../design.md) explains this
 boundary in more detail.
+
+To create an installed extension, follow [Write a module](../guides/write-a-module.md).

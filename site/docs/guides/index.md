@@ -11,6 +11,7 @@ Task-oriented pages. Each one uses only commands that exist in the CLI; see the
 - [Write a Process card](write-a-process.md): the working rules injected into
   briefs, and the executable `workflow:` block (stages, grouped transitions,
   guards, work types, projection, admission pin, check command).
+- [Write a module](write-a-module.md): package, install, activate and test a Python module.
 - [Write a Pipeline](write-a-pipeline.md): a pipeline declared as canon data
   (`pipelines/*.md`), its declarative module, adoption and native commands,
   with the acme and after-sales support examples.
