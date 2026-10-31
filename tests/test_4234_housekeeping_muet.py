@@ -30,25 +30,33 @@ class KeptWorktreeSizesTest(unittest.TestCase):
             fh.write(b"x" * (kib * 1024))
         return path
 
-    def test_biggest_first_and_only_the_dirty_kept_worktrees(self):
+    def test_biggest_first_includes_clean_kept_and_waiting_worktrees(self):
         small = self._tree("small", 1)
         big = self._tree("big", 64)
         clean = self._tree("clean", 32)
+        waiting = self._tree("waiting", 16)
         plan = [
             {"kind": "worktree", "path": small, "action": "garde",
              "detail": "lot #1 merged: kept — 1 file(s) modified or untracked"},
             {"kind": "worktree", "path": big, "action": "garde",
              "detail": "lot #2 merged: kept — 7 file(s) modified or untracked"},
             {"kind": "worktree", "path": clean, "action": "garde",
-             "detail": "lot #3 merged: kept — worktree active within 24 h"},
+             "detail": "lot #3 merged: kept — HEAD abcdef0 not integrated"},
+            {"kind": "worktree", "path": clean, "action": "attend",
+             "detail": "duplicate entry"},
+            {"kind": "worktree", "path": waiting, "action": "attend",
+             "detail": "lot build"},
+            {"kind": "worktree", "path": big, "action": "retrait",
+             "detail": "clean and pushed"},
             {"kind": "clone", "path": big, "action": "garde",
              "detail": "3 file(s) modified or untracked"},
         ]
         sizes = hk.kept_worktree_sizes(plan)
         self.assertEqual(sizes["dirty"], 2)
-        self.assertEqual(sizes["measured"], 2)
+        self.assertEqual(sizes["kept"], 4)
+        self.assertEqual(sizes["measured"], 4)
         self.assertEqual(sizes["unmeasured"], 0)
-        self.assertEqual([row["path"] for row in sizes["top"]], [big, small])
+        self.assertEqual([row["path"] for row in sizes["top"]], [big, clean, waiting, small])
         self.assertGreater(sizes["top"][0]["bytes"], sizes["top"][1]["bytes"])
         self.assertEqual(sizes["total_bytes"],
                          sum(row["bytes"] for row in sizes["top"]))
@@ -61,12 +69,26 @@ class KeptWorktreeSizesTest(unittest.TestCase):
                 for path in (first, second)]
         sizes = hk.kept_worktree_sizes(plan, seconds=0.0)
         self.assertEqual(sizes["dirty"], 2)
+        self.assertEqual(sizes["kept"], 2)
         self.assertEqual(sizes["measured"], 0)
         self.assertEqual(sizes["unmeasured"], 2)
         self.assertEqual(sizes["top"], [])
 
 
 class ReportShowsKeptVolumeTest(unittest.TestCase):
+    def test_clean_nonintegrated_tree_is_visible_without_dirty_trees(self):
+        report = {"host": "pc", "dry_run": True, "entries": [], "plan": [],
+                  "skipped": [], "worktree_sizes": {
+                      "dirty": 0, "kept": 1, "measured": 1, "unmeasured": 0,
+                      "total_bytes": 1024, "seconds": 0.1, "top": [],
+                      "archive_declared": True}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            hk.print_report(report)
+        self.assertIn("kept worktrees by volume", out.getvalue())
+        self.assertIn("1 of 1 measured", out.getvalue())
+        self.assertIn("inactivity and safety guards still apply", out.getvalue())
+
     def test_the_report_prints_the_biggest_kept_worktrees(self):
         report = {"host": "pc", "dry_run": True, "status": "ok",
                   "entries": [], "plan": [], "skipped": [], "orphans": [],
