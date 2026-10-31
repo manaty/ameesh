@@ -188,8 +188,43 @@ def objects(conn):
                         "AND c.relkind IN ('r','p','v','m','f','S')").fetchall()
 
 
+def migration_owner(conn, schema):
+    """The role whose future objects the next migrations create."""
+    row = conn.execute("SELECT r.rolname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                       "JOIN pg_roles r ON r.oid=c.relowner WHERE n.nspname=%s "
+                       "AND c.relname='agent_registry' AND c.relkind IN ('r','p')", (schema,)).fetchone()
+    require(row is not None, 'migration owner relation missing')
+    return row[0]
+
+
+def set_default_reads(conn, value, grant):
+    """Cover relations a later migration adds, and remove only that dependency."""
+    owner = sql.Identifier(migration_owner(conn, value['schema']))
+    namespace = sql.Identifier(value['schema'])
+    backup = sql.Identifier(value['backup_role'])
+    for kind in ('TABLES', 'SEQUENCES'):
+        if grant:
+            conn.execute(sql.SQL('ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA {} '
+                                 'GRANT SELECT ON {} TO {}').format(owner, namespace, sql.SQL(kind), backup))
+        else:
+            conn.execute(sql.SQL('ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA {} '
+                                 'REVOKE SELECT ON {} FROM {}').format(owner, namespace, sql.SQL(kind), backup))
+
+
+def audit_default_reads(conn, oid, schema):
+    rows = conn.execute("SELECT d.defaclobjtype,a.privilege_type,a.is_grantable FROM pg_default_acl d "
+                        "CROSS JOIN LATERAL aclexplode(d.defaclacl) a "
+                        "WHERE d.defaclnamespace=(SELECT oid FROM pg_namespace WHERE nspname=%s) "
+                        "AND d.defaclrole=(SELECT oid FROM pg_roles WHERE rolname=%s) AND a.grantee=%s",
+                        (schema, migration_owner(conn, schema), oid)).fetchall()
+    require(sorted(rows) == [('S', 'SELECT', False), ('r', 'SELECT', False)],
+            'backup default read privilege differs from contract')
+
+
 def audit_data(conn, name, schema, parent=None):
     oid = audit_flags(conn, name, parent)
+    if parent is None:
+        audit_default_reads(conn, oid, schema)
     require(not conn.execute("SELECT 1 FROM pg_database WHERE datdba=%s", (oid,)).fetchone(),
             'source identity must not own a database')
     require(not conn.execute("SELECT 1 FROM pg_namespace WHERE nspowner=%s", (oid,)).fetchone(),
@@ -298,6 +333,9 @@ def grant_reads(conn, value):
         conn.execute(sql.SQL('GRANT USAGE ON SCHEMA {} TO {}').format(sql.Identifier(ns), name))
         conn.execute(sql.SQL('GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {}').format(sql.Identifier(ns), name))
         conn.execute(sql.SQL('GRANT SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}').format(sql.Identifier(ns), name))
+    # ALL TABLES only covers relations that exist now; the next migration adds
+    # tables and sequences the backup must still read without a root gesture.
+    set_default_reads(conn, value, grant=True)
 
 
 def apply_group(value, directory):
@@ -421,6 +459,9 @@ def leave(value, directory):
                 if kind == 'controller':
                     conn.execute(sql.SQL('REVOKE {} FROM {}').format(sql.Identifier(value['group_role']), ident))
                 if kind == 'backup':
+                    # The default ACL is a dependency of the role: a plain
+                    # DROP ROLE fails until it is revoked symmetrically.
+                    set_default_reads(conn, value, grant=False)
                     for ns, in conn.execute("SELECT nspname FROM pg_namespace WHERE nspname !~ '^pg_' AND nspname <> 'information_schema'"):
                         conn.execute(sql.SQL('REVOKE SELECT ON ALL TABLES IN SCHEMA {} FROM {}').format(sql.Identifier(ns), ident))
                         conn.execute(sql.SQL('REVOKE SELECT ON ALL SEQUENCES IN SCHEMA {} FROM {}').format(sql.Identifier(ns), ident))

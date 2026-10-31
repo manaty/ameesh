@@ -331,7 +331,11 @@ note cette origine lors de la préparation des sept JSON de #4989.
 
 Le groupe NOLOGIN est appliqué par le contrat SQL existant, sans rôle parent.
 Le contrôleur LOGIN n'hérite que de ce groupe ; la sauvegarde reçoit USAGE des
-schémas et SELECT des relations/séquences de la base source, aucune écriture.
+schémas et SELECT des relations et séquences présentes de la base source, aucune
+écriture. Le propriétaire des migrations (le propriétaire d'`agent_registry`)
+accorde en plus à la sauvegarde des privilèges par défaut `SELECT` sur les
+tables et séquences du schéma : les relations qu'une migration ultérieure
+ajoute restent lisibles par la sauvegarde, sans réexécution de la commande.
 L'audit refuse les privilèges supplémentaires, colonnes comprises, les rôles
 parents imprévus, les propriétés administratives, la propriété d'objets,
 les fonctions SECURITY DEFINER accessibles et les tables sous RLS que l'identité
@@ -342,8 +346,9 @@ groupe. Cette exception ne dispense d'aucun contrôle d'écriture, de propriét�
 ou de fonction SECURITY DEFINER. Un refus `IdentityError` expose sa raison
 locale fixe ; les erreurs du serveur et les DSN restent masqués.
 La commande ne répare pas les droits PUBLIC d'une base partagée : un refus
-exige une correction explicite sous son propre mandat. Réappliquer après toute
-migration qui ajoute des relations à sauvegarder.
+exige une correction explicite sous son propre mandat. Elle vérifie aussi les
+privilèges par défaut de la sauvegarde et les retire symétriquement au retrait,
+pour que `DROP ROLE` ne bute pas sur cette dépendance.
 
 La cible de restauration est un **cluster PostgreSQL dédié jetable sur l'hôte
 du contrôleur**, distinct du cluster vif. L'outil mesure les deux
