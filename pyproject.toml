@@ -83,3 +83,7 @@ ameesh = ["migrations/*.sql", "progress_page.html", "harness_descriptors/*.json"
     "deploy/mise-a-jour/systemd/ameesh-handoff-local.socket",
     "deploy/mise-a-jour/systemd/ameesh-handoff-local@.service",
 ]
+
+# #5162: preserve the private identity tool and its audited SQL sibling.
+"share/ameesh/postgres" = ["deploy/postgres/enroler-identites.py"]
+"share/ameesh/sql" = ["deploy/sql/role-release-controller.sql"]

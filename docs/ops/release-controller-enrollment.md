@@ -306,9 +306,11 @@ du login utilise loopback avec le même port et la même base. La commande véri
 que le cluster écoute uniquement 127.0.0.1 sur ce port ; aucun endpoint distant
 alternatif n'est admis.
 
-Après livraison par paquet et staging, installer le répertoire `deploy/postgres`
-et son voisin `deploy/sql/role-release-controller.sql` depuis le même SHA relu,
-sous une racine root non modifiable par les agents. Avec le Python root isolé
+Après livraison par paquet et staging, installer les fichiers wheel
+`share/ameesh/postgres/enroler-identites.py` et
+`share/ameesh/sql/role-release-controller.sql` depuis le même SHA relu,
+sous `/opt/ameesh-admin/deploy`, racine root non modifiable par les agents.
+Avec le Python root isolé
 où psycopg est installé, la commande est :
 
 ```sh
