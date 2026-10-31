@@ -529,9 +529,13 @@ def request_text(decision: dict, *, requester: str, owner: str | None,
 
 
 def _hold_lot(db, item: dict, *, note: str, actor: str) -> str:
-    """Le lot passe en `waiting_human` (journal) ; rend son état."""
+    """Le lot passe en `waiting_human` (journal) ; rend son état.
+
+    #4957 : au profil nu, le module dev n'existe pas — aucune transition à
+    tenter ; la demande reste enregistrée et la note seule est journalisée."""
     state = work_lifecycle.phase(item)
-    if state != "waiting_human" and "waiting_human" in work.TRANSITIONS.get(state, ()):
+    transitions = work.development_transitions()
+    if state != "waiting_human" and "waiting_human" in transitions.get(state, ()):
         try:
             return work.move(db, int(item["id"]), "waiting_human", note=note, actor=actor)["state"]
         except work.WorkError:
@@ -1007,8 +1011,11 @@ def _release_lot(db, view: dict, *, actor: str, note: str, replay: bool = False)
     if replay and (item["state"] != "waiting_human" or others):
         return {"lot": int(lot), "state": item["state"], "moved": False, "others": len(others)}
     target = view.get("previous_state")
+    # #4957 : au profil nu, aucune transition n'est connue ; le lot reste en
+    # `waiting_human` et la note le dit (même repli qu'un déplacement refusé).
+    allowed = work.development_transitions().get("waiting_human", ())
     if item["state"] == "waiting_human" and not others and target \
-            and target in work.TRANSITIONS["waiting_human"]:
+            and target in allowed:
         try:
             work.move(db, int(lot), target, note="%s — the work item returns to %s" % (note, target),
                       actor=actor)
