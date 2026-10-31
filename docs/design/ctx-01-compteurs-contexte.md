@@ -612,10 +612,11 @@ raison, jamais `0` (§2.4).
 | `turn_id`, `agent`, `started_ts`, `ended_ts`, `duration_s` | identité et fenêtre du tour ; `started_ts`/`ended_ts` viennent de la publication |
 | `harness`, `model`, `model_quality`, `mode`, `role` | profil effectif du tour |
 | `session` | identifiant **opaque** : `sha256:` + 32 hex, lié à l'agent ; jamais l'identifiant brut |
+| `session_seq` | rang du tour dans sa session (1..N), stable et suffisant au rejeu |
 | `W` | fenêtre du modèle effectif : `value`, `quality`, `reasons`, `granularity`, `source` (provenance runtime) |
 | `auxiliary_models` | modèles auxiliaires observés (jamais utilisés pour `W`) |
-| `C_last`, `O_last`, `C_next_input`, `C_next`, `R_turn`, `R_session`, `O`, `S_hist`, `cache_read_tokens`, `cache_write_tokens` | mesures au même format `{value, quality, reasons, granularity, source}` |
-| `decision` | décision **observée** : `observed` ∈ `none`/`close`/`rotation`/`compaction`, `cause` normalisée, et les blocs `close`, `rotation`, `compaction`, `window` |
+| `C_last`, `O_last`, `C_next_input`, `C_next`, `R_turn`, `R_session`, `R_session_base`, `O`, `S_hist`, `cache_read_tokens`, `cache_write_tokens` | mesures au même format `{value, quality, reasons, granularity, source}` ; `R_session_base` est le cumul de relecture **avant** le tour |
+| `decision` | décision **observée** : `observed` ∈ `none`/`close`/`rotation`/`compaction`, `cause` normalisée, `compacted` (vrai si une compaction est publiée, `null` sinon), et les blocs `close`, `rotation`, `compaction`, `window` ; `compaction.observed`/`requested` séparent la réussite de la demande |
 | `policy` | politique en vigueur au tour : `session`, `context_max_tokens`, `session_max_tokens`, budgets opt-in, part d'entretien |
 | `legacy` | les onze compteurs legacy publiés à côté des mesures |
 | `quality`, `reasons` | qualité d'ensemble (mesures principales) et raisons, triées |
@@ -624,7 +625,10 @@ raison, jamais `0` (§2.4).
 La publication `turn.context` de CTX-02b ne porte pas encore le profil CTX-03 : sur le corpus réel, `W` reste donc `null` avec `window_unknown`, et `C_next_input`/`C_next` restent `null` hors opt-in CTX-04b. Les fixtures R1 et R4 portent, elles, une fenêtre observée. Aucune valeur n'est supposée pour combler ces absences.
 
 `S_hist` est reconstruit du grand livre : somme des `input_tokens +
-output_tokens` des lignes `turn_costs` de la session jusqu'au tour inclus. Un
+output_tokens` des lignes `turn_costs` de la session jusqu'au tour inclus.
+`R_session_base` suit la même lecture : somme des entrées relues (cache lu
+compris, Codex entrée seule) des lignes **précédentes** ; sans ligne de grand
+livre, il se déduit de `R_session - R_turn`, marqué `derived` ou `partial`. Un
 `turn_id` sans ligne de grand livre reprend le `session_tokens` legacy de
 l'événement, marqué `fallback` avec `ledger_row_missing` ; un écart entre les
 deux marque `session_tokens_mismatch` et laisse la ligne `partial` — le grand

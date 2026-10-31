@@ -171,9 +171,10 @@ class CorpusLineTest(unittest.TestCase):
 
     def test_absence_reste_none_avec_raison_jamais_zero(self):
         line = build(measures={}, cache={}, legacy_values={})
-        for name in ("C_last", "O_last", "R_turn", "R_session", "O",
-                     "cache_read_tokens", "cache_write_tokens", "S_hist",
-                     "C_next_input", "C_next", "W"):
+        for name in ("C_last", "O_last", "R_turn", "R_session",
+                     "R_session_base", "O", "cache_read_tokens",
+                     "cache_write_tokens", "S_hist", "C_next_input", "C_next",
+                     "W"):
             with self.subTest(measure=name):
                 self.assertIsNone(line[name]["value"])
                 self.assertTrue(line[name]["reasons"])
@@ -340,7 +341,27 @@ class CorpusLineTest(unittest.TestCase):
         self.assertEqual(line["decision"]["observed"], "compaction")
         self.assertIsNone(line["decision"]["compaction"]["post_tokens"])
         self.assertTrue(line["decision"]["compaction"]["requested"])
+        self.assertIsNone(line["decision"]["compaction"]["observed"])
+        self.assertIsNone(line["decision"]["compacted"])
         self.assertIn(context_corpus.REASON_COMPACTION_REQUESTED,
+                      line["decision"]["compaction"]["reasons"])
+
+    def test_compaction_observee_est_visible_a_part(self):
+        line = build(context_extra={"compaction": {
+            "pre": 100000, "post": 40000, "quality": "measured",
+            "reasons": [], "trigger": "auto"}})
+        self.assertEqual(line["decision"]["observed"], "compaction")
+        self.assertEqual(line["decision"]["compacted"], True)
+        self.assertEqual(line["decision"]["compaction"]["observed"], True)
+        self.assertEqual(line["decision"]["compaction"]["pre_tokens"], 100000)
+        self.assertEqual(line["decision"]["compaction"]["post_tokens"], 40000)
+
+    def test_compaction_non_publiee_reste_inconnue(self):
+        line = build()
+        self.assertIsNone(line["decision"]["compacted"])
+        self.assertIsNone(line["decision"]["compaction"]["observed"])
+        self.assertFalse(line["decision"]["compaction"]["requested"])
+        self.assertIn(context_corpus.REASON_COMPACTION_NOT_PUBLISHED,
                       line["decision"]["compaction"]["reasons"])
 
     def test_projection_publiee_est_derivee(self):
@@ -402,6 +423,7 @@ class ReproductionsTest(unittest.TestCase):
     def test_r4_400k_cumules_pour_50k_de_contexte(self):
         lines = context_corpus.read_corpus(fixture("r4_cumulative_budget"))
         self.assertEqual(len(lines), 3)
+        self.assertEqual([line["session_seq"] for line in lines], [1, 2, 3])
         self.assertEqual(lines[-1]["R_session"]["value"], 400000)
         for line in lines:
             self.assertEqual(line["C_last"]["value"], 50000)
@@ -417,6 +439,8 @@ class ReproductionsTest(unittest.TestCase):
         self.assertEqual(claude["legacy"]["input_tokens"], 100000)
         self.assertEqual(codex["legacy"]["input_tokens"], 150000)
         self.assertEqual(codex["cache_write_tokens"]["quality"], "derived")
+        self.assertEqual(claude["session_seq"], 1)
+        self.assertEqual(codex["session_seq"], 1)
 
 
 class CorpusFileTest(unittest.TestCase):
@@ -492,7 +516,7 @@ class ExportCorpusTest(PgTestCase):
     def _event(self, *, agent="ctx05-a", harness="claude", session="s",
                turn_id, started=1000.0, ended=1010.0, session_tokens=100,
                measures=None, cache=None, decision=None, policy=None,
-               schema="ameesh-context/1"):
+               schema="ameesh-context/1", context_extra=None):
         body = payload(
             agent=agent, harness=harness, session=session, turn_id=turn_id,
             started=started, ended=ended,
@@ -502,7 +526,7 @@ class ExportCorpusTest(PgTestCase):
             legacy_values=legacy(input_tokens=100, output_tokens=10,
                                  reread_tokens=100, context_tokens=1000,
                                  session_tokens=session_tokens),
-            decision=decision, policy=policy,
+            decision=decision, policy=policy, context_extra=context_extra,
         )
         body["schema"] = schema
         body["observation_id"] = "turn:" + turn_id
@@ -518,8 +542,10 @@ class ExportCorpusTest(PgTestCase):
     def test_export_lit_le_grand_livre_et_les_evenements(self):
         self._ledger(turn_id="t1", input_tokens=100, output=10)
         self._ledger(turn_id="t2", input_tokens=200, output=20)
-        self._event(turn_id="t1", started=1000.0, session_tokens=110)
-        self._event(turn_id="t2", started=2000.0, session_tokens=330)
+        self._event(turn_id="t1", started=1000.0, session_tokens=110,
+                    measures=core(1000, 100, 1000, 1000, 100))
+        self._event(turn_id="t2", started=2000.0, session_tokens=330,
+                    measures=core(1000, 100, 1000, 1100, 100))
         result = self._export()
         self.assertEqual(result.turns, 2)
         self.assertEqual(result.sessions, 1)
@@ -528,6 +554,12 @@ class ExportCorpusTest(PgTestCase):
         self.assertEqual(second["S_hist"]["value"], 330)
         self.assertEqual(first["S_hist"]["source"], "ledger")
         self.assertEqual(first["S_hist"]["quality"], "measured")
+        self.assertEqual([line["session_seq"] for line in result.lines],
+                         [1, 2])
+        self.assertEqual(first["R_session_base"]["value"], 0)
+        self.assertEqual(second["R_session_base"]["value"], 100)
+        self.assertEqual(second["R_session_base"]["source"], "ledger")
+        self.assertEqual(second["R_session_base"]["quality"], "measured")
         self.assertIsNotNone(first["source"]["ledger_id"])
         self.assertNotIn("session-1", json.dumps(first))
         self.assertEqual(first["quality"], "measured")
@@ -556,6 +588,15 @@ class ExportCorpusTest(PgTestCase):
         self.assertEqual(len(result.skipped), 1)
         self.assertEqual(result.skipped[0]["reason"],
                          context_corpus.REASON_EVENT_SCHEMA_MISMATCH)
+
+    def test_export_ecarte_un_evenement_hors_contrat(self):
+        self._event(turn_id="bad", context_extra={"compaction": {
+            "pre": 1, "post": 2, "quality": "unknown"}})
+        result = self._export()
+        self.assertEqual(result.turns, 0)
+        self.assertEqual(len(result.skipped), 1)
+        self.assertEqual(result.skipped[0]["reason"],
+                         context_corpus.REASON_EVENT_INVALID)
 
     def test_export_signale_un_ecart_de_session_tokens(self):
         self._ledger(turn_id="t1", input_tokens=100, output=10)

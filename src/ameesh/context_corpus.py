@@ -67,38 +67,44 @@ REASON_EVENT_NOT_OBJECT = "event_not_an_object"
 REASON_EVENT_SCHEMA_MISMATCH = "event_schema_mismatch"
 REASON_EVENT_AGENT_MISSING = "event_agent_missing"
 REASON_QUALITY_UNKNOWN = "quality_unknown"
+REASON_SESSION_BASE_UNKNOWN = "session_base_unknown"
+REASON_SESSION_BASE_INCONSISTENT = "session_base_inconsistent"
+REASON_SESSION_REREAD_MISMATCH = "session_reread_mismatch"
+REASON_COMPACTION_NOT_PUBLISHED = "compaction_not_published"
+REASON_EVENT_INVALID = "event_invalid"
 
 #: liste blanche du schéma, vérifiée à la lecture comme à l'écriture
 LINE_KEYS = frozenset({
     "schema", "turn_id", "agent", "started_ts", "ended_ts", "duration_s",
     "harness", "model", "model_quality", "mode", "role", "session",
-    "W", "auxiliary_models",
+    "session_seq", "W", "auxiliary_models",
     "C_last", "O_last", "C_next_input", "C_next", "R_turn", "R_session",
-    "O", "S_hist", "cache_read_tokens", "cache_write_tokens",
+    "R_session_base", "O", "S_hist", "cache_read_tokens", "cache_write_tokens",
     "decision", "policy", "legacy", "quality", "reasons", "source",
 })
 REQUIRED_LINE_KEYS = frozenset({
     "schema", "turn_id", "agent", "harness", "model", "model_quality",
-    "mode", "role", "session", "W", "auxiliary_models", "C_last", "O_last",
-    "C_next_input", "C_next", "R_turn", "R_session", "O", "S_hist",
-    "cache_read_tokens", "cache_write_tokens", "decision", "policy", "legacy",
+    "mode", "role", "session", "session_seq", "W", "auxiliary_models",
+    "C_last", "O_last", "C_next_input", "C_next", "R_turn", "R_session",
+    "R_session_base", "O", "S_hist", "cache_read_tokens", "cache_write_tokens",
+    "decision", "policy", "legacy",
     "quality", "reasons", "source",
 })
 MEASURE_KEYS = frozenset({"value", "quality", "reasons", "granularity", "source"})
-CORE_MEASURES = ("C_last", "O_last", "R_turn", "R_session", "O", "S_hist",
-                 "cache_read_tokens", "cache_write_tokens")
+CORE_MEASURES = ("C_last", "O_last", "R_turn", "R_session", "R_session_base",
+                 "O", "S_hist", "cache_read_tokens", "cache_write_tokens")
 ALL_MEASURES = ("W", "C_last", "O_last", "C_next_input", "C_next", "R_turn",
-                "R_session", "O", "S_hist", "cache_read_tokens",
-                "cache_write_tokens")
-DECISION_KEYS = frozenset({"observed", "cause", "close", "rotation",
-                           "compaction", "window"})
+                "R_session", "R_session_base", "O", "S_hist",
+                "cache_read_tokens", "cache_write_tokens")
+DECISION_KEYS = frozenset({"observed", "cause", "compacted", "close",
+                           "rotation", "compaction", "window"})
 OBSERVED_DECISIONS = ("none", "close", "rotation", "compaction")
 CLOSE_KEYS = frozenset({"kind", "context_tokens", "context_max_tokens",
                         "elapsed_s", "turn_max_seconds", "measure", "value",
                         "budget"})
 ROTATION_KEYS = frozenset({"kind", "previous_session"})
 COMPACTION_KEYS = frozenset({"pre_tokens", "post_tokens", "quality", "reasons",
-                             "trigger", "requested"})
+                             "trigger", "requested", "observed"})
 WINDOW_KEYS = frozenset({"C_last", "O_last", "W", "C_next_input", "C_next",
                          "O_reserve_next", "share", "near", "decision",
                          "unknowns"})
@@ -254,14 +260,20 @@ class LedgerSession:
         self.rows = [dict(row) for row in (rows or ()) if isinstance(row, Mapping)]
         self._by_turn: dict[str, list[dict]] = {}
         self._cumulative: dict[int, int] = {}
+        self._reread_before: dict[int, int] = {}
         total = 0
+        reread = 0
         for row in self.rows:
             try:
                 ident = int(row["id"])
             except (KeyError, TypeError, ValueError):
                 continue
-            total += max(int(row.get("input_tokens") or 0), 0)
-            total += max(int(row.get("output_tokens") or 0), 0)
+            input_tokens = max(int(row.get("input_tokens") or 0), 0)
+            cached = max(int(row.get("cached_input_tokens") or 0), 0)
+            self._reread_before[ident] = reread
+            reread += input_tokens if row.get("harness") == "codex" \
+                else input_tokens + cached
+            total += input_tokens + max(int(row.get("output_tokens") or 0), 0)
             self._cumulative[ident] = total
             turn_id = _text(row.get("turn_id"))
             if turn_id:
@@ -283,6 +295,20 @@ class LedgerSession:
         except (KeyError, TypeError, ValueError):
             return None, None, REASON_LEDGER_ROW_MISSING
 
+    def reread_base(self, turn_id) -> tuple[dict | None, int | None, str | None]:
+        """(ligne, ``R_session`` avant ce tour, raison) — la base du grand livre.
+
+        La base suit la convention de :meth:`session_reread` : entrée + cache
+        **lu** pour Claude/DeepSeek/ACP, entrée seule pour Codex (cache inclus).
+        """
+        row, _s_hist, reason = self.find(turn_id)
+        if row is None:
+            return None, None, reason
+        try:
+            return row, self._reread_before[int(row["id"])], None
+        except (KeyError, TypeError, ValueError):
+            return None, None, REASON_LEDGER_ROW_MISSING
+
 
 def _legacy(payload: Mapping) -> dict:
     raw = payload.get("legacy")
@@ -299,7 +325,7 @@ def _policy(payload: Mapping) -> dict:
         raw = decision.get("policy") if isinstance(decision, Mapping) \
             and isinstance(decision.get("policy"), Mapping) else {}
     return {
-        "session": _text(raw.get("session")),
+        "session": _trigger(raw.get("session")),
         "context_max_tokens": _number(raw.get("context_max_tokens")),
         "session_max_tokens": _number(raw.get("session_max_tokens")),
         "turn_reread_budget": _number(raw.get("turn_reread_budget")),
@@ -385,28 +411,37 @@ def _window_measure(payload: Mapping, context: Mapping, decision: Mapping,
 def _close(raw) -> dict | None:
     if not isinstance(raw, Mapping):
         return None
-    out = {"kind": _text(raw.get("kind")) or "unknown"}
+    out = {"kind": _trigger(raw.get("kind")) or "unknown"}
     for key in ("context_tokens", "context_max_tokens", "elapsed_s",
                 "turn_max_seconds", "value", "budget"):
         if key in raw:
             out[key] = _number(raw.get(key))
     if "measure" in raw:
-        out["measure"] = _text(raw.get("measure"))
+        out["measure"] = _trigger(raw.get("measure"))
     return out
 
 
 def _rotation(raw, agent: str) -> dict | None:
     if not isinstance(raw, Mapping):
         return None
-    out = {"kind": _text(raw.get("kind")) or "unknown"}
+    out = {"kind": _trigger(raw.get("kind")) or "unknown"}
     previous = opaque_session(agent, _text(raw.get("old_session")))
     if previous is not None:
         out["previous_session"] = previous
     return out
 
 
-def _compaction(context: Mapping, window: Mapping | None) -> dict | None:
+def _compaction(context: Mapping, window: Mapping | None) -> dict:
+    """La compaction du tour, toujours visible à côté de la décision observée.
+
+    ``observed`` est vrai seulement si le harnais a publié une compaction
+    (``context.compaction``) ; une demande de la politique n'est pas une
+    réussite (contrat §4.2) et laisse ``observed`` inconnu. Quand rien n'est
+    publié, le bloc le dit avec ``compaction_not_published`` : le rejeu ne
+    suppose jamais « pas de compaction ».
+    """
     raw = context.get("compaction")
+    requested = isinstance(window, Mapping) and window.get("decision") == "compact"
     if isinstance(raw, Mapping):
         pre = _token(raw.get("pre"))
         post = _token(raw.get("post"))
@@ -426,9 +461,10 @@ def _compaction(context: Mapping, window: Mapping | None) -> dict | None:
             "quality": quality,
             "reasons": reasons,
             "trigger": _trigger(raw.get("trigger")),
-            "requested": bool(raw.get("requested", False)),
+            "requested": bool(raw.get("requested", False)) or requested,
+            "observed": True,
         }
-    if isinstance(window, Mapping) and window.get("decision") == "compact":
+    if requested:
         # Une compaction DEMANDÉE n'est pas une compaction réussie : l'après
         # reste inconnu tant que le harnais ne le publie pas (contrat §4.2).
         return {
@@ -438,8 +474,17 @@ def _compaction(context: Mapping, window: Mapping | None) -> dict | None:
             "reasons": [REASON_COMPACTION_REQUESTED, REASON_POST_TOKENS_UNKNOWN],
             "trigger": "window_maintenance",
             "requested": True,
+            "observed": None,
         }
-    return None
+    return {
+        "pre_tokens": None,
+        "post_tokens": None,
+        "quality": UNKNOWN,
+        "reasons": [REASON_COMPACTION_NOT_PUBLISHED],
+        "trigger": None,
+        "requested": False,
+        "observed": None,
+    }
 
 
 def _window_block(raw) -> dict | None:
@@ -459,7 +504,7 @@ def _window_block(raw) -> dict | None:
         "O_reserve_next": _token(raw.get("O_reserve_next")),
         "share": _number(raw.get("share")),
         "near": near if isinstance(near, bool) else None,
-        "decision": _text(raw.get("decision")),
+        "decision": _trigger(raw.get("decision")),
         "unknowns": unknowns,
     }
 
@@ -473,7 +518,7 @@ def _decision(payload: Mapping, context: Mapping) -> dict:
     close = _close(raw.get("close"))
     rotation = _rotation(raw.get("rotation"), agent)
     compaction = _compaction(context, window)
-    if compaction is not None:
+    if compaction.get("observed") is True or compaction.get("requested"):
         observed, cause = "compaction", (compaction.get("trigger")
                                          or "compaction")
     elif rotation is not None:
@@ -487,6 +532,7 @@ def _decision(payload: Mapping, context: Mapping) -> dict:
     return {
         "observed": observed,
         "cause": cause,
+        "compacted": compaction.get("observed"),
         "close": close,
         "rotation": rotation,
         "compaction": compaction,
@@ -547,6 +593,60 @@ def _s_hist(payload: Mapping, ledger: LedgerSession | None, *,
             int(row["id"]))
 
 
+def _r_session_base(payload: Mapping, ledger: LedgerSession | None, *,
+                   session: str | None, r_session: Mapping,
+                   r_turn: Mapping) -> dict:
+    """La base ``R_session`` avant le tour : grand livre, sinon soustraction.
+
+    Le grand livre est la source de référence (même convention que
+    :meth:`session_reread`). Sans ligne de grand livre, la base se déduit de
+    ``R_session - R_turn`` quand les deux mesures sont présentes ; elle est
+    alors ``derived`` ou ``partial``, jamais supposée. Un écart entre la base
+    du grand livre et ``R_session - R_turn`` est nommé, la ligne reste
+    utilisable.
+    """
+    if session is None:
+        return measure(None, quality=UNKNOWN,
+                       reasons=(context_metrics.REASON_NO_SESSION,),
+                       granularity="session", source="none")
+    ledger_reason = None
+    if ledger is not None:
+        row, base, reason = ledger.reread_base(payload.get("turn_id"))
+        if row is not None:
+            quality, reasons = MEASURED, []
+            if r_session.get("value") is not None \
+                    and r_turn.get("value") is not None \
+                    and int(base) + int(r_turn["value"]) != int(r_session["value"]):
+                quality = PARTIAL
+                reasons = [REASON_SESSION_REREAD_MISMATCH]
+            return measure(base, quality=quality, reasons=reasons,
+                           granularity="session", source="ledger")
+        ledger_reason = reason
+    if r_session.get("value") is not None and r_turn.get("value") is not None:
+        base = int(r_session["value"]) - int(r_turn["value"])
+        if base < 0:
+            return measure(None, quality=UNKNOWN,
+                           reasons=(REASON_SESSION_BASE_INCONSISTENT,),
+                           granularity="session", source="none")
+        quality = DERIVED if (r_session.get("quality") in (MEASURED, DERIVED)
+                              and r_turn.get("quality") in (MEASURED, DERIVED)) \
+            else PARTIAL
+        reasons = _reasons(list(r_session.get("reasons") or ())
+                           + list(r_turn.get("reasons") or ()))
+        if ledger_reason:
+            reasons.append(ledger_reason)
+        return measure(base, quality=quality, reasons=reasons,
+                       granularity="session",
+                       source="derived:R_session-R_turn")
+    reasons = [REASON_SESSION_BASE_UNKNOWN]
+    if ledger_reason:
+        reasons.append(ledger_reason)
+    reasons.extend(r_session.get("reasons") or ())
+    reasons.extend(r_turn.get("reasons") or ())
+    return measure(None, quality=UNKNOWN, reasons=reasons,
+                   granularity="session", source="none")
+
+
 def corpus_line(payload: Mapping, *, event_id: int | None = None,
                 ledger: LedgerSession | None = None) -> dict:
     """Construit une ligne ``ameesh-context-corpus/1`` depuis un événement
@@ -577,6 +677,7 @@ def corpus_line(payload: Mapping, *, event_id: int | None = None,
     harness_raw = _text(payload.get("harness")) or _text(context.get("harness"))
     harness = context_metrics.convention(harness_raw).harness \
         if harness_raw else "unknown"
+    harness = _trigger(harness) or "unknown"
     decision_raw = payload.get("decision")
     if not isinstance(decision_raw, Mapping):
         decision_raw = {}
@@ -604,9 +705,10 @@ def corpus_line(payload: Mapping, *, event_id: int | None = None,
         "harness": harness,
         "model": model,
         "model_quality": model_quality,
-        "mode": _text(payload.get("mode")) or _text(context.get("mode")),
-        "role": _text(payload.get("role")) or _text(context.get("role")),
+        "mode": _trigger(payload.get("mode")) or _trigger(context.get("mode")),
+        "role": _trigger(payload.get("role")) or _trigger(context.get("role")),
         "session": session,
+        "session_seq": None,
         "W": window_measure,
         "auxiliary_models": auxiliary_models,
         "C_last": _copy_measure(
@@ -618,6 +720,9 @@ def corpus_line(payload: Mapping, *, event_id: int | None = None,
         "R_session": _copy_measure(
             measures_raw.get("R_session"),
             context_metrics.REASON_TURN_NOT_MEASURED),
+        "R_session_base": measure(None, quality=UNKNOWN,
+                                  reasons=(REASON_SESSION_BASE_UNKNOWN,),
+                                  granularity="session", source="none"),
         "O": _copy_measure(
             measures_raw.get("O"), context_metrics.REASON_NO_MEASURE),
         "cache_read_tokens": _copy_measure(
@@ -642,6 +747,9 @@ def corpus_line(payload: Mapping, *, event_id: int | None = None,
     s_hist, ledger_id = _s_hist(
         payload, ledger, agent=agent, session=session_raw)
     result["S_hist"] = s_hist
+    result["R_session_base"] = _r_session_base(
+        payload, ledger, session=session_raw,
+        r_session=result["R_session"], r_turn=result["R_turn"])
     result["source"] = {
         "schema": SOURCE_SCHEMA,
         "event_id": event_id if isinstance(event_id, int)
@@ -765,8 +873,13 @@ def _validate_compaction(raw, name: str) -> None:
         raise CorpusError("%s.reasons must be a list of non-empty strings" % name)
     if post is None and not reasons:
         raise CorpusError("%s: an unknown after needs a reason" % name)
-    if "requested" in mapping and not isinstance(mapping["requested"], bool):
+    if not isinstance(mapping.get("requested"), bool):
         raise CorpusError("%s.requested must be a boolean" % name)
+    observed = mapping.get("observed")
+    if observed is not None and not isinstance(observed, bool):
+        raise CorpusError("%s.observed must be a boolean or null" % name)
+    if "observed" not in mapping:
+        raise CorpusError("%s.observed is required" % name)
     trigger = mapping.get("trigger")
     if trigger is not None and not isinstance(trigger, str):
         raise CorpusError("%s.trigger must be a string or null" % name)
@@ -811,6 +924,13 @@ def _validate_decision(raw) -> None:
             raise CorpusError("decision.cause must be null when observed is none")
     elif not _text(cause):
         raise CorpusError("decision.cause is required for an observed decision")
+    compacted = mapping.get("compacted")
+    if compacted is not None and not isinstance(compacted, bool):
+        raise CorpusError("decision.compacted must be a boolean or null")
+    if "compacted" not in mapping:
+        raise CorpusError("decision.compacted is required")
+    if mapping.get("compaction") is None and compacted is not None:
+        raise CorpusError("decision.compacted needs a compaction block")
     for key in ("close", "rotation", "compaction", "window"):
         if key not in mapping:
             raise CorpusError("decision.%s is required" % key)
@@ -822,6 +942,9 @@ def _validate_decision(raw) -> None:
             _validate_rotation(mapping[key], "decision.rotation")
         elif key == "compaction":
             _validate_compaction(mapping[key], "decision.compaction")
+            if mapping[key].get("observed") != compacted:
+                raise CorpusError(
+                    "decision.compacted must equal decision.compaction.observed")
         else:
             _validate_window(mapping[key], "decision.window")
 
@@ -914,6 +1037,11 @@ def validate_line(line) -> dict:
     session = mapping.get("session")
     if session is not None and not _OPAQUE_SESSION_RE.match(str(session)):
         raise CorpusError("line.session must be opaque (sha256:…)")
+    session_seq = mapping.get("session_seq")
+    if session_seq is not None and (isinstance(session_seq, bool)
+                                    or not isinstance(session_seq, int)
+                                    or session_seq < 1):
+        raise CorpusError("line.session_seq must be a positive integer or null")
     for name in ALL_MEASURES:
         _validate_measure(mapping.get(name), name)
     auxiliary = mapping.get("auxiliary_models")
@@ -947,6 +1075,11 @@ def iter_corpus(path: str):
                 yield validate_line(line)
             except CorpusError as exc:
                 raise CorpusError("%s:%d: %s" % (path, number, exc)) from exc
+
+
+def iter_turns(path: str):
+    """Alias de :func:`iter_corpus` pour CTX-05b (un tour par itération)."""
+    return iter_corpus(path)
 
 
 def read_corpus(path: str) -> list[dict]:
@@ -1113,12 +1246,30 @@ def export_corpus(db, *, since_ts: float, until_ts: float | None = None,
         agent = _text(data.get("agent")) or "unknown"
         session = _text(data.get("session"))
         ledger = ledgers.get((agent, session)) if session is not None else None
-        lines.append(corpus_line(data, event_id=_token(row.get("id")),
-                                 ledger=ledger))
+        try:
+            lines.append(corpus_line(data, event_id=_token(row.get("id")),
+                                     ledger=ledger))
+        except CorpusError as exc:
+            # Un événement publiable mais hors contrat n'arrête pas l'export :
+            # il est écarté avec sa raison, jamais transformé en ligne devinée.
+            skipped.append({"event_id": row.get("id"),
+                            "reason": REASON_EVENT_INVALID,
+                            "detail": str(exc)[:200]})
     lines.sort(key=lambda line: (
         line.get("started_ts") if isinstance(line.get("started_ts"),
                                              (int, float)) else 0.0,
         (line.get("source") or {}).get("event_id") or 0))
+    by_session: dict[str, list[dict]] = {}
+    for line in lines:
+        if line.get("session") is not None:
+            by_session.setdefault(line["session"], []).append(line)
+    for group in by_session.values():
+        group.sort(key=lambda line: (
+            line.get("started_ts") if isinstance(line.get("started_ts"),
+                                                 (int, float)) else 0.0,
+            (line.get("source") or {}).get("event_id") or 0))
+        for index, line in enumerate(group, 1):
+            line["session_seq"] = index
     return ExportResult(lines=lines, since_ts=since, until_ts=until,
                         harness=harness_key, sessions=len(ledgers),
                         skipped=tuple(skipped))
@@ -1237,6 +1388,6 @@ __all__ = [
     "DEFAULT_BATCH", "ExportResult", "LINE_KEYS", "LedgerSession",
     "MEASURE_KEYS", "MODEL_QUALITIES", "REQUIRED_LINE_KEYS", "SCHEMA",
     "SOURCE_SCHEMA", "build_parser", "corpus_line", "export_corpus",
-    "iter_corpus", "main", "measure", "opaque_session", "read_corpus",
-    "validate_line", "write_corpus",
+    "iter_corpus", "iter_turns", "main", "measure", "opaque_session",
+    "read_corpus", "validate_line", "write_corpus",
 ]
