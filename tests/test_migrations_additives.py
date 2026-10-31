@@ -95,7 +95,7 @@ class NonAdditiveTest(unittest.TestCase):
             ("do $a$ create table t (id bigint); $b$ $a$; revoke insert on t from app;",
              "revoke on t"),
             ("do 'unterminated create table t (id bigint); revoke insert on t from app;",
-             "revoke on t"),
+             "revoke in a string"),
             ("alter table t add unique (c);", "add unique"),
             ("alter table t add primary key (c);", "add primary key"),
             ("alter table t add check (c > 0);", "add check"),
@@ -118,7 +118,7 @@ class NonAdditiveTest(unittest.TestCase):
             ("revoke all on \"a;b\" from r;", "privilege removed (revoke"),
             # B cx1 : un nom cité garde sa casse, et son contenu n'est pas du code
             ('create table "T" (id bigint); revoke insert on "t" from app;',
-             'revoke on "t"'),
+             "privilege removed (revoke on \""),
             ('select 1 as "create table t "; revoke insert on t from app;', "revoke on t"),
             ('create table "T" (id bigint); alter table "t" add unique (id);', "add unique"),
             ('select 1 as "create table t "; alter table t add unique (c);', "add unique"),
@@ -128,6 +128,17 @@ class NonAdditiveTest(unittest.TestCase):
              "add constraint k"),
             ("create table n (id int); do $$ begin alter table n add column x int;"
              " alter table t add unique (c); end $$;", "add unique"),
+            # B cx1 : les mots d'une chaîne ne coupent pas une instruction
+            ("create table n (id int);"
+             " alter table t add column d text default 'alter table n ', add unique (c);",
+             "add unique"),
+            ("create table n (id int);"
+             " alter table t add column d text default $$alter table n $$, add unique (c);",
+             "add unique"),
+            # mesh-design #174693 : une chaîne n'est pas analysée, même pour une table neuve
+            ("create table n (id int); do $$ begin alter table n add unique (id); end $$;",
+             "add unique in a string"),
+            ("execute 'revoke insert on t from app';", "revoke in a string"),
         ):
             with self.subTest(sql=sql):
                 reasons = migrations.non_additive(_migration(sql))

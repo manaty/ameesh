@@ -500,10 +500,8 @@ _PRIVILEGES_CHECKED_AFTER = 528
 _REVOKE = re.compile(r"\brevoke\b[^;]*?\bon\s+(?:(table|function|sequence)\s+)?([\w.\"]+)"
                      r"\s*(\([^)]*\))?\s*(from\b)?|\brevoke\b")
 _DOLLAR_TAG = re.compile(r"\$(?:[^\W\d]\w*)?\$")
-#: lu sur le texte sans `;` de chaîne : un ALTER s'arrête au `;` suivant ou au
-#: prochain ALTER TABLE (les instructions d'un corps DO restent séparées)
-_ALTER_TABLE = re.compile(r"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)\s"
-                          r"(?:(?!\balter\s+table\b)[^;])*")
+#: lu, comme _REVOKE, sur le texte sans chaînes : ses `;` et ses mots sont du code
+_ALTER_TABLE = re.compile(r"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?([\w.\"]+)\s[^;]*")
 _ADD_CONSTRAINT = re.compile(r"\badd\s+(?:constraint\s+([\w\"]+)"
                              r"|(primary\s+key|unique|check|foreign\s+key)\b)")
 #: le texte ne dit pas si une contrainte élargit ou resserre : celle qui ne
@@ -537,14 +535,13 @@ def non_additive(migration: Migration) -> list[str]:
     return reasons
 
 
-def _lex(sql: str) -> tuple[str, str, str]:
-    """(texte sans commentaires, le même sans aucun `;` de chaîne, texte sans
-    commentaires ni chaînes), en une seule passe : le délimiteur d'une chaîne ne
-    se lit jamais dans un commentaire, ni l'inverse. Le premier garde les
-    chaînes, sans leurs `;` sauf dans un corps $$ (du code ou une valeur : le
-    second les retire aussi). Une fin manquante garde le reste pour commentaire
-    ou chaîne : le CREATE qu'il contiendrait ne prouve rien."""
-    kept, flat, code, at, size = [], [], [], 0, len(sql)
+def _lex(sql: str) -> tuple[list[str], str]:
+    """(chaînes, texte sans commentaires ni chaînes), en une seule passe : le
+    délimiteur d'une chaîne ne se lit jamais dans un commentaire, ni l'inverse.
+    Un identifiant cité devient un jeton neutre : son contenu n'est pas du code
+    et sa casse ne survit pas aux minuscules. Une fin manquante garde le reste
+    pour commentaire ou chaîne : le CREATE qu'il contiendrait ne prouve rien."""
+    strings, code, at, size = [], [], 0, len(sql)
     while at < size:
         two = sql[at:at + 2]
         dollar = _DOLLAR_TAG.match(sql, at) if sql[at] == "$" else None
@@ -557,7 +554,7 @@ def _lex(sql: str) -> tuple[str, str, str]:
                 two = sql[at:at + 2]
                 depth += (two == "/*") - (two == "*/")
                 at += 2 if two in ("/*", "*/") else 1
-            kept.append(" "), flat.append(" "), code.append(" ")
+            code.append(" ")
         elif dollar or sql[at] in "'\"":
             if dollar:
                 closing = sql.find(dollar.group(0), dollar.end())
@@ -577,25 +574,15 @@ def _lex(sql: str) -> tuple[str, str, str]:
                     else:
                         end += 1
                 end = min(end + 1, size)
-            if dollar:
-                # un corps $$ est du code : ses propres chaînes y sont neutralisées
-                tag = dollar.group(0)
-                body = sql[dollar.end():end - len(tag) if closing >= 0 else end]
-                kept.append(tag + _lex(body)[0] + (tag if closing >= 0 else ""))
-                # B cx1 : DEFAULT $$;$$ ne termine pas non plus l'instruction
-                flat.append(kept[-1].replace(";", " "))
+            if sql[at] == '"':
+                code.append('"_"')
             else:
-                # un `;` dans une chaîne ne termine pas l'instruction (B docs-01)
-                kept.append(sql[at:end].replace(";", " "))
-                flat.append(kept[-1])
-            # un identifiant entre guillemets n'est ni du code ni un nom
-            # comparable une fois les minuscules posées : jeton neutre (B cx1)
-            code.append('"_"' if sql[at] == '"' else " ")
+                strings.append(sql[at:end]), code.append(" ")
             at = end
         else:
-            kept.append(sql[at]), flat.append(sql[at]), code.append(sql[at])
+            code.append(sql[at])
             at += 1
-    return "".join(kept), "".join(flat), "".join(code)
+    return strings, "".join(code)
 
 
 def _param_types(params: str, *, named: bool) -> list[str]:
@@ -627,19 +614,28 @@ def _proven_new(code: str, kind: str, name: str, signature: str = "") -> bool:
 
 
 def _privilege_reasons(sql: str) -> list[str]:
-    """Droits retirés et contraintes posées sur ce qui n'est pas prouvé neuf (#5055)."""
+    """Droits retirés et contraintes posées sur ce qui n'est pas prouvé neuf (#5055).
+    Une chaîne n'est pas analysée : un REVOKE ou un ADD de contrainte qu'elle
+    contient (DO, EXECUTE) suffit à classer la migration, sans chercher de preuve."""
     def normal(value: str) -> str:
         return re.sub(r"\s+", " ", value.lower())
 
-    kept, flat, code = (normal(value) for value in _lex(sql))
+    strings, code = _lex(sql)
+    code, strings = normal(code), [normal(value) for value in strings]
     reasons = []
-    for match in _REVOKE.finditer(kept):
+    if any(re.search(r"\brevoke\b", value) for value in strings):
+        reasons.append("privilege removed (revoke in a string, not analysed)")
+    for match in _REVOKE.finditer(code):
         kind, name, signature, single = match.groups()
         if not (name and single and '"' not in name
                 and _proven_new(code, kind or "table", name, signature or "")):
             reasons.append("privilege removed (revoke%s)" % (" on " + name if name else ""))
     if not _CONSTRAINT_MARKER.search(sql):
-        for statement in _ALTER_TABLE.finditer(flat):
+        for value in strings:
+            reasons.extend("constraint possibly tightened (add %s in a string, not analysed)"
+                           % (name and "constraint " + name or form)
+                           for name, form in _ADD_CONSTRAINT.findall(value))
+        for statement in _ALTER_TABLE.finditer(code):
             if '"' not in statement.group(1) and _proven_new(code, "table", statement.group(1)):
                 continue
             reasons.extend("constraint possibly tightened (add %s)"
