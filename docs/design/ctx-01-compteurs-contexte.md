@@ -586,6 +586,79 @@ devient jamais une valeur par défaut silencieuse.
 | Version | Date | Changement |
 |---|---|---|
 | `ameesh-context/1` r1 | 2026-10-29 | création : contrat, profils, décisions, cinq reproductions, compatibilité legacy |
+| `ameesh-context-corpus/1` r1 | 2026-10-31 | corpus de rejeu CTX-05a (§8) |
+
+---
+
+## 8. Corpus de rejeu — `ameesh-context-corpus/1`
+
+CTX-05a (#5134) reconstruit un corpus de tours, **en lecture seule**, à partir
+de deux sources : les événements `turn.context` publiés par CTX-02b (#4870) et
+le grand livre `turn_costs`. Il alimente le rejeu contrefactuel de CTX-05b ;
+il ne prend aucune décision et ne rejoue aucune politique.
+
+### 8.1 Forme
+
+Un fichier JSONL : une ligne par tour, schéma `ameesh-context-corpus/1`.
+Chaque ligne ne porte que les clés de la liste blanche du module
+`src/ameesh/context_corpus.py` ; une clé inconnue est refusée à la lecture
+comme à l'écriture. Aucun prompt, résultat d'outil, texte de courrier, secret
+ni chemin privé n'est recopié. Les mesures absentes restent `null` avec une
+raison, jamais `0` (§2.4).
+
+| Champ | Contenu |
+|---|---|
+| `schema` | `ameesh-context-corpus/1` |
+| `turn_id`, `agent`, `started_ts`, `ended_ts`, `duration_s` | identité et fenêtre du tour ; `started_ts`/`ended_ts` viennent de la publication |
+| `harness`, `model`, `model_quality`, `mode`, `role` | profil effectif du tour |
+| `session` | identifiant **opaque** : `sha256:` + 32 hex, lié à l'agent ; jamais l'identifiant brut |
+| `W` | fenêtre du modèle effectif : `value`, `quality`, `reasons`, `granularity`, `source` (provenance runtime) |
+| `auxiliary_models` | modèles auxiliaires observés (jamais utilisés pour `W`) |
+| `C_last`, `O_last`, `C_next_input`, `C_next`, `R_turn`, `R_session`, `O`, `S_hist`, `cache_read_tokens`, `cache_write_tokens` | mesures au même format `{value, quality, reasons, granularity, source}` |
+| `decision` | décision **observée** : `observed` ∈ `none`/`close`/`rotation`/`compaction`, `cause` normalisée, et les blocs `close`, `rotation`, `compaction`, `window` |
+| `policy` | politique en vigueur au tour : `session`, `context_max_tokens`, `session_max_tokens`, budgets opt-in, part d'entretien |
+| `legacy` | les onze compteurs legacy publiés à côté des mesures |
+| `quality`, `reasons` | qualité d'ensemble (mesures principales) et raisons, triées |
+| `source` | `event_id`, `observation_id`, `ledger_id`, schéma source, hôte |
+
+La publication `turn.context` de CTX-02b ne porte pas encore le profil CTX-03 : sur le corpus réel, `W` reste donc `null` avec `window_unknown`, et `C_next_input`/`C_next` restent `null` hors opt-in CTX-04b. Les fixtures R1 et R4 portent, elles, une fenêtre observée. Aucune valeur n'est supposée pour combler ces absences.
+
+`S_hist` est reconstruit du grand livre : somme des `input_tokens +
+output_tokens` des lignes `turn_costs` de la session jusqu'au tour inclus. Un
+`turn_id` sans ligne de grand livre reprend le `session_tokens` legacy de
+l'événement, marqué `fallback` avec `ledger_row_missing` ; un écart entre les
+deux marque `session_tokens_mismatch` et laisse la ligne `partial` — le grand
+livre reste la mesure de référence, l'écart est nommé.
+
+`C_next_input` et `C_next` ne sont publiés que si la décision de fenêtre les a
+publiés (`decision.window`) ; sinon ils restent `null` avec
+`projection_not_published`. Une compaction **demandée** n'est pas une
+compaction réussie : `post_tokens` reste `null`, la raison
+`post_tokens_unknown` le dit (§4.2).
+
+### 8.2 Export et bornes
+
+```
+ameesh context corpus export --out FILE [--days N | --since T] [--until T]
+                             [--harness H] [--batch N] [--force]
+ameesh context corpus check FILE
+```
+
+L'export est borné par la fenêtre d'insertion des événements et par le
+harnais ; il lit le grand livre de chaque session une fois. Le corpus réel
+n'est **pas** versionné dans le dépôt : l'écriture refuse un chemin dans un
+arbre Git et pose le fichier en `0600`. Un événement hors schéma ou sans agent
+est écarté avec sa raison, jamais transformé en ligne inventée.
+
+### 8.3 Reproductions et vérification
+
+Les cinq reproductions R1 à R5 de §6.1 sont versionnées dans
+`tests/fixtures/ctx05/` et se relisent avec `read_corpus` : ordre de
+`modelUsage` (R1), écriture de cache Claude (R2), dix appels Codex (R3),
+400 k cumulés pour un `C_last` de 50 k et `W` de 1 M (R4), garde 150 k et
+conventions de cache (R5). Les tests vérifient la liste blanche, l'absence en
+`null` avec raison, la session opaque, l'écriture `0600` hors dépôt et
+l'export borné.
 
 ---
 
