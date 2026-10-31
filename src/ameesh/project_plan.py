@@ -200,8 +200,10 @@ def assignment_ready(db, item, done, *, cfg=None, now=None, can_take=None):
     cfg = cfg or getattr(db, "cfg", None)
     rule = acceptance_rule(cfg, project)
     holds = backlog._take_holds(db, rows, cfg=cfg)
-    return int(done["id"]) in evaluate(rows, project=project, rule=rule,
-                                       holds=holds, now=now, can_take=can_take)["ready"]
+    from . import work_footprints
+    policies = work_footprints.policies_of(db, {str(r.get("app") or "") for r in rows})
+    return int(done["id"]) in evaluate(rows, project=project, rule=rule, holds=holds, now=now,
+                                       can_take=can_take, policies=policies)["ready"]
 
 
 def mark_taken(snapshots, item_id):
