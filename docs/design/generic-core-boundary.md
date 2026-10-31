@@ -34,12 +34,15 @@ The scanners and their unit tests remain useful for inspecting the transition.
 Only direct imports of module implementations are blocking, including relative
 and aliased imports. The registry (`ameesh.modules.registry`, L98) is the
 core's interface to modules and is not a module implementation: importing it
-never counts. The test lists two legacy storage adapter exceptions in
-`mesh_cli.py` and `work.py` until those interfaces use the registry. New imports
-fail, and removing an adapter requires removing its exception from the test.
-The blocking vocabulary boundary will be introduced with L98 through module
-imports and the registry, rather than word counts. Architectural review remains
-necessary.
+never counts. L98 T3 (#4406) removed the storage adapter exceptions of
+`mesh_cli.py` and `work.py`. The only remaining direct imports are the pure
+`sys.modules` aliases listed in `COMPATIBILITY_ALIASES`, each with its origin
+lot, date and reason (L104 T6, #4414): this declared list counts as
+infrastructure. New imports fail, and an entry whose import has gone must leave
+the list. Removing the aliases is a separate lot (L104b); `ameesh work merge-pr`
+and `ameesh review-class` are retained, as the canon's process cites them.
+The blocking boundary is module imports and the registry, not word counts.
+Architectural review remains necessary.
 
 L98 tranche 1 adds the `Module` interface (name, version, capabilities, CLI
 and storage entry points) and `registry.discover()`, which reads the built-in
@@ -133,9 +136,8 @@ unchanged. The old paths `ameesh.connectors.git_merge` and `ameesh.merge_pr`
 are `sys.modules` aliases of the same module object, so importers and tests
 patching a module global by the old name keep working;
 `tests/test_l100_dev_aliases.py` pins identity and patching for both. Those two
-aliases are the only new direct module imports outside `modules/`, declared as
-exceptions in `tests/test_generic_core.py` until a separately reviewed
-compatibility cleanup removes them.
+aliases, like those of tranches 2 to 4, are declared in
+`COMPATIBILITY_ALIASES` in `tests/test_generic_core.py`.
 
 Installed module activation is compiled from `extensions.ameesh.modules`,
 `teams.<team>.modules` and `projects.<project>.modules` in the trusted canon.
@@ -150,8 +152,10 @@ retained. The bare profile has neither built-ins nor external entry points,
 and workspace operations without `dev` are no-ops.
 
 The site's [Core and modules](../../site/docs/concepts/core-and-modules.md)
-page describes this installed-module architecture. Removal of compatibility
-adapters remains separate work.
+page describes this installed-module architecture. A new canon starts without
+any project module: `tests/test_l104_bare_canon.py` runs `canon check`, `canon
+sync` and a core work item through the CLI, in the standard and bare profiles,
+and leaves `project_modules` empty.
 
 L99 tranche 5 (#4353, owner decision #164165, signed approval #167) stores
 both development delivery phases under `state = delivered`. Unpinned dev
