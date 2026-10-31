@@ -1764,6 +1764,7 @@ _OWN_ACTOR = ("delegate", "expire-delegations", "sync-branches", "device-gates",
 def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
     """L'acteur des commandes `work` (correctif du 2026-10-11) : `--actor`,
     sinon l'identité liée de la session, jamais vide (« inconnu », averti).
+    Un déplacement ordinaire journalise l'identité liée avant `--actor`.
     Une correction d'état (`move --correct`) vérifie en plus qui corrige, un
     forçage (`add`/`assign --force`, #540) qui force."""
     v = _vocabulary()
@@ -1774,6 +1775,12 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
         # #4043 : le retrait d'un paquet est le geste du pilote (paquet-horaire)
         args.actor = work.corrector(cfg, db, args.actor, what="package exclusion")
         return
+    if args.work_command == "move":
+        # #5041 : journaliser l'identité qui exerce l'autorité du move.
+        from . import identity
+        binding = identity.resolve_binding(cfg, db)
+        if binding.name:
+            args.actor = binding.name
     if args.work_command in ("add", "assign") and (getattr(args, "force", None) or "").strip():
         # #540 : l'auteur d'un forçage est l'identité de la session
         args.actor = work.forcer(cfg, db, args.actor)
