@@ -805,15 +805,25 @@ class OnceTurnTest(PgTestCase):
         runner = self.once_runner({"value": False})
         runner.RELEASE_RETRY_S = 0.05
         bounds = {}
+        entered, may_answer = threading.Event(), threading.Event()
+
+        def renew(*_a):
+            entered.set()
+            may_answer.wait(10)
+            return answer()
 
         def turn(worker, _wait):
             runner.lease_ttl = 0.3  # the bound a late answer gives
             bounds["start"] = time.monotonic()
             worker.lease_held_until = bounds["start"] + 0.05
             worker.lease_deadline = time.time() + 60
-            with mock.patch.object(runner_mod.registry, "renew", lambda *_a: answer()), \
+            with mock.patch.object(runner_mod.registry, "renew", renew), \
                     mock.patch.object(worker, "call_budget", return_value=0.01):
                 self.assertEqual(worker._renew_call(), (False, None, None))
+                # #5155: the detached call passes the schema check first; the
+                # patch must outlast it, or the call reaches the real `renew`
+                self.assertTrue(entered.wait(10))
+            may_answer.set()
             return True
 
         guard = threading.Timer(10, runner.stop.set)  # a wait that never ends fails
