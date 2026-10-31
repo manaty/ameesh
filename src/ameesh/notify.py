@@ -3384,13 +3384,14 @@ class Notifier:
             # pas de `work_item_id` : un message lié au lot compterait comme
             # son activité (stagnation) et effacerait l'alerte qu'il signale
             delivered = []
+            quiet = alert_briefs.quiet_payloads(alert, briefs, by_name)
             for name, text in sorted(briefs.items()):
                 if not self._delivery_open():
                     break
                 if self.dry_run:
                     self.log("[%s] mail to %s (dry run): %s" % (kind, name, text))
                     continue
-                meta = dict(payload, reminder=name in reminders)
+                meta = dict(payload, reminder=name in reminders, **quiet.get(name, {}))
                 try:
                     if kind == "slo_breach" and alert.get("lot"):
                         # #3512: the alert snapshot can predate a merge. Check

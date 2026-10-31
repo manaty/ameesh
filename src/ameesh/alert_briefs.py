@@ -822,6 +822,34 @@ def _budget_pause_long(alert: dict) -> str:
             % (alert.get("detail") or "?"))
 
 
+def _automatic_sleep(alert: dict) -> bool:
+    """#4525 : la pause qui dure est le sommeil automatique du découpage."""
+    from . import file_decoupage
+    return bool(alert.get("sleep") or file_decoupage.is_sleep_reason(alert.get("reason")))
+
+
+def quiet_payloads(alert: dict, names, by_name: dict) -> dict:
+    """#5044 : par destinataire, les clés passives de son courrier (`mail.PASSIVE_KEYS`).
+
+    Le sommeil automatique n'attend aucun geste : il part sans réveiller. Une
+    alerte SLO copiée à plusieurs coordinateurs n'en réveille qu'un, stable
+    d'une passe à l'autre (`_one_orchestrator`) ; les autres la lisent en copie
+    à leur tour suivant, et le palier suivant reprend si rien ne bouge. Un P1
+    (`urgent`) réveille tout le monde, comme avant."""
+    if alert.get("urgent"):
+        return {}
+    names = [name for name in names if not name.startswith("thread:")]
+    kind = alert.get("type")
+    if kind in ("operator_pause_long", "operator_pause_host") and _automatic_sleep(alert):
+        return {name: {"info": True} for name in names}
+    if kind != "slo_breach" or len(names) < 2:
+        return {}
+    holder = alert.get("agent")
+    woken = holder if holder in names else \
+        _one_orchestrator(names, by_name, alert.get("lot"))[0]
+    return {name: {"cc": woken} for name in names if name != woken}
+
+
 def _operator_pause(alert: dict) -> str:
     """#3961 : une pause opérateur qui dure (un agent, ou la plupart des
     agents d'un hôte). Aux orchestrateurs de l'équipe et aux auditeurs.
@@ -832,9 +860,8 @@ def _operator_pause(alert: dict) -> str:
     #4610 : la levée est aussi automatique sur un lot attribué ou un courrier
     du pilote ou d'un orchestrateur.
     """
-    from . import file_decoupage
     v = vocab.active()
-    if alert.get("sleep") or file_decoupage.is_sleep_reason(alert.get("reason")):
+    if _automatic_sleep(alert):
         return ("Automatic sleep still in place: %s. This is the automatic sleep of an "
                 "exhausted roadmap, not a maintenance: it is lifted by the first "
                 "startable %s, an assigned actionable %s, or pilot/orchestrator "
