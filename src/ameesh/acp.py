@@ -230,8 +230,11 @@ class JsonRpcPeer:
         self.last_message = time.monotonic()
         #: première panne de protocole : elle prime sur toute réponse
         self.fatal: AcpError | None = None
+        from .platform import child_environment
+        prepared = (child_environment.grant(env, getattr(env, "credentials", ()))
+                    if env is not None else None)
         self.proc = subprocess.Popen(
-            self.argv, cwd=cwd, env=dict(env) if env is not None else None,
+            self.argv, cwd=cwd, env=prepared,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
             text=True, bufsize=1, start_new_session=new_session,
         )

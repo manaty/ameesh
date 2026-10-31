@@ -878,7 +878,9 @@ def run_harness(adapter, prompt: str, *, run_dir: str, cwd: str, env: dict,
     timed_out = False
     with open(stdout_path, "w", encoding="utf-8") as stdout, \
             open(stderr_path, "w", encoding="utf-8") as stderr:
-        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+        from .platform.child_environment import harness as harness_environment
+        proc = subprocess.Popen(argv, cwd=cwd, env=harness_environment(env, harness),
+                                stdin=subprocess.DEVNULL,
                                 stdout=stdout, stderr=stderr, text=True,
                                 start_new_session=True)
         try:
@@ -1179,7 +1181,9 @@ def run_review(adapter, prompt: str, *, run_dir: str, cwd: str | None = None,
     timed_out = False
     with open(stdout_path, "w", encoding="utf-8") as stdout, \
             open(stderr_path, "w", encoding="utf-8") as stderr:
-        proc = subprocess.Popen(argv, cwd=cwd or run_dir, env=env, stdin=subprocess.DEVNULL,
+        from .platform.child_environment import harness as harness_environment
+        proc = subprocess.Popen(argv, cwd=cwd or run_dir,
+                                env=harness_environment(env, harness), stdin=subprocess.DEVNULL,
                                 stdout=stdout, stderr=stderr, text=True,
                                 start_new_session=True)
         try:
@@ -2441,6 +2445,8 @@ def _cmd_report(cfg: Config, args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .platform.child_environment import install
+    install()
     parser = build_parser()
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     if not getattr(args, "command", None):

@@ -689,6 +689,24 @@ class ChatTest(_Base):
                             popen=_Popen(self.cfg, calls))
         return code, calls
 
+    def test_chat_grants_the_selected_account_and_mesh_transport(self):
+        from types import SimpleNamespace
+        from ameesh import account_turn
+        from ameesh.platform import child_environment as E
+        def selected(env, *_):
+            env["CUSTOM_ACCOUNT_KEY"] = "selected"
+            return True
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "unrelated"}), \
+                mock.patch.object(account_turn, "attach_profile", return_value=(
+                    True, SimpleNamespace(env="CUSTOM_ACCOUNT_KEY"))), \
+                mock.patch.object(account_turn, "apply_env_attach", side_effect=selected):
+            code, calls = self.run_chat()
+        self.assertEqual(code, 0, self.err.getvalue())
+        clean = E.for_child(calls[0]["command"], calls[0]["env"])
+        self.assertEqual(clean["CUSTOM_ACCOUNT_KEY"], "selected")
+        self.assertEqual(clean["AMEESH_DSN"], calls[0]["env"]["AMEESH_DSN"])
+        self.assertNotIn("OPENAI_API_KEY", clean)
+
     def test_consigne_versionnee(self):
         text = chat.consigne(ALICE, "chat-alice")
         for attendu in ("Tu es **chat-alice**, l'agent de conversation de **human:alice**",

@@ -3,6 +3,8 @@
 (code 141, aucune trace), mais un tube cassé ailleurs remonte."""
 from __future__ import annotations
 
+from .entrypoint import run as isolated_entrypoint
+
 import os
 import subprocess
 import sys
@@ -41,7 +43,7 @@ class TubeFermeTest(unittest.TestCase):
         try:
             with mock.patch.object(sys, "stdout", _TamponDejaVide(w)), \
                     mock.patch.object(main_mod, "_dispatch", side_effect=BrokenPipeError):
-                self.assertEqual(main_mod.main(["alerts"]), 141)
+                self.assertEqual(isolated_entrypoint(main_mod.main, ["alerts"]), 141)
         finally:
             os.close(w)
 
@@ -51,14 +53,14 @@ class TubeFermeTest(unittest.TestCase):
         try:
             with mock.patch.object(sys, "stdout", _SortieFermee(w)), \
                     mock.patch.object(main_mod, "_dispatch", side_effect=BrokenPipeError):
-                self.assertEqual(main_mod.main(["alerts"]), 141)
+                self.assertEqual(isolated_entrypoint(main_mod.main, ["alerts"]), 141)
         finally:
             os.close(w)
 
     def test_tube_casse_ailleurs_remonte(self):
         with mock.patch.object(main_mod, "_dispatch", side_effect=BrokenPipeError):
             with self.assertRaises(BrokenPipeError):
-                main_mod.main(["alerts"])
+                isolated_entrypoint(main_mod.main, ["alerts"])
 
     def test_de_bout_en_bout_sans_trace(self):
         # l'aide complète dépasse une ligne : `head -1` ferme le tube tôt

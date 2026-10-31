@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Native/guest gate selection and bounded acknowledgement retries (#501)."""
+from .entrypoint import run as isolated_entrypoint
+
 import errno
 import os
 from pathlib import Path
@@ -221,7 +223,7 @@ class NativeGateTest(unittest.TestCase):
                 mock.patch.object(runner, "load_config", return_value=config.Config(host_gate="none")), \
                 mock.patch.object(runner, "_connect_at_start") as connect, \
                 mock.patch.object(runner.sys, "stderr", new_callable=io.StringIO) as stderr:
-            self.assertEqual(runner.main(["--once", "--runner-id", "native:test"]), 2)
+            self.assertEqual(isolated_entrypoint(runner.main, ["--once", "--runner-id", "native:test"]), 2)
             self.assertIn("guest runner requires host_gate=file", stderr.getvalue())
             connect.assert_not_called()
 

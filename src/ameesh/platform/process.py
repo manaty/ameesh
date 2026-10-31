@@ -333,12 +333,13 @@ def env_values(name: str, allow=()) -> dict:
     processus ni de lire leur environnement.
 
     `allow` (L230, comme `holders`) : noms des processus dont l'illisibilité
-    n'est PAS un doute. #5029 : l'exécuteur se rend non-dumpable et ne porte
-    jamais d'identifiant de tour ; sans cette liste, sa propre famille de
-    processus empêcherait de solder un tour resté ouvert (le doute est
-    volontairement sans borne haute pour un tour inachevé)."""
+    n'est PAS un doute (choix explicite de la politique). #5038 : les services
+    non-dumpables sont reconnus séparément par leur MainPID systemd, uid,
+    cgroup et tops de démarrage, jamais par un ajout automatique de noms.
+    Sans identité vérifiée, leur environnement illisible reste un doute."""
     uid = os.getuid() if hasattr(os, "getuid") else None
     allow = frozenset(allow or ())
+    executors = _once(executor_processes)
     values: dict = {}
     unread: list = []
     ps = _psutil()
@@ -355,7 +356,8 @@ def env_values(name: str, allow=()) -> dict:
             except ps.NoSuchProcess:
                 continue
             except Exception:
-                if allow and _proc_ok() and _allowed_proc(int(info["pid"]), allow):
+                if _proc_ok() and (_trusted_executor(int(info["pid"]), executors)
+                                   or _allowed_proc(int(info["pid"]), allow)):
                     continue
                 unread.append(info.get("create_time"))
                 continue
@@ -383,7 +385,7 @@ def env_values(name: str, allow=()) -> dict:
         except FileNotFoundError:
             continue
         except OSError:
-            if allow and _allowed_proc(pid, allow):
+            if _trusted_executor(pid, executors) or _allowed_proc(pid, allow):
                 continue
             unread.append(start)
             continue
@@ -829,6 +831,66 @@ def service_managers(uid: int | None = None) -> frozenset:
     return frozenset(out)
 
 
+def executor_processes() -> dict:
+    """#5038: service MainPIDs with their kernel start ticks and cgroup.
+
+    Names/argv alone grant nothing. systemd supplies the MainPID and the exact
+    unit control group; a turn process or a child in that same service is never
+    its MainPID. A missing manager, malformed response or reused PID exempts
+    nothing. The snapshot is local to one scan, never a cross-scan PID cache.
+    """
+    if not _proc_ok():
+        return {}
+    import subprocess
+    blocks = []
+    for manager in (["systemctl", "--user"], ["systemctl", "--system"]):
+        try:
+            done = subprocess.run(
+                [*manager, "show", "--no-pager",
+                 "--property=Id,MainPID,ControlGroup,Transient,FragmentPath", "ameesh-*.service"],
+                capture_output=True, text=True, timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode == 0:
+            blocks.extend(done.stdout.strip().split("\n\n"))
+    result = {}
+    for block in blocks:
+        fields = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
+        unit, pid, group = (fields.get(k, "") for k in ("Id", "MainPID", "ControlGroup"))
+        fragment = fields.get("FragmentPath", "")
+        if (fields.get("Transient") != "no" or not os.path.isabs(fragment)
+                or "/transient/" in fragment):
+            continue
+        if not (unit.startswith("ameesh-") and unit.endswith(".service")
+                and pid.isdecimal() and int(pid) > 1 and group.startswith("/")
+                and group.rstrip("/").split("/")[-1] == unit):
+            continue
+        identity = _executor_identity(int(pid), group)
+        if identity is not None:
+            result[int(pid)] = identity
+    return result
+
+
+def _executor_identity(pid, group):
+    try:
+        status = _proc_status(pid)
+        stat = _stat_fields(int(pid))
+        cgroups = _read_text(os.path.join(PROC, str(pid), "cgroup")).splitlines()
+        actual = next((line[3:] for line in cgroups if line.startswith("0::")), "")
+        if (not status or not status.get("Uid") or len(stat) <= 19
+                or status["Uid"][1] != str(os.getuid())
+                or actual not in (group, group + "/runner")):
+            return None
+        return (stat[19], group)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _trusted_executor(pid, identities) -> bool:
+    identity = identities().get(int(pid))
+    return identity is not None and _executor_identity(int(pid), identity[1]) == identity
+
+
 def _named_by(allow, name: str, argv) -> bool:
     """L230 : le processus se nomme (`comm`) et s'annonce dans `allow` —
     `argv[0]`, ou `argv[1]` quand un interpréteur lance un script (le cas de
@@ -857,13 +919,14 @@ def _allowed_proc(pid, allow) -> bool:
     return _named_by(allow, name, argv)
 
 
-def _doubt_proc(pid, uid: int, managers, allow=()) -> str | None:
+def _doubt_proc(pid, uid: int, managers, allow=(), executors=None) -> str | None:
     """L63b: why a process whose open files were denied leaves the answer
     unknown, read on /proc; None when it cannot hold anything of the user's:
     gone, a zombie (no files left), running as another user (effective uid:
     a setuid helper such as sudo is root's), the user's service manager
-    (`managers()`, by PID), or a process named by `allow` (L230, `comm` and
-    one of its first two argv entries; an unreadable status is a doubt)."""
+    (`managers()`, by PID), a verified service MainPID (`executors()`), or a
+    process explicitly named by `allow` (L230, `comm` and one of its first two argv entries; an
+    unreadable status is a doubt)."""
     try:
         status = _proc_status(pid)
     except OSError as exc:
@@ -875,7 +938,8 @@ def _doubt_proc(pid, uid: int, managers, allow=()) -> str | None:
         return "%s (uid unreadable)" % pid
     if int(uids[1]) != uid or int(pid) in managers():
         return None
-    if _allowed_proc(pid, allow):
+    if ((executors is not None and _trusted_executor(pid, executors))
+            or _allowed_proc(pid, allow)):
         return None
     return "%s %s" % (pid, " ".join(status.get("Name") or ["?"]))
 
@@ -1079,9 +1143,10 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False,
                            % type(exc).__name__) from None
     if _proc_ok():   # Linux: the same reading of a doubt as the /proc way
         uid, managers = os.getuid(), _once(service_managers)
+        executors = _once(executor_processes)
 
         def doubt(pid):
-            return _doubt_proc(pid, uid, managers, allow)
+            return _doubt_proc(pid, uid, managers, allow, executors)
     else:
         def doubt(pid):
             return _doubt_psutil(ps, pid, user, allow)
@@ -1184,6 +1249,7 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
                            "open files unreadable even for this process (%s)"
                            % exc) from None
     uid, managers = os.getuid(), _once(service_managers)
+    executors = _once(executor_processes)
     found = []
     doubts: dict = {}
     for pid in pids:
@@ -1226,13 +1292,13 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
         if row:
             found.append(row)
         elif refused:
-            who = _doubt_proc(pid, uid, managers, allow)
+            who = _doubt_proc(pid, uid, managers, allow, executors)
             if who:
                 doubts[pid] = who
     # L63b : même règle que la voie psutil — un détenteur vérifié ne se jette
     # pas parce qu'un tiers du même utilisateur refuse ses fichiers ouverts.
     if not found:
-        _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers, allow))
+        _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers, allow, executors))
     return found
 
 
@@ -1244,14 +1310,6 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
 #: service manager (`systemd --user`, cwd `/`)
 SERVICE_MANAGER = frozenset({"systemd", "(sd-pam)"})
 
-#: #5029: the executor's console-script names. The executor is made
-#: non-dumpable at startup and never holds a session journal or a
-#: worktree/node_modules file: a session or dependency holder check may pass
-#: these through `allow` (both `comm` and `argv[0]`, like every allowed name).
-#: Housekeeping adds them to the host policy's list
-#: (`policy.housekeeping.unreadable_ok`), where a worktree's working directory
-#: could matter.
-EXECUTOR_NAMES = ("ameesh", "agent-runner")
 
 
 class UserPaths:

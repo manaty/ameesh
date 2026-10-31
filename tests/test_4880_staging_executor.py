@@ -87,6 +87,18 @@ class ExecutorTest(unittest.TestCase):
             self.proofs = [dict(data=dict(state="completed"))]
         return 0, False
 
+    def test_staging_scripts_receive_explicit_transport_credentials(self):
+        from ameesh.platform import child_environment as E
+        with mock.patch.dict("os.environ", {"GH_TOKEN": "test-gh", "AMEESH_DSN": "test-db",
+                                            "OPENAI_API_KEY": "other"}):
+            executor.tick(self.db, self.cfg, self.options)
+        self.assertTrue(self.calls)
+        for argv, env in self.calls:
+            clean = E.for_child(argv, env)
+            self.assertEqual(clean.get("GH_TOKEN"), "test-gh")
+            self.assertEqual(clean.get("AMEESH_DSN"), "test-db")
+            self.assertNotIn("OPENAI_API_KEY", clean)
+
     def test_attested_foreign_run_allows_next_attempt(self):
         self.foreign = [running("previous")]
         self.attested = [dict(id=2, data=dict(sha="a" * 40))]

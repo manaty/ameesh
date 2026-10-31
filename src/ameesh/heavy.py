@@ -458,7 +458,11 @@ def run(cfg, argv: list, *, nice: int = DEFAULT_NICE, max_s: float | None = None
             if nice:
                 os.nice(nice)
         try:
-            child = subprocess.Popen(argv, preexec_fn=lower, pass_fds=(fh.fileno(),))
+            from .platform.child_environment import grant
+            # heavy is a scheduling wrapper for the caller's exact command.
+            env = grant(os.environ, os.environ.keys())
+            child = subprocess.Popen(argv, env=env, preexec_fn=lower,
+                                     pass_fds=(fh.fileno(),))
         except FileNotFoundError:
             print("ameesh heavy: command not found: %s" % argv[0], file=sys.stderr)
             return 127
