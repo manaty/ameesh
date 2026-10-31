@@ -69,12 +69,16 @@ def reference(backend, operation, previous, decision):
                and e.get('operation') == previous and e.get('bundle_digest') == old['digest']
                and e.get('decision') == decision for e in entries):
         raise b.BootstrapError('previous signed install provenance unavailable')
-    # If this operation was also run with another genuine install mandate,
-    # replacing only one would leave an executable old enable. Refuse this
-    # ambiguous history; it needs an explicit multi-authority reconciliation.
-    others = {e.get('decision') for e in entries if e.get('command') == 'install'
-              and e.get('phase') == 'start' and e.get('operation') == previous
-              and e.get('bundle_digest') == old['digest'] and e.get('decision') != decision}
+    # Every signed install mandate can execute the old bundle, including one
+    # never passed to install(). Scan the exact question without a history
+    # limit: journal provenance alone cannot enumerate outstanding authority.
+    others = backend.db.query(
+        "SELECT id FROM agent_mailbox WHERE kind = 'request'"
+        " AND payload -> 'decision' ->> 'question' = %s"
+        " AND payload -> 'decision' ->> 'state' = 'answered'"
+        " AND id <> %s",
+        (previous_prepared.question, decision))
+    others = [row['id'] for row in others]
     if any(type(identifier) is int and signed_previous(identifier) for identifier in others):
         raise b.BootstrapError('multiple previous signed bootstrap decisions require reconciliation')
     return dict(version=1, operation=previous, decision=decision, digest=old['digest'],
