@@ -1302,6 +1302,61 @@ class ReveilTest(_Base):
                 self.assertEqual(row["actionable_lots"], 1)
                 self.assertEqual(self.pick(worker)["lot"], str(lot))
 
+    def _qa_lot(self, name, *, freeze, verdict=None):
+        lot = work.add(self.db, title="qa lot", assignee=name, force=_FORCE)["id"]
+        work.move(self.db, lot, "build")
+        work.move(self.db, lot, "qa")
+        if freeze:
+            head = "b" * 40
+            work.milestone(self.db, lot, "frozen", sha=head, actor="test")
+            if verdict:
+                work.milestone(self.db, lot, "verdict", verdict=verdict, sha=head,
+                               actor="reviewer")
+        return lot
+
+    def _future_wake(self, lot):
+        self.db.execute("UPDATE work_items SET wake_at = clock_timestamp()"
+                        " + interval '1 hour' WHERE id = %s", (lot,))
+
+    def test_blocking_verdict_primes_over_a_future_wake(self):
+        # #5037 (N2 de la revue de #5028) : la correction due n'attend pas
+        # l'échéance du réveil, ni pour le réveil ni pour le décompte.
+        name = "wake5037blocked"
+        worker = self._worker(name)
+        lot = self._qa_lot(name, freeze=True, verdict="blocked")
+        self._future_wake(lot)
+        self.assertEqual([r["id"] for r in self.st.actionable(name)], [lot])
+        row = next(r for r in storage.of(self.db).operations.listing()
+                   if r["name"] == name)
+        self.assertEqual(row["actionable_lots"], 1)
+        spec = self.pick(worker)
+        self.assertEqual((spec["kind"], spec["lot"]), ("idle", str(lot)))
+        self.assertIn("Resuming lot #%d" % lot, spec["prompt"])
+
+    def test_missing_freeze_primes_over_a_future_wake(self):
+        # #5037 (N2) : le gel dû est un geste de l'auteur, pas une attente.
+        name = "wake5037freeze"
+        worker = self._worker(name)
+        lot = self._qa_lot(name, freeze=False)
+        self._future_wake(lot)
+        self.assertEqual([r["id"] for r in self.st.actionable(name)], [lot])
+        row = next(r for r in storage.of(self.db).operations.listing()
+                   if r["name"] == name)
+        self.assertEqual(row["actionable_lots"], 1)
+        self.assertEqual(self.pick(worker)["lot"], str(lot))
+
+    def test_qa_without_due_work_still_waits_for_its_future_wake(self):
+        # contrôle : tout lot en qa à réveil futur n'est pas rendu actionnable.
+        name = "wake5037ok"
+        worker = self._worker(name)
+        lot = self._qa_lot(name, freeze=True, verdict="ok")
+        self._future_wake(lot)
+        self.assertEqual(self.st.actionable(name), [])
+        row = next(r for r in storage.of(self.db).operations.listing()
+                   if r["name"] == name)
+        self.assertEqual(row["actionable_lots"], 0)
+        self.assertIsNone(self.pick(worker))
+
     def test_backoff_en_base_survit_au_redemarrage(self):
         worker = self._worker("r2")
         b = work.add(self.db, title="à faire", assignee="r2", force=_FORCE)["id"]

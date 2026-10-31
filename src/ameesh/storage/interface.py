@@ -5076,12 +5076,16 @@ class LotSessions(Domain):
     @abc.abstractmethod
     def actionable(self, name: str, *, today: str | None = None) -> list[dict]:
         """Les lots de l'agent que la règle 1 peut reprendre, par priorité
-        puis ancienneté : assignés à lui, en `intake`/`build`, ni prévus après
-        `today`, ni en attente d'une décision (demande non lue, jalon de
-        décision ouvert), d'un lot bloquant ouvert ou d'une note `hold:`
-        (la dernière posée par un agent du registre ou un humain). La retenue
-        tient jusqu'à une note de l'assigné ou d'un humain (`human:…`), une
-        levée explicite (`unhold:`, `hold lifted:`…) ou un changement d'état ;
+        puis ancienneté : assignés à lui, en `intake`/`build`, ou en `qa`
+        quand un geste de l'auteur est dû (gel manquant, #3986, ou verdict
+        courant bloquant, #5037) ; ni prévus après `today`, ni en attente
+        d'une décision (demande non lue, jalon de
+        décision ouvert), d'un lot bloquant ouvert, d'une note `hold:`
+        (la dernière posée par un agent du registre ou un humain) ni d'un
+        réveil programmé futur (#5028 ; sauf quand ce geste est dû, #5037).
+        La retenue tient jusqu'à une note de l'assigné ou d'un humain
+        (`human:…`), une levée explicite (`unhold:`, `hold lifted:`…) ou un
+        changement d'état ;
         ne la lèvent pas une note `wake:` (#2466 : pose ou déclenchement d'un
         réveil programmé), une note de l'outillage (#3992 : composition de
         paquet, runner, git…) ni la note ordinaire d'un autre agent (#4162,

@@ -23,7 +23,8 @@ from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
 from .work import REQUEUED_PARAMS, has_reviewer, requeued_sql
-from .work_dependencies import current_verdict as _current_verdict, freeze_due
+from .work_dependencies import (current_verdict as _current_verdict, freeze_due,
+                                wake_defers)
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = f"('{lifecycle.DELIVERY_RECORDED}', '{lifecycle.PROMOTED}', '{lifecycle.CLOSED}')"   # closed : abandonné ou remplacé (L29)
@@ -236,7 +237,7 @@ class Operations(interface.Operations):
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                      AND w.state NOT IN """ + _WAITING_ON_OTHERS + """
                      AND (w.planned_start IS NULL OR w.planned_start <= j.today)
-                     AND (w.wake_at IS NULL OR w.wake_at <= clock_timestamp())) al ON true
+                     AND NOT """ + wake_defers("w") + """) al ON true
               LEFT JOIN LATERAL (
                   -- #1677 : ce que l'agent doit encore faire — ses lots qui
                   -- l'occupent, plus la correction d'un lot en qa dont le
@@ -251,6 +252,8 @@ class Operations(interface.Operations):
                   -- peut citer ; `assigned_lot_id` reste le lot assigné le plus
                   -- récemment touché, qui peut être prévu plus tard ou en
                   -- attente d'un autre.
+                  -- #5037 : un réveil futur ne l'éteint pas quand ce geste est
+                  -- dû (gel manquant ou verdict courant bloquant).
                   SELECT count(*)""" + review_due + """ AS n, min(w.id) AS lot_id
                     FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
@@ -258,7 +261,7 @@ class Operations(interface.Operations):
                           OR (w.state = '{lifecycle.QA}' AND (""" + freeze_due("w") + """
                               OR """ + _current_verdict("w") + """ = 'blocked')))
                      AND (w.planned_start IS NULL OR w.planned_start <= j.today)
-                     AND (w.wake_at IS NULL OR w.wake_at <= clock_timestamp())) ac ON true
+                     AND NOT """ + wake_defers("w") + """) ac ON true
               LEFT JOIN LATERAL (
                   SELECT c.harness, c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at
                     FROM turn_costs c
