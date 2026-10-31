@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#5099 : le courrier reste livrable avant les migrations additives."""
-import io
-import unittest
-from contextlib import redirect_stderr
-from unittest import mock
-
-from ameesh import cli, db, mail, registry
+from ameesh import cli, mail, registry
 from ameesh.backend import PgBackend
 from .support import PgTestCase
 
@@ -36,16 +31,3 @@ class SchemaMailTest(PgTestCase):
         finally:
             self.db.execute("ALTER TABLE agent_registry ADD COLUMN review_hold jsonb")
             self.db.execute("ALTER TABLE agent_registry ADD COLUMN operator_pause_until timestamptz")
-
-
-class MigrationDiagnosticTest(unittest.TestCase):
-    def test_sqlstate_transmis_sans_dependre_du_texte_localise(self):
-        database = mock.Mock()
-        error = db.DbError("verrou indisponible", sqlstate="55P03")
-        output = io.StringIO()
-        with mock.patch.object(cli.db_mod, "connect", return_value=database), \
-                mock.patch.object(cli.migrations, "migrate", side_effect=error), \
-                redirect_stderr(output):
-            self.assertEqual(cli.cmd_migrate(mock.Mock()), 1)
-        self.assertIn("[SQLSTATE 55P03]", output.getvalue())
-        database.close.assert_called_once()

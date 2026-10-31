@@ -1627,9 +1627,6 @@ def align_schema(ctx: Context) -> None:
         ctx.say("[essai] migrations à poser : %s" % ", ".join(labels))
         return
     result = _migrate(ctx, "--additive-only")
-    if result.returncode != 0 and "[SQLSTATE 55P03]" in result.text:
-        ctx.say("schéma : verrou indisponible (55P03), un seul réessai")
-        result = _migrate(ctx, "--additive-only")
     if result.returncode != 0:
         kind = "droit-ddl" if DENIED_RE.search(result.text) else (
             "non-additive" if result.returncode == 3 else "pose")
@@ -1670,13 +1667,9 @@ def alert_schema(ctx: Context, kind: str, what: str, message: str) -> None:
     lot = 0
     try:
         payload = json.loads(opened.stdout) if opened.returncode == 0 else {}
-        lot = int(payload.get("lot") or 0)
-        if lot:
-            noted = ctx.ameesh("work", "note", str(lot), message)
-            if noted.returncode != 0:
-                ctx.say("détail schéma non consigné : %s" % auto._tail(noted.text, 5))
         if payload.get("created") is False:
             return
+        lot = int(payload.get("lot") or 0)
     except (ValueError, TypeError, AttributeError):
         lot = 0
     for to in dict.fromkeys((ctx.pilot, BUREAU)):

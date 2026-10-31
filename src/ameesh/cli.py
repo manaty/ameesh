@@ -2008,8 +2008,7 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
     try:
         db = db_mod.connect(cfg, writer=False)
     except db_mod.Unavailable as exc:
-        print("migration failed%s: %s" % (
-            " [SQLSTATE %s]" % exc.sqlstate if exc.sqlstate else "", exc), file=sys.stderr)
+        print("migration failed: %s" % exc, file=sys.stderr)
         return 1
     try:
         if dry_run or additive_only:
@@ -2042,8 +2041,7 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False,
         print(str(exc), file=sys.stderr)
         return 3
     except db_mod.DbError as exc:
-        print("migration failed%s: %s" % (
-            " [SQLSTATE %s]" % exc.sqlstate if exc.sqlstate else "", exc), file=sys.stderr)
+        print("migration failed: %s" % exc, file=sys.stderr)
         return 1
     finally:
         db.close()
