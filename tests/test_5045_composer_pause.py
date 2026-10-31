@@ -54,7 +54,7 @@ class AnnouncementTest(bench.Base):
             send.assert_not_called()
             check(NOW + 3600)
             first = send.call_args_list[:]
-            check(NOW + 7200)
+            check(NOW + 3600 + packet_pause.REMIND_S - 1)
             self.assertEqual(send.call_args_list[2:], first)
             self.assertEqual(len(first), 2)
             self.assertEqual(first[0].args[1], "ameesh")
@@ -105,6 +105,15 @@ class CommandTest(bench.CommandTest):
 
 
 class DurablePauseTest(PgTestCase):
+    def setUp(self):
+        super().setUp()
+        # #5057: the log is append-only and the class shares one schema; an
+        # old tombstone breaks the pause chain earlier tests left behind.
+        self.db.execute(
+            "INSERT INTO ameesh_events (type, object, project, data, created_at)"
+            " VALUES ('packet.pause', 'paquet-horaire:ameesh:main', 'ameesh',"
+            " '{\"state\": \"resumed\"}'::jsonb, now() - interval '500 days')")
+
     def old(self, state, *, object="paquet-horaire:ameesh:main", days=400):
         data = {"state": state, "until": int(time.time() - (days - 1) * 86400),
                 "await_announcement": True, "reason": "window", "by": "pilot"}
