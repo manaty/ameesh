@@ -2,6 +2,7 @@
 """L151 : migrer avant d'installer — reconnaître une migration additive."""
 from __future__ import annotations
 
+import dataclasses
 import unittest
 
 from ameesh import migrations
@@ -46,8 +47,22 @@ class NonAdditiveTest(unittest.TestCase):
             "-- revoke all on t from r\n/* alter table t add unique (c); */ select 1;",
             "alter table t add column c int check (c > 0) unique;",
             "drop view if exists v; create view v as select * from t;",
+            "-- ameesh: trigger compatible with previous code\n"
             "drop trigger if exists g on t; create trigger g after insert on t "
             "for each row execute function f();",
+            # #5142 : la table est neuve, le code d'avant n'y écrit pas
+            "create table n (id int); create trigger g before insert on n "
+            "for each row execute function f();",
+            "create table n (id int);"
+            " create function f() returns trigger language plpgsql as $$ begin return new; end $$;"
+            " create trigger g before insert on n for each row execute function f();",
+            "create table n (id int); create rule r as on insert to n do nothing;",
+            "create table n (id int); create policy p on n using (true);",
+            "create table n (id int); alter table n enable trigger g;",
+            "-- ameesh: trigger compatible with previous code\n"
+            "do $$ begin execute 'create trigger g after insert on t "
+            "for each row execute function f()'; end $$;",
+            "comment on trigger g on t is 'garde';",
             "-- on ne fait pas de drop table ici\nalter table t add column d text;",
         ):
             with self.subTest(sql=sql):
@@ -158,6 +173,54 @@ class NonAdditiveTest(unittest.TestCase):
             with self.subTest(sql=sql):
                 reasons = migrations.non_additive(_migration(sql))
                 self.assertTrue(any(reason in r for r in reasons), reasons)
+
+    def test_gardes_posees_sur_une_table_existante(self):
+        # #5142 : elles changent ce que fait l'écriture du code d'avant
+        for sql, reason in (
+            ("create trigger g after insert on t for each row execute function f();",
+             "trigger on a table not proven new (t)"),
+            ("create or replace trigger g before update of a, b on only t"
+             " for each row execute function f();", "trigger on a table not proven new (t)"),
+            ("create constraint trigger g after insert on t for each row execute function f();",
+             "trigger on a table not proven new (t)"),
+            ("create rule r as on insert to t do nothing;", "rule on a table not proven new (t)"),
+            ("create or replace rule r as on insert to t do nothing;", "rule on a table"),
+            ("create policy p on t using (true);", "policy on a table not proven new (t)"),
+            ("alter table t enable row level security;", "row level security"),
+            ("alter table t force row level security;", "row level security"),
+            ("create table t (id int); alter table t enable row level security;",
+             "row level security"),
+            ("alter table t enable always trigger g;", "trigger enabled"),
+            ("alter table t enable rule r;", "rule enabled"),
+            ("create table if not exists t (id int); create trigger g after insert on t"
+             " for each row execute function f();", "trigger on a table"),
+            ("drop table if exists t; create table t (id int); create rule r as on insert"
+             " to t do nothing;", "rule on a table"),
+            ('create table "T" (id int); create trigger g after insert on "t"'
+             " for each row execute function f();", "trigger on a table"),
+            ("create table n (id int); create trigger g after insert on t"
+             " for each row execute function f();", "trigger on a table not proven new (t)"),
+            ("do $$ begin execute 'create trigger g after insert on t"
+             " for each row execute function f()'; end $$;", "trigger in a string"),
+            ("execute 'alter table t enable row level security';", "row level security in a string"),
+            # le marqueur est réservé aux triggers
+            ("-- ameesh: trigger compatible with previous code\n"
+             "create rule r as on insert to t do nothing;", "rule on a table"),
+            ("-- ameesh: trigger compatible with previous code\n"
+             "create policy p on t using (true);", "policy on a table"),
+            ("-- ameesh: trigger compatible with previous code\n"
+             "alter table t enable row level security;", "row level security"),
+        ):
+            with self.subTest(sql=sql):
+                reasons = migrations.non_additive(_migration(sql))
+                self.assertTrue(any(reason in r for r in reasons), reasons)
+
+    def test_0529_rejouee_hors_seuil_est_non_additive(self):
+        hold = next(m for m in migrations.discover() if m.version == 529)
+        self.assertEqual(migrations.non_additive(hold), [])
+        replayed = dataclasses.replace(hold, version=migrations._GUARDS_CHECKED_AFTER + 1)
+        self.assertTrue(any("trigger on a table not proven new (work_items)" in r
+                            for r in migrations.non_additive(replayed)))
 
     def test_les_versions_livrees_gardent_leur_classement(self):
         # 0524 retire un droit : le reclasser marquerait une migration appliquée
